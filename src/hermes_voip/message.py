@@ -21,8 +21,9 @@ _CRLF = "\r\n"
 # A status-line requires a single SP between the code and the (possibly empty)
 # reason phrase, so "SIP/2.0 200OK" is rejected as malformed framing.
 _STATUS_LINE = re.compile(r"SIP/2\.0 (\d{3})(?: (.*))?")
-# A request-line is "METHOD request-uri SIP/2.0".
-_REQUEST_LINE = re.compile(r"([A-Za-z]+) (\S+) SIP/2\.0")
+# A request-line is "METHOD request-uri SIP/2.0"; method is an RFC 3261 token
+# (covers extension methods, not just the alphabetic standard ones).
+_REQUEST_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0")
 # A header field name is an RFC 3261 token: no whitespace, colon, or controls.
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 

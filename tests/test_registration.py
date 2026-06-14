@@ -183,3 +183,22 @@ def test_response_with_wrong_cseq_raises() -> None:
 def test_deregister_before_registration_raises() -> None:
     with pytest.raises(RuntimeError, match="not registered"):
         RegistrationFlow(_CONFIG).deregister()
+
+
+def test_call_id_matches_the_wire_and_is_stable() -> None:
+    # The manager demuxes REGISTER responses by Call-ID (ADR-0011), so the
+    # property must equal the Call-ID actually used on the wire.
+    flow = RegistrationFlow(_CONFIG)
+    req = flow.start()
+    assert flow.call_id == _h(req, "Call-ID")
+    # Stable across re-authentication and re-registration (same registration).
+    challenged = flow.handle(_challenge())
+    assert isinstance(challenged, Challenged)
+    assert _h(challenged.request, "Call-ID") == flow.call_id
+    refresh = flow.start()
+    assert _h(refresh, "Call-ID") == flow.call_id
+
+
+def test_distinct_flows_have_distinct_call_ids() -> None:
+    # Each extension's registration is an independent transaction space.
+    assert RegistrationFlow(_CONFIG).call_id != RegistrationFlow(_CONFIG).call_id

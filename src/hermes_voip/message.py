@@ -26,6 +26,12 @@ _STATUS_LINE = re.compile(r"SIP/2\.0 (\d{3})(?: (.*))?")
 _REQUEST_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0")
 # A header field name is an RFC 3261 token: no whitespace, colon, or controls.
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# A To/From header already carrying a dialog tag parameter.
+_TAG_PRESENT = re.compile(r";\s*tag=", re.IGNORECASE)
+
+# A SIP status code is in the 1xx..6xx range.
+_MIN_STATUS = 100
+_MAX_STATUS = 699
 
 # Forbidden control characters: the ASCII C0 range (code points below this) and DEL.
 _C0_END = 0x20
@@ -125,6 +131,80 @@ def build_request(
         lines.append(f"{name}: {value}")
     lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
     return _CRLF.join(lines) + _CRLF + _CRLF + body
+
+
+def build_response(  # noqa: PLR0913 — status, reason, to-tag, extra headers and body are irreducible response fields; 3 are keyword-only
+    request: SipRequest,
+    status_code: int,
+    reason: str,
+    *,
+    to_tag: str | None = None,
+    extra_headers: Sequence[tuple[str, str]] = (),
+    body: str = "",
+) -> str:
+    """Assemble a SIP response to ``request`` as wire text (RFC 3261 §8.2.6).
+
+    Echoes the request's full ``Via`` stack (in order), ``From``, ``To``,
+    ``Call-ID`` and ``CSeq`` so the response routes back. When ``to_tag`` is
+    given and the request's ``To`` has no tag, it is appended (a dialog-forming
+    2xx); a ``To`` that already carries a tag (an in-dialog request) is echoed
+    unchanged. ``Content-Length`` is computed from ``body``.
+
+    Args:
+        request: The request being answered.
+        status_code: The response status (100..699).
+        reason: The reason phrase (may be empty).
+        to_tag: Our dialog tag, added to ``To`` only when it has none.
+        extra_headers: Response headers (e.g. ``Contact``, ``Content-Type``).
+        body: The message body.
+
+    Raises:
+        ValueError: If ``status_code`` is out of range, the request is missing a
+            mandatory header to echo, or a header name/value would corrupt the
+            message.
+    """
+    if not _MIN_STATUS <= status_code <= _MAX_STATUS:
+        msg = f"status code out of range 100..699: {status_code}"
+        raise ValueError(msg)
+    _reject_controls(reason, "reason phrase")
+    vias = request.headers_all("Via")
+    if not vias:
+        msg = "cannot build a response: request has no Via header"
+        raise ValueError(msg)
+    from_value = _require_echo(request, "From")
+    to_value = _require_echo(request, "To")
+    call_id = _require_echo(request, "Call-ID")
+    cseq = _require_echo(request, "CSeq")
+    if to_tag is not None and _TAG_PRESENT.search(_after_angle(to_value)) is None:
+        to_value = f"{to_value};tag={to_tag}"
+    headers: list[tuple[str, str]] = [("Via", via) for via in vias]
+    headers.append(("From", from_value))
+    headers.append(("To", to_value))
+    headers.append(("Call-ID", call_id))
+    headers.append(("CSeq", cseq))
+    headers.extend(extra_headers)
+    lines = [f"SIP/2.0 {status_code} {reason}"]
+    for name, value in headers:
+        if _HEADER_NAME.fullmatch(name) is None:
+            msg = f"invalid header name: {name!r}"
+            raise ValueError(msg)
+        _reject_controls(value, "header value")
+        lines.append(f"{name}: {value}")
+    lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
+    return _CRLF.join(lines) + _CRLF + _CRLF + body
+
+
+def _require_echo(request: SipRequest, name: str) -> str:
+    value = request.header(name)
+    if value is None:
+        msg = f"cannot build a response: request has no {name} header"
+        raise ValueError(msg)
+    return value
+
+
+def _after_angle(header_value: str) -> str:
+    """The header-parameter span of a name-addr value (after ``>``)."""
+    return header_value.split(">", 1)[1] if ">" in header_value else header_value
 
 
 @dataclass(frozen=True, slots=True)

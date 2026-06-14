@@ -14,9 +14,10 @@ jobs:
         run: |
           set -euo pipefail
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
-          curl -sSL "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tgz
-          curl -sSL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o checksums.txt
-          grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" checksums.txt | sha256sum -c -
-          tar -xzf gitleaks.tgz gitleaks
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL "${base}/${tarball}" -o "${tarball}"
+          curl -fsSL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o checksums.txt
+          grep "${tarball}" checksums.txt | sha256sum -c -
+          tar -xzf "${tarball}" gitleaks
       - name: Scan full history
         run: ./gitleaks git --redact --verbose . # fetch-depth: 0 gives full history

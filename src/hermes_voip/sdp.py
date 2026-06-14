@@ -24,7 +24,13 @@ _TELEPHONE_EVENT = "telephone-event"
 _DEFAULT_CLOCK_RATE = 8000
 _CONN_ADDR_FIELD = 2  # c=<nettype> <addrtype> <address>
 _MIN_LINE_LEN = 2  # an SDP line is at minimum "<type>="
+_M_AUDIO_MIN_FIELDS = 3  # m=audio <port> <proto> [<fmt>...]
+_MAX_PORT = 65535
 _CRLF = "\r\n"
+
+
+class SdpError(ValueError):
+    """Raised when an SDP body is malformed (inbound network data)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,15 +95,40 @@ class _AudioAccumulator:
     connection: str | None = None
 
     def set_media_line(self, value: str) -> None:
-        """Apply an ``m=audio <port> <proto> <fmt...>`` line."""
-        _, port, protocol, *formats = value.split()
-        self.port = int(port)
-        self.protocol = protocol
-        self.fmt_order = [int(pt) for pt in formats]
+        """Apply an ``m=audio <port> <proto> <fmt...>`` line.
+
+        Raises:
+            SdpError: If the line is truncated or carries a non-integer port or
+                payload type.
+        """
+        fields = value.split()
+        if len(fields) < _M_AUDIO_MIN_FIELDS:
+            msg = f"malformed m=audio line: {value!r}"
+            raise SdpError(msg)
+        try:
+            self.port = int(fields[1])
+            self.fmt_order = [int(pt) for pt in fields[3:]]
+        except ValueError as exc:
+            msg = f"malformed m=audio line: {value!r}"
+            raise SdpError(msg) from exc
+        self.protocol = fields[2]
 
     def add_attribute(self, value: str) -> None:
-        """Fold one media-level ``a=`` attribute into the accumulator."""
+        """Fold one media-level ``a=`` attribute into the accumulator.
+
+        Raises:
+            SdpError: If an ``rtpmap``/``fmtp``/``ptime`` value is malformed.
+        """
         tag, _, rest = value.partition(":")
+        try:
+            self._add_attribute(tag, rest, value)
+        except ValueError as exc:
+            if isinstance(exc, SdpError):
+                raise
+            msg = f"malformed a={value!r}"
+            raise SdpError(msg) from exc
+
+    def _add_attribute(self, tag: str, rest: str, value: str) -> None:
         if tag == "rtpmap":
             pt_str, _, enc_str = rest.partition(" ")
             encoding, _, after = enc_str.partition("/")
@@ -152,7 +183,8 @@ class SessionDescription:
         """Parse an SDP body, extracting the first audio media if present."""
         session_conn: str | None = None
         acc: _AudioAccumulator | None = None
-        in_audio = False
+        in_audio = False  # currently inside the (single) selected audio section
+        seen_media = False  # any m= line has started; session-level c= is over
 
         for raw in text.replace(_CRLF, "\n").split("\n"):
             line = raw.strip()
@@ -160,19 +192,24 @@ class SessionDescription:
                 continue
             kind, value = line[0], line[2:]
             if kind == "m":
-                in_audio = value.startswith("audio")
-                if in_audio and acc is None:
+                seen_media = True
+                if acc is not None:
+                    in_audio = False  # first audio already captured; ignore the rest
+                elif value.startswith("audio"):
                     acc = _AudioAccumulator()
                     acc.set_media_line(value)
+                    in_audio = True
+                else:
+                    in_audio = False
             elif kind == "c":
                 fields = value.split()
                 addr = (
                     fields[_CONN_ADDR_FIELD] if len(fields) > _CONN_ADDR_FIELD else None
                 )
-                if in_audio and acc is not None:
-                    acc.connection = addr
-                else:
-                    session_conn = addr
+                if not seen_media:
+                    session_conn = addr  # session-level c= precedes any media
+                elif in_audio and acc is not None:
+                    acc.connection = addr  # media-level c= for the audio section
             elif kind == "a" and in_audio and acc is not None:
                 acc.add_attribute(value)
 
@@ -227,10 +264,20 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
         The SDP body terminated by CRLF, ready to attach to an INVITE/200.
 
     Raises:
-        ValueError: If ``direction`` is not a valid SDP direction attribute.
+        ValueError: If ``direction`` is invalid, ``codecs`` is empty, ``port`` is
+            outside ``1..65535``, or ``ptime`` is not positive.
     """
     if direction not in _DIRECTIONS:
         msg = f"invalid SDP direction: {direction!r}"
+        raise ValueError(msg)
+    if not codecs:
+        msg = "an SDP audio offer needs at least one codec"
+        raise ValueError(msg)
+    if not 1 <= port <= _MAX_PORT:
+        msg = f"RTP port out of range 1..{_MAX_PORT}: {port}"
+        raise ValueError(msg)
+    if ptime <= 0:
+        msg = f"ptime must be positive, got {ptime}"
         raise ValueError(msg)
     payloads = " ".join(str(c.payload_type) for c in codecs)
     lines = [
@@ -242,9 +289,10 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
         f"m=audio {port} RTP/AVP {payloads}",
     ]
     for codec in codecs:
-        lines.append(
-            f"a=rtpmap:{codec.payload_type} {codec.encoding}/{codec.clock_rate}"
-        )
+        rate = f"{codec.encoding}/{codec.clock_rate}"
+        if codec.channels != 1:
+            rate = f"{rate}/{codec.channels}"
+        lines.append(f"a=rtpmap:{codec.payload_type} {rate}")
         if codec.fmtp is not None:
             lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
     lines.append(f"a=ptime:{ptime}")

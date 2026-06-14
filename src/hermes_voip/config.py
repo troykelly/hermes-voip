@@ -115,6 +115,29 @@ class GatewayConfig:
     extensions: tuple[ExtensionConfig, ...]
     default_index: int
 
+    def __post_init__(self) -> None:
+        """Enforce the invariants the type promises, not just the parser.
+
+        ``GatewayConfig`` is public, so a caller can construct one directly;
+        the dataclass validates itself rather than trusting
+        :func:`load_gateway_config` to have done so (the ``default_extension``
+        lookup and the demux logic depend on these holding).
+        """
+        if not self.extensions:
+            msg = "GatewayConfig requires at least one extension"
+            raise ConfigError(msg)
+        indices = [ext.index for ext in self.extensions]
+        if len(set(indices)) != len(indices):
+            msg = "GatewayConfig extension indices must be unique"
+            raise ConfigError(msg)
+        numbers = [ext.extension for ext in self.extensions]
+        if len(set(numbers)) != len(numbers):
+            msg = "GatewayConfig extension numbers must be unique"
+            raise ConfigError(msg)
+        if self.default_index not in indices:
+            msg = f"default_index {self.default_index} is not a configured index"
+            raise ConfigError(msg)
+
     @property
     def via_transport(self) -> str:
         """The Via transport token (``TLS`` | ``WSS``) for this gateway."""
@@ -123,12 +146,8 @@ class GatewayConfig:
     @property
     def default_extension(self) -> ExtensionConfig:
         """The registration that owns inbound calls with no better match."""
-        for ext in self.extensions:
-            if ext.index == self.default_index:
-                return ext
-        # Unreachable: default_index is validated at parse time.
-        msg = f"no extension with index {self.default_index}"
-        raise ConfigError(msg)
+        # __post_init__ guarantees exactly one match for default_index.
+        return next(ext for ext in self.extensions if ext.index == self.default_index)
 
     def registration_config(
         self,
@@ -142,8 +161,12 @@ class GatewayConfig:
         ``contact`` and ``local_sent_by`` are knowable only once the transport
         socket is up (the local host:port, or an ``.invalid`` host for WebSocket
         per RFC 7118), so they are supplied by the caller; everything else comes
-        from this env-sourced config.
+        from this env-sourced config. ``ext`` must be one of this gateway's
+        configured extensions.
         """
+        if ext not in self.extensions:
+            msg = f"extension {ext.extension!r} is not configured on this gateway"
+            raise ConfigError(msg)
         return RegistrationConfig(
             aor=f"sip:{ext.extension}@{self.host}",
             username=ext.username,
@@ -240,13 +263,19 @@ def _parse_int(raw: str, key: str) -> int:
 
 
 def _parse_extensions(env: Mapping[str, str]) -> tuple[ExtensionConfig, ...]:
-    has_bare = _BARE_EXTENSION in env
+    # Any bare credential key — not just the extension — signals the single
+    # scheme, so a stray HERMES_SIP_PASSWORD/USERNAME beside the indexed scheme
+    # is caught as a mix (a likely typo) rather than silently ignored.
+    has_bare = any(
+        key in env for key in (_BARE_EXTENSION, _BARE_PASSWORD, _BARE_USERNAME)
+    )
     indexed_indices = _indexed_indices(env)
 
     if has_bare and indexed_indices:
         msg = (
-            f"{_BARE_EXTENSION} (single) and {_EXTENSION_PREFIX}<n> (indexed) "
-            "schemes must not be combined; use one"
+            f"{_BARE_EXTENSION}/{_BARE_PASSWORD} (single) and "
+            f"{_EXTENSION_PREFIX}<n> (indexed) schemes must not be combined; "
+            "use one"
         )
         raise ConfigError(msg)
 

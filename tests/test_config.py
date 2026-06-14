@@ -10,6 +10,7 @@ import pytest
 
 from hermes_voip.config import (
     ConfigError,
+    ExtensionConfig,
     GatewayConfig,
     load_gateway_config,
 )
@@ -292,3 +293,86 @@ def test_gateway_config_is_frozen() -> None:
     assert isinstance(cfg, GatewayConfig)
     with pytest.raises((AttributeError, TypeError)):
         cfg.host = "evil.example.test"  # type: ignore[misc]
+
+
+# ---- review hardening: stray-bare mixing, self-validating type, foreign ext
+
+
+def test_stray_bare_password_with_indexed_rejected() -> None:
+    # A stray bare credential alongside the indexed scheme is a likely typo, not
+    # a valid mix; it must not be silently ignored (codex MEDIUM).
+    with pytest.raises(ConfigError):
+        load_gateway_config(
+            _base(
+                HERMES_SIP_EXTENSION_1="1001",
+                HERMES_SIP_PASSWORD_1="p1",
+                HERMES_SIP_PASSWORD="stray",
+            )
+        )
+
+
+def test_stray_bare_username_with_indexed_rejected() -> None:
+    with pytest.raises(ConfigError):
+        load_gateway_config(
+            _base(
+                HERMES_SIP_EXTENSION_1="1001",
+                HERMES_SIP_PASSWORD_1="p1",
+                HERMES_SIP_USERNAME="stray",
+            )
+        )
+
+
+def _ext(index: int, number: str) -> ExtensionConfig:
+    return ExtensionConfig(index=index, extension=number, username=number, password="p")
+
+
+def test_gateway_config_rejects_empty_extensions() -> None:
+    with pytest.raises(ConfigError):
+        GatewayConfig(
+            host="pbx.example.test",
+            port=5061,
+            transport="tls",
+            expires=300,
+            user_agent="hermes-voip/0",
+            extensions=(),
+            default_index=0,
+        )
+
+
+def test_gateway_config_rejects_unknown_default_index() -> None:
+    with pytest.raises(ConfigError):
+        GatewayConfig(
+            host="pbx.example.test",
+            port=5061,
+            transport="tls",
+            expires=300,
+            user_agent="hermes-voip/0",
+            extensions=(_ext(1, "1001"),),
+            default_index=99,
+        )
+
+
+def test_gateway_config_rejects_duplicate_indices() -> None:
+    with pytest.raises(ConfigError):
+        GatewayConfig(
+            host="pbx.example.test",
+            port=5061,
+            transport="tls",
+            expires=300,
+            user_agent="hermes-voip/0",
+            extensions=(_ext(1, "1001"), _ext(1, "1002")),
+            default_index=1,
+        )
+
+
+def test_registration_config_rejects_foreign_extension() -> None:
+    cfg = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="secret")
+    )
+    foreign = _ext(7, "7777")
+    with pytest.raises(ConfigError):
+        cfg.registration_config(
+            foreign,
+            contact="<sip:7777@198.51.100.7:5061;transport=tls>",
+            local_sent_by="198.51.100.7:5061",
+        )

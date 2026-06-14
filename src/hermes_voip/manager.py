@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -125,6 +126,7 @@ class _FlowState:
     registered: bool = False
     expires: int | None = None
     refresh_task: asyncio.Task[None] | None = field(default=None)
+    last_error: BaseException | None = None
 
 
 class RegistrationManager:
@@ -136,11 +138,17 @@ class RegistrationManager:
         transport: SipTransport,
         *,
         refresh_fraction: float = _DEFAULT_REFRESH_FRACTION,
+        on_registration_error: Callable[[str, BaseException], None] | None = None,
     ) -> None:
-        """Build one flow per configured extension (no IO until :meth:`start`)."""
+        """Build one flow per configured extension (no IO until :meth:`start`).
+
+        ``on_registration_error`` is invoked (extension, error) when a background
+        refresh fails, so a flapping registration is observed, never swallowed.
+        """
         self._gateway = gateway
         self._transport = transport
         self._refresh_fraction = refresh_fraction
+        self._on_error = on_registration_error
         self._flows: dict[str, _FlowState] = {}
         self._by_extension: dict[str, _FlowState] = {}
         self._calls: dict[tuple[str, str, str], DialogConsumer] = {}
@@ -197,7 +205,12 @@ class RegistrationManager:
         return self.is_up
 
     async def aclose(self) -> None:
-        """Cancel every refresh task; the transport is closed by its owner."""
+        """Cancel every refresh task; the transport is closed by its owner.
+
+        Each task's done callback (:meth:`_on_refresh_done`) has already observed
+        any real failure; the ``gather`` here only drains the resulting
+        cancellations.
+        """
         tasks = [
             state.refresh_task
             for state in self._flows.values()
@@ -239,11 +252,32 @@ class RegistrationManager:
         if state.refresh_task is not None:
             state.refresh_task.cancel()
         delay = max(0.0, expires * self._refresh_fraction)
-        state.refresh_task = asyncio.create_task(self._refresh_after(state, delay))
+        task = asyncio.create_task(self._refresh_after(state, delay))
+        state.refresh_task = task
+        task.add_done_callback(lambda done: self._on_refresh_done(state, done))
 
     async def _refresh_after(self, state: _FlowState, delay: float) -> None:
         await asyncio.sleep(delay)
         await self._transport.send(state.flow.start())
+
+    def _on_refresh_done(self, state: _FlowState, task: asyncio.Task[None]) -> None:
+        """Observe a finished refresh task; surface any failure (never swallow).
+
+        A cancelled task (shutdown) is expected. Any other exception means the
+        refresh could not be sent, so the registration can no longer be kept
+        alive: mark it down, record the error, and report it.
+        """
+        if state.refresh_task is task:
+            state.refresh_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        state.registered = False
+        state.last_error = error
+        if self._on_error is not None:
+            self._on_error(state.extension.extension, error)
 
     # --- inbound requests (demux) -------------------------------------------
 

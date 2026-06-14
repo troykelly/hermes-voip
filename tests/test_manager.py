@@ -280,6 +280,44 @@ async def test_refresh_resends_register() -> None:
     await manager.aclose()
 
 
+class _FlakyTransport(_FakeTransport):
+    """A transport whose ``send`` fails once it has sent ``fail_after`` messages."""
+
+    def __init__(self, *, fail_after: int) -> None:
+        super().__init__()
+        self._fail_after = fail_after
+
+    async def send(self, message: str) -> None:
+        if len(self.sent) >= self._fail_after:
+            msg = "transport down"
+            raise RuntimeError(msg)
+        self.sent.append(message)
+
+
+async def test_refresh_failure_marks_down_and_is_reported() -> None:
+    # A refresh that fails to send must not be swallowed (rule 37): the
+    # registration is marked down and the error surfaced, never left as a lost
+    # background-task exception (codex HIGH).
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FlakyTransport(fail_after=2)  # 2 initial REGISTERs ok; refresh fails
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        refresh_fraction=0.0,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    await manager.on_response(_ok_for(transport.sent[0]))
+    await asyncio.sleep(0.05)  # the refresh fires and its send() raises
+    assert errors
+    extension, error = errors[0]
+    assert extension == "1000"
+    assert isinstance(error, RuntimeError)
+    down = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert down.registered is False
+    await manager.aclose()
+
+
 async def test_aclose_cancels_refresh_tasks() -> None:
     transport = _FakeTransport()
     manager = RegistrationManager(_gateway(), transport, refresh_fraction=0.5)

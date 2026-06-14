@@ -151,7 +151,10 @@ def build_attended_refer(
         from_tag=consult.local_tag,
     )
     escaped = quote(replaces.header_value(), safe="")
-    refer_to = f"<{consult.remote_target}?Replaces={escaped}>"
+    # Join with '&' when the target URI already carries a header (a leading '?'),
+    # never a malformed second '?'.
+    separator = "&" if "?" in consult.remote_target else "?"
+    refer_to = f"<{consult.remote_target}{separator}Replaces={escaped}>"
     extra: list[tuple[str, str]] = [("Refer-To", refer_to)]
     if referred_by is not None:
         extra.append(("Referred-By", _wrap_uri(referred_by)))
@@ -165,13 +168,13 @@ def parse_refer(request: SipRequest) -> ReferRequest:
     """Parse an inbound REFER into its target, ``Replaces``, and ``Referred-By``.
 
     Raises:
-        ReferError: if the REFER has no ``Refer-To`` header.
+        ReferError: if the REFER does not carry exactly one ``Refer-To`` header.
     """
-    refer_to_raw = request.header("Refer-To")
-    if refer_to_raw is None:
-        msg = "REFER has no Refer-To header"
+    refer_to_values = request.headers_all("Refer-To")
+    if len(refer_to_values) != 1:
+        msg = f"REFER must have exactly one Refer-To header, got {len(refer_to_values)}"
         raise ReferError(msg)
-    addr = _bracketed_uri(refer_to_raw)
+    addr = _bracketed_uri(refer_to_values[0])
     target, _, query = addr.partition("?")
     replaces = _replaces_from_uri_query(query)
     referred_by_raw = request.header("Referred-By")
@@ -269,8 +272,11 @@ def parse_notify_sipfrag(request: SipRequest) -> NotifyProgress:
     Raises:
         ReferError: if the body has no ``SIP/2.0`` status-line.
     """
-    subscription = (request.header("Subscription-State") or "").strip().lower()
-    terminated = subscription.startswith("terminated")
+    subscription_raw = request.header("Subscription-State")
+    if subscription_raw is None:
+        msg = "NOTIFY has no Subscription-State header (RFC 6665 §8.2.1)"
+        raise ReferError(msg)
+    terminated = subscription_raw.strip().lower().startswith("terminated")
     first_line = request.body.strip().split("\n", 1)[0].strip()
     match = _SIPFRAG_STATUS.match(first_line)
     if match is None:
@@ -308,24 +314,38 @@ def _replaces_from_uri_query(query: str) -> ReplacesSpec | None:
 
 
 def _parse_replaces_value(value: str) -> ReplacesSpec:
-    """Parse a ``Replaces`` value ``call-id;to-tag=..;from-tag=..`` (RFC 3891)."""
+    """Parse a ``Replaces`` value ``call-id;to-tag=..;from-tag=..`` (RFC 3891).
+
+    Requires a non-empty call-id and **exactly one** non-empty ``to-tag`` and
+    ``from-tag`` each; duplicates or empties are rejected.
+    """
     parts = value.split(";")
     call_id = parts[0].strip()
-    to_tag: str | None = None
-    from_tag: str | None = None
+    to_tags: list[str] = []
+    from_tags: list[str] = []
     early_only = False
     for part in parts[1:]:
         key, sep, val = part.partition("=")
         name = key.strip().lower()
         if name == "to-tag" and sep:
-            to_tag = val.strip()
+            to_tags.append(val.strip())
         elif name == "from-tag" and sep:
-            from_tag = val.strip()
+            from_tags.append(val.strip())
         elif name == "early-only":
             early_only = True
-    if not call_id or to_tag is None or from_tag is None:
-        msg = f"Replaces requires call-id, to-tag and from-tag: {value!r}"
+    if not call_id:
+        msg = f"Replaces requires a call-id: {value!r}"
         raise ReferError(msg)
+    to_tag = _single_tag(to_tags, "to-tag", value)
+    from_tag = _single_tag(from_tags, "from-tag", value)
     return ReplacesSpec(
         call_id=call_id, to_tag=to_tag, from_tag=from_tag, early_only=early_only
     )
+
+
+def _single_tag(tags: list[str], name: str, value: str) -> str:
+    """Return the one non-empty tag, rejecting absence, duplicates, or emptiness."""
+    if len(tags) != 1 or not tags[0]:
+        msg = f"Replaces requires exactly one non-empty {name}: {value!r}"
+        raise ReferError(msg)
+    return tags[0]

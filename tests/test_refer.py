@@ -329,3 +329,71 @@ def test_parse_notify_sipfrag_without_status_line_raises() -> None:
 def test_replaces_spec_header_value_round_trips() -> None:
     spec = ReplacesSpec(call_id="x@h", to_tag="t1", from_tag="f1", early_only=True)
     assert spec.header_value() == "x@h;to-tag=t1;from-tag=f1;early-only"
+
+
+# ---- review hardening: strict RFC 3515/3891/6665 parsing -------------------
+
+
+def test_parse_refer_rejects_duplicate_refer_to() -> None:
+    # RFC 3515: a REFER carries exactly one Refer-To.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Refer-To", "<sip:3000@pbx.example.test>"),
+            ("Refer-To", "<sip:4000@pbx.example.test>"),
+        ),
+        body="",
+    )
+    with pytest.raises(ReferError):
+        parse_refer(refer)
+
+
+def test_match_replaces_rejects_empty_tag() -> None:
+    invite = _invite_with_replaces("ac-call;to-tag=;from-tag=a-ctag")
+    with pytest.raises(ReferError):
+        match_replaces(invite, [_target_view()])
+
+
+def test_match_replaces_rejects_duplicate_tag() -> None:
+    invite = _invite_with_replaces("ac-call;to-tag=c-tag;to-tag=x;from-tag=a-ctag")
+    with pytest.raises(ReferError):
+        match_replaces(invite, [_target_view()])
+
+
+def test_parse_notify_sipfrag_rejects_missing_subscription_state() -> None:
+    # RFC 6665 §8.2.1: a NOTIFY MUST carry Subscription-State.
+    notify = SipRequest(
+        method="NOTIFY",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Content-Type", "message/sipfrag"),),
+        body="SIP/2.0 200 OK",
+    )
+    with pytest.raises(ReferError):
+        parse_notify_sipfrag(notify)
+
+
+def test_attended_refer_appends_replaces_when_target_has_uri_header() -> None:
+    consult = _consult()
+    with_header = Dialog(
+        call_id=consult.call_id,
+        local_uri=consult.local_uri,
+        local_tag=consult.local_tag,
+        remote_uri=consult.remote_uri,
+        remote_tag=consult.remote_tag,
+        remote_target="sip:3000@198.51.100.50:5061?Subject=consult",
+        route_set=consult.route_set,
+        local_contact=consult.local_contact,
+        local_sent_by=consult.local_sent_by,
+        transport=consult.transport,
+        local_cseq=consult.local_cseq,
+        sdp_version=consult.sdp_version,
+    )
+    refer = SipRequest.parse(build_attended_refer(_dialog(), with_header).text)
+    refer_to = refer.header("Refer-To") or ""
+    # A second URI header is joined with '&', never a malformed second '?'.
+    assert refer_to.count("?") == 1
+    assert "&Replaces=" in refer_to
+    parsed = parse_refer(refer)
+    assert parsed.replaces is not None
+    assert parsed.replaces.to_tag == "c-tag"

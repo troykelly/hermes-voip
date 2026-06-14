@@ -48,6 +48,10 @@ _REQUEST_PENDING = 491
 _UNAUTHORIZED = 401
 _PROXY_AUTH_REQUIRED = 407
 
+# A legacy RFC 2543 hold sets the connection address to the IPv4 black hole;
+# deprecated and never generated, but tolerated on receive (ADR-0011).
+_BLACKHOLE_ADDRESS = "0.0.0.0"  # noqa: S104 — detection sentinel, never a bind address
+
 # A hold/resume target is one of these two directions (ADR-0011 §2).
 _HOLD_DIRECTIONS = frozenset({"sendonly", "sendrecv"})
 
@@ -127,9 +131,9 @@ def build_hold_reinvite(
 
 @dataclass(frozen=True, slots=True)
 class HoldConfirmed:
-    """The peer accepted our re-INVITE (2xx); ``answer`` is its SDP, if any."""
+    """The peer accepted our re-INVITE (2xx) with a usable SDP answer."""
 
-    answer: SessionDescription | None
+    answer: SessionDescription
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,11 +168,18 @@ type ReinviteResponse = (
 
 
 def handle_reinvite_response(response: SipResponse) -> ReinviteResponse:
-    """Classify a response to a re-INVITE we sent.
+    """Classify a response to a hold/resume re-INVITE we sent.
 
-    Returns :class:`ReinviteProgress` (1xx), :class:`HoldConfirmed` (2xx, with the
-    parsed SDP answer when present), :class:`ReinviteChallenged` (401/407), or
+    Returns :class:`ReinviteProgress` (1xx), :class:`HoldConfirmed` (2xx with a
+    usable SDP answer), :class:`ReinviteChallenged` (401/407), or
     :class:`ReinviteRejected` (every other final status, ``is_glare`` for 491).
+
+    Raises:
+        IncallError: if a 2xx carries no usable SDP answer. We always offer SDP
+            in a hold/resume re-INVITE, so a 2xx without an audio answer is an
+            RFC 3264 offer/answer violation, not a confirmed media change.
+        ValueError: if a 401/407 carries no parseable digest challenge
+            (propagated from :meth:`DigestChallenge.parse`).
     """
     code = response.status_code
     if 100 <= code < 200:  # noqa: PLR2004 — 1xx provisional range
@@ -177,6 +188,9 @@ def handle_reinvite_response(response: SipResponse) -> ReinviteResponse:
         answer = (
             SessionDescription.parse(response.body) if response.body.strip() else None
         )
+        if answer is None or answer.audio is None:
+            msg = "2xx to our SDP offer carried no usable SDP answer"
+            raise IncallError(msg)
         return HoldConfirmed(answer=answer)
     if code in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
         proxy = code == _PROXY_AUTH_REQUIRED
@@ -202,8 +216,9 @@ class MediaUpdate:
         offer: The peer's parsed SDP offer.
         offer_direction: The offer's media direction.
         answer_direction: The direction to answer with (RFC 3264 §6.1 mirror).
-        held_by_peer: ``True`` when the peer has placed us on hold (it is not
-            receiving our media: ``sendonly`` or ``inactive`` offer).
+        held_by_peer: ``True`` when the peer has placed us on hold — it is not
+            receiving our media (``sendonly``/``inactive`` offer) or it used a
+            legacy ``c=0.0.0.0`` black-hole hold (RFC 2543, tolerated on receive).
     """
 
     offer: SessionDescription
@@ -245,9 +260,13 @@ def classify_inbound_reinvite(
     if answer_direction is None:
         msg = f"unknown offer media direction: {offer_direction!r}"
         raise IncallError(msg)
+    held = (
+        offer_direction in _HELD_OFFER_DIRECTIONS
+        or offer.audio.connection_address == _BLACKHOLE_ADDRESS
+    )
     return MediaUpdate(
         offer=offer,
         offer_direction=offer_direction,
         answer_direction=answer_direction,
-        held_by_peer=offer_direction in _HELD_OFFER_DIRECTIONS,
+        held_by_peer=held,
     )

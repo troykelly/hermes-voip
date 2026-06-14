@@ -144,10 +144,25 @@ def test_handle_200_with_answer() -> None:
     assert out.answer.audio.direction == "recvonly"
 
 
-def test_handle_200_without_body() -> None:
-    out = handle_reinvite_response(_response(200, "OK"))
-    assert isinstance(out, HoldConfirmed)
-    assert out.answer is None
+def test_handle_200_without_answer_raises() -> None:
+    # We always offer SDP in a hold/resume re-INVITE, so a 2xx with no usable
+    # SDP answer is an RFC 3264 offer/answer violation — fail loudly, never
+    # silently confirm media (codex HIGH).
+    with pytest.raises(IncallError):
+        handle_reinvite_response(_response(200, "OK"))
+
+
+def test_handle_200_with_non_audio_sdp_raises() -> None:
+    video_only = (
+        "v=0\r\n"
+        "o=- 1 1 IN IP4 198.51.100.99\r\n"
+        "s=-\r\n"
+        "c=IN IP4 198.51.100.99\r\n"
+        "t=0 0\r\n"
+        "m=video 40000 RTP/AVP 96\r\n"
+    )
+    with pytest.raises(IncallError):
+        handle_reinvite_response(_response(200, "OK", body=video_only))
 
 
 def test_handle_401_challenged() -> None:
@@ -246,6 +261,28 @@ def test_classify_inactive_answers_inactive_held() -> None:
     )
     assert isinstance(out, MediaUpdate)
     assert out.answer_direction == "inactive"
+    assert out.held_by_peer is True
+
+
+def test_classify_legacy_blackhole_hold_is_held() -> None:
+    # Legacy RFC 2543 hold sets c= to 0.0.0.0 (often with sendrecv). ADR-0011
+    # tolerates it on receive: classify it as held even though the direction is
+    # not sendonly/inactive (codex MEDIUM).
+    legacy = build_audio_offer(
+        local_address="0.0.0.0",  # noqa: S104 — modelling a legacy black-hole hold offer
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendrecv",
+        session_id=9,
+    )
+    req = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@pbx.example.test",
+        headers=(("Content-Type", "application/sdp"),),
+        body=legacy,
+    )
+    out = classify_inbound_reinvite(req, pending_local_offer=False)
+    assert isinstance(out, MediaUpdate)
     assert out.held_by_peer is True
 
 

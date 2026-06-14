@@ -57,10 +57,14 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-# asserts are the point of tests; test fns need no docstrings; test credentials are
-# deliberately fake literals (bandit S105/S106/S107); tests compare against literal
-# expected values (PLR2004 magic-value).
-"tests/**" = ["S101", "D103", "S105", "S106", "S107", "PLR2004"]
+# asserts are the point of tests; test fns/classes/fakes need no docstrings
+# (D101/D102/D103/D105/D106/D107); test credentials are deliberately fake literals
+# (bandit S105/S106/S107); tests compare against literal expected values (PLR2004).
+"tests/**" = [
+  "S101", "D101", "D102", "D103", "D105", "D106", "D107",
+  "S105", "S106", "S107", "PLR2004",
+  "ARG001", "ARG002",  # fakes implement Protocols; matching unused params are intentional
+]
 
 # ---------------------------------------------------------------------------
 # mypy — strict, no escape hatches (AGENTS.md rule 17).

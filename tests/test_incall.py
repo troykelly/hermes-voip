@@ -303,3 +303,15 @@ def test_classify_glare_takes_priority_over_offer() -> None:
         _offer_request("sendonly"), pending_local_offer=True
     )
     assert isinstance(out, Glare)
+
+
+def test_build_hold_reinvite_carries_auth_header() -> None:
+    # Re-auth path (CallSession): a 401/407 re-send carries the Authorization.
+    result = build_hold_reinvite(
+        _dialog(local_cseq=5, sdp_version=2),
+        _MEDIA,
+        "sendonly",
+        auth=("Authorization", "Digest username=1000"),
+    )
+    parsed = SipRequest.parse(result.text)
+    assert parsed.header("Authorization") == "Digest username=1000"

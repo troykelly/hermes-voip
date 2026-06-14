@@ -1,0 +1,45 @@
+"""Streaming text-to-speech provider seam (ADR-0004; impls in ADR-0007)."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Protocol, runtime_checkable
+
+from hermes_voip.providers.audio import PcmFrame
+
+
+@runtime_checkable
+class TtsStream(AsyncIterator[PcmFrame], Protocol):
+    """Async iterator of PCM16 output frames with explicit lifecycle control."""
+
+    async def flush(self) -> None:
+        """Force synthesis of any buffered text and emit remaining frames."""
+        ...
+
+    async def cancel(self) -> None:
+        """Stop synthesis NOW for barge-in: stop yielding and free the backend.
+
+        Maps to the vendor primitive: Deepgram Aura ``Clear``, Cartesia cancel,
+        ElevenLabs websocket ``close_context``, sherpa-onnx chunk callback ``0``.
+        """
+        ...
+
+
+@runtime_checkable
+class StreamingTTS(Protocol):
+    """Streaming synthesiser: incremental text in, PCM16 frames out."""
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        """Stream token/sentence text in, stream PCM16 frames out.
+
+        ``text`` is the agent's incremental output; the engine begins emitting
+        audio before ``text`` completes. ``voice`` is an opaque provider-scoped
+        id. This is a synchronous factory returning a ``TtsStream`` — the caller
+        iterates the result, it does not ``await`` this call.
+        """
+        ...
+
+    @property
+    def output_sample_rate(self) -> int:
+        """Declared output rate; the media layer resamples to 8 kHz for G.711."""
+        ...

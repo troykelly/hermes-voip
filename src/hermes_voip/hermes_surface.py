@@ -87,7 +87,12 @@ class BasePlatformAdapterProtocol(Protocol):
         reply_to: str | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> SendResultProtocol:
-        """Deliver the agent's reply text to ``chat_id``."""
+        """Deliver the agent's reply text to ``chat_id``.
+
+        ``metadata`` is deliberately typed ``Mapping[str, object] | None`` — a
+        no-``Any`` narrowing of the runtime's ``Optional[Dict[str, Any]]``; our
+        code reads no value out of it, so the narrower type is sound.
+        """
         ...
 
     async def get_chat_info(self, chat_id: str) -> dict[str, object]:

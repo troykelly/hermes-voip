@@ -21,3 +21,19 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy
       - run: uv run pytest
+
+  # Verifies the real hermes-agent surface still matches hermes_voip.hermes_surface
+  # (the typed shim). Separate job so the heavy optional `hermes` extra and its
+  # transitive tree stay out of the main gate's install / licence / audit scope.
+  hermes-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --extra hermes
+      - env:
+          HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
+        run: uv run pytest tests/test_hermes_contract.py -rs

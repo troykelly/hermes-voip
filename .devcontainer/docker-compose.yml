@@ -1,0 +1,41 @@
+# Standardized devcontainer compose — rendered by `remoteclip init-devcontainer`.
+# Repo name, the deterministic IPv6 ULA subnet, and any opt-in extra services
+# are filled in at render time.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Host UID/GID, written to .devcontainer/.env by initializeCommand so
+        # bind-mount writes from the in-container vscode user line up with the
+        # host owner (avoids macOS gRPC-FUSE chmod EACCES on host-owned files).
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    env_file:
+      # Repo-root .env (provisioned from 1Password by remoteclip). Optional so a
+      # missing .env never breaks `docker compose config` or a manual up.
+      - path: ../.env
+        required: false
+    volumes:
+      - ..:/workspaces/hermes-voip:cached
+      # Keep the pnpm content-addressable store off the bind mount.
+      - hermes-voip-pnpm-store:/home/vscode/.local/share/pnpm/store
+    command: sleep infinity
+    mem_limit: 8g
+    networks:
+      - devnet
+
+volumes:
+  hermes-voip-pnpm-store:
+
+networks:
+  devnet:
+    # Deterministic per-repo IPv6 ULA (RFC 4193): fd + 40-bit Global ID derived
+    # from sha256("<org>/<repo>"). Stable across hosts/rebuilds, collision-free
+    # across repos — replaces hand-picked fd00:… prefixes. Docker assigns a
+    # dual-stack IPv4 subnet automatically alongside this.
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: "fd88:d08f:425a:1::/64"

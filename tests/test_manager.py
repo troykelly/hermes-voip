@@ -15,7 +15,7 @@ import asyncio
 
 import pytest
 
-from hermes_voip.config import load_gateway_config
+from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import (
     InDialog,
     NewCall,
@@ -50,7 +50,7 @@ class _FakeConsumer:
         self.received.append(request)
 
 
-def _gateway(**over: str) -> object:
+def _gateway(**over: str) -> GatewayConfig:
     env = {
         "HERMES_SIP_HOST": "pbx.example.test",
         "HERMES_SIP_EXTENSION_1": "1000",

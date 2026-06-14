@@ -23,10 +23,34 @@ from dataclasses import dataclass, field
 
 _PARAM = re.compile(r'(\w+)=(?:"([^"]*)"|([^,\s]+))')
 
+# Only plain MD5 is implemented; MD5-sess and SHA-* are rejected rather than
+# silently mis-signed (a wrong response would just fail against the registrar).
+_SUPPORTED_ALGORITHMS = frozenset({"md5"})
+
+# Forbidden control characters: the ASCII C0 range (code points below this) and DEL.
+_C0_END = 0x20
+_DEL = 0x7F
+
 
 def _md5_hex(value: str) -> str:
     """Return the lowercase hex MD5 digest of ``value`` (UTF-8 encoded)."""
     return hashlib.md5(value.encode("utf-8")).hexdigest()  # noqa: S324 - digest scheme mandates MD5
+
+
+def _quoted(value: str) -> str:
+    """Render ``value`` as an RFC 2617 quoted-string body (without the quotes).
+
+    Rejects control characters (which a hostile or garbled peer could use to
+    inject extra SIP headers once this lands in an ``Authorization`` line) and
+    escapes the backslash and double-quote characters per the quoted-pair rule.
+
+    Raises:
+        ValueError: If ``value`` contains a control character.
+    """
+    if any(ord(char) < _C0_END or ord(char) == _DEL for char in value):
+        msg = "auth-param value contains a control character"
+        raise ValueError(msg)
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +138,19 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
 
     Returns:
         The full header value, beginning with ``Digest ``.
+
+    Raises:
+        ValueError: If the challenge algorithm is unsupported, if it offers
+            ``qop`` but not ``auth``, or if any rendered auth-param value
+            contains a control character.
     """
+    if challenge.algorithm.lower() not in _SUPPORTED_ALGORITHMS:
+        msg = f"unsupported digest algorithm: {challenge.algorithm!r}"
+        raise ValueError(msg)
+    if challenge.qop and "auth" not in challenge.qop:
+        msg = f"challenge offers qop without 'auth': {challenge.qop!r}"
+        raise ValueError(msg)
+
     ha1 = _md5_hex(f"{credentials.username}:{challenge.realm}:{credentials.password}")
     ha2 = _md5_hex(f"{method}:{uri}")
 
@@ -146,7 +182,7 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
         params.append(("opaque", challenge.opaque, True))
 
     rendered = ", ".join(
-        f'{name}="{value}"' if quoted else f"{name}={value}"
+        f'{name}="{_quoted(value)}"' if quoted else f"{name}={value}"
         for name, value, quoted in params
     )
     return f"Digest {rendered}"

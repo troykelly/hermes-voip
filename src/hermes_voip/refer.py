@@ -126,17 +126,31 @@ class NotifyProgress:
 
 
 def build_blind_refer(
-    dialog: Dialog, target_uri: str, *, referred_by: str | None = None
+    dialog: Dialog,
+    target_uri: str,
+    *,
+    referred_by: str | None = None,
+    auth: tuple[str, str] | None = None,
 ) -> InDialogRequest:
-    """Build a blind-transfer REFER (``Refer-To: <target>``) in ``dialog``."""
+    """Build a blind-transfer REFER (``Refer-To: <target>``) in ``dialog``.
+
+    ``auth`` is an optional ``(Authorization|Proxy-Authorization, value)`` header
+    carried when re-sending after a 401/407.
+    """
     extra: list[tuple[str, str]] = [("Refer-To", f"<{target_uri}>")]
     if referred_by is not None:
         extra.append(("Referred-By", _wrap_uri(referred_by)))
+    if auth is not None:
+        extra.append(auth)
     return build_in_dialog_request(dialog, "REFER", extra_headers=tuple(extra))
 
 
 def build_attended_refer(
-    dialog: Dialog, consult: Dialog, *, referred_by: str | None = None
+    dialog: Dialog,
+    consult: Dialog,
+    *,
+    referred_by: str | None = None,
+    auth: tuple[str, str] | None = None,
 ) -> InDialogRequest:
     """Build an attended-transfer REFER in ``dialog`` (the primary call).
 
@@ -144,6 +158,7 @@ def build_attended_refer(
     naming the consultation dialog with RFC 3891 orientation from the target's
     point of view (``to-tag`` = the target's tag, ``from-tag`` = ours). The
     ``Replaces`` is percent-escaped so its ``;``/``=`` do not split the URI.
+    ``auth`` carries an ``Authorization``/``Proxy-Authorization`` on a re-send.
     """
     replaces = ReplacesSpec(
         call_id=consult.call_id,
@@ -158,6 +173,8 @@ def build_attended_refer(
     extra: list[tuple[str, str]] = [("Refer-To", refer_to)]
     if referred_by is not None:
         extra.append(("Referred-By", _wrap_uri(referred_by)))
+    if auth is not None:
+        extra.append(auth)
     return build_in_dialog_request(dialog, "REFER", extra_headers=tuple(extra))
 
 

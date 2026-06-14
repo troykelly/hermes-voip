@@ -93,14 +93,19 @@ class LocalMediaSession:
 
 
 def build_hold_reinvite(
-    dialog: Dialog, media: LocalMediaSession, direction: str
+    dialog: Dialog,
+    media: LocalMediaSession,
+    direction: str,
+    *,
+    auth: tuple[str, str] | None = None,
 ) -> InDialogRequest:
     """Build a hold (``sendonly``) or resume (``sendrecv``) re-INVITE.
 
     Advances the SDP version first (new offer), then builds the in-dialog INVITE
     (advances CSeq) — invariant 1. The returned :class:`InDialogRequest` carries
     the wire text and the dialog with **both** counters incremented and the
-    session-id unchanged.
+    session-id unchanged. ``auth`` is an optional ``(Authorization|
+    Proxy-Authorization, value)`` header carried when re-sending after a 401/407.
 
     Raises:
         IncallError: if ``direction`` is not ``sendonly`` or ``sendrecv``.
@@ -118,10 +123,13 @@ def build_hold_reinvite(
         session_id=media.session_id,
         version=offered.sdp_version,
     )
+    extra: tuple[tuple[str, str], ...] = (
+        (_SDP_CONTENT_TYPE,) if auth is None else (_SDP_CONTENT_TYPE, auth)
+    )
     return build_in_dialog_request(
         offered,
         "INVITE",
-        extra_headers=(_SDP_CONTENT_TYPE,),
+        extra_headers=extra,
         body=body,
     )
 

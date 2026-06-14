@@ -56,6 +56,12 @@ ignore = [
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ruff.lint.isort]
+# Pin first-party explicitly so import grouping is identical whether or not the
+# package happens to be installed in the active venv (otherwise ruff's heuristic
+# classifies hermes_voip differently locally vs CI — a real determinism bug).
+known-first-party = ["hermes_voip"]
+
 [tool.ruff.lint.per-file-ignores]
 # asserts are the point of tests; test fns/classes/fakes need no docstrings
 # (D101/D102/D103/D105/D106/D107); test credentials are deliberately fake literals

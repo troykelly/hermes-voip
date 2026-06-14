@@ -6,6 +6,7 @@ on an unknown name (rule 37).
 """
 
 import pytest
+
 from hermes_voip.providers.registry import ProviderRegistry
 
 

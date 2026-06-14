@@ -6,7 +6,6 @@ thread and yields its items on the event loop, with bounded back-pressure,
 exception propagation, and clean shutdown that joins the thread (no leak/hang).
 """
 
-import asyncio
 import threading
 from collections.abc import Iterator
 from contextlib import aclosing
@@ -24,7 +23,7 @@ async def test_yields_all_items_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_producer_yields_nothing() -> None:
-    out = [item async for item in stream_from_thread(lambda: iter([]))]
+    out = [item async for item in stream_from_thread(lambda: iter(range(0)))]
     assert out == []
 
 
@@ -71,7 +70,6 @@ async def test_early_close_stops_and_joins_the_worker() -> None:
         finally:
             closed.set()  # the worker must close us on early shutdown
 
-    threads_before = threading.active_count()
     async with aclosing(stream_from_thread(make_iter, max_buffer=1)) as stream:
         out: list[int] = []
         async for item in stream:
@@ -82,6 +80,6 @@ async def test_early_close_stops_and_joins_the_worker() -> None:
     assert out == [0, 1, 2]
     assert started.is_set()
     assert closed.is_set()  # the producer was closed, not abandoned
-    # the worker thread terminated (no leak)
-    await asyncio.sleep(0)
-    assert threading.active_count() <= threads_before
+    # the named worker thread was joined (checking active_count would also count
+    # asyncio.to_thread's executor-pool thread, so target the worker by name)
+    assert all(t.name != "hermes-voip-stream" for t in threading.enumerate())

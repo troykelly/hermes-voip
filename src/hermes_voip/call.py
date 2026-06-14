@@ -1,0 +1,396 @@
+"""The CallSession: the one IO-driving in-call orchestrator (ADR-0011 §2).
+
+A :class:`CallSession` owns one established call's control plane — its
+:class:`~hermes_voip.dialog.Dialog`, the signalling and media-control seams, the
+per-call :class:`~hermes_voip.providers.policy.GuardSessionState`, and the local
+media parameters — and exposes the agent-facing verbs ``hold`` / ``unhold`` /
+``transfer_blind`` / ``transfer_attended``. It is also the manager's
+``DialogConsumer``: :meth:`handle_request` answers inbound re-INVITE (mirrored
+direction; **glare → 491**), NOTIFY (transfer progress), REFER (we are being
+transferred), and BYE.
+
+It drives the sans-IO ``dialog`` / ``incall`` / ``refer`` modules over two
+injected seams — :class:`CallSignaling` (send wire text) and :class:`CallMedia`
+(hold gating + teardown) — and correlates responses to its own requests by CSeq.
+A re-INVITE/REFER that is challenged (401/407) is re-sent authenticated once.
+Outbound verbs are serialised by a lock; while our offer is outstanding an
+inbound re-INVITE is answered ``491 Request Pending`` (glare).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Protocol, runtime_checkable
+
+from hermes_voip.dialog import Dialog, InDialogRequest
+from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
+from hermes_voip.incall import (
+    Glare,
+    HoldConfirmed,
+    LocalMediaSession,
+    MediaUpdate,
+    ReinviteRejected,
+    build_hold_reinvite,
+    classify_inbound_reinvite,
+    handle_reinvite_response,
+)
+from hermes_voip.message import (
+    SipRequest,
+    SipResponse,
+    build_request,
+    build_response,
+    new_branch,
+)
+from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import (
+    NotifyProgress,
+    ReferRequest,
+    build_attended_refer,
+    build_blind_refer,
+    parse_notify_sipfrag,
+    parse_refer,
+)
+from hermes_voip.sdp import build_audio_offer
+
+__all__ = [
+    "CallError",
+    "CallMedia",
+    "CallSession",
+    "CallSignaling",
+    "ReferHandler",
+]
+
+_PROVISIONAL_CEILING = 200  # a status below this is a 1xx provisional response
+_UNAUTHORIZED = 401
+_PROXY_AUTH_REQUIRED = 407
+_FIRST_ERROR_STATUS = 300
+_MAX_FORWARDS = "70"
+_DEFAULT_RESPONSE_TIMEOUT = 32.0
+
+
+class CallError(RuntimeError):
+    """An in-call control verb could not complete (rejected, timed out, glare)."""
+
+
+@runtime_checkable
+class CallSignaling(Protocol):
+    """The call's SIP transaction-layer seam (ADR-0005 implements it).
+
+    This is a **transaction** layer, not a bare socket: it owns request
+    retransmission and the **ACK for a non-2xx final response** to an INVITE,
+    which RFC 3261 §17.1.1.3 generates in the client transaction (same branch),
+    not in the transaction user. :class:`CallSession` is the TU, so it emits only
+    the §13.2.2.4 **2xx** ACK (a fresh transaction); it never ACKs a 401/407/491
+    re-INVITE — that is this layer's job.
+    """
+
+    async def send(self, message: str) -> None:
+        """Send one SIP message over the call's signalling transport."""
+        ...
+
+
+@runtime_checkable
+class CallMedia(Protocol):
+    """The call's media-control seam: hold gating and teardown."""
+
+    async def set_hold(self, on_hold: bool) -> None:
+        """Gate (hold) or restore (resume) the RTP send and jitter buffer."""
+        ...
+
+    async def stop(self) -> None:
+        """Tear down the media plane when the call ends; idempotent."""
+        ...
+
+
+type ReferHandler = Callable[[ReferRequest], Awaitable[None]]
+
+
+class CallSession:
+    """Drives one call's hold/transfer control and answers its in-dialog requests."""
+
+    def __init__(  # noqa: PLR0913 — a call binds its dialog, two transport seams, guard state, media params and credentials; all keyword-only
+        self,
+        *,
+        dialog: Dialog,
+        signaling: CallSignaling,
+        media: CallMedia,
+        guard: GuardSessionState,
+        local_media: LocalMediaSession,
+        credentials: DigestCredentials,
+        on_refer: ReferHandler | None = None,
+        response_timeout: float = _DEFAULT_RESPONSE_TIMEOUT,
+    ) -> None:
+        """Bind the call to its dialog, transport seams, and guard state."""
+        self._dialog = dialog
+        self._signaling = signaling
+        self._media = media
+        self._guard = guard
+        self._local_media = local_media
+        self._credentials = credentials
+        self._refer_handler = on_refer
+        self._response_timeout = response_timeout
+        self._pending: dict[int, asyncio.Queue[SipResponse]] = {}
+        self._lock = asyncio.Lock()
+        self._local_offer_pending = False
+        self.on_hold = False
+        self.ended = False
+        self.transfer_progress: NotifyProgress | None = None
+
+    @property
+    def dialog(self) -> Dialog:
+        """The current dialog state (CSeq/SDP version advance as the call runs)."""
+        return self._dialog
+
+    @property
+    def dialog_id(self) -> tuple[str, str, str]:
+        """The demux key the manager routes this call's in-dialog requests by."""
+        return self._dialog.dialog_id
+
+    @property
+    def guard(self) -> GuardSessionState:
+        """The per-call guard state (``degraded`` gates the transfer tools)."""
+        return self._guard
+
+    # --- response correlation -----------------------------------------------
+
+    async def on_response(self, response: SipResponse) -> None:
+        """Deliver a response to the verb awaiting that CSeq (transport calls this)."""
+        cseq = _cseq_number(response.header("CSeq"))
+        if cseq is None:
+            return
+        queue = self._pending.get(cseq)
+        if queue is not None:
+            queue.put_nowait(response)
+
+    async def _send_and_await_final(self, text: str, cseq: int) -> SipResponse:
+        queue: asyncio.Queue[SipResponse] = asyncio.Queue()
+        self._pending[cseq] = queue
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._response_timeout
+        timeout_msg = (
+            f"no final response to CSeq {cseq} within {self._response_timeout}s"
+        )
+        try:
+            await self._signaling.send(text)
+            while True:
+                # An absolute deadline bounds the whole exchange, so a stream of
+                # 1xx provisionals cannot keep the verb alive past the timeout.
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise CallError(timeout_msg)
+                response = await asyncio.wait_for(queue.get(), remaining)
+                if response.status_code < _PROVISIONAL_CEILING:
+                    continue  # 1xx provisional; keep waiting for the final response
+                return response
+        except TimeoutError as exc:
+            raise CallError(timeout_msg) from exc
+        finally:
+            self._pending.pop(cseq, None)
+
+    # --- agent-facing verbs -------------------------------------------------
+
+    async def hold(self) -> None:
+        """Place the caller on hold (re-INVITE ``sendonly``) and gate the media."""
+        async with self._lock:
+            await self._reinvite("sendonly")
+            self.on_hold = True
+            await self._media.set_hold(True)
+
+    async def unhold(self) -> None:
+        """Resume the caller (re-INVITE ``sendrecv``) and un-gate the media."""
+        async with self._lock:
+            await self._reinvite("sendrecv")
+            self.on_hold = False
+            await self._media.set_hold(False)
+
+    async def transfer_blind(
+        self, target_uri: str, *, referred_by: str | None = None
+    ) -> None:
+        """Blind-transfer the caller to ``target_uri`` (REFER); progress via NOTIFY."""
+        async with self._lock:
+            await self._refer(
+                lambda auth: build_blind_refer(
+                    self._dialog, target_uri, referred_by=referred_by, auth=auth
+                )
+            )
+
+    async def transfer_attended(
+        self, consult: Dialog, *, referred_by: str | None = None
+    ) -> None:
+        """Attended-transfer the caller to the ``consult`` peer (REFER + Replaces)."""
+        async with self._lock:
+            await self._refer(
+                lambda auth: build_attended_refer(
+                    self._dialog, consult, referred_by=referred_by, auth=auth
+                )
+            )
+
+    async def _reinvite(self, direction: str) -> None:
+        self._local_offer_pending = True
+        try:
+            result = build_hold_reinvite(self._dialog, self._local_media, direction)
+            self._dialog = result.dialog
+            response = await self._send_and_await_final(
+                result.text, self._dialog.local_cseq
+            )
+            if response.status_code in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
+                auth = self._authorization(response, "INVITE")
+                result = build_hold_reinvite(
+                    self._dialog, self._local_media, direction, auth=auth
+                )
+                self._dialog = result.dialog
+                response = await self._send_and_await_final(
+                    result.text, self._dialog.local_cseq
+                )
+            outcome = handle_reinvite_response(response)
+            if isinstance(outcome, HoldConfirmed):
+                await self._send_ack(response)
+                return
+            if isinstance(outcome, ReinviteRejected):
+                detail = (
+                    "glare (491 Request Pending)"
+                    if outcome.is_glare
+                    else f"{outcome.status_code} {outcome.reason}"
+                )
+                msg = f"re-INVITE rejected: {detail}"
+                raise CallError(msg)
+            msg = "re-INVITE not confirmed after authentication"
+            raise CallError(msg)
+        finally:
+            self._local_offer_pending = False
+
+    async def _refer(
+        self, build: Callable[[tuple[str, str] | None], InDialogRequest]
+    ) -> None:
+        result = build(None)
+        self._dialog = result.dialog
+        response = await self._send_and_await_final(
+            result.text, self._dialog.local_cseq
+        )
+        if response.status_code in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
+            auth = self._authorization(response, "REFER")
+            result = build(auth)
+            self._dialog = result.dialog
+            response = await self._send_and_await_final(
+                result.text, self._dialog.local_cseq
+            )
+        if response.status_code >= _FIRST_ERROR_STATUS:
+            msg = f"REFER rejected: {response.status_code} {response.reason}"
+            raise CallError(msg)
+
+    def _authorization(self, response: SipResponse, method: str) -> tuple[str, str]:
+        proxy = response.status_code == _PROXY_AUTH_REQUIRED
+        challenge_header = "Proxy-Authenticate" if proxy else "WWW-Authenticate"
+        header_name = "Proxy-Authorization" if proxy else "Authorization"
+        challenge = DigestChallenge.parse(response.header(challenge_header) or "")
+        value = build_authorization(
+            challenge,
+            self._credentials,
+            method=method,
+            uri=self._dialog.remote_target,
+        )
+        return (header_name, value)
+
+    async def _send_ack(self, response: SipResponse) -> None:
+        """ACK a 2xx to our re-INVITE (same CSeq number, method ACK, new branch)."""
+        cseq = _cseq_number(response.header("CSeq"))
+        if cseq is None:
+            msg = "cannot ACK a 2xx with no CSeq"
+            raise CallError(msg)
+        dialog = self._dialog
+        via = (
+            f"SIP/2.0/{dialog.transport} {dialog.local_sent_by}"
+            f";branch={new_branch()};rport"
+        )
+        headers: list[tuple[str, str]] = [("Via", via), ("Max-Forwards", _MAX_FORWARDS)]
+        headers += [("Route", route) for route in dialog.route_set]
+        headers += [
+            ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+            ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+            ("Call-ID", dialog.call_id),
+            ("CSeq", f"{cseq} ACK"),
+            ("Contact", dialog.local_contact),
+        ]
+        await self._signaling.send(build_request("ACK", dialog.remote_target, headers))
+
+    # --- inbound in-dialog requests (DialogConsumer) ------------------------
+
+    async def handle_request(self, request: SipRequest) -> None:
+        """Answer an inbound in-dialog request (re-INVITE/REFER/NOTIFY/BYE/ACK)."""
+        method = request.method
+        if method == "INVITE":
+            await self._on_reinvite(request)
+        elif method == "BYE":
+            await self._on_bye(request)
+        elif method == "NOTIFY":
+            await self._on_notify(request)
+        elif method == "REFER":
+            await self._on_refer(request)
+        elif method == "ACK":
+            return  # confirms our 2xx answer to an inbound re-INVITE; no response
+        else:
+            await self._signaling.send(build_response(request, 501, "Not Implemented"))
+
+    async def _on_reinvite(self, request: SipRequest) -> None:
+        routing = classify_inbound_reinvite(
+            request, pending_local_offer=self._local_offer_pending
+        )
+        if isinstance(routing, Glare):
+            await self._signaling.send(build_response(request, 491, "Request Pending"))
+            return
+        if isinstance(routing, MediaUpdate):
+            await self._answer_reinvite(request, routing.answer_direction)
+            self.on_hold = routing.held_by_peer
+            await self._media.set_hold(routing.held_by_peer)
+            return
+        # OfferlessReinvite: re-offer our current media direction in the 2xx.
+        await self._answer_reinvite(request, "sendonly" if self.on_hold else "sendrecv")
+
+    async def _answer_reinvite(self, request: SipRequest, direction: str) -> None:
+        self._dialog = self._dialog.with_next_sdp_version()
+        answer = build_audio_offer(
+            local_address=self._local_media.local_address,
+            port=self._local_media.port,
+            codecs=self._local_media.codecs,
+            direction=direction,
+            ptime=self._local_media.ptime,
+            session_id=self._local_media.session_id,
+            version=self._dialog.sdp_version,
+        )
+        await self._signaling.send(
+            build_response(
+                request,
+                200,
+                "OK",
+                extra_headers=(
+                    ("Contact", self._dialog.local_contact),
+                    ("Content-Type", "application/sdp"),
+                ),
+                body=answer,
+            )
+        )
+
+    async def _on_bye(self, request: SipRequest) -> None:
+        await self._signaling.send(build_response(request, 200, "OK"))
+        self.ended = True
+        await self._media.stop()
+
+    async def _on_notify(self, request: SipRequest) -> None:
+        self.transfer_progress = parse_notify_sipfrag(request)
+        await self._signaling.send(build_response(request, 200, "OK"))
+
+    async def _on_refer(self, request: SipRequest) -> None:
+        refer = parse_refer(request)
+        await self._signaling.send(build_response(request, 202, "Accepted"))
+        if self._refer_handler is not None:
+            await self._refer_handler(refer)
+
+
+def _cseq_number(cseq: str | None) -> int | None:
+    if cseq is None:
+        return None
+    parts = cseq.split()
+    if not parts or not parts[0].isdigit():
+        return None
+    return int(parts[0])

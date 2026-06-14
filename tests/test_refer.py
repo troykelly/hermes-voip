@@ -397,3 +397,13 @@ def test_attended_refer_appends_replaces_when_target_has_uri_header() -> None:
     parsed = parse_refer(refer)
     assert parsed.replaces is not None
     assert parsed.replaces.to_tag == "c-tag"
+
+
+def test_build_blind_refer_carries_auth_header() -> None:
+    result = build_blind_refer(
+        _dialog(),
+        "sip:3000@pbx.example.test",
+        auth=("Proxy-Authorization", "Digest username=1000"),
+    )
+    parsed = SipRequest.parse(result.text)
+    assert parsed.header("Proxy-Authorization") == "Digest username=1000"

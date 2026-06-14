@@ -43,10 +43,16 @@ __all__ = [
 _DEFAULT_USER_AGENT = "hermes-voip/0"
 _MAX_FORWARDS = "70"
 
+# RFC 3261 §8.1.1.5: the CSeq sequence number must be below 2**31.
+_MAX_CSEQ = 2**31
+
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
-_TAG_PARAM = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
-_VIA_SENT_BY = re.compile(r"SIP/2\.0/(\S+)\s+([^;]+)")
+# Anchored at the start of the topmost Via value: transport then sent-by
+# (host:port, no whitespace or parameters).
+_VIA_TOP = re.compile(r"SIP/2\.0/(\S+)\s+([^\s;]+)")
 _CSEQ = re.compile(r"(\d+)\s+(\w+)")
+# A loose-routing first hop carries an ``lr`` flag parameter (RFC 3261 §16.12).
+_LR_PARAM = re.compile(r";\s*lr\b", re.IGNORECASE)
 
 type _Message = SipRequest | SipResponse
 
@@ -206,7 +212,21 @@ def build_in_dialog_request(
     request-URI is the remote target and the route set is emitted as ``Route``
     headers; ``extra_headers`` (e.g. ``Refer-To``, ``Content-Type``) follow the
     standard block, and ``Content-Length`` is computed by :func:`build_request`.
+
+    Loose routing only: a strict-router first hop (a route set head without an
+    ``lr`` parameter) raises :class:`DialogError` rather than producing a
+    silently mis-routed request. Strict routers predate RFC 3261 and no
+    RFC-compliant gateway uses them.
+
+    Raises:
+        DialogError: if the route set head is a strict router.
     """
+    if dialog.route_set and _LR_PARAM.search(dialog.route_set[0]) is None:
+        msg = (
+            "route set head is a strict router (no lr parameter); "
+            "only loose routing is supported"
+        )
+        raise DialogError(msg)
     next_cseq = dialog.local_cseq + 1
     via = (
         f"SIP/2.0/{dialog.transport} {dialog.local_sent_by};branch={new_branch()};rport"
@@ -241,34 +261,76 @@ def _require(message: _Message, name: str) -> str:
 
 
 def _addr_spec(value: str) -> str:
-    """Return the addr-spec from a name-addr / addr-spec header value.
+    """Return the (non-empty) addr-spec from a name-addr / addr-spec value.
 
     Inside ``<...>`` if present (params there are URI params), otherwise up to
     the first ``;`` (where params are header params, per RFC 3261 §20).
     """
     match = _ANGLE_ADDR.search(value)
-    if match is not None:
-        return match.group(1).strip()
-    return value.split(";", 1)[0].strip()
+    spec = (
+        match.group(1).strip() if match is not None else value.split(";", 1)[0].strip()
+    )
+    if not spec:
+        msg = f"empty addr-spec in header: {value!r}"
+        raise DialogError(msg)
+    return spec
 
 
 def _uri_and_tag(value: str) -> tuple[str, str | None]:
     """Return ``(addr-spec, tag)`` from a ``From``/``To`` header value."""
     uri = _addr_spec(value)
-    # The tag is a header parameter: after the closing ``>`` for a name-addr, or
-    # anywhere in an addr-spec form (which has no URI parameters).
-    search_space = value.split(">", 1)[1] if ">" in value else value
-    tag_match = _TAG_PARAM.search(search_space)
-    return uri, (tag_match.group(1) if tag_match is not None else None)
+    # Header parameters live after the closing ``>`` for a name-addr, or after
+    # the first ``;`` for a bare addr-spec (which has no URI parameters).
+    if ">" in value:
+        params = value.split(">", 1)[1]
+    else:
+        _, _, params = value.partition(";")
+    return uri, _header_param(params, "tag")
+
+
+def _header_param(params: str, name: str) -> str | None:
+    """Return the value of header parameter ``name`` (quote-aware), or ``None``.
+
+    Splits on ``;`` outside double-quoted strings, so a quoted value that itself
+    contains ``;tag=`` is not mistaken for the parameter.
+    """
+    for part in _split_semicolons(params):
+        key, sep, raw = part.partition("=")
+        if sep and key.strip().lower() == name:
+            return raw.strip()
+    return None
+
+
+def _split_semicolons(text: str) -> list[str]:
+    """Split ``text`` on ``;`` that fall outside double-quoted spans."""
+    parts: list[str] = []
+    buffer: list[str] = []
+    in_quote = False
+    for char in text:
+        if char == '"':
+            in_quote = not in_quote
+            buffer.append(char)
+        elif char == ";" and not in_quote:
+            parts.append("".join(buffer))
+            buffer = []
+        else:
+            buffer.append(char)
+    parts.append("".join(buffer))
+    return parts
 
 
 def _via_transport_sent_by(value: str) -> tuple[str, str]:
-    """Return ``(transport, sent-by)`` from the topmost Via header value."""
-    match = _VIA_SENT_BY.search(value)
+    """Return ``(transport, sent-by)`` from the **topmost** Via header value.
+
+    A comma-folded Via combines several Via values; only the first (our own) is
+    parsed, and the match is anchored so a garbled prefix is rejected.
+    """
+    topmost = value.split(",", 1)[0].strip()
+    match = _VIA_TOP.match(topmost)
     if match is None:
         msg = f"malformed Via header: {value!r}"
         raise DialogError(msg)
-    return match.group(1), match.group(2).strip()
+    return match.group(1), match.group(2)
 
 
 def _cseq(value: str) -> tuple[int, str]:
@@ -277,4 +339,8 @@ def _cseq(value: str) -> tuple[int, str]:
     if match is None:
         msg = f"malformed CSeq header: {value!r}"
         raise DialogError(msg)
-    return int(match.group(1)), match.group(2)
+    sequence = int(match.group(1))
+    if sequence >= _MAX_CSEQ:
+        msg = f"CSeq sequence {sequence} must be below 2**31 (RFC 3261 §8.1.1.5)"
+        raise DialogError(msg)
+    return sequence, match.group(2)

@@ -335,3 +335,92 @@ def test_from_inbound_invite_rejects_missing_from_tag() -> None:
             local_sent_by="198.51.100.7:5061",
             transport="TLS",
         )
+
+
+# ---- review hardening: robust peer-facing parsing + routing safety ---------
+
+
+def _invite_with(*, via: str | None = None, cseq: str | None = None) -> SipRequest:
+    return SipRequest(
+        method="INVITE",
+        request_uri="sip:2000@pbx.example.test",
+        headers=(
+            ("Via", via if via is not None else _LOCAL_VIA),
+            ("From", "<sip:1000@pbx.example.test>;tag=ftag"),
+            ("To", "<sip:2000@pbx.example.test>"),
+            ("Call-ID", "call-abc"),
+            ("CSeq", cseq if cseq is not None else "1 INVITE"),
+            ("Contact", _LOCAL_CONTACT),
+        ),
+        body="",
+    )
+
+
+def test_via_comma_folded_takes_topmost() -> None:
+    folded = (
+        "SIP/2.0/TLS 198.51.100.7:5061;branch=a, SIP/2.0/TLS 198.51.100.8:5061;branch=b"
+    )
+    d = Dialog.from_invite_2xx(_invite_with(via=folded), _ok())
+    assert d.transport == "TLS"
+    assert d.local_sent_by == "198.51.100.7:5061"  # the topmost Via, not the tail
+
+
+def test_via_garbage_prefix_rejected() -> None:
+    with pytest.raises(DialogError):
+        Dialog.from_invite_2xx(
+            _invite_with(via="garbage SIP/2.0/TLS 198.51.100.7:5061"), _ok()
+        )
+
+
+def test_to_tag_in_quoted_param_not_confused() -> None:
+    # A quoted parameter value that contains ";tag=" must not be mistaken for the
+    # real header tag (codex finding).
+    tricky = SipResponse(
+        status_code=200,
+        reason="OK",
+        headers=(
+            ("Via", _LOCAL_VIA),
+            ("From", "<sip:1000@pbx.example.test>;tag=ftag"),
+            ("To", '<sip:2000@pbx.example.test>;foo=";tag=wrong";tag=right'),
+            ("Call-ID", "call-abc"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", _PEER_CONTACT),
+        ),
+        body="",
+    )
+    d = Dialog.from_invite_2xx(_invite(), tricky)
+    assert d.remote_tag == "right"
+
+
+def test_empty_addr_spec_rejected() -> None:
+    empty_contact = SipResponse(
+        status_code=200,
+        reason="OK",
+        headers=(
+            ("Via", _LOCAL_VIA),
+            ("From", "<sip:1000@pbx.example.test>;tag=ftag"),
+            ("To", "<sip:2000@pbx.example.test>;tag=ttag"),
+            ("Call-ID", "call-abc"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", "<>"),  # empty addr-spec
+        ),
+        body="",
+    )
+    with pytest.raises(DialogError):
+        Dialog.from_invite_2xx(_invite(), empty_contact)
+
+
+def test_cseq_overflow_rejected() -> None:
+    # RFC 3261 §8.1.1.5: the CSeq sequence number must be below 2**31.
+    with pytest.raises(DialogError):
+        Dialog.from_invite_2xx(_invite_with(cseq="2147483648 INVITE"), _ok())
+
+
+def test_strict_router_first_route_rejected() -> None:
+    # A first route hop without ;lr is a strict router; we support loose routing
+    # only and must fail loudly rather than mis-route silently.
+    d = Dialog.from_invite_2xx(
+        _invite(), _ok(record_route=("<sip:proxy.example.test>",))
+    )
+    with pytest.raises(DialogError):
+        build_in_dialog_request(d, "BYE")

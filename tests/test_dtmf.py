@@ -111,3 +111,40 @@ def test_receiver_distinguishes_repeated_digit_by_timestamp() -> None:
         rx.feed(DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=2000)
         == "7"
     )
+
+
+# --- hardening per cross-vendor review ---
+
+
+def test_digit_to_event_rejects_empty_and_multichar() -> None:
+    for bad in ("", "12", "*#"):
+        with pytest.raises(ValueError, match="DTMF digit"):
+            digit_to_event(bad)
+
+
+def test_event_payloads_validates_step_and_duration() -> None:
+    with pytest.raises(ValueError, match="step"):
+        list(event_payloads("5", total_duration=480, step=0))
+    with pytest.raises(ValueError, match="step"):
+        list(event_payloads("5", total_duration=480, step=-160))
+    with pytest.raises(ValueError, match="total_duration"):
+        list(event_payloads("5", total_duration=0, step=160))
+    with pytest.raises(ValueError, match="total_duration"):
+        list(event_payloads("5", total_duration=70000, step=160))
+
+
+def test_receiver_dedups_reordered_end_packets() -> None:
+    rx = DtmfReceiver()
+    assert (
+        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
+        == "3"
+    )
+    assert (
+        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=2000)
+        == "3"
+    )
+    # a late duplicate of the first press must NOT double-emit
+    assert (
+        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
+        is None
+    )

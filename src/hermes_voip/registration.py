@@ -110,6 +110,17 @@ class RegistrationFlow:
         self._registered = False
         self._txn: _Transaction | None = None
 
+    @property
+    def call_id(self) -> str:
+        """The stable ``Call-ID`` of this registration's REGISTER dialog.
+
+        The :class:`RegistrationManager` demuxes REGISTER responses to the owning
+        flow by this value (ADR-0011). It is distinct from any call dialog's
+        ``Call-ID`` — registration and call have independent transaction spaces
+        (invariant 2).
+        """
+        return self._call_id
+
     def start(self) -> str:
         """Begin a (re)registration transaction; returns the REGISTER request."""
         return self._begin(self._cfg.expires)

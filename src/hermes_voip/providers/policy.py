@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import assert_never
 
 from hermes_voip.providers.guard import GuardResult
 
@@ -67,4 +68,8 @@ def gate_tool_call(
         return confirmed and not state.degraded
     if risk is ToolRisk.ELEVATED:
         return not state.degraded
-    return True
+    if risk is ToolRisk.SAFE:
+        return True
+    assert_never(
+        risk
+    )  # exhaustive: a new ToolRisk member fails mypy here, not silently allows

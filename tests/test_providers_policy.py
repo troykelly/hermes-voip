@@ -28,6 +28,13 @@ def test_safe_tools_always_run() -> None:
     assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
 
 
+def test_gate_is_total_over_tool_risk() -> None:
+    # Every ToolRisk member yields a bool; none falls through to assert_never.
+    state = GuardSessionState(call_id="c1")
+    for risk in ToolRisk:
+        assert isinstance(gate_tool_call(risk, state, confirmed=True), bool)
+
+
 def test_irreversible_requires_confirmation() -> None:
     state = GuardSessionState(call_id="c1")
     assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False) is False

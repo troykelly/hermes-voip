@@ -9,7 +9,9 @@ build→parse round-trip.
 import pytest
 
 from hermes_voip.sdp import (
+    AudioMedia,
     Codec,
+    SdpError,
     SessionDescription,
     build_audio_offer,
     negotiate_audio,
@@ -120,3 +122,101 @@ def test_parse_without_audio_media_returns_none() -> None:
         "m=video 50000 RTP/AVP 96\r\n"
     )
     assert SessionDescription.parse(video_only).audio is None
+
+
+# --- hardening per cross-vendor review (RFC 4566 scoping + robustness) ---
+
+
+def _audio(sdp: SessionDescription) -> AudioMedia:
+    assert sdp.audio is not None
+    return sdp.audio
+
+
+def test_media_level_c_overrides_session_c() -> None:
+    sdp = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\nc=IN IP4 192.0.2.5\r\na=rtpmap:0 PCMU/8000\r\n"
+    )
+    assert _audio(sdp).connection_address == "192.0.2.5"
+
+
+def test_first_audio_wins_without_attribute_bleed() -> None:
+    sdp = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        "m=audio 40002 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n"
+    )
+    audio = _audio(sdp)
+    assert audio.port == 40000
+    assert [c.encoding for c in audio.codecs] == ["PCMU"]  # second section ignored
+
+
+def test_later_video_section_does_not_change_audio_address() -> None:
+    sdp = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\nc=IN IP4 192.0.2.5\r\na=rtpmap:0 PCMU/8000\r\n"
+        "m=video 50000 RTP/AVP 96\r\nc=IN IP4 192.0.2.9\r\n"
+    )
+    assert _audio(sdp).connection_address == "192.0.2.5"
+
+
+def test_static_payload_without_rtpmap() -> None:
+    sdp = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 8\r\n"
+    )
+    by_pt = {c.payload_type: c for c in _audio(sdp).codecs}
+    assert by_pt[0].encoding == "PCMU"
+    assert by_pt[8].encoding == "PCMA"
+
+
+def test_dynamic_payload_without_rtpmap_is_dropped() -> None:
+    sdp = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 96\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+    )
+    assert [c.payload_type for c in _audio(sdp).codecs] == [0]
+
+
+def test_ipv6_connection_address() -> None:
+    sdp = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP6 2001:db8::1\r\nc=IN IP6 2001:db8::1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+    )
+    assert _audio(sdp).connection_address == "2001:db8::1"
+
+
+def test_rtpmap_channels_round_trip() -> None:
+    codecs = (Codec(payload_type=111, encoding="OPUS", clock_rate=48000, channels=2),)
+    text = build_audio_offer(local_address="192.0.2.10", port=41000, codecs=codecs)
+    assert "a=rtpmap:111 OPUS/48000/2" in text
+    parsed = _audio(SessionDescription.parse(text))
+    assert parsed.codecs[0].channels == 2
+
+
+def test_parse_rejects_non_int_port() -> None:
+    with pytest.raises(SdpError, match="m=audio"):
+        SessionDescription.parse("v=0\r\nt=0 0\r\nm=audio notaport RTP/AVP 0\r\n")
+
+
+def test_parse_rejects_truncated_media_line() -> None:
+    with pytest.raises(SdpError, match="m=audio"):
+        SessionDescription.parse("v=0\r\nt=0 0\r\nm=audio\r\n")
+
+
+def test_build_rejects_empty_codecs() -> None:
+    with pytest.raises(ValueError, match="at least one codec"):
+        build_audio_offer(local_address="192.0.2.10", port=41000, codecs=())
+
+
+def test_build_rejects_bad_port() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    with pytest.raises(ValueError, match="port"):
+        build_audio_offer(local_address="192.0.2.10", port=70000, codecs=codecs)
+
+
+def test_build_rejects_non_positive_ptime() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    with pytest.raises(ValueError, match="ptime"):
+        build_audio_offer(
+            local_address="192.0.2.10", port=41000, codecs=codecs, ptime=0
+        )

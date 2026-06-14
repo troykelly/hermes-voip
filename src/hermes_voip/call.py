@@ -75,7 +75,15 @@ class CallError(RuntimeError):
 
 @runtime_checkable
 class CallSignaling(Protocol):
-    """Sends SIP requests/responses for this call (ADR-0005 implements it)."""
+    """The call's SIP transaction-layer seam (ADR-0005 implements it).
+
+    This is a **transaction** layer, not a bare socket: it owns request
+    retransmission and the **ACK for a non-2xx final response** to an INVITE,
+    which RFC 3261 §17.1.1.3 generates in the client transaction (same branch),
+    not in the transaction user. :class:`CallSession` is the TU, so it emits only
+    the §13.2.2.4 **2xx** ACK (a fresh transaction); it never ACKs a 401/407/491
+    re-INVITE — that is this layer's job.
+    """
 
     async def send(self, message: str) -> None:
         """Send one SIP message over the call's signalling transport."""
@@ -158,16 +166,25 @@ class CallSession:
     async def _send_and_await_final(self, text: str, cseq: int) -> SipResponse:
         queue: asyncio.Queue[SipResponse] = asyncio.Queue()
         self._pending[cseq] = queue
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._response_timeout
+        timeout_msg = (
+            f"no final response to CSeq {cseq} within {self._response_timeout}s"
+        )
         try:
             await self._signaling.send(text)
             while True:
-                response = await asyncio.wait_for(queue.get(), self._response_timeout)
+                # An absolute deadline bounds the whole exchange, so a stream of
+                # 1xx provisionals cannot keep the verb alive past the timeout.
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise CallError(timeout_msg)
+                response = await asyncio.wait_for(queue.get(), remaining)
                 if response.status_code < _PROVISIONAL_CEILING:
                     continue  # 1xx provisional; keep waiting for the final response
                 return response
         except TimeoutError as exc:
-            msg = f"no final response to CSeq {cseq} within {self._response_timeout}s"
-            raise CallError(msg) from exc
+            raise CallError(timeout_msg) from exc
         finally:
             self._pending.pop(cseq, None)
 

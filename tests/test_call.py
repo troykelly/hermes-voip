@@ -157,6 +157,39 @@ async def test_hold_skips_provisional_then_completes() -> None:
     assert session.on_hold is True
 
 
+async def test_provisional_stream_cannot_extend_past_deadline() -> None:
+    # A peer dripping 1xx just under the per-response timeout must not keep the
+    # verb alive forever — the wait is bounded by an absolute deadline (codex).
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_MEDIA,
+        credentials=_CREDENTIALS,
+        response_timeout=0.1,
+    )
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    trying = SipResponse.parse(build_response(reinvite, 100, "Trying"))
+
+    async def _drip() -> None:
+        for _ in range(8):
+            await asyncio.sleep(0.04)
+            await session.on_response(trying)
+
+    feeder = asyncio.create_task(_drip())
+    start = loop.time()
+    with pytest.raises(CallError, match="no final response"):
+        await task
+    elapsed = loop.time() - start
+    feeder.cancel()
+    assert elapsed < 0.25  # bounded by ~response_timeout, not 8 * 0.04 + timeout
+
+
 async def test_hold_reauthenticates_on_401() -> None:
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media)

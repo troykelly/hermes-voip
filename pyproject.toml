@@ -90,6 +90,7 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+asyncio_mode = "strict"  # async tests carry an explicit @pytest.mark.asyncio
 
 [dependency-groups]
 # Exact pins (AGENTS.md rule 33: no floating ranges); uv.lock is the full
@@ -100,5 +101,6 @@ dev = [
     "pip-licenses==5.5.5",
     "pre-commit==4.6.0",
     "pytest==9.1.0",
+    "pytest-asyncio==1.4.0",
     "ruff==0.15.17",
 ]

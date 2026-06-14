@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-qdrant@0.8.1"],
+      "env": {
+        "QDRANT_LOCAL_PATH": "/workspaces/hermes-voip/.memory/qdrant",
+        "COLLECTION_NAME": "memory",
+        "FASTEMBED_CACHE_PATH": "/workspaces/hermes-voip/.memory/fastembed_cache",
+        "TOOL_FIND_DESCRIPTION": "Semantic search over this repository's persistent project memory: decisions, operator feedback, gotchas and milestones from past sessions. Use proactively at the start of any non-trivial task, and before re-deriving anything a past session may have settled. Phrase the query as a natural-language question.",
+        "TOOL_STORE_DESCRIPTION": "Persist a memory for future sessions: a non-trivial decision, operator feedback or correction, a hard-won gotcha, or milestone state. Store proactively when you learn something a future session needs - do not wait to be asked. Write 1-3 self-contained sentences, present tense, absolute dates; metadata: {\"type\": \"project|feedback|user|reference\", \"topic\": \"<kebab-case>\"}."
+      }
+    }
+  }
+}

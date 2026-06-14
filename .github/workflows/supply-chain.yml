@@ -1,0 +1,40 @@
+name: supply-chain
+on:
+  pull_request:
+    paths: ["pyproject.toml", "uv.lock"]
+  push:
+    branches: [main]
+    paths: ["pyproject.toml", "uv.lock"]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen
+      # Advisory gate (AGENTS.md rule 35). The editable local project is not on
+      # PyPI and is skipped (not a failure).
+      - run: uv run pip-audit
+      # Licence gate (AGENTS.md rule 35), scoped to PRODUCTION deps — the licences
+      # we actually ship carry the distribution obligations; dev-tooling licences
+      # do not. Empty today (no runtime deps), so it passes and begins gating the
+      # moment a runtime dependency is added. Permissive-OSS allowlist only —
+      # extend deliberately, never to copyleft.
+      - name: Licence allowlist (production deps)
+        run: |
+          set -euo pipefail
+          uv export --frozen --no-dev --no-emit-project --no-hashes 2>/dev/null \
+            | sed 's/[<>=!~; ].*//' | grep -vE '^$|^#|^-e' > runtime-pkgs.txt || true
+          if [ -s runtime-pkgs.txt ]; then
+            echo "Licence-checking production deps:"; cat runtime-pkgs.txt
+            # --allow-only exits non-zero on any disallowed licence (no extra flag needed).
+            uv run pip-licenses --packages $(tr '\n' ' ' < runtime-pkgs.txt) \
+              --allow-only="MIT;MIT License;BSD License;BSD-2-Clause;BSD-3-Clause;Apache-2.0;Apache Software License;ISC;ISC License (ISCL);Python Software Foundation License;PSF-2.0;0BSD;BlueOak-1.0.0"
+          else
+            echo "No production dependencies to licence-check yet."
+          fi

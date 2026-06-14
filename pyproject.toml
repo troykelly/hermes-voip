@@ -1,0 +1,89 @@
+[project]
+name = "hermes-voip"
+version = "0.0.0"
+description = "Hermes plugin for two-way voice over telephony, on any RFC-compliant SIP-over-TLS or WebRTC voice gateway."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_voip"]
+
+# ---------------------------------------------------------------------------
+# Ruff — format + lint at high strictness (AGENTS.md rule 17). A strong curated
+# rule set rather than literal "ALL" (whose opinionated edge rules add churn
+# without adding safety). Extend deliberately.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",      # pycodestyle + pyflakes
+  "I",                # isort
+  "N",                # pep8-naming
+  "D",                # pydocstyle
+  "UP",               # pyupgrade
+  "ANN",              # flake8-annotations (no missing/Any annotations)
+  "S",                # flake8-bandit (security)
+  "BLE",              # flake8-blind-except
+  "B",                # flake8-bugbear
+  "A",                # flake8-builtins
+  "C4",               # flake8-comprehensions
+  "T20",              # flake8-print
+  "PT",               # flake8-pytest-style
+  "RET",              # flake8-return
+  "SIM",              # flake8-simplify
+  "ARG",              # flake8-unused-arguments
+  "PTH",              # flake8-use-pathlib
+  "ERA",              # eradicate (commented-out code)
+  "PL",               # pylint
+  "TRY",              # tryceratops (exception handling)
+  "RUF",              # ruff-specific
+]
+ignore = [
+  "D203",   # conflicts with D211 (no blank line before class docstring)
+  "D213",   # conflicts with D212 (multi-line summary on first line)
+  "TRY003", # long messages outside the exception class — noisy with assigned msgs
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "D103"] # asserts are the point of tests; test fns need no docstrings
+
+# ---------------------------------------------------------------------------
+# mypy — strict, no escape hatches (AGENTS.md rule 17).
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = true
+files = ["src", "tests"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[dependency-groups]
+# Exact pins (AGENTS.md rule 33: no floating ranges); uv.lock is the full
+# transitive lock and CI installs with `uv sync --frozen`.
+dev = [
+    "mypy==2.1.0",
+    "pip-audit==2.10.1",
+    "pip-licenses==5.5.5",
+    "pre-commit==4.6.0",
+    "pytest==9.1.0",
+    "ruff==0.15.17",
+]

@@ -11,18 +11,31 @@ removed in Python 3.13) — a typed, battle-tested C codec.
 
 from __future__ import annotations
 
+from typing import Final
+
 import audioop
 
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 
 _MONO: int = 1
 
+#: The fixed sample rate of telephony G.711 (mu-law/a-law) narrowband audio.
+G711_SAMPLE_RATE: Final[int] = 8000
+
 # audioop.ratecv's resumable conversion state (or None to start a fresh stream).
 type _RateState = tuple[int, tuple[tuple[int, int], ...]] | None
 
 
+def _validate_pcm16(pcm16: bytes) -> None:
+    """Raise if ``pcm16`` is not a whole number of 16-bit samples."""
+    if len(pcm16) % PCM16_BYTES_PER_SAMPLE != 0:
+        msg = f"PCM16 buffer must be whole 16-bit samples, got {len(pcm16)} bytes"
+        raise ValueError(msg)
+
+
 def encode_ulaw(pcm16: bytes) -> bytes:
     """Encode PCM16-LE mono to G.711 mu-law (one byte per sample)."""
+    _validate_pcm16(pcm16)
     return audioop.lin2ulaw(pcm16, PCM16_BYTES_PER_SAMPLE)
 
 
@@ -33,6 +46,7 @@ def decode_ulaw(ulaw: bytes) -> bytes:
 
 def encode_alaw(pcm16: bytes) -> bytes:
     """Encode PCM16-LE mono to G.711 a-law (one byte per sample)."""
+    _validate_pcm16(pcm16)
     return audioop.lin2alaw(pcm16, PCM16_BYTES_PER_SAMPLE)
 
 
@@ -41,17 +55,30 @@ def decode_alaw(alaw: bytes) -> bytes:
     return audioop.alaw2lin(alaw, PCM16_BYTES_PER_SAMPLE)
 
 
-def ulaw_to_frame(ulaw: bytes, *, sample_rate: int, monotonic_ts_ns: int) -> PcmFrame:
-    """Decode a mu-law payload into a :class:`PcmFrame` at ``sample_rate``."""
+def ulaw_to_frame(ulaw: bytes, *, monotonic_ts_ns: int) -> PcmFrame:
+    """Decode a mu-law payload into a :class:`PcmFrame`.
+
+    G.711 is intrinsically 8 kHz, so the frame is always stamped at
+    ``G711_SAMPLE_RATE``; resampling to the recogniser rate is a separate step.
+    """
     return PcmFrame(
         samples=decode_ulaw(ulaw),
-        sample_rate=sample_rate,
+        sample_rate=G711_SAMPLE_RATE,
         monotonic_ts_ns=monotonic_ts_ns,
     )
 
 
 def frame_to_ulaw(frame: PcmFrame) -> bytes:
-    """Encode a :class:`PcmFrame`'s PCM16 samples to a mu-law payload."""
+    """Encode an 8 kHz :class:`PcmFrame` to a mu-law payload.
+
+    Raises:
+        ValueError: If ``frame.sample_rate`` is not ``G711_SAMPLE_RATE`` —
+            encoding a wider-band frame to G.711 would silently change its
+            duration; the caller must resample to 8 kHz first.
+    """
+    if frame.sample_rate != G711_SAMPLE_RATE:
+        msg = f"G.711 requires {G711_SAMPLE_RATE} Hz, got {frame.sample_rate} Hz"
+        raise ValueError(msg)
     return encode_ulaw(frame.samples)
 
 
@@ -76,6 +103,7 @@ class Resampler:
 
     def resample(self, pcm16: bytes) -> bytes:
         """Convert one chunk of PCM16-LE mono, carrying stream state forward."""
+        _validate_pcm16(pcm16)
         converted, self._state = audioop.ratecv(
             pcm16, PCM16_BYTES_PER_SAMPLE, _MONO, self._from, self._to, self._state
         )

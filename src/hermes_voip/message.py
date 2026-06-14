@@ -21,6 +21,9 @@ _CRLF = "\r\n"
 # A status-line requires a single SP between the code and the (possibly empty)
 # reason phrase, so "SIP/2.0 200OK" is rejected as malformed framing.
 _STATUS_LINE = re.compile(r"SIP/2\.0 (\d{3})(?: (.*))?")
+# A request-line is "METHOD request-uri SIP/2.0"; method is an RFC 3261 token
+# (covers extension methods, not just the alphabetic standard ones).
+_REQUEST_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0")
 # A header field name is an RFC 3261 token: no whitespace, colon, or controls.
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
@@ -34,6 +37,42 @@ def _reject_controls(value: str, what: str) -> None:
     if any(ord(char) < _C0_END or ord(char) == _DEL for char in value):
         msg = f"{what} contains a control character"
         raise ValueError(msg)
+
+
+def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
+    """Unfold (RFC 3261 §7.3.1) and split header lines into ``(name, value)`` pairs.
+
+    Raises:
+        ValueError: If a continuation line has no preceding header.
+    """
+    unfolded: list[str] = []
+    for line in lines:
+        if line[:1] in (" ", "\t"):
+            if not unfolded:
+                msg = "header continuation line with no preceding header"
+                raise ValueError(msg)
+            unfolded[-1] = f"{unfolded[-1]} {line.strip()}"
+        else:
+            unfolded.append(line)
+    headers: list[tuple[str, str]] = []
+    for line in unfolded:
+        name, sep, value = line.partition(":")
+        if sep:
+            headers.append((name.strip(), value.strip()))
+    return tuple(headers)
+
+
+def _header_value(headers: tuple[tuple[str, str], ...], name: str) -> str | None:
+    low = name.lower()
+    for field_name, value in headers:
+        if field_name.lower() == low:
+            return value
+    return None
+
+
+def _header_values(headers: tuple[tuple[str, str], ...], name: str) -> tuple[str, ...]:
+    low = name.lower()
+    return tuple(v for field_name, v in headers if field_name.lower() == low)
 
 
 def new_branch() -> str:
@@ -106,16 +145,11 @@ class SipResponse:
 
     def header(self, name: str) -> str | None:
         """Return the first header value matching ``name`` (case-insensitive)."""
-        low = name.lower()
-        for field_name, value in self.headers:
-            if field_name.lower() == low:
-                return value
-        return None
+        return _header_value(self.headers, name)
 
     def headers_all(self, name: str) -> tuple[str, ...]:
         """Return every header value matching ``name`` (case-insensitive)."""
-        low = name.lower()
-        return tuple(v for field_name, v in self.headers if field_name.lower() == low)
+        return _header_values(self.headers, name)
 
     @classmethod
     def parse(cls, raw: str) -> SipResponse:
@@ -142,24 +176,61 @@ class SipResponse:
         if match is None:
             msg = f"not a SIP status-line: {lines[0]!r}"
             raise ValueError(msg)
-        # RFC 3261 §7.3.1: a line starting with SP/HTAB continues the prior header.
-        unfolded: list[str] = []
-        for line in lines[1:]:
-            if line[:1] in (" ", "\t"):
-                if not unfolded:
-                    msg = "header continuation line with no preceding header"
-                    raise ValueError(msg)
-                unfolded[-1] = f"{unfolded[-1]} {line.strip()}"
-            else:
-                unfolded.append(line)
-        headers: list[tuple[str, str]] = []
-        for line in unfolded:
-            name, sep, value = line.partition(":")
-            if sep:
-                headers.append((name.strip(), value.strip()))
         return cls(
             status_code=int(match.group(1)),
-            reason=match.group(2).strip(),
-            headers=tuple(headers),
+            reason=match.group(2).strip() if match.group(2) else "",
+            headers=_parse_headers(lines[1:]),
+            body=body,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SipRequest:
+    """A parsed inbound SIP request: request-line, headers, and body.
+
+    Attributes:
+        method: The SIP method (e.g. ``INVITE``, ``REFER``, ``NOTIFY``, ``BYE``).
+        request_uri: The request URI.
+        headers: Header ``(name, value)`` pairs in received order.
+        body: The message body (empty when absent).
+    """
+
+    method: str
+    request_uri: str
+    headers: tuple[tuple[str, str], ...]
+    body: str
+
+    def header(self, name: str) -> str | None:
+        """Return the first header value matching ``name`` (case-insensitive)."""
+        return _header_value(self.headers, name)
+
+    def headers_all(self, name: str) -> tuple[str, ...]:
+        """Return every header value matching ``name`` (case-insensitive)."""
+        return _header_values(self.headers, name)
+
+    @classmethod
+    def parse(cls, raw: str) -> SipRequest:
+        """Parse request wire text into a :class:`SipRequest`.
+
+        Args:
+            raw: One complete request (request-line, headers, blank line, body).
+
+        Returns:
+            The parsed request.
+
+        Raises:
+            ValueError: If the first line is not a valid SIP request-line, or a
+                header continuation line has no preceding header.
+        """
+        head, _, body = raw.partition(_CRLF + _CRLF)
+        lines = head.split(_CRLF)
+        match = _REQUEST_LINE.fullmatch(lines[0])
+        if match is None:
+            msg = f"not a SIP request-line: {lines[0]!r}"
+            raise ValueError(msg)
+        return cls(
+            method=match.group(1),
+            request_uri=match.group(2),
+            headers=_parse_headers(lines[1:]),
             body=body,
         )

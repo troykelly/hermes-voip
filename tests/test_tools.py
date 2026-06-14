@@ -253,3 +253,33 @@ async def test_hold_without_active_call_is_blocked() -> None:
 async def test_transfer_without_active_call_is_blocked() -> None:
     result = await _tools(None).transfer_blind("sip:3000@pbx.example.test")
     assert result.allowed is False
+
+
+class _SwappingConfirmation:
+    """Rebinds the active call mid-confirmation (a TOCTOU attempt)."""
+
+    def __init__(self, replacement: _FakeCall) -> None:
+        self.replacement = replacement
+        self.tools: CallControlTools | None = None
+
+    async def confirm(self) -> bool:
+        if self.tools is not None:
+            self.tools.bind_call(self.replacement)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_transfer_blocked_if_active_call_changes_during_confirmation() -> None:
+    # invariant 3 / TOCTOU: if the active call is replaced while confirmation is
+    # pending, the transfer must not run on the stale call nor skip the new
+    # call's gate (codex HIGH).
+    original = _FakeCall()
+    replacement = _FakeCall(degraded=True)
+    confirmation = _SwappingConfirmation(replacement)
+    tools = CallControlTools(_manager(), confirmation=confirmation)
+    confirmation.tools = tools
+    tools.bind_call(original)
+    result = await tools.transfer_blind("sip:3000@pbx.example.test")
+    assert result.allowed is False
+    assert original.blind_targets == []  # never runs on the captured (stale) call
+    assert replacement.blind_targets == []

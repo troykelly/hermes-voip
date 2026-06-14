@@ -200,6 +200,15 @@ class CallControlTools:
         if call is None:
             return ToolResult(allowed=False, message=f"{tool}: no active call")
         confirmed = await self._confirmation.confirm()
+        # Re-validate after the await: the confirmation was sought for THIS call,
+        # so if the active call was replaced while confirmation was pending the
+        # transfer must not run on the stale call nor skip the new call's gate
+        # (TOCTOU). Confirmation never carries across calls.
+        if self._call is not call:
+            return ToolResult(
+                allowed=False,
+                message=f"{tool} blocked: the active call changed during confirmation",
+            )
         if not gate_voip_tool(tool, call.guard, confirmed=confirmed):
             reason = "degraded session" if call.guard.degraded else "not confirmed"
             return ToolResult(allowed=False, message=f"{tool} blocked: {reason}")

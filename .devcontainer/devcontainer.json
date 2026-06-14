@@ -1,0 +1,47 @@
+{
+  "name": "hermes-voip (TypeScript)",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/hermes-voip",
+  "initializeCommand": "printf 'USER_UID=%s\\nUSER_GID=%s\\n' \"$(id -u)\" \"$(id -g)\" > .devcontainer/.env",
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true,
+      "installOhMyZsh": true,
+      "username": "automatic"
+    },
+    "ghcr.io/devcontainers/features/node:2": { "version": "26" },
+    "ghcr.io/devcontainers/features/github-cli:1": { "version": "latest" },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": { "moby": false },
+    "ghcr.io/devcontainers-extra/features/zsh-plugins:0": {
+      "plugins": "ssh-agent npm",
+      "omzPlugins": "https://github.com/zsh-users/zsh-autosuggestions",
+      "username": "vscode"
+    }
+  },
+  "remoteEnv": {
+    "CONTAINER_WORKSPACE_FOLDER": "${containerWorkspaceFolder}",
+    "PUPPETEER_SKIP_DOWNLOAD": "true",
+    "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium",
+    "PLAYWRIGHT_BROWSERS_PATH": "/home/vscode/.cache/ms-playwright"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-vscode.vscode-typescript-next",
+        "tamasfe.even-better-toml",
+        "redhat.vscode-yaml",
+        "usernamehw.errorlens",
+        "eamodio.gitlens",
+        "ms-azuretools.vscode-docker",
+        "ms-ossdata.vscode-pgsql"
+      ]
+    }
+  }
+}

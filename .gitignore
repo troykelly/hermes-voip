@@ -1,0 +1,28 @@
+# Secrets — never commit. The repo is PUBLIC.
+.env
+.env.*
+!.env.example
+
+# Local memory MCP store — never commit
+.memory/
+
+# Worktree lanes — disposable, never committed
+.worktrees/
+
+# Python virtualenv, caches, build output
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# OS / editor noise
+.DS_Store
+*.log

@@ -1,0 +1,23 @@
+name: gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.21" # pin uv (AGENTS.md rule 33)
+          enable-cache: true
+      # uv reads .python-version and provisions that interpreter; --frozen
+      # installs exactly from the committed uv.lock.
+      - run: uv sync --frozen
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - run: uv run pytest

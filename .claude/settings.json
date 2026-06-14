@@ -1,0 +1,42 @@
+{
+  "enableAllProjectMcpServers": true,
+  "permissions": {
+    "deny": [
+      "Read(/.env)",
+      "Read(/.env.*)",
+      "Read(/.memory/**)",
+      "Read(/**/.venv/**)",
+      "Read(/**/__pycache__/**)",
+      "Read(/**/.mypy_cache/**)",
+      "Read(/**/.ruff_cache/**)",
+      "Read(/**/.pytest_cache/**)",
+      "Read(/**/*.egg-info/**)",
+      "Read(/**/htmlcov/**)",
+      "Read(/**/dist/**)",
+      "Read(/**/build/**)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Persistent project memory is active: recall prior decisions with qdrant-find before non-trivial work; store new decisions, corrections and gotchas with qdrant-store (conventions: the memory skill). Reminder: repo is PUBLIC — keep the gateway host/extension/password/device-model out of every tracked file.'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-worktree.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}

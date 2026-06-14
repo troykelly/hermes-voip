@@ -1,0 +1,38 @@
+# Local git gate (AGENTS.md rule 15) — mirrors CI so failures surface before push.
+# All hooks are `repo: local` / `language: system` and call the project's own uv
+# toolchain: nothing external is cloned or fetched (rule 36). Install once with:
+#   uv run pre-commit install && uv run pre-commit install --hook-type pre-push
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format (check)
+        entry: uv run ruff format --check
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: ruff-check
+        name: ruff lint
+        entry: uv run ruff check
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: gitleaks
+        name: gitleaks secret scan (if installed; CI is authoritative)
+        entry: bash -c 'if command -v gitleaks >/dev/null 2>&1; then gitleaks git --pre-commit --staged --redact --verbose; else echo "gitleaks not installed; skipping local scan (CI is authoritative)"; fi'
+        language: system
+        pass_filenames: false
+      - id: mypy
+        name: mypy (strict)
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

@@ -49,22 +49,37 @@ async def stream_from_thread[T](
     make_iterator: Callable[[], Iterator[T]],
     *,
     max_buffer: int = 8,
+    on_cancel: Callable[[], None] | None = None,
+    shutdown_timeout: float = _JOIN_TIMEOUT_S,
 ) -> AsyncGenerator[T]:
     """Run ``make_iterator()`` on a worker thread; yield its items on the loop.
 
+    The producer must be *cooperative*: it must return or raise promptly once its
+    input is exhausted, the floor is yielded, or — for a producer parked inside an
+    uninterruptible native call — once ``on_cancel`` is invoked. ``stop`` is only
+    checked between yielded items, so a producer that blocks forever inside
+    ``next()`` with no ``on_cancel`` to release it cannot be interrupted: shutdown
+    then raises rather than silently leaking the thread (rule 37).
+
     Args:
         make_iterator: A zero-arg factory called once *inside the worker thread*
-            to create the blocking iterator (so its construction does not block
-            the loop either).
-        max_buffer: Maximum number of produced-but-unconsumed items before the
-            worker blocks (back-pressure). Must be >= 1.
+            to create the blocking iterator (so its construction never blocks the
+            loop). An exception it raises propagates to the consumer.
+        max_buffer: Maximum produced-but-unconsumed items before the worker blocks
+            (back-pressure). Must be >= 1.
+        on_cancel: Optional thread-safe callback invoked from the loop side during
+            shutdown to release a producer blocked in a native call (e.g. close
+            the engine's input stream / set its stop flag).
+        shutdown_timeout: Seconds to wait for the worker to terminate on shutdown.
 
     Yields:
         Each item produced by the iterator, in order.
 
     Raises:
         ValueError: If ``max_buffer`` < 1.
-        BaseException: Whatever the producer raised (re-raised on the loop side).
+        RuntimeError: If the worker does not terminate within ``shutdown_timeout``
+            (a producer that ignored cancellation — surfaced, never swallowed).
+        BaseException: Whatever the producer (or its factory) raised.
     """
     if max_buffer < 1:
         msg = f"max_buffer must be >= 1, got {max_buffer}"
@@ -86,8 +101,9 @@ async def stream_from_thread[T](
         return True
 
     def _worker() -> None:
-        iterator = make_iterator()
+        iterator: Iterator[T] | None = None
         try:
+            iterator = make_iterator()  # inside the try: factory errors propagate
             for item in iterator:
                 if stop.is_set() or not _put(_Item(item)):
                     return
@@ -111,7 +127,12 @@ async def stream_from_thread[T](
             yield message.value
     finally:
         stop.set()
+        if on_cancel is not None:
+            on_cancel()  # release a producer blocked in an uninterruptible call
         # free any slot the worker is blocked on so its pending put() completes
         while not queue.empty():
             queue.get_nowait()
-        await asyncio.to_thread(thread.join, _JOIN_TIMEOUT_S)
+        await asyncio.to_thread(thread.join, shutdown_timeout)
+        if thread.is_alive():
+            msg = "worker did not terminate; producer ignored cancellation"
+            raise RuntimeError(msg)

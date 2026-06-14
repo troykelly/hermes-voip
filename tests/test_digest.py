@@ -10,6 +10,7 @@ gateway host or credentials (the repo is public; AGENTS.md invariant).
 import re
 
 import pytest
+
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 
 

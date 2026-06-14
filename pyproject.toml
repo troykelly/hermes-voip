@@ -58,8 +58,9 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 # asserts are the point of tests; test fns need no docstrings; test credentials are
-# deliberately fake literals (bandit hardcoded-secret rules S105/S106/S107).
-"tests/**" = ["S101", "D103", "S105", "S106", "S107"]
+# deliberately fake literals (bandit S105/S106/S107); tests compare against literal
+# expected values (PLR2004 magic-value).
+"tests/**" = ["S101", "D103", "S105", "S106", "S107", "PLR2004"]
 
 # ---------------------------------------------------------------------------
 # mypy — strict, no escape hatches (AGENTS.md rule 17).

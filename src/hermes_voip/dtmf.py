@@ -11,6 +11,7 @@ spoof-resistant confirmation channel for irreversible tools (ADR-0009).
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -23,6 +24,7 @@ _MAX_EVENT = 0xFF
 _MAX_VOLUME = 0x3F
 _MAX_DURATION = 0xFFFF
 _REDUNDANT_END_COUNT = 3
+_RECEIVER_HISTORY = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +82,9 @@ def digit_to_event(digit: str) -> int:
     """Map a keypad character to its event code (case-insensitive).
 
     Raises:
-        ValueError: If ``digit`` is not a DTMF keypad character.
+        ValueError: If ``digit`` is not a single DTMF keypad character.
     """
-    index = _DIGITS.find(digit.upper())
+    index = _DIGITS.find(digit.upper()) if len(digit) == 1 else -1
     if index < 0:
         msg = f"not a DTMF digit: {digit!r}"
         raise ValueError(msg)
@@ -117,7 +119,17 @@ def event_payloads(
 
     Yields:
         4-byte telephone-event payloads, in send order.
+
+    Raises:
+        ValueError: If ``step`` is not positive or ``total_duration`` is outside
+            ``1..65535`` (duration 0 is reserved for state events, not tones).
     """
+    if step <= 0:
+        msg = f"step must be positive, got {step}"
+        raise ValueError(msg)
+    if not 1 <= total_duration <= _MAX_DURATION:
+        msg = f"total_duration out of range 1..65535: {total_duration}"
+        raise ValueError(msg)
     event = digit_to_event(digit)
     duration = step
     while duration < total_duration:
@@ -137,25 +149,33 @@ def event_payloads(
 class DtmfReceiver:
     """Collapses RFC 4733 events into one digit per key-press.
 
-    A key-press ends with three identical end packets (same RTP timestamp); the
-    receiver emits the digit on the first and suppresses the duplicates. A later
-    press of the same digit carries a new RTP timestamp and is emitted again.
+    A key-press ends with redundant end packets at one RTP timestamp; the
+    receiver emits on the first and suppresses duplicates, including ones that
+    arrive reordered (after a later press), by remembering a bounded window of
+    recently-emitted timestamps. A later press carries a new RTP timestamp and
+    is emitted again. The end packet is the trigger: a press whose start/update
+    packets were all lost is still surfaced (favouring not missing a digit), and
+    a non-digit event (e.g. flash) is not surfaced as a digit.
     """
 
-    def __init__(self) -> None:
-        """Create a receiver with no prior emission."""
-        self._last_emitted_timestamp: int | None = None
+    def __init__(self, history: int = _RECEIVER_HISTORY) -> None:
+        """Create a receiver remembering the last ``history`` press timestamps."""
+        self._order: deque[int] = deque(maxlen=history)
+        self._seen: set[int] = set()
 
     def feed(self, event: DtmfEvent, *, timestamp: int) -> str | None:
         """Process one decoded event at its RTP ``timestamp``.
 
         Returns:
             The pressed digit when a new key-press ends, else ``None`` (still
-            pressing, a redundant end packet, or a non-digit event like flash).
+            pressing, a duplicate/reordered end packet, or a non-digit event).
         """
-        if not event.end or self._last_emitted_timestamp == timestamp:
+        if not event.end or timestamp in self._seen:
             return None
-        self._last_emitted_timestamp = timestamp
+        if len(self._order) == self._order.maxlen and self._order:
+            self._seen.discard(self._order[0])  # evicted with the deque append
+        self._order.append(timestamp)
+        self._seen.add(timestamp)
         if 0 <= event.event < len(_DIGITS):
             return _DIGITS[event.event]
         return None  # a non-digit telephone-event (e.g. flash); not surfaced

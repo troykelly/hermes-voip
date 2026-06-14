@@ -8,6 +8,9 @@ case-insensitive, repeatable header access), and the token generators
 
 import re
 
+import pytest
+
+from hermes_voip.digest import DigestChallenge
 from hermes_voip.message import (
     SipResponse,
     build_request,
@@ -15,8 +18,6 @@ from hermes_voip.message import (
     new_call_id,
     new_tag,
 )
-
-from hermes_voip.digest import DigestChallenge
 
 
 def test_build_request_assembles_start_line_headers_and_content_length() -> None:
@@ -91,15 +92,55 @@ def test_header_missing_returns_none_and_repeatable_headers_collected() -> None:
 def test_parse_401_challenge_feeds_digest_layer() -> None:
     raw = (
         "SIP/2.0 401 Unauthorized\r\n"
-        'WWW-Authenticate: Digest realm="voip002", nonce="171/9c", '
+        'WWW-Authenticate: Digest realm="pbx.example.test", nonce="171/9c", '
         'algorithm=md5, qop="auth"\r\n'
         "Content-Length: 0\r\n"
         "\r\n"
     )
     resp = SipResponse.parse(raw)
     challenge = DigestChallenge.parse(resp.header("WWW-Authenticate") or "")
-    assert challenge.realm == "voip002"
+    assert challenge.realm == "pbx.example.test"
     assert challenge.qop == ("auth",)
+
+
+def test_parse_unfolds_continuation_lines() -> None:
+    # RFC 3261 allows a header value to continue on a line starting with SP/HTAB.
+    raw = (
+        "SIP/2.0 401 Unauthorized\r\n"
+        'WWW-Authenticate: Digest realm="pbx.example.test",\r\n'
+        '  nonce="171/9c", qop="auth"\r\n'
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    resp = SipResponse.parse(raw)
+    value = resp.header("WWW-Authenticate") or ""
+    assert "nonce=" in value
+    challenge = DigestChallenge.parse(value)
+    assert challenge.qop == ("auth",)
+
+
+def test_parse_rejects_malformed_status_line() -> None:
+    with pytest.raises(ValueError, match="status-line"):
+        SipResponse.parse("SIP/2.0 200OK\r\nContent-Length: 0\r\n\r\n")
+
+
+def test_build_request_rejects_crlf_injection_in_header_value() -> None:
+    with pytest.raises(ValueError, match="control"):
+        build_request(
+            "REGISTER",
+            "sip:pbx.example.test",
+            [("Contact", "<sip:1000@host.invalid>\r\nEvil: injected")],
+        )
+
+
+def test_build_request_rejects_crlf_in_request_uri() -> None:
+    with pytest.raises(ValueError, match="control"):
+        build_request("REGISTER", "sip:pbx.example.test\r\nEvil: x", [])
+
+
+def test_build_request_rejects_invalid_header_name() -> None:
+    with pytest.raises(ValueError, match="header name"):
+        build_request("REGISTER", "sip:pbx.example.test", [("Bad Name", "value")])
 
 
 def test_new_branch_has_rfc3261_magic_cookie_and_is_unique() -> None:

@@ -74,8 +74,8 @@ def test_parse_rejects_challenge_without_nonce() -> None:
 
 def test_sip_register_shape_echoes_algorithm_and_opaque() -> None:
     challenge = DigestChallenge.parse(
-        'Digest realm="voip002", nonce="171/9c", algorithm=md5, qop="auth", '
-        'opaque="55aa"'
+        'Digest realm="pbx.example.test", nonce="171/9c", algorithm=md5, '
+        'qop="auth", opaque="55aa"'
     )
     header = build_authorization(
         challenge,
@@ -91,15 +91,15 @@ def test_sip_register_shape_echoes_algorithm_and_opaque() -> None:
     assert _param(header, "algorithm") == "md5"  # echoed as challenged
     assert _param(header, "opaque") == "55aa"
     assert _param(header, "qop") == "auth"
-    # response is deterministic for fixed inputs
-    assert re.fullmatch(r"[0-9a-f]{32}", _param(header, "response") or "")
+    # pinned known-answer for these fixed inputs (rule 19: no shape-only assertions)
+    assert _param(header, "response") == "74e090d5d1ded4f9c97e68d9823d559e"
 
 
 def test_no_qop_uses_rfc2069_response() -> None:
-    challenge = DigestChallenge.parse('Digest realm="r", nonce="n"')
+    challenge = DigestChallenge.parse('Digest realm="pbx.example.test", nonce="abc123"')
     header = build_authorization(
         challenge,
-        DigestCredentials(username="u", password="p"),
+        DigestCredentials(username="1000", password="s3cr3t"),
         method="REGISTER",
         uri="sip:pbx.example.test",
     )
@@ -107,7 +107,48 @@ def test_no_qop_uses_rfc2069_response() -> None:
     assert _param(header, "qop") is None
     assert _param(header, "nc") is None
     assert _param(header, "cnonce") is None
-    assert _param(header, "response") is not None
+    assert _param(header, "response") == "63d60cc16a94d108c62cddcff1c171af"
+
+
+def test_rejects_qop_present_without_auth() -> None:
+    # A server offering only auth-int must not be answered with the RFC 2069 form.
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", qop="auth-int"'
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+        )
+
+
+def test_rejects_unsupported_algorithm() -> None:
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", algorithm=MD5-sess, qop="auth"'
+    )
+    with pytest.raises(ValueError, match="algorithm"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+        )
+
+
+def test_rejects_crlf_in_auth_param_value() -> None:
+    # A nonce carrying CRLF (hostile/garbled peer) must not be able to inject
+    # additional SIP headers via the Authorization value.
+    challenge = DigestChallenge.parse('Digest realm="pbx.example.test", nonce="n"')
+    poisoned = DigestChallenge(realm=challenge.realm, nonce="n\r\nInjected: x")
+    with pytest.raises(ValueError, match="control"):
+        build_authorization(
+            poisoned,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+        )
 
 
 def test_nc_is_zero_padded_hex() -> None:

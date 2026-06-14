@@ -21,8 +21,6 @@ from hermes_voip.tools import (
     gate_voip_tool,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 class _FakeCall:
     def __init__(self, *, degraded: bool = False) -> None:
@@ -134,6 +132,7 @@ def test_gate_voip_tool_maps_to_gate_tool_call() -> None:
 # ---- list_registrations (SAFE) ---------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_list_registrations_always_allowed() -> None:
     tools = _tools(None)
     result = await tools.list_registrations()
@@ -145,6 +144,7 @@ async def test_list_registrations_always_allowed() -> None:
 # ---- hold / resume (ELEVATED) ----------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_hold_call_runs_when_not_degraded() -> None:
     call = _FakeCall()
     result = await _tools(call).hold_call()
@@ -152,6 +152,7 @@ async def test_hold_call_runs_when_not_degraded() -> None:
     assert call.held == 1
 
 
+@pytest.mark.asyncio
 async def test_hold_call_blocked_when_degraded() -> None:
     call = _FakeCall(degraded=True)
     result = await _tools(call).hold_call()
@@ -159,6 +160,7 @@ async def test_hold_call_blocked_when_degraded() -> None:
     assert call.held == 0  # the verb never runs when blocked
 
 
+@pytest.mark.asyncio
 async def test_resume_call_runs_when_not_degraded() -> None:
     call = _FakeCall()
     result = await _tools(call).resume_call()
@@ -169,6 +171,7 @@ async def test_resume_call_runs_when_not_degraded() -> None:
 # ---- transfer (IRREVERSIBLE) — invariant 3 ---------------------------------
 
 
+@pytest.mark.asyncio
 async def test_transfer_blind_runs_when_confirmed_and_clean() -> None:
     call = _FakeCall()
     result = await _tools(call, confirmed=True).transfer_blind(
@@ -178,6 +181,7 @@ async def test_transfer_blind_runs_when_confirmed_and_clean() -> None:
     assert call.blind_targets == ["sip:3000@pbx.example.test"]
 
 
+@pytest.mark.asyncio
 async def test_transfer_blind_blocked_when_unconfirmed() -> None:
     call = _FakeCall()
     result = await _tools(call, confirmed=False).transfer_blind(
@@ -187,6 +191,7 @@ async def test_transfer_blind_blocked_when_unconfirmed() -> None:
     assert call.blind_targets == []  # invariant 3: never transfers unconfirmed
 
 
+@pytest.mark.asyncio
 async def test_transfer_blind_blocked_while_degraded_even_if_confirmed() -> None:
     # invariant 3: a degraded session hard-blocks an IRREVERSIBLE transfer even
     # when confirmed and even if the injection guard returned ALLOW.
@@ -198,6 +203,7 @@ async def test_transfer_blind_blocked_while_degraded_even_if_confirmed() -> None
     assert call.blind_targets == []
 
 
+@pytest.mark.asyncio
 async def test_transfer_attended_runs_when_confirmed_and_clean() -> None:
     call = _FakeCall()
     consult = _consult()
@@ -206,6 +212,7 @@ async def test_transfer_attended_runs_when_confirmed_and_clean() -> None:
     assert call.attended == [consult]
 
 
+@pytest.mark.asyncio
 async def test_transfer_attended_blocked_when_unconfirmed() -> None:
     call = _FakeCall()
     result = await _tools(call, confirmed=False).transfer_attended(_consult())
@@ -213,6 +220,7 @@ async def test_transfer_attended_blocked_when_unconfirmed() -> None:
     assert call.attended == []
 
 
+@pytest.mark.asyncio
 async def test_transfer_confirmation_is_actively_requested() -> None:
     call = _FakeCall()
     confirmation = _FakeConfirmation(confirmed=True)
@@ -222,6 +230,7 @@ async def test_transfer_confirmation_is_actively_requested() -> None:
     assert confirmation.prompts == 1  # the caller is asked to confirm
 
 
+@pytest.mark.asyncio
 async def test_hold_does_not_request_confirmation() -> None:
     call = _FakeCall()
     confirmation = _FakeConfirmation(confirmed=False)
@@ -234,11 +243,13 @@ async def test_hold_does_not_request_confirmation() -> None:
 # ---- no active call --------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_hold_without_active_call_is_blocked() -> None:
     result = await _tools(None).hold_call()
     assert result.allowed is False
 
 
+@pytest.mark.asyncio
 async def test_transfer_without_active_call_is_blocked() -> None:
     result = await _tools(None).transfer_blind("sip:3000@pbx.example.test")
     assert result.allowed is False

@@ -8,6 +8,13 @@ dependencies = [
     "audioop-lts==0.2.2",
 ]
 
+[project.optional-dependencies]
+# The Hermes runtime that loads this plugin; provided by the host. Declared as an
+# optional extra so its large transitive tree stays out of the default install,
+# the production licence gate, and the default pip-audit env. The typed boundary
+# is hermes_voip.hermes_surface; the contract test verifies the real surface.
+hermes = ["hermes-agent==0.16.0"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

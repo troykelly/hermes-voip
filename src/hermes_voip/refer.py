@@ -1,0 +1,331 @@
+"""Sans-IO call transfer: REFER / Replaces / Referred-By / NOTIFY (ADR-0011 §2).
+
+Transfer is REFER (RFC 3515). A **blind** transfer is a REFER carrying
+``Refer-To: <target>``; an **attended** transfer is a REFER whose ``Refer-To``
+embeds a ``Replaces`` header (RFC 3891) naming the consultation dialog, so the
+transferee's triggered INVITE replaces it at the target. Progress flows back over
+the implicit subscription as a ``NOTIFY`` with a ``message/sipfrag`` status-line.
+
+The agent both makes and receives calls, so this module covers **both** RFC 5589
+roles, all sans-IO (produce/consume wire text, no socket):
+
+* Transferor — :func:`build_blind_refer`, :func:`build_attended_refer`,
+  :func:`parse_notify_sipfrag`.
+* Transferee — :func:`parse_refer`, :func:`build_triggered_invite`,
+  :func:`build_notify_sipfrag`.
+* Target — :func:`match_replaces` (RFC 3891 §3 tag orientation).
+
+RFC 3891 §3 orientation (the load-bearing detail): in a ``Replaces`` naming a
+dialog, ``to-tag`` is the **local** tag at the party that receives the
+Replaces-INVITE and ``from-tag`` is that party's **remote** tag. So an attended
+REFER built from our consultation dialog (we are the transferor) sets
+``to-tag = consult.remote_tag`` (the target's tag) and
+``from-tag = consult.local_tag`` (ours); and when we are the target,
+:func:`match_replaces` matches ``dialog.local_tag == to-tag`` and
+``dialog.remote_tag == from-tag``.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from urllib.parse import quote, unquote
+
+from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
+from hermes_voip.message import (
+    SipRequest,
+    build_request,
+    new_branch,
+    new_call_id,
+    new_tag,
+)
+
+__all__ = [
+    "NotifyProgress",
+    "ReferError",
+    "ReferRequest",
+    "ReplacesSpec",
+    "build_attended_refer",
+    "build_blind_refer",
+    "build_notify_sipfrag",
+    "build_triggered_invite",
+    "match_replaces",
+    "parse_notify_sipfrag",
+    "parse_refer",
+]
+
+_DEFAULT_USER_AGENT = "hermes-voip/0"
+_MAX_FORWARDS = "70"
+_SDP_CONTENT_TYPE = ("Content-Type", "application/sdp")
+_SIPFRAG_CONTENT_TYPE = ("Content-Type", "message/sipfrag;version=2.0")
+_DEFAULT_SUBSCRIPTION_STATE = "active;expires=60"
+
+_ANGLE_ADDR = re.compile(r"<([^>]*)>")
+_SIPFRAG_STATUS = re.compile(r"SIP/2\.0\s+(\d{3})\s*(.*)")
+
+
+class ReferError(ValueError):
+    """A REFER / Replaces / NOTIFY message is malformed or incomplete."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacesSpec:
+    """The identifiers of the dialog a ``Replaces`` header names (RFC 3891).
+
+    Attributes:
+        call_id: The ``Call-ID`` of the dialog to replace.
+        to_tag: The ``to-tag`` — the local tag at the Replaces recipient.
+        from_tag: The ``from-tag`` — the remote tag at the Replaces recipient.
+        early_only: The ``early-only`` flag (replace only an early dialog).
+    """
+
+    call_id: str
+    to_tag: str
+    from_tag: str
+    early_only: bool = False
+
+    def header_value(self) -> str:
+        """Render the ``Replaces`` header value (unescaped, for a real header)."""
+        base = f"{self.call_id};to-tag={self.to_tag};from-tag={self.from_tag}"
+        return f"{base};early-only" if self.early_only else base
+
+
+@dataclass(frozen=True, slots=True)
+class ReferRequest:
+    """A parsed inbound REFER.
+
+    Attributes:
+        refer_to: The transfer target URI (without any embedded ``Replaces``).
+        replaces: The embedded ``Replaces`` (attended transfer), else ``None``.
+        referred_by: The ``Referred-By`` URI, if present.
+    """
+
+    refer_to: str
+    replaces: ReplacesSpec | None
+    referred_by: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class NotifyProgress:
+    """A parsed transfer-progress NOTIFY (``message/sipfrag`` status-line).
+
+    Attributes:
+        status_code: The sipfrag status-line code (e.g. ``100``, ``200``).
+        reason: The sipfrag reason phrase.
+        terminated: ``True`` when ``Subscription-State`` is ``terminated`` — the
+            transfer reached a final outcome and the subscription is over.
+    """
+
+    status_code: int
+    reason: str
+    terminated: bool
+
+
+# --- Transferor: build REFER ------------------------------------------------
+
+
+def build_blind_refer(
+    dialog: Dialog, target_uri: str, *, referred_by: str | None = None
+) -> InDialogRequest:
+    """Build a blind-transfer REFER (``Refer-To: <target>``) in ``dialog``."""
+    extra: list[tuple[str, str]] = [("Refer-To", f"<{target_uri}>")]
+    if referred_by is not None:
+        extra.append(("Referred-By", _wrap_uri(referred_by)))
+    return build_in_dialog_request(dialog, "REFER", extra_headers=tuple(extra))
+
+
+def build_attended_refer(
+    dialog: Dialog, consult: Dialog, *, referred_by: str | None = None
+) -> InDialogRequest:
+    """Build an attended-transfer REFER in ``dialog`` (the primary call).
+
+    The ``Refer-To`` targets the consultation peer and embeds a ``Replaces``
+    naming the consultation dialog with RFC 3891 orientation from the target's
+    point of view (``to-tag`` = the target's tag, ``from-tag`` = ours). The
+    ``Replaces`` is percent-escaped so its ``;``/``=`` do not split the URI.
+    """
+    replaces = ReplacesSpec(
+        call_id=consult.call_id,
+        to_tag=consult.remote_tag,
+        from_tag=consult.local_tag,
+    )
+    escaped = quote(replaces.header_value(), safe="")
+    refer_to = f"<{consult.remote_target}?Replaces={escaped}>"
+    extra: list[tuple[str, str]] = [("Refer-To", refer_to)]
+    if referred_by is not None:
+        extra.append(("Referred-By", _wrap_uri(referred_by)))
+    return build_in_dialog_request(dialog, "REFER", extra_headers=tuple(extra))
+
+
+# --- Transferee/Target: parse REFER -----------------------------------------
+
+
+def parse_refer(request: SipRequest) -> ReferRequest:
+    """Parse an inbound REFER into its target, ``Replaces``, and ``Referred-By``.
+
+    Raises:
+        ReferError: if the REFER has no ``Refer-To`` header.
+    """
+    refer_to_raw = request.header("Refer-To")
+    if refer_to_raw is None:
+        msg = "REFER has no Refer-To header"
+        raise ReferError(msg)
+    addr = _bracketed_uri(refer_to_raw)
+    target, _, query = addr.partition("?")
+    replaces = _replaces_from_uri_query(query)
+    referred_by_raw = request.header("Referred-By")
+    referred_by = _bracketed_uri(referred_by_raw) if referred_by_raw else None
+    return ReferRequest(
+        refer_to=target.strip(), replaces=replaces, referred_by=referred_by
+    )
+
+
+def build_triggered_invite(  # noqa: PLR0913 — an out-of-dialog INVITE needs the full local endpoint plus the transfer headers; all keyword-only
+    *,
+    target_uri: str,
+    local_aor: str,
+    local_contact: str,
+    local_sent_by: str,
+    transport: str,
+    body: str = "",
+    replaces: ReplacesSpec | None = None,
+    referred_by: str | None = None,
+    user_agent: str = _DEFAULT_USER_AGENT,
+) -> str:
+    """Build the out-of-dialog INVITE a transferee places to the REFER target.
+
+    A fresh dialog (new ``Call-ID``/``From``-tag/branch, ``CSeq 1``). For an
+    attended transfer ``replaces`` is rendered as a real ``Replaces`` header so
+    the target can replace the consultation dialog; ``body`` (when present) is an
+    SDP offer.
+    """
+    via = f"SIP/2.0/{transport} {local_sent_by};branch={new_branch()};rport"
+    headers: list[tuple[str, str]] = [
+        ("Via", via),
+        ("Max-Forwards", _MAX_FORWARDS),
+        ("From", f"<{local_aor}>;tag={new_tag()}"),
+        ("To", f"<{target_uri}>"),
+        ("Call-ID", new_call_id()),
+        ("CSeq", "1 INVITE"),
+        ("Contact", local_contact),
+        ("User-Agent", user_agent),
+    ]
+    if replaces is not None:
+        headers.append(("Replaces", replaces.header_value()))
+    if referred_by is not None:
+        headers.append(("Referred-By", _wrap_uri(referred_by)))
+    if body:
+        headers.append(_SDP_CONTENT_TYPE)
+    return build_request("INVITE", target_uri, headers, body)
+
+
+# --- Target: match an inbound Replaces --------------------------------------
+
+
+def match_replaces(request: SipRequest, dialogs: Iterable[Dialog]) -> Dialog | None:
+    """Return the dialog an inbound INVITE's ``Replaces`` names, or ``None``.
+
+    RFC 3891 §3: the ``Replaces`` ``to-tag`` is our local tag and ``from-tag`` is
+    our remote tag. Returns ``None`` when there is no ``Replaces`` header or no
+    dialog matches (the caller answers ``481``).
+    """
+    raw = request.header("Replaces")
+    if raw is None:
+        return None
+    spec = _parse_replaces_value(raw)
+    for dialog in dialogs:
+        if (
+            dialog.call_id == spec.call_id
+            and dialog.local_tag == spec.to_tag
+            and dialog.remote_tag == spec.from_tag
+        ):
+            return dialog
+    return None
+
+
+# --- NOTIFY message/sipfrag progress ----------------------------------------
+
+
+def build_notify_sipfrag(
+    dialog: Dialog,
+    status_line: str,
+    *,
+    subscription_state: str = _DEFAULT_SUBSCRIPTION_STATE,
+) -> InDialogRequest:
+    """Build a transfer-progress NOTIFY carrying a ``message/sipfrag`` status."""
+    body = status_line if status_line.endswith("\r\n") else status_line + "\r\n"
+    extra = (
+        ("Event", "refer"),
+        ("Subscription-State", subscription_state),
+        _SIPFRAG_CONTENT_TYPE,
+    )
+    return build_in_dialog_request(dialog, "NOTIFY", extra_headers=extra, body=body)
+
+
+def parse_notify_sipfrag(request: SipRequest) -> NotifyProgress:
+    """Parse a transfer-progress NOTIFY's sipfrag status-line and subscription.
+
+    Raises:
+        ReferError: if the body has no ``SIP/2.0`` status-line.
+    """
+    subscription = (request.header("Subscription-State") or "").strip().lower()
+    terminated = subscription.startswith("terminated")
+    first_line = request.body.strip().split("\n", 1)[0].strip()
+    match = _SIPFRAG_STATUS.match(first_line)
+    if match is None:
+        msg = f"NOTIFY sipfrag body has no status-line: {first_line!r}"
+        raise ReferError(msg)
+    return NotifyProgress(
+        status_code=int(match.group(1)),
+        reason=match.group(2).strip(),
+        terminated=terminated,
+    )
+
+
+# --- helpers ----------------------------------------------------------------
+
+
+def _wrap_uri(value: str) -> str:
+    return value if value.startswith("<") else f"<{value}>"
+
+
+def _bracketed_uri(value: str) -> str:
+    """Return the URI inside ``<...>``, or the bare value when unbracketed."""
+    match = _ANGLE_ADDR.search(value)
+    return match.group(1).strip() if match is not None else value.strip()
+
+
+def _replaces_from_uri_query(query: str) -> ReplacesSpec | None:
+    """Extract a ``Replaces`` from a Refer-To URI header query, if present."""
+    if not query:
+        return None
+    for pair in query.split("&"):
+        name, _, raw = pair.partition("=")
+        if name.strip().lower() == "replaces":
+            return _parse_replaces_value(unquote(raw))
+    return None
+
+
+def _parse_replaces_value(value: str) -> ReplacesSpec:
+    """Parse a ``Replaces`` value ``call-id;to-tag=..;from-tag=..`` (RFC 3891)."""
+    parts = value.split(";")
+    call_id = parts[0].strip()
+    to_tag: str | None = None
+    from_tag: str | None = None
+    early_only = False
+    for part in parts[1:]:
+        key, sep, val = part.partition("=")
+        name = key.strip().lower()
+        if name == "to-tag" and sep:
+            to_tag = val.strip()
+        elif name == "from-tag" and sep:
+            from_tag = val.strip()
+        elif name == "early-only":
+            early_only = True
+    if not call_id or to_tag is None or from_tag is None:
+        msg = f"Replaces requires call-id, to-tag and from-tag: {value!r}"
+        raise ReferError(msg)
+    return ReplacesSpec(
+        call_id=call_id, to_tag=to_tag, from_tag=from_tag, early_only=early_only
+    )

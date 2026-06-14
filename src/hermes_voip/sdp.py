@@ -248,6 +248,7 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
     direction: str = "sendrecv",
     ptime: int = 20,
     session_id: int = 0,
+    version: int | None = None,
 ) -> str:
     """Build an SDP audio offer/answer body (RTP/AVP).
 
@@ -257,8 +258,10 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
         codecs: The codecs to offer, in preference order.
         direction: Media direction attribute.
         ptime: Packetisation time in ms.
-        session_id: SDP ``o=`` session id/version (the transport supplies a real,
-            monotonic value for re-INVITE; defaults to 0).
+        session_id: SDP ``o=`` session id (constant for the life of a dialog).
+        version: SDP ``o=`` session version. A re-offer keeps ``session_id``
+            constant and increments ``version`` (RFC 4566 §5.2, ADR-0011
+            invariant 1). Defaults to ``session_id`` for an initial offer.
 
     Returns:
         The SDP body terminated by CRLF, ready to attach to an INVITE/200.
@@ -267,6 +270,7 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
         ValueError: If ``direction`` is invalid, ``codecs`` is empty, ``port`` is
             outside ``1..65535``, or ``ptime`` is not positive.
     """
+    sess_version = session_id if version is None else version
     if direction not in _DIRECTIONS:
         msg = f"invalid SDP direction: {direction!r}"
         raise ValueError(msg)
@@ -282,7 +286,7 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
     payloads = " ".join(str(c.payload_type) for c in codecs)
     lines = [
         "v=0",
-        f"o=- {session_id} {session_id} IN IP4 {local_address}",
+        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
         "s=-",
         f"c=IN IP4 {local_address}",
         "t=0 0",

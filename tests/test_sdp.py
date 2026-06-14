@@ -113,6 +113,28 @@ def test_build_audio_offer_round_trips() -> None:
     assert te.fmtp == "0-16"
 
 
+def test_build_audio_offer_distinct_session_id_and_version() -> None:
+    # A re-INVITE keeps the o= session-id constant and bumps only the version
+    # (ADR-0011 invariant 1); build_audio_offer takes them separately.
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=codecs,
+        session_id=5000,
+        version=7,
+    )
+    assert "o=- 5000 7 IN IP4 192.0.2.10" in text
+
+
+def test_build_audio_offer_version_defaults_to_session_id() -> None:
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10", port=41000, codecs=codecs, session_id=42
+    )
+    assert "o=- 42 42 IN IP4 192.0.2.10" in text
+
+
 def test_parse_without_audio_media_returns_none() -> None:
     video_only = (
         "v=0\r\n"

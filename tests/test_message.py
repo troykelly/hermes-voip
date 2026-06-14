@@ -12,12 +12,111 @@ import pytest
 
 from hermes_voip.digest import DigestChallenge
 from hermes_voip.message import (
+    SipRequest,
     SipResponse,
     build_request,
+    build_response,
     new_branch,
     new_call_id,
     new_tag,
 )
+
+
+def _inbound(method: str = "BYE", *, to_tag: str | None = "ourtag") -> SipRequest:
+    to = "<sip:1000@pbx.example.test>"
+    if to_tag is not None:
+        to = f"{to};tag={to_tag}"
+    return SipRequest(
+        method=method,
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.50:5061;branch=z9hG4bK-a"),
+            ("Via", "SIP/2.0/TLS 198.51.100.60:5061;branch=z9hG4bK-b"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirtag"),
+            ("To", to),
+            ("Call-ID", "call-xyz"),
+            ("CSeq", f"5 {method}"),
+        ),
+        body="",
+    )
+
+
+def test_build_response_echoes_routing_headers() -> None:
+    text = build_response(_inbound("BYE"), 200, "OK")
+    resp = SipResponse.parse(text)
+    assert resp.status_code == 200
+    assert resp.reason == "OK"
+    assert resp.header("Call-ID") == "call-xyz"
+    assert resp.header("CSeq") == "5 BYE"
+    assert resp.header("From") == "<sip:2000@pbx.example.test>;tag=theirtag"
+    assert resp.header("To") == "<sip:1000@pbx.example.test>;tag=ourtag"
+
+
+def test_build_response_echoes_the_full_via_stack_in_order() -> None:
+    text = build_response(_inbound("BYE"), 200, "OK")
+    resp = SipResponse.parse(text)
+    assert resp.headers_all("Via") == (
+        "SIP/2.0/TLS 198.51.100.50:5061;branch=z9hG4bK-a",
+        "SIP/2.0/TLS 198.51.100.60:5061;branch=z9hG4bK-b",
+    )
+
+
+def test_build_response_adds_to_tag_when_absent() -> None:
+    text = build_response(_inbound("INVITE", to_tag=None), 200, "OK", to_tag="newtag")
+    resp = SipResponse.parse(text)
+    assert resp.header("To") == "<sip:1000@pbx.example.test>;tag=newtag"
+
+
+def test_build_response_does_not_duplicate_existing_to_tag() -> None:
+    text = build_response(_inbound("INVITE", to_tag="already"), 200, "OK", to_tag="new")
+    resp = SipResponse.parse(text)
+    assert resp.header("To") == "<sip:1000@pbx.example.test>;tag=already"
+
+
+def test_build_response_carries_extra_headers_and_body() -> None:
+    sdp = "v=0\r\n"
+    text = build_response(
+        _inbound("INVITE", to_tag=None),
+        200,
+        "OK",
+        to_tag="t",
+        extra_headers=(
+            ("Contact", "<sip:1000@198.51.100.7:5061;transport=tls>"),
+            ("Content-Type", "application/sdp"),
+        ),
+        body=sdp,
+    )
+    resp = SipResponse.parse(text)
+    assert resp.header("Contact") == "<sip:1000@198.51.100.7:5061;transport=tls>"
+    assert resp.header("Content-Type") == "application/sdp"
+    assert resp.body == sdp
+
+
+def test_build_response_request_pending() -> None:
+    resp = SipResponse.parse(build_response(_inbound("INVITE"), 491, "Request Pending"))
+    assert resp.status_code == 491
+    assert resp.reason == "Request Pending"
+
+
+def test_build_response_rejects_invalid_status() -> None:
+    with pytest.raises(ValueError, match="status"):
+        build_response(_inbound("BYE"), 99, "Bad")
+
+
+def test_build_response_rejects_request_without_via() -> None:
+    no_via = SipRequest(
+        method="BYE",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("From", "<sip:2000@pbx.example.test>;tag=t"),
+            ("To", "<sip:1000@pbx.example.test>;tag=o"),
+            ("Call-ID", "c"),
+            ("CSeq", "5 BYE"),
+        ),
+        body="",
+    )
+    with pytest.raises(ValueError, match="Via"):
+        build_response(no_via, 200, "OK")
 
 
 def test_build_request_assembles_start_line_headers_and_content_length() -> None:

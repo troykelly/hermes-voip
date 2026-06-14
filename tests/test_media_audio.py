@@ -12,6 +12,7 @@ import struct
 import pytest
 
 from hermes_voip.media.audio import (
+    G711_SAMPLE_RATE,
     Resampler,
     decode_alaw,
     decode_ulaw,
@@ -65,17 +66,28 @@ def test_resampler_16k_to_8k_roughly_halves_samples() -> None:
     assert 140 <= len(out) // 2 <= 180  # ~0.5x 320
 
 
-def test_resampler_state_continuity_matches_single_pass() -> None:
-    whole = _pcm16(*range(-200, 200))  # 400 samples
-    half = len(whole) // 2
+@pytest.mark.parametrize(("from_rate", "to_rate"), [(8000, 16000), (16000, 8000)])
+def test_resampler_state_continuity_matches_single_pass(
+    from_rate: int, to_rate: int
+) -> None:
+    # both directions: streaming repeated 20 ms chunks must equal a single pass
+    chunk = _pcm16(*range(-160, 160))  # 320 samples
+    streamed = Resampler(from_rate, to_rate)
+    streamed_out = b"".join(streamed.resample(chunk) for _ in range(4))
+    single = Resampler(from_rate, to_rate).resample(chunk * 4)
+    assert streamed_out == single
 
-    streamed = Resampler(8000, 16000)
-    out_a = streamed.resample(whole[:half])
-    out_b = streamed.resample(whole[half:])
 
-    single = Resampler(8000, 16000).resample(whole)
-    # streaming in two frames yields the same total audio as one pass (no clicks)
-    assert out_a + out_b == single
+def test_resampler_rejects_odd_length_pcm() -> None:
+    with pytest.raises(ValueError, match="whole 16-bit samples"):
+        Resampler(8000, 16000).resample(b"\x00\x01\x02")  # 3 bytes
+
+
+def test_encoders_reject_odd_length_pcm() -> None:
+    with pytest.raises(ValueError, match="whole 16-bit samples"):
+        encode_ulaw(b"\x00")
+    with pytest.raises(ValueError, match="whole 16-bit samples"):
+        encode_alaw(b"\x00\x01\x02")
 
 
 def test_resampler_reset_clears_state() -> None:
@@ -89,14 +101,22 @@ def test_resampler_reset_clears_state() -> None:
 
 
 def test_frame_helpers_round_trip_through_ulaw() -> None:
+    # G.711 is intrinsically 8 kHz: ulaw_to_frame always stamps the wire rate.
     pcm = _pcm16(0, 4000, -4000, 1234)
     ulaw = encode_ulaw(pcm)
-    frame = ulaw_to_frame(ulaw, sample_rate=8000, monotonic_ts_ns=42)
+    frame = ulaw_to_frame(ulaw, monotonic_ts_ns=42)
     assert isinstance(frame, PcmFrame)
-    assert frame.sample_rate == 8000
+    assert frame.sample_rate == G711_SAMPLE_RATE == 8000
     assert frame.monotonic_ts_ns == 42
     assert frame.sample_count == 4
     assert frame_to_ulaw(frame) == ulaw  # frame -> wire is the inverse of wire -> frame
+
+
+def test_frame_to_ulaw_rejects_non_8k_frame() -> None:
+    # encoding a 16 kHz frame to G.711 would silently halve its duration
+    frame = PcmFrame(samples=_pcm16(0, 1, 2), sample_rate=16000, monotonic_ts_ns=0)
+    with pytest.raises(ValueError, match="8000 Hz"):
+        frame_to_ulaw(frame)
 
 
 def test_resampler_rejects_equal_rates() -> None:

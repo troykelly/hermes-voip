@@ -64,13 +64,13 @@ Concrete shape:
       )
   ```
 
-  No `register_tts_provider` / `register_transcription_provider` call is made for the live path — those are batch and are deliberately bypassed (see Consequences). Tools, hooks, and the injection guard register separately (ADR-0009) but do not change this platform seam.
+  `register_platform(...)` is the **only live-call seam**: the live conversational path uses no batch STT/TTS — Hermes' `register_tts_provider` / `register_transcription_provider` are whole-file batch and are bypassed for the live turn loop. Consistent with ADR-0004, the plugin **MAY additionally register** those batch hooks for **non-live** uses (voicemail / whole-file `transcribe_audio` tooling); doing so never touches the live platform seam. Tools, hooks, and the injection guard register separately (ADR-0009) but do not change this platform seam.
 
 - **The adapter owns the socket and the media plane.** `VoipAdapter(BasePlatformAdapter)` implements the four abstract methods. `connect()` brings up SIP-over-TLS/WebRTC signalling and the SRTP/RTP media stack (ADR-0005) and registers the extension; it returns `True` only once registered. Inside `connect()` (and the per-call tasks it spawns on the shared loop) live VAD/endpointing (ADR-0008), streaming STT (ADR-0006), streaming TTS (ADR-0007), barge-in, and DTMF (ADR-0010). None of this is visible to Hermes core. Off-loop callbacks from the media stack are marshalled back onto the agent loop via `agent.async_utils.safe_schedule_threadsafe` (exact signature to be verified in implementation, rule 23).
 
 - **The adapter↔core contract is text only.**
   - *Inbound:* when an utterance is finalized, the adapter builds one discrete `MessageEvent` of `MessageType.VOICE` carrying the **transcript** as `text=...` and (optionally) the captured-audio **file path** in `media_urls`, then calls `self.handle_message(event)`. Because the transcript is already populated, Hermes' auto-STT need not re-run; the file path is retained only for tooling/forensics under the 25 MB cap.
-  - *Outbound:* Hermes calls `adapter.send(chat_id, content, reply_to, metadata)` with the agent's reply **text**; the adapter renders it to speech via its in-process streaming TTS and returns a `SendResult`. The batch `synthesize(...)`/`play_tts` override path is *not* used for the live conversation.
+  - *Outbound:* Hermes calls `adapter.send(chat_id, content, reply_to, metadata)` with the agent's reply **text**; the adapter renders it to speech via its in-process streaming TTS and returns a `SendResult`. The batch `synthesize(...)`/`play_tts` override path is *not* used for the live conversation (it remains available only for the optional non-live batch uses noted above, per ADR-0004).
 
 - **A call is a Hermes session.** The adapter maps one phone call to one session/chat:
   - `chat_id` ← SIP `Call-ID` (one call = one chat = one session).

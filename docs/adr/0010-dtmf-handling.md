@@ -26,11 +26,11 @@ The constraints that bind the choice:
   near-universal standard, but some gateways negotiate it badly or prefer SIP INFO, and
   a few legacy paths only pass in-band. We must support more than one and pick per call
   from what SDP/signalling actually offers — not hard-code one gateway's behaviour.
-- **aiortc gives us RTP but not the event codec.** aiortc (ADR-0005) transports RTP and
-  negotiates `m=audio` payload types, but it does **not** implement the RFC 4733
-  `telephone-event` payload codec. We implement that codec ourselves; the alternative
-  PJSIP/pjsua2 fallback transport (ADR-0005) does provide DTMF natively, so the codec
-  layer sits behind a transport-agnostic seam.
+- **The transport choice is spike-resolved (ADR-0005).** The two candidate transports differ
+  on DTMF: the `aiortc` candidate transports RTP and negotiates `m=audio` payload types but does
+  **not** implement the RFC 4733 `telephone-event` payload codec, so we implement that codec
+  ourselves; the first-class `pjsua2` candidate provides DTMF natively. The codec layer therefore
+  sits behind a transport-agnostic seam so either transport works unchanged.
 - **Confirmation must be spoof-resistant** (ADR-0009). A confirmation gate that accepts
   spoken "yes" is defeated by a caller who reads the agent's own injected instructions
   back to it, or by audio replay. A keypad press carried out-of-band on its own RTP
@@ -60,13 +60,14 @@ Concrete shape:
   mode is decided once per call and logged; nothing downstream cares which fired.
 
 - **One detector seam, three backends.** A `DtmfDetector` protocol abstracts the source
-  so the transport choice (aiortc primary vs. pjsua2 fallback, ADR-0005) and the
-  mechanism are both invisible to callers. Each backend emits the same
+  so the transport choice (the `aiortc` or `pjsua2` candidate, resolved by the ADR-0005 spike)
+  and the mechanism are both invisible to callers. Each backend emits the same
   `DtmfDigit` events:
 
   ```python
   from __future__ import annotations
 
+  from collections.abc import AsyncIterator
   from dataclasses import dataclass
   from enum import Enum
   from typing import Protocol
@@ -89,7 +90,10 @@ Concrete shape:
 
 
   class DtmfDetector(Protocol):
-      async def digits(self) -> "AsyncIterator[DtmfDigit]": ...
+      # Synchronous factory returning an AsyncIterator, matching ADR-0004's
+      # calling convention (StreamingASR.stream / MediaTransport.inbound_audio):
+      # the caller iterates the returned async iterator, it does not await this.
+      def digits(self) -> AsyncIterator[DtmfDigit]: ...
       def mode(self) -> DtmfMode: ...
   ```
 
@@ -153,12 +157,12 @@ Concrete shape:
   negotiation, means a new gateway works without a code change in the common case;
   in-band remains available for the legacy long tail. This is the explicit cost of
   staying gateway-agnostic: three backends to maintain and test, not one.
-- **We own the RFC 4733 codec.** Because aiortc does not provide telephone-event
-  (ADR-0005), the event-payload codec and its packet state machine are ours to keep
-  correct (duration/end-bit handling, lost-end-packet recovery, dedup). This is a small,
-  well-specified, fully-testable surface with golden packet fixtures — acceptable. The
-  pjsua2 fallback transport supplies DTMF natively, so the `DtmfDetector` seam lets us
-  swap to its events without touching callers.
+- **We own the RFC 4733 codec.** Because the `aiortc` candidate does not provide
+  telephone-event (ADR-0005), the event-payload codec and its packet state machine are ours to
+  keep correct (duration/end-bit handling, lost-end-packet recovery, dedup) on that path. This is
+  a small, well-specified, fully-testable surface with golden packet fixtures — acceptable. The
+  `pjsua2` candidate transport supplies DTMF natively, so the `DtmfDetector` seam lets us use its
+  events without touching callers if the spike selects it.
 - **A real spoof-resistant confirmation channel.** DTMF gives ADR-0009 a confirmation
   input that does not pass through STT or the LLM and is not satisfiable by recognised
   speech or audio replay, materially strengthening the human-in-the-loop gate. We commit

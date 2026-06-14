@@ -138,9 +138,14 @@ delays both first audio and barge-in.
 **CI licence assertion.** A test asserts the configured `HERMES_VOIP_TTS_MODEL` /
 `HERMES_VOIP_TTS_VOICE` resolves to an allow-listed licence (Apache-2.0, MIT, CC0, CC-BY-4.0),
 and that the disqualified set above can never be the committed default — mirroring the STT
-licence gate (ADR-0006) and the project's licence-gating rule (rule 35). Provider work is
-TDD (rule 18): a failing test for streaming order, `TtsStream.flush()` end-of-utterance
-framing, and mid-stream `TtsStream.cancel()` lands before implementation.
+licence gate (ADR-0006) and the project's licence-gating rule (rule 35). The gate pins the
+**exact** model/voice artifact — the source repo (e.g. `hexgrad/Kokoro-82M` for the default
+weights, the Piper voices repo for `en_US-libritts/high`), a **pinned revision**, the specific
+model/voice file names, and their **checksums** — not the generic names "Kokoro-82M" or
+"en_US-libritts/high"; the exact revisions + checksums are recorded at implementation so CI
+verifies those artifacts, not a name. Provider work is TDD (rule 18): a failing test for
+streaming order, `TtsStream.flush()` end-of-utterance framing, and mid-stream
+`TtsStream.cancel()` lands before implementation.
 
 ## Consequences
 

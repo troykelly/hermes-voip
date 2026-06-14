@@ -99,19 +99,22 @@ class SherpaOnnxASR:
 
 # Structural conformance is enforced by mypy and the runtime_checkable Protocol:
 _: type[StreamingASR] = SherpaOnnxASR
+```
 
 ### Media glue we own
 
-The transport delivers 8 kHz G.711; the recognizer and silero-vad (ADR-0008) both require
-16 kHz. The plugin owns the decode + resample, using **`audioop-lts`** (the maintained
+The transport delivers 8 kHz G.711; the recognizer requires 16 kHz (silero-vad, ADR-0008, runs
+natively at 8 kHz or 16 kHz, so it does not force the resample — it just shares the recognizer's
+16 kHz stream). The plugin owns the decode + resample, using **`audioop-lts`** (the maintained
 replacement for the `audioop` stdlib module removed in Python 3.13):
 
 - `audioop.ulaw2lin` / `audioop.alaw2lin` — G.711 mu-law/a-law → linear PCM16 @ 8 kHz.
 - `audioop.ratecv` — 8 kHz → 16 kHz upsample (carrying the codec state tuple across frames
   so the resampler is continuous, not per-frame).
 
-The same 16 kHz PCM stream fans out to both this recognizer and silero-vad (ADR-0008),
-which hard-rejects 8 kHz input — a second reason 16 kHz is the canonical internal rate.
+The same 16 kHz PCM stream fans out to both this recognizer and silero-vad (ADR-0008). The
+recognizer's 16 kHz requirement is what fixes the canonical internal rate; silero-vad supports
+both 8 kHz and 16 kHz natively and simply reuses this stream so one resample serves both.
 
 ### Configuration and selection
 
@@ -134,10 +137,12 @@ Plugin file paths: `src/hermes_voip/stt/base.py` (the Protocol + `Transcript`),
 
 Because the engine and the model carry independent licences and the Kroko zipformer trap is
 specifically CC-BY-SA, a CI test asserts the **model's** declared licence is Apache-2.0
-before the pinned model is accepted — the pin is verified, not trusted. The model is
-identified by its directory + a checksum; the test reads the recorded licence metadata for
-that pinned id and fails the build on anything other than Apache-2.0. TDD per rule 18: the
-licence-assertion test and the resample-continuity test are written red first.
+before the pinned model is accepted — the pin is verified, not trusted. The licence gate pins
+the **exact** model artifact — the source repo, a **pinned revision**, the specific file names,
+and their **checksums** — not the generic model name; the exact revision + checksums are
+recorded at implementation. The test reads the recorded licence metadata for that pinned id and
+fails the build on anything other than Apache-2.0. TDD per rule 18: the licence-assertion test
+and the resample-continuity test are written red first.
 
 ## Consequences
 

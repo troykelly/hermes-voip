@@ -1,4 +1,4 @@
-# ADR-0008: VAD, endpointing and full-duplex barge-in (silero-vad; phased half→full duplex)
+# ADR-0008: VAD + endpointing with silero-vad (Phase 1, accepted); full-duplex barge-in deferred to a follow-up ADR
 
 - **Date:** 2026-06-14
 - **Status:** Accepted
@@ -30,22 +30,34 @@ shared event loop (ADR-0005).
 A load-bearing **unknown** gates true barge-in: whether `AIAgent.run_conversation` can be
 cancelled mid-generation. If it cannot, we can still stop *audible* output (cancel the
 `TtsStream`, flush the playout buffer) but the agent keeps generating tokens into a discarded
-turn. This must be verified in Hermes source / a spike before Phase 2 is called done
-(rules 23, 26).
+turn. This is **unverified**. Per rule 6 (no claiming un-built design as done), full-duplex
+barge-in is therefore **NOT accepted in this ADR**: the material below on barge-in/AEC is
+**research and design context**, and the actual decision — cancellation mechanism and AEC
+choice — is **deferred to a follow-up ADR after the cancellation spike** (rules 23, 26). What
+this ADR accepts is Phase 1 only.
 
 ## Decision
 
-We use **`silero-vad`** (MIT) for speech detection, a **tunable ~500 ms silence
-endpointing timer** (with `Smart-Turn-v2` as an optional later upgrade) to decide
-end-of-turn, and we build **full-duplex barge-in inside our own media engine** — but we
-**ship it in two phases**: Phase 1 is half-duplex (correct, matching Hermes' own model);
-Phase 2 adds barge-in once the cancellation unknown is resolved.
+**Accepted (Phase 1):** we use **`silero-vad`** (MIT) for speech detection and a **tunable
+~500 ms silence endpointing timer** (with `Smart-Turn-v2` as an optional later upgrade) to
+decide end-of-turn, running **half-duplex** turn-taking inside our own in-process media engine
+(correct, and matching Hermes' own half-duplex model). The VAD choice and the half-duplex
+endpointing path are the finished, accepted deliverable of this ADR.
 
-**VAD — silero-vad fed 16 kHz.** silero-vad **hard-rejects 8 kHz** input, so the media engine
-already up-samples the inbound G.711 8 kHz stream to 16 kHz for STT (ADR-0006); VAD consumes
-that same 16 kHz PCM (one resample, two consumers). The detector runs per frame on the inbound
-stream and emits speech-onset / speech-offset events. Provider shape (ADR-0004 lives in
-`src/hermes_voip/media/vad.py`):
+**Deferred (Phase 2):** full-duplex barge-in (running VAD during TTS playout, cancelling the
+in-flight turn, AEC). It is **not accepted here** and **not designed to completion**: it is
+contingent on (a) a **verified mechanism to cancel an in-flight `AIAgent.run_conversation`**
+(currently unverified — see the load-bearing unknown) and (b) an **AEC choice**, and is **to be
+settled in a follow-up ADR after the cancellation spike** (rule 6). The Phase 2 material below
+is recorded as research/design context for that follow-up, not as an accepted design.
+
+**VAD — silero-vad, fed 16 kHz by choice (not by constraint).** silero-vad runs **natively at
+either 8 kHz or 16 kHz**, so 8 kHz input is fully supported — it does **not** force a resample.
+The media engine already up-samples the inbound G.711 8 kHz stream to 16 kHz for STT (ADR-0006),
+and we feed VAD that **same** 16 kHz PCM so a single resample serves both consumers — a design
+choice to share one stream, not a VAD requirement. The detector runs per frame on the inbound
+stream and emits speech-onset / speech-offset events. Provider shape (the VAD lives in
+`src/hermes_voip/media/vad.py`; it consumes ADR-0004's canonical `PcmFrame`/16 kHz convention):
 
 ```python
 from collections.abc import Iterator
@@ -66,12 +78,18 @@ class VadEvent:
 
 
 class VoiceActivityDetector:
-    """Per-frame speech detector over 16 kHz mono PCM (silero-vad rejects 8 kHz)."""
+    """Per-frame speech detector over mono PCM (silero-vad supports 8 kHz or 16 kHz).
 
-    def __init__(self, sample_rate_hz: int = 16_000, threshold: float = 0.5) -> None: ...
+    silero-vad runs natively at either rate; we default to 16 kHz only to share
+    one resampled stream with STT (ADR-0006), not because 8 kHz is unsupported.
+    """
+
+    def __init__(self, sample_rate_hz: int = 16_000, threshold: float = 0.5) -> None:
+        """`sample_rate_hz` is 8000 or 16000 — both are native silero-vad rates."""
+        ...
 
     def feed(self, pcm16_frame: bytes) -> Iterator[VadEvent]:
-        """Push one fixed-size 16 kHz frame; yield onset/offset edges it produces."""
+        """Push one fixed-size frame at `sample_rate_hz`; yield onset/offset edges."""
         ...
 
     def reset(self) -> None: ...
@@ -87,21 +105,26 @@ config pattern):
 
 | Env var | Default | Meaning |
 | ------- | ------- | ------- |
-| `HERMES_VOIP_VAD_THRESHOLD` | `0.5` | silero-vad speech probability cutoff |
-| `HERMES_VOIP_ENDPOINT_SILENCE_MS` | `500` | trailing silence to declare end-of-turn |
-| `HERMES_VOIP_DUPLEX_MODE` | `half` | `half` (Phase 1) or `full` (Phase 2 barge-in) |
-| `HERMES_VOIP_AEC` | `off` | acoustic echo cancellation: `off` \| `speex` \| `webrtc` |
+| `HERMES_VOIP_VAD_THRESHOLD` | `0.5` | silero-vad speech probability cutoff (Phase 1) |
+| `HERMES_VOIP_ENDPOINT_SILENCE_MS` | `500` | trailing silence to declare end-of-turn (Phase 1) |
+| `HERMES_VOIP_DUPLEX_MODE` | `half` | `half` (Phase 1, the only accepted mode); `full` is reserved for the deferred Phase 2 ADR |
+| `HERMES_VOIP_AEC` | `off` | (Phase 2, deferred) acoustic echo cancellation: `off` \| `speex` \| `webrtc` |
 
-**Phase 1 — half-duplex (ships first, complete on its own).** While the agent's TTS is
+The `full`/AEC settings are listed for continuity with the Phase 2 research below; they are
+**not** part of the accepted decision and ship no behaviour until the follow-up ADR settles
+cancellation + AEC.
+
+**Phase 1 — half-duplex (accepted; complete on its own).** While the agent's TTS is
 playing out, the inbound stream is **not** routed to STT; VAD/endpointing only gate caller
 turns *between* agent utterances. This matches Hermes' native model exactly, is correct (no
 self-transcription, no echo problem), and is the default (`HERMES_VOIP_DUPLEX_MODE=half`).
 This is a real, finished deliverable — not a stub (rule 6).
 
-**Phase 2 — full-duplex barge-in (in the media engine).** With `HERMES_VOIP_DUPLEX_MODE=full`,
-VAD runs on the inbound stream **during** TTS playout. On a **confident caller-speech onset**
-(VAD onset sustained past a short debounce so a cough/echo doesn't trigger it), the media
-engine, in order:
+**Phase 2 — full-duplex barge-in (DEFERRED research context, not an accepted design).** The
+following sketches the intended Phase 2 so the follow-up ADR starts informed; it is **not**
+decided here. With a future `HERMES_VOIP_DUPLEX_MODE=full`, VAD would run on the inbound stream
+**during** TTS playout. On a **confident caller-speech onset** (VAD onset sustained past a short
+debounce so a cough/echo doesn't trigger it), the media engine would, in order:
 
 1. cancels the in-flight `TtsStream` (ADR-0007 exposes `cancel()` — sherpa-onnx returns 0 from
    its chunk callback; cloud paths Cartesia/Deepgram Aura-2 send explicit cancel/flush),
@@ -111,7 +134,8 @@ engine, in order:
 
 ```python
 class DuplexController:
-    """Owns the barge-in decision; lives on the media event loop (ADR-0005)."""
+    """Phase 2 (deferred) sketch: would own the barge-in decision on the media
+    event loop (ADR-0005). Not part of the accepted Phase 1 decision."""
 
     async def on_caller_onset(self, ev: VadEvent) -> None:
         if not self._agent_is_speaking:
@@ -121,23 +145,28 @@ class DuplexController:
         await self._try_abort_agent_turn()  # see UNKNOWN below
 ```
 
-**Acoustic echo cancellation is required for full duplex.** Without AEC the agent hears its own
-TTS on the inbound leg and re-transcribes it as caller speech, which would both false-trigger
-barge-in and poison STT. Phase 2 therefore runs an in-process AEC stage on the inbound PCM —
-`speexdsp` echo canceller (simpler) or the WebRTC Audio Processing Module (`webrtc` APM,
-stronger), selected by `HERMES_VOIP_AEC`. AEC runs **before** VAD/STT in the inbound chain.
-AEC is **off** in Phase 1 (mic-deaf during TTS means there is no echo to cancel).
+**Acoustic echo cancellation would be required for full duplex (Phase 2, deferred).** Without
+AEC the agent hears its own TTS on the inbound leg and re-transcribes it as caller speech, which
+would both false-trigger barge-in and poison STT. Phase 2 would therefore run an in-process AEC
+stage on the inbound PCM — candidates are the `speexdsp` echo canceller (simpler) or the WebRTC
+Audio Processing Module (`webrtc` APM, stronger). **Which AEC engine to adopt is an open part of
+the deferred Phase 2 decision**, to be settled in the follow-up ADR alongside the cancellation
+mechanism — not chosen here. AEC would run **before** VAD/STT in the inbound chain. AEC is
+irrelevant to Phase 1 (mic-deaf during TTS means there is no echo to cancel).
 
-**LOAD-BEARING UNKNOWN (must be resolved before Phase 2 is "done", rules 23/26):** whether
-`AIAgent.run_conversation` is cancellable mid-generation. The spike must establish, from
-Hermes source plus a live test, one of: (a) a supported cancel/cooperative-abort path exists →
-true barge-in; or (b) it does not → `_try_abort_agent_turn` degrades to discarding the
-completed turn's output (audio is already silenced; the orphan generation finishes and is
-dropped), which is *acceptable degraded* full-duplex and must be documented as such, not
-claimed as clean cancellation. The off-loop→asyncio bridge for any threaded media callback is
+**LOAD-BEARING UNKNOWN — the reason Phase 2 is deferred, not accepted (rules 6/23/26):** whether
+`AIAgent.run_conversation` is cancellable mid-generation. The cancellation spike must establish,
+from Hermes source plus a live test, one of: (a) a supported cancel/cooperative-abort path exists
+→ true barge-in; or (b) it does not → the abort degrades to discarding the completed turn's
+output (audio is already silenced; the orphan generation finishes and is dropped), which is
+*acceptable degraded* full-duplex and must be documented as such, not claimed as clean
+cancellation. Either way, the verified mechanism plus the AEC choice are the substance of the
+**follow-up ADR**; until that spike lands there is no accepted full-duplex design. The
+off-loop→asyncio bridge for any threaded media callback is
 `agent.async_utils.safe_schedule_threadsafe` (signature **unverified** — confirm in the spike).
 
-All of this is in-process (ADR-0005); no media server, no SaaS, no rule-40 trigger.
+All of this (Phase 1 today, Phase 2 when settled) is in-process (ADR-0005); no media server, no
+SaaS, no rule-40 trigger.
 
 ## Consequences
 
@@ -146,21 +175,21 @@ All of this is in-process (ADR-0005); no media server, no SaaS, no rule-40 trigg
   whole-file batches; without this ADR the cascade cannot meet the latency bar.
 - **Phase 1 ships a correct, shippable product** with no echo/self-transcription risk, matching
   Hermes' own UX. We are not blocked on the cancellation unknown to deliver voice calls.
-- **We commit to maintaining an in-process duplex media engine** — VAD frame loop, endpointing
-  timer, playout/jitter buffer, and (Phase 2) an AEC stage — on the shared event loop. This is
-  real CPU on the media path: silero-vad and AEC run per-frame and must fit the per-frame budget
-  alongside resampling and codec work (rule 22 — measured, not assumed, on the 8 kHz path).
-- **Barge-in quality is bounded by the cancellation unknown.** Even with audio silenced
-  instantly, if the agent turn cannot be aborted we pay wasted LLM tokens/latency on
-  interrupted turns and must surface that honestly. The barge-in *responsiveness* number
-  (onset→silence) must be re-measured on our path, not inherited from any vendor figure
-  (rule 23).
-- **Config-driven, no lock-in.** Thresholds and duplex/AEC mode are env vars; silero-vad
-  (MIT), speexdsp and WebRTC APM are permissive/OSS, all in-process — no per-minute cost, no
-  vendor egress, no operator-gated infra. `Smart-Turn-v2` and AEC engine choice remain
-  swappable behind stable seams.
-- **Upgrade cadence:** silero-vad and the AEC libraries are pinned in `uv.lock` (rule 33);
-  model/library bumps are deliberate, gated by a re-measure of endpointing and barge-in latency.
+- **We commit (Phase 1) to maintaining an in-process VAD/endpointing engine** — VAD frame loop,
+  endpointing timer, playout/jitter buffer — on the shared event loop. This is real CPU on the
+  media path: silero-vad runs per-frame and must fit the per-frame budget alongside resampling
+  and codec work (rule 22 — measured, not assumed, on the 8 kHz path). A Phase 2 AEC stage is
+  **not** a commitment of this ADR; it is scoped to the deferred follow-up.
+- **Phase 2 (deferred) carries an unresolved cancellation risk.** Even with audio silenced
+  instantly, if the agent turn cannot be aborted we pay wasted LLM tokens/latency on interrupted
+  turns. That risk is precisely why barge-in is deferred to a follow-up ADR rather than accepted
+  here; the barge-in *responsiveness* number (onset→silence) and the cancellation behaviour must
+  be measured on our path before any acceptance (rules 6/23).
+- **Config-driven, no lock-in.** Phase 1 thresholds are env vars; silero-vad (MIT) is permissive
+  OSS, in-process — no per-minute cost, no vendor egress, no operator-gated infra. `Smart-Turn-v2`
+  and any future AEC engine remain swappable behind stable seams.
+- **Upgrade cadence:** silero-vad is pinned in `uv.lock` (rule 33); model/library bumps are
+  deliberate, gated by a re-measure of endpointing latency.
 
 ## Alternatives considered
 
@@ -168,7 +197,7 @@ All of this is in-process (ADR-0005); no media server, no SaaS, no rule-40 trigg
 | ----------- | ---------------- |
 | RMS / energy-threshold VAD (Hermes/Discord style) | Too blunt for telephony: line noise, comfort noise and varying levels make a fixed energy gate either trigger-happy or deaf. A learned model (silero-vad) is far more robust at the per-frame decision the endpointer depends on. |
 | WebRTC VAD (`py-webrtcvad`) as the detector | Lighter and native-8 kHz, but materially weaker accuracy than silero-vad on noisy speech, with no probability output to tune a debounce/onset confidence against — barge-in needs that confidence signal. (We still use WebRTC's APM for *echo cancellation* in Phase 2, a different task.) |
-| Permanently half-duplex (never build barge-in) | Acceptable as the Phase 1 interim and as Hermes' own ceiling, but interrupting an over-long agent answer is core to natural phone conversation; we commit to Phase 2 rather than freezing at the floor. Shipping it as the *default* until verified is the safe sequencing. |
+| Permanently half-duplex (never build barge-in) | Acceptable as the Phase 1 deliverable (accepted here) and as Hermes' own ceiling. Interrupting an over-long agent answer is core to natural phone conversation, so a full-duplex Phase 2 is *intended* — but it is deferred to a follow-up ADR (gated on the cancellation spike + AEC choice), not committed in this ADR. Half-duplex is the verified default until then. |
 | Server-side / gateway-provided VAD or endpointing | Vendor-specific behaviour in the core, violating the gateway-agnostic invariant (CLAUDE.md) — the first test gateway is only a test target. Also moves the decision off our event loop where we cannot tune it against the real 8 kHz path. |
 | Fused speech-to-speech model owning turn-taking (OpenAI Realtime / Gemini Live) | Replaces Hermes as the brain and adds lock-in/egress (rejected for the core in ADR-0003). Turn-taking stays ours, in-process, model-agnostic. |
 

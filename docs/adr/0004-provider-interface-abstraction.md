@@ -10,8 +10,10 @@ The cascaded media path (ADR-0003) wires four swappable components into the core
 streaming speech recogniser, a streaming synthesiser, a prompt-injection classifier, and the
 SIP/WebRTC+RTP transport. Each has a research-selected default and at least one cloud
 fallback (sherpa-onnx vs Deepgram Flux for STT in ADR-0006; sherpa-onnx/Kokoro vs
-Cartesia/Deepgram/ElevenLabs for TTS in ADR-0007; LLM Guard ONNX in ADR-0009; aiortc with a
-PJSIP fallback in ADR-0005). If the core imports any of those vendors by name, it stops being
+Cartesia/Deepgram/ElevenLabs for TTS in ADR-0007; an in-process DeBERTa ONNX guard in
+ADR-0009; an in-process media engine — aiortc behind a thin SIP-over-TLS signalling layer as
+the leading candidate, with PJSIP a first-class candidate — to be confirmed by the ADR-0005
+spike). If the core imports any of those vendors by name, it stops being
 gateway- and provider-agnostic and acquires exactly the lock-in that rule 40 forbids
 introducing without an ADR. The choice that is "decided" must be a *seam*, not a vendor.
 
@@ -36,7 +38,8 @@ Three constraints bind the shape of that seam:
 
 3. **Fully-typed, no escape hatches** (rules 17/39). The seam is the most-imported contract in
    the codebase; it must be clean under `mypy --strict` with no `Any`, and must let us prefer
-   types over runtime checks (a `Verdict` discriminated by a typed field, not a dict probe).
+   types over runtime checks (a graded `GuardVerdict`/`ToolRisk` discriminated by a typed
+   field, not a dict probe).
 
 The decision is *how* to express that seam, not *which vendor* — vendor selection lives in the
 sibling ADRs and is reduced here to a config key.
@@ -68,10 +71,16 @@ class PcmFrame:
     `samples` length is `len(samples) // PCM16_BYTES_PER_SAMPLE` mono samples.
     Codec (G.711) and 8<->16 kHz resampling never appear here: by the time a
     frame reaches a provider it is already PCM16 at the provider's declared rate.
+    `monotonic_ts_ns` is the de-jittered, gap-free presentation clock the media
+    layer (ADR-0005) stamps on every frame so downstream stages (VAD/endpointing
+    ADR-0008, A/V sync, barge-in timing) share one monotonic timebase. This is
+    the single canonical `PcmFrame`; transport and provider ADRs import it and
+    never redefine its fields.
     """
 
     samples: bytes
     sample_rate: int
+    monotonic_ts_ns: int
 ```
 
 ### StreamingASR (see ADR-0006)
@@ -170,38 +179,106 @@ factory call. The concrete implementations in ADR-0006 (`StreamingASR`) and ADR-
 
 ### InjectionGuard (see ADR-0009)
 
+This is the single canonical prompt-injection contract; ADR-0009 imports it and
+does not redefine `InjectionGuard`, `GuardResult`, or `GuardVerdict` with a
+different shape. The verdict is **graded** (not a binary benign/injection label)
+so the caller can degrade behaviour proportionally — proceed, clarify, restrict
+the toolset, or refuse — and `degraded` records a fail-open guard so policy can
+clamp the action surface even when classification was unavailable.
+
 ```python
 # src/hermes_voip/providers/guard.py
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
 
-class GuardLabel(Enum):
-    BENIGN = "benign"
-    INJECTION = "injection"
+class GuardVerdict(Enum):
+    """Graded screening outcome (ascending severity)."""
+
+    ALLOW = "allow"        # benign turn; proceed normally
+    CLARIFY = "clarify"    # ambiguous; ask a clarifying question, no tools this turn
+    RESTRICT = "restrict"  # weak/medium signal; proceed least-privilege (read-only)
+    REFUSE = "refuse"      # strong signal; refuse the instruction, flag, escalate
 
 
 @dataclass(frozen=True, slots=True)
-class Verdict:
-    label: GuardLabel
-    score: float                    # 0.0..1.0 model confidence in `label`
-    detail: Mapping[str, str]       # provider-specific, never load-bearing
+class GuardResult:
+    verdict: GuardVerdict
+    normalized_text: str            # after decode/normalize (base64/ROT13/homoglyph)
+    reasons: tuple[str, ...]        # audit-log detail, never shown to the caller
+    degraded: bool                  # True when the guard failed open (errored/unreachable)
+    score: float                    # 0.0..1.0 raw detector probability
 
 
 @runtime_checkable
 class InjectionGuard(Protocol):
-    async def classify(self, text: str, context: str) -> Verdict:
-        """Classify a transcribed turn as benign/injection.
+    async def screen(self, text: str, *, call_id: str) -> GuardResult:
+        """Screen one finalized, transcribed caller turn for prompt injection.
 
-        `context` is the surrounding conversation state the detector may use.
-        This is an early-warning LAYER, not the defense (ADR-0009); the caller
-        decides policy on the typed `Verdict`, not on a raw string.
+        `call_id` scopes per-session state (cumulative risk, rate of suspicious
+        turns; ADR-0009). Returns a graded `GuardResult`, never a raw string.
+        This is an early-warning LAYER, not the defense (ADR-0009): the caller
+        decides policy on the typed verdict, and the enforceable control is the
+        tool-policy gate below — not the classifier outcome alone.
         """
         ...
+```
+
+### Tool policy (the enforceable control — see ADR-0009)
+
+The classifier has false negatives by construction, so the *enforceable* control
+is a typed tool-policy gate, also canonical here. Every registered tool carries a
+`ToolRisk`; per-session guard state carries the `degraded` flag (it follows the
+session, set by any fail-open `GuardResult`); and a `pre_tool_call` hook **MUST**
+gate every `irreversible` tool — requiring explicit human/DTMF confirmation
+(ADR-0010) and hard-blocking while `degraded` — **regardless of the classifier
+outcome**. A missed injection therefore still cannot reach an irreversible action.
+
+```python
+# src/hermes_voip/providers/policy.py
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class ToolRisk(Enum):
+    """Action risk class for a registered tool (ascending)."""
+
+    SAFE = "safe"                  # read-only / no side effects
+    ELEVATED = "elevated"          # mutating but reversible / low blast radius
+    IRREVERSIBLE = "irreversible"  # payments, bookings, transfers, account mutation
+
+
+@dataclass(slots=True)
+class GuardSessionState:
+    """Per-session guard state; lives for the call (ADR-0009)."""
+
+    call_id: str
+    degraded: bool = False                       # any fail-open screen sets this and it sticks
+    flagged_turns: tuple[str, ...] = field(default_factory=tuple)
+
+    def record(self, result: GuardResult) -> None:
+        """Fold one screen into session state; degraded never un-sets within a call."""
+        self.degraded = self.degraded or result.degraded
+
+
+def gate_tool_call(risk: ToolRisk, state: GuardSessionState, *, confirmed: bool) -> bool:
+    """`pre_tool_call` policy: may this tool run? Enforced regardless of verdict.
+
+    An `IRREVERSIBLE` tool requires explicit confirmation (human/DTMF, ADR-0010)
+    and is hard-blocked while the session is `degraded` — even if the classifier
+    returned ALLOW (the miss case ADR-0009 tests for). Errors propagate; this
+    never silently allows (rule 37).
+    """
+    if risk is ToolRisk.IRREVERSIBLE:
+        return confirmed and not state.degraded
+    if risk is ToolRisk.ELEVATED and state.degraded:
+        return False
+    return True
 ```
 
 ### MediaTransport (see ADR-0005)
@@ -222,6 +299,12 @@ class MediaTransport(Protocol):
 
     Hides G.711 codec, RTP packetisation, jitter buffering, and DTMF
     (RFC 4733, ADR-0010). Above this line everything is PCM16 frames.
+
+    This is the single canonical media seam: there is exactly one media
+    interface name (`MediaTransport`) with `inbound_audio()` / `send_audio()`
+    and an `inbound_sample_rate` property. ADR-0005 implements this exact
+    Protocol for its in-process engine; it does not define a second media
+    protocol under a different name.
     """
 
     async def connect(self) -> bool:

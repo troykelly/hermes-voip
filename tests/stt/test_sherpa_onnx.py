@@ -23,7 +23,9 @@ The contract under test (ADR-0006):
 
 from __future__ import annotations
 
+import asyncio
 import struct
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
@@ -275,3 +277,107 @@ async def test_sherpa_asr_propagates_engine_errors() -> None:
     asr = SherpaOnnxASR.from_recognizer(_Boom([_Script("x", endpoint=False)]))
     with pytest.raises(RuntimeError, match="engine exploded"):
         [_ async for _ in asr.stream(_frames(_frame(1)))]
+
+
+@pytest.mark.asyncio
+async def test_sherpa_asr_early_consumer_break_releases_worker_without_timeout() -> (
+    None
+):
+    """Breaking from ``stream()`` early releases the worker without a hang.
+
+    The bug: the ``_END_OF_AUDIO`` sentinel is enqueued with ``put_nowait``
+    in ``_run()``'s finally.  When the frame queue is full at that moment the
+    put is silently dropped (``contextlib.suppress(queue.Full)``), and the
+    worker thread parks in ``frames.get()`` indefinitely.  The asyncgen
+    finalizer cleanup raises ``RuntimeError("worker did not terminate")``
+    after 5 s — swallowed as an unhandled task exception, but the thread
+    is leaked for 5 s.
+
+    The fix: pass an ``on_cancel`` to ``stream_from_thread`` that sets the stop
+    flag AND enqueues ``_END_OF_AUDIO`` via a blocking put so the sentinel is
+    guaranteed to arrive even when the queue is full.
+
+    To reproduce the bug deterministically we block the worker inside
+    ``accept_waveform`` (the frame-processing step) until the feeder has
+    filled the entire frame queue.  At that moment we let the consumer ``break``
+    early.  With the bug the ``put_nowait`` is dropped; with the fix the
+    ``on_cancel`` delivers the sentinel reliably.
+
+    We detect the leak by checking whether the worker thread is still alive
+    shortly after the break (it should not be).
+    """
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
+
+    # Frame queue capacity mirrors sherpa_onnx._BUFFER (16).
+    frame_queue_cap = 16
+    release = threading.Event()
+    first_accept_done = threading.Event()
+
+    # Track the worker thread so we can check it after the break.
+    worker_threads: list[threading.Thread] = []
+    orig_thread_init = threading.Thread.__init__
+
+    def _tracking_init(self: threading.Thread, *args: object, **kwargs: object) -> None:
+        orig_thread_init(self, *args, **kwargs)
+        if getattr(self, "name", "").startswith("hermes-voip-stream"):
+            worker_threads.append(self)
+
+    threading.Thread.__init__ = _tracking_init  # type: ignore[method-assign]
+
+    class _SlowFirstAccept(_FakeRecognizer):
+        """Blocks on the first ``accept_waveform`` so frames fill the queue."""
+
+        _blocked_once: bool = False
+
+        def accept_waveform(
+            self,
+            stream: _FakeStream,
+            sample_rate: int,
+            samples: FloatArray,
+        ) -> None:
+            if not self._blocked_once:
+                self._blocked_once = True
+                first_accept_done.set()
+                release.wait()  # hold the worker; feeder fills the queue
+            super().accept_waveform(stream, sample_rate, samples)
+
+    recognizer = _SlowFirstAccept(
+        [_Script("word", endpoint=False)] * (frame_queue_cap + 2)
+    )
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+
+    async def _many_frames() -> AsyncIterator[PcmFrame]:
+        for _ in range(frame_queue_cap + 2):
+            yield _frame(1)
+
+    collected: list[str] = []
+
+    async def _fill_then_release() -> None:
+        # Wait until the worker is blocked inside accept_waveform.
+        await asyncio.to_thread(first_accept_done.wait)
+        # Give the feeder time to fill the frame queue while the worker is stuck.
+        await asyncio.sleep(0.05)
+        # Unblock the worker so it produces the first transcript then loops back
+        # to frames.get() — at which point the queue is full and we break.
+        release.set()
+
+    fill_task = asyncio.create_task(_fill_then_release())
+    try:
+        async for t in asr.stream(_many_frames()):
+            collected.append(t.text)
+            break  # early exit — frame queue is full at this moment
+    finally:
+        threading.Thread.__init__ = orig_thread_init  # type: ignore[method-assign]
+
+    await fill_task
+    # Give the worker a brief window to terminate (on_cancel must deliver the
+    # sentinel before this check; the old best-effort put_nowait would have
+    # dropped it and the thread would still be alive here).
+    await asyncio.sleep(0.1)
+
+    assert collected, "no transcript was received"
+    leaked = [t for t in worker_threads if t.is_alive()]
+    assert not leaked, (
+        f"{len(leaked)} worker thread(s) still alive after early break — "
+        "on_cancel not wired; sentinel dropped when frame queue is full"
+    )

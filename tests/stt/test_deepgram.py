@@ -15,11 +15,17 @@ Contract under test (ADR-0006):
   ``is_final=False, end_of_turn=False``; an ``EndOfTurn`` (and the eager variant)
   sets ``end_of_turn=True`` *natively* (the engine owns the turn, unlike sherpa);
 * the socket is closed when the inbound audio ends;
-* a transport/JSON error surfaces to the consumer (rule 37).
+* a transport/JSON error surfaces to the consumer (rule 37);
+* ``stream()`` completes after audio ends even when the fake socket stays open
+  indefinitely (CloseStream sentinel is sent so the receive loop drains then
+  exits — no hang);
+* a ``socket.send()`` failure surfaces promptly (no hang; the receive loop is
+  closed and the error re-raised from the consumer iterator).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 from collections.abc import AsyncIterator
@@ -66,7 +72,10 @@ class _FakeFluxSocket:
 
     Mirrors the minimal ``async`` websocket surface the provider uses: ``send``
     (bytes), async iteration for inbound text frames, and ``close``. The replayed
-    text frames are the recorded Flux JSON events.
+    text frames are the recorded Flux JSON events, followed by an unbounded wait
+    until ``close()`` is called — matching real Deepgram behaviour where the
+    server keeps the socket open until it receives a CloseStream control message
+    (or the client closes the connection).
     """
 
     def __init__(self, events: tuple[str, ...]) -> None:
@@ -74,6 +83,7 @@ class _FakeFluxSocket:
         self.sent: list[bytes] = []
         self.closed = False
         self.opened = False
+        self._close_event = asyncio.Event()
 
     async def __aenter__(self) -> _FakeFluxSocket:
         self.opened = True
@@ -81,17 +91,22 @@ class _FakeFluxSocket:
 
     async def __aexit__(self, *exc: object) -> None:
         self.closed = True
+        self._close_event.set()
 
     async def send(self, data: bytes) -> None:
         self.sent.append(data)
 
     async def close(self) -> None:
         self.closed = True
+        self._close_event.set()
 
     def __aiter__(self) -> AsyncIterator[str]:
         async def _gen() -> AsyncIterator[str]:
             for event in self._events:
                 yield event
+            # Simulate real Deepgram: socket stays open (waiting for more audio or
+            # a CloseStream control) until the provider signals end-of-stream.
+            await self._close_event.wait()
 
         return _gen()
 
@@ -193,3 +208,76 @@ async def test_deepgram_asr_ignores_non_transcript_events() -> None:
     )
     out = await _run(_asr_with(_FakeFluxSocket(events)), _frame(0))
     assert [t.text for t in out] == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_deepgram_asr_stream_completes_after_audio_ends() -> None:
+    """``stream()`` completes + yields trailing finals even when socket stays open.
+
+    Real Deepgram sockets stay open until the server receives a CloseStream
+    control (or the client closes the connection).  The provider must send the
+    CloseStream sentinel (or close the socket) after the audio iterator is
+    exhausted so the receive loop drains remaining finals and then ends — no
+    hang.
+    """
+    # The socket emits a trailing final AFTER all audio has been sent, then
+    # blocks in ``__aiter__`` until closed.  The provider must trigger the close
+    # so both the trailing final is collected AND the receive loop terminates.
+    trailing_event = json.dumps(
+        {"type": "EndOfTurn", "transcript": "trailing", "end_of_turn": True}
+    )
+    socket = _FakeFluxSocket((trailing_event,))
+    asr = _asr_with(socket)
+
+    # Must complete within a tight deadline (no hang).
+    transcripts = await asyncio.wait_for(
+        _collect(asr.stream(_frames(_frame(0)))),
+        timeout=2.0,
+    )
+
+    assert any(t.text == "trailing" and t.is_final for t in transcripts)
+    assert socket.closed is True
+
+
+@pytest.mark.asyncio
+async def test_deepgram_asr_send_error_surfaces_promptly() -> None:
+    """A ``socket.send()`` failure surfaces to the consumer without hanging.
+
+    If the sender task raises (e.g. the connection was reset mid-stream), the
+    consumer must see the error promptly — the receive loop must not block
+    indefinitely waiting for server events that will never arrive.
+
+    This is tested by running the stream as an asyncio Task and checking that
+    the task has *already failed* after a brief cooperative yield — no need to
+    wait for an external timeout to cancel it.  With concurrent supervision
+    (TaskGroup / gather), the sender failure propagates to the consumer in
+    O(one event-loop iteration); without it, the consumer hangs until some
+    external cancel arrives.
+    """
+
+    class _BrokenSendSocket(_FakeFluxSocket):
+        """Send always raises; ``__aiter__`` blocks until the socket is closed."""
+
+        async def send(self, data: bytes) -> None:
+            msg = "send failed mid-stream"
+            raise ConnectionResetError(msg)
+
+    socket = _BrokenSendSocket(())
+    asr = _asr_with(socket)
+
+    task: asyncio.Task[list[Transcript]] = asyncio.create_task(
+        _collect(asr.stream(_frames(_frame(0))))
+    )
+    # Yield control a few times so the sender and receiver tasks can run.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # With concurrent supervision the task should already be done (failed).
+    assert task.done(), "task is still running — sender error not yet surfaced (bug)"
+    task.cancel()  # no-op if already done; prevents ResourceWarning
+    with pytest.raises(ConnectionResetError, match="send failed mid-stream"):
+        await task
+
+
+async def _collect(it: AsyncIterator[Transcript]) -> list[Transcript]:
+    return [t async for t in it]

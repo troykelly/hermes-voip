@@ -91,8 +91,10 @@ def _tts(synth: Synthesizer) -> SherpaKokoroTTS:
 
 def test_fake_synth_satisfies_the_synthesizer_protocol() -> None:
     """The injected fake structurally matches the Synthesizer backend seam."""
-    synth: Synthesizer = _FakeSynth()
-    assert synth.requested == []  # exercise a member so the bind is meaningful
+    synth = _FakeSynth()
+    conforms: Synthesizer = synth  # fails to type-check unless it matches the seam
+    assert conforms is synth
+    assert synth.requested == []  # exercise a concrete member so the bind is real
 
 
 def test_sherpa_kokoro_is_a_streaming_tts() -> None:
@@ -218,8 +220,9 @@ async def test_backend_error_propagates_to_the_consumer() -> None:
 
     class _BoomSynth:
         def synthesize(self, text: str, stop: Callable[[], bool]) -> Iterator[bytes]:
-            raise RuntimeError("model exploded")
-            yield b""  # pragma: no cover - unreachable, makes this a generator
+            if text:  # always true for the test input; keeps the yield reachable
+                raise RuntimeError("model exploded")
+            yield b""  # pragma: no cover - empty-text branch makes this a generator
 
     tts = _tts(_BoomSynth())
     stream = tts.synthesize(_text("Trigger it. "), voice="af")

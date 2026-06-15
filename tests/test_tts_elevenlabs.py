@@ -178,8 +178,9 @@ async def test_http_error_propagates_to_the_consumer() -> None:
 
     class _BoomHttp:
         def open(self, request: ElevenLabsRequest) -> Iterator[bytes]:
-            raise ConnectionError("upstream unavailable")
-            yield b""  # pragma: no cover - unreachable, makes this a generator
+            if request.text:  # always true here; keeps the yield reachable
+                raise ConnectionError("upstream unavailable")
+            yield b""  # pragma: no cover - empty-text branch makes this a generator
 
     tts = ElevenLabsTTS(api_key=_FAKE_KEY, voice="x", http=_BoomHttp())
     stream = tts.synthesize(_text("Trigger. "), voice="x")
@@ -189,5 +190,7 @@ async def test_http_error_propagates_to_the_consumer() -> None:
 
 def test_http_byte_stream_protocol_is_satisfied_by_the_fake() -> None:
     """The injected fake structurally matches the HttpByteStream seam."""
-    http: HttpByteStream = _RecordedHttp()
-    assert http.request is None  # exercises the member so the bind is meaningful
+    http = _RecordedHttp()
+    conforms: HttpByteStream = http  # fails to type-check unless it matches the seam
+    assert conforms is http
+    assert http.request is None  # exercise a concrete member so the bind is real

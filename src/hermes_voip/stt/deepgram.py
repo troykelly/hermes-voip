@@ -17,6 +17,24 @@ The websocket is hidden behind the :class:`_FluxSocket` Protocol and supplied by
 an injected ``connect`` factory, so the event-mapping is tested against a recorded
 fixture with no network or account; the production factory opens a real
 ``websockets`` connection (the optional ``deepgram`` extra).
+
+Async-lifecycle invariants
+--------------------------
+Sender and receiver run as concurrent :class:`asyncio.Task` objects so that
+either task's failure immediately cancels the other (rule 37 — errors propagate,
+never swallowed):
+
+* The **sender** drains ``audio``, encodes each frame to mu-law, sends it, then
+  sends a ``CloseStream`` control message so Deepgram flushes its buffers, emits
+  any trailing finals, and closes the server side of the socket.
+* The **receiver** maps inbound Flux JSON events to :class:`Transcript` and
+  enqueues them; it exits naturally when the server closes (after receiving
+  ``CloseStream``).
+
+The two tasks communicate through a shared :class:`asyncio.Queue`; this async
+generator drains the queue and yields each transcript to the consumer.  A shared
+:class:`asyncio.Event` (``done``) signals when the receiver has exited (success
+or failure) so the generator knows when there is nothing more to drain.
 """
 
 from __future__ import annotations
@@ -48,16 +66,22 @@ _END_OF_TURN: Final[frozenset[str]] = frozenset({"EndOfTurn", "EagerEndOfTurn"})
 # confidence (the value is informational — the turn decision is the event type).
 _FULL_CONFIDENCE: Final[float] = 1.0
 
+# Deepgram CloseStream control message: signals the server to flush its buffers,
+# emit any remaining finals, and close the websocket from the server side.  Sent
+# as a text frame (str) after all audio frames are exhausted.
+_CLOSE_STREAM: Final[str] = json.dumps({"type": "CloseStream"})
+
 
 class _FluxSocket(Protocol):
     """The minimal async websocket surface the provider drives.
 
     Both the real ``websockets`` connection and the test fake satisfy this. Text
     frames yielded by async iteration are Deepgram Flux JSON events; ``send``
-    takes the binary mu-law audio; ``close`` ends the session.
+    accepts bytes (mu-law audio) OR str (control messages); ``close`` ends the
+    session.
     """
 
-    async def send(self, data: bytes) -> None: ...
+    async def send(self, data: bytes | str) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -100,33 +124,14 @@ class DeepgramASR:
     def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
         """Stream PCM16 frames to Flux as mu-law; yield mapped transcripts.
 
-        A sender task drains ``audio``, encodes each frame to mu-law, and sends it;
-        the receive loop maps inbound Flux events to ``Transcript``. The socket is
-        closed once the audio ends; any sender error surfaces to the consumer
-        (rule 37).
+        Sender and receiver run as concurrent tasks so that either task's failure
+        immediately cancels the other (rule 37).  The sender sends a
+        ``CloseStream`` control after the last audio frame so the server flushes,
+        emits trailing finals, then closes; the receiver drains those events and
+        exits naturally.  Transcripts flow through an :class:`asyncio.Queue` and
+        are yielded to the consumer as they arrive.
         """
-
-        async def _run() -> AsyncIterator[Transcript]:
-            socket = self._connect()
-            sender = asyncio.ensure_future(_send_frames(socket, audio))
-            try:
-                async for raw in socket:
-                    transcript = _map_event(raw)
-                    if transcript is not None:
-                        yield transcript
-                # Surface a sender failure that completed before the socket closed.
-                await sender
-            finally:
-                if not sender.done():
-                    sender.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await sender
-                elif (exc := _task_exception(sender)) is not None:
-                    await socket.close()
-                    raise exc
-                await socket.close()
-
-        return _run()
+        return _generate(self._connect, audio)
 
     def _default_connect(self) -> _FluxSocket:
         """Open a real Flux websocket (production path; runtime-only ``websockets``).
@@ -147,10 +152,125 @@ class DeepgramASR:
         return _FluxConnection(opener)
 
 
+async def _generate(
+    connect: _Connect, audio: AsyncIterator[PcmFrame]
+) -> AsyncIterator[Transcript]:
+    """Run sender + receiver concurrently; yield transcripts as they arrive.
+
+    The transcript queue carries :class:`Transcript` items from the receiver;
+    the generator drains it until both tasks are done.  If either task raises,
+    the other is cancelled and the exception is re-raised (rule 37).
+
+    Sender and receiver are supervised via a shared :class:`asyncio.Event`
+    (``error_event``) so the generator wakes up immediately when either task
+    fails — no event-loop polling lag.
+    """
+    socket = connect()
+    # Unbounded queue: network events must not be dropped.
+    out: asyncio.Queue[Transcript] = asyncio.Queue()
+    # Signalled as soon as either background task raises an exception.
+    error_event = asyncio.Event()
+
+    async def _guarded_sender() -> None:
+        try:
+            await _send_frames(socket, audio)
+        except BaseException:
+            error_event.set()
+            raise
+
+    async def _guarded_receiver() -> None:
+        try:
+            await _receive(socket, out)
+        except BaseException:
+            error_event.set()
+            raise
+
+    sender_task = asyncio.create_task(_guarded_sender())
+    receiver_task = asyncio.create_task(_guarded_receiver())
+
+    # ``error_task`` acts as a waitable for "something went wrong"; it is
+    # cancelled once both background tasks are done.
+    # mypy infers Event.wait() as Coroutine[Any,Any,Literal[True]] while
+    # create_task[None] expects Coroutine[Any,Any,None]; the return value is
+    # intentionally discarded (we only care that the event fired), so the cast
+    # is sound.  No type-laundering: Task[None] vs Task[Literal[True]] is a
+    # covariant read-only annotation difference with no runtime impact.
+    error_task: asyncio.Task[None] = asyncio.create_task(error_event.wait())  # type: ignore[arg-type]
+
+    try:
+        # Drain the queue while the receiver is still running; surface any error
+        # from either task as soon as it lands (rule 37 — no silent hold).
+        while not receiver_task.done():
+            # Wait for the next queue item OR for a task to finish / raise.
+            get_task: asyncio.Task[Transcript] = asyncio.create_task(out.get())
+            wait_set: set[asyncio.Task[object]] = {
+                sender_task,
+                receiver_task,
+                get_task,
+                error_task,
+            }
+            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+            if get_task in done:
+                # A transcript arrived; cancel the pending error watch for now.
+                yield get_task.result()
+            else:
+                # A background task finished or errored; discard the queue-get.
+                get_task.cancel()
+            # If the error event fired, surface the exception immediately.
+            if error_task in done or error_event.is_set():
+                _raise_task_exception(sender_task)
+                _raise_task_exception(receiver_task)
+        # Receiver done normally; drain any transcripts already in the queue.
+        while not out.empty():
+            yield out.get_nowait()
+        # Await sender to propagate any late error and mark it retrieved.
+        await sender_task
+    except BaseException:
+        sender_task.cancel()
+        receiver_task.cancel()
+        for t in (sender_task, receiver_task):
+            with contextlib.suppress(BaseException):
+                await t
+        raise
+    finally:
+        error_task.cancel()
+        await socket.close()
+
+
+def _raise_task_exception(task: asyncio.Task[object]) -> None:
+    """Re-raise ``task``'s exception if it has one; no-op otherwise.
+
+    Factored out so ``raise t.exception()`` (which ruff's TRY301 flags as an
+    abstract-raise candidate) lives in a dedicated function rather than inside
+    a conditional branch.
+    """
+    if task.done() and not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+
 async def _send_frames(socket: _FluxSocket, audio: AsyncIterator[PcmFrame]) -> None:
-    """Encode each inbound PCM16 frame to mu-law and send it to Flux."""
+    """Encode each PCM16 frame to mu-law, send it, then send ``CloseStream``.
+
+    ``CloseStream`` is a Deepgram control message (text frame) that signals the
+    server to flush its internal buffers, emit any remaining finals, and close
+    the websocket from the server side.  This is the correct end-of-audio signal
+    (not relying on a server-side timeout) so the receive loop drains all finals
+    and exits naturally rather than hanging.
+    """
     async for frame in audio:
         await socket.send(encode_ulaw(frame.samples))
+    # Signal end-of-audio to Deepgram so it finalises and closes the socket.
+    await socket.send(_CLOSE_STREAM)
+
+
+async def _receive(socket: _FluxSocket, out: asyncio.Queue[Transcript]) -> None:
+    """Drain inbound Flux events into ``out``; exits when the socket closes."""
+    async for raw in socket:
+        transcript = _map_event(raw)
+        if transcript is not None:
+            await out.put(transcript)
 
 
 def _map_event(raw: str) -> Transcript | None:
@@ -175,13 +295,6 @@ def _map_event(raw: str) -> Transcript | None:
     )
 
 
-def _task_exception(task: asyncio.Task[None]) -> BaseException | None:
-    """Return a finished task's exception, or ``None`` if it succeeded/cancelled."""
-    if task.cancelled():
-        return None
-    return task.exception()
-
-
 class _FluxConnection:
     """Adapt a ``websockets`` async connection to :class:`_FluxSocket`.
 
@@ -201,7 +314,7 @@ class _FluxConnection:
             self._conn = await self._opener.__aenter__()
         return self._conn
 
-    async def send(self, data: bytes) -> None:
+    async def send(self, data: bytes | str) -> None:
         conn = await self._connection()
         await conn.send(data)
 
@@ -222,7 +335,7 @@ class _FluxConnection:
 class _WebsocketConnection(Protocol):
     """Structural view of a ``websockets`` connection's methods we call."""
 
-    async def send(self, data: bytes) -> None: ...
+    async def send(self, data: bytes | str) -> None: ...
 
     def __aiter__(self) -> AsyncIterator[str]: ...
 

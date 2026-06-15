@@ -317,8 +317,26 @@ async def test_sherpa_asr_early_consumer_break_releases_worker_without_timeout()
     worker_threads: list[threading.Thread] = []
     orig_thread_init = threading.Thread.__init__
 
-    def _tracking_init(self: threading.Thread, *args: object, **kwargs: object) -> None:
-        orig_thread_init(self, *args, **kwargs)
+    def _tracking_init(  # noqa: PLR0913  # mirrors Thread.__init__ signature exactly
+        self: threading.Thread,
+        group: None = None,
+        target: object = None,
+        name: str | None = None,
+        args: object = (),
+        kwargs: object = None,
+        *,
+        daemon: bool | None = None,
+    ) -> None:
+        # Forward all arguments to the real __init__; add name-based tracking.
+        orig_thread_init(
+            self,
+            group=group,
+            target=target,  # type: ignore[arg-type]  # target is Callable|None
+            name=name,
+            args=args,  # type: ignore[arg-type]  # args is Iterable
+            kwargs=kwargs,  # type: ignore[arg-type]  # kwargs is Mapping|None
+            daemon=daemon,
+        )
         if getattr(self, "name", "").startswith("hermes-voip-stream"):
             worker_threads.append(self)
 

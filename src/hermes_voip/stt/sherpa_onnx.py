@@ -144,22 +144,48 @@ class SherpaOnnxASR:
         that runs the blocking sherpa decode loop; the worker's transcripts are
         bridged back via :func:`stream_from_thread`. ``end_of_turn`` is always
         ``False`` here — ADR-0008's endpointer owns the turn boundary.
+
+        The ``on_cancel`` callback passed to :func:`stream_from_thread` sets the
+        stop flag and enqueues ``_END_OF_AUDIO`` via a daemon thread that performs
+        a blocking ``put`` — this guarantees the sentinel always reaches the worker
+        even when the frame queue is at capacity (a ``put_nowait`` would silently
+        fail when the queue is full, leaving the worker parked in ``frames.get``
+        and the ``stream_from_thread`` join timing out after 5 s).
         """
 
         async def _run() -> AsyncIterator[Transcript]:
             frames: queue.Queue[_FrameItem] = queue.Queue(maxsize=_BUFFER)
             stop = threading.Event()
             feeder = asyncio.ensure_future(_feed(audio, frames, stop))
+
+            def _on_cancel() -> None:
+                """Set stop and guarantee delivery of the end-of-audio sentinel.
+
+                Called from the event-loop side by :func:`stream_from_thread` when
+                the consumer closes the generator early.  Spawns a daemon thread to
+                do a *blocking* ``frames.put`` so the sentinel is never lost even
+                when the queue is at capacity.  The thread is daemon so it does not
+                prevent interpreter exit if the process dies while the queue is full.
+                """
+                stop.set()
+                threading.Thread(
+                    target=frames.put,
+                    args=(_END_OF_AUDIO,),
+                    daemon=True,
+                    name="hermes-voip-stt-cancel",
+                ).start()
+
             try:
                 async for transcript in stream_from_thread(
-                    lambda: self._decode_run(frames), max_buffer=_BUFFER
+                    lambda: self._decode_run(frames),
+                    max_buffer=_BUFFER,
+                    on_cancel=_on_cancel,
                 ):
                     yield transcript
             finally:
                 stop.set()
-                # Unblock the worker if it is parked on queue.get during shutdown.
-                # A full queue means it already has work and will observe `stop`,
-                # so dropping this best-effort sentinel is correct, not an error.
+                # Best-effort put in case _on_cancel was not called (normal path:
+                # audio exhausted → feeder put sentinel → worker returned cleanly).
                 with contextlib.suppress(queue.Full):
                     frames.put_nowait(_END_OF_AUDIO)
                 feeder.cancel()

@@ -71,11 +71,12 @@ class _FakeFluxSocket:
     """A fake Deepgram websocket: records sent audio, replays recorded events.
 
     Mirrors the minimal ``async`` websocket surface the provider uses: ``send``
-    (bytes), async iteration for inbound text frames, and ``close``. The replayed
-    text frames are the recorded Flux JSON events, followed by an unbounded wait
-    until ``close()`` is called — matching real Deepgram behaviour where the
-    server keeps the socket open until it receives a CloseStream control message
-    (or the client closes the connection).
+    (bytes for audio, str for control messages), async iteration for inbound text
+    frames, and ``close``. The replayed text frames are the recorded Flux JSON
+    events, followed by an unbounded wait until ``close()`` is called OR a
+    ``CloseStream`` control message is received via ``send`` — matching real
+    Deepgram behaviour where the server keeps the socket open until it receives
+    ``CloseStream`` (or the client closes the connection).
     """
 
     def __init__(self, events: tuple[str, ...]) -> None:
@@ -93,8 +94,14 @@ class _FakeFluxSocket:
         self.closed = True
         self._close_event.set()
 
-    async def send(self, data: bytes) -> None:
-        self.sent.append(data)
+    async def send(self, data: bytes | str) -> None:
+        if isinstance(data, bytes):
+            self.sent.append(data)
+        else:
+            # A text control frame (e.g. CloseStream): signal that the server
+            # should close the socket — mirroring real Deepgram behaviour where
+            # CloseStream causes the server to flush + close its side.
+            self._close_event.set()
 
     async def close(self) -> None:
         self.closed = True
@@ -189,7 +196,7 @@ async def test_deepgram_asr_propagates_transport_errors() -> None:
     """A websocket send error surfaces to the consumer (rule 37)."""
 
     class _BrokenSocket(_FakeFluxSocket):
-        async def send(self, data: bytes) -> None:
+        async def send(self, data: bytes | str) -> None:
             msg = "socket reset"
             raise ConnectionError(msg)
 
@@ -258,7 +265,7 @@ async def test_deepgram_asr_send_error_surfaces_promptly() -> None:
     class _BrokenSendSocket(_FakeFluxSocket):
         """Send always raises; ``__aiter__`` blocks until the socket is closed."""
 
-        async def send(self, data: bytes) -> None:
+        async def send(self, data: bytes | str) -> None:
             msg = "send failed mid-stream"
             raise ConnectionResetError(msg)
 
@@ -268,8 +275,11 @@ async def test_deepgram_asr_send_error_surfaces_promptly() -> None:
     task: asyncio.Task[list[Transcript]] = asyncio.create_task(
         _collect(asr.stream(_frames(_frame(0))))
     )
-    # Yield control a few times so the sender and receiver tasks can run.
-    for _ in range(5):
+    # Yield control enough times for the concurrent supervision to detect the
+    # sender error and propagate it through the cleanup path.  With TaskGroup
+    # the error surfaces in O(few event-loop iterations); without concurrent
+    # supervision the consumer never sees it (hangs forever).
+    for _ in range(20):
         await asyncio.sleep(0)
 
     # With concurrent supervision the task should already be done (failed).

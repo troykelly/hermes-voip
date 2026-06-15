@@ -84,14 +84,17 @@ def _validate_crypto(tag: int, suite: str, key_params: str) -> None:
         msg = f"unsupported crypto suite: {suite!r}"
         raise SdpError(msg)
     if not key_params.startswith(_INLINE_PREFIX):
-        msg = f"crypto key-params must use an inline key: {key_params!r}"
+        # Never echo key_params: it is (or carries) the SRTP master key.
+        msg = "crypto key-params must use an inline: key"
         raise SdpError(msg)
     # inline:<key||salt>[|lifetime][|MKI:length] — only the key||salt is checked.
     key_b64 = key_params[len(_INLINE_PREFIX) :].split("|", 1)[0]
     try:
         decoded = base64.b64decode(key_b64, validate=True)
     except (binascii.Error, ValueError) as exc:
-        msg = f"crypto inline key is not valid base64: {key_b64!r}"
+        # Never echo the token: an invalid base64 string is still (corrupt) key
+        # material; report only the structural fault.
+        msg = "crypto inline key is not valid base64"
         raise SdpError(msg) from exc
     expected = _SRTP_KEY_SALT_OCTETS[suite]
     if len(decoded) != expected:
@@ -116,11 +119,15 @@ class CryptoAttribute:
 
     DTLS-SRTP fingerprints and ICE are out of scope (deferred to W12); this is
     SDES keying only.
+
+    ``key_params`` is suppressed from ``repr`` (``field(repr=False)``) because it
+    is (or carries) the SRTP master key||salt; a repr lands in logs and
+    tracebacks and must never expose key material.
     """
 
     tag: int
     suite: str
-    key_params: str
+    key_params: str = field(repr=False)
 
     def __post_init__(self) -> None:
         """Validate on construction so an instance is always RFC-4568-valid."""
@@ -141,7 +148,9 @@ class CryptoAttribute:
         """
         fields = body.split()
         if len(fields) < _CRYPTO_MIN_FIELDS:
-            msg = f"malformed a=crypto attribute: {body!r}"
+            # Never echo the body: a truncated line still carries the inline key
+            # in its trailing token; report only the expected structure.
+            msg = "malformed a=crypto attribute: expected '<tag> <suite> <key-params>'"
             raise SdpError(msg)
         tag_str, suite = fields[0], fields[1]
         # The remaining tokens are key-params then optional session-params; we
@@ -196,16 +205,20 @@ class AudioMedia:
         ptime: Packetisation time in ms, if declared.
         direction: ``sendrecv`` / ``sendonly`` / ``recvonly`` / ``inactive``.
         connection_address: The effective connection address for this media.
+
+    ``crypto`` and ``crypto_attrs`` are suppressed from ``repr``
+    (``field(repr=False)``): both carry SDES inline master key||salt material,
+    which must never reach a log line or traceback.
     """
 
     port: int
     protocol: str
     codecs: tuple[Codec, ...]
-    crypto: tuple[str, ...]
+    crypto: tuple[str, ...] = field(repr=False)
     ptime: int | None
     direction: str
     connection_address: str | None
-    crypto_attrs: tuple[CryptoAttribute, ...] = ()
+    crypto_attrs: tuple[CryptoAttribute, ...] = field(default=(), repr=False)
 
     @property
     def is_srtp(self) -> bool:

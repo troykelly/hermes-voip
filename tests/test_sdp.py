@@ -13,8 +13,15 @@ from hermes_voip.sdp import (
     Codec,
     SdpError,
     SessionDescription,
+    build_audio_answer,
     build_audio_offer,
     negotiate_audio,
+)
+
+# Obvious fake SRTP master key||salt (RFC 4568 inline:). Never a real key.
+_FAKE_CRYPTO = "AES_CM_128_HMAC_SHA1_80 inline:ZmFrZWtleXNhbHRmYWtla2V5c2FsdGZha2VrZXlz"
+_FAKE_ANSWER_CRYPTO = (
+    "AES_CM_128_HMAC_SHA1_80 inline:YW5zd2Vya2V5c2FsdGFuc3dlcmtleXNhbHRhbnN3ZXJr"
 )
 
 _OFFER_AVP = (
@@ -242,3 +249,192 @@ def test_build_rejects_non_positive_ptime() -> None:
         build_audio_offer(
             local_address="192.0.2.10", port=41000, codecs=codecs, ptime=0
         )
+
+
+# --- W3: RTP/SAVP + a=crypto (SDES) offer building (RFC 4568) ---
+
+
+def test_build_secure_offer_emits_savp_and_crypto_line() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=codecs,
+        crypto=_FAKE_CRYPTO,
+    )
+    # SAVP profile on the m= line; the crypto attribute carries tag 1.
+    assert "m=audio 41000 RTP/SAVP 0" in text
+    assert f"a=crypto:1 {_FAKE_CRYPTO}" in text
+    # Negative control: the plaintext AVP profile must NOT appear.
+    assert "RTP/AVP" not in text
+
+
+def test_secure_offer_round_trips_to_srtp_media() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10", port=41000, codecs=codecs, crypto=_FAKE_CRYPTO
+    )
+    parsed = _audio(SessionDescription.parse(text))
+    assert parsed.protocol == "RTP/SAVP"
+    assert parsed.is_srtp is True
+    assert parsed.crypto == (f"1 {_FAKE_CRYPTO}",)
+
+
+def test_plaintext_offer_emits_no_crypto_line() -> None:
+    # Negative control: without crypto, output stays RTP/AVP with no a=crypto.
+    codecs = (Codec(0, "PCMU", 8000),)
+    text = build_audio_offer(local_address="192.0.2.10", port=41000, codecs=codecs)
+    assert "RTP/AVP" in text
+    assert "RTP/SAVP" not in text
+    assert "a=crypto" not in text
+
+
+# --- W3: Opus-first then G.711 codec ordering in the offer ---
+
+
+def test_offer_orders_opus_before_g711() -> None:
+    # Codecs are supplied G.711-first; the offer must reorder Opus to the front.
+    codecs = (
+        Codec(0, "PCMU", 8000),
+        Codec(8, "PCMA", 8000),
+        Codec(111, "opus", 48000, channels=2),
+        Codec(101, "telephone-event", 8000, fmtp="0-16"),
+    )
+    text = build_audio_offer(local_address="192.0.2.10", port=41000, codecs=codecs)
+    # m= payload order: opus(111), PCMU(0), PCMA(8), telephone-event(101).
+    assert "m=audio 41000 RTP/AVP 111 0 8 101" in text
+    # rtpmap lines follow the same order.
+    rtpmap_pts = [
+        int(line.split(":", 1)[1].split(" ", 1)[0])
+        for line in text.split("\r\n")
+        if line.startswith("a=rtpmap:")
+    ]
+    assert rtpmap_pts == [111, 0, 8, 101]
+
+
+def test_offer_without_opus_preserves_given_order() -> None:
+    # No Opus present -> ordering is left exactly as supplied (no reshuffle).
+    codecs = (
+        Codec(8, "PCMA", 8000),
+        Codec(0, "PCMU", 8000),
+        Codec(101, "telephone-event", 8000, fmtp="0-16"),
+    )
+    text = build_audio_offer(local_address="192.0.2.10", port=41000, codecs=codecs)
+    assert "m=audio 41000 RTP/AVP 8 0 101" in text
+
+
+# --- W3: build_audio_answer (RFC 3264 §6.1 direction mirroring + negotiation) ---
+
+
+def test_answer_negotiates_codecs_and_mirrors_sendrecv() -> None:
+    offer = SessionDescription.parse(_OFFER_AVP)  # PCMU, PCMA, telephone-event
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+    )
+    parsed = _audio(SessionDescription.parse(text))
+    # PCMA dropped (unsupported); PCMU + telephone-event kept in offer order.
+    assert [c.encoding for c in parsed.codecs] == ["PCMU", "telephone-event"]
+    assert parsed.port == 42000
+    assert parsed.connection_address == "192.0.2.20"
+    assert parsed.protocol == "RTP/AVP"
+    # sendrecv offer -> sendrecv answer (RFC 3264 §6.1).
+    assert "a=sendrecv" in text
+
+
+@pytest.mark.parametrize(
+    ("offer_dir", "answer_dir"),
+    [
+        ("sendrecv", "sendrecv"),
+        ("sendonly", "recvonly"),
+        ("recvonly", "sendonly"),
+        ("inactive", "inactive"),
+    ],
+)
+def test_answer_mirrors_direction(offer_dir: str, answer_dir: str) -> None:
+    offer_text = (
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a={offer_dir}\r\n"
+    )
+    offer = SessionDescription.parse(offer_text)
+    text = build_audio_answer(
+        offer, local_address="192.0.2.20", port=42000, supported=("PCMU",)
+    )
+    assert f"a={answer_dir}\r\n" in text
+    # Negative control: the offered direction is not blindly echoed when it
+    # differs from the mirrored one.
+    if offer_dir != answer_dir:
+        assert f"a={offer_dir}\r\n" not in text
+
+
+def test_answer_to_savp_offer_keys_crypto() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVP)  # PCMU + telephone-event, SAVP
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        crypto=_FAKE_ANSWER_CRYPTO,
+    )
+    parsed = _audio(SessionDescription.parse(text))
+    assert parsed.protocol == "RTP/SAVP"
+    # The answer carries OUR key material (RFC 4568: each party sends its own).
+    assert text.count("a=crypto:") == 1
+    assert f"a=crypto:1 {_FAKE_ANSWER_CRYPTO}" in text
+    # Negative control: the offerer's key material is not echoed back.
+    assert "WVNfX19zZW1jdGwg" not in text
+
+
+def test_answer_to_savp_offer_without_crypto_is_rejected() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVP)
+    with pytest.raises(SdpError, match="crypto"):
+        build_audio_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU", "telephone-event"),
+        )
+
+
+def test_answer_rejects_telephone_event_only_offer() -> None:
+    te_only = (
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 101\r\na=rtpmap:101 telephone-event/8000\r\n"
+        "a=fmtp:101 0-16\r\na=sendrecv\r\n"
+    )
+    offer = SessionDescription.parse(te_only)
+    with pytest.raises(SdpError, match="no common audio codec"):
+        build_audio_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU", "telephone-event"),
+        )
+
+
+def test_answer_requires_audio_in_offer() -> None:
+    video_only = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.3\r\ns=-\r\nt=0 0\r\n"
+        "m=video 50000 RTP/AVP 96\r\n"
+    )
+    with pytest.raises(SdpError, match="no audio media"):
+        build_audio_answer(
+            video_only, local_address="192.0.2.20", port=42000, supported=("PCMU",)
+        )
+
+
+def test_answer_preserves_offer_codec_order_not_supported_order() -> None:
+    # Offer lists PCMA before PCMU; answer must follow the OFFER order, not the
+    # order of `supported` (RFC 3264: answer uses the offerer's preference).
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 8 0\r\na=rtpmap:8 PCMA/8000\r\n"
+        "a=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+    )
+    text = build_audio_answer(
+        offer, local_address="192.0.2.20", port=42000, supported=("PCMU", "PCMA")
+    )
+    assert "m=audio 42000 RTP/AVP 8 0" in text

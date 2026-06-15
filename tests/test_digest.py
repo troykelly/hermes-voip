@@ -7,6 +7,7 @@ cover SIP-shaped usage and the RFC 2069 (no-``qop``) fallback. Fakes only — no
 gateway host or credentials (the repo is public; AGENTS.md invariant).
 """
 
+import hashlib
 import re
 
 import pytest
@@ -182,3 +183,66 @@ def test_generated_cnonce_is_random_when_not_supplied() -> None:
     a = build_authorization(challenge, creds, method="REGISTER", uri="sip:x")
     b = build_authorization(challenge, creds, method="REGISTER", uri="sip:x")
     assert _param(a, "cnonce") != _param(b, "cnonce")
+
+
+def test_parse_honours_quoted_pair_escapes_in_quoted_strings() -> None:
+    # RFC 2617 quoted-strings allow quoted-pair escapes: \" is a literal quote
+    # and \\ a literal backslash. The parser must unescape them, not stop at the
+    # first inner quote (which truncates realm and silently corrupts HA1).
+    challenge = DigestChallenge.parse(
+        r'Digest realm="a\"b\\c", nonce="n\"x", qop="auth"'
+    )
+    assert challenge.realm == 'a"b\\c'  # a"b\c
+    assert challenge.nonce == 'n"x'
+
+
+def test_response_hashes_the_unescaped_realm_not_the_wire_form() -> None:
+    # The security-sensitive property: realm/nonce feed HA1/response in their
+    # UNESCAPED form, while the emitted header escapes them for the wire. A
+    # future "simplify" that hashed the escaped form (or stopped escaping the
+    # header) must fail this independently-computed known-answer vector.
+    realm = 'a"b\\c'  # contains a literal quote and a literal backslash
+    nonce = "nonce42"
+    challenge = DigestChallenge(realm=realm, nonce=nonce, qop=("auth",))
+    creds = DigestCredentials(username="1000", password="s3cr3t")
+    header = build_authorization(
+        challenge,
+        creds,
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="fixedcnonce",
+        nc=1,
+    )
+
+    def md5_hex(value: str) -> str:
+        return hashlib.md5(value.encode("utf-8")).hexdigest()  # noqa: S324 - test KAT
+
+    ha1 = md5_hex(f"1000:{realm}:s3cr3t")
+    ha2 = md5_hex("REGISTER:sip:pbx.example.test")
+    expected = md5_hex(f"{ha1}:{nonce}:00000001:fixedcnonce:auth:{ha2}")
+
+    # The header renders the escaped wire form of the realm...
+    assert r'realm="a\"b\\c"' in header
+    # ...but the response equals the digest of the UNESCAPED inputs.
+    assert f'response="{expected}"' in header
+
+
+def test_username_with_quote_is_escaped_on_the_wire_and_hashed_raw() -> None:
+    # The same asymmetry must hold for the username (it feeds HA1 and is quoted).
+    username = 'jo"hn'
+    realm = "pbx.example.test"
+    nonce = "n"
+    challenge = DigestChallenge(realm=realm, nonce=nonce, qop=("auth",))
+    creds = DigestCredentials(username=username, password="pw")
+    header = build_authorization(
+        challenge, creds, method="REGISTER", uri="sip:x", cnonce="c", nc=1
+    )
+
+    def md5_hex(value: str) -> str:
+        return hashlib.md5(value.encode("utf-8")).hexdigest()  # noqa: S324 - test KAT
+
+    ha1 = md5_hex(f"{username}:{realm}:pw")
+    ha2 = md5_hex("REGISTER:sip:x")
+    expected = md5_hex(f"{ha1}:{nonce}:00000001:c:auth:{ha2}")
+    assert r'username="jo\"hn"' in header
+    assert f'response="{expected}"' in header

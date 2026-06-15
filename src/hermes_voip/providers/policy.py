@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import assert_never
 
-from hermes_voip.providers.guard import GuardResult
+from hermes_voip.providers.guard import GuardResult, GuardVerdict
 
 
 class ToolRisk(Enum):
@@ -33,16 +33,33 @@ class GuardSessionState:
     Attributes:
         call_id: The call/session this state belongs to.
         degraded: True once any fail-open screen occurred; never un-sets in-call.
-        flagged_turns: Identifiers of turns flagged for audit during the call.
+        flagged_turns: Identifiers of turns flagged for audit during the call —
+            one per screened turn whose verdict was not ``ALLOW`` or which failed
+            open (``degraded``). A benign ``ALLOW`` adds nothing.
     """
 
     call_id: str
     degraded: bool = False
     flagged_turns: tuple[str, ...] = field(default_factory=tuple)
+    _turns_seen: int = 0
 
     def record(self, result: GuardResult) -> None:
-        """Fold one screen into session state; ``degraded`` never un-sets in-call."""
+        """Fold one screen into session state (ADR-0009 audit + degrade tracking).
+
+        ``degraded`` is sticky — once any fail-open turn sets it, it never un-sets
+        for the rest of the call. A turn is *flagged for audit* (appended to
+        ``flagged_turns`` with a per-call turn id) when it carries a non-``ALLOW``
+        verdict OR it failed open; a clean ``ALLOW`` turn is not audit-worthy and
+        flags nothing. The verdict is therefore honoured, not just the degrade bit.
+
+        Args:
+            result: The graded outcome of screening one caller turn.
+        """
+        self._turns_seen += 1
         self.degraded = self.degraded or result.degraded
+        if result.verdict is not GuardVerdict.ALLOW or result.degraded:
+            turn_id = f"{self.call_id}#{self._turns_seen}"
+            self.flagged_turns = (*self.flagged_turns, turn_id)
 
 
 def gate_tool_call(

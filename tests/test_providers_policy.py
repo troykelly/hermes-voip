@@ -21,6 +21,17 @@ def _result(
     )
 
 
+def _flagged(verdict: GuardVerdict) -> GuardResult:
+    """A non-degraded screen carrying a graded (possibly flagged) verdict."""
+    return GuardResult(
+        verdict=verdict,
+        normalized_text="",
+        reasons=("audit",),
+        degraded=False,
+        score=0.5,
+    )
+
+
 def test_safe_tools_always_run() -> None:
     state = GuardSessionState(call_id="c1")
     assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
@@ -68,3 +79,41 @@ def test_record_keeps_clean_session_clean() -> None:
     state = GuardSessionState(call_id="c1")
     state.record(_result(degraded=False))
     assert state.degraded is False
+
+
+# --- record() populates flagged_turns and honours the graded verdict ----------
+
+
+def test_record_does_not_flag_an_allow_turn() -> None:
+    # A benign ALLOW is not an audit-worthy event: flagged_turns stays empty.
+    state = GuardSessionState(call_id="c1")
+    state.record(_flagged(GuardVerdict.ALLOW))
+    assert state.flagged_turns == ()
+
+
+def test_record_flags_each_non_allow_verdict() -> None:
+    # CLARIFY, RESTRICT, REFUSE are all flagged for audit; each adds a turn id.
+    state = GuardSessionState(call_id="c1")
+    state.record(_flagged(GuardVerdict.CLARIFY))
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    state.record(_flagged(GuardVerdict.REFUSE))
+    assert len(state.flagged_turns) == 3
+    # The flagged turn ids are distinct (one per screened turn).
+    assert len(set(state.flagged_turns)) == 3
+
+
+def test_record_flags_a_degraded_turn_even_if_verdict_is_allow() -> None:
+    # A fail-open turn (degraded) is audit-worthy regardless of its verdict.
+    state = GuardSessionState(call_id="c1")
+    state.record(_result(degraded=True, verdict=GuardVerdict.ALLOW))
+    assert len(state.flagged_turns) == 1
+    assert state.degraded is True
+
+
+def test_flagged_turns_accumulate_across_a_call() -> None:
+    state = GuardSessionState(call_id="c1")
+    state.record(_flagged(GuardVerdict.ALLOW))  # not flagged
+    state.record(_flagged(GuardVerdict.REFUSE))  # flagged
+    state.record(_flagged(GuardVerdict.ALLOW))  # not flagged
+    state.record(_flagged(GuardVerdict.RESTRICT))  # flagged
+    assert len(state.flagged_turns) == 2

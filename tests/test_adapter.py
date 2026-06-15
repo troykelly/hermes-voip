@@ -108,6 +108,34 @@ class _FakeTransport:
         self._calls.pop(call_id, None)
 
 
+class _ConnectOrderTransport(_FakeTransport):
+    """Transport double enforcing the real ``SipOverTlsTransport`` contract.
+
+    ``local_sent_by`` / ``contact_uri`` are unavailable until ``connect()`` has
+    been awaited (the live transport learns the local socket address only then).
+    Used to prove ``VoipAdapter.connect()`` connects the transport *before* it
+    builds the ``RegistrationManager`` (whose ``__init__`` reads ``contact_uri``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._connected = False
+
+    @property
+    def local_sent_by(self) -> str:
+        if not self._connected:
+            msg = "local_sent_by is unavailable before connect()"
+            raise RuntimeError(msg)
+        return self._local_sent_by
+
+    def contact_uri(self, extension: str) -> str:
+        # Reads local_sent_by, so it raises before connect() just like the real one.
+        return f"<sip:{extension}@{self.local_sent_by};transport=tls>"
+
+    async def connect(self) -> None:
+        self._connected = True
+
+
 # ---------------------------------------------------------------------------
 # Fake manager
 # ---------------------------------------------------------------------------
@@ -702,3 +730,47 @@ async def test_inbound_invite_failure_after_200ok_releases_resources() -> None:
     assert call_id not in adapter._call_loops
     info = await adapter.get_chat_info(call_id)
     assert info.get("ended") is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: connect() must connect the transport BEFORE building the manager.
+#
+# The live SipOverTlsTransport learns its local socket address only inside
+# connect(); local_sent_by/contact_uri raise RuntimeError before then. The
+# RegistrationManager __init__ reads transport.contact_uri() for every
+# extension, so the adapter must await transport.connect() first. This test
+# uses the REAL RegistrationManager + real load_gateway_config so the ordering
+# is exercised against the genuine contract (only the transport, TLS, and
+# providers are fakes). It fails (RuntimeError) on the buggy ordering and
+# passes once connect() is reordered.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_brings_transport_up_before_building_manager() -> None:
+    """connect() registers without raising; the strict transport proves ordering."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _ConnectOrderTransport()
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+
+    # Real RegistrationManager + real load_gateway_config: only fake the
+    # transport (strict contract), the TLS context, and the provider build.
+    with (
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+    ):
+        adapter = VoipAdapter(config)
+        # On the buggy ordering this raises RuntimeError("local_sent_by is
+        # unavailable before connect()"); on the fixed ordering it returns.
+        up = await adapter.connect()
+
+    # The manager was built after the transport came up and sent its initial
+    # REGISTER through the (now-connected) transport.
+    assert any("REGISTER" in msg for msg in transport.sent), (
+        "manager.connect() did not send a REGISTER — ordering/build is wrong"
+    )
+    # connect() returns the manager's degraded-up boolean (no real 200 OK here,
+    # so it is False after the wait_for timeout — but it MUST NOT raise).
+    assert up is False

@@ -55,16 +55,20 @@ class GuardConfig:
 
     All scores are malicious-probabilities in ``0.0..1.0``. The single-turn ladder
     is ``score >= refuse_threshold`` -> REFUSE, ``>= restrict_threshold`` ->
-    RESTRICT, else ALLOW. Two cumulative signals can escalate an otherwise-low
-    turn: the per-call running sum of scores crossing ``cumulative_threshold``, and
-    the count of suspicious turns (``score >= suspicious_threshold``) within the
-    last ``window`` turns reaching ``window_threshold``.
+    RESTRICT, ``>= clarify_threshold`` -> CLARIFY, else ALLOW. Two cumulative
+    signals can escalate an otherwise-low turn: the per-call running sum of scores
+    crossing ``cumulative_threshold``, and the count of suspicious turns
+    (``score >= suspicious_threshold``) within the last ``window`` turns reaching
+    ``window_threshold``.
 
     Defaults are conservative starting points to be re-tuned against the eval
     harness (ADR-0009); they are not claimed as validated accuracy.
 
     Attributes:
+        clarify_threshold: Single-turn score at/above which a turn is CLARIFY.
+            Below this the turn is ALLOW. Must be < ``restrict_threshold``.
         restrict_threshold: Single-turn score at/above which a turn is RESTRICT.
+            Must be >= ``clarify_threshold`` and <= ``refuse_threshold``.
         refuse_threshold: Single-turn score at/above which a turn is REFUSE.
         suspicious_threshold: Score at/above which a turn counts toward the window.
         cumulative_threshold: Per-call running-sum of scores that forces escalation.
@@ -72,6 +76,7 @@ class GuardConfig:
         window_threshold: Suspicious-turn count in the window that forces escalation.
     """
 
+    clarify_threshold: float = 0.3
     restrict_threshold: float = 0.5
     refuse_threshold: float = 0.85
     suspicious_threshold: float = 0.4
@@ -82,6 +87,7 @@ class GuardConfig:
     def __post_init__(self) -> None:
         """Reject a config whose thresholds are not coherent probabilities."""
         for name in (
+            "clarify_threshold",
             "restrict_threshold",
             "refuse_threshold",
             "suspicious_threshold",
@@ -90,6 +96,13 @@ class GuardConfig:
             if not 0.0 <= value <= 1.0:
                 msg = f"GuardConfig.{name} must be in 0.0..1.0, got {value!r}"
                 raise ValueError(msg)
+        if self.clarify_threshold >= self.restrict_threshold:
+            msg = (
+                "GuardConfig.clarify_threshold must be < restrict_threshold, "
+                f"got clarify={self.clarify_threshold!r} "
+                f"restrict={self.restrict_threshold!r}"
+            )
+            raise ValueError(msg)
         if self.restrict_threshold > self.refuse_threshold:
             msg = "GuardConfig.restrict_threshold must be <= refuse_threshold"
             raise ValueError(msg)
@@ -214,7 +227,14 @@ class OnnxInjectionGuard:
     def _verdict(
         self, score: float, *, cumulative_hit: bool, window_hit: bool
     ) -> GuardVerdict:
-        """The grade ladder: single-turn score, escalated by the stateful signals."""
+        """The grade ladder: single-turn score, escalated by the stateful signals.
+
+        Ladder (highest first):
+          score >= refuse_threshold                           -> REFUSE
+          score >= restrict_threshold (or escalation signal) -> RESTRICT
+          score >= clarify_threshold                         -> CLARIFY
+          else                                               -> ALLOW
+        """
         config = self._config
         if score >= config.refuse_threshold:
             return GuardVerdict.REFUSE
@@ -226,6 +246,8 @@ class OnnxInjectionGuard:
             return GuardVerdict.RESTRICT
         if score >= config.restrict_threshold:
             return GuardVerdict.RESTRICT
+        if score >= config.clarify_threshold:
+            return GuardVerdict.CLARIFY
         return GuardVerdict.ALLOW
 
     def _fail_open(self, normalized: NormalizedText, *, reason: str) -> GuardResult:

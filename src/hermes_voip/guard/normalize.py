@@ -13,7 +13,12 @@ form, not the disguise.
 * ``candidates`` — ``canonical`` plus any reversible *decode* (base64/ROT13/leet)
   that yielded readable text, de-duplicated, canonical first. Decodes are
   **added**, never substituted: a decode that turns text into noise must not
-  blind the classifier to the literal payload, so the surface form is retained;
+  blind the classifier to the literal payload, so the surface form is retained.
+  Decoding is *compositional*: each decoded output is itself re-normalised and
+  fed back into the decoder so that nested encodings (e.g. base64 wrapping a
+  ROT13 payload) surface the fully-unwrapped clear instruction. A bounded
+  work queue (max depth 3, max total candidates ``_MAX_CANDIDATES``) caps CPU
+  on adversarial deeply-nested input (rule 22);
 * ``reasons`` — one audit string per transform that fired, so the guard's
   ``GuardResult.reasons`` can explain *why* a turn was flagged.
 
@@ -88,6 +93,14 @@ _LEET: dict[str, str] = {
     "$": "s",
     "!": "i",
 }
+
+# Bounded work-queue parameters (rule 22: deterministic + CPU-bounded on adversarial
+# deeply-nested input). Each candidate is a (text, depth) pair; decode steps are
+# tried on each candidate and the outputs are queued at depth+1.
+_MAX_DECODE_DEPTH: int = 3
+# Maximum total candidates (including canonical) the queue will accumulate.
+# At most _MAX_CANDIDATES - 1 decoded strings are ever appended.
+_MAX_CANDIDATES: int = 64
 
 # A run that *might* be base64: the standard alphabet, length a multiple of four,
 # at least 12 chars (short tokens decode to noise and just add false candidates).
@@ -227,11 +240,38 @@ def normalize(text: str) -> NormalizedText:
     if had_homoglyphs:
         reasons.append("homoglyph-folded")
 
+    # Bounded compositional decode work-queue (rule 22: deterministic + CPU-bounded).
+    # Each entry is (text_to_decode_from, depth). We start from the canonical form
+    # and apply each reversible decoder; each decoded output is itself re-normalised
+    # (so homoglyphs and controls inside a base64 payload are also folded) and then
+    # queued for further decoding — this is what makes nested encodings surface the
+    # innermost clear instruction. The queue terminates when empty or when the bounds
+    # (_MAX_DECODE_DEPTH, _MAX_CANDIDATES) are reached.
     candidates: list[str] = [canonical]
-    for decoded, reason in _reversible_decodes(canonical):
-        if decoded and decoded not in candidates:
-            candidates.append(decoded)
+    seen: set[str] = {canonical}
+    # Queue entries: (text to decode from, depth). Depth starts at 0.
+    queue: list[tuple[str, int]] = [(canonical, 0)]
+
+    while queue and len(candidates) < _MAX_CANDIDATES:
+        current, depth = queue.pop(0)
+        if depth >= _MAX_DECODE_DEPTH:
+            continue
+        for decoded, reason in _single_pass_decodes(current):
+            if not decoded or decoded in seen:
+                continue
+            # Re-normalise the decoded output so nested control chars / homoglyphs
+            # inside the payload are also folded before classification.
+            re_stripped, _ = _strip_controls(decoded)
+            re_nfkc = unicodedata.normalize("NFKC", re_stripped)
+            re_canon, _ = _fold_homoglyphs(re_nfkc)
+            if re_canon in seen:
+                continue
+            seen.add(decoded)
+            seen.add(re_canon)
+            candidates.append(re_canon)
             reasons.append(reason)
+            if len(candidates) < _MAX_CANDIDATES:
+                queue.append((re_canon, depth + 1))
 
     return NormalizedText(
         canonical=canonical,
@@ -269,14 +309,16 @@ def _fold_homoglyphs(text: str) -> tuple[str, bool]:
     return "".join(out), folded
 
 
-def _reversible_decodes(text: str) -> list[tuple[str, str]]:
+def _single_pass_decodes(text: str) -> list[tuple[str, str]]:
     """Return ``(decoded_text, reason)`` for each decode that revealed hidden text.
 
-    Each decode is *additive*: the caller appends it as an extra candidate beside
-    the surface form. base64 is surfaced when a run decodes to readable UTF-8;
-    ROT13 and leetspeak are surfaced only when the decode raises the count of
-    recognisable English/attack words versus the source (so the transform reveals
-    a disguised instruction without adding a gibberish candidate over plain text).
+    One decode step against ``text``. Each decode is *additive*: the caller
+    appends it as an extra candidate beside the surface form. base64 is surfaced
+    when a run decodes to readable UTF-8; ROT13 and leetspeak are surfaced only
+    when the decode raises the count of recognisable English/attack words versus
+    the source (so the transform reveals a disguised instruction without adding a
+    gibberish candidate over plain text). Called from the bounded work queue in
+    :func:`normalize`; never called directly by tests.
     """
     out: list[tuple[str, str]] = []
     source_hits = _english_hits(text)

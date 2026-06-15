@@ -74,15 +74,15 @@ def test_feed_runs_one_inference_per_silero_window_16k() -> None:
 
 
 def test_feed_buffers_partial_window_until_full() -> None:
-    model = _ScriptedModel([0.1])
+    model = _ScriptedModel([0.1, 0.1])
     vad = VoiceActivityDetector(sample_rate_hz=_RATE_16K, model=model)
     win = _window_bytes(_RATE_16K)
-    # feed one and a half windows: only one inference runs, half a window held
-    list(vad.feed(_frame(_silence(1, _RATE_16K) + b"\x00\x00" * 100, _RATE_16K)))
+    partial = 200  # bytes (100 samples), a sub-window remainder to be buffered
+    # one full window plus a partial: exactly one inference, the partial held
+    list(vad.feed(_frame(_silence(1, _RATE_16K) + b"\x00" * partial, _RATE_16K)))
     assert len(model.windows) == 1
-    # feed the rest of the second window -> the second inference runs
-    remainder = win - (b"\x00\x00" * 100).__len__()
-    list(vad.feed(_frame(b"\x00\x00" * (remainder // 2), _RATE_16K)))
+    # feed exactly the bytes that complete the second window -> a 2nd inference
+    list(vad.feed(_frame(b"\x00" * (win - partial), _RATE_16K)))
     assert len(model.windows) == 2
 
 

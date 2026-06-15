@@ -98,43 +98,50 @@ raises `LicenceError`.
 
 ## 3. Wire the LLM backend (the agent's brain)
 
-The LLAP proxy is OpenRouter-compatible, so configure Hermes' OpenRouter provider with a
-**base-URL override** pointing at the proxy. The credential goes ONLY into Hermes' gitignored
-secrets file (`~/.hermes/.env`), fetched from 1Password — never printed or committed.
+The agent talks to an LLM through an OpenAI/OpenRouter-compatible proxy. The credential +
+base URL go ONLY into Hermes' gitignored secrets file (`~/.hermes/.env`), fetched from the
+session env or 1Password — never printed or committed. Choose the provider that matches the
+proxy's model-id style:
+
+- **OpenAI provider (`openai-api`)** — for a proxy serving bare OpenAI model ids (`gpt-5.5`,
+  `gpt-4o`, …). The base URL **must include `/v1`** (this provider does not append it); key
+  env `OPENAI_API_KEY`, base-URL env `OPENAI_BASE_URL`. This is the current configuration
+  (model `gpt-5.5`), using the session's `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (which
+  address the same proxy):
+
+  ```bash
+  # Values come from the session env; never printed. The base URL needs the /v1 suffix.
+  mkdir -p ~/.hermes
+  {
+    echo "OPENAI_API_KEY=$ANTHROPIC_AUTH_TOKEN"
+    echo "OPENAI_BASE_URL=${ANTHROPIC_BASE_URL%/}/v1"
+  } >> ~/.hermes/.env
+  chmod 600 ~/.hermes/.env
+  uv run hermes config set provider openai-api
+  uv run hermes config set model gpt-5.5
+  # Optionally also pin model.base_url in config.yaml (the provider reads OPENAI_BASE_URL too).
+  ```
+  > Hermes' provider name for a custom OpenAI-compatible endpoint is **`openai-api`** (not
+  > `openai`). Verify the resolution without printing the key:
+  > `uv run python -c "import hermes_cli.runtime_provider as r; d=r.resolve_runtime_provider(requested='openai-api', target_model='gpt-5.5'); print(d['provider'], d['base_url'], bool(d['api_key']))"`
+  > → `openai-api  https://…/v1  True`.
+
+- **OpenRouter provider (`openrouter`)** — for a proxy serving OpenRouter-style `vendor/model`
+  ids (`nousresearch/hermes-4-70b`, `anthropic/…`). Key env `OPENROUTER_API_KEY`, base-URL
+  override env `OPENROUTER_BASE_URL` (include `/v1`). The `LLAP Hermes mbp018 Provider Key`
+  1Password item (vault `Claude API Access`) holds such a key (`credential` field) + `hostname`.
+
+Smoke-test the chosen backend (a one-line completion returns `OK`, proving key + base URL):
 
 ```bash
-# Fetch the proxy key into a shell var (NOT printed) and write it to ~/.hermes/.env.
-LLAP_KEY="$(op item get 'LLAP Hermes mbp018 Provider Key' --vault 'Claude API Access' \
-  --fields label=credential --reveal)"
-LLAP_HOST="$(op item get 'LLAP Hermes mbp018 Provider Key' --vault 'Claude API Access' \
-  --fields label=hostname)"
-mkdir -p ~/.hermes
-{ echo "OPENROUTER_API_KEY=$LLAP_KEY"; echo "OPENROUTER_BASE_URL=https://$LLAP_HOST/v1"; } \
-  >> ~/.hermes/.env
-chmod 600 ~/.hermes/.env
-unset LLAP_KEY                                  # do not leave the secret in the shell
-
-# Select provider + model (non-secret; written to ~/.hermes/config.yaml).
-uv run hermes config set provider openrouter
-uv run hermes config set model nousresearch/hermes-4-70b
+# OpenAI-provider example (gpt-5.5 via the session proxy; token via VAR, never printed):
+curl -sS -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.5","max_tokens":8,"messages":[{"role":"user","content":"Reply with OK"}]}' \
+  "${ANTHROPIC_BASE_URL%/}/v1/chat/completions"
 ```
 
-Smoke-test the backend (returns `READY`, proving the key + base URL work):
-
-```bash
-LLAP_KEY="$(op item get 'LLAP Hermes mbp018 Provider Key' --vault 'Claude API Access' \
-  --fields label=credential --reveal)"
-curl -sS -H "Authorization: Bearer $LLAP_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"nousresearch/hermes-4-70b","max_tokens":8,
-       "messages":[{"role":"user","content":"Say READY"}]}' \
-  "https://$(op item get 'LLAP Hermes mbp018 Provider Key' --vault 'Claude API Access' \
-     --fields label=hostname)/v1/chat/completions" | python3 -m json.tool
-unset LLAP_KEY
-```
-
-> **If no LLM key existed in 1Password, that is a hard blocker** — the operator must supply an
-> Anthropic/OpenAI/OpenRouter-compatible key; do not fabricate one. (For this gateway the
-> `LLAP Hermes mbp018 Provider Key` exists and is the backend.)
+> **If no LLM key is available, that is a hard blocker** — the operator must supply an
+> OpenAI/OpenRouter/Anthropic-compatible key; do not fabricate one.
 
 ## 4. Enable the plugin in the Hermes runtime
 
@@ -201,11 +208,37 @@ simultaneous registrations use the indexed scheme `HERMES_SIP_EXTENSION_<n>` /
 
 ## 6. Launch + REGISTER on the gateway
 
-With every variable from steps 2/3/5 exported in the same shell, bring the adapter up. In the
-full runtime this is `uv run hermes gateway run` (the gateway calls
-`platform_registry.create_adapter("voip", cfg)` → `VoipAdapter.connect()`); the registration
-exchange is the same. To validate just registration (no full gateway), drive the adapter
-directly:
+With every variable from steps 2/3/5 exported in the same shell, launch the gateway. The
+plugin's `register(ctx)` supplies an `env_enablement_fn` that seeds `PlatformConfig.extra`
+from the `HERMES_SIP_*` / `HERMES_VOIP_*` process env (secrets stay in env, never
+config.yaml), and an `is_connected` gate, so the gateway enables `voip`, instantiates the
+adapter, and calls `connect()` (TLS handshake + REGISTER) on its own — no `platforms:` block
+in config.yaml is required.
+
+**Detached launch (persists across turns; the inbound call arrives asynchronously):**
+
+```bash
+# All of steps 2/3/5's exports must be live in THIS shell first.
+nohup uv run hermes gateway run -vv > /tmp/hermes-voip-live.log 2>&1 &
+echo "gateway PID=$!  log=/tmp/hermes-voip-live.log"
+```
+
+Confirm in the log that the `voip` platform loaded and the extension REGISTERED:
+
+```bash
+grep -E "voip|REGISTER|Connecting to voip|registered" /tmp/hermes-voip-live.log | tail -20
+```
+
+**Registration-only check (no full gateway)** — drive the adapter directly:
+
+```bash
+uv run python - <<'PY'
+import asyncio, os, logging
+logging.basicConfig(level=logging.INFO)
+import hermes_voip
+from gateway.config import PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
+
 
 ```bash
 uv run python - <<'PY'

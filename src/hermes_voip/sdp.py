@@ -37,12 +37,21 @@ _G711_ENCODINGS = frozenset({"PCMU", "PCMA"})
 _DEFAULT_CLOCK_RATE = 8000
 _SECURE_PROFILE = "RTP/SAVP"
 _PLAIN_PROFILE = "RTP/AVP"
-# RFC 4568 SDES. We negotiate exactly one SRTP crypto-suite: AES_CM_128 with an
-# 80-bit HMAC-SHA1 auth tag. Its master key is 128 bits (16 octets) and master
-# salt 112 bits (14 octets), so the inline key||salt decodes to 30 octets.
+# RFC 4568 SDES. We negotiate the two AES_CM_128 SRTP crypto-suites: with an
+# 80-bit and a 32-bit HMAC-SHA1 auth tag. Both use a 128-bit (16-octet) master
+# key and 112-bit (14-octet) master salt — they differ only in the SRTP/SRTCP
+# auth-tag length (RFC 4568 §6.2) — so for both the inline key||salt decodes to
+# 30 octets. DTLS-SRTP and other suites are out of scope.
 _AES_CM_128_HMAC_SHA1_80 = "AES_CM_128_HMAC_SHA1_80"
-_SUPPORTED_CRYPTO_SUITES = frozenset({_AES_CM_128_HMAC_SHA1_80})
-_SRTP_KEY_SALT_OCTETS: dict[str, int] = {_AES_CM_128_HMAC_SHA1_80: 16 + 14}
+_AES_CM_128_HMAC_SHA1_32 = "AES_CM_128_HMAC_SHA1_32"
+_SUPPORTED_CRYPTO_SUITES = frozenset(
+    {_AES_CM_128_HMAC_SHA1_80, _AES_CM_128_HMAC_SHA1_32}
+)
+_AES_CM_128_KEY_SALT_OCTETS = 16 + 14  # shared by both supported suites
+_SRTP_KEY_SALT_OCTETS: dict[str, int] = {
+    _AES_CM_128_HMAC_SHA1_80: _AES_CM_128_KEY_SALT_OCTETS,
+    _AES_CM_128_HMAC_SHA1_32: _AES_CM_128_KEY_SALT_OCTETS,
+}
 _INLINE_PREFIX = "inline:"
 _CRYPTO_MIN_FIELDS = 3  # <tag> <crypto-suite> <key-params>
 _MAX_TAG_DIGITS = 9  # RFC 4568: tag = 1*9DIGIT
@@ -63,10 +72,10 @@ def _validate_crypto(tag: int, suite: str, key_params: str) -> None:
 
     Enforces: a positive decimal ``tag`` of at most nine digits (the ``parse``
     path also rejects a leading zero per RFC 4568 §4); a *supported* crypto-suite
-    (we negotiate only ``AES_CM_128_HMAC_SHA1_80``); and an ``inline:`` key whose
-    base64-decoded master key||salt is exactly the suite's length (30 octets for
-    that suite). Optional ``|lifetime|MKI:length`` fields after the key are kept
-    verbatim but not interpreted.
+    (``AES_CM_128_HMAC_SHA1_80`` or ``AES_CM_128_HMAC_SHA1_32``); and an
+    ``inline:`` key whose base64-decoded master key||salt is exactly the suite's
+    length (30 octets for both supported suites). Optional ``|lifetime|MKI:length``
+    fields after the key are kept verbatim but not interpreted.
     """
     if not 1 <= tag <= 10**_MAX_TAG_DIGITS - 1:
         msg = f"crypto tag out of range 1..{10**_MAX_TAG_DIGITS - 1}: {tag}"
@@ -100,8 +109,8 @@ class CryptoAttribute:
     Attributes:
         tag: The negotiation identifier (``1*9DIGIT``); the answer reuses the
             accepted offer's tag.
-        suite: The crypto-suite token (only ``AES_CM_128_HMAC_SHA1_80`` is
-            supported here).
+        suite: The crypto-suite token (``AES_CM_128_HMAC_SHA1_80`` or
+            ``AES_CM_128_HMAC_SHA1_32`` are supported here).
         key_params: The key parameters starting with ``inline:`` (the base64
             master key||salt plus any optional ``|lifetime|MKI:length`` fields).
 

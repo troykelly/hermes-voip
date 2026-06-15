@@ -28,6 +28,13 @@ ml = [
     "sherpa-onnx==1.13.2",
     "tokenizers==0.23.1",
 ]
+# SDES-SRTP media encryption (ADR-0013, RFC 3711): AES-CM keystream + HMAC-SHA1
+# auth via pyca/cryptography (Apache-2.0).  Lazy-imported inside media/srtp.py so
+# `import hermes_voip.media.srtp` works without this extra and mypy stays clean.
+# The `media` CI job installs this extra and runs the full RFC-3711 KAT suite.
+media = [
+    "cryptography>=44.0.0,<46",
+]
 
 [build-system]
 requires = ["hatchling"]

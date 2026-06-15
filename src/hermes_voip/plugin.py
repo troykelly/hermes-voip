@@ -179,18 +179,14 @@ def _adapter_factory(config: object) -> BasePlatformAdapterProtocol:
 
     ``config`` is typed ``object`` at the hermes-surface boundary (the gateway
     passes an opaque object through the ``Callable[[object], …]`` adapter-factory
-    contract in :mod:`hermes_voip.hermes_surface`).  The runtime always supplies a
-    ``PlatformConfig`` here; the ``isinstance`` guard narrows the type for mypy
-    and enforces the contract at runtime.
+    contract in :mod:`hermes_voip.hermes_surface`).  The gateway always supplies a
+    real ``PlatformConfig`` at runtime; ``VoipAdapter`` reads the settings it needs
+    via ``config.extra``.  No ``isinstance`` check is performed here — the
+    ``gateway.config`` module is not imported in this file (doing so would break
+    the no-hermes default mypy gate; see ADR-0014).
     """
-    from gateway.config import PlatformConfig  # noqa: PLC0415  # isort: skip
-    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415  # isort: skip
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
-    if not isinstance(config, PlatformConfig):
-        msg = (
-            f"_adapter_factory: expected PlatformConfig, got {type(config).__name__!r}"
-        )
-        raise TypeError(msg)
     return VoipAdapter(config)
 
 

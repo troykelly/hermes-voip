@@ -19,8 +19,9 @@ Three properties matter:
   edges to one fed window-aligned.
 * **Hysteresis.** A single ``threshold`` would chatter around the boundary, so we
   enter speech at ``threshold`` and only leave it once the probability drops below
-  a lower ``exit_threshold`` (silero's recipe uses ``threshold - 0.15``). This is
-  what gives the endpointer a clean offset to time silence from.
+  a lower ``exit_threshold`` (default ``threshold * 0.5`` — a proportional
+  half-band that always stays strictly inside ``(0.0, threshold)``). This is what
+  gives the endpointer a clean offset to time silence from.
 
 The model is **dependency-injected** as a :class:`VadModel` callable so the pure
 edge state machine is unit-tested offline with a fake returning canned
@@ -72,9 +73,14 @@ __all__ = [
 #: (both 32 ms) — and rejects any other window. The detector slices to these.
 SILERO_WINDOW_SAMPLES: Final[dict[int, int]] = {8_000: 256, 16_000: 512}
 
-#: silero's recommended gap between the speech-entry and speech-exit thresholds,
-#: giving the hysteresis dead band that stops edge chatter at the boundary.
-_DEFAULT_HYSTERESIS_GAP: Final[float] = 0.15
+#: Multiplicative factor deriving the default speech-exit threshold from the
+#: speech-entry ``threshold`` (``exit = threshold * factor``). A proportional
+#: half-band gives the hysteresis dead band that stops edge chatter at the
+#: boundary while *always* landing strictly inside ``(0.0, threshold)`` for any
+#: ``threshold > 0`` — no flooring edge case (an additive gap like
+#: ``threshold - 0.15`` floors to ``0.0`` for small thresholds, which can never
+#: be crossed by a ``0.0..1.0`` probability and would wedge speech open).
+_DEFAULT_EXIT_FACTOR: Final[float] = 0.5
 
 
 class SpeechEdge(Enum):
@@ -147,15 +153,18 @@ class VoiceActivityDetector:
             threshold: Speech-entry probability cutoff in ``[0.0, 1.0]`` (sourced
                 from ``MediaConfig.vad_threshold``).
             exit_threshold: Speech-exit cutoff; speech ends once probability drops
-                below it. Defaults to ``max(0.0, threshold - 0.15)`` (silero's
-                hysteresis recipe). Must be finite and in ``[0.0, threshold]`` —
-                a NaN, infinite, or negative cutoff can never be crossed and
+                strictly below it. Defaults to ``threshold * 0.5`` — a
+                proportional hysteresis half-band that, for any ``threshold > 0``,
+                always lands strictly inside ``(0.0, threshold)``. Must be finite
+                and in ``(0.0, threshold]``: a zero, negative, NaN, or infinite
+                cutoff can never be crossed by a ``0.0..1.0`` probability and
                 would mean speech never ends.
 
         Raises:
             ValueError: If the rate is not 8000/16000, ``threshold`` is outside
                 ``[0.0, 1.0]``, or ``exit_threshold`` is not finite and within
-                ``[0.0, threshold]``.
+                ``(0.0, threshold]`` (the derived default needs ``threshold > 0``
+                to be valid).
         """
         if sample_rate_hz not in SILERO_WINDOW_SAMPLES:
             msg = f"sample_rate_hz must be 8000 or 16000, got {sample_rate_hz}"
@@ -164,19 +173,24 @@ class VoiceActivityDetector:
             msg = f"threshold must be in [0.0, 1.0], got {threshold}"
             raise ValueError(msg)
         resolved_exit = (
-            max(0.0, threshold - _DEFAULT_HYSTERESIS_GAP)
+            threshold * _DEFAULT_EXIT_FACTOR
             if exit_threshold is None
             else exit_threshold
         )
-        # exit_threshold must be a real, crossable cutoff. NaN (``p < nan`` is
-        # always False) and negatives (probabilities are >= 0.0, never crossable)
-        # would silently mean speech never ends; reject both, plus infinities and
-        # anything above ``threshold`` (which would re-onset chatter). ``not (0.0
-        # <= x <= threshold)`` also catches NaN, since every NaN comparison is
-        # False; ``math.isfinite`` then keeps the message specific for infinities.
-        if not math.isfinite(resolved_exit) or not 0.0 <= resolved_exit <= threshold:
+        # exit_threshold must be a real, crossable cutoff strictly above 0.0. The
+        # OFFSET test is ``probability < exit_threshold`` and probabilities are in
+        # ``[0.0, 1.0]``, so an exit of 0.0 (``p < 0.0`` never true), a negative,
+        # or a NaN (``p < nan`` always False) would silently mean speech never
+        # ends; an infinity or anything above ``threshold`` would instead re-onset
+        # chatter. Require ``0.0 < x <= threshold``. ``not (0.0 < x <= threshold)``
+        # also catches NaN, since every NaN comparison is False; ``math.isfinite``
+        # then keeps the message specific for infinities. With the default
+        # ``threshold * 0.5`` this holds for any ``threshold > 0``; a ``threshold``
+        # of exactly 0.0 leaves no valid cutoff and is rejected here with a clear
+        # error rather than wedging speech open.
+        if not math.isfinite(resolved_exit) or not 0.0 < resolved_exit <= threshold:
             msg = (
-                f"exit_threshold must be finite and in [0.0, threshold], "
+                f"exit_threshold must be finite and in (0.0, threshold], "
                 f"got {resolved_exit} (threshold {threshold})"
             )
             raise ValueError(msg)

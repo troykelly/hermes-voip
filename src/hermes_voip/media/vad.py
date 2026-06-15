@@ -40,7 +40,7 @@ from __future__ import annotations
 import importlib
 import math
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -53,8 +53,10 @@ from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 # ``py.typed`` even when present — so a static ``import`` would error differently
 # in each environment. Like ``hermes_voip.providers.onnx_compat``, the live path
 # resolves them dynamically (``importlib.import_module``) inside the one factory
-# that needs them, and every numpy/ort reference is held as ``object`` at the
-# boundaries. The pure detector and state machine above carry no ML dependency.
+# that needs them, and the resolved module/session are typed against the narrow
+# local Protocols (``_NumpyModule`` / ``_OrtSession``) defined below — so the
+# array math is fully type-checked in both environments with no escape hatch. The
+# pure detector and state machine above carry no ML dependency.
 
 __all__ = [
     "SILERO_WINDOW_SAMPLES",
@@ -273,6 +275,72 @@ _SILERO_STATE_SHAPE: Final[tuple[int, int, int]] = (2, 1, 128)
 _PCM16_FULL_SCALE: Final[float] = 32768.0
 
 
+# numpy/onnxruntime ship no ``py.typed`` and are absent in the default gate, so
+# their public API is untyped to the checker. Rather than reach for
+# ``# type: ignore`` (rule 17), we declare *narrow local Protocols* covering only
+# the handful of array/session operations the live path uses. The dynamically
+# imported module/session (held as ``Any`` from ``importlib``) is assignable to
+# these structural types with no cast, and the math below is then fully checked in
+# BOTH the no-ml gate and an ml environment.
+
+
+@runtime_checkable
+class _NdArray(Protocol):
+    """The slice of the numpy ndarray surface the silero math touches."""
+
+    def astype(self, dtype: object, /) -> _NdArray:
+        """Return a copy cast to ``dtype`` (we pass the module's ``float32``)."""
+        ...
+
+    def reshape(self, *shape: int) -> _NdArray:
+        """Return a view with the given shape (``(1, -1)`` and ``(-1,)`` here)."""
+        ...
+
+    def __truediv__(self, divisor: float, /) -> _NdArray:
+        """Elementwise division by a scalar (the PCM16 full-scale divisor)."""
+        ...
+
+    def __getitem__(self, index: int, /) -> _NdArray:
+        """Index into the array / the run outputs (``out[0]``, ``out[1]``)."""
+        ...
+
+    def __float__(self) -> float:
+        """Coerce a 0-d / single-element array to a Python float."""
+        ...
+
+
+@runtime_checkable
+class _NumpyModule(Protocol):
+    """The slice of the ``numpy`` module the silero math calls."""
+
+    #: dtype singletons; opaque here — only passed back as a ``dtype`` argument.
+    float32: object
+    int64: object
+
+    def zeros(self, shape: object, *, dtype: object) -> _NdArray:
+        """Allocate a zero-filled array (the recurrent state tensor)."""
+        ...
+
+    def frombuffer(self, buffer: bytes, *, dtype: str) -> _NdArray:
+        """Wrap raw PCM16-LE bytes as an ``<i2`` array with no copy."""
+        ...
+
+    def array(self, obj: object, *, dtype: object) -> _NdArray:
+        """Build an array from a scalar (the int64 sample-rate input)."""
+        ...
+
+
+@runtime_checkable
+class _OrtSession(Protocol):
+    """The slice of ``onnxruntime.InferenceSession`` the live path calls."""
+
+    def run(
+        self, output_names: Sequence[str] | None, input_feed: dict[str, object], /
+    ) -> Sequence[_NdArray]:
+        """Run the graph; output 0 = speech probability, output 1 = next state."""
+        ...
+
+
 class _SileroOnnxModel:
     """A :class:`VadModel` backed by the silero-vad ONNX graph via onnxruntime.
 
@@ -281,34 +349,33 @@ class _SileroOnnxModel:
     here and thread it through every call, resetting it on :meth:`reset` so a new
     utterance starts clean (matching the pure detector's ``reset``).
 
-    numpy/onnxruntime are unresolved to the type checker (optional ``ml`` extra,
-    absent in the gate), so the session, the numpy module, and the state tensor
-    are held as ``object`` at the boundaries; the array math lives entirely in
-    :meth:`__call__`. The factory :func:`load_silero_model` constructs this.
+    The session and numpy module are typed against the narrow local Protocols
+    (:class:`_OrtSession`, :class:`_NumpyModule`) above, so every array operation
+    is type-checked with no escape hatch even though neither dependency ships
+    ``py.typed`` and neither is present in the default gate. The factory
+    :func:`load_silero_model` constructs this from the dynamically imported deps.
     """
 
-    def __init__(self, session: object, numpy_module: object) -> None:
+    def __init__(self, session: _OrtSession, numpy_module: _NumpyModule) -> None:
         self._session = session
         self._np = numpy_module
-        self._state: object = self._zero_state()
+        self._state: _NdArray = self._zero_state()
 
-    def _zero_state(self) -> object:
-        return self._np.zeros(_SILERO_STATE_SHAPE, dtype=self._np.float32)  # type: ignore[attr-defined]
+    def _zero_state(self) -> _NdArray:
+        return self._np.zeros(_SILERO_STATE_SHAPE, dtype=self._np.float32)
 
     def __call__(self, window_pcm16: bytes, sample_rate: int) -> float:
         np = self._np
         samples = (
-            np.frombuffer(window_pcm16, dtype="<i2").astype(np.float32)  # type: ignore[attr-defined]
+            np.frombuffer(window_pcm16, dtype="<i2").astype(np.float32)
             / _PCM16_FULL_SCALE
         )
-        inputs = {
+        inputs: dict[str, object] = {
             "input": samples.reshape(1, -1),
             "state": self._state,
-            "sr": np.array(sample_rate, dtype=np.int64),  # type: ignore[attr-defined]
+            "sr": np.array(sample_rate, dtype=np.int64),
         }
-        # onnxruntime's InferenceSession.run is dynamically typed; the silero
-        # contract is fixed: output 0 = speech probability, output 1 = next state.
-        out = self._session.run(None, inputs)  # type: ignore[attr-defined]
+        out = self._session.run(None, inputs)
         self._state = out[1]
         return float(out[0].reshape(-1)[0])
 

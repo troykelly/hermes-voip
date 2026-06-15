@@ -13,7 +13,7 @@ one inference per window, emitting ONSET/OFFSET edges with hysteresis.
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import pytest
 
@@ -286,6 +286,135 @@ def test_real_pcm_fixture_drives_edges_via_injected_model() -> None:
     onset, offset = events
     assert onset.frame_index == 2  # speech starts at the 3rd window
     assert offset.frame_index == 4  # silence resumes at the 5th window
+
+
+# --- live ONNX wrapper contract (fakes; no ml extra) ----------------------
+#
+# These drive the private ``_SileroOnnxModel`` with fakes that implement EXACTLY
+# the narrow ``_NumpyModule`` / ``_OrtSession`` Protocols it depends on — no
+# wider numpy/ort surface. That proves two things offline (the ml extra is never
+# needed here): the wrapper marshals each window into the silero inputs and
+# threads the recurrent state correctly, AND the local Protocols are the real
+# call contract (a fake missing a used method would fail to construct/run). If a
+# future edit reaches outside the declared Protocol surface, this test breaks.
+
+
+class _FakeArray:
+    """A stand-in ndarray exposing only the ``_NdArray`` Protocol operations.
+
+    It carries an opaque ``tag`` so the test can identify which array flowed
+    where (e.g. that the next-state output is threaded into the following call),
+    and a ``value`` used only when the wrapper coerces a scalar via ``float()``.
+    """
+
+    def __init__(self, tag: str, value: float = 0.0) -> None:
+        self.tag = tag
+        self.value = value
+
+    def astype(self, dtype: object, /) -> _FakeArray:
+        return self
+
+    def reshape(self, *shape: int) -> _FakeArray:
+        return self
+
+    def __truediv__(self, divisor: float, /) -> _FakeArray:
+        return self
+
+    def __getitem__(self, index: int, /) -> _FakeArray:
+        return self
+
+    def __float__(self) -> float:
+        return self.value
+
+
+class _FakeNumpy:
+    """A ``_NumpyModule`` whose factories return tagged :class:`_FakeArray`s."""
+
+    # typed ``object`` to match the Protocol's opaque dtype members exactly
+    # (mypy treats Protocol attribute types invariantly).
+    float32: object = "float32"
+    int64: object = "int64"
+
+    def zeros(self, shape: object, *, dtype: object) -> _FakeArray:
+        return _FakeArray("zero-state")
+
+    def frombuffer(self, buffer: bytes, *, dtype: str) -> _FakeArray:
+        return _FakeArray("samples")
+
+    def array(self, obj: object, *, dtype: object) -> _FakeArray:
+        return _FakeArray("sr")
+
+
+class _FakeSession:
+    """An ``_OrtSession`` returning scripted probabilities and a fresh next-state.
+
+    Records each call's ``state`` input and the full input feed so the test can
+    assert the recurrent state is threaded and the inputs are well-formed.
+    """
+
+    def __init__(self, probabilities: list[float]) -> None:
+        self._probs = iter(probabilities)
+        self.seen_states: list[object] = []
+        self.feeds: list[dict[str, object]] = []
+
+    def run(
+        self, output_names: Sequence[str] | None, input_feed: dict[str, object], /
+    ) -> Sequence[_FakeArray]:
+        assert output_names is None
+        self.seen_states.append(input_feed["state"])
+        self.feeds.append(dict(input_feed))
+        prob = next(self._probs)
+        # output 0 = probability (coerced via float()); output 1 = next state,
+        # uniquely tagged per call so state-threading is observable.
+        next_state = _FakeArray(f"state-after-call-{len(self.feeds)}")
+        return [_FakeArray("prob", value=prob), next_state]
+
+
+def test_silero_onnx_wrapper_marshals_inputs_and_threads_state() -> None:
+    from hermes_voip.media.vad import (  # noqa: PLC0415  (lazy: private symbol)
+        _NumpyModule,
+        _OrtSession,
+        _SileroOnnxModel,
+    )
+
+    session = _FakeSession([0.8, 0.1])
+    numpy = _FakeNumpy()
+    # the fakes satisfy the runtime-checkable Protocols the wrapper relies on
+    assert isinstance(session, _OrtSession)
+    assert isinstance(numpy, _NumpyModule)
+
+    model = _SileroOnnxModel(session, numpy)
+    window = b"\x00\x00" * SILERO_WINDOW_SAMPLES[_RATE_16K]
+
+    first = model(window, _RATE_16K)
+    second = model(window, _RATE_16K)
+
+    # the scripted probabilities are returned, coerced from output 0
+    assert first == pytest.approx(0.8)
+    assert second == pytest.approx(0.1)
+    # every call feeds the three named silero inputs
+    assert set(session.feeds[0]) == {"input", "state", "sr"}
+    # the first call starts from the zero state; the second is threaded the
+    # next-state output of the first (recurrent state carried across windows)
+    assert isinstance(session.seen_states[0], _FakeArray)
+    assert session.seen_states[0].tag == "zero-state"
+    assert isinstance(session.seen_states[1], _FakeArray)
+    assert session.seen_states[1].tag == "state-after-call-1"
+
+
+def test_silero_onnx_wrapper_reset_restores_zero_state() -> None:
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    session = _FakeSession([0.9, 0.9])
+    model = _SileroOnnxModel(session, _FakeNumpy())
+    window = b"\x00\x00" * SILERO_WINDOW_SAMPLES[_RATE_16K]
+
+    model(window, _RATE_16K)  # advances the state away from zero
+    model.reset()
+    model(window, _RATE_16K)  # must start from the zero state again
+    last_state = session.seen_states[-1]
+    assert isinstance(last_state, _FakeArray)
+    assert last_state.tag == "zero-state"
 
 
 # --- real-model smoke (skipped in the model-free gate) --------------------

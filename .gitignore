@@ -9,6 +9,12 @@
 # Worktree lanes — disposable, never committed
 .worktrees/
 
+# Local model-weight cache — large binaries, NEVER committed (rule 33). The STT/
+# TTS/VAD/guard weights are downloaded + sha256-verified at validation time from
+# their pinned manifest revisions (see docs/runbooks/0002-voip-live-validation.md);
+# the default cache path used there is `.models/`.
+.models/
+
 # Python virtualenv, caches, build output
 .venv/
 __pycache__/

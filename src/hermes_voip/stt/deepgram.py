@@ -188,14 +188,16 @@ async def _generate(
     sender_task = asyncio.create_task(_guarded_sender())
     receiver_task = asyncio.create_task(_guarded_receiver())
 
+    async def _wait_for_error() -> None:
+        """Wait for the error event; discard the bool return so Task[None] is exact."""
+        await error_event.wait()
+
     # ``error_task`` acts as a waitable for "something went wrong"; it is
-    # cancelled once both background tasks are done.
-    # mypy infers Event.wait() as Coroutine[Any,Any,Literal[True]] while
-    # create_task[None] expects Coroutine[Any,Any,None]; the return value is
-    # intentionally discarded (we only care that the event fired), so the cast
-    # is sound.  No type-laundering: Task[None] vs Task[Literal[True]] is a
-    # covariant read-only annotation difference with no runtime impact.
-    error_task: asyncio.Task[None] = asyncio.create_task(error_event.wait())  # type: ignore[arg-type]
+    # cancelled once both background tasks are done.  The thin wrapper above
+    # turns the Coroutine[Any,Any,Literal[True]] from Event.wait() into a
+    # Coroutine[Any,Any,None] so create_task infers Task[None] without any
+    # escape hatch (rule 17).
+    error_task: asyncio.Task[None] = asyncio.create_task(_wait_for_error())
 
     try:
         # Drain the queue while the receiver is still running; surface any error

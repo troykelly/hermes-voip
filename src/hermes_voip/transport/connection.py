@@ -319,6 +319,11 @@ class SipOverTlsTransport:
 
         Returns ``True`` when a response was sent (the caller must not also report
         the request unroutable), ``False`` when this is not a keepalive request.
+
+        Note: this assumes a *qualify* ``OPTIONS`` is out of dialog (no ``To``-tag),
+        which holds for RFC 3261 §11 registrars; a tagged ``OPTIONS`` is treated as
+        in-dialog and left to the unroutable path (answering it could 200 a genuine
+        in-dialog request for an unknown dialog, which should be ``481``).
         """
         if _has_to_tag(request.header("To")):
             return False

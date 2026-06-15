@@ -213,6 +213,105 @@ async def test_in_dialog_request_for_unknown_dialog_is_unroutable() -> None:
         await server.stop()
 
 
+# --------------------------------------------------------------------------
+# An OPTIONS that DOES carry a To-tag is in-dialog → unroutable, not answered.
+# This pins the To-tag guard to OPTIONS specifically (a method-only fall-through
+# test, e.g. BYE, would pass even with the guard removed).
+# --------------------------------------------------------------------------
+
+
+async def test_options_with_a_to_tag_is_unroutable_not_answered() -> None:
+    unroutable: list[Unroutable | SipResponse] = []
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = await _connected_transport(server, on_unroutable=unroutable.append)
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        # An in-dialog OPTIONS (To carries a tag) for a dialog we never created:
+        # it must NOT be auto-answered as a qualify ping — it takes the unroutable
+        # path, exactly like any other in-dialog request for an unknown dialog.
+        tagged_options = (
+            "OPTIONS sip:1000@127.0.0.1:5061;transport=tls SIP/2.0\r\n"
+            "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bKopt9;rport\r\n"
+            "Max-Forwards: 70\r\n"
+            "From: <sip:caller@pbx.example.test>;tag=remote-y\r\n"
+            "To: <sip:1000@pbx.example.test>;tag=unknown-local\r\n"
+            "Call-ID: ghost-dialog-opt\r\n"
+            "CSeq: 5 OPTIONS\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        await server.push(tagged_options)
+        await _wait_until(lambda: len(unroutable) == 1)
+        observed = unroutable[0]
+        assert isinstance(observed, Unroutable)
+        assert observed.request.method == "OPTIONS"
+        await asyncio.sleep(0.1)
+        assert not any(r.startswith("SIP/2.0 200") for r in server.received)
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+# --------------------------------------------------------------------------
+# An in-dialog NOTIFY for a KNOWN dialog routes to the CallSession, NOT the
+# keepalive responder — protects the ADR-0011 REFER-progress NOTIFY, which the
+# call-control layer must consume (it must never be swallowed by a bare 200).
+# --------------------------------------------------------------------------
+
+
+async def test_in_dialog_notify_routes_to_consumer_not_keepalive() -> None:
+    handled: list[SipRequest] = []
+    unroutable: list[Unroutable | SipResponse] = []
+
+    class _Consumer:
+        async def handle_request(self, request: SipRequest) -> None:
+            handled.append(request)
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = await _connected_transport(server, on_unroutable=unroutable.append)
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    # Register a live dialog whose local tag is the NOTIFY's To-tag and whose
+    # remote tag is its From-tag (the manager keys in-dialog routing this way).
+    manager.add_call(("refer-call", "local-tag", "remote-tag"), _Consumer())
+    try:
+        in_dialog_notify = (
+            "NOTIFY sip:1000@127.0.0.1:5061;transport=tls SIP/2.0\r\n"
+            "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bKntf9;rport\r\n"
+            "Max-Forwards: 70\r\n"
+            "From: <sip:caller@pbx.example.test>;tag=remote-tag\r\n"
+            "To: <sip:1000@pbx.example.test>;tag=local-tag\r\n"
+            "Call-ID: refer-call\r\n"
+            "CSeq: 4 NOTIFY\r\n"
+            "Event: refer\r\n"
+            "Subscription-State: terminated;reason=noresource\r\n"
+            "Content-Type: message/sipfrag;version=2.0\r\n"
+            "Content-Length: 16\r\n\r\n"
+            "SIP/2.0 200 OK\r\n"
+        )
+        await server.push(in_dialog_notify)
+        await _wait_until(lambda: len(handled) == 1)
+        assert handled[0].method == "NOTIFY"
+        # The keepalive responder must NOT have fired: no auto 200, not unroutable.
+        await asyncio.sleep(0.1)
+        assert not any(r.startswith("SIP/2.0 200") for r in server.received)
+        assert unroutable == []
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 async def _wait_until(
     predicate: object, *, timeout: float = 3.0, step: float = 0.01
 ) -> None:

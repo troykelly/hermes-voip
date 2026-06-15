@@ -1,21 +1,23 @@
 """STT media glue: int16<->float32 conversion + 8 kHz->16 kHz upsampling.
 
-Runs with the *real* ``audioop`` (the ``audioop-lts`` base dependency), so it is
-always in the default gate — no ml extra, no model. It proves the two things the
-recogniser layer owns (ADR-0006 §"Media glue we own"):
+It proves the two things the recogniser layer owns (ADR-0006 §"Media glue we own"):
 
 * the PCM16-bytes <-> normalised float32 conversion sherpa-onnx's
   ``accept_waveform`` requires (it wants float32 in ``-1..1``, not PCM16 bytes);
 * a continuous, state-carrying 8 kHz -> 16 kHz upsample that reuses the canonical
   ``media.audio.Resampler`` so feeding a stream frame-by-frame yields exactly the
   same samples as one pass (no per-frame boundary clicks, ADR-0006).
+
+The float32 conversion uses ``numpy`` (the optional ``ml`` extra), so those tests
+``pytest.importorskip("numpy")`` and run in the ``providers`` (ml) gate; they skip
+cleanly in the default no-ml gate. The ``FrameUpsampler`` rides on ``audioop-lts``
+(a base dependency) and is numpy-free, so its tests run everywhere.
 """
 
 from __future__ import annotations
 
 import struct
 
-import numpy as np
 import pytest
 
 from hermes_voip.media.audio import G711_SAMPLE_RATE, Resampler
@@ -43,7 +45,8 @@ def _frame(pcm16: bytes, *, rate: int = G711_SAMPLE_RATE, ts: int = 0) -> PcmFra
 
 def test_pcm16_to_float32_normalises_by_32768() -> None:
     """Each sample is divided by 32768 so the range maps into ``-1..1``."""
-    out = pcm16_to_float32(_pcm16(0, 32767, -32768, 16384))
+    np = pytest.importorskip("numpy")
+    out = np.asarray(pcm16_to_float32(_pcm16(0, 32767, -32768, 16384)))
     assert list(out) == [
         0.0,
         32767 / 32768,
@@ -54,13 +57,15 @@ def test_pcm16_to_float32_normalises_by_32768() -> None:
 
 def test_pcm16_to_float32_is_float32_dtype() -> None:
     """The recogniser wants float32, not float64 — the dtype must be float32."""
-    out = pcm16_to_float32(_pcm16(1, -1))
+    np = pytest.importorskip("numpy")
+    out = np.asarray(pcm16_to_float32(_pcm16(1, -1)))
     assert out.dtype.name == "float32"
 
 
 def test_pcm16_to_float32_empty_is_empty() -> None:
     """An empty buffer yields an empty array (a zero-length frame is valid)."""
-    out = pcm16_to_float32(b"")
+    np = pytest.importorskip("numpy")
+    out = np.asarray(pcm16_to_float32(b""))
     assert out.shape == (0,)
 
 
@@ -75,6 +80,7 @@ def test_pcm16_to_float32_rejects_odd_length() -> None:
 
 def test_float32_to_pcm16_round_trips_within_quantisation() -> None:
     """float32 -> PCM16 inverts PCM16 -> float32 (modulo 1-LSB rounding)."""
+    pytest.importorskip("numpy")
     original = _pcm16(0, 1000, -1000, 32767, -32768, 12345)
     back = float32_to_pcm16(pcm16_to_float32(original))
     restored = struct.unpack(f"<{len(original) // 2}h", back)
@@ -84,6 +90,7 @@ def test_float32_to_pcm16_round_trips_within_quantisation() -> None:
 
 def test_float32_to_pcm16_clamps_out_of_range() -> None:
     """Values outside ``-1..1`` saturate at the int16 limits, never wrap."""
+    np = pytest.importorskip("numpy")
     out = float32_to_pcm16(np.array([2.0, -2.0, 1.0, -1.0], dtype=np.float32))
     assert struct.unpack("<4h", out) == (32767, -32768, 32767, -32768)
 

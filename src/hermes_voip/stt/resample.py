@@ -18,15 +18,15 @@ recogniser seam:
 
 from __future__ import annotations
 
-from typing import Final
-
-import numpy as np
+import importlib
+from typing import Final, Protocol
 
 from hermes_voip.media.audio import G711_SAMPLE_RATE, Resampler
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 
 __all__ = [
     "RECOGNISER_SAMPLE_RATE",
+    "FloatArray",
     "FrameUpsampler",
     "float32_to_pcm16",
     "pcm16_to_float32",
@@ -42,12 +42,60 @@ _PCM16_FULL_SCALE: Final[float] = 32_768.0
 _INT16_MIN: Final[int] = -32_768
 _INT16_MAX: Final[int] = 32_767
 
-# A 1-D float32 audio buffer (mono samples in -1..1) and its int16 counterpart.
-type _Float32Array = np.ndarray[tuple[int], np.dtype[np.float32]]
-type _Int16Array = np.ndarray[tuple[int], np.dtype[np.int16]]
+
+class FloatArray(Protocol):
+    """Structural view of the 1-D numpy float32 buffer the recogniser is fed.
+
+    ``numpy`` lives in the optional ``ml`` extra, so this module never imports it
+    statically — it would break ``import hermes_voip.stt`` on the default install
+    and ``mypy --strict`` in the no-ml gate. Typing the array structurally (only
+    the few ndarray members used) keeps both clean with no ``Any`` and no
+    ``# type: ignore``; the real value is a ``numpy.ndarray`` produced on the
+    ml-present media path. The bridge to sherpa-onnx (``accept_waveform``) accepts
+    this object directly.
+    """
+
+    def astype(self, dtype: object) -> FloatArray:
+        """Return a copy cast to ``dtype`` (``float32`` or the ``<i2`` wire type)."""
+        ...
+
+    def tobytes(self) -> bytes:
+        """Return the array's raw bytes (the PCM16-LE buffer for the wire)."""
+        ...
+
+    def __truediv__(self, other: float) -> FloatArray:
+        """Elementwise division by a scalar (the PCM16 full-scale divisor)."""
+        ...
+
+    def __mul__(self, other: float) -> FloatArray:
+        """Elementwise multiplication by a scalar (the PCM16 full-scale factor)."""
+        ...
 
 
-def pcm16_to_float32(pcm16: bytes) -> _Float32Array:
+class _NumpyModule(Protocol):
+    """The ``numpy`` surface this module uses, bound to the lazily-imported module."""
+
+    float32: object
+
+    def frombuffer(self, buffer: bytes, dtype: str) -> FloatArray: ...
+
+    def rint(self, x: FloatArray) -> FloatArray: ...
+
+    def clip(self, a: FloatArray, a_min: int, a_max: int) -> FloatArray: ...
+
+
+def _numpy() -> _NumpyModule:
+    """Load ``numpy`` lazily (optional ``ml`` extra) bound to :class:`_NumpyModule`.
+
+    Imported via :func:`importlib.import_module` so the package imports without the
+    ``ml`` extra and ``mypy --strict`` stays clean in both envs (no stub-bearing
+    static import, no ``# type: ignore``). Callers are on the ml-present media path.
+    """
+    module: _NumpyModule = importlib.import_module("numpy")
+    return module
+
+
+def pcm16_to_float32(pcm16: bytes) -> FloatArray:
     """Decode PCM16-LE mono bytes to a normalised float32 array in ``-1..1``.
 
     Each signed 16-bit sample is divided by 32768, so the recogniser receives the
@@ -59,24 +107,22 @@ def pcm16_to_float32(pcm16: bytes) -> _Float32Array:
     if len(pcm16) % PCM16_BYTES_PER_SAMPLE != 0:
         msg = f"PCM16 buffer must be whole 16-bit samples, got {len(pcm16)} bytes"
         raise ValueError(msg)
-    as_int16: _Int16Array = np.frombuffer(pcm16, dtype="<i2")
-    normalised: _Float32Array = (
-        as_int16.astype(np.float32) / _PCM16_FULL_SCALE
-    ).astype(np.float32)
-    return normalised
+    np = _numpy()
+    as_int16 = np.frombuffer(pcm16, dtype="<i2")
+    return (as_int16.astype(np.float32) / _PCM16_FULL_SCALE).astype(np.float32)
 
 
-def float32_to_pcm16(samples: _Float32Array) -> bytes:
+def float32_to_pcm16(samples: FloatArray) -> bytes:
     """Encode a normalised float32 array back to PCM16-LE mono bytes.
 
     The inverse of :func:`pcm16_to_float32`. Values outside ``-1..1`` **saturate**
     at the int16 limits (they never wrap), so a synthesiser or gain stage that
     overshoots clips cleanly instead of producing a wrap-around artefact.
     """
+    np = _numpy()
     scaled = np.rint(samples.astype(np.float32) * _PCM16_FULL_SCALE)
     clamped = np.clip(scaled, _INT16_MIN, _INT16_MAX)
-    as_int16: _Int16Array = clamped.astype("<i2")
-    return as_int16.tobytes()
+    return clamped.astype("<i2").tobytes()
 
 
 class FrameUpsampler:

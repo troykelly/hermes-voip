@@ -31,18 +31,17 @@ import queue
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import Final, Protocol
 
 from hermes_voip.aio import stream_from_thread
 from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.onnx_compat import ensure_sherpa_loadable
-from hermes_voip.stt.resample import RECOGNISER_SAMPLE_RATE, pcm16_to_float32
-
-if TYPE_CHECKING:
-    import numpy as np
-
-    _Float32Array = np.ndarray[tuple[int], np.dtype[np.float32]]
+from hermes_voip.stt.resample import (
+    RECOGNISER_SAMPLE_RATE,
+    FloatArray,
+    pcm16_to_float32,
+)
 
 __all__ = ["SherpaOnnxASR"]
 
@@ -69,7 +68,7 @@ class _Recognizer[StreamT](Protocol):
     def create_stream(self) -> StreamT: ...
 
     def accept_waveform(
-        self, stream: StreamT, sample_rate: int, samples: _Float32Array
+        self, stream: StreamT, sample_rate: int, samples: FloatArray
     ) -> None: ...
 
     def is_ready(self, stream: StreamT) -> bool: ...
@@ -93,7 +92,7 @@ class _EndOfAudio:
 
 _END_OF_AUDIO: Final[_EndOfAudio] = _EndOfAudio()
 
-type _FrameItem = _Float32Array | _EndOfAudio
+type _FrameItem = FloatArray | _EndOfAudio
 
 
 # A decode run: consume frames from the queue, yield transcripts. The recogniser
@@ -311,7 +310,7 @@ class _SherpaModule(Protocol):
 class _SherpaOnlineStream(Protocol):
     """Structural view of the sherpa ``OnlineStream`` methods the adapter calls."""
 
-    def accept_waveform(self, sample_rate: int, samples: _Float32Array) -> None: ...
+    def accept_waveform(self, sample_rate: int, samples: FloatArray) -> None: ...
 
     def input_finished(self) -> None: ...
 
@@ -350,7 +349,7 @@ class _SherpaRecognizerAdapter:
         return self._r.create_stream()
 
     def accept_waveform(
-        self, stream: _SherpaOnlineStream, sample_rate: int, samples: _Float32Array
+        self, stream: _SherpaOnlineStream, sample_rate: int, samples: FloatArray
     ) -> None:
         stream.accept_waveform(sample_rate, samples)
 

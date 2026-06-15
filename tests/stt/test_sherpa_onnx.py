@@ -27,11 +27,11 @@ import struct
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
-import numpy as np
 import pytest
 
 from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.audio import PcmFrame
+from hermes_voip.stt.resample import FloatArray
 from hermes_voip.stt.sherpa_onnx import SherpaOnnxASR
 
 _RATE = 16_000
@@ -57,9 +57,7 @@ async def _frames(*items: PcmFrame) -> AsyncIterator[PcmFrame]:
 class _FakeStream:
     """Stands in for a sherpa ``OnlineStream``; records fed waveforms."""
 
-    fed: list[np.ndarray[tuple[int], np.dtype[np.float32]]] = field(
-        default_factory=list
-    )
+    fed: list[FloatArray] = field(default_factory=list)
     fed_rates: list[int] = field(default_factory=list)
     finished: bool = False
 
@@ -101,7 +99,7 @@ class _FakeRecognizer:
         self,
         stream: _FakeStream,
         sample_rate: int,
-        samples: np.ndarray[tuple[int], np.dtype[np.float32]],
+        samples: FloatArray,
     ) -> None:
         stream.fed.append(samples)
         stream.fed_rates.append(sample_rate)
@@ -153,6 +151,7 @@ def test_sherpa_asr_declares_16k_input_rate() -> None:
 @pytest.mark.asyncio
 async def test_sherpa_asr_emits_interim_then_final_on_endpoint() -> None:
     """Growing partials, then a final transcript when the engine endpoints."""
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
     recognizer = _FakeRecognizer(
         [
             _Script("book", endpoint=False),
@@ -183,6 +182,7 @@ async def test_sherpa_asr_starts_a_new_segment_after_endpoint() -> None:
     ``test_sherpa_asr_flushes_tail_on_input_end``) — the consumer always gets a
     closing final per utterance.
     """
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
     recognizer = _FakeRecognizer(
         [
             _Script("yes", endpoint=True),
@@ -207,6 +207,7 @@ async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
     The non-empty hypothesis is emitted once as interim and once, promoted, as the
     end-of-stream final; the blank result in between is never emitted.
     """
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
     recognizer = _FakeRecognizer(
         [
             _Script("", endpoint=False),
@@ -221,6 +222,7 @@ async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
 @pytest.mark.asyncio
 async def test_sherpa_asr_feeds_float32_at_16k() -> None:
     """The engine receives normalised float32 at 16 kHz, not PCM16 bytes."""
+    np = pytest.importorskip("numpy")
     recognizer = _FakeRecognizer([_Script("x", endpoint=False)])
     asr = SherpaOnnxASR.from_recognizer(recognizer)
     # max-positive and max-negative PCM16 -> ~+1.0 / -1.0 float32.
@@ -230,7 +232,7 @@ async def test_sherpa_asr_feeds_float32_at_16k() -> None:
     stream = recognizer.last_stream
     assert stream is not None
     assert stream.fed_rates == [_RATE]
-    fed = stream.fed[0]
+    fed = np.asarray(stream.fed[0])
     assert fed.dtype.name == "float32"
     assert fed[0] == pytest.approx(32767 / 32768, abs=1e-6)
     assert fed[1] == pytest.approx(-1.0, abs=1e-6)
@@ -245,6 +247,7 @@ async def test_sherpa_asr_flushes_tail_on_input_end() -> None:
     being stranded mid-buffer. We assert a final transcript is still emitted for
     the last segment after the inbound iterator is exhausted.
     """
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
     recognizer = _FakeRecognizer(
         [
             _Script("almost", endpoint=False),
@@ -262,6 +265,7 @@ async def test_sherpa_asr_flushes_tail_on_input_end() -> None:
 @pytest.mark.asyncio
 async def test_sherpa_asr_propagates_engine_errors() -> None:
     """An exception from the engine surfaces to the consumer (rule 37)."""
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
 
     class _Boom(_FakeRecognizer):
         def decode_stream(self, stream: _FakeStream) -> None:

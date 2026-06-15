@@ -55,3 +55,21 @@ jobs:
       # Prove the native ML stack actually loads (the onnx_compat shim runs first).
       - run: uv run python -c "from hermes_voip.providers.onnx_compat import ensure_sherpa_loadable; ensure_sherpa_loadable(); import onnxruntime, sherpa_onnx, numpy; print('ml stack:', onnxruntime.__version__, numpy.__version__)"
       - run: uv run pytest -rs
+
+  # Runs the SRTP media-crypto tests (RFC 3711 known-answer vectors + functional
+  # suite) with the optional `media` extra installed (pyca/cryptography).  Separate
+  # job so the native OpenSSL binding stays out of the main gate's install / licence /
+  # audit scope.  The full suite is re-run here so the media-gated SRTP tests (which
+  # importorskip without the extra) actually execute against pyca/cryptography.
+  media:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --extra media
+      # Prove the cryptography library loads and the SRTP module is importable.
+      - run: uv run python -c "import cryptography; from hermes_voip.media.srtp import SrtpSession, SrtpError; print('media stack: cryptography', cryptography.__version__)"
+      - run: uv run pytest -rs

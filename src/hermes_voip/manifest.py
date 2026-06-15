@@ -34,6 +34,7 @@ from typing import assert_never
 
 __all__ = [
     "GUARD_ALLOWED_SPDX",
+    "GUARD_MODEL_MANIFEST",
     "STT_ALLOWED_SPDX",
     "TTS_ALLOWED_SPDX",
     "LicenceError",
@@ -195,6 +196,29 @@ class ModelManifest:
         if len(set(names)) != len(names):
             msg = f"ModelManifest({self.repo!r}) has duplicate file names"
             raise ValueError(msg)
+
+
+# The pinned default model for the in-process injection guard (ADR-0009).
+#
+# protectai/deberta-v3-base-prompt-injection-v2 is the ADR-0009 default: an
+# Apache-2.0, ungated DeBERTa-v3 injection detector served offline via ONNX. The
+# pin is the exact identity the licence gate verifies (rule 35) — a PUBLIC model-
+# registry coordinate (no host/secret/PII): the `repo`, an immutable 40-hex commit
+# `revision` (NOT a moving tag — the licence file landed at this commit), and the
+# `onnx/model.onnx` artifact's content SHA-256 (the file's Git-LFS `oid sha256:`,
+# i.e. the digest the guard's `_onnx_runtime.load_deberta_classifier` loads). The
+# repo's declared SPDX is Apache-2.0, which the GUARD family's allow-list permits.
+GUARD_MODEL_MANIFEST = ModelManifest(
+    repo="protectai/deberta-v3-base-prompt-injection-v2",
+    revision="e6535ca4ce3ba852083e75ec585d7c8aeb4be4c5",
+    files=(
+        ModelFile(
+            name="onnx/model.onnx",
+            sha256="f0ea7f239f765aedbde7c9e163a7cb38a79c5b8853d3f76db5152172047b228c",
+            spdx="Apache-2.0",
+        ),
+    ),
+)
 
 
 def validate_manifest(manifest: ModelManifest, family: ModelFamily) -> None:

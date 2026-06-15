@@ -61,7 +61,7 @@ def test_register_calls_register_platform_once() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     assert len(ctx.calls) == 1
 
 
@@ -69,7 +69,7 @@ def test_register_uses_name_voip() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     assert ctx.calls[0]["name"] == "voip"
 
 
@@ -78,7 +78,7 @@ def test_register_supplies_all_required_params() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     call = ctx.calls[0]
     for param in ("name", "label", "adapter_factory", "check_fn"):
         assert param in call, f"register_platform missing param: {param!r}"
@@ -89,9 +89,10 @@ def test_register_required_env_includes_hermes_sip_host() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     required_env = ctx.calls[0]["required_env"]
     assert required_env is not None
+    assert isinstance(required_env, (list, tuple, frozenset, set))
     assert "HERMES_SIP_HOST" in required_env
 
 
@@ -99,7 +100,7 @@ def test_register_adapter_factory_is_callable() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     factory = ctx.calls[0]["adapter_factory"]
     assert callable(factory)
 
@@ -108,7 +109,7 @@ def test_register_check_fn_is_callable() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     check_fn = ctx.calls[0]["check_fn"]
     assert callable(check_fn)
 
@@ -117,7 +118,7 @@ def test_register_validate_config_is_callable_or_none() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     vc = ctx.calls[0]["validate_config"]
     assert vc is None or callable(vc)
 
@@ -132,10 +133,13 @@ def test_validate_config_callback_raises_on_missing_host() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
-    validate = ctx.calls[0]["validate_config"]
-    if validate is None:
+    register(ctx)
+    validate_raw = ctx.calls[0]["validate_config"]
+    if validate_raw is None:
         pytest.skip("validate_config not supplied")
+
+    assert callable(validate_raw)
+    validate: Callable[[object], None] = validate_raw
 
     # A config with no HERMES_SIP_HOST
     fake_config = MagicMock()
@@ -145,13 +149,17 @@ def test_validate_config_callback_raises_on_missing_host() -> None:
 
 
 def test_validate_config_callback_passes_with_host() -> None:
+
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
-    validate = ctx.calls[0]["validate_config"]
-    if validate is None:
+    register(ctx)
+    validate_raw = ctx.calls[0]["validate_config"]
+    if validate_raw is None:
         pytest.skip("validate_config not supplied")
+
+    assert callable(validate_raw)
+    validate: Callable[[object], None] = validate_raw
 
     fake_config = MagicMock()
     fake_config.extra = {
@@ -171,7 +179,7 @@ def test_register_install_hint_is_non_empty() -> None:
     from hermes_voip.adapter import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
-    register(ctx)  # type: ignore[arg-type]
+    register(ctx)
     hint = ctx.calls[0]["install_hint"]
     assert isinstance(hint, str)
 

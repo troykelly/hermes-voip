@@ -36,6 +36,26 @@ media = [
     "cryptography==46.0.7",
 ]
 
+# ---------------------------------------------------------------------------
+# Hermes plugin discovery (hermes_agent.plugins entry point group).
+#
+# The Hermes runtime scans this group at startup. The value must be a module
+# path that exposes a callable ``register(ctx)`` at module level. We point
+# directly at the package root (``hermes_voip``) so that the call is:
+#
+#     import hermes_voip; hermes_voip.register(ctx)
+#
+# ``hermes_voip.__init__`` re-exports ``register`` from ``hermes_voip.adapter``;
+# no ML or transport heavy imports occur at this point — those are deferred to
+# ``connect()`` and ``_on_inbound_invite``. A bare ``import hermes_voip``
+# therefore stays light (only audioop-lts and the sans-IO SIP modules).
+#
+# To activate the plugin the operator must run:
+#     hermes plugins enable hermes-voip
+# (Hermes gates pip-installed plugins by config.yaml; see ADR-0002.)
+[project.entry-points."hermes_agent.plugins"]
+hermes-voip = "hermes_voip"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

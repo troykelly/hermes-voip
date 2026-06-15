@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio  # noqa: F401 — pytest-asyncio is a test dep; needed for asyncio_mode
 
-from hermes_voip.config import ConfigError
+from hermes_voip.config import ConfigError, ExtensionConfig
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 from hermes_voip.providers.audio import PcmFrame
@@ -37,6 +37,7 @@ class _FakeTransport:
     def __init__(self, *, local_sent_by: str = "127.0.0.1:5061") -> None:
         self._local_sent_by = local_sent_by
         self.sent: list[str] = []
+        self._calls: dict[str, object] = {}
 
     @property
     def local_sent_by(self) -> str:
@@ -47,6 +48,21 @@ class _FakeTransport:
 
     async def send(self, message: str) -> None:
         self.sent.append(message)
+
+    async def connect(self) -> None:
+        """No-op TLS connect for tests."""
+
+    async def aclose(self) -> None:
+        """No-op close for tests."""
+
+    def bind_manager(self, manager: object) -> None:
+        """No-op manager bind for tests."""
+
+    def add_call(self, call_id: str, sink: object) -> None:
+        self._calls[call_id] = sink
+
+    def remove_call(self, call_id: str) -> None:
+        self._calls.pop(call_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -120,16 +136,24 @@ class _FakeTTS:
 
 class _FakeASR:
     async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
-        # consume the iterator so the pump does not stall
+        """Drain audio frames and produce no transcripts (empty ASR stub)."""
+        # This is an async generator: drains audio, never yields transcripts.
+        chunks: list[object] = []
         async for _ in audio:
-            pass
-        return
-        yield  # make this an async generator
+            pass  # consume so pump does not stall
+        for chunk in chunks:  # chunks is always empty — forces async-gen shape
+            yield chunk
 
 
 class _FakeGuard:
     async def screen(self, text: str, *, call_id: str) -> GuardResult:
-        return GuardResult(verdict=GuardVerdict.ALLOW, score=0.0, degraded=False)
+        return GuardResult(
+            verdict=GuardVerdict.ALLOW,
+            score=0.0,
+            degraded=False,
+            normalized_text=text,
+            reasons=(),
+        )
 
 
 def _fake_providers() -> Providers:
@@ -183,10 +207,8 @@ _FAKE_MEDIA_ENV: dict[str, str] = {
 }
 
 
-def _fake_ext_config() -> object:
+def _fake_ext_config() -> ExtensionConfig:
     """The ExtensionConfig the fake manager would return."""
-    from hermes_voip.config import ExtensionConfig  # noqa: PLC0415
-
     return ExtensionConfig(index=0, extension="1000", username="1000", password="fake")
 
 
@@ -301,13 +323,11 @@ async def _build_adapter(
     ):
         adapter = VoipAdapter(config, platform)
         # Patch handle_message so we can observe inbound turns
-        adapter.handle_message = MagicMock()  # type: ignore[method-assign]
+        adapter.handle_message = MagicMock()  # type: ignore[attr-defined]
         # Patch _make_send_result so send() can return a fake SendResult
         adapter._make_send_result = _make_result  # type: ignore[attr-defined]
         if connect:
-            # Also patch transport.connect to be a no-op (no real TLS)
-            with patch.object(transport, "connect", new=AsyncMock(return_value=None)):
-                await adapter.connect()
+            await adapter.connect()
         return adapter
 
 
@@ -346,7 +366,7 @@ async def test_connect_returns_false_when_manager_down() -> None:
         patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
     ):
         adapter = VoipAdapter(config, platform)
-        adapter.handle_message = MagicMock()  # type: ignore[method-assign]
+        adapter.handle_message = MagicMock()  # type: ignore[attr-defined]
         with patch.object(transport, "connect", new=AsyncMock(return_value=None)):
             result = await adapter.connect()
     assert result is False
@@ -407,7 +427,7 @@ async def test_send_known_call_id_calls_loop_speak() -> None:
             async for chunk in text:
                 spoken.append(chunk)
 
-    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[attr-defined]
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
 
     result = await adapter.send(call_id, "hello agent")
     assert result.success
@@ -429,7 +449,7 @@ async def test_get_chat_info_live_call() -> None:
     assert isinstance(adapter, VoipAdapter)
     call_id = new_call_id()
     # Register a fake call record
-    adapter._call_info[call_id] = {  # type: ignore[attr-defined]
+    adapter._call_info[call_id] = {
         "name": "9999",
         "remote_uri": "sip:9999@pbx.example.test",
         "type": "dm",
@@ -449,7 +469,7 @@ async def test_get_chat_info_ended_call() -> None:
 
     assert isinstance(adapter, VoipAdapter)
     call_id = new_call_id()
-    adapter._call_info[call_id] = {  # type: ignore[attr-defined]
+    adapter._call_info[call_id] = {
         "name": "caller",
         "remote_uri": "sip:caller@pbx.example.test",
         "type": "dm",
@@ -489,7 +509,9 @@ async def test_inbound_invite_registers_call_loop() -> None:
     call_id = new_call_id()
     invite_raw = _make_invite(call_id=call_id)
 
-    # Patch the heavy IO parts of _on_inbound_invite so no UDP socket is opened
+    # Patch the heavy IO parts of _on_inbound_invite so no UDP socket is opened.
+    # Keep the patches active while we await — the background task resolves
+    # its module-level names at call time, so patches must outlive the fire.
     with (
         patch(
             "hermes_voip.adapter.RtpMediaTransport",
@@ -513,6 +535,14 @@ async def test_inbound_invite_registers_call_loop() -> None:
             "hermes_voip.adapter.GuardSessionState",
             return_value=MagicMock(),
         ),
+        patch(
+            "hermes_voip.adapter._make_vad",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "hermes_voip.adapter._make_endpointer",
+            return_value=MagicMock(),
+        ),
     ):
         invite_req = SipRequest.parse(invite_raw)
         from hermes_voip.config import ExtensionConfig  # noqa: PLC0415
@@ -521,12 +551,13 @@ async def test_inbound_invite_registers_call_loop() -> None:
         new_call = NewCall(registration=ext, invite=invite_req)
         adapter._on_inbound_invite(new_call)
 
-        # Give event loop a turn to start the background task
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        # Allow multiple loop iterations for the background task to reach
+        # the self._call_info assignment (after connect + 200 OK + SessionSetup).
+        for _ in range(10):
+            await asyncio.sleep(0)
 
-    # The call_id should be registered
-    assert call_id in adapter._call_info  # type: ignore[attr-defined]
+        # The call_id should be registered before or during call_loop.run()
+        assert call_id in adapter._call_info
 
 
 # ---------------------------------------------------------------------------
@@ -546,14 +577,14 @@ async def test_deliver_turn_calls_handle_message() -> None:
 
     call_id = new_call_id()
     # Register a call record
-    adapter._call_info[call_id] = {  # type: ignore[attr-defined]
+    adapter._call_info[call_id] = {
         "name": "9999",
         "remote_uri": "sip:9999@pbx.example.test",
         "type": "dm",
         "ended": False,
     }
     # Simulate deliver_turn being called
-    await adapter._deliver_turn(call_id, "hello from caller")  # type: ignore[attr-defined]
+    await adapter._deliver_turn(call_id, "hello from caller")
 
     # handle_message should have been called once
     adapter.handle_message.assert_called_once()  # type: ignore[attr-defined]
@@ -621,6 +652,8 @@ async def test_each_call_gets_distinct_guard_state() -> None:
             "hermes_voip.adapter.GuardSessionState",
             side_effect=lambda call_id: MagicMock(call_id=call_id),
         ) as mock_guard_state,
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
         for n in range(2):
             cid = f"call-id-{n}"
@@ -630,8 +663,9 @@ async def test_each_call_gets_distinct_guard_state() -> None:
             ext = ExtensionConfig(
                 index=0, extension="1000", username="1000", password="x"
             )
-            adapter._on_inbound_invite(NewCall(registration=ext, invite=req))  # type: ignore[attr-defined]
-            await asyncio.sleep(0)
+            adapter._on_inbound_invite(NewCall(registration=ext, invite=req))
+            for _ in range(10):
+                await asyncio.sleep(0)
 
     # GuardSessionState should have been constructed twice, with different call_ids
     assert mock_guard_state.call_count == 2

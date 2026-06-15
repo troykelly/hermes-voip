@@ -105,11 +105,11 @@ async def test_classifier_exception_fails_open_to_restrict_degraded() -> None:
     guard = _guard(_boom)
     result = await _screen(guard, "hello", call_id="c1")
     assert result.degraded is True
+    # Fail-open is RESTRICT (read-only), which is also, by construction, never a
+    # silent ALLOW — the load-bearing guarantee of the fail policy (ADR-0009).
     assert result.verdict is GuardVerdict.RESTRICT
     # The error is reported, not swallowed (rule 37).
     assert any("onnx session died" in r or "error" in r.lower() for r in result.reasons)
-    # Fail-open must NEVER silently ALLOW.
-    assert result.verdict is not GuardVerdict.ALLOW
 
 
 @pytest.mark.asyncio

@@ -206,3 +206,105 @@ def test_register_exported_from_package_root() -> None:
         "register() must be re-exported from hermes_voip.__init__"
     )
     assert callable(hermes_voip.register)
+
+
+# ---------------------------------------------------------------------------
+# (e) env_enablement_fn + is_connected: the gateway seeds PlatformConfig.extra
+#     from the HERMES_SIP_*/HERMES_VOIP_* PROCESS ENV (never config.yaml — the
+#     SIP password is a secret). Without these hooks the gateway enables the
+#     "voip" platform but with an EMPTY extra, so VoipAdapter.connect() fails
+#     with ConfigError (no HERMES_SIP_HOST in extra). The registry-driven enable
+#     pass in gateway.config calls env_enablement_fn() to seed extra and consults
+#     is_connected(probe_cfg) to gate enablement.
+# ---------------------------------------------------------------------------
+
+
+def test_register_supplies_env_enablement_fn() -> None:
+    """register_platform must pass a zero-arg env_enablement_fn."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn = ctx.calls[0].get("env_enablement_fn")
+    assert fn is not None, "register_platform must supply env_enablement_fn"
+    assert callable(fn)
+
+
+def test_env_enablement_fn_seeds_sip_and_voip_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """env_enablement_fn() returns the HERMES_SIP_*/HERMES_VOIP_* env as a dict.
+
+    The gateway merges this dict into PlatformConfig.extra, which the adapter
+    reads. It must pick up every HERMES_SIP_*/HERMES_VOIP_* var present in the
+    process environment, and nothing unrelated.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_SIP_EXTENSION", "1000")
+    monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
+    monkeypatch.setenv("HERMES_VOIP_STT_MODEL_DIR", "/models/stt")
+    monkeypatch.setenv("UNRELATED_VAR", "ignore-me")
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn_raw = ctx.calls[0].get("env_enablement_fn")
+    assert fn_raw is not None
+    assert callable(fn_raw)
+    fn: Callable[[], dict[str, str] | None] = fn_raw
+
+    seed = fn()
+    assert isinstance(seed, dict)
+    assert seed.get("HERMES_SIP_HOST") == "pbx.example.test"
+    assert seed.get("HERMES_SIP_EXTENSION") == "1000"
+    assert seed.get("HERMES_SIP_PASSWORD") == "fake-password"
+    assert seed.get("HERMES_VOIP_STT_MODEL_DIR") == "/models/stt"
+    assert "UNRELATED_VAR" not in seed
+
+
+def test_register_supplies_is_connected() -> None:
+    """register_platform must pass an is_connected gate callable."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn = ctx.calls[0].get("is_connected")
+    assert fn is not None, "register_platform must supply is_connected"
+    assert callable(fn)
+
+
+def test_is_connected_true_when_required_sip_in_extra() -> None:
+    """is_connected(probe) is True when the required SIP keys are in extra."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn_raw = ctx.calls[0].get("is_connected")
+    assert fn_raw is not None
+    assert callable(fn_raw)
+    fn: Callable[[object], bool] = fn_raw
+
+    probe = MagicMock()
+    probe.extra = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "fake",
+    }
+    assert fn(probe) is True
+
+
+def test_is_connected_false_when_sip_env_absent() -> None:
+    """is_connected(probe) is False when the SIP config is missing from extra."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn_raw = ctx.calls[0].get("is_connected")
+    assert fn_raw is not None
+    assert callable(fn_raw)
+    fn: Callable[[object], bool] = fn_raw
+
+    probe = MagicMock()
+    probe.extra = {}
+    assert fn(probe) is False

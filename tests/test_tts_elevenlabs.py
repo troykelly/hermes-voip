@@ -10,6 +10,9 @@ network call is never made.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import threading
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
@@ -20,6 +23,7 @@ from hermes_voip.tts.elevenlabs import (
     ElevenLabsRequest,
     ElevenLabsTTS,
     HttpByteStream,
+    HttpCancellation,
 )
 
 _OUTPUT_RATE = 24_000
@@ -46,8 +50,13 @@ class _RecordedHttp:
         self.closed = False
         self._chunks = chunks
 
-    def open(self, request: ElevenLabsRequest) -> Iterator[bytes]:
+    def open(
+        self, request: ElevenLabsRequest, cancel: HttpCancellation
+    ) -> Iterator[bytes]:
         self.request = request
+        # A real transport arms the cancellation with the live response so a
+        # barge-in closes the socket; this recorded fake completes promptly, so
+        # it simply records teardown via the generator's finally below.
         return self._iter()
 
     def _iter(self) -> Iterator[bytes]:
@@ -62,6 +71,62 @@ class _RecordedHttp:
 async def _text(*parts: str) -> AsyncIterator[str]:
     for part in parts:
         yield part
+
+
+class _OpenEndedText:
+    """Yields one partial (un-terminated) chunk, then stays open indefinitely.
+
+    Lets a test prove ``flush()`` forces the buffered partial text to synthesise
+    *while the input iterator is still open*, not only when it ends.
+    """
+
+    def __init__(self, partial: str) -> None:
+        self.consumed = asyncio.Event()
+        self.release = asyncio.Event()
+        self._partial = partial
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[str]:
+        yield self._partial
+        self.consumed.set()
+        await self.release.wait()
+
+
+class _BlockingHttp:
+    """A transport that parks in its body read until cancellation releases it.
+
+    Models ``_UrllibHttp`` stuck in ``response.read()``: it yields nothing and
+    blocks on an internal event. ``cancel.arm(...)`` registers the releaser, so
+    when the loop calls ``cancel.close()`` on barge-in the blocked read returns
+    and the worker thread is freed — the exact teardown path the no-``on_cancel``
+    bug left hanging until the join timeout.
+    """
+
+    def __init__(self) -> None:
+        self.opened = threading.Event()
+        self.aborted = threading.Event()
+        self._unblock = threading.Event()
+
+    def open(
+        self, request: ElevenLabsRequest, cancel: HttpCancellation
+    ) -> Iterator[bytes]:
+        # Arm BEFORE blocking, exactly like the real transport arms the response
+        # right after urlopen() and before the first read().
+        cancel.arm(self._abort)
+        return self._iter()
+
+    def _abort(self) -> None:
+        self.aborted.set()
+        self._unblock.set()  # release the parked read (socket close => read returns)
+
+    def _iter(self) -> Iterator[bytes]:
+        self.opened.set()
+        # Park as if inside a blocking response.read() with no data yet.
+        self._unblock.wait()
+        return
+        yield b""  # pragma: no cover - unreachable; makes this a generator
 
 
 async def _drain(stream: TtsStream) -> list[PcmFrame]:
@@ -169,6 +234,81 @@ async def test_cancel_before_iteration_yields_nothing() -> None:
     assert await _drain(stream) == []
 
 
+@pytest.mark.asyncio
+async def test_cancel_releases_a_worker_blocked_in_the_http_read() -> None:
+    """Barge-in aborts an in-flight HTTP read and frees the worker promptly.
+
+    The transport is parked as if inside ``response.read()`` (no data yet). With
+    no ``on_cancel`` wired into ``stream_from_thread`` the loop side cannot close
+    the socket, so teardown hangs until the worker-join timeout. A correct
+    cancel() arms the transport's cancellation, closing the response from the loop
+    side so the read returns and the worker exits — ``aclose()`` then completes
+    well within the join timeout (it does not raise the "producer ignored
+    cancellation" RuntimeError).
+    """
+    http = _BlockingHttp()
+    tts = _make(http)
+    stream = tts.synthesize(_text("Interrupt me mid-fetch. "), voice="x")
+
+    iterator = aiter(stream)
+    first = asyncio.ensure_future(anext(iterator))
+    # The worker reaches the (blocked) read; nothing is yielded yet.
+    await asyncio.to_thread(http.opened.wait, 1.0)
+    assert http.opened.is_set()
+    assert not first.done()
+
+    # Barge-in. aclose() awaits the worker join; if cancel did not release the
+    # blocked read this would hang then raise RuntimeError at the join timeout.
+    await asyncio.wait_for(stream.aclose(), timeout=2.0)
+    assert http.aborted.is_set()  # the in-flight read was aborted from the loop
+
+    first.cancel()
+    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+        await first
+
+
+# --- flush forces buffered text to synthesis (input iterator still open) -----
+
+
+@pytest.mark.asyncio
+async def test_flush_synthesises_buffered_text_while_input_is_still_open() -> None:
+    """flush() pushes buffered partial text to a synthesis request mid-stream.
+
+    The agent has emitted only un-terminated words and the input iterator is
+    still open. flush() must force those words into a synthesis request now; we
+    assert the request is made (and frames flow) before the iterator ever ends.
+    """
+    http = _RecordedHttp()
+    tts = _make(http)
+    text = _OpenEndedText("partial unfinished words")
+    stream = tts.synthesize(text, voice="x")
+
+    drained: list[PcmFrame] = []
+
+    async def _consume() -> None:
+        async for frame in stream:
+            drained.append(frame)
+
+    consumer = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(text.consumed.wait(), timeout=1.0)
+        await stream.flush()
+
+        async def _has_request() -> None:
+            while http.request is None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_has_request(), timeout=1.0)
+        assert http.request is not None
+        assert http.request.text == "partial unfinished words"
+        assert not text.release.is_set()  # the input was never ended
+    finally:
+        await stream.cancel()
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
 # --- errors propagate (rule 37) ---------------------------------------------
 
 
@@ -177,7 +317,9 @@ async def test_http_error_propagates_to_the_consumer() -> None:
     """A transport error surfaces from the stream rather than being swallowed."""
 
     class _BoomHttp:
-        def open(self, request: ElevenLabsRequest) -> Iterator[bytes]:
+        def open(
+            self, request: ElevenLabsRequest, cancel: HttpCancellation
+        ) -> Iterator[bytes]:
             if request.text:  # always true here; keeps the yield reachable
                 raise ConnectionError("upstream unavailable")
             yield b""  # pragma: no cover - empty-text branch makes this a generator

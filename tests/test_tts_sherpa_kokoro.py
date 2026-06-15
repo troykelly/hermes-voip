@@ -12,6 +12,7 @@ real-model test (``importorskip``) covers the actual engine when weights exist.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
@@ -77,6 +78,30 @@ async def _text(*parts: str) -> AsyncIterator[str]:
         yield part
 
 
+class _OpenEndedText:
+    """A text source that yields one partial chunk then stays open indefinitely.
+
+    Mirrors a live agent that has emitted a few un-terminated words and is still
+    "thinking": after the chunk is delivered, ``consumed`` is set and the iterator
+    parks on ``release`` (which the test may set to end the turn). This lets a test
+    prove ``flush()`` forces the buffered partial text to synthesise *while the
+    input iterator is still open* — not only when it finally ends.
+    """
+
+    def __init__(self, partial: str) -> None:
+        self.consumed = asyncio.Event()
+        self.release = asyncio.Event()
+        self._partial = partial
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[str]:
+        yield self._partial
+        self.consumed.set()
+        await self.release.wait()
+
+
 async def _drain(stream: TtsStream) -> list[PcmFrame]:
     return [frame async for frame in stream]
 
@@ -137,6 +162,51 @@ async def test_flush_synthesises_the_trailing_unterminated_sentence() -> None:
     # Draining to exhaustion flushes the tail; both segments were synthesised.
     assert fake.requested == ["Complete.", "dangling tail"]
     assert len(frames) == 2
+
+
+@pytest.mark.asyncio
+async def test_flush_synthesises_buffered_text_while_input_is_still_open() -> None:
+    """flush() forces the buffered partial text to synthesise mid-stream.
+
+    The agent has emitted only un-terminated words ("Hello world", no boundary)
+    and the input iterator is still open. Without a working flush() those words
+    sit in the segmenter until the iterator ends; the call loop needs flush() to
+    push them to synthesis NOW. We assert frames for that partial text arrive
+    before the iterator is ever released.
+    """
+    fake = _FakeSynth(chunks_per_call=2)
+    tts = _tts(fake)
+    text = _OpenEndedText("Hello world")
+    stream = tts.synthesize(text, voice="af")
+
+    drained: list[PcmFrame] = []
+
+    async def _consume() -> None:
+        async for frame in stream:
+            drained.append(frame)
+
+    consumer = asyncio.create_task(_consume())
+    try:
+        # Wait until the segmenter has actually consumed the partial chunk, then
+        # flush. The iterator is NEVER released, so any frames can only come from
+        # flush() forcing the buffered "Hello world" to synthesis.
+        await asyncio.wait_for(text.consumed.wait(), timeout=1.0)
+        await stream.flush()
+
+        async def _has_frames() -> None:
+            while not drained:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_has_frames(), timeout=1.0)
+        assert fake.requested == ["Hello world"]
+        assert drained  # buffered partial text was synthesised before iterator end
+        assert all(f.sample_rate == _OUTPUT_RATE for f in drained)
+        assert not text.release.is_set()  # proved it: we never ended the input
+    finally:
+        await stream.cancel()
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
 
 
 @pytest.mark.asyncio

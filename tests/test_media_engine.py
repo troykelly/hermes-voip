@@ -22,7 +22,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import gc
 import socket
+import warnings
 
 import pytest
 
@@ -844,3 +846,120 @@ async def test_inbound_propagates_non_srtp_error() -> None:
         await asyncio.wait_for(task, timeout=2.0)
 
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# (m) a datagram dequeued during a stop-tie is NOT lost (lossless rollback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_tie_does_not_lose_dequeued_datagram() -> None:
+    """A datagram dequeued in the same step the stop flag is set is preserved.
+
+    Regression for a LOW defect: when stop wins a race in which ``queue.get()``
+    had already dequeued a datagram, the old code re-queued it with
+    ``put_nowait`` under ``suppress(QueueFull)`` — silently dropping it if the
+    bounded queue had refilled.  Rollback is now lossless: the datagram is
+    parked in a private one-item slot (``_pending``) that is checked before the
+    queue, so it survives regardless of queue capacity and is returned next.
+
+    We drive ``_next_datagram`` directly (white-box) for a deterministic tie:
+    park it on an empty queue so its internal ``get_task`` blocks, then in the
+    SAME loop step enqueue a datagram and set the stop flag.  Both the get and
+    the stop resolve together; stop wins; the dequeued datagram must be parked,
+    not lost.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        clock=_dummy_clock,
+    )
+    await engine.connect()
+    assert engine._recv_queue.qsize() == 0
+
+    # Park _next_datagram in its internal asyncio.wait on an EMPTY queue.
+    nd_task: asyncio.Task[bytes | None] = asyncio.create_task(engine._next_datagram())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # Same loop step: a datagram arrives AND stop is signalled → a tie.
+    tie_datagram = _make_rtp(7, 7 * _SAMPLES_PER_FRAME, _ulaw_silence())
+    engine._recv_queue.put_nowait(tie_datagram)
+    engine._stop_event.set()
+
+    # Stop wins the tie → returns None, but the dequeued datagram is preserved.
+    result = await asyncio.wait_for(nd_task, timeout=2.0)
+    assert result is None
+    assert engine._pending == tie_datagram
+    # The datagram was taken off the queue (dequeued), not left/duplicated.
+    assert engine._recv_queue.qsize() == 0
+
+    # Prove the rollback is capacity-independent: fill the queue to capacity,
+    # then the NEXT _next_datagram() still returns the parked datagram FIRST
+    # (a re-queue under a full queue would have lost it).
+    capacity = engine._recv_queue.maxsize
+    for _ in range(capacity):
+        engine._recv_queue.put_nowait(b"\x00\x00\x00\x00")
+    assert engine._recv_queue.full()
+
+    engine._stop_event.clear()  # simulate the engine being reused after stop
+    nxt = await asyncio.wait_for(engine._next_datagram(), timeout=2.0)
+    assert nxt == tie_datagram  # the rolled-back datagram, delivered losslessly
+    assert engine._pending is None  # slot cleared after delivery
+
+    await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# (n) the stop/recv race leaks no pending task (RuntimeWarning-as-error)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_recv_race_leaks_no_pending_task() -> None:
+    """The loser of the stop/recv race is awaited — no task is left pending.
+
+    Regression for a MEDIUM defect: ``_next_datagram`` cancelled the losing race
+    task but never awaited it, so cleanup was deferred and a "Task was destroyed
+    but it is pending" RuntimeWarning was possible.  Both race tasks are now
+    cancelled AND awaited.
+
+    Treating RuntimeWarning as an error makes a leaked/destroyed task fail the
+    test; a forced GC surfaces any task finalised without being awaited.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+
+        engine = RtpMediaTransport(
+            local_address="127.0.0.1",
+            local_port=0,
+            remote_address="127.0.0.1",
+            remote_port=5004,
+            codec=Codec.PCMU,
+            clock=_dummy_clock,
+        )
+
+        async def _drain() -> int:
+            count = 0
+            async for _frame in engine.inbound_audio():
+                count += 1
+            return count
+
+        # Run several stop/recv cycles so the race's losing task is created and
+        # must be cleaned up each time.
+        for _ in range(3):
+            await engine.connect()
+            task: asyncio.Task[int] = asyncio.create_task(_drain())
+            await asyncio.sleep(0)  # let the generator park in the race
+            await asyncio.sleep(0)
+            await engine.stop()  # stop wins; the get-task must be cancelled+awaited
+            produced = await asyncio.wait_for(task, timeout=2.0)
+            assert produced == 0
+
+        # Force finalisation of any orphaned task object; a pending one would
+        # emit a RuntimeWarning, which is promoted to an error here.
+        gc.collect()

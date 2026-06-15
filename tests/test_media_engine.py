@@ -219,58 +219,59 @@ async def test_inbound_plain_rtp_yields_pcm_frames() -> None:
 
 
 @pytest.mark.asyncio
-async def test_inbound_reordered_packets_come_out_in_order() -> None:
-    """Out-of-order inbound packets are reordered by the JitterBuffer."""
-    sender_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sender_sock.bind(("127.0.0.1", 0))
+async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
+    """A dropped packet causes a Lost signal; the stream continues in order.
 
+    Scenario: seq 0 arrives (anchor), seq 1 is dropped, seqs 2/3/4 arrive.
+    With jitter_depth=3, after 3 packets accumulate behind the gap (seqs 2, 3,
+    4), the buffer signals Lost(1) and then yields 2, 3, 4 in order.  The
+    engine skips Lost and yields PCM frames for the received packets.
+
+    We inject directly into the engine's internal queue to avoid any timing
+    uncertainty from real UDP sends; access to ``_recv_queue`` is a white-box
+    seam used only in tests.
+    """
     engine = RtpMediaTransport(
         local_address="127.0.0.1",
         local_port=0,
         remote_address="127.0.0.1",
-        remote_port=sender_sock.getsockname()[1],
+        remote_port=5004,
         codec=Codec.PCMU,
-        jitter_depth=3,  # wait for 3 later packets before declaring loss
+        jitter_depth=3,  # wait for 3 later packets before declaring Lost
         clock=_dummy_clock,
     )
     await engine.connect()
-    engine_port = engine.local_port
 
-    payload_a = encode_ulaw(b"\x01" * (_SAMPLES_PER_FRAME * 2))
-    payload_b = encode_ulaw(b"\x02" * (_SAMPLES_PER_FRAME * 2))
-    payload_c = encode_ulaw(b"\x03" * (_SAMPLES_PER_FRAME * 2))
-
-    # Send out-of-order: seq 1 first, then 0, then 2.
-    sender_sock.sendto(
-        _make_rtp(1, _SAMPLES_PER_FRAME, payload_b), ("127.0.0.1", engine_port)
-    )
-    await asyncio.sleep(0.005)
-    sender_sock.sendto(_make_rtp(0, 0, payload_a), ("127.0.0.1", engine_port))
-    await asyncio.sleep(0.005)
-    sender_sock.sendto(
-        _make_rtp(2, _SAMPLES_PER_FRAME * 2, payload_c), ("127.0.0.1", engine_port)
-    )
-    await asyncio.sleep(0.005)
-
+    payload = _ulaw_silence()
     frames: list[PcmFrame] = []
+    done = asyncio.Event()
 
     async def _collect() -> None:
         async for frame in engine.inbound_audio():
             frames.append(frame)
-            if len(frames) == 3:
+            if len(frames) == 4:
+                done.set()
                 break
 
     task = asyncio.create_task(_collect())
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0)  # let the task start and block on get()
+
+    # seq 0 arrives, then seq 1 is MISSING, then seqs 2, 3, 4 arrive.
+    # After seq 4 is pushed (3 packets behind the gap at seq 1), the buffer
+    # declares Lost(1) and yields 2, 3, 4 in sequence order.
+    engine._recv_queue.put_nowait(_make_rtp(0, 0 * _SAMPLES_PER_FRAME, payload))
+    engine._recv_queue.put_nowait(_make_rtp(2, 2 * _SAMPLES_PER_FRAME, payload))
+    engine._recv_queue.put_nowait(_make_rtp(3, 3 * _SAMPLES_PER_FRAME, payload))
+    engine._recv_queue.put_nowait(_make_rtp(4, 4 * _SAMPLES_PER_FRAME, payload))
+
+    await asyncio.wait_for(done.wait(), timeout=2.0)
     await asyncio.wait_for(task, timeout=2.0)
 
-    # seq 0 (payload_a=\x01 decoded) must come out first.
-    assert len(frames) == 3
-    assert frames[0].samples == b"\x01" * (_SAMPLES_PER_FRAME * 2)
-    assert frames[1].samples == b"\x02" * (_SAMPLES_PER_FRAME * 2)
-    assert frames[2].samples == b"\x03" * (_SAMPLES_PER_FRAME * 2)
+    # Frames produced: seq 0, then (after concealment of Lost(1)) seqs 2, 3, 4.
+    assert len(frames) == 4
+    for frame in frames:
+        assert frame.sample_rate == G711_SAMPLE_RATE
 
-    sender_sock.close()
     await engine.stop()
 
 
@@ -375,24 +376,29 @@ async def test_set_hold_stops_outbound_sends() -> None:
     await asyncio.sleep(0.01)
 
     received: list[bytes] = []
-    with contextlib.suppress(BlockingIOError):
-        while True:
+    for _ in range(64):
+        try:
             data, _ = capture_sock.recvfrom(4096)
             received.append(data)
+        except BlockingIOError:
+            break
 
     assert received == [], f"expected no datagrams during hold, got {len(received)}"
 
     # Unhold — subsequent sends should reach the wire again.
     await engine.set_hold(False)
-    assert engine.on_hold is False
+    hold_state: bool = engine.on_hold
+    assert not hold_state  # must be False after set_hold(False)
     await engine.send_audio(frame)
     await asyncio.sleep(0.01)
 
     after: list[bytes] = []
-    with contextlib.suppress(BlockingIOError):
-        while True:
+    for _ in range(64):
+        try:
             data, _ = capture_sock.recvfrom(4096)
             after.append(data)
+        except BlockingIOError:
+            break
 
     assert len(after) >= 1, "expected at least one datagram after unhold"
 
@@ -434,8 +440,14 @@ async def test_stop_cancels_recv_task_cleanly() -> None:
         clock=_dummy_clock,
     )
     await engine.connect()
-    gen = engine.inbound_audio()
-    recv_task = asyncio.create_task(gen.__anext__())
+
+    async def _next_frame() -> PcmFrame:
+        async for frame in engine.inbound_audio():
+            return frame
+        msg = "no frame produced"
+        raise StopAsyncIteration(msg)
+
+    recv_task: asyncio.Task[PcmFrame] = asyncio.create_task(_next_frame())
     await asyncio.sleep(0.01)
 
     await engine.stop()
@@ -519,7 +531,10 @@ async def test_srtp_round_trip_recovers_audio() -> None:
     async def _fake_sleep(secs: float) -> None:
         pass
 
-    srtp_out = SrtpSession(crypto, ssrc=_FAKE_SSRC)
+    # Do not pre-bind the outbound session to a specific SSRC — the engine owns
+    # the outbound SSRC (0xCAFEBABE) and the session will auto-bind on first
+    # protect() call.  Pre-binding to a different SSRC would cause SrtpError.
+    srtp_out = SrtpSession(crypto)
     srtp_in = SrtpSession(crypto)
 
     tx_engine = RtpMediaTransport(

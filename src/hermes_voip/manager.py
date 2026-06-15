@@ -26,7 +26,7 @@ import contextlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Protocol, assert_never, runtime_checkable
 
 from hermes_voip.config import ExtensionConfig, GatewayConfig
 from hermes_voip.message import SipRequest, SipResponse
@@ -35,6 +35,7 @@ from hermes_voip.registration import (
     Failed,
     Registered,
     RegistrationFlow,
+    Retry,
 )
 
 __all__ = [
@@ -238,7 +239,9 @@ class RegistrationManager:
             raise KeyError(msg)
         state = self._flows[call_id]
         outcome = state.flow.handle(response)
-        if isinstance(outcome, Challenged):
+        # Challenged (401/407) and Retry (423 Interval Too Brief) both carry a
+        # ready-to-send follow-up request; the rest update registration state.
+        if isinstance(outcome, Challenged | Retry):
             await self._transport.send(outcome.request)
         elif isinstance(outcome, Registered):
             state.registered = True
@@ -247,6 +250,10 @@ class RegistrationManager:
             self._schedule_refresh(state, outcome.expires)
         elif isinstance(outcome, Failed):
             state.registered = False
+        else:
+            # Exhaustive over RegistrationOutcome: a future member fails mypy here
+            # (and raises at runtime), never silently dropped (rule 37).
+            assert_never(outcome)
 
     def _schedule_refresh(self, state: _FlowState, expires: int) -> None:
         if state.refresh_task is not None:

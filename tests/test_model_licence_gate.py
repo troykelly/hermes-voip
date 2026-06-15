@@ -201,6 +201,35 @@ def test_model_file_rejects_a_malformed_sha256() -> None:
         ModelFile(name="model.onnx", sha256="deadbeef", spdx="Apache-2.0")
 
 
+@pytest.mark.parametrize(
+    "bad_spdx",
+    [
+        " ",  # whitespace only
+        "Apache 2.0",  # space instead of hyphen — not a valid id
+        "Apache-2.0 OR MIT",  # an SPDX expression, not a simple id
+        "Apache-2.0 AND MIT",
+        "GPL-2.0-only WITH Classpath-exception-2.0",
+        "Apache-2.0+",  # trailing '+' operator
+        "Apache-2.0 ",  # trailing whitespace
+    ],
+)
+def test_model_file_rejects_a_malformed_spdx_id(bad_spdx: str) -> None:
+    """A malformed SPDX id (whitespace / expression operators) is rejected.
+
+    The allow-list gate already rejects anything outside an exact id, but the
+    pinned-artifact metadata itself must be a single well-formed SPDX id, not an
+    expression or a value with stray whitespace (audit-quality boundary).
+    """
+    with pytest.raises(ValueError, match="spdx"):
+        ModelFile(name="model.onnx", sha256=_FAKE_SHA256, spdx=bad_spdx)
+
+
+def test_model_file_accepts_well_formed_spdx_ids() -> None:
+    """Valid simple SPDX ids (including a LicenseRef-) construct cleanly."""
+    for ok in ("Apache-2.0", "MIT", "CC0-1.0", "CC-BY-4.0", "LicenseRef-CPML"):
+        assert ModelFile(name="m.onnx", sha256=_FAKE_SHA256, spdx=ok).spdx == ok
+
+
 def test_model_manifest_rejects_a_malformed_revision() -> None:
     """A revision that is not a 40-hex commit SHA is not a real pin."""
     with pytest.raises(ValueError, match="revision"):

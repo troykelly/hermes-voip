@@ -85,6 +85,9 @@ class _FakeRecognizer:
         self._steps = steps
         self._index = 0
         self._ready = False
+        # Mirrors real sherpa: after reset() the current segment is cleared, so
+        # get_result() is "" and is_endpoint() is False until the next decode.
+        self._cleared = True
         self.resets = 0
         self.created_streams = 0
         self.last_stream: _FakeStream | None = None
@@ -112,19 +115,21 @@ class _FakeRecognizer:
     def decode_stream(self, stream: _FakeStream) -> None:
         if self._index < len(self._steps):
             self._index += 1
+            self._cleared = False
 
     def get_result(self, stream: _FakeStream) -> str:
-        if self._index == 0:
+        if self._cleared or self._index == 0:
             return ""
         return self._steps[self._index - 1].text
 
     def is_endpoint(self, stream: _FakeStream) -> bool:
-        if self._index == 0:
+        if self._cleared or self._index == 0:
             return False
         return self._steps[self._index - 1].endpoint
 
     def reset(self, stream: _FakeStream) -> None:
         self.resets += 1
+        self._cleared = True  # the finalized segment is consumed
 
     def input_finished(self, stream: _FakeStream) -> None:
         stream.finished = True
@@ -171,7 +176,13 @@ async def test_sherpa_asr_emits_interim_then_final_on_endpoint() -> None:
 
 @pytest.mark.asyncio
 async def test_sherpa_asr_starts_a_new_segment_after_endpoint() -> None:
-    """After a final, decoding continues into a fresh segment (multi-utterance)."""
+    """After a final, decoding continues into a fresh segment (multi-utterance).
+
+    The second utterance never reaches an engine endpoint, so it is emitted as an
+    interim and then promoted to a final at end-of-stream (the flush; see
+    ``test_sherpa_asr_flushes_tail_on_input_end``) — the consumer always gets a
+    closing final per utterance.
+    """
     recognizer = _FakeRecognizer(
         [
             _Script("yes", endpoint=True),
@@ -184,13 +195,18 @@ async def test_sherpa_asr_starts_a_new_segment_after_endpoint() -> None:
     assert [(t.text, t.is_final) for t in out] == [
         ("yes", True),
         ("please", False),
+        ("please", True),  # promoted to final by the end-of-stream flush
     ]
     assert recognizer.resets == 1
 
 
 @pytest.mark.asyncio
 async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
-    """An empty decode result is not emitted as a transcript (no blank partials)."""
+    """An empty decode result is not emitted as a transcript (no blank partials).
+
+    The non-empty hypothesis is emitted once as interim and once, promoted, as the
+    end-of-stream final; the blank result in between is never emitted.
+    """
     recognizer = _FakeRecognizer(
         [
             _Script("", endpoint=False),
@@ -199,7 +215,7 @@ async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
     )
     asr = SherpaOnnxASR.from_recognizer(recognizer)
     out = [t async for t in asr.stream(_frames(_frame(1), _frame(2)))]
-    assert [t.text for t in out] == ["hi"]
+    assert [(t.text, t.is_final) for t in out] == [("hi", False), ("hi", True)]
 
 
 @pytest.mark.asyncio

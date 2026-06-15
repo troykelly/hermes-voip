@@ -10,11 +10,17 @@ short"). These tests pin the pure segmentation contract: ``SentenceAggregator``
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 
 import pytest
 
-from hermes_voip.tts.segment import SentenceAggregator, segment_stream
+from hermes_voip.tts.segment import (
+    FlushableSegmenter,
+    SentenceAggregator,
+    segment_stream,
+)
 
 
 def _drain(agg: SentenceAggregator, chunks: list[str]) -> list[str]:
@@ -153,3 +159,96 @@ async def test_segment_stream_whitespace_only_input_yields_nothing() -> None:
     """Whitespace-only text has no real segment to synthesise."""
     out = [seg async for seg in segment_stream(_tokens("   ", "\n\t "))]
     assert out == []
+
+
+# --- FlushableSegmenter: out-of-band flush + error propagation ---------------
+
+
+class _OpenEndedTokens:
+    """A real ``AsyncIterator[str]``: yields one partial chunk, then stays open.
+
+    Lets a test drive ``FlushableSegmenter.flush()`` while the input is still
+    open (the call loop's end-of-turn lever), exactly as a live agent stream that
+    has emitted a few un-terminated words and is still producing.
+    """
+
+    def __init__(self, partial: str) -> None:
+        self.consumed = asyncio.Event()
+        self.release = asyncio.Event()
+        self._partial = partial
+        self._yielded = False
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._yielded:
+            self._yielded = True
+            return self._partial
+        self.consumed.set()
+        await self.release.wait()
+        raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_flushable_segmenter_flush_emits_buffer_while_input_open() -> None:
+    """flush() drains the buffered partial text to a segment, input still open."""
+    text = _OpenEndedTokens("partial unfinished words")
+    seg = FlushableSegmenter(text)
+    out: list[str] = []
+
+    async def _consume() -> None:
+        async for segment in seg:
+            out.append(segment)
+
+    consumer = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(text.consumed.wait(), timeout=1.0)
+        await seg.flush()
+
+        async def _has() -> None:
+            while not out:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_has(), timeout=1.0)
+        assert out == ["partial unfinished words"]
+        assert not text.release.is_set()  # the input was never ended
+    finally:
+        await seg.aclose()
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
+@pytest.mark.asyncio
+async def test_flushable_segmenter_emits_completed_segments_then_flushes_tail() -> None:
+    """It yields completed sentences as they arrive, then the trailing remainder."""
+    seg = FlushableSegmenter(_tokens("First one. ", "tail without end"))
+    out = [segment async for segment in seg]
+    assert out == ["First one.", "tail without end"]
+
+
+@pytest.mark.asyncio
+async def test_flushable_segmenter_propagates_input_error() -> None:
+    """An error from the input stream surfaces to the consumer (rule 37).
+
+    The valid segment before the error is still delivered; the exception then
+    re-raises rather than being swallowed.
+    """
+
+    async def _boom() -> AsyncIterator[str]:
+        yield "Before the error. "
+        msg = "input stream exploded"
+        raise RuntimeError(msg)
+
+    seg = FlushableSegmenter(_boom())
+    seen: list[str] = []
+
+    async def _consume() -> None:
+        async for segment in seg:
+            seen.append(segment)
+
+    with pytest.raises(RuntimeError, match="input stream exploded"):
+        await _consume()
+    assert seen == ["Before the error."]
+    await seg.aclose()

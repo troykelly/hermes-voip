@@ -276,12 +276,13 @@ _PCM16_FULL_SCALE: Final[float] = 32768.0
 
 
 # numpy/onnxruntime ship no ``py.typed`` and are absent in the default gate, so
-# their public API is untyped to the checker. Rather than reach for
-# ``# type: ignore`` (rule 17), we declare *narrow local Protocols* covering only
-# the handful of array/session operations the live path uses. The dynamically
-# imported module/session (held as ``Any`` from ``importlib``) is assignable to
-# these structural types with no cast, and the math below is then fully checked in
-# BOTH the no-ml gate and an ml environment.
+# their public API is untyped to the checker. Rather than suppress the resulting
+# errors with an escape hatch (rule 17 bans them), we declare *narrow local
+# Protocols* covering only the handful of array/session operations the live path
+# uses. The dynamically imported module/session (a ``ModuleType`` from
+# ``importlib``, whose attribute access yields ``Any``) is assignable to these
+# structural types with no cast, and the math below is then fully checked in BOTH
+# the no-ml gate and an ml environment.
 
 
 @runtime_checkable

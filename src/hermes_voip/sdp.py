@@ -20,8 +20,21 @@ _STATIC_PAYLOADS: dict[int, tuple[str, int]] = {
     18: ("G729", 8000),
 }
 _DIRECTIONS = frozenset({"sendrecv", "sendonly", "recvonly", "inactive"})
+# RFC 3264 §6.1: the answer mirrors the offer's direction. An offerer that can
+# only send wants us to only receive, and vice versa; inactive stays inactive.
+_ANSWER_DIRECTION: dict[str, str] = {
+    "sendrecv": "sendrecv",
+    "sendonly": "recvonly",
+    "recvonly": "sendonly",
+    "inactive": "inactive",
+}
 _TELEPHONE_EVENT = "telephone-event"
+_OPUS = "opus"
+# G.711 payloads, emitted after Opus when Opus is offered (ADR-0005 codec order).
+_G711_ENCODINGS = frozenset({"PCMU", "PCMA"})
 _DEFAULT_CLOCK_RATE = 8000
+_SECURE_PROFILE = "RTP/SAVP"
+_PLAIN_PROFILE = "RTP/AVP"
 _CONN_ADDR_FIELD = 2  # c=<nettype> <addrtype> <address>
 _MIN_LINE_LEN = 2  # an SDP line is at minimum "<type>="
 _M_AUDIO_MIN_FIELDS = 3  # m=audio <port> <proto> [<fmt>...]
@@ -240,6 +253,81 @@ def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec,
     return chosen
 
 
+def _order_opus_first(codecs: Sequence[Codec]) -> tuple[Codec, ...]:
+    """Reorder to Opus, then G.711 (PCMU/PCMA), then everything else.
+
+    A no-op when no Opus codec is present: the supplied order is preserved
+    exactly (ADR-0005 only mandates promoting Opus ahead of G.711 when Opus is
+    offered). Relative order within each band is kept stable.
+    """
+    if not any(c.encoding.lower() == _OPUS for c in codecs):
+        return tuple(codecs)
+
+    def band(codec: Codec) -> int:
+        if codec.encoding.lower() == _OPUS:
+            return 0
+        if codec.encoding.upper() in _G711_ENCODINGS:
+            return 1
+        return 2
+
+    return tuple(sorted(codecs, key=band))
+
+
+def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
+    *,
+    local_address: str,
+    port: int,
+    codecs: Sequence[Codec],
+    direction: str,
+    ptime: int,
+    session_id: int,
+    sess_version: int,
+    crypto: str | None,
+) -> str:
+    """Emit the SDP body shared by offer and answer.
+
+    The profile is ``RTP/SAVP`` with a single ``a=crypto:1`` line when ``crypto``
+    is supplied (RFC 4568 SDES), otherwise plain ``RTP/AVP``. Validation of
+    ``direction``/``codecs``/``port``/``ptime`` happens here so both callers
+    enforce the same invariants. The SRTP master key/salt is the caller's; this
+    function never generates key material.
+    """
+    if direction not in _DIRECTIONS:
+        msg = f"invalid SDP direction: {direction!r}"
+        raise ValueError(msg)
+    if not codecs:
+        msg = "an SDP audio body needs at least one codec"
+        raise ValueError(msg)
+    if not 1 <= port <= _MAX_PORT:
+        msg = f"RTP port out of range 1..{_MAX_PORT}: {port}"
+        raise ValueError(msg)
+    if ptime <= 0:
+        msg = f"ptime must be positive, got {ptime}"
+        raise ValueError(msg)
+    profile = _SECURE_PROFILE if crypto is not None else _PLAIN_PROFILE
+    payloads = " ".join(str(c.payload_type) for c in codecs)
+    lines = [
+        "v=0",
+        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
+        "s=-",
+        f"c=IN IP4 {local_address}",
+        "t=0 0",
+        f"m=audio {port} {profile} {payloads}",
+    ]
+    for codec in codecs:
+        rate = f"{codec.encoding}/{codec.clock_rate}"
+        if codec.channels != 1:
+            rate = f"{rate}/{codec.channels}"
+        lines.append(f"a=rtpmap:{codec.payload_type} {rate}")
+        if codec.fmtp is not None:
+            lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
+    if crypto is not None:
+        lines.append(f"a=crypto:1 {crypto}")
+    lines.append(f"a=ptime:{ptime}")
+    lines.append(f"a={direction}")
+    return _CRLF.join(lines) + _CRLF
+
+
 def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
     *,
     local_address: str,
@@ -249,19 +337,28 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
     ptime: int = 20,
     session_id: int = 0,
     version: int | None = None,
+    crypto: str | None = None,
 ) -> str:
-    """Build an SDP audio offer/answer body (RTP/AVP).
+    """Build an SDP audio offer/answer body (RTP/AVP, or RTP/SAVP with crypto).
 
     Args:
         local_address: The address we receive RTP on (IPv4 literal).
         port: The RTP port we receive on.
-        codecs: The codecs to offer, in preference order.
+        codecs: The codecs to offer, in preference order. When an Opus codec is
+            present it is promoted ahead of G.711 (ADR-0005); otherwise the given
+            order is preserved.
         direction: Media direction attribute.
         ptime: Packetisation time in ms.
         session_id: SDP ``o=`` session id (constant for the life of a dialog).
         version: SDP ``o=`` session version. A re-offer keeps ``session_id``
             constant and increments ``version`` (RFC 4566 §5.2, ADR-0011
             invariant 1). Defaults to ``session_id`` for an initial offer.
+        crypto: SDES key parameter for SRTP (RFC 4568) — the suite plus the
+            ``inline:`` master key||salt, e.g.
+            ``AES_CM_128_HMAC_SHA1_80 inline:<base64-key||salt>``. When supplied,
+            the profile becomes ``RTP/SAVP`` and an ``a=crypto:1`` line is added;
+            the key material is the caller's, never generated here. DTLS-SRTP
+            fingerprints and ICE candidates are out of scope (deferred to W12).
 
     Returns:
         The SDP body terminated by CRLF, ready to attach to an INVITE/200.
@@ -271,34 +368,85 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
             outside ``1..65535``, or ``ptime`` is not positive.
     """
     sess_version = session_id if version is None else version
-    if direction not in _DIRECTIONS:
-        msg = f"invalid SDP direction: {direction!r}"
-        raise ValueError(msg)
-    if not codecs:
-        msg = "an SDP audio offer needs at least one codec"
-        raise ValueError(msg)
-    if not 1 <= port <= _MAX_PORT:
-        msg = f"RTP port out of range 1..{_MAX_PORT}: {port}"
-        raise ValueError(msg)
-    if ptime <= 0:
-        msg = f"ptime must be positive, got {ptime}"
-        raise ValueError(msg)
-    payloads = " ".join(str(c.payload_type) for c in codecs)
-    lines = [
-        "v=0",
-        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
-        "s=-",
-        f"c=IN IP4 {local_address}",
-        "t=0 0",
-        f"m=audio {port} RTP/AVP {payloads}",
-    ]
-    for codec in codecs:
-        rate = f"{codec.encoding}/{codec.clock_rate}"
-        if codec.channels != 1:
-            rate = f"{rate}/{codec.channels}"
-        lines.append(f"a=rtpmap:{codec.payload_type} {rate}")
-        if codec.fmtp is not None:
-            lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
-    lines.append(f"a=ptime:{ptime}")
-    lines.append(f"a={direction}")
-    return _CRLF.join(lines) + _CRLF
+    return _build_audio_body(
+        local_address=local_address,
+        port=port,
+        codecs=_order_opus_first(codecs),
+        direction=direction,
+        ptime=ptime,
+        session_id=session_id,
+        sess_version=sess_version,
+        crypto=crypto,
+    )
+
+
+def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
+    offer: SessionDescription,
+    *,
+    local_address: str,
+    port: int,
+    supported: Sequence[str],
+    ptime: int = 20,
+    session_id: int = 0,
+    version: int | None = None,
+    crypto: str | None = None,
+) -> str:
+    """Build an SDP answer to ``offer`` (RFC 3264 §6.1).
+
+    Negotiates the codecs common to the offer and ``supported`` (in the offer's
+    preference order, via :func:`negotiate_audio`), mirrors the offered
+    direction (sendrecv->sendrecv, sendonly->recvonly, recvonly->sendonly,
+    inactive->inactive), and answers a secured (``RTP/SAVP``) offer by keying our
+    own ``a=crypto`` from ``crypto``. The answer's payload ordering follows the
+    offer, not ``supported`` — the answerer honours the offerer's preference.
+
+    DTLS-SRTP fingerprints and ICE attributes are explicitly out of scope here
+    (deferred to W12); this builds SDES-keyed SAVP or plain AVP only.
+
+    Args:
+        offer: The parsed peer offer to answer; must carry audio media.
+        local_address: The address we receive RTP on (IPv4 literal).
+        port: The RTP port we receive on.
+        supported: Encoding names we can handle (case-insensitive).
+        ptime: Packetisation time in ms.
+        session_id: SDP ``o=`` session id for the answer.
+        version: SDP ``o=`` session version (defaults to ``session_id``).
+        crypto: Our SDES key parameter (RFC 4568) — required to answer an
+            ``RTP/SAVP`` offer, ignored for a plain ``RTP/AVP`` offer.
+
+    Returns:
+        The SDP answer body terminated by CRLF, ready to attach to a 200 OK.
+
+    Raises:
+        SdpError: If the offer has no audio media, shares no usable voice codec
+            (e.g. a telephone-event-only offer), or is secured (``RTP/SAVP``)
+            while no ``crypto`` was supplied to key the answer.
+    """
+    audio = offer.audio
+    if audio is None:
+        msg = "cannot answer an offer with no audio media"
+        raise SdpError(msg)
+    try:
+        chosen = negotiate_audio(audio, supported)
+    except ValueError as exc:
+        # negotiate_audio raises plain ValueError; surface as SdpError so callers
+        # handle one inbound-SDP error type. Preserves the "no common audio
+        # codec" message (covers the telephone-event-only rejection).
+        raise SdpError(str(exc)) from exc
+    answer_crypto: str | None = None
+    if audio.is_srtp:
+        if crypto is None:
+            msg = "cannot answer an RTP/SAVP offer without a crypto key"
+            raise SdpError(msg)
+        answer_crypto = crypto
+    sess_version = session_id if version is None else version
+    return _build_audio_body(
+        local_address=local_address,
+        port=port,
+        codecs=chosen,
+        direction=_ANSWER_DIRECTION[audio.direction],
+        ptime=ptime,
+        session_id=session_id,
+        sess_version=sess_version,
+        crypto=answer_crypto,
+    )

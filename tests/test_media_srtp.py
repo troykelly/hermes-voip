@@ -640,6 +640,33 @@ class TestPerSsrcBinding:
         with pytest.raises(SrtpError, match="SSRC"):
             tx.protect(_make_packet(seq=2, ssrc=0x0BADBEEF))
 
+    def test_forged_first_packet_does_not_bind_ssrc(self) -> None:
+        """A forged (bad-auth) first packet must NOT bind the receiver's SSRC.
+
+        Auth is verified before the SSRC binding, so an attacker who injects a
+        packet with an arbitrary SSRC before the first legitimate one cannot
+        wedge the session onto the wrong SSRC: the forged packet fails auth, the
+        binding never happens, and the genuine stream still works.
+        """
+        crypto = _make_crypto()
+        tx = SrtpSession(crypto)
+        rx = SrtpSession(crypto)
+        # Forge a packet for a spoofed SSRC, then corrupt its auth tag.
+        forged = bytearray(tx.protect(_make_packet(seq=1, ssrc=0x5F00F000)))
+        forged[-1] ^= 0xFF
+        with pytest.raises(SrtpError, match="auth"):
+            rx.unprotect(bytes(forged))
+        # The receiver is still unbound: a genuine packet on a different SSRC is
+        # accepted and recovers its payload (the forged SSRC did not stick).
+        genuine_tx = SrtpSession(crypto)
+        payload = bytes(range(160))
+        genuine = genuine_tx.protect(
+            _make_packet(seq=1, ssrc=0xABCD1234, payload=payload)
+        )
+        recovered = rx.unprotect(genuine)
+        assert recovered.payload == payload
+        assert recovered.ssrc == 0xABCD1234
+
 
 # ---------------------------------------------------------------------------
 # SDES session params (lifetime / MKI) rejection at construction.

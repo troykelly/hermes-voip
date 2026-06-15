@@ -30,7 +30,7 @@ import hmac
 import importlib
 import struct
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from hermes_voip.rtp import RtpPacket
 from hermes_voip.sdp import CryptoAttribute
@@ -69,8 +69,19 @@ _AES_BLOCK = 16
 _REPLAY_WINDOW = 64
 _REPLAY_WINDOW_MASK = (1 << _REPLAY_WINDOW) - 1
 
-# RTP fixed header size.
+# RTP fixed header size (V/P/X/CC/M/PT, seq, timestamp, SSRC), before any CSRC
+# list or header extension (RFC 3550 §5.1).
 _RTP_HEADER_LEN = 12
+
+# RTP header-extension preamble length: 2-byte profile + 2-byte length-in-words.
+_RTP_EXT_HEADER_LEN = 4
+
+# One CSRC identifier / one extension word is 4 octets (RFC 3550 §5.1, §5.3.1).
+_RTP_WORD = 4
+
+# RTP first-byte bit masks (RFC 3550 §5.1).
+_RTP_CSRC_COUNT_MASK = 0x0F  # CC: number of CSRC identifiers after the header
+_RTP_EXTENSION_BIT = 0x10  # X: a header extension follows the CSRC list
 
 # Minimum raw SRTP byte length: 12-byte RTP header + 4-byte minimum auth tag.
 _MIN_SRTP_LEN = _RTP_HEADER_LEN + 4
@@ -105,36 +116,78 @@ class SrtpError(ValueError):
 # Narrow Protocol surface over the optional ``cryptography`` extra.
 #
 # ``cryptography`` is in the optional ``media`` extra, absent in the default
-# install and its mypy gate.  These Protocols describe the exact members used
-# in _aes_cm_keystream; the lazy resolver _get_cipher() binds
-# importlib.import_module(...) to a Protocol-typed handle.  mypy stays clean
-# under both the no-media gate and the media env — no Any, no cast, no
-# # type: ignore (AGENTS.md rules 17/39).
+# install and its mypy gate.  Mirroring the ``ml``-extra lanes
+# (``hermes_voip.media.vad`` / ``hermes_voip.stt.sherpa_onnx``): rather than
+# suppress the resulting untyped-import errors with an escape hatch (AGENTS.md
+# rules 17/39 ban them), we declare *narrow local Protocols* covering only the
+# constructors and methods the keystream path uses.  A module attribute resolved
+# via ``importlib.import_module`` is a ``ModuleType`` whose attribute access
+# yields ``Any``; ``Any`` is assignable to these structural callables with NO
+# cast, and every subsequent call is then fully type-checked — clean in BOTH the
+# no-media gate and the media env, with zero ``# type: ignore``.
 # ---------------------------------------------------------------------------
 
 
 class _CipherContext(Protocol):
     """The subset of cryptography's ``CipherContext`` used here."""
 
-    def update(self, data: bytes) -> bytes: ...
-    def finalize(self) -> bytes: ...
+    def update(self, data: bytes) -> bytes:
+        """Feed plaintext (here: zero bytes) and return the keystream chunk."""
+        ...
+
+    def finalize(self) -> bytes:
+        """Finalise the cipher and return any trailing keystream bytes."""
+        ...
 
 
 class _CipherHandle(Protocol):
     """The subset of cryptography's ``Cipher`` object used here."""
 
-    def encryptor(self) -> _CipherContext: ...
+    def encryptor(self) -> _CipherContext:
+        """Return an encryptor context for this cipher."""
+        ...
 
 
-@runtime_checkable
-class _CryptographyModule(Protocol):
-    """Combined surface of ciphers + algorithms + modes used in _aes_cm_keystream."""
+class _Algorithm(Protocol):
+    """Opaque handle for an ``algorithms.AES`` instance (passed to ``Cipher``)."""
 
-    def make_cipher(self, key: bytes, iv: bytes) -> _CipherHandle: ...
+
+class _Mode(Protocol):
+    """Opaque handle for a ``modes.CTR`` instance (passed to ``Cipher``)."""
+
+
+class _AesCtor(Protocol):
+    """The ``algorithms.AES`` constructor surface (``AES(key) -> algorithm``)."""
+
+    def __call__(self, key: bytes) -> _Algorithm:
+        """Construct an AES algorithm bound to ``key``."""
+        ...
+
+
+class _CtrCtor(Protocol):
+    """The ``modes.CTR`` constructor surface (``CTR(nonce) -> mode``)."""
+
+    def __call__(self, nonce: bytes) -> _Mode:
+        """Construct a CTR mode with initial counter ``nonce``."""
+        ...
+
+
+class _CipherCtor(Protocol):
+    """The ``ciphers.Cipher`` constructor surface (``Cipher(algo, mode)``)."""
+
+    def __call__(self, algorithm: _Algorithm, mode: _Mode) -> _CipherHandle:
+        """Construct a cipher from an algorithm and a mode."""
+        ...
 
 
 class _CryptographyImpl:
-    """Runtime adapter that wraps importlib-loaded cryptography modules."""
+    """Runtime adapter that wraps importlib-loaded cryptography modules.
+
+    The three constructors are bound to the narrow ``_AesCtor`` / ``_CtrCtor`` /
+    ``_CipherCtor`` Protocols.  Assigning the ``Any``-typed module attributes to
+    these structural callables needs no cast, so :meth:`make_cipher` returns a
+    fully-typed ``_CipherHandle`` with no escape hatch.
+    """
 
     def __init__(self) -> None:
         try:
@@ -154,17 +207,13 @@ class _CryptographyImpl:
                 "or `pip install hermes-voip[media]`"
             )
             raise ImportError(msg) from exc
-        self._Cipher = ciphers_mod.Cipher
-        self._AES = algorithms_mod.AES
-        self._CTR = modes_mod.CTR
+        self._cipher: _CipherCtor = ciphers_mod.Cipher
+        self._aes: _AesCtor = algorithms_mod.AES
+        self._ctr: _CtrCtor = modes_mod.CTR
 
     def make_cipher(self, key: bytes, iv: bytes) -> _CipherHandle:
         """Build an AES-CTR cipher instance for ``key`` and initial counter ``iv``."""
-        # self._Cipher / _AES / _CTR are loaded via importlib so their type is Any;
-        # calling Any(...) returns Any, triggering no-any-return against the Protocol
-        # return annotation.  cast() is equally banned (AGENTS.md rule 17); this single
-        # boundary ignore is the minimum escape needed for the importlib lazy pattern.
-        return self._Cipher(self._AES(key), self._CTR(iv))  # type: ignore[no-any-return]
+        return self._cipher(self._aes(key), self._ctr(iv))
 
 
 _CRYPTO: _CryptographyImpl | None = None
@@ -314,6 +363,78 @@ def _auth_tag(
     return digest[:tag_len]
 
 
+def _rtp_header_len(data: bytes) -> int:
+    """Return the length of the clear RTP header in ``data`` (RFC 3550 §5.1).
+
+    The clear (authenticated, never encrypted) header is the 12-byte fixed
+    header plus the CSRC list (``CC`` * 4 octets) plus, when the ``X`` bit is
+    set, the 4-byte extension preamble and its declared extension words. SRTP
+    encrypts only what follows this boundary (RFC 3711 §3.1/§3.3), so the header
+    length must be computed from the actual ``CC``/``X`` fields — a fixed
+    12-byte assumption corrupts any packet carrying CSRCs or an extension.
+
+    Args:
+        data: The (decrypted-or-plaintext) RTP wire bytes — header onwards.
+
+    Returns:
+        The number of leading octets that form the clear RTP header.
+
+    Raises:
+        SrtpError: If ``data`` is too short for its declared CSRC count or
+            extension.
+    """
+    if len(data) < _RTP_HEADER_LEN:
+        msg = "SRTP packet too short for a fixed RTP header"
+        raise SrtpError(msg)
+    byte0 = data[0]
+    offset = _RTP_HEADER_LEN + (byte0 & _RTP_CSRC_COUNT_MASK) * _RTP_WORD
+    if len(data) < offset:
+        msg = "SRTP packet too short for its CSRC count"
+        raise SrtpError(msg)
+    if byte0 & _RTP_EXTENSION_BIT:
+        if len(data) < offset + _RTP_EXT_HEADER_LEN:
+            msg = "SRTP packet too short for its extension header"
+            raise SrtpError(msg)
+        ext_words = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        offset += _RTP_EXT_HEADER_LEN + ext_words * _RTP_WORD
+        if len(data) < offset:
+            msg = "SRTP packet too short for its extension data"
+            raise SrtpError(msg)
+    return offset
+
+
+def _reject_session_params(params: list[str]) -> None:
+    """Reject unsupported SDES inline session parameters (RFC 4568 §6.1).
+
+    The inline key may carry ``|lifetime`` and/or ``|MKI:length`` after the
+    base64 key||salt. We implement neither: a non-default key lifetime is not
+    honoured, and an MKI changes the SRTP packet layout (MKI octets sit between
+    the payload and the auth tag) which this transform does not parse. Reject
+    them at construction rather than silently dropping them.
+
+    The offending tokens are never echoed — they sit alongside the master key in
+    the same attribute and a copy in a log line or traceback is a leak.
+
+    Args:
+        params: The ``|``-split segments that follow the base64 key||salt.
+
+    Raises:
+        SrtpError: Always — an MKI segment (``contains ':'``) is named as such;
+            anything else is reported as an unsupported lifetime/session param.
+    """
+    if any(":" in segment for segment in params):
+        msg = (
+            "SRTP MKI is not supported (it changes the SRTP packet layout); "
+            "offer an inline key without an MKI"
+        )
+        raise SrtpError(msg)
+    msg = (
+        "unsupported SDES session parameter (non-default key lifetime); "
+        "offer an inline key without session parameters"
+    )
+    raise SrtpError(msg)
+
+
 # ---------------------------------------------------------------------------
 # SrtpSession
 # ---------------------------------------------------------------------------
@@ -321,20 +442,32 @@ def _auth_tag(
 
 @dataclass(slots=True)
 class SrtpSession:
-    """SRTP session for one direction (RFC 3711).
+    """SRTP session for ONE direction and ONE SSRC (RFC 3711).
 
-    One :class:`SrtpSession` instance per direction (TX / RX).  Instantiate
-    with the :class:`~hermes_voip.sdp.CryptoAttribute` from the negotiated
-    SDES ``a=crypto`` line; use :meth:`protect` on the sender and
-    :meth:`unprotect` on the receiver.
+    Use one :class:`SrtpSession` per direction (TX / RX): :meth:`protect` on the
+    sender, :meth:`unprotect` on the receiver.  Instantiate with the
+    :class:`~hermes_voip.sdp.CryptoAttribute` from the negotiated SDES
+    ``a=crypto`` line.
+
+    **One SSRC per session (RFC 3711 §3.2.3).** The rollover counter and replay
+    window form a per-SSRC cryptographic context, so a session is bound to a
+    single SSRC. The SSRC is fixed either at construction (``ssrc=``) or captured
+    from the first packet processed; every later packet must carry that same
+    SSRC, or it is rejected (``SrtpError``) *before* any ROC/replay state is
+    mutated. A second media source needs its own :class:`SrtpSession`. (For
+    telephony there is one SSRC per stream direction, so this is the normal
+    case, not a limitation.)
 
     **Key material is never stored in repr** — all key-bearing fields are
-    ``field(repr=False)`` so that ``repr(session)`` and tracebacks never
-    expose SRTP key material.
+    ``field(repr=False)`` so that ``repr(session)`` and tracebacks never expose
+    SRTP key material.
 
     Raises:
         ImportError: At construction time if the ``media`` extra is not installed.
-        SrtpError:   From :meth:`unprotect` on auth failure, replay, or format error.
+        SrtpError:   At construction on an unsupported suite or unsupported SDES
+            session parameters (a non-default key lifetime or an MKI); from
+            :meth:`protect`/:meth:`unprotect` on an SSRC mismatch; from
+            :meth:`unprotect` on auth failure, replay, or a malformed packet.
     """
 
     _crypto: CryptoAttribute = field(repr=False)
@@ -346,6 +479,8 @@ class SrtpSession:
     _k_a: bytes = field(init=False, repr=False)
     #: SRTP auth-tag byte length (10 for _80, 4 for _32).
     _tag_len: int = field(init=False, repr=False)
+    #: The SSRC this context is bound to, or None until the first packet binds it.
+    _ssrc: int | None = field(default=None, init=False)
     #: Current rollover counter (sender or receiver).
     roc: int = field(default=0, init=False)
     #: Highest sequence number seen (receiver) or sent (sender), or -1 if none.
@@ -353,17 +488,23 @@ class SrtpSession:
     #: Receiver replay-window bitmask (_REPLAY_WINDOW bits).
     _replay_mask: int = field(default=0, init=False, repr=False)
 
-    def __init__(self, crypto: CryptoAttribute) -> None:
+    def __init__(self, crypto: CryptoAttribute, *, ssrc: int | None = None) -> None:
         """Construct an SRTP session and derive session keys from the CryptoAttribute.
 
         Args:
             crypto: The validated SDES ``a=crypto`` attribute (from
-                :class:`~hermes_voip.sdp.CryptoAttribute`).  The 30-byte
-                inline key||salt is decoded and the session keys are derived
-                immediately (RFC 3711 §4.3.1, KDR = 0).
+                :class:`~hermes_voip.sdp.CryptoAttribute`).  The 30-byte inline
+                key||salt is decoded and the session keys are derived immediately
+                (RFC 3711 §4.3.1, KDR = 0).
+            ssrc: Optionally bind this context to a known SSRC up front. When
+                omitted, the session binds to the SSRC of the first packet it
+                processes.
 
         Raises:
             ImportError: If the ``media`` extra (``cryptography``) is not installed.
+            SrtpError: If the suite is unsupported, or the inline key carries SDES
+                session parameters we do not support (a non-default key lifetime
+                or an MKI — an MKI would change the SRTP packet layout).
         """
         # Trigger lazy import early so the error is at construction, not first use.
         _get_crypto()
@@ -376,9 +517,17 @@ class SrtpSession:
             raise SrtpError(msg)
         self._tag_len = _AUTH_TAG_LEN[suite]
 
-        # Decode the 30-byte inline master key||salt from the CryptoAttribute.
-        key_params = crypto.key_params
-        b64 = key_params[len(_INLINE_PREFIX) :].split("|", 1)[0]
+        # Split the inline key-params: inline:<base64 key||salt>[|lifetime][|MKI:len]
+        # (RFC 4568 §6.1). We support neither a non-default lifetime nor an MKI, and
+        # an MKI in particular changes the SRTP packet layout (it inserts MKI octets
+        # between the payload and the auth tag), so reject either rather than
+        # silently dropping it. Never echo the offending token — it carries the key.
+        inline = crypto.key_params[len(_INLINE_PREFIX) :]
+        segments = inline.split("|")
+        b64 = segments[0]
+        if len(segments) > 1:
+            _reject_session_params(segments[1:])
+
         raw = base64.b64decode(b64)
         master_key = raw[:_MASTER_KEY_LEN]
         master_salt = raw[_MASTER_KEY_LEN : _MASTER_KEY_LEN + _MASTER_SALT_LEN]
@@ -386,10 +535,29 @@ class SrtpSession:
         # Derive the three session keys (KDR=0, r=0 for all labels).
         self._k_e, self._k_s, self._k_a = _derive_session_keys(master_key, master_salt)
 
-        # Sender/receiver state.
+        # Per-SSRC context state.
+        self._ssrc = ssrc
         self.roc = 0
         self._seq_top = -1
         self._replay_mask = 0
+
+    def _bind_ssrc(self, ssrc: int) -> None:
+        """Bind the context to ``ssrc`` on first use, or reject a mismatch.
+
+        Called before any ROC/replay mutation, so a rejected foreign-SSRC packet
+        leaves the context untouched.
+
+        Raises:
+            SrtpError: If ``ssrc`` differs from the SSRC this session is bound to.
+        """
+        if self._ssrc is None:
+            self._ssrc = ssrc
+        elif ssrc != self._ssrc:
+            msg = (
+                "SRTP packet SSRC does not match this session's SSRC; "
+                "one SrtpSession serves a single SSRC (RFC 3711 §3.2.3)"
+            )
+            raise SrtpError(msg)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -398,41 +566,85 @@ class SrtpSession:
     def protect(self, packet: RtpPacket) -> bytes:
         """Encrypt and authenticate an outbound RTP packet (RFC 3711 §3.3).
 
-        Constructs the SRTP packet: encrypted payload + appended auth tag.
-        Updates the sender's ROC when the sequence number wraps.
+        Equivalent to ``protect_wire(packet.pack())``. Because
+        :meth:`~hermes_voip.rtp.RtpPacket.pack` emits only the 12-byte fixed
+        header (no CSRC/extension), this is the common sender path; use
+        :meth:`protect_wire` to protect a pre-built RTP datagram that carries a
+        CSRC list or a header extension.
 
         Args:
             packet: Plaintext :class:`~hermes_voip.rtp.RtpPacket` to protect.
 
         Returns:
-            SRTP wire bytes (RTP header || encrypted payload || auth tag).
+            SRTP wire bytes (clear RTP header || encrypted payload || auth tag).
+
+        Raises:
+            SrtpError: If ``packet.ssrc`` differs from this session's bound SSRC.
         """
-        seq = packet.sequence_number
-        ssrc = packet.ssrc
+        return self.protect_wire(packet.pack())
+
+    def protect_wire(self, rtp_wire: bytes) -> bytes:
+        """Encrypt and authenticate a complete RTP datagram (RFC 3711 §3.3).
+
+        Encrypts only the RTP *payload*; the full clear RTP header (the fixed
+        header plus any CSRC list and header extension) is left in the clear and
+        covered by the authentication tag (header || ciphertext || ROC). Updates
+        the sender ROC when the 16-bit sequence number wraps.
+
+        Args:
+            rtp_wire: A complete RTP datagram (header onwards), e.g. from
+                :meth:`~hermes_voip.rtp.RtpPacket.pack` or a relayed packet.
+
+        Returns:
+            SRTP wire bytes (clear RTP header || encrypted payload || auth tag).
+
+        Raises:
+            SrtpError: If the datagram is malformed, or its SSRC differs from
+                this session's bound SSRC.
+        """
+        header_len = _rtp_header_len(rtp_wire)
+        try:
+            seq = int.from_bytes(rtp_wire[2:4], "big")
+            ssrc = int.from_bytes(rtp_wire[8:12], "big")
+        except (IndexError, ValueError) as exc:  # pragma: no cover - len-guarded above
+            msg = "RTP datagram header is malformed"
+            raise SrtpError(msg) from exc
+
+        # Bind/verify the SSRC BEFORE mutating any ROC/seq state.
+        self._bind_ssrc(ssrc)
+
+        header = rtp_wire[:header_len]
+        payload = rtp_wire[header_len:]
 
         # Update sender ROC on sequence-number wraparound.
         if self._seq_top == _SEQ_MAX and seq == 0:
             self.roc += 1
         self._seq_top = seq
 
-        # Encrypt the payload.
+        # Encrypt only the payload (the header stays clear, authenticated).
         iv = _packet_iv(self._k_s, ssrc, self.roc, seq)
-        ks = _aes_cm_keystream(self._k_e, iv, len(packet.payload))
-        ciphertext = bytes(p ^ k for p, k in zip(packet.payload, ks, strict=True))
+        ks = _aes_cm_keystream(self._k_e, iv, len(payload))
+        ciphertext = bytes(p ^ k for p, k in zip(payload, ks, strict=True))
 
-        # Re-pack the fixed 12-byte RTP header (no CSRC/extension in our packets).
-        rtp_wire = packet.pack()
-        header = rtp_wire[:_RTP_HEADER_LEN]
-
-        # Compute and append the authentication tag.
+        # Compute and append the authentication tag over the clear header.
         tag = _auth_tag(self._k_a, header, ciphertext, self.roc, self._tag_len)
         return header + ciphertext + tag
 
     def unprotect(self, data: bytes) -> RtpPacket:
         """Authenticate and decrypt an inbound SRTP packet (RFC 3711 §3.3).
 
-        Verifies the auth tag FIRST (constant-time), then checks the replay
-        window, then decrypts the payload.
+        Processing order (RFC 3711 §3.3): estimate the index, verify the auth tag
+        FIRST (constant-time over the full clear header + ciphertext + ROC), then
+        enforce the per-SSRC binding, then the replay window, then decrypt only
+        the payload. The clear header (including any CSRC list / header
+        extension) is preserved verbatim.
+
+        Auth precedes the SSRC binding deliberately: the session auth key derives
+        from the master key alone (it does not depend on the SSRC), and on the
+        first packet the index estimate is SSRC-independent — so a *forged* first
+        packet bearing an arbitrary SSRC fails authentication and never binds the
+        context. Only an authentic packet can bind it. No receiver state (ROC,
+        replay window, SSRC binding) is mutated until auth has passed.
 
         Args:
             data: Raw SRTP wire bytes.
@@ -441,43 +653,48 @@ class SrtpSession:
             Decrypted :class:`~hermes_voip.rtp.RtpPacket`.
 
         Raises:
-            SrtpError: On auth-tag mismatch, replay detection, or format error.
+            SrtpError: On a malformed packet, an auth-tag mismatch, an SSRC
+                mismatch, or replay detection.
         """
         tag_len = self._tag_len
-        min_len = _RTP_HEADER_LEN + tag_len
-        if len(data) < min_len:
+        if len(data) < _RTP_HEADER_LEN + tag_len:
             msg = "SRTP packet too short to contain a valid RTP header and auth tag"
             raise SrtpError(msg)
 
-        # Split off the auth tag.
+        # Split off the auth tag, then locate the clear-header boundary.
         srtp_body = data[: len(data) - tag_len]
         received_tag = data[len(data) - tag_len :]
+        header_len = _rtp_header_len(srtp_body)
 
-        header = srtp_body[:_RTP_HEADER_LEN]
-        ciphertext = srtp_body[_RTP_HEADER_LEN:]
+        header = srtp_body[:header_len]
+        ciphertext = srtp_body[header_len:]
 
-        # Parse SEQ and SSRC from the fixed RTP header.
-        try:
-            _b0, _b1, seq, _ts, ssrc = struct.unpack("!BBHII", header)
-        except struct.error as exc:
-            msg = "SRTP packet header is malformed"
-            raise SrtpError(msg) from exc
+        # Parse SEQ and SSRC from the fixed RTP header (always the first 12 bytes).
+        seq = int.from_bytes(header[2:4], "big")
+        ssrc = int.from_bytes(header[8:12], "big")
 
         # Compute the extended sequence index using the current ROC estimate
         # (RFC 3711 §3.3.1).
         roc_for_packet = self._estimate_roc(seq)
 
-        # Verify the authentication tag BEFORE decrypting (constant-time).
+        # Verify the authentication tag FIRST (constant-time). This is computed
+        # over the clear header + ciphertext + ROC; the auth key is SSRC-agnostic,
+        # so a forged SSRC cannot forge a tag.
         expected_tag = _auth_tag(self._k_a, header, ciphertext, roc_for_packet, tag_len)
         if not hmac.compare_digest(expected_tag, received_tag):
             msg = "SRTP auth tag mismatch — packet rejected"
             raise SrtpError(msg)
 
+        # Enforce the per-SSRC binding only after auth, and before any replay or
+        # ROC state mutation, so neither a forged nor a foreign-SSRC packet ever
+        # binds the context or advances receiver state.
+        self._bind_ssrc(ssrc)
+
         # Replay-window check (after auth, to prevent DoS via replay oracle).
         packet_index = (roc_for_packet << 16) | seq
         self._check_replay(packet_index)
 
-        # Decrypt payload.
+        # Decrypt only the payload.
         iv = _packet_iv(self._k_s, ssrc, roc_for_packet, seq)
         ks = _aes_cm_keystream(self._k_e, iv, len(ciphertext))
         plaintext = bytes(c ^ k for c, k in zip(ciphertext, ks, strict=True))
@@ -485,7 +702,7 @@ class SrtpSession:
         # Update receiver ROC and replay window.
         self._update_state(seq, roc_for_packet, packet_index)
 
-        # Reconstruct the RTP packet from the decrypted wire bytes.
+        # Reconstruct the RTP packet from the clear header + decrypted payload.
         plain_wire = header + plaintext
         return RtpPacket.parse(plain_wire)
 

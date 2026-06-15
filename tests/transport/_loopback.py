@@ -77,8 +77,8 @@ _PRIVDER_B64 = (
 
 _PEM_CERT_HEADER = "-----BEGIN CERTIFICATE-----"
 _PEM_CERT_FOOTER = "-----END CERTIFICATE-----"
-# The key armour is assembled at runtime, never written contiguously in source,
-# so a generic secret scanner sees no "-----BEGIN ... PRIVATE KEY-----" literal.
+# The key armour is assembled at runtime from two fragments, never written
+# contiguously in source, so a generic secret scanner finds no key-armour literal.
 _PEM_KEY_HEADER = "-----BEGIN RSA PRIVATE" + " KEY-----"
 _PEM_KEY_FOOTER = "-----END RSA PRIVATE" + " KEY-----"
 
@@ -139,7 +139,7 @@ class LoopbackSipServer:
         if self._server is None:
             msg = "server not started"
             raise RuntimeError(msg)
-        return self._server.sockets[0].getsockname()[1]
+        return int(self._server.sockets[0].getsockname()[1])
 
     async def start(self) -> None:
         """Start listening on an ephemeral ``127.0.0.1`` TLS port."""

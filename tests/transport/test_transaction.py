@@ -1,10 +1,11 @@
-"""Tests for the INVITE client transaction (RFC 3261 §17.1).
+"""Tests for the INVITE transaction state machines (RFC 3261 §17).
 
-This layer owns the ACK for a **non-2xx final** response to an INVITE: that ACK
-is generated in the client transaction, on the **same branch** as the INVITE,
-and is *not* the transaction-user's job (the TU emits only the §13.2.2.4 2xx
-ACK). The state machine is modelled (Calling → Proceeding → Completed →
-Terminated); over a reliable transport (TLS) request retransmission (Timer A) is
+The client transaction (§17.1) owns the ACK for a **non-2xx final** response to
+an INVITE: that ACK is generated on the **same branch** as the INVITE and is
+*not* the transaction-user's job (the TU emits only the §13.2.2.4 2xx ACK). The
+server transaction (§17.2) tracks our final response and absorbs the peer's ACK.
+The state machines are modelled (Calling → Proceeding → Completed → Terminated);
+over a reliable transport (TLS) request retransmission (Timer A / Timer E) is
 disabled, so these tests focus on the response side and the ACK construction.
 
 Fakes only — ``pbx.example.test``, ``127.0.0.1``/``198.51.100.x``.
@@ -17,6 +18,7 @@ import pytest
 from hermes_voip.message import SipResponse
 from hermes_voip.transport.transaction import (
     InviteClientTransaction,
+    InviteServerTransaction,
     TransactionState,
 )
 
@@ -143,3 +145,58 @@ def test_final_after_provisional_acks_when_non_2xx() -> None:
     ack = txn.ack_for_response(_response(487, "Request Terminated"))
     assert ack is not None
     assert txn.state is TransactionState.COMPLETED
+
+
+def test_constructing_from_a_non_invite_raises() -> None:
+    register = (
+        "REGISTER sip:pbx.example.test SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bKr\r\n"
+        "From: <sip:1000@pbx.example.test>;tag=t\r\n"
+        "To: <sip:1000@pbx.example.test>\r\n"
+        "Call-ID: c\r\n"
+        "CSeq: 1 REGISTER\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    with pytest.raises(ValueError, match="not an INVITE"):
+        InviteClientTransaction(register)
+
+
+# ---- server transaction (RFC 3261 §17.2) -----------------------------------
+
+
+def test_server_transaction_starts_proceeding() -> None:
+    txn = InviteServerTransaction()
+    assert txn.state is TransactionState.PROCEEDING
+
+
+def test_server_non_2xx_final_moves_to_completed_awaiting_the_ack() -> None:
+    txn = InviteServerTransaction()
+    txn.on_final_sent(486)
+    assert txn.state is TransactionState.COMPLETED
+
+
+def test_server_absorbs_the_ack_to_a_non_2xx_final_and_terminates() -> None:
+    txn = InviteServerTransaction()
+    txn.on_final_sent(486)
+    absorbed = txn.absorb_ack()  # the ACK to our non-2xx final is ours
+    assert absorbed is True
+    assert txn.state is TransactionState.TERMINATED
+
+
+def test_server_2xx_final_terminates_and_does_not_absorb_ack() -> None:
+    # The 2xx ACK arrives end-to-end in a fresh transaction, not absorbed here.
+    txn = InviteServerTransaction()
+    txn.on_final_sent(200)
+    assert txn.state is TransactionState.TERMINATED
+    assert txn.absorb_ack() is False
+
+
+def test_server_absorb_ack_without_a_pending_final_is_not_ours() -> None:
+    txn = InviteServerTransaction()
+    assert txn.absorb_ack() is False
+
+
+def test_server_on_final_sent_rejects_a_provisional() -> None:
+    txn = InviteServerTransaction()
+    with pytest.raises(ValueError, match="requires a final status"):
+        txn.on_final_sent(180)

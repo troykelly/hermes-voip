@@ -32,7 +32,7 @@ from hermes_voip.message import (
 )
 from hermes_voip.transport.connection import SipOverTlsTransport
 
-from ._loopback import LoopbackSipServer, client_ssl_context
+from ._loopback import LoopbackSipServer, Responder, client_ssl_context
 
 pytestmark = pytest.mark.asyncio
 
@@ -122,7 +122,7 @@ async def test_register_round_trips_to_registered() -> None:
         await server.stop()
 
 
-def _register_responder() -> object:
+def _register_responder() -> Responder:
     state = {"seen": 0}
 
     async def respond(request: SipRequest) -> list[str]:

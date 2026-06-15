@@ -222,6 +222,43 @@ def test_invalid_exit_threshold_rejected() -> None:
         )
 
 
+def test_nan_exit_threshold_rejected() -> None:
+    # A NaN exit threshold silently breaks endpointing: `probability < nan` is
+    # always False, so speech never ends. It must be rejected at construction,
+    # not accepted because `nan > threshold` happens to be False.
+    with pytest.raises(ValueError, match="exit_threshold"):
+        VoiceActivityDetector(
+            sample_rate_hz=_RATE_16K,
+            threshold=0.5,
+            exit_threshold=float("nan"),
+            model=_ScriptedModel([]),
+        )
+
+
+def test_infinite_exit_threshold_rejected() -> None:
+    # +inf would pass a naive `> threshold` check inverted but is meaningless; a
+    # finite value in [0, threshold] is required.
+    with pytest.raises(ValueError, match="exit_threshold"):
+        VoiceActivityDetector(
+            sample_rate_hz=_RATE_16K,
+            threshold=0.5,
+            exit_threshold=float("-inf"),
+            model=_ScriptedModel([]),
+        )
+
+
+def test_negative_exit_threshold_rejected() -> None:
+    # A negative exit threshold can never be crossed (probabilities are >= 0.0),
+    # so speech would never end. Require exit_threshold >= 0.0.
+    with pytest.raises(ValueError, match="exit_threshold"):
+        VoiceActivityDetector(
+            sample_rate_hz=_RATE_16K,
+            threshold=0.5,
+            exit_threshold=-0.1,
+            model=_ScriptedModel([]),
+        )
+
+
 # --- a real PCM fixture exercises the same edges deterministically --------
 
 

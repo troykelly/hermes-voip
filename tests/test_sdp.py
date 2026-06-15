@@ -701,3 +701,95 @@ def test_answer_echoes_sha1_32_accepted_suite() -> None:
     assert f"a=crypto:5 {_SUITE_32} inline:{_FAKE_ANSWER_KEY}" in text
     # Negative control: the offerer's key material is NOT echoed back.
     assert _FAKE_KEY not in text
+
+
+# --- W3 (security review): SDES key material must never leak via repr/errors ---
+# A `repr()` lands in logs and tracebacks; SDES master key||salt in a repr leaks
+# the SRTP session key. Likewise SdpError messages can surface for our OWN crypto,
+# so they must report STRUCTURAL facts only, never the key bytes/base64 string.
+
+
+def test_crypto_attribute_repr_hides_key_material() -> None:
+    # HIGH: the key||salt is the SRTP master key; it must not appear in repr().
+    attr = CryptoAttribute.parse(f"1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}")
+    text = repr(attr)
+    assert _FAKE_KEY not in text
+    assert "inline:" not in text  # the whole key-params field is suppressed
+    # The non-secret fields are still useful for diagnostics.
+    assert "tag=1" in text
+    assert "AES_CM_128_HMAC_SHA1_80" in text
+
+
+def test_audio_media_repr_hides_crypto_key_material() -> None:
+    # HIGH: AudioMedia.repr() must expose neither the raw a=crypto line (which
+    # carries the inline key) nor the typed crypto_attrs.
+    audio = _audio(SessionDescription.parse(_OFFER_SAVP))
+    assert audio.crypto  # the raw line is retained on the object...
+    assert audio.crypto_attrs  # ...as is the typed attribute...
+    text = repr(audio)
+    assert _FAKE_KEY not in text  # ...but neither leaks into its repr.
+    assert "inline:" not in text
+
+
+def test_audio_media_repr_hides_directly_constructed_key() -> None:
+    # The suppression is a property of the dataclass fields, not of the parser:
+    # a directly-constructed AudioMedia hides the key too.
+    attr = CryptoAttribute.parse(f"1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}")
+    audio = AudioMedia(
+        port=40000,
+        protocol="RTP/SAVP",
+        codecs=(Codec(0, "PCMU", 8000),),
+        crypto=(f"1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}",),
+        ptime=20,
+        direction="sendrecv",
+        connection_address="192.0.2.2",
+        crypto_attrs=(attr,),
+    )
+    text = repr(audio)
+    assert _FAKE_KEY not in text
+    assert "inline:" not in text
+
+
+def test_crypto_error_non_inline_key_does_not_leak_key() -> None:
+    # MEDIUM: a non-inline key-params string must not be echoed into the error.
+    secret = "keymethodext:SECRETKEYMATERIAL0123456789"
+    with pytest.raises(SdpError) as exc_info:
+        CryptoAttribute.parse(f"1 AES_CM_128_HMAC_SHA1_80 {secret}")
+    msg = str(exc_info.value)
+    assert "SECRETKEYMATERIAL0123456789" not in msg
+    assert "keymethodext:" not in msg
+    assert "inline" in msg  # structural fact: it must be an inline key
+
+
+def test_crypto_error_bad_base64_does_not_leak_token() -> None:
+    # MEDIUM: the invalid base64 token can BE the (corrupt) key; never echo it.
+    with pytest.raises(SdpError) as exc_info:
+        CryptoAttribute.parse("1 AES_CM_128_HMAC_SHA1_80 inline:@@notbase64@@")
+    msg = str(exc_info.value)
+    assert "@@notbase64@@" not in msg
+    assert "base64" in msg  # structural fact: not valid base64
+
+
+def test_crypto_error_malformed_body_does_not_leak_key() -> None:
+    # MEDIUM: a truncated crypto body (here the tag is missing, so only two
+    # whitespace tokens remain) still carries the inline key in the last token;
+    # the "malformed" error must not echo the whole body.
+    body = f"AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}"  # missing tag => 2 fields
+    with pytest.raises(SdpError) as exc_info:
+        CryptoAttribute.parse(body)
+    msg = str(exc_info.value)
+    assert _FAKE_KEY not in msg
+    assert "inline:" not in msg
+
+
+def test_crypto_error_wrong_length_reports_structure_only() -> None:
+    # The key-length error is already structural (octet counts + suite). Confirm
+    # it states the lengths and suite but never the base64 key itself.
+    with pytest.raises(SdpError) as exc_info:
+        CryptoAttribute.parse(f"1 AES_CM_128_HMAC_SHA1_80 inline:{_SHORT_KEY}")
+    msg = str(exc_info.value)
+    assert _SHORT_KEY not in msg
+    # Structural facts are retained.
+    assert "29" in msg  # decoded octet count
+    assert "30" in msg  # expected octet count
+    assert "AES_CM_128_HMAC_SHA1_80" in msg

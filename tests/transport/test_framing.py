@@ -157,3 +157,32 @@ def test_non_numeric_content_length_is_a_framing_error() -> None:
     )
     with pytest.raises(FramingError):
         list(framer)
+
+
+def test_head_without_terminator_is_capped_to_bound_memory() -> None:
+    framer = SipMessageFramer()
+    framer.feed(b"A" * (64 * 1024 + 1))  # never a CRLFCRLF
+    with pytest.raises(FramingError):
+        list(framer)
+
+
+def test_oversized_content_length_is_rejected_without_buffering_the_body() -> None:
+    framer = SipMessageFramer()
+    framer.feed(
+        b"SIP/2.0 200 OK\r\n"
+        b"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bK1\r\n"
+        b"Content-Length: 300000\r\n\r\n"  # head only; body never sent
+    )
+    with pytest.raises(FramingError):
+        list(framer)
+
+
+def test_unicode_nondecimal_content_length_is_a_framing_error() -> None:
+    framer = SipMessageFramer()
+    framer.feed(
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bK1\r\n"
+        "Content-Length: ²\r\n\r\n".encode()  # isdigit() but not int()-parseable
+    )
+    with pytest.raises(FramingError):
+        list(framer)

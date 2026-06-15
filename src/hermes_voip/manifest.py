@@ -36,7 +36,9 @@ __all__ = [
     "GUARD_ALLOWED_SPDX",
     "GUARD_MODEL_MANIFEST",
     "STT_ALLOWED_SPDX",
+    "STT_MODEL_MANIFEST",
     "TTS_ALLOWED_SPDX",
+    "TTS_MODEL_MANIFEST",
     "LicenceError",
     "ModelFamily",
     "ModelFile",
@@ -215,6 +217,75 @@ GUARD_MODEL_MANIFEST = ModelManifest(
         ModelFile(
             name="onnx/model.onnx",
             sha256="f0ea7f239f765aedbde7c9e163a7cb38a79c5b8853d3f76db5152172047b228c",
+            spdx="Apache-2.0",
+        ),
+    ),
+)
+
+
+# The pinned default model for the self-host streaming STT (ADR-0006).
+#
+# csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26 is the ADR-0006 default
+# recogniser: the Apache-2.0 icefall streaming zipformer the `SherpaOnnxASR`
+# provider runs in-process. ADR-0006 names the model
+# (`sherpa-onnx-streaming-zipformer-en-2023-06-26`) and asserts Apache-2.0 but
+# defers the exact repo + revision + checksums to implementation ("the exact
+# revision + checksums are recorded at implementation"); this pin IS that record.
+# The coordinates are PUBLIC model-registry data (no host/secret/PII): the repo,
+# an immutable 40-hex commit `revision`, and each transducer ONNX file's content
+# SHA-256 (the file's Git-LFS `oid sha256:` as HuggingFace records it at this
+# commit). The repo's declared SPDX is Apache-2.0 (`cardData.license` +
+# `license:apache-2.0` tag), which the STT family's allow-list permits. The
+# default `left-64` full-precision transducer triplet is pinned (the `tokens.txt`
+# vocab is a small non-LFS file and is not licence-bearing, so it is not pinned —
+# the gate verifies the weight artifacts that carry the licence).
+STT_MODEL_MANIFEST = ModelManifest(
+    repo="csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
+    revision="672fbf1b30579d6585301139bb363f42a0ad4a24",
+    files=(
+        ModelFile(
+            name="encoder-epoch-99-avg-1-chunk-16-left-64.onnx",
+            sha256="b67600b0eaf19069867f109a5b6ad78db10efba67ec8e781ea719c956d20261f",
+            spdx="Apache-2.0",
+        ),
+        ModelFile(
+            name="decoder-epoch-99-avg-1-chunk-16-left-64.onnx",
+            sha256="7bf787f90b194b307e5a4ad6a34fadb4e748304c35f78a8d66358a05b13ee6ef",
+            spdx="Apache-2.0",
+        ),
+        ModelFile(
+            name="joiner-epoch-99-avg-1-chunk-16-left-64.onnx",
+            sha256="210591f72b3c56b8364f85f345dca240bc2b4c00632848f4aa923630d5639d3b",
+            spdx="Apache-2.0",
+        ),
+    ),
+)
+
+
+# The pinned default model for the self-host streaming TTS (ADR-0007).
+#
+# csukuangfj/kokoro-en-v0_19 is the sherpa-onnx ONNX packaging of the ADR-0007
+# default Kokoro-82M voice model the `SherpaKokoroTTS` provider runs in-process.
+# ADR-0007 names the model (Kokoro-82M, `hexgrad/Kokoro-82M` upstream) and asserts
+# "Apache-2.0 engine *and* Apache-2.0 weights" but defers the exact repo +
+# revision + checksums to implementation; this pin IS that record, for the
+# sherpa-onnx-ready ONNX artifact (the upstream `hexgrad/Kokoro-82M` ships
+# PyTorch, not the ONNX `model.onnx` sherpa loads). The coordinates are PUBLIC
+# model-registry data: the repo, an immutable 40-hex commit `revision`, and the
+# `model.onnx` content SHA-256 (its Git-LFS `oid sha256:` at this commit). This
+# repo carries NO HuggingFace `cardData.license`; the Apache-2.0 licence is
+# verified from the in-repo `LICENSE` file at the pinned commit (its git blob
+# `d645695673349e3947e8e5ae42332d0ac3164cd7` is the canonical Apache-2.0 text),
+# which the TTS family's allow-list permits. Only the licence-bearing weight
+# (`model.onnx`) is pinned; `voices.bin`/`tokens.txt` are non-licence vocab/voice
+# data the gate does not need to assert.
+TTS_MODEL_MANIFEST = ModelManifest(
+    repo="csukuangfj/kokoro-en-v0_19",
+    revision="92805c485745946a0d945562d3aba19e7cbb2104",
+    files=(
+        ModelFile(
+            name="model.onnx",
+            sha256="10ff414106a038ce7e9e0126c6461e4dc8a86efaa89dc91d2009d69fe635e339",
             spdx="Apache-2.0",
         ),
     ),

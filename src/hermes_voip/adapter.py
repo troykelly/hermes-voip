@@ -207,6 +207,13 @@ class VoipAdapter(BasePlatformAdapter):
         # raises RuntimeError("local_sent_by is unavailable before connect()").
         await transport.connect()
 
+        # INVARIANT: keep these three statements await-free and contiguous. The
+        # transport's reader task is already running, but on the single-threaded
+        # loop it cannot dispatch an inbound message until the next await
+        # (``manager.connect()`` below) — so the manager is always built, stored,
+        # and bound before any REGISTER response / INVITE can be routed. Insert
+        # an ``await`` here and a pre-bind message would be routed with
+        # ``transport._manager is None`` (reported unroutable, not delivered).
         manager = RegistrationManager(
             gateway_cfg,
             transport,

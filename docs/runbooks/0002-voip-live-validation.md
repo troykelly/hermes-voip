@@ -183,7 +183,9 @@ export HERMES_SIP_HOST="$(op item get "$SIP_ITEM" --vault "$SIP_VAULT" --format=
 export HERMES_SIP_EXTENSION="$(op item get "$SIP_ITEM" --vault "$SIP_VAULT" --fields label=Extension)"
 export HERMES_SIP_USERNAME="$HERMES_SIP_EXTENSION"
 export HERMES_SIP_PASSWORD="$(op item get "$SIP_ITEM" --vault "$SIP_VAULT" \
-  --fields '166A4EE5251242E1BC9CAE78F9B0AD6A' --reveal)"   # VoIP-section Password (digest secret)
+  --fields 'VoIP.Password' --reveal)"   # the VoIP-section Password (the SIP-TLS digest secret;
+                                        # 'VoIP.Password' = <section>.<label>, which disambiguates
+                                        # it from the item's top-level portal `password` field)
 export HERMES_SIP_PORT=5061
 export HERMES_SIP_TRANSPORT=tls
 ```

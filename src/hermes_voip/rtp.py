@@ -175,18 +175,32 @@ class JitterBuffer:
         self._max_ahead = max_ahead
         self._packets: dict[int, RtpPacket] = {}
         self._next: int | None = None
+        self._emitted = False
 
     def push(self, packet: RtpPacket) -> None:
-        """Add a packet; duplicate, late, and too-far-ahead packets are dropped."""
+        """Add a packet; duplicate, late, and too-far-ahead packets are dropped.
+
+        The anchor (next expected sequence) is set tentatively at the first
+        arrival and revised downward by any earlier sequence that arrives before
+        the first :meth:`pop`, so a reordered opening packet (a lower sequence
+        arriving after a higher one) is never skipped — the start of a call is
+        the most reordering-prone. The playout window is measured against this
+        tentative anchor throughout, keeping storage bounded. Once a packet has
+        been emitted the anchor only advances, and late arrivals are dropped.
+        """
         seq = packet.sequence_number
         if self._next is not None:
             if _seq_before(seq, self._next):
-                return  # too late: this sequence has already been emitted
-            if (seq - self._next) % _SEQ_MOD > self._max_ahead:
+                if self._emitted:
+                    return  # too late: this sequence has already been emitted
+                if (self._next - seq) % _SEQ_MOD > self._max_ahead:
+                    return  # too far behind to be a start reorder; bound the window
+                self._next = seq  # pre-playout reorder within window: revise anchor
+            elif (seq - self._next) % _SEQ_MOD > self._max_ahead:
                 return  # outside the playout window: keep storage bounded
+        else:
+            self._next = seq  # tentative anchor at the first arrival
         self._packets.setdefault(seq, packet)  # first arrival wins; ignore duplicates
-        if self._next is None:
-            self._next = seq  # anchor playout at the first packet seen
 
     def pop(self) -> JitterOutput | None:
         """Return the next packet, a :class:`Lost` marker, or ``None`` (underflow)."""
@@ -195,9 +209,11 @@ class JitterBuffer:
         expected = self._next
         packet = self._packets.pop(expected, None)
         if packet is not None:
+            self._emitted = True
             self._next = _seq_next(expected)
             return packet
         if len(self._packets) >= self._depth:
+            self._emitted = True
             self._next = _seq_next(expected)
             return Lost(expected)
         return None

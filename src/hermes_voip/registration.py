@@ -26,8 +26,38 @@ from hermes_voip.message import (
 
 _UNAUTHORIZED = 401
 _PROXY_AUTH_REQUIRED = 407
+_INTERVAL_TOO_BRIEF = 423
 _OK = 200
 _EXPIRES_PARAM = re.compile(r";\s*expires\s*=\s*(\d+)", re.IGNORECASE)
+# The SIP schemes an AOR may carry; sips is ADR-0005's SIP-over-TLS scheme.
+_AOR_SCHEMES = frozenset({"sip", "sips"})
+
+
+def _split_aor(aor: str) -> tuple[str, str]:
+    """Split an AOR into its ``(scheme, host)`` for the registrar request-URI.
+
+    The host is the AOR host, dropping any ``user@`` and trailing ``;params``.
+
+    Raises:
+        ValueError: If the AOR has no ``sip``/``sips`` scheme or an empty host.
+    """
+    scheme, sep, rest = aor.partition(":")
+    if not sep or scheme.lower() not in _AOR_SCHEMES:
+        msg = f"aor must use a sip(s): scheme: {aor!r}"
+        raise ValueError(msg)
+    host = rest.split(";", 1)[0].split("@", 1)[-1]
+    if not host:
+        msg = f"aor has no host: {aor!r}"
+        raise ValueError(msg)
+    return scheme, host
+
+
+def _min_expires(response: SipResponse) -> int | None:
+    """Return the ``Min-Expires`` value from a 423, or ``None`` if absent/malformed."""
+    raw = response.header("Min-Expires")
+    if raw is None or not raw.strip().isdigit():
+        return None
+    return int(raw.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +85,30 @@ class RegistrationConfig:
     expires: int = 300
     user_agent: str = "hermes-voip/0"
 
+    def __post_init__(self) -> None:
+        """Reject a malformed AOR at construction (fail fast, not mid-flow).
+
+        Raises:
+            ValueError: If ``aor`` has no ``sip``/``sips`` scheme or empty host.
+        """
+        _split_aor(self.aor)
+
 
 @dataclass(frozen=True, slots=True)
 class Challenged:
     """The registrar demanded auth; ``request`` is the authenticated REGISTER."""
+
+    request: str
+
+
+@dataclass(frozen=True, slots=True)
+class Retry:
+    """The registrar rejected the interval; ``request`` re-registers with a longer one.
+
+    Returned on a ``423 Interval Too Brief``: the transport sends ``request``
+    (a fresh REGISTER transaction whose ``Expires`` is at least the registrar's
+    ``Min-Expires``) exactly as it would send a :class:`Challenged` request.
+    """
 
     request: str
 
@@ -78,7 +128,7 @@ class Failed:
     reason: str
 
 
-type RegistrationOutcome = Challenged | Registered | Failed
+type RegistrationOutcome = Challenged | Retry | Registered | Failed
 
 
 @dataclass(slots=True)
@@ -91,9 +141,12 @@ class _Transaction:
 
 
 def _registrar_uri(aor: str) -> str:
-    """Derive the registrar request-URI (``sip:domain``) from an AOR."""
-    scheme, _, rest = aor.partition(":")
-    host = rest.split(";", 1)[0].split("@", 1)[-1]
+    """Derive the registrar request-URI (``sip:domain`` / ``sips:domain``) from an AOR.
+
+    Raises:
+        ValueError: If the AOR has no ``sip``/``sips`` scheme or an empty host.
+    """
+    scheme, host = _split_aor(aor)
     return f"{scheme}:{host}"
 
 
@@ -109,6 +162,7 @@ class RegistrationFlow:
         self._cseq = 0
         self._registered = False
         self._txn: _Transaction | None = None
+        self._interval_retried = False
 
     @property
     def call_id(self) -> str:
@@ -123,6 +177,7 @@ class RegistrationFlow:
 
     def start(self) -> str:
         """Begin a (re)registration transaction; returns the REGISTER request."""
+        self._interval_retried = False
         return self._begin(self._cfg.expires)
 
     def deregister(self) -> str:
@@ -134,6 +189,7 @@ class RegistrationFlow:
         if not self._registered:
             msg = "cannot de-register: not registered"
             raise RuntimeError(msg)
+        self._interval_retried = False
         return self._begin(0)
 
     def handle(self, response: SipResponse) -> RegistrationOutcome:
@@ -158,6 +214,12 @@ class RegistrationFlow:
                 self._txn = None  # already answered once; the credential is wrong
                 return Failed(status, response.reason)
             return Challenged(request=self._reauthenticate(response, status, txn))
+        if status == _INTERVAL_TOO_BRIEF:
+            retry = self._retry_interval(response, txn)
+            if retry is not None:
+                return retry
+            self._txn = None
+            return Failed(status, response.reason)
         self._txn = None
         return Failed(status, response.reason)
 
@@ -186,6 +248,22 @@ class RegistrationFlow:
         return self._build(
             expires=txn.requested_expires, auth=(auth_header, auth_value)
         )
+
+    def _retry_interval(self, response: SipResponse, txn: _Transaction) -> Retry | None:
+        """Re-issue REGISTER honouring ``Min-Expires`` after a 423, or ``None``.
+
+        Returns ``None`` (the caller then fails) when there is nothing to comply
+        with: a de-registration, an already-retried attempt (no loops), or a
+        ``Min-Expires`` that is missing, malformed, or not larger than what we
+        already requested.
+        """
+        if self._interval_retried or txn.requested_expires <= 0:
+            return None
+        min_expires = _min_expires(response)
+        if min_expires is None or min_expires <= txn.requested_expires:
+            return None
+        self._interval_retried = True
+        return Retry(request=self._begin(min_expires))
 
     def _check_cseq(self, response: SipResponse, txn: _Transaction) -> None:
         cseq = response.header("CSeq")

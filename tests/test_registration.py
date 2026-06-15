@@ -10,6 +10,7 @@ import re
 
 import pytest
 
+import hermes_voip
 from hermes_voip.message import SipResponse
 from hermes_voip.registration import (
     Challenged,
@@ -17,6 +18,7 @@ from hermes_voip.registration import (
     Registered,
     RegistrationConfig,
     RegistrationFlow,
+    Retry,
 )
 
 _CONFIG = RegistrationConfig(
@@ -44,6 +46,16 @@ def _ok(cseq: int, contact_expires: str = ";expires=300") -> SipResponse:
         "SIP/2.0 200 OK\r\n"
         f"CSeq: {cseq} REGISTER\r\n"
         f"Contact: <sip:1000@198.51.100.7:5061;transport=tls>{contact_expires}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _too_brief(cseq: int, min_expires: str | None = "3600") -> SipResponse:
+    min_line = f"Min-Expires: {min_expires}\r\n" if min_expires is not None else ""
+    return SipResponse.parse(
+        "SIP/2.0 423 Interval Too Brief\r\n"
+        f"CSeq: {cseq} REGISTER\r\n"
+        f"{min_line}"
         "Content-Length: 0\r\n\r\n"
     )
 
@@ -202,3 +214,113 @@ def test_call_id_matches_the_wire_and_is_stable() -> None:
 def test_distinct_flows_have_distinct_call_ids() -> None:
     # Each extension's registration is an independent transaction space.
     assert RegistrationFlow(_CONFIG).call_id != RegistrationFlow(_CONFIG).call_id
+
+
+def test_423_retries_with_min_expires() -> None:
+    # A registrar enforcing a minimum interval returns 423 + Min-Expires; the
+    # flow must re-issue REGISTER with the larger interval (a new transaction),
+    # not give up — a silent total outage otherwise.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_too_brief(_cseq_num(started), min_expires="3600"))
+    assert isinstance(outcome, Retry)
+    assert _h(outcome.request, "Expires") == "3600"  # bumped to Min-Expires
+    assert _cseq_num(outcome.request) > _cseq_num(started)  # fresh transaction
+    # the retried REGISTER then completes normally
+    assert isinstance(flow.handle(_ok(_cseq_num(outcome.request))), Registered)
+
+
+def test_423_keeps_our_interval_when_min_expires_is_smaller() -> None:
+    # max(requested, min_expires): a Min-Expires below what we already asked for
+    # cannot be the reason for the 423, so there is nothing larger to retry with.
+    flow = RegistrationFlow(_CONFIG)  # requests 300
+    started = flow.start()
+    outcome = flow.handle(_too_brief(_cseq_num(started), min_expires="60"))
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 423
+
+
+def test_423_without_min_expires_fails() -> None:
+    # 423 with no Min-Expires gives nothing to comply with -> Failed, not a loop.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_too_brief(_cseq_num(started), min_expires=None))
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 423
+
+
+def test_second_423_after_retry_fails_no_loop() -> None:
+    # A registrar that 423s again after we honoured Min-Expires must not loop us.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    retry = flow.handle(_too_brief(_cseq_num(started), min_expires="3600"))
+    assert isinstance(retry, Retry)
+    again = flow.handle(_too_brief(_cseq_num(retry.request), min_expires="7200"))
+    assert isinstance(again, Failed)
+    assert again.status == 423
+
+
+def test_deregister_423_fails_rather_than_extending() -> None:
+    # A 423 on a de-registration (Expires: 0) must not be "fixed" by bumping the
+    # interval, which would silently turn a de-register into a registration.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    flow.handle(_ok(_cseq_num(started)))
+    dereg = flow.deregister()
+    outcome = flow.handle(_too_brief(_cseq_num(dereg), min_expires="3600"))
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 423
+
+
+@pytest.mark.parametrize(
+    "aor",
+    [
+        "",
+        ":",
+        "1000@pbx.example.test",
+        "sip:",
+        "sip:1000@",
+        "ftp:1000@pbx.example.test",
+    ],
+)
+def test_config_rejects_malformed_aor(aor: str) -> None:
+    # A malformed AOR would corrupt the request-URI and the digest uri and only
+    # surface much later as a confusing gateway rejection; fail fast instead.
+    with pytest.raises(ValueError, match=r"aor|scheme|host"):
+        RegistrationConfig(
+            aor=aor,
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+            local_sent_by="198.51.100.7:5061",
+        )
+
+
+def test_config_accepts_sips_aor() -> None:
+    # sips: is valid (ADR-0005's SIP-over-TLS mandate); the registrar URI keeps
+    # the scheme and drops the user/params.
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test;transport=tls",
+        username="1000",
+        password="s3cr3t",
+        contact="<sips:1000@198.51.100.7:5061>",
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    req = RegistrationFlow(cfg).start()
+    assert req.startswith("REGISTER sips:pbx.example.test SIP/2.0\r\n")
+
+
+def test_registration_public_api_is_importable_from_package() -> None:
+    # The plugin's reason to exist is registration; its API must be reachable
+    # from the package root, not only via the deep module path (ADR-0011).
+    for name in (
+        "RegistrationFlow",
+        "RegistrationConfig",
+        "Challenged",
+        "Registered",
+        "Failed",
+        "Retry",
+    ):
+        assert hasattr(hermes_voip, name), name
+        assert name in hermes_voip.__all__

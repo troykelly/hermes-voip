@@ -37,3 +37,21 @@ jobs:
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
         run: uv run pytest tests/test_hermes_contract.py -rs
+
+  # Runs the conversational-provider tests with the optional `ml` extra installed
+  # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack
+  # stays out of the main gate's install / licence / audit scope. The full suite is
+  # re-run here so the ml-gated provider tests (which importorskip without the extra)
+  # actually execute against the real runtime.
+  providers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --extra ml
+      # Prove the native ML stack actually loads (the onnx_compat shim runs first).
+      - run: uv run python -c "from hermes_voip.providers.onnx_compat import ensure_sherpa_loadable; ensure_sherpa_loadable(); import onnxruntime, sherpa_onnx, numpy; print('ml stack:', onnxruntime.__version__, numpy.__version__)"
+      - run: uv run pytest -rs

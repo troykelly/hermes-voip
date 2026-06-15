@@ -623,8 +623,11 @@ async def test_asr_exception_propagates_and_cancels_pump() -> None:
     """An ASR-task failure must surface out of run() (not hang the pump).
 
     The old 2-task design awaited only the pump; an ASR exception was
-    unobserved while the pump blocked on a full audio queue.  The supervised
-    design must raise the ASR error from run() and leave no task running.
+    unobserved while the pump blocked on a full audio queue (the run hung
+    indefinitely).  The supervised TaskGroup design must surface the ASR error
+    from run() promptly and leave no task running.  TaskGroup re-raises a child
+    failure inside an ExceptionGroup, so the original RuntimeError is asserted
+    to be one of its sub-exceptions.
     """
     tasks_before = set(asyncio.all_tasks())
 
@@ -640,8 +643,16 @@ async def test_asr_exception_propagates_and_cancels_pump() -> None:
         _noop,
     )
 
-    with pytest.raises(RuntimeError, match="asr exploded"):
+    with pytest.raises(BaseExceptionGroup) as excinfo:
         await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    # The exact ASR failure must be carried inside the group (not swallowed).
+    matched, _rest = excinfo.value.split(RuntimeError)
+    assert matched is not None
+    runtime_errors = [
+        exc for exc in matched.exceptions if isinstance(exc, RuntimeError)
+    ]
+    assert any(str(exc) == "asr exploded" for exc in runtime_errors)
 
     tasks_after = set(asyncio.all_tasks())
     leaked = tasks_after - tasks_before

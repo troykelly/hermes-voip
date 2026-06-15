@@ -6,19 +6,44 @@ endpointer/ASR/TTS) and the Hermes adapter that owns the Hermes conversation.
 
 Architecture
 ------------
-``run()`` runs two concurrent tasks on the asyncio event loop:
+``run()`` runs **three one-directional tasks** under an :class:`asyncio.TaskGroup`
+(Python 3.13). Each task owns exactly one hop, so no task ever both feeds and
+drains two bounded queues — which is what precludes the two-queue deadlock:
 
-* **Inbound pump** — consumes ``transport.inbound_audio()``, feeds every frame
-  through VAD + endpointer, and also routes each frame into the ASR stream via
-  a bounded asyncio.Queue. On a speech ONSET while the agent is speaking,
-  ``barge_in()`` is called immediately to cancel the active TtsStream before
-  the ASR task can see more audio. On a finalised end-of-turn transcript the
-  pump awaits the guard, records the result in ``guard_state``, and (if the
-  verdict is not REFUSE) awaits ``deliver_turn`` to hand the text to the agent.
+* **pump** — consumes ``transport.inbound_audio()``, feeds every frame through
+  VAD + endpointer (calling :meth:`barge_in` on a speech ONSET while the agent
+  is speaking), and forwards each frame onto the bounded ``audio_q``. When the
+  transport ends it puts an end-of-stream marker and returns.
 
-* **ASR consumer** — iterates ``asr.stream(audio_queue_iter)``, yielding
-  ``Transcript`` objects. Final/end-of-turn transcripts are sent to the inbound
-  pump via a second queue so the pump serialises guard screening and delivery.
+* **asr** — iterates ``asr.stream(audio_iter)`` where ``audio_iter`` drains
+  ``audio_q`` until the marker; it forwards each finalised end-of-turn
+  transcript onto the bounded ``transcript_q``. When the ASR stream ends it puts
+  a marker and returns.
+
+* **delivery** — drains ``transcript_q``; for each transcript it awaits
+  ``guard.screen``, folds the result into ``guard_state``, and (when the verdict
+  is not REFUSE) awaits ``deliver_turn``. It returns on the marker.
+
+Because the pump only *feeds* ``audio_q`` and the delivery task only *drains*
+``transcript_q``, the dependency graph is a straight line
+(pump → audio_q → asr → transcript_q → delivery) with **no cycle**. Both queues
+are bounded, so memory is bounded and a slow stage back-pressures upstream — but
+back-pressure on an acyclic chain cannot deadlock: the most-downstream runnable
+stage (delivery) always makes progress, releasing the stage above it, and so on.
+The old two-task design had the pump *both* feeding ``audio_q`` *and* draining
+``transcript_q``, closing a cycle that deadlocked once both bounded queues filled.
+
+Supervision & shutdown
+-----------------------
+:class:`asyncio.TaskGroup` cancels every sibling the moment any task raises and
+re-raises that exception (inside an ``ExceptionGroup``) from ``run()`` — so an
+ASR failure can never go unobserved while the pump blocks forever. Shutdown is
+**cancellation-driven**: on normal completion the end-of-stream markers flow
+down the chain and all three tasks return; on error or external cancellation the
+TaskGroup cancels the tasks and the blocked ``put``/``get`` calls raise
+``CancelledError``. No cleanup step blocks on putting a sentinel into a possibly
+full bounded queue — the end-of-stream markers are emitted on the normal path,
+never from a ``finally`` that could re-block.
 
 Barge-in
 --------
@@ -28,19 +53,10 @@ makes the stream stop yielding (per the TtsStream protocol) so ``speak()``'s
 ``async for`` loop exits; no more frames are sent to ``transport.send_audio``.
 The ``barge_in()`` call completes synchronously-within-the-event-loop, so
 cancellation is immediate relative to any subsequent ``send_audio`` calls.
-
-Task safety
------------
-* The inbound pump and ASR consumer run as ``asyncio.Task`` objects; ``run()``
-  cancels and awaits them in a ``finally`` block so no task leaks on any exit
-  path (clean end or exception).
-* ``speak()`` is not launched as a background task by ``run()`` — the Hermes
-  adapter calls it from its own coroutine while ``run()`` is live. It is
-  independently cancellable via ``barge_in()``.
-* The audio tee (inbound → ASR) uses a bounded ``asyncio.Queue`` so the pump
-  never buffers unbounded frames while a slow ASR consumer lags behind.
-* ``_active_tts_stream`` is accessed only from the event loop; no locking is
-  needed.
+``speak()`` is not launched by ``run()`` — the Hermes adapter calls it from its
+own coroutine while ``run()`` is live; it is independently cancellable via
+``barge_in()``. ``_active_tts_stream`` is touched only from the event loop, so
+no locking is needed.
 
 Tool gating
 -----------
@@ -54,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+from enum import Enum
 from typing import Final
 
 from hermes_voip.media.endpoint import Endpointer
@@ -65,12 +82,29 @@ from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_
 from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 
-#: Maximum audio frames buffered between the inbound pump and the ASR consumer
-#: (back-pressure: pump blocks once the ASR task is this far behind).
+#: Maximum audio frames buffered between the pump and the ASR task (back-pressure:
+#: the pump blocks once the ASR task is this far behind). Bounds inbound memory.
 _AUDIO_QUEUE_MAX: Final[int] = 32
 
-#: Sentinel that signals end-of-audio to the ASR consumer queue.
-_AUDIO_DONE: Final[None] = None
+#: Maximum finalised transcripts buffered between the ASR task and the delivery
+#: task. Bounds memory if guard screening / delivery lags behind ASR finals
+#: (finding #3): ASR back-pressures rather than buffering an unbounded backlog.
+_TRANSCRIPT_QUEUE_MAX: Final[int] = 32
+
+
+class _EndOfStream(Enum):
+    """Typed end-of-stream marker passed through the inter-task queues.
+
+    A single-member enum gives a distinct, ``is``-comparable sentinel with a
+    precise static type (``Literal[_EndOfStream.MARKER]``), so a queue can carry
+    ``Frame | _EndOfStream`` with no ``None``-ambiguity and no ``Any``.
+    """
+
+    MARKER = "marker"
+
+
+#: The sole end-of-stream marker value (see :class:`_EndOfStream`).
+_END_OF_STREAM: Final[_EndOfStream] = _EndOfStream.MARKER
 
 
 def gate_voip_tool(
@@ -167,104 +201,80 @@ class CallLoop:
         # Accessed only from the event loop; no locking required.
         self._active_tts_stream: TtsStream | None = None
 
-    async def run(self) -> None:  # noqa: PLR0915 — long but linear; extraction loses coupling
+    async def run(self) -> None:
         """Run the duplex loop until the transport's inbound stream ends.
 
-        Starts two concurrent tasks (inbound audio pump + ASR consumer), drives
-        them to completion when the transport closes, and cancels/cleans up both
-        tasks on any exit path so no asyncio tasks are leaked.
+        Runs three one-directional tasks under an :class:`asyncio.TaskGroup`
+        (pump → ``audio_q`` → asr → ``transcript_q`` → delivery). The TaskGroup
+        supervises them: if any task raises, the others are cancelled and the
+        error is re-raised from ``run()`` (wrapped in an ``ExceptionGroup``);
+        when the transport ends, end-of-stream markers flow down the chain and
+        all three tasks return cleanly. No task is leaked on any exit path, and
+        the acyclic two-bounded-queue topology cannot deadlock (see the module
+        docstring).
 
         The caller (the Hermes adapter) can call ``speak()`` and ``barge_in()``
         concurrently while this coroutine is live.
 
         Raises:
-            Any exception propagated from the inbound pump or ASR consumer.
+            ExceptionGroup: Wrapping any exception raised by a stage task (e.g.
+                a transport, ASR, guard, or delivery failure).
         """
-        # Bounded queue: inbound pump → ASR consumer.
-        # PcmFrame | None: None is the end-of-audio sentinel.
-        audio_q: asyncio.Queue[PcmFrame | None] = asyncio.Queue(
+        # Bounded queues on a straight pump → asr → delivery line. Both bounded,
+        # so memory is bounded; acyclic, so back-pressure never deadlocks.
+        audio_q: asyncio.Queue[PcmFrame | _EndOfStream] = asyncio.Queue(
             maxsize=_AUDIO_QUEUE_MAX
         )
-        # Queue from ASR consumer back to the pump for finalised transcripts.
-        transcript_q: asyncio.Queue[str] = asyncio.Queue()
+        transcript_q: asyncio.Queue[str | _EndOfStream] = asyncio.Queue(
+            maxsize=_TRANSCRIPT_QUEUE_MAX
+        )
 
-        async def _asr_consumer() -> None:
-            """Drain the ASR stream; push final end-of-turn text to transcript_q."""
+        async def _pump() -> None:
+            """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded)."""
+            window_index = 0
+            async for frame in self._transport.inbound_audio():
+                for vad_event in self._vad.feed(frame):
+                    self._endpointer.on_event(vad_event)
+                    # Speech onset while the agent is speaking → barge-in.
+                    if (
+                        vad_event.edge is SpeechEdge.ONSET
+                        and self._active_tts_stream is not None
+                    ):
+                        await self.barge_in()
+                self._endpointer.advance(window_index)
+                window_index += 1
+                await audio_q.put(frame)
+            # End-of-stream marker on the normal path (not a finally): the ASR
+            # task is still draining audio_q, so this put cannot block forever.
+            await audio_q.put(_END_OF_STREAM)
+
+        async def _asr() -> None:
+            """audio_q → asr.stream(...) → transcript_q (bounded)."""
 
             async def _audio_iter() -> AsyncIterator[PcmFrame]:
                 while True:
-                    frame = await audio_q.get()
-                    if frame is None:
+                    item = await audio_q.get()
+                    if item is _END_OF_STREAM:
                         return
-                    yield frame
+                    yield item
 
             async for transcript in self._asr.stream(_audio_iter()):
                 if transcript.is_final and transcript.end_of_turn:
                     await transcript_q.put(transcript.text)
+            await transcript_q.put(_END_OF_STREAM)
 
-        pump_task: asyncio.Task[None] | None = None
-        asr_task: asyncio.Task[None] | None = None
+        async def _delivery() -> None:
+            """transcript_q → guard.screen → record → (non-REFUSE) deliver_turn."""
+            while True:
+                item = await transcript_q.get()
+                if item is _END_OF_STREAM:
+                    return
+                await self._screen_and_deliver(item)
 
-        async def _inbound_pump() -> None:
-            """Consume inbound frames; route to VAD, endpointer, audio_q, guard."""
-            window_index = 0
-            try:
-                async for frame in self._transport.inbound_audio():
-                    # --- VAD / barge-in detection ---
-                    for vad_event in self._vad.feed(frame):
-                        self._endpointer.on_event(vad_event)
-                        # Speech onset while agent is speaking → barge-in.
-                        if (
-                            vad_event.edge is SpeechEdge.ONSET
-                            and self._active_tts_stream is not None
-                        ):
-                            await self.barge_in()
-                    self._endpointer.advance(window_index)
-                    window_index += 1
-
-                    # --- Route to ASR consumer ---
-                    await audio_q.put(frame)
-
-                    # --- Drain any finalised transcripts (non-blocking) ---
-                    while not transcript_q.empty():
-                        text = transcript_q.get_nowait()
-                        await self._screen_and_deliver(text)
-
-            finally:
-                # Signal end-of-audio to the ASR consumer.
-                await audio_q.put(_AUDIO_DONE)
-
-            # Drain the final transcript flush after the stream ends.
-            # The ASR consumer will emit any buffered final transcript before it
-            # exits, so we wait for the ASR task to flush before draining.
-            if asr_task is not None:
-                await asr_task  # wait for the consumer to finish draining
-            while not transcript_q.empty():
-                text = transcript_q.get_nowait()
-                await self._screen_and_deliver(text)
-
-        try:
-            asr_task = asyncio.create_task(_asr_consumer())
-            pump_task = asyncio.create_task(_inbound_pump())
-            # Wait for the pump to complete (it drives the loop's lifetime).
-            await pump_task
-        except BaseException:
-            if pump_task is not None and not pump_task.done():
-                pump_task.cancel()
-            raise
-        finally:
-            if asr_task is not None and not asr_task.done():
-                asr_task.cancel()
-            # Gather with return_exceptions so cancellation of one does not
-            # swallow the other's error; exceptions discarded here because
-            # the pump already surfaced any meaningful error above.
-            tasks: list[asyncio.Task[None]] = []
-            if pump_task is not None:
-                tasks.append(pump_task)
-            if asr_task is not None:
-                tasks.append(asr_task)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(_pump())
+            tg.create_task(_asr())
+            tg.create_task(_delivery())
 
     async def speak(self, text: AsyncIterator[str]) -> None:
         """Synthesise agent text and send frames to the far end.

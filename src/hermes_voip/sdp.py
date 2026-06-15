@@ -232,14 +232,20 @@ class AudioMedia:
 
 @dataclass(slots=True)
 class _AudioAccumulator:
-    """Mutable scratch state for one ``m=audio`` block while parsing."""
+    """Mutable scratch state for one ``m=audio`` block while parsing.
+
+    ``crypto`` accumulates raw ``a=crypto`` bodies, which carry the SDES inline
+    master key||salt; it is suppressed from ``repr`` (``field(repr=False)``) so a
+    debug log or traceback local of this scratch object cannot leak key material,
+    consistent with the public :class:`CryptoAttribute`/:class:`AudioMedia`.
+    """
 
     port: int = 0
     protocol: str = ""
     fmt_order: list[int] = field(default_factory=list)
     rtpmaps: dict[int, tuple[str, int, int]] = field(default_factory=dict)
     fmtps: dict[int, str] = field(default_factory=dict)
-    crypto: list[str] = field(default_factory=list)
+    crypto: list[str] = field(default_factory=list, repr=False)
     ptime: int | None = None
     direction: str = "sendrecv"
     connection: str | None = None

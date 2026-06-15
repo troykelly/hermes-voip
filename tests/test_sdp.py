@@ -14,6 +14,7 @@ from hermes_voip.sdp import (
     CryptoAttribute,
     SdpError,
     SessionDescription,
+    _AudioAccumulator,
     build_audio_answer,
     build_audio_offer,
     negotiate_audio,
@@ -819,3 +820,16 @@ def test_crypto_error_non_decimal_tag_does_not_leak_key() -> None:
     assert _FAKE_KEY not in msg
     assert "inline:" not in msg
     assert "tag" in msg  # structural fact: the tag is not decimal
+
+
+def test_audio_accumulator_repr_hides_crypto_key_material() -> None:
+    # LOW (full-path sweep): the internal parse accumulator stores raw a=crypto
+    # bodies (which carry inline:<key||salt>). It is never returned, but a debug
+    # log or a traceback local would expose its repr — so its crypto field must
+    # be repr-suppressed, like the public CryptoAttribute/AudioMedia fields.
+    acc = _AudioAccumulator()
+    acc.add_attribute(f"crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}")
+    assert acc.crypto == [f"1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}"]  # retained
+    text = repr(acc)
+    assert _FAKE_KEY not in text  # ...but the key never leaks into the repr.
+    assert "inline:" not in text

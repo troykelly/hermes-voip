@@ -30,22 +30,28 @@ _SONAME = "libonnxruntime.so"
 def ensure_sherpa_loadable() -> None:
     """Symlink onnxruntime's library where sherpa-onnx's RPATH resolves it.
 
-    Does nothing when sherpa-onnx or onnxruntime is absent, or when the symlink
-    already exists. Any failure other than a concurrent-create race propagates.
+    Does nothing when sherpa-onnx or onnxruntime is absent, or when a working
+    ``libonnxruntime.so`` (resolving to a real library) is already present. A
+    **missing or dangling** link is (re)created pointing at onnxruntime's library;
+    a concurrent-create race is accepted only if the link then resolves, else the
+    error propagates.
     """
     sherpa_lib = _sherpa_lib_dir()
     if sherpa_lib is None:
         return
     link = sherpa_lib / _SONAME
     if link.exists():
-        return
+        return  # an existing, resolvable library (ours or sherpa-bundled) works
     target = _onnxruntime_library()
     if target is None:
         return
+    if link.is_symlink():
+        link.unlink()  # a dangling symlink: remove before recreating
     try:
         link.symlink_to(target)
     except FileExistsError:
-        return  # created concurrently between the exists() check and here
+        if not link.exists():  # concurrent creation that is itself broken
+            raise
 
 
 def _sherpa_lib_dir() -> Path | None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import pathlib
 
 import pytest
 
@@ -46,3 +47,24 @@ def test_shim_is_idempotent() -> None:
     ensure_sherpa_loadable()
     ensure_sherpa_loadable()  # second call must not raise (symlink already present)
     assert importlib.import_module("sherpa_onnx") is not None
+
+
+def test_shim_repairs_a_broken_symlink() -> None:
+    # A dangling libonnxruntime.so left by a prior install must be repaired, not
+    # treated as already-present (codex MEDIUM).
+    if not _ml_extra_present():
+        pytest.skip("ml extra not installed")
+    spec = importlib.util.find_spec("sherpa_onnx")
+    assert spec is not None
+    assert spec.origin is not None
+    link = pathlib.Path(spec.origin).parent / "lib" / "libonnxruntime.so"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(link.parent / "does-not-exist-onnxruntime.so")
+    assert link.is_symlink()  # confirmed broken
+    assert not link.exists()
+
+    ensure_sherpa_loadable()
+
+    assert link.exists()  # repaired: resolves to a real library now
+    assert link.resolve().name.startswith("libonnxruntime.so.")

@@ -26,7 +26,7 @@ import pytest
 from hermes_voip.media.call_loop import CallLoop, gate_voip_tool
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import VoiceActivityDetector
-from hermes_voip.providers.asr import Transcript
+from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState, ToolRisk
@@ -231,7 +231,7 @@ def _make_endpointer() -> Endpointer:
 
 def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own 9-arg __init__
     transport: _FakeTransport,
-    asr: _FakeASR,
+    asr: StreamingASR,
     tts: _FakeTTS,
     guard: _FakeGuard,
     deliver_turn: Callable[[str], Awaitable[None]],
@@ -523,3 +523,201 @@ async def test_multiple_turns_each_delivered() -> None:
     await loop.run()
 
     assert delivered == ["turn one", "turn two"]
+
+
+# ---------------------------------------------------------------------------
+# Concurrency-defect regressions (codex review of PR #43)
+# ---------------------------------------------------------------------------
+
+
+class _RaisingAsrIterator:
+    """Async iterator that consumes a few frames, then raises (never yields).
+
+    It stops draining its input after ``drain_before_raise`` frames, so the
+    inbound pump — still pushing many more frames into a *bounded* audio queue
+    — blocks on ``put()`` once the queue fills.  This is the finding-1 trap:
+    a 2-task design that awaits only the pump will hang forever; a supervised
+    design must observe the ASR failure, cancel the pump, and propagate.
+    """
+
+    def __init__(
+        self,
+        audio: AsyncIterator[PcmFrame],
+        exc: Exception,
+        drain_before_raise: int,
+    ) -> None:
+        self._audio = audio
+        self._exc = exc
+        self._remaining = drain_before_raise
+
+    def __aiter__(self) -> _RaisingAsrIterator:
+        return self
+
+    async def __anext__(self) -> Transcript:
+        while self._remaining > 0:
+            self._remaining -= 1
+            await self._audio.__anext__()
+        raise self._exc
+
+
+class _RaisingASR:
+    """StreamingASR fake whose stream raises after a few frames (then stops).
+
+    Models an ASR engine that fails mid-call while inbound audio is still
+    flowing.  Because it stops consuming the audio iterator, the pump fills the
+    bounded audio queue and blocks; the supervisor must propagate the error out
+    of run() and cancel the pump rather than leaving it blocked forever.
+    """
+
+    def __init__(self, exc: Exception, *, drain_before_raise: int = 2) -> None:
+        self._exc = exc
+        self._drain_before_raise = drain_before_raise
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
+
+    def stream(
+        self,
+        audio: AsyncIterator[PcmFrame],
+    ) -> AsyncIterator[Transcript]:
+        return _RaisingAsrIterator(audio, self._exc, self._drain_before_raise)
+
+
+class _SlowDrainASR:
+    """StreamingASR fake that emits one final transcript per inbound frame.
+
+    Used to prove the pump and ASR keep flowing under back-pressure from a
+    stalled delivery stage: every inbound frame yields a finalised turn, so a
+    bounded transcript queue plus a blocked delivery would, in the old 2-task
+    design, deadlock the pump. In the 3-task design the pump only feeds audio
+    and never drains transcripts, so there is no cycle.
+    """
+
+    def __init__(self) -> None:
+        self.frames_drained = 0
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
+
+    def stream(
+        self,
+        audio: AsyncIterator[PcmFrame],
+    ) -> AsyncIterator[Transcript]:
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:
+                self.frames_drained += 1
+                yield Transcript(
+                    text=f"turn-{self.frames_drained}",
+                    is_final=True,
+                    end_of_turn=True,
+                    confidence=1.0,
+                )
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_asr_exception_propagates_and_cancels_pump() -> None:
+    """An ASR-task failure must surface out of run() (not hang the pump).
+
+    The old 2-task design awaited only the pump; an ASR exception was
+    unobserved while the pump blocked on a full audio queue.  The supervised
+    design must raise the ASR error from run() and leave no task running.
+    """
+    tasks_before = set(asyncio.all_tasks())
+
+    boom = RuntimeError("asr exploded")
+    # Many frames so the pump would, without supervision, block on a full queue.
+    frames = [_silence_frame(i) for i in range(200)]
+
+    loop = _build_loop(
+        _FakeTransport(frames),
+        _RaisingASR(boom),
+        _FakeTTS([]),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    with pytest.raises(RuntimeError, match="asr exploded"):
+        await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    tasks_after = set(asyncio.all_tasks())
+    leaked = tasks_after - tasks_before
+    assert leaked == set(), f"Leaked tasks after failed run(): {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_stalled_delivery_does_not_deadlock_pump_and_asr() -> None:
+    """A blocked delivery stage must not deadlock the pump/ASR (bounded memory).
+
+    With one finalised turn per inbound frame and delivery gated on an event,
+    the transcript queue back-pressures the ASR (and the audio queue
+    back-pressures the pump) — but there is no cycle, so once delivery is
+    released the call completes.  This would hang under the old 2-task design.
+    """
+    gate = asyncio.Event()
+    delivered: list[str] = []
+
+    async def gated_deliver(text: str) -> None:
+        await gate.wait()
+        delivered.append(text)
+
+    n_frames = 100
+    frames = [_silence_frame(i) for i in range(n_frames)]
+    asr = _SlowDrainASR()
+
+    loop = _build_loop(
+        _FakeTransport(frames),
+        asr,
+        _FakeTTS([]),
+        _FakeGuard([_allow_result()]),
+        gated_deliver,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the pump and ASR make as much progress as back-pressure allows while
+    # delivery is stalled.  They must not deadlock: the task is simply pending.
+    await asyncio.sleep(0)
+    assert not run_task.done(), "run() finished before delivery was released"
+
+    # Release delivery; the whole pipeline must now drain and complete.
+    gate.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert len(delivered) == n_frames
+    assert asr.frames_drained == n_frames
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_leaks_no_tasks() -> None:
+    """Cancelling run() mid-flight must tear down every child task cleanly."""
+    tasks_before = set(asyncio.all_tasks())
+
+    # Delivery blocks forever so run() cannot complete on its own.
+    block_forever = asyncio.Event()
+
+    async def stuck_deliver(text: str) -> None:
+        _ = text
+        await block_forever.wait()
+
+    frames = [_silence_frame(i) for i in range(50)]
+
+    loop = _build_loop(
+        _FakeTransport(frames),
+        _SlowDrainASR(),
+        _FakeTTS([]),
+        _FakeGuard([_allow_result()]),
+        stuck_deliver,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0)  # let the pipeline start and back-pressure build
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    tasks_after = set(asyncio.all_tasks())
+    leaked = tasks_after - tasks_before
+    assert leaked == set(), f"Leaked tasks after cancellation: {leaked}"

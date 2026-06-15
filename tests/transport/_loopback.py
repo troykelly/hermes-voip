@@ -8,116 +8,97 @@ handler. It is deliberately minimal — it canned-replies; it is not a real UAS.
 
 The TLS material is an **obviously-fake, throwaway, self-signed** loopback cert
 for ``pbx.example.test`` / ``localhost`` / ``127.0.0.1`` with no production
-validity, embedded below as base64 **DER** (not PEM) so a generic secret scanner
-sees no key armour, and materialised to a 0600 temp file at runtime. No real
-host, extension, credential, or PII appears here.
+validity. It is generated **ephemerally at test time** with the ``openssl`` CLI
+into a per-session temp directory and is **never committed** — so no private-key
+material lives in the repo (a committed key would also trip secret scanning). The
+test is skipped if ``openssl`` is unavailable. No real host, extension,
+credential, or PII appears here.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import atexit
+import shutil
 import ssl
+import subprocess
 import tempfile
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable
+from functools import cache
 from pathlib import Path
+
+import pytest
 
 from hermes_voip.message import SipRequest
 from hermes_voip.transport.framing import SipMessageFramer
 
 type Responder = Callable[[SipRequest], Awaitable[list[str]]]
 
-# A throwaway self-signed RSA-2048 cert (CN=pbx.example.test; SAN pbx.example.test,
-# localhost, 127.0.0.1) and its private material, as base64 DER. FAKE test-only
-# loopback material — never a real credential.
-_CERT_DER_B64 = (
-    "MIIDvDCCAqSgAwIBAgIUasMS8FrSFNh/OrUxqbw0AbpfAoEwDQYJKoZIhvcNAQELBQAwVTEZMBcG"
-    "A1UEAwwQcGJ4LmV4YW1wbGUudGVzdDEgMB4GA1UECgwXaGVybWVzLXZvaXAgdGVzdCAoRkFLRSkx"
-    "FjAUBgNVBAsMDWxvb3BiYWNrIG9ubHkwIBcNMjYwNjE1MDIzOTI3WhgPMjEyNjA1MjIwMjM5Mjda"
-    "MFUxGTAXBgNVBAMMEHBieC5leGFtcGxlLnRlc3QxIDAeBgNVBAoMF2hlcm1lcy12b2lwIHRlc3Qg"
-    "KEZBS0UpMRYwFAYDVQQLDA1sb29wYmFjayBvbmx5MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIB"
-    "CgKCAQEAuRAyku3FVLRS9PKMPuwSJvyZYGNPlfR3X3WVWSRpDRy6b82cpzFn1sGq9OZmrC68Fomo"
-    "dSltVKpeJPFzECeHdcruCzjt17ypZwn95ILEVf0D2QpYoS9ycVEX992yEQ/JCmRifj7ZQzMpg662"
-    "MXWD2e9AURVLuilIXtRE2zUcby9V3OyK6KezTIsp0KUerm6u1N53xiZp42jItnUBdEE8FfN4r3wy"
-    "1iBRKOO/2eNAjfOL9k1xPwxOeELXBIyrWYT46PD0N2WYov4jaMzWw4C4xNpjkry0a7QB4QWkfMuS"
-    "zecX3maQbhpnnnI20uGXbK+wKMbDFv4+ylvZ+CpjUagGMwIDAQABo4GBMH8wHQYDVR0OBBYEFC4O"
-    "0e9mi5VWHawQMpFdphVHbqbmMB8GA1UdIwQYMBaAFC4O0e9mi5VWHawQMpFdphVHbqbmMA8GA1Ud"
-    "EwEB/wQFMAMBAf8wLAYDVR0RBCUwI4IQcGJ4LmV4YW1wbGUudGVzdIIJbG9jYWxob3N0hwR/AAAB"
-    "MA0GCSqGSIb3DQEBCwUAA4IBAQAK/ltoiwoiISPNs7bsXDgHvAmgxor7O6Q9vET6KWf8vk5zh68k"
-    "FFf7vfzcdsDjCyvYvMsY7X3ztNlmF+uebybABkbivY8vjMXGwl3xLr9qKN1mhlROHWhpBPuQuznM"
-    "YBSceQhovtmTLUsnqka5MSosbg8ZIg28Bp8Z4kl8IjKdNFwW2Jykylh96OyPUhVHC1YUYhDC8SRP"
-    "6h0VPLDQjvNiDTGyWq6CtE1HEcskxIMP3KcwXLVTV1SDlf0srVeavRgzC8r97BYKZVTFr496Pd1n"
-    "h5vz24qBF4M5v518ZR5Xwqm2zybwLJpNAbL3Y+VAJq1PHjKv4crcfTABsl+dLlLs"
-)
-# RSA private material in PKCS#1 DER, base64. FAKE loopback test-only material.
-_PRIVDER_B64 = (
-    "MIIEpAIBAAKCAQEAuRAyku3FVLRS9PKMPuwSJvyZYGNPlfR3X3WVWSRpDRy6b82cpzFn1sGq9OZm"
-    "rC68FomodSltVKpeJPFzECeHdcruCzjt17ypZwn95ILEVf0D2QpYoS9ycVEX992yEQ/JCmRifj7Z"
-    "QzMpg662MXWD2e9AURVLuilIXtRE2zUcby9V3OyK6KezTIsp0KUerm6u1N53xiZp42jItnUBdEE8"
-    "FfN4r3wy1iBRKOO/2eNAjfOL9k1xPwxOeELXBIyrWYT46PD0N2WYov4jaMzWw4C4xNpjkry0a7QB"
-    "4QWkfMuSzecX3maQbhpnnnI20uGXbK+wKMbDFv4+ylvZ+CpjUagGMwIDAQABAoIBAACP2wd1L181"
-    "ePcDcYeTYe66X6DaTFiROHeSvNRbdvIyPyKtxib/0GfniKRbur4VGj8bReatLIbQSZ7lGMtYw2GJ"
-    "LzXbg2VfTkhg0GOMPhpgvU1Aacp7gWZ0r5TyGGNS3/JnIaFugWxh0GN0+VqnF7JmtpRIc0VqcKzR"
-    "CjB8Nczkn5SFcb2U19JOtv96nY3HXjVTnQ3eZqf+lHLZ5EuQmZxzbQSIuk8ox41sVT4UbHHXrglK"
-    "pYapH3UgAMw5YMXCd4xRVAnTZYGgFHlZSZ8nb/w6QWgK9D6iRcvGyN+JH7derdPOWAsynNtDgyfh"
-    "pC6fezgI+C5X/KF9wdqNZmaHDvECgYEA4WOe0Vz8snQ8adQs32/WiZ40u+PXUl35fawpTxMRnXj+"
-    "wkmwg4sGJlVSMrN3MOyOadxF0CkD2pj2dAMSL5ozkRsi+vPwvUXFI43p4aUHqGVejsQSGxpdKiZm"
-    "aqom7NbJ1Sj7sUtCzyR+ZvNzm34YKS299P+TzfQAiSBYDKAZkWkCgYEA0jKEtF3kX9jncUO4hscO"
-    "g4QUBJccPuRTtUJ19fkeq2lzd2n7e/s6su1x0hYgxfYjrlwLuSIQBOuR9BSMf2329Zalot/XfCPd"
-    "iPOirIK9EM3OokCx8pySwIKO8/GFcyjG0ODvkUDfPpXHiJzLz9pxI0LVEd6YyPxzUHHd+inkCzsC"
-    "gYB+AXLFu4WuwtsPk0Yu+FhpgaAbtuonK1CTGM/TXGbJsd5Dgm0DbZLXlXWp0Ll/CZEoz7PcB0IX"
-    "UNLf0uO05zGTGye4Qu7A8iOfl/Q8aUXZuCpgCG/S5S9WpDc3xL6URBR8bjggS2IjalSce9iTArDB"
-    "PMhpEwVv68zs3L8897izmQKBgQC203//jec0wunT545ZlEv4cmoi7/h+b4SrlQobDzrw5wCqrgEyf"
-    "ns45DRrAhoxdXzljGQZ/Bmo3ekOPs1RjSkPxZ9+QmogLOXk19z3ZaPjOM9w6wqcNjmivixu2/UyD"
-    "BaZ2fwmACHtQsPR/Gd9+8cKX3gKWe3Ua1g1cUUc8VDLvwKBgQCSSlJQsF2Pn+jhNAjX5NA0nXdBS"
-    "IuSyRyGE7wzYcXSYkMbczouwwQ3HxKzs4vWUTl6LEOJLW053TgWhnHLjU18dbbrEoBvwx+vFTpNN"
-    "JfHeUHqasI/nA+xkytn+nyyaM2mIYB5Uks61K5I5sh9Sl1Zpo9CkXz2+XQFpCUyLTt8qw=="
-)
 
-_PEM_CERT_HEADER = "-----BEGIN CERTIFICATE-----"
-_PEM_CERT_FOOTER = "-----END CERTIFICATE-----"
-# The key armour is assembled at runtime from two fragments, never written
-# contiguously in source, so a generic secret scanner finds no key-armour literal.
-_PEM_KEY_HEADER = "-----BEGIN RSA PRIVATE" + " KEY-----"
-_PEM_KEY_FOOTER = "-----END RSA PRIVATE" + " KEY-----"
+def _ensure_openssl() -> str:
+    """Return the ``openssl`` executable path, or skip the test if it is absent."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl CLI not available; cannot mint the loopback test cert")
+    return openssl
 
 
-def _pem(der_b64: str, header: str, footer: str) -> str:
-    lines = "\n".join(der_b64[i : i + 64] for i in range(0, len(der_b64), 64))
-    return f"{header}\n{lines}\n{footer}\n"
+@cache
+def _generate_chain() -> tuple[Path, Path]:
+    """Mint a throwaway self-signed loopback cert+key with openssl (once/session).
 
-
-@contextmanager
-def _materialised_chain() -> Iterator[tuple[Path, Path]]:
-    """Write the fake cert + key to a 0600 temp dir; yield ``(cert, key)`` paths."""
-    with tempfile.TemporaryDirectory(prefix="hermes-voip-loopback-") as raw:
-        directory = Path(raw)
-        cert = directory / "cert.pem"
-        key = directory / "key.pem"
-        cert.write_text(_pem(_CERT_DER_B64, _PEM_CERT_HEADER, _PEM_CERT_FOOTER))
-        key.write_text(_pem(_PRIVDER_B64, _PEM_KEY_HEADER, _PEM_KEY_FOOTER))
-        key.chmod(0o600)
-        yield cert, key
+    The directory is created with ``mkdtemp`` (0700) and removed at process exit;
+    the key file is written by openssl. Nothing is committed. ``@cache`` runs the
+    openssl call once so it does not repeat per test.
+    """
+    openssl = _ensure_openssl()
+    directory = Path(tempfile.mkdtemp(prefix="hermes-voip-loopback-"))
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    cert = directory / "cert.pem"
+    key = directory / "key.pem"
+    subprocess.run(  # noqa: S603 — fixed argv (no shell), openssl path from shutil.which
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=pbx.example.test/O=hermes-voip test (FAKE)",
+            "-addext",
+            "subjectAltName=DNS:pbx.example.test,DNS:localhost,IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return (cert, key)
 
 
 def server_ssl_context() -> ssl.SSLContext:
-    """A TLS server context using the fake loopback cert/key (materialised)."""
+    """A TLS server context using the ephemeral fake loopback cert/key."""
+    cert, key = _generate_chain()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    with _materialised_chain() as (cert, key):
-        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
     return ctx
 
 
 def client_ssl_context() -> ssl.SSLContext:
-    """A TLS client context that trusts the fake loopback cert.
+    """A TLS client context that trusts the ephemeral fake loopback cert.
 
     Real deployments verify against the system trust store; the test pins the one
     throwaway cert so the loopback handshake verifies end-to-end (hostname
     ``pbx.example.test`` / ``127.0.0.1`` are SANs on the cert).
     """
+    cert, _key = _generate_chain()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=base64.b64decode(_CERT_DER_B64))
+    ctx.load_verify_locations(cafile=str(cert))
     return ctx
 
 

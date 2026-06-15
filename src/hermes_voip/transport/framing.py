@@ -25,13 +25,23 @@ _HEAD_END = b"\r\n\r\n"
 # Content-Length and its RFC 3261 §20 compact form ``l`` (case-insensitive).
 _CONTENT_LENGTH_NAMES = frozenset({"content-length", "l"})
 
+# Defensive bounds: real SIP messages are a few KiB (large SDP+ICE ~8 KiB); these
+# caps sit far above any legitimate message yet bound memory if a peer never
+# terminates a head or declares an oversized body (the TLS peer is authenticated
+# but may be buggy/compromised).
+_MAX_HEAD = 64 * 1024
+_MAX_MESSAGE = 256 * 1024
+
 
 class FramingError(ValueError):
-    """A message head is malformed: no Content-Length, or a non-numeric one.
+    """A message cannot be framed: a malformed, missing, or oversized boundary.
 
-    The stream cannot be re-synchronised after this — a missing or unparseable
-    Content-Length means the body length is unknown, so the transport cannot find
-    the next message boundary. The transport surfaces it (rule 37), never guesses.
+    Raised for an absent / unparseable / out-of-range ``Content-Length``, a head
+    that exceeds :data:`_MAX_HEAD` without terminating, or a declared message size
+    above :data:`_MAX_MESSAGE`. The stream cannot be re-synchronised after the
+    first three (the next boundary is unknown); the size caps fault before the
+    buffer can grow toward an oversized body. The transport surfaces it (rule 37),
+    never guesses.
     """
 
 
@@ -58,16 +68,24 @@ class SipMessageFramer:
         """Pop one complete message, or return ``None`` if none is complete yet.
 
         Raises:
-            FramingError: if a complete head declares no usable Content-Length.
+            FramingError: if a complete head declares no usable Content-Length, an
+                unterminated head exceeds :data:`_MAX_HEAD`, or the declared
+                message size exceeds :data:`_MAX_MESSAGE`.
         """
         self._skip_keepalive_crlf()
         end = self._buffer.find(_HEAD_END)
         if end == -1:
+            if len(self._buffer) > _MAX_HEAD:
+                msg = f"message head exceeds {_MAX_HEAD} bytes without termination"
+                raise FramingError(msg)
             return None  # head not yet terminated
         head = bytes(self._buffer[:end]).decode("utf-8", errors="replace")
         body_start = end + len(_HEAD_END)
         content_length = _content_length(head)
         body_end = body_start + content_length
+        if body_end > _MAX_MESSAGE:
+            msg = f"declared message size {body_end} exceeds {_MAX_MESSAGE} bytes"
+            raise FramingError(msg)
         if len(self._buffer) < body_end:
             return None  # body not fully arrived
         message = bytes(self._buffer[:body_end])
@@ -96,7 +114,11 @@ def _content_length(head: str) -> int:
         name, sep, value = line.partition(":")
         if sep and name.strip().lower() in _CONTENT_LENGTH_NAMES:
             stripped = value.strip()
-            if not stripped.isdigit():
+            # RFC 3261 Content-Length is ASCII 1*DIGIT. ``isascii() and
+            # isdecimal()`` rejects superscripts/exotic Unicode digits (which
+            # ``isdigit()`` admits but ``int()`` cannot parse), signs, and empty —
+            # all as FramingError, never a bare ValueError from int().
+            if not (stripped.isascii() and stripped.isdecimal()):
                 msg = f"non-numeric Content-Length: {stripped!r}"
                 raise FramingError(msg)
             return int(stripped)

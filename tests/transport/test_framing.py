@@ -119,6 +119,26 @@ def test_body_consumes_exactly_content_length_not_more() -> None:
     assert list(framer) == []
 
 
+def test_leading_crlf_keepalive_ping_is_skipped_before_a_message() -> None:
+    # RFC 5626 §3.5.1: a bare CRLF (ping) / CRLFCRLF (pong) precedes no message.
+    framer = SipMessageFramer()
+    framer.feed(b"\r\n" + b"\r\n\r\n" + _register("a"))
+    messages = list(framer)
+    assert len(messages) == 1
+    assert "Call-ID: a" in messages[0]
+
+
+def test_keepalive_only_feed_yields_no_message_and_does_not_fault() -> None:
+    framer = SipMessageFramer()
+    framer.feed(b"\r\n\r\n")  # a pong with no following message
+    assert list(framer) == []
+    # A subsequent real message still frames (the buffer is left consistent).
+    framer.feed(_register("b"))
+    messages = list(framer)
+    assert len(messages) == 1
+    assert "Call-ID: b" in messages[0]
+
+
 def test_missing_content_length_is_a_framing_error() -> None:
     framer = SipMessageFramer()
     framer.feed(

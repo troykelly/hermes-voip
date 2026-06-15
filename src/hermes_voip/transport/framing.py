@@ -60,6 +60,7 @@ class SipMessageFramer:
         Raises:
             FramingError: if a complete head declares no usable Content-Length.
         """
+        self._skip_keepalive_crlf()
         end = self._buffer.find(_HEAD_END)
         if end == -1:
             return None  # head not yet terminated
@@ -72,6 +73,20 @@ class SipMessageFramer:
         message = bytes(self._buffer[:body_end])
         del self._buffer[:body_end]
         return message.decode("utf-8")
+
+    def _skip_keepalive_crlf(self) -> None:
+        """Drop leading CRLF keep-alive pings/pongs (RFC 5626 §3.5.1 / RFC 6223).
+
+        A stream UA may send a bare ``CRLF`` (ping) or ``CRLFCRLF`` (pong) for NAT
+        keep-alive; these precede no message, so they are consumed before the head
+        is located (otherwise an empty head would look like a missing
+        Content-Length and fault the stream).
+        """
+        skip = 0
+        while self._buffer[skip : skip + len(_CRLF)] == _CRLF:
+            skip += len(_CRLF)
+        if skip:
+            del self._buffer[:skip]
 
 
 def _content_length(head: str) -> int:

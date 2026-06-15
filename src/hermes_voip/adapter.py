@@ -200,6 +200,13 @@ class VoipAdapter(BasePlatformAdapter):
         )
         self._transport = transport
 
+        # Open the TLS connection FIRST: the transport learns its local socket
+        # address inside connect(), and RegistrationManager's constructor reads
+        # transport.local_sent_by / contact_uri() for every extension to build
+        # each Contact + Via. Building the manager before the transport is up
+        # raises RuntimeError("local_sent_by is unavailable before connect()").
+        await transport.connect()
+
         manager = RegistrationManager(
             gateway_cfg,
             transport,
@@ -207,7 +214,6 @@ class VoipAdapter(BasePlatformAdapter):
         self._manager = manager
         transport.bind_manager(manager)
 
-        await transport.connect()
         up = await manager.connect()
 
         self._connected = True

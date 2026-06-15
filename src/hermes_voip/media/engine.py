@@ -235,6 +235,12 @@ class RtpMediaTransport:
         # otherwise drop a sentinel datagram and strand the consumer).
         self._stop_event: asyncio.Event = asyncio.Event()
 
+        # Lossless one-item rollback slot.  When the stop flag wins a race in
+        # which a datagram had already been dequeued, that datagram is parked
+        # here (never re-queued, so it cannot be lost to a full queue) and
+        # returned first by the next _next_datagram() call.
+        self._pending: bytes | None = None
+
     # ------------------------------------------------------------------
     # MediaTransport Protocol
     # ------------------------------------------------------------------
@@ -256,6 +262,7 @@ class RtpMediaTransport:
         self._recv_queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
         self._stop_event = asyncio.Event()
+        self._pending = None
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -346,12 +353,25 @@ class RtpMediaTransport:
         a caller has asked us to abandon).
 
         ``asyncio.CancelledError`` from the awaited tasks propagates to the
-        caller (rule 37); the losing task is always cancelled before returning so
-        no pending task is left dangling.
+        caller (rule 37).  Both race tasks are always cancelled AND awaited
+        before this method returns or propagates, so no task is ever left
+        pending (no "Task was destroyed but it is pending" warning).
+
+        Rollback is lossless: if the stop flag wins a race in which a datagram
+        had already been dequeued, that datagram is parked in :attr:`_pending`
+        (never re-queued, so a full queue cannot drop it) and returned first by
+        the next call.
 
         Returns:
             The next datagram, or ``None`` when the stop flag is set.
         """
+        # A datagram rolled back from a previous stop-tie is delivered first,
+        # in order, independent of recv-queue capacity.
+        if self._pending is not None:
+            data = self._pending
+            self._pending = None
+            return data
+
         # Fast path: already stopped.
         if self._stop_event.is_set():
             return None
@@ -364,20 +384,22 @@ class RtpMediaTransport:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            # Cancel whichever task did not complete so it is not left pending.
-            # A cancellation of THIS coroutine flows through here too: both
-            # tasks are cancelled and the CancelledError propagates onward.
+            # Cancel whichever task did not complete, then AWAIT both so their
+            # cancellation is fully processed before we return — nothing is left
+            # pending.  return_exceptions=True absorbs the CancelledError of the
+            # losing task; a cancellation of THIS coroutine still propagates out
+            # of the await below (and thus out of _next_datagram) per rule 37.
             for task in (get_task, stop_task):
                 if not task.done():
                     task.cancel()
+            await asyncio.gather(get_task, stop_task, return_exceptions=True)
 
         # Stop wins over a delivered datagram (abandon a full queue on stop).
         if stop_task.done() and not stop_task.cancelled():
-            # A datagram may have been dequeued in the same loop step; push it
-            # back so it is not lost if the engine is later reused.
+            # A datagram may have been dequeued in the same loop step; park it
+            # losslessly so the next call returns it (no silent drop).
             if get_task.done() and not get_task.cancelled():
-                with contextlib.suppress(asyncio.QueueFull):
-                    self._recv_queue.put_nowait(get_task.result())
+                self._pending = get_task.result()
             return None
 
         return get_task.result()

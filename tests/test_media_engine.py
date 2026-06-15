@@ -894,7 +894,8 @@ async def test_stop_tie_does_not_lose_dequeued_datagram() -> None:
     # Stop wins the tie → returns None, but the dequeued datagram is preserved.
     result = await asyncio.wait_for(nd_task, timeout=2.0)
     assert result is None
-    assert engine._pending == tie_datagram
+    parked: bytes | None = engine._pending
+    assert parked == tie_datagram
     # The datagram was taken off the queue (dequeued), not left/duplicated.
     assert engine._recv_queue.qsize() == 0
 
@@ -909,7 +910,8 @@ async def test_stop_tie_does_not_lose_dequeued_datagram() -> None:
     engine._stop_event.clear()  # simulate the engine being reused after stop
     nxt = await asyncio.wait_for(engine._next_datagram(), timeout=2.0)
     assert nxt == tie_datagram  # the rolled-back datagram, delivered losslessly
-    assert engine._pending is None  # slot cleared after delivery
+    cleared: bytes | None = engine._pending
+    assert cleared is None  # slot cleared after delivery
 
     await engine.stop()
 

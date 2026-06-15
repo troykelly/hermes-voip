@@ -1,32 +1,49 @@
 """Config → concrete provider instance wiring (W8, ADR-0004).
 
-This module owns the three module-level ``ProviderRegistry`` singletons for the
-ASR, TTS, and injection-guard families and exposes :func:`build_providers` —
-the single call-site that resolves the active token from a
-:class:`~hermes_voip.config.MediaConfig` and returns the live :class:`Providers`
-tuple.
+:func:`build_providers` maps a :class:`~hermes_voip.config.MediaConfig` to live
+concrete provider instances for the three swappable families (streaming ASR,
+streaming TTS, prompt-injection guard). It is the single call-site that turns the
+config-selected provider tokens into objects the call loop uses.
+
+Selection mechanism (ADR-0004 §"Selection and registration": *a registry maps a
+config key to a factory*)
+-----------------------------------------------------------------------------
+Resolution is **direct dispatch over a typed factory map** — one
+``Mapping[str, <Family>Factory]`` per family, where each factory is
+``Callable[[MediaConfig], <Provider>]``. The selected provider is
+``factories[token](config)``. There is no shared mutable state: dispatch is a pure
+read of an immutable mapping, so concurrent :func:`build_providers` calls never
+race (the earlier mutate-a-global-registry/restore approach did — fixed here).
+
+The default maps (:data:`DEFAULT_ASR_FACTORIES`, :data:`DEFAULT_TTS_FACTORIES`,
+:data:`DEFAULT_GUARD_FACTORIES`) wire every shipped token to its production
+factory. Tests (and any embedder wanting a different wiring) inject alternative
+maps through the explicit ``asr_factories`` / ``tts_factories`` /
+``guard_factories`` keyword seam — never by mutating module state.
+
+(The generic :class:`~hermes_voip.providers.registry.ProviderRegistry` — a
+name→zero-arg-factory map with raise-on-duplicate — remains available for any
+future *dynamic* external-provider registration, where a mutable registry with
+collision detection is the right tool. W8's wiring is static and config-aware, so
+it uses the simpler, thread-safe direct map; ``ProviderRegistry`` is intentionally
+not used here.)
 
 Design invariants
 -----------------
-- **Registry is the source of truth**: :func:`build_providers` always resolves
-  providers via the module-level registries. Tests inject fakes by overwriting
-  registry entries; :func:`build_providers` installs config-aware production
-  factories for the selected token, calls ``make()``, then restores the previous
-  entry. An entry removed from the registry (simulating an unknown token) causes
-  the registry to raise ``ValueError`` as designed.
 - **Fail-fast on misconfiguration**: a self-host provider whose required model dir
   is ``None`` raises :class:`~hermes_voip.config.ConfigError` naming the missing
-  env var *before* any registry lookup.
-- **Licence gate**: the in-process ONNX guard runs
-  :func:`~hermes_voip.manifest.validate_manifest` on
-  :data:`~hermes_voip.manifest.GUARD_MODEL_MANIFEST` inside its factory;
+  env var, inside the factory, before any model load.
+- **Licence gate (rule 35 / ADR-0006/0007/0009)**: every *self-host default* model
+  factory runs :func:`~hermes_voip.manifest.validate_manifest` against the family's
+  pinned :class:`~hermes_voip.manifest.ModelManifest` before constructing the
+  provider — STT (:data:`~hermes_voip.manifest.STT_MODEL_MANIFEST`), TTS
+  (:data:`~hermes_voip.manifest.TTS_MODEL_MANIFEST`), and the ONNX guard
+  (:data:`~hermes_voip.manifest.GUARD_MODEL_MANIFEST`). Cloud providers
+  (Deepgram, ElevenLabs) carry no committed model artifact and skip the gate.
   :class:`~hermes_voip.manifest.LicenceError` propagates uncaught (rule 37).
 - **ML-free import**: importing this module never loads sherpa-onnx, onnxruntime,
-  tokenizers, or websockets. Each factory closes over config fields and defers the
-  heavy import to the concrete class constructor.
-- **Idempotent calls**: calling :func:`build_providers` multiple times is safe.
-  Each call installs a fresh config-aware factory, calls ``make()``, then restores
-  the previous entry (or removes the entry if none existed before).
+  tokenizers, or websockets. Each factory lazy-imports the concrete class only when
+  invoked.
 
 Env keys named in :class:`~hermes_voip.config.ConfigError` messages
 ---------------------------------------------------------------------
@@ -37,108 +54,41 @@ Env keys named in :class:`~hermes_voip.config.ConfigError` messages
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from hermes_voip.config import ConfigError, MediaConfig
 from hermes_voip.manifest import (
     GUARD_MODEL_MANIFEST,
+    STT_MODEL_MANIFEST,
+    TTS_MODEL_MANIFEST,
     ModelFamily,
     validate_manifest,
 )
 from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.guard import InjectionGuard
-from hermes_voip.providers.registry import ProviderRegistry
 from hermes_voip.providers.tts import StreamingTTS
 
 __all__ = [
+    "DEFAULT_ASR_FACTORIES",
+    "DEFAULT_GUARD_FACTORIES",
+    "DEFAULT_TTS_FACTORIES",
+    "GUARD_MODEL_MANIFEST",
+    "STT_MODEL_MANIFEST",
+    "TTS_MODEL_MANIFEST",
+    "AsrFactory",
+    "GuardFactory",
     "Providers",
-    "_asr_registry",
-    "_guard_registry",
-    "_tts_registry",
+    "TtsFactory",
     "build_providers",
 ]
 
-# ---------------------------------------------------------------------------
-# Module-level registry singletons — one per provider family (ADR-0004).
-# ---------------------------------------------------------------------------
-
-_asr_registry: ProviderRegistry[StreamingASR] = ProviderRegistry("asr")
-_tts_registry: ProviderRegistry[StreamingTTS] = ProviderRegistry("tts")
-_guard_registry: ProviderRegistry[InjectionGuard] = ProviderRegistry("guard")
-
-
-def _sentinel_factory_asr(name: str) -> Callable[[], StreamingASR]:
-    """Return a placeholder ASR factory that raises; replaced at build time."""
-
-    def _unconfigured() -> StreamingASR:
-        msg = (
-            f"asr provider {name!r} is registered but has no config-aware factory yet; "
-            "call build_providers(config) to wire it"
-        )
-        raise RuntimeError(msg)
-
-    return _unconfigured
-
-
-def _sentinel_factory_tts(name: str) -> Callable[[], StreamingTTS]:
-    """Return a placeholder TTS factory that raises; replaced at build time."""
-
-    def _unconfigured() -> StreamingTTS:
-        msg = (
-            f"tts provider {name!r} is registered but has no config-aware factory yet; "
-            "call build_providers(config) to wire it"
-        )
-        raise RuntimeError(msg)
-
-    return _unconfigured
-
-
-def _sentinel_factory_guard(name: str) -> Callable[[], InjectionGuard]:
-    """Return a placeholder guard factory that raises; replaced at build time."""
-
-    def _unconfigured() -> InjectionGuard:
-        msg = (
-            f"guard provider {name!r} is registered but has no"
-            " config-aware factory yet; call build_providers(config) to wire it"
-        )
-        raise RuntimeError(msg)
-
-    return _unconfigured
-
-
-def _register_defaults() -> None:
-    """Pre-populate the registries with sentinel factories for every known token.
-
-    Called once at module import. Each sentinel raises ``RuntimeError`` if
-    ``make()`` is called before ``build_providers`` replaces it with a
-    config-aware factory. This ensures:
-
-    - A token that IS in the registry (pre-populated) is recognised as known;
-      :func:`_resolve` replaces it with a config-aware factory at call time.
-    - A token that is NOT in the registry (e.g. removed by a test to simulate an
-      unknown provider) causes the registry to raise ``ValueError`` on ``make()``.
-    """
-    for name in ("sherpa-onnx", "deepgram"):
-        if name not in _asr_registry._factories:
-            _asr_registry._factories[name] = _sentinel_factory_asr(name)
-    for name in (
-        "sherpa-kokoro",
-        "piper",
-        "kittentts",
-        "kyutai",
-        "cartesia",
-        "aura2",
-        "elevenlabs",
-    ):
-        if name not in _tts_registry._factories:
-            _tts_registry._factories[name] = _sentinel_factory_tts(name)
-    for name in ("onnx", "sidecar"):
-        if name not in _guard_registry._factories:
-            _guard_registry._factories[name] = _sentinel_factory_guard(name)
-
-
-_register_defaults()
+# A provider factory takes the full validated MediaConfig and returns one live
+# provider. Config-aware (not zero-arg) so a factory reads exactly the fields its
+# provider needs (model dir, api key, voice) without a global or a partial closure.
+type AsrFactory = Callable[[MediaConfig], StreamingASR]
+type TtsFactory = Callable[[MediaConfig], StreamingTTS]
+type GuardFactory = Callable[[MediaConfig], InjectionGuard]
 
 
 # ---------------------------------------------------------------------------
@@ -162,219 +112,173 @@ class Providers:
 
 
 # ---------------------------------------------------------------------------
+# Production factories — one per shipped token. Each is config-aware: it reads
+# the fields its provider needs, fails fast on a missing required model dir,
+# runs the licence gate for self-host defaults, and lazy-imports the concrete
+# class so importing this module pulls no ml/cloud dependency.
+# ---------------------------------------------------------------------------
+
+
+def _make_sherpa_onnx_asr(config: MediaConfig) -> StreamingASR:
+    """Build the self-host sherpa-onnx streaming zipformer recogniser (ADR-0006)."""
+    model_dir = config.stt_model_dir
+    if model_dir is None:
+        msg = "stt_provider 'sherpa-onnx' requires HERMES_VOIP_STT_MODEL_DIR to be set"
+        raise ConfigError(msg)
+    # Licence gate (rule 35): the pinned default STT model must declare an
+    # STT-family-allowed SPDX before we construct the provider.
+    validate_manifest(STT_MODEL_MANIFEST, ModelFamily.STT)
+    from hermes_voip.stt.sherpa_onnx import SherpaOnnxASR  # noqa: PLC0415
+
+    return SherpaOnnxASR(model_dir)
+
+
+def _make_deepgram_asr(config: MediaConfig) -> StreamingASR:
+    """Build the Deepgram Flux cloud-fallback recogniser (ADR-0006, no model pin)."""
+    # Cloud provider: no committed model artifact, so no licence gate. The key
+    # presence is already enforced by MediaConfig.__post_init__ (fail-fast there).
+    api_key = config.deepgram_api_key or ""
+    from hermes_voip.stt.deepgram import DeepgramASR  # noqa: PLC0415
+
+    return DeepgramASR(api_key)
+
+
+def _make_sherpa_kokoro_tts(config: MediaConfig) -> StreamingTTS:
+    """Build the self-host sherpa-onnx + Kokoro-82M synthesiser (ADR-0007)."""
+    model_dir = config.tts_model
+    if model_dir is None:
+        msg = "tts_provider 'sherpa-kokoro' requires HERMES_VOIP_TTS_MODEL to be set"
+        raise ConfigError(msg)
+    # Licence gate (rule 35): the pinned default TTS model must declare a
+    # TTS-family-allowed SPDX before we construct the provider.
+    validate_manifest(TTS_MODEL_MANIFEST, ModelFamily.TTS)
+    voice = config.tts_voice or ""
+    from hermes_voip.tts.sherpa_kokoro import SherpaKokoroTTS  # noqa: PLC0415
+
+    return SherpaKokoroTTS(model_dir=model_dir, voice=voice)
+
+
+def _make_elevenlabs_tts(config: MediaConfig) -> StreamingTTS:
+    """Build the ElevenLabs Flash v2.5 cloud-fallback synthesiser (ADR-0007)."""
+    # Cloud provider: no committed model artifact, so no licence gate. The key
+    # presence is already enforced by MediaConfig.__post_init__ (fail-fast there).
+    api_key = config.elevenlabs_api_key or ""
+    voice = config.tts_voice or ""
+    from hermes_voip.tts.elevenlabs import ElevenLabsTTS  # noqa: PLC0415
+
+    return ElevenLabsTTS(api_key=api_key, voice=voice)
+
+
+def _make_onnx_guard(config: MediaConfig) -> InjectionGuard:
+    """Build the in-process ONNX DeBERTa injection guard (ADR-0009)."""
+    model_dir = config.injection_guard_model_dir
+    if model_dir is None:
+        msg = (
+            "injection_guard 'onnx' requires "
+            "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR to be set"
+        )
+        raise ConfigError(msg)
+    # Licence gate (rule 35 / ADR-0009): runs before any model load.
+    validate_manifest(GUARD_MODEL_MANIFEST, ModelFamily.GUARD)
+    from hermes_voip.guard.onnx import (  # noqa: PLC0415
+        OnnxInjectionGuard,
+        build_onnx_classifier,
+    )
+
+    classifier = build_onnx_classifier(model_dir)
+    return OnnxInjectionGuard(classify=classifier)
+
+
+# ---------------------------------------------------------------------------
+# Default factory maps — the production wiring (ADR-0004 config-key→factory).
+# Only providers whose concrete class is implemented are wired; selecting a
+# config-valid-but-not-yet-implemented token (e.g. a deferred TTS engine) raises
+# the unknown-provider ValueError from dispatch, which is correct fail-fast.
+# ---------------------------------------------------------------------------
+
+DEFAULT_ASR_FACTORIES: Mapping[str, AsrFactory] = {
+    "sherpa-onnx": _make_sherpa_onnx_asr,
+    "deepgram": _make_deepgram_asr,
+}
+
+DEFAULT_TTS_FACTORIES: Mapping[str, TtsFactory] = {
+    "sherpa-kokoro": _make_sherpa_kokoro_tts,
+    "elevenlabs": _make_elevenlabs_tts,
+}
+
+DEFAULT_GUARD_FACTORIES: Mapping[str, GuardFactory] = {
+    "onnx": _make_onnx_guard,
+}
+
+
+# ---------------------------------------------------------------------------
 # Public entry point.
 # ---------------------------------------------------------------------------
 
 
-def build_providers(config: MediaConfig) -> Providers:
+def build_providers(
+    config: MediaConfig,
+    *,
+    asr_factories: Mapping[str, AsrFactory] = DEFAULT_ASR_FACTORIES,
+    tts_factories: Mapping[str, TtsFactory] = DEFAULT_TTS_FACTORIES,
+    guard_factories: Mapping[str, GuardFactory] = DEFAULT_GUARD_FACTORIES,
+) -> Providers:
     """Resolve the config-selected providers and return live instances.
 
-    For each provider family, :func:`build_providers`:
-
-    1. Validates that required self-host model dirs are set (raises
-       :class:`~hermes_voip.config.ConfigError` if not).
-    2. Builds a config-aware factory closure.
-    3. Installs it in the module-level registry (overwriting any previous entry,
-       including test-injected fakes — except that if the entry was put there by
-       a test, the test's ``_RegistryPatch`` context manager will restore it; our
-       own restoration happens in the finally block).
-    4. Calls ``registry.make(token)`` — which raises ``ValueError`` if the token
-       is no longer in the registry (e.g. removed by a test to simulate an
-       unknown token).
-    5. Restores the previous registry entry (or removes the entry if none
-       existed before this call).
+    Each family is resolved by direct dispatch: the provider token from ``config``
+    indexes the family's factory map, and the factory is called with ``config``.
+    The factory validates required config (raising
+    :class:`~hermes_voip.config.ConfigError`), runs the licence gate for self-host
+    defaults (raising :class:`~hermes_voip.manifest.LicenceError`), and constructs
+    the provider. An unknown token (no map entry) raises ``ValueError``.
 
     Args:
         config: The validated media/provider config.
+        asr_factories: Token→factory map for the ASR family. Defaults to the
+            production wiring (:data:`DEFAULT_ASR_FACTORIES`); inject an alternative
+            (e.g. fakes in tests) through this seam, never by mutating globals.
+        tts_factories: Token→factory map for the TTS family.
+        guard_factories: Token→factory map for the guard family.
 
     Returns:
         A frozen :class:`Providers` dataclass with the three live provider
         instances.
 
     Raises:
-        ValueError: If the selected token is not registered in the registry at
-            call time (the registry has no entry for it — removed by a test or
-            genuinely absent).
-        ConfigError: If a self-host provider requires a model dir that is
-            ``None`` in ``config``.
-        LicenceError: If the ONNX guard's pinned model manifest fails the
-            per-family licence gate.
+        ValueError: If a selected provider token has no factory in its map.
+        ConfigError: If a self-host provider requires a model dir that is ``None``.
+        LicenceError: If a self-host default model's pinned manifest fails its
+            family licence gate.
     """
-    asr = _resolve(_asr_registry, config.stt_provider, _asr_factory(config))
-    tts = _resolve(_tts_registry, config.tts_provider, _tts_factory(config))
-    guard = _resolve(_guard_registry, config.injection_guard, _guard_factory(config))
+    asr = _dispatch("asr", asr_factories, config.stt_provider, config)
+    tts = _dispatch("tts", tts_factories, config.tts_provider, config)
+    guard = _dispatch("guard", guard_factories, config.injection_guard, config)
     return Providers(asr=asr, tts=tts, guard=guard)
 
 
-# ---------------------------------------------------------------------------
-# Per-family factory builders — called by build_providers at resolve time.
-# These raise ConfigError immediately if required config is missing, BEFORE
-# any registry lookup.
-# ---------------------------------------------------------------------------
-
-
-def _asr_factory(config: MediaConfig) -> Callable[[], StreamingASR]:
-    """Build a config-aware ASR factory for the selected provider name."""
-    provider = config.stt_provider
-    if provider == "sherpa-onnx":
-        model_dir = config.stt_model_dir
-        if model_dir is None:
-            msg = (
-                "stt_provider 'sherpa-onnx' requires "
-                "HERMES_VOIP_STT_MODEL_DIR to be set"
-            )
-            raise ConfigError(msg)
-
-        def _sherpa_onnx_asr() -> StreamingASR:
-            from hermes_voip.stt.sherpa_onnx import (  # noqa: PLC0415
-                SherpaOnnxASR,
-            )
-
-            return SherpaOnnxASR(model_dir)
-
-        return _sherpa_onnx_asr
-
-    if provider == "deepgram":
-        api_key = config.deepgram_api_key or ""
-
-        def _deepgram_asr() -> StreamingASR:
-            from hermes_voip.stt.deepgram import DeepgramASR  # noqa: PLC0415
-
-            return DeepgramASR(api_key)
-
-        return _deepgram_asr
-
-    # Unknown provider: return a factory that raises. The _resolve helper will
-    # install this into the registry and call make(); the factory raises here.
-    def _unknown_asr() -> StreamingASR:
-        msg = f"unknown asr provider: {provider!r}"
-        raise ValueError(msg)
-
-    return _unknown_asr
-
-
-def _tts_factory(config: MediaConfig) -> Callable[[], StreamingTTS]:
-    """Build a config-aware TTS factory for the selected provider name."""
-    provider = config.tts_provider
-    if provider == "sherpa-kokoro":
-        model_dir = config.tts_model
-        if model_dir is None:
-            msg = (
-                "tts_provider 'sherpa-kokoro' requires HERMES_VOIP_TTS_MODEL to be set"
-            )
-            raise ConfigError(msg)
-        voice = config.tts_voice or ""
-
-        def _sherpa_kokoro_tts() -> StreamingTTS:
-            from hermes_voip.tts.sherpa_kokoro import (  # noqa: PLC0415
-                SherpaKokoroTTS,
-            )
-
-            return SherpaKokoroTTS(model_dir=model_dir, voice=voice)
-
-        return _sherpa_kokoro_tts
-
-    if provider == "elevenlabs":
-        api_key = config.elevenlabs_api_key or ""
-        voice = config.tts_voice or ""
-
-        def _elevenlabs_tts() -> StreamingTTS:
-            from hermes_voip.tts.elevenlabs import ElevenLabsTTS  # noqa: PLC0415
-
-            return ElevenLabsTTS(api_key=api_key, voice=voice)
-
-        return _elevenlabs_tts
-
-    def _unknown_tts() -> StreamingTTS:
-        msg = f"unknown tts provider: {provider!r}"
-        raise ValueError(msg)
-
-    return _unknown_tts
-
-
-def _guard_factory(config: MediaConfig) -> Callable[[], InjectionGuard]:
-    """Build a config-aware guard factory for the selected provider name."""
-    provider = config.injection_guard
-    if provider == "onnx":
-        model_dir = config.injection_guard_model_dir
-        if model_dir is None:
-            msg = (
-                "injection_guard 'onnx' requires "
-                "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR to be set"
-            )
-            raise ConfigError(msg)
-
-        def _onnx_guard() -> InjectionGuard:
-            # Licence gate: runs before any model load (rule 35 / ADR-0009).
-            validate_manifest(GUARD_MODEL_MANIFEST, ModelFamily.GUARD)
-            from hermes_voip.guard.onnx import (  # noqa: PLC0415
-                OnnxInjectionGuard,
-                build_onnx_classifier,
-            )
-
-            classifier = build_onnx_classifier(model_dir)
-            return OnnxInjectionGuard(classify=classifier)
-
-        return _onnx_guard
-
-    def _unknown_guard() -> InjectionGuard:
-        msg = f"unknown guard provider: {provider!r}"
-        raise ValueError(msg)
-
-    return _unknown_guard
-
-
-# ---------------------------------------------------------------------------
-# Registry resolution helper.
-# ---------------------------------------------------------------------------
-
-
-def _resolve[T](
-    registry: ProviderRegistry[T],
+def _dispatch[T](
+    family: str,
+    factories: Mapping[str, Callable[[MediaConfig], T]],
     token: str,
-    production_factory: Callable[[], T],
+    config: MediaConfig,
 ) -> T:
-    """Replace the sentinel factory for ``token`` with ``production_factory``.
-
-    ``_register_defaults()`` pre-populates the registry with sentinel factories
-    for every known token. This function swaps the sentinel for a config-aware
-    production factory, calls ``make()``, then restores the sentinel.
-
-    If the entry has been replaced by a test-injected fake (the factory is NOT
-    a sentinel — the test wrote a non-``RuntimeError``-raising callable), we do
-    NOT overwrite it: the fake wins and we call ``make()`` directly.
-
-    If the token has been REMOVED from the registry (e.g. a test popped it to
-    simulate an unknown token), there is no entry to swap; we call ``make()``
-    directly which raises ``ValueError`` (the registry's "unknown token" error).
+    """Look up ``token`` in ``factories`` and invoke it with ``config``.
 
     Args:
-        registry: The family registry to resolve against.
-        token: The provider name to look up.
-        production_factory: The config-aware factory to install in place of the
-            sentinel (ignored if a test fake is already in place).
+        family: The family label for the error message (``"asr"`` etc.).
+        factories: The token→factory map for this family.
+        token: The config-selected provider token.
+        config: The config to hand the resolved factory.
 
     Returns:
-        The provider instance returned by the winning factory.
+        The provider the factory builds.
 
     Raises:
-        ValueError: If ``token`` is not in the registry at call time.
+        ValueError: If ``token`` has no entry in ``factories`` (unknown provider).
     """
-    previous = registry._factories.get(token)
-    if previous is None:
-        # Token is absent (removed by a test); call make() to get the ValueError.
-        return registry.make(token)
-
-    # Swap in the production factory (sentinel → real; test fake → stays as-is
-    # because we check the sentinel identity). We use a simple heuristic: if the
-    # current entry's ``__qualname__`` contains ``_unconfigured``, it is our
-    # sentinel and we replace it. Otherwise it is a test fake and we leave it.
-    is_sentinel = getattr(previous, "__qualname__", "").endswith("_unconfigured")
-    if is_sentinel:
-        registry._factories[token] = production_factory
     try:
-        return registry.make(token)
-    finally:
-        if is_sentinel:
-            # Restore the sentinel so the next call can swap it again.
-            registry._factories[token] = previous
+        factory = factories[token]
+    except KeyError as exc:
+        msg = f"unknown {family} provider: {token!r}"
+        raise ValueError(msg) from exc
+    return factory(config)

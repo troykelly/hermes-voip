@@ -635,3 +635,69 @@ def test_answer_to_savp_offer_with_bad_answer_key_is_rejected() -> None:
             supported=("PCMU", "telephone-event"),
             crypto=f"1 AES_CM_128_HMAC_SHA1_80 inline:{_SHORT_KEY}",
         )
+
+
+# --- W3 (lane spec): also allow-list AES_CM_128_HMAC_SHA1_32 (RFC 4568 §6.2) ---
+# The _32 suite uses the same AES_CM_128 cipher (16-octet master key + 14-octet
+# master salt = 30-octet inline key||salt); it differs from _80 only in the SRTP
+# auth-tag length (32 vs 80 bits). The lane requires both suites accepted.
+
+_SUITE_32 = "AES_CM_128_HMAC_SHA1_32"
+
+
+def test_crypto_attribute_accepts_sha1_32_suite() -> None:
+    attr = CryptoAttribute.parse(f"3 {_SUITE_32} inline:{_FAKE_KEY}")
+    assert attr.suite == _SUITE_32
+    assert attr.tag == 3
+    assert attr.key_params == f"inline:{_FAKE_KEY}"
+    assert attr.render() == f"3 {_SUITE_32} inline:{_FAKE_KEY}"
+
+
+def test_crypto_attribute_sha1_32_enforces_key_length() -> None:
+    # The _32 suite shares the 30-octet key||salt requirement; a short key is
+    # still rejected (proves _32 is validated, not blindly accepted).
+    with pytest.raises(SdpError, match="key"):
+        CryptoAttribute.parse(f"1 {_SUITE_32} inline:{_SHORT_KEY}")
+
+
+def test_parser_promotes_sha1_32_offer_line() -> None:
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:1 {_SUITE_32} inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    audio = _audio(offer)
+    assert len(audio.crypto_attrs) == 1
+    assert audio.crypto_attrs[0].suite == _SUITE_32
+
+
+def test_offer_builder_emits_sha1_32_crypto_line() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=codecs,
+        crypto=f"{_SUITE_32} inline:{_FAKE_KEY}",
+    )
+    assert "m=audio 41000 RTP/SAVP 0" in text
+    assert f"a=crypto:1 {_SUITE_32} inline:{_FAKE_KEY}" in text
+
+
+def test_answer_echoes_sha1_32_accepted_suite() -> None:
+    # An offer keyed with the _32 suite under tag 5 must be answered with the
+    # _32 suite and tag 5, carrying OUR key material.
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:5 {_SUITE_32} inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        crypto=f"{_SUITE_32} inline:{_FAKE_ANSWER_KEY}",
+    )
+    assert f"a=crypto:5 {_SUITE_32} inline:{_FAKE_ANSWER_KEY}" in text
+    # Negative control: the offerer's key material is NOT echoed back.
+    assert _FAKE_KEY not in text

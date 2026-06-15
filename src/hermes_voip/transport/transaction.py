@@ -82,7 +82,15 @@ class InviteClientTransaction:
         (absorbing the retransmission). A **2xx** yields ``None`` and terminates
         the transaction — the TU ACKs the 2xx itself (§13.2.2.4). A provisional
         (1xx) yields ``None`` and moves to ``Proceeding``.
+
+        ``Terminated`` is **absorbing** (§17.1.1.2): once a 2xx has terminated the
+        transaction, any later response — a reordered or retransmitted non-2xx, or
+        a forged one — is a no-op that returns ``None`` and never resurrects the
+        transaction or builds an ACK. (A non-2xx ACK lives only in ``Completed``,
+        which is unreachable once ``Terminated``.)
         """
+        if self._state is TransactionState.TERMINATED:
+            return None
         status = response.status_code
         if status < _PROVISIONAL_CEILING:
             if self._state is TransactionState.CALLING:

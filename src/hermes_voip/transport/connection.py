@@ -43,7 +43,10 @@ from hermes_voip.manager import (
 )
 from hermes_voip.message import SipRequest, SipResponse
 from hermes_voip.transport.framing import SipMessageFramer
-from hermes_voip.transport.transaction import InviteClientTransaction
+from hermes_voip.transport.transaction import (
+    InviteClientTransaction,
+    TransactionState,
+)
 
 __all__ = ["CallResponseSink", "SipOverTlsTransport"]
 
@@ -247,16 +250,25 @@ class SipOverTlsTransport:
         self._report_unroutable(response)
 
     async def _auto_ack_non_2xx(self, response: SipResponse) -> None:
-        """ACK a non-2xx final to an INVITE we sent (RFC 3261 §17.1.1.3)."""
+        """ACK a non-2xx final to an INVITE we sent (RFC 3261 §17.1.1.3).
+
+        A 2xx terminates the client transaction (the TU owns the 2xx ACK), so the
+        terminated transaction is unregistered here — a later non-2xx for the same
+        branch then finds no transaction and produces no ACK (§17.1.1.2). The
+        ``Completed`` non-2xx transaction is kept so a retransmitted non-2xx
+        re-emits the same absorbing ACK; it is dropped with the call.
+        """
         if _method_of(response.header("CSeq")) != "INVITE":
             return
         key = _txn_key(response.header("Call-ID"), response.header("CSeq"))
         txn = self._client_txns.get(key) if key is not None else None
-        if txn is None:
+        if txn is None or key is None:
             return
         ack = txn.ack_for_response(response)
         if ack is not None:
             await self.send(ack)
+        if txn.state is TransactionState.TERMINATED:
+            del self._client_txns[key]
 
     async def _dispatch_request(self, request: SipRequest) -> None:
         manager = self._manager

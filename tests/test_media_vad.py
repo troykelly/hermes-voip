@@ -142,7 +142,7 @@ def test_no_spurious_edges_while_steady() -> None:
 
 def test_hysteresis_holds_speech_in_the_dead_band() -> None:
     # once in speech, a probability in (exit, threshold) must NOT end the turn:
-    # threshold 0.5 -> exit 0.35; 0.4 sits in the dead band
+    # threshold 0.5 -> default exit 0.25 (threshold * 0.5); 0.4 sits in the dead band
     model = _ScriptedModel([0.9, 0.4, 0.9])
     vad = VoiceActivityDetector(sample_rate_hz=_RATE_16K, threshold=0.5, model=model)
     events = list(vad.feed(_frame(_silence(3, _RATE_16K), _RATE_16K)))
@@ -285,7 +285,8 @@ def test_low_threshold_derives_crossable_exit_and_speech_ends() -> None:
         threshold=0.1,
         model=_ScriptedModel([0.9, 0.0]),
     )
-    derived_exit = vad._exit_threshold  # noqa: SLF001  (assert derivation bounds)
+    # read the resolved private cutoff to assert the derivation's bounds directly
+    derived_exit = vad._exit_threshold
     assert 0.0 < derived_exit < 0.1
     # drive prob above threshold (ONSET) then prob == 0.0 silence (OFFSET fires)
     events = list(vad.feed(_frame(_silence(2, _RATE_16K), _RATE_16K)))

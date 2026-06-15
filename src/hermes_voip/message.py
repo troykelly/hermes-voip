@@ -18,9 +18,12 @@ from dataclasses import dataclass
 # RFC 3261 §8.1.1.7: a branch value MUST begin with this magic cookie.
 _MAGIC_COOKIE = "z9hG4bK"
 _CRLF = "\r\n"
-# A status-line requires a single SP between the code and the (possibly empty)
-# reason phrase, so "SIP/2.0 200OK" is rejected as malformed framing.
-_STATUS_LINE = re.compile(r"SIP/2\.0 (\d{3})(?: (.*))?")
+# A status-line is "SIP/2.0 <code> <reason>" with a mandatory single SP before
+# the (possibly empty) reason phrase: "SIP/2.0 200OK" (no SP) and "SIP/2.0 200"
+# (no reason SP at all) are both rejected as malformed framing, while
+# "SIP/2.0 200 " parses with an empty reason. build_response always emits the
+# SP, so parse and build agree on the wire shape.
+_STATUS_LINE = re.compile(r"SIP/2\.0 (\d{3}) (.*)")
 # A request-line is "METHOD request-uri SIP/2.0"; method is an RFC 3261 token
 # (covers extension methods, not just the alphabetic standard ones).
 _REQUEST_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0")
@@ -28,6 +31,8 @@ _REQUEST_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0")
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 # A To/From header already carrying a dialog tag parameter.
 _TAG_PRESENT = re.compile(r";\s*tag=", re.IGNORECASE)
+# The header this module computes itself; callers must not also supply it.
+_CONTENT_LENGTH = "Content-Length"
 
 # A SIP status code is in the 1xx..6xx range.
 _MIN_STATUS = 100
@@ -105,7 +110,9 @@ def build_request(
     """Assemble a SIP request as wire text.
 
     ``Content-Length`` is computed from the UTF-8 byte length of ``body`` and
-    appended automatically; callers supply every other header in order.
+    appended automatically; callers supply every other header in order and must
+    NOT pass their own ``Content-Length`` (a duplicate would make the message
+    ambiguously framed per RFC 7230 §3.3.3).
 
     Args:
         method: The SIP method (e.g. ``REGISTER``, ``INVITE``).
@@ -118,7 +125,9 @@ def build_request(
 
     Raises:
         ValueError: If the method, request URI, or any header name/value would
-            corrupt the message (control characters; a non-token header name).
+            corrupt the message (control characters; a non-token header name),
+            or if a caller supplies a ``Content-Length`` header (it is owned by
+            this function).
     """
     _reject_controls(method, "method")
     _reject_controls(request_uri, "request URI")
@@ -127,9 +136,12 @@ def build_request(
         if _HEADER_NAME.fullmatch(name) is None:
             msg = f"invalid header name: {name!r}"
             raise ValueError(msg)
+        if name.lower() == _CONTENT_LENGTH.lower():
+            msg = "Content-Length is computed automatically; do not supply it"
+            raise ValueError(msg)
         _reject_controls(value, "header value")
         lines.append(f"{name}: {value}")
-    lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
+    lines.append(f"{_CONTENT_LENGTH}: {len(body.encode('utf-8'))}")
     return _CRLF.join(lines) + _CRLF + _CRLF + body
 
 
@@ -258,7 +270,8 @@ class SipResponse:
             raise ValueError(msg)
         return cls(
             status_code=int(match.group(1)),
-            reason=match.group(2).strip() if match.group(2) else "",
+            # group(2) is always present (possibly "") now the SP is mandatory.
+            reason=match.group(2).strip(),
             headers=_parse_headers(lines[1:]),
             body=body,
         )

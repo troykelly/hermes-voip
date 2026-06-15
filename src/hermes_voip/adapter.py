@@ -1,11 +1,20 @@
-"""The Hermes VoIP plugin: register(ctx) entry point and VoipAdapter (W10).
+"""The Hermes VoIP platform adapter (W10): ``VoipAdapter``.
 
-This module is the **only** place in the codebase that imports the Hermes
-runtime surface (``gateway.platforms.base``, ``gateway.config``). Those
-classes are unavailable in the default install and ship no ``py.typed``, so
-they would resolve to ``Any`` under ``mypy --strict``. The typed boundary in
-:mod:`hermes_voip.hermes_surface` provides the Protocol-checked substitutes
-we compile against; the running plugin receives the real Hermes classes.
+``VoipAdapter`` subclasses the real ``gateway.platforms.base.BasePlatformAdapter``
+so the Hermes gateway recognises it via ``isinstance`` and it inherits
+``handle_message`` / ``build_source`` / ``set_message_handler`` and the
+send-retry machinery. This module is therefore the **only** one that imports the
+hermes-agent runtime (``gateway.platforms.base`` / ``gateway.config``) at module
+top — and it is imported **lazily** (from :func:`hermes_voip.plugin.register`'s
+factory, only when the gateway instantiates the platform), so a bare
+``import hermes_voip`` never pulls in the optional runtime.
+
+hermes-agent ships no ``py.typed``. Rather than launder the imports to ``Any``
+with ``# type: ignore`` (banned by rule 17), this module is excluded from the
+default no-hermes ``mypy`` gate and type-checked in the ``hermes-contract`` CI
+job — which installs the ``hermes`` extra and uses ``follow_untyped_imports`` so
+mypy analyses the real ``gateway`` source for genuine types. There are **zero**
+``# type: ignore`` here.
 
 End-to-end call flow for a SIP-over-TLS inbound INVITE:
 1. ``SipOverTlsTransport`` frames the TLS stream and delivers a ``NewCall``
@@ -13,10 +22,12 @@ End-to-end call flow for a SIP-over-TLS inbound INVITE:
 2. ``_on_inbound_invite`` builds a ``Dialog``, negotiates the SDP offer,
    sends a ``200 OK`` answer, opens a UDP ``RtpMediaTransport``, wires a
    ``CallSession`` and ``CallLoop``, and starts the loop as a background
-   asyncio task.
+   asyncio task. Any failure after the 200 OK runs ``_teardown_call`` so the
+   accepted call never leaks its RTP engine or in-dialog routes.
 3. When the caller finishes a turn the ``CallLoop`` calls ``deliver_turn``
-   with the transcript. ``deliver_turn`` builds a ``MessageEvent`` and calls
-   the Hermes base's ``handle_message``, which routes the text to the agent.
+   with the transcript. ``_deliver_turn`` builds a VOICE ``MessageEvent`` via
+   the inherited ``build_source`` and awaits the inherited ``handle_message``,
+   which routes the text to the agent.
 4. The Hermes agent replies via ``adapter.send(call_id, text)``; ``send``
    delivers the text to the call's ``CallLoop.speak()``.
 5. ``disconnect()`` cancels all call loops, closes the manager and transport.
@@ -31,17 +42,33 @@ import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
+# The real hermes-agent runtime surface. This module is imported ONLY lazily
+# (inside ``hermes_voip.plugin._adapter_factory``), so a bare ``import
+# hermes_voip`` never triggers these imports — but when the Hermes gateway
+# instantiates the platform, ``VoipAdapter`` is a genuine ``BasePlatformAdapter``
+# subclass and inherits ``handle_message`` / ``build_source`` /
+# ``set_message_handler`` / the send-retry machinery. The hermes-agent package
+# ships no ``py.typed``; this module is therefore excluded from the no-hermes
+# ``mypy`` gate and type-checked in the hermes-contract CI job (which installs
+# the ``hermes`` extra) instead of via per-line escape hatches.
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+
 from hermes_voip.call import CallSession
 from hermes_voip.config import MediaConfig, load_gateway_config, load_media_config
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
-from hermes_voip.hermes_surface import SendResultProtocol
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.media.call_loop import CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import Codec, RtpMediaTransport
-from hermes_voip.media.vad import VadModel, VoiceActivityDetector
+from hermes_voip.media.vad import VoiceActivityDetector, load_silero_model
 from hermes_voip.message import build_response, new_tag
 from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.policy import GuardSessionState
@@ -59,33 +86,15 @@ from hermes_voip.transport.connection import SipOverTlsTransport
 if TYPE_CHECKING:
     from hermes_voip.media.srtp import SrtpSession
 
-__all__ = ["VoipAdapter", "register", "validate_voip_config"]
+__all__ = ["VoipAdapter"]
 
 _log = logging.getLogger(__name__)
-
-# The RTP port range we pick from when binding the media engine.
-_RTP_PORT_START = 20000
-_RTP_PORT_END = 29999
-
-# Default VAD silence window size (samples at 16 kHz).
-_VAD_WINDOW_SAMPLES = 512
 
 # Supported G.711 encoding names for SDP negotiation.
 _SUPPORTED_ENCODINGS = ("PCMU", "PCMA", "telephone-event")
 
-# Install hint shown by ``hermes plugins list``.
-_INSTALL_HINT = (
-    "Set HERMES_SIP_HOST, HERMES_SIP_EXTENSION, and HERMES_SIP_PASSWORD "
-    "(or indexed HERMES_SIP_EXTENSION_<n>/PASSWORD_<n> for multiple registrations). "
-    "Run `hermes plugins enable hermes-voip` to activate the plugin."
-)
-
-# The required HERMES_SIP_* environment variable names.
-_REQUIRED_ENV = (
-    "HERMES_SIP_HOST",
-    "HERMES_SIP_EXTENSION",
-    "HERMES_SIP_PASSWORD",
-)
+# The platform name this adapter registers under.
+_PLATFORM_NAME = "voip"
 
 
 def _make_tls_context(host: str) -> ssl.SSLContext:
@@ -115,51 +124,32 @@ def _srtp_from_audio(audio: AudioMedia, *, outbound: bool) -> SrtpSession | None
     return SrtpSession(audio.crypto_attrs[0])
 
 
-def validate_voip_config(config: object) -> None:
-    """Validate the Hermes PlatformConfig for the VoIP adapter.
-
-    Calls :func:`~hermes_voip.config.load_gateway_config` against the config's
-    ``extra`` mapping — if any required env var is missing or malformed this
-    raises :class:`~hermes_voip.config.ConfigError`.
-
-    Args:
-        config: A Hermes ``PlatformConfig``-like object with an ``extra``
-            attribute (``Mapping[str, str]``).
-
-    Raises:
-        ConfigError: If a required SIP env var is absent or invalid.
-    """
-    extra = getattr(config, "extra", {})
-    load_gateway_config(extra)
-
-
-class VoipAdapter:
+class VoipAdapter(BasePlatformAdapter):
     """Hermes ``kind: platform`` adapter for SIP-over-TLS telephony (ADR-0002).
 
-    Implements the four abstract methods of ``BasePlatformAdapter``
-    (via :class:`~hermes_voip.hermes_surface.BasePlatformAdapterProtocol`) and
-    wires all the now-merged pieces — provider registry, SIP-over-TLS transport,
-    RTP media engine, and per-call ``CallLoop`` — into a loadable plugin.
+    Subclasses the real ``gateway.platforms.base.BasePlatformAdapter`` and
+    implements its four abstract async methods (``connect`` / ``disconnect`` /
+    ``send`` / ``get_chat_info``), inheriting ``handle_message`` /
+    ``build_source`` / ``set_message_handler`` and the gateway's send-retry
+    machinery. It wires all the merged pieces — provider registry,
+    SIP-over-TLS transport, RTP media engine, and per-call ``CallLoop`` — into a
+    loadable plugin.
 
     One adapter instance supports **N simultaneous SIP registrations** (one per
     configured ``HERMES_SIP_EXTENSION_<n>``); each inbound call creates its own
     ``CallSession`` + ``CallLoop`` keyed by SIP ``Call-ID``.
 
-    ``config`` and ``platform`` are the Hermes ``PlatformConfig`` and
-    ``Platform`` objects injected by the framework; the adapter reads its SIP
-    credentials and media settings from ``config.extra`` (which the Hermes
-    gateway populates from environment variables).
+    ``config`` is the Hermes ``PlatformConfig`` injected by the framework; the
+    adapter reads its SIP credentials and media settings from ``config.extra``
+    (which the Hermes gateway populates from environment variables). The
+    ``Platform`` member is resolved from :data:`_PLATFORM_NAME` (the gateway has
+    already registered ``"voip"`` by the time the factory runs, so
+    ``Platform("voip")`` resolves via the enum's ``_missing_`` hook).
     """
 
-    # The Hermes framework injects these at construction (BasePlatformAdapter
-    # signature: __init__(self, config, platform)).  We accept them as ``object``
-    # and forward them to the real base in the running plugin (the typed boundary
-    # is the Protocol in hermes_surface.py; no direct import of the Hermes base
-    # here keeps the default install ML-free and mypy-clean).
-    def __init__(self, config: object, platform: object) -> None:
-        """Accept Hermes-injected config and platform; defer all IO until connect."""
-        self._config = config
-        self._platform = platform
+    def __init__(self, config: PlatformConfig) -> None:
+        """Initialise the base adapter; defer all IO until ``connect()``."""
+        super().__init__(config, Platform(_PLATFORM_NAME))
 
         # Populated by connect():
         self._providers: Providers | None = None
@@ -191,7 +181,7 @@ class VoipAdapter:
             ``False`` otherwise (never raises on partial failure — the caller
             decides whether to retry).
         """
-        extra = getattr(self._config, "extra", {})
+        extra = self.config.extra
         gateway_cfg = load_gateway_config(extra)
         media_cfg = load_media_config(extra)
 
@@ -253,20 +243,20 @@ class VoipAdapter:
         chat_id: str,
         content: str,
         reply_to: str | None = None,  # noqa: ARG002 — SIP has no threaded replies
-        metadata: object | None = None,  # noqa: ARG002 — no metadata consumed
-    ) -> SendResultProtocol:
+        metadata: dict[str, object] | None = None,  # noqa: ARG002 — no metadata consumed
+    ) -> SendResult:
         """Deliver agent text to the caller via TTS synthesis.
 
         ``chat_id`` is the SIP ``Call-ID``. The text is passed to the call's
         ``CallLoop.speak()`` as a single-item async iterator (the Hermes adapter
         calls this once per agent reply; full streaming is a Phase-2 upgrade).
 
-        Returns a SendResult-compatible object. An unknown ``chat_id`` returns a
-        failure result (does not raise) — the call may have already ended.
+        Returns a ``SendResult``. An unknown ``chat_id`` returns a failure result
+        (does not raise) — the call may have already ended.
         """
         loop = self._call_loops.get(chat_id)
         if loop is None:
-            return _FailSendResult(f"unknown call_id {chat_id!r}")
+            return SendResult(success=False, error=f"unknown call_id {chat_id!r}")
 
         text = content
 
@@ -277,8 +267,8 @@ class VoipAdapter:
             await loop.speak(_single_chunk())
         except Exception as exc:  # noqa: BLE001 — surface as failure, never swallow
             _log.warning("speak() failed for %s: %s", chat_id, exc)
-            return _FailSendResult(str(exc))
-        return _OkSendResult(chat_id)
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=chat_id)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, object]:
         """Return chat metadata for a live or ended call.
@@ -315,7 +305,7 @@ class VoipAdapter:
         self._call_tasks[call_id] = task
         task.add_done_callback(lambda t: self._on_call_task_done(call_id, t))
 
-    async def _handle_inbound_invite(  # noqa: PLR0911, PLR0915 — RFC 3261 INVITE handling requires these sequential reject-early guard steps; extraction would only move the complexity elsewhere
+    async def _handle_inbound_invite(  # noqa: PLR0915 — RFC 3261 INVITE handling requires these sequential reject-early guard steps; extraction would only move the complexity elsewhere
         self, new_call: NewCall
     ) -> None:
         """Async body of _on_inbound_invite; wires the full call stack."""
@@ -441,17 +431,46 @@ class VoipAdapter:
             "ended": False,
         }
 
-        # --- Build + start CallLoop ----------------------------------------
+        # --- Build + run CallLoop (leak-safe) ------------------------------
+        # Everything from here on has already accepted the call (200 OK sent,
+        # in-dialog routes installed). ANY failure now — provider/config not
+        # ready, VAD/endpointer/CallLoop construction, or the loop itself —
+        # must release the RTP engine and both call routes, never leak them.
+        try:
+            await self._run_call_loop(
+                call_id=call_id,
+                engine=engine,
+                guard_state=guard_state,
+            )
+        finally:
+            await self._teardown_call(
+                call_id=call_id,
+                engine=engine,
+                transport=transport,
+                dialog_id=session.dialog_id,
+            )
+
+    async def _run_call_loop(
+        self,
+        *,
+        call_id: str,
+        engine: RtpMediaTransport,
+        guard_state: GuardSessionState,
+    ) -> None:
+        """Build the per-call ``CallLoop`` and drive it to completion.
+
+        Raises if providers/media config are absent or any collaborator
+        construction fails; the caller's ``finally`` performs teardown.
+        """
         providers = self._providers
         if providers is None:
-            _log.error("INVITE %s: providers not initialised — ending call", call_id)
-            await engine.stop()
-            return
+            msg = f"INVITE {call_id}: providers not initialised"
+            raise RuntimeError(msg)
         media_cfg = self._media_cfg
         if media_cfg is None:
-            _log.error("INVITE %s: media config not initialised — ending call", call_id)
-            await engine.stop()
-            return
+            msg = f"INVITE {call_id}: media config not initialised"
+            raise RuntimeError(msg)
+
         vad = _make_vad(media_cfg)
         endpointer = _make_endpointer(media_cfg)
 
@@ -471,66 +490,60 @@ class VoipAdapter:
             call_id=call_id,
         )
         self._call_loops[call_id] = call_loop
+        await call_loop.run()
 
+    async def _teardown_call(
+        self,
+        *,
+        call_id: str,
+        engine: RtpMediaTransport,
+        transport: SipOverTlsTransport,
+        dialog_id: tuple[str, str, str],
+    ) -> None:
+        """Release every resource an accepted call holds; mark it ended.
+
+        Safe to call after a partial setup failure: stops the RTP engine,
+        removes the manager + transport in-dialog routes, drops the live
+        ``CallLoop``, and flags the call ended. Never raises (teardown of one
+        resource must not strand the others).
+        """
+        info = dict(self._call_info.get(call_id, {}))
+        info["ended"] = True
+        self._call_info[call_id] = info
+        self._call_loops.pop(call_id, None)
+        if self._manager is not None:
+            self._manager.remove_call(dialog_id)
+        transport.remove_call(call_id)
         try:
-            await call_loop.run()
-        finally:
-            self._call_info[call_id] = dict(self._call_info.get(call_id, {}))
-            self._call_info[call_id]["ended"] = True
-            self._call_loops.pop(call_id, None)
-            if self._manager is not None:
-                self._manager.remove_call(session.dialog_id)
-            transport.remove_call(call_id)
+            await engine.stop()
+        except Exception as exc:  # noqa: BLE001 — log; never strand the call routes
+            _log.warning("INVITE %s: error stopping media engine: %s", call_id, exc)
 
     async def _deliver_turn(self, call_id: str, text: str) -> None:
         """Route a finalized caller transcript to the Hermes agent.
 
-        Builds a ``MessageEvent`` compatible with the Hermes runtime's
-        ``handle_message`` and calls the base. The Hermes framework supplies
-        ``MessageType.VOICE`` and ``MessageEvent`` at runtime; we import them
-        lazily so the default install (no ``hermes-agent``) stays importable.
+        Builds a ``MessageEvent`` via the inherited ``build_source`` and hands
+        it to the inherited ``handle_message`` (which spawns the agent turn).
+        ``handle_message`` is an async method on the real base, so it is awaited
+        here (this runs on the call's background task, off the media hot path).
         """
         info = self._call_info.get(call_id, {})
         caller_name = str(info.get("name", call_id))
 
-        try:
-            from gateway.config import (  # type: ignore[import-not-found]  # noqa: PLC0415
-                Platform,
-                PlatformConfig,
-            )
-            from gateway.platforms.base import (  # type: ignore[import-not-found]  # noqa: PLC0415
-                MessageEvent,
-                MessageType,
-            )
-
-            # Platform accepts unknown names via _missing_ (verified in P0.1).
-            platform = Platform("voip")
-            platform_config = PlatformConfig(
-                platform=platform,
-                label="VoIP",
-                extra=getattr(self._config, "extra", {}),
-            )
-            source = self.build_source(  # type: ignore[attr-defined]
-                chat_id=call_id,
-                user_id=caller_name,
-                user_name=caller_name,
-                platform_config=platform_config,
-            )
-            event = MessageEvent(
-                text=text,
-                message_type=MessageType.VOICE,
-                source=source,
-                media_urls=[],
-            )
-            self.handle_message(event)  # type: ignore[attr-defined]
-        except ImportError:
-            # Running outside the Hermes runtime (e.g. in tests); call the mock.
-            _handle = getattr(self, "handle_message", None)
-            if _handle is not None:
-                from types import SimpleNamespace  # noqa: PLC0415
-
-                _test_event = SimpleNamespace(text=text, media_urls=[])
-                _handle(_test_event)
+        source = self.build_source(
+            chat_id=call_id,
+            chat_name=caller_name,
+            chat_type="dm",
+            user_id=caller_name,
+            user_name=caller_name,
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.VOICE,
+            source=source,
+            media_urls=[],
+        )
+        await self.handle_message(event)
 
     def _on_unroutable(self, what: object) -> None:
         """Log unroutable SIP messages at DEBUG; never crash the transport."""
@@ -551,31 +564,6 @@ class VoipAdapter:
         exc = task.exception()
         if exc is not None:
             _log.error("call %s ended with error: %s", call_id, exc)
-
-
-# ---------------------------------------------------------------------------
-# SendResult-compatible lightweight objects (no Hermes dependency at module level)
-# ---------------------------------------------------------------------------
-
-
-class _OkSendResult:
-    """A successful send result."""
-
-    success: bool = True
-    error: str | None = None
-
-    def __init__(self, message_id: str) -> None:
-        self.message_id: str | None = message_id
-
-
-class _FailSendResult:
-    """A failed send result."""
-
-    success: bool = False
-    message_id: str | None = None
-
-    def __init__(self, reason: str) -> None:
-        self.error: str | None = reason
 
 
 # ---------------------------------------------------------------------------
@@ -626,11 +614,8 @@ def _make_vad(media_cfg: MediaConfig) -> VoiceActivityDetector:
     Called once per inbound call; the ONNX session is created inside
     :func:`~hermes_voip.media.vad.load_silero_model`.
     """
-    from hermes_voip.media.vad import load_silero_model  # noqa: PLC0415
-
-    model: VadModel = load_silero_model()
     return VoiceActivityDetector(
-        model=model,
+        model=load_silero_model(),
         threshold=media_cfg.vad_threshold,
     )
 
@@ -638,55 +623,3 @@ def _make_vad(media_cfg: MediaConfig) -> VoiceActivityDetector:
 def _make_endpointer(media_cfg: MediaConfig) -> Endpointer:
     """Build an Endpointer using the configured trailing-silence threshold."""
     return Endpointer(silence_ms=media_cfg.endpoint_silence_ms)
-
-
-# ---------------------------------------------------------------------------
-# Plugin entry point
-# ---------------------------------------------------------------------------
-
-
-def register(ctx: object) -> None:
-    """Register the VoIP plugin with the Hermes runtime.
-
-    Called by the Hermes plugin loader (``hermes_cli.plugins``) after the
-    package is discovered via the ``hermes_agent.plugins`` entry point. The
-    ``ctx`` object is a ``PluginContext`` at runtime — typed here as ``object``
-    to keep the Hermes import out of the default install path.
-
-    Registration is unconditional (``check_fn`` does the runtime probe);
-    the Hermes gateway decides whether to activate the platform based on the
-    user's ``hermes plugins enable hermes-voip`` configuration.
-
-    Args:
-        ctx: The Hermes ``PluginContextProtocol`` — accepts
-             ``register_platform`` calls.
-    """
-    register_platform = getattr(ctx, "register_platform", None)
-    if register_platform is None:
-        _log.warning("register(ctx): ctx has no register_platform — skipping")
-        return
-
-    def _adapter_factory(config: object) -> VoipAdapter:
-        """Lazy factory: import VoipAdapter only when the platform activates."""
-        platform = object()  # replaced by real Platform by the gateway
-        return VoipAdapter(config, platform)
-
-    def _check_fn() -> bool:
-        """Probe whether the SIP deps and env are available."""
-        try:
-            import ssl as _ssl  # noqa: PLC0415
-
-            _ssl.create_default_context()
-        except Exception:  # noqa: BLE001
-            return False
-        return True
-
-    register_platform(
-        "voip",
-        "VoIP (SIP/WebRTC telephony)",
-        _adapter_factory,
-        _check_fn,
-        validate_config=validate_voip_config,
-        required_env=list(_REQUIRED_ENV),
-        install_hint=_INSTALL_HINT,
-    )

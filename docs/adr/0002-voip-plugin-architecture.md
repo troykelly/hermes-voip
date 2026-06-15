@@ -30,8 +30,16 @@ Concrete shape:
 
   ```toml
   [project.entry-points."hermes_agent.plugins"]
-  hermes_voip = "hermes_voip:register"
+  hermes-voip = "hermes_voip"
   ```
+
+  > Implementation note (W10, verified against hermes-agent 0.16.0): the entry
+  > point points at the **package** (`"hermes_voip"`), not `"hermes_voip:register"`.
+  > The loader (`hermes_cli/plugins.py`) does `module = ep.load()` then
+  > `getattr(module, "register")`, so it needs the module; a `:register` target
+  > would load the function and the subsequent `getattr` would fail. `register`
+  > is re-exported from `hermes_voip/__init__.py` (from the light
+  > `hermes_voip.plugin` module, which imports no hermes-agent runtime).
 
   `plugin.yaml` (sibling of the package `__init__.py`):
 

@@ -10,14 +10,19 @@ conversational providers are designed on the record in ``docs/adr/``.
 The Hermes plugin entry point :func:`register` is also re-exported here so the
 ``[project.entry-points."hermes_agent.plugins"]`` entry point
 (``hermes-voip = "hermes_voip"``) resolves immediately without importing any
-ML or transport heavy dependency (those are lazy-imported inside the adapter).
+ML or transport heavy dependency — and, crucially, without importing the
+hermes-agent runtime itself. ``register`` lives in the light
+:mod:`hermes_voip.plugin` module; the real ``VoipAdapter`` (which subclasses
+the hermes-agent ``BasePlatformAdapter`` and so imports the runtime) is
+imported lazily inside the registration factory, only when the gateway
+instantiates the platform.
 """
 
-# Lazy re-export: importing hermes_voip.adapter does not pull in the Hermes
-# runtime (which is optional) — the heavy imports happen inside the factory
-# and connect() — but ``register`` must be present at module level so the
-# Hermes plugin loader can call it immediately after import.
-from hermes_voip.adapter import register
+# ``register`` comes from the light plugin module — it imports neither the
+# hermes-agent runtime nor any heavy media/ML dependency, so a bare
+# ``import hermes_voip`` stays cheap. The Hermes plugin loader calls
+# ``hermes_voip.register(ctx)`` immediately after importing the package.
+from hermes_voip.plugin import register
 from hermes_voip.registration import (
     Challenged,
     Failed,

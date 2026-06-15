@@ -23,8 +23,13 @@ jobs:
       - run: uv run pytest
 
   # Verifies the real hermes-agent surface still matches hermes_voip.hermes_surface
-  # (the typed shim). Separate job so the heavy optional `hermes` extra and its
-  # transitive tree stay out of the main gate's install / licence / audit scope.
+  # (the typed shim) AND type-checks + tests the VoipAdapter against the real
+  # `gateway.platforms.base.BasePlatformAdapter`. The adapter imports the real
+  # (un-`py.typed`) runtime, so it is excluded from the main no-hermes mypy gate
+  # and checked HERE with the `hermes` extra installed (follow_untyped_imports
+  # gives mypy genuine types — no `# type: ignore`/ignore_missing_imports).
+  # Separate job so the heavy optional `hermes` extra and its transitive tree
+  # stay out of the main gate's install / licence / audit scope.
   hermes-contract:
     runs-on: ubuntu-latest
     steps:
@@ -34,9 +39,13 @@ jobs:
           version: "0.11.21"
           enable-cache: true
       - run: uv sync --frozen --extra hermes
+      # Type-check the Hermes-dependent modules against the REAL base (these are
+      # excluded from the default `uv run mypy` gate; passing them explicitly
+      # bypasses the exclude).
+      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
-        run: uv run pytest tests/test_hermes_contract.py -rs
+        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py -rs
 
   # Runs the conversational-provider tests with the optional `ml` extra installed
   # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack

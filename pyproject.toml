@@ -131,6 +131,26 @@ strict = true
 warn_unreachable = true
 disallow_any_explicit = true
 files = ["src", "tests"]
+# ``src/hermes_voip/adapter.py`` imports the real hermes-agent runtime
+# (``gateway.platforms.base`` / ``gateway.config``), which is an OPTIONAL extra
+# absent from the default install and ships no ``py.typed``. Type-checking it
+# here (no ``hermes`` extra) would force ``# type: ignore[import-not-found]``
+# escape hatches — banned by rule 17. Instead it is type-checked in the
+# ``hermes-contract`` CI job (which installs the ``hermes`` extra) via the
+# dedicated mypy config below; ``tests/test_adapter.py`` likewise imports the
+# real runtime and is excluded from the default gate (it ``importorskip``s and
+# runs in that same CI job).
+exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py)$'
+
+# hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
+# (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``
+# explicitly, which bypasses ``exclude``), ``follow_untyped_imports`` makes mypy
+# ANALYSE the real ``gateway`` / ``hermes_cli`` source to derive genuine types —
+# NOT ``ignore_missing_imports`` (which would erase them to ``Any`` and is a
+# banned escape hatch). With the extra absent these sections are inert.
+[[tool.mypy.overrides]]
+module = ["gateway.*", "hermes_cli.*"]
+follow_untyped_imports = true
 
 # ---------------------------------------------------------------------------
 # pytest

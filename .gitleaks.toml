@@ -1,0 +1,21 @@
+# gitleaks configuration for hermes-voip (scanned in CI: `gitleaks git --redact --verbose .`).
+#
+# Keeps the FULL default rule set (no detection is removed) and allowlists only
+# the synthetic SRTP test vectors in tests/test_sdp.py. Those are deterministic
+# fake SDES `key||salt` values — base64 of byte ranges 0..29 / 100..129 / 0..28
+# (see the comments at tests/test_sdp.py) — exercising RFC 4568 `a=crypto`
+# parse/validate; they are NOT real keys. gitleaks' generic-api-key rule flags
+# their high entropy as a false positive, and because the scan walks full git
+# history the literals cannot be removed without rewriting the TDD red commit.
+#
+# Invariant (AGENTS.md rule 34): this repo is PUBLIC and holds NO real secrets in
+# tracked files. Real connection material (SIP host/extension/password) lives only
+# in the gitignored, read-denied .env and in 1Password — never in tests/fixtures.
+title = "hermes-voip"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic SRTP test vectors (fake SDES key||salt) in the SDP a=crypto tests — not real secrets"
+paths = ['''tests/test_sdp\.py''']

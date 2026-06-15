@@ -13,7 +13,9 @@ demuxes:
   :meth:`~hermes_voip.manager.RegistrationManager.route_request` —
   :class:`~hermes_voip.manager.NewCall` to the ``on_new_call`` callback,
   :class:`~hermes_voip.manager.InDialog` to the owning consumer's
-  ``handle_request``, :class:`~hermes_voip.manager.Unroutable` to ``on_unroutable``.
+  ``handle_request``; otherwise the transport answers an out-of-dialog UA-liveness
+  request itself (see below), and only a genuinely unroutable
+  :class:`~hermes_voip.manager.Unroutable` reaches ``on_unroutable``.
 
 It implements :class:`~hermes_voip.manager.SipTransport` (``send`` /
 ``local_sent_by`` / ``contact_uri``) and is each call's
@@ -21,6 +23,14 @@ It implements :class:`~hermes_voip.manager.SipTransport` (``send`` /
 concern those seams delegate here: when **we** send an INVITE, the transport
 tracks its client transaction and **auto-ACKs a non-2xx final** (RFC 3261
 §17.1.1.3) — the TU (``CallSession``) only ever ACKs the 2xx.
+
+It also keeps the UA alive: an out-of-dialog ``OPTIONS`` qualify ping is answered
+``200 OK`` with an ``Allow`` header (RFC 3261 §11) and an unsolicited ``NOTIFY``
+(e.g. ``message-summary`` MWI) is acknowledged ``200 OK``
+(:func:`~hermes_voip.keepalive.build_options_ok` /
+:func:`~hermes_voip.keepalive.build_keepalive_ok`), so the registrar keeps the
+contact *qualified* and rings the extension rather than diverting inbound calls to
+voicemail — without one, a registrar marks the endpoint unreachable.
 
 Errors propagate (rule 37): an unparseable / unframable stream fails the reader
 task and is reported via ``on_connection_lost``; a stray response or unroutable
@@ -32,16 +42,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
+from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
     InDialog,
     NewCall,
     RegistrationManager,
     Unroutable,
 )
-from hermes_voip.message import SipRequest, SipResponse
+from hermes_voip.message import SipRequest, SipResponse, new_tag
 from hermes_voip.transport.framing import SipMessageFramer
 from hermes_voip.transport.transaction import (
     InviteClientTransaction,
@@ -51,6 +63,8 @@ from hermes_voip.transport.transaction import (
 __all__ = ["CallResponseSink", "SipOverTlsTransport"]
 
 _RESPONSE_PREFIX = "SIP/2.0 "
+# A To/From header parameter carrying a dialog tag (after the name-addr's '>').
+_TO_TAG_PARAM = re.compile(r";\s*tag=", re.IGNORECASE)
 
 
 @runtime_checkable
@@ -285,8 +299,41 @@ class SipOverTlsTransport:
                 )
         elif isinstance(routing, InDialog):
             await routing.consumer.handle_request(routing.request)
+        elif await self._answer_keepalive(request):
+            return
         else:
             self._report_unroutable(routing)
+
+    async def _answer_keepalive(self, request: SipRequest) -> bool:
+        """Answer an out-of-dialog ``OPTIONS``/``NOTIFY`` 200 OK; report success.
+
+        The gateway *qualifies* the registered contact with out-of-dialog
+        ``OPTIONS`` pings and expects a ``200 OK``; without one it marks the
+        endpoint UNREACHABLE and sends inbound calls to voicemail (RFC 3261 §11).
+        It also sends unsolicited ``message-summary`` ``NOTIFY`` (MWI) that we
+        acknowledge but do not process. This runs only on the
+        :class:`~hermes_voip.manager.Unroutable` branch, so an in-dialog request
+        (it carries a ``To``-tag, classified before us) never reaches here — and
+        an out-of-dialog request that *does* carry a ``To``-tag is left to the
+        unroutable path, never auto-answered.
+
+        Returns ``True`` when a response was sent (the caller must not also report
+        the request unroutable), ``False`` when this is not a keepalive request.
+
+        Note: this assumes a *qualify* ``OPTIONS`` is out of dialog (no ``To``-tag),
+        which holds for RFC 3261 §11 registrars; a tagged ``OPTIONS`` is treated as
+        in-dialog and left to the unroutable path (answering it could 200 a genuine
+        in-dialog request for an unknown dialog, which should be ``481``).
+        """
+        if _has_to_tag(request.header("To")):
+            return False
+        if request.method == "OPTIONS":
+            await self.send(build_options_ok(request, to_tag=new_tag()))
+            return True
+        if request.method == "NOTIFY":
+            await self.send(build_keepalive_ok(request, to_tag=new_tag()))
+            return True
+        return False
 
     def _report_unroutable(self, what: Unroutable | SipResponse) -> None:
         if self._on_unroutable is not None:
@@ -301,6 +348,20 @@ class SipOverTlsTransport:
         error = task.exception()
         if self._on_connection_lost is not None:
             self._on_connection_lost(error)
+
+
+def _has_to_tag(to_value: str | None) -> bool:
+    """``True`` when a ``To`` header carries a dialog ``tag`` parameter.
+
+    The tag is a header parameter, so it lives after the closing ``>`` of a
+    name-addr (a ``tag=`` inside the URI's user/host part would not be a dialog
+    tag). A request with a ``To``-tag is in-dialog and is never auto-answered as a
+    keepalive — it is left to the unroutable path.
+    """
+    if to_value is None:
+        return False
+    search_space = to_value.split(">", 1)[1] if ">" in to_value else to_value
+    return _TO_TAG_PARAM.search(search_space) is not None
 
 
 def _format_sent_by(host: str, port: int) -> str:

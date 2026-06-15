@@ -176,9 +176,21 @@ def _adapter_factory(config: object) -> BasePlatformAdapterProtocol:
     runtime at module top) is imported **here, lazily** — so a bare
     ``import hermes_voip`` never pulls in hermes-agent, but the adapter is a real
     ``BasePlatformAdapter`` subclass the moment the gateway instantiates it.
-    """
-    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
+    ``config`` is typed ``object`` at the hermes-surface boundary (the gateway
+    passes an opaque object through the ``Callable[[object], …]`` adapter-factory
+    contract in :mod:`hermes_voip.hermes_surface`).  The runtime always supplies a
+    ``PlatformConfig`` here; the ``isinstance`` guard narrows the type for mypy
+    and enforces the contract at runtime.
+    """
+    from gateway.config import PlatformConfig  # noqa: PLC0415  # isort: skip
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415  # isort: skip
+
+    if not isinstance(config, PlatformConfig):
+        msg = (
+            f"_adapter_factory: expected PlatformConfig, got {type(config).__name__!r}"
+        )
+        raise TypeError(msg)
     return VoipAdapter(config)
 
 

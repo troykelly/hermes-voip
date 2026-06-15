@@ -39,7 +39,7 @@ import asyncio
 import logging
 import ssl
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING
 
 # The real hermes-agent runtime surface. This module is imported ONLY lazily
@@ -256,7 +256,7 @@ class VoipAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: str | None = None,  # noqa: ARG002 — SIP has no threaded replies
-        metadata: dict[str, object] | None = None,  # noqa: ARG002 — no metadata consumed
+        metadata: Mapping[str, object] | None = None,  # noqa: ARG002 — no metadata consumed
     ) -> SendResult:
         """Deliver agent text to the caller via TTS synthesis.
 

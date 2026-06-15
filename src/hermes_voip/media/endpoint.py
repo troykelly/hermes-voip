@@ -11,8 +11,10 @@ The timer is measured in **silero window ordinals**, not the wall clock: VAD emi
 one window per fixed 32 ms slice and stamps each edge with its monotonic ordinal,
 so counting windows gives an exact, deterministic, offline-testable timer with no
 clock drift. ``silence_ms`` is converted to a window count once (rounding up so we
-never end a turn *earlier* than configured), and the turn ends on the first window
-that is ``silence_windows`` past the last speech offset.
+never end a turn *earlier* than configured). The VAD stamps its OFFSET edge on the
+*first* silent window, so the ``silence_windows`` silent windows of the timer are
+the ordinals ``[offset, offset + silence_windows - 1]`` and the turn ends on the
+**last** of them — once that many windows have actually been silent.
 
 ``Smart-Turn-v2`` (a learned end-of-turn classifier) is the optional later swap
 behind this same end-of-turn signal (ADR-0008) — not built here.
@@ -101,9 +103,11 @@ class Endpointer:
     def advance(self, current_index: int) -> bool:
         """Tick the timer at window ``current_index``; True iff a turn ends now.
 
-        Returns ``True`` on the first window whose distance from the last speech
-        offset reaches :attr:`silence_windows`, and only once per turn (further
-        ticks in the same silent run return ``False`` until speech resumes).
+        Returns ``True`` on the first window at which :attr:`silence_windows`
+        windows (counting the OFFSET window itself, which is already silent) have
+        been silent — i.e. ``offset + silence_windows - 1`` — and only once per
+        turn (further ticks in the same silent run return ``False`` until speech
+        resumes).
 
         Args:
             current_index: The ordinal of the window just processed. Must be
@@ -121,7 +125,14 @@ class Endpointer:
         self._last_index = current_index
         if self._silence_since is None or self._fired:
             return False
-        if current_index - self._silence_since >= self._silence_windows:
+        # ``_silence_since`` is the FIRST silent window (the ordinal VAD stamped on
+        # the OFFSET edge — see vad.py ``_score_window``, which fires OFFSET on the
+        # first below-exit window). By ``current_index`` inclusive we have seen
+        # ``current_index - _silence_since + 1`` silent windows; the turn ends once
+        # that count reaches ``silence_windows``, i.e. on window
+        # ``_silence_since + silence_windows - 1``.
+        silent_windows_seen = current_index - self._silence_since + 1
+        if silent_windows_seen >= self._silence_windows:
             self._fired = True
             return True
         return False

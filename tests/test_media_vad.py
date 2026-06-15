@@ -249,7 +249,7 @@ def test_infinite_exit_threshold_rejected() -> None:
 
 def test_negative_exit_threshold_rejected() -> None:
     # A negative exit threshold can never be crossed (probabilities are >= 0.0),
-    # so speech would never end. Require exit_threshold >= 0.0.
+    # so speech would never end. Require exit_threshold > 0.0.
     with pytest.raises(ValueError, match="exit_threshold"):
         VoiceActivityDetector(
             sample_rate_hz=_RATE_16K,
@@ -257,6 +257,39 @@ def test_negative_exit_threshold_rejected() -> None:
             exit_threshold=-0.1,
             model=_ScriptedModel([]),
         )
+
+
+def test_zero_exit_threshold_rejected() -> None:
+    # exit_threshold == 0.0 silently breaks endpointing: the OFFSET test is
+    # `probability < exit_threshold`, and probabilities are in [0.0, 1.0], so
+    # `prob < 0.0` is NEVER true -> once speech starts it never ends. A zero
+    # cutoff must be rejected at construction (require exit_threshold > 0.0),
+    # exactly like a negative one.
+    with pytest.raises(ValueError, match="exit_threshold"):
+        VoiceActivityDetector(
+            sample_rate_hz=_RATE_16K,
+            threshold=0.5,
+            exit_threshold=0.0,
+            model=_ScriptedModel([]),
+        )
+
+
+def test_low_threshold_derives_crossable_exit_and_speech_ends() -> None:
+    # For a LOW threshold the default exit_threshold must still be a real,
+    # crossable cutoff strictly inside (0, threshold) -- never floored to 0,
+    # which would leave speech stuck open forever. With threshold=0.1 and no
+    # explicit exit_threshold, construction must succeed, derive an exit in
+    # (0.0, 0.1), and silence (prob=0.0) must actually end the turn.
+    vad = VoiceActivityDetector(
+        sample_rate_hz=_RATE_16K,
+        threshold=0.1,
+        model=_ScriptedModel([0.9, 0.0]),
+    )
+    derived_exit = vad._exit_threshold  # noqa: SLF001  (assert derivation bounds)
+    assert 0.0 < derived_exit < 0.1
+    # drive prob above threshold (ONSET) then prob == 0.0 silence (OFFSET fires)
+    events = list(vad.feed(_frame(_silence(2, _RATE_16K), _RATE_16K)))
+    assert _edges(iter(events)) == [SpeechEdge.ONSET, SpeechEdge.OFFSET]
 
 
 # --- a real PCM fixture exercises the same edges deterministically --------

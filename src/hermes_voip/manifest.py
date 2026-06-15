@@ -47,6 +47,11 @@ __all__ = [
 # A model file's content digest: exactly 64 lowercase hex chars (SHA-256). A pin
 # that is not a full digest is not a pin, so construction rejects it.
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+# A single SPDX licence id: letters/digits/dot/hyphen (incl. a `LicenseRef-`
+# prefix). This deliberately excludes whitespace and the SPDX *expression*
+# operators (OR/AND/WITH and a trailing `+`) — a pinned artifact must declare one
+# concrete id, not an expression, so the allow-list gate compares like for like.
+_SPDX_ID_RE = re.compile(r"[A-Za-z0-9.-]+")
 # A pinned revision is a full 40-hex Git commit SHA (ADR-0006/0007/0009 each pin a
 # revision, not a branch/tag) — a moving ref like "main" is not a reproducible pin.
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
@@ -145,8 +150,11 @@ class ModelFile:
                 f"got {self.sha256!r} for {self.name!r}"
             )
             raise ValueError(msg)
-        if not self.spdx:
-            msg = f"ModelFile.spdx must not be empty for {self.name!r}"
+        if _SPDX_ID_RE.fullmatch(self.spdx) is None:
+            msg = (
+                f"ModelFile.spdx must be a single SPDX licence id (no whitespace "
+                f"or expression operators), got {self.spdx!r} for {self.name!r}"
+            )
             raise ValueError(msg)
 
 

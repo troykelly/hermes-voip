@@ -82,6 +82,14 @@ SILERO_WINDOW_SAMPLES: Final[dict[int, int]] = {8_000: 256, 16_000: 512}
 #: be crossed by a ``0.0..1.0`` probability and would wedge speech open).
 _DEFAULT_EXIT_FACTOR: Final[float] = 0.5
 
+#: Smallest accepted speech-entry ``threshold``. A silero speech *probability*
+#: cutoff is realistically 0.1-0.9; anything below this is not a usable detector
+#: setting and would also make the derived default exit (``threshold * 0.5``)
+#: underflow toward 0.0 — e.g. the smallest positive float ``5e-324 * 0.5 == 0.0``
+#: — which can never be crossed by a ``0.0..1.0`` probability. Bounding
+#: ``threshold`` here keeps the derived exit always positive and representable.
+_MIN_THRESHOLD: Final[float] = 0.01
+
 
 class SpeechEdge(Enum):
     """A transition of the inbound stream's speech/silence state."""
@@ -150,8 +158,10 @@ class VoiceActivityDetector:
                 fake in tests; use :func:`load_silero_model` for the live path.
             sample_rate_hz: ``8000`` or ``16000`` — both native silero rates. The
                 frames fed to :meth:`feed` must carry this exact rate.
-            threshold: Speech-entry probability cutoff in ``[0.0, 1.0]`` (sourced
-                from ``MediaConfig.vad_threshold``).
+            threshold: Speech-entry probability cutoff. Must be a normal positive
+                probability in ``[0.01, 1.0]`` (sourced from
+                ``MediaConfig.vad_threshold``); a vanishingly small value is
+                unusable and would underflow the derived default exit to ``0.0``.
             exit_threshold: Speech-exit cutoff; speech ends once probability drops
                 strictly below it. Defaults to ``threshold * 0.5`` — a
                 proportional hysteresis half-band that, for any ``threshold > 0``,
@@ -162,15 +172,19 @@ class VoiceActivityDetector:
 
         Raises:
             ValueError: If the rate is not 8000/16000, ``threshold`` is outside
-                ``[0.0, 1.0]``, or ``exit_threshold`` is not finite and within
-                ``(0.0, threshold]`` (the derived default needs ``threshold > 0``
-                to be valid).
+                ``[0.01, 1.0]``, or ``exit_threshold`` is not finite and within
+                ``(0.0, threshold]``.
         """
         if sample_rate_hz not in SILERO_WINDOW_SAMPLES:
             msg = f"sample_rate_hz must be 8000 or 16000, got {sample_rate_hz}"
             raise ValueError(msg)
-        if not 0.0 <= threshold <= 1.0:
-            msg = f"threshold must be in [0.0, 1.0], got {threshold}"
+        # ``threshold`` must be a normal positive probability, not just any value
+        # in [0.0, 1.0]: a vanishingly small one is unusable AND would make the
+        # derived default exit (``threshold * 0.5``) underflow to 0.0 (e.g.
+        # ``5e-324 * 0.5 == 0.0``), which can never be crossed. ``not (lo <= x <=
+        # hi)`` also catches NaN, since every NaN comparison is False.
+        if not _MIN_THRESHOLD <= threshold <= 1.0:
+            msg = f"threshold must be in [{_MIN_THRESHOLD}, 1.0], got {threshold}"
             raise ValueError(msg)
         resolved_exit = (
             threshold * _DEFAULT_EXIT_FACTOR
@@ -184,10 +198,10 @@ class VoiceActivityDetector:
         # ends; an infinity or anything above ``threshold`` would instead re-onset
         # chatter. Require ``0.0 < x <= threshold``. ``not (0.0 < x <= threshold)``
         # also catches NaN, since every NaN comparison is False; ``math.isfinite``
-        # then keeps the message specific for infinities. With the default
-        # ``threshold * 0.5`` this holds for any ``threshold > 0``; a ``threshold``
-        # of exactly 0.0 leaves no valid cutoff and is rejected here with a clear
-        # error rather than wedging speech open.
+        # then keeps the message specific for infinities. The derived default
+        # ``threshold * 0.5`` always satisfies this because ``threshold`` is bounded
+        # at or above ``_MIN_THRESHOLD`` above; this check therefore guards an
+        # explicitly-supplied ``exit_threshold``.
         if not math.isfinite(resolved_exit) or not 0.0 < resolved_exit <= threshold:
             msg = (
                 f"exit_threshold must be finite and in (0.0, threshold], "

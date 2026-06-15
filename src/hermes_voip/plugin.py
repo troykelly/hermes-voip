@@ -57,9 +57,16 @@ _REQUIRED_ENV: tuple[str, ...] = (
 # The env-var name prefixes the adapter reads its config from. The SIP scheme
 # (``HERMES_SIP_*``) carries the gateway + registration credentials; the media
 # scheme (``HERMES_VOIP_*``) carries the STT/TTS/VAD/guard + feature settings.
-# These are exactly the keys ``env_enablement_fn`` copies from the process env
+# These are the key prefixes ``env_enablement_fn`` copies from the process env
 # into ``PlatformConfig.extra`` for the running gateway (see :func:`_env_enablement`).
 _EXTRA_ENV_PREFIXES: tuple[str, ...] = ("HERMES_SIP_", "HERMES_VOIP_")
+
+# Non-prefixed cloud-credential keys that ``load_media_config`` reads from the
+# same ``extra`` mapping.  ``DEEPGRAM_API_KEY`` is required when
+# ``HERMES_VOIP_STT_PROVIDER=deepgram``; ``ELEVENLABS_API_KEY`` is required when
+# ``HERMES_VOIP_TTS_PROVIDER=elevenlabs``.  Neither carries one of the two
+# prefixes above, so they must be copied by exact name alongside the prefix match.
+_EXTRA_ENV_KEYS: frozenset[str] = frozenset({"DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY"})
 
 
 def validate_voip_config(config: object) -> bool:
@@ -91,7 +98,7 @@ def validate_voip_config(config: object) -> bool:
 
 
 def _env_enablement() -> dict[str, str]:
-    """Seed ``PlatformConfig.extra`` from the ``HERMES_SIP_*``/``HERMES_VOIP_*`` env.
+    """Seed ``PlatformConfig.extra`` from the process env for the VoIP adapter.
 
     The Hermes gateway's registry-driven plugin-platform enable pass
     (``gateway.config._apply_env_overrides``) calls this hook to populate the
@@ -102,18 +109,25 @@ def _env_enablement() -> dict[str, str]:
     ``connect()`` raises :class:`~hermes_voip.config.ConfigError`.
 
     Returning the env keeps every secret (the SIP password, any cloud key) in the
-    process environment only — never written to ``config.yaml`` (rule 34). Only
-    the two ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` namespaces are copied; unrelated
-    process env is excluded.
+    process environment only — never written to ``config.yaml`` (rule 34). Two
+    classes of keys are copied:
+
+    * Every key matching the ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` prefixes
+      (``_EXTRA_ENV_PREFIXES``) — the gateway and media/feature config.
+    * The exact non-prefixed cloud-credential keys in ``_EXTRA_ENV_KEYS``
+      (``DEEPGRAM_API_KEY``, ``ELEVENLABS_API_KEY``) — required by
+      ``load_media_config`` when the matching cloud provider is selected.
+
+    All other process env vars are excluded.
 
     Returns:
-        A mapping of every ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` variable currently
-        set in the process environment to its value (empty if none are set).
+        A mapping of every relevant variable currently set in the process
+        environment to its value (empty dict if none are set).
     """
     return {
         key: value
         for key, value in os.environ.items()
-        if key.startswith(_EXTRA_ENV_PREFIXES)
+        if key.startswith(_EXTRA_ENV_PREFIXES) or key in _EXTRA_ENV_KEYS
     }
 
 

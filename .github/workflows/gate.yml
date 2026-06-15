@@ -71,5 +71,5 @@ jobs:
           enable-cache: true
       - run: uv sync --frozen --extra media
       # Prove the cryptography library loads and the SRTP module is importable.
-      - run: uv run python -c "import cryptography; from hermes_voip.media.srtp import SrtpSession, SrtpError; print('media stack: cryptography', cryptography.__version__)"
+      - run: uv run python -c "import cryptography; from hermes_voip.media.srtp import SrtpSession, SrtpError; print('media stack cryptography', cryptography.__version__)"
       - run: uv run pytest -rs

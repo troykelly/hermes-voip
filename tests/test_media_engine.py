@@ -675,3 +675,172 @@ async def test_srtp_inbound_tampered_datagram_is_dropped_by_engine() -> None:
 
     sender_sock.close()
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# (j) stop() wakes a blocked consumer even when the recv queue is full
+#     (regression: a bounded-queue sentinel can be silently dropped)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_wakes_inbound_when_queue_full() -> None:
+    """stop() must terminate inbound_audio() even with a full recv queue.
+
+    Regression for a HIGH defect: if stop() enqueues a single sentinel and the
+    bounded recv queue is already at capacity, the sentinel is dropped (the
+    QueueFull is suppressed) and the inbound generator never receives it — it
+    blocks forever on ``queue.get()``.  A stop signal independent of the queue
+    (a stop-flag the generator selects on) must wake the consumer regardless of
+    queue fullness.
+
+    We fill the queue to capacity with valid-but-buffered RTP that the jitter
+    buffer holds (single packet, target_depth>1 ⇒ nothing popped yet), so the
+    consumer drains every datagram, produces no frame, and then blocks on an
+    empty queue.  Only the stop signal can terminate it.
+
+    The assertion is robust against ``wait_for`` cancellation semantics: we use
+    ``asyncio.wait`` (which does NOT cancel the task on timeout) and assert the
+    task finished ON ITS OWN.  A buggy implementation leaves it pending; we then
+    cancel only for cleanup, so the swallowed-cancellation path cannot disguise
+    a hang as success.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        clock=_dummy_clock,
+    )
+    await engine.connect()
+
+    # Fill the bounded recv queue to capacity with datagrams that decode to no
+    # frames (too short to be a valid 12-byte RTP header → dropped on parse).
+    capacity = engine._recv_queue.maxsize
+    bad = b"\x00\x00\x00\x00"  # < 12 bytes: RtpPacket.parse raises ValueError
+    for _ in range(capacity):
+        engine._recv_queue.put_nowait(bad)
+    assert engine._recv_queue.full()
+
+    async def _drain() -> int:
+        count = 0
+        async for _frame in engine.inbound_audio():
+            count += 1
+        return count
+
+    task: asyncio.Task[int] = asyncio.create_task(_drain())
+
+    # Call stop() while the queue is STILL FULL — before the consumer task has
+    # had a chance to run.  stop() has no await before its queue write, so its
+    # whole body runs synchronously here.  With the buggy put_nowait-sentinel
+    # approach the sentinel is dropped (QueueFull suppressed).
+    assert engine._recv_queue.full()
+    await engine.stop()
+
+    # Give the consumer time to drain and (correctly) terminate via the stop
+    # signal.  asyncio.wait does NOT cancel the task on timeout — so if the
+    # generator hangs, the task stays pending and we detect it explicitly,
+    # rather than having wait_for's cancellation be swallowed into a false pass.
+    _done, pending = await asyncio.wait({task}, timeout=2.0)
+
+    if pending:
+        # Hung: clean up the leaked task, then fail loudly.
+        for p in pending:
+            p.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await p
+        pytest.fail("inbound_audio() hung after stop() with a full recv queue")
+
+    produced = task.result()
+    assert produced == 0  # all datagrams were malformed → no frames
+
+
+# ---------------------------------------------------------------------------
+# (k) inbound_audio() must propagate asyncio.CancelledError (rule 37)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_propagates_cancellation() -> None:
+    """Cancelling the consumer of inbound_audio() must raise CancelledError.
+
+    Regression for a MEDIUM defect: the inbound generator caught
+    asyncio.CancelledError and returned, swallowing cancellation (masking
+    timeouts / caller cancel).  Cancellation must propagate.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        clock=_dummy_clock,
+    )
+    await engine.connect()
+
+    async def _await_frame() -> PcmFrame:
+        async for frame in engine.inbound_audio():
+            return frame
+        msg = "no frame produced"
+        raise AssertionError(msg)
+
+    task: asyncio.Task[PcmFrame] = asyncio.create_task(_await_frame())
+    await asyncio.sleep(0.01)  # let it block on the empty queue
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# (l) inbound_audio() drops only SrtpError; other errors propagate (rule 37)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_propagates_non_srtp_error() -> None:
+    """A non-SrtpError from the inbound SRTP session must propagate.
+
+    Regression for a MEDIUM defect: the SRTP path swallowed ImportError as a
+    per-packet drop, so a misconfigured/unimportable SRTP backend would silently
+    drop ALL packets.  Only SrtpError (auth/replay) drops a single packet; every
+    other failure (config/programming error) must propagate.
+    """
+
+    class _ExplodingUnprotect:
+        """A _SrtpUnprotect stand-in whose unprotect raises a config error."""
+
+        def unprotect(self, data: bytes) -> RtpPacket:
+            msg = "SRTP backend misconfigured"
+            raise RuntimeError(msg)
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        srtp_inbound=_ExplodingUnprotect(),
+        clock=_dummy_clock,
+    )
+    await engine.connect()
+
+    async def _await_frame() -> PcmFrame:
+        async for frame in engine.inbound_audio():
+            return frame
+        msg = "no frame produced"
+        raise AssertionError(msg)
+
+    task: asyncio.Task[PcmFrame] = asyncio.create_task(_await_frame())
+    await asyncio.sleep(0)
+
+    # A datagram arrives; unprotect raises RuntimeError → must propagate.
+    engine._recv_queue.put_nowait(_make_rtp(0, 0, _ulaw_silence()))
+
+    with pytest.raises(RuntimeError, match="misconfigured"):
+        await asyncio.wait_for(task, timeout=2.0)
+
+    await engine.stop()

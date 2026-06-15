@@ -12,153 +12,197 @@ The subtle part is cancellation. The per-segment byte source is itself an async
 generator running a worker thread; closing the *outer* frame generator does
 **not** transitively close it (a ``GeneratorExit`` at the outer ``yield`` unwinds
 the ``async for`` without awaiting the inner generator's ``aclose``). So this
-class keeps a handle on the active byte source and closes it explicitly — on
-barge-in ``cancel()`` and at each segment boundary — which joins the worker and
-tears the backend/connection down (rule 37: no leaked thread).
+class keeps a handle on the active byte source and closes it explicitly at each
+segment boundary and on teardown — which joins the worker and tears the
+backend/connection down (rule 37: no leaked thread).
+
+Barge-in (``cancel()``) is the other subtlety. It runs on a *different* task from
+the consumer iterating frames, so it must not ``aclose()`` the frame generator
+directly — that races the consumer's in-flight ``__anext__`` (``aclose():
+asynchronous generator is already running``). Instead ``cancel()`` sets the shared
+stop flag and calls the active segment's thread-safe ``abort`` (e.g. close the
+HTTP socket) so a consumer parked in a blocking read unblocks; the consumer's own
+resuming ``__anext__`` then runs the loop's teardown. A cooperative backend that
+polls the stop flag (sherpa-onnx) needs no ``abort``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import dataclass, field
 
 from hermes_voip.providers.audio import PcmFrame
+from hermes_voip.tts.segment import DEFAULT_FIRST_SEGMENT_MAX_CHARS, FlushableSegmenter
 
 # Frames leave the provider with a placeholder timestamp; the media layer
 # (ADR-0005) restamps every frame on the de-jittered playout clock.
 _NO_TIMESTAMP = 0
 
 
-def _surface_teardown_error(task: asyncio.Task[None]) -> None:
-    """Surface a background teardown failure to the loop handler (rule 37).
+def _noop() -> None:
+    """Default per-segment abort: nothing to forcibly interrupt (cooperative)."""
+    return
 
-    The cancel-path teardown runs detached; if it raised (a backend that ignored
-    the stop flag, so ``stream_from_thread`` hit its join timeout), report it via
-    the running loop's exception handler rather than letting it vanish as an
-    unretrieved task exception. A normal cancellation is ignored.
+
+@dataclass(frozen=True, slots=True)
+class SegmentSource:
+    """One sentence's PCM-byte source plus a thread-safe barge-in abort.
+
+    ``chunks`` is the worker-thread-bridged byte stream for the sentence;
+    ``abort`` is called (from the loop thread) on ``cancel()`` to interrupt a
+    backend parked in an uninterruptible read so iteration unblocks promptly. A
+    cooperative backend that already polls the shared stop flag (sherpa-onnx)
+    leaves ``abort`` at its no-op default; a blocking transport (ElevenLabs over
+    urllib) supplies one that closes the in-flight HTTP response/socket.
     """
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        asyncio.get_running_loop().call_exception_handler(
-            {"message": "TTS stream teardown failed", "exception": exc}
-        )
+
+    chunks: AsyncIterator[bytes]
+    abort: Callable[[], None] = field(default=_noop)
 
 
 class PcmFrameStream:
     """A ``TtsStream`` over a per-segment PCM-byte source (ADR-0004/0007).
 
     Iterates 24 kHz ``PcmFrame``s; ``cancel()`` stops mid-utterance for barge-in
-    (ADR-0008) and closes the active byte source; ``flush()`` is a no-op because
-    draining to exhaustion already synthesises the trailing sentence (the
-    segmenter flushes its tail at stream end).
+    (ADR-0008) and closes the active byte source. ``flush()`` forces the segmenter
+    to emit whatever text is buffered as a segment *now* — so partial,
+    un-terminated text reaches synthesis while the agent's input iterator is still
+    open, not only when it ends (the call loop's end-of-turn / first-audio lever).
+
+    This is the single shared ``TtsStream`` both providers use: it owns the
+    :class:`FlushableSegmenter`, so the segmentation, flush, and cancel logic lives
+    in one place rather than being duplicated per backend.
     """
 
     def __init__(
         self,
         *,
-        segments: AsyncIterator[str],
-        open_segment: Callable[[str], AsyncIterator[bytes]],
+        text: AsyncIterator[str],
+        open_segment: Callable[[str], SegmentSource],
         sample_rate: int,
         stop: threading.Event,
+        first_segment_max_chars: int = DEFAULT_FIRST_SEGMENT_MAX_CHARS,
     ) -> None:
         """Wire the stream.
 
         Args:
-            segments: The agent's text already segmented into sentences (ADR-0007).
-            open_segment: Factory: given one sentence, return an async iterator of
-                PCM16-LE byte chunks for it (the worker-thread-bridged backend).
+            text: The agent's incremental text stream (segmented internally).
+            open_segment: Factory: given one sentence, return a :class:`SegmentSource`
+                — its worker-thread-bridged PCM16 byte iterator plus a thread-safe
+                barge-in ``abort`` for backends whose read cannot otherwise be
+                interrupted.
             sample_rate: The provider's output rate (stamped on every frame).
             stop: The barge-in flag the backend polls; ``cancel()`` sets it. Shared
                 with the backend so a cooperative producer can observe it.
+            first_segment_max_chars: Forwarded to the segmenter (keeps the opening
+                utterance short for first-audio latency, ADR-0007).
         """
-        self._segments = segments
+        self._segmenter = FlushableSegmenter(
+            text, first_segment_max_chars=first_segment_max_chars
+        )
         self._open_segment = open_segment
         self._sample_rate = sample_rate
         self._stop = stop
         self._active: AsyncIterator[bytes] | None = None
+        self._abort: Callable[[], None] = _noop
         self._frames: AsyncGenerator[PcmFrame] = self._run()
-        self._teardown: asyncio.Task[None] | None = None
+        self._torn_down = False
 
     def __aiter__(self) -> AsyncIterator[PcmFrame]:
         return self
 
     async def __anext__(self) -> PcmFrame:
         if self._stop.is_set():
-            # Barge-in: stop yielding. Reap the cancel-path teardown first so its
-            # effect (the backend observing the stop flag, the worker joining) is
+            # Barge-in flagged with no pull resuming the run loop: drive teardown
+            # here (joins the worker, closes the segmenter) so its effect is
             # complete and observable by the time iteration ends.
-            await self._reap_teardown()
+            await self._teardown()
             raise StopAsyncIteration
         return await self._frames.__anext__()
 
     async def flush(self) -> None:
-        """No-op: iterating to exhaustion already emits the final sentence."""
+        """Force synthesis of any buffered text now (end-of-turn / first-audio).
+
+        Drains the segmenter's current buffer to a segment, so a consumer
+        iterating frames receives audio for partial, un-terminated text while the
+        agent's input iterator is still open — not only once it ends. A no-op when
+        nothing is buffered or after :meth:`cancel`.
+        """
+        await self._segmenter.flush()
 
     async def cancel(self) -> None:
-        """Stop now (barge-in): flag the backend; tear the source down off-path.
+        """Stop now (barge-in): flag the backend and abort the in-flight read.
 
-        Idempotent and **prompt**: setting the stop flag halts iteration
-        immediately (``__anext__`` then raises ``StopAsyncIteration``). The actual
-        teardown — closing the frame generator, whose ``finally`` closes the active
-        per-segment byte source and joins its worker — runs as a background task so
-        ``cancel()`` does not block on a backend that only observes the stop flag
-        on its *next* chunk (e.g. one parked in a native call). Its outcome is
-        surfaced via the loop's exception handler, never swallowed (rule 37); a
-        cooperative backend that polls the flag joins within
-        ``stream_from_thread``'s shutdown timeout.
+        Idempotent and **prompt**. Setting the stop flag halts iteration (a fresh
+        ``__anext__`` then raises ``StopAsyncIteration``); the per-segment
+        ``abort`` interrupts a backend parked in an uninterruptible read (closes
+        the HTTP socket) so a consumer already awaiting the next frame unblocks and
+        its own ``__anext__`` runs the run loop's teardown to completion. Crucially
+        this does **not** ``aclose()`` the frame generator from here — doing so
+        would collide with a consumer's in-flight ``__anext__`` on a different task
+        (``aclose(): asynchronous generator is already running``). The worker join
+        happens on that resuming pull, or via :meth:`aclose`.
         """
-        if self._teardown is not None:
-            return  # already cancelling
         self._stop.set()
-        self._teardown = asyncio.ensure_future(self._frames.aclose())
-        self._teardown.add_done_callback(_surface_teardown_error)
+        self._abort()
 
     async def aclose(self) -> None:
-        """Cancel (if not already) and await teardown to completion (clean exit).
+        """Cancel and drive teardown to completion (worker join, no thread left).
 
-        Unlike :meth:`cancel`, this awaits the worker join, so on return no thread
-        is left running. A teardown error (a backend that ignored the stop flag)
-        propagates here rather than only to the loop handler.
+        For a clean shutdown when the single consumer is no longer iterating (it
+        has stopped, broken, or never started). A teardown error — a backend that
+        ignored both the stop flag and the abort, so ``stream_from_thread`` hit its
+        join timeout — propagates here, never swallowed (rule 37).
         """
         await self.cancel()
-        await self._reap_teardown()
+        await self._teardown()
 
-    async def _reap_teardown(self) -> None:
-        """Await the in-flight cancel-path teardown to completion, once.
+    async def _teardown(self) -> None:
+        """Close the frame generator once: run its finally, join the worker.
 
-        Takes ownership of the teardown task (so a second call is a no-op),
-        detaches the loop-handler callback — because awaiting here surfaces any
-        teardown error directly (rule 37) rather than only via the loop handler —
-        and awaits the worker join. Safe to call when no teardown is in flight.
+        Idempotent. Safe because it is only reached when the single consumer is not
+        parked inside ``self._frames.__anext__`` — either from ``__anext__``'s
+        stop-flag short-circuit (which did not await the generator) or from
+        ``aclose`` after iteration has ended.
         """
-        teardown, self._teardown = self._teardown, None
-        if teardown is not None:
-            teardown.remove_done_callback(_surface_teardown_error)
-            await teardown
+        if self._torn_down:
+            return
+        self._torn_down = True
+        await self._frames.aclose()
 
     async def _run(self) -> AsyncGenerator[PcmFrame]:
         """Segment by segment, yield re-framed PCM until done or cancelled."""
-        async for sentence in self._segments:
-            if self._stop.is_set():
-                return
-            self._active = self._open_segment(sentence)
-            try:
-                async for chunk in self._active:
-                    if self._stop.is_set():
-                        return
-                    if chunk:
-                        yield self._frame(chunk)
-            finally:
-                # Close this segment's source before the next one (and on the
-                # GeneratorExit that cancel()/early-return raises here).
-                await self._aclose_active()
+        try:
+            async for sentence in self._segmenter:
+                if self._stop.is_set():
+                    return
+                source = self._open_segment(sentence)
+                self._active = source.chunks
+                self._abort = source.abort
+                try:
+                    async for chunk in source.chunks:
+                        if self._stop.is_set():
+                            return
+                        if chunk:
+                            yield self._frame(chunk)
+                finally:
+                    # Close this segment's source before the next one (and on the
+                    # GeneratorExit that cancel()/early-return raises here).
+                    await self._aclose_active()
+        finally:
+            # Stop the segmenter's pump and release the input iterator on any exit
+            # — clean end, early return, or the GeneratorExit from aclose.
+            await self._segmenter.aclose()
 
     async def _aclose_active(self) -> None:
-        """Close the active per-segment byte source, if any (idempotent)."""
+        """Close the active per-segment byte source, if any (idempotent).
+
+        Also clears the barge-in ``abort`` for the segment just finished, so a
+        later ``cancel()`` between segments does not poke a closed source.
+        """
         active, self._active = self._active, None
+        self._abort = _noop
         if active is not None:
             aclose = getattr(active, "aclose", None)
             if aclose is not None:

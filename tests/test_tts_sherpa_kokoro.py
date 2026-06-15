@@ -81,25 +81,30 @@ async def _text(*parts: str) -> AsyncIterator[str]:
 class _OpenEndedText:
     """A text source that yields one partial chunk then stays open indefinitely.
 
-    Mirrors a live agent that has emitted a few un-terminated words and is still
-    "thinking": after the chunk is delivered, ``consumed`` is set and the iterator
-    parks on ``release`` (which the test may set to end the turn). This lets a test
-    prove ``flush()`` forces the buffered partial text to synthesise *while the
-    input iterator is still open* — not only when it finally ends.
+    A real ``AsyncIterator[str]`` mirroring a live agent that has emitted a few
+    un-terminated words and is still "thinking": after the chunk is delivered,
+    ``consumed`` is set and the iterator parks on ``release`` (which the test may
+    set to end the turn). This lets a test prove ``flush()`` forces the buffered
+    partial text to synthesise *while the input iterator is still open* — not only
+    when it finally ends.
     """
 
     def __init__(self, partial: str) -> None:
         self.consumed = asyncio.Event()
         self.release = asyncio.Event()
         self._partial = partial
+        self._yielded = False
 
     def __aiter__(self) -> AsyncIterator[str]:
-        return self._iter()
+        return self
 
-    async def _iter(self) -> AsyncIterator[str]:
-        yield self._partial
+    async def __anext__(self) -> str:
+        if not self._yielded:
+            self._yielded = True
+            return self._partial
         self.consumed.set()
         await self.release.wait()
+        raise StopAsyncIteration
 
 
 async def _drain(stream: TtsStream) -> list[PcmFrame]:

@@ -10,14 +10,25 @@ barge-in. Sentence/clause segmentation of the agent's token stream lives in
 
 from __future__ import annotations
 
-from hermes_voip.tts.elevenlabs import ElevenLabsRequest, ElevenLabsTTS, HttpByteStream
-from hermes_voip.tts.segment import SentenceAggregator, segment_stream
+from hermes_voip.tts.elevenlabs import (
+    ElevenLabsRequest,
+    ElevenLabsTTS,
+    HttpByteStream,
+    HttpCancellation,
+)
+from hermes_voip.tts.segment import (
+    FlushableSegmenter,
+    SentenceAggregator,
+    segment_stream,
+)
 from hermes_voip.tts.sherpa_kokoro import SherpaKokoroTTS, Synthesizer
 
 __all__ = [
     "ElevenLabsRequest",
     "ElevenLabsTTS",
+    "FlushableSegmenter",
     "HttpByteStream",
+    "HttpCancellation",
     "SentenceAggregator",
     "SherpaKokoroTTS",
     "Synthesizer",

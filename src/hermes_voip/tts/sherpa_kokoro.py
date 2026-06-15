@@ -26,10 +26,14 @@ from typing import Protocol, runtime_checkable
 
 from hermes_voip.aio import stream_from_thread
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
-from hermes_voip.tts._stream import PcmFrameStream
-from hermes_voip.tts.segment import segment_stream
+from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
 
-__all__ = ["KOKORO_SAMPLE_RATE", "SherpaKokoroTTS", "Synthesizer"]
+__all__ = [
+    "KOKORO_SAMPLE_RATE",
+    "SherpaKokoroTTS",
+    "Synthesizer",
+    "pcm16_from_float32",
+]
 
 #: Kokoro-82M emits 24 kHz mono audio; the media layer downsamples to 8 kHz for
 #: G.711 (ADR-0005/0007). This is the provider's declared ``output_sample_rate``.
@@ -111,16 +115,19 @@ class SherpaKokoroTTS:
         """
         synthesizer = self._backend(voice or self._default_voice)
         stop = threading.Event()
-        # The backend polls ``stop`` directly (the barge-in predicate), so no
-        # ``on_cancel`` is wired into stream_from_thread — cancel() sets the flag
-        # before closing the stream, and the backend observes it at the next chunk
-        # boundary. (Wiring ``stop.set`` as ``on_cancel`` would be wrong: it also
-        # runs on *normal* exhaustion, spuriously stopping after one sentence.)
-        return PcmFrameStream(
-            segments=segment_stream(text),
-            open_segment=lambda sentence: stream_from_thread(
+
+        def _open(sentence: str) -> SegmentSource:
+            # The backend polls ``stop`` directly (the barge-in predicate) and
+            # returns promptly once it is set, so the segment needs no forcible
+            # ``abort`` — synthesis is never parked in an uninterruptible read.
+            chunks = stream_from_thread(
                 lambda: synthesizer.synthesize(sentence, stop.is_set)
-            ),
+            )
+            return SegmentSource(chunks=chunks)
+
+        return PcmFrameStream(
+            text=text,
+            open_segment=_open,
             sample_rate=KOKORO_SAMPLE_RATE,
             stop=stop,
         )
@@ -213,6 +220,38 @@ def _load_sherpa_onnx() -> _SherpaOnnx:
     return module
 
 
+#: Negative full-scale PCM16: int16's range is asymmetric (-32768..32767), so a
+#: float ``-1.0`` maps to ``-32768`` using the negative full-scale code. Scaling
+#: by 32768 (not 32767) maps both signs to full scale; the clamp below keeps the
+#: top end at ``32767`` and saturates anything past either rail (no int16 wrap).
+_FLOAT_TO_INT16_SCALE = 32_768.0
+_INT16_MIN = -32_768.0
+_INT16_MAX = 32_767.0
+
+
+def pcm16_from_float32(samples: object) -> bytes:
+    """Convert float32 audio in ``[-1.0, 1.0]`` to full-scale PCM16-LE bytes.
+
+    The model emits float32 samples (sherpa-onnx hands them in as a numpy array);
+    this maps them to signed 16-bit little-endian PCM at full scale. ``-1.0`` maps
+    to ``-32768`` (PCM16 negative full scale) and ``+1.0`` to ``+32767``. Values
+    outside the range **saturate** to the int16 endpoints rather than wrapping:
+    the scale-then-clamp order means e.g. ``2.0`` becomes ``32767``, never an
+    overflowed near-zero value. numpy is resolved lazily (the ``ml`` extra), so
+    importing this module never requires numpy.
+
+    Args:
+        samples: A float32 numpy array (or array-like) of samples in ``[-1, 1]``.
+
+    Returns:
+        The samples as signed 16-bit little-endian PCM bytes (2 bytes/sample).
+    """
+    np = _load_numpy()
+    scaled = np.asarray(samples, dtype=np.float32) * _FLOAT_TO_INT16_SCALE
+    clamped = np.clip(scaled, _INT16_MIN, _INT16_MAX)
+    return clamped.astype("<i2").tobytes()
+
+
 class _SherpaSynthesizer:
     """The real sherpa-onnx + Kokoro backend (built only when weights exist).
 
@@ -255,17 +294,12 @@ class _SherpaSynthesizer:
         """Synthesise ``text``, yielding PCM16-LE chunks until done or stopped."""
         import queue  # noqa: PLC0415 - lazy import, real-backend path only
 
-        np = _load_numpy()
         chunks: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
 
         def _on_chunk(samples: object, _progress: float) -> int:
             if stop():
                 return 0  # sherpa-onnx stop: cancel synthesis at this boundary
-            # Inline float32 [-1.0, 1.0] -> PCM16-LE int16 conversion: clip to the
-            # full-scale range, scale by 32767, reinterpret as little-endian i16.
-            array = np.asarray(samples, dtype=np.float32)
-            pcm16 = (np.clip(array, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-            chunks.put(pcm16)
+            chunks.put(pcm16_from_float32(samples))
             return 1  # keep generating
 
         # generate() blocks until synthesis finishes, invoking _on_chunk inline;

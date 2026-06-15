@@ -76,6 +76,8 @@ async def _text(*parts: str) -> AsyncIterator[str]:
 class _OpenEndedText:
     """Yields one partial (un-terminated) chunk, then stays open indefinitely.
 
+    A real ``AsyncIterator[str]`` (not just iterable): after the partial chunk it
+    sets ``consumed`` and parks on ``release`` so the input iterator stays open.
     Lets a test prove ``flush()`` forces the buffered partial text to synthesise
     *while the input iterator is still open*, not only when it ends.
     """
@@ -84,14 +86,18 @@ class _OpenEndedText:
         self.consumed = asyncio.Event()
         self.release = asyncio.Event()
         self._partial = partial
+        self._yielded = False
 
     def __aiter__(self) -> AsyncIterator[str]:
-        return self._iter()
+        return self
 
-    async def _iter(self) -> AsyncIterator[str]:
-        yield self._partial
+    async def __anext__(self) -> str:
+        if not self._yielded:
+            self._yielded = True
+            return self._partial
         self.consumed.set()
         await self.release.wait()
+        raise StopAsyncIteration
 
 
 class _BlockingHttp:
@@ -123,17 +129,17 @@ class _BlockingHttp:
 
     def _iter(self) -> Iterator[bytes]:
         self.opened.set()
-        # Park as if inside a blocking response.read() with no data yet.
+        # Park as if inside a blocking response.read() with no data yet; once the
+        # abort releases us, the body is empty (the read was interrupted).
         self._unblock.wait()
-        return
-        yield b""  # pragma: no cover - unreachable; makes this a generator
+        yield from ()
 
 
 async def _drain(stream: TtsStream) -> list[PcmFrame]:
     return [frame async for frame in stream]
 
 
-def _make(http: _RecordedHttp, *, voice: str = "Rachel") -> ElevenLabsTTS:
+def _make(http: HttpByteStream, *, voice: str = "Rachel") -> ElevenLabsTTS:
     return ElevenLabsTTS(api_key=_FAKE_KEY, voice=voice, http=http)
 
 
@@ -238,33 +244,47 @@ async def test_cancel_before_iteration_yields_nothing() -> None:
 async def test_cancel_releases_a_worker_blocked_in_the_http_read() -> None:
     """Barge-in aborts an in-flight HTTP read and frees the worker promptly.
 
-    The transport is parked as if inside ``response.read()`` (no data yet). With
-    no ``on_cancel`` wired into ``stream_from_thread`` the loop side cannot close
-    the socket, so teardown hangs until the worker-join timeout. A correct
-    cancel() arms the transport's cancellation, closing the response from the loop
-    side so the read returns and the worker exits — ``aclose()`` then completes
-    well within the join timeout (it does not raise the "producer ignored
-    cancellation" RuntimeError).
+    A consumer is parked awaiting the next frame while the transport sits inside
+    ``response.read()`` (no data yet). Barge-in (``cancel()``, on a different task)
+    must close the response from the loop side so the read returns, the worker
+    exits, and the consumer's iteration ends — all within the worker-join timeout.
+
+    With no ``on_cancel`` wired into ``stream_from_thread`` the loop side cannot
+    close the socket, so teardown blocks on the read until the 5s join timeout and
+    then raises ``RuntimeError`` ("producer ignored cancellation"). The fix makes
+    this complete promptly with the worker provably released.
     """
     http = _BlockingHttp()
     tts = _make(http)
     stream = tts.synthesize(_text("Interrupt me mid-fetch. "), voice="x")
 
-    iterator = aiter(stream)
-    first = asyncio.ensure_future(anext(iterator))
-    # The worker reaches the (blocked) read; nothing is yielded yet.
-    await asyncio.to_thread(http.opened.wait, 1.0)
-    assert http.opened.is_set()
-    assert not first.done()
+    ended = asyncio.Event()
 
-    # Barge-in. aclose() awaits the worker join; if cancel did not release the
-    # blocked read this would hang then raise RuntimeError at the join timeout.
-    await asyncio.wait_for(stream.aclose(), timeout=2.0)
-    assert http.aborted.is_set()  # the in-flight read was aborted from the loop
+    async def _consume() -> None:
+        try:
+            async for _ in stream:
+                pass
+        finally:
+            ended.set()
 
-    first.cancel()
-    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-        await first
+    consumer = asyncio.create_task(_consume())
+    try:
+        # The worker reaches the (blocked) read; nothing is yielded yet.
+        await asyncio.to_thread(http.opened.wait, 1.0)
+        assert http.opened.is_set()
+        assert not ended.is_set()
+
+        # Barge-in from this (separate) task. If cancel did not abort the blocked
+        # read, the consumer would hang ~5s then surface the join-timeout error.
+        await stream.cancel()
+        await asyncio.wait_for(ended.wait(), timeout=2.0)
+        assert http.aborted.is_set()  # the in-flight read was aborted from the loop
+        # The worker thread is provably gone (not just the read returned).
+        assert all(t.name != "hermes-voip-stream" for t in threading.enumerate())
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
 
 
 # --- flush forces buffered text to synthesis (input iterator still open) -----

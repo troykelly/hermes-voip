@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.aio import stream_from_thread
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
-from hermes_voip.tts._stream import PcmFrameStream
-from hermes_voip.tts.segment import segment_stream
+from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
 
 __all__ = [
     "ELEVENLABS_SAMPLE_RATE",
@@ -34,6 +33,7 @@ __all__ = [
     "ElevenLabsRequest",
     "ElevenLabsTTS",
     "HttpByteStream",
+    "HttpCancellation",
 ]
 
 #: We request raw PCM16 @ 24 kHz so the provider emits ``PcmFrame``s in the same
@@ -80,16 +80,67 @@ class ElevenLabsRequest:
         return json.dumps(payload).encode("utf-8")
 
 
+class HttpCancellation:
+    """A thread-safe barge-in handle linking the loop side to the HTTP read.
+
+    The transport opens the connection *on a worker thread* (so the loop never
+    blocks on connect/TLS), but a barge-in ``cancel()`` runs on the **loop**
+    thread — and a worker parked in ``response.read()`` cannot see a Python flag.
+    This handle bridges them: the worker :meth:`arm`s it with the live response's
+    ``close`` right after opening, and the loop calls :meth:`close` on barge-in to
+    shut the socket so the blocked read returns and the worker is freed. It is
+    created on the loop side and passed into ``open`` so ``close`` is wireable as
+    ``stream_from_thread``'s ``on_cancel`` before the worker has even connected;
+    if ``close`` lands first, the next :meth:`arm` tears the response down at once.
+    """
+
+    def __init__(self) -> None:
+        """Create an un-armed, not-yet-cancelled barge-in handle."""
+        self._lock = threading.Lock()
+        self._closer: Callable[[], None] | None = None
+        self._cancelled = False
+
+    def arm(self, closer: Callable[[], None]) -> None:
+        """Register the live response's close (worker side, after it opens).
+
+        If :meth:`close` already fired (a barge-in that raced ahead of connect),
+        ``closer`` is invoked immediately so the just-opened response is torn down
+        without waiting for a read that would otherwise block.
+        """
+        with self._lock:
+            if not self._cancelled:
+                self._closer = closer
+                return
+        closer()
+
+    def close(self) -> None:
+        """Abort the in-flight read (loop side, on barge-in). Idempotent.
+
+        Closes the armed response/socket so a worker blocked in ``read()`` returns
+        promptly; if nothing is armed yet, records the cancellation so the next
+        :meth:`arm` closes immediately.
+        """
+        with self._lock:
+            self._cancelled = True
+            closer, self._closer = self._closer, None
+        if closer is not None:
+            closer()
+
+
 @runtime_checkable
 class HttpByteStream(Protocol):
     """The streaming-HTTP transport behind :class:`ElevenLabsTTS`.
 
     ``open`` performs the request and returns an iterator of raw response-body
-    byte chunks (the PCM audio). Closing the iterator (on ``cancel()``) must tear
-    the underlying connection down. Injected so tests replay a recorded body.
+    byte chunks (the PCM audio). It must :meth:`HttpCancellation.arm` ``cancel``
+    with a handle that closes the live response, so a barge-in (which calls
+    ``cancel.close()`` from the loop) tears the connection down and releases a
+    worker parked in the body read. Injected so tests replay a recorded body.
     """
 
-    def open(self, request: ElevenLabsRequest) -> Iterator[bytes]:
+    def open(
+        self, request: ElevenLabsRequest, cancel: HttpCancellation
+    ) -> Iterator[bytes]:
         """POST ``request`` and yield the streamed response-body byte chunks."""
         ...
 
@@ -156,11 +207,25 @@ class ElevenLabsTTS:
         """
         voice_id = voice or self._default_voice
         stop = threading.Event()
+
+        def _open(sentence: str) -> SegmentSource:
+            # One cancellation handle per segment: the read happens on a worker
+            # thread, so a barge-in must close the response from the loop side.
+            # ``cancel.close`` is both the segment's barge-in ``abort`` (called by
+            # PcmFrameStream.cancel() to unblock a parked read) and on_cancel for
+            # stream_from_thread (so teardown joins the worker). Without it the
+            # worker stays parked in read() until the join timeout (the bug fixed).
+            cancel = HttpCancellation()
+            request = self._request(sentence, voice_id)
+            chunks = stream_from_thread(
+                lambda: self._http.open(request, cancel),
+                on_cancel=cancel.close,
+            )
+            return SegmentSource(chunks=chunks, abort=cancel.close)
+
         return PcmFrameStream(
-            segments=segment_stream(text),
-            open_segment=lambda sentence: stream_from_thread(
-                lambda: self._http.open(self._request(sentence, voice_id))
-            ),
+            text=text,
+            open_segment=_open,
             sample_rate=ELEVENLABS_SAMPLE_RATE,
             stop=stop,
         )
@@ -194,8 +259,15 @@ class _UrllibHttp:
 
     _CHUNK_BYTES = 4096
 
-    def open(self, request: ElevenLabsRequest) -> Iterator[bytes]:
-        """POST ``request`` and stream the response body in chunks."""
+    def open(
+        self, request: ElevenLabsRequest, cancel: HttpCancellation
+    ) -> Iterator[bytes]:
+        """POST ``request`` and stream the response body in chunks.
+
+        Arms ``cancel`` with the live response's ``close`` immediately after
+        opening (before the first, blocking ``read``), so a barge-in closes the
+        socket from the loop side and the parked read returns promptly.
+        """
         import urllib.request  # noqa: PLC0415 - lazy: real transport path only
 
         req = urllib.request.Request(  # noqa: S310 - fixed https ElevenLabs API URL
@@ -205,6 +277,8 @@ class _UrllibHttp:
             method="POST",
         )
         response = urllib.request.urlopen(req)  # noqa: S310 - fixed https API URL
+        # If a barge-in already fired while connecting, arm() closes it right now.
+        cancel.arm(response.close)
         try:
             while True:
                 chunk = response.read(self._CHUNK_BYTES)

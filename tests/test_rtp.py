@@ -115,6 +115,17 @@ def test_jitter_in_order_emits_in_order() -> None:
     assert jb.pop() is None
 
 
+def test_jitter_far_behind_first_arrival_does_not_reset_anchor() -> None:
+    # A packet more than max_ahead behind the tentative anchor is not a start-of-
+    # call reorder; it must be dropped, not move the anchor down out of the window
+    # (which would strand the buffered higher packet behind a huge artificial gap).
+    jb = JitterBuffer(target_depth=1, max_ahead=100)
+    jb.push(_pkt(1000))
+    jb.push(_pkt(1))  # 999 behind > max_ahead -> dropped, anchor stays at 1000
+    out = jb.pop()
+    assert _packet(out).sequence_number == 1000
+
+
 def test_jitter_reorders_within_depth() -> None:
     jb = JitterBuffer(target_depth=3)
     for seq in (10, 12, 11):
@@ -195,3 +206,26 @@ def test_seq_before_edge_cases() -> None:
     assert _seq_before(5, 5) is False  # equality is never "before"
     assert _seq_before(65535, 0) is True  # across wrap
     assert _seq_before(0, 65535) is False
+
+
+def test_jitter_reordered_first_pair_does_not_drop_the_earlier_packet() -> None:
+    # At stream start the first packets are the most reordering-prone. A higher
+    # sequence arriving before a lower one must NOT anchor playout above the
+    # lower one (which would permanently lose the call's opening audio).
+    jb = JitterBuffer(target_depth=2)
+    jb.push(_pkt(12))
+    jb.push(_pkt(10))  # arrives second but is earlier in sequence
+    assert _packet(jb.pop()).sequence_number == 10  # earliest emitted first
+    assert jb.pop() is None  # 11 missing, only 12 buffered (< depth): wait
+    jb.push(_pkt(11))  # the gap fills in
+    assert _packet(jb.pop()).sequence_number == 11
+    assert _packet(jb.pop()).sequence_number == 12
+
+
+def test_jitter_anchors_at_minimum_of_a_reordered_start_cluster() -> None:
+    # A burst of reordered packets at stream start must all survive, emitted in
+    # ascending order from the lowest sequence seen before the first pop.
+    jb = JitterBuffer(target_depth=4)
+    for seq in (13, 11, 14, 10, 12):  # heavily reordered opening cluster
+        jb.push(_pkt(seq))
+    assert [_packet(jb.pop()).sequence_number for _ in range(5)] == [10, 11, 12, 13, 14]

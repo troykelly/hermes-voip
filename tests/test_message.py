@@ -103,6 +103,15 @@ def test_build_response_rejects_invalid_status() -> None:
         build_response(_inbound("BYE"), 99, "Bad")
 
 
+def test_build_response_rejects_caller_supplied_content_length() -> None:
+    # Content-Length is computed from the body; a caller-supplied one would
+    # duplicate the framing header and corrupt the message.
+    with pytest.raises(ValueError, match="Content-Length"):
+        build_response(
+            _inbound("BYE"), 200, "OK", extra_headers=(("Content-Length", "5"),)
+        )
+
+
 def test_build_response_rejects_request_without_via() -> None:
     no_via = SipRequest(
         method="BYE",
@@ -221,6 +230,44 @@ def test_parse_unfolds_continuation_lines() -> None:
 def test_parse_rejects_malformed_status_line() -> None:
     with pytest.raises(ValueError, match="status-line"):
         SipResponse.parse("SIP/2.0 200OK\r\nContent-Length: 0\r\n\r\n")
+
+
+def test_parse_reason_less_status_line_is_rejected() -> None:
+    # "SIP/2.0 200" with no SP-and-reason is malformed framing; the parser must
+    # raise a ValueError per its contract (never leak an AttributeError, rule 37).
+    with pytest.raises(ValueError, match="status-line"):
+        SipResponse.parse("SIP/2.0 200\r\nContent-Length: 0\r\n\r\n")
+
+
+def test_parse_empty_reason_status_line_yields_empty_reason() -> None:
+    # The reason phrase MAY be empty, but the SP after the code is mandatory:
+    # "SIP/2.0 200 " parses with reason == "".
+    resp = SipResponse.parse("SIP/2.0 200 \r\nContent-Length: 0\r\n\r\n")
+    assert resp.status_code == 200
+    assert resp.reason == ""
+
+
+def test_build_request_rejects_caller_supplied_content_length() -> None:
+    # build_request owns Content-Length (computed from the body); a caller value
+    # would produce two Content-Length headers -> ambiguous framing (RFC 7230).
+    with pytest.raises(ValueError, match="Content-Length"):
+        build_request(
+            "REGISTER",
+            "sip:pbx.example.test",
+            [("Content-Length", "999")],
+            body="",
+        )
+
+
+def test_build_request_rejects_caller_content_length_case_insensitively() -> None:
+    # Header names are case-insensitive: a lower-case duplicate is rejected too.
+    with pytest.raises(ValueError, match="Content-Length"):
+        build_request(
+            "INVITE",
+            "sip:1000@pbx.example.test",
+            [("content-length", "5")],
+            body="hello",
+        )
 
 
 def test_build_request_rejects_crlf_injection_in_header_value() -> None:

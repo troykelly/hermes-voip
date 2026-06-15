@@ -14,10 +14,12 @@ import pytest
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
     Resampler,
+    alaw_to_frame,
     decode_alaw,
     decode_ulaw,
     encode_alaw,
     encode_ulaw,
+    frame_to_alaw,
     frame_to_ulaw,
     ulaw_to_frame,
 )
@@ -122,3 +124,44 @@ def test_frame_to_ulaw_rejects_non_8k_frame() -> None:
 def test_resampler_rejects_equal_rates() -> None:
     with pytest.raises(ValueError, match="differ"):
         Resampler(8000, 8000)
+
+
+@pytest.mark.parametrize("bad_rate", [0, -8000])
+def test_resampler_rejects_non_positive_from_rate(bad_rate: int) -> None:
+    # A config-derived rate of 0/negative must fail fast at construction with a
+    # ValueError, not lie dormant until ratecv raises audioop.error mid-call.
+    with pytest.raises(ValueError, match="positive"):
+        Resampler(bad_rate, 16000)
+
+
+@pytest.mark.parametrize("bad_rate", [0, -16000])
+def test_resampler_rejects_non_positive_to_rate(bad_rate: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        Resampler(8000, bad_rate)
+
+
+def test_alaw_is_one_byte_per_sample_via_frame_bridge() -> None:
+    pcm = _pcm16(0, 4000, -4000, 1234)
+    alaw = encode_alaw(pcm)
+    frame = alaw_to_frame(alaw, monotonic_ts_ns=7)
+    assert isinstance(frame, PcmFrame)
+    assert frame.sample_rate == G711_SAMPLE_RATE == 8000
+    assert frame.monotonic_ts_ns == 7
+    assert frame.sample_count == 4
+    # frame -> wire is the exact inverse of wire -> frame
+    assert frame_to_alaw(frame) == alaw
+
+
+def test_frame_to_alaw_rejects_non_8k_frame() -> None:
+    frame = PcmFrame(samples=_pcm16(0, 1, 2), sample_rate=16000, monotonic_ts_ns=0)
+    with pytest.raises(ValueError, match="8000 Hz"):
+        frame_to_alaw(frame)
+
+
+def test_alaw_frame_bridge_is_distinct_from_ulaw() -> None:
+    # PCMA and PCMU are different codecs: the a-law wire bytes for a non-trivial
+    # frame must differ from the mu-law bytes (guards a copy-paste mu/a swap).
+    frame = PcmFrame(
+        samples=_pcm16(1000, -1000, 8000), sample_rate=8000, monotonic_ts_ns=0
+    )
+    assert frame_to_alaw(frame) != frame_to_ulaw(frame)

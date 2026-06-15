@@ -21,7 +21,13 @@ import re
 import secrets
 from dataclasses import dataclass, field
 
-_PARAM = re.compile(r'(\w+)=(?:"([^"]*)"|([^,\s]+))')
+# An auth-param is ``name=token`` or ``name="quoted-string"``. The quoted
+# alternative is escape-aware (RFC 2617 quoted-pair): ``\"`` is a literal quote
+# and ``\\`` a literal backslash, so the value spans to the matching unescaped
+# ``"`` instead of stopping at the first inner quote.
+_PARAM = re.compile(r'(\w+)=(?:"((?:[^"\\]|\\.)*)"|([^,\s]+))')
+# A quoted-pair: a backslash followed by any single character it escapes.
+_QUOTED_PAIR = re.compile(r"\\(.)")
 
 # Only plain MD5 is implemented; MD5-sess and SHA-* are rejected rather than
 # silently mis-signed (a wrong response would just fail against the registrar).
@@ -30,6 +36,15 @@ _SUPPORTED_ALGORITHMS = frozenset({"md5"})
 # Forbidden control characters: the ASCII C0 range (code points below this) and DEL.
 _C0_END = 0x20
 _DEL = 0x7F
+
+
+def _unescape(quoted: str) -> str:
+    r"""Resolve RFC 2617 quoted-pair escapes (``\X`` -> ``X``) in a parsed value.
+
+    The inverse of :func:`_quoted`'s escaping, applied to the body of a
+    quoted-string so realm/nonce/opaque reach HA1/HA2 in their literal form.
+    """
+    return _QUOTED_PAIR.sub(r"\1", quoted)
 
 
 def _md5_hex(value: str) -> str:
@@ -88,7 +103,9 @@ class DigestChallenge:
         params: dict[str, str] = {}
         for match in _PARAM.finditer(header_value):
             quoted, bare = match.group(2), match.group(3)
-            params[match.group(1).lower()] = quoted if quoted is not None else bare
+            # Quoted values carry quoted-pair escapes; bare tokens never do.
+            value = _unescape(quoted) if quoted is not None else bare
+            params[match.group(1).lower()] = value
         nonce = params.get("nonce")
         if not nonce:
             msg = "digest challenge is missing a nonce"

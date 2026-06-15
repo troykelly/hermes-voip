@@ -158,6 +158,26 @@ async def test_on_response_challenge_resends_authenticated() -> None:
     assert "Authorization:" in transport.sent[-1]
 
 
+async def test_on_response_423_retries_with_min_expires() -> None:
+    # A 423 Interval Too Brief yields a Retry outcome; the manager must resend the
+    # retry REGISTER (else the registration silently never completes).
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()
+    reg = SipRequest.parse(transport.sent[0])
+    too_brief = SipResponse.parse(
+        "SIP/2.0 423 Interval Too Brief\r\n"
+        f"Call-ID: {reg.header('Call-ID')}\r\n"
+        f"CSeq: {reg.header('CSeq')}\r\n"
+        "Min-Expires: 3600\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    sent_before = len(transport.sent)
+    await manager.on_response(too_brief)
+    assert len(transport.sent) == sent_before + 1
+    assert "Expires: 3600" in transport.sent[-1]  # retried with the server's minimum
+
+
 async def test_on_response_unknown_call_id_raises() -> None:
     transport = _FakeTransport()
     manager = RegistrationManager(_gateway(), transport)

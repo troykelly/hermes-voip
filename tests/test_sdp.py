@@ -11,6 +11,7 @@ import pytest
 from hermes_voip.sdp import (
     AudioMedia,
     Codec,
+    CryptoAttribute,
     SdpError,
     SessionDescription,
     build_audio_answer,
@@ -19,10 +20,14 @@ from hermes_voip.sdp import (
 )
 
 # Obvious fake SRTP master key||salt (RFC 4568 inline:). Never a real key.
-_FAKE_CRYPTO = "AES_CM_128_HMAC_SHA1_80 inline:ZmFrZWtleXNhbHRmYWtla2V5c2FsdGZha2VrZXlz"
-_FAKE_ANSWER_CRYPTO = (
-    "AES_CM_128_HMAC_SHA1_80 inline:YW5zd2Vya2V5c2FsdGFuc3dlcmtleXNhbHRhbnN3ZXJr"
-)
+# AES_CM_128_HMAC_SHA1_80 needs a 30-octet (16 key + 14 salt) key||salt, which
+# base64-encodes to exactly 40 chars. These two decode to 30 octets.
+_FAKE_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd"  # bytes 0..29
+_FAKE_ANSWER_KEY = "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CB"  # bytes 100..129
+_FAKE_CRYPTO = f"AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}"
+_FAKE_ANSWER_CRYPTO = f"AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_ANSWER_KEY}"
+# A key that decodes to 29 octets — one short for the suite (invalid).
+_SHORT_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxw="
 
 _OFFER_AVP = (
     "v=0\r\n"
@@ -40,6 +45,22 @@ _OFFER_AVP = (
 )
 
 _OFFER_SAVP = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.2\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.2\r\n"
+    "t=0 0\r\n"
+    "m=audio 40002 RTP/SAVP 0 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\n"
+    "a=sendrecv\r\n"
+)
+
+# A SAVP offer whose only crypto line is malformed (key||salt does not decode to
+# the suite's 30 octets). The lenient parser keeps it in the raw `crypto` tuple
+# but excludes it from typed `crypto_attrs`; an answer to it must be rejected.
+_OFFER_SAVP_BAD_CRYPTO = (
     "v=0\r\n"
     "o=- 1 1 IN IP4 192.0.2.2\r\n"
     "s=-\r\n"
@@ -381,11 +402,12 @@ def test_answer_to_savp_offer_keys_crypto() -> None:
     )
     parsed = _audio(SessionDescription.parse(text))
     assert parsed.protocol == "RTP/SAVP"
-    # The answer carries OUR key material (RFC 4568: each party sends its own).
+    # The answer echoes the ACCEPTED offer's tag (1) + suite but carries OUR key
+    # material (RFC 4568: each party supplies its own key||salt).
     assert text.count("a=crypto:") == 1
     assert f"a=crypto:1 {_FAKE_ANSWER_CRYPTO}" in text
-    # Negative control: the offerer's key material is not echoed back.
-    assert "WVNfX19zZW1jdGwg" not in text
+    # Negative control: the offerer's key material is NOT echoed back.
+    assert _FAKE_KEY not in text
 
 
 def test_answer_to_savp_offer_without_crypto_is_rejected() -> None:
@@ -438,3 +460,178 @@ def test_answer_preserves_offer_codec_order_not_supported_order() -> None:
         offer, local_address="192.0.2.20", port=42000, supported=("PCMU", "PCMA")
     )
     assert "m=audio 42000 RTP/AVP 8 0" in text
+
+
+# --- W3 (review): typed a=crypto parse + validation + negotiation (RFC 4568) ---
+
+
+def test_crypto_attribute_parse_and_render_round_trip() -> None:
+    attr = CryptoAttribute.parse(f"7 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}")
+    assert attr.tag == 7
+    assert attr.suite == "AES_CM_128_HMAC_SHA1_80"
+    assert attr.key_params == f"inline:{_FAKE_KEY}"
+    # render() reproduces the attribute body byte-for-byte.
+    assert attr.render() == f"7 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}"
+
+
+def test_crypto_attribute_parse_tolerates_lifetime_and_mki() -> None:
+    # RFC 4568: inline key may carry optional |lifetime|MKI:length fields.
+    body = f"1 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}|2^20|1:4"
+    attr = CryptoAttribute.parse(body)
+    assert attr.tag == 1
+    assert attr.key_params == f"inline:{_FAKE_KEY}|2^20|1:4"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"0 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}",  # leading-zero tag
+        f"x AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}",  # non-decimal tag
+        f"1 AES_CM_256_HMAC_SHA1_80 inline:{_FAKE_KEY}",  # unsupported suite
+        f"1 AES_CM_128_HMAC_SHA1_80 inline:{_SHORT_KEY}",  # wrong key length
+        "1 AES_CM_128_HMAC_SHA1_80 inline:@@notbase64@@",  # non-base64 key
+        "1 AES_CM_128_HMAC_SHA1_80 keymethodext:zzz",  # not an inline key
+        "1 AES_CM_128_HMAC_SHA1_80",  # missing key params
+    ],
+)
+def test_crypto_attribute_parse_rejects_malformed(body: str) -> None:
+    with pytest.raises(SdpError):
+        CryptoAttribute.parse(body)
+
+
+def test_parser_exposes_typed_crypto_attrs() -> None:
+    audio = _audio(SessionDescription.parse(_OFFER_SAVP))
+    assert len(audio.crypto_attrs) == 1
+    attr = audio.crypto_attrs[0]
+    assert isinstance(attr, CryptoAttribute)
+    assert attr.tag == 1
+    assert attr.suite == "AES_CM_128_HMAC_SHA1_80"
+    assert attr.key_params == f"inline:{_FAKE_KEY}"
+
+
+def test_parser_is_lenient_on_malformed_crypto() -> None:
+    # The raw line is preserved for diagnostics, but it is NOT promoted to a
+    # typed crypto_attrs entry (it fails suite/key validation).
+    audio = _audio(SessionDescription.parse(_OFFER_SAVP_BAD_CRYPTO))
+    assert len(audio.crypto) == 1  # raw line kept
+    assert audio.crypto_attrs == ()  # nothing well-formed
+
+
+def test_offer_builder_rejects_garbage_crypto_string() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    with pytest.raises(SdpError):
+        build_audio_offer(
+            local_address="192.0.2.10", port=41000, codecs=codecs, crypto="bogus"
+        )
+
+
+def test_offer_builder_rejects_bad_suite() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    with pytest.raises(SdpError, match="suite"):
+        build_audio_offer(
+            local_address="192.0.2.10",
+            port=41000,
+            codecs=codecs,
+            crypto=f"1 AES_CM_256_HMAC_SHA1_80 inline:{_FAKE_KEY}",
+        )
+
+
+def test_offer_builder_rejects_bad_key_length() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    with pytest.raises(SdpError, match="key"):
+        build_audio_offer(
+            local_address="192.0.2.10",
+            port=41000,
+            codecs=codecs,
+            crypto=f"1 AES_CM_128_HMAC_SHA1_80 inline:{_SHORT_KEY}",
+        )
+
+
+def test_offer_builder_accepts_crypto_attribute_object() -> None:
+    codecs = (Codec(0, "PCMU", 8000),)
+    attr = CryptoAttribute.parse(f"9 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}")
+    text = build_audio_offer(
+        local_address="192.0.2.10", port=41000, codecs=codecs, crypto=attr
+    )
+    assert "m=audio 41000 RTP/SAVP 0" in text
+    assert f"a=crypto:9 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}" in text
+
+
+def test_answer_echoes_accepted_offer_tag() -> None:
+    # Offer presents the crypto under tag 7; the answer MUST reuse tag 7 (the
+    # negotiated identifier, RFC 4568), with OUR key material.
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        crypto=_FAKE_ANSWER_CRYPTO,
+    )
+    assert f"a=crypto:7 {_FAKE_ANSWER_CRYPTO}" in text
+    # Negative control: tag 1 (a different tag) is not emitted.
+    assert "a=crypto:1 " not in text
+
+
+def test_answer_selects_supported_suite_among_offered() -> None:
+    # First offered crypto is an unsupported suite; the second is supported. The
+    # answer must select the supported one and echo ITS tag (2).
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:1 AES_CM_256_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\n"
+        f"a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        crypto=_FAKE_ANSWER_CRYPTO,
+    )
+    assert f"a=crypto:2 {_FAKE_ANSWER_CRYPTO}" in text
+
+
+def test_answer_rejects_savp_offer_with_only_malformed_crypto() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVP_BAD_CRYPTO)
+    with pytest.raises(SdpError, match="crypto"):
+        build_audio_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU", "telephone-event"),
+            crypto=_FAKE_ANSWER_CRYPTO,
+        )
+
+
+def test_answer_rejects_savp_offer_with_no_supported_suite() -> None:
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:1 AES_CM_256_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    with pytest.raises(SdpError, match="crypto"):
+        build_audio_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU",),
+            crypto=_FAKE_ANSWER_CRYPTO,
+        )
+
+
+def test_answer_to_savp_offer_with_bad_answer_key_is_rejected() -> None:
+    # Our OWN supplied key must also be validated before emission.
+    offer = SessionDescription.parse(_OFFER_SAVP)
+    with pytest.raises(SdpError, match="key"):
+        build_audio_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU", "telephone-event"),
+            crypto=f"1 AES_CM_128_HMAC_SHA1_80 inline:{_SHORT_KEY}",
+        )

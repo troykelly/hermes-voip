@@ -68,18 +68,48 @@ def ulaw_to_frame(ulaw: bytes, *, monotonic_ts_ns: int) -> PcmFrame:
     )
 
 
-def frame_to_ulaw(frame: PcmFrame) -> bytes:
-    """Encode an 8 kHz :class:`PcmFrame` to a mu-law payload.
+def _require_8k(frame: PcmFrame) -> None:
+    """Raise if ``frame`` is not at the G.711 wire rate.
 
-    Raises:
-        ValueError: If ``frame.sample_rate`` is not ``G711_SAMPLE_RATE`` —
-            encoding a wider-band frame to G.711 would silently change its
-            duration; the caller must resample to 8 kHz first.
+    Encoding a wider-band frame to G.711 would silently change its duration, so
+    the caller must resample to 8 kHz first.
     """
     if frame.sample_rate != G711_SAMPLE_RATE:
         msg = f"G.711 requires {G711_SAMPLE_RATE} Hz, got {frame.sample_rate} Hz"
         raise ValueError(msg)
+
+
+def frame_to_ulaw(frame: PcmFrame) -> bytes:
+    """Encode an 8 kHz :class:`PcmFrame` to a mu-law (PCMU) payload.
+
+    Raises:
+        ValueError: If ``frame.sample_rate`` is not ``G711_SAMPLE_RATE``.
+    """
+    _require_8k(frame)
     return encode_ulaw(frame.samples)
+
+
+def alaw_to_frame(alaw: bytes, *, monotonic_ts_ns: int) -> PcmFrame:
+    """Decode an a-law (PCMA) payload into a :class:`PcmFrame`.
+
+    G.711 is intrinsically 8 kHz, so the frame is always stamped at
+    ``G711_SAMPLE_RATE``; resampling to the recogniser rate is a separate step.
+    """
+    return PcmFrame(
+        samples=decode_alaw(alaw),
+        sample_rate=G711_SAMPLE_RATE,
+        monotonic_ts_ns=monotonic_ts_ns,
+    )
+
+
+def frame_to_alaw(frame: PcmFrame) -> bytes:
+    """Encode an 8 kHz :class:`PcmFrame` to an a-law (PCMA) payload.
+
+    Raises:
+        ValueError: If ``frame.sample_rate`` is not ``G711_SAMPLE_RATE``.
+    """
+    _require_8k(frame)
+    return encode_alaw(frame.samples)
 
 
 class Resampler:
@@ -93,7 +123,19 @@ class Resampler:
     """
 
     def __init__(self, from_rate: int, to_rate: int) -> None:
-        """Create a converter from ``from_rate`` to ``to_rate`` (must differ)."""
+        """Create a converter from ``from_rate`` to ``to_rate``.
+
+        Both rates must be positive and differ. Validating here fails a
+        config-derived rate of 0 (or negative) at construction with a
+        ``ValueError`` rather than letting ``audioop.ratecv`` raise its own
+        ``audioop.error`` deep inside the first ``resample`` call mid-stream.
+
+        Raises:
+            ValueError: If either rate is not positive, or the rates are equal.
+        """
+        if from_rate <= 0 or to_rate <= 0:
+            msg = f"sample rates must be positive, got {from_rate} -> {to_rate}"
+            raise ValueError(msg)
         if from_rate == to_rate:
             msg = f"from_rate and to_rate must differ (both {from_rate})"
             raise ValueError(msg)

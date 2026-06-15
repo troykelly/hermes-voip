@@ -132,6 +132,18 @@ def test_retransmitted_non_2xx_final_is_re_acked_idempotently() -> None:
     assert txn.state is TransactionState.COMPLETED
 
 
+def test_terminated_is_absorbing_a_late_non_2xx_is_not_acked() -> None:
+    # RFC 3261 §17.1.1.2: once a 2xx terminates the INVITE client transaction (the
+    # TU owns the 2xx ACK), the transaction is DONE — a later non-2xx (reorder,
+    # retransmit, or malicious) must NOT resurrect it or emit an ACK.
+    txn = InviteClientTransaction(_INVITE)
+    assert txn.ack_for_response(_response(200, "OK")) is None
+    assert txn.state is TransactionState.TERMINATED
+    late = txn.ack_for_response(_response(486, "Busy Here", to_tag="evil"))
+    assert late is None
+    assert txn.state is TransactionState.TERMINATED
+
+
 def test_provisional_after_provisional_stays_in_proceeding() -> None:
     txn = InviteClientTransaction(_INVITE)
     txn.ack_for_response(_response(100, "Trying", to_tag=None))

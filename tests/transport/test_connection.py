@@ -232,7 +232,45 @@ async def test_non_2xx_invite_response_is_acked_by_the_transport() -> None:
         await server.stop()
 
 
-def _outbound_invite(branch: str) -> str:
+async def test_2xx_to_our_invite_unregisters_txn_and_no_late_ack() -> None:
+    # A 2xx terminates the client transaction (the TU owns the 2xx ACK), so the
+    # transport unregisters it; a late non-2xx for the same branch then produces
+    # NO ACK (the terminated transaction is gone, RFC 3261 §17.1.1.2).
+    branch = new_branch()
+    call_id = new_call_id()
+
+    async def respond(request: SipRequest) -> list[str]:
+        if request.method != "INVITE":
+            return []
+        return [_final(request, 200, "OK")]  # a 2xx — the transport must NOT ACK
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    try:
+        invite = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        # Once the 200 is processed the txn must be unregistered (the review
+        # finding): poll the transport's client-txn registry directly.
+        await _until(lambda: not transport._client_txns)
+        # A late non-2xx for the same transaction must NOT be ACKed.
+        await server.push(_final(SipRequest.parse(invite), 486, "Busy Here"))
+        await asyncio.sleep(0.1)
+        assert not any(raw.startswith("ACK ") for raw in server.received)
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+def _outbound_invite(branch: str, *, call_id: str | None = None) -> str:
     return build_request(
         "INVITE",
         "sip:2000@127.0.0.1:5061;transport=tls",
@@ -241,7 +279,7 @@ def _outbound_invite(branch: str) -> str:
             ("Max-Forwards", "70"),
             ("From", f"<sip:1000@pbx.example.test>;tag={new_tag()}"),
             ("To", "<sip:2000@pbx.example.test>"),
-            ("Call-ID", new_call_id()),
+            ("Call-ID", call_id if call_id is not None else new_call_id()),
             ("CSeq", "1 INVITE"),
             ("Contact", "<sip:1000@127.0.0.1:5061;transport=tls>"),
         ],

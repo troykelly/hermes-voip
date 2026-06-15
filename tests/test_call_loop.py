@@ -136,7 +136,7 @@ class _FakeTTS:
     ) -> TtsStream:
         stream = _FakeTtsStream(self._frames)
         self.last_stream = stream
-        return stream  # type: ignore[return-value]  # structural TtsStream match
+        return stream
 
 
 class _FakeASR:
@@ -312,31 +312,67 @@ async def test_refuse_verdict_blocks_deliver_turn() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _BlockingTransport(_FakeTransport):
+    """Transport whose send_audio blocks on an event so tests can interleave."""
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__(frames)
+        # Set this event to unblock the first send_audio call.
+        self.first_send_gate = asyncio.Event()
+
+    async def send_audio(self, frame: PcmFrame) -> None:
+        # First call blocks until the gate is set; thereafter, proceeds freely.
+        if not self.sent_audio:
+            await self.first_send_gate.wait()
+        self.sent_audio.append(frame)
+
+
 @pytest.mark.asyncio
 async def test_barge_in_cancels_tts_before_next_audio() -> None:
-    """Barge-in while speaking must cancel the active TtsStream promptly."""
+    """Barge-in while speaking must cancel the active TtsStream promptly.
+
+    Strategy: give the transport's send_audio a gate that blocks after the
+    first frame.  We start speak(), let it synthesise the stream (synthesize()
+    is synchronous, so _active_tts_stream is set before any await), then call
+    barge_in() which cancels the stream; finally unblock send_audio.  The key
+    invariant is that cancel_called is True.
+    """
     tts_frame = PcmFrame(
         samples=b"\x10\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
     tts = _FakeTTS([tts_frame, tts_frame, tts_frame])
+    transport = _BlockingTransport([])
 
-    loop = _build_loop(
-        _FakeTransport([]),
-        _FakeASR([]),
-        tts,
-        _FakeGuard([_allow_result()]),
-        _noop,
+    async def _noop_deliver(text: str) -> None:
+        _ = text
+
+    state = GuardSessionState(call_id=_CALL_ID)
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=state,
+        deliver_turn=_noop_deliver,
+        voice=_VOICE,
+        call_id=_CALL_ID,
     )
 
     async def _token_gen() -> AsyncIterator[str]:
         yield "Hello there"
 
-    # Start speaking, then barge-in while frames would be streaming.
+    # Start speaking; synthesize() is synchronous so _active_tts_stream is set
+    # before speak() reaches its first await (the async-for __anext__ call).
     speak_task = asyncio.create_task(loop.speak(_token_gen()))
-    # Yield control so speak() can start and acquire the stream.
+    # Yield once so speak() runs up to the first send_audio gate.
     await asyncio.sleep(0)
-    # Now trigger barge-in.
+
+    # The stream is active; trigger barge-in.
     await loop.barge_in()
+    # Unblock send_audio so speak() can exit cleanly.
+    transport.first_send_gate.set()
     await speak_task
 
     stream = tts.last_stream

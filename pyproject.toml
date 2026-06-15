@@ -33,7 +33,7 @@ ml = [
 # `import hermes_voip.media.srtp` works without this extra and mypy stays clean.
 # The `media` CI job installs this extra and runs the full RFC-3711 KAT suite.
 media = [
-    "cryptography>=44.0.0,<46",
+    "cryptography==45.0.7",
 ]
 
 [build-system]

@@ -522,7 +522,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "audioop-lts", specifier = "==0.2.2" },
-    { name = "cryptography", marker = "extra == 'media'", specifier = ">=44.0.0,<46" },
+    { name = "cryptography", marker = "extra == 'media'", specifier = "==45.0.7" },
     { name = "hermes-agent", marker = "extra == 'hermes'", specifier = "==0.16.0" },
     { name = "numpy", marker = "extra == 'ml'", specifier = "==2.4.6" },
     { name = "onnxruntime", marker = "extra == 'ml'", specifier = "==1.24.4" },

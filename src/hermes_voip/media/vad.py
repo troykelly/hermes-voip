@@ -38,6 +38,7 @@ the per-frame CPU budget (rule 22).
 from __future__ import annotations
 
 import importlib
+import math
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -145,11 +146,14 @@ class VoiceActivityDetector:
                 from ``MediaConfig.vad_threshold``).
             exit_threshold: Speech-exit cutoff; speech ends once probability drops
                 below it. Defaults to ``max(0.0, threshold - 0.15)`` (silero's
-                hysteresis recipe). Must be ``<= threshold``.
+                hysteresis recipe). Must be finite and in ``[0.0, threshold]`` —
+                a NaN, infinite, or negative cutoff can never be crossed and
+                would mean speech never ends.
 
         Raises:
             ValueError: If the rate is not 8000/16000, ``threshold`` is outside
-                ``[0.0, 1.0]``, or ``exit_threshold`` exceeds ``threshold``.
+                ``[0.0, 1.0]``, or ``exit_threshold`` is not finite and within
+                ``[0.0, threshold]``.
         """
         if sample_rate_hz not in SILERO_WINDOW_SAMPLES:
             msg = f"sample_rate_hz must be 8000 or 16000, got {sample_rate_hz}"
@@ -162,8 +166,17 @@ class VoiceActivityDetector:
             if exit_threshold is None
             else exit_threshold
         )
-        if resolved_exit > threshold:
-            msg = f"exit_threshold ({resolved_exit}) must be <= threshold ({threshold})"
+        # exit_threshold must be a real, crossable cutoff. NaN (``p < nan`` is
+        # always False) and negatives (probabilities are >= 0.0, never crossable)
+        # would silently mean speech never ends; reject both, plus infinities and
+        # anything above ``threshold`` (which would re-onset chatter). ``not (0.0
+        # <= x <= threshold)`` also catches NaN, since every NaN comparison is
+        # False; ``math.isfinite`` then keeps the message specific for infinities.
+        if not math.isfinite(resolved_exit) or not 0.0 <= resolved_exit <= threshold:
+            msg = (
+                f"exit_threshold must be finite and in [0.0, threshold], "
+                f"got {resolved_exit} (threshold {threshold})"
+            )
             raise ValueError(msg)
         self._model = model
         self._sample_rate = sample_rate_hz

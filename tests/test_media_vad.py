@@ -105,6 +105,32 @@ def test_constructor_rejects_unsupported_rate() -> None:
         VoiceActivityDetector(sample_rate_hz=44_100, model=_ScriptedModel([]))
 
 
+@pytest.mark.parametrize("tiny", [5e-324, 1e-300, 0.001, 0.0099])
+def test_constructor_rejects_threshold_below_min(tiny: float) -> None:
+    # A VAD probability threshold is realistically 0.1-0.9. A vanishingly small
+    # one is not a usable cutoff AND breaks the derived default: the smallest
+    # positive float (5e-324) times 0.5 underflows to 0.0, which can never be
+    # crossed by a 0.0..1.0 probability. Require a normal positive probability
+    # (threshold >= 0.01) so the derived exit is always positive/representable.
+    with pytest.raises(ValueError, match="threshold"):
+        VoiceActivityDetector(
+            sample_rate_hz=_RATE_16K, threshold=tiny, model=_ScriptedModel([])
+        )
+
+
+@pytest.mark.parametrize("threshold", [0.1, 0.5, 0.9, 1.0, 0.01])
+def test_normal_threshold_constructs_with_default_exit_in_open_interval(
+    threshold: float,
+) -> None:
+    # Every realistic threshold (and the inclusive 0.01 lower bound and 1.0 upper
+    # bound) constructs without an explicit exit_threshold and derives a default
+    # cutoff strictly inside (0.0, threshold) -- always positive, never floored.
+    vad = VoiceActivityDetector(
+        sample_rate_hz=_RATE_16K, threshold=threshold, model=_ScriptedModel([])
+    )
+    assert 0.0 < vad._exit_threshold < threshold
+
+
 # --- edge detection -------------------------------------------------------
 
 

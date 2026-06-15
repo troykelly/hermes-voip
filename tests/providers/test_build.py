@@ -25,7 +25,7 @@ from hermes_voip.manifest import (
 )
 from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
-from hermes_voip.providers.build import (  # type: ignore[import]  # module not yet present — RED
+from hermes_voip.providers.build import (
     Providers,
     _asr_registry,
     _guard_registry,
@@ -244,7 +244,7 @@ def test_build_providers_unknown_stt_raises_valueerror() -> None:
             build_providers(_media_config())
     finally:
         if saved is not None:
-            _asr_registry._factories["sherpa-onnx"] = saved  # type: ignore[assignment]
+            _asr_registry._factories["sherpa-onnx"] = saved
 
 
 # ---------------------------------------------------------------------------

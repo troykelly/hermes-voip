@@ -5,4 +5,11 @@ guard, the SIP/WebRTC media transport) sits behind a typed ``Protocol`` here;
 the core depends on these contracts, never on a concrete vendor. Audio crossing
 any boundary is linear PCM16 framed at a declared sample rate — codec (G.711)
 and 8<->16 kHz resampling are the media layer's job, never a provider's.
+
+:func:`build_providers` wires a :class:`~hermes_voip.config.MediaConfig` to live
+concrete provider instances; :class:`Providers` carries the result.
 """
+
+from hermes_voip.providers.build import Providers, build_providers
+
+__all__ = ["Providers", "build_providers"]

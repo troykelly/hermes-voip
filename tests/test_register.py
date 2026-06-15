@@ -206,3 +206,215 @@ def test_register_exported_from_package_root() -> None:
         "register() must be re-exported from hermes_voip.__init__"
     )
     assert callable(hermes_voip.register)
+
+
+# ---------------------------------------------------------------------------
+# (e) env_enablement_fn + is_connected: the gateway seeds PlatformConfig.extra
+#     from the HERMES_SIP_*/HERMES_VOIP_* PROCESS ENV (never config.yaml — the
+#     SIP password is a secret). Without these hooks the gateway enables the
+#     "voip" platform but with an EMPTY extra, so VoipAdapter.connect() fails
+#     with ConfigError (no HERMES_SIP_HOST in extra). The registry-driven enable
+#     pass in gateway.config calls env_enablement_fn() to seed extra and consults
+#     is_connected(probe_cfg) to gate enablement.
+# ---------------------------------------------------------------------------
+
+
+def test_register_supplies_env_enablement_fn() -> None:
+    """register_platform must pass a zero-arg env_enablement_fn."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn = ctx.calls[0].get("env_enablement_fn")
+    assert fn is not None, "register_platform must supply env_enablement_fn"
+    assert callable(fn)
+
+
+def test_env_enablement_fn_seeds_sip_and_voip_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """env_enablement_fn() returns the HERMES_SIP_*/HERMES_VOIP_* env as a dict.
+
+    The gateway merges this dict into PlatformConfig.extra, which the adapter
+    reads. It must pick up every HERMES_SIP_*/HERMES_VOIP_* var present in the
+    process environment, and nothing unrelated.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_SIP_EXTENSION", "1000")
+    monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
+    monkeypatch.setenv("HERMES_VOIP_STT_MODEL_DIR", "/models/stt")
+    monkeypatch.setenv("UNRELATED_VAR", "ignore-me")
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn_raw = ctx.calls[0].get("env_enablement_fn")
+    assert fn_raw is not None
+    assert callable(fn_raw)
+    fn: Callable[[], dict[str, str] | None] = fn_raw
+
+    seed = fn()
+    assert isinstance(seed, dict)
+    assert seed.get("HERMES_SIP_HOST") == "pbx.example.test"
+    assert seed.get("HERMES_SIP_EXTENSION") == "1000"
+    assert seed.get("HERMES_SIP_PASSWORD") == "fake-password"
+    assert seed.get("HERMES_VOIP_STT_MODEL_DIR") == "/models/stt"
+    assert "UNRELATED_VAR" not in seed
+
+
+def test_register_supplies_is_connected() -> None:
+    """register_platform must pass an is_connected gate callable."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn = ctx.calls[0].get("is_connected")
+    assert fn is not None, "register_platform must supply is_connected"
+    assert callable(fn)
+
+
+def test_is_connected_true_when_required_sip_in_extra() -> None:
+    """is_connected(probe) is True when the required SIP keys are in extra."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn_raw = ctx.calls[0].get("is_connected")
+    assert fn_raw is not None
+    assert callable(fn_raw)
+    fn: Callable[[object], bool] = fn_raw
+
+    probe = MagicMock()
+    probe.extra = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "fake",
+    }
+    assert fn(probe) is True
+
+
+def test_is_connected_false_when_sip_env_absent() -> None:
+    """is_connected(probe) is False when the SIP config is missing from extra."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    fn_raw = ctx.calls[0].get("is_connected")
+    assert fn_raw is not None
+    assert callable(fn_raw)
+    fn: Callable[[object], bool] = fn_raw
+
+    probe = MagicMock()
+    probe.extra = {}
+    assert fn(probe) is False
+
+
+# ---------------------------------------------------------------------------
+# (f) _env_enablement copies DEEPGRAM_API_KEY / ELEVENLABS_API_KEY so that
+#     load_media_config(extra) succeeds when a cloud provider is selected.
+#     These two keys have no HERMES_SIP_*/HERMES_VOIP_* prefix, so a prefix-
+#     only filter would drop them — causing ConfigError inside connect().
+# ---------------------------------------------------------------------------
+
+
+def test_env_enablement_includes_deepgram_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """env_enablement_fn() must include DEEPGRAM_API_KEY when set.
+
+    Selecting stt_provider=deepgram requires DEEPGRAM_API_KEY in extra;
+    that key has no HERMES_SIP_*/HERMES_VOIP_* prefix so a prefix-only
+    filter silently drops it, causing load_media_config(extra) to raise
+    ConfigError with "stt_provider 'deepgram' requires DEEPGRAM_API_KEY".
+    """
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_SIP_EXTENSION", "1000")
+    monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
+    monkeypatch.setenv("HERMES_VOIP_STT_PROVIDER", "deepgram")
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-fake-key-for-test")
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+
+    seed = _env_enablement()
+    assert "DEEPGRAM_API_KEY" in seed, (
+        "_env_enablement() must include DEEPGRAM_API_KEY so load_media_config "
+        "does not raise ConfigError when stt_provider=deepgram"
+    )
+    assert seed["DEEPGRAM_API_KEY"] == "dg-fake-key-for-test"
+
+
+def test_env_enablement_deepgram_key_survives_load_media_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEEPGRAM_API_KEY in env_enablement output keeps load_media_config from raising.
+
+    This is the end-to-end contract: the seeded extra dict must be accepted
+    by load_media_config without ConfigError when stt_provider=deepgram.
+    """
+    from hermes_voip.config import load_media_config  # noqa: PLC0415
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_SIP_EXTENSION", "1000")
+    monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
+    monkeypatch.setenv("HERMES_VOIP_STT_PROVIDER", "deepgram")
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-fake-key-for-test")
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+
+    extra = _env_enablement()
+    # Must not raise ConfigError about missing DEEPGRAM_API_KEY.
+    media = load_media_config(extra)
+    assert media.deepgram_api_key == "dg-fake-key-for-test"
+
+
+def test_env_enablement_includes_elevenlabs_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """env_enablement_fn() must include ELEVENLABS_API_KEY when set.
+
+    Selecting tts_provider=elevenlabs requires ELEVENLABS_API_KEY in extra;
+    that key has no HERMES_SIP_*/HERMES_VOIP_* prefix so a prefix-only
+    filter silently drops it, causing load_media_config(extra) to raise
+    ConfigError with "tts_provider 'elevenlabs' requires ELEVENLABS_API_KEY".
+    """
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_SIP_EXTENSION", "1000")
+    monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
+    monkeypatch.setenv("HERMES_VOIP_TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-fake-key-for-test")
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+
+    seed = _env_enablement()
+    assert "ELEVENLABS_API_KEY" in seed, (
+        "_env_enablement() must include ELEVENLABS_API_KEY so load_media_config "
+        "does not raise ConfigError when tts_provider=elevenlabs"
+    )
+    assert seed["ELEVENLABS_API_KEY"] == "el-fake-key-for-test"
+
+
+def test_env_enablement_elevenlabs_key_survives_load_media_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ELEVENLABS_API_KEY in env_enablement output keeps load_media_config from raising.
+
+    End-to-end contract: the seeded extra dict must be accepted by
+    load_media_config without ConfigError when tts_provider=elevenlabs.
+    """
+    from hermes_voip.config import load_media_config  # noqa: PLC0415
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_SIP_EXTENSION", "1000")
+    monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
+    monkeypatch.setenv("HERMES_VOIP_TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-fake-key-for-test")
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+
+    extra = _env_enablement()
+    # Must not raise ConfigError about missing ELEVENLABS_API_KEY.
+    media = load_media_config(extra)
+    assert media.elevenlabs_api_key == "el-fake-key-for-test"

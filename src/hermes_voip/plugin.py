@@ -24,6 +24,7 @@ Lifecycle (verified against hermes-agent 0.16.0):
 from __future__ import annotations
 
 import logging
+import os
 import ssl
 from typing import TYPE_CHECKING
 
@@ -52,6 +53,20 @@ _REQUIRED_ENV: tuple[str, ...] = (
     "HERMES_SIP_EXTENSION",
     "HERMES_SIP_PASSWORD",
 )
+
+# The env-var name prefixes the adapter reads its config from. The SIP scheme
+# (``HERMES_SIP_*``) carries the gateway + registration credentials; the media
+# scheme (``HERMES_VOIP_*``) carries the STT/TTS/VAD/guard + feature settings.
+# These are the key prefixes ``env_enablement_fn`` copies from the process env
+# into ``PlatformConfig.extra`` for the running gateway (see :func:`_env_enablement`).
+_EXTRA_ENV_PREFIXES: tuple[str, ...] = ("HERMES_SIP_", "HERMES_VOIP_")
+
+# Non-prefixed cloud-credential keys that ``load_media_config`` reads from the
+# same ``extra`` mapping.  ``DEEPGRAM_API_KEY`` is required when
+# ``HERMES_VOIP_STT_PROVIDER=deepgram``; ``ELEVENLABS_API_KEY`` is required when
+# ``HERMES_VOIP_TTS_PROVIDER=elevenlabs``.  Neither carries one of the two
+# prefixes above, so they must be copied by exact name alongside the prefix match.
+_EXTRA_ENV_KEYS: frozenset[str] = frozenset({"DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY"})
 
 
 def validate_voip_config(config: object) -> bool:
@@ -82,6 +97,64 @@ def validate_voip_config(config: object) -> bool:
     return True
 
 
+def _env_enablement() -> dict[str, str]:
+    """Seed ``PlatformConfig.extra`` from the process env for the VoIP adapter.
+
+    The Hermes gateway's registry-driven plugin-platform enable pass
+    (``gateway.config._apply_env_overrides``) calls this hook to populate the
+    platform's ``extra`` mapping *before* it builds the adapter — and
+    :class:`~hermes_voip.adapter.VoipAdapter` reads its entire SIP + media config
+    from ``config.extra`` (via ``load_gateway_config``/``load_media_config``).
+    Without this seed the gateway enables ``voip`` with an empty ``extra`` and
+    ``connect()`` raises :class:`~hermes_voip.config.ConfigError`.
+
+    Returning the env keeps every secret (the SIP password, any cloud key) in the
+    process environment only — never written to ``config.yaml`` (rule 34). Two
+    classes of keys are copied:
+
+    * Every key matching the ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` prefixes
+      (``_EXTRA_ENV_PREFIXES``) — the gateway and media/feature config.
+    * The exact non-prefixed cloud-credential keys in ``_EXTRA_ENV_KEYS``
+      (``DEEPGRAM_API_KEY``, ``ELEVENLABS_API_KEY``) — required by
+      ``load_media_config`` when the matching cloud provider is selected.
+
+    All other process env vars are excluded.
+
+    Returns:
+        A mapping of every relevant variable currently set in the process
+        environment to its value (empty dict if none are set).
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith(_EXTRA_ENV_PREFIXES) or key in _EXTRA_ENV_KEYS
+    }
+
+
+def _is_connected(config: object) -> bool:
+    """Return whether the SIP credentials are present for this platform.
+
+    The gateway consults this gate before flipping the ``voip`` platform on, so a
+    runtime without SIP env configured is left disabled (no noisy retry-forever
+    connect attempts) instead of failing inside ``connect()``. It checks the
+    probe config's ``extra`` — which the gateway has already seeded via
+    :func:`_env_enablement` — for the required SIP keys, reusing the same
+    validation as :func:`validate_voip_config` so "connected" means "would build".
+
+    Args:
+        config: A Hermes ``PlatformConfig``-like object with an ``extra`` mapping.
+
+    Returns:
+        ``True`` if ``extra`` holds a complete, valid SIP configuration.
+    """
+    extra = getattr(config, "extra", {})
+    try:
+        load_gateway_config(extra)
+    except Exception:  # noqa: BLE001 — any config error means "not configured yet"
+        return False
+    return True
+
+
 def _check_fn() -> bool:
     """Probe whether the runtime can build a TLS context (SIP-over-TLS needs it).
 
@@ -103,6 +176,14 @@ def _adapter_factory(config: object) -> BasePlatformAdapterProtocol:
     runtime at module top) is imported **here, lazily** — so a bare
     ``import hermes_voip`` never pulls in hermes-agent, but the adapter is a real
     ``BasePlatformAdapter`` subclass the moment the gateway instantiates it.
+
+    ``config`` is typed ``object`` at the hermes-surface boundary (the gateway
+    passes an opaque object through the ``Callable[[object], …]`` adapter-factory
+    contract in :mod:`hermes_voip.hermes_surface`).  The gateway always supplies a
+    real ``PlatformConfig`` at runtime; ``VoipAdapter`` reads the settings it needs
+    via ``config.extra``.  No ``isinstance`` check is performed here — the
+    ``gateway.config`` module is not imported in this file (doing so would break
+    the no-hermes default mypy gate; see ADR-0014).
     """
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
@@ -136,4 +217,10 @@ def register(ctx: PluginContextProtocol) -> None:
         validate_config=validate_voip_config,
         required_env=list(_REQUIRED_ENV),
         install_hint=_INSTALL_HINT,
+        # The gateway's registry-driven enable pass seeds PlatformConfig.extra
+        # from env_enablement_fn() and gates enablement on is_connected(probe),
+        # so `hermes gateway run` brings the platform up from the HERMES_SIP_*/
+        # HERMES_VOIP_* process env (secrets stay in env, never config.yaml).
+        env_enablement_fn=_env_enablement,
+        is_connected=_is_connected,
     )

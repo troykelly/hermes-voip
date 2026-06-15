@@ -39,7 +39,7 @@ import asyncio
 import logging
 import ssl
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING
 
 # The real hermes-agent runtime surface. This module is imported ONLY lazily
@@ -139,16 +139,22 @@ class VoipAdapter(BasePlatformAdapter):
     configured ``HERMES_SIP_EXTENSION_<n>``); each inbound call creates its own
     ``CallSession`` + ``CallLoop`` keyed by SIP ``Call-ID``.
 
-    ``config`` is the Hermes ``PlatformConfig`` injected by the framework; the
-    adapter reads its SIP credentials and media settings from ``config.extra``
-    (which the Hermes gateway populates from environment variables). The
-    ``Platform`` member is resolved from :data:`_PLATFORM_NAME` (the gateway has
-    already registered ``"voip"`` by the time the factory runs, so
-    ``Platform("voip")`` resolves via the enum's ``_missing_`` hook).
+    ``config`` is the opaque object passed by the Hermes gateway through the
+    ``Callable[[object], …]`` adapter-factory contract; at runtime this is always
+    a ``PlatformConfig``.  ``__init__`` narrows it with an ``isinstance`` check
+    (valid here because this module is in the hermes gate where ``PlatformConfig``
+    is importable) and then reads SIP credentials and media settings from
+    ``config.extra`` (which the Hermes gateway populates from environment
+    variables).  The ``Platform`` member is resolved from :data:`_PLATFORM_NAME`
+    (the gateway has already registered ``"voip"`` by the time the factory runs,
+    so ``Platform("voip")`` resolves via the enum's ``_missing_`` hook).
     """
 
-    def __init__(self, config: PlatformConfig) -> None:
+    def __init__(self, config: object) -> None:
         """Initialise the base adapter; defer all IO until ``connect()``."""
+        if not isinstance(config, PlatformConfig):
+            msg = f"VoipAdapter: expected PlatformConfig, got {type(config).__name__!r}"
+            raise TypeError(msg)
         super().__init__(config, Platform(_PLATFORM_NAME))
 
         # Populated by connect():
@@ -256,7 +262,7 @@ class VoipAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: str | None = None,  # noqa: ARG002 — SIP has no threaded replies
-        metadata: dict[str, object] | None = None,  # noqa: ARG002 — no metadata consumed
+        metadata: Mapping[str, object] | None = None,  # noqa: ARG002 — no metadata consumed
     ) -> SendResult:
         """Deliver agent text to the caller via TTS synthesis.
 

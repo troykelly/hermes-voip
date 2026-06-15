@@ -1,22 +1,27 @@
 """Tests for hermes_voip.providers.build — config-to-provider wiring (W8).
 
 All tests are model-free (no ml weights, no network): concrete provider types
-are verified without triggering their constructors' ml-load paths by injecting
-fake factories into the module-level registries before each test.
+are verified without triggering their constructors' ml-load paths by passing fake
+factory maps through the explicit ``*_factories`` dependency seam of
+:func:`build_providers` (NOT by mutating any global state — the redesign after the
+codex review dropped the mutate/restore registry pattern for direct dispatch).
 
-TDD (rule 18): this test file is committed red before the implementation lands.
+TDD (rule 18): the new DI-seam tests are committed red before the redesign lands.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import fields
 
 import pytest
 
+import hermes_voip.providers.build as build_mod
 from hermes_voip.config import ConfigError, MediaConfig
 from hermes_voip.manifest import (
+    STT_MODEL_MANIFEST,
+    TTS_MODEL_MANIFEST,
     LicenceError,
     ModelFamily,
     ModelFile,
@@ -26,10 +31,10 @@ from hermes_voip.manifest import (
 from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import (
+    AsrFactory,
+    GuardFactory,
     Providers,
-    _asr_registry,
-    _guard_registry,
-    _tts_registry,
+    TtsFactory,
     build_providers,
 )
 from hermes_voip.providers.guard import GuardResult, GuardVerdict, InjectionGuard
@@ -92,62 +97,43 @@ class _FakeGuard:
 
 
 # ---------------------------------------------------------------------------
-# Helper: inject fake factories and restore originals as a context manager.
+# Fake factory maps — passed through the build_providers DI seam.
+# Each factory is Callable[[MediaConfig], <Provider>], mirroring the production
+# signature so tests exercise the real dispatch path with no ml load.
 # ---------------------------------------------------------------------------
 
 
-class _RegistryPatch:
-    """Temporarily override specific factory entries in the build registries."""
-
-    def __init__(
-        self,
-        asr_overrides: dict[str, object] | None = None,
-        tts_overrides: dict[str, object] | None = None,
-        guard_overrides: dict[str, object] | None = None,
-    ) -> None:
-        self._asr_overrides = asr_overrides or {}
-        self._tts_overrides = tts_overrides or {}
-        self._guard_overrides = guard_overrides or {}
-        self._saved_asr: dict[str, object] = {}
-        self._saved_tts: dict[str, object] = {}
-        self._saved_guard: dict[str, object] = {}
-
-    def __enter__(self) -> _RegistryPatch:
-        for key, factory in self._asr_overrides.items():
-            self._saved_asr[key] = _asr_registry._factories.get(key)
-            _asr_registry._factories[key] = factory  # type: ignore[assignment]
-        for key, factory in self._tts_overrides.items():
-            self._saved_tts[key] = _tts_registry._factories.get(key)
-            _tts_registry._factories[key] = factory  # type: ignore[assignment]
-        for key, factory in self._guard_overrides.items():
-            self._saved_guard[key] = _guard_registry._factories.get(key)
-            _guard_registry._factories[key] = factory  # type: ignore[assignment]
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        for key, orig in self._saved_asr.items():
-            if orig is None:
-                _asr_registry._factories.pop(key, None)
-            else:
-                _asr_registry._factories[key] = orig  # type: ignore[assignment]
-        for key, orig in self._saved_tts.items():
-            if orig is None:
-                _tts_registry._factories.pop(key, None)
-            else:
-                _tts_registry._factories[key] = orig  # type: ignore[assignment]
-        for key, orig in self._saved_guard.items():
-            if orig is None:
-                _guard_registry._factories.pop(key, None)
-            else:
-                _guard_registry._factories[key] = orig  # type: ignore[assignment]
+def _fake_asr_factories() -> Mapping[str, AsrFactory]:
+    return {"sherpa-onnx": lambda _config: _FakeASR()}
 
 
-def _all_fake_patch() -> _RegistryPatch:
-    """Patch all three registries to return fresh fakes."""
-    return _RegistryPatch(
-        asr_overrides={"sherpa-onnx": _FakeASR},
-        tts_overrides={"sherpa-kokoro": _FakeTTS},
-        guard_overrides={"onnx": _FakeGuard},
+def _fake_tts_factories() -> Mapping[str, TtsFactory]:
+    return {"sherpa-kokoro": lambda _config: _FakeTTS()}
+
+
+def _fake_guard_factories() -> Mapping[str, GuardFactory]:
+    return {"onnx": lambda _config: _FakeGuard()}
+
+
+def _build_with_fakes(
+    config: MediaConfig,
+    *,
+    asr_factories: Mapping[str, AsrFactory] | None = None,
+    tts_factories: Mapping[str, TtsFactory] | None = None,
+    guard_factories: Mapping[str, GuardFactory] | None = None,
+) -> Providers:
+    """Call build_providers with all-fake factory maps unless overridden."""
+    return build_providers(
+        config,
+        asr_factories=asr_factories
+        if asr_factories is not None
+        else _fake_asr_factories(),
+        tts_factories=tts_factories
+        if tts_factories is not None
+        else _fake_tts_factories(),
+        guard_factories=guard_factories
+        if guard_factories is not None
+        else _fake_guard_factories(),
     )
 
 
@@ -187,40 +173,44 @@ def _media_config(**overrides: object) -> MediaConfig:
 
 def test_build_providers_returns_providers_dataclass() -> None:
     """build_providers returns a Providers dataclass with asr/tts/guard fields."""
-    with _all_fake_patch():
-        result = build_providers(_media_config())
+    result = _build_with_fakes(_media_config())
     assert isinstance(result, Providers)
     field_names = {f.name for f in fields(result)}
     assert {"asr", "tts", "guard"} <= field_names
 
 
 def test_build_providers_wires_correct_instances() -> None:
-    """build_providers resolves the selected token to the registered factory."""
+    """build_providers resolves the selected token to the injected factory."""
     fake_asr = _FakeASR()
     fake_tts = _FakeTTS()
     fake_guard = _FakeGuard()
-    with _RegistryPatch(
-        asr_overrides={"sherpa-onnx": lambda: fake_asr},
-        tts_overrides={"sherpa-kokoro": lambda: fake_tts},
-        guard_overrides={"onnx": lambda: fake_guard},
-    ):
-        result = build_providers(_media_config())
+    result = _build_with_fakes(
+        _media_config(),
+        asr_factories={"sherpa-onnx": lambda _c: fake_asr},
+        tts_factories={"sherpa-kokoro": lambda _c: fake_tts},
+        guard_factories={"onnx": lambda _c: fake_guard},
+    )
     assert result.asr is fake_asr
     assert result.tts is fake_tts
     assert result.guard is fake_guard
 
 
+def test_build_providers_passes_config_to_factory() -> None:
+    """The selected factory receives the same MediaConfig instance (DI contract)."""
+    seen: list[MediaConfig] = []
+
+    def _capturing_asr(config: MediaConfig) -> StreamingASR:
+        seen.append(config)
+        return _FakeASR()
+
+    cfg = _media_config()
+    _build_with_fakes(cfg, asr_factories={"sherpa-onnx": _capturing_asr})
+    assert seen == [cfg]
+
+
 def test_providers_fields_satisfy_protocols_statically() -> None:
     """Providers.asr/tts/guard are typed as the ADR-0004 Protocol types."""
-    fake_asr = _FakeASR()
-    fake_tts = _FakeTTS()
-    fake_guard = _FakeGuard()
-    with _RegistryPatch(
-        asr_overrides={"sherpa-onnx": lambda: fake_asr},
-        tts_overrides={"sherpa-kokoro": lambda: fake_tts},
-        guard_overrides={"onnx": lambda: fake_guard},
-    ):
-        result = build_providers(_media_config())
+    result = _build_with_fakes(_media_config())
     # Static: mypy verifies these assignments at analysis time.
     asr: StreamingASR = result.asr
     tts: StreamingTTS = result.tts
@@ -231,53 +221,66 @@ def test_providers_fields_satisfy_protocols_statically() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (b) Unknown token → ValueError propagated from the registry.
+# (b) Unknown token → ValueError from direct dispatch.
 # ---------------------------------------------------------------------------
 
 
 def test_build_providers_unknown_stt_raises_valueerror() -> None:
-    """Unknown stt_provider raises ValueError naming the bad token."""
-    # Remove 'sherpa-onnx' from the ASR registry so the registry raises.
-    saved = _asr_registry._factories.pop("sherpa-onnx", None)
-    try:
-        with pytest.raises(ValueError, match="sherpa-onnx"):
-            build_providers(_media_config())
-    finally:
-        if saved is not None:
-            _asr_registry._factories["sherpa-onnx"] = saved
+    """An stt_provider with no factory entry raises ValueError naming the token."""
+    # An empty ASR factory map has no entry for 'sherpa-onnx'.
+    with pytest.raises(ValueError, match="sherpa-onnx"):
+        _build_with_fakes(_media_config(), asr_factories={})
+
+
+def test_build_providers_unknown_tts_raises_valueerror() -> None:
+    """A tts_provider with no factory entry raises ValueError naming the token."""
+    with pytest.raises(ValueError, match="sherpa-kokoro"):
+        _build_with_fakes(_media_config(), tts_factories={})
+
+
+def test_build_providers_unknown_guard_raises_valueerror() -> None:
+    """An injection_guard with no factory entry raises ValueError naming the token."""
+    with pytest.raises(ValueError, match="onnx"):
+        _build_with_fakes(_media_config(), guard_factories={})
 
 
 # ---------------------------------------------------------------------------
 # (c) Self-host token with model_dir=None → ConfigError naming the env key.
+# These use the REAL default factory maps (no fake override for the family under
+# test) so the production model-dir validation path is exercised.
 # ---------------------------------------------------------------------------
 
 
 def test_build_providers_sherpa_onnx_no_model_dir_raises_config_error() -> None:
     """sherpa-onnx STT without model_dir raises ConfigError naming the env key."""
+    # Use the real ASR factory map (default) so the production guard fires; fake
+    # the other two families so only the STT path matters.
     with pytest.raises(ConfigError, match="HERMES_VOIP_STT_MODEL_DIR"):
-        build_providers(_media_config(stt_model_dir=None))
+        build_providers(
+            _media_config(stt_model_dir=None),
+            tts_factories=_fake_tts_factories(),
+            guard_factories=_fake_guard_factories(),
+        )
 
 
 def test_build_providers_sherpa_kokoro_no_model_dir_raises_config_error() -> None:
     """sherpa-kokoro TTS without tts_model raises ConfigError naming the env key."""
-    with (
-        _RegistryPatch(asr_overrides={"sherpa-onnx": _FakeASR}),
-        pytest.raises(ConfigError, match="HERMES_VOIP_TTS_MODEL"),
-    ):
-        build_providers(_media_config(tts_model=None))
+    with pytest.raises(ConfigError, match="HERMES_VOIP_TTS_MODEL"):
+        build_providers(
+            _media_config(tts_model=None),
+            asr_factories=_fake_asr_factories(),
+            guard_factories=_fake_guard_factories(),
+        )
 
 
 def test_build_providers_onnx_guard_no_model_dir_raises_config_error() -> None:
     """ONNX guard without injection_guard_model_dir raises ConfigError."""
-    patch = _RegistryPatch(
-        asr_overrides={"sherpa-onnx": _FakeASR},
-        tts_overrides={"sherpa-kokoro": _FakeTTS},
-    )
-    with (
-        patch,
-        pytest.raises(ConfigError, match="HERMES_VOIP_INJECTION_GUARD_MODEL_DIR"),
-    ):
-        build_providers(_media_config(injection_guard_model_dir=None))
+    with pytest.raises(ConfigError, match="HERMES_VOIP_INJECTION_GUARD_MODEL_DIR"):
+        build_providers(
+            _media_config(injection_guard_model_dir=None),
+            asr_factories=_fake_asr_factories(),
+            tts_factories=_fake_tts_factories(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -286,11 +289,7 @@ def test_build_providers_onnx_guard_no_model_dir_raises_config_error() -> None:
 
 
 def test_validate_manifest_bad_spdx_raises_licence_error() -> None:
-    """A manifest with a disallowed SPDX licence raises LicenceError (guard family).
-
-    This exercises the licence gate that build_providers calls for ONNX guard
-    providers that expose a manifest.
-    """
+    """A manifest with a disallowed SPDX licence raises LicenceError (guard family)."""
     bad_manifest = ModelManifest(
         repo="example/model",
         revision="a" * 40,
@@ -307,10 +306,7 @@ def test_validate_manifest_bad_spdx_raises_licence_error() -> None:
 
 
 def test_build_providers_licence_gate_blocks_bad_guard_manifest() -> None:
-    """build_providers rejects a guard provider whose manifest fails the licence gate.
-
-    The factory injects the licence check before returning; LicenceError propagates.
-    """
+    """build_providers surfaces a LicenceError raised inside a guard factory."""
     bad_manifest = ModelManifest(
         repo="example/bad-model",
         revision="c" * 40,
@@ -323,32 +319,142 @@ def test_build_providers_licence_gate_blocks_bad_guard_manifest() -> None:
         ),
     )
 
-    def _bad_guard_factory() -> _FakeGuard:
+    def _bad_guard_factory(_config: MediaConfig) -> InjectionGuard:
         validate_manifest(bad_manifest, ModelFamily.GUARD)
         return _FakeGuard()  # unreachable after the licence gate raises
 
-    patch = _RegistryPatch(
-        asr_overrides={"sherpa-onnx": _FakeASR},
-        tts_overrides={"sherpa-kokoro": _FakeTTS},
-        guard_overrides={"onnx": _bad_guard_factory},
+    with pytest.raises(LicenceError, match=re.escape("GPL-3.0")):
+        _build_with_fakes(
+            _media_config(),
+            guard_factories={"onnx": _bad_guard_factory},
+        )
+
+
+# ---------------------------------------------------------------------------
+# (d.STT / d.TTS) The default STT and TTS self-host factories run the licence
+# gate before constructing. A disallowed-SPDX manifest for those families must
+# surface a LicenceError too — proving the self-host weights are gated, not just
+# the guard (codex finding #3).
+# ---------------------------------------------------------------------------
+
+
+def test_validate_manifest_stt_bad_spdx_raises_licence_error() -> None:
+    """A non-Apache-2.0 STT manifest is rejected by the STT family gate."""
+    bad_stt = ModelManifest(
+        repo="example/stt",
+        revision="e" * 40,
+        files=(
+            ModelFile(
+                name="encoder.onnx",
+                sha256="f" * 64,
+                spdx="CC-BY-SA-4.0",  # the Kroko trap — share-alike, banned for STT
+            ),
+        ),
     )
-    with patch, pytest.raises(LicenceError, match=re.escape("GPL-3.0")):
-        build_providers(_media_config())
+    with pytest.raises(LicenceError, match=re.escape("CC-BY-SA-4.0")):
+        validate_manifest(bad_stt, ModelFamily.STT)
 
 
-# ---------------------------------------------------------------------------
-# (e) build_providers is safe to call twice (idempotent registration).
-# ---------------------------------------------------------------------------
+def test_validate_manifest_tts_bad_spdx_raises_licence_error() -> None:
+    """A non-allow-listed TTS manifest is rejected by the TTS family gate."""
+    bad_tts = ModelManifest(
+        repo="example/tts",
+        revision="1" * 40,
+        files=(
+            ModelFile(
+                name="model.onnx",
+                sha256="2" * 64,
+                spdx="CC-BY-NC-4.0",  # non-commercial — banned for TTS
+            ),
+        ),
+    )
+    with pytest.raises(LicenceError, match=re.escape("CC-BY-NC-4.0")):
+        validate_manifest(bad_tts, ModelFamily.TTS)
 
 
-def test_build_providers_idempotent_registration() -> None:
-    """build_providers can be called multiple times without errors.
+def test_default_stt_manifest_passes_its_family_gate() -> None:
+    """The shipped STT_MODEL_MANIFEST validates under the STT (Apache-2.0) gate."""
+    # A clean return is the assertion; raises LicenceError on any non-allowed file.
+    validate_manifest(STT_MODEL_MANIFEST, ModelFamily.STT)
 
-    _register_defaults() guards against double-registration; calling build_providers
-    twice must not raise ValueError from a duplicate register attempt.
+
+def test_default_tts_manifest_passes_its_family_gate() -> None:
+    """The shipped TTS_MODEL_MANIFEST validates under the TTS gate."""
+    validate_manifest(TTS_MODEL_MANIFEST, ModelFamily.TTS)
+
+
+def test_build_providers_stt_factory_runs_licence_gate() -> None:
+    """The DEFAULT sherpa-onnx STT factory runs the licence gate before building.
+
+    Patching the STT manifest to a disallowed SPDX must make the default factory
+    raise LicenceError — i.e. the self-host STT weights are gated (codex #3). We
+    monkeypatch the manifest module's STT manifest to a bad one and use the REAL
+    default ASR factory map.
     """
-    with _all_fake_patch():
-        result1 = build_providers(_media_config())
-        result2 = build_providers(_media_config())
+    bad_stt = ModelManifest(
+        repo="example/stt-bad",
+        revision="3" * 40,
+        files=(ModelFile(name="encoder.onnx", sha256="4" * 64, spdx="GPL-3.0"),),
+    )
+    original = build_mod.STT_MODEL_MANIFEST
+    build_mod.STT_MODEL_MANIFEST = bad_stt
+    try:
+        with pytest.raises(LicenceError, match=re.escape("GPL-3.0")):
+            build_providers(
+                _media_config(),
+                tts_factories=_fake_tts_factories(),
+                guard_factories=_fake_guard_factories(),
+            )
+    finally:
+        build_mod.STT_MODEL_MANIFEST = original
+
+
+def test_build_providers_tts_factory_runs_licence_gate() -> None:
+    """The DEFAULT sherpa-kokoro TTS factory runs the licence gate before building."""
+    bad_tts = ModelManifest(
+        repo="example/tts-bad",
+        revision="5" * 40,
+        files=(ModelFile(name="model.onnx", sha256="6" * 64, spdx="CC-BY-NC-4.0"),),
+    )
+    original = build_mod.TTS_MODEL_MANIFEST
+    build_mod.TTS_MODEL_MANIFEST = bad_tts
+    try:
+        with pytest.raises(LicenceError, match=re.escape("CC-BY-NC-4.0")):
+            build_providers(
+                _media_config(),
+                asr_factories=_fake_asr_factories(),
+                guard_factories=_fake_guard_factories(),
+            )
+    finally:
+        build_mod.TTS_MODEL_MANIFEST = original
+
+
+# ---------------------------------------------------------------------------
+# (e) build_providers is safe to call repeatedly and concurrently.
+# ---------------------------------------------------------------------------
+
+
+def test_build_providers_repeated_calls_are_independent() -> None:
+    """build_providers can be called many times; direct dispatch has no shared state."""
+    cfg = _media_config()
+    result1 = _build_with_fakes(cfg)
+    result2 = _build_with_fakes(cfg)
     assert isinstance(result1, Providers)
     assert isinstance(result2, Providers)
+    # Distinct instances each call (the fake factories build fresh objects).
+    assert result1.asr is not result2.asr
+
+
+def test_build_providers_uses_real_default_factory_maps() -> None:
+    """Calling build_providers with no factory args uses the production maps.
+
+    The default maps must contain the known tokens; we assert resolution does NOT
+    raise the unknown-token ValueError for the default config. The sherpa-onnx STT
+    factory would try to load ml, so we only assert the maps recognise the tokens
+    by checking the module-level default maps directly (no construction).
+    """
+    assert "sherpa-onnx" in build_mod.DEFAULT_ASR_FACTORIES
+    assert "deepgram" in build_mod.DEFAULT_ASR_FACTORIES
+    assert "sherpa-kokoro" in build_mod.DEFAULT_TTS_FACTORIES
+    assert "elevenlabs" in build_mod.DEFAULT_TTS_FACTORIES
+    assert "onnx" in build_mod.DEFAULT_GUARD_FACTORIES

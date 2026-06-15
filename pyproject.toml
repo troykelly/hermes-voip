@@ -36,6 +36,26 @@ media = [
     "cryptography==46.0.7",
 ]
 
+# ---------------------------------------------------------------------------
+# Hermes plugin discovery (hermes_agent.plugins entry point group).
+#
+# The Hermes runtime scans this group at startup. The value must be a module
+# path that exposes a callable ``register(ctx)`` at module level. We point
+# directly at the package root (``hermes_voip``) so that the call is:
+#
+#     import hermes_voip; hermes_voip.register(ctx)
+#
+# ``hermes_voip.__init__`` re-exports ``register`` from ``hermes_voip.adapter``;
+# no ML or transport heavy imports occur at this point — those are deferred to
+# ``connect()`` and ``_on_inbound_invite``. A bare ``import hermes_voip``
+# therefore stays light (only audioop-lts and the sans-IO SIP modules).
+#
+# To activate the plugin the operator must run:
+#     hermes plugins enable hermes-voip
+# (Hermes gates pip-installed plugins by config.yaml; see ADR-0002.)
+[project.entry-points."hermes_agent.plugins"]
+hermes-voip = "hermes_voip"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -99,7 +119,7 @@ known-first-party = ["hermes_voip"]
 "tests/**" = [
   "S101", "D101", "D102", "D103", "D105", "D106", "D107",
   "S105", "S106", "S107", "PLR2004",
-  "ARG001", "ARG002",  # fakes implement Protocols; matching unused params are intentional
+  "ARG001", "ARG002", "ARG005",  # fakes/lambdas mirror real signatures; matching unused params are intentional
 ]
 
 # ---------------------------------------------------------------------------
@@ -111,6 +131,26 @@ strict = true
 warn_unreachable = true
 disallow_any_explicit = true
 files = ["src", "tests"]
+# ``src/hermes_voip/adapter.py`` imports the real hermes-agent runtime
+# (``gateway.platforms.base`` / ``gateway.config``), which is an OPTIONAL extra
+# absent from the default install and ships no ``py.typed``. Type-checking it
+# here (no ``hermes`` extra) would force ``# type: ignore[import-not-found]``
+# escape hatches — banned by rule 17. Instead it is type-checked in the
+# ``hermes-contract`` CI job (which installs the ``hermes`` extra) via the
+# dedicated mypy config below; ``tests/test_adapter.py`` likewise imports the
+# real runtime and is excluded from the default gate (it ``importorskip``s and
+# runs in that same CI job).
+exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py)$'
+
+# hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
+# (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``
+# explicitly, which bypasses ``exclude``), ``follow_untyped_imports`` makes mypy
+# ANALYSE the real ``gateway`` / ``hermes_cli`` source to derive genuine types —
+# NOT ``ignore_missing_imports`` (which would erase them to ``Any`` and is a
+# banned escape hatch). With the extra absent these sections are inert.
+[[tool.mypy.overrides]]
+module = ["gateway.*", "hermes_cli.*"]
+follow_untyped_imports = true
 
 # ---------------------------------------------------------------------------
 # pytest

@@ -1,0 +1,704 @@
+"""Tests for VoipAdapter against the REAL hermes-agent BasePlatformAdapter.
+
+``VoipAdapter`` subclasses ``gateway.platforms.base.BasePlatformAdapter`` at
+runtime (so it inherits ``handle_message``/``build_source``/
+``set_message_handler`` and is recognised by ``isinstance`` in the gateway).
+These tests therefore require the optional ``hermes`` extra and skip cleanly
+without it; the dedicated ``hermes-contract`` CI job installs the extra so they
+actually run there (rule 26: validate against the real deployment target).
+
+The SIP/RTP/provider collaborators are still fakes (no real network, no real
+ML); credentials and hostnames are obvious fakes (``pbx.example.test`` / ext
+``1000`` / ``127.0.0.1``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# The adapter imports the real Hermes base at module top; skip the whole module
+# when the optional runtime is absent (it runs in the hermes-contract CI job).
+pytest.importorskip("gateway.platforms.base")
+pytest.importorskip("gateway.config")
+
+from gateway.config import PlatformConfig
+from gateway.platform_registry import (
+    PlatformEntry,
+    platform_registry,
+)
+from gateway.platforms.base import BasePlatformAdapter
+
+from hermes_voip.config import ConfigError, ExtensionConfig
+from hermes_voip.manager import NewCall
+from hermes_voip.message import SipRequest, new_call_id, new_tag
+from hermes_voip.providers.audio import PcmFrame
+from hermes_voip.providers.build import Providers
+from hermes_voip.providers.guard import GuardResult, GuardVerdict
+from hermes_voip.providers.tts import TtsStream
+
+if TYPE_CHECKING:
+    from hermes_voip.adapter import VoipAdapter
+
+
+# ---------------------------------------------------------------------------
+# Ensure the "voip" platform name resolves (Platform("voip") only works once
+# the plugin has registered it in the module-singleton platform_registry).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _register_voip_platform() -> None:
+    """Register a throwaway "voip" entry so ``Platform("voip")`` resolves."""
+    if not platform_registry.is_registered("voip"):
+        platform_registry.register(
+            PlatformEntry(
+                name="voip",
+                label="VoIP",
+                adapter_factory=lambda cfg: MagicMock(),
+                check_fn=lambda: True,
+                validate_config=lambda cfg: True,
+                required_env=[],
+                install_hint="",
+                source="plugin",
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fake SIP transport
+# ---------------------------------------------------------------------------
+
+
+class _FakeTransport:
+    """Fake SipTransport + CallSignaling that captures sent messages."""
+
+    def __init__(self, *, local_sent_by: str = "127.0.0.1:5061") -> None:
+        self._local_sent_by = local_sent_by
+        self.sent: list[str] = []
+        self._calls: dict[str, object] = {}
+
+    @property
+    def local_sent_by(self) -> str:
+        return self._local_sent_by
+
+    def contact_uri(self, extension: str) -> str:
+        return f"<sip:{extension}@{self._local_sent_by};transport=tls>"
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def connect(self) -> None:
+        """No-op TLS connect for tests."""
+
+    async def aclose(self) -> None:
+        """No-op close for tests."""
+
+    def bind_manager(self, manager: object) -> None:
+        """No-op manager bind for tests."""
+
+    def add_call(self, call_id: str, sink: object) -> None:
+        self._calls[call_id] = sink
+
+    def remove_call(self, call_id: str) -> None:
+        self._calls.pop(call_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Fake manager
+# ---------------------------------------------------------------------------
+
+
+class _FakeManager:
+    """Minimal stand-in for RegistrationManager."""
+
+    def __init__(self, *, is_up: bool = True) -> None:
+        self._is_up = is_up
+        self._calls: dict[tuple[str, str, str], object] = {}
+        self.connected = False
+        self.closed = False
+
+    @property
+    def is_up(self) -> bool:
+        return self._is_up
+
+    async def connect(self, *, timeout: float = 10.0) -> bool:
+        self.connected = True
+        return self._is_up
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    def add_call(self, dialog_id: tuple[str, str, str], consumer: object) -> None:
+        self._calls[dialog_id] = consumer
+
+    def remove_call(self, dialog_id: tuple[str, str, str]) -> None:
+        self._calls.pop(dialog_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Fake providers
+# ---------------------------------------------------------------------------
+
+
+class _FakeTtsStream:
+    def __init__(self, frames: list[PcmFrame] | None = None) -> None:
+        self._frames = frames or []
+        self._cancelled = False
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self._gen()
+
+    async def _gen(self) -> AsyncIterator[PcmFrame]:
+        for f in self._frames:
+            if self._cancelled:
+                return
+            yield f
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+
+
+class _FakeTTS:
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        return _FakeTtsStream()  # type: ignore[return-value]
+
+
+class _FakeASR:
+    async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+        """Drain audio frames and produce no transcripts (empty ASR stub)."""
+        chunks: list[object] = []
+        async for _ in audio:
+            pass  # consume so pump does not stall
+        for chunk in chunks:  # chunks is always empty — forces async-gen shape
+            yield chunk
+
+
+class _FakeGuard:
+    async def screen(self, text: str, *, call_id: str) -> GuardResult:
+        return GuardResult(
+            verdict=GuardVerdict.ALLOW,
+            score=0.0,
+            degraded=False,
+            normalized_text=text,
+            reasons=(),
+        )
+
+
+def _fake_providers() -> Providers:
+    return Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Minimal fake env (never real credentials; pbx.example.test / ext 1000)
+# ---------------------------------------------------------------------------
+
+_FAKE_ENV: dict[str, str] = {
+    "HERMES_SIP_HOST": "pbx.example.test",
+    "HERMES_SIP_EXTENSION": "1000",
+    "HERMES_SIP_PASSWORD": "fake-password",
+}
+
+_FAKE_MEDIA_ENV: dict[str, str] = {
+    "HERMES_VOIP_STT_PROVIDER": "sherpa-onnx",
+    "HERMES_VOIP_STT_MODEL_DIR": "/fake/stt",
+    "HERMES_VOIP_TTS_PROVIDER": "sherpa-kokoro",
+    "HERMES_VOIP_TTS_MODEL": "/fake/tts",
+    "HERMES_VOIP_INJECTION_GUARD": "onnx",
+    "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": "/fake/guard",
+}
+
+
+def _platform_config(env: dict[str, str] | None = None) -> PlatformConfig:
+    """A real ``PlatformConfig`` carrying the fake SIP/media env in ``extra``."""
+    return PlatformConfig(enabled=True, extra=dict(env or {}))
+
+
+def _ext_config() -> ExtensionConfig:
+    return ExtensionConfig(index=0, extension="1000", username="1000", password="fake")
+
+
+# ---------------------------------------------------------------------------
+# Helper to build a minimal inbound INVITE raw text
+# ---------------------------------------------------------------------------
+
+_FAKE_SDP_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 0 8\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite(call_id: str | None = None, from_tag: str | None = None) -> str:
+    cid = call_id or new_call_id()
+    ftag = from_tag or new_tag()
+    content_length = len(_FAKE_SDP_OFFER.encode("utf-8"))
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKfake\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={ftag}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {cid}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:60000;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Build a real VoipAdapter wired to fakes (connect() patched collaborators).
+# ---------------------------------------------------------------------------
+
+
+async def _build_adapter(
+    transport: _FakeTransport,
+    manager: _FakeManager,
+    *,
+    connect: bool = True,
+) -> VoipAdapter:
+    """Construct a real ``VoipAdapter`` wired to fakes, optionally calling connect()."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=MagicMock(
+                host="pbx.example.test",
+                transport="tls",
+                port=5061,
+                extensions=(
+                    MagicMock(
+                        index=0, extension="1000", username="1000", password="fake"
+                    ),
+                ),
+                default_extension=MagicMock(extension="1000"),
+                via_transport="TLS",
+            ),
+        ),
+        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch(
+            "hermes_voip.adapter._make_tls_context",
+            return_value=MagicMock(),
+        ),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        if connect:
+            await adapter.connect()
+        return adapter
+
+
+# ---------------------------------------------------------------------------
+# (sub) VoipAdapter is a real BasePlatformAdapter subclass
+# ---------------------------------------------------------------------------
+
+
+def test_voip_adapter_subclasses_base() -> None:
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    assert issubclass(VoipAdapter, BasePlatformAdapter)
+
+
+def test_voip_adapter_instance_is_base_and_has_inherited_methods() -> None:
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    adapter = VoipAdapter(_platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV))
+    assert isinstance(adapter, BasePlatformAdapter)
+    # Inherited runtime services (NOT defined on VoipAdapter itself):
+    for name in ("handle_message", "build_source", "set_message_handler"):
+        assert callable(getattr(adapter, name)), f"missing inherited {name}"
+
+
+# ---------------------------------------------------------------------------
+# (a) connect() returns True when the fake manager is up; False when down
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_returns_true_when_manager_up() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    _ = await _build_adapter(transport, manager)
+    assert manager.connected
+
+
+@pytest.mark.asyncio
+async def test_connect_returns_false_when_manager_down() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=False)
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+
+    with (
+        patch("hermes_voip.adapter.load_gateway_config", return_value=MagicMock()),
+        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        result = await adapter.connect()
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
+# (b) send() routes to CallLoop.speak(); unknown call_id → failure result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_unknown_call_id_returns_failure() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    result = await adapter.send("nonexistent-call-id", "hello")
+    assert not result.success
+
+
+@pytest.mark.asyncio
+async def test_send_known_call_id_calls_loop_speak() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, "hello agent")
+    assert result.success
+    assert "hello agent" in spoken
+
+
+# ---------------------------------------------------------------------------
+# (c) get_chat_info returns {name, type} for live + ended + unknown calls
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_live_call() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {
+        "name": "9999",
+        "remote_uri": "sip:9999@pbx.example.test",
+        "type": "dm",
+        "ended": False,
+    }
+    info = await adapter.get_chat_info(call_id)
+    assert info["name"] == "9999"
+    assert info["type"] == "dm"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_ended_call() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {
+        "name": "caller",
+        "remote_uri": "sip:caller@pbx.example.test",
+        "type": "dm",
+        "ended": True,
+    }
+    info = await adapter.get_chat_info(call_id)
+    assert info["type"] == "dm"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_info_unknown_returns_fallback() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    info = await adapter.get_chat_info("unknown-call")
+    assert "type" in info
+
+
+# ---------------------------------------------------------------------------
+# (d) validate_voip_config raises ConfigError on missing host (light module)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_raises_on_missing_host() -> None:
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    with pytest.raises(ConfigError):
+        validate_voip_config(_platform_config({}))
+
+
+def test_validate_config_truthy_with_valid_env() -> None:
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    assert validate_voip_config(_platform_config(_FAKE_ENV)) is True
+
+
+# ---------------------------------------------------------------------------
+# (e) inbound INVITE creates a CallLoop per call (heavy IO patched out)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_registers_call_loop() -> None:
+    """An inbound INVITE should create a CallLoop in _call_loops."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    call_id = new_call_id()
+    invite_raw = _make_invite(call_id=call_id)
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(
+                dialog_id=("call-id", "local-tag", "remote-tag"),
+                ended=False,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        invite_req = SipRequest.parse(invite_raw)
+        new_call = NewCall(registration=_ext_config(), invite=invite_req)
+        adapter._on_inbound_invite(new_call)
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert call_id in adapter._call_info
+
+
+# ---------------------------------------------------------------------------
+# (f) a finalized transcript reaches the agent via the REAL handle_message
+#     (set_message_handler + inherited handle_message — no SimpleNamespace stub)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_routes_to_message_handler() -> None:
+    """deliver_turn must reach the agent's message handler via the real base."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    received: list[str] = []
+
+    async def _handler(event: object) -> None:
+        received.append(getattr(event, "text", ""))
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {
+        "name": "9999",
+        "remote_uri": "sip:9999@pbx.example.test",
+        "type": "dm",
+        "ended": False,
+    }
+
+    await adapter._deliver_turn(call_id, "hello from caller")
+
+    # handle_message spawns a background task in the base; give it time.
+    for _ in range(50):
+        if received:
+            break
+        await asyncio.sleep(0.02)
+
+    assert received == ["hello from caller"]
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_builds_voice_message_event() -> None:
+    """The MessageEvent handed to the agent must be VOICE-typed with the text."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    from gateway.platforms.base import MessageType  # noqa: PLC0415
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {
+        "name": "9999",
+        "remote_uri": "sip:9999@pbx.example.test",
+        "type": "dm",
+        "ended": False,
+    }
+    await adapter._deliver_turn(call_id, "voice turn")
+    for _ in range(50):
+        if captured:
+            break
+        await asyncio.sleep(0.02)
+
+    assert captured, "no event reached the handler"
+    event = captured[0]
+    assert getattr(event, "text", None) == "voice turn"
+    assert getattr(event, "message_type", None) == MessageType.VOICE
+
+
+# ---------------------------------------------------------------------------
+# (g) disconnect() is idempotent and drains manager + transport
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_disconnect_idempotent() -> None:
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    await adapter.disconnect()
+    await adapter.disconnect()  # second call must not raise
+    assert manager.closed
+
+
+# ---------------------------------------------------------------------------
+# (h) guard state is per-call (distinct GuardSessionState per Call-ID)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_each_call_gets_distinct_guard_state() -> None:
+    """Two calls must not share GuardSessionState (one per Call-ID)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(dialog_id=("cid", "lt", "rt"), ended=False),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch(
+            "hermes_voip.adapter.GuardSessionState",
+            side_effect=lambda call_id: MagicMock(call_id=call_id),
+        ) as mock_guard_state,
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        for n in range(2):
+            cid = f"call-id-{n}"
+            req = SipRequest.parse(_make_invite(call_id=cid))
+            adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=req))
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+    assert mock_guard_state.call_count == 2
+    call_ids_used = {c.args[0] for c in mock_guard_state.call_args_list}
+    assert "call-id-0" in call_ids_used
+    assert "call-id-1" in call_ids_used
+
+
+# ---------------------------------------------------------------------------
+# (i) LEAK GUARD: a failure during post-200-OK setup must release the RTP
+#     engine and the manager/transport call routes, and mark the call ended.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_failure_after_200ok_releases_resources() -> None:
+    """If CallLoop construction fails after the 200 OK, nothing must leak.
+
+    The engine must be stopped, the manager + transport call routes removed,
+    and the call marked ended — otherwise an accepted call leaks an open RTP
+    socket and a dangling in-dialog route for the life of the process.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=20002,
+    )
+    call_id = new_call_id()
+    dialog_id = ("cid", "lt", "rt")
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(dialog_id=dialog_id, ended=False),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        # CallLoop construction blows up AFTER the 200 OK + add_call wiring.
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            side_effect=RuntimeError("boom building loop"),
+        ),
+    ):
+        req = SipRequest.parse(_make_invite(call_id=call_id))
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=req))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    # The RTP engine must have been stopped (no leaked socket).
+    engine.stop.assert_awaited()
+    # The in-dialog call routes must have been removed from both sides.
+    assert dialog_id not in manager._calls
+    assert call_id not in transport._calls
+    # The call must be marked ended, and no live CallLoop left behind.
+    assert call_id not in adapter._call_loops
+    info = await adapter.get_chat_info(call_id)
+    assert info.get("ended") is True

@@ -56,6 +56,14 @@ from hermes_voip.media.audio import (
     frame_to_ulaw,
     ulaw_to_frame,
 )
+
+# SrtpError is defined at srtp.py module level and carries no cryptography
+# dependency (the cryptography backend is imported lazily inside SrtpSession),
+# so importing it here is safe in the default (no-`media`-extra) environment.
+# Importing it at module scope — rather than per-packet inside the inbound loop
+# — means an import failure propagates at module load (rule 37) instead of
+# being silently swallowed as a per-packet drop.
+from hermes_voip.media.srtp import SrtpError
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket
 
@@ -222,6 +230,11 @@ class RtpMediaTransport:
         self._recv_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._jitter: JitterBuffer = JitterBuffer(target_depth=jitter_depth)
 
+        # Stop signal: set by stop(), selected on by the inbound generator so it
+        # wakes promptly regardless of recv-queue fullness (a bounded queue can
+        # otherwise drop a sentinel datagram and strand the consumer).
+        self._stop_event: asyncio.Event = asyncio.Event()
+
     # ------------------------------------------------------------------
     # MediaTransport Protocol
     # ------------------------------------------------------------------
@@ -242,6 +255,7 @@ class RtpMediaTransport:
 
         self._recv_queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
+        self._stop_event = asyncio.Event()
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -275,34 +289,28 @@ class RtpMediaTransport:
         return self._inbound_gen()
 
     async def _inbound_gen(self) -> AsyncIterator[PcmFrame]:
-        """Internal async generator implementing inbound_audio."""
-        while True:
-            try:
-                data = await self._recv_queue.get()
-            except asyncio.CancelledError:
-                return
+        """Internal async generator implementing inbound_audio.
 
-            # Empty sentinel from stop() — exit cleanly.
-            if not data:
+        Terminates when :meth:`stop` sets the stop flag (even if the recv queue
+        is full).  Cancellation (``asyncio.CancelledError``) propagates — it is
+        never swallowed (rule 37), so a caller timeout or cancel is honoured.
+        """
+        while True:
+            data = await self._next_datagram()
+            # ``None`` ⇒ stop signalled; exit cleanly.
+            if data is None:
                 return
 
             rtp_pkt: RtpPacket
 
-            # SRTP un-protect (if configured); drop on auth failure.
+            # SRTP un-protect (if configured).  Only an authentication/replay
+            # failure (SrtpError) drops a single packet; any other exception
+            # (e.g. a misconfigured backend) propagates (rule 37).
             if self._srtp_in is not None:
                 try:
-                    from hermes_voip.media.srtp import SrtpError  # noqa: PLC0415
-
-                    try:
-                        rtp_pkt = self._srtp_in.unprotect(data)
-                    except SrtpError as exc:
-                        _log.debug(
-                            "SRTP auth/replay failure — datagram dropped: %s", exc
-                        )
-                        continue
-                except ImportError:
-                    # media extra absent; skip SRTP (should not occur in practice
-                    # if srtp_inbound was constructed with the extra installed).
+                    rtp_pkt = self._srtp_in.unprotect(data)
+                except SrtpError as exc:
+                    _log.debug("SRTP auth/replay failure — datagram dropped: %s", exc)
                     continue
             else:
                 # Plain RTP: drop malformed datagrams.
@@ -327,6 +335,52 @@ class RtpMediaTransport:
                 ts_ns = self._clock()
                 frame = self._decode(output.payload, ts_ns)
                 yield frame
+
+    async def _next_datagram(self) -> bytes | None:
+        """Await the next inbound datagram, or return ``None`` if stopped.
+
+        Races :meth:`asyncio.Queue.get` against the stop flag so the consumer
+        wakes promptly when :meth:`stop` is called — even when the bounded recv
+        queue is full and a sentinel datagram could not be enqueued.  When both
+        are ready, the stop flag wins (we never start draining a full queue that
+        a caller has asked us to abandon).
+
+        ``asyncio.CancelledError`` from the awaited tasks propagates to the
+        caller (rule 37); the losing task is always cancelled before returning so
+        no pending task is left dangling.
+
+        Returns:
+            The next datagram, or ``None`` when the stop flag is set.
+        """
+        # Fast path: already stopped.
+        if self._stop_event.is_set():
+            return None
+
+        get_task: asyncio.Task[bytes] = asyncio.ensure_future(self._recv_queue.get())
+        stop_task: asyncio.Task[bool] = asyncio.ensure_future(self._stop_event.wait())
+        try:
+            await asyncio.wait(
+                {get_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            # Cancel whichever task did not complete so it is not left pending.
+            # A cancellation of THIS coroutine flows through here too: both
+            # tasks are cancelled and the CancelledError propagates onward.
+            for task in (get_task, stop_task):
+                if not task.done():
+                    task.cancel()
+
+        # Stop wins over a delivered datagram (abandon a full queue on stop).
+        if stop_task.done() and not stop_task.cancelled():
+            # A datagram may have been dequeued in the same loop step; push it
+            # back so it is not lost if the engine is later reused.
+            if get_task.done() and not get_task.cancelled():
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._recv_queue.put_nowait(get_task.result())
+            return None
+
+        return get_task.result()
 
     async def send_audio(self, frame: PcmFrame) -> None:
         """Encode and packetise one near-end frame; gate on hold state.
@@ -393,10 +447,10 @@ class RtpMediaTransport:
         self._transport = None
         if transport is not None:
             transport.close()
-        # Push an empty sentinel so any awaiter on _recv_queue.get() unblocks
-        # and the inbound generator exits cleanly.
-        with contextlib.suppress(asyncio.QueueFull):
-            self._recv_queue.put_nowait(b"")
+        # Set the stop flag so the inbound generator wakes and exits cleanly.
+        # Unlike a queued sentinel, this is independent of recv-queue capacity:
+        # a full queue cannot drop the signal and strand the consumer.
+        self._stop_event.set()
 
     # ------------------------------------------------------------------
     # Discovered port (after connect with local_port=0)

@@ -193,7 +193,9 @@ class JitterBuffer:
             if _seq_before(seq, self._next):
                 if self._emitted:
                     return  # too late: this sequence has already been emitted
-                self._next = seq  # pre-playout reorder: revise the anchor down
+                if (self._next - seq) % _SEQ_MOD > self._max_ahead:
+                    return  # too far behind to be a start reorder; bound the window
+                self._next = seq  # pre-playout reorder within window: revise anchor
             elif (seq - self._next) % _SEQ_MOD > self._max_ahead:
                 return  # outside the playout window: keep storage bounded
         else:

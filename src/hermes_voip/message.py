@@ -179,6 +179,10 @@ def build_response(  # noqa: PLR0913 — status, reason, to-tag, extra headers a
         msg = f"status code out of range 100..699: {status_code}"
         raise ValueError(msg)
     _reject_controls(reason, "reason phrase")
+    for name, _ in extra_headers:
+        if name.lower() == _CONTENT_LENGTH.lower():
+            msg = "Content-Length is computed automatically; do not supply it"
+            raise ValueError(msg)
     vias = request.headers_all("Via")
     if not vias:
         msg = "cannot build a response: request has no Via header"

@@ -115,6 +115,17 @@ def test_jitter_in_order_emits_in_order() -> None:
     assert jb.pop() is None
 
 
+def test_jitter_far_behind_first_arrival_does_not_reset_anchor() -> None:
+    # A packet more than max_ahead behind the tentative anchor is not a start-of-
+    # call reorder; it must be dropped, not move the anchor down out of the window
+    # (which would strand the buffered higher packet behind a huge artificial gap).
+    jb = JitterBuffer(target_depth=1, max_ahead=100)
+    jb.push(_pkt(1000))
+    jb.push(_pkt(1))  # 999 behind > max_ahead -> dropped, anchor stays at 1000
+    out = jb.pop()
+    assert _packet(out).sequence_number == 1000
+
+
 def test_jitter_reorders_within_depth() -> None:
     jb = JitterBuffer(target_depth=3)
     for seq in (10, 12, 11):

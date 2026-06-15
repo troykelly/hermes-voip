@@ -103,6 +103,15 @@ def test_build_response_rejects_invalid_status() -> None:
         build_response(_inbound("BYE"), 99, "Bad")
 
 
+def test_build_response_rejects_caller_supplied_content_length() -> None:
+    # Content-Length is computed from the body; a caller-supplied one would
+    # duplicate the framing header and corrupt the message.
+    with pytest.raises(ValueError, match="Content-Length"):
+        build_response(
+            _inbound("BYE"), 200, "OK", extra_headers=(("Content-Length", "5"),)
+        )
+
+
 def test_build_response_rejects_request_without_via() -> None:
     no_via = SipRequest(
         method="BYE",

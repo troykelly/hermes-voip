@@ -793,3 +793,29 @@ def test_crypto_error_wrong_length_reports_structure_only() -> None:
     assert "29" in msg  # decoded octet count
     assert "30" in msg  # expected octet count
     assert "AES_CM_128_HMAC_SHA1_80" in msg
+
+
+def test_crypto_error_unsupported_suite_does_not_leak_key() -> None:
+    # MEDIUM (re-review): the suite token sits in field[1]. A body that puts the
+    # key there (e.g. a doubled inline: with no real suite) makes the
+    # "unsupported suite" error leak the key — so it must be structural only.
+    body = f"1 inline:{_FAKE_KEY} inline:{_FAKE_KEY}"  # field[1] == the key
+    with pytest.raises(SdpError) as exc_info:
+        CryptoAttribute.parse(body)
+    msg = str(exc_info.value)
+    assert _FAKE_KEY not in msg
+    assert "inline:" not in msg
+    assert "suite" in msg  # structural fact: the suite is unsupported
+
+
+def test_crypto_error_non_decimal_tag_does_not_leak_key() -> None:
+    # MEDIUM (re-review): the tag token sits in field[0]. A body that puts the
+    # key there (key, then a real suite, then the key) makes the "tag is not
+    # decimal" error leak the key — so it must be structural only.
+    body = f"inline:{_FAKE_KEY} AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}"
+    with pytest.raises(SdpError) as exc_info:
+        CryptoAttribute.parse(body)
+    msg = str(exc_info.value)
+    assert _FAKE_KEY not in msg
+    assert "inline:" not in msg
+    assert "tag" in msg  # structural fact: the tag is not decimal

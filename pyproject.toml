@@ -16,14 +16,17 @@ dependencies = [
 hermes = ["hermes-agent==0.16.0"]
 # Local-inference ML stack for the conversational providers (ADR-0006/0007/0008/
 # 0009): onnxruntime for VAD (silero) + the injection guard (DeBERTa), sherpa-onnx
-# for streaming STT/TTS, numpy for frame math. Optional so the default install,
-# licence gate, and audit stay lean; the `providers` CI job installs it. onnxruntime
-# is pinned to the symbol version sherpa-onnx 1.13.2 links against; that wheel needs
-# onnxruntime's library symlinked onto its RPATH (hermes_voip.providers.onnx_compat).
+# for streaming STT/TTS, tokenizers for the DeBERTa guard's SentencePiece tokenizer
+# (loads tokenizer.json standalone — far lighter than pulling transformers), numpy
+# for frame math. Optional so the default install, licence gate, and audit stay
+# lean; the `providers` CI job installs it. onnxruntime is pinned to the symbol
+# version sherpa-onnx 1.13.2 links against; that wheel needs onnxruntime's library
+# symlinked onto its RPATH (hermes_voip.providers.onnx_compat).
 ml = [
     "numpy==2.4.6",
     "onnxruntime==1.24.4",
     "sherpa-onnx==1.13.2",
+    "tokenizers==0.23.1",
 ]
 
 [build-system]

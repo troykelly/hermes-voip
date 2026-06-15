@@ -81,7 +81,9 @@ def _validate_crypto(tag: int, suite: str, key_params: str) -> None:
         msg = f"crypto tag out of range 1..{10**_MAX_TAG_DIGITS - 1}: {tag}"
         raise SdpError(msg)
     if suite not in _SUPPORTED_CRYPTO_SUITES:
-        msg = f"unsupported crypto suite: {suite!r}"
+        # Never echo the suite token: a malformed body can put the inline key in
+        # the suite position (e.g. "1 inline:<KEY> inline:<KEY>").
+        msg = "unsupported crypto suite"
         raise SdpError(msg)
     if not key_params.startswith(_INLINE_PREFIX):
         # Never echo key_params: it is (or carries) the SRTP master key.
@@ -157,7 +159,9 @@ class CryptoAttribute:
         # keep only the first (the inline key) — session-params are not used.
         key_params = fields[2]
         if not tag_str.isdigit():
-            msg = f"crypto tag is not decimal: {tag_str!r}"
+            # Never echo the tag token: a malformed body can put the inline key
+            # in the tag position (e.g. "inline:<KEY> <suite> inline:<KEY>").
+            msg = "crypto tag is not decimal"
             raise SdpError(msg)
         if len(tag_str) > 1 and tag_str[0] == "0":
             msg = f"crypto tag has a leading zero: {tag_str!r}"

@@ -24,6 +24,7 @@ Lifecycle (verified against hermes-agent 0.16.0):
 from __future__ import annotations
 
 import logging
+import os
 import ssl
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,13 @@ _REQUIRED_ENV: tuple[str, ...] = (
     "HERMES_SIP_PASSWORD",
 )
 
+# The env-var name prefixes the adapter reads its config from. The SIP scheme
+# (``HERMES_SIP_*``) carries the gateway + registration credentials; the media
+# scheme (``HERMES_VOIP_*``) carries the STT/TTS/VAD/guard + feature settings.
+# These are exactly the keys ``env_enablement_fn`` copies from the process env
+# into ``PlatformConfig.extra`` for the running gateway (see :func:`_env_enablement`).
+_EXTRA_ENV_PREFIXES: tuple[str, ...] = ("HERMES_SIP_", "HERMES_VOIP_")
+
 
 def validate_voip_config(config: object) -> bool:
     """Validate the Hermes ``PlatformConfig`` for the VoIP adapter.
@@ -79,6 +87,57 @@ def validate_voip_config(config: object) -> bool:
     """
     extra = getattr(config, "extra", {})
     load_gateway_config(extra)
+    return True
+
+
+def _env_enablement() -> dict[str, str]:
+    """Seed ``PlatformConfig.extra`` from the ``HERMES_SIP_*``/``HERMES_VOIP_*`` env.
+
+    The Hermes gateway's registry-driven plugin-platform enable pass
+    (``gateway.config._apply_env_overrides``) calls this hook to populate the
+    platform's ``extra`` mapping *before* it builds the adapter — and
+    :class:`~hermes_voip.adapter.VoipAdapter` reads its entire SIP + media config
+    from ``config.extra`` (via ``load_gateway_config``/``load_media_config``).
+    Without this seed the gateway enables ``voip`` with an empty ``extra`` and
+    ``connect()`` raises :class:`~hermes_voip.config.ConfigError`.
+
+    Returning the env keeps every secret (the SIP password, any cloud key) in the
+    process environment only — never written to ``config.yaml`` (rule 34). Only
+    the two ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` namespaces are copied; unrelated
+    process env is excluded.
+
+    Returns:
+        A mapping of every ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` variable currently
+        set in the process environment to its value (empty if none are set).
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith(_EXTRA_ENV_PREFIXES)
+    }
+
+
+def _is_connected(config: object) -> bool:
+    """Return whether the SIP credentials are present for this platform.
+
+    The gateway consults this gate before flipping the ``voip`` platform on, so a
+    runtime without SIP env configured is left disabled (no noisy retry-forever
+    connect attempts) instead of failing inside ``connect()``. It checks the
+    probe config's ``extra`` — which the gateway has already seeded via
+    :func:`_env_enablement` — for the required SIP keys, reusing the same
+    validation as :func:`validate_voip_config` so "connected" means "would build".
+
+    Args:
+        config: A Hermes ``PlatformConfig``-like object with an ``extra`` mapping.
+
+    Returns:
+        ``True`` if ``extra`` holds a complete, valid SIP configuration.
+    """
+    extra = getattr(config, "extra", {})
+    try:
+        load_gateway_config(extra)
+    except Exception:  # noqa: BLE001 — any config error means "not configured yet"
+        return False
     return True
 
 
@@ -136,4 +195,10 @@ def register(ctx: PluginContextProtocol) -> None:
         validate_config=validate_voip_config,
         required_env=list(_REQUIRED_ENV),
         install_hint=_INSTALL_HINT,
+        # The gateway's registry-driven enable pass seeds PlatformConfig.extra
+        # from env_enablement_fn() and gates enablement on is_connected(probe),
+        # so `hermes gateway run` brings the platform up from the HERMES_SIP_*/
+        # HERMES_VOIP_* process env (secrets stay in env, never config.yaml).
+        env_enablement_fn=_env_enablement,
+        is_connected=_is_connected,
     )

@@ -431,7 +431,7 @@ def test_media_full_override() -> None:
             "HERMES_VOIP_VAD_THRESHOLD": "0.75",
             "HERMES_VOIP_ENDPOINT_SILENCE_MS": "650",
             "HERMES_VOIP_DUPLEX_MODE": "full",
-            "HERMES_VOIP_INJECTION_GUARD": "none",
+            "HERMES_VOIP_INJECTION_GUARD": "sidecar",
             "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": "/models/deberta",
             "HERMES_SIP_DTMF_MODE": "rfc4733",
             "HERMES_SIP_DTMF_INTERDIGIT_MS": "120",
@@ -448,7 +448,7 @@ def test_media_full_override() -> None:
     assert cfg.vad_threshold == pytest.approx(0.75)
     assert cfg.endpoint_silence_ms == 650
     assert cfg.duplex_mode == "full"
-    assert cfg.injection_guard == "none"
+    assert cfg.injection_guard == "sidecar"
     assert cfg.injection_guard_model_dir == "/models/deberta"
     assert cfg.dtmf_mode == "rfc4733"
     assert cfg.dtmf_interdigit_ms == 120
@@ -459,6 +459,7 @@ def test_media_values_are_trimmed() -> None:
     cfg = load_media_config(
         {
             "HERMES_VOIP_STT_PROVIDER": "  deepgram  ",
+            "DEEPGRAM_API_KEY": "dg-x",  # deepgram (cloud) requires its key
             "HERMES_VOIP_TTS_VOICE": "  rachel  ",
             "HERMES_VOIP_VAD_THRESHOLD": "  0.3 ",
             "HERMES_SIP_DTMF_MODE": "  sip_info  ",
@@ -483,6 +484,50 @@ def test_media_provider_tokens_lowercased() -> None:
     assert cfg.duplex_mode == "full"
     assert cfg.injection_guard == "onnx"
     assert cfg.dtmf_mode == "rfc4733"
+
+
+# ---- provider enum + cloud-key fail-fast (review) ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("HERMES_VOIP_STT_PROVIDER", "deepgarm"),  # typo
+        ("HERMES_VOIP_TTS_PROVIDER", "espeak"),  # unsupported
+        ("HERMES_VOIP_INJECTION_GUARD", "none"),  # not a real guard
+    ],
+)
+def test_media_unknown_provider_rejected(key: str, bad: str) -> None:
+    with pytest.raises(ConfigError):
+        load_media_config({key: bad})
+
+
+def test_media_deepgram_stt_requires_key() -> None:
+    with pytest.raises(ConfigError, match="DEEPGRAM_API_KEY"):
+        load_media_config({"HERMES_VOIP_STT_PROVIDER": "deepgram"})
+
+
+def test_media_elevenlabs_tts_requires_key() -> None:
+    with pytest.raises(ConfigError, match="ELEVENLABS_API_KEY"):
+        load_media_config({"HERMES_VOIP_TTS_PROVIDER": "elevenlabs"})
+
+
+def test_media_cartesia_tts_requires_key() -> None:
+    with pytest.raises(ConfigError, match="CARTESIA_API_KEY"):
+        load_media_config({"HERMES_VOIP_TTS_PROVIDER": "cartesia"})
+
+
+def test_media_aura2_tts_requires_deepgram_key() -> None:
+    with pytest.raises(ConfigError, match="DEEPGRAM_API_KEY"):
+        load_media_config({"HERMES_VOIP_TTS_PROVIDER": "aura2"})
+
+
+def test_media_cloud_provider_with_key_accepted() -> None:
+    cfg = load_media_config(
+        {"HERMES_VOIP_TTS_PROVIDER": "cartesia", "HERMES_VOIP_CARTESIA_API_KEY": "c-x"}
+    )
+    assert cfg.tts_provider == "cartesia"
+    assert cfg.cartesia_api_key == "c-x"
 
 
 def test_media_blank_optional_is_none_not_empty() -> None:
@@ -638,6 +683,7 @@ def test_media_config_validates_itself_on_direct_construction() -> None:
             tts_voice=None,
             elevenlabs_api_key=None,
             deepgram_api_key=None,
+            cartesia_api_key=None,
             vad_threshold=2.0,
             endpoint_silence_ms=500,
             duplex_mode="half",
@@ -659,6 +705,7 @@ def test_media_config_rejects_bad_enum_on_direct_construction() -> None:
             tts_voice=None,
             elevenlabs_api_key=None,
             deepgram_api_key=None,
+            cartesia_api_key=None,
             vad_threshold=0.5,
             endpoint_silence_ms=500,
             duplex_mode="sideways",

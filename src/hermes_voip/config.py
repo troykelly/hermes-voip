@@ -86,18 +86,30 @@ _INDEX_RE = re.compile(r"[0-9]+")
 _STT_PROVIDER_KEY = "HERMES_VOIP_STT_PROVIDER"
 _STT_MODEL_DIR_KEY = "HERMES_VOIP_STT_MODEL_DIR"
 _DEFAULT_STT_PROVIDER = "sherpa-onnx"
+_STT_PROVIDERS = frozenset({"sherpa-onnx", "deepgram"})
 
 # TTS (ADR-0007 §"Configuration surface").
 _TTS_PROVIDER_KEY = "HERMES_VOIP_TTS_PROVIDER"
 _TTS_MODEL_KEY = "HERMES_VOIP_TTS_MODEL"
 _TTS_VOICE_KEY = "HERMES_VOIP_TTS_VOICE"
 _DEFAULT_TTS_PROVIDER = "sherpa-kokoro"
+_TTS_PROVIDERS = frozenset(
+    {"sherpa-kokoro", "piper", "kittentts", "kyutai", "cartesia", "aura2", "elevenlabs"}
+)
 
 # Cloud credentials, consumed by the cloud providers when selected. These are
 # the env-var *names* (not secrets); the values are read by reference only and
 # never logged (see MediaConfig repr-suppressed fields).
 _ELEVENLABS_API_KEY = "ELEVENLABS_API_KEY"
 _DEEPGRAM_API_KEY = "DEEPGRAM_API_KEY"
+_CARTESIA_API_KEY = "HERMES_VOIP_CARTESIA_API_KEY"
+# A selected cloud provider must have its key set (fail-fast, ADR-0006/0007).
+_STT_REQUIRED_KEY = {"deepgram": _DEEPGRAM_API_KEY}
+_TTS_REQUIRED_KEY = {
+    "elevenlabs": _ELEVENLABS_API_KEY,
+    "cartesia": _CARTESIA_API_KEY,
+    "aura2": _DEEPGRAM_API_KEY,
+}
 
 # VAD / endpointing / duplex (ADR-0008). Full-duplex barge-in is a deferred
 # Phase-2 design; the enum still accepts the token so config can opt in once the
@@ -117,6 +129,7 @@ _MAX_VAD_THRESHOLD = 1.0
 _INJECTION_GUARD_KEY = "HERMES_VOIP_INJECTION_GUARD"
 _INJECTION_GUARD_MODEL_DIR_KEY = "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR"
 _DEFAULT_INJECTION_GUARD = "onnx"
+_INJECTION_GUARDS = frozenset({"onnx", "sidecar"})
 
 # DTMF (ADR-0010). Default `auto` negotiates RFC 4733 and falls back per offer.
 _DTMF_MODE_KEY = "HERMES_SIP_DTMF_MODE"
@@ -273,6 +286,7 @@ class MediaConfig:
     tts_voice: str | None
     elevenlabs_api_key: str | None = field(repr=False)
     deepgram_api_key: str | None = field(repr=False)
+    cartesia_api_key: str | None = field(repr=False)
     vad_threshold: float
     endpoint_silence_ms: int
     duplex_mode: str
@@ -317,6 +331,39 @@ class MediaConfig:
             allowed = ", ".join(sorted(_DTMF_MODES))
             msg = f"dtmf_mode must be one of {{{allowed}}}, got {self.dtmf_mode!r}"
             raise ConfigError(msg)
+        _require_enum("stt_provider", self.stt_provider, _STT_PROVIDERS)
+        _require_enum("tts_provider", self.tts_provider, _TTS_PROVIDERS)
+        _require_enum("injection_guard", self.injection_guard, _INJECTION_GUARDS)
+        self._require_cloud_keys()
+
+    def _require_cloud_keys(self) -> None:
+        """A selected cloud provider must have its credential set (fail-fast)."""
+        if (
+            key := _STT_REQUIRED_KEY.get(self.stt_provider)
+        ) and not self.deepgram_api_key:
+            msg = f"stt_provider {self.stt_provider!r} requires {key} to be set"
+            raise ConfigError(msg)
+        tts_key_env = _TTS_REQUIRED_KEY.get(self.tts_provider)
+        if tts_key_env is not None:
+            held = {
+                _ELEVENLABS_API_KEY: self.elevenlabs_api_key,
+                _CARTESIA_API_KEY: self.cartesia_api_key,
+                _DEEPGRAM_API_KEY: self.deepgram_api_key,
+            }[tts_key_env]
+            if not held:
+                msg = (
+                    f"tts_provider {self.tts_provider!r} requires "
+                    f"{tts_key_env} to be set"
+                )
+                raise ConfigError(msg)
+
+
+def _require_enum(name: str, value: str, allowed: frozenset[str]) -> None:
+    """Raise ConfigError unless ``value`` is one of ``allowed`` (fail-fast)."""
+    if value not in allowed:
+        opts = ", ".join(sorted(allowed))
+        msg = f"{name} must be one of {{{opts}}}, got {value!r}"
+        raise ConfigError(msg)
 
 
 def load_media_config(env: Mapping[str, str]) -> MediaConfig:
@@ -339,6 +386,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         tts_voice=_optional(env, _TTS_VOICE_KEY),
         elevenlabs_api_key=_optional(env, _ELEVENLABS_API_KEY),
         deepgram_api_key=_optional(env, _DEEPGRAM_API_KEY),
+        cartesia_api_key=_optional(env, _CARTESIA_API_KEY),
         vad_threshold=_parse_vad_threshold(env),
         endpoint_silence_ms=_parse_positive_int(
             env, _ENDPOINT_SILENCE_MS_KEY, _DEFAULT_ENDPOINT_SILENCE_MS

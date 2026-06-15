@@ -58,7 +58,7 @@ class _FakeCtx:
 
 
 def test_register_calls_register_platform_once() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -66,7 +66,7 @@ def test_register_calls_register_platform_once() -> None:
 
 
 def test_register_uses_name_voip() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -75,7 +75,7 @@ def test_register_uses_name_voip() -> None:
 
 def test_register_supplies_all_required_params() -> None:
     """register_platform must supply name, label, adapter_factory, check_fn."""
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -86,7 +86,7 @@ def test_register_supplies_all_required_params() -> None:
 
 
 def test_register_required_env_includes_hermes_sip_host() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -97,7 +97,7 @@ def test_register_required_env_includes_hermes_sip_host() -> None:
 
 
 def test_register_adapter_factory_is_callable() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -106,7 +106,7 @@ def test_register_adapter_factory_is_callable() -> None:
 
 
 def test_register_check_fn_is_callable() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -115,7 +115,7 @@ def test_register_check_fn_is_callable() -> None:
 
 
 def test_register_validate_config_is_callable_or_none() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
@@ -124,42 +124,28 @@ def test_register_validate_config_is_callable_or_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (b) validate_config raises ConfigError on missing HERMES_SIP_HOST
+# (b) validate_config: Hermes PlatformRegistry.create_adapter() treats a falsey
+#     return as FAILURE, so success MUST return a truthy value (not None), and a
+#     missing/invalid config must be falsey (raising ConfigError is caught by the
+#     registry and treated as falsey too).
 # ---------------------------------------------------------------------------
 
 
-def test_validate_config_callback_raises_on_missing_host() -> None:
-    """The validate_config callback registered with ctx must raise ConfigError."""
-    from hermes_voip.adapter import register  # noqa: PLC0415
+def test_validate_config_callback_truthy_on_valid_config() -> None:
+    """The registered validate_config callback MUST return truthy on success.
+
+    Hermes 0.16.0 ``PlatformRegistry.create_adapter`` aborts adapter creation
+    when ``validate_config(config)`` is falsey — returning ``None`` (the previous
+    behaviour) silently disables the platform even for a valid config.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
     validate_raw = ctx.calls[0]["validate_config"]
-    if validate_raw is None:
-        pytest.skip("validate_config not supplied")
-
+    assert validate_raw is not None, "validate_config must be supplied"
     assert callable(validate_raw)
-    validate: Callable[[object], None] = validate_raw
-
-    # A config with no HERMES_SIP_HOST
-    fake_config = MagicMock()
-    fake_config.extra = {}
-    with pytest.raises(ConfigError):
-        validate(fake_config)
-
-
-def test_validate_config_callback_passes_with_host() -> None:
-
-    from hermes_voip.adapter import register  # noqa: PLC0415
-
-    ctx = _FakeCtx()
-    register(ctx)
-    validate_raw = ctx.calls[0]["validate_config"]
-    if validate_raw is None:
-        pytest.skip("validate_config not supplied")
-
-    assert callable(validate_raw)
-    validate: Callable[[object], None] = validate_raw
+    validate: Callable[[object], bool] = validate_raw
 
     fake_config = MagicMock()
     fake_config.extra = {
@@ -167,7 +153,30 @@ def test_validate_config_callback_passes_with_host() -> None:
         "HERMES_SIP_EXTENSION": "1000",
         "HERMES_SIP_PASSWORD": "fake",
     }
-    validate(fake_config)  # must not raise
+    result = validate(fake_config)
+    assert result is True, "validate_config(valid) must return True, not None/falsey"
+
+
+def test_validate_config_callback_falsey_on_missing_host() -> None:
+    """A config with no HERMES_SIP_HOST must be rejected (raise ConfigError).
+
+    The registry catches the raise and treats it as falsey, so either a falsey
+    return or a ``ConfigError`` is a correct rejection; we assert the explicit
+    ``ConfigError`` the validator raises.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    validate_raw = ctx.calls[0]["validate_config"]
+    assert validate_raw is not None
+    assert callable(validate_raw)
+    validate: Callable[[object], bool] = validate_raw
+
+    fake_config = MagicMock()
+    fake_config.extra = {}
+    with pytest.raises(ConfigError):
+        validate(fake_config)
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +185,13 @@ def test_validate_config_callback_passes_with_host() -> None:
 
 
 def test_register_install_hint_is_non_empty() -> None:
-    from hermes_voip.adapter import register  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
     hint = ctx.calls[0]["install_hint"]
     assert isinstance(hint, str)
+    assert hint  # non-empty
 
 
 # ---------------------------------------------------------------------------

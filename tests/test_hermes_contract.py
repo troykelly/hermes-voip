@@ -87,3 +87,80 @@ def test_runtime_value_types_are_exported() -> None:
     assert hasattr(base.MessageType, "VOICE")  # the inbound voice-turn type we emit
     for name in ("Platform", "PlatformConfig"):
         assert hasattr(config, name), f"gateway.config.{name} missing"
+
+
+# ---------------------------------------------------------------------------
+# The VoipAdapter must work against the REAL base — these are the checks the
+# unit tests (which used fakes) could not make. They run only with the hermes
+# extra installed; the dedicated CI job makes a missing surface a hard failure.
+# ---------------------------------------------------------------------------
+
+
+def test_voip_adapter_is_real_base_platform_adapter_subclass() -> None:
+    """VoipAdapter must subclass the real ``BasePlatformAdapter`` at runtime.
+
+    The gateway relies on ``isinstance(adapter, BasePlatformAdapter)`` for
+    handle_message/build_source/set_message_handler/send-retry wiring; a duck
+    type that merely has the four methods does not get any of that.
+    """
+    base = _hermes("gateway.platforms.base")
+    _hermes("gateway.config")  # ensure the optional runtime is importable
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    assert issubclass(VoipAdapter, base.BasePlatformAdapter)
+
+
+def test_validate_voip_config_is_truthy_on_valid_config() -> None:
+    """``validate_voip_config`` must return truthy for a valid config.
+
+    ``PlatformRegistry.create_adapter`` treats a falsey return as a validation
+    failure and refuses to build the adapter.
+    """
+    config_mod = _hermes("gateway.config")
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    cfg = config_mod.PlatformConfig(
+        enabled=True,
+        extra={
+            "HERMES_SIP_HOST": "pbx.example.test",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "fake",
+        },
+    )
+    assert validate_voip_config(cfg) is True
+
+
+def test_platform_registry_create_adapter_builds_voip_adapter() -> None:
+    """The real ``PlatformRegistry.create_adapter`` path must produce an adapter.
+
+    This exercises the exact gateway flow: ``register(ctx)`` registers the
+    platform, then ``create_adapter("voip", config)`` runs check_fn +
+    validate_config + the factory and must return a live ``VoipAdapter``.
+    """
+    base = _hermes("gateway.platforms.base")
+    config_mod = _hermes("gateway.config")
+    registry_mod = _hermes("gateway.platform_registry")
+    plugins_mod = _hermes("hermes_cli.plugins")
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    # A minimal PluginContext-like ctx is the real one; build it from a manifest.
+    manifest = plugins_mod.PluginManifest(name="hermes-voip", source="entrypoint")
+    manager = plugins_mod.PluginManager()
+    ctx = plugins_mod.PluginContext(manifest, manager)
+    register(ctx)
+
+    assert registry_mod.platform_registry.is_registered("voip")
+
+    cfg = config_mod.PlatformConfig(
+        enabled=True,
+        extra={
+            "HERMES_SIP_HOST": "pbx.example.test",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "fake",
+        },
+    )
+    adapter = registry_mod.platform_registry.create_adapter("voip", cfg)
+    assert adapter is not None, "create_adapter returned None for a valid config"
+    assert isinstance(adapter, base.BasePlatformAdapter)
+    assert isinstance(adapter, VoipAdapter)

@@ -119,7 +119,7 @@ known-first-party = ["hermes_voip"]
 "tests/**" = [
   "S101", "D101", "D102", "D103", "D105", "D106", "D107",
   "S105", "S106", "S107", "PLR2004",
-  "ARG001", "ARG002",  # fakes implement Protocols; matching unused params are intentional
+  "ARG001", "ARG002", "ARG005",  # fakes/lambdas mirror real signatures; matching unused params are intentional
 ]
 
 # ---------------------------------------------------------------------------

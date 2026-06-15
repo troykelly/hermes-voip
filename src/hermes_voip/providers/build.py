@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from hermes_voip.config import ConfigError, MediaConfig
 from hermes_voip.manifest import (
@@ -196,19 +197,25 @@ def _make_onnx_guard(config: MediaConfig) -> InjectionGuard:
 # the unknown-provider ValueError from dispatch, which is correct fail-fast.
 # ---------------------------------------------------------------------------
 
-DEFAULT_ASR_FACTORIES: Mapping[str, AsrFactory] = {
-    "sherpa-onnx": _make_sherpa_onnx_asr,
-    "deepgram": _make_deepgram_asr,
-}
+DEFAULT_ASR_FACTORIES: Mapping[str, AsrFactory] = MappingProxyType(
+    {
+        "sherpa-onnx": _make_sherpa_onnx_asr,
+        "deepgram": _make_deepgram_asr,
+    }
+)
 
-DEFAULT_TTS_FACTORIES: Mapping[str, TtsFactory] = {
-    "sherpa-kokoro": _make_sherpa_kokoro_tts,
-    "elevenlabs": _make_elevenlabs_tts,
-}
+DEFAULT_TTS_FACTORIES: Mapping[str, TtsFactory] = MappingProxyType(
+    {
+        "sherpa-kokoro": _make_sherpa_kokoro_tts,
+        "elevenlabs": _make_elevenlabs_tts,
+    }
+)
 
-DEFAULT_GUARD_FACTORIES: Mapping[str, GuardFactory] = {
-    "onnx": _make_onnx_guard,
-}
+DEFAULT_GUARD_FACTORIES: Mapping[str, GuardFactory] = MappingProxyType(
+    {
+        "onnx": _make_onnx_guard,
+    }
+)
 
 
 # ---------------------------------------------------------------------------

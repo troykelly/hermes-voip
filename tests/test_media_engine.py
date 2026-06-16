@@ -23,8 +23,10 @@ import asyncio
 import base64
 import contextlib
 import gc
+import logging
 import socket
 import warnings
+from collections.abc import Iterator
 
 import pytest
 
@@ -40,6 +42,11 @@ from hermes_voip.rtp import RtpPacket
 
 _FAKE_SSRC = 0xDEADBEEF
 _FAKE_KEY_B64 = base64.b64encode(b"\xab" * 16 + b"\xcd" * 14).decode()
+
+# A stand-in UDP source address for white-box injections into the engine's recv
+# queue (which carries (datagram, source-addr) pairs so the engine can latch its
+# outbound destination onto the peer's real media source — symmetric RTP).
+_FAKE_SRC: tuple[str, int] = ("198.51.100.7", 6000)
 
 # 20 ms of silence at 8 kHz = 160 samples = 320 bytes PCM16.
 _PTIME_MS = 20
@@ -261,10 +268,18 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
     # seq 0 arrives, then seq 1 is MISSING, then seqs 2, 3, 4 arrive.
     # After seq 4 is pushed (3 packets behind the gap at seq 1), the buffer
     # declares Lost(1) and yields 2, 3, 4 in sequence order.
-    engine._recv_queue.put_nowait(_make_rtp(0, 0 * _SAMPLES_PER_FRAME, payload))
-    engine._recv_queue.put_nowait(_make_rtp(2, 2 * _SAMPLES_PER_FRAME, payload))
-    engine._recv_queue.put_nowait(_make_rtp(3, 3 * _SAMPLES_PER_FRAME, payload))
-    engine._recv_queue.put_nowait(_make_rtp(4, 4 * _SAMPLES_PER_FRAME, payload))
+    engine._recv_queue.put_nowait(
+        (_make_rtp(0, 0 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
+    )
+    engine._recv_queue.put_nowait(
+        (_make_rtp(2, 2 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
+    )
+    engine._recv_queue.put_nowait(
+        (_make_rtp(3, 3 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
+    )
+    engine._recv_queue.put_nowait(
+        (_make_rtp(4, 4 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
+    )
 
     await asyncio.wait_for(done.wait(), timeout=2.0)
     await asyncio.wait_for(task, timeout=2.0)
@@ -722,7 +737,7 @@ async def test_stop_wakes_inbound_when_queue_full() -> None:
     capacity = engine._recv_queue.maxsize
     bad = b"\x00\x00\x00\x00"  # < 12 bytes: RtpPacket.parse raises ValueError
     for _ in range(capacity):
-        engine._recv_queue.put_nowait(bad)
+        engine._recv_queue.put_nowait((bad, _FAKE_SRC))
     assert engine._recv_queue.full()
 
     async def _drain() -> int:
@@ -840,7 +855,7 @@ async def test_inbound_propagates_non_srtp_error() -> None:
     await asyncio.sleep(0)
 
     # A datagram arrives; unprotect raises RuntimeError → must propagate.
-    engine._recv_queue.put_nowait(_make_rtp(0, 0, _ulaw_silence()))
+    engine._recv_queue.put_nowait((_make_rtp(0, 0, _ulaw_silence()), _FAKE_SRC))
 
     with pytest.raises(RuntimeError, match="misconfigured"):
         await asyncio.wait_for(task, timeout=2.0)
@@ -882,20 +897,26 @@ async def test_stop_tie_does_not_lose_dequeued_datagram() -> None:
     assert engine._recv_queue.qsize() == 0
 
     # Park _next_datagram in its internal asyncio.wait on an EMPTY queue.
-    nd_task: asyncio.Task[bytes | None] = asyncio.create_task(engine._next_datagram())
+    nd_task: asyncio.Task[tuple[bytes, tuple[str, int]] | None] = asyncio.create_task(
+        engine._next_datagram()
+    )
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    # Same loop step: a datagram arrives AND stop is signalled → a tie.
-    tie_datagram = _make_rtp(7, 7 * _SAMPLES_PER_FRAME, _ulaw_silence())
-    engine._recv_queue.put_nowait(tie_datagram)
+    # Same loop step: a datagram arrives AND stop is signalled → a tie.  The
+    # recv queue carries (datagram, source-addr) pairs.
+    tie_item: tuple[bytes, tuple[str, int]] = (
+        _make_rtp(7, 7 * _SAMPLES_PER_FRAME, _ulaw_silence()),
+        _FAKE_SRC,
+    )
+    engine._recv_queue.put_nowait(tie_item)
     engine._stop_event.set()
 
     # Stop wins the tie → returns None, but the dequeued datagram is preserved.
     result = await asyncio.wait_for(nd_task, timeout=2.0)
     assert result is None
-    parked: bytes | None = engine._pending
-    assert parked == tie_datagram
+    parked: tuple[bytes, tuple[str, int]] | None = engine._pending
+    assert parked == tie_item
     # The datagram was taken off the queue (dequeued), not left/duplicated.
     assert engine._recv_queue.qsize() == 0
 
@@ -904,13 +925,13 @@ async def test_stop_tie_does_not_lose_dequeued_datagram() -> None:
     # (a re-queue under a full queue would have lost it).
     capacity = engine._recv_queue.maxsize
     for _ in range(capacity):
-        engine._recv_queue.put_nowait(b"\x00\x00\x00\x00")
+        engine._recv_queue.put_nowait((b"\x00\x00\x00\x00", _FAKE_SRC))
     assert engine._recv_queue.full()
 
     engine._stop_event.clear()  # simulate the engine being reused after stop
     nxt = await asyncio.wait_for(engine._next_datagram(), timeout=2.0)
-    assert nxt == tie_datagram  # the rolled-back datagram, delivered losslessly
-    cleared: bytes | None = engine._pending
+    assert nxt == tie_item  # the rolled-back datagram, delivered losslessly
+    cleared: tuple[bytes, tuple[str, int]] | None = engine._pending
     assert cleared is None  # slot cleared after delivery
 
     await engine.stop()
@@ -965,3 +986,364 @@ async def test_stop_recv_race_leaks_no_pending_task() -> None:
         # Force finalisation of any orphaned task object; a pending one would
         # emit a RuntimeWarning, which is promoted to an error here.
         gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# (o) Symmetric-RTP (comedia) latching for NAT traversal
+#
+# When either side is behind NAT the SDP c=/m= address can be a private or
+# rewritten address the peer's media never actually originates from.  The engine
+# must latch its outbound destination onto the ACTUAL UDP source of the first
+# VALID inbound RTP packet, so we send to wherever the peer's media really comes
+# from — not blindly to the negotiated SDP address.
+# ---------------------------------------------------------------------------
+
+# An SDP-negotiated remote that is deliberately UNREACHABLE / wrong, standing in
+# for a private or SBC-rewritten address the peer's media never comes from.
+_SDP_REMOTE_ADDR = "203.0.113.1"  # TEST-NET-3 (RFC 5737); never a real source
+_SDP_REMOTE_PORT = 40000
+
+
+class _SendRecorder(asyncio.DatagramTransport):
+    """A DatagramTransport stand-in that records every ``sendto`` destination.
+
+    Installed onto ``engine._transport`` AFTER ``connect()`` so we can observe
+    exactly where ``send_audio`` aims each datagram without parsing the wire on a
+    capture socket.  It owns no socket: inbound delivery still runs through the
+    real socket the event loop already registered in ``connect()`` (the loop
+    calls the original protocol's ``datagram_received`` directly, independent of
+    this object), so replacing only the engine's outbound handle leaves the
+    receive path intact.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[tuple[bytes, tuple[str, int]]] = []
+
+    def sendto(self, data: bytes, addr: tuple[str, int] | None = None) -> None:  # type: ignore[override]  # narrower addr type than the stdlib stub; we only ever pass (host, port)
+        assert addr is not None  # the engine always sends to an explicit address
+        self.sent.append((bytes(data), addr))
+
+    def close(self) -> None:
+        """No-op: this stand-in owns no socket (the real one is closed by stop)."""
+
+    def is_closing(self) -> bool:
+        """Never closing — the engine may probe this during teardown."""
+        return False
+
+
+@contextlib.contextmanager
+def _capture_sends(engine: RtpMediaTransport) -> Iterator[_SendRecorder]:
+    """Temporarily intercept the engine's outbound ``sendto`` destinations.
+
+    Swaps in a :class:`_SendRecorder` for the duration of the block and restores
+    the real DatagramTransport afterwards, so the engine's own ``stop()`` closes
+    the real socket cleanly (no leak) and we still observe exactly where each
+    ``send_audio`` aimed.
+    """
+    real = engine._transport
+    recorder = _SendRecorder()
+    engine._transport = recorder
+    try:
+        yield recorder
+    finally:
+        engine._transport = real
+
+
+async def _drain_one_frame(engine: RtpMediaTransport) -> None:
+    """Consume exactly one inbound frame so the engine processes a datagram."""
+
+    async def _one() -> None:
+        async for _frame in engine.inbound_audio():
+            return
+
+    task: asyncio.Task[None] = asyncio.create_task(_one())
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+async def _no_sleep(_secs: float) -> None:
+    """A no-op pacing sleep for deterministic outbound tests."""
+
+
+def _latching_engine(*, symmetric: bool = True) -> RtpMediaTransport:
+    """An engine whose SDP remote is the deliberately-wrong _SDP_REMOTE_*."""
+    return RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address=_SDP_REMOTE_ADDR,
+        remote_port=_SDP_REMOTE_PORT,
+        codec=Codec.PCMU,
+        symmetric=symmetric,
+        clock=_dummy_clock,
+        sleep=_no_sleep,
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_outbound_before_any_inbound_uses_sdp_address() -> None:
+    """The greeting (first send, before any inbound) targets the SDP address.
+
+    This is the critical "send first" path (PR #52): nothing has arrived yet, so
+    the engine must aim at the negotiated SDP remote so the greeting goes out and
+    a comedia gateway can latch onto US.
+    """
+    engine = _latching_engine()
+    await engine.connect()
+
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+
+    assert recorder.sent, "the first send must transmit a datagram"
+    _wire, dest = recorder.sent[-1]
+    assert dest == (_SDP_REMOTE_ADDR, _SDP_REMOTE_PORT)
+
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_latches_onto_first_valid_inbound_rtp_source() -> None:
+    """After a valid inbound RTP packet, send_audio targets its UDP source.
+
+    The peer's real media comes from ``peer_sock``'s ``(127.0.0.1, port)`` — a
+    different tuple than the (wrong) SDP remote.  After the engine receives one
+    valid RTP packet from there, the NEXT send must go to that real source, not
+    the SDP address.
+    """
+    peer_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer_sock.bind(("127.0.0.1", 0))
+    peer_addr = peer_sock.getsockname()  # the ACTUAL media source tuple
+
+    engine = _latching_engine()
+    await engine.connect()
+    engine_port = engine.local_port
+
+    # A valid inbound RTP packet arrives from the peer's real source tuple.
+    peer_sock.sendto(_make_rtp(0, 0, _ulaw_silence()), ("127.0.0.1", engine_port))
+    await _drain_one_frame(engine)
+
+    # Now record outbound and send — it must target the latched real source.
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+
+    assert recorder.sent, "send_audio must transmit after latching"
+    _wire, dest = recorder.sent[-1]
+    assert dest == (peer_addr[0], peer_addr[1])
+    assert dest != (_SDP_REMOTE_ADDR, _SDP_REMOTE_PORT)
+
+    peer_sock.close()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_garbage_datagram_does_not_cause_a_latch() -> None:
+    """A non-RTP / garbage datagram must NOT latch (anti-spoofing).
+
+    Only a datagram that parses as RTP triggers a latch; random noise from an
+    attacker's tuple must be ignored so it cannot hijack our outbound media.
+    """
+    attacker_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    attacker_sock.bind(("127.0.0.1", 0))
+
+    engine = _latching_engine()
+    await engine.connect()
+    engine_port = engine.local_port
+
+    # Garbage (too short to be a 12-byte RTP header) from the attacker's tuple,
+    # then a VALID RTP packet from the same tuple so the consumer yields a frame
+    # and we know the garbage was processed-and-rejected (not merely pending).
+    attacker_sock.sendto(b"\x00\x01\x02\x03", ("127.0.0.1", engine_port))
+    await asyncio.sleep(0)
+    attacker_sock.sendto(_make_rtp(0, 0, _ulaw_silence()), ("127.0.0.1", engine_port))
+
+    # Drain a frame: the garbage is dropped on parse, the valid packet decodes.
+    await _drain_one_frame(engine)
+
+    # The valid RTP from the SAME tuple WILL latch — that is correct.  To isolate
+    # the garbage behaviour we instead assert the latch target is the valid
+    # packet's source, proving the garbage alone did not pre-latch a wrong value.
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+    _wire, dest = recorder.sent[-1]
+    assert dest == attacker_sock.getsockname()  # latched by the VALID packet
+
+    attacker_sock.close()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_garbage_only_keeps_sdp_address() -> None:
+    """Garbage with no following valid RTP must leave the SDP address in place.
+
+    A pure stream of non-RTP datagrams must never latch — send_audio keeps
+    targeting the SDP remote.
+    """
+    attacker_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    attacker_sock.bind(("127.0.0.1", 0))
+
+    engine = _latching_engine()
+    await engine.connect()
+    engine_port = engine.local_port
+
+    # A pure stream of garbage from the attacker's tuple — no valid RTP follows.
+    for _ in range(3):
+        attacker_sock.sendto(b"\x00\x01\x02\x03", ("127.0.0.1", engine_port))
+
+    async def _drain_until_empty() -> None:
+        async for _frame in engine.inbound_audio():
+            pass  # never yields — garbage drops on parse
+
+    task: asyncio.Task[None] = asyncio.create_task(_drain_until_empty())
+    await asyncio.sleep(0.05)  # let the garbage be dequeued and dropped
+
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+    _wire, dest = recorder.sent[-1]
+    assert dest == (_SDP_REMOTE_ADDR, _SDP_REMOTE_PORT)  # never latched
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    attacker_sock.close()
+
+
+@pytest.mark.asyncio
+async def test_off_codec_payload_type_does_not_trigger_a_latch() -> None:
+    """A well-formed RTP packet with a NON-negotiated payload type must not latch.
+
+    Anti-spoofing tightening: parsing as RTP is necessary but not sufficient — the
+    packet must carry the negotiated audio payload type (here PCMU = 0).  A
+    spec-legal but off-codec packet (e.g. an RFC 4733 telephone-event, PT 101, or
+    comfort noise, PT 13) arriving before any audio — possibly from an attacker's
+    tuple — must NOT move the outbound target.  The engine codec is PCMU, so a
+    PT-101 packet from the attacker is delivered and processed but must leave the
+    SDP address in place and ``_latched`` False.
+    """
+    attacker_addr: tuple[str, int] = ("192.0.2.66", 7777)  # TEST-NET-1
+
+    engine = _latching_engine()
+    await engine.connect()
+
+    off_codec = RtpPacket(
+        payload_type=101,  # telephone-event PT — not the negotiated PCMU (0)
+        sequence_number=0,
+        timestamp=0,
+        ssrc=_FAKE_SSRC,
+        payload=b"\x00\x00\x00\x00",
+    ).pack()
+    engine._recv_queue.put_nowait((off_codec, attacker_addr))
+
+    async def _drain_until_empty() -> None:
+        async for _frame in engine.inbound_audio():
+            pass
+
+    task: asyncio.Task[None] = asyncio.create_task(_drain_until_empty())
+    await asyncio.sleep(0.05)  # let the off-codec packet be dequeued + processed
+
+    assert engine._latched is False  # the off-codec packet did NOT latch
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+    _wire, dest = recorder.sent[-1]
+    assert dest == (_SDP_REMOTE_ADDR, _SDP_REMOTE_PORT)  # SDP address retained
+    assert dest != attacker_addr
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_latch_is_sticky_ignores_later_source_change() -> None:
+    """Latching happens ONCE: a later packet from a new source is ignored.
+
+    Default policy is latch-on-first-valid-RTP-and-stick.  A second valid packet
+    from a DIFFERENT tuple (a spoof or a re-INVITE'd media path) must not move
+    the outbound target.
+    """
+    peer_a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer_a.bind(("127.0.0.1", 0))
+    peer_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer_b.bind(("127.0.0.1", 0))
+
+    engine = _latching_engine()
+    await engine.connect()
+    engine_port = engine.local_port
+
+    peer_a.sendto(_make_rtp(0, 0, _ulaw_silence()), ("127.0.0.1", engine_port))
+    await _drain_one_frame(engine)
+    peer_b.sendto(
+        _make_rtp(1, _SAMPLES_PER_FRAME, _ulaw_silence()),
+        ("127.0.0.1", engine_port),
+    )
+    await _drain_one_frame(engine)
+
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+    _wire, dest = recorder.sent[-1]
+    assert dest == peer_a.getsockname()  # stuck on the FIRST source
+    assert dest != peer_b.getsockname()
+
+    peer_a.close()
+    peer_b.close()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_symmetric_false_disables_latching() -> None:
+    """With symmetric=False the engine always uses the SDP address.
+
+    Even after a valid inbound packet from a different source, send_audio keeps
+    targeting the negotiated SDP remote (the opt-out for gateways that honour the
+    SDP address literally).
+    """
+    peer_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer_sock.bind(("127.0.0.1", 0))
+
+    engine = _latching_engine(symmetric=False)
+    await engine.connect()
+    engine_port = engine.local_port
+
+    peer_sock.sendto(_make_rtp(0, 0, _ulaw_silence()), ("127.0.0.1", engine_port))
+    await _drain_one_frame(engine)
+
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+    _wire, dest = recorder.sent[-1]
+    assert dest == (_SDP_REMOTE_ADDR, _SDP_REMOTE_PORT)  # never latches
+    assert dest != peer_sock.getsockname()
+
+    peer_sock.close()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_latch_logs_peer_media_address(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Latching logs an operational ``rtp: latched to <ip>:<port>`` line.
+
+    The gateway's media ip:port is operational (not PII-sensitive); logging it is
+    how a live call is traced.  No other identifier is emitted.
+    """
+    peer_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer_sock.bind(("127.0.0.1", 0))
+    peer_addr = peer_sock.getsockname()
+
+    engine = _latching_engine()
+    await engine.connect()
+    engine_port = engine.local_port
+
+    peer_sock.sendto(_make_rtp(0, 0, _ulaw_silence()), ("127.0.0.1", engine_port))
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.engine"):
+        await _drain_one_frame(engine)
+
+    expected = f"rtp: latched to {peer_addr[0]}:{peer_addr[1]}"
+    assert any(expected in rec.getMessage() for rec in caplog.records), (
+        f"expected a latch log line {expected!r}, got "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+    peer_sock.close()
+    await engine.stop()

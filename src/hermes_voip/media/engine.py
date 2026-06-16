@@ -85,6 +85,13 @@ _OUTBOUND_SSRC: int = 0xCAFEBABE
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512
 
+# A received datagram paired with the UDP source address it arrived from. The
+# source address is what symmetric-RTP (comedia) latching needs: we send our
+# media back to wherever the peer's media ACTUALLY originates, not blindly to the
+# negotiated SDP c=/m= address (which may be a private or SBC-rewritten address
+# under NAT).
+type _Datagram = tuple[bytes, tuple[str, int]]
+
 
 class Codec(enum.Enum):
     """The G.711 codec variant for this media session."""
@@ -127,7 +134,7 @@ class _UdpReceiver(asyncio.DatagramProtocol):
     :meth:`RtpMediaTransport.inbound_audio`.
     """
 
-    def __init__(self, queue: asyncio.Queue[bytes]) -> None:
+    def __init__(self, queue: asyncio.Queue[_Datagram]) -> None:
         self._queue = queue
         self._transport: asyncio.BaseTransport | None = None
 
@@ -136,9 +143,13 @@ class _UdpReceiver(asyncio.DatagramProtocol):
         self._transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        """Place the datagram on the queue (non-blocking; drops on overflow)."""
+        """Queue the datagram with its source address (non-blocking; drop on overflow).
+
+        The source ``addr`` is preserved so the engine can latch its outbound
+        destination onto the peer's real media source (symmetric RTP / comedia).
+        """
         with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(data)
+            self._queue.put_nowait((data, addr))
         if self._queue.full():
             _log.debug("inbound queue full — datagram dropped from %s", addr)
 
@@ -198,6 +209,7 @@ class RtpMediaTransport:
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
         jitter_depth: int = 2,
+        symmetric: bool = True,
         clock: Callable[[], int] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -211,6 +223,7 @@ class RtpMediaTransport:
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
         self._jitter_depth = jitter_depth
+        self._symmetric = symmetric
         self._clock: Callable[[], int] = (
             clock if clock is not None else time.monotonic_ns
         )
@@ -225,9 +238,20 @@ class RtpMediaTransport:
         # Hold state.
         self.on_hold: bool = False
 
+        # Symmetric-RTP (comedia) latch state.  ``_outbound_addr`` is the actual
+        # destination send_audio aims at; it starts as the SDP-negotiated remote
+        # so the first outbound (the greeting) goes out immediately and a comedia
+        # gateway can latch onto us.  On the FIRST valid inbound RTP packet we
+        # latch it onto that packet's real UDP source (when symmetric is on) and
+        # never move it again — see :meth:`_maybe_latch`.
+        self._outbound_addr: tuple[str, int] = (remote_address, remote_port)
+        self._latched: bool = False
+
         # Socket / asyncio transport state (populated by connect()).
         self._transport: asyncio.DatagramTransport | None = None
-        self._recv_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+        self._recv_queue: asyncio.Queue[_Datagram] = asyncio.Queue(
+            maxsize=_QUEUE_MAXSIZE
+        )
         self._jitter: JitterBuffer = JitterBuffer(target_depth=jitter_depth)
 
         # Stop signal: set by stop(), selected on by the inbound generator so it
@@ -239,7 +263,7 @@ class RtpMediaTransport:
         # which a datagram had already been dequeued, that datagram is parked
         # here (never re-queued, so it cannot be lost to a full queue) and
         # returned first by the next _next_datagram() call.
-        self._pending: bytes | None = None
+        self._pending: _Datagram | None = None
 
     # ------------------------------------------------------------------
     # MediaTransport Protocol
@@ -263,6 +287,10 @@ class RtpMediaTransport:
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
         self._stop_event = asyncio.Event()
         self._pending = None
+        # Reset the latch so a reused engine re-latches on its next call: aim
+        # back at the SDP-negotiated remote until the first valid inbound packet.
+        self._outbound_addr = (self._remote_address, self._remote_port)
+        self._latched = False
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -303,10 +331,11 @@ class RtpMediaTransport:
         never swallowed (rule 37), so a caller timeout or cancel is honoured.
         """
         while True:
-            data = await self._next_datagram()
+            item = await self._next_datagram()
             # ``None`` ⇒ stop signalled; exit cleanly.
-            if data is None:
+            if item is None:
                 return
+            data, source = item
 
             rtp_pkt: RtpPacket
 
@@ -327,6 +356,11 @@ class RtpMediaTransport:
                     _log.debug("malformed RTP datagram — dropped: %s", exc)
                     continue
 
+            # The datagram is genuine RTP (it parsed / authenticated): this is
+            # the only point at which a comedia latch may fire (anti-spoofing —
+            # garbage that does not parse never reaches here).
+            self._maybe_latch(rtp_pkt, source)
+
             # Feed the jitter buffer.
             self._jitter.push(rtp_pkt)
 
@@ -343,7 +377,41 @@ class RtpMediaTransport:
                 frame = self._decode(output.payload, ts_ns)
                 yield frame
 
-    async def _next_datagram(self) -> bytes | None:
+    def _maybe_latch(self, packet: RtpPacket, source: tuple[str, int]) -> None:
+        """Latch the outbound destination onto the peer's real media source.
+
+        Symmetric-RTP (comedia) NAT traversal: the SDP ``c=``/``m=`` address can
+        be a private or SBC-rewritten address the peer's media never actually
+        comes from, so we send our RTP back to the source tuple of the peer's
+        first genuine RTP packet instead.
+
+        Anti-spoofing — three guards before we move the target:
+
+        * ``self._symmetric`` must be on (``HERMES_VOIP_RTP_SYMMETRIC``); when
+          off we always honour the SDP address.
+        * We latch only ONCE per call (``self._latched``): the first valid source
+          wins and a later packet from a different tuple (a spoof, or a re-routed
+          media path) cannot move it.
+        * The caller has already proven the datagram is genuine RTP (it parsed,
+          or — under SRTP — authenticated), and we additionally require the
+          negotiated audio payload type, so neither random noise that happens to
+          set the RTP version bits nor an off-codec stray triggers a latch.
+
+        Latching to a tuple we are already sending to is a silent no-op (no log).
+        """
+        if not self._symmetric or self._latched:
+            return
+        if packet.payload_type != self._codec.value:
+            return  # not the negotiated audio stream — not a latch trigger
+        self._latched = True
+        if source == self._outbound_addr:
+            return  # already aimed here (SDP address matched reality); nothing to do
+        self._outbound_addr = source
+        # The peer's media ip:port is operational, not PII — logging it is how a
+        # live NAT'd call is traced.  No other identifier is emitted.
+        _log.info("rtp: latched to %s:%d", source[0], source[1])
+
+    async def _next_datagram(self) -> _Datagram | None:
         """Await the next inbound datagram, or return ``None`` if stopped.
 
         Races :meth:`asyncio.Queue.get` against the stop flag so the consumer
@@ -376,7 +444,9 @@ class RtpMediaTransport:
         if self._stop_event.is_set():
             return None
 
-        get_task: asyncio.Task[bytes] = asyncio.ensure_future(self._recv_queue.get())
+        get_task: asyncio.Task[_Datagram] = asyncio.ensure_future(
+            self._recv_queue.get()
+        )
         stop_task: asyncio.Task[bool] = asyncio.ensure_future(self._stop_event.wait())
         try:
             await asyncio.wait(
@@ -439,7 +509,9 @@ class RtpMediaTransport:
         samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
         self._ts = (self._ts + samples_per_frame) % (1 << 32)
 
-        self._transport.sendto(wire, (self._remote_address, self._remote_port))
+        # Send to the latched peer source if symmetric-RTP has latched, else to
+        # the SDP-negotiated remote (the initial value of _outbound_addr).
+        self._transport.sendto(wire, self._outbound_addr)
 
         await self._sleep(self._ptime / 1000.0)
 

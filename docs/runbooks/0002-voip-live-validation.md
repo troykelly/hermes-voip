@@ -330,20 +330,26 @@ handler failure is logged at `ERROR` **with its traceback**. Read these first.
   private RTP address:** a public gateway cannot reach a private address unaided.
   This is a media-reachability concern beyond the loopback fix. Resolve in this
   order:
+  Two mechanisms work together (both shipped, both on by default); option 3 is
+  the fallback for gateways that route RTP strictly by the SDP address.
   1. **Outbound greeting on answer (shipped, on by default):** the plugin speaks
      the configured greeting (`HERMES_VOIP_GREETING`) the instant the call is
      answered, so we send RTP **first** — this opens the NAT pinhole and gives a
      symmetric-RTP gateway our source tuple to latch onto. Confirm the
-     `greeting: first RTP sent` INFO line appears. This is what makes the live
-     UCM6304-behind-NAT call work; set `HERMES_VOIP_GREETING=` (empty) to disable
-     it. It is **not sufficient alone** if the gateway honours the SDP address
-     literally (no comedia/symmetric-RTP) — then use option 2 or 3.
-  2. **Symmetric-RTP latching in the media engine (vendor-neutral, future):**
-     learn the peer's real source `(IP, port)` from the first inbound RTP packet
-     and send our RTP back to that tuple, ignoring a private/incorrect SDP
-     address. Survives NAT and SBC rewriting; a media-engine change, not
-     signalling. Not yet implemented — the greeting covers the common comedia
-     gateway; this hardens the case where the gateway does not auto-latch.
+     `greeting: first RTP sent` INFO line appears. Set `HERMES_VOIP_GREETING=`
+     (empty) to disable it.
+  2. **Symmetric-RTP (comedia) latching in the media engine (shipped, on by
+     default):** the engine learns the peer's real source `(IP, port)` from the
+     first **valid** inbound RTP packet and sends our RTP back to that tuple,
+     ignoring a private/incorrect SDP address. This is OUR half of comedia — it
+     makes two-way audio work even when the peer honours its own SDP literally
+     and that SDP is a private/SBC-rewritten address. Vendor-neutral; survives
+     NAT and SBC rewriting; a media-engine change, not signalling. Confirm the
+     `rtp: latched to <ip>:<port>` INFO line (the gateway's media address — log
+     it; it is operational, not PII). Anti-spoofing: only a datagram that parses
+     as RTP with the negotiated audio payload type triggers a latch, and the
+     latch fires once per call and then sticks. Set `HERMES_VOIP_RTP_SYMMETRIC=`
+     `false` to disable it and always honour the SDP address.
   3. **Correct public address in the SDP** (rport/STUN/configured external IP) is
      the alternative for gateways that honour the SDP address literally.
 

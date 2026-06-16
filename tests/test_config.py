@@ -413,6 +413,8 @@ def test_media_defaults_when_env_empty() -> None:
     # greeting (ADR-0002 NAT-latch): a non-empty friendly default
     assert cfg.greeting == DEFAULT_GREETING
     assert cfg.greeting != ""
+    # symmetric-RTP (comedia) latching is ON by default
+    assert cfg.rtp_symmetric is True
     # injection guard
     assert cfg.injection_guard == "onnx"
     assert cfg.injection_guard_model_dir is None
@@ -441,6 +443,7 @@ def test_media_full_override() -> None:
             "HERMES_SIP_DTMF_INTERDIGIT_MS": "120",
             "HERMES_SIP_DTMF_INBAND_ENABLED": "false",
             "HERMES_VOIP_GREETING": "Hi from the test gateway.",
+            "HERMES_VOIP_RTP_SYMMETRIC": "false",
         }
     )
     assert cfg.stt_provider == "deepgram"
@@ -459,6 +462,7 @@ def test_media_full_override() -> None:
     assert cfg.dtmf_interdigit_ms == 120
     assert cfg.dtmf_inband_enabled is False
     assert cfg.greeting == "Hi from the test gateway."
+    assert cfg.rtp_symmetric is False
 
 
 def test_media_greeting_explicit_empty_disables_greeting() -> None:
@@ -718,6 +722,7 @@ def test_media_config_validates_itself_on_direct_construction() -> None:
             endpoint_silence_ms=500,
             duplex_mode="half",
             greeting="",
+            rtp_symmetric=True,
             injection_guard="onnx",
             injection_guard_model_dir=None,
             dtmf_mode="auto",
@@ -741,6 +746,7 @@ def test_media_config_rejects_bad_enum_on_direct_construction() -> None:
             endpoint_silence_ms=500,
             duplex_mode="sideways",
             greeting="",
+            rtp_symmetric=True,
             injection_guard="onnx",
             injection_guard_model_dir=None,
             dtmf_mode="auto",

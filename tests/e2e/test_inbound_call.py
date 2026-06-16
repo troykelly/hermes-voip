@@ -39,7 +39,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -356,7 +356,7 @@ async def _real_adapter(
             "hermes_voip.adapter.load_silero_model",
             return_value=vad_model,
         ),
-        patch("hermes_voip.adapter._make_tls_context", return_value=None),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
         patch(
             "hermes_voip.adapter.SipOverTlsTransport",
             side_effect=_transport_factory,

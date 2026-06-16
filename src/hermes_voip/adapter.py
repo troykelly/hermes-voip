@@ -330,6 +330,11 @@ class VoipAdapter(BasePlatformAdapter):
         """Async body of _on_inbound_invite; wires the full call stack."""
         invite = new_call.invite
         call_id = invite.header("Call-ID") or ""
+        _log.info(
+            "INVITE received: Call-ID %s, registration ext %s",
+            call_id,
+            new_call.registration.extension,
+        )
         transport = self._transport
         if transport is None:
             _log.warning("INVITE %s arrived after transport closed — ignored", call_id)
@@ -346,8 +351,17 @@ class VoipAdapter(BasePlatformAdapter):
 
         audio = offer.audio
         if audio is None:
+            _log.warning("INVITE %s: SDP offer has no audio media — 488", call_id)
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
+        _log.info(
+            "INVITE %s: SDP offer — %s, remote RTP %s:%d, payload types %s",
+            call_id,
+            "RTP/SAVP (SRTP)" if audio.is_srtp else "RTP/AVP",
+            _effective_address(audio, offer),
+            audio.port,
+            ",".join(c.encoding for c in audio.codecs),
+        )
 
         try:
             agreed_sdp_codecs = negotiate_audio(audio, _SUPPORTED_ENCODINGS)
@@ -407,11 +421,27 @@ class VoipAdapter(BasePlatformAdapter):
             await engine.stop()
             return
 
+        _log.info(
+            "INVITE %s: SDP answer built — local RTP %s:%d, codecs %s",
+            call_id,
+            local_media.local_address,
+            local_media.port,
+            ",".join(c.encoding for c in agreed_sdp_codecs),
+        )
+
         # --- Send 200 OK with the SDP answer --------------------------------
+        # The To-tag is REQUIRED on a dialog-forming 2xx (RFC 3261 §12.1.1): it
+        # is our dialog local tag, and the peer echoes it on every in-dialog
+        # request (ACK/BYE/re-INVITE). Without it the gateway's ACK/BYE carry no
+        # To-tag and the manager routes them out-of-dialog — the call answers but
+        # never establishes a routable dialog (the live UCM6304 no-audio failure).
+        # It must match dialog.local_tag so the registered dialog_id matches the
+        # routed key.
         ok_response = build_response(
             invite,
             200,
             "OK",
+            to_tag=local_tag,
             extra_headers=(
                 ("Contact", local_contact),
                 ("Content-Type", "application/sdp"),
@@ -419,6 +449,7 @@ class VoipAdapter(BasePlatformAdapter):
             body=answer_sdp,
         )
         await transport.send(ok_response)
+        _log.info("INVITE %s: 200 OK sent (To-tag %s)", call_id, local_tag)
 
         # --- Register the call for in-dialog routing -----------------------
         # One GuardSessionState per call, shared between CallSession and CallLoop.
@@ -438,6 +469,11 @@ class VoipAdapter(BasePlatformAdapter):
         if self._manager is not None:
             self._manager.add_call(session.dialog_id, session)
         transport.add_call(call_id, session)
+        _log.info(
+            "INVITE %s: CallSession registered — dialog_id %s",
+            call_id,
+            session.dialog_id,
+        )
 
         # --- Extract caller info from the inbound INVITE -------------------
         remote_uri = invite.header("From") or ""
@@ -509,6 +545,7 @@ class VoipAdapter(BasePlatformAdapter):
             call_id=call_id,
         )
         self._call_loops[call_id] = call_loop
+        _log.info("INVITE %s: CallLoop started", call_id)
         await call_loop.run()
 
     async def _teardown_call(
@@ -576,13 +613,25 @@ class VoipAdapter(BasePlatformAdapter):
             _log.info("SIP-over-TLS connection closed cleanly")
 
     def _on_call_task_done(self, call_id: str, task: asyncio.Task[None]) -> None:
-        """Observe a finished call task; surface any unhandled exception."""
+        """Observe a finished call task; surface any unhandled exception.
+
+        ``_handle_inbound_invite`` runs as a fire-and-forget task, so without this
+        an exception it raises (SDP/media setup, CallSession wiring, the loop
+        itself) is silently lost — the live no-audio call showed zero handler
+        output on failure. The full traceback is logged (``exc_info`` carries the
+        exception), not just ``str(exc)``, so the next live call is diagnosable.
+        """
         self._call_tasks.pop(call_id, None)
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
-            _log.error("call %s ended with error: %s", call_id, exc)
+            _log.error(
+                "inbound call %s handler failed: %s",
+                call_id,
+                exc,
+                exc_info=exc,
+            )
 
 
 # ---------------------------------------------------------------------------

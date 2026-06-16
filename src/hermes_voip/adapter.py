@@ -69,26 +69,35 @@ from hermes_voip.config import (
     load_media_config,
 )
 from hermes_voip.dialog import Dialog
-from hermes_voip.digest import DigestCredentials
+from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.media.call_loop import CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import Codec, RtpMediaTransport
 from hermes_voip.media.vad import VoiceActivityDetector, load_silero_model
-from hermes_voip.message import build_response, new_tag
+from hermes_voip.message import (
+    SipRequest,
+    SipResponse,
+    build_request,
+    build_response,
+    new_branch,
+    new_tag,
+)
+from hermes_voip.originate import OutboundCallFailed, build_outbound_invite
 from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
     AudioMedia,
     SessionDescription,
     build_audio_answer,
+    build_audio_offer,
     negotiate_audio,
 )
 from hermes_voip.sdp import (
     Codec as SdpCodec,
 )
-from hermes_voip.transport.connection import SipOverTlsTransport
+from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
 
 if TYPE_CHECKING:
     from hermes_voip.media.srtp import SrtpSession
@@ -107,6 +116,21 @@ _PLATFORM_NAME = "voip"
 _RECONNECT_BACKOFF_INITIAL = 1.0  # first retry delay in seconds
 _RECONNECT_BACKOFF_CAP = 30.0  # maximum delay cap in seconds
 _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
+
+# HERMES_VOIP_CALL_ON_CONNECT: if set, the named extension is dialled once after
+# the first successful registration — useful for an AFK test or a scheduled call.
+# The flag prevents re-firing on reconnect (the flag is permanent once set).
+_CALL_ON_CONNECT_KEY = "HERMES_VOIP_CALL_ON_CONNECT"
+
+# Maximum time to wait for a final response to an outbound INVITE (seconds).
+# RFC 3261 §14.1: Timer B / Timer F = 64*T1 ≈ 32 s.
+_OUTBOUND_INVITE_TIMEOUT = 35.0
+
+# SIP status codes used in the outbound INVITE flow.
+_SIP_UNAUTHORIZED = 401
+_SIP_PROXY_AUTH = 407
+_SIP_FINAL_FLOOR = 200  # responses at or above this are final
+_SIP_ERROR_FLOOR = 300  # responses at or above this are errors
 
 
 def _make_tls_context(host: str) -> ssl.SSLContext:
@@ -134,6 +158,31 @@ def _srtp_from_audio(audio: AudioMedia, *, outbound: bool) -> SrtpSession | None
 
     # The first validated, supported crypto attribute wins (offer order).
     return SrtpSession(audio.crypto_attrs[0])
+
+
+class _QueueSink:
+    """Temporary :class:`CallResponseSink` for an outbound INVITE transaction.
+
+    Registered with the transport for a single outbound Call-ID so that
+    :meth:`VoipAdapter.place_call` can ``await`` the final response rather than
+    polling.  After the call is established (2xx + ACK) the sink is removed from
+    the transport and a :class:`CallSession` takes its place for in-dialog routing.
+    """
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[SipResponse] = asyncio.Queue()
+
+    async def on_response(self, response: SipResponse) -> None:
+        """Enqueue the response for the INVITE transaction awaiter."""
+        await self._queue.put(response)
+
+    async def get(self, *, timeout: float = _OUTBOUND_INVITE_TIMEOUT) -> SipResponse:
+        """Block until the next response arrives or ``timeout`` elapses.
+
+        Raises:
+            asyncio.TimeoutError: When no response arrives within ``timeout``.
+        """
+        return await asyncio.wait_for(self._queue.get(), timeout)
 
 
 class VoipAdapter(BasePlatformAdapter):
@@ -200,6 +249,18 @@ class VoipAdapter(BasePlatformAdapter):
         # a reconnect: {call_id → CallSession}
         self._call_sessions: dict[str, CallSession] = {}
 
+        # Outbound call state (ADR-0019).
+        # _call_on_connect_fired: True once the CALL_ON_CONNECT trigger has fired
+        # (set permanently after first connect to prevent re-triggering on reconnect).
+        self._call_on_connect_fired: bool = False
+        # _outbound_extensions: extensions with an active outbound call in progress
+        # (prevents a second concurrent outbound per extension).
+        self._outbound_extensions: set[str] = set()
+        # _extra: the raw env config dict stored from connect() so _establish()
+        # (called on reconnect too) can read CALL_ON_CONNECT without re-reading
+        # self.config.extra each time.
+        self._extra: Mapping[str, str] | None = None
+
     # -----------------------------------------------------------------------
     # BasePlatformAdapter abstract methods
     # -----------------------------------------------------------------------
@@ -217,6 +278,7 @@ class VoipAdapter(BasePlatformAdapter):
             decides whether to retry).
         """
         extra = self.config.extra
+        self._extra = extra
         gateway_cfg = load_gateway_config(extra)
         media_cfg = load_media_config(extra)
 
@@ -293,7 +355,31 @@ class VoipAdapter(BasePlatformAdapter):
             transport.add_call(call_id, session)
             manager.add_call(session.dialog_id, session)
 
-        return await manager.connect()
+        result = await manager.connect()
+
+        # CALL_ON_CONNECT: fire place_call once after the first successful
+        # registration (not on reconnects — the flag is permanent once set).
+        extra = self._extra
+        call_on_connect = extra.get(_CALL_ON_CONNECT_KEY) if extra is not None else None
+        if call_on_connect and not self._call_on_connect_fired and result:
+            self._call_on_connect_fired = True
+            target_ext = str(call_on_connect)
+
+            async def _call_on_connect_task() -> None:
+                try:
+                    await self.place_call(target_ext)
+                except Exception as exc:  # noqa: BLE001 — background trigger; log, don't crash connect()
+                    _log.warning(
+                        "CALL_ON_CONNECT: place_call(%r) failed: %s", target_ext, exc
+                    )
+
+            task: asyncio.Task[None] = asyncio.create_task(_call_on_connect_task())
+            self._call_tasks.setdefault(f"__con__{target_ext}", set()).add(task)
+            task.add_done_callback(
+                lambda t: self._on_call_task_done(f"__con__{target_ext}", t)
+            )
+
+        return result
 
     async def disconnect(self) -> None:
         """Cancel all call loops, close the manager and transport; idempotent."""
@@ -381,6 +467,364 @@ class VoipAdapter(BasePlatformAdapter):
             "remote_uri": info.get("remote_uri", ""),
             "ended": info.get("ended", False),
         }
+
+    # -----------------------------------------------------------------------
+    # Outbound call origination (ADR-0019)
+    # -----------------------------------------------------------------------
+
+    async def place_call(self, extension: str) -> str:
+        """Place an outbound SIP INVITE to ``extension`` (UAC, ADR-0019 Phase 1).
+
+        Drives the full UAC transaction: build an SDP offer, send INVITE, handle
+        a 407 Proxy Auth challenge (re-send with ``Proxy-Authorization``), accept
+        the 2xx answer, send ACK, wire the ``CallSession`` + ``CallLoop``, start
+        the loop as a tracked background task, and return the ``Call-ID`` once the
+        ``CallLoop`` is up.
+
+        Only one outbound call per extension is allowed concurrently. The
+        ``_outbound_extensions`` set guards against a second overlapping call;
+        ``OutboundCallFailed(503, …)`` is raised if the slot is busy.
+
+        Args:
+            extension: The SIP extension to call (e.g. ``"1001"``).
+
+        Returns:
+            The SIP ``Call-ID`` of the established call.
+
+        Raises:
+            OutboundCallFailed: When the INVITE receives a final non-2xx response,
+                when no registered extension is available, or when the slot is busy.
+            RuntimeError: When the transport or manager is not initialised.
+        """
+        if extension in self._outbound_extensions:
+            raise OutboundCallFailed(
+                503, f"outbound call to {extension!r} already in progress"
+            )
+        self._outbound_extensions.add(extension)
+        try:
+            return await self._handle_outbound_invite(extension)
+        finally:
+            self._outbound_extensions.discard(extension)
+
+    async def _handle_outbound_invite(  # noqa: PLR0912,PLR0915 — UAC flow: sequential INVITE/challenge/2xx/ACK/loop steps; extraction would only shift the complexity elsewhere
+        self,
+        extension: str,
+    ) -> str:
+        """Async body of :meth:`place_call`; drives the full outbound UAC flow."""
+        transport = self._transport
+        manager = self._manager
+        if transport is None or manager is None:
+            msg = "place_call: not initialised — call connect() first"
+            raise RuntimeError(msg)
+
+        media_cfg = self._media_cfg
+        if media_cfg is None:
+            msg = "place_call: media config not initialised"
+            raise RuntimeError(msg)
+
+        # Find a registered extension to source the call from.
+        # Any registered extension can originate the call; pick the first one.
+        source_state = None
+        for state in manager._by_extension.values():
+            if state.registered:
+                source_state = state
+                break
+        if source_state is None:
+            raise OutboundCallFailed(
+                503, "no registered extension available to originate call"
+            )
+
+        source_ext = source_state.extension
+        gateway_cfg = self._gateway_cfg
+        if gateway_cfg is None:
+            msg = "place_call: gateway config not initialised"
+            raise RuntimeError(msg)
+
+        target_uri = f"sip:{extension}@{gateway_cfg.host}"
+        local_aor = f"sip:{source_ext.extension}@{gateway_cfg.host}"
+        local_contact = transport.contact_uri(source_ext.extension)
+        local_sent_by = transport.local_sent_by
+
+        # --- Build the SDP offer -------------------------------------------
+        engine = RtpMediaTransport(
+            local_address="0.0.0.0",  # noqa: S104 — bind all interfaces for RTP
+            local_port=0,
+            remote_address="127.0.0.1",  # placeholder; updated from 2xx SDP answer
+            remote_port=9,  # discard port placeholder
+            codec=Codec.PCMU,
+            srtp_inbound=None,
+            srtp_outbound=None,
+            symmetric=media_cfg.rtp_symmetric,
+        )
+        await engine.connect()
+        local_rtp_host = _host_of(local_sent_by)
+        session_id = int(time.monotonic() * 1000) & 0xFFFF_FFFF
+        offer_codecs: list[SdpCodec] = [
+            SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
+            SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
+            SdpCodec(
+                payload_type=101,
+                encoding="telephone-event",
+                clock_rate=8000,
+                fmtp="0-16",
+            ),
+        ]
+        offer_body = build_audio_offer(
+            local_address=local_rtp_host,
+            port=engine.local_port,
+            codecs=offer_codecs,
+            session_id=session_id,
+        )
+
+        # --- Register a _QueueSink so we can await responses ---------------
+        sink: CallResponseSink = _QueueSink()
+
+        # --- Send initial INVITE (no auth) ----------------------------------
+        invite_text, call_id, from_tag = build_outbound_invite(
+            target_uri=target_uri,
+            local_aor=local_aor,
+            local_contact=local_contact,
+            local_sent_by=local_sent_by,
+            transport="TLS",
+            body=offer_body,
+        )
+        transport.add_call(call_id, sink)
+        session: CallSession | None = None
+        dialog: Dialog | None = None
+        # Track the CSeq of the last INVITE actually sent so the dialog and ACK
+        # use the correct sequence number (re-auth increments this to 2).
+        last_cseq = 1
+        # Set to True once the CallSession is wired and the loop background task
+        # is running — the outer finally must NOT teardown in that case (the
+        # background task owns teardown from that point on).
+        session_established = False
+        try:
+            await transport.send(invite_text)
+            _log.info("INVITE sent: Call-ID %s -> %s", call_id, target_uri)
+
+            # --- Await first response (possibly 407 challenge) --------
+            assert isinstance(sink, _QueueSink)  # noqa: S101 — mypy narrowing aid; _QueueSink is the only impl here
+            response = await sink.get()
+
+            if response.status_code in (_SIP_UNAUTHORIZED, _SIP_PROXY_AUTH):
+                # Challenge: build Proxy-Authorization and re-send.
+                is_proxy_auth = response.status_code == _SIP_PROXY_AUTH
+                auth_hdr_name = (
+                    "Proxy-Authenticate" if is_proxy_auth else "WWW-Authenticate"
+                )
+                auth_value = response.header(auth_hdr_name)
+                if auth_value is None:
+                    raise OutboundCallFailed(
+                        response.status_code, "challenge has no auth header"
+                    )
+                challenge = DigestChallenge.parse(auth_value)
+                credentials = DigestCredentials(
+                    username=source_ext.username,
+                    password=source_ext.password,
+                )
+                auth_resp_value = build_authorization(
+                    challenge,
+                    credentials,
+                    method="INVITE",
+                    uri=target_uri,
+                )
+                auth_hdr_out = (
+                    "Proxy-Authorization" if is_proxy_auth else "Authorization"
+                )
+                last_cseq = 2
+                invite_text2, _, _ = build_outbound_invite(
+                    target_uri=target_uri,
+                    local_aor=local_aor,
+                    local_contact=local_contact,
+                    local_sent_by=local_sent_by,
+                    transport="TLS",
+                    body=offer_body,
+                    call_id=call_id,
+                    from_tag=from_tag,
+                    cseq=last_cseq,
+                    auth=(auth_hdr_out, auth_resp_value),
+                )
+                await transport.send(invite_text2)
+                _log.info("INVITE re-sent with auth: Call-ID %s", call_id)
+
+                # Skip provisional responses (1xx) until a final response.
+                while True:
+                    response = await sink.get()
+                    if response.status_code >= _SIP_FINAL_FLOOR:
+                        break
+
+            elif response.status_code < _SIP_FINAL_FLOOR:
+                # Skip unexpected provisional(s) until a final response.
+                while True:
+                    response = await sink.get()
+                    if response.status_code >= _SIP_FINAL_FLOOR:
+                        break
+
+            # --- Handle final response to INVITE ---------------------------
+            if response.status_code >= _SIP_ERROR_FLOOR:
+                # Non-2xx final: transport auto-ACKs non-2xx (RFC 3261 §17.1.1.3)
+                raise OutboundCallFailed(
+                    response.status_code, response.reason or "Call Failed"
+                )
+
+            # 2xx success: parse the SDP answer and build UAC dialog.
+            # We must send ACK ourselves (RFC 3261 §17.1.2.1 — the TU ACKs 2xx).
+            answer_body = response.body or ""
+            try:
+                answer_sdp = SessionDescription.parse(answer_body)
+            except Exception as exc:
+                raise OutboundCallFailed(
+                    500, f"2xx SDP answer unparseable: {exc}"
+                ) from exc
+
+            answer_audio = answer_sdp.audio
+            if answer_audio is None:
+                raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
+
+            try:
+                agreed_codecs = negotiate_audio(answer_audio, _SUPPORTED_ENCODINGS)
+            except ValueError as exc:
+                raise OutboundCallFailed(
+                    488, f"no common codec in 2xx answer: {exc}"
+                ) from exc
+
+            if _first_voice_codec(agreed_codecs) is None:
+                raise OutboundCallFailed(488, "2xx answer has no voice codec")
+
+            # Build a synthetic SipRequest carrying the headers Dialog.from_invite_2xx
+            # reads (From, To, Via, CSeq, Contact, Call-ID). This avoids keeping the
+            # raw text of the last INVITE we sent; from_invite_2xx only reads these
+            # six headers and we know all their values.
+            last_invite_headers = [
+                ("Via", f"SIP/2.0/TLS {local_sent_by};branch={new_branch()};rport"),
+                ("From", f"<{local_aor}>;tag={from_tag}"),
+                ("To", f"<{target_uri}>"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{last_cseq} INVITE"),
+                ("Contact", local_contact),
+            ]
+            synthetic_invite_text = build_request(
+                "INVITE", target_uri, last_invite_headers, ""
+            )
+            parsed_invite = SipRequest.parse(synthetic_invite_text)
+
+            dialog = Dialog.from_invite_2xx(parsed_invite, response)
+
+            # Update the engine's remote destination from the 2xx SDP answer.
+            remote_address = _effective_address(answer_audio, answer_sdp)
+            # Direct attribute writes are necessary because RtpMediaTransport has
+            # no public set_remote() method; the engine is already connected and
+            # the initial placeholder address must be replaced with the real one.
+            engine._remote_address = remote_address
+            engine._remote_port = answer_audio.port
+            engine._outbound_addr = (remote_address, answer_audio.port)
+
+            # --- Send ACK for 2xx (RFC 3261 §17.1.2.1 — TU owns ACK for 2xx) ---
+            ack_cseq_num = int(dialog.local_cseq)
+            ack_via = f"SIP/2.0/TLS {local_sent_by};branch={new_branch()};rport"
+            ack_text = build_request(
+                "ACK",
+                dialog.remote_target,
+                [
+                    ("Via", ack_via),
+                    ("Max-Forwards", "70"),
+                    ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                    ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                    ("Call-ID", call_id),
+                    ("CSeq", f"{ack_cseq_num} ACK"),
+                    ("Contact", local_contact),
+                ],
+            )
+            await transport.send(ack_text)
+            _log.info("ACK sent: Call-ID %s", call_id)
+
+            # --- Wire the CallSession and CallLoop -------------------------
+            guard_state = GuardSessionState(call_id)
+            credentials_for_session = DigestCredentials(
+                username=source_ext.username,
+                password=source_ext.password,
+            )
+            local_media = LocalMediaSession(
+                local_address=local_rtp_host,
+                port=engine.local_port,
+                codecs=tuple(agreed_codecs),
+                session_id=session_id,
+            )
+            session = CallSession(
+                dialog=dialog,
+                signaling=transport,
+                media=engine,
+                guard=guard_state,
+                local_media=local_media,
+                credentials=credentials_for_session,
+            )
+            # Remove the temporary _QueueSink and install the real session sink.
+            transport.remove_call(call_id, sink)
+            transport.add_call(call_id, session)
+            if manager is not None:
+                manager.add_call(session.dialog_id, session)
+            self._call_sessions[call_id] = session
+
+            self._call_info[call_id] = {
+                "name": extension,
+                "remote_uri": target_uri,
+                "type": "dm",
+                "ended": False,
+            }
+
+            # Capture local variables for the background task closure.
+            _bg_engine = engine
+            _bg_transport = transport
+            _bg_session = session
+            _bg_call_id = call_id
+            _bg_guard_state = guard_state
+
+            async def _run_and_teardown() -> None:
+                """Run the CallLoop then tear down all resources (background task)."""
+                _loop: CallLoop | None = None
+                try:
+                    _loop = await self._run_call_loop(
+                        call_id=_bg_call_id,
+                        engine=_bg_engine,
+                        guard_state=_bg_guard_state,
+                    )
+                finally:
+                    await self._teardown_call(
+                        call_id=_bg_call_id,
+                        engine=_bg_engine,
+                        transport=_bg_transport,
+                        dialog_id=_bg_session.dialog_id,
+                        session=_bg_session,
+                        call_loop=_loop,
+                    )
+
+            loop_task: asyncio.Task[None] = asyncio.create_task(_run_and_teardown())
+            self._call_tasks.setdefault(call_id, set()).add(loop_task)
+            loop_task.add_done_callback(lambda t: self._on_call_task_done(call_id, t))
+            session_established = True
+            return call_id
+
+        finally:
+            # Teardown only for pre-session failures (engine connect, SIP
+            # handshake, dialog/session wiring). Once session_established is
+            # True the background task owns teardown — don't double-teardown.
+            if not session_established:
+                dialog_id: tuple[str, str, str] = (
+                    session.dialog_id if session is not None else (call_id, "", "")
+                )
+                # Remove the temporary sink if it is still installed (failure
+                # before we replaced it with the CallSession).
+                transport_cur = self._transport
+                if transport_cur is not None:
+                    transport_cur.remove_call(call_id, sink)
+                await self._teardown_call(
+                    call_id=call_id,
+                    engine=engine,
+                    transport=transport,
+                    dialog_id=dialog_id,
+                    session=session,
+                    call_loop=None,
+                )
 
     # -----------------------------------------------------------------------
     # Inbound call wiring

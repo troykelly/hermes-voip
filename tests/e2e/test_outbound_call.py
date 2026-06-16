@@ -20,7 +20,7 @@ These tests fail until adapter.py + originate.py are implemented.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
 
@@ -142,7 +142,7 @@ class _FakeASR:
             pass
         # Never emit a turn; satisfy the async generator contract.
         return
-        yield  # type: ignore[misc]  # makes this an async generator
+        yield  # type: ignore[unreachable]  # dead yield makes this an async generator
 
 
 class _FakeGuard:
@@ -178,7 +178,9 @@ class OutboundGateway:
     def __init__(self) -> None:
         self._server = LoopbackSipServer(self._respond)
         self.rtp = FakeRtpEndpoint()
-        self._register_responder: object = None
+        self._register_responder: (
+            Callable[[SipRequest], Awaitable[list[str]]] | None
+        ) = None
         self._sip_port = 0
         # Received SIP requests from plugin (UAC)
         self._received_invites: asyncio.Queue[SipRequest] = asyncio.Queue()
@@ -212,8 +214,8 @@ class OutboundGateway:
     ) -> None:
         """Install a REGISTER responder: 401 challenge first, then 200 OK."""
         from tests.e2e._fake_gateway import (  # noqa: PLC0415
-            _register_challenge,  # type: ignore[attr-defined]  # private helper in test infra
-            _register_ok,  # type: ignore[attr-defined]  # private helper in test infra
+            _register_challenge,
+            _register_ok,
         )
 
         state = {"seen": 0}
@@ -230,14 +232,8 @@ class OutboundGateway:
 
     async def _respond(self, request: SipRequest) -> list[str]:
         """Handle any SIP request the plugin sends."""
-        from collections.abc import Callable  # noqa: PLC0415
-
-        if (
-            request.method == "REGISTER"
-            and self._register_responder is not None
-            and isinstance(self._register_responder, Callable)
-        ):
-            return await self._register_responder(request)  # type: ignore[operator]
+        if request.method == "REGISTER" and self._register_responder is not None:
+            return await self._register_responder(request)
 
         if request.method == "INVITE":
             return await self._handle_invite(request)
@@ -493,14 +489,11 @@ async def _real_adapter(
 
 
 async def _until(
-    predicate: object,
+    predicate: Callable[[], bool],
     *,
     timeout: float = 5.0,
     step: float = 0.005,
 ) -> None:
-    from collections.abc import Callable  # noqa: PLC0415
-
-    assert isinstance(predicate, Callable)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while not predicate():
@@ -618,9 +611,7 @@ async def test_outbound_call_486_busy() -> None:
     class _BusyGateway(OutboundGateway):
         """Gateway that always rejects with 486 Busy Here (no auth challenge)."""
 
-        async def _handle_invite(  # type: ignore[override]  # override for test
-            self, request: SipRequest
-        ) -> list[str]:
+        async def _handle_invite(self, request: SipRequest) -> list[str]:
             await self._received_invites.put(request)
             via = request.header("Via") or ""
             from_ = request.header("From") or ""
@@ -678,9 +669,7 @@ async def test_call_on_connect_trigger() -> None:
     class _DirectOkGateway(OutboundGateway):
         """Gateway that answers INVITE immediately with 200 OK (no challenge)."""
 
-        async def _handle_invite(  # type: ignore[override]  # override for test
-            self, request: SipRequest
-        ) -> list[str]:
+        async def _handle_invite(self, request: SipRequest) -> list[str]:
             await self._received_invites.put(request)
             return [
                 self._build_100(request),

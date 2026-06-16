@@ -4,6 +4,16 @@ Fakes use the RFC 5737 documentation address range (``192.0.2.0/24``); no real
 gateway address appears. Covers codec/rtpmap/fmtp parsing, media-security
 detection (RTP/AVP vs RTP/SAVP + ``a=crypto`` SDES), codec negotiation, and a
 build→parse round-trip.
+
+Also covers the WebRTC SDP attributes (ADR-0016, PR-B):
+- ``a=fingerprint:sha-256 <hex>`` and ``a=setup:actpass|active|passive``
+  (DTLS-SRTP, RFC 5763/8122).
+- ``a=ice-ufrag`` / ``a=ice-pwd`` and ``a=candidate`` (ICE, RFC 8839).
+- ``a=rtcp-mux`` and the ``UDP/TLS/RTP/SAVPF`` media profile.
+- ``build_webrtc_answer`` producing a SAVPF answer with our fingerprint/setup/ice.
+- Mutual exclusion: a WebRTC (SAVPF/DTLS) m-line carries NO ``a=crypto`` and
+  NO ``c=`` connection attribute (RFC 5763 §5).
+- SDES/AVP path is fully unregressed (no cross-contamination).
 """
 
 import pytest
@@ -12,11 +22,15 @@ from hermes_voip.sdp import (
     AudioMedia,
     Codec,
     CryptoAttribute,
+    Fingerprint,
+    IceCandidate,
     SdpError,
     SessionDescription,
+    SetupRole,
     _AudioAccumulator,
     build_audio_answer,
     build_audio_offer,
+    build_webrtc_answer,
     negotiate_audio,
 )
 
@@ -833,3 +847,601 @@ def test_audio_accumulator_repr_hides_crypto_key_material() -> None:
     text = repr(acc)
     assert _FAKE_KEY not in text  # ...but the key never leaks into the repr.
     assert "inline:" not in text
+
+
+# ---------------------------------------------------------------------------
+# ADR-0016 PR-B — WebRTC SDP attributes (DTLS-SRTP + ICE)
+# RFC 5763/8122 (fingerprint + setup), RFC 8839 (ICE candidates), RFC 5761
+# (rtcp-mux), profile UDP/TLS/RTP/SAVPF.  Fakes only; no network.
+# ---------------------------------------------------------------------------
+
+# Fake SHA-256 fingerprint hex (32 bytes x 2 hex chars + 31 colons = 95 chars).
+# Format: two-hex-per-octet, colon-separated, upper-case (RFC 4572 §5).
+_FAKE_FINGERPRINT = (
+    "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:"
+    "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89"
+)
+_FAKE_FINGERPRINT_ANSWER = (
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+)
+# Fake ICE credentials — RFC 8839 §5.4: ufrag 4+, pwd 22+ chars of ice-char.
+_FAKE_UFRAG = "offerUfrag01"
+_FAKE_PWD = "offerPassword0123456789"
+_FAKE_ANSWER_UFRAG = "answerUfrag01"
+_FAKE_ANSWER_PWD = "answerPassword01234567"
+
+# A realistic WebRTC offer from a gateway: SAVPF + fingerprint + setup:actpass +
+# ice-ufrag/pwd + one host candidate + one srflx candidate + rtcp-mux.
+_OFFER_SAVPF = (
+    "v=0\r\n"
+    "o=- 2000 2000 IN IP4 192.0.2.10\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 49000 UDP/TLS/RTP/SAVPF 0 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\n"
+    "a=setup:actpass\r\n"
+    f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+    f"a=ice-pwd:{_FAKE_PWD}\r\n"
+    "a=ice-options:ice2\r\n"
+    "a=candidate:1 1 UDP 2130706431 192.0.2.10 49000 typ host\r\n"
+    "a=candidate:2 1 UDP 1694498815 203.0.113.1 49000"
+    " typ srflx raddr 192.0.2.10 rport 49000\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+# --- Fingerprint typed attribute ---
+
+
+def test_fingerprint_parse_sha256() -> None:
+    """Parse a valid sha-256 fingerprint attribute body."""
+    fp = Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT}")
+    assert fp.algorithm == "sha-256"
+    assert fp.value == _FAKE_FINGERPRINT
+
+
+def test_fingerprint_parse_rejects_missing_value() -> None:
+    with pytest.raises(SdpError, match="fingerprint"):
+        Fingerprint.parse("sha-256")
+
+
+def test_fingerprint_parse_rejects_empty_body() -> None:
+    with pytest.raises(SdpError, match="fingerprint"):
+        Fingerprint.parse("")
+
+
+def test_fingerprint_render_round_trip() -> None:
+    fp = Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT}")
+    assert fp.render() == f"sha-256 {_FAKE_FINGERPRINT}"
+
+
+def test_fingerprint_algorithm_lowercased() -> None:
+    # RFC 4572 allows any case; we normalise to lower for consistent matching.
+    fp = Fingerprint.parse(f"SHA-256 {_FAKE_FINGERPRINT}")
+    assert fp.algorithm == "sha-256"
+
+
+# --- SetupRole typed attribute ---
+
+
+def test_setup_role_all_values_accepted() -> None:
+    for role_str in ("actpass", "active", "passive"):
+        role = SetupRole.parse(role_str)
+        assert role.value == role_str
+
+
+def test_setup_role_rejects_unknown() -> None:
+    with pytest.raises(SdpError, match="setup"):
+        SetupRole.parse("holdconn")
+
+
+def test_setup_role_rejects_empty() -> None:
+    with pytest.raises(SdpError, match="setup"):
+        SetupRole.parse("")
+
+
+def test_setup_role_render() -> None:
+    assert SetupRole.parse("actpass").render() == "actpass"
+    assert SetupRole.parse("active").render() == "active"
+    assert SetupRole.parse("passive").render() == "passive"
+
+
+# --- IceCandidate typed attribute ---
+
+
+def test_ice_candidate_parse_host() -> None:
+    body = "1 1 UDP 2130706431 192.0.2.10 49000 typ host"
+    cand = IceCandidate.parse(body)
+    assert cand.foundation == "1"
+    assert cand.component == 1
+    assert cand.transport == "UDP"
+    assert cand.priority == 2130706431
+    assert cand.address == "192.0.2.10"
+    assert cand.port == 49000
+    assert cand.typ == "host"
+    assert cand.raddr is None
+    assert cand.rport is None
+
+
+def test_ice_candidate_parse_srflx() -> None:
+    body = "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 rport 49000"
+    cand = IceCandidate.parse(body)
+    assert cand.foundation == "2"
+    assert cand.typ == "srflx"
+    assert cand.raddr == "192.0.2.10"
+    assert cand.rport == 49000
+
+
+def test_ice_candidate_parse_relay() -> None:
+    # relay: candidate address 203.0.113.5:50000; base (raddr/rport) is the
+    # server-reflexive addr at the TURN server: 203.0.113.1:49001 (RFC 8839 §5.1).
+    body = "3 1 UDP 16777215 203.0.113.5 50000 typ relay raddr 203.0.113.1 rport 49001"
+    cand = IceCandidate.parse(body)
+    assert cand.typ == "relay"
+    assert cand.address == "203.0.113.5"
+    assert cand.port == 50000
+    assert cand.raddr == "203.0.113.1"
+    assert cand.rport == 49001
+
+
+def test_ice_candidate_render_host_round_trip() -> None:
+    body = "1 1 UDP 2130706431 192.0.2.10 49000 typ host"
+    cand = IceCandidate.parse(body)
+    assert cand.render() == body
+
+
+def test_ice_candidate_render_srflx_round_trip() -> None:
+    body = "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 rport 49000"
+    cand = IceCandidate.parse(body)
+    assert cand.render() == body
+
+
+def test_ice_candidate_rejects_truncated_body() -> None:
+    with pytest.raises(SdpError, match="candidate"):
+        IceCandidate.parse("1 1 UDP 2130706431 192.0.2.10")  # missing port + typ
+
+
+def test_ice_candidate_rejects_bad_component() -> None:
+    with pytest.raises(SdpError, match="candidate"):
+        IceCandidate.parse("1 notint UDP 2130706431 192.0.2.10 49000 typ host")
+
+
+def test_ice_candidate_rejects_bad_port() -> None:
+    with pytest.raises(SdpError, match="candidate"):
+        IceCandidate.parse("1 1 UDP 2130706431 192.0.2.10 99999 typ host")
+
+
+# --- AudioMedia.is_webrtc property ---
+
+
+def test_audio_media_is_webrtc_savpf_profile() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.is_webrtc is True
+
+
+def test_audio_media_is_not_webrtc_for_savp() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVP)
+    assert sdp.audio is not None
+    assert sdp.audio.is_webrtc is False
+
+
+def test_audio_media_is_not_webrtc_for_avp() -> None:
+    sdp = SessionDescription.parse(_OFFER_AVP)
+    assert sdp.audio is not None
+    assert sdp.audio.is_webrtc is False
+
+
+# --- Full WebRTC offer parsing ---
+
+
+def test_parse_webrtc_offer_fingerprint() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.fingerprint is not None
+    assert sdp.audio.fingerprint.algorithm == "sha-256"
+    assert sdp.audio.fingerprint.value == _FAKE_FINGERPRINT
+
+
+def test_parse_webrtc_offer_setup_role() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.setup is not None
+    assert sdp.audio.setup.value == "actpass"
+
+
+def test_parse_webrtc_offer_ice_credentials() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.ice_ufrag == _FAKE_UFRAG
+    assert sdp.audio.ice_pwd == _FAKE_PWD
+
+
+def test_parse_webrtc_offer_candidates() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert len(sdp.audio.ice_candidates) == 2
+    host = sdp.audio.ice_candidates[0]
+    srflx = sdp.audio.ice_candidates[1]
+    assert host.typ == "host"
+    assert host.address == "192.0.2.10"
+    assert srflx.typ == "srflx"
+    assert srflx.raddr == "192.0.2.10"
+
+
+def test_parse_webrtc_offer_rtcp_mux() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.rtcp_mux is True
+
+
+def test_parse_webrtc_offer_protocol() -> None:
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.protocol == "UDP/TLS/RTP/SAVPF"
+
+
+def test_parse_webrtc_offer_has_no_sdes_crypto() -> None:
+    """A WebRTC SAVPF offer MUST NOT carry a=crypto (RFC 8827 §6.5 / ADR-0016)."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.crypto == ()
+    assert sdp.audio.crypto_attrs == ()
+
+
+def test_parse_sdes_offer_has_no_webrtc_attrs() -> None:
+    """An RTP/SAVP SDES offer MUST NOT expose fingerprint/setup/ice/rtcp-mux."""
+    sdp = SessionDescription.parse(_OFFER_SAVP)
+    assert sdp.audio is not None
+    assert sdp.audio.fingerprint is None
+    assert sdp.audio.setup is None
+    assert sdp.audio.ice_ufrag is None
+    assert sdp.audio.ice_pwd is None
+    assert sdp.audio.ice_candidates == ()
+    assert sdp.audio.rtcp_mux is False
+
+
+# --- build_webrtc_answer ---
+
+
+def _make_host_candidate(  # noqa: PLR0913 - ICE candidate fields are independent
+    foundation: str = "1",
+    component: int = 1,
+    transport: str = "UDP",
+    priority: int = 2130706431,
+    address: str = "192.0.2.20",
+    port: int = 42000,
+) -> IceCandidate:
+    return IceCandidate(
+        foundation=foundation,
+        component=component,
+        transport=transport,
+        priority=priority,
+        address=address,
+        port=port,
+        typ="host",
+        raddr=None,
+        rport=None,
+    )
+
+
+_ANSWER_CANDIDATE = _make_host_candidate()
+
+
+def test_build_webrtc_answer_profile() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert "UDP/TLS/RTP/SAVPF" in text
+
+
+def test_build_webrtc_answer_fingerprint_present() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT_ANSWER}" in text
+
+
+def test_build_webrtc_answer_setup_present() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert "a=setup:active" in text
+
+
+def test_build_webrtc_answer_ice_credentials_present() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert f"a=ice-ufrag:{_FAKE_ANSWER_UFRAG}" in text
+    assert f"a=ice-pwd:{_FAKE_ANSWER_PWD}" in text
+
+
+def test_build_webrtc_answer_candidate_present() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert "a=candidate:1 1 UDP 2130706431 192.0.2.20 42000 typ host" in text
+
+
+def test_build_webrtc_answer_rtcp_mux_present() -> None:
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert "a=rtcp-mux" in text
+
+
+def test_build_webrtc_answer_no_sdes_crypto() -> None:
+    """RFC 8827 §6.5 / ADR-0016: WebRTC answer MUST NOT carry a=crypto."""
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert "a=crypto" not in text
+
+
+def test_build_webrtc_answer_no_connection_attribute() -> None:
+    """RFC 5763 §5: MUST NOT use the connection attribute on DTLS-SRTP m-lines."""
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    # RFC 5763 §5 forbids the RFC 4145 a=connection attribute (not the c= line).
+    assert "a=connection:" not in text
+
+
+def test_build_webrtc_answer_no_session_c_line() -> None:
+    """RFC 5763 §5: The c= connection-address MUST NOT be used on DTLS-SRTP m-lines.
+
+    ADR-0016 records: 'The endpoint MUST NOT use the connection attribute defined
+    in [RFC4145]'.  For WebRTC we also suppress the session-level c= line so that
+    the SDP body contains no connection address at all (address is conveyed by ICE
+    candidates instead).
+    """
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    assert "c=IN" not in text
+
+
+def test_build_webrtc_answer_round_trip_parse() -> None:
+    """A built WebRTC answer parses back to the expected typed fields."""
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+    parsed = SessionDescription.parse(text)
+    assert parsed.audio is not None
+    audio = parsed.audio
+    assert audio.protocol == "UDP/TLS/RTP/SAVPF"
+    assert audio.is_webrtc is True
+    assert audio.fingerprint is not None
+    assert audio.fingerprint.value == _FAKE_FINGERPRINT_ANSWER
+    assert audio.setup is not None
+    assert audio.setup.value == "active"
+    assert audio.ice_ufrag == _FAKE_ANSWER_UFRAG
+    assert audio.ice_pwd == _FAKE_ANSWER_PWD
+    assert len(audio.ice_candidates) == 1
+    assert audio.ice_candidates[0].typ == "host"
+    assert audio.rtcp_mux is True
+    assert audio.crypto == ()
+    assert audio.crypto_attrs == ()
+
+
+def test_build_webrtc_answer_rejects_non_savpf_offer() -> None:
+    """build_webrtc_answer requires a UDP/TLS/RTP/SAVPF offer."""
+    offer = SessionDescription.parse(_OFFER_SAVP)
+    with pytest.raises(SdpError, match="WebRTC"):
+        build_webrtc_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU",),
+            fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+            setup=SetupRole.parse("active"),
+            ice_ufrag=_FAKE_ANSWER_UFRAG,
+            ice_pwd=_FAKE_ANSWER_PWD,
+            ice_candidates=(_ANSWER_CANDIDATE,),
+        )
+
+
+def test_build_webrtc_answer_requires_audio_in_offer() -> None:
+    video_only = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.3\r\ns=-\r\nt=0 0\r\n"
+        "m=video 50000 RTP/AVP 96\r\n"
+    )
+    with pytest.raises(SdpError, match="audio"):
+        build_webrtc_answer(
+            video_only,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU",),
+            fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+            setup=SetupRole.parse("active"),
+            ice_ufrag=_FAKE_ANSWER_UFRAG,
+            ice_pwd=_FAKE_ANSWER_PWD,
+            ice_candidates=(_ANSWER_CANDIDATE,),
+        )
+
+
+def test_build_webrtc_answer_rejects_actpass_setup() -> None:
+    # RFC 5763: an answerer MUST NOT offer actpass; it must choose active or passive.
+    """Build rejects setup=actpass in the answer (RFC 5763 §5)."""
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    with pytest.raises(SdpError, match="actpass"):
+        build_webrtc_answer(
+            offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU",),
+            fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+            setup=SetupRole.parse("actpass"),  # invalid for an answerer
+            ice_ufrag=_FAKE_ANSWER_UFRAG,
+            ice_pwd=_FAKE_ANSWER_PWD,
+            ice_candidates=(_ANSWER_CANDIDATE,),
+        )
+
+
+def test_build_webrtc_answer_multiple_candidates() -> None:
+    """Multiple candidates are all rendered in the answer."""
+    host = _make_host_candidate()
+    srflx = IceCandidate(
+        foundation="2",
+        component=1,
+        transport="UDP",
+        priority=1694498815,
+        address="203.0.113.20",
+        port=42000,
+        typ="srflx",
+        raddr="192.0.2.20",
+        rport=42000,
+    )
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    text = build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(host, srflx),
+    )
+    assert text.count("a=candidate:") == 2
+    assert "typ host" in text
+    assert "typ srflx" in text
+
+
+# --- SDES / AVP path regression (no cross-contamination) ---
+
+
+def test_sdes_path_unchanged_build_offer_avp() -> None:
+    """The existing plain AVP offer builder is unaffected by WebRTC additions."""
+    codecs = (Codec(0, "PCMU", 8000),)
+    text = build_audio_offer(local_address="192.0.2.10", port=41000, codecs=codecs)
+    assert "RTP/AVP" in text
+    assert "fingerprint" not in text
+    assert "ice-ufrag" not in text
+    assert "a=setup" not in text
+    assert "rtcp-mux" not in text
+
+
+def test_sdes_path_unchanged_build_offer_savp() -> None:
+    """The existing SAVP+SDES offer builder is unaffected by WebRTC additions."""
+    codecs = (Codec(0, "PCMU", 8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10", port=41000, codecs=codecs, crypto=_FAKE_CRYPTO
+    )
+    assert "RTP/SAVP" in text
+    assert "a=crypto:" in text
+    assert "fingerprint" not in text
+    assert "ice-ufrag" not in text
+    assert "UDP/TLS" not in text
+
+
+def test_sdes_path_unchanged_build_answer_savp() -> None:
+    """The existing SAVP+SDES answer builder is unaffected by WebRTC additions."""
+    offer = SessionDescription.parse(_OFFER_SAVP)
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        crypto=_FAKE_ANSWER_CRYPTO,
+    )
+    assert "RTP/SAVP" in text
+    assert "a=crypto:" in text
+    assert "fingerprint" not in text
+    assert "UDP/TLS" not in text

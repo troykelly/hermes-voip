@@ -252,10 +252,15 @@ async def test_sherpa_asr_upsamples_8k_inbound_to_16k_before_feeding() -> None:
     assert stream is not None
     assert stream.fed, "the recogniser must have been fed at least one waveform"
     # Every waveform must be presented at the recogniser's real rate (16 kHz),
-    # never the 8 kHz wire rate.
-    assert stream.fed_rates == [_RATE]
-    # And it must carry the UPSAMPLED sample count (~2x): proof the 8 kHz frame
-    # was actually converted to 16 kHz, not relabelled. audioop.ratecv produces
+    # never the 8 kHz wire rate.  The stream ends without an engine endpoint so
+    # _flush() is called, which adds a silence-pad waveform at the recogniser rate
+    # before input_finished — so fed_rates has at least two entries, all 16 kHz.
+    assert all(r == _RATE for r in stream.fed_rates), (
+        f"all fed rates must be {_RATE}, got {stream.fed_rates}"
+    )
+    # The FIRST fed waveform is the real audio (upsampled from 8 kHz -> 16 kHz).
+    # It must carry the UPSAMPLED sample count (~2x): proof the 8 kHz frame was
+    # actually converted to 16 kHz, not relabelled. audioop.ratecv produces
     # close to 2x the input samples (a couple of samples of edge slack).
     fed = _fed_sample_count(stream.fed[0])
     assert fed >= input_samples * 2 - 4, (
@@ -294,7 +299,12 @@ async def test_sherpa_asr_feeds_float32_at_16k() -> None:
     assert recognizer.created_streams == 1
     stream = recognizer.last_stream
     assert stream is not None
-    assert stream.fed_rates == [_RATE]
+    # _flush() adds a silence-pad waveform before input_finished so there are at
+    # least two fed calls; all must be at the recogniser rate (16 kHz).
+    assert all(r == _RATE for r in stream.fed_rates), (
+        f"all fed rates must be {_RATE}, got {stream.fed_rates}"
+    )
+    # The FIRST fed waveform is the real audio — check dtype and sample values.
     fed = np.asarray(stream.fed[0])
     assert fed.dtype.name == "float32"
     assert fed[0] == pytest.approx(32767 / 32768, abs=1e-6)

@@ -1122,6 +1122,9 @@ class VoipAdapter(BasePlatformAdapter):
             # Speak the configured opening line on answer so RTP flows out first
             # — the caller hears it and a NAT'd gateway latches (ADR-0002).
             greeting=media_cfg.greeting,
+            # Tone diagnostic: when set, plays a 440 Hz sine at 8 kHz bypassing
+            # TTS + resample entirely so the operator can isolate transport issues.
+            tone_secs=media_cfg.tone_secs,
         )
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)

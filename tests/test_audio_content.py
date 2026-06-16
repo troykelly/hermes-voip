@@ -36,6 +36,7 @@ from hermes_voip.media.call_loop import CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import Codec, RtpMediaTransport
 from hermes_voip.media.vad import VadModel, VoiceActivityDetector
+from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
@@ -153,6 +154,23 @@ class _FakeTtsStream:
         self._cancelled = True
 
 
+class _NeverIter:
+    """AsyncIterator[PcmFrame] that blocks until cancelled and yields nothing.
+
+    Used by _CountingTransport.inbound_audio() to simulate an open call whose
+    inbound stream is never closed, so the CallLoop pump blocks indefinitely
+    (until the TaskGroup is cancelled externally). Avoids the ``yield`` after
+    ``return`` pattern that mypy flags as unreachable.
+    """
+
+    def __aiter__(self) -> _NeverIter:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        await asyncio.Event().wait()  # blocks until cancelled
+        raise StopAsyncIteration
+
+
 class _CountingTransport:
     """MediaTransport that counts send_audio calls; inbound never yields."""
 
@@ -160,13 +178,11 @@ class _CountingTransport:
         self.inbound_sample_rate: int = G711_SAMPLE_RATE
         self.send_count: int = 0
 
-    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
-        async def _never() -> AsyncIterator[PcmFrame]:
-            await asyncio.Event().wait()
-            return
-            yield  # make it an async generator
+    async def connect(self) -> bool:
+        return True
 
-        return _never()
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        return _NeverIter()
 
     async def send_audio(self, frame: PcmFrame) -> None:
         self.send_count += 1
@@ -175,19 +191,38 @@ class _CountingTransport:
         pass
 
 
+class _EmptyTranscriptIter:
+    """AsyncIterator[Transcript] that yields nothing.
+
+    Drains audio but emits no transcripts. Used by _DrainASR to satisfy the
+    StreamingASR.stream return type while
+    ensuring the audio is consumed (to avoid blocking the pump's audio_q).
+    Avoids the ``yield`` after ``return`` anti-pattern that mypy flags as
+    unreachable.
+    """
+
+    def __init__(self, audio: AsyncIterator[PcmFrame]) -> None:
+        self._audio = audio
+        self._drained = False
+
+    def __aiter__(self) -> _EmptyTranscriptIter:
+        return self
+
+    async def __anext__(self) -> Transcript:
+        if not self._drained:
+            async for _ in self._audio:
+                pass
+            self._drained = True
+        raise StopAsyncIteration
+
+
 class _DrainASR:
     """ASR that drains audio without emitting transcripts."""
 
     input_sample_rate: int = 16_000
 
-    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
-        async def _drain() -> AsyncIterator[object]:
-            async for _ in audio:
-                pass
-            return
-            yield  # async generator
-
-        return _drain()
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        return _EmptyTranscriptIter(audio)
 
 
 class _FixedStreamTTS:
@@ -201,13 +236,17 @@ class _FixedStreamTTS:
         return G711_SAMPLE_RATE
 
     def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
-        return self._stream  # type: ignore[return-value]
+        return self._stream
 
 
 class _AlwaysAllowGuard:
     async def screen(self, text: str, *, call_id: str) -> GuardResult:
         return GuardResult(
-            verdict=GuardVerdict.ALLOW, score=0.0, label="clean", reason="test"
+            verdict=GuardVerdict.ALLOW,
+            normalized_text=text,
+            reasons=("allow",),
+            degraded=False,
+            score=0.0,
         )
 
 
@@ -308,10 +347,10 @@ async def test_greeting_play_sends_all_frames_not_just_first() -> None:
         pass
 
     call_loop = CallLoop(
-        transport=transport,  # type: ignore[arg-type]
-        asr=_DrainASR(),  # type: ignore[arg-type]
-        tts=_FixedStreamTTS(fake_tts_stream),  # type: ignore[arg-type]
-        guard=_AlwaysAllowGuard(),  # type: ignore[arg-type]
+        transport=transport,
+        asr=_DrainASR(),
+        tts=_FixedStreamTTS(fake_tts_stream),
+        guard=_AlwaysAllowGuard(),
         vad=vad,
         endpointer=endpointer,
         guard_state=GuardSessionState("test-call"),
@@ -322,7 +361,7 @@ async def test_greeting_play_sends_all_frames_not_just_first() -> None:
     )
 
     # Drive _play with the fake stream directly (same path as _play_greeting).
-    await call_loop._play(fake_tts_stream, on_first_frame=None)  # type: ignore[arg-type]
+    await call_loop._play(fake_tts_stream, on_first_frame=None)
 
     assert transport.send_count == n_frames, (
         f"_play stall: expected {n_frames} send_audio calls for "

@@ -165,6 +165,7 @@ def _media_config(**overrides: object) -> MediaConfig:
         "dtmf_mode": "auto",
         "dtmf_interdigit_ms": None,
         "dtmf_inband_enabled": True,
+        "tone_secs": 0.0,
     }
     defaults.update(overrides)
     return MediaConfig(**defaults)  # type: ignore[arg-type]

@@ -728,6 +728,7 @@ def test_media_config_validates_itself_on_direct_construction() -> None:
             dtmf_mode="auto",
             dtmf_interdigit_ms=None,
             dtmf_inband_enabled=True,
+            tone_secs=0.0,
         )
 
 
@@ -752,4 +753,5 @@ def test_media_config_rejects_bad_enum_on_direct_construction() -> None:
             dtmf_mode="auto",
             dtmf_interdigit_ms=None,
             dtmf_inband_enabled=True,
+            tone_secs=0.0,
         )

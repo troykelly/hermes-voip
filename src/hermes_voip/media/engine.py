@@ -45,9 +45,10 @@ import contextlib
 import enum
 import logging
 import socket
+import struct
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Protocol
+from typing import Final, Protocol
 
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
@@ -85,6 +86,10 @@ _OUTBOUND_SSRC: int = 0xCAFEBABE
 
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512
+
+# Number of TX frames for which peak amplitude is logged at INFO on call open.
+# Lets the operator confirm the signal is non-silent without noise in steady state.
+_TX_AMPLITUDE_LOG_FRAMES: Final[int] = 3
 
 # A received datagram paired with the UDP source address it arrived from. The
 # source address is what symmetric-RTP (comedia) latching needs: we send our
@@ -252,6 +257,9 @@ class RtpMediaTransport:
         # RTP packet at INFO so the media path is visible in the operator log.
         self._first_tx_logged: bool = False
         self._first_rx_logged: bool = False
+        # Peak amplitude logged for the first few TX frames (post-resample,
+        # pre-encode) so the operator can confirm the signal is non-silent.
+        self._tx_amplitude_frames_left: int = _TX_AMPLITUDE_LOG_FRAMES
 
         # Socket / asyncio transport state (populated by connect()).
         # _ever_connected distinguishes "stopped after a real call" (silent no-op
@@ -316,6 +324,7 @@ class RtpMediaTransport:
         # outbound and inbound packets of the new call.
         self._first_tx_logged = False
         self._first_rx_logged = False
+        self._tx_amplitude_frames_left = _TX_AMPLITUDE_LOG_FRAMES
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -541,7 +550,8 @@ class RtpMediaTransport:
             msg = "send_audio called before connect()"
             raise RuntimeError(msg)
 
-        payload = self._encode(self._to_wire_rate(frame))
+        wire_rate_frame = self._to_wire_rate(frame)
+        payload = self._encode(wire_rate_frame)
 
         pkt = RtpPacket(
             payload_type=self._codec.value,
@@ -569,6 +579,23 @@ class RtpMediaTransport:
                 self._codec.value,
                 _OUTBOUND_SSRC,
             )
+        # Log peak amplitude for the first few TX frames (post-resample,
+        # pre-encode) so the operator can verify the outbound signal is
+        # non-silent even when they cannot capture the wire.
+        if self._tx_amplitude_frames_left > 0:
+            self._tx_amplitude_frames_left -= 1
+            n_samples = len(wire_rate_frame.samples) // 2
+            if n_samples > 0:
+                pcm_samples = struct.unpack_from(
+                    f"<{n_samples}h", wire_rate_frame.samples
+                )
+                peak = max(abs(s) for s in pcm_samples)
+                _log.info(
+                    "rtp tx: frame %d peak_amplitude=%d (%.1f%% full-scale)",
+                    _TX_AMPLITUDE_LOG_FRAMES - self._tx_amplitude_frames_left,
+                    peak,
+                    peak / 327.67,
+                )
         self._transport.sendto(wire, self._outbound_addr)
 
         await self._sleep(self._ptime / 1000.0)

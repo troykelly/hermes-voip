@@ -550,6 +550,9 @@ class VoipAdapter(BasePlatformAdapter):
             deliver_turn=_deliver,
             voice="",
             call_id=call_id,
+            # Speak the configured opening line on answer so RTP flows out first
+            # — the caller hears it and a NAT'd gateway latches (ADR-0002).
+            greeting=media_cfg.greeting,
         )
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)

@@ -28,11 +28,20 @@ class ToolRisk(Enum):
 
 @dataclass(slots=True)
 class GuardSessionState:
-    """Per-session guard state; lives for the call (ADR-0009).
+    """Per-session guard state; lives for the call (ADR-0009 / ADR-0020).
 
     Attributes:
         call_id: The call/session this state belongs to.
         degraded: True once any fail-open screen occurred; never un-sets in-call.
+        privileged: Whether this session may use ``ELEVATED``/``IRREVERSIBLE``
+            tools at all (ADR-0020 caller modes). ``True`` is the default
+            (assistant / trusted ALLOW call), preserving the ADR-0009 behaviour.
+            The adapter sets it to ``False`` for an **untrusted** remote party —
+            the GREY receptionist and the OUTBOUND untrusted callee — and
+            :func:`gate_tool_call` then hard-blocks every non-``SAFE`` tool. This
+            is *least privilege*: an untrusted party's agent cannot invoke a tool
+            that could reach an operator secret or mutate state, regardless of the
+            persona prompt, the injection classifier verdict, or any confirmation.
         flagged_turns: Identifiers of turns flagged for audit during the call —
             one per screened turn whose verdict was not ``ALLOW`` or which failed
             open (``degraded``). A benign ``ALLOW`` adds nothing.
@@ -40,6 +49,7 @@ class GuardSessionState:
 
     call_id: str
     degraded: bool = False
+    privileged: bool = True
     flagged_turns: tuple[str, ...] = field(default_factory=tuple)
     _turns_seen: int = 0
 
@@ -67,10 +77,22 @@ def gate_tool_call(
 ) -> bool:
     """Decide whether a tool may run (``pre_tool_call`` policy).
 
-    An ``IRREVERSIBLE`` tool requires explicit confirmation (human/DTMF,
-    ADR-0010) and is hard-blocked while the session is ``degraded`` — even if
-    the classifier returned ALLOW (the miss case ADR-0009 tests for). An
-    ``ELEVATED`` tool is blocked while ``degraded``. ``SAFE`` tools always run.
+    An **unprivileged** session (ADR-0020: an untrusted remote party — the GREY
+    receptionist or the OUTBOUND untrusted callee) is hard-blocked from every
+    ``ELEVATED``/``IRREVERSIBLE`` tool, structurally and unconditionally — before
+    confirmation or the ``degraded`` flag is even considered. This is *least
+    privilege* as the primary defense: the agent for an untrusted party cannot
+    invoke a tool that could reach an operator secret or mutate state, no matter
+    what the persona prompt, the injection classifier, or a (spoofable)
+    confirmation say. ``SAFE`` (read-only) tools still run so the caller is never
+    dropped.
+
+    For a **privileged** session the ADR-0009 rules apply unchanged: an
+    ``IRREVERSIBLE`` tool requires explicit confirmation (human/DTMF, ADR-0010)
+    and is hard-blocked while ``degraded`` — even if the classifier returned
+    ALLOW (the miss case ADR-0009 tests for); an ``ELEVATED`` tool is blocked
+    while ``degraded``.
+
     This never silently allows (rule 37): the decision is total over ``ToolRisk``.
 
     Args:
@@ -81,12 +103,19 @@ def gate_tool_call(
     Returns:
         True if the tool may run, else False.
     """
+    if risk is ToolRisk.SAFE:
+        # Read-only tools always run, even for an untrusted/unprivileged session:
+        # the caller is screened, never dropped.
+        return True
+    # Every non-SAFE (mutating) tool requires a privileged session (ADR-0020). An
+    # untrusted remote party (receptionist / outbound callee) is clamped here
+    # before confirmation or degraded are consulted — least privilege first.
+    if not state.privileged:
+        return False
     if risk is ToolRisk.IRREVERSIBLE:
         return confirmed and not state.degraded
     if risk is ToolRisk.ELEVATED:
         return not state.degraded
-    if risk is ToolRisk.SAFE:
-        return True
     assert_never(
         risk
     )  # exhaustive: a new ToolRisk member fails mypy here, not silently allows

@@ -105,12 +105,15 @@ class _FakeManager:
 
 
 class _FakeTtsStream:
+    def __init__(self) -> None:
+        self._frames: list[PcmFrame] = []
+
     def __aiter__(self) -> AsyncIterator[PcmFrame]:
         return self._gen()
 
     async def _gen(self) -> AsyncIterator[PcmFrame]:
-        return
-        yield  # pragma: no cover - empty async generator
+        for frame in self._frames:  # always empty — fixes the async-gen shape
+            yield frame
 
     async def cancel(self) -> None: ...
 
@@ -122,10 +125,11 @@ class _FakeTTS:
 
 class _FakeASR:
     async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+        chunks: list[object] = []
         async for _ in audio:
-            pass
-        return
-        yield  # pragma: no cover - empty async generator
+            pass  # consume so the pump does not stall
+        for chunk in chunks:  # always empty — forces the async-gen shape
+            yield chunk
 
 
 class _FakeGuard:

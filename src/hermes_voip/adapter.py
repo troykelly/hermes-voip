@@ -719,6 +719,26 @@ class VoipAdapter(BasePlatformAdapter):
             engine._remote_port = answer_audio.port
             engine._outbound_addr = (remote_address, answer_audio.port)
 
+            # Update the engine codec from the negotiated answer (the engine was
+            # constructed with Codec.PCMU as a placeholder before the answer was
+            # known; sending with the wrong payload type causes the callee to hear
+            # nothing when they chose PCMA).
+            negotiated_voice = _first_voice_codec(agreed_codecs)
+            if negotiated_voice is not None:
+                engine._codec = _to_engine_codec(negotiated_voice)
+
+            _log.info(
+                "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
+                "our advertised RTP %s:%d, answer direction=%s",
+                negotiated_voice.encoding if negotiated_voice is not None else "none",
+                negotiated_voice.payload_type if negotiated_voice is not None else -1,
+                remote_address,
+                answer_audio.port,
+                local_rtp_host,
+                engine.local_port,
+                answer_audio.direction or "unset",
+            )
+
             # --- Send ACK for 2xx (RFC 3261 §17.1.2.1 — TU owns ACK for 2xx) ---
             ack_cseq_num = int(dialog.local_cseq)
             ack_via = f"SIP/2.0/TLS {local_sent_by};branch={new_branch()};rport"

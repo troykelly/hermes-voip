@@ -540,8 +540,16 @@ class VoipAdapter(BasePlatformAdapter):
             msg = f"INVITE {call_id}: media config not initialised"
             raise RuntimeError(msg)
 
-        vad = _make_vad(media_cfg)
-        endpointer = _make_endpointer(media_cfg)
+        # Build the VAD + endpointer at the engine's INBOUND rate (8 kHz G.711),
+        # not silero's 16 kHz default: the pump feeds engine.inbound_audio()
+        # frames straight into the VAD, so a 16 kHz detector raises
+        # "frame rate 8000 != detector rate 16000" on the first frame, fails the
+        # CallLoop TaskGroup, and the caller hears silence. silero runs natively
+        # at 8 kHz; the STT resamples 8->16 kHz internally (ADR-0017), so the
+        # inbound chain stays at the wire rate end-to-end.
+        inbound_rate = engine.inbound_sample_rate
+        vad = _make_vad(media_cfg, sample_rate_hz=inbound_rate)
+        endpointer = _make_endpointer(media_cfg, sample_rate_hz=inbound_rate)
 
         async def _deliver(text: str) -> None:
             await self._deliver_turn(call_id, text)
@@ -702,23 +710,37 @@ def _caller_number(from_header: str) -> str:
     return match.group(1) if match else from_header
 
 
-def _make_vad(media_cfg: MediaConfig) -> VoiceActivityDetector:
-    """Build a VoiceActivityDetector from the media config.
+def _make_vad(media_cfg: MediaConfig, *, sample_rate_hz: int) -> VoiceActivityDetector:
+    """Build a VoiceActivityDetector at the engine's inbound sample rate.
 
     Loads the silero-vad ONNX model from ``media_cfg.vad_model_dir`` (or the
     ``HERMES_VOIP_VAD_MODEL_DIR`` environment variable). Requires the ``ml``
     extra (onnxruntime + numpy); raises ``ImportError`` / ``FileNotFoundError``
     when the extra or model file is absent so the error surfaces clearly.
 
-    Called once per inbound call; the ONNX session is created inside
+    ``sample_rate_hz`` is the media engine's ``inbound_sample_rate`` (8 kHz for
+    G.711). It is passed to BOTH the model factory and the detector so the
+    detector scores the engine's frames at their native rate — silero supports
+    8 kHz and 16 kHz, and the pump feeds inbound frames into the VAD directly, so
+    a mismatched detector rate would raise inside the pump. Called once per
+    inbound call; the ONNX session is created inside
     :func:`~hermes_voip.media.vad.load_silero_model`.
     """
     return VoiceActivityDetector(
-        model=load_silero_model(),
+        model=load_silero_model(sample_rate_hz),
+        sample_rate_hz=sample_rate_hz,
         threshold=media_cfg.vad_threshold,
     )
 
 
-def _make_endpointer(media_cfg: MediaConfig) -> Endpointer:
-    """Build an Endpointer using the configured trailing-silence threshold."""
-    return Endpointer(silence_ms=media_cfg.endpoint_silence_ms)
+def _make_endpointer(media_cfg: MediaConfig, *, sample_rate_hz: int) -> Endpointer:
+    """Build an Endpointer at the engine's inbound sample rate.
+
+    ``sample_rate_hz`` (the engine's ``inbound_sample_rate``) sets the window
+    duration the trailing-silence threshold is converted against, so the
+    endpointer's window ordinals line up with the VAD's at the same rate.
+    """
+    return Endpointer(
+        silence_ms=media_cfg.endpoint_silence_ms,
+        sample_rate_hz=sample_rate_hz,
+    )

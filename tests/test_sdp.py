@@ -977,11 +977,15 @@ def test_ice_candidate_parse_srflx() -> None:
 
 
 def test_ice_candidate_parse_relay() -> None:
+    # relay: candidate address 203.0.113.5:50000; base (raddr/rport) is the
+    # server-reflexive addr at the TURN server: 203.0.113.1:49001 (RFC 8839 §5.1).
     body = "3 1 UDP 16777215 203.0.113.5 50000 typ relay raddr 203.0.113.1 rport 49001"
     cand = IceCandidate.parse(body)
     assert cand.typ == "relay"
-    assert cand.raddr == "203.0.113.5"
-    assert cand.rport == 50000
+    assert cand.address == "203.0.113.5"
+    assert cand.port == 50000
+    assert cand.raddr == "203.0.113.1"
+    assert cand.rport == 49001
 
 
 def test_ice_candidate_render_host_round_trip() -> None:

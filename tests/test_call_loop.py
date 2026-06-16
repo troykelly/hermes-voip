@@ -993,3 +993,148 @@ async def test_caller_speech_during_greeting_cancels_it() -> None:
 
     assert tts.last_stream is not None
     assert tts.last_stream.cancel_called is True
+
+
+class _SlowTtsStream:
+    """TtsStream fake that yields each frame after a cooperative ``sleep(0)``.
+
+    The per-frame yield lets a *second* concurrent ``speak()`` interleave with
+    this one if playback is not single-owner — which is exactly the clobber the
+    serialization fix must prevent. Stops promptly when cancelled.
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        self._frames = frames
+        self.cancel_called = False
+        self.flush_called = False
+        self._cancelled = False
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncIterator[PcmFrame]:
+        for frame in self._frames:
+            if self._cancelled:
+                return
+            await asyncio.sleep(0)  # cooperative yield so a rival speak() can run
+            if self._cancelled:
+                return
+            yield frame
+
+    async def flush(self) -> None:
+        self.flush_called = True
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+        self.cancel_called = True
+
+
+class _SingleStreamTTS:
+    """StreamingTTS fake that returns one preset _SlowTtsStream from synthesize()."""
+
+    def __init__(self, stream: _SlowTtsStream) -> None:
+        self._stream = stream
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = text, voice
+        return self._stream
+
+
+@pytest.mark.asyncio
+async def test_second_speak_supersedes_first_no_interleave() -> None:
+    """A new speak() must supersede the in-flight one — frames never interleave.
+
+    Regression for the greeting/reply clobber race: ``_active_tts_stream`` is a
+    single slot, and without serialization two concurrent ``speak()`` loops push
+    frames into ``transport.send_audio`` at once (interleaved on the wire) while
+    ``barge_in`` can only cancel the last-registered stream. Speaking again must
+    cancel the previous stream and take sole ownership: once the second stream's
+    frames begin, none of the first stream's frames may follow.
+    """
+    a_frames = [_greeting_frame(0xA0 + i) for i in range(6)]
+    b_frames = [_greeting_frame(0xB0 + i) for i in range(3)]
+    a_stream = _SlowTtsStream(a_frames)
+    b_stream = _SlowTtsStream(b_frames)
+    transport = _FakeTransport([])
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=_SingleStreamTTS(a_stream),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+    )
+
+    async def _tokens(word: str) -> AsyncIterator[str]:
+        yield word
+
+    # Start the first (long) utterance; let it send a couple of frames.
+    first = asyncio.create_task(loop.speak(_tokens("first utterance")))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert transport.sent_audio, "first speak() should have started sending"
+
+    # Now swap the TTS to the second stream and speak again — it must supersede.
+    loop._tts = _SingleStreamTTS(b_stream)
+    second = asyncio.create_task(loop.speak(_tokens("second utterance")))
+
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=5.0)
+
+    # The first stream was cancelled (superseded); the second ran to completion.
+    assert a_stream.cancel_called is True
+    # Single-owner invariant: once any B-frame is sent, no A-frame follows it.
+    sent = transport.sent_audio
+    last_b = max(
+        (i for i, f in enumerate(sent) if f in b_frames),
+        default=-1,
+    )
+    a_after_b = [f for f in sent[last_b + 1 :] if f in a_frames]
+    assert a_after_b == [], f"first-stream frames leaked after supersede: {sent!r}"
+    # The full second utterance must have been delivered.
+    assert [f for f in sent if f in b_frames] == b_frames
+
+
+@pytest.mark.asyncio
+async def test_first_inbound_onset_cancels_greeting_without_gating() -> None:
+    """Barge-in must catch a caller-onset on the VERY FIRST inbound frame.
+
+    Regression for the onset-before-registration race: the pump task is created
+    before the greeting, and ``_FakeTransport``'s inbound generator yields its
+    first frame WITHOUT awaiting, so the pump can observe an ONSET before the
+    greeting task has run. If the greeting registers its active stream only when
+    its task runs, that first onset sees ``_active_tts_stream is None`` and
+    barge-in is silently missed. The greeting's stream must be registered before
+    the pump can process any inbound audio, so even a first-frame onset cancels
+    it.
+    """
+    # A full 16 kHz silero window scored as speech → ONSET on the first frame.
+    speech_frame = PcmFrame(samples=bytes(1024), sample_rate=16_000, monotonic_ts_ns=0)
+    tts = _FakeTTS([_greeting_frame(1), _greeting_frame(2), _greeting_frame(3)])
+    transport = _FakeTransport([speech_frame])  # ungated; first __anext__ won't await
+
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+        vad=_make_speaking_vad(),
+        greeting="Hello there, the caller barges in on the first frame.",
+    )
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True

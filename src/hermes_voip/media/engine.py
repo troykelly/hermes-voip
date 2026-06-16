@@ -87,9 +87,12 @@ _OUTBOUND_SSRC: int = 0xCAFEBABE
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512
 
-# Number of TX frames for which peak amplitude is logged at INFO on call open.
-# Lets the operator confirm the signal is non-silent without noise in steady state.
-_TX_AMPLITUDE_LOG_FRAMES: Final[int] = 3
+# How often to log a rolling peak amplitude for outbound TX audio.
+# Every _TX_AMPLITUDE_LOG_PERIOD packets (= 1 second at 20 ms ptime, 50 pps)
+# the engine emits one INFO line showing the peak amplitude seen in that window.
+# This replaces the old "first 3 chunks only" approach, which always logged 0
+# because the TTS synthesiser has a brief silent lead-in before actual speech.
+_TX_AMPLITUDE_LOG_PERIOD: Final[int] = 50
 
 # A received datagram paired with the UDP source address it arrived from. The
 # source address is what symmetric-RTP (comedia) latching needs: we send our
@@ -257,9 +260,12 @@ class RtpMediaTransport:
         # RTP packet at INFO so the media path is visible in the operator log.
         self._first_tx_logged: bool = False
         self._first_rx_logged: bool = False
-        # Peak amplitude logged for the first few TX frames (post-resample,
-        # pre-encode) so the operator can confirm the signal is non-silent.
-        self._tx_amplitude_frames_left: int = _TX_AMPLITUDE_LOG_FRAMES
+        # Rolling TX amplitude tracking: every _TX_AMPLITUDE_LOG_PERIOD packets
+        # emit one INFO line showing the peak seen in that window.  Counts and
+        # resets on each period boundary so a slow TTS lead-in (which is silent)
+        # does not swamp the early log lines with zeros.
+        self._tx_amplitude_chunk_count: int = 0
+        self._tx_amplitude_period_peak: int = 0
 
         # Socket / asyncio transport state (populated by connect()).
         # _ever_connected distinguishes "stopped after a real call" (silent no-op
@@ -324,7 +330,8 @@ class RtpMediaTransport:
         # outbound and inbound packets of the new call.
         self._first_tx_logged = False
         self._first_rx_logged = False
-        self._tx_amplitude_frames_left = _TX_AMPLITUDE_LOG_FRAMES
+        self._tx_amplitude_chunk_count = 0
+        self._tx_amplitude_period_peak = 0
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -613,21 +620,28 @@ class RtpMediaTransport:
                     _OUTBOUND_SSRC,
                 )
 
-            # Log peak amplitude for the first few TX chunks (post-resample,
-            # pre-encode) so the operator can verify the outbound signal is
-            # non-silent even when they cannot capture the wire.
-            if self._tx_amplitude_frames_left > 0:
-                self._tx_amplitude_frames_left -= 1
-                n_samp = len(chunk) // 2
-                if n_samp > 0:
-                    pcm_vals = struct.unpack_from(f"<{n_samp}h", chunk)
-                    peak = max(abs(s) for s in pcm_vals)
-                    _log.info(
-                        "rtp tx: chunk %d peak_amplitude=%d (%.1f%% full-scale)",
-                        _TX_AMPLITUDE_LOG_FRAMES - self._tx_amplitude_frames_left,
-                        peak,
-                        peak / 327.67,
-                    )
+            # Rolling TX amplitude: accumulate the peak across each
+            # _TX_AMPLITUDE_LOG_PERIOD-packet window (1 second at 50 pps) and
+            # emit one INFO line at the boundary.  This replaces the old
+            # "first 3 chunks" approach, which always sampled silent TTS lead-in
+            # and gave the operator a misleading zero reading.
+            n_samp = len(chunk) // 2
+            if n_samp > 0:
+                pcm_vals = struct.unpack_from(f"<{n_samp}h", chunk)
+                chunk_peak = max(abs(s) for s in pcm_vals)
+                self._tx_amplitude_period_peak = max(
+                    self._tx_amplitude_period_peak, chunk_peak
+                )
+            self._tx_amplitude_chunk_count += 1
+            if self._tx_amplitude_chunk_count % _TX_AMPLITUDE_LOG_PERIOD == 0:
+                period = self._tx_amplitude_chunk_count // _TX_AMPLITUDE_LOG_PERIOD
+                _log.info(
+                    "rtp tx: period %d peak_amplitude=%d (%.1f%% full-scale)",
+                    period,
+                    self._tx_amplitude_period_peak,
+                    self._tx_amplitude_period_peak / 327.67,
+                )
+                self._tx_amplitude_period_peak = 0
 
             self._transport.sendto(wire, self._outbound_addr)
             await self._sleep(self._ptime / 1000.0)

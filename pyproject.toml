@@ -35,6 +35,19 @@ ml = [
 media = [
     "cryptography==46.0.7",
 ]
+# WebRTC transport: SIP-over-Secure-WebSocket (RFC 7118), DTLS-SRTP keying
+# (RFC 5763/5764), and ICE (RFC 8445) — ADR-0016. Lazy-imported inside each
+# sub-module so ``import hermes_voip`` stays light (no websockets/aioice/
+# pyOpenSSL imported at package level). All licences are permissive (BSD-3 /
+# Apache-2.0); no copyleft.
+#
+# PR-A adds websockets (the SIP-over-WSS client, RFC 6455); later PRs (C/D)
+# add pyOpenSSL (DTLS) and aioice (ICE) as they land.
+#
+# websockets 16.0: BSD-3-Clause, pure-Python, asyncio-native.
+webrtc = [
+    "websockets==16.0",
+]
 
 # ---------------------------------------------------------------------------
 # Hermes plugin discovery (hermes_agent.plugins entry point group).

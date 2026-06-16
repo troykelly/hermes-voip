@@ -525,6 +525,9 @@ ml = [
     { name = "sherpa-onnx" },
     { name = "tokenizers" },
 ]
+webrtc = [
+    { name = "websockets" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -546,8 +549,9 @@ requires-dist = [
     { name = "onnxruntime", marker = "extra == 'ml'", specifier = "==1.24.4" },
     { name = "sherpa-onnx", marker = "extra == 'ml'", specifier = "==1.13.2" },
     { name = "tokenizers", marker = "extra == 'ml'", specifier = "==0.23.1" },
+    { name = "websockets", marker = "extra == 'webrtc'", specifier = "==16.0" },
 ]
-provides-extras = ["hermes", "ml", "media"]
+provides-extras = ["hermes", "ml", "media", "webrtc"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -44,6 +44,12 @@ from hermes_voip.providers.tts import TtsStream
 from hermes_voip.rtp import RtpPacket
 from hermes_voip.stt.resample import FrameUpsampler
 
+# Realistic large TTS frame sizes (kokoro emits chunks of thousands of samples).
+# A single 24kHz chunk from sherpa-onnx Kokoro is ~17 000-56 000 samples, i.e.
+# 700ms-2300ms of audio per frame.  send_audio must rechunk these into standard
+# 20ms RTP packets so the gateway does not drop or mangle oversized payloads.
+_LARGE_TTS_SAMPLES = 17_792  # ~5931 samples at 8 kHz -> 37 standard 20ms packets
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -475,3 +481,91 @@ def test_generate_tone_frames_g711_roundtrip_non_silent() -> None:
         assert rms >= _MIN_RMS, (
             f"Tone frame G.711 round-trip produces silence: RMS={rms:.1f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Large-frame rechunking test (proves the TTS-silence root cause and fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_large_tts_frame_rechunked_into_standard_rtp_packets() -> None:
+    """A single large TTS frame must become many standard 20 ms RTP packets.
+
+    ROOT CAUSE: sherpa-onnx Kokoro emits audio in chunks of ~17 000-56 000 samples
+    (700ms-2300ms per frame).  The old send_audio forwarded each chunk as ONE RTP
+    packet.  A standard telephony G.711 RTP packet carries exactly 160 samples
+    (20 ms at 8 kHz = 160 bytes payload).  A gateway receiving a 5 931-byte payload
+    (37x oversized) silently drops or ignores it, producing SILENCE on the callee's
+    phone even though the engine log shows "greeting: first RTP sent".
+
+    This test proves the fix: send_audio must rechunk any oversized wire-rate frame
+    into N standard 20 ms packets (each 160 samples / 160 bytes G.711), so every
+    RTP packet on the wire is RFC-compliant and the gateway plays all of them.
+
+    Drive: one large 24 kHz frame (_LARGE_TTS_SAMPLES samples = 37x a 20 ms frame),
+    passed through the REAL send_audio resample + G.711 path.
+
+    Assert:
+    (a) At least 30 packets are sent (not just 1 — that was the bug).
+    (b) Every decoded G.711 payload is exactly 160 bytes (standard ptime).
+    (c) Every decoded payload is non-silent (RMS > threshold).
+    (d) Total decoded duration matches the input (no samples lost or doubled).
+    """
+    # Build a non-silent sine at 24 kHz: _LARGE_TTS_SAMPLES samples.
+    large_pcm_24k = _sine_pcm16(1000.0, _TTS_RATE, _LARGE_TTS_SAMPLES)
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    frame = PcmFrame(samples=large_pcm_24k, sample_rate=_TTS_RATE, monotonic_ts_ns=0)
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(frame)
+
+    await engine.stop()
+
+    n_pkts = len(recorder.sent)
+    # At 3:1 downsample 24k->8k: 17792 samples -> ~5931 samples -> 37x 160-sample pkts.
+    # Require at least 30 to catch the old 1-packet behaviour.
+    assert n_pkts >= 30, (
+        f"Large TTS frame produced only {n_pkts} RTP packet(s) — gateway will "
+        f"drop oversized payload (was: 1 packet, need ≥30 standard 20ms packets). "
+        f"This is the TTS-silence root cause."
+    )
+
+    # (b) Every payload must be exactly _SAMPLES_PER_8K_FRAME bytes (= 160 bytes).
+    for i, (wire, _dest) in enumerate(recorder.sent):
+        pkt = RtpPacket.parse(wire)
+        assert len(pkt.payload) == _SAMPLES_PER_8K_FRAME, (
+            f"Packet {i}: payload is {len(pkt.payload)} bytes, "
+            f"expected {_SAMPLES_PER_8K_FRAME} (20 ms standard G.711 ptime)"
+        )
+
+    # (c) Every decoded payload must be non-silent.
+    silent_pkts = 0
+    total_pcm = b""
+    for wire, _dest in recorder.sent:
+        pkt = RtpPacket.parse(wire)
+        decoded = decode_ulaw(pkt.payload)
+        total_pcm += decoded
+        if _rms(decoded) < _MIN_RMS:
+            silent_pkts += 1
+    assert silent_pkts == 0, (
+        f"{silent_pkts}/{n_pkts} rechunked RTP packets decoded to silence"
+    )
+
+    # (d) Total duration: resample 17792 24kHz samples → ~5931 8kHz samples.
+    # With integer-ratio resampling the count is floor(17792 * 8000/24000) = 5930.
+    # Allow ±1 packet (160 samples) of rounding from the stateful resampler.
+    expected_8k_samples = _LARGE_TTS_SAMPLES * G711_SAMPLE_RATE // _TTS_RATE
+    actual_8k_samples = len(total_pcm) // 2
+    assert abs(actual_8k_samples - expected_8k_samples) <= _SAMPLES_PER_8K_FRAME, (
+        f"Rechunking lost or duplicated samples: expected ~{expected_8k_samples} "
+        f"8kHz samples, got {actual_8k_samples}"
+    )

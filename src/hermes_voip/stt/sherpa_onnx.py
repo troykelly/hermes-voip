@@ -34,12 +34,18 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from hermes_voip.aio import stream_from_thread
+
+# G711_SAMPLE_RATE is the narrowband rate the transport delivers inbound frames
+# at; imported from the codec module (single source of truth) so the 8 kHz->16
+# kHz upsample threshold in _feed tracks the wire rate everywhere.
+from hermes_voip.media.audio import G711_SAMPLE_RATE
 from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.onnx_compat import ensure_sherpa_loadable
 from hermes_voip.stt.resample import (
     RECOGNISER_SAMPLE_RATE,
     FloatArray,
+    FrameUpsampler,
     pcm16_to_float32,
 )
 
@@ -195,6 +201,29 @@ class SherpaOnnxASR:
         return _run()
 
 
+def _to_recogniser_rate(frame: PcmFrame, upsampler: FrameUpsampler) -> PcmFrame:
+    """Return ``frame`` at the recogniser's 16 kHz rate (ADR-0017).
+
+    The transport delivers 8 kHz G.711 frames, but the zipformer wants 16 kHz
+    (ADR-0006). An 8 kHz frame is upsampled via the per-stream, state-carrying
+    :class:`FrameUpsampler` (so frame-by-frame output matches a single pass); a
+    frame already at the recogniser rate (e.g. a fake in a test, or a future
+    wideband seam) passes through unchanged. Any other rate is a genuine
+    misconfiguration and raises — the seam reconciles the known wire rate, it
+    does not silently mis-feed an unexpected one.
+    """
+    if frame.sample_rate == G711_SAMPLE_RATE:
+        return upsampler.upsample(frame)
+    if frame.sample_rate == RECOGNISER_SAMPLE_RATE:
+        return frame
+    msg = (
+        f"inbound STT frame at {frame.sample_rate} Hz: expected the "
+        f"{G711_SAMPLE_RATE} Hz wire rate or {RECOGNISER_SAMPLE_RATE} Hz "
+        f"recogniser rate"
+    )
+    raise ValueError(msg)
+
+
 async def _feed(
     audio: AsyncIterator[PcmFrame],
     frames: queue.Queue[_FrameItem],
@@ -202,16 +231,24 @@ async def _feed(
 ) -> None:
     """Pump float32 frames from the async inbound iterator into the sync queue.
 
+    Each inbound frame is first reconciled to the recogniser's 16 kHz rate
+    (8 kHz transport frames are upsampled — ADR-0017) and then converted to the
+    normalised float32 sherpa's ``accept_waveform`` requires.
+
     Runs as a loop task so the worker thread can ``queue.get`` blocking. On
     completion it enqueues the end-of-audio sentinel so the decoder flushes its
     tail and returns. ``queue.put`` runs in a thread so a full queue back-pressures
     without blocking the loop.
     """
+    # One upsampler per feed (i.e. per stream/call) so resample state carries
+    # across this stream's frames and resets naturally for the next call.
+    upsampler = FrameUpsampler()
     try:
         async for frame in audio:
             if stop.is_set():
                 return
-            samples = pcm16_to_float32(frame.samples)
+            at_rate = _to_recogniser_rate(frame, upsampler)
+            samples = pcm16_to_float32(at_rate.samples)
             await asyncio.to_thread(frames.put, samples)
     finally:
         if not stop.is_set():

@@ -51,6 +51,7 @@ from typing import Protocol
 
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
+    Resampler,
     alaw_to_frame,
     frame_to_alaw,
     frame_to_ulaw,
@@ -254,6 +255,14 @@ class RtpMediaTransport:
         )
         self._jitter: JitterBuffer = JitterBuffer(target_depth=jitter_depth)
 
+        # Outbound rate reconciliation (ADR-0017): a TTS provider emits frames at
+        # its own output rate (e.g. sherpa-Kokoro at 24 kHz), but the G.711 wire
+        # is fixed at 8 kHz. send_audio resamples any non-8 kHz frame down to the
+        # wire rate before encoding. We keep one state-carrying Resampler PER
+        # source rate so a continuous stream resamples click-free (frame-by-frame
+        # output matches a single pass); 8 kHz frames bypass it entirely.
+        self._tx_resamplers: dict[int, Resampler] = {}
+
         # Stop signal: set by stop(), selected on by the inbound generator so it
         # wakes promptly regardless of recv-queue fullness (a bounded queue can
         # otherwise drop a sentinel datagram and strand the consumer).
@@ -287,6 +296,9 @@ class RtpMediaTransport:
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
         self._stop_event = asyncio.Event()
         self._pending = None
+        # Drop any carried outbound-resample state so a reused engine starts a
+        # fresh stream (no stale sub-sample phase from a previous call).
+        self._tx_resamplers = {}
         # Reset the latch so a reused engine re-latches on its next call: aim
         # back at the SDP-negotiated remote until the first valid inbound packet.
         self._outbound_addr = (self._remote_address, self._remote_port)
@@ -478,12 +490,17 @@ class RtpMediaTransport:
         """Encode and packetise one near-end frame; gate on hold state.
 
         When :attr:`on_hold` is ``True`` the datagram is silently discarded.
-        Otherwise the frame is encoded, packed into an RTP packet (incrementing
-        seq/timestamp), optionally SRTP-protected, and sent to the remote.
-        The injected ``sleep`` callable paces the stream at ``ptime`` ms.
+        Otherwise the frame is resampled to the 8 kHz G.711 wire rate (if it
+        arrives at any other rate — e.g. a 24 kHz TTS frame), encoded, packed
+        into an RTP packet (incrementing seq/timestamp), optionally
+        SRTP-protected, and sent to the remote.  The injected ``sleep`` callable
+        paces the stream at ``ptime`` ms.
 
         Args:
-            frame: PCM16 audio at the G.711 wire rate (8 kHz).
+            frame: PCM16 audio at ANY sample rate.  A frame already at 8 kHz is
+                encoded directly; any other rate (e.g. the TTS provider's 24 kHz
+                output) is resampled down to 8 kHz first (ADR-0017), so this
+                method never raises on a non-8 kHz frame — it converts.
         """
         if self.on_hold:
             return
@@ -492,7 +509,7 @@ class RtpMediaTransport:
             msg = "send_audio called before connect()"
             raise RuntimeError(msg)
 
-        payload = self._encode(frame)
+        payload = self._encode(self._to_wire_rate(frame))
 
         pkt = RtpPacket(
             payload_type=self._codec.value,
@@ -558,6 +575,33 @@ class RtpMediaTransport:
     # ------------------------------------------------------------------
     # Internal codec helpers
     # ------------------------------------------------------------------
+
+    def _to_wire_rate(self, frame: PcmFrame) -> PcmFrame:
+        """Return ``frame`` resampled to the 8 kHz G.711 wire rate (ADR-0017).
+
+        A frame already at :data:`G711_SAMPLE_RATE` is returned unchanged (no
+        resampler touches it, so the 8 kHz fast path is byte-exact). A frame at
+        any other rate — typically the TTS provider's 24 kHz output — is
+        downsampled to 8 kHz using a per-source-rate, state-carrying
+        :class:`~hermes_voip.media.audio.Resampler`, so a continuous stream
+        converts click-free (frame-by-frame output equals a single pass). This
+        is a conversion, not an error: ``send_audio`` therefore never raises on a
+        non-8 kHz frame.
+
+        The output frame keeps the source ``monotonic_ts_ns`` (the presentation
+        clock is unaffected by the rate change) and is stamped at the wire rate.
+        """
+        if frame.sample_rate == G711_SAMPLE_RATE:
+            return frame
+        resampler = self._tx_resamplers.get(frame.sample_rate)
+        if resampler is None:
+            resampler = Resampler(frame.sample_rate, G711_SAMPLE_RATE)
+            self._tx_resamplers[frame.sample_rate] = resampler
+        return PcmFrame(
+            samples=resampler.resample(frame.samples),
+            sample_rate=G711_SAMPLE_RATE,
+            monotonic_ts_ns=frame.monotonic_ts_ns,
+        )
 
     def _decode(self, payload: bytes, ts_ns: int) -> PcmFrame:
         """Decode a G.711 RTP payload to a PcmFrame."""

@@ -13,6 +13,15 @@ static metadata — no network, no download, no ONNX load — so it runs in the
 offline CI (rule 33). The pin values were obtained from the HuggingFace tree API
 at the pinned commit (LFS ``oid`` = the artifact's sha256) and independently
 re-verified before they were committed.
+
+STT model swap (2026-06-16): the default STT model was changed from
+``csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26`` (LibriSpeech-only)
+to ``csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21``
+(LibriSpeech+GigaSpeech), which measurably reduces telephony WER (1.3-2.6pp
+across G.711-only and 15-25dB SNR conditions on real speech). Architecture is
+identical (streaming zipformer transducer, ``from_transducer`` API, same file
+layout); no code change was needed. Apache-2.0 licence verified from HuggingFace
+``cardData.license`` field at the pinned commit.
 """
 
 from __future__ import annotations
@@ -27,12 +36,13 @@ from hermes_voip.manifest import (
     validate_manifest,
 )
 
-# ADR-0006 STT default: the Apache-2.0 sherpa-onnx streaming zipformer. PUBLIC
-# model-registry coordinates (no host/secret/PII) — recorded so drift fails loudly.
-_STT_REPO = "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26"
-_STT_REVISION = "672fbf1b30579d6585301139bb363f42a0ad4a24"
-_STT_ENCODER = "encoder-epoch-99-avg-1-chunk-16-left-64.onnx"
-_STT_ENCODER_SHA256 = "b67600b0eaf19069867f109a5b6ad78db10efba67ec8e781ea719c956d20261f"
+# ADR-0006 STT default (updated 2026-06-16): the LibriSpeech+GigaSpeech streaming
+# zipformer — Apache-2.0, telephony-robust. PUBLIC model-registry coordinates (no
+# host/secret/PII) — recorded so drift fails loudly.
+_STT_REPO = "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21"
+_STT_REVISION = "9a65b6ea94c311ca770c2bf895b30f456a22d703"
+_STT_ENCODER = "encoder-epoch-99-avg-1.onnx"
+_STT_ENCODER_SHA256 = "b584884daad8cd4e60a5258e6da11876460089f1c4d3b5a92e19f0f104edb77a"
 
 # ADR-0007 TTS default: the Apache-2.0 sherpa-onnx Kokoro ONNX packaging.
 _TTS_REPO = "csukuangfj/kokoro-en-v0_19"
@@ -65,8 +75,8 @@ def test_stt_manifest_pins_the_full_transducer_triplet() -> None:
     """The STT pin covers the encoder, decoder, and joiner (the whole model)."""
     names = {f.name for f in STT_MODEL_MANIFEST.files}
     assert _STT_ENCODER in names
-    assert "decoder-epoch-99-avg-1-chunk-16-left-64.onnx" in names
-    assert "joiner-epoch-99-avg-1-chunk-16-left-64.onnx" in names
+    assert "decoder-epoch-99-avg-1.onnx" in names
+    assert "joiner-epoch-99-avg-1.onnx" in names
 
 
 def test_stt_manifest_validates_under_the_stt_family_gate() -> None:

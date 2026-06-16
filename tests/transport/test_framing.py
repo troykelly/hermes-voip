@@ -186,3 +186,27 @@ def test_unicode_nondecimal_content_length_is_a_framing_error() -> None:
     )
     with pytest.raises(FramingError):
         list(framer)
+
+
+# ---------------------------------------------------------------------------
+# RFC 5626 keepalive interleaving (reconnect feature)
+# ---------------------------------------------------------------------------
+
+
+def test_leading_crlf_skipped() -> None:
+    """A bare CRLF preceding a message is skipped; exactly one message yields."""
+    framer = SipMessageFramer()
+    framer.feed(b"\r\n" + _register("ping-skip"))
+    messages = list(framer)
+    assert len(messages) == 1
+    assert "Call-ID: ping-skip" in messages[0]
+
+
+def test_pong_between_messages_both_framed() -> None:
+    """A double-CRLF pong interleaved between two messages must not drop either."""
+    framer = SipMessageFramer()
+    framer.feed(_register("first") + b"\r\n\r\n" + _register("second"))
+    messages = list(framer)
+    assert len(messages) == 2
+    assert "Call-ID: first" in messages[0]
+    assert "Call-ID: second" in messages[1]

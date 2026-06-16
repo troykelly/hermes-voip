@@ -525,6 +525,9 @@ ml = [
     { name = "sherpa-onnx" },
     { name = "tokenizers" },
 ]
+webrtc = [
+    { name = "pyopenssl" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -544,10 +547,11 @@ requires-dist = [
     { name = "hermes-agent", marker = "extra == 'hermes'", specifier = "==0.16.0" },
     { name = "numpy", marker = "extra == 'ml'", specifier = "==2.4.6" },
     { name = "onnxruntime", marker = "extra == 'ml'", specifier = "==1.24.4" },
+    { name = "pyopenssl", marker = "extra == 'webrtc'", specifier = "==26.2.0" },
     { name = "sherpa-onnx", marker = "extra == 'ml'", specifier = "==1.13.2" },
     { name = "tokenizers", marker = "extra == 'ml'", specifier = "==0.23.1" },
 ]
-provides-extras = ["hermes", "ml", "media"]
+provides-extras = ["hermes", "ml", "media", "webrtc"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1428,6 +1432,18 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography" },
+]
+
+[[package]]
+name = "pyopenssl"
+version = "26.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/51/27a5ad5f939d08f690a326ef9582cda7140555180db71695f6fb747d6a36/pyopenssl-26.2.0.tar.gz", hash = "sha256:8c6fcecd1183a7fc897548dfe388b0cdb7f37e018200d8409cf33959dbe35387", size = 182195, upload-time = "2026-05-04T23:06:09.72Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/b8/a0e2790ae249d6f38c9f66de7a211621a7ab2650217bcd04e1262f578a56/pyopenssl-26.2.0-py3-none-any.whl", hash = "sha256:4f9d971bc5298b8bc1fab282803da04bf000c755d4ad9d99b52de2569ca19a70", size = 55823, upload-time = "2026-05-04T23:06:08.395Z" },
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from hermes_voip.config import (
+    DEFAULT_GREETING,
     ConfigError,
     ExtensionConfig,
     GatewayConfig,
@@ -409,6 +410,9 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.vad_threshold == pytest.approx(0.5)
     assert cfg.endpoint_silence_ms == 500
     assert cfg.duplex_mode == "half"
+    # greeting (ADR-0002 NAT-latch): a non-empty friendly default
+    assert cfg.greeting == DEFAULT_GREETING
+    assert cfg.greeting != ""
     # injection guard
     assert cfg.injection_guard == "onnx"
     assert cfg.injection_guard_model_dir is None
@@ -436,6 +440,7 @@ def test_media_full_override() -> None:
             "HERMES_SIP_DTMF_MODE": "rfc4733",
             "HERMES_SIP_DTMF_INTERDIGIT_MS": "120",
             "HERMES_SIP_DTMF_INBAND_ENABLED": "false",
+            "HERMES_VOIP_GREETING": "Hi from the test gateway.",
         }
     )
     assert cfg.stt_provider == "deepgram"
@@ -453,6 +458,31 @@ def test_media_full_override() -> None:
     assert cfg.dtmf_mode == "rfc4733"
     assert cfg.dtmf_interdigit_ms == 120
     assert cfg.dtmf_inband_enabled is False
+    assert cfg.greeting == "Hi from the test gateway."
+
+
+def test_media_greeting_explicit_empty_disables_greeting() -> None:
+    """An explicitly-empty HERMES_VOIP_GREETING means 'no greeting' (kept ``""``).
+
+    Unlike the optional provider/model fields (which collapse blank → ``None``),
+    the greeting distinguishes 'unset' (use the friendly default) from
+    'explicitly empty' (opt out of any opening greeting). The empty string is
+    therefore preserved verbatim, not defaulted.
+    """
+    cfg = load_media_config({"HERMES_VOIP_GREETING": ""})
+    assert cfg.greeting == ""
+
+
+def test_media_greeting_whitespace_only_disables_greeting() -> None:
+    """A whitespace-only greeting also opts out (trimmed to ``""``)."""
+    cfg = load_media_config({"HERMES_VOIP_GREETING": "   "})
+    assert cfg.greeting == ""
+
+
+def test_media_greeting_is_trimmed() -> None:
+    """A set greeting is trimmed of surrounding whitespace (consistent parser)."""
+    cfg = load_media_config({"HERMES_VOIP_GREETING": "  Hello there.  "})
+    assert cfg.greeting == "Hello there."
 
 
 def test_media_values_are_trimmed() -> None:

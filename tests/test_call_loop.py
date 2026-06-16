@@ -30,7 +30,7 @@ from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState, ToolRisk
-from hermes_voip.providers.tts import TtsStream
+from hermes_voip.providers.tts import StreamingTTS, TtsStream
 
 # ---------------------------------------------------------------------------
 # Shared constants for fakes
@@ -225,17 +225,30 @@ def _make_vad() -> VoiceActivityDetector:
     return VoiceActivityDetector(model=_silent_model, sample_rate_hz=16_000)
 
 
+def _make_speaking_vad() -> VoiceActivityDetector:
+    """Return a VAD whose model always returns 1.0 → fires ONSET on first window."""
+
+    def _voiced_model(window_pcm16: bytes, sample_rate: int) -> float:
+        _ = window_pcm16, sample_rate  # Protocol match; unused in fake
+        return 1.0
+
+    return VoiceActivityDetector(model=_voiced_model, sample_rate_hz=16_000)
+
+
 def _make_endpointer() -> Endpointer:
     return Endpointer(silence_ms=500, sample_rate_hz=16_000)
 
 
-def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own 9-arg __init__
+def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own keyword __init__
     transport: _FakeTransport,
     asr: StreamingASR,
-    tts: _FakeTTS,
+    tts: StreamingTTS,
     guard: _FakeGuard,
     deliver_turn: Callable[[str], Awaitable[None]],
     guard_state: GuardSessionState | None = None,
+    *,
+    vad: VoiceActivityDetector | None = None,
+    greeting: str = "",
 ) -> CallLoop:
     state = guard_state or GuardSessionState(call_id=_CALL_ID)
     return CallLoop(
@@ -243,12 +256,13 @@ def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own 9-arg __ini
         asr=asr,
         tts=tts,
         guard=guard,
-        vad=_make_vad(),
+        vad=vad or _make_vad(),
         endpointer=_make_endpointer(),
         guard_state=state,
         deliver_turn=deliver_turn,
         voice=_VOICE,
         call_id=_CALL_ID,
+        greeting=greeting,
     )
 
 
@@ -358,6 +372,7 @@ async def test_barge_in_cancels_tts_before_next_audio() -> None:
         deliver_turn=_noop_deliver,
         voice=_VOICE,
         call_id=_CALL_ID,
+        greeting="",
     )
 
     async def _token_gen() -> AsyncIterator[str]:
@@ -732,3 +747,241 @@ async def test_external_cancellation_leaks_no_tasks() -> None:
     tasks_after = set(asyncio.all_tasks())
     leaked = tasks_after - tasks_before
     assert leaked == set(), f"Leaked tasks after cancellation: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# Greeting on answer (ADR-0002 NAT-latch): run() speaks the configured greeting
+# IMMEDIATELY — before/independent of any inbound audio — so RTP flows out at
+# once (caller hears it; a symmetric-RTP gateway latches the NAT'd source).
+# ---------------------------------------------------------------------------
+
+
+def _greeting_frame(byte: int) -> PcmFrame:
+    """A distinct TTS output frame so greeting RTP is identifiable in send_audio."""
+    return PcmFrame(
+        samples=bytes([byte, 0]) * 128,
+        sample_rate=16_000,
+        monotonic_ts_ns=0,
+    )
+
+
+class _RecordingTtsStream:
+    """TtsStream fake that records the synthesised text, then yields preset frames.
+
+    Mirrors a real TTS: it first drains the incremental ``text`` iterator
+    (recording the concatenation) and then emits audio. Lets a test assert the
+    greeting text was the thing synthesised and that frames were produced.
+    """
+
+    def __init__(self, text: AsyncIterator[str], frames: list[PcmFrame]) -> None:
+        self._text = text
+        self._frames = frames
+        self.synthesised_text = ""
+        self.cancel_called = False
+        self.flush_called = False
+        self._cancelled = False
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[PcmFrame]:
+        async for chunk in self._text:
+            self.synthesised_text += chunk
+        for frame in self._frames:
+            if self._cancelled:
+                return
+            yield frame
+
+    async def flush(self) -> None:
+        self.flush_called = True
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+        self.cancel_called = True
+
+
+class _RecordingTTS:
+    """StreamingTTS fake recording every synthesise() call's text + frames out."""
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        self._frames = frames
+        self.calls = 0
+        self.last_stream: _RecordingTtsStream | None = None
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = voice
+        self.calls += 1
+        stream = _RecordingTtsStream(text, self._frames)
+        self.last_stream = stream
+        return stream
+
+
+@pytest.mark.asyncio
+async def test_greeting_synthesised_and_sent_without_inbound_audio() -> None:
+    """run() speaks the configured greeting immediately — no inbound audio first.
+
+    The transport delivers ZERO inbound frames, so the only audio that can reach
+    ``send_audio`` is the greeting. This proves the plugin sends RTP first (which
+    is what makes the caller hear the opening and a symmetric-RTP gateway latch).
+    """
+    greeting = "Hello, you're through to the assistant."
+    frames = [_greeting_frame(1), _greeting_frame(2)]
+    tts = _RecordingTTS(frames)
+    transport = _FakeTransport([])  # NO inbound audio
+
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+        greeting=greeting,
+    )
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    # The greeting was synthesised exactly once, with the configured text…
+    assert tts.calls == 1
+    assert tts.last_stream is not None
+    assert tts.last_stream.synthesised_text == greeting
+    # …and its frames were sent as outbound RTP, with no inbound audio first.
+    assert transport.sent_audio == frames
+
+
+@pytest.mark.asyncio
+async def test_empty_greeting_sends_no_audio() -> None:
+    """An empty greeting config synthesises nothing and sends no RTP on answer."""
+    tts = _RecordingTTS([_greeting_frame(9)])
+    transport = _FakeTransport([])
+
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+        greeting="",
+    )
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    assert tts.calls == 0
+    assert transport.sent_audio == []
+
+
+class _GatedGreetingTransport(_FakeTransport):
+    """Transport that withholds its (speaking) inbound frame until released.
+
+    Lets the greeting's synthesis start and register its active stream before
+    the caller's barge-in frame is delivered — so the ONSET cancels an
+    in-flight greeting, exactly as on a live call where the caller talks over it.
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__(frames)
+        self.release = asyncio.Event()
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        frames = self._frames
+        release = self.release
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            await release.wait()
+            for frame in frames:
+                yield frame
+
+        return _gen()
+
+
+class _GatedGreetingTtsStream:
+    """Greeting TtsStream that blocks mid-playout until cancelled or released.
+
+    It emits its first frame, then parks on an event; ``cancel()`` (barge-in)
+    sets the stop flag and unblocks it so the consumer stops yielding — the same
+    two-task barge-in shape as a live call (the pump cancels while the greeting
+    coroutine is parked in ``__anext__``).
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        self._frames = frames
+        self.cancel_called = False
+        self.flush_called = False
+        self._resume = asyncio.Event()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[PcmFrame]:
+        # Emit one frame so RTP starts, then park until cancel()/resume.
+        if self._frames:
+            yield self._frames[0]
+        await self._resume.wait()
+        # If we got here without a cancel, emit the rest (not exercised here).
+        if not self.cancel_called:
+            for frame in self._frames[1:]:
+                yield frame
+
+    async def flush(self) -> None:
+        self.flush_called = True
+
+    async def cancel(self) -> None:
+        self.cancel_called = True
+        self._resume.set()
+
+
+class _GatedGreetingTTS:
+    """StreamingTTS fake returning a single gated (blocking) greeting stream."""
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        self._frames = frames
+        self.last_stream: _GatedGreetingTtsStream | None = None
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = text, voice
+        stream = _GatedGreetingTtsStream(self._frames)
+        self.last_stream = stream
+        return stream
+
+
+@pytest.mark.asyncio
+async def test_caller_speech_during_greeting_cancels_it() -> None:
+    """Barge-in: caller speech onset while the greeting plays cancels the greeting.
+
+    The greeting stream blocks after its first frame; once the gated inbound
+    frame (scored as speech by the VAD) is released, the pump detects ONSET and
+    cancels the active greeting stream — proving barge-in works against the
+    greeting via the existing cancel path.
+    """
+    # One full 16 kHz silero window (512 samples → 1024 bytes) so the VAD runs
+    # exactly one inference and emits an ONSET (model returns 1.0).
+    speech_frame = PcmFrame(samples=bytes(1024), sample_rate=16_000, monotonic_ts_ns=0)
+    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    transport = _GatedGreetingTransport([speech_frame])
+
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+        vad=_make_speaking_vad(),
+        greeting="Hello there, this is a long greeting the caller talks over.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting start and emit its first frame (registering the active
+    # stream) before the caller's speech frame is delivered.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # Release the caller's speech frame → ONSET → barge_in() cancels the greeting.
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True

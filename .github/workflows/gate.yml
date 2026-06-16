@@ -42,10 +42,10 @@ jobs:
       # Type-check the Hermes-dependent modules against the REAL base (these are
       # excluded from the default `uv run mypy` gate; passing them explicitly
       # bypasses the exclude).
-      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py
+      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py tests/test_media_concurrency_hermes.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
-        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py -rs
+        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_media_concurrency_hermes.py -rs
 
   # Runs the conversational-provider tests with the optional `ml` extra installed
   # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack

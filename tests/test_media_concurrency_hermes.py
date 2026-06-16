@@ -77,6 +77,9 @@ class _NullTtsStream:
     async def cancel(self) -> None:
         self._done = True
 
+    async def aclose(self) -> None:
+        self._done = True
+
     def __aiter__(self) -> AsyncIterator[PcmFrame]:
         return self
 

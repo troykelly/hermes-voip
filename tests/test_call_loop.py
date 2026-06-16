@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from typing import Final
 
 import pytest
@@ -118,6 +118,9 @@ class _FakeTtsStream:
     async def cancel(self) -> None:
         self._cancelled = True
         self.cancel_called = True
+
+    async def aclose(self) -> None:
+        self._cancelled = True
 
 
 class _FakeTTS:
@@ -805,6 +808,9 @@ class _RecordingTtsStream:
         self._cancelled = True
         self.cancel_called = True
 
+    async def aclose(self) -> None:
+        self._cancelled = True
+
 
 class _RecordingTTS:
     """StreamingTTS fake recording every synthesise() call's text + frames out."""
@@ -923,7 +929,7 @@ class _GatedGreetingTtsStream:
     async def __anext__(self) -> PcmFrame:
         return await self._gen.__anext__()
 
-    async def _iter(self) -> AsyncIterator[PcmFrame]:
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
         # Emit one frame so RTP starts, then park until cancel()/resume.
         if self._frames:
             yield self._frames[0]
@@ -939,6 +945,12 @@ class _GatedGreetingTtsStream:
     async def cancel(self) -> None:
         self.cancel_called = True
         self._resume.set()
+
+    async def aclose(self) -> None:
+        # Unblock the parked generator and close it (consumer-task teardown).
+        self.cancel_called = True
+        self._resume.set()
+        await self._gen.aclose()
 
 
 class _GatedGreetingTTS:
@@ -1018,7 +1030,7 @@ class _SlowTtsStream:
     async def __anext__(self) -> PcmFrame:
         return await self._gen.__anext__()
 
-    async def _iter(self) -> AsyncIterator[PcmFrame]:
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
         for frame in self._frames:
             # cooperative yield so a rival speak() can run; cancel() may flip the
             # flag across the await. Re-read into a fresh local each time so the
@@ -1037,6 +1049,10 @@ class _SlowTtsStream:
     async def cancel(self) -> None:
         self._cancelled = True
         self.cancel_called = True
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        await self._gen.aclose()
 
 
 class _SingleStreamTTS:

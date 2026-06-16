@@ -24,6 +24,21 @@ class TtsStream(AsyncIterator[PcmFrame], Protocol):
         """
         ...
 
+    async def aclose(self) -> None:
+        """Close the stream and release its backend; idempotent.
+
+        Drives teardown to completion when the single consumer is no longer
+        iterating — it has finished, broken out, or an exception aborted the
+        loop body. The consumer (the call loop's playout) wraps iteration in
+        :func:`contextlib.aclosing`, so this is called on **every** exit path
+        (normal end, barge-in, or a fatal error mid-playout) on the consumer's
+        own task — never abandoning the underlying async generator for a GC
+        finalizer to close later (which would race a parked pull and raise
+        ``RuntimeError: aclose(): asynchronous generator is already running``).
+        Safe to call more than once.
+        """
+        ...
+
 
 @runtime_checkable
 class StreamingTTS(Protocol):

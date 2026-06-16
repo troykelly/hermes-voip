@@ -309,6 +309,9 @@ class _NullTtsStream:
     async def cancel(self) -> None:
         self._done = True
 
+    async def aclose(self) -> None:
+        self._done = True
+
     def __aiter__(self) -> AsyncIterator[PcmFrame]:
         return self
 
@@ -431,6 +434,9 @@ async def test_two_concurrent_call_loops_run_independently() -> None:
 
         async def flush(self) -> None:
             self.flush_called = True
+
+        async def aclose(self) -> None:
+            self._cancelled = True
 
     class _GreetingTTS:
         """TTS that yields 3 frames for any synthesize() call."""

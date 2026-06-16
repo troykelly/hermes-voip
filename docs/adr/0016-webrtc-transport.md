@@ -119,8 +119,13 @@ reused verbatim; only the source of the key||salt changes.** A new
   picks `a=setup:active`/`passive`. `a=setup` decides DTLS roles: the **`active`** party
   is the DTLS client and sends ClientHello, **`passive`** is the server (RFC 4145). We
   offer `actpass` and, as answerer to a gateway offer, prefer `active`. `a=connection`
-  **MUST NOT** appear (RFC 5763 §5). The media profile token is **`UDP/TLS/RTP/SAVPF`**
-  (vs SDES's `RTP/SAVP`).
+  **MUST NOT** appear (RFC 5763 §5: "The endpoint MUST NOT use the connection attribute
+  defined in [RFC4145]"). The media profile token is **`UDP/TLS/RTP/SAVPF`** (vs SDES's
+  `RTP/SAVP`). **Glare policy:** the plugin's calls are inbound-driven, so the gateway is
+  normally the offerer and we answer `active`; if our own re-offer (a hold/transfer
+  re-INVITE) glares with an inbound one, the §13.3.1.4 / §3264 loser re-offers and again
+  picks `active`, so the DTLS role is unambiguous on every resolved offer/answer (we never
+  end up `actpass↔actpass`).
 - **DTLS handshake + keying.** After ICE nominates a candidate pair (§3), run a DTLS
   handshake over that UDP path using a memory-BIO DTLS endpoint (so DTLS rides the
   ICE-selected datagram flow, not a raw socket). On completion, verify the peer cert
@@ -128,15 +133,26 @@ reused verbatim; only the source of the key||salt changes.** A new
   exporter, label `"EXTRACTOR-dtls_srtp"`, no context** (RFC 5764 §4.2). The exported
   block is `client_write_key ‖ server_write_key ‖ client_write_salt ‖ server_write_salt`
   (16/16/14/14 B for `SRTP_AES128_CM_HMAC_SHA1_80`). DTLS-client side uses the client
-  key/salt outbound and server inbound; DTLS-server side mirrors it (RFC 5764 §4.2). Each
-  direction's key||salt constructs a `SrtpSession` exactly as the SDES path does today
-  (`CryptoAttribute`-shaped or a small direct constructor — see PR plan).
+  key/salt outbound and server inbound; DTLS-server side mirrors it (RFC 5764 §4.2).
+- **The one `srtp.py` change — a raw-key constructor.** The *transform* (AES-CM/HMAC,
+  ROC, replay window, per-SSRC binding, KATs) is reused unchanged, but `SrtpSession`'s
+  current constructor takes a `CryptoAttribute` built from an SDES `inline:<base64>`
+  string and self-validates that wire shape. DTLS produces **raw bytes**, so `srtp.py`
+  gains a `SrtpSession.from_raw_keys(master_key, master_salt, *, suite, ssrc=None)`
+  classmethod that skips the SDES inline parse and feeds the existing key derivation
+  directly (synthesising a fake base64 `CryptoAttribute` is rejected — it abuses a type
+  whose validation exists for real SDES data). The module + class docstrings (today
+  "SDES-SRTP … instantiate with the `CryptoAttribute` from the `a=crypto` line") are
+  widened in the same PR to say the keying source is SDES **or** DTLS-SRTP — no
+  now-false docstring left behind (rule 27). This is the **only** edit to the RFC 3711
+  module; the per-packet protect/unprotect path is byte-for-byte the same.
 - **SRTP profile negotiation.** Offer `SRTP_AES128_CM_HMAC_SHA1_80` (and `_32`) in the
   DTLS `use_srtp` extension (RFC 5764 §4.1.1); the gateway returns one.
 - **rtcp-mux + demux.** RTP, RTCP, DTLS, and STUN share one UDP 5-tuple (`a=rtcp-mux`,
-  RFC 5761). The receive path demuxes by first byte (RFC 5764 §5.1.2): STUN 0–1, DTLS
-  20–63, SRTP/SRTCP 128–191. This is the one new piece of receive-side dispatch the
-  engine grows; below it, the SRTP branch is the existing `unprotect` path.
+  RFC 5761). The receive path demuxes by first byte per **RFC 7983** (which updates the
+  RFC 5764 §5.1.2 scheme): **STUN 0–3**, DTLS 20–63, SRTP/SRTCP 128–191 (values 2–3 are
+  STUN under RFC 7983, not the older 0–1). This is the one new piece of receive-side
+  dispatch the engine grows; below it, the SRTP branch is the existing `unprotect` path.
 - **No SDES, no plain RTP on WSS (RFC 8827 §6.5).** The WSS transport never emits
   `a=crypto` and never accepts `RTP/AVP`. The SDES path (ADR-0013) and plain-RTP path
   remain **SIP-over-TLS only**.
@@ -147,13 +163,25 @@ A new `src/hermes_voip/media/ice.py` wrapping **`aioice`** (pure-Python asyncio 
 STUN + TURN agent) gathers candidates, performs connectivity checks, and yields the
 nominated UDP path to the DTLS+SRTP engine.
 
+- **The ICE agent owns the media socket (the key wiring seam).** `aioice` opens and binds
+  the UDP socket(s) it gathers candidates on and runs STUN over them, so the **ICE agent —
+  not the engine — owns the bound socket** on the nominated pair. Today
+  `RtpMediaTransport.connect()` creates its *own* `SOCK_DGRAM` socket; it cannot bind a
+  second socket on the ICE 5-tuple. On the WSS path the engine therefore does **not** open
+  a socket: `ice.py` hands the nominated transport down and the engine sends/receives
+  through it. PR-E adds a single `RtpMediaTransport` entry point that accepts an
+  already-connected datagram sink (the ICE-nominated path) instead of binding its own — the
+  packet path, codecs, jitter, pacing, and SRTP seam above it are unchanged; only the
+  socket-acquisition step is swapped. (On the TLS path the engine keeps binding its own
+  socket exactly as today.) This is the one engine change the reuse table calls out
+  ("socket-acquisition swapped, packet path same").
 - **Full ICE, not ICE-lite.** The client is behind NAT (ADR-0015's whole premise), and
   ICE-lite never initiates checks (valid only on a public address, RFC 8445 §A.2). So we
   run **full ICE**: gather, initiate, and respond to checks.
-- **Non-trickle MVP (RFC 8838 §15).** Gather a full candidate generation, then send
-  **all** candidates in the initial offer/answer — no trickling. This is fully
-  interoperable with trickle-capable gateways. Trickle / half-trickle is a later
-  optimisation, not MVP.
+- **Non-trickle MVP (RFC 8838 §3).** Gather a full candidate generation, then send
+  **all** candidates in the initial offer/answer — no trickling (RFC 8838 §3, "Sending
+  the Initial Offer"). This is fully interoperable with trickle-capable gateways. Trickle
+  / half-trickle is a later optimisation, not MVP.
 - **Candidate types, phased.** **MVP: host candidates always, server-reflexive (srflx)
   via a configured STUN server.** **TURN (relay) is deferred** — it needs an allocation +
   credentials + an operated/contracted TURN server (rule 40/41 infra), out of MVP scope;
@@ -199,11 +227,11 @@ shape; the SDES signature is untouched.
 | `transaction.py` (INVITE client/server txn, non-2xx ACK) | `media/dtls.py` — DTLS handshake + RFC 5705 keying export → `SrtpSession` |
 | `dialog.py`, `incall.py`, `refer.py` (dialog, hold, transfer) | `media/ice.py` — `aioice` ICE agent (gather/checks/nominate) + STUN |
 | `registration.py` + `digest.py` (REGISTER, auth) | `sdp.py` **additions** — `Fingerprint`/`SetupRole`/ICE attrs + a WebRTC offer/answer branch |
-| `manager.py` (`SipTransport`/demux/routing) | engine receive-side first-byte demux (STUN/DTLS/SRTP) |
-| `sdp.py` core (parse, `negotiate_audio`, codec order) | new `webrtc` optional extra (`aioice`, `pyOpenSSL` [, `pylibsrtp`]) |
-| `media/srtp.py` (`SrtpSession` RFC 3711 transform, KATs) | `+sip.instance` UUID + GRUU handling on the WSS Contact |
-| `media/rtp.py` (`RtpPacket`, `JitterBuffer`) + `media/audio.py` (G.711, resample) | — |
-| `media/engine.py` (RTP send/recv, pacing, hold) — keying swapped in, packet path same | — |
+| `manager.py` (`SipTransport`/demux/routing) | engine receive-side first-byte demux (STUN/DTLS/SRTP, RFC 7983) |
+| `sdp.py` core (parse, `negotiate_audio`, codec order) | engine entry point that takes the ICE-nominated socket (vs binding its own) |
+| `media/srtp.py` **transform** (`SrtpSession` AES-CM/HMAC, KATs, ROC, replay) | `SrtpSession.from_raw_keys(...)` constructor (DTLS bytes, not SDES inline) + widened docstrings |
+| `media/rtp.py` (`RtpPacket`, `JitterBuffer`) + `media/audio.py` (G.711, resample) | new `webrtc` optional extra (`websockets`, `aioice`, `pyOpenSSL` [, `pylibsrtp`]) |
+| `media/engine.py` packet path (encode/packetise/pace/hold, SRTP `protect`/`unprotect`) | `+sip.instance` UUID + GRUU handling on the WSS Contact |
 | `media/vad.py`, `stt/*`, `tts/*`, `guard/*`, `media/call_loop.py` (conversational plane) | — |
 | `adapter.py`, `call.py`, `keepalive.py`, `tools.py` (control plane + agent verbs) | — |
 
@@ -214,9 +242,13 @@ adapter helpers branch by transport: the transport constructor (`_make_tls_conte
 the transport class) and the per-call keying (today `_srtp_from_audio` reads SDES
 `crypto_attrs`; the WSS path instead drives `media/dtls.py` to produce the two
 `SrtpSession`s, then constructs the **same** `RtpMediaTransport` with `srtp_inbound`/
-`srtp_outbound` and `symmetric=False`). `RtpMediaTransport` itself is reused — its SRTP
-seam is already a narrow Protocol (`_SrtpProtect`/`_SrtpUnprotect`), so DTLS-derived
-sessions slot in with no engine change beyond the receive demux.
+`srtp_outbound` and `symmetric=False`). `RtpMediaTransport`'s steady-state packet path is
+reused — its SRTP seam is already a narrow Protocol (`_SrtpProtect`/`_SrtpUnprotect`), so
+DTLS-derived sessions slot in unchanged. The two engine changes the WSS path needs are
+named in §3 and the table: it takes the **ICE-nominated socket** instead of binding its
+own (the TLS path keeps binding its own), and it grows the **first-byte receive demux**
+(STUN/DTLS/SRTP) — both confined to socket acquisition + inbound dispatch, never the
+encode/packetise/protect path.
 
 ### 6. Configuration + scope
 
@@ -253,12 +285,16 @@ PR-G validates live.
    `sip`), one-message-per-frame dispatch, `.invalid` Via, `transport=ws` Contact +
    `+sip.instance`/`reg-id`, `local_sent_by`/`contact_uri`. Tested against a loopback
    asyncio WS echo/SIP server fixture (mirrors the existing TLS loopback fixture):
-   REGISTER 401→200 via `RegistrationManager`. No new media. *(Decide the WS client lib
-   here: stdlib has no WS client; evaluate a minimal permissive WS lib vs a hand-rolled
-   RFC 6455 client over the existing asyncio TLS — recorded in PR-A, licence-gated.)*
+   REGISTER 401→200 via `RegistrationManager`. No new media. WS client library:
+   **`websockets`** (BSD-3-Clause, pure-Python, asyncio-native, no transitive native deps)
+   is the decided default — the stdlib has no WS client and `websockets` is the smallest
+   permissive asyncio fit; it lands in the `webrtc` extra in this PR. (A hand-rolled RFC
+   6455 framer over the existing asyncio TLS stream stays the fallback only if the licence/
+   audit gate flags `websockets`, which is not expected.)
 2. **PR-B — SDP DTLS + ICE attributes.** `sdp.py` parse/build for `a=fingerprint`,
    `a=setup`, `a=ice-ufrag`/`-pwd`, `a=candidate`, `a=rtcp-mux`, `UDP/TLS/RTP/SAVPF`.
-   Pure sans-IO; round-trip + RFC-8839 field-order tests. No network.
+   Pure sans-IO; round-trip + RFC-8839 field-order tests. No network. Also updates the now-
+   stale `sdp.py` comments that say "DTLS-SRTP … out of scope" / "deferred to W12" (rule 27).
 3. **PR-C — DTLS-SRTP keying (`media/dtls.py`).** `pyOpenSSL` memory-BIO DTLS handshake +
    cert-fingerprint verify + RFC 5705 export → two `SrtpSession`s. Deterministic test:
    drive both ends of a DTLS handshake in-process, assert the exported key||salt feeds
@@ -297,6 +333,10 @@ PR-G validates live.
   requires new dependencies; it cannot be done with the pinned lib alone.** A new
   **`webrtc` optional extra** (mirroring `media`/`ml` isolation, lazy-imported, absent
   from the default install/licence-gate/audit) carries:
+  - **`websockets`** — the SIP-over-WSS client transport (RFC 6455), **pure-Python**,
+    asyncio-native, no transitive native deps — **BSD-3-Clause**. The stdlib has no WS
+    client, so this is required for PR-A; a hand-rolled RFC 6455 framer is the only-if-
+    flagged fallback.
   - **`aioice`** — ICE + STUN + TURN agent, **pure-Python**, asyncio-native — **BSD-3-Clause**.
   - **`pyOpenSSL`** — DTLS handshake + `export_keying_material` (RFC 5705) over a memory
     BIO — **Apache-2.0** (native OpenSSL 3.x, also Apache-2.0). **Pin `pyOpenSSL==25.3.0`**:

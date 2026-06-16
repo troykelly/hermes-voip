@@ -248,6 +248,11 @@ class RtpMediaTransport:
         self._outbound_addr: tuple[str, int] = (remote_address, remote_port)
         self._latched: bool = False
 
+        # One-shot diagnostic flags: log the first outbound and first inbound
+        # RTP packet at INFO so the media path is visible in the operator log.
+        self._first_tx_logged: bool = False
+        self._first_rx_logged: bool = False
+
         # Socket / asyncio transport state (populated by connect()).
         # _ever_connected distinguishes "stopped after a real call" (silent no-op
         # in send_audio — the frame is dropped cleanly because the call is ending)
@@ -307,6 +312,10 @@ class RtpMediaTransport:
         # back at the SDP-negotiated remote until the first valid inbound packet.
         self._outbound_addr = (self._remote_address, self._remote_port)
         self._latched = False
+        # Reset one-shot diagnostic flags so a reconnected engine logs the first
+        # outbound and inbound packets of the new call.
+        self._first_tx_logged = False
+        self._first_rx_logged = False
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -377,6 +386,15 @@ class RtpMediaTransport:
             # the only point at which a comedia latch may fire (anti-spoofing —
             # garbage that does not parse never reaches here).
             self._maybe_latch(rtp_pkt, source)
+
+            if not self._first_rx_logged:
+                self._first_rx_logged = True
+                _log.info(
+                    "rtp rx: first packet <- %s:%d (%d bytes)",
+                    source[0],
+                    source[1],
+                    len(data),
+                )
 
             # Feed the jitter buffer.
             self._jitter.push(rtp_pkt)
@@ -542,6 +560,15 @@ class RtpMediaTransport:
 
         # Send to the latched peer source if symmetric-RTP has latched, else to
         # the SDP-negotiated remote (the initial value of _outbound_addr).
+        if not self._first_tx_logged:
+            self._first_tx_logged = True
+            _log.info(
+                "rtp tx: first packet -> %s:%d pt=%d ssrc=0x%08x",
+                self._outbound_addr[0],
+                self._outbound_addr[1],
+                self._codec.value,
+                _OUTBOUND_SSRC,
+            )
         self._transport.sendto(wire, self._outbound_addr)
 
         await self._sleep(self._ptime / 1000.0)

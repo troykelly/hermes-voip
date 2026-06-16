@@ -33,16 +33,31 @@ from gateway.platform_registry import (
 )
 from gateway.platforms.base import BasePlatformAdapter
 
-from hermes_voip.config import ConfigError, ExtensionConfig
-from hermes_voip.manager import NewCall
-from hermes_voip.message import SipRequest, new_call_id, new_tag
+from hermes_voip.config import ConfigError, ExtensionConfig, GatewayConfig
+from hermes_voip.manager import InDialog, NewCall, RegistrationManager
+from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from hermes_voip.adapter import VoipAdapter
+
+
+async def _until(
+    predicate: Callable[[], bool], *, timeout: float = 3.0, step: float = 0.001
+) -> None:
+    """Poll ``predicate`` until true or the timeout elapses (no fixed sleeps)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            msg = "condition not met within the timeout"
+            raise TimeoutError(msg)
+        await asyncio.sleep(step)
 
 
 # ---------------------------------------------------------------------------
@@ -774,3 +789,330 @@ async def test_connect_brings_transport_up_before_building_manager() -> None:
     # connect() returns the manager's degraded-up boolean (no real 200 OK here,
     # so it is False after the wait_for timeout — but it MUST NOT raise).
     assert up is False
+
+
+# ---------------------------------------------------------------------------
+# Regression (live inbound-call failure, 2026-06-16): the 200 OK answering an
+# inbound INVITE MUST carry our dialog To-tag, so the gateway's subsequent
+# in-dialog ACK/BYE route back to the established CallSession instead of going
+# out-of-dialog. The live UCM6304 call showed the caller "answered immediately"
+# but heard no audio, and the plugin logged the ACK and BYE as
+# ``out-of-dialog ACK`` / ``out-of-dialog BYE`` — the dialog_id the adapter
+# registered (local tag present) never matched the routed key (no tag on the
+# wire). These tests drive the REAL _handle_inbound_invite with the REAL Dialog,
+# CallSession, build_response, and RegistrationManager (only media/providers are
+# fakes), so the on-the-wire 200 OK To-tag and the manager routing are exercised.
+# ---------------------------------------------------------------------------
+
+
+def _real_gateway_config() -> GatewayConfig:
+    """A real GatewayConfig for ext 1000 (matches the fake transport's contact)."""
+    return GatewayConfig(
+        host="pbx.example.test",
+        port=5061,
+        transport="tls",
+        expires=300,
+        user_agent="hermes-voip/0",
+        extensions=(
+            ExtensionConfig(index=0, extension="1000", username="1000", password="x"),
+        ),
+        default_index=0,
+    )
+
+
+def _gateway_in_dialog_request(
+    method: str, ok: SipResponse, *, call_id: str
+) -> SipRequest:
+    """A gateway in-dialog ACK/BYE: it echoes the dialog To/From from our 200 OK.
+
+    Per RFC 3261 §12, the peer's in-dialog request carries OUR identity in ``To``
+    (the 200 OK's ``To``, *with whatever tag we put there*) and the caller's
+    identity in ``From``. We reproduce exactly that, so the test is faithful to
+    what a real gateway sends after our answer.
+    """
+    to_value = ok.header("To") or ""
+    from_value = ok.header("From") or ""
+    raw = (
+        f"{method} sip:1000@127.0.0.1:5061 SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.7:5061;branch=z9hG4bKdlg\r\n"
+        "Max-Forwards: 70\r\n"
+        f"From: {from_value}\r\n"
+        f"To: {to_value}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 2 {method}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    return SipRequest.parse(raw)
+
+
+async def _build_adapter_with_real_manager(
+    transport: _FakeTransport,
+) -> tuple[VoipAdapter, RegistrationManager]:
+    """A real VoipAdapter + a real RegistrationManager over the fake transport."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+    manager = RegistrationManager(_real_gateway_config(), transport)
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=_real_gateway_config(),
+        ),
+        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+    return adapter, manager
+
+
+def _sent_200_ok(transport: _FakeTransport) -> SipResponse:
+    """The single 2xx response the adapter sent (the INVITE answer)."""
+    oks = [SipResponse.parse(m) for m in transport.sent if m.startswith("SIP/2.0 200")]
+    assert oks, "the adapter did not send a 200 OK answer"
+    return oks[-1]
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_ack_and_bye_route_in_dialog() -> None:
+    """A call we answer must route its own ACK/BYE in-dialog (not out-of-dialog).
+
+    Reproduces the live UCM6304 failure: with no To-tag on the 200 OK, the
+    gateway's ACK/BYE were ``Unroutable`` (``out-of-dialog``) and the call never
+    established a routable dialog. The fix puts our dialog tag on the 200 OK's
+    ``To`` so the manager routes the ACK/BYE to the CallSession.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(call_id=call_id))
+
+    # Hold the call open: a real CallLoop.run() blocks for the call's lifetime, so
+    # the in-dialog ACK/BYE arrive WHILE the call is active and registered (the
+    # realistic ordering — and the live failure point). A run() that returned
+    # immediately would tear the call down before the ACK/BYE, masking the bug.
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch(
+                "hermes_voip.adapter.RtpMediaTransport",
+                return_value=MagicMock(
+                    connect=AsyncMock(return_value=True),
+                    stop=AsyncMock(return_value=None),
+                    local_port=20002,
+                ),
+            ),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            # Real Dialog + real CallSession + real build_response — only media and
+            # the loop body are faked, so the on-the-wire 200 OK and the registered
+            # dialog_id are exactly what production produces.
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            # Let the handler run up to (and block at) call_loop.run().
+            await _until(lambda: call_id in adapter._call_loops)
+
+            ok = _sent_200_ok(transport)
+
+            # The gateway now sends ACK + BYE in-dialog (echoing our 200 OK
+            # To/From) while the call is live; both must route to the CallSession.
+            for method in ("ACK", "BYE"):
+                request = _gateway_in_dialog_request(method, ok, call_id=call_id)
+                routing = manager.route_request(request)
+                assert isinstance(routing, InDialog), (
+                    f"{method} routed {type(routing).__name__} "
+                    f"({getattr(routing, 'reason', '')!r}); To={request.header('To')!r}"
+                )
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_200ok_carries_dialog_to_tag() -> None:
+    """The 200 OK answering an inbound INVITE carries our dialog To-tag.
+
+    A dialog-forming 2xx without a To-tag is an RFC 3261 §12.1.1 violation and is
+    the precise cause of the out-of-dialog ACK/BYE. The tag on the wire must be
+    the same local tag the registered CallSession's dialog_id uses.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(call_id=call_id))
+
+    captured: dict[str, tuple[str, str, str]] = {}
+    real_add_call = manager.add_call
+
+    def _spy_add_call(dialog_id: tuple[str, str, str], consumer: object) -> None:
+        captured["dialog_id"] = dialog_id
+        # The spy takes object (it only records the key); the value forwarded is
+        # the real CallSession the adapter passed, which IS a DialogConsumer.
+        real_add_call(dialog_id, consumer)  # type: ignore[arg-type]
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        patch.object(manager, "add_call", side_effect=_spy_add_call),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    to_value = ok.header("To") or ""
+    # The To header must carry a dialog tag (after the name-addr's '>').
+    after_angle = to_value.split(">", 1)[1] if ">" in to_value else to_value
+    assert ";tag=" in after_angle.lower(), (
+        f"200 OK To header has no dialog tag: {to_value!r}"
+    )
+
+    # And that tag must equal the local tag of the registered dialog_id.
+    dialog_id = captured["dialog_id"]
+    local_tag = dialog_id[1]
+    assert f"tag={local_tag}" in after_angle, (
+        f"200 OK To-tag does not match registered dialog local tag {local_tag!r}: "
+        f"{to_value!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression (live no-audio failure): the SDP answer must advertise the runtime's
+# REAL local RTP address (the transport's local interface), never the 127.0.0.1
+# loopback placeholder. A gateway that receives c=IN IP4 127.0.0.1 sends RTP to
+# its own loopback, so audio can never flow even once the dialog is routable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_sdp_answer_advertises_real_local_rtp_address() -> None:
+    """The 200 OK SDP answer connection address is the transport's local host."""
+    transport = _FakeTransport(local_sent_by="172.23.0.2:55728")
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(call_id=call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    # The SDP answer (200 OK body) must carry the runtime's real RTP host, not
+    # the loopback placeholder.
+    assert "c=IN IP4 172.23.0.2" in ok.body, (
+        f"SDP answer does not advertise the local interface address; body:\n{ok.body}"
+    )
+    assert "127.0.0.1" not in ok.body, (
+        f"SDP answer still advertises the 127.0.0.1 loopback placeholder:\n{ok.body}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression (W10 review finding): an exception raised inside the fire-and-forget
+# inbound-INVITE handler must be LOGGED WITH ITS TRACEBACK, never silently lost.
+# On the live call there was zero log output from the handler — any failure (SDP
+# parse, media setup, anything) was invisible. The done-callback must record the
+# exception with full traceback (``exc_info``) so the next live call is
+# diagnosable, not just ``str(exc)`` with no stack.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_handler_exception_is_logged_with_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure in the inbound handler is logged with its traceback, not swallowed."""
+    import logging  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(call_id=call_id))
+
+    boom = RuntimeError("media setup exploded")
+
+    # Force a failure at an UNGUARDED point: the RTP engine's connect() (no local
+    # try/except wraps it), so the exception escapes the handler body into the
+    # fire-and-forget task. The safety net must log it WITH its traceback, not
+    # lose it (the live call showed zero handler output on failure).
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(side_effect=boom),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        caplog.at_level(logging.ERROR, logger="hermes_voip.adapter"),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    # exc_info is (type, value, tb) | None; collect the values from ERROR records
+    # that carry one — a record with exc_info proves the traceback was logged.
+    logged_exceptions = [
+        record.exc_info[1]
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and record.exc_info is not None
+    ]
+    assert logged_exceptions, (
+        "the inbound handler swallowed an exception (no ERROR log with exc_info)"
+    )
+    # The logged record must carry the actual exception (so the traceback is real).
+    assert boom in logged_exceptions, (
+        "the logged ERROR did not carry the handler's exception traceback"
+    )

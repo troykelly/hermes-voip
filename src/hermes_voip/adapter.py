@@ -330,6 +330,11 @@ class VoipAdapter(BasePlatformAdapter):
         """Async body of _on_inbound_invite; wires the full call stack."""
         invite = new_call.invite
         call_id = invite.header("Call-ID") or ""
+        _log.info(
+            "INVITE received: Call-ID %s, registration ext %s",
+            call_id,
+            new_call.registration.extension,
+        )
         transport = self._transport
         if transport is None:
             _log.warning("INVITE %s arrived after transport closed — ignored", call_id)
@@ -346,8 +351,17 @@ class VoipAdapter(BasePlatformAdapter):
 
         audio = offer.audio
         if audio is None:
+            _log.warning("INVITE %s: SDP offer has no audio media — 488", call_id)
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
+        _log.info(
+            "INVITE %s: SDP offer — %s, remote RTP %s:%d, payload types %s",
+            call_id,
+            "RTP/SAVP (SRTP)" if audio.is_srtp else "RTP/AVP",
+            _effective_address(audio, offer),
+            audio.port,
+            ",".join(c.encoding for c in audio.codecs),
+        )
 
         try:
             agreed_sdp_codecs = negotiate_audio(audio, _SUPPORTED_ENCODINGS)
@@ -387,8 +401,15 @@ class VoipAdapter(BasePlatformAdapter):
         await engine.connect()
 
         # --- Build the SDP answer ------------------------------------------
+        # Advertise the runtime's REAL local interface for RTP — the same host as
+        # the SIP Contact (the transport's local socket address). The 127.0.0.1
+        # loopback placeholder makes the gateway send RTP to its own loopback, so
+        # audio never flows. (Behind NAT this is the private interface address;
+        # reaching it from a public gateway needs symmetric-RTP latching or an
+        # outbound greeting first — see docs/runbooks/0002-voip-live-validation.md.)
+        local_rtp_host = _host_of(transport.local_sent_by)
         local_media = LocalMediaSession(
-            local_address="127.0.0.1",  # replaced by real local addr in production
+            local_address=local_rtp_host,
             port=engine.local_port,
             codecs=agreed_sdp_codecs,
             session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
@@ -407,11 +428,27 @@ class VoipAdapter(BasePlatformAdapter):
             await engine.stop()
             return
 
+        _log.info(
+            "INVITE %s: SDP answer built — local RTP %s:%d, codecs %s",
+            call_id,
+            local_media.local_address,
+            local_media.port,
+            ",".join(c.encoding for c in agreed_sdp_codecs),
+        )
+
         # --- Send 200 OK with the SDP answer --------------------------------
+        # The To-tag is REQUIRED on a dialog-forming 2xx (RFC 3261 §12.1.1): it
+        # is our dialog local tag, and the peer echoes it on every in-dialog
+        # request (ACK/BYE/re-INVITE). Without it the gateway's ACK/BYE carry no
+        # To-tag and the manager routes them out-of-dialog — the call answers but
+        # never establishes a routable dialog (the live UCM6304 no-audio failure).
+        # It must match dialog.local_tag so the registered dialog_id matches the
+        # routed key.
         ok_response = build_response(
             invite,
             200,
             "OK",
+            to_tag=local_tag,
             extra_headers=(
                 ("Contact", local_contact),
                 ("Content-Type", "application/sdp"),
@@ -419,6 +456,7 @@ class VoipAdapter(BasePlatformAdapter):
             body=answer_sdp,
         )
         await transport.send(ok_response)
+        _log.info("INVITE %s: 200 OK sent (To-tag %s)", call_id, local_tag)
 
         # --- Register the call for in-dialog routing -----------------------
         # One GuardSessionState per call, shared between CallSession and CallLoop.
@@ -438,6 +476,11 @@ class VoipAdapter(BasePlatformAdapter):
         if self._manager is not None:
             self._manager.add_call(session.dialog_id, session)
         transport.add_call(call_id, session)
+        _log.info(
+            "INVITE %s: CallSession registered — dialog_id %s",
+            call_id,
+            session.dialog_id,
+        )
 
         # --- Extract caller info from the inbound INVITE -------------------
         remote_uri = invite.header("From") or ""
@@ -509,6 +552,7 @@ class VoipAdapter(BasePlatformAdapter):
             call_id=call_id,
         )
         self._call_loops[call_id] = call_loop
+        _log.info("INVITE %s: CallLoop started", call_id)
         await call_loop.run()
 
     async def _teardown_call(
@@ -576,13 +620,25 @@ class VoipAdapter(BasePlatformAdapter):
             _log.info("SIP-over-TLS connection closed cleanly")
 
     def _on_call_task_done(self, call_id: str, task: asyncio.Task[None]) -> None:
-        """Observe a finished call task; surface any unhandled exception."""
+        """Observe a finished call task; surface any unhandled exception.
+
+        ``_handle_inbound_invite`` runs as a fire-and-forget task, so without this
+        an exception it raises (SDP/media setup, CallSession wiring, the loop
+        itself) is silently lost — the live no-audio call showed zero handler
+        output on failure. The full traceback is logged (``exc_info`` carries the
+        exception), not just ``str(exc)``, so the next live call is diagnosable.
+        """
         self._call_tasks.pop(call_id, None)
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
-            _log.error("call %s ended with error: %s", call_id, exc)
+            _log.error(
+                "inbound call %s handler failed: %s",
+                call_id,
+                exc,
+                exc_info=exc,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +667,20 @@ def _effective_address(audio: AudioMedia, offer: SessionDescription) -> str:
     """The remote RTP address: media-level c=, then session-level c=, else loopback."""
     addr = audio.connection_address or offer.connection_address
     return addr if addr else "127.0.0.1"
+
+
+def _host_of(sent_by: str) -> str:
+    """The host part of a Via ``sent-by`` (``host:port``), IPv6-bracket aware.
+
+    Used to advertise our real RTP interface in the SDP answer — the same host
+    the SIP Contact carries. ``[2001:db8::1]:5061`` -> ``2001:db8::1``;
+    ``172.23.0.2:55728`` -> ``172.23.0.2``; a bare host with no port is returned
+    unchanged.
+    """
+    if sent_by.startswith("["):  # bracketed IPv6 literal, optional :port after ]
+        return sent_by[1 : sent_by.index("]")]
+    host, sep, _port = sent_by.rpartition(":")
+    return host if sep else sent_by
 
 
 def _caller_number(from_header: str) -> str:

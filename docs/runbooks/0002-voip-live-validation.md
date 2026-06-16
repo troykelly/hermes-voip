@@ -307,6 +307,35 @@ auth challenge/response (`401` → `200 OK`) all work. The process then waits fo
    said, and follow-up turns work. Hang up to end the call; the loop tears down the RTP engine
    and in-dialog routes (no leaked socket).
 
+### 8a. Troubleshooting — call answers but there is no audio
+
+The plugin now logs the full inbound path at `INFO` (`hermes_voip.adapter`):
+`INVITE received` → `SDP offer` → `SDP answer built` → `200 OK sent (To-tag …)` →
+`CallSession registered (dialog_id …)` → `CallLoop started`. A fire-and-forget
+handler failure is logged at `ERROR` **with its traceback**. Read these first.
+
+- **The caller's ACK/BYE log as `out-of-dialog`:** the `200 OK` is missing its
+  dialog `To`-tag (RFC 3261 §12.1.1). Fixed — the answer now carries
+  `to_tag=local_tag`, matching the registered `dialog_id`. If it recurs, confirm
+  the `200 OK sent (To-tag …)` line shows a non-empty tag.
+- **The `SDP answer built` line shows `127.0.0.1`:** the answer is advertising
+  loopback and no RTP can arrive. Fixed — the RTP host is derived from the
+  transport's local interface (same host as the SIP `Contact`).
+- **The runtime is behind NAT (private interface) and the SDP advertises a
+  private RTP address:** a public gateway cannot reach a private address unaided.
+  This is a media-reachability concern beyond the loopback fix. Resolve in this
+  order:
+  1. **Symmetric-RTP latching (preferred, vendor-neutral):** learn the peer's
+     real source `(IP, port)` from the first inbound RTP packet and send our RTP
+     back to that tuple, ignoring a private/incorrect SDP address. Survives NAT
+     and SBC rewriting; a media-engine change, not signalling.
+  2. **Outbound greeting on answer (complementary):** speak a short greeting
+     immediately after the `200 OK` so we send RTP first — opens the NAT pinhole
+     and gives a symmetric-RTP gateway our address to latch onto. Helps, but is
+     **not sufficient alone** if the gateway honours the SDP address literally.
+  3. **Correct public address in the SDP** (rport/STUN/configured external IP) is
+     the alternative; latching is the more robust default.
+
 ## 9. Teardown
 
 - Stop the validation process / gateway with `Ctrl-C` (the driver above calls

@@ -112,8 +112,10 @@ class _FakeReconnectTransport:
         """Register a call sink."""
         self._calls[call_id] = sink
 
-    def remove_call(self, call_id: str) -> None:
-        """Forget a call sink."""
+    def remove_call(self, call_id: str, sink: object | None = None) -> None:
+        """Forget a call sink (identity-checked when ``sink`` is given)."""
+        if sink is not None and self._calls.get(call_id) is not sink:
+            return
         self._calls.pop(call_id, None)
 
 

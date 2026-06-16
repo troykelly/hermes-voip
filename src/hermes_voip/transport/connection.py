@@ -257,8 +257,19 @@ class SipOverTlsTransport:
         """Register a call's response sink so its responses route to it by Call-ID."""
         self._calls[call_id] = sink
 
-    def remove_call(self, call_id: str) -> None:
-        """Forget a call; drop any tracked client transactions for it."""
+    def remove_call(self, call_id: str, sink: CallResponseSink | None = None) -> None:
+        """Forget a call; drop any tracked client transactions for it.
+
+        When ``sink`` is given the registration is only removed if it is still
+        that exact sink. Overlapping INVITEs can share a Call-ID (retransmission
+        or fork); a later call's :meth:`add_call` overwrites the entry, so an
+        earlier call's teardown must not evict the live later one — pass the
+        earlier call's own sink and the identity check makes the removal a no-op
+        when it no longer owns the entry. With ``sink=None`` the removal is
+        unconditional (used where there is provably one call per Call-ID).
+        """
+        if sink is not None and self._calls.get(call_id) is not sink:
+            return
         self._calls.pop(call_id, None)
         for key in [k for k in self._client_txns if k[0] == call_id]:
             del self._client_txns[key]

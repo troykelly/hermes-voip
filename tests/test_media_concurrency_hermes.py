@@ -259,7 +259,9 @@ async def test_adapter_concurrent_same_call_id_teardown_isolation() -> None:  # 
         def add_call(self, call_id: str, sink: object) -> None:
             self._calls[call_id] = sink
 
-        def remove_call(self, call_id: str) -> None:
+        def remove_call(self, call_id: str, sink: object | None = None) -> None:
+            if sink is not None and self._calls.get(call_id) is not sink:
+                return
             self._calls.pop(call_id, None)
 
     class _FakeMgr:
@@ -509,7 +511,9 @@ async def test_concurrent_same_call_id_all_tasks_tracked_and_cancelled() -> None
         def add_call(self, call_id: str, sink: object) -> None:
             self.calls[call_id] = sink
 
-        def remove_call(self, call_id: str) -> None:
+        def remove_call(self, call_id: str, sink: object | None = None) -> None:
+            if sink is not None and self.calls.get(call_id) is not sink:
+                return
             self.calls.pop(call_id, None)
 
     class _FakeMgr:

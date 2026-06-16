@@ -1004,6 +1004,55 @@ async def test_inbound_invite_200ok_carries_dialog_to_tag() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression (live no-audio failure): the SDP answer must advertise the runtime's
+# REAL local RTP address (the transport's local interface), never the 127.0.0.1
+# loopback placeholder. A gateway that receives c=IN IP4 127.0.0.1 sends RTP to
+# its own loopback, so audio can never flow even once the dialog is routable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_sdp_answer_advertises_real_local_rtp_address() -> None:
+    """The 200 OK SDP answer connection address is the transport's local host."""
+    transport = _FakeTransport(local_sent_by="172.23.0.2:55728")
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(call_id=call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    # The SDP answer (200 OK body) must carry the runtime's real RTP host, not
+    # the loopback placeholder.
+    assert "c=IN IP4 172.23.0.2" in ok.body, (
+        f"SDP answer does not advertise the local interface address; body:\n{ok.body}"
+    )
+    assert "127.0.0.1" not in ok.body, (
+        f"SDP answer still advertises the 127.0.0.1 loopback placeholder:\n{ok.body}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression (W10 review finding): an exception raised inside the fire-and-forget
 # inbound-INVITE handler must be LOGGED WITH ITS TRACEBACK, never silently lost.
 # On the live call there was zero log output from the handler — any failure (SDP

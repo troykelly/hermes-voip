@@ -2,14 +2,28 @@
 
 Scoped to what a telephony endpoint needs: one audio media description with its
 codecs (PCMU/PCMA/telephone-event), the media-security profile (RTP/AVP vs
-RTP/SAVP + SDES ``a=crypto`` lines), ptime, and direction. Video and other media
-are ignored. Addresses are passed in by the transport; none are hard-coded.
+RTP/SAVP + SDES ``a=crypto`` lines, or UDP/TLS/RTP/SAVPF + DTLS-SRTP
+``a=fingerprint``/``a=setup`` + ICE for WebRTC), ptime, and direction. Video and
+other media are ignored. Addresses are passed in by the transport; none are
+hard-coded.
+
+Two exclusive media-keying paths are supported (ADR-0016):
+
+* **SDES** (``RTP/SAVP``): ``a=crypto`` inline key; no fingerprint, no ICE.
+  Used on the SIP-over-TLS transport.
+* **DTLS-SRTP / WebRTC** (``UDP/TLS/RTP/SAVPF``): ``a=fingerprint`` +
+  ``a=setup`` + ``a=ice-ufrag`` / ``a=ice-pwd`` + ``a=candidate`` +
+  ``a=rtcp-mux``; **no** ``a=crypto``, **no** ``c=`` connection address
+  (RFC 5763 §5).
+
+A media description is EITHER SDES OR DTLS-SRTP, never both.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -37,11 +51,13 @@ _G711_ENCODINGS = frozenset({"PCMU", "PCMA"})
 _DEFAULT_CLOCK_RATE = 8000
 _SECURE_PROFILE = "RTP/SAVP"
 _PLAIN_PROFILE = "RTP/AVP"
+# WebRTC DTLS-SRTP profile (ADR-0016, RFC 5764 / RFC 4585).
+_WEBRTC_PROFILE = "UDP/TLS/RTP/SAVPF"
 # RFC 4568 SDES. We negotiate the two AES_CM_128 SRTP crypto-suites: with an
 # 80-bit and a 32-bit HMAC-SHA1 auth tag. Both use a 128-bit (16-octet) master
 # key and 112-bit (14-octet) master salt — they differ only in the SRTP/SRTCP
 # auth-tag length (RFC 4568 §6.2) — so for both the inline key||salt decodes to
-# 30 octets. DTLS-SRTP and other suites are out of scope.
+# 30 octets.
 _AES_CM_128_HMAC_SHA1_80 = "AES_CM_128_HMAC_SHA1_80"
 _AES_CM_128_HMAC_SHA1_32 = "AES_CM_128_HMAC_SHA1_32"
 _SUPPORTED_CRYPTO_SUITES = frozenset(
@@ -61,6 +77,19 @@ _MIN_LINE_LEN = 2  # an SDP line is at minimum "<type>="
 _M_AUDIO_MIN_FIELDS = 3  # m=audio <port> <proto> [<fmt>...]
 _MAX_PORT = 65535
 _CRLF = "\r\n"
+
+# ICE candidate fields: foundation component transport priority address port typ [raddr rport]  # noqa: E501
+_ICE_CAND_MIN_FIELDS = 8  # up to and including "typ <type>"
+_ICE_CAND_TYP_IDX = 6  # index of the literal "typ" keyword
+_ICE_CAND_TYPE_IDX = 7  # index of the candidate type token (host/srflx/relay)
+_ICE_CAND_RADDR_IDX = 8  # index of "raddr" keyword in srflx/relay extension
+_ICE_CAND_RADDR_VAL_IDX = 9  # index of the raddr value
+_ICE_CAND_RPORT_KW_IDX = 10  # index of "rport" keyword in srflx/relay extension
+_ICE_CAND_RPORT_VAL_IDX = 11  # index of the rport value
+# Valid ICE candidate types (RFC 8839 §5.1).
+_ICE_CANDIDATE_TYPES = frozenset({"host", "srflx", "prflx", "relay"})
+# Valid DTLS setup roles (RFC 4145 §4, RFC 5763 §5).
+_SETUP_ROLES = frozenset({"actpass", "active", "passive"})
 
 
 class SdpError(ValueError):
@@ -119,8 +148,9 @@ class CryptoAttribute:
         key_params: The key parameters starting with ``inline:`` (the base64
             master key||salt plus any optional ``|lifetime|MKI:length`` fields).
 
-    DTLS-SRTP fingerprints and ICE are out of scope (deferred to W12); this is
-    SDES keying only.
+    This is SDES keying only (SIP-over-TLS transport, ADR-0013). The DTLS-SRTP
+    path (WebRTC, ADR-0016) uses :class:`Fingerprint` + :class:`SetupRole` +
+    ICE — never ``a=crypto``.
 
     ``key_params`` is suppressed from ``repr`` (``field(repr=False)``) because it
     is (or carries) the SRTP master key||salt; a repr lands in logs and
@@ -174,6 +204,175 @@ class CryptoAttribute:
 
 
 @dataclass(frozen=True, slots=True)
+class Fingerprint:
+    """A validated DTLS certificate fingerprint (``a=fingerprint``, RFC 4572).
+
+    Used on the WebRTC / DTLS-SRTP media path (ADR-0016). The SDES path
+    (:class:`CryptoAttribute`) does not use fingerprints.
+
+    Attributes:
+        algorithm: The hash algorithm name, lower-cased (e.g. ``sha-256``).
+        value: The colon-separated hex fingerprint string as it appears in SDP,
+            preserving the original case (RFC 4572 allows upper or lower; the
+            algorithm token is normalised to lower-case by :meth:`parse`).
+    """
+
+    algorithm: str
+    value: str
+
+    @classmethod
+    def parse(cls, body: str) -> Fingerprint:
+        """Parse a ``fingerprint`` attribute body (``<algorithm> <value>``).
+
+        ``body`` is the text after ``a=fingerprint:``.
+
+        Raises:
+            SdpError: If the body is missing the value token.
+        """
+        parts = body.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():  # noqa: PLR2004 - literal count
+            msg = "malformed a=fingerprint attribute: expected '<algorithm> <value>'"
+            raise SdpError(msg)
+        return cls(algorithm=parts[0].lower(), value=parts[1].strip())
+
+    def render(self) -> str:
+        """Render the attribute body for an ``a=fingerprint:`` line (no prefix)."""
+        return f"{self.algorithm} {self.value}"
+
+
+@dataclass(frozen=True, slots=True)
+class SetupRole:
+    """A validated DTLS setup role (``a=setup``, RFC 4145 / RFC 5763).
+
+    Valid values are ``actpass``, ``active``, and ``passive``.  RFC 5763 §5
+    restricts the answerer to ``active`` or ``passive`` (never ``actpass``);
+    :func:`build_webrtc_answer` enforces that constraint.
+
+    Attributes:
+        value: One of ``actpass``, ``active``, or ``passive``.
+    """
+
+    value: str
+
+    @classmethod
+    def parse(cls, body: str) -> SetupRole:
+        """Parse a ``setup`` attribute body.
+
+        ``body`` is the text after ``a=setup:`` (leading/trailing whitespace
+        is stripped).
+
+        Raises:
+            SdpError: If the value is not a recognised setup role.
+        """
+        role = body.strip()
+        if role not in _SETUP_ROLES:
+            msg = f"unknown a=setup role: {role!r} (expected actpass/active/passive)"
+            raise SdpError(msg)
+        return cls(value=role)
+
+    def render(self) -> str:
+        """Render the attribute value for an ``a=setup:`` line (no prefix)."""
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class IceCandidate:
+    """A parsed ICE candidate (``a=candidate``, RFC 8839 §5.1).
+
+    Attributes:
+        foundation: An opaque string identifying the candidate's base.
+        component: RTP component id (1 for RTP, 2 for RTCP; typically 1 with
+            ``a=rtcp-mux``).
+        transport: Transport protocol token (``UDP`` or ``TCP``).
+        priority: 32-bit candidate priority.
+        address: The candidate IP address (IPv4 or IPv6 literal).
+        port: The candidate port (1-65535).
+        typ: Candidate type: ``host``, ``srflx``, ``prflx``, or ``relay``.
+        raddr: Reflexive/relay base address (``srflx``/``relay``), or ``None``
+            for ``host`` candidates.
+        rport: Reflexive/relay base port, or ``None`` for ``host`` candidates.
+    """
+
+    foundation: str
+    component: int
+    transport: str
+    priority: int
+    address: str
+    port: int
+    typ: str
+    raddr: str | None
+    rport: int | None
+
+    @classmethod
+    def parse(cls, body: str) -> IceCandidate:
+        """Parse a ``candidate`` attribute body (text after ``a=candidate:``).
+
+        Raises:
+            SdpError: If the body is truncated, a numeric field is non-integer,
+                or the port is out of range.
+        """
+        tokens = body.split()
+        if len(tokens) < _ICE_CAND_MIN_FIELDS:
+            msg = (
+                "malformed a=candidate: expected at least "
+                f"{_ICE_CAND_MIN_FIELDS} tokens"
+            )
+            raise SdpError(msg)
+        try:
+            component = int(tokens[1])
+            priority = int(tokens[3])
+            port = int(tokens[5])
+        except ValueError as exc:
+            msg = "malformed a=candidate: non-integer numeric field"
+            raise SdpError(msg) from exc
+        if not 1 <= port <= _MAX_PORT:
+            msg = f"a=candidate port out of range 1..{_MAX_PORT}: {port}"
+            raise SdpError(msg)
+        foundation = tokens[0]
+        transport = tokens[2]
+        address = tokens[4]
+        # tokens[6] should be "typ"; tokens[7] is the type value.
+        typ = tokens[_ICE_CAND_TYPE_IDX]
+        # Parse optional raddr/rport extension for non-host candidates.
+        # Extension layout (0-based): ..., "raddr", <addr>, "rport", <port>
+        # i.e. indices 8, 9, 10, 11 (when all four tokens are present).
+        raddr: str | None = None
+        rport: int | None = None
+        if (
+            len(tokens) > _ICE_CAND_RADDR_IDX
+            and tokens[_ICE_CAND_RADDR_IDX] == "raddr"
+            and len(tokens) > _ICE_CAND_RADDR_VAL_IDX
+        ):
+            raddr = tokens[_ICE_CAND_RADDR_VAL_IDX]
+            if (
+                len(tokens) > _ICE_CAND_RPORT_VAL_IDX
+                and tokens[_ICE_CAND_RPORT_KW_IDX] == "rport"
+            ):
+                rport = int(tokens[_ICE_CAND_RPORT_VAL_IDX])
+        return cls(
+            foundation=foundation,
+            component=component,
+            transport=transport,
+            priority=priority,
+            address=address,
+            port=port,
+            typ=typ,
+            raddr=raddr,
+            rport=rport,
+        )
+
+    def render(self) -> str:
+        """Render the attribute body for an ``a=candidate:`` line (no prefix)."""
+        base = (
+            f"{self.foundation} {self.component} {self.transport} {self.priority} "
+            f"{self.address} {self.port} typ {self.typ}"
+        )
+        if self.raddr is not None and self.rport is not None:
+            return f"{base} raddr {self.raddr} rport {self.rport}"
+        return base
+
+
+@dataclass(frozen=True, slots=True)
 class Codec:
     """One RTP codec: payload type plus its rtpmap and optional fmtp.
 
@@ -198,17 +397,29 @@ class AudioMedia:
 
     Attributes:
         port: The RTP port the peer receives on.
-        protocol: The transport profile (``RTP/AVP``, ``RTP/SAVP``, ...).
+        protocol: The transport profile (``RTP/AVP``, ``RTP/SAVP``,
+            ``UDP/TLS/RTP/SAVPF``, ...).
         codecs: The offered codecs in offer order.
         crypto: Raw ``a=crypto`` lines (SDES) for an SRTP profile, verbatim and
-            in offer order — kept for diagnostics even when malformed.
+            in offer order — kept for diagnostics even when malformed.  Always
+            empty on a WebRTC (``SAVPF``) m-line (RFC 8827 §6.5 / ADR-0016).
         crypto_attrs: The subset of ``crypto`` lines that parse and validate as
             a supported :class:`CryptoAttribute`, in offer order. Parsing is
             lenient: a malformed or unsupported crypto line stays in ``crypto``
             but is excluded here, so this carries only usable offered keys.
+            Always empty on WebRTC m-lines.
         ptime: Packetisation time in ms, if declared.
         direction: ``sendrecv`` / ``sendonly`` / ``recvonly`` / ``inactive``.
         connection_address: The effective connection address for this media.
+            ``None`` on a WebRTC m-line (address is conveyed by ICE candidates).
+        fingerprint: Parsed ``a=fingerprint`` (DTLS-SRTP, RFC 4572), or ``None``
+            on an SDES / plain-RTP m-line.
+        setup: Parsed ``a=setup`` role (RFC 4145 / RFC 5763), or ``None`` on an
+            SDES / plain-RTP m-line.
+        ice_ufrag: ICE username fragment (``a=ice-ufrag``), or ``None`` if absent.
+        ice_pwd: ICE password (``a=ice-pwd``), or ``None`` if absent.
+        ice_candidates: Parsed ICE candidate list (``a=candidate``), in offer order.
+        rtcp_mux: ``True`` when ``a=rtcp-mux`` is present (RFC 5761).
 
     ``crypto`` and ``crypto_attrs`` are suppressed from ``repr``
     (``field(repr=False)``): both carry SDES inline master key||salt material,
@@ -223,11 +434,26 @@ class AudioMedia:
     direction: str
     connection_address: str | None
     crypto_attrs: tuple[CryptoAttribute, ...] = field(default=(), repr=False)
+    fingerprint: Fingerprint | None = None
+    setup: SetupRole | None = None
+    ice_ufrag: str | None = None
+    ice_pwd: str | None = None
+    ice_candidates: tuple[IceCandidate, ...] = field(default_factory=tuple)
+    rtcp_mux: bool = False
 
     @property
     def is_srtp(self) -> bool:
-        """True when the transport profile is secured (SAVP)."""
+        """True when the transport profile is SDES-secured (SAVP or SAVPF)."""
         return "SAVP" in self.protocol
+
+    @property
+    def is_webrtc(self) -> bool:
+        """True when the transport profile is ``UDP/TLS/RTP/SAVPF`` (ADR-0016).
+
+        A WebRTC m-line carries fingerprint + ICE; it MUST NOT carry
+        ``a=crypto`` (RFC 8827 §6.5).
+        """
+        return self.protocol == _WEBRTC_PROFILE
 
 
 @dataclass(slots=True)
@@ -249,6 +475,13 @@ class _AudioAccumulator:
     ptime: int | None = None
     direction: str = "sendrecv"
     connection: str | None = None
+    # WebRTC / DTLS-SRTP + ICE attributes (ADR-0016)
+    fingerprint: Fingerprint | None = None
+    setup: SetupRole | None = None
+    ice_ufrag: str | None = None
+    ice_pwd: str | None = None
+    ice_candidates: list[IceCandidate] = field(default_factory=list)
+    rtcp_mux: bool = False
 
     def set_media_line(self, value: str) -> None:
         """Apply an ``m=audio <port> <proto> <fmt...>`` line.
@@ -301,6 +534,25 @@ class _AudioAccumulator:
             self.ptime = int(rest.strip())
         elif value in _DIRECTIONS:
             self.direction = value
+        # WebRTC attributes (ADR-0016, RFC 5763/8839).  Malformed lines are
+        # tolerated: a bad fingerprint or candidate leaves the field None/empty
+        # (same leniency as SDES crypto lines) so a single bad attr does not
+        # discard the whole m-line.
+        elif tag == "fingerprint":
+            with contextlib.suppress(SdpError):
+                self.fingerprint = Fingerprint.parse(rest.strip())
+        elif tag == "setup":
+            with contextlib.suppress(SdpError):
+                self.setup = SetupRole.parse(rest.strip())
+        elif tag == "ice-ufrag":
+            self.ice_ufrag = rest.strip()
+        elif tag == "ice-pwd":
+            self.ice_pwd = rest.strip()
+        elif tag == "candidate":
+            with contextlib.suppress(SdpError):
+                self.ice_candidates.append(IceCandidate.parse(rest.strip()))
+        elif value == "rtcp-mux":
+            self.rtcp_mux = True
 
     def build(self, session_connection: str | None) -> AudioMedia:
         """Resolve the accumulated state into an immutable :class:`AudioMedia`."""
@@ -327,6 +579,12 @@ class _AudioAccumulator:
                 crypto_attrs.append(CryptoAttribute.parse(raw))
             except SdpError:
                 continue
+        # WebRTC m-lines use ICE for address/port — no c= connection address.
+        effective_conn: str | None
+        if self.protocol == _WEBRTC_PROFILE:
+            effective_conn = None
+        else:
+            effective_conn = self.connection or session_connection
         return AudioMedia(
             port=self.port,
             protocol=self.protocol,
@@ -334,8 +592,14 @@ class _AudioAccumulator:
             crypto=tuple(self.crypto),
             ptime=self.ptime,
             direction=self.direction,
-            connection_address=self.connection or session_connection,
+            connection_address=effective_conn,
             crypto_attrs=tuple(crypto_attrs),
+            fingerprint=self.fingerprint,
+            setup=self.setup,
+            ice_ufrag=self.ice_ufrag,
+            ice_pwd=self.ice_pwd,
+            ice_candidates=tuple(self.ice_candidates),
+            rtcp_mux=self.rtcp_mux,
         )
 
 
@@ -468,7 +732,7 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
     sess_version: int,
     crypto: CryptoAttribute | None,
 ) -> str:
-    """Emit the SDP body shared by offer and answer.
+    """Emit the SDP body shared by offer and answer (SDES or plain RTP paths).
 
     The profile is ``RTP/SAVP`` with a single ``a=crypto`` line carrying the
     given attribute's tag/suite/key (RFC 4568 SDES) when ``crypto`` is supplied,
@@ -476,6 +740,8 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
     ``ptime`` happens here so both callers enforce the same invariants; the
     crypto attribute is already validated by construction. The SRTP master
     key/salt is the caller's; this function never generates key material.
+
+    For the WebRTC / DTLS-SRTP path, use :func:`_build_webrtc_body` instead.
     """
     if direction not in _DIRECTIONS:
         msg = f"invalid SDP direction: {direction!r}"
@@ -513,6 +779,80 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
     return _CRLF.join(lines) + _CRLF
 
 
+def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; all keyword-only
+    *,
+    local_address: str,
+    port: int,
+    codecs: Sequence[Codec],
+    direction: str,
+    ptime: int,
+    session_id: int,
+    sess_version: int,
+    fingerprint: Fingerprint,
+    setup: SetupRole,
+    ice_ufrag: str,
+    ice_pwd: str,
+    ice_candidates: Sequence[IceCandidate],
+) -> str:
+    """Emit a WebRTC SDP body (``UDP/TLS/RTP/SAVPF``, ADR-0016).
+
+    Per RFC 5763 §5:
+    - The ``c=`` session connection-address line is omitted (address is
+      conveyed by ICE candidates).
+    - The ``a=connection`` attribute (RFC 4145) MUST NOT appear.
+    - No ``a=crypto`` (SDES keying is forbidden on WebRTC m-lines per RFC 8827
+      §6.5).
+
+    Includes ``a=fingerprint``, ``a=setup``, ``a=ice-ufrag``, ``a=ice-pwd``,
+    one ``a=candidate`` per entry, and ``a=rtcp-mux``.
+
+    ``local_address`` is used in the ``o=`` origin line only (RFC 4566 §5.2);
+    it does not appear in a ``c=`` line (which is omitted per RFC 5763 §5).
+    """
+    if direction not in _DIRECTIONS:
+        msg = f"invalid SDP direction: {direction!r}"
+        raise ValueError(msg)
+    if not codecs:
+        msg = "an SDP audio body needs at least one codec"
+        raise ValueError(msg)
+    if not 1 <= port <= _MAX_PORT:
+        msg = f"RTP port out of range 1..{_MAX_PORT}: {port}"
+        raise ValueError(msg)
+    if ptime <= 0:
+        msg = f"ptime must be positive, got {ptime}"
+        raise ValueError(msg)
+    payloads = " ".join(str(c.payload_type) for c in codecs)
+    # RFC 5763 §5: no c= line on a DTLS-SRTP m-line (connection address is
+    # conveyed by ICE candidates, not a c= attribute).
+    lines = [
+        "v=0",
+        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
+        "s=-",
+        "t=0 0",
+        f"m=audio {port} {_WEBRTC_PROFILE} {payloads}",
+    ]
+    for codec in codecs:
+        rate = f"{codec.encoding}/{codec.clock_rate}"
+        if codec.channels != 1:
+            rate = f"{rate}/{codec.channels}"
+        lines.append(f"a=rtpmap:{codec.payload_type} {rate}")
+        if codec.fmtp is not None:
+            lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
+    # DTLS-SRTP keying attributes (RFC 5763 §5, RFC 4572).
+    lines.append(f"a=fingerprint:{fingerprint.render()}")
+    lines.append(f"a=setup:{setup.render()}")
+    # ICE credentials and candidates (RFC 8839 §5.4, §5.1).
+    lines.append(f"a=ice-ufrag:{ice_ufrag}")
+    lines.append(f"a=ice-pwd:{ice_pwd}")
+    for cand in ice_candidates:
+        lines.append(f"a=candidate:{cand.render()}")
+    # rtcp-mux (RFC 5761): RTP + RTCP share the one ICE-selected 5-tuple.
+    lines.append("a=rtcp-mux")
+    lines.append(f"a=ptime:{ptime}")
+    lines.append(f"a={direction}")
+    return _CRLF.join(lines) + _CRLF
+
+
 def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
     *,
     local_address: str,
@@ -525,6 +865,10 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
     crypto: CryptoAttribute | str | None = None,
 ) -> str:
     """Build an SDP audio offer/answer body (RTP/AVP, or RTP/SAVP with crypto).
+
+    This is the SDES / plain-RTP path only (SIP-over-TLS transport, ADR-0013).
+    For the WebRTC / DTLS-SRTP path (``UDP/TLS/RTP/SAVPF``), use
+    :func:`build_webrtc_answer`.
 
     Args:
         local_address: The address we receive RTP on (IPv4 literal).
@@ -544,8 +888,7 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
             supplied, the profile becomes ``RTP/SAVP`` and the attribute's own
             tag/suite/key is emitted as the ``a=crypto`` line — a string is
             validated (suite + 30-octet inline key) and rejected if malformed.
-            The key material is the caller's, never generated here. DTLS-SRTP
-            fingerprints and ICE candidates are out of scope (deferred to W12).
+            The key material is the caller's, never generated here.
 
     Returns:
         The SDP body terminated by CRLF, ready to attach to an INVITE/200.
@@ -581,6 +924,10 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
 ) -> str:
     """Build an SDP answer to ``offer`` (RFC 3264 §6.1).
 
+    This is the SDES / plain-RTP answer path (SIP-over-TLS transport,
+    ADR-0013).  For a WebRTC / DTLS-SRTP offer (``UDP/TLS/RTP/SAVPF``), use
+    :func:`build_webrtc_answer` instead.
+
     Negotiates the codecs common to the offer and ``supported`` (in the offer's
     preference order, via :func:`negotiate_audio`), mirrors the offered
     direction (sendrecv->sendrecv, sendonly->recvonly, recvonly->sendonly,
@@ -590,9 +937,6 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
     choice by the offer's tag) but carries **our own** key material from
     ``crypto``. The answer's payload ordering follows the offer, not
     ``supported`` — the answerer honours the offerer's preference.
-
-    DTLS-SRTP fingerprints and ICE attributes are explicitly out of scope here
-    (deferred to W12); this builds SDES-keyed SAVP or plain AVP only.
 
     Args:
         offer: The parsed peer offer to answer; must carry audio media.
@@ -639,6 +983,105 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
         session_id=session_id,
         sess_version=sess_version,
         crypto=answer_crypto,
+    )
+
+
+def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; all keyword-only
+    offer: SessionDescription,
+    *,
+    local_address: str,
+    port: int,
+    supported: Sequence[str],
+    fingerprint: Fingerprint,
+    setup: SetupRole,
+    ice_ufrag: str,
+    ice_pwd: str,
+    ice_candidates: Sequence[IceCandidate],
+    ptime: int = 20,
+    session_id: int = 0,
+    version: int | None = None,
+) -> str:
+    """Build a WebRTC SDP answer to a ``UDP/TLS/RTP/SAVPF`` offer (ADR-0016).
+
+    Produces a ``UDP/TLS/RTP/SAVPF`` answer carrying DTLS-SRTP keying
+    attributes (``a=fingerprint``, ``a=setup``), ICE credentials and candidates
+    (``a=ice-ufrag``, ``a=ice-pwd``, ``a=candidate``), and ``a=rtcp-mux``.
+
+    Per RFC 5763 §5:
+    - The answer carries NO ``a=crypto`` (SDES keying is forbidden on WebRTC
+      m-lines, RFC 8827 §6.5).
+    - No ``c=`` connection-address line (RFC 4145 ``a=connection`` is also
+      forbidden; address is conveyed by ICE candidates).
+    - ``setup`` MUST be ``active`` or ``passive`` — the answerer MUST NOT
+      offer ``actpass`` (RFC 5763 §5).
+
+    The direction mirrors the offer's direction per RFC 3264 §6.1 (not a
+    caller-supplied value — the answerer has no independent direction choice on
+    a WebRTC answer).
+
+    Codec negotiation (via :func:`negotiate_audio`) follows the offer's
+    preference order, not ``supported``.
+
+    Args:
+        offer: The parsed peer WebRTC offer; must carry ``UDP/TLS/RTP/SAVPF``
+            audio media.
+        local_address: Used in the ``o=`` origin line (RFC 4566 §5.2); ICE
+            candidates carry the real media addresses so no ``c=`` is emitted.
+        port: The port in the ``m=`` line.  The actual media address and port
+            are conveyed by ``ice_candidates``.
+        supported: Encoding names we handle (case-insensitive).
+        fingerprint: Our DTLS certificate fingerprint.
+        setup: Our DTLS role (``active`` or ``passive``; never ``actpass``).
+        ice_ufrag: Our ICE username fragment.
+        ice_pwd: Our ICE password.
+        ice_candidates: Our gathered ICE candidates (all of them for non-trickle
+            MVP, RFC 8838 §3).
+        ptime: Packetisation time in ms.
+        session_id: SDP ``o=`` session id.
+        version: SDP ``o=`` session version (defaults to ``session_id``).
+
+    Returns:
+        The SDP answer body terminated by CRLF, ready to attach to a 200 OK.
+
+    Raises:
+        SdpError: If the offer has no audio media, the offer is not
+            ``UDP/TLS/RTP/SAVPF``, no common voice codec is shared, or
+            ``setup`` is ``actpass`` (forbidden for an answerer).
+    """
+    audio = offer.audio
+    if audio is None:
+        msg = "cannot answer an offer with no audio media"
+        raise SdpError(msg)
+    if not audio.is_webrtc:
+        msg = (
+            "build_webrtc_answer requires a WebRTC (UDP/TLS/RTP/SAVPF) offer; "
+            f"got profile {audio.protocol!r}"
+        )
+        raise SdpError(msg)
+    if setup.value == "actpass":
+        msg = (
+            "build_webrtc_answer: setup=actpass is forbidden for an answerer "
+            "(RFC 5763 §5); use active or passive"
+        )
+        raise SdpError(msg)
+    try:
+        chosen = negotiate_audio(audio, supported)
+    except ValueError as exc:
+        raise SdpError(str(exc)) from exc
+    sess_version = session_id if version is None else version
+    return _build_webrtc_body(
+        local_address=local_address,
+        port=port,
+        codecs=chosen,
+        direction=_ANSWER_DIRECTION[audio.direction],
+        ptime=ptime,
+        session_id=session_id,
+        sess_version=sess_version,
+        fingerprint=fingerprint,
+        setup=setup,
+        ice_ufrag=ice_ufrag,
+        ice_pwd=ice_pwd,
+        ice_candidates=ice_candidates,
     )
 
 

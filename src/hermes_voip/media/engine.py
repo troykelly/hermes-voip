@@ -45,12 +45,14 @@ import contextlib
 import enum
 import logging
 import socket
+import struct
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Protocol
+from typing import Final, Protocol
 
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
+    Resampler,
     alaw_to_frame,
     frame_to_alaw,
     frame_to_ulaw,
@@ -84,6 +86,13 @@ _OUTBOUND_SSRC: int = 0xCAFEBABE
 
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512
+
+# How often to log a rolling peak amplitude for outbound TX audio.
+# Every _TX_AMPLITUDE_LOG_PERIOD packets (= 1 second at 20 ms ptime, 50 pps)
+# the engine emits one INFO line showing the peak amplitude seen in that window.
+# This replaces the old "first 3 chunks only" approach, which always logged 0
+# because the TTS synthesiser has a brief silent lead-in before actual speech.
+_TX_AMPLITUDE_LOG_PERIOD: Final[int] = 50
 
 # A received datagram paired with the UDP source address it arrived from. The
 # source address is what symmetric-RTP (comedia) latching needs: we send our
@@ -247,12 +256,35 @@ class RtpMediaTransport:
         self._outbound_addr: tuple[str, int] = (remote_address, remote_port)
         self._latched: bool = False
 
+        # One-shot diagnostic flags: log the first outbound and first inbound
+        # RTP packet at INFO so the media path is visible in the operator log.
+        self._first_tx_logged: bool = False
+        self._first_rx_logged: bool = False
+        # Rolling TX amplitude tracking: every _TX_AMPLITUDE_LOG_PERIOD packets
+        # emit one INFO line showing the peak seen in that window.  Counts and
+        # resets on each period boundary so a slow TTS lead-in (which is silent)
+        # does not swamp the early log lines with zeros.
+        self._tx_amplitude_chunk_count: int = 0
+        self._tx_amplitude_period_peak: int = 0
+
         # Socket / asyncio transport state (populated by connect()).
+        # _ever_connected distinguishes "stopped after a real call" (silent no-op
+        # in send_audio — the frame is dropped cleanly because the call is ending)
+        # from "never connected" (programming error — still raises RuntimeError).
+        self._ever_connected: bool = False
         self._transport: asyncio.DatagramTransport | None = None
         self._recv_queue: asyncio.Queue[_Datagram] = asyncio.Queue(
             maxsize=_QUEUE_MAXSIZE
         )
         self._jitter: JitterBuffer = JitterBuffer(target_depth=jitter_depth)
+
+        # Outbound rate reconciliation (ADR-0017): a TTS provider emits frames at
+        # its own output rate (e.g. sherpa-Kokoro at 24 kHz), but the G.711 wire
+        # is fixed at 8 kHz. send_audio resamples any non-8 kHz frame down to the
+        # wire rate before encoding. We keep one state-carrying Resampler PER
+        # source rate so a continuous stream resamples click-free (frame-by-frame
+        # output matches a single pass); 8 kHz frames bypass it entirely.
+        self._tx_resamplers: dict[int, Resampler] = {}
 
         # Stop signal: set by stop(), selected on by the inbound generator so it
         # wakes promptly regardless of recv-queue fullness (a bounded queue can
@@ -287,10 +319,19 @@ class RtpMediaTransport:
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
         self._stop_event = asyncio.Event()
         self._pending = None
+        # Drop any carried outbound-resample state so a reused engine starts a
+        # fresh stream (no stale sub-sample phase from a previous call).
+        self._tx_resamplers = {}
         # Reset the latch so a reused engine re-latches on its next call: aim
         # back at the SDP-negotiated remote until the first valid inbound packet.
         self._outbound_addr = (self._remote_address, self._remote_port)
         self._latched = False
+        # Reset one-shot diagnostic flags so a reconnected engine logs the first
+        # outbound and inbound packets of the new call.
+        self._first_tx_logged = False
+        self._first_rx_logged = False
+        self._tx_amplitude_chunk_count = 0
+        self._tx_amplitude_period_peak = 0
         protocol = _UdpReceiver(self._recv_queue)
 
         transport, _ = await loop.create_datagram_endpoint(
@@ -301,6 +342,7 @@ class RtpMediaTransport:
         # is always a DatagramTransport when a UDP socket is passed.
         assert isinstance(transport, asyncio.DatagramTransport)  # noqa: S101 — invariant, not a test assertion
         self._transport = transport
+        self._ever_connected = True
         return True
 
     async def disconnect(self) -> None:
@@ -360,6 +402,15 @@ class RtpMediaTransport:
             # the only point at which a comedia latch may fire (anti-spoofing —
             # garbage that does not parse never reaches here).
             self._maybe_latch(rtp_pkt, source)
+
+            if not self._first_rx_logged:
+                self._first_rx_logged = True
+                _log.info(
+                    "rtp rx: first packet <- %s:%d (%d bytes)",
+                    source[0],
+                    source[1],
+                    len(data),
+                )
 
             # Feed the jitter buffer.
             self._jitter.push(rtp_pkt)
@@ -478,42 +529,122 @@ class RtpMediaTransport:
         """Encode and packetise one near-end frame; gate on hold state.
 
         When :attr:`on_hold` is ``True`` the datagram is silently discarded.
-        Otherwise the frame is encoded, packed into an RTP packet (incrementing
-        seq/timestamp), optionally SRTP-protected, and sent to the remote.
-        The injected ``sleep`` callable paces the stream at ``ptime`` ms.
+        Otherwise the frame is resampled to the 8 kHz G.711 wire rate (if it
+        arrives at any other rate — e.g. a 24 kHz TTS frame), encoded, packed
+        into an RTP packet (incrementing seq/timestamp), optionally
+        SRTP-protected, and sent to the remote.  The injected ``sleep`` callable
+        paces the stream at ``ptime`` ms.
 
         Args:
-            frame: PCM16 audio at the G.711 wire rate (8 kHz).
+            frame: PCM16 audio at ANY sample rate.  A frame already at 8 kHz is
+                encoded directly; any other rate (e.g. the TTS provider's 24 kHz
+                output) is resampled down to 8 kHz first (ADR-0017), so this
+                method never raises on a non-8 kHz frame — it converts.
         """
         if self.on_hold:
             return
 
         if self._transport is None:
+            if self._ever_connected:
+                # Engine has been stopped mid-call (teardown while TTS was in
+                # flight). Dropping this frame is correct — the call is ending.
+                # This is intentional graceful degradation (AGENTS.md rule 37
+                # exemption: the stopped state is established control flow, not
+                # an unexpected error; raising here would propagate through the
+                # TaskGroup and tear the call down with an abnormal exit instead
+                # of a clean BYE).
+                return
             msg = "send_audio called before connect()"
             raise RuntimeError(msg)
 
-        payload = self._encode(frame)
+        wire_rate_frame = self._to_wire_rate(frame)
 
-        pkt = RtpPacket(
-            payload_type=self._codec.value,
-            sequence_number=self._seq,
-            timestamp=self._ts,
-            ssrc=_OUTBOUND_SSRC,
-            payload=payload,
-        )
-
-        wire = self._srtp_out.protect(pkt) if self._srtp_out is not None else pkt.pack()
-
-        # Advance counters (mod 2^16 for seq, mod 2^32 for ts).
-        self._seq = (self._seq + 1) % (1 << 16)
+        # Rechunk the resampled 8 kHz PCM into standard 20 ms (160-sample)
+        # slices and emit one RTP packet per slice.
+        #
+        # WHY: TTS providers (e.g. sherpa-onnx Kokoro) emit audio in large
+        # chunks -- typically 17 000-56 000 samples at 24 kHz, which after
+        # downsampling to 8 kHz become 5 931-18 630 samples (700ms-2300ms).
+        # A G.711 telephony RTP packet carries exactly 160 samples (20 ms at
+        # 8 kHz = 160 bytes payload).  Sending a single 5 931-byte payload
+        # (37x standard size) causes the gateway to silently discard it,
+        # producing complete SILENCE on the callee's phone even though the
+        # engine log shows "first RTP sent".
+        #
+        # The tone path was immune because generate_tone_frames() already
+        # yields 160-sample frames before calling send_audio.
         samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
-        self._ts = (self._ts + samples_per_frame) % (1 << 32)
+        chunk_bytes = samples_per_frame * 2  # PCM16 = 2 bytes per sample
+        raw = wire_rate_frame.samples
 
-        # Send to the latched peer source if symmetric-RTP has latched, else to
-        # the SDP-negotiated remote (the initial value of _outbound_addr).
-        self._transport.sendto(wire, self._outbound_addr)
+        # Pad the tail to a full chunk so the last packet is always full-length.
+        remainder = len(raw) % chunk_bytes
+        if remainder:
+            raw = raw + bytes(chunk_bytes - remainder)
 
-        await self._sleep(self._ptime / 1000.0)
+        for offset in range(0, len(raw), chunk_bytes):
+            chunk = raw[offset : offset + chunk_bytes]
+            chunk_frame = PcmFrame(
+                samples=chunk,
+                sample_rate=G711_SAMPLE_RATE,
+                monotonic_ts_ns=wire_rate_frame.monotonic_ts_ns,
+            )
+            payload = self._encode(chunk_frame)
+
+            pkt = RtpPacket(
+                payload_type=self._codec.value,
+                sequence_number=self._seq,
+                timestamp=self._ts,
+                ssrc=_OUTBOUND_SSRC,
+                payload=payload,
+            )
+
+            wire = (
+                self._srtp_out.protect(pkt)
+                if self._srtp_out is not None
+                else pkt.pack()
+            )
+
+            # Advance counters (mod 2^16 for seq, mod 2^32 for ts).
+            self._seq = (self._seq + 1) % (1 << 16)
+            self._ts = (self._ts + samples_per_frame) % (1 << 32)
+
+            # Log the first packet sent in this call.
+            if not self._first_tx_logged:
+                self._first_tx_logged = True
+                _log.info(
+                    "rtp tx: first packet -> %s:%d pt=%d ssrc=0x%08x",
+                    self._outbound_addr[0],
+                    self._outbound_addr[1],
+                    self._codec.value,
+                    _OUTBOUND_SSRC,
+                )
+
+            # Rolling TX amplitude: accumulate the peak across each
+            # _TX_AMPLITUDE_LOG_PERIOD-packet window (1 second at 50 pps) and
+            # emit one INFO line at the boundary.  This replaces the old
+            # "first 3 chunks" approach, which always sampled silent TTS lead-in
+            # and gave the operator a misleading zero reading.
+            n_samp = len(chunk) // 2
+            if n_samp > 0:
+                pcm_vals = struct.unpack_from(f"<{n_samp}h", chunk)
+                chunk_peak = max(abs(s) for s in pcm_vals)
+                self._tx_amplitude_period_peak = max(
+                    self._tx_amplitude_period_peak, chunk_peak
+                )
+            self._tx_amplitude_chunk_count += 1
+            if self._tx_amplitude_chunk_count % _TX_AMPLITUDE_LOG_PERIOD == 0:
+                period = self._tx_amplitude_chunk_count // _TX_AMPLITUDE_LOG_PERIOD
+                _log.info(
+                    "rtp tx: period %d peak_amplitude=%d (%.1f%% full-scale)",
+                    period,
+                    self._tx_amplitude_period_peak,
+                    self._tx_amplitude_period_peak / 327.67,
+                )
+                self._tx_amplitude_period_peak = 0
+
+            self._transport.sendto(wire, self._outbound_addr)
+            await self._sleep(self._ptime / 1000.0)
 
     @property
     def inbound_sample_rate(self) -> int:
@@ -558,6 +689,33 @@ class RtpMediaTransport:
     # ------------------------------------------------------------------
     # Internal codec helpers
     # ------------------------------------------------------------------
+
+    def _to_wire_rate(self, frame: PcmFrame) -> PcmFrame:
+        """Return ``frame`` resampled to the 8 kHz G.711 wire rate (ADR-0017).
+
+        A frame already at :data:`G711_SAMPLE_RATE` is returned unchanged (no
+        resampler touches it, so the 8 kHz fast path is byte-exact). A frame at
+        any other rate — typically the TTS provider's 24 kHz output — is
+        downsampled to 8 kHz using a per-source-rate, state-carrying
+        :class:`~hermes_voip.media.audio.Resampler`, so a continuous stream
+        converts click-free (frame-by-frame output equals a single pass). This
+        is a conversion, not an error: ``send_audio`` therefore never raises on a
+        non-8 kHz frame.
+
+        The output frame keeps the source ``monotonic_ts_ns`` (the presentation
+        clock is unaffected by the rate change) and is stamped at the wire rate.
+        """
+        if frame.sample_rate == G711_SAMPLE_RATE:
+            return frame
+        resampler = self._tx_resamplers.get(frame.sample_rate)
+        if resampler is None:
+            resampler = Resampler(frame.sample_rate, G711_SAMPLE_RATE)
+            self._tx_resamplers[frame.sample_rate] = resampler
+        return PcmFrame(
+            samples=resampler.resample(frame.samples),
+            sample_rate=G711_SAMPLE_RATE,
+            monotonic_ts_ns=frame.monotonic_ts_ns,
+        )
 
     def _decode(self, payload: bytes, ts_ns: int) -> PcmFrame:
         """Decode a G.711 RTP payload to a PcmFrame."""

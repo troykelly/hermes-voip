@@ -163,6 +163,14 @@ _DEFAULT_DTMF_MODE = "auto"
 _DTMF_MODES = frozenset({"auto", "rfc4733", "sip_info", "inband"})
 _DEFAULT_DTMF_INBAND_ENABLED = True
 
+# Tone diagnostic (operator-use only).  When set to a positive number of
+# seconds the call opening plays a generated 440 Hz sine tone directly at
+# 8 kHz (bypassing TTS + resample) instead of the TTS greeting.  This lets
+# the operator confirm the RTP transport and G.711 codec are working before
+# implicating the TTS/resample layers.  Unset / 0 = normal operation.
+_TEST_TONE_KEY = "HERMES_VOIP_TEST_TONE"
+_DEFAULT_TEST_TONE_SECS: float = 0.0
+
 # Boolean spellings accepted for the env booleans (case-insensitive, trimmed).
 _TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
 _FALSE_TOKENS = frozenset({"false", "0", "no", "off"})
@@ -309,6 +317,10 @@ class MediaConfig:
         dtmf_mode: ``auto`` | ``rfc4733`` | ``sip_info`` | ``inband``.
         dtmf_interdigit_ms: Inter-digit gap (ms) for digit aggregation, or ``None``.
         dtmf_inband_enabled: Whether the in-band Goertzel detector is armed.
+        tone_secs: When positive, the call opening plays a generated 440 Hz sine
+            tone for this many seconds at 8 kHz (bypassing TTS + resample) so the
+            operator can isolate the RTP transport layer from TTS issues.
+            ``0.0`` (the default) means normal operation (TTS greeting).
     """
 
     stt_provider: str
@@ -329,6 +341,7 @@ class MediaConfig:
     dtmf_mode: str
     dtmf_interdigit_ms: int | None
     dtmf_inband_enabled: bool
+    tone_secs: float
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -368,6 +381,12 @@ class MediaConfig:
         _require_enum("stt_provider", self.stt_provider, _STT_PROVIDERS)
         _require_enum("tts_provider", self.tts_provider, _TTS_PROVIDERS)
         _require_enum("injection_guard", self.injection_guard, _INJECTION_GUARDS)
+        if not math.isfinite(self.tone_secs) or self.tone_secs < 0:
+            msg = (
+                "tone_secs must be a non-negative finite number, "
+                f"got {self.tone_secs!r}"
+            )
+            raise ConfigError(msg)
         self._require_cloud_keys()
 
     def _require_cloud_keys(self) -> None:
@@ -438,6 +457,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         dtmf_inband_enabled=_parse_bool(
             env, _DTMF_INBAND_ENABLED_KEY, _DEFAULT_DTMF_INBAND_ENABLED
         ),
+        tone_secs=_parse_tone_secs(env),
     )
 
 
@@ -610,6 +630,29 @@ def _parse_greeting(env: Mapping[str, str]) -> str:
     if raw is None:  # key absent → friendly default
         return DEFAULT_GREETING
     return raw.strip()  # present (incl. empty/whitespace) → verbatim, trimmed
+
+
+def _parse_tone_secs(env: Mapping[str, str]) -> float:
+    """Parse ``HERMES_VOIP_TEST_TONE`` as a non-negative float (seconds).
+
+    Absent or ``"0"`` → ``0.0`` (tone disabled, normal operation). A positive
+    value enables the diagnostic tone path for that many seconds.
+
+    Raises:
+        ConfigError: If the value is set but not a valid non-negative number.
+    """
+    raw = _value(env, _TEST_TONE_KEY)
+    if not raw:
+        return _DEFAULT_TEST_TONE_SECS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        msg = f"{_TEST_TONE_KEY} must be a number of seconds, got {raw!r}"
+        raise ConfigError(msg) from exc
+    if not math.isfinite(value) or value < 0:
+        msg = f"{_TEST_TONE_KEY} must be a non-negative number, got {raw!r}"
+        raise ConfigError(msg)
+    return value
 
 
 def _parse_vad_threshold(env: Mapping[str, str]) -> float:

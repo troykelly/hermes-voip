@@ -41,11 +41,13 @@ jobs:
       - run: uv sync --frozen --extra hermes
       # Type-check the Hermes-dependent modules against the REAL base (these are
       # excluded from the default `uv run mypy` gate; passing them explicitly
-      # bypasses the exclude).
-      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py
+      # bypasses the exclude). The end-to-end test, reconnect supervisor tests, and
+      # the media-concurrency adapter isolation test all drive the real
+      # VoipAdapter, so they are checked + run here too.
+      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
-        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py -rs
+        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e -rs
 
   # Runs the conversational-provider tests with the optional `ml` extra installed
   # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack
@@ -84,10 +86,11 @@ jobs:
       - run: uv run pytest -rs
 
   # Runs the WebRTC transport tests with the optional `webrtc` extra installed
-  # (websockets).  Separate job so the websockets library stays out of the main
-  # gate's install / licence / audit scope.  The full suite is re-run so the
-  # webrtc-gated WS transport tests (which skip without the extra) actually
-  # execute against the real library.  ADR-0016 §7 PR-A.
+  # (websockets + pyopenssl + aioice — ADR-0016 building blocks: PR-A WSS,
+  # PR-C DTLS, PR-D ICE).  Separate job so the WebRTC libraries stay out of
+  # the main gate's install / licence / audit scope.  The full suite is re-run
+  # so the webrtc-gated tests (which skip without the extra) execute against
+  # the real libraries.
   webrtc:
     runs-on: ubuntu-latest
     steps:
@@ -97,6 +100,9 @@ jobs:
           version: "0.11.21"
           enable-cache: true
       - run: uv sync --frozen --extra webrtc
-      # Prove websockets loads and the WSS transport module is importable.
-      - run: uv run python -c "import websockets; from hermes_voip.transport.ws_connection import WssSipTransport; print('webrtc stack websockets', websockets.__version__)"
+      # Prove all three WebRTC building-block libraries load and their modules
+      # are importable: WSS transport (PR-A), DTLS keying (PR-C), ICE (PR-D).
+      - run: uv run python -c "import websockets; from hermes_voip.transport.ws_connection import WssSipTransport; print('webrtc/wss websockets', websockets.__version__)"
+      - run: uv run python -c "import OpenSSL; print('webrtc/dtls pyopenssl', OpenSSL.__version__)"
+      - run: uv run python -c "import aioice; from hermes_voip.media.ice import IceConnection, IceCandidate, IceSelectedPair; print('webrtc/ice aioice', aioice.__version__)"
       - run: uv run pytest -rs

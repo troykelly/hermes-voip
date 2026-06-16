@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import logging
 import queue
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -34,21 +35,39 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from hermes_voip.aio import stream_from_thread
+
+# G711_SAMPLE_RATE is the narrowband rate the transport delivers inbound frames
+# at; imported from the codec module (single source of truth) so the 8 kHz->16
+# kHz upsample threshold in _feed tracks the wire rate everywhere.
+from hermes_voip.media.audio import G711_SAMPLE_RATE
 from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.onnx_compat import ensure_sherpa_loadable
 from hermes_voip.stt.resample import (
     RECOGNISER_SAMPLE_RATE,
     FloatArray,
+    FrameUpsampler,
     pcm16_to_float32,
 )
 
 __all__ = ["SherpaOnnxASR"]
 
+_log: Final = logging.getLogger(__name__)
+
 # sherpa's streaming zipformer does not expose a per-hypothesis score on this
 # path, so a stable hypothesis is reported at full confidence; the value is
 # informational (the turn/endpoint decision lives in ADR-0008, not here).
 _FULL_CONFIDENCE: Final[float] = 1.0
+
+# Pre-flush silence padding (samples at RECOGNISER_SAMPLE_RATE).  The streaming
+# zipformer requires lookahead context — trailing silence — to commit its final
+# hypothesis; without padding the last word is stranded in the model's lookahead
+# buffer and never emitted.  500 ms (8 000 samples at 16 kHz) matches the
+# endpointer's silence threshold (MediaConfig.endpoint_silence_ms default) and is
+# enough for rule2 (1.2 s trailing silence) to have fired in the normal live path;
+# the flush path only runs on end-of-call (stream exhausted), where no silence has
+# been fed yet.
+_FLUSH_SILENCE_SAMPLES: Final[int] = RECOGNISER_SAMPLE_RATE // 2  # 500 ms
 
 # How many items may sit un-consumed before a producer blocks (back-pressure;
 # bounds memory if one side stalls). Used for both the frame and transcript hops.
@@ -195,6 +214,29 @@ class SherpaOnnxASR:
         return _run()
 
 
+def _to_recogniser_rate(frame: PcmFrame, upsampler: FrameUpsampler) -> PcmFrame:
+    """Return ``frame`` at the recogniser's 16 kHz rate (ADR-0017).
+
+    The transport delivers 8 kHz G.711 frames, but the zipformer wants 16 kHz
+    (ADR-0006). An 8 kHz frame is upsampled via the per-stream, state-carrying
+    :class:`FrameUpsampler` (so frame-by-frame output matches a single pass); a
+    frame already at the recogniser rate (e.g. a fake in a test, or a future
+    wideband seam) passes through unchanged. Any other rate is a genuine
+    misconfiguration and raises — the seam reconciles the known wire rate, it
+    does not silently mis-feed an unexpected one.
+    """
+    if frame.sample_rate == G711_SAMPLE_RATE:
+        return upsampler.upsample(frame)
+    if frame.sample_rate == RECOGNISER_SAMPLE_RATE:
+        return frame
+    msg = (
+        f"inbound STT frame at {frame.sample_rate} Hz: expected the "
+        f"{G711_SAMPLE_RATE} Hz wire rate or {RECOGNISER_SAMPLE_RATE} Hz "
+        f"recogniser rate"
+    )
+    raise ValueError(msg)
+
+
 async def _feed(
     audio: AsyncIterator[PcmFrame],
     frames: queue.Queue[_FrameItem],
@@ -202,16 +244,24 @@ async def _feed(
 ) -> None:
     """Pump float32 frames from the async inbound iterator into the sync queue.
 
+    Each inbound frame is first reconciled to the recogniser's 16 kHz rate
+    (8 kHz transport frames are upsampled — ADR-0017) and then converted to the
+    normalised float32 sherpa's ``accept_waveform`` requires.
+
     Runs as a loop task so the worker thread can ``queue.get`` blocking. On
     completion it enqueues the end-of-audio sentinel so the decoder flushes its
     tail and returns. ``queue.put`` runs in a thread so a full queue back-pressures
     without blocking the loop.
     """
+    # One upsampler per feed (i.e. per stream/call) so resample state carries
+    # across this stream's frames and resets naturally for the next call.
+    upsampler = FrameUpsampler()
     try:
         async for frame in audio:
             if stop.is_set():
                 return
-            samples = pcm16_to_float32(frame.samples)
+            at_rate = _to_recogniser_rate(frame, upsampler)
+            samples = pcm16_to_float32(at_rate.samples)
             await asyncio.to_thread(frames.put, samples)
     finally:
         if not stop.is_set():
@@ -235,27 +285,49 @@ class _Decoder[StreamT]:
         recognizer = self._recognizer
         stream = recognizer.create_stream()
         last_emitted = ""
+        samples_fed = 0
         while True:
             item = frames.get()
             if isinstance(item, _EndOfAudio):
-                yield from self._flush(stream)
+                yield from self._flush(stream, samples_fed=samples_fed)
                 return
             recognizer.accept_waveform(stream, RECOGNISER_SAMPLE_RATE, item)
+            samples_fed += len(item.tobytes()) // 4  # float32 = 4 bytes/sample
             while recognizer.is_ready(stream):
                 recognizer.decode_stream(stream)
             text = recognizer.get_result(stream)
             if recognizer.is_endpoint(stream):
                 if text:
+                    seg_ms = samples_fed * 1000 // RECOGNISER_SAMPLE_RATE
+                    _log.info(
+                        "stt: final segment %r (%d ms, %.0f%% confidence)",
+                        text,
+                        seg_ms,
+                        _FULL_CONFIDENCE * 100,
+                    )
                     yield _transcript(text, is_final=True)
                 recognizer.reset(stream)
                 last_emitted = ""
+                samples_fed = 0
             elif text and text != last_emitted:
                 last_emitted = text
                 yield _transcript(text, is_final=False)
 
-    def _flush(self, stream: StreamT) -> Iterator[Transcript]:
-        """Finish input and emit a final transcript for any pending hypothesis."""
+    def _flush(self, stream: StreamT, *, samples_fed: int) -> Iterator[Transcript]:
+        """Pad silence, finish input, emit a final transcript for pending hypotheses.
+
+        The streaming zipformer needs lookahead context — trailing silence — to
+        commit its final hypothesis.  ``_FLUSH_SILENCE_SAMPLES`` all-zero samples
+        are fed via ``accept_waveform`` before ``input_finished`` is called, so the
+        model's lookahead buffer sees the necessary context and the last word of a
+        phrase is not stranded when the call hangs up mid-utterance.
+        """
         recognizer = self._recognizer
+        # Feed trailing silence so the model's lookahead commits pending hypotheses.
+        silence = _zeros_float32(_FLUSH_SILENCE_SAMPLES)
+        recognizer.accept_waveform(stream, RECOGNISER_SAMPLE_RATE, silence)
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
         recognizer.input_finished(stream)
         while recognizer.is_ready(stream):
             recognizer.decode_stream(stream)
@@ -263,6 +335,13 @@ class _Decoder[StreamT]:
         if text:
             # Promote the trailing hypothesis to final so the caller does not lose
             # speech that never reached an engine endpoint (end-of-call flush).
+            seg_ms = samples_fed * 1000 // RECOGNISER_SAMPLE_RATE
+            _log.info(
+                "stt: flush final segment %r (%d ms, %.0f%% confidence)",
+                text,
+                seg_ms,
+                _FULL_CONFIDENCE * 100,
+            )
             yield _transcript(text, is_final=True)
 
 
@@ -274,6 +353,30 @@ def _transcript(text: str, *, is_final: bool) -> Transcript:
         end_of_turn=False,
         confidence=_FULL_CONFIDENCE,
     )
+
+
+class _NpZeroModule(Protocol):
+    """Narrow numpy surface used only to create a zero float32 array."""
+
+    float32: object
+
+    def zeros(self, shape: int, dtype: object) -> FloatArray: ...
+
+
+def _zeros_float32(n: int) -> FloatArray:
+    """Return an all-zero float32 array of ``n`` samples (silence).
+
+    Used to pre-pad ``_flush()`` so the streaming model's lookahead buffer
+    receives trailing silence and commits its final hypothesis before
+    ``input_finished`` is called. Loads numpy lazily (optional ``ml`` extra)
+    via :func:`importlib.import_module` bound to the narrow :class:`_NpZeroModule`
+    Protocol so the call is type-safe without a static import or ``# type: ignore``.
+
+    Only called from the worker thread (inside the ``ml``-present decode path),
+    where numpy is guaranteed present.
+    """
+    np: _NpZeroModule = importlib.import_module("numpy")
+    return np.zeros(n, dtype=np.float32)
 
 
 def _build_recognizer(model_dir: str) -> _Recognizer[_SherpaOnlineStream]:

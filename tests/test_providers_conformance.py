@@ -44,6 +44,8 @@ class FakeTtsStream:
 
     async def cancel(self) -> None: ...
 
+    async def aclose(self) -> None: ...
+
 
 class FakeTTS:
     @property

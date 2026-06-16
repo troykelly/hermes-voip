@@ -79,6 +79,7 @@ honoured without the call loop needing to know tool semantics.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
@@ -394,15 +395,26 @@ class CallLoop:
         prior ``_play`` exits its loop promptly and releases the lock to this
         one. ``on_first_frame`` fires once, right after the first frame is
         actually sent (so a cancelled-before-any-frame stream never logs it).
+
+        The iteration runs under ``contextlib.aclosing`` so the stream is closed
+        on EVERY exit path — normal end, barge-in, cancellation, OR a fatal error
+        raised inside the loop body (e.g. ``send_audio`` failing). A plain
+        ``async for`` does NOT call ``aclose`` when the loop body raises, leaving
+        the stream's frame generator suspended and abandoned for a GC finalizer to
+        close later — which races a parked pull and raises ``RuntimeError:
+        aclose(): asynchronous generator is already running`` (the live cascade).
+        Closing here, on this consumer task, is race-free: ``aclose`` runs only
+        after the body has finished, never concurrently with a pull.
         """
         first_frame_pending = on_first_frame is not None
         async with self._playout_lock:
             try:
-                async for frame in stream:
-                    await self._transport.send_audio(frame)
-                    if first_frame_pending and on_first_frame is not None:
-                        on_first_frame()
-                        first_frame_pending = False
+                async with contextlib.aclosing(stream):
+                    async for frame in stream:
+                        await self._transport.send_audio(frame)
+                        if first_frame_pending and on_first_frame is not None:
+                            on_first_frame()
+                            first_frame_pending = False
             finally:
                 # Clear the reference only if it is still ours (a superseding
                 # speak() may have already pointed it at a newer stream).

@@ -146,11 +146,13 @@ files = ["src", "tests"]
 # escape hatches — banned by rule 17. Instead it is type-checked in the
 # ``hermes-contract`` CI job (which installs the ``hermes`` extra) via the
 # dedicated mypy config below; ``tests/test_adapter.py``,
-# ``tests/test_adapter_reconnect.py``, and the end-to-end
-# ``tests/e2e/test_inbound_call.py`` likewise import the real runtime and are
-# excluded from the default gate (they ``importorskip`` and run in that same CI
-# job). ``tests/e2e/_fake_gateway.py`` imports no runtime and stays in this gate.
-exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py|tests/test_adapter_reconnect\.py|tests/e2e/test_inbound_call\.py)$'
+# ``tests/test_adapter_reconnect.py``, ``tests/test_media_concurrency_hermes.py``,
+# and the end-to-end ``tests/e2e/test_inbound_call.py`` +
+# ``tests/e2e/test_concurrent_inbound_calls.py`` likewise import the real runtime
+# and are excluded from the default gate (they ``importorskip`` and run in that
+# same CI job). ``tests/e2e/_fake_gateway.py`` imports no runtime and stays in this
+# gate.
+exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py|tests/test_adapter_reconnect\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py)$'
 
 # hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
 # (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``

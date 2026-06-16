@@ -188,8 +188,14 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_loops: dict[str, CallLoop] = {}
         # Per-call metadata: {call_id → {name, remote_uri, type, ended}}
         self._call_info: dict[str, dict[str, object]] = {}
-        # Background tasks for each active call loop
-        self._call_tasks: dict[str, asyncio.Task[None]] = {}
+        # Background tasks per Call-ID. A gateway can deliver multiple overlapping
+        # INVITEs with the SAME Call-ID (retransmission before our 200 OK, or a
+        # fork), each spawning its own handler task — so this maps a Call-ID to
+        # the SET of its in-flight tasks. Keyed-by-Call-ID-with-a-single-value
+        # would drop all but the last, orphaning the earlier tasks on disconnect
+        # (their engines never stopped). disconnect() cancels every task in every
+        # set; _on_call_task_done discards just the one that finished.
+        self._call_tasks: dict[str, set[asyncio.Task[None]]] = {}
         # Active call sessions mirrored here so they can be re-attached after
         # a reconnect: {call_id → CallSession}
         self._call_sessions: dict[str, CallSession] = {}
@@ -305,8 +311,9 @@ class VoipAdapter(BasePlatformAdapter):
             with contextlib.suppress(asyncio.CancelledError):
                 await supervisor
 
-        # Cancel and drain all per-call tasks.
-        tasks = list(self._call_tasks.values())
+        # Cancel and drain EVERY per-call task across all Call-ID sets (a Call-ID
+        # may have multiple overlapping tasks from retransmitted/forked INVITEs).
+        tasks = [task for task_set in self._call_tasks.values() for task in task_set]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -387,9 +394,12 @@ class VoipAdapter(BasePlatformAdapter):
         does not block while we open a UDP socket and send the 200 OK.
         """
         task = asyncio.ensure_future(self._handle_inbound_invite(new_call))
-        # Store by call_id so we can cancel on disconnect.
+        # Track by call_id so we can cancel on disconnect. Multiple overlapping
+        # INVITEs can share a Call-ID (retransmission/fork), so accumulate them in
+        # a set rather than overwriting — otherwise disconnect() would only cancel
+        # the last and orphan the rest (their engines would never stop).
         call_id = new_call.invite.header("Call-ID") or ""
-        self._call_tasks[call_id] = task
+        self._call_tasks.setdefault(call_id, set()).add(task)
         task.add_done_callback(lambda t: self._on_call_task_done(call_id, t))
 
     async def _handle_inbound_invite(  # noqa: PLR0915 — RFC 3261 INVITE handling requires these sequential reject-early guard steps; extraction would only move the complexity elsewhere
@@ -575,8 +585,12 @@ class VoipAdapter(BasePlatformAdapter):
         # in-dialog routes installed). ANY failure now — provider/config not
         # ready, VAD/endpointer/CallLoop construction, or the loop itself —
         # must release the RTP engine and both call routes, never leak them.
+        # Initialise to None so teardown's identity check degrades gracefully
+        # to an unconditional pop if _run_call_loop raises before the CallLoop
+        # is returned (e.g. providers not initialised at the very start).
+        this_call_loop: CallLoop | None = None
         try:
-            await self._run_call_loop(
+            this_call_loop = await self._run_call_loop(
                 call_id=call_id,
                 engine=engine,
                 guard_state=guard_state,
@@ -587,6 +601,8 @@ class VoipAdapter(BasePlatformAdapter):
                 engine=engine,
                 transport=transport,
                 dialog_id=session.dialog_id,
+                session=session,
+                call_loop=this_call_loop,
             )
 
     async def _run_call_loop(
@@ -595,8 +611,12 @@ class VoipAdapter(BasePlatformAdapter):
         call_id: str,
         engine: RtpMediaTransport,
         guard_state: GuardSessionState,
-    ) -> None:
-        """Build the per-call ``CallLoop`` and drive it to completion.
+    ) -> CallLoop:
+        """Build the per-call ``CallLoop``, drive it to completion, return it.
+
+        The returned ``CallLoop`` is THIS task's object; the caller passes it to
+        ``_teardown_call`` for the identity-based isolation check that prevents
+        a concurrent task's teardown from removing a still-running call's loop.
 
         Raises if providers/media config are absent or any collaborator
         construction fails; the caller's ``finally`` performs teardown.
@@ -642,14 +662,17 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)
         await call_loop.run()
+        return call_loop
 
-    async def _teardown_call(
+    async def _teardown_call(  # noqa: PLR0913 — six keyword-only params all needed: call_id + engine + transport + dialog_id + session + call_loop for isolation
         self,
         *,
         call_id: str,
         engine: RtpMediaTransport,
         transport: SipOverTlsTransport,
         dialog_id: tuple[str, str, str],
+        session: CallSession | None = None,
+        call_loop: CallLoop | None = None,
     ) -> None:
         """Release every resource an accepted call holds; mark it ended.
 
@@ -657,15 +680,38 @@ class VoipAdapter(BasePlatformAdapter):
         removes the manager + transport in-dialog routes, drops the live
         ``CallLoop``, and flags the call ended. Never raises (teardown of one
         resource must not strand the others).
+
+        ``session`` and ``call_loop`` are the objects owned by THIS call task.
+        Every Call-ID-keyed structure is cleared only if it still belongs to THIS
+        task — not a newer concurrent task's objects for the same Call-ID. A
+        gateway can deliver overlapping INVITEs with the same Call-ID
+        (retransmission before our 200 OK, or a fork); without these identity
+        checks task_1's teardown would evict task_2's live CallLoop, CallSession,
+        transport response sink, and call-info (the same-Call-ID isolation bug).
+        The manager route is keyed by the full dialog tuple (Call-ID + both tags),
+        which is already unique per task, so its removal needs no identity check.
         """
-        info = dict(self._call_info.get(call_id, {}))
-        info["ended"] = True
-        self._call_info[call_id] = info
-        self._call_loops.pop(call_id, None)
-        self._call_sessions.pop(call_id, None)
+        # ``is_current`` is True when we are still the registered call for this
+        # Call-ID (no newer same-Call-ID task has superseded us). The session
+        # registration is the authority: a later task's add_call overwrites it.
+        # When session is None (partial-setup teardown before registration) we
+        # are the only task and treat ourselves as current.
+        is_current = session is None or self._call_sessions.get(call_id) is session
+        if is_current:
+            # Only flag the call ended / drop its metadata when WE own it — else a
+            # newer same-Call-ID task is live and must keep reporting as active.
+            info = dict(self._call_info.get(call_id, {}))
+            info["ended"] = True
+            self._call_info[call_id] = info
+        if call_loop is None or self._call_loops.get(call_id) is call_loop:
+            self._call_loops.pop(call_id, None)
+        if session is None or self._call_sessions.get(call_id) is session:
+            self._call_sessions.pop(call_id, None)
         if self._manager is not None:
             self._manager.remove_call(dialog_id)
-        transport.remove_call(call_id)
+        # Identity-checked: only evict the transport response sink if it is still
+        # OUR session (a newer same-Call-ID task may have overwritten it).
+        transport.remove_call(call_id, session)
         try:
             await engine.stop()
         except Exception as exc:  # noqa: BLE001 — log; never strand the call routes
@@ -825,7 +871,14 @@ class VoipAdapter(BasePlatformAdapter):
         output on failure. The full traceback is logged (``exc_info`` carries the
         exception), not just ``str(exc)``, so the next live call is diagnosable.
         """
-        self._call_tasks.pop(call_id, None)
+        # Discard only THIS task from the Call-ID's set — never the whole set,
+        # which may still hold a concurrent same-Call-ID task that disconnect()
+        # must be able to cancel. Drop the set entry once it is empty.
+        tasks = self._call_tasks.get(call_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._call_tasks.pop(call_id, None)
         if task.cancelled():
             return
         exc = task.exception()

@@ -67,6 +67,9 @@ class _RecordingTtsStream:
     async def cancel(self) -> None:
         self.cancelled = True
 
+    async def aclose(self) -> None:
+        self.cancelled = True
+
 
 class _ScriptedTTS:
     def __init__(self) -> None:

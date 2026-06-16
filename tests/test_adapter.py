@@ -125,7 +125,9 @@ class _FakeTransport:
     def add_call(self, call_id: str, sink: object) -> None:
         self._calls[call_id] = sink
 
-    def remove_call(self, call_id: str) -> None:
+    def remove_call(self, call_id: str, sink: object | None = None) -> None:
+        if sink is not None and self._calls.get(call_id) is not sink:
+            return
         self._calls.pop(call_id, None)
 
 

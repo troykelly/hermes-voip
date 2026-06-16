@@ -185,6 +185,10 @@ class _FakeTtsStream:
     async def cancel(self) -> None:
         self._cancelled = True
 
+    async def aclose(self) -> None:
+        """Close the stream (the call loop closes it on every playout exit)."""
+        self._cancelled = True
+
 
 class _FakeTTS:
     """Synthesises any text to two 24 kHz frames; records every synth request.

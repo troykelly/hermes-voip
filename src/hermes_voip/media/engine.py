@@ -249,6 +249,10 @@ class RtpMediaTransport:
         self._latched: bool = False
 
         # Socket / asyncio transport state (populated by connect()).
+        # _ever_connected distinguishes "stopped after a real call" (silent no-op
+        # in send_audio — the frame is dropped cleanly because the call is ending)
+        # from "never connected" (programming error — still raises RuntimeError).
+        self._ever_connected: bool = False
         self._transport: asyncio.DatagramTransport | None = None
         self._recv_queue: asyncio.Queue[_Datagram] = asyncio.Queue(
             maxsize=_QUEUE_MAXSIZE
@@ -313,6 +317,7 @@ class RtpMediaTransport:
         # is always a DatagramTransport when a UDP socket is passed.
         assert isinstance(transport, asyncio.DatagramTransport)  # noqa: S101 — invariant, not a test assertion
         self._transport = transport
+        self._ever_connected = True
         return True
 
     async def disconnect(self) -> None:
@@ -506,6 +511,15 @@ class RtpMediaTransport:
             return
 
         if self._transport is None:
+            if self._ever_connected:
+                # Engine has been stopped mid-call (teardown while TTS was in
+                # flight). Dropping this frame is correct — the call is ending.
+                # This is intentional graceful degradation (AGENTS.md rule 37
+                # exemption: the stopped state is established control flow, not
+                # an unexpected error; raising here would propagate through the
+                # TaskGroup and tear the call down with an abnormal exit instead
+                # of a clean BYE).
+                return
             msg = "send_audio called before connect()"
             raise RuntimeError(msg)
 

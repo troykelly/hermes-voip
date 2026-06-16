@@ -1061,6 +1061,10 @@ async def _drain_one_frame(engine: RtpMediaTransport) -> None:
     await asyncio.wait_for(task, timeout=2.0)
 
 
+async def _no_sleep(_secs: float) -> None:
+    """A no-op pacing sleep for deterministic outbound tests."""
+
+
 def _latching_engine(*, symmetric: bool = True) -> RtpMediaTransport:
     """An engine whose SDP remote is the deliberately-wrong _SDP_REMOTE_*."""
     return RtpMediaTransport(
@@ -1073,10 +1077,6 @@ def _latching_engine(*, symmetric: bool = True) -> RtpMediaTransport:
         clock=_dummy_clock,
         sleep=_no_sleep,
     )
-
-
-async def _no_sleep(_secs: float) -> None:
-    """A no-op pacing sleep for deterministic outbound tests."""
 
 
 @pytest.mark.asyncio
@@ -1206,6 +1206,52 @@ async def test_garbage_only_keeps_sdp_address() -> None:
         await task
 
     attacker_sock.close()
+
+
+@pytest.mark.asyncio
+async def test_off_codec_payload_type_does_not_trigger_a_latch() -> None:
+    """A well-formed RTP packet with a NON-negotiated payload type must not latch.
+
+    Anti-spoofing tightening: parsing as RTP is necessary but not sufficient — the
+    packet must carry the negotiated audio payload type (here PCMU = 0).  A
+    spec-legal but off-codec packet (e.g. an RFC 4733 telephone-event, PT 101, or
+    comfort noise, PT 13) arriving before any audio — possibly from an attacker's
+    tuple — must NOT move the outbound target.  The engine codec is PCMU, so a
+    PT-101 packet from the attacker is delivered and processed but must leave the
+    SDP address in place and ``_latched`` False.
+    """
+    attacker_addr: tuple[str, int] = ("192.0.2.66", 7777)  # TEST-NET-1
+
+    engine = _latching_engine()
+    await engine.connect()
+
+    off_codec = RtpPacket(
+        payload_type=101,  # telephone-event PT — not the negotiated PCMU (0)
+        sequence_number=0,
+        timestamp=0,
+        ssrc=_FAKE_SSRC,
+        payload=b"\x00\x00\x00\x00",
+    ).pack()
+    engine._recv_queue.put_nowait((off_codec, attacker_addr))
+
+    async def _drain_until_empty() -> None:
+        async for _frame in engine.inbound_audio():
+            pass
+
+    task: asyncio.Task[None] = asyncio.create_task(_drain_until_empty())
+    await asyncio.sleep(0.05)  # let the off-codec packet be dequeued + processed
+
+    assert engine._latched is False  # the off-codec packet did NOT latch
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_silence_frame())
+    _wire, dest = recorder.sent[-1]
+    assert dest == (_SDP_REMOTE_ADDR, _SDP_REMOTE_PORT)  # SDP address retained
+    assert dest != attacker_addr
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio

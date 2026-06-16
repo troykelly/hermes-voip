@@ -354,22 +354,33 @@ class FakeGateway:
 
     # INVITE / 200 OK / ACK ----------------------------------------------------
 
-    async def send_invite(self, *, to_user: str) -> GatewayCall:
+    async def send_invite(
+        self,
+        *,
+        to_user: str,
+        rtp: FakeRtpEndpoint | None = None,
+        call_id: str | None = None,
+    ) -> GatewayCall:
         """Send an INVITE with a realistic G.711 RTP/AVP SDP offer.
 
-        The offer advertises this gateway's real loopback RTP endpoint (so the
-        plugin's media flows back to :attr:`rtp`) under a "public" RFC-5737
-        connection address, mirroring a NAT'd gateway. Returns the
+        The offer advertises a loopback RTP endpoint (so the plugin's media flows
+        back to it) under a "public" RFC-5737 connection address, mirroring a NAT'd
+        gateway. ``rtp`` defaults to this gateway's shared :attr:`rtp` endpoint; a
+        test driving CONCURRENT calls passes a distinct :class:`FakeRtpEndpoint`
+        per call so each call's media stays isolated. ``call_id`` defaults to a
+        fresh value; a test reproducing the gateway retransmission/fork case passes
+        the SAME Call-ID across overlapping INVITEs. Returns the
         :class:`GatewayCall` dialog state for the follow-up ACK/BYE.
         """
+        endpoint = rtp if rtp is not None else self.rtp
         call = GatewayCall(
-            call_id=new_call_id(),
+            call_id=call_id if call_id is not None else new_call_id(),
             from_tag=new_tag(),
             to_user=to_user,
             request_uri=f"sip:{to_user}@127.0.0.1:5061;transport=tls",
             via_branch=new_branch(),
         )
-        offer = _g711_avp_offer(rtp_port=self.rtp.port)
+        offer = _g711_avp_offer(rtp_port=endpoint.port)
         await self._server.push(
             build_request(
                 "INVITE",
@@ -416,22 +427,45 @@ class FakeGateway:
         return SipResponse.parse(raw)
 
     async def await_invite_ok(
-        self, call: GatewayCall, *, timeout: float = 3.0
+        self,
+        call: GatewayCall,
+        *,
+        timeout: float = 3.0,
+        rtp: FakeRtpEndpoint | None = None,
     ) -> SipResponse:
         """Wait for the plugin's 200 OK to the INVITE; record To-tag + RTP port.
 
         The 200 OK's To-tag is the plugin's dialog local tag — the gateway must
         echo it on the in-dialog ACK/BYE or the plugin routes them out-of-dialog
         (the live no-audio failure). The SDP answer's ``m=audio`` port is where
-        the plugin receives RTP, so the RTP endpoint is aimed at it.
+        the plugin receives RTP, so the RTP endpoint (``rtp``, defaulting to the
+        shared :attr:`rtp`) is aimed at it. A concurrent-call test passes the same
+        per-call endpoint it used for :meth:`send_invite`.
+
+        For concurrent calls each 200 OK must be matched to ITS call, not just the
+        first 200 OK seen — so the match is scoped by the call's Via branch (unique
+        per INVITE even when the Call-ID is shared).
         """
-        response = await self.await_response(
-            method="INVITE", status=200, timeout=timeout
-        )
+        endpoint = rtp if rtp is not None else self.rtp
+
+        def is_match(raw: str) -> bool:
+            if not raw.startswith("SIP/2.0 "):
+                return False
+            resp = SipResponse.parse(raw)
+            if resp.status_code != 200:
+                return False
+            cseq = resp.header("CSeq") or ""
+            if not cseq.endswith("INVITE"):
+                return False
+            via = resp.header("Via") or ""
+            return f"branch={call.via_branch}" in via
+
+        raw = await self._server.wait_for_received(is_match, timeout=timeout)
+        response = SipResponse.parse(raw)
         call.remote_to_tag = _to_tag_of(response.header("To"))
         call.answer_sdp = response.body
         call.plugin_rtp_port = _sdp_media_port(response.body)
-        self.rtp.aim_at("127.0.0.1", call.plugin_rtp_port)
+        endpoint.aim_at("127.0.0.1", call.plugin_rtp_port)
         return response
 
     async def send_ack(self, call: GatewayCall) -> None:

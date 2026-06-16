@@ -148,7 +148,7 @@ files = ["src", "tests"]
 # dedicated mypy config below; ``tests/test_adapter.py`` likewise imports the
 # real runtime and is excluded from the default gate (it ``importorskip``s and
 # runs in that same CI job).
-exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py)$'
+exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py|tests/test_adapter_reconnect\.py)$'
 
 # hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
 # (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``

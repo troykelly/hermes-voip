@@ -36,7 +36,9 @@ End-to-end call flow for a SIP-over-TLS inbound INVITE:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import random
 import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -60,7 +62,12 @@ from gateway.platforms.base import (
 )
 
 from hermes_voip.call import CallSession
-from hermes_voip.config import MediaConfig, load_gateway_config, load_media_config
+from hermes_voip.config import (
+    GatewayConfig,
+    MediaConfig,
+    load_gateway_config,
+    load_media_config,
+)
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.incall import LocalMediaSession
@@ -95,6 +102,11 @@ _SUPPORTED_ENCODINGS = ("PCMU", "PCMA", "telephone-event")
 
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
+
+# Reconnect supervisor tuning constants.
+_RECONNECT_BACKOFF_INITIAL = 1.0  # first retry delay in seconds
+_RECONNECT_BACKOFF_CAP = 30.0  # maximum delay cap in seconds
+_RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
 
 
 def _make_tls_context(host: str) -> ssl.SSLContext:
@@ -160,9 +172,17 @@ class VoipAdapter(BasePlatformAdapter):
         # Populated by connect():
         self._providers: Providers | None = None
         self._media_cfg: MediaConfig | None = None
+        self._gateway_cfg: GatewayConfig | None = None
+        self._tls_ctx: ssl.SSLContext | None = None
+        self._keepalive_interval: float = 30.0
         self._transport: SipOverTlsTransport | None = None
         self._manager: RegistrationManager | None = None
         self._connected = False
+
+        # Reconnect supervisor state (populated by connect()):
+        self._lost_event: asyncio.Event = asyncio.Event()
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._consecutive_failures: int = 0
 
         # Per-call state: {call_id → CallLoop}
         self._call_loops: dict[str, CallLoop] = {}
@@ -170,13 +190,16 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_info: dict[str, dict[str, object]] = {}
         # Background tasks for each active call loop
         self._call_tasks: dict[str, asyncio.Task[None]] = {}
+        # Active call sessions mirrored here so they can be re-attached after
+        # a reconnect: {call_id → CallSession}
+        self._call_sessions: dict[str, CallSession] = {}
 
     # -----------------------------------------------------------------------
     # BasePlatformAdapter abstract methods
     # -----------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Load config, open TLS, register extensions.
+        """Load config, open TLS, register extensions, start reconnect supervisor.
 
         Returns True when at least one extension is up. Degraded-up (one out
         of N extensions registered) counts as up — the manager's ``is_up``
@@ -193,13 +216,45 @@ class VoipAdapter(BasePlatformAdapter):
 
         self._providers = build_providers(media_cfg)
         self._media_cfg = media_cfg
+        self._gateway_cfg = gateway_cfg
+        self._tls_ctx = _make_tls_context(gateway_cfg.host)
+        self._keepalive_interval = float(
+            extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
+        )
 
-        tls_ctx = _make_tls_context(gateway_cfg.host)
+        up = await self._establish()
+
+        self._connected = True
+        self._lost_event = asyncio.Event()
+        self._supervisor_task = asyncio.create_task(self._supervise())
+        return up
+
+    async def _establish(self) -> bool:
+        """Build, connect, and bind a fresh transport + manager pair.
+
+        Re-attaches active call sessions to the new transport so in-progress
+        calls survive a short reconnect.  Must be called with ``_gateway_cfg``
+        and ``_tls_ctx`` already populated (i.e. after :meth:`connect` has
+        stored them).
+
+        Returns:
+            ``True`` if at least one extension registered successfully.
+
+        Raises:
+            Any exception from ``transport.connect()`` or ``manager.connect()``
+            propagates to the caller (the supervisor's backoff loop).
+        """
+        gateway_cfg = self._gateway_cfg
+        tls_ctx = self._tls_ctx
+        if gateway_cfg is None or tls_ctx is None:
+            msg = "_establish called before config was populated by connect()"
+            raise RuntimeError(msg)
 
         transport = SipOverTlsTransport(
             host=gateway_cfg.host,
             port=gateway_cfg.port,
             ssl_context=tls_ctx,
+            keepalive_interval=self._keepalive_interval,
             on_new_call=self._on_inbound_invite,
             on_unroutable=self._on_unroutable,
             on_connection_lost=self._on_connection_lost,
@@ -227,16 +282,28 @@ class VoipAdapter(BasePlatformAdapter):
         self._manager = manager
         transport.bind_manager(manager)
 
-        up = await manager.connect()
+        # Re-attach active call sinks so in-progress calls survive the reconnect.
+        for call_id, session in self._call_sessions.items():
+            transport.add_call(call_id, session)
+            manager.add_call(session.dialog_id, session)
 
-        self._connected = True
-        return up
+        return await manager.connect()
 
     async def disconnect(self) -> None:
         """Cancel all call loops, close the manager and transport; idempotent."""
         if not self._connected:
             return
         self._connected = False
+
+        # Unblock and cancel the supervisor so it does not attempt a reconnect
+        # after we tear down.
+        self._lost_event.set()
+        supervisor = self._supervisor_task
+        self._supervisor_task = None
+        if supervisor is not None:
+            supervisor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await supervisor
 
         # Cancel and drain all per-call tasks.
         tasks = list(self._call_tasks.values())
@@ -246,6 +313,7 @@ class VoipAdapter(BasePlatformAdapter):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._call_tasks.clear()
         self._call_loops.clear()
+        self._call_sessions.clear()
 
         manager = self._manager
         if manager is not None:
@@ -483,6 +551,8 @@ class VoipAdapter(BasePlatformAdapter):
         if self._manager is not None:
             self._manager.add_call(session.dialog_id, session)
         transport.add_call(call_id, session)
+        # Mirror in _call_sessions so _establish() can re-attach on reconnect.
+        self._call_sessions[call_id] = session
         _log.info(
             "INVITE %s: CallSession registered — dialog_id %s",
             call_id,
@@ -592,6 +662,7 @@ class VoipAdapter(BasePlatformAdapter):
         info["ended"] = True
         self._call_info[call_id] = info
         self._call_loops.pop(call_id, None)
+        self._call_sessions.pop(call_id, None)
         if self._manager is not None:
             self._manager.remove_call(dialog_id)
         transport.remove_call(call_id)
@@ -631,11 +702,119 @@ class VoipAdapter(BasePlatformAdapter):
         _log.debug("unroutable SIP message: %s", what)
 
     def _on_connection_lost(self, exc: BaseException | None) -> None:
-        """Log a TLS connection loss; the adapter stays alive for in-progress calls."""
+        """Signal the reconnect supervisor that the TLS connection is gone."""
+        if not self._connected:
+            return
         if exc is not None:
-            _log.error("SIP-over-TLS connection lost: %s", exc)
+            _log.warning("SIP-over-TLS connection lost: %s", exc)
         else:
-            _log.info("SIP-over-TLS connection closed cleanly")
+            _log.warning("SIP-over-TLS connection closed cleanly — will reconnect")
+        self._lost_event.set()
+
+    # -----------------------------------------------------------------------
+    # Reconnect supervisor
+    # -----------------------------------------------------------------------
+
+    async def _supervise(self) -> None:
+        """Event-driven reconnect loop: wait for connection loss, then reconnect.
+
+        Runs as a background task from :meth:`connect`; cancelled by
+        :meth:`disconnect`. The ``while True`` avoids a mypy ``[unreachable]``
+        false-positive: after ``await self._lost_event.wait()`` another coroutine
+        may set ``_connected = False`` (``disconnect()``), but mypy's flow
+        narrows the loop condition to ``True`` and sees the post-await check as
+        dead code — it is live at runtime.
+        """
+        while True:
+            if not self._connected:
+                break
+            await self._lost_event.wait()
+            self._lost_event.clear()
+            # ``disconnect()`` may have set ``_connected = False`` while we were
+            # suspended in the await above; mypy narrows the type to ``True`` at
+            # the earlier guard and flags the body of this check as unreachable —
+            # it is live at runtime because another coroutine can mutate the
+            # attribute during the await.
+            if not self._connected:
+                break  # type: ignore[unreachable]
+            await self._reconnect_with_backoff()
+
+    async def _reconnect_with_backoff(self) -> None:
+        """Tear down the old transport and re-establish with exponential backoff.
+
+        Uses decorrelated jitter (±20%) to avoid reconnect storms.  Emits an
+        ERROR-level ALERT after ``_RECONNECT_ALERT_THRESHOLD`` consecutive
+        failures so an operator knows SIP is down.
+        """
+        attempt = 0
+        # ``while True`` avoids mypy ``[unreachable]`` on post-await ``_connected``
+        # checks: another coroutine (``disconnect()``) may clear ``_connected``
+        # while we await teardown or ``asyncio.sleep``, but mypy's flow-narrowing
+        # would see those checks as dead code if the loop condition were the bool.
+        while True:
+            if not self._connected:
+                return
+            # Best-effort teardown of the old manager + transport so the sockets
+            # are not leaked.  Any failure here is suppressed (teardown must
+            # never prevent the next connect attempt).
+            old_manager = self._manager
+            self._manager = None
+            old_transport = self._transport
+            self._transport = None
+            if old_manager is not None:
+                with contextlib.suppress(Exception):
+                    await old_manager.aclose()
+            if old_transport is not None:
+                with contextlib.suppress(Exception):
+                    await old_transport.aclose()
+
+            try:
+                await self._establish()
+            except Exception as exc:  # noqa: BLE001 — all errors are retried
+                attempt += 1
+                self._consecutive_failures += 1
+                delay = min(
+                    _RECONNECT_BACKOFF_CAP,
+                    _RECONNECT_BACKOFF_INITIAL * (2 ** (attempt - 1)),
+                )
+                jitter = random.uniform(  # noqa: S311 — not cryptographic; decorrelation jitter only
+                    0.8, 1.2
+                )
+                actual_delay = delay * jitter
+                _log.warning(
+                    "reconnect attempt %d failed: %s; retrying in %.1fs",
+                    attempt,
+                    exc,
+                    actual_delay,
+                )
+                if self._consecutive_failures >= _RECONNECT_ALERT_THRESHOLD:
+                    _log.error(
+                        "ALERT: SIP registration DOWN — %d consecutive reconnect "
+                        "failures; inbound calls go to voicemail until restored",
+                        self._consecutive_failures,
+                    )
+                # ``disconnect()`` may have set ``_connected = False`` while we
+                # were suspended in the awaits above; mypy narrows the type to
+                # ``True`` at the top-of-loop guard and sees the body of this
+                # check as unreachable — it is live at runtime because another
+                # coroutine can mutate the attribute during an await.
+                if not self._connected:
+                    return  # type: ignore[unreachable]
+                await asyncio.sleep(actual_delay)
+            else:
+                if attempt > 0:
+                    _log.warning(
+                        "SIP connection recovered after %d attempt(s)", attempt + 1
+                    )
+                else:
+                    _log.info("SIP connection re-established")
+                self._consecutive_failures = 0
+                return
+
+    @property
+    def is_flow_healthy(self) -> bool:
+        """``True`` when connected and no consecutive reconnect failures are pending."""
+        return self._connected and self._consecutive_failures == 0
 
     def _on_call_task_done(self, call_id: str, task: asyncio.Task[None]) -> None:
         """Observe a finished call task; surface any unhandled exception.

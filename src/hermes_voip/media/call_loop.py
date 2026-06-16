@@ -85,6 +85,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from typing import Final
 
+from hermes_voip.media.audio import generate_tone_frames
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import SpeechEdge, VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR
@@ -119,6 +120,51 @@ class _EndOfStream(Enum):
 
 #: The sole end-of-stream marker value (see :class:`_EndOfStream`).
 _END_OF_STREAM: Final[_EndOfStream] = _EndOfStream.MARKER
+
+
+class _ToneStream:
+    """``TtsStream``-compatible iterator that emits pure-sine 8 kHz PcmFrames.
+
+    A thin adapter around :func:`~hermes_voip.media.audio.generate_tone_frames`
+    that satisfies the ``TtsStream`` protocol (``__aiter__`` / ``__anext__`` /
+    ``flush`` / ``cancel`` / ``aclose``) without touching any TTS provider.
+    Because the frames are already at 8 kHz they go through the fast path in
+    ``RtpMediaTransport.send_audio`` (no resample), so the tone validates the
+    G.711 encode + UDP send layer in isolation from TTS and sample-rate
+    conversion.
+
+    ``cancel()`` sets a stop flag that causes ``__anext__`` to raise
+    ``StopAsyncIteration`` on the next pull — identical to the barge-in
+    contract of the real TTS streams.  ``aclose()`` is idempotent and sets the
+    same flag so ``contextlib.aclosing`` in ``_play`` closes the generator
+    safely on every exit path.
+    """
+
+    def __init__(self, *, duration_secs: float) -> None:
+        self._iter = generate_tone_frames(duration_secs=duration_secs)
+        self._stopped = False
+
+    def __aiter__(self) -> _ToneStream:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        if self._stopped:
+            raise StopAsyncIteration
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def flush(self) -> None:
+        """No-op: all frames are pre-computed; nothing is buffered."""
+
+    async def cancel(self) -> None:
+        """Stop yielding immediately (barge-in)."""
+        self._stopped = True
+
+    async def aclose(self) -> None:
+        """Idempotent teardown; sets the stop flag so further pulls are safe."""
+        self._stopped = True
 
 
 def gate_voip_tool(
@@ -187,9 +233,14 @@ class CallLoop:
         greeting: The opening line spoken the instant the loop starts (before any
             inbound audio). Empty string disables the greeting. Defaults to empty
             so a caller that does not want one need not pass it.
+        tone_secs: When positive, the call opening plays a generated 440 Hz sine
+            tone for this many seconds at 8 kHz directly, bypassing TTS +
+            resample entirely (``HERMES_VOIP_TEST_TONE`` env var).  When set,
+            ``greeting`` is ignored.  ``0.0`` (the default) means normal
+            operation.
     """
 
-    def __init__(  # noqa: PLR0913 — 11-arg constructor; all keyword-only
+    def __init__(  # noqa: PLR0913 — 12-arg constructor; all keyword-only
         self,
         *,
         transport: MediaTransport,
@@ -203,6 +254,7 @@ class CallLoop:
         voice: str,
         call_id: str,
         greeting: str = "",
+        tone_secs: float = 0.0,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -216,6 +268,7 @@ class CallLoop:
         self._voice = voice
         self._call_id = call_id
         self._greeting = greeting
+        self._tone_secs = tone_secs
         # The currently-active TtsStream, or None when the agent is silent.
         # Written synchronously (``synthesize`` is a sync factory) before any
         # await, so a single ``speak``/greeting always registers its stream
@@ -320,23 +373,31 @@ class CallLoop:
                     return
                 await self._screen_and_deliver(item)
 
-        # Optional one-shot greeting: synthesise + REGISTER it synchronously here,
-        # before the TaskGroup starts the pump, so a caller speech onset on the
-        # very first inbound frame already sees an active stream and barges in
-        # (the pump task, created below, only runs once this coroutine awaits the
-        # TaskGroup — by then the greeting stream is registered). The greeting is
-        # then played by its own task so it runs concurrently with the pump and
-        # never blocks inbound audio (NAT-latch rationale: ADR-0002).
+        # Optional one-shot opening: either a diagnostic tone (when tone_secs > 0)
+        # or the TTS greeting (when greeting is non-empty). Both are registered
+        # synchronously here, before the TaskGroup starts the pump, so a caller
+        # speech onset on the very first inbound frame already sees an active
+        # stream and barges in. The opening is then played by its own task so it
+        # runs concurrently with the pump and never blocks inbound audio
+        # (NAT-latch rationale: ADR-0002).
         #
-        # A greeting failure is intentionally FATAL to the call: it runs as a
-        # TaskGroup child (or raises synchronously here), so a synth/send error
+        # A tone/greeting failure is intentionally FATAL to the call: it runs as
+        # a TaskGroup child (or raises synchronously here), so a synth/send error
         # propagates and cancels the loop rather than being swallowed (rule 37).
-        # The rationale is causal, not just policy — if the greeting cannot emit
+        # The rationale is causal, not just policy — if the opening cannot emit
         # RTP then a NAT'd gateway never latches, so the return media path never
-        # opens and the call is already dead; failing fast surfaces it. (This is
-        # deliberately stricter than a mid-call agent reply, which the adapter
-        # degrades to a failed send so one bad turn does not drop a live call.)
-        greeting_stream = self._begin_greeting() if self._greeting else None
+        # opens and the call is already dead; failing fast surfaces it.
+        #
+        # Tone path: when tone_secs > 0, bypass TTS + resample entirely by
+        # playing a generated 440 Hz sine tone directly at 8 kHz through the
+        # existing _play path (uses the real send_audio, so it validates the RTP
+        # encode/send path independently of the TTS layer — ADR-0002 §diagnostic).
+        if self._tone_secs > 0:
+            greeting_stream: TtsStream | None = self._begin_tone()
+        elif self._greeting:
+            greeting_stream = self._begin_greeting()
+        else:
+            greeting_stream = None
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_pump())
@@ -438,6 +499,21 @@ class CallLoop:
             yield greeting
 
         stream = self._tts.synthesize(_single_chunk(), self._voice)
+        self._active_tts_stream = stream
+        return stream
+
+    def _begin_tone(self) -> TtsStream:
+        """Build + register a pure-sine tone stream synchronously (no await).
+
+        Creates a :class:`_ToneStream` wrapping :func:`generate_tone_frames` at
+        the configured ``tone_secs`` duration.  The stream is registered as the
+        active TTS stream before any ``await`` so a first-frame caller onset
+        barges in correctly — identical lifecycle to :meth:`_begin_greeting`.
+        Only called when ``self._tone_secs > 0``.
+        """
+        duration = self._tone_secs
+        _log.info("tone diagnostic: %.1f s at 440 Hz (bypassing TTS)", duration)
+        stream: TtsStream = _ToneStream(duration_secs=duration)
         self._active_tts_stream = stream
         return stream
 

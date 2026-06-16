@@ -37,6 +37,7 @@ from hermes_voip.config import (
     ConfigError,
     ExtensionConfig,
     GatewayConfig,
+    MediaConfig,
     load_media_config,
 )
 from hermes_voip.manager import InDialog, NewCall, RegistrationManager
@@ -1174,3 +1175,117 @@ async def test_inbound_handler_exception_is_logged_with_traceback(
     assert boom in logged_exceptions, (
         "the logged ERROR did not carry the handler's exception traceback"
     )
+
+
+# ---------------------------------------------------------------------------
+# LIVE BUG 1 — VAD + endpointer must be built at the engine's INBOUND sample
+# rate (8 kHz G.711), not the silero default (16 kHz). The pump feeds the
+# engine's 8 kHz frames straight into the VAD; a 16 kHz detector raises
+# ``ValueError: frame rate 8000 != detector rate 16000`` on the very first frame,
+# fails the CallLoop TaskGroup, and the caller hears silence. silero-vad runs
+# natively at 8 kHz, so the inbound chain stays at the wire rate.
+# ---------------------------------------------------------------------------
+
+
+def _media_cfg_8k() -> MediaConfig:
+    """A real MediaConfig with defaults (the rate is supplied separately)."""
+    return load_media_config({})
+
+
+def test_make_endpointer_built_at_engine_inbound_rate() -> None:
+    """``_make_endpointer`` must build the endpointer at the supplied 8 kHz rate.
+
+    Before the fix the endpointer was hard-built at silero's 16 kHz default, so
+    its window clock (and silence-window count) did not match the 8 kHz VAD the
+    pump actually drives. The endpointer must take the engine's inbound rate.
+    """
+    from hermes_voip.adapter import _make_endpointer  # noqa: PLC0415
+
+    endpointer = _make_endpointer(_media_cfg_8k(), sample_rate_hz=8_000)
+
+    # A 256-sample (32 ms) window at 8 kHz gives 16 windows per 500 ms — the same
+    # 32 ms window duration as 16 kHz, so the silence-window count is rate-correct.
+    assert endpointer.silence_windows == 16
+
+
+def test_make_vad_built_at_engine_inbound_rate() -> None:
+    """``_make_vad`` must load the model and build the VAD at the supplied rate.
+
+    The silero model factory and the detector both take a sample rate; the
+    adapter must pass the engine's 8 kHz inbound rate to BOTH so the detector
+    accepts the engine's 8 kHz frames (256-sample windows) instead of rejecting
+    them against a 16 kHz (512-sample) expectation.
+    """
+    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
+
+    captured: dict[str, object] = {}
+
+    def _fake_load(sample_rate_hz: int = 16_000, **_kw: object) -> object:
+        captured["model_rate"] = sample_rate_hz
+
+        def _model(window_pcm16: bytes, sample_rate: int) -> float:
+            _ = window_pcm16, sample_rate
+            return 0.0
+
+        return _model
+
+    with patch.object(adapter_mod, "load_silero_model", _fake_load):
+        vad = adapter_mod._make_vad(_media_cfg_8k(), sample_rate_hz=8_000)
+
+    # The model factory got the engine rate ...
+    assert captured["model_rate"] == 8_000
+    # ... and the detector accepts an 8 kHz frame without raising (proves the
+    # detector itself was constructed at 8 kHz, i.e. one window == 256 samples).
+    frame_8k = PcmFrame(samples=bytes(512), sample_rate=8_000, monotonic_ts_ns=0)
+    events = list(vad.feed(frame_8k))  # no ValueError
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_run_call_loop_builds_detectors_at_engine_inbound_rate() -> None:
+    """``_run_call_loop`` must build VAD + endpointer at ``engine.inbound_sample_rate``.
+
+    This is the live wiring: the engine reports 8 kHz, so the detectors handed to
+    the CallLoop must be 8 kHz. We capture the ``sample_rate_hz`` the adapter
+    passes to ``_make_vad`` / ``_make_endpointer`` and assert it is the engine's
+    inbound rate, not the silero 16 kHz default.
+    """
+    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+    adapter._providers = MagicMock(asr=MagicMock(), tts=MagicMock(), guard=MagicMock())
+
+    engine = MagicMock()
+    engine.inbound_sample_rate = 8_000
+
+    vad_rates: list[int] = []
+    endpointer_rates: list[int] = []
+
+    def _capture_vad(_cfg: MediaConfig, *, sample_rate_hz: int) -> object:
+        vad_rates.append(sample_rate_hz)
+        return MagicMock()
+
+    def _capture_endpointer(_cfg: MediaConfig, *, sample_rate_hz: int) -> object:
+        endpointer_rates.append(sample_rate_hz)
+        return MagicMock()
+
+    with (
+        patch.object(adapter_mod, "_make_vad", _capture_vad),
+        patch.object(adapter_mod, "_make_endpointer", _capture_endpointer),
+        patch.object(
+            adapter_mod,
+            "CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+    ):
+        await adapter._run_call_loop(
+            call_id="call-rate-1",
+            engine=engine,
+            guard_state=MagicMock(),
+        )
+
+    assert vad_rates == [8_000]
+    assert endpointer_rates == [8_000]

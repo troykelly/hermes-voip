@@ -401,8 +401,15 @@ class VoipAdapter(BasePlatformAdapter):
         await engine.connect()
 
         # --- Build the SDP answer ------------------------------------------
+        # Advertise the runtime's REAL local interface for RTP — the same host as
+        # the SIP Contact (the transport's local socket address). The 127.0.0.1
+        # loopback placeholder makes the gateway send RTP to its own loopback, so
+        # audio never flows. (Behind NAT this is the private interface address;
+        # reaching it from a public gateway needs symmetric-RTP latching or an
+        # outbound greeting first — see docs/runbooks/0002-voip-live-validation.md.)
+        local_rtp_host = _host_of(transport.local_sent_by)
         local_media = LocalMediaSession(
-            local_address="127.0.0.1",  # replaced by real local addr in production
+            local_address=local_rtp_host,
             port=engine.local_port,
             codecs=agreed_sdp_codecs,
             session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
@@ -660,6 +667,20 @@ def _effective_address(audio: AudioMedia, offer: SessionDescription) -> str:
     """The remote RTP address: media-level c=, then session-level c=, else loopback."""
     addr = audio.connection_address or offer.connection_address
     return addr if addr else "127.0.0.1"
+
+
+def _host_of(sent_by: str) -> str:
+    """The host part of a Via ``sent-by`` (``host:port``), IPv6-bracket aware.
+
+    Used to advertise our real RTP interface in the SDP answer — the same host
+    the SIP Contact carries. ``[2001:db8::1]:5061`` -> ``2001:db8::1``;
+    ``172.23.0.2:55728`` -> ``172.23.0.2``; a bare host with no port is returned
+    unchanged.
+    """
+    if sent_by.startswith("["):  # bracketed IPv6 literal, optional :port after ]
+        return sent_by[1 : sent_by.index("]")]
+    host, sep, _port = sent_by.rpartition(":")
+    return host if sep else sent_by
 
 
 def _caller_number(from_header: str) -> str:

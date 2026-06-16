@@ -202,6 +202,66 @@ async def test_sherpa_asr_starts_a_new_segment_after_endpoint() -> None:
     assert recognizer.resets == 1
 
 
+# --- inbound rate reconciliation (ADR-0017) -----------------------------------
+#
+# The transport delivers 8 kHz G.711 frames (inbound_sample_rate ==
+# G711_SAMPLE_RATE). The zipformer wants 16 kHz. The ASR feed path must upsample
+# 8 kHz -> 16 kHz BEFORE accept_waveform, so the recogniser is fed audio whose
+# real rate matches the rate it is told (16 kHz). Previously the 8 kHz samples
+# were handed to accept_waveform LABELLED 16 kHz (half-rate audio, wrong pitch).
+
+_WIRE_RATE = 8_000  # G.711 narrowband wire rate the transport delivers
+
+
+def _wire_frame(sample_count: int, *, ts: int = 0) -> PcmFrame:
+    """An 8 kHz PcmFrame of ``sample_count`` non-silent samples (a ramp).
+
+    Mirrors what the transport yields: PCM16 at the G.711 wire rate. Non-silent
+    so the upsampled output is a real, longer array (not all-zero) and its sample
+    count is observable.
+    """
+    samples = struct.pack(
+        f"<{sample_count}h",
+        *[((i % 32) - 16) * 8 for i in range(sample_count)],
+    )
+    return PcmFrame(samples=samples, sample_rate=_WIRE_RATE, monotonic_ts_ns=ts)
+
+
+def _fed_sample_count(samples: FloatArray) -> int:
+    """Number of float32 samples in a captured ``accept_waveform`` array."""
+    return len(samples.tobytes()) // 4  # float32 = 4 bytes/sample
+
+
+@pytest.mark.asyncio
+async def test_sherpa_asr_upsamples_8k_inbound_to_16k_before_feeding() -> None:
+    """8 kHz transport frames are upsampled to 16 kHz before accept_waveform.
+
+    The recogniser must be fed at 16 kHz AND receive ~2x the input sample count
+    (8 kHz -> 16 kHz doubles the samples). The previous code fed the raw 8 kHz
+    samples while telling sherpa they were 16 kHz: half the samples, wrong rate.
+    """
+    pytest.importorskip("numpy")  # the decode loop / resample need numpy
+    recognizer = _FakeRecognizer([_Script("hi", endpoint=True)])
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+
+    input_samples = 160  # 20 ms at 8 kHz
+    _ = [t async for t in asr.stream(_frames(_wire_frame(input_samples)))]
+
+    stream = recognizer.last_stream
+    assert stream is not None
+    assert stream.fed, "the recogniser must have been fed at least one waveform"
+    # Every waveform must be presented at the recogniser's real rate (16 kHz),
+    # never the 8 kHz wire rate.
+    assert stream.fed_rates == [_RATE]
+    # And it must carry the UPSAMPLED sample count (~2x): proof the 8 kHz frame
+    # was actually converted to 16 kHz, not relabelled. audioop.ratecv produces
+    # close to 2x the input samples (a couple of samples of edge slack).
+    fed = _fed_sample_count(stream.fed[0])
+    assert fed >= input_samples * 2 - 4, (
+        f"expected ~{input_samples * 2} upsampled samples, got {fed}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
     """An empty decode result is not emitted as a transcript (no blank partials).

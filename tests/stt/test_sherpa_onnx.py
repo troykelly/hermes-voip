@@ -24,6 +24,7 @@ The contract under test (ADR-0006):
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import threading
 from collections.abc import AsyncIterator
@@ -202,6 +203,71 @@ async def test_sherpa_asr_starts_a_new_segment_after_endpoint() -> None:
     assert recognizer.resets == 1
 
 
+# --- inbound rate reconciliation (ADR-0017) -----------------------------------
+#
+# The transport delivers 8 kHz G.711 frames (inbound_sample_rate ==
+# G711_SAMPLE_RATE). The zipformer wants 16 kHz. The ASR feed path must upsample
+# 8 kHz -> 16 kHz BEFORE accept_waveform, so the recogniser is fed audio whose
+# real rate matches the rate it is told (16 kHz). Previously the 8 kHz samples
+# were handed to accept_waveform LABELLED 16 kHz (half-rate audio, wrong pitch).
+
+_WIRE_RATE = 8_000  # G.711 narrowband wire rate the transport delivers
+
+
+def _wire_frame(sample_count: int, *, ts: int = 0) -> PcmFrame:
+    """An 8 kHz PcmFrame of ``sample_count`` non-silent samples (a ramp).
+
+    Mirrors what the transport yields: PCM16 at the G.711 wire rate. Non-silent
+    so the upsampled output is a real, longer array (not all-zero) and its sample
+    count is observable.
+    """
+    samples = struct.pack(
+        f"<{sample_count}h",
+        *[((i % 32) - 16) * 8 for i in range(sample_count)],
+    )
+    return PcmFrame(samples=samples, sample_rate=_WIRE_RATE, monotonic_ts_ns=ts)
+
+
+def _fed_sample_count(samples: FloatArray) -> int:
+    """Number of float32 samples in a captured ``accept_waveform`` array."""
+    return len(samples.tobytes()) // 4  # float32 = 4 bytes/sample
+
+
+@pytest.mark.asyncio
+async def test_sherpa_asr_upsamples_8k_inbound_to_16k_before_feeding() -> None:
+    """8 kHz transport frames are upsampled to 16 kHz before accept_waveform.
+
+    The recogniser must be fed at 16 kHz AND receive ~2x the input sample count
+    (8 kHz -> 16 kHz doubles the samples). The previous code fed the raw 8 kHz
+    samples while telling sherpa they were 16 kHz: half the samples, wrong rate.
+    """
+    pytest.importorskip("numpy")  # the decode loop / resample need numpy
+    recognizer = _FakeRecognizer([_Script("hi", endpoint=True)])
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+
+    input_samples = 160  # 20 ms at 8 kHz
+    _ = [t async for t in asr.stream(_frames(_wire_frame(input_samples)))]
+
+    stream = recognizer.last_stream
+    assert stream is not None
+    assert stream.fed, "the recogniser must have been fed at least one waveform"
+    # Every waveform must be presented at the recogniser's real rate (16 kHz),
+    # never the 8 kHz wire rate.  The stream ends without an engine endpoint so
+    # _flush() is called, which adds a silence-pad waveform at the recogniser rate
+    # before input_finished — so fed_rates has at least two entries, all 16 kHz.
+    assert all(r == _RATE for r in stream.fed_rates), (
+        f"all fed rates must be {_RATE}, got {stream.fed_rates}"
+    )
+    # The FIRST fed waveform is the real audio (upsampled from 8 kHz -> 16 kHz).
+    # It must carry the UPSAMPLED sample count (~2x): proof the 8 kHz frame was
+    # actually converted to 16 kHz, not relabelled. audioop.ratecv produces
+    # close to 2x the input samples (a couple of samples of edge slack).
+    fed = _fed_sample_count(stream.fed[0])
+    assert fed >= input_samples * 2 - 4, (
+        f"expected ~{input_samples * 2} upsampled samples, got {fed}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
     """An empty decode result is not emitted as a transcript (no blank partials).
@@ -233,7 +299,12 @@ async def test_sherpa_asr_feeds_float32_at_16k() -> None:
     assert recognizer.created_streams == 1
     stream = recognizer.last_stream
     assert stream is not None
-    assert stream.fed_rates == [_RATE]
+    # _flush() adds a silence-pad waveform before input_finished so there are at
+    # least two fed calls; all must be at the recogniser rate (16 kHz).
+    assert all(r == _RATE for r in stream.fed_rates), (
+        f"all fed rates must be {_RATE}, got {stream.fed_rates}"
+    )
+    # The FIRST fed waveform is the real audio — check dtype and sample values.
     fed = np.asarray(stream.fed[0])
     assert fed.dtype.name == "float32"
     assert fed[0] == pytest.approx(32767 / 32768, abs=1e-6)
@@ -262,6 +333,89 @@ async def test_sherpa_asr_flushes_tail_on_input_end() -> None:
     # engine endpoint, so the caller never loses trailing speech.
     assert out[-1].text == "almost done"
     assert out[-1].is_final is True
+
+
+@pytest.mark.asyncio
+async def test_sherpa_asr_flush_feeds_silence_before_input_finished() -> None:
+    """_flush() pads silence before input_finished so the last word decodes.
+
+    The streaming zipformer needs lookahead context (trailing silence) to commit
+    its final hypothesis.  Without a pre-flush silence pad, the trailing word of
+    a phrase that ends right at the audio boundary is stranded in the model's
+    lookahead buffer and never emitted.
+
+    This test asserts that when inbound audio ends mid-utterance the recogniser
+    receives at least one silence frame (all-zero waveform) via ``accept_waveform``
+    BEFORE ``input_finished`` is called.  The silence frame must be at the
+    recogniser rate (16 kHz) and must contain at least one sample.
+
+    The ``_FakeRecognizer.accept_waveform`` records every waveform fed.  We
+    observe the sequence: real audio frames, then at least one all-zero frame,
+    then ``input_finished()``.
+    """
+    np = pytest.importorskip("numpy")
+
+    # A recogniser whose flush can only succeed if silence is fed first:
+    # the script has two steps; the second is only reached when a second waveform
+    # (the silence pad) is accepted after the single real audio frame.
+    recognizer = _FakeRecognizer(
+        [
+            _Script("tail", endpoint=False),  # produced by the real audio frame
+            _Script("tail word", endpoint=False),  # produced by the silence pad
+        ]
+    )
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+
+    # Feed exactly one real (non-zero) audio frame, then let the stream end.
+    out = [t async for t in asr.stream(_frames(_frame(32767)))]
+
+    stream = recognizer.last_stream
+    assert stream is not None, "recogniser was never given a stream"
+    assert stream.finished, "input_finished() must be called on stream end"
+
+    # Find the waveforms that were fed: there must be at least two.
+    fed = stream.fed
+    assert len(fed) >= 2, (
+        f"expected real audio frame + at least one silence pad, "
+        f"got {len(fed)} fed calls"
+    )
+
+    # The last fed waveform before input_finished must be all-zero (the silence pad).
+    last_fed = np.asarray(fed[-1])
+    assert len(last_fed) > 0, "silence pad must be non-empty"
+    assert float(np.max(np.abs(last_fed))) == pytest.approx(0.0), (
+        "the pre-flush padding frame must be all zeros (silence)"
+    )
+
+    # The final transcript must still be the promoted flush result.
+    assert out[-1].is_final is True
+
+
+@pytest.mark.asyncio
+async def test_sherpa_asr_logs_segment_at_final(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A final transcript logs INFO with its text and sample count.
+
+    The logging provides operators with observability into the STT confidence
+    and segment length so they can tune the endpointer silence threshold and
+    identify transcription quality problems (per the task requirement).
+    """
+    pytest.importorskip("numpy")  # the decode loop converts PCM16 -> float32
+    recognizer = _FakeRecognizer(
+        [
+            _Script("hello world", endpoint=True),
+        ]
+    )
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+    with caplog.at_level(logging.INFO, logger="hermes_voip.stt.sherpa_onnx"):
+        _out = [t async for t in asr.stream(_frames(_frame(1)))]
+
+    # At least one INFO record must mention the transcript text.
+    info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+    assert any("hello world" in m.lower() for m in info_msgs), (
+        f"no INFO log mentioning the final transcript text; got: {info_msgs}"
+    )
 
 
 @pytest.mark.asyncio

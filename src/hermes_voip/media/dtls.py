@@ -546,7 +546,13 @@ class DtlsEndpoint:
 
         Args:
             datagram: A single DTLS datagram from the peer.
+
+        Raises:
+            OpenSSL.SSL.Error: If the handshake has already failed fatally — the
+                stored error is re-raised before touching the dead connection.
         """
+        if self._fatal_error is not None:
+            raise self._fatal_error
         self._conn.bio_write(datagram)
         self._step_handshake()
 

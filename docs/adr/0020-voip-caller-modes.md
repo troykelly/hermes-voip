@@ -235,11 +235,18 @@ The adapter sets `guard_state.privileged = (mode is CallerMode.ALLOW)` when it b
 per-call `GuardSessionState` (the existing `GuardSessionState(call_id)` construction
 point, inbound and outbound). `gate_tool_call` then enforces:
 
-| `ToolRisk` | ALLOW (`privileged=True`) | GREY (`privileged=False`) |
+| `ToolRisk` | ALLOW (`privileged=True`) | GREY / OUTBOUND (`privileged=False`) |
 |---|---|---|
-| `SAFE` (e.g. `list_registrations`) | allowed | allowed |
-| `ELEVATED` (`hold_call`, `resume_call`) | allowed iff not `degraded` (unchanged) | **blocked** |
+| `SAFE` (read-only, no sensitive output) | allowed | allowed |
+| `ELEVATED` (`hold_call`, `resume_call`, `list_registrations`) | allowed iff not `degraded` (unchanged) | **blocked** |
 | `IRREVERSIBLE` (`transfer_*`, `place_call`) | allowed iff confirmed **and** not `degraded` (unchanged) | **blocked** |
+
+> **Hardening (2026-06-16, cross-vendor review).** `list_registrations` is
+> **`ELEVATED`**, not `SAFE`: it discloses the operator's SIP extension numbers +
+> registration status, which an untrusted (unprivileged) caller must not enumerate.
+> The privilege clamp therefore blocks it for GREY/OUTBOUND calls. There is no
+> sensitive `SAFE` tool, so "clamped to `SAFE`" means the untrusted party reaches
+> nothing it shouldn't.
 
 So a receptionist call is clamped to `SAFE` tools **structurally**, independent of what
 the persona preamble says and independent of the injection classifier — the same
@@ -324,7 +331,7 @@ _handle_inbound_invite(invite):
     cls = classify_caller(caller, self._caller_modes)
     if cls.mode is CallerMode.DENY:
         await transport.send(build_response(invite, 603, "Decline"))   # final, no dialog
-        # audit log: both raw From and extracted number, for spoof review
+        # audit log: call_id + source + REDACTED number tail (PII), for spoof review
         return                                                          # no engine, no agent
     # ALLOW / GREY: proceed to SDP negotiation + 200 OK as today,
     # setting guard_state.privileged from cls.mode
@@ -341,9 +348,12 @@ _handle_inbound_invite(invite):
 - **Decision point:** entirely inside the adapter's inbound handler, on the call's own
   task — `build_response`/`transport.send` is the same call path already used for `488`,
   so no transport change is needed. Outbound is never deny-classified (§3).
-- **Audit:** the deny is logged with both the verbatim `From` header and the extracted
-  number so the operator can spot spoofing (a deny that "shouldn't" have fired). Caller
-  text is never logged beyond ADR-0009's retention policy.
+- **Audit:** the deny is logged with the call_id, the match source, and the extracted
+  number **redacted to its last 2 digits** so the operator can correlate a spoof report
+  (a deny that "shouldn't" have fired) without writing the full caller number (PII) — or
+  the verbatim `From`, or the matched deny pattern — to a log that may be shared
+  (corrected 2026-06-16, cross-vendor review). Caller text is never logged beyond
+  ADR-0009's retention policy.
 
 ### 6. Config surface, defaults, phasing
 
@@ -427,8 +437,8 @@ caller-ID) and is **not** recommended.
   `ELEVATED`/`IRREVERSIBLE` tools structurally blocked. Misconfiguration (empty lists)
   degrades to *more* restriction (everyone receptionist), never to open privilege.
 - DENY is enforced **at SIP setup** and is honestly framed as a convenience filter
-  (spoof-evadable), not a security boundary; both `From` and extracted number are audited
-  so spoof attempts are visible.
+  (spoof-evadable), not a security boundary; the deny is audited (call_id + source +
+  redacted number tail) so spoof attempts are visible without logging full caller PII.
 - The receptionist's two-layer containment — spotlighted persona preamble (advisory) **+**
   the `privileged=False` tool clamp (enforced through ADR-0009's gate) — means an injection
   that talks the receptionist into "transfer me to the operator" still hits the gate and is

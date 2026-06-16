@@ -1,10 +1,13 @@
 """Agent-facing call-control tools, gated by the ADR-0009 policy (ADR-0011 §3).
 
 The agent drives a live call through five tools: ``hold_call`` / ``resume_call``
-(``ELEVATED`` — reversible), ``transfer_blind`` / ``transfer_attended``
-(**``IRREVERSIBLE``**), and ``list_registrations`` (``SAFE``). Each carries a
-:class:`~hermes_voip.providers.policy.ToolRisk` and runs through
-``gate_tool_call`` **verbatim** — no new policy code.
+and ``list_registrations`` (``ELEVATED`` — reversible / read-only-but-sensitive),
+and ``transfer_blind`` / ``transfer_attended`` (**``IRREVERSIBLE``**). Each
+carries a :class:`~hermes_voip.providers.policy.ToolRisk` and runs through
+``gate_tool_call`` **verbatim** — no new policy code. ``list_registrations`` is
+``ELEVATED`` rather than ``SAFE`` because it discloses the operator's internal
+extension/registration metadata, which an untrusted (unprivileged) caller must
+not enumerate (ADR-0020).
 
 **Invariant 3** (the load-bearing control): an ``IRREVERSIBLE`` transfer requires
 explicit caller confirmation (DTMF/human, ADR-0010 — sourced via
@@ -43,12 +46,18 @@ __all__ = [
 ]
 
 # Each tool's action risk class (ADR-0011 §3); the source of truth for the gate.
+# ``list_registrations`` is ``ELEVATED`` (not ``SAFE``): it discloses the
+# operator's SIP extension numbers + registration status, which is internal
+# infrastructure metadata an untrusted (GREY receptionist / OUTBOUND callee)
+# caller must not be able to enumerate (ADR-0020 least-privilege). The privilege
+# clamp therefore blocks it for an unprivileged session; a trusted ALLOW session
+# still gets it (it is read-only, so it needs no ADR-0010 confirmation).
 TOOL_RISKS: dict[str, ToolRisk] = {
     "hold_call": ToolRisk.ELEVATED,
     "resume_call": ToolRisk.ELEVATED,
     "transfer_blind": ToolRisk.IRREVERSIBLE,
     "transfer_attended": ToolRisk.IRREVERSIBLE,
-    "list_registrations": ToolRisk.SAFE,
+    "list_registrations": ToolRisk.ELEVATED,
 }
 
 
@@ -142,12 +151,21 @@ class CallControlTools:
         self._call = None
 
     async def list_registrations(self) -> ToolResult:
-        """List the gateway registrations and their status (``SAFE``)."""
-        # SAFE: always permitted; gate kept explicit for symmetry/auditability.
+        """List the gateway registrations and their status (``ELEVATED``).
+
+        ELEVATED (ADR-0020): this discloses internal extension/registration
+        metadata, so the gate blocks it for an **unprivileged** call (a GREY
+        receptionist / OUTBOUND callee) and for a ``degraded`` call. When invoked
+        with no active call, the ambient state is clean+privileged so the operator
+        can still list registrations outside a call.
+        """
         if not gate_voip_tool(
             "list_registrations", _ambient_state(self._call), confirmed=False
-        ):  # pragma: no cover - SAFE never blocks
-            return ToolResult(allowed=False, message="list_registrations blocked")
+        ):
+            return ToolResult(
+                allowed=False,
+                message="list_registrations blocked: this call is not privileged",
+            )
         lines = [
             f"{s.extension}: {'registered' if s.registered else 'down'}"
             for s in self._registrations.snapshot()

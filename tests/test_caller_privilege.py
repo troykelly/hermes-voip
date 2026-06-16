@@ -81,8 +81,20 @@ def test_gate_voip_tool_honours_the_privilege_clamp() -> None:
     unpriv = GuardSessionState(call_id="c1", privileged=False)
     assert gate_voip_tool("hold_call", unpriv, confirmed=False) is False
     assert gate_voip_tool("transfer_blind", unpriv, confirmed=True) is False
-    # SAFE still runs.
-    assert gate_voip_tool("list_registrations", unpriv, confirmed=False) is True
+
+
+def test_unprivileged_caller_cannot_enumerate_registrations() -> None:
+    """list_registrations leaks internal extension/registration metadata.
+
+    An untrusted (GREY receptionist / OUTBOUND callee) caller must NOT be able to
+    enumerate the operator's SIP extensions and their status, so list_registrations
+    is ELEVATED — the privilege clamp blocks it for an unprivileged session, while
+    a trusted ALLOW session still gets it.
+    """
+    unpriv = GuardSessionState(call_id="c1", privileged=False)
+    assert gate_voip_tool("list_registrations", unpriv, confirmed=False) is False
+    priv = GuardSessionState(call_id="c1", privileged=True)
+    assert gate_voip_tool("list_registrations", priv, confirmed=False) is True
 
 
 # --- end-to-end: the credit-card attack fails BY CONSTRUCTION ----------------

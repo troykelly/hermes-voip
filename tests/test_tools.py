@@ -110,7 +110,9 @@ def test_tool_risk_map_is_correct() -> None:
     assert TOOL_RISKS["resume_call"] is ToolRisk.ELEVATED
     assert TOOL_RISKS["transfer_blind"] is ToolRisk.IRREVERSIBLE
     assert TOOL_RISKS["transfer_attended"] is ToolRisk.IRREVERSIBLE
-    assert TOOL_RISKS["list_registrations"] is ToolRisk.SAFE
+    # ELEVATED (ADR-0020): list_registrations discloses internal extension
+    # metadata, so an untrusted/unprivileged caller must not enumerate it.
+    assert TOOL_RISKS["list_registrations"] is ToolRisk.ELEVATED
 
 
 def test_gate_voip_tool_unknown_tool_denied() -> None:
@@ -121,7 +123,10 @@ def test_gate_voip_tool_unknown_tool_denied() -> None:
 def test_gate_voip_tool_maps_to_gate_tool_call() -> None:
     clean = GuardSessionState(call_id="call-1")
     degraded = GuardSessionState(call_id="call-1", degraded=True)
-    assert gate_voip_tool("list_registrations", degraded, confirmed=False) is True
+    # list_registrations is ELEVATED: allowed on a clean privileged call, blocked
+    # while degraded (and — see test_caller_privilege — for an unprivileged call).
+    assert gate_voip_tool("list_registrations", clean, confirmed=False) is True
+    assert gate_voip_tool("list_registrations", degraded, confirmed=False) is False
     assert gate_voip_tool("hold_call", clean, confirmed=False) is True
     assert gate_voip_tool("hold_call", degraded, confirmed=False) is False
     assert gate_voip_tool("transfer_blind", clean, confirmed=True) is True
@@ -129,16 +134,26 @@ def test_gate_voip_tool_maps_to_gate_tool_call() -> None:
     assert gate_voip_tool("transfer_blind", degraded, confirmed=True) is False
 
 
-# ---- list_registrations (SAFE) ---------------------------------------------
+# ---- list_registrations (ELEVATED) -----------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_registrations_always_allowed() -> None:
+async def test_list_registrations_allowed_on_privileged_call() -> None:
+    # No active call => ambient clean+privileged state => the operator can list.
     tools = _tools(None)
     result = await tools.list_registrations()
     assert result.allowed is True
     assert "1000" in result.message
     assert "1001" in result.message
+
+
+@pytest.mark.asyncio
+async def test_list_registrations_blocked_on_unprivileged_call() -> None:
+    # An untrusted (unprivileged) call cannot enumerate registrations (ADR-0020).
+    call = _FakeCall()
+    call.guard.privileged = False
+    result = await _tools(call).list_registrations()
+    assert result.allowed is False
 
 
 # ---- hold / resume (ELEVATED) ----------------------------------------------

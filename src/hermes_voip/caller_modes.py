@@ -319,16 +319,24 @@ def load_caller_modes(env: Mapping[str, str]) -> CallerModeConfig:
 
 
 def _load_list(env: Mapping[str, str], key: str) -> tuple[str, ...]:
-    """Load the patterns from the JSON file at ``env[key]`` (empty if unset)."""
+    """Load the patterns from the JSON file at ``env[key]``.
+
+    An **unset** path => empty list (an operator may run with only one list, or
+    none). A path that **is configured but does not exist** => :class:`ConfigError`
+    (rule 37): silently treating a typo'd/absent security-list path as empty would,
+    under ``default_mode=allow``, grant ALLOW to callers a missing deny/grey file
+    was meant to constrain. ``unset`` and ``configured-but-missing`` are distinct.
+    """
     path_str = (env.get(key) or "").strip()
     if not path_str:
         return ()
     path = Path(path_str)
     if not path.exists():
-        _log.info(
-            "caller-modes: %s path %r does not exist — treating as empty", key, path_str
+        msg = (
+            f"{key}: caller-list file {path_str!r} is configured but does not "
+            "exist (unset the variable to run without this list)"
         )
-        return ()
+        raise ConfigError(msg)
     try:
         raw_text = path.read_text(encoding="utf-8")
     except OSError as exc:  # unreadable file is a real misconfiguration

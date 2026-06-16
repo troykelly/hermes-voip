@@ -237,12 +237,21 @@ def test_load_reads_patterns_from_json_files(tmp_path: Path) -> None:
     assert classify_caller(_BLOCKED, cfg).mode is CallerMode.DENY
 
 
-def test_load_missing_file_path_is_empty_not_an_error(tmp_path: Path) -> None:
-    # An unset/missing path => empty list (an operator may run with only a deny
-    # list, or none). This is logged at INFO, not raised.
-    missing = tmp_path / "does-not-exist.json"
-    cfg = load_caller_modes({"HERMES_VOIP_CALLER_ALLOW_FILE": str(missing)})
+def test_load_unset_file_path_is_empty() -> None:
+    # An UNSET path => empty list (an operator may run with only a deny list, or
+    # none). This is logged at INFO, not raised.
+    cfg = load_caller_modes({})
     assert cfg.allow == ()
+
+
+def test_load_configured_but_missing_file_raises(tmp_path: Path) -> None:
+    # A path that IS configured but does not exist is a misconfiguration and must
+    # fail LOUDLY (rule 37): silently treating it as empty would, under
+    # default_mode=allow, grant ALLOW to callers a missing deny/grey file was
+    # meant to constrain. unset != configured-but-missing.
+    missing = tmp_path / "does-not-exist.json"
+    with pytest.raises(ConfigError):
+        load_caller_modes({"HERMES_VOIP_CALLER_ALLOW_FILE": str(missing)})
 
 
 def test_load_malformed_file_raises_config_error(tmp_path: Path) -> None:

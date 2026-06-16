@@ -74,6 +74,9 @@ would leak into shell history / `printenv`). A present-but-malformed list file r
 
 - An entry is an **exact** value or a literal **`*`-suffixed prefix** (a number block;
   `startswith`, no regex). Matching tries both the normalized and the raw form.
+- An **unset** `*_FILE` var means that list is empty; a var that **is set but points at a
+  missing or malformed file raises a `ConfigError` at startup** — a typo'd security-list path
+  must fail loudly, never silently grant access (rule 37).
 - Precedence is **deny > allow > grey > default(grey)** — a number on both deny and allow is
   denied (fail safe).
 - `default_mode=grey` with empty lists means **everyone is a receptionist** — the safe default.
@@ -95,9 +98,10 @@ export HERMES_VOIP_CALLER_DENY_FILE=/run/secrets/.caller-deny.json
   `caller-modes: allow=N deny=M grey=K default=grey normalization=e164` — confirming the files
   parsed. The patterns themselves are never logged.
 - **A deny fires at SIP setup:** a deny-listed caller's INVITE is answered `603 Decline` before
-  any media/agent; the adapter logs `caller DENIED (matched ...) — 603 Decline` with both the
-  verbatim `From` and the extracted number (for spotting a spoofed deny). No `CallSession` is
-  created.
+  any media/agent; the adapter logs `caller DENIED (source=deny) — 603 Decline; number=****NN`
+  — the number is **redacted to its last 2 digits** (caller numbers are PII; logs may be
+  shared), enough to correlate a spoof report by call_id + tail without dumping the number. No
+  `CallSession` is created.
 - **An unknown caller is unprivileged:** the call's `GuardSessionState.privileged` is `False`,
   so a transfer/hold tool is blocked regardless of confirmation. The unit/contract tests
   `test_caller_privilege.py` and `test_adapter_caller_modes.py` pin this; the e2e

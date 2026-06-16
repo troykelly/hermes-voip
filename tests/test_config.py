@@ -755,3 +755,70 @@ def test_media_config_rejects_bad_enum_on_direct_construction() -> None:
             dtmf_inband_enabled=True,
             tone_secs=0.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# HERMES_VOIP_TEST_TONE / tone_secs
+# ---------------------------------------------------------------------------
+
+
+def test_media_tone_secs_default_is_zero() -> None:
+    """HERMES_VOIP_TEST_TONE absent -> tone_secs == 0.0 (normal operation)."""
+    cfg = load_media_config({})
+    assert cfg.tone_secs == 0.0
+
+
+def test_media_tone_secs_parses_positive_float() -> None:
+    """HERMES_VOIP_TEST_TONE=5 -> tone_secs == 5.0."""
+    cfg = load_media_config({"HERMES_VOIP_TEST_TONE": "5"})
+    assert cfg.tone_secs == 5.0
+
+
+def test_media_tone_secs_parses_decimal() -> None:
+    """HERMES_VOIP_TEST_TONE=2.5 -> tone_secs == 2.5."""
+    cfg = load_media_config({"HERMES_VOIP_TEST_TONE": "2.5"})
+    assert cfg.tone_secs == 2.5
+
+
+def test_media_tone_secs_zero_is_accepted() -> None:
+    """HERMES_VOIP_TEST_TONE=0 -> tone_secs == 0.0 (off, same as absent)."""
+    cfg = load_media_config({"HERMES_VOIP_TEST_TONE": "0"})
+    assert cfg.tone_secs == 0.0
+
+
+def test_media_tone_secs_negative_rejected() -> None:
+    """HERMES_VOIP_TEST_TONE=-1 must raise ConfigError (negative duration)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TEST_TONE": "-1"})
+
+
+def test_media_tone_secs_non_numeric_rejected() -> None:
+    """HERMES_VOIP_TEST_TONE=abc must raise ConfigError (non-numeric)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TEST_TONE": "abc"})
+
+
+def test_media_tone_secs_validates_on_direct_construction() -> None:
+    """MediaConfig(tone_secs=-1.0) must raise ConfigError in __post_init__."""
+    with pytest.raises(ConfigError):
+        MediaConfig(
+            stt_provider="sherpa-onnx",
+            stt_model_dir=None,
+            tts_provider="sherpa-kokoro",
+            tts_model=None,
+            tts_voice=None,
+            elevenlabs_api_key=None,
+            deepgram_api_key=None,
+            cartesia_api_key=None,
+            vad_threshold=0.5,
+            endpoint_silence_ms=500,
+            duplex_mode="half",
+            greeting="",
+            rtp_symmetric=True,
+            injection_guard="onnx",
+            injection_guard_model_dir=None,
+            dtmf_mode="auto",
+            dtmf_interdigit_ms=None,
+            dtmf_inband_enabled=True,
+            tone_secs=-1.0,
+        )

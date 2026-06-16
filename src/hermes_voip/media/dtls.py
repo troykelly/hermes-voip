@@ -307,8 +307,9 @@ class _PyOpenSSLImpl:
     # SSL method constants.
     DTLS_CLIENT_METHOD: int
     DTLS_SERVER_METHOD: int
-    VERIFY_NONE: int
+    VERIFY_PEER: int
     SSL_ERROR_CLASS: type[Exception]
+    WANT_READ_ERROR_CLASS: type[Exception]
 
     # Typed constructors.
     Context: _ContextCtor = field(repr=False)
@@ -342,8 +343,9 @@ class _PyOpenSSLImpl:
         return cls(
             DTLS_CLIENT_METHOD=ssl_mod.DTLS_CLIENT_METHOD,
             DTLS_SERVER_METHOD=ssl_mod.DTLS_SERVER_METHOD,
-            VERIFY_NONE=ssl_mod.VERIFY_NONE,
+            VERIFY_PEER=ssl_mod.VERIFY_PEER,
             SSL_ERROR_CLASS=ssl_mod.Error,
+            WANT_READ_ERROR_CLASS=ssl_mod.WantReadError,
             Context=ssl_mod.Context,
             Connection=ssl_mod.Connection,
             PKey=crypto_mod.PKey,
@@ -460,6 +462,8 @@ class DtlsEndpoint:
     _conn: _SSLConnection = field(init=False, repr=False)
     _fp: str = field(init=False, repr=False)
     _done: bool = field(default=False, init=False, repr=False)
+    _failed: bool = field(default=False, init=False, repr=False)
+    _fingerprint_verified: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Initialise the DTLS connection and ephemeral certificate."""
@@ -481,10 +485,13 @@ class DtlsEndpoint:
         ctx.use_certificate(cert)
         ctx.use_privatekey(pkey)
         ctx.check_privatekey()
-        # We verify the peer cert via fingerprint comparison (RFC 5763 §5), not
-        # via a PKI chain — so set VERIFY_NONE here and require the caller to
-        # invoke verify_peer_fingerprint() after the handshake.
-        ctx.set_verify(ossl.VERIFY_NONE, _accept_any_cert)
+        # RFC 5763 §5: both sides MUST present and verify each other's certificate
+        # fingerprint.  VERIFY_PEER makes the server request a client certificate
+        # (mutual auth over memory BIO) so get_peer_certificate() returns the peer
+        # cert on BOTH sides after the handshake.  The callback always returns True
+        # (skip PKI chain validation); fingerprint comparison is done separately via
+        # verify_peer_fingerprint().
+        ctx.set_verify(ossl.VERIFY_PEER, _accept_any_cert)
 
         conn: _SSLConnection = ossl.Connection(ctx, None)  # memory BIO
         if self.role is DtlsRole.CLIENT:
@@ -538,6 +545,19 @@ class DtlsEndpoint:
     def handshake_done(self) -> bool:
         """Return ``True`` once the DTLS handshake has completed successfully."""
         return self._done
+
+    def handshake_failed(self) -> bool:
+        """Return ``True`` if the DTLS handshake encountered a fatal TLS alert.
+
+        A fatal alert (e.g. ``certificate_unknown``, ``protocol_version``, or
+        ``handshake_failure``) terminates the handshake permanently.  Once this
+        returns ``True``, neither :meth:`feed` nor :meth:`get_outbound_datagrams`
+        will make progress; the endpoint must be discarded.
+
+        Note that ``_failed`` and ``_done`` are mutually exclusive: a successful
+        handshake sets ``_done``; a fatal error sets ``_failed``.
+        """
+        return self._failed
 
     def selected_profile(self) -> SrtpProfile:
         """Return the negotiated DTLS-SRTP profile.
@@ -600,8 +620,16 @@ class DtlsEndpoint:
             ready for :meth:`~SrtpSession.unprotect` / :meth:`~SrtpSession.protect`.
 
         Raises:
-            RuntimeError: If called before the handshake completes.
+            RuntimeError: If called before the handshake completes, or if
+                :meth:`verify_peer_fingerprint` has not been called first
+                (RFC 5763 §5 requires fingerprint verification before keying).
         """
+        if not self._fingerprint_verified:
+            msg = (
+                "verify_peer_fingerprint() must be called before derive_srtp_sessions()"
+                " — RFC 5763 §5 requires fingerprint verification before keying"
+            )
+            raise RuntimeError(msg)
         material: bytes = self.export_srtp_keying_material()
         suite: str = _PROFILE_TO_SUITE.get(
             self._conn.get_selected_srtp_profile(), _SUITE_80
@@ -660,6 +688,7 @@ class DtlsEndpoint:
         if _normalise(actual) != _normalise(expected_fingerprint):
             msg = "DTLS peer certificate fingerprint mismatch — call rejected"
             raise ValueError(msg)
+        self._fingerprint_verified = True
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -668,24 +697,31 @@ class DtlsEndpoint:
     def _step_handshake(self) -> None:
         """Advance the DTLS handshake state machine by one step.
 
-        Calls ``do_handshake()`` once; catches ``SSL.WantReadError`` (the normal
-        "need more inbound data" signal in a memory-BIO DTLS session) and
-        ``SSL.Error`` (e.g. when feeding unexpected data to a fresh client —
-        ignored so the caller can keep pumping without special-casing).
+        Calls ``do_handshake()`` once; catches only ``SSL.WantReadError`` (the
+        normal "need more inbound data" signal in a memory-BIO DTLS session).
+        Any other ``SSL.Error`` subclass is a fatal TLS alert; the endpoint sets
+        ``_failed = True`` and re-raises so the caller sees the failure
+        immediately (AGENTS.md rule 37 — errors propagate, never swallowed).
 
         On successful completion (no exception), sets ``_done = True``.
         """
-        if self._done:
+        if self._done or self._failed:
             return
         ossl = self._ossl
         try:
             self._conn.do_handshake()
             self._done = True
-        except ossl.SSL_ERROR_CLASS:
-            # SSL.WantReadError is a subclass of SSL.Error; both mean "need
-            # more data or the handshake produced an error" — either way we
-            # drain the outbound BIO on the next get_outbound_datagrams call.
+        except ossl.WANT_READ_ERROR_CLASS:
+            # WantReadError is the normal "need more inbound data" signal —
+            # the handshake is still in progress.  Drain the outbound BIO on
+            # the next get_outbound_datagrams call.
             pass
+        except ossl.SSL_ERROR_CLASS:
+            # Any SSL.Error that is NOT WantReadError is a fatal TLS alert
+            # (e.g. certificate_unknown, handshake_failure, protocol_version).
+            # The handshake is permanently broken; mark it and re-raise.
+            self._failed = True
+            raise
 
     def _drain_outbound(self) -> list[bytes]:
         """Read and return all pending outbound DTLS datagrams from the memory BIO.

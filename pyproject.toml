@@ -175,6 +175,21 @@ exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py|tests/test_a
 module = ["gateway.*", "hermes_cli.*"]
 follow_untyped_imports = true
 
+# ``websockets`` lives in the optional ``webrtc`` extra and is absent from the
+# default mypy gate.  ``ws_connection.py`` imports ``websockets.asyncio.client``
+# under ``TYPE_CHECKING``; the test helper imports ``websockets.asyncio.server``
+# and ``websockets.typing``.  All three sub-modules ship no ``py.typed``, so
+# ``follow_untyped_imports`` would give only ``Any``-typed stubs — the same
+# escape-hatch problem as hermes-agent.  ``ignore_missing_imports`` is
+# intentionally used here ONLY for the optional-extra guard: the webrtc CI job
+# installs websockets and runs the full test suite against the real library,
+# so this override does not hide runtime failures.  The mypy coverage that
+# matters (the TYPE_CHECKING-gated ``ClientConnection`` annotation) is exercised
+# when the devcontainer has the webrtc extra active.
+[[tool.mypy.overrides]]
+module = ["websockets.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------

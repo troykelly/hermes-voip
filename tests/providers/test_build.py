@@ -157,6 +157,7 @@ def _media_config(**overrides: object) -> MediaConfig:
         "endpoint_silence_ms": 500,
         "duplex_mode": "half",
         "greeting": "",
+        "rtp_symmetric": True,
         "injection_guard": "onnx",
         "injection_guard_model_dir": "/models/guard",
         "dtmf_mode": "auto",

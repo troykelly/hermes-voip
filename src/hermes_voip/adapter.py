@@ -388,6 +388,10 @@ class VoipAdapter(BasePlatformAdapter):
         )
 
         # --- Open the media engine ------------------------------------------
+        media_cfg = self._media_cfg
+        if media_cfg is None:  # connect() populates this before any INVITE
+            msg = f"INVITE {call_id}: media config not initialised"
+            raise RuntimeError(msg)
         remote_address = _effective_address(audio, offer)
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — bind to all interfaces for RTP
@@ -397,6 +401,9 @@ class VoipAdapter(BasePlatformAdapter):
             codec=_to_engine_codec(codec),
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
+            # Symmetric-RTP (comedia) latching for NAT traversal: send our media
+            # to the peer's real RTP source, not blindly to the SDP address.
+            symmetric=media_cfg.rtp_symmetric,
         )
         await engine.connect()
 

@@ -139,6 +139,15 @@ _MAX_VAD_THRESHOLD = 1.0
 # the friendly DEFAULT_GREETING; present-but-empty (or whitespace) → no greeting.
 _GREETING_KEY = "HERMES_VOIP_GREETING"
 
+# Symmetric-RTP (comedia) latching for NAT traversal (ADR-0005 §NAT). When on
+# (the default) the media engine latches its outbound destination onto the peer's
+# real RTP source — the source tuple of the first valid inbound RTP packet —
+# instead of trusting the SDP c=/m= address (which under NAT may be a private or
+# SBC-rewritten address the peer's media never comes from). Set false to always
+# honour the SDP address (for gateways that route RTP by the negotiated address).
+_RTP_SYMMETRIC_KEY = "HERMES_VOIP_RTP_SYMMETRIC"
+_DEFAULT_RTP_SYMMETRIC = True
+
 # Prompt-injection guard (ADR-0009). Default is the in-process ONNX classifier;
 # the optional loopback sidecar is opt-in (and out of this parser's scope).
 _INJECTION_GUARD_KEY = "HERMES_VOIP_INJECTION_GUARD"
@@ -291,6 +300,10 @@ class MediaConfig:
             (``DEFAULT_GREETING`` when unset; ``""`` disables it). Speaking on
             answer sends RTP first — the caller hears it immediately and a
             symmetric-RTP gateway behind NAT latches onto our source tuple.
+        rtp_symmetric: Whether the media engine latches its outbound RTP onto the
+            peer's real source tuple (the first valid inbound RTP packet) for NAT
+            traversal — ``True`` by default. ``False`` always honours the SDP
+            ``c=``/``m=`` address.
         injection_guard: Prompt-injection guard token (``onnx`` in-process default).
         injection_guard_model_dir: Path to the guard's ONNX model dir, or ``None``.
         dtmf_mode: ``auto`` | ``rfc4733`` | ``sip_info`` | ``inband``.
@@ -310,6 +323,7 @@ class MediaConfig:
     endpoint_silence_ms: int
     duplex_mode: str
     greeting: str
+    rtp_symmetric: bool
     injection_guard: str
     injection_guard_model_dir: str | None
     dtmf_mode: str
@@ -415,6 +429,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _DUPLEX_MODE_KEY, _DUPLEX_MODES, _DEFAULT_DUPLEX_MODE
         ),
         greeting=_parse_greeting(env),
+        rtp_symmetric=_parse_bool(env, _RTP_SYMMETRIC_KEY, _DEFAULT_RTP_SYMMETRIC),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,
         injection_guard_model_dir=_optional(env, _INJECTION_GUARD_MODEL_DIR_KEY),

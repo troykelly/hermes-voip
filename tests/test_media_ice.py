@@ -109,7 +109,11 @@ async def test_ice_candidate_sdp_round_trip() -> None:
     # Canonical SDP a=candidate line (RFC 8839 §5.1 syntax, without leading 'a=').
     sdp_attr = "candidate:1 1 UDP 2130706431 192.0.2.1 5000 typ host"
     cand = IceCandidate.from_sdp(sdp_attr)
-    assert cand.foundation == "1"
+    # aioice includes the "candidate:" token in the foundation field; the full
+    # value "candidate:1" is what appears as the foundation token in the
+    # a=candidate line (RFC 8839 §5.1 treats the whole "candidate:<id>" as the
+    # foundation string, and to_sdp() outputs it verbatim).
+    assert cand.foundation == "candidate:1"
     assert cand.component == 1
     assert cand.transport == "UDP"
     assert cand.priority == 2130706431

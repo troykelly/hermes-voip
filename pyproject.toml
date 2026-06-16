@@ -35,6 +35,15 @@ ml = [
 media = [
     "cryptography==46.0.7",
 ]
+# WebRTC transport stack (ADR-0016): ICE agent (aioice, BSD-3-Clause) for PR-D.
+# Full extra will also include websockets (WSS signalling, PR-A) and
+# pyOpenSSL==25.3.0 (DTLS-SRTP keying, PR-C) once those PRs land.
+# Lazy-imported inside media/ice.py so the module loads without this extra.
+# The `webrtc` CI job installs this extra and runs the ICE connectivity tests.
+# Transitive: dnspython (ISC), ifaddr (MIT) — all permissive, zero copyleft.
+webrtc = [
+    "aioice==0.10.2",
+]
 
 # ---------------------------------------------------------------------------
 # Hermes plugin discovery (hermes_agent.plugins entry point group).

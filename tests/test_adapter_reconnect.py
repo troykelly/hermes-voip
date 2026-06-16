@@ -200,9 +200,7 @@ def _capture_cb(
     transport: _FakeReconnectTransport, kw: dict[str, object]
 ) -> _FakeReconnectTransport:
     """Store on_connection_lost callback on the fake transport and return it."""
-    transport._on_connection_lost_cb = kw.get(  # type: ignore[assignment]
-        "on_connection_lost"
-    )
+    transport._on_connection_lost_cb = kw.get("on_connection_lost")
     return transport
 
 
@@ -231,7 +229,7 @@ async def test_connection_lost_triggers_reestablish() -> None:
 
         initial_count = transport.connect_count
         # Simulate a connection drop via the adapter's own callback.
-        adapter._on_connection_lost(None)  # type: ignore[attr-defined]
+        adapter._on_connection_lost(None)
 
         # The adapter must attempt a reconnect: connect_count must increase.
         await _until(lambda: transport.connect_count > initial_count, timeout=3.0)
@@ -256,9 +254,7 @@ async def test_establish_failure_then_success_reconnects() -> None:
         t = _FakeReconnectTransport(fail_connect=fail)
         transport_instances.append(t)
         if call_count == 1:
-            t._on_connection_lost_cb = kw.get(  # type: ignore[assignment]
-                "on_connection_lost"
-            )
+            t._on_connection_lost_cb = kw.get("on_connection_lost")
         return t
 
     manager = _FakeManager()
@@ -274,7 +270,7 @@ async def test_establish_failure_then_success_reconnects() -> None:
         await adapter.connect()
 
         # Trigger a reconnect.
-        adapter._on_connection_lost(None)  # type: ignore[attr-defined]
+        adapter._on_connection_lost(None)
 
         # Wait for 3 transports (initial + fail + success).
         await _until(lambda: call_count >= 3, timeout=5.0)
@@ -298,9 +294,7 @@ async def test_consecutive_failures_emit_error_alert(
         call_count += 1
         if call_count == 1:
             t = _FakeReconnectTransport()
-            t._on_connection_lost_cb = kw.get(  # type: ignore[assignment]
-                "on_connection_lost"
-            )
+            t._on_connection_lost_cb = kw.get("on_connection_lost")
             return t
         # All reconnect attempts fail.
         return _FakeReconnectTransport(fail_connect=True)
@@ -322,7 +316,7 @@ async def test_consecutive_failures_emit_error_alert(
         await adapter.connect()
 
         # Trigger connection loss.
-        adapter._on_connection_lost(None)  # type: ignore[attr-defined]
+        adapter._on_connection_lost(None)
 
         def _alert_logged() -> bool:
             return any(
@@ -363,7 +357,7 @@ async def test_disconnect_stops_supervisor() -> None:
         count_after_disconnect = transport.connect_count
 
         # Fire connection-lost; supervisor must NOT reconnect after disconnect.
-        adapter._on_connection_lost(None)  # type: ignore[attr-defined]
+        adapter._on_connection_lost(None)
 
         # Give the loop a moment to run any stray task.
         await asyncio.sleep(0.05)
@@ -389,9 +383,7 @@ async def test_active_call_sink_reattached_on_reconnect() -> None:
         t = _FakeReconnectTransport()
         transports.append(t)
         if call_count == 1:
-            t._on_connection_lost_cb = kw.get(  # type: ignore[assignment]
-                "on_connection_lost"
-            )
+            t._on_connection_lost_cb = kw.get("on_connection_lost")
         return t
 
     manager = _FakeManager()
@@ -410,10 +402,10 @@ async def test_active_call_sink_reattached_on_reconnect() -> None:
         await adapter.connect()
 
         # Directly register a fake call session in the adapter's tracking dict.
-        adapter._call_sessions["call-id-1"] = fake_sink  # type: ignore[attr-defined]
+        adapter._call_sessions["call-id-1"] = fake_sink
 
         # Trigger reconnect.
-        adapter._on_connection_lost(None)  # type: ignore[attr-defined]
+        adapter._on_connection_lost(None)
 
         # Wait for a second transport to be created.
         await _until(lambda: len(transports) >= 2, timeout=3.0)

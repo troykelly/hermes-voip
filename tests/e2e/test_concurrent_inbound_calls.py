@@ -465,8 +465,13 @@ async def test_concurrent_inbound_calls_isolated_media_and_teardown() -> None:  
             endpoints[0].send_frames(g711_silence_frames(40))
 
             await _until(lambda: len(delivered_turns) >= 1, timeout=5.0)
-            assert delivered_turns == ["hello there"], (
+            # The delivered turn is the spotlighted per-mode preamble (ADR-0020)
+            # with the caller's transcript fenced as untrusted DATA.
+            assert len(delivered_turns) == 1, (
                 "call 0's speech→silence turn was not delivered exactly once"
+            )
+            assert "hello there" in delivered_turns[0], (
+                "call 0's transcript is missing from the delivered turn"
             )
 
             # Call 0's echo reply is synthesised (24→8 kHz) and sent as RTP — its
@@ -477,7 +482,7 @@ async def test_concurrent_inbound_calls_isolated_media_and_teardown() -> None:  
             for packet in reply_packets:
                 assert packet.payload_type == Codec.PCMU.value
                 assert len(packet.payload) == _SAMPLES_PER_FRAME_8K
-            assert "echo: hello there" in fake_tts.synth_texts
+            assert any("hello there" in t for t in fake_tts.synth_texts)
 
             # Calls 1 and 2 are still live (call 0's activity didn't end them).
             for call in calls[1:]:
@@ -506,7 +511,7 @@ async def test_concurrent_inbound_calls_isolated_media_and_teardown() -> None:  
             endpoints[1].send_frames(g711_speech_frames(30))
             endpoints[1].send_frames(g711_silence_frames(40))
             await _until(lambda: len(delivered_turns) >= 2, timeout=5.0)
-            assert delivered_turns[1] == "hello there", (
+            assert "hello there" in delivered_turns[1], (
                 "call 1 could not deliver a turn after call 0's teardown "
                 "(its engine/loop was collaterally damaged)"
             )

@@ -650,7 +650,12 @@ async def test_deliver_turn_routes_to_message_handler() -> None:
             break
         await asyncio.sleep(0.02)
 
-    assert received == ["hello from caller"]
+    # The delivered turn carries the spotlighted per-mode persona preamble
+    # (ADR-0020) wrapping the caller's transcript as untrusted data, so it
+    # contains the caller's words rather than equalling them verbatim.
+    assert len(received) == 1
+    assert "hello from caller" in received[0]
+    assert "UNTRUSTED_CALLER_TRANSCRIPT" in received[0]
 
 
 @pytest.mark.asyncio
@@ -683,7 +688,9 @@ async def test_deliver_turn_builds_voice_message_event() -> None:
 
     assert captured, "no event reached the handler"
     event = captured[0]
-    assert getattr(event, "text", None) == "voice turn"
+    # The text is the spotlighted persona preamble + the caller's transcript
+    # (ADR-0020); assert the transcript is present rather than a bare equal.
+    assert "voice turn" in getattr(event, "text", "")
     assert getattr(event, "message_type", None) == MessageType.VOICE
 
 
@@ -733,7 +740,11 @@ async def test_each_call_gets_distinct_guard_state() -> None:
         ),
         patch(
             "hermes_voip.adapter.GuardSessionState",
-            side_effect=lambda call_id: MagicMock(call_id=call_id),
+            # The adapter constructs GuardSessionState(call_id, privileged=...)
+            # since ADR-0020; accept the kwarg so the call handler does not error.
+            side_effect=lambda call_id, *, privileged=True: MagicMock(
+                call_id=call_id, privileged=privileged
+            ),
         ) as mock_guard_state,
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),

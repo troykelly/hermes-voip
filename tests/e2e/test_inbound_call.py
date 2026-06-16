@@ -633,11 +633,20 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
             gateway.rtp.send_frames(g711_speech_frames(30))
             gateway.rtp.send_frames(g711_silence_frames(40))
 
-            # Exactly one turn reaches the echo agent.
+            # Exactly one turn reaches the echo agent. The delivered text is the
+            # spotlighted per-mode persona preamble (ADR-0020) with the caller's
+            # transcript fenced as untrusted DATA — so we assert one turn carrying
+            # the caller's words inside the untrusted-data marker, not a bare equal.
             await _until(lambda: len(delivered_turns) >= 1, timeout=5.0)
-            assert delivered_turns == ["hello there"], (
+            assert len(delivered_turns) == 1, (
                 "the caller's speech→silence turn was not delivered exactly once "
                 "(bug 3 would raise a VAD rate ValueError before any turn lands)"
+            )
+            assert "hello there" in delivered_turns[0], (
+                "the caller's transcript is missing from the delivered turn"
+            )
+            assert "UNTRUSTED_CALLER_TRANSCRIPT" in delivered_turns[0], (
+                "the caller transcript is not spotlighted as untrusted data (ADR-0020)"
             )
             assert fake_asr.saw_speech, "the ASR never saw the caller's speech frames"
 
@@ -658,7 +667,10 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
                 assert len(packet.payload) == _SAMPLES_PER_FRAME_8K, (
                     "the agent reply RTP is not 20 ms of 8 kHz G.711 (bug 2)"
                 )
-            assert "echo: hello there" in fake_tts.synth_texts, (
+            # The echo agent mirrors the (now spotlighted) turn, so the synthesised
+            # reply contains the caller's transcript rather than equalling
+            # "echo: hello there" verbatim.
+            assert any("hello there" in t for t in fake_tts.synth_texts), (
                 "the agent reply text was not handed to the TTS for synthesis"
             )
 

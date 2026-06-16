@@ -18,7 +18,8 @@ All fakes are synchronous; no real timing, threads, or network involved.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+import threading
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from typing import Final
 
 import pytest
@@ -31,6 +32,7 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState, ToolRisk
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
+from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
 
 # ---------------------------------------------------------------------------
 # Shared constants for fakes
@@ -116,6 +118,9 @@ class _FakeTtsStream:
     async def cancel(self) -> None:
         self._cancelled = True
         self.cancel_called = True
+
+    async def aclose(self) -> None:
+        self._cancelled = True
 
 
 class _FakeTTS:
@@ -803,6 +808,9 @@ class _RecordingTtsStream:
         self._cancelled = True
         self.cancel_called = True
 
+    async def aclose(self) -> None:
+        self._cancelled = True
+
 
 class _RecordingTTS:
     """StreamingTTS fake recording every synthesise() call's text + frames out."""
@@ -921,7 +929,7 @@ class _GatedGreetingTtsStream:
     async def __anext__(self) -> PcmFrame:
         return await self._gen.__anext__()
 
-    async def _iter(self) -> AsyncIterator[PcmFrame]:
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
         # Emit one frame so RTP starts, then park until cancel()/resume.
         if self._frames:
             yield self._frames[0]
@@ -937,6 +945,12 @@ class _GatedGreetingTtsStream:
     async def cancel(self) -> None:
         self.cancel_called = True
         self._resume.set()
+
+    async def aclose(self) -> None:
+        # Unblock the parked generator and close it (consumer-task teardown).
+        self.cancel_called = True
+        self._resume.set()
+        await self._gen.aclose()
 
 
 class _GatedGreetingTTS:
@@ -1016,7 +1030,7 @@ class _SlowTtsStream:
     async def __anext__(self) -> PcmFrame:
         return await self._gen.__anext__()
 
-    async def _iter(self) -> AsyncIterator[PcmFrame]:
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
         for frame in self._frames:
             # cooperative yield so a rival speak() can run; cancel() may flip the
             # flag across the await. Re-read into a fresh local each time so the
@@ -1035,6 +1049,10 @@ class _SlowTtsStream:
     async def cancel(self) -> None:
         self._cancelled = True
         self.cancel_called = True
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        await self._gen.aclose()
 
 
 class _SingleStreamTTS:
@@ -1142,3 +1160,395 @@ async def test_first_inbound_onset_cancels_greeting_without_gating() -> None:
 
     assert tts.last_stream is not None
     assert tts.last_stream.cancel_called is True
+
+
+# ---------------------------------------------------------------------------
+# LIVE BUG 1 — the inbound chain must be rate-consistent at the engine's
+# telephony rate. The RtpMediaTransport yields 8 kHz G.711 frames
+# (inbound_sample_rate == 8000); the VAD + endpointer must accept them at that
+# exact rate. A 16 kHz detector against an 8 kHz stream raises
+# ``ValueError: frame rate 8000 != detector rate 16000`` inside the pump, fails
+# the TaskGroup, and cancels the greeting before it finishes — the caller hears
+# silence. silero-vad runs natively at 8 kHz, so the inbound chain stays at the
+# wire rate (the STT resamples 8->16 kHz internally; ADR-0017).
+# ---------------------------------------------------------------------------
+
+
+_G711_INBOUND_RATE: Final[int] = 8_000
+
+
+def _silence_frame_8k(index: int) -> PcmFrame:
+    """A silent 8 kHz PCM16 frame (256 samples = one 32 ms silero window at 8 kHz)."""
+    return PcmFrame(
+        samples=bytes(512),
+        sample_rate=_G711_INBOUND_RATE,
+        monotonic_ts_ns=index * 32_000_000,
+    )
+
+
+class _Transport8k(_FakeTransport):
+    """MediaTransport fake at the engine's real G.711 inbound rate (8000 Hz)."""
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+
+def _make_vad_8k() -> VoiceActivityDetector:
+    """A silero VAD at the engine inbound rate (8 kHz) with a silent fake model."""
+
+    def _silent_model(window_pcm16: bytes, sample_rate: int) -> float:
+        _ = window_pcm16, sample_rate
+        return 0.0
+
+    return VoiceActivityDetector(model=_silent_model, sample_rate_hz=_G711_INBOUND_RATE)
+
+
+def _make_speaking_vad_8k() -> VoiceActivityDetector:
+    """An 8 kHz VAD whose model always returns 1.0 → ONSET on the first window."""
+
+    def _voiced_model(window_pcm16: bytes, sample_rate: int) -> float:
+        _ = window_pcm16, sample_rate
+        return 1.0
+
+    return VoiceActivityDetector(model=_voiced_model, sample_rate_hz=_G711_INBOUND_RATE)
+
+
+def _make_endpointer_8k() -> Endpointer:
+    """An endpointer at the engine inbound rate (8 kHz)."""
+    return Endpointer(silence_ms=500, sample_rate_hz=_G711_INBOUND_RATE)
+
+
+@pytest.mark.asyncio
+async def test_inbound_8khz_stream_drives_vad_and_one_turn() -> None:
+    """An 8 kHz inbound stream feeds VAD->endpoint->ASR with NO rate ValueError.
+
+    Reproduces the live inbound topology: the transport yields 8 kHz G.711
+    frames, the VAD + endpointer are built at that same engine rate, and the ASR
+    finalises exactly one end-of-turn. The pump must feed every 8 kHz frame into
+    the VAD without raising, and the single finalised turn must deliver exactly
+    once. Before the fix the adapter built the VAD/endpointer at 16 kHz, so the
+    very first 8 kHz frame raised ``ValueError: frame rate 8000 != detector rate
+    16000`` and no turn was ever delivered.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # Several real 8 kHz windows so the VAD actually scores them (one window is
+    # 256 samples = 512 bytes at 8 kHz; each frame here is exactly one window).
+    frames = [_silence_frame_8k(i) for i in range(4)]
+
+    loop = CallLoop(
+        transport=_Transport8k(frames),
+        asr=_FakeASR([("caller said hello", True, True)]),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",
+    )
+
+    # No ValueError must escape run(); the single end-of-turn delivers once.
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    assert delivered == ["caller said hello"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_rate_mismatch_is_what_crashes_the_pump() -> None:
+    """Root-cause proof (rule 25): a 16 kHz VAD vs an 8 kHz stream crashes run().
+
+    This pins the exact failure the fix removes: building the detector at the
+    wrong rate (16 kHz, the old adapter default) and feeding it the engine's real
+    8 kHz frames raises the live ``ValueError`` from inside the pump, which the
+    TaskGroup surfaces. The companion test above proves the rate-consistent build
+    does NOT raise — together they show the mismatch, not the CallLoop, is the
+    defect, and that matching the rate fixes it.
+    """
+    frames = [_silence_frame_8k(0)]
+
+    # Deliberately mis-built at 16 kHz against the 8 kHz transport.
+    loop = CallLoop(
+        transport=_Transport8k(frames),
+        asr=_FakeASR([]),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),  # 16 kHz default — the bug
+        endpointer=_make_endpointer(),  # 16 kHz default
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",
+    )
+
+    with pytest.raises(BaseExceptionGroup) as excinfo:
+        await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    matched, _rest = excinfo.value.split(ValueError)
+    assert matched is not None
+    value_errors = [e for e in matched.exceptions if isinstance(e, ValueError)]
+    assert any("frame rate 8000 != detector rate 16000" in str(e) for e in value_errors)
+
+
+# ---------------------------------------------------------------------------
+# LIVE BUG 2 — async-generator teardown lifecycle. The pump iterates the
+# transport's ``inbound_audio()`` async generator; on shutdown the consuming
+# task must drive that generator's close on its OWN task (cancel + unwind), never
+# leave it suspended for a foreign ``aclose()`` or the GC finalizer to close
+# while a pull is still running (``RuntimeError: aclose(): asynchronous generator
+# is already running``). The real engine generator awaits between yields, so a
+# cancellation lands at an inner await — the regression case.
+# ---------------------------------------------------------------------------
+
+
+class _EngineLikeTransport(_FakeTransport):
+    """A transport whose ``inbound_audio()`` awaits between yields (like RTP).
+
+    The real :class:`RtpMediaTransport` parks its inbound generator at
+    ``await self._next_datagram()`` between yields, so a cancellation of the pump
+    lands at an *inner* await, not at the ``yield``. This fake reproduces that by
+    sleeping each iteration. The generator's ``finally`` records that it ran, so
+    the teardown test can assert the generator was closed (its ``finally`` ran),
+    not left dangling.
+    """
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self._n = 0
+        self.gen_closed = False
+        self.gen_started = asyncio.Event()
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            try:
+                while True:
+                    self.gen_started.set()
+                    # Inner await between yields — the engine parks here.
+                    await asyncio.sleep(0.005)
+                    self._n += 1
+                    yield _silence_frame_8k(self._n)
+            finally:
+                self.gen_closed = True
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_teardown_mid_iteration_no_aclose_race(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """Cancelling run() mid-iteration tears the inbound generator down cleanly.
+
+    Runs the loop against an engine-like transport whose inbound generator parks
+    at an inner await between yields, then cancels run() while the pump is
+    iterating. The cancellation must propagate as a clean ``CancelledError``, the
+    inbound generator must be closed (its ``finally`` ran), no task must be left
+    leaked, and — the live symptom — there must be NO ``RuntimeWarning`` (e.g.
+    ``aclose(): asynchronous generator is already running`` surfaced as a warning,
+    or an un-awaited coroutine/generator). All warnings are captured and asserted
+    clean. The pump iterates ``inbound_audio()`` under ``contextlib.aclosing`` so
+    it closes the generator on its own task as it unwinds.
+    """
+    tasks_before = set(asyncio.all_tasks())
+    transport = _EngineLikeTransport()
+
+    block_forever = asyncio.Event()
+
+    async def stuck_deliver(text: str) -> None:
+        _ = text
+        await block_forever.wait()
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_SlowDrainASR(),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=stuck_deliver,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Wait until the inbound generator is actually producing (pump is iterating).
+    await asyncio.wait_for(transport.gen_started.wait(), timeout=5.0)
+    await asyncio.sleep(0.01)
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    # The inbound generator was closed (its finally ran), not left dangling.
+    assert transport.gen_closed is True
+
+    # No tasks leaked by the cancelled run.
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks after cancellation: {leaked}"
+
+    # No "aclose(): asynchronous generator is already running" RuntimeError, and
+    # no RuntimeWarning (un-awaited coroutine / generator-already-running) leaked.
+    runtime_warnings = [
+        w for w in recwarn.list if issubclass(w.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == [], (
+        "unexpected RuntimeWarnings during teardown: "
+        f"{[str(w.message) for w in runtime_warnings]}"
+    )
+
+
+class _CooperativePcmTTS:
+    """A real :class:`PcmFrameStream` over a pure-async cooperative byte source.
+
+    This exercises the *real* barge-in teardown path — not a fake. ``synthesize``
+    returns a genuine ``PcmFrameStream`` whose per-segment byte source yields PCM
+    chunks while polling the shared stop flag. It sets ``parked`` after yielding
+    its first chunk, so a test can hold off the barge-in trigger until the
+    greeting consumer (``_play`` on its own task) is actually parked inside the
+    frame generator's ``__anext__`` — the precise moment the cross-task aclose
+    race fires. The point is to prove the production ``PcmFrameStream.cancel()``
+    does NOT ``aclose()`` the running frame generator from the (different) pump
+    task — which would raise ``RuntimeError: aclose(): asynchronous generator is
+    already running``. A ``cancel()`` that acloses the running generator makes
+    this test fail.
+    """
+
+    def __init__(self) -> None:
+        self.last_stop: threading.Event | None = None
+        self.parked = asyncio.Event()
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = voice
+        stop = threading.Event()
+        self.last_stop = stop
+
+        def _open_segment(sentence: str) -> SegmentSource:
+            _ = sentence
+
+            async def _chunks() -> AsyncIterator[bytes]:
+                # First chunk goes out immediately; after the consumer pulls it
+                # and parks for the next, signal `parked` so the test can fire the
+                # barge-in exactly when _play is inside the frame __anext__.
+                first = True
+                for _ in range(200):
+                    if stop.is_set():
+                        return
+                    if first:
+                        yield bytes(160)
+                        self.parked.set()
+                        first = False
+                        continue
+                    await asyncio.sleep(0.005)
+                    yield bytes(160)
+
+            return SegmentSource(chunks=_chunks())
+
+        return PcmFrameStream(
+            text=text,
+            open_segment=_open_segment,
+            sample_rate=_G711_INBOUND_RATE,
+            stop=stop,
+        )
+
+
+class _BargeInTransport(_FakeTransport):
+    """8 kHz transport that yields its single speech frame only after `release`.
+
+    The greeting must be parked inside the frame generator's ``__anext__`` before
+    the pump processes the speech frame (and fires barge-in), or the cross-task
+    aclose race cannot occur. The test sets ``release`` once the TTS reports the
+    greeting is parked, then this transport yields the one speech frame.
+    """
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.release = asyncio.Event()
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        release = self.release
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            await release.wait()
+            # One speech frame, then the generator returns so the loop ends
+            # naturally once barge-in has fired and the greeting has stopped.
+            yield _silence_frame_8k(0)
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_barge_in_during_greeting_no_aclose_race(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """Barge-in on the greeting must not raise the cross-task aclose RuntimeError.
+
+    This is the live regression guard for ``RuntimeError: aclose(): asynchronous
+    generator is already running``. The greeting plays a *real* ``PcmFrameStream``
+    on its own task; the pump (a different task) sees a speech ONSET on the first
+    8 kHz frame and calls ``barge_in()`` → ``stream.cancel()`` while the greeting
+    is parked inside the frame generator's ``__anext__`` (the transport withholds
+    the speech frame until the greeting reports it is parked). ``cancel()`` must
+    stop the stream via the stop flag — never ``aclose()`` the running generator
+    from the pump task. run() must complete with no exception and no
+    ``RuntimeWarning``; the greeting's stop flag must be set (barge-in took
+    effect). Mutating ``cancel()`` to aclose the running generator makes this fail.
+    """
+    transport = _BargeInTransport()
+    tts = _CooperativePcmTTS()
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_speaking_vad_8k(),  # ONSET on the first 8 kHz window
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="Hello there, this greeting plays while the caller barges in.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Wait until the greeting consumer is parked inside the frame __anext__, THEN
+    # release the speech frame so the pump's barge-in lands on a running pull.
+    await asyncio.wait_for(tts.parked.wait(), timeout=5.0)
+    await asyncio.sleep(0)
+    transport.release.set()
+
+    # No exception (in particular no aclose RuntimeError) must escape run().
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    # Barge-in took effect: the greeting stream was stopped.
+    assert tts.last_stop is not None
+    assert tts.last_stop.is_set() is True
+
+    runtime_warnings = [
+        w for w in recwarn.list if issubclass(w.category, RuntimeWarning)
+    ]
+    assert runtime_warnings == [], (
+        "unexpected RuntimeWarnings during barge-in teardown: "
+        f"{[str(w.message) for w in runtime_warnings]}"
+    )

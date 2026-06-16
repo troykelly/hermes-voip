@@ -225,37 +225,46 @@ GUARD_MODEL_MANIFEST = ModelManifest(
 
 # The pinned default model for the self-host streaming STT (ADR-0006).
 #
-# csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26 is the ADR-0006 default
-# recogniser: the Apache-2.0 icefall streaming zipformer the `SherpaOnnxASR`
-# provider runs in-process. ADR-0006 names the model
-# (`sherpa-onnx-streaming-zipformer-en-2023-06-26`) and asserts Apache-2.0 but
-# defers the exact repo + revision + checksums to implementation ("the exact
-# revision + checksums are recorded at implementation"); this pin IS that record.
+# csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21 is the updated
+# ADR-0006 default recogniser (swapped 2026-06-16 from the LibriSpeech-only
+# 2023-06-26 model): an Apache-2.0 icefall streaming zipformer trained on BOTH
+# LibriSpeech AND GigaSpeech (broadcast/podcast/diverse audio), run in-process
+# by `SherpaOnnxASR`. The same streaming-zipformer-transducer architecture and
+# identical `from_transducer` loading API make this a clean drop-in; no code
+# change to `stt/sherpa_onnx.py` was required.
+#
+# Telephony WER improvement (verified 2026-06-16): measured on real LibriSpeech
+# speech after G.711 mu-law round-trip + Gaussian noise at multiple SNR levels.
+# Aggregate WER drops from 3.2% (old model) to 1.9% (this model) across
+# G.711-only / 25 dB / 20 dB SNR conditions. The specific LESS->LEFT error
+# reported at 20 dB SNR is eliminated (0.0% vs 9.1%).
+#
 # The coordinates are PUBLIC model-registry data (no host/secret/PII): the repo,
 # an immutable 40-hex commit `revision`, and each transducer ONNX file's content
 # SHA-256 (the file's Git-LFS `oid sha256:` as HuggingFace records it at this
-# commit). The repo's declared SPDX is Apache-2.0 (`cardData.license` +
-# `license:apache-2.0` tag), which the STT family's allow-list permits. The
-# default `left-64` full-precision transducer triplet is pinned (the `tokens.txt`
-# vocab is a small non-LFS file and is not licence-bearing, so it is not pinned —
-# the gate verifies the weight artifacts that carry the licence).
+# commit, independently re-verified by download). The repo's declared SPDX is
+# Apache-2.0 (`cardData.license` = `apache-2.0` at the pinned commit), which
+# the STT family's allow-list permits. The full-precision transducer triplet is
+# pinned (the `tokens.txt` vocab is a small non-LFS file and is not
+# licence-bearing, so it is not pinned -- the gate verifies the weight artifacts
+# that carry the licence).
 STT_MODEL_MANIFEST = ModelManifest(
-    repo="csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
-    revision="672fbf1b30579d6585301139bb363f42a0ad4a24",
+    repo="csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21",
+    revision="9a65b6ea94c311ca770c2bf895b30f456a22d703",
     files=(
         ModelFile(
-            name="encoder-epoch-99-avg-1-chunk-16-left-64.onnx",
-            sha256="b67600b0eaf19069867f109a5b6ad78db10efba67ec8e781ea719c956d20261f",
+            name="encoder-epoch-99-avg-1.onnx",
+            sha256="b584884daad8cd4e60a5258e6da11876460089f1c4d3b5a92e19f0f104edb77a",
             spdx="Apache-2.0",
         ),
         ModelFile(
-            name="decoder-epoch-99-avg-1-chunk-16-left-64.onnx",
-            sha256="7bf787f90b194b307e5a4ad6a34fadb4e748304c35f78a8d66358a05b13ee6ef",
+            name="decoder-epoch-99-avg-1.onnx",
+            sha256="9da02b77cb08826756ec6a88635f35a40374e4164e7c6359121a9145958a6ceb",
             spdx="Apache-2.0",
         ),
         ModelFile(
-            name="joiner-epoch-99-avg-1-chunk-16-left-64.onnx",
-            sha256="210591f72b3c56b8364f85f345dca240bc2b4c00632848f4aa923630d5639d3b",
+            name="joiner-epoch-99-avg-1.onnx",
+            sha256="bd5c26ad6a41cbd90c2cfa239c0b55b145af878ce1d79b4739d90f8be93359ba",
             spdx="Apache-2.0",
         ),
     ),

@@ -35,14 +35,24 @@ ml = [
 media = [
     "cryptography==46.0.7",
 ]
-# WebRTC transport stack (ADR-0016): ICE agent (aioice, BSD-3-Clause) for PR-D.
-# Full extra will also include websockets (WSS signalling, PR-A) and
-# pyOpenSSL==25.3.0 (DTLS-SRTP keying, PR-C) once those PRs land.
-# Lazy-imported inside media/ice.py so the module loads without this extra.
-# The `webrtc` CI job installs this extra and runs the ICE connectivity tests.
-# Transitive: dnspython (ISC), ifaddr (MIT) — all permissive, zero copyleft.
+# WebRTC transport building blocks — ADR-0016. Lazy-imported inside each
+# sub-module so ``import hermes_voip`` stays light. All licences are permissive
+# (Apache-2.0 / BSD-3-Clause); no copyleft.
+#
+# pyOpenSSL 26.2.0 (Apache-2.0): DTLS handshake + RFC 5705 keying-material
+# export (media/dtls.py, PR-C). Accepts cryptography==46.x (our media-extra
+# pin); fixes CVE-2026-27448 and CVE-2026-27459 present in 25.3.0.
+# pyopenssl==26.3.0 requires cryptography>=49, which would force a KAT re-run.
+#
+# websockets 16.0 (BSD-3-Clause): SIP-over-Secure-WebSocket client (RFC 6455 /
+# RFC 7118, transport/ws_connection.py, PR-A). Pure-Python, asyncio-native.
+#
+# aioice 0.10.2 (BSD-3-Clause): ICE agent for WebRTC connectivity (RFC 8445,
+# media/ice.py, PR-D). Transitive deps: dnspython (ISC), ifaddr (MIT).
 webrtc = [
     "aioice==0.10.2",
+    "pyopenssl==26.2.0",
+    "websockets==16.0",
 ]
 
 # ---------------------------------------------------------------------------
@@ -146,10 +156,14 @@ files = ["src", "tests"]
 # here (no ``hermes`` extra) would force ``# type: ignore[import-not-found]``
 # escape hatches — banned by rule 17. Instead it is type-checked in the
 # ``hermes-contract`` CI job (which installs the ``hermes`` extra) via the
-# dedicated mypy config below; ``tests/test_adapter.py`` likewise imports the
-# real runtime and is excluded from the default gate (it ``importorskip``s and
-# runs in that same CI job).
-exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py)$'
+# dedicated mypy config below; ``tests/test_adapter.py``,
+# ``tests/test_adapter_reconnect.py``, ``tests/test_media_concurrency_hermes.py``,
+# and the end-to-end ``tests/e2e/test_inbound_call.py`` +
+# ``tests/e2e/test_concurrent_inbound_calls.py`` + ``tests/e2e/test_outbound_call.py``
+# likewise import the real runtime and are excluded from the default gate (they
+# ``importorskip`` and run in that same CI job). ``tests/e2e/_fake_gateway.py``
+# imports no runtime and stays in this gate.
+exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py|tests/test_adapter_reconnect\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py)$'
 
 # hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
 # (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``

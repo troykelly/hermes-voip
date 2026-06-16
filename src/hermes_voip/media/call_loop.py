@@ -79,11 +79,15 @@ honoured without the call loop needing to know tool semantics.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import math
+import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from typing import Final
 
+from hermes_voip.media.audio import generate_tone_frames
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import SpeechEdge, VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR
@@ -118,6 +122,51 @@ class _EndOfStream(Enum):
 
 #: The sole end-of-stream marker value (see :class:`_EndOfStream`).
 _END_OF_STREAM: Final[_EndOfStream] = _EndOfStream.MARKER
+
+
+class _ToneStream:
+    """``TtsStream``-compatible iterator that emits pure-sine 8 kHz PcmFrames.
+
+    A thin adapter around :func:`~hermes_voip.media.audio.generate_tone_frames`
+    that satisfies the ``TtsStream`` protocol (``__aiter__`` / ``__anext__`` /
+    ``flush`` / ``cancel`` / ``aclose``) without touching any TTS provider.
+    Because the frames are already at 8 kHz they go through the fast path in
+    ``RtpMediaTransport.send_audio`` (no resample), so the tone validates the
+    G.711 encode + UDP send layer in isolation from TTS and sample-rate
+    conversion.
+
+    ``cancel()`` sets a stop flag that causes ``__anext__`` to raise
+    ``StopAsyncIteration`` on the next pull — identical to the barge-in
+    contract of the real TTS streams.  ``aclose()`` is idempotent and sets the
+    same flag so ``contextlib.aclosing`` in ``_play`` closes the generator
+    safely on every exit path.
+    """
+
+    def __init__(self, *, duration_secs: float) -> None:
+        self._iter = generate_tone_frames(duration_secs=duration_secs)
+        self._stopped = False
+
+    def __aiter__(self) -> _ToneStream:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        if self._stopped:
+            raise StopAsyncIteration
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def flush(self) -> None:
+        """No-op: all frames are pre-computed; nothing is buffered."""
+
+    async def cancel(self) -> None:
+        """Stop yielding immediately (barge-in)."""
+        self._stopped = True
+
+    async def aclose(self) -> None:
+        """Idempotent teardown; sets the stop flag so further pulls are safe."""
+        self._stopped = True
 
 
 def gate_voip_tool(
@@ -186,9 +235,14 @@ class CallLoop:
         greeting: The opening line spoken the instant the loop starts (before any
             inbound audio). Empty string disables the greeting. Defaults to empty
             so a caller that does not want one need not pass it.
+        tone_secs: When positive, the call opening plays a generated 440 Hz sine
+            tone for this many seconds at 8 kHz directly, bypassing TTS +
+            resample entirely (``HERMES_VOIP_TEST_TONE`` env var).  When set,
+            ``greeting`` is ignored.  ``0.0`` (the default) means normal
+            operation.
     """
 
-    def __init__(  # noqa: PLR0913 — 11-arg constructor; all keyword-only
+    def __init__(  # noqa: PLR0913 — 12-arg constructor; all keyword-only
         self,
         *,
         transport: MediaTransport,
@@ -202,6 +256,7 @@ class CallLoop:
         voice: str,
         call_id: str,
         greeting: str = "",
+        tone_secs: float = 0.0,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -215,6 +270,7 @@ class CallLoop:
         self._voice = voice
         self._call_id = call_id
         self._greeting = greeting
+        self._tone_secs = tone_secs
         # The currently-active TtsStream, or None when the agent is silent.
         # Written synchronously (``synthesize`` is a sync factory) before any
         # await, so a single ``speak``/greeting always registers its stream
@@ -226,7 +282,7 @@ class CallLoop:
         # a following agent reply never interleave frames on the wire.
         self._playout_lock = asyncio.Lock()
 
-    async def run(self) -> None:
+    async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
         """Run the duplex loop until the transport's inbound stream ends.
 
         Runs three one-directional tasks under an :class:`asyncio.TaskGroup`
@@ -254,9 +310,40 @@ class CallLoop:
             maxsize=_TRANSCRIPT_QUEUE_MAX
         )
 
+        # End-of-turn counter shared between _pump and _asr (ADR-0008 §wiring).
+        # The endpointer owns the turn boundary; the ASR recogniser does not
+        # (SherpaOnnxASR always yields end_of_turn=False). When the endpointer
+        # fires, _pump increments this counter; _asr decrements it once per
+        # is_final transcript (if > 0) and delivers the transcript as end-of-turn.
+        #
+        # Why int instead of asyncio.Event (W2 fix): asyncio.Event is boolean —
+        # two endpointer fires before the ASR produces a is_final collapse to
+        # one signal, so only ONE turn is delivered. An int counter lets each
+        # fire be consumed by exactly one is_final: N fires → N turns.
+        #
+        # Both _pump and _asr run on the same asyncio event loop and never yield
+        # between the int read and write, so no lock is needed: asyncio tasks are
+        # co-operatively scheduled and only yield at explicit ``await`` points.
+        _eot_count: int = 0
+
         async def _pump() -> None:
-            """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded)."""
+            """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded).
+
+            The pump is the SOLE iterator of ``transport.inbound_audio()``, so it
+            owns that generator's lifecycle: a plain ``async for`` closes it on
+            this task on every exit path — normal end, an error raised in the loop
+            body (e.g. a VAD rate mismatch), or cancellation when the TaskGroup
+            tears the loop down — because ``async for`` drives the generator's
+            ``aclose`` as it unwinds. The generator is therefore never left
+            suspended for a foreign ``aclose()`` (which would race a running
+            ``__anext__`` and raise ``RuntimeError: aclose(): asynchronous
+            generator is already running``). The cross-task cancel that the loop
+            *does* perform — barge-in cancelling the TTS stream — goes through
+            ``TtsStream.cancel`` (a stop flag, never ``aclose`` from another task).
+            """
+            nonlocal _eot_count
             window_index = 0
+            frames_received = 0
             async for frame in self._transport.inbound_audio():
                 for vad_event in self._vad.feed(frame):
                     self._endpointer.on_event(vad_event)
@@ -265,16 +352,62 @@ class CallLoop:
                         vad_event.edge is SpeechEdge.ONSET
                         and self._active_tts_stream is not None
                     ):
+                        _log.debug(
+                            "pump: speech ONSET at window %d → barge-in", window_index
+                        )
                         await self.barge_in()
-                self._endpointer.advance(window_index)
+                    else:
+                        _log.debug(
+                            "pump: VAD %s at window %d",
+                            vad_event.edge.name,
+                            window_index,
+                        )
+                if self._endpointer.advance(window_index):
+                    # ADR-0008: endpointer owns the turn boundary. Increment the
+                    # EOT counter so the ASR task's next is_final transcript is
+                    # delivered as an end-of-turn. Each increment is consumed by
+                    # exactly one decrement in _asr (W2 fix: int counter counts
+                    # fires; Event is boolean and loses duplicates).
+                    _eot_count += 1
+                    _log.info(
+                        "pump: end-of-turn at window %d (frames=%d)",
+                        window_index,
+                        frames_received,
+                    )
                 window_index += 1
+                frames_received += 1
+                if frames_received % 50 == 0:
+                    _log.debug(
+                        "pump: %d frames received, window=%d",
+                        frames_received,
+                        window_index,
+                    )
                 await audio_q.put(frame)
             # End-of-stream marker on the normal path (not a finally): the ASR
             # task is still draining audio_q, so this put cannot block forever.
+            _log.debug("pump: inbound stream ended after %d frames", frames_received)
             await audio_q.put(_END_OF_STREAM)
 
         async def _asr() -> None:
-            """audio_q → asr.stream(...) → transcript_q (bounded)."""
+            """audio_q → asr.stream(...) → transcript_q (bounded).
+
+            ``_audio_iter`` is an async generator this task creates and hands to
+            ``asr.stream``. The ``async for`` over the recogniser output closes on
+            this task when the stream ends, errors, or is cancelled; the provider
+            owns its own teardown of the audio iterator it consumes (the
+            ``StreamingASR`` contract: it drains ``audio`` until exhausted and the
+            ``asr.stream`` result is only an
+            :class:`~collections.abc.AsyncIterator`, so it is consumed with a
+            plain ``async for`` — the protocol does not promise ``aclose``).
+
+            End-of-turn wiring (ADR-0008): the recogniser always yields
+            ``end_of_turn=False``; the turn boundary comes from the endpointer via
+            the ``_eot_count`` counter.  When a transcript is final, we check
+            ``_eot_count``: if > 0, decrement and deliver as end-of-turn.  The
+            recogniser's own ``end_of_turn`` field is still honoured (fused
+            engines like Deepgram Flux set it natively), so this is additive.
+            """
+            nonlocal _eot_count
 
             async def _audio_iter() -> AsyncIterator[PcmFrame]:
                 while True:
@@ -283,9 +416,36 @@ class CallLoop:
                         return
                     yield item
 
+            prev_text = ""
             async for transcript in self._asr.stream(_audio_iter()):
-                if transcript.is_final and transcript.end_of_turn:
-                    await transcript_q.put(transcript.text)
+                if transcript.text != prev_text:
+                    _log.debug("asr: hypothesis %r", transcript.text)
+                    prev_text = transcript.text
+                if transcript.is_final:
+                    # Check the endpointer's end-of-turn counter (ADR-0008): the
+                    # recogniser always returns end_of_turn=False; the endpointer
+                    # increments _eot_count when trailing silence fires. We
+                    # consume one count (non-blocking) per is_final — each
+                    # decrement matches exactly one endpointer fire, so N fires
+                    # yield N turns (W2 fix: was asyncio.Event which is boolean
+                    # and collapses multiple fires before the first is_final).
+                    # Both tasks are on the same event loop: no lock needed
+                    # (asyncio is single-threaded; there is no yield between the
+                    # read and the write).
+                    eot_from_endpointer: bool
+                    if _eot_count > 0:
+                        _eot_count -= 1
+                        eot_from_endpointer = True
+                    else:
+                        eot_from_endpointer = False
+                    if eot_from_endpointer or transcript.end_of_turn:
+                        _log.debug(
+                            "asr: delivering turn %r (eot_endpointer=%s, eot_asr=%s)",
+                            transcript.text,
+                            eot_from_endpointer,
+                            transcript.end_of_turn,
+                        )
+                        await transcript_q.put(transcript.text)
             await transcript_q.put(_END_OF_STREAM)
 
         async def _delivery() -> None:
@@ -296,23 +456,31 @@ class CallLoop:
                     return
                 await self._screen_and_deliver(item)
 
-        # Optional one-shot greeting: synthesise + REGISTER it synchronously here,
-        # before the TaskGroup starts the pump, so a caller speech onset on the
-        # very first inbound frame already sees an active stream and barges in
-        # (the pump task, created below, only runs once this coroutine awaits the
-        # TaskGroup — by then the greeting stream is registered). The greeting is
-        # then played by its own task so it runs concurrently with the pump and
-        # never blocks inbound audio (NAT-latch rationale: ADR-0002).
+        # Optional one-shot opening: either a diagnostic tone (when tone_secs > 0)
+        # or the TTS greeting (when greeting is non-empty). Both are registered
+        # synchronously here, before the TaskGroup starts the pump, so a caller
+        # speech onset on the very first inbound frame already sees an active
+        # stream and barges in. The opening is then played by its own task so it
+        # runs concurrently with the pump and never blocks inbound audio
+        # (NAT-latch rationale: ADR-0002).
         #
-        # A greeting failure is intentionally FATAL to the call: it runs as a
-        # TaskGroup child (or raises synchronously here), so a synth/send error
+        # A tone/greeting failure is intentionally FATAL to the call: it runs as
+        # a TaskGroup child (or raises synchronously here), so a synth/send error
         # propagates and cancels the loop rather than being swallowed (rule 37).
-        # The rationale is causal, not just policy — if the greeting cannot emit
+        # The rationale is causal, not just policy — if the opening cannot emit
         # RTP then a NAT'd gateway never latches, so the return media path never
-        # opens and the call is already dead; failing fast surfaces it. (This is
-        # deliberately stricter than a mid-call agent reply, which the adapter
-        # degrades to a failed send so one bad turn does not drop a live call.)
-        greeting_stream = self._begin_greeting() if self._greeting else None
+        # opens and the call is already dead; failing fast surfaces it.
+        #
+        # Tone path: when tone_secs > 0, bypass TTS + resample entirely by
+        # playing a generated 440 Hz sine tone directly at 8 kHz through the
+        # existing _play path (uses the real send_audio, so it validates the RTP
+        # encode/send path independently of the TTS layer — ADR-0002 §diagnostic).
+        if self._tone_secs > 0:
+            greeting_stream: TtsStream | None = self._begin_tone()
+        elif self._greeting:
+            greeting_stream = self._begin_greeting()
+        else:
+            greeting_stream = None
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_pump())
@@ -371,20 +539,51 @@ class CallLoop:
         prior ``_play`` exits its loop promptly and releases the lock to this
         one. ``on_first_frame`` fires once, right after the first frame is
         actually sent (so a cancelled-before-any-frame stream never logs it).
+
+        The iteration runs under ``contextlib.aclosing`` so the stream is closed
+        on EVERY exit path — normal end, barge-in, cancellation, OR a fatal error
+        raised inside the loop body (e.g. ``send_audio`` failing). A plain
+        ``async for`` does NOT call ``aclose`` when the loop body raises, leaving
+        the stream's frame generator suspended and abandoned for a GC finalizer to
+        close later — which races a parked pull and raises ``RuntimeError:
+        aclose(): asynchronous generator is already running`` (the live cascade).
+        Closing here, on this consumer task, is race-free: ``aclose`` runs only
+        after the body has finished, never concurrently with a pull.
         """
         first_frame_pending = on_first_frame is not None
+        total_samples = 0
+        peak_amplitude = 0
+        tts_sample_rate = 0
         async with self._playout_lock:
             try:
-                async for frame in stream:
-                    await self._transport.send_audio(frame)
-                    if first_frame_pending and on_first_frame is not None:
-                        on_first_frame()
-                        first_frame_pending = False
+                async with contextlib.aclosing(stream):
+                    async for frame in stream:
+                        await self._transport.send_audio(frame)
+                        if first_frame_pending and on_first_frame is not None:
+                            on_first_frame()
+                            first_frame_pending = False
+                        # Accumulate audio stats for the end-of-stream log.
+                        n_samp = len(frame.samples) // 2
+                        if n_samp > 0:
+                            total_samples += n_samp
+                            if tts_sample_rate == 0:
+                                tts_sample_rate = frame.sample_rate
+                            pcm_vals = struct.unpack_from(f"<{n_samp}h", frame.samples)
+                            frame_peak = max(abs(s) for s in pcm_vals)
+                            peak_amplitude = max(peak_amplitude, frame_peak)
             finally:
                 # Clear the reference only if it is still ours (a superseding
                 # speak() may have already pointed it at a newer stream).
                 if self._active_tts_stream is stream:
                     self._active_tts_stream = None
+        if total_samples > 0 and tts_sample_rate > 0:
+            duration_ms = math.floor(total_samples * 1000 / tts_sample_rate)
+            _log.info(
+                "tts playout: %d ms of audio synthesised (peak=%d, %.1f%% full-scale)",
+                duration_ms,
+                peak_amplitude,
+                peak_amplitude / 327.67,
+            )
 
     def _begin_greeting(self) -> TtsStream:
         """Synthesise + register the greeting stream synchronously (no await).
@@ -403,6 +602,21 @@ class CallLoop:
             yield greeting
 
         stream = self._tts.synthesize(_single_chunk(), self._voice)
+        self._active_tts_stream = stream
+        return stream
+
+    def _begin_tone(self) -> TtsStream:
+        """Build + register a pure-sine tone stream synchronously (no await).
+
+        Creates a :class:`_ToneStream` wrapping :func:`generate_tone_frames` at
+        the configured ``tone_secs`` duration.  The stream is registered as the
+        active TTS stream before any ``await`` so a first-frame caller onset
+        barges in correctly — identical lifecycle to :meth:`_begin_greeting`.
+        Only called when ``self._tone_secs > 0``.
+        """
+        duration = self._tone_secs
+        _log.info("tone diagnostic: %.1f s at 440 Hz (bypassing TTS)", duration)
+        stream: TtsStream = _ToneStream(duration_secs=duration)
         self._active_tts_stream = stream
         return stream
 

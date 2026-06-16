@@ -360,6 +360,129 @@ async def test_send_audio_emits_rtp_datagrams() -> None:
 
 
 # ---------------------------------------------------------------------------
+# (b2) send_audio resamples any non-8 kHz frame to the 8 kHz wire rate
+# ---------------------------------------------------------------------------
+#
+# Regression: a real inbound call's greeting passed a 24 kHz TTS frame (sherpa-
+# Kokoro output rate, ADR-0007) to send_audio, which raised
+# ``ValueError: G.711 requires 8000 Hz, got 24000 Hz`` inside the greeting task,
+# cancelling the whole CallLoop and emitting ZERO RTP — the caller heard silence.
+# send_audio must instead RESAMPLE the frame to 8 kHz and encode it (ADR-0017).
+
+# A non-trivial 24 kHz frame: a 20 ms window is 480 samples at 24 kHz, which the
+# resampler must reduce to 160 samples (20 ms at 8 kHz) before G.711 encoding.
+_TTS_RATE_HZ = 24_000
+_TTS_FRAME_MS = 20
+_TTS_SAMPLES = (_TTS_RATE_HZ * _TTS_FRAME_MS) // 1000  # 480
+# Wire (8 kHz) sample count for the same 20 ms window.
+_WIRE_SAMPLES = (G711_SAMPLE_RATE * _TTS_FRAME_MS) // 1000  # 160
+
+
+def _ramp_frame(rate: int, sample_count: int) -> PcmFrame:
+    """A frame of non-silent PCM16 at ``rate`` (a low-amplitude ramp).
+
+    Non-silent so a resample actually changes the sample COUNT in a way the test
+    can observe; a low amplitude keeps the values inside int16 with margin.
+    """
+    samples = b"".join(
+        int(((i % 32) - 16) * 8).to_bytes(2, "little", signed=True)
+        for i in range(sample_count)
+    )
+    return PcmFrame(samples=samples, sample_rate=rate, monotonic_ts_ns=0)
+
+
+@pytest.mark.asyncio
+async def test_send_audio_resamples_24k_frame_to_8k_without_raising() -> None:
+    """A 24 kHz TTS frame is resampled to 8 kHz and G.711-encoded (the live crash).
+
+    Reproduces the exact production failure: feeding send_audio a 24 kHz frame
+    must NOT raise; it must convert to the 8 kHz wire rate and emit one G.711
+    (mu-law, one byte/sample) RTP payload of the 8 kHz sample count.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    frame = _ramp_frame(_TTS_RATE_HZ, _TTS_SAMPLES)
+    with _capture_sends(engine) as recorder:
+        # MUST NOT raise ValueError("G.711 requires 8000 Hz, got 24000 Hz").
+        await engine.send_audio(frame)
+
+    assert recorder.sent, "send_audio must emit a datagram for a 24 kHz frame"
+    wire, _dest = recorder.sent[-1]
+    pkt = RtpPacket.parse(wire)
+    assert pkt.payload_type == 0  # PCMU
+    # mu-law is one byte per sample; the payload must carry the 8 kHz sample
+    # count (160), proving the 24 kHz frame (480) was resampled, not encoded raw.
+    assert len(pkt.payload) == _WIRE_SAMPLES
+
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_audio_8k_frame_passes_through_unchanged() -> None:
+    """An 8 kHz frame is encoded directly (byte-identical to a raw G.711 encode).
+
+    The 8 kHz fast path must not run the frame through a resampler (which would
+    perturb the samples); the emitted payload equals encode_ulaw of the frame.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    frame = _ramp_frame(G711_SAMPLE_RATE, _WIRE_SAMPLES)
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(frame)
+
+    assert recorder.sent
+    wire, _dest = recorder.sent[-1]
+    pkt = RtpPacket.parse(wire)
+    # Byte-identical to a direct encode: the 8 kHz frame is untouched.
+    assert pkt.payload == encode_ulaw(frame.samples)
+    assert len(pkt.payload) == _WIRE_SAMPLES
+
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_audio_resamples_24k_for_pcma_too() -> None:
+    """The resample-before-encode path is codec-agnostic (a-law / PCMA)."""
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMA,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    frame = _ramp_frame(_TTS_RATE_HZ, _TTS_SAMPLES)
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(frame)
+
+    assert recorder.sent
+    wire, _dest = recorder.sent[-1]
+    pkt = RtpPacket.parse(wire)
+    assert pkt.payload_type == 8  # PCMA
+    assert len(pkt.payload) == _WIRE_SAMPLES
+
+    await engine.stop()
+
+
+# ---------------------------------------------------------------------------
 # (d) set_hold stops outbound media
 # ---------------------------------------------------------------------------
 

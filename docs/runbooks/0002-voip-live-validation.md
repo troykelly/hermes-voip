@@ -61,13 +61,20 @@ fixed):
 
 | Family | Env var (model dir) | Source (HuggingFace, pinned in `manifest.py`) | Files placed in the dir |
 | --- | --- | --- | --- |
-| STT | `HERMES_VOIP_STT_MODEL_DIR` | `STT_MODEL_MANIFEST` repo@revision | `encoder.onnx`, `decoder.onnx`, `joiner.onnx` (the three pinned `*-chunk-16-left-64.onnx` weights, renamed), `tokens.txt` |
+| STT | `HERMES_VOIP_STT_MODEL_DIR` | `STT_MODEL_MANIFEST` repo@revision | `encoder.onnx`, `decoder.onnx`, `joiner.onnx` (the three pinned `*-epoch-99-avg-1.onnx` weights, renamed from the HF repo filenames), `tokens.txt` |
 | TTS | `HERMES_VOIP_TTS_MODEL` | `TTS_MODEL_MANIFEST` repo@revision | `model.onnx` (pinned), `voices.bin`, `tokens.txt`, `espeak-ng-data/` |
 | Guard | `HERMES_VOIP_INJECTION_GUARD_MODEL_DIR` | `GUARD_MODEL_MANIFEST` repo@revision | `model.onnx` (pinned, the repo's `onnx/model.onnx`), `tokenizer.json`, `config.json` |
 | VAD | `HERMES_VOIP_VAD_MODEL_DIR` | `snakers4/silero-vad` tag `v5.1.2`, file `src/silero_vad/data/silero_vad.onnx` (MIT) | `silero_vad.onnx` |
 
+**STT model history** (the active pin is always `STT_MODEL_MANIFEST` in `manifest.py`):
+
+| Date | HuggingFace repo | revision (40-hex) | Training data | Notes |
+| --- | --- | --- | --- | --- |
+| 2026-06-16 (current) | `csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21` | `9a65b6ea94c311ca770c2bf895b30f456a22d703` | LibriSpeech + GigaSpeech | telephony WER 3.2%->1.9%; LESS->LEFT error eliminated at 20 dB SNR |
+| 2026-06-14 (previous) | `csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26` | `672fbf1b30579d6585301139bb363f42a0ad4a24` | LibriSpeech only | original ADR-0006 default; degraded on noisy telephony audio |
+
 Download script (reads the pins from `manifest.py`; verifies each pinned sha256 and aborts on
-mismatch — see the project history for the exact `huggingface_hub.hf_hub_download` +
+mismatch -- see the project history for the exact `huggingface_hub.hf_hub_download` +
 `snapshot_download` invocation used). The silero VAD is fetched from the official tagged
 release and is *not* manifest-pinned (it is the VAD, not a licence-bearing conversational
 model); record its sha256 when you cache it. After downloading, prove the stack actually

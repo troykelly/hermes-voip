@@ -44,7 +44,7 @@ jobs:
       # bypasses the exclude). The end-to-end test, reconnect supervisor tests, and
       # the media-concurrency adapter isolation test all drive the real
       # VoipAdapter, so they are checked + run here too.
-      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py
+      - run: uv run mypy src/hermes_voip/adapter.py tests/test_adapter.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
         run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e -rs

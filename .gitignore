@@ -3,6 +3,17 @@
 .env.*
 !.env.example
 
+# Caller-mode list files (ADR-0020): phone numbers are PII and must NEVER be
+# committed. These are the default filenames an operator may drop at the repo
+# root; the real lists live alongside .env / in 1Password. Any *.caller-*.json
+# is ignored so a stray copy cannot be staged by accident.
+.caller-allow.json
+.caller-deny.json
+.caller-grey.json
+*.caller-allow.json
+*.caller-deny.json
+*.caller-grey.json
+
 # Local memory MCP store — never commit
 .memory/
 

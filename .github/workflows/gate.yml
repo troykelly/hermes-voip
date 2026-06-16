@@ -84,3 +84,25 @@ jobs:
       # Prove the cryptography library loads and the SRTP module is importable.
       - run: uv run python -c "import cryptography; from hermes_voip.media.srtp import SrtpSession, SrtpError; print('media stack cryptography', cryptography.__version__)"
       - run: uv run pytest -rs
+
+  # Runs the WebRTC transport tests with the optional `webrtc` extra installed
+  # (websockets + pyopenssl + aioice — ADR-0016 building blocks: PR-A WSS,
+  # PR-C DTLS, PR-D ICE).  Separate job so the WebRTC libraries stay out of
+  # the main gate's install / licence / audit scope.  The full suite is re-run
+  # so the webrtc-gated tests (which skip without the extra) execute against
+  # the real libraries.
+  webrtc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --extra webrtc
+      # Prove all three WebRTC building-block libraries load and their modules
+      # are importable: WSS transport (PR-A), DTLS keying (PR-C), ICE (PR-D).
+      - run: uv run python -c "import websockets; from hermes_voip.transport.ws_connection import WssSipTransport; print('webrtc/wss websockets', websockets.__version__)"
+      - run: uv run python -c "import OpenSSL; print('webrtc/dtls pyopenssl', OpenSSL.__version__)"
+      - run: uv run python -c "import aioice; from hermes_voip.media.ice import IceConnection, IceCandidate, IceSelectedPair; print('webrtc/ice aioice', aioice.__version__)"
+      - run: uv run pytest -rs

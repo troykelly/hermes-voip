@@ -146,19 +146,33 @@ class _FakeTtsStream:
     """A ``TtsStream`` emitting fixed 24 kHz PCM16 frames (the real Kokoro rate).
 
     A genuine async iterator (``__aiter__`` + ``__anext__``) plus ``flush`` /
-    ``cancel`` — structurally a ``TtsStream`` so it needs no type-ignore. After
-    ``cancel`` it stops yielding (barge-in semantics).
+    ``cancel`` — structurally a ``TtsStream`` so it needs no type-ignore. It drains
+    the agent's ``text`` iterator on the first frame and appends the joined text to
+    ``recorded`` (no fire-and-forget task — the stream owns ``text`` the way a real
+    synthesiser does). After ``cancel`` it stops yielding (barge-in semantics).
     """
 
-    def __init__(self, frames: list[PcmFrame]) -> None:
+    def __init__(
+        self,
+        frames: list[PcmFrame],
+        text: AsyncIterator[str],
+        recorded: list[str],
+    ) -> None:
         self._frames = list(frames)
         self._index = 0
         self._cancelled = False
+        self._text = text
+        self._recorded = recorded
+        self._text_drained = False
 
     def __aiter__(self) -> _FakeTtsStream:
         return self
 
     async def __anext__(self) -> PcmFrame:
+        if not self._text_drained:
+            self._text_drained = True
+            chunks = [chunk async for chunk in self._text]
+            self._recorded.append("".join(chunks))
         if self._cancelled or self._index >= len(self._frames):
             raise StopAsyncIteration
         frame = self._frames[self._index]
@@ -177,7 +191,8 @@ class _FakeTTS:
 
     Emitting at 24 kHz forces the engine's ``send_audio`` to resample to the 8 kHz
     G.711 wire before encoding (ADR-0017) — the seam that crashed the live call
-    when the greeting/reply was 24 kHz (bug 2).
+    when the greeting/reply was 24 kHz (bug 2). Each synthesised stream records the
+    full joined text it was given in :attr:`synth_texts`.
     """
 
     output_sample_rate = _KOKORO_RATE
@@ -186,47 +201,65 @@ class _FakeTTS:
         self.synth_texts: list[str] = []
 
     def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
-        async def _collect_then_register() -> None:
-            async for chunk in text:
-                self.synth_texts.append(chunk)
-
-        # The CallLoop drives ``text`` as an async iterator; collect it eagerly in
-        # the background so the recorded text is available for assertions. The
-        # frames are fixed so synthesis does not depend on the text content.
-        asyncio.ensure_future(_collect_then_register())  # noqa: RUF006 - fire-and-forget collector; the loop awaits the stream
         sample = (4096).to_bytes(2, "little", signed=True)
         frame = PcmFrame(
             samples=sample * _SAMPLES_PER_FRAME_24K,
             sample_rate=_KOKORO_RATE,
             monotonic_ts_ns=0,
         )
-        return _FakeTtsStream([frame, frame])
+        return _FakeTtsStream([frame, frame], text, self.synth_texts)
+
+
+def _frame_is_speech(frame: PcmFrame) -> bool:
+    """True iff the frame carries audible energy (peak |sample| above a floor).
+
+    The inbound RTP is G.711-encoded then decoded by the engine, so silence is not
+    perfectly zero; a small peak floor distinguishes the caller's tone from the
+    digital-silence run.
+    """
+    peak = 0
+    for i in range(0, len(frame.samples) - 1, 2):
+        value = int.from_bytes(frame.samples[i : i + 2], "little", signed=True)
+        peak = max(peak, abs(value))
+    return peak > 256
 
 
 class _FakeASR:
-    """A streaming ASR that yields exactly ONE final end-of-turn transcript.
+    """A streaming ASR whose end-of-turn is driven by the caller's speech→silence.
 
-    The real CallLoop pump feeds VAD-windowed 8 kHz frames into ``stream``. This
-    fake counts frames and, once it has seen the caller's speech-then-silence run
-    (``_turn_after`` frames), yields a single
-    ``Transcript(is_final=True, end_of_turn=True)`` and then stays quiet — so the
-    delivery stage hands the agent exactly one turn (bug-free turn delivery), no
-    matter how many further frames arrive before BYE.
+    The real CallLoop pump feeds it the SAME 8 kHz frames it feeds the VAD. This
+    fake overlays an endpoint signal exactly as a self-host (sherpa) ASR must: it
+    accumulates while the caller has energy and yields ONE
+    ``Transcript(is_final=True, end_of_turn=True)`` only after it has seen speech
+    and then ``_silence_to_end`` consecutive silent frames — so the delivered turn
+    genuinely depends on the speech→silence inbound sequence (not a blind frame
+    count). If the inbound path were broken (e.g. the VAD rate crash starves the
+    pump), no frames arrive and no turn is ever emitted.
     """
 
     input_sample_rate = 16_000
 
-    def __init__(self, *, transcript: str, turn_after: int) -> None:
+    def __init__(self, *, transcript: str, silence_to_end: int = 10) -> None:
         self._transcript = transcript
-        self._turn_after = turn_after
+        self._silence_to_end = silence_to_end
         self.frames_seen = 0
+        self.saw_speech = False
+        self.turns_emitted = 0
 
     async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
-        emitted = False
-        async for _frame in audio:
+        trailing_silence = 0
+        async for frame in audio:
             self.frames_seen += 1
-            if not emitted and self.frames_seen >= self._turn_after:
-                emitted = True
+            if _frame_is_speech(frame):
+                self.saw_speech = True
+                trailing_silence = 0
+                continue
+            # A silent frame: only counts toward end-of-turn once speech has begun.
+            if not self.saw_speech or self.turns_emitted:
+                continue
+            trailing_silence += 1
+            if trailing_silence >= self._silence_to_end:
+                self.turns_emitted += 1
                 yield Transcript(
                     text=self._transcript,
                     is_final=True,
@@ -372,7 +405,7 @@ async def test_options_qualify_is_answered() -> None:
     await gateway.start()
     vad_model = _RecordingVadModel()
     providers = Providers(
-        asr=_FakeASR(transcript="unused", turn_after=1),
+        asr=_FakeASR(transcript="unused"),
         tts=_FakeTTS(),
         guard=_FakeGuard(),
     )
@@ -388,20 +421,24 @@ async def test_options_qualify_is_answered() -> None:
 
 
 # ===========================================================================
-# (Bug 3, isolated) The real VAD/endpointer must accept the engine's 8 kHz
-# inbound frames without the "frame rate 8000 != detector rate 16000" ValueError.
-# This drives a real RtpMediaTransport pair through the real CallLoop pump so the
-# rate seam is exercised exactly as in production.
+# (Media-layer rate contract) The real CallLoop pump must feed the engine's 8 kHz
+# inbound frames to a VAD/endpointer built at that same rate without the
+# "frame rate 8000 != detector rate 16000" ValueError. This pins the media-layer
+# rate contract directly (the engine's inbound_sample_rate IS the rate the VAD must
+# run at). The ADAPTER-side regression — the adapter must HONOUR that contract when
+# it constructs the VAD — is covered by test_full_inbound_call_end_to_end, which
+# drives the real _make_vad.
 # ===========================================================================
 
 
 async def test_inbound_8k_frames_drive_real_vad_without_rate_error() -> None:
-    """Real CallLoop pump feeds real 8 kHz inbound RTP to the real VAD, no raise.
+    """Real CallLoop pump feeds real 8 kHz inbound RTP to a rate-matched VAD.
 
-    Isolated companion to the full-call test: it pins the exact rate seam. On a
-    stack where the adapter still builds the VAD at 16 kHz this fails with the
-    live ValueError; with the VAD built at the engine's 8 kHz inbound rate it
-    passes and the VAD genuinely scores the audio (ONSET + OFFSET edges seen).
+    Pins the media-layer rate contract: when the VAD/endpointer are built at the
+    engine's ``inbound_sample_rate`` (8 kHz), the real pump feeds the real 8 kHz
+    frames through them with no rate ValueError and the VAD genuinely scores the
+    audio (real ONSET + OFFSET edges). The adapter-side guarantee that it picks
+    that rate is asserted by the full-call test (it patches the real ``_make_vad``).
     """
     # The engine the plugin uses for inbound media decodes G.711 → 8 kHz PcmFrames.
     rx = RtpMediaTransport(
@@ -443,7 +480,7 @@ async def test_inbound_8k_frames_drive_real_vad_without_rate_error() -> None:
 
     loop = CallLoop(
         transport=rx,
-        asr=_FakeASR(transcript="hi", turn_after=20),
+        asr=_FakeASR(transcript="hi"),
         tts=_FakeTTS(),
         guard=_FakeGuard(),
         vad=vad,
@@ -500,11 +537,26 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
     logging.getLogger("hermes_voip").addHandler(caplog_handler)
     logging.getLogger("hermes_voip").setLevel(logging.DEBUG)
 
+    # Capture unhandled task exceptions via the loop exception handler (bug 5):
+    # "Task exception was never retrieved" is reported HERE, not as a warning, so
+    # the -W error::RuntimeWarning filter alone would miss a swallowed failure in
+    # a fire-and-forget call task. Any entry here fails the test.
+    loop = asyncio.get_running_loop()
+    loop_exceptions: list[str] = []
+    previous_handler = loop.get_exception_handler()
+
+    def _record_loop_exception(
+        _loop: asyncio.AbstractEventLoop, context: dict[str, object]
+    ) -> None:
+        loop_exceptions.append(str(context.get("message", context)))
+
+    loop.set_exception_handler(_record_loop_exception)
+
     gateway = FakeGateway()
     gateway.set_register_responder()
     await gateway.start()
 
-    fake_asr = _FakeASR(transcript="hello there", turn_after=20)
+    fake_asr = _FakeASR(transcript="hello there")
     fake_tts = _FakeTTS()
     providers = Providers(
         asr=fake_asr,
@@ -548,21 +600,34 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
             # (4) ACK (in-dialog). Must route to the CallSession, never unroutable.
             await gateway.send_ack(call)
 
-            # (5) The greeting flows out as RTP at the 8 kHz wire rate (TTS=24 kHz).
-            await gateway.rtp.wait_for_frames(1, timeout=5.0)
-            greeting_frame = gateway.rtp.received_frames[0]
-            assert greeting_frame.sample_rate == _G711_RATE, (
-                "outbound RTP is not 8 kHz G.711 — the 24 kHz TTS was not "
-                "resampled (bug 2)"
-            )
-            assert greeting_frame.sample_count > 0
+            # (5) The greeting flows out as RTP at the 8 kHz wire rate. The fake
+            # TTS emits TWO 24 kHz frames per synth, so wait for both before taking
+            # a baseline (otherwise a late second greeting packet would satisfy the
+            # reply check below — a false-green for reply playout, codex HIGH #4).
+            await gateway.rtp.wait_for_frames(2, timeout=5.0)
+            # Genuine 8 kHz G.711, proven on the WIRE (codec payload type + the
+            # exact 20 ms payload length), not just the test decoder's metadata: a
+            # mis-resampled or wrong-length frame would fail here (codec HIGH #3).
+            for packet in gateway.rtp.received_packets[:2]:
+                assert packet.payload_type == Codec.PCMU.value, (
+                    "greeting RTP payload type is not PCMU (0)"
+                )
+                assert len(packet.payload) == _SAMPLES_PER_FRAME_8K, (
+                    f"greeting RTP payload is {len(packet.payload)} octets, expected "
+                    f"{_SAMPLES_PER_FRAME_8K} (20 ms of 8 kHz G.711) — the 24 kHz "
+                    "TTS was not resampled to the wire rate (bug 2)"
+                )
+            assert gateway.rtp.received_frames[0].sample_rate == _G711_RATE
             greeting_count = len(gateway.rtp.received_packets)
 
             # (6) Inbound caller audio: 8 kHz speech then silence. The real
             # CallLoop pump feeds it through the real VAD/endpoint/ASR. A rate
-            # mismatch (bug 3) raises inside the call task and no turn lands.
+            # mismatch (bug 3) raises inside the call task and no turn lands. The
+            # fake ASR's end-of-turn is driven by the speech→silence transition
+            # (not a frame count), so a turn lands only if the trailing silence is
+            # actually delivered through the pipeline.
             gateway.rtp.send_frames(g711_speech_frames(30))
-            gateway.rtp.send_frames(g711_silence_frames(30))
+            gateway.rtp.send_frames(g711_silence_frames(40))
 
             # Exactly one turn reaches the echo agent.
             await _until(lambda: len(delivered_turns) >= 1, timeout=5.0)
@@ -570,6 +635,7 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
                 "the caller's speech→silence turn was not delivered exactly once "
                 "(bug 3 would raise a VAD rate ValueError before any turn lands)"
             )
+            assert fake_asr.saw_speech, "the ASR never saw the caller's speech frames"
 
             # The real VAD ran over the real 8 kHz inbound frames (bug 3 seam).
             assert vad_model.sample_rates, "the VAD was never fed any inbound audio"
@@ -578,12 +644,16 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
                 "(bug 3: the detector must run at the engine's 8 kHz inbound rate)"
             )
 
-            # The echo reply is synthesised (24 kHz → 8 kHz) and sent as RTP out.
+            # The echo reply is synthesised (24 kHz → 8 kHz) and sent as RTP out —
+            # strictly MORE packets than the greeting, all genuine 8 kHz G.711.
             await gateway.rtp.wait_for_frames(greeting_count + 1, timeout=5.0)
-            reply_frame = gateway.rtp.received_frames[-1]
-            assert reply_frame.sample_rate == _G711_RATE, (
-                "the agent reply RTP is not 8 kHz G.711 (bug 2)"
-            )
+            reply_packets = gateway.rtp.received_packets[greeting_count:]
+            assert reply_packets, "no agent-reply RTP was sent after the greeting"
+            for packet in reply_packets:
+                assert packet.payload_type == Codec.PCMU.value
+                assert len(packet.payload) == _SAMPLES_PER_FRAME_8K, (
+                    "the agent reply RTP is not 20 ms of 8 kHz G.711 (bug 2)"
+                )
             assert "echo: hello there" in fake_tts.synth_texts, (
                 "the agent reply text was not handed to the TTS for synthesis"
             )
@@ -606,13 +676,20 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
                 if "unroutable" in r.getMessage().lower()
             ]
             assert not unroutable, f"a SIP message was unroutable (bug 4): {unroutable}"
+
+        # The adapter is now disconnected (the async with exited). Settle the loop
+        # so any callback/finaliser from the torn-down call task runs, then assert
+        # no unhandled task exception was reported and no aclose generator race
+        # surfaced (bug 5). The module's -W error::RuntimeWarning catches the
+        # generator race; the loop exception handler catches the unretrieved task.
+        await asyncio.sleep(0)
+        assert not loop_exceptions, (
+            f"unhandled task/loop exceptions during the call (bug 5): {loop_exceptions}"
+        )
     finally:
+        loop.set_exception_handler(previous_handler)
         await gateway.stop()
         logging.getLogger("hermes_voip").removeHandler(caplog_handler)
-
-    # Settle any just-completed callbacks so an unretrieved task exception (bug 5)
-    # is surfaced as a RuntimeWarning -> error within this test, not at teardown.
-    await asyncio.sleep(0)
 
 
 # ---------------------------------------------------------------------------

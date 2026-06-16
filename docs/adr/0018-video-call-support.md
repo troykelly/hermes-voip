@@ -312,11 +312,15 @@ At QCIF 10 fps 128 kbps H.264 + ~20% RTP overhead ≈ **154 kbps** for video, pl
 audio stream (G.711 PCMU 64 kbps + overhead ≈ 77 kbps). Total ≈ 231 kbps, well within the
 1 Mbps floor of any modern SIP trunk.
 
-### 5. Inbound video — receive-and-discard
+### 5. Inbound video
 
-Inbound video RTP (the caller's camera feed) is **received at the UDP socket level and
-immediately discarded** — no decode, no buffer, no codec context. The discard happens in
-the `RtpVideoTransport` receive path before any payload inspection:
+#### 5a. v1 (shipped) — receive-and-discard
+
+Inbound video RTP (the caller's camera feed) is, in v1, **received at the UDP socket level
+and immediately discarded** — no decode, no buffer, no codec context. This is the shipped
+v1 behaviour and it keeps the critical path clean: no decoder runs while the core audio and
+outbound video paths are brought up. The discard happens in the `RtpVideoTransport` receive
+path before any payload inspection:
 
 ```python
 # receive loop for the video socket / BUNDLE demux
@@ -340,10 +344,88 @@ video inbound is derived from the same DTLS handshake as audio (BUNDLE), so the 
 already exists; calling `unprotect` is one function call per received packet with no
 additional memory allocation.
 
-**No decoder dependency.** This is the principal design benefit: the `video` extra contains
-the encoder (openh264 / libvpx), used only at startup. No decoder library is imported at
-any point. A rogue or corrupted video stream from the peer cannot crash a decoder or
-exploit a decoder vulnerability.
+**No decoder dependency.** In v1 this is the principal design benefit: the `video` extra
+contains the encoder (openh264 / libvpx), used only at startup. No decoder library is
+imported at any point. A rogue or corrupted video stream from the peer cannot crash a
+decoder or exploit a decoder vulnerability.
+
+#### 5b. Backlog / future phase — inbound video → agent vision snapshot
+
+> **Status: Backlog / future phase — ships after core audio + outbound video are working.**
+> This subsection records design intent only; it is not part of v1 and is not built. The
+> detailed tracking is in backlog issue #64 ("Inbound video → agent vision (1 FPS
+> snapshot)").
+
+A later phase gives a **vision-capable Hermes agent the ability to "see" the call on
+demand**. Motivating use case (operator-stated): the agent answers a video intercom and can
+see that someone is standing at the door holding a package — it glances at the scene, it
+does not watch a video stream.
+
+**Design intent:**
+
+- **Decode the inbound caller video, throttled to ~1 frame/second**, and write the latest
+  decoded frame as a still image to a known, configurable location. The throttle is the
+  core idea: the agent only needs to *glance*, not stream. Decoding one frame per second
+  (dropping the other ~9–14 frames/s of a 10–15 fps stream without decoding them) keeps CPU
+  negligible and **bounds the decoder CVE surface** — the decoder touches one keyframe-class
+  frame per second rather than every packet of every frame. A decode error on any frame is
+  logged and skipped (the previous snapshot stays); a corrupt stream degrades to "no fresh
+  snapshot", never a crash.
+- **Latest-frame snapshot, overwritten each cycle.** Only the most recent decoded frame is
+  kept on disk — each ~1 Hz decode overwrites the single snapshot file. No frame history,
+  no ring buffer, no recording.
+- **Configurable, runtime-only path.** `HERMES_VOIP_VIDEO_SNAPSHOT_PATH`, defaulting to a
+  generic per-process runtime directory (e.g. under the OS temp/runtime dir, resolved at
+  start) — **never a tracked or public path**, never inside the repo. Tests use a fake
+  temp path, exactly as the rest of the suite uses `pbx.example.test` / ext `1000`.
+
+**Decoder — reuse the same zero-copyleft libraries.** The decode path adds **no new codec
+licence surface**: H.264 decode via **openh264** (Cisco, BSD-2-Clause) and VP8 decode via
+**libvpx** (BSD-3-Clause) — the very libraries the outbound encoder already brings in the
+`video` extra. No GPL/LGPL decoder (no libx264, no FFmpeg/PyAV) is introduced.
+
+**Snapshot still-image encode.** Writing the decoded frame as a still requires turning a
+raw decoded YUV/RGB frame into an image file. Two options, decision deferred to the build:
+
+- **Pillow** (PIL fork) — license **HPND** (permissive, BSD-style, zero copyleft; clears
+  rule 35). Mature, handles YUV→RGB→JPEG/PNG cleanly, already a common dependency. The
+  natural default for "decoded frame → `snapshot.jpg`".
+- **Raw YUV→JPEG without Pillow** — write a baseline JPEG from the decoded plane directly
+  (or emit a `.yuv`/`.ppm` and let the agent layer convert). Avoids a new dependency
+  entirely but reimplements colour conversion + JPEG entropy coding, which is more code and
+  more risk for marginal benefit.
+
+The expected pick is **Pillow (HPND)** — permissive, correct, and far less code than a
+hand-rolled JPEG encoder — declared in the `video` extra alongside the codecs when this
+phase lands. (Final choice and pin happen in the implementing PR.)
+
+**Agent-access seam (design, not built).** Two ways the agent reaches the snapshot, both
+recorded here so the build can choose:
+
+- **A gated "voip vision" tool** — a tool registered alongside the existing verbs in
+  `tools.py` (subject to the same injection-guard gating, ADR-0009) that, when the agent
+  calls it, reads the current snapshot file and returns the image to the model. This is the
+  "glance on demand" shape: the agent decides when to look.
+- **Attach the snapshot to the delivered turn** — include the latest snapshot with the
+  finalized inbound turn handed to Hermes, so a vision-capable agent sees it inline without
+  an explicit tool call.
+
+Both are viable; the choice is left to the build (the tool form fits the "agent glances on
+demand" intent more cleanly and matches the existing `tools.py` pattern, but the per-turn
+attachment may suit some agent configurations). Either way, the media plane's job is only to
+keep the single snapshot file fresh at ~1 Hz; how the agent consumes it is an upper-layer
+seam.
+
+**Privacy.** The snapshot is **runtime-only**, written to a **gitignored / non-public**
+location, and **overwritten on every decode cycle** — there is no accumulation, no
+recording, and nothing committed. The path is operator-configurable so it can point at an
+ephemeral/tmpfs location.
+
+**Efficiency (rule 22) for this future phase.** At ~1 decoded frame/second of a QCIF/CIF
+keyframe-class frame, decode cost is a small fraction of one core (orders of magnitude below
+a full-rate decode), plus one image-encode + file write per second. Memory: one decoded
+frame buffer + the snapshot file; no history. This is why the throttle is intrinsic to the
+design, not an afterthought — it is what keeps both CPU and CVE exposure negligible.
 
 ### 6. Integration seam: how video slots into the existing architecture
 
@@ -459,6 +541,11 @@ The test suite for video follows the TDD discipline of prior PRs:
 - Looping short clip source (directory of YUV frames → multi-IDR pre-encoded sequence).
 - RTCP Sender Report for video (maintains RTP/NTP timestamps for gateway sync).
 - CIF resolution option (352×288) via env var.
+- **Inbound video → agent vision snapshot** (§5b): decode inbound at ~1 fps → latest-frame
+  still at a configurable runtime path → vision-capable agent reads it (gated tool or
+  per-turn attachment). Decoder reuses openh264/libvpx (zero-copyleft); still-image encode
+  via Pillow (HPND). Tracked in the backlog issue "Inbound video → agent vision (1 FPS
+  snapshot)"; depends on core audio + outbound video landing first.
 
 ## Consequences
 

@@ -81,6 +81,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
+import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from typing import Final
@@ -468,6 +470,9 @@ class CallLoop:
         after the body has finished, never concurrently with a pull.
         """
         first_frame_pending = on_first_frame is not None
+        total_samples = 0
+        peak_amplitude = 0
+        tts_sample_rate = 0
         async with self._playout_lock:
             try:
                 async with contextlib.aclosing(stream):
@@ -476,11 +481,28 @@ class CallLoop:
                         if first_frame_pending and on_first_frame is not None:
                             on_first_frame()
                             first_frame_pending = False
+                        # Accumulate audio stats for the end-of-stream log.
+                        n_samp = len(frame.samples) // 2
+                        if n_samp > 0:
+                            total_samples += n_samp
+                            if tts_sample_rate == 0:
+                                tts_sample_rate = frame.sample_rate
+                            pcm_vals = struct.unpack_from(f"<{n_samp}h", frame.samples)
+                            frame_peak = max(abs(s) for s in pcm_vals)
+                            peak_amplitude = max(peak_amplitude, frame_peak)
             finally:
                 # Clear the reference only if it is still ours (a superseding
                 # speak() may have already pointed it at a newer stream).
                 if self._active_tts_stream is stream:
                     self._active_tts_stream = None
+        if total_samples > 0 and tts_sample_rate > 0:
+            duration_ms = math.floor(total_samples * 1000 / tts_sample_rate)
+            _log.info(
+                "tts playout: %d ms of audio synthesised (peak=%d, %.1f%% full-scale)",
+                duration_ms,
+                peak_amplitude,
+                peak_amplitude / 327.67,
+            )
 
     def _begin_greeting(self) -> TtsStream:
         """Synthesise + register the greeting stream synchronously (no await).

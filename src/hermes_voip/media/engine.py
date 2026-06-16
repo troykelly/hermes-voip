@@ -551,54 +551,86 @@ class RtpMediaTransport:
             raise RuntimeError(msg)
 
         wire_rate_frame = self._to_wire_rate(frame)
-        payload = self._encode(wire_rate_frame)
 
-        pkt = RtpPacket(
-            payload_type=self._codec.value,
-            sequence_number=self._seq,
-            timestamp=self._ts,
-            ssrc=_OUTBOUND_SSRC,
-            payload=payload,
-        )
-
-        wire = self._srtp_out.protect(pkt) if self._srtp_out is not None else pkt.pack()
-
-        # Advance counters (mod 2^16 for seq, mod 2^32 for ts).
-        self._seq = (self._seq + 1) % (1 << 16)
+        # Rechunk the resampled 8 kHz PCM into standard 20 ms (160-sample)
+        # slices and emit one RTP packet per slice.
+        #
+        # WHY: TTS providers (e.g. sherpa-onnx Kokoro) emit audio in large
+        # chunks -- typically 17 000-56 000 samples at 24 kHz, which after
+        # downsampling to 8 kHz become 5 931-18 630 samples (700ms-2300ms).
+        # A G.711 telephony RTP packet carries exactly 160 samples (20 ms at
+        # 8 kHz = 160 bytes payload).  Sending a single 5 931-byte payload
+        # (37x standard size) causes the gateway to silently discard it,
+        # producing complete SILENCE on the callee's phone even though the
+        # engine log shows "first RTP sent".
+        #
+        # The tone path was immune because generate_tone_frames() already
+        # yields 160-sample frames before calling send_audio.
         samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
-        self._ts = (self._ts + samples_per_frame) % (1 << 32)
+        chunk_bytes = samples_per_frame * 2  # PCM16 = 2 bytes per sample
+        raw = wire_rate_frame.samples
 
-        # Send to the latched peer source if symmetric-RTP has latched, else to
-        # the SDP-negotiated remote (the initial value of _outbound_addr).
-        if not self._first_tx_logged:
-            self._first_tx_logged = True
-            _log.info(
-                "rtp tx: first packet -> %s:%d pt=%d ssrc=0x%08x",
-                self._outbound_addr[0],
-                self._outbound_addr[1],
-                self._codec.value,
-                _OUTBOUND_SSRC,
+        # Pad the tail to a full chunk so the last packet is always full-length.
+        remainder = len(raw) % chunk_bytes
+        if remainder:
+            raw = raw + bytes(chunk_bytes - remainder)
+
+        for offset in range(0, len(raw), chunk_bytes):
+            chunk = raw[offset : offset + chunk_bytes]
+            chunk_frame = PcmFrame(
+                samples=chunk,
+                sample_rate=G711_SAMPLE_RATE,
+                monotonic_ts_ns=wire_rate_frame.monotonic_ts_ns,
             )
-        # Log peak amplitude for the first few TX frames (post-resample,
-        # pre-encode) so the operator can verify the outbound signal is
-        # non-silent even when they cannot capture the wire.
-        if self._tx_amplitude_frames_left > 0:
-            self._tx_amplitude_frames_left -= 1
-            n_samples = len(wire_rate_frame.samples) // 2
-            if n_samples > 0:
-                pcm_samples = struct.unpack_from(
-                    f"<{n_samples}h", wire_rate_frame.samples
-                )
-                peak = max(abs(s) for s in pcm_samples)
-                _log.info(
-                    "rtp tx: frame %d peak_amplitude=%d (%.1f%% full-scale)",
-                    _TX_AMPLITUDE_LOG_FRAMES - self._tx_amplitude_frames_left,
-                    peak,
-                    peak / 327.67,
-                )
-        self._transport.sendto(wire, self._outbound_addr)
+            payload = self._encode(chunk_frame)
 
-        await self._sleep(self._ptime / 1000.0)
+            pkt = RtpPacket(
+                payload_type=self._codec.value,
+                sequence_number=self._seq,
+                timestamp=self._ts,
+                ssrc=_OUTBOUND_SSRC,
+                payload=payload,
+            )
+
+            wire = (
+                self._srtp_out.protect(pkt)
+                if self._srtp_out is not None
+                else pkt.pack()
+            )
+
+            # Advance counters (mod 2^16 for seq, mod 2^32 for ts).
+            self._seq = (self._seq + 1) % (1 << 16)
+            self._ts = (self._ts + samples_per_frame) % (1 << 32)
+
+            # Log the first packet sent in this call.
+            if not self._first_tx_logged:
+                self._first_tx_logged = True
+                _log.info(
+                    "rtp tx: first packet -> %s:%d pt=%d ssrc=0x%08x",
+                    self._outbound_addr[0],
+                    self._outbound_addr[1],
+                    self._codec.value,
+                    _OUTBOUND_SSRC,
+                )
+
+            # Log peak amplitude for the first few TX chunks (post-resample,
+            # pre-encode) so the operator can verify the outbound signal is
+            # non-silent even when they cannot capture the wire.
+            if self._tx_amplitude_frames_left > 0:
+                self._tx_amplitude_frames_left -= 1
+                n_samp = len(chunk) // 2
+                if n_samp > 0:
+                    pcm_vals = struct.unpack_from(f"<{n_samp}h", chunk)
+                    peak = max(abs(s) for s in pcm_vals)
+                    _log.info(
+                        "rtp tx: chunk %d peak_amplitude=%d (%.1f%% full-scale)",
+                        _TX_AMPLITUDE_LOG_FRAMES - self._tx_amplitude_frames_left,
+                        peak,
+                        peak / 327.67,
+                    )
+
+            self._transport.sendto(wire, self._outbound_addr)
+            await self._sleep(self._ptime / 1000.0)
 
     @property
     def inbound_sample_rate(self) -> int:

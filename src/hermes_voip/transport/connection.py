@@ -79,7 +79,7 @@ class CallResponseSink(Protocol):
 class SipOverTlsTransport:
     """An asyncio TLS SIP transport (a ``SipTransport`` and ``CallSignaling``)."""
 
-    def __init__(  # noqa: PLR0913 — connection identity (host/port/SNI/connect-address) plus three optional observer callbacks; all but host/port are keyword-only
+    def __init__(  # noqa: PLR0913 — connection identity (host/port/SNI/connect-address) plus observer callbacks and keepalive knob; all but host/port are keyword-only
         self,
         *,
         host: str,
@@ -87,6 +87,7 @@ class SipOverTlsTransport:
         ssl_context: object,
         server_hostname: str | None = None,
         connect_address: str | None = None,
+        keepalive_interval: float = 30.0,
         on_new_call: Callable[[NewCall], None] | None = None,
         on_unroutable: Callable[[Unroutable | SipResponse], None] | None = None,
         on_connection_lost: Callable[[BaseException | None], None] | None = None,
@@ -104,6 +105,9 @@ class SipOverTlsTransport:
                 to ``host``.
             connect_address: The address to dial if it differs from ``host``
                 (e.g. an IP under a hostname SNI, as on the loopback test).
+            keepalive_interval: Seconds between RFC 5626 §5.4 double-CRLF
+                keepalive pings.  Zero or negative disables pings entirely.
+                Default 30 s matches the common NAT binding lifetime.
             on_new_call: Invoked with each out-of-dialog INVITE the manager maps
                 to a registration; the consumer builds the ``CallSession``.
             on_unroutable: Invoked with an unroutable request or a response that
@@ -116,12 +120,14 @@ class SipOverTlsTransport:
         self._ssl_context = ssl_context
         self._server_hostname = server_hostname if server_hostname is not None else host
         self._connect_address = connect_address if connect_address is not None else host
+        self._keepalive_interval = keepalive_interval
         self._on_new_call = on_new_call
         self._on_unroutable = on_unroutable
         self._on_connection_lost = on_connection_lost
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
         self._local_sent_by: str | None = None
         self._manager: RegistrationManager | None = None
         self._calls: dict[str, CallResponseSink] = {}
@@ -142,6 +148,8 @@ class SipOverTlsTransport:
         self._local_sent_by = _format_sent_by(host, port)
         self._reader_task = asyncio.create_task(self._read_loop(self._reader))
         self._reader_task.add_done_callback(self._on_reader_done)
+        if self._keepalive_interval > 0:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def aclose(self) -> None:
         """Stop the reader task and close the connection (idempotent).
@@ -150,6 +158,12 @@ class SipOverTlsTransport:
         returns cleanly, so the only outcome to drain here is the cancellation we
         request (rule 37: real failures are surfaced, not swallowed in shutdown).
         """
+        keepalive = self._keepalive_task
+        self._keepalive_task = None
+        if keepalive is not None:
+            keepalive.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keepalive
         task = self._reader_task
         self._reader_task = None
         if task is not None:
@@ -164,6 +178,35 @@ class SipOverTlsTransport:
                 await self._writer.wait_closed()
             self._writer = None
         self._reader = None
+
+    async def _keepalive_loop(self) -> None:
+        """Send RFC 5626 §5.4 double-CRLF keepalive pings at the configured interval.
+
+        Runs as a background task from :meth:`connect`; cancelled by
+        :meth:`aclose`.  On write failure the writer is closed and
+        ``on_connection_lost`` is fired directly (the reader may not see EOF on
+        a clean close of a fake or already-dead socket, so we surface the event
+        here rather than waiting for the reader task to discover it).
+        """
+        while True:
+            await asyncio.sleep(self._keepalive_interval)
+            writer = self._writer
+            if writer is None:
+                return
+            try:
+                async with self._send_lock:
+                    writer.write(b"\r\n\r\n")
+                    await writer.drain()
+            except (OSError, ConnectionError) as exc:
+                # Close the writer so no further sends are attempted.
+                if self._writer is not None:
+                    self._writer.close()
+                    self._writer = None
+                # Surface the loss via on_connection_lost (the reader task may
+                # not detect a write-side failure on its own).
+                if self._on_connection_lost is not None:
+                    self._on_connection_lost(exc)
+                return
 
     # --- SipTransport seam --------------------------------------------------
 

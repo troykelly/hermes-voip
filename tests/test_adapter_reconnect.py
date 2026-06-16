@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -311,7 +311,9 @@ async def test_consecutive_failures_emit_error_alert(
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
         patch("hermes_voip.adapter.build_providers", return_value=MagicMock()),
         patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
-        patch("asyncio.sleep", new_callable=AsyncMock),
+        # Use tiny backoff so 5 attempts complete well within the 5s timeout.
+        patch("hermes_voip.adapter._RECONNECT_BACKOFF_INITIAL", 0.001),
+        patch("hermes_voip.adapter._RECONNECT_BACKOFF_CAP", 0.001),
         caplog.at_level(logging.ERROR, logger="hermes_voip.adapter"),
     ):
         adapter = VoipAdapter(_platform_config())

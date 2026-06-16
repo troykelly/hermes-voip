@@ -962,6 +962,8 @@ async def test_inbound_invite_200ok_carries_dialog_to_tag() -> None:
 
     def _spy_add_call(dialog_id: tuple[str, str, str], consumer: object) -> None:
         captured["dialog_id"] = dialog_id
+        # The spy takes object (it only records the key); the value forwarded is
+        # the real CallSession the adapter passed, which IS a DialogConsumer.
         real_add_call(dialog_id, consumer)  # type: ignore[arg-type]
 
     with (
@@ -1100,15 +1102,17 @@ async def test_inbound_handler_exception_is_logged_with_traceback(
         for _ in range(20):
             await asyncio.sleep(0)
 
-    failures = [
-        record
+    # exc_info is (type, value, tb) | None; collect the values from ERROR records
+    # that carry one — a record with exc_info proves the traceback was logged.
+    logged_exceptions = [
+        record.exc_info[1]
         for record in caplog.records
         if record.levelno >= logging.ERROR and record.exc_info is not None
     ]
-    assert failures, (
+    assert logged_exceptions, (
         "the inbound handler swallowed an exception (no ERROR log with exc_info)"
     )
     # The logged record must carry the actual exception (so the traceback is real).
-    assert any(record.exc_info[1] is boom for record in failures), (  # type: ignore[index]
+    assert boom in logged_exceptions, (
         "the logged ERROR did not carry the handler's exception traceback"
     )

@@ -1,0 +1,295 @@
+"""Tests for hermes_voip.caller_modes — caller classification + persona (ADR-0020).
+
+The module is pure and sans-IO beyond a one-time list-file read. It classifies a
+**forgeable** caller-ID into a :class:`CallerMode`, maps the mode to a privilege
+bit and a spotlighted persona preamble, and loads the allow/deny/grey lists from
+operator-managed JSON files addressed by env-var paths (PII-safe — never inline).
+
+The load-bearing security properties asserted here:
+
+* Classification is **deny-biased**: deny > allow > grey > default(grey). A number
+  on both deny and allow is denied (fail safe).
+* The default for an unmatched caller is **GREY** (receptionist), never ALLOW —
+  privilege is strictly opt-in on a forgeable identifier.
+* ``GREY``/``OUTBOUND`` are **not privileged**; only ``ALLOW`` is. ``DENY`` is
+  rejected at SIP setup and never produces a persona.
+
+PUBLIC repo: all numbers are obvious fakes (``+15551230000`` etc.); no list file
+in the repo ever contains a real number — tests write their own to a tmp path.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_voip.caller_modes import (
+    CallerClassification,
+    CallerMode,
+    CallerModeConfig,
+    Normalization,
+    classify_caller,
+    load_caller_modes,
+    persona_preamble,
+)
+from hermes_voip.config import ConfigError
+
+# --- fakes (PUBLIC repo: never a real number) -------------------------------
+_TRUSTED = "+15551230001"
+_BLOCKED = "+15551230002"
+_GREY_PIN = "+15551230003"
+_UNKNOWN = "+15551239999"
+
+
+def _cfg(
+    *,
+    allow: tuple[str, ...] = (),
+    deny: tuple[str, ...] = (),
+    grey: tuple[str, ...] = (),
+    default_mode: CallerMode = CallerMode.GREY,
+    normalization: Normalization = Normalization.E164,
+) -> CallerModeConfig:
+    return CallerModeConfig(
+        allow=allow,
+        deny=deny,
+        grey=grey,
+        default_mode=default_mode,
+        normalization=normalization,
+    )
+
+
+# --- classification precedence (deny > allow > grey > default) --------------
+
+
+def test_unmatched_caller_defaults_to_grey() -> None:
+    cls = classify_caller(_UNKNOWN, _cfg())
+    assert cls.mode is CallerMode.GREY
+    assert cls.source == "default"
+
+
+def test_allow_listed_caller_is_allow() -> None:
+    cls = classify_caller(_TRUSTED, _cfg(allow=(_TRUSTED,)))
+    assert cls.mode is CallerMode.ALLOW
+    assert cls.source == "allow"
+    assert cls.matched_pattern == _TRUSTED
+
+
+def test_deny_listed_caller_is_deny() -> None:
+    cls = classify_caller(_BLOCKED, _cfg(deny=(_BLOCKED,)))
+    assert cls.mode is CallerMode.DENY
+    assert cls.source == "deny"
+
+
+def test_deny_beats_allow_for_a_number_on_both_lists() -> None:
+    # Fail safe: a number on BOTH deny and allow is DENIED.
+    cls = classify_caller(_TRUSTED, _cfg(allow=(_TRUSTED,), deny=(_TRUSTED,)))
+    assert cls.mode is CallerMode.DENY
+
+
+def test_explicit_grey_pin_overrides_default_allow() -> None:
+    # An operator can pin a caller to receptionist even if default were ALLOW.
+    cfg = _cfg(grey=(_GREY_PIN,), default_mode=CallerMode.ALLOW)
+    cls = classify_caller(_GREY_PIN, cfg)
+    assert cls.mode is CallerMode.GREY
+    assert cls.source == "grey"
+
+
+def test_default_mode_allow_applies_only_to_unmatched() -> None:
+    cfg = _cfg(default_mode=CallerMode.ALLOW)
+    cls = classify_caller(_UNKNOWN, cfg)
+    assert cls.mode is CallerMode.ALLOW
+    assert cls.source == "default"
+
+
+# --- normalization ----------------------------------------------------------
+
+
+def test_e164_normalization_matches_despite_punctuation() -> None:
+    # The From AOR carried punctuation/spaces; the list entry is clean E.164.
+    cls = classify_caller("+1 (555) 123-0001", _cfg(allow=(_TRUSTED,)))
+    assert cls.mode is CallerMode.ALLOW
+
+
+def test_e164_prepends_plus_for_a_bare_international_number() -> None:
+    # A bare "15551230001" normalizes to "+15551230001" and matches.
+    cls = classify_caller("15551230001", _cfg(allow=(_TRUSTED,)))
+    assert cls.mode is CallerMode.ALLOW
+
+
+def test_strip_plus_normalization_matches_digits_only() -> None:
+    cfg = _cfg(allow=("15551230001",), normalization=Normalization.STRIP_PLUS)
+    cls = classify_caller("+15551230001", cfg)
+    assert cls.mode is CallerMode.ALLOW
+
+
+def test_none_normalization_is_verbatim() -> None:
+    # NONE: a bare extension presented verbatim by the gateway matches verbatim.
+    cfg = _cfg(allow=("1000",), normalization=Normalization.NONE)
+    assert classify_caller("1000", cfg).mode is CallerMode.ALLOW
+    # ...and a punctuated form does NOT match under NONE.
+    assert classify_caller("+1000", cfg).mode is CallerMode.GREY
+
+
+def test_raw_form_also_matches_when_gateway_does_not_normalize() -> None:
+    # Both the normalized and the raw forms are tried against each list, so a
+    # bare-extension entry still matches even under E164 normalization.
+    cfg = _cfg(allow=("1000",), normalization=Normalization.E164)
+    assert classify_caller("1000", cfg).mode is CallerMode.ALLOW
+
+
+# --- prefix (block) matching ------------------------------------------------
+
+
+def test_prefix_pattern_matches_a_block_of_numbers() -> None:
+    cfg = _cfg(deny=("+15551230*",))
+    assert classify_caller("+15551230055", cfg).mode is CallerMode.DENY
+    assert classify_caller("+15551239999", cfg).mode is CallerMode.GREY
+
+
+def test_prefix_is_literal_startswith_not_regex() -> None:
+    # A '.' in a pattern is a literal dot, not a regex wildcard (no ReDoS).
+    cfg = _cfg(deny=("+1555123000.*",))
+    # The literal '.' cannot match a digit, so this does NOT deny.
+    assert classify_caller("+155512300011", cfg).mode is CallerMode.GREY
+
+
+# --- privilege mapping (the security spine) ---------------------------------
+
+
+def test_only_allow_is_privileged() -> None:
+    assert CallerMode.ALLOW.privileged is True
+    assert CallerMode.GREY.privileged is False
+    assert CallerMode.OUTBOUND.privileged is False
+    assert CallerMode.DENY.privileged is False
+
+
+# --- persona preamble (spotlighted, untrusted-data marked) ------------------
+
+
+def test_receptionist_preamble_for_grey_is_constrained() -> None:
+    text = persona_preamble(CallerMode.GREY)
+    lowered = text.lower()
+    assert "receptionist" in lowered
+    # It must instruct screening + forbid privileged actions + mark caller as data.
+    assert "who" in lowered  # "ask who is calling"
+    assert "untrusted" in lowered
+    assert "transfer" in lowered  # explicit prohibition listed
+
+
+def test_assistant_preamble_for_allow_grants_the_assistant_persona() -> None:
+    text = persona_preamble(CallerMode.ALLOW)
+    assert "assistant" in text.lower()
+
+
+def test_outbound_preamble_is_task_scoped_and_resists_steering() -> None:
+    text = persona_preamble(CallerMode.OUTBOUND)
+    lowered = text.lower()
+    # Task-scoped: pursue the operator's task, no operator secrets, untrusted callee.
+    assert "task" in lowered
+    assert "untrusted" in lowered
+    assert "secret" in lowered or "credential" in lowered
+
+
+def test_deny_has_no_persona() -> None:
+    # DENY never reaches a turn; asking for its persona is a programming error.
+    with pytest.raises(ValueError, match="DENY"):
+        persona_preamble(CallerMode.DENY)
+
+
+def test_classification_is_frozen() -> None:
+    cls = classify_caller(_UNKNOWN, _cfg())
+    assert isinstance(cls, CallerClassification)
+    with pytest.raises(AttributeError):
+        cls.mode = CallerMode.ALLOW  # type: ignore[misc]
+
+
+# --- list-file loading (PII-safe: paths in env, numbers in gitignored files) -
+
+
+def test_load_with_no_files_makes_every_caller_grey() -> None:
+    cfg = load_caller_modes({})
+    assert cfg.allow == ()
+    assert cfg.deny == ()
+    assert cfg.grey == ()
+    assert cfg.default_mode is CallerMode.GREY
+    assert cfg.normalization is Normalization.E164
+    # The safe default: nothing configured => receptionist for everyone.
+    assert classify_caller(_UNKNOWN, cfg).mode is CallerMode.GREY
+    assert classify_caller(_TRUSTED, cfg).mode is CallerMode.GREY
+
+
+def test_load_reads_patterns_from_json_files(tmp_path: Path) -> None:
+    allow_file = tmp_path / ".caller-allow.json"
+    deny_file = tmp_path / ".caller-deny.json"
+    allow_file.write_text(json.dumps({"patterns": [_TRUSTED]}), encoding="utf-8")
+    deny_file.write_text(json.dumps({"patterns": [_BLOCKED]}), encoding="utf-8")
+    cfg = load_caller_modes(
+        {
+            "HERMES_VOIP_CALLER_ALLOW_FILE": str(allow_file),
+            "HERMES_VOIP_CALLER_DENY_FILE": str(deny_file),
+        }
+    )
+    assert cfg.allow == (_TRUSTED,)
+    assert cfg.deny == (_BLOCKED,)
+    assert classify_caller(_TRUSTED, cfg).mode is CallerMode.ALLOW
+    assert classify_caller(_BLOCKED, cfg).mode is CallerMode.DENY
+
+
+def test_load_missing_file_path_is_empty_not_an_error(tmp_path: Path) -> None:
+    # An unset/missing path => empty list (an operator may run with only a deny
+    # list, or none). This is logged at INFO, not raised.
+    missing = tmp_path / "does-not-exist.json"
+    cfg = load_caller_modes({"HERMES_VOIP_CALLER_ALLOW_FILE": str(missing)})
+    assert cfg.allow == ()
+
+
+def test_load_malformed_file_raises_config_error(tmp_path: Path) -> None:
+    # A present-but-malformed security-relevant file fails LOUDLY (rule 37),
+    # never silently treated as empty.
+    bad = tmp_path / ".caller-deny.json"
+    bad.write_text("{ this is not json", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_caller_modes({"HERMES_VOIP_CALLER_DENY_FILE": str(bad)})
+
+
+def test_load_wrong_shape_file_raises_config_error(tmp_path: Path) -> None:
+    # A JSON file whose "patterns" is not a list of strings is malformed.
+    bad = tmp_path / ".caller-allow.json"
+    bad.write_text(json.dumps({"patterns": "not-a-list"}), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_caller_modes({"HERMES_VOIP_CALLER_ALLOW_FILE": str(bad)})
+
+
+def test_load_default_mode_from_env() -> None:
+    cfg = load_caller_modes({"HERMES_VOIP_CALLER_DEFAULT_MODE": "allow"})
+    assert cfg.default_mode is CallerMode.ALLOW
+
+
+def test_load_rejects_default_mode_deny() -> None:
+    # default=deny would block every unknown caller — a foot-gun; reject it.
+    with pytest.raises(ConfigError):
+        load_caller_modes({"HERMES_VOIP_CALLER_DEFAULT_MODE": "deny"})
+
+
+def test_load_rejects_unknown_default_mode() -> None:
+    with pytest.raises(ConfigError):
+        load_caller_modes({"HERMES_VOIP_CALLER_DEFAULT_MODE": "wat"})
+
+
+def test_load_normalization_from_env() -> None:
+    cfg = load_caller_modes({"HERMES_VOIP_CALLER_NORMALIZATION": "strip-plus"})
+    assert cfg.normalization is Normalization.STRIP_PLUS
+
+
+def test_load_rejects_unknown_normalization() -> None:
+    with pytest.raises(ConfigError):
+        load_caller_modes({"HERMES_VOIP_CALLER_NORMALIZATION": "rot13"})
+
+
+def test_load_rejects_inline_number_list_env() -> None:
+    # Inline number lists in env would leak PII into shell history / printenv.
+    # Only the *_FILE path form is accepted; an inline list var is rejected.
+    with pytest.raises(ConfigError, match="HERMES_VOIP_CALLER_ALLOW"):
+        load_caller_modes({"HERMES_VOIP_CALLER_ALLOW": _TRUSTED})

@@ -602,6 +602,56 @@ async def test_outbound_call_auth_challenge_then_200() -> None:
         await gateway.stop()
 
 
+async def test_outbound_call_runs_unprivileged_with_callee_identity() -> None:
+    """An established outbound call is OUTBOUND-TASK (ADR-0020 §3, amended).
+
+    The callee is UNTRUSTED (operator mandate): the agent pursues only the
+    operator's task with no privileged tool, so the call's GuardSessionState is
+    ``privileged=False`` — the credit-card attack fails by construction on an
+    outbound call exactly as it does inbound. The callee identity is recorded in
+    ``_call_info`` so the agent knows who it called (fixes "I don't know you").
+    """
+    gateway = OutboundGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            first_invite = await gateway.await_invite_from_plugin(timeout=5.0)
+            call_id = first_invite.header("Call-ID")
+            assert call_id is not None
+            await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth INVITE
+            await gateway.await_ack_from_plugin(timeout=5.0)
+
+            returned_call_id = await asyncio.wait_for(place_task, timeout=5.0)
+            assert returned_call_id == call_id
+
+            await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+            session = adapter._call_sessions.get(call_id)
+            assert session is not None
+
+            # The security spine: the outbound (untrusted-callee) session is NOT
+            # privileged, so ELEVATED/IRREVERSIBLE tools are structurally blocked.
+            assert session.guard.privileged is False
+
+            # The agent knows the callee it dialled (not "unknown caller").
+            from hermes_voip.caller_modes import CallerMode  # noqa: PLC0415
+
+            info = adapter._call_info[call_id]
+            assert info["name"] == _TARGET_EXT
+            assert info["mode"] is CallerMode.OUTBOUND
+    finally:
+        await gateway.stop()
+
+
 async def test_outbound_call_486_busy() -> None:
     """Plugin sends INVITE, gateway responds 486 Busy Here -> OutboundCallFailed.
 

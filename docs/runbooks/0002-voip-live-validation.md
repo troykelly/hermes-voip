@@ -299,10 +299,15 @@ auth challenge/response (`401` → `200 OK`) all work. The process then waits fo
 1. From any phone able to reach the gateway, **dial the registered extension** (the value of
    `HERMES_SIP_EXTENSION` for this item). Do **not** place an outbound call from the plugin.
 2. The plugin answers the inbound `INVITE` (sends `200 OK` with an SDP answer), opens the RTP
-   (or SDES-SRTP) media path, and starts the per-call loop.
+   (or SDES-SRTP) media path, and starts the per-call loop. On answer it immediately speaks the
+   configured opening greeting (`HERMES_VOIP_GREETING`, on by default) — this sends RTP **first**
+   so the caller hears the opening at once and a gateway behind NAT latches onto our source tuple
+   (symmetric RTP), opening the return media path. Look for the `greeting: synthesising N chars`
+   and `greeting: first RTP sent` INFO lines.
 3. **Speak.** On end-of-utterance (silero VAD endpointing), the transcript is screened by the
    injection guard, routed to the Hermes agent as a `VOICE` message, and the agent's reply is
-   synthesised by the TTS provider and played back over RTP.
+   synthesised by the TTS provider and played back over RTP. (If you talk over the greeting, a
+   speech onset barges in and cancels it.)
 4. **Success = a real two-way conversation:** you hear the agent's spoken reply to what you
    said, and follow-up turns work. Hang up to end the call; the loop tears down the RTP engine
    and in-dialog routes (no leaked socket).
@@ -325,16 +330,22 @@ handler failure is logged at `ERROR` **with its traceback**. Read these first.
   private RTP address:** a public gateway cannot reach a private address unaided.
   This is a media-reachability concern beyond the loopback fix. Resolve in this
   order:
-  1. **Symmetric-RTP latching (preferred, vendor-neutral):** learn the peer's
-     real source `(IP, port)` from the first inbound RTP packet and send our RTP
-     back to that tuple, ignoring a private/incorrect SDP address. Survives NAT
-     and SBC rewriting; a media-engine change, not signalling.
-  2. **Outbound greeting on answer (complementary):** speak a short greeting
-     immediately after the `200 OK` so we send RTP first — opens the NAT pinhole
-     and gives a symmetric-RTP gateway our address to latch onto. Helps, but is
-     **not sufficient alone** if the gateway honours the SDP address literally.
+  1. **Outbound greeting on answer (shipped, on by default):** the plugin speaks
+     the configured greeting (`HERMES_VOIP_GREETING`) the instant the call is
+     answered, so we send RTP **first** — this opens the NAT pinhole and gives a
+     symmetric-RTP gateway our source tuple to latch onto. Confirm the
+     `greeting: first RTP sent` INFO line appears. This is what makes the live
+     UCM6304-behind-NAT call work; set `HERMES_VOIP_GREETING=` (empty) to disable
+     it. It is **not sufficient alone** if the gateway honours the SDP address
+     literally (no comedia/symmetric-RTP) — then use option 2 or 3.
+  2. **Symmetric-RTP latching in the media engine (vendor-neutral, future):**
+     learn the peer's real source `(IP, port)` from the first inbound RTP packet
+     and send our RTP back to that tuple, ignoring a private/incorrect SDP
+     address. Survives NAT and SBC rewriting; a media-engine change, not
+     signalling. Not yet implemented — the greeting covers the common comedia
+     gateway; this hardens the case where the gateway does not auto-latch.
   3. **Correct public address in the SDP** (rport/STUN/configured external IP) is
-     the alternative; latching is the more robust default.
+     the alternative for gateways that honour the SDP address literally.
 
 ## 9. Teardown
 

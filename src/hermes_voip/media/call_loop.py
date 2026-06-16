@@ -255,7 +255,20 @@ class CallLoop:
         )
 
         async def _pump() -> None:
-            """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded)."""
+            """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded).
+
+            The pump is the SOLE iterator of ``transport.inbound_audio()``, so it
+            owns that generator's lifecycle: a plain ``async for`` closes it on
+            this task on every exit path — normal end, an error raised in the loop
+            body (e.g. a VAD rate mismatch), or cancellation when the TaskGroup
+            tears the loop down — because ``async for`` drives the generator's
+            ``aclose`` as it unwinds. The generator is therefore never left
+            suspended for a foreign ``aclose()`` (which would race a running
+            ``__anext__`` and raise ``RuntimeError: aclose(): asynchronous
+            generator is already running``). The cross-task cancel that the loop
+            *does* perform — barge-in cancelling the TTS stream — goes through
+            ``TtsStream.cancel`` (a stop flag, never ``aclose`` from another task).
+            """
             window_index = 0
             async for frame in self._transport.inbound_audio():
                 for vad_event in self._vad.feed(frame):
@@ -274,7 +287,17 @@ class CallLoop:
             await audio_q.put(_END_OF_STREAM)
 
         async def _asr() -> None:
-            """audio_q → asr.stream(...) → transcript_q (bounded)."""
+            """audio_q → asr.stream(...) → transcript_q (bounded).
+
+            ``_audio_iter`` is an async generator this task creates and hands to
+            ``asr.stream``. The ``async for`` over the recogniser output closes on
+            this task when the stream ends, errors, or is cancelled; the provider
+            owns its own teardown of the audio iterator it consumes (the
+            ``StreamingASR`` contract: it drains ``audio`` until exhausted and the
+            ``asr.stream`` result is only an
+            :class:`~collections.abc.AsyncIterator`, so it is consumed with a
+            plain ``async for`` — the protocol does not promise ``aclose``).
+            """
 
             async def _audio_iter() -> AsyncIterator[PcmFrame]:
                 while True:

@@ -660,6 +660,103 @@ async def test_outbound_call_486_busy() -> None:
         await gateway.stop()
 
 
+async def test_outbound_engine_uses_negotiated_codec_pcma() -> None:
+    """When the 2xx answer selects PCMA, the engine must use PCMA(8), not PCMU(0).
+
+    RED test (TDD): before the fix the engine is always initialised with PCMU
+    and the codec is never updated from the negotiated SDP answer, so this test
+    fails on the unfixed code.
+    """
+
+    class _PcmaOnlyGateway(OutboundGateway):
+        """Gateway that answers with PCMA-only SDP (no PCMU in the answer)."""
+
+        def _sdp_answer(self) -> str:
+            rtp_port = self.rtp.port
+            return (
+                "v=0\r\n"
+                "o=- 8000 8000 IN IP4 127.0.0.1\r\n"
+                "s=-\r\n"
+                "c=IN IP4 127.0.0.1\r\n"
+                "t=0 0\r\n"
+                f"m=audio {rtp_port} RTP/AVP 8 101\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=rtpmap:101 telephone-event/8000\r\n"
+                "a=fmtp:101 0-16\r\n"
+                "a=ptime:20\r\n"
+                "a=sendrecv\r\n"
+            )
+
+    from hermes_voip.media.engine import Codec  # noqa: PLC0415
+
+    gateway = _PcmaOnlyGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(
+        asr=_FakeASR(),
+        tts=_FakeTTS(),
+        guard=_FakeGuard(),
+    )
+
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            # Consume both INVITEs (challenge + re-auth)
+            await gateway.await_invite_from_plugin(timeout=5.0)
+            await gateway.await_invite_from_plugin(timeout=5.0)
+
+            # Wait for ACK (confirms 200 OK processed)
+            await gateway.await_ack_from_plugin(timeout=5.0)
+
+            returned_call_id = await asyncio.wait_for(place_task, timeout=5.0)
+
+            # Engine must have been updated to PCMA (payload type 8), not PCMU (0).
+            await _until(
+                lambda: returned_call_id in adapter._call_sessions, timeout=5.0
+            )
+            session = adapter._call_sessions[returned_call_id]
+            engine = session._media
+            assert isinstance(engine, RtpMediaTransport), (
+                f"expected RtpMediaTransport, got {type(engine)}"
+            )
+            assert engine._codec is Codec.PCMA, (
+                f"engine codec is {engine._codec!r} (payload type "
+                f"{engine._codec.value}); expected Codec.PCMA (payload type 8). "
+                "The outbound engine was not updated after codec negotiation."
+            )
+
+            # Tear down the call cleanly.
+            dialog = session.dialog
+            bye = build_request(
+                "BYE",
+                f"sip:{_TO_USER}@127.0.0.1:{gateway.sip_port};transport=tls",
+                [
+                    (
+                        "Via",
+                        f"SIP/2.0/TLS 127.0.0.1:{gateway.sip_port}"
+                        f";branch={new_branch()};rport",
+                    ),
+                    ("Max-Forwards", "70"),
+                    ("From", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                    ("To", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                    ("Call-ID", returned_call_id),
+                    ("CSeq", "2 BYE"),
+                ],
+            )
+            await gateway._server.push(bye)
+            await _until(
+                lambda: returned_call_id not in adapter._call_sessions, timeout=5.0
+            )
+    finally:
+        await gateway.stop()
+
+
 async def test_call_on_connect_trigger() -> None:
     """HERMES_VOIP_CALL_ON_CONNECT fires place_call once after registration.
 

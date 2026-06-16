@@ -191,6 +191,10 @@ class _SSLContext(Protocol):
         """Set the peer-certificate verification mode."""
         ...
 
+    def set_cipher_list(self, ciphers: bytes) -> None:
+        """Restrict the cipher suites offered/accepted to the given list."""
+        ...
+
 
 class _VerifyCallback(Protocol):
     """Type signature for the pyOpenSSL verify callback."""
@@ -465,6 +469,11 @@ class DtlsEndpoint:
     """
 
     role: DtlsRole
+    #: Optional OpenSSL cipher list (RFC 4346 cipher string) restricting the DTLS
+    #: ciphers offered/accepted.  ``None`` (the default) leaves the OpenSSL default
+    #: list in place.  Set to e.g. ``b"ECDHE-RSA-AES128-GCM-SHA256"`` to pin AEAD
+    #: ciphers as a security-hardening policy.
+    cipher_list: bytes | None = None
     _ossl: _PyOpenSSLImpl = field(init=False, repr=False)
     _pkey: _PKey = field(init=False, repr=False)
     _cert: _X509 = field(init=False, repr=False)
@@ -472,6 +481,7 @@ class DtlsEndpoint:
     _fp: str = field(init=False, repr=False)
     _done: bool = field(default=False, init=False, repr=False)
     _failed: bool = field(default=False, init=False, repr=False)
+    _fatal_error: Exception | None = field(default=None, init=False, repr=False)
     _fingerprint_verified: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -491,6 +501,8 @@ class DtlsEndpoint:
         )
         ctx: _SSLContext = ossl.Context(method)
         ctx.set_tlsext_use_srtp(_SRTP_PROFILES)
+        if self.cipher_list is not None:
+            ctx.set_cipher_list(self.cipher_list)
         ctx.use_certificate(cert)
         ctx.use_privatekey(pkey)
         ctx.check_privatekey()
@@ -709,13 +721,21 @@ class DtlsEndpoint:
         Calls ``do_handshake()`` once; catches only ``SSL.WantReadError`` (the
         normal "need more inbound data" signal in a memory-BIO DTLS session).
         Any other ``SSL.Error`` subclass is a fatal TLS alert; the endpoint sets
-        ``_failed = True`` and re-raises so the caller sees the failure
-        immediately (AGENTS.md rule 37 — errors propagate, never swallowed).
+        ``_failed = True``, stores the exception, and re-raises so the caller sees
+        the failure immediately (AGENTS.md rule 37 — errors propagate, never
+        swallowed).  Once failed, every subsequent call re-raises the SAME stored
+        error rather than silently no-opping — a failed endpoint keeps surfacing
+        its failure deterministically.
 
         On successful completion (no exception), sets ``_done = True``.
         """
-        if self._done or self._failed:
+        if self._done:
             return
+        if self._fatal_error is not None:
+            # Re-surface the original fatal error on every subsequent call so a
+            # failed endpoint never silently no-ops (rule 37).  Checking
+            # _fatal_error (not _failed) also narrows the type for the raise.
+            raise self._fatal_error
         ossl = self._ossl
         try:
             self._conn.do_handshake()
@@ -725,11 +745,13 @@ class DtlsEndpoint:
             # the handshake is still in progress.  Drain the outbound BIO on
             # the next get_outbound_datagrams call.
             pass
-        except ossl.SSL_ERROR_CLASS:
+        except ossl.SSL_ERROR_CLASS as exc:
             # Any SSL.Error that is NOT WantReadError is a fatal TLS alert
-            # (e.g. certificate_unknown, handshake_failure, protocol_version).
-            # The handshake is permanently broken; mark it and re-raise.
+            # (e.g. certificate_unknown, handshake_failure, protocol_version,
+            # or "no shared cipher").  The handshake is permanently broken;
+            # store the error, mark failed, and re-raise.
             self._failed = True
+            self._fatal_error = exc
             raise
 
     def _drain_outbound(self) -> list[bytes]:

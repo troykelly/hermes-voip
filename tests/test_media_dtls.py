@@ -19,7 +19,7 @@ real pyOpenSSL over an in-memory datagram pair, not a mock).
 
 from __future__ import annotations
 
-import contextlib
+import importlib
 
 import pytest
 
@@ -55,6 +55,36 @@ from hermes_voip.rtp import RtpPacket  # noqa: E402
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _ssl_error_class() -> type[Exception]:
+    """Return ``OpenSSL.SSL.Error`` for use in ``pytest.raises``.
+
+    Loaded via importlib (the suite is already gated on OpenSSL being present)
+    so the return type is a concrete ``type[Exception]`` with no ``Any``.
+    """
+    ssl_mod = importlib.import_module("OpenSSL.SSL")
+    error_cls: type[Exception] = ssl_mod.Error
+    return error_cls
+
+
+def _pump_until_raise(
+    client: DtlsEndpoint,
+    server: DtlsEndpoint,
+    *,
+    max_rounds: int = 30,
+) -> None:
+    """Drive the handshake, letting any fatal SSL error propagate to the caller.
+
+    Unlike :func:`_pump_handshake` (which expects success), this helper does not
+    catch SSL errors - it is used to assert that a fatal DTLS alert escapes
+    feed()/get_outbound_datagrams().
+    """
+    for _ in range(max_rounds):
+        for dg in client.get_outbound_datagrams():
+            server.feed(dg)
+        for dg in server.get_outbound_datagrams():
+            client.feed(dg)
 
 
 def _pump_handshake(
@@ -500,31 +530,57 @@ class TestFatalTlsAlert:
         assert not client.handshake_failed()
         assert not server.handshake_failed()
 
-    def test_fatal_alert_sets_failed_flag(self) -> None:
-        """Feeding garbage to a DTLS endpoint after a ClientHello sets _failed.
+    def test_fatal_alert_reraises_and_sets_failed_flag(self) -> None:
+        """A fatal DTLS alert re-raises (not swallowed) AND sets handshake_failed().
 
-        A CLIENT sends a ClientHello; feeding the raw ClientHello bytes back to
-        the same CLIENT (which is now waiting for a ServerHello) triggers a fatal
-        TLS alert because the record type or content is unexpected.  The endpoint
-        must expose this as handshake_failed() == True and re-raise rather than
-        silently ignoring the error.
+        Deterministically forces a fatal ``SSL.Error`` ("no shared cipher") via a
+        cipher-suite mismatch: the client offers only AES128-GCM, the server only
+        AES256-GCM.  This proves the DEFECT-4 fix - a non-WantRead ``SSL.Error``
+        must propagate (rule 37) and the endpoint must record the failure - rather
+        than being silently swallowed alongside the normal WantReadError signal.
         """
-        # Client sends ClientHello.
-        client = DtlsEndpoint(role=DtlsRole.CLIENT)
-        c_hellos = client.get_outbound_datagrams()
-        assert c_hellos, "CLIENT must produce ClientHello"
+        client = DtlsEndpoint(
+            role=DtlsRole.CLIENT, cipher_list=b"ECDHE-RSA-AES128-GCM-SHA256"
+        )
+        server = DtlsEndpoint(
+            role=DtlsRole.SERVER, cipher_list=b"ECDHE-RSA-AES256-GCM-SHA384"
+        )
 
-        # Feed the ClientHello BACK to the client itself — it will see a
-        # DTLS record whose content doesn't match the expected ServerHello.
-        # This should produce a fatal alert from pyOpenSSL.
-        for dg in c_hellos:
-            # Suppress the re-raised SSL error — we only care that _failed is set.
-            with contextlib.suppress(Exception):
-                client.feed(dg)
+        # Drive the handshake until the server rejects the cipher list.  The
+        # fatal SSL.Error MUST propagate out of feed()/get_outbound_datagrams().
+        with pytest.raises(_ssl_error_class()):
+            _pump_until_raise(client, server)
 
-        # After a fatal error the endpoint must be in the failed state.
-        # If pyOpenSSL treats this as WantReadError the test passes vacuously
-        # (no failure was raised); we at minimum verify done stays False.
-        if client.handshake_failed():
-            # Confirm _done and _failed are mutually exclusive.
-            assert not client.handshake_done()
+        # The server saw the fatal "no shared cipher" alert.
+        assert server.handshake_failed()
+        # _done and _failed are mutually exclusive.
+        assert not server.handshake_done()
+
+    def test_failed_endpoint_reraises_on_subsequent_calls(self) -> None:
+        """Once failed, an endpoint re-raises the SAME error on later calls.
+
+        A failed endpoint must never silently no-op (rule 37): every subsequent
+        feed()/get_outbound_datagrams() must keep surfacing the original fatal
+        error so callers cannot mistake a dead endpoint for an idle one.
+        """
+        client = DtlsEndpoint(
+            role=DtlsRole.CLIENT, cipher_list=b"ECDHE-RSA-AES128-GCM-SHA256"
+        )
+        server = DtlsEndpoint(
+            role=DtlsRole.SERVER, cipher_list=b"ECDHE-RSA-AES256-GCM-SHA384"
+        )
+
+        # Drive until the server fails (the first raise is exercised above).
+        first_error: BaseException | None = None
+        try:
+            _pump_until_raise(client, server)
+        except _ssl_error_class() as exc:
+            first_error = exc
+        assert first_error is not None, "expected a fatal SSL.Error"
+        assert server.handshake_failed()
+
+        # A subsequent call on the failed server re-raises (does NOT no-op).
+        with pytest.raises(_ssl_error_class()):
+            server.get_outbound_datagrams()
+        with pytest.raises(_ssl_error_class()):
+            server.feed(b"\x16\xfe\xfd")  # any DTLS-looking byte triggers re-raise

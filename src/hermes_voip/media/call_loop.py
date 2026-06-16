@@ -216,8 +216,15 @@ class CallLoop:
         self._call_id = call_id
         self._greeting = greeting
         # The currently-active TtsStream, or None when the agent is silent.
-        # Accessed only from the event loop; no locking required.
+        # Written synchronously (``synthesize`` is a sync factory) before any
+        # await, so a single ``speak``/greeting always registers its stream
+        # before it yields control; read by ``barge_in`` from the same loop.
         self._active_tts_stream: TtsStream | None = None
+        # Serialises near-end playout so only ONE TtsStream is ever draining to
+        # ``transport.send_audio`` at a time. A new ``speak`` supersedes any
+        # in-flight stream (cancels it, then takes the lock), so the greeting and
+        # a following agent reply never interleave frames on the wire.
+        self._playout_lock = asyncio.Lock()
 
     async def run(self) -> None:
         """Run the duplex loop until the transport's inbound stream ends.
@@ -289,16 +296,30 @@ class CallLoop:
                     return
                 await self._screen_and_deliver(item)
 
+        # Optional one-shot greeting: synthesise + REGISTER it synchronously here,
+        # before the TaskGroup starts the pump, so a caller speech onset on the
+        # very first inbound frame already sees an active stream and barges in
+        # (the pump task, created below, only runs once this coroutine awaits the
+        # TaskGroup — by then the greeting stream is registered). The greeting is
+        # then played by its own task so it runs concurrently with the pump and
+        # never blocks inbound audio (NAT-latch rationale: ADR-0002).
+        #
+        # A greeting failure is intentionally FATAL to the call: it runs as a
+        # TaskGroup child (or raises synchronously here), so a synth/send error
+        # propagates and cancels the loop rather than being swallowed (rule 37).
+        # The rationale is causal, not just policy — if the greeting cannot emit
+        # RTP then a NAT'd gateway never latches, so the return media path never
+        # opens and the call is already dead; failing fast surfaces it. (This is
+        # deliberately stricter than a mid-call agent reply, which the adapter
+        # degrades to a failed send so one bad turn does not drop a live call.)
+        greeting_stream = self._begin_greeting() if self._greeting else None
+
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_pump())
             tg.create_task(_asr())
             tg.create_task(_delivery())
-            # Optional one-shot greeting: speak the configured opening line at
-            # once so RTP flows out before any inbound audio (NAT-latch, ADR-0002).
-            # Concurrent with the pump (never blocks it); barge-in-cancellable via
-            # speak()'s registered TtsStream. Returns after the greeting is sent.
-            if self._greeting:
-                tg.create_task(self._greet())
+            if greeting_stream is not None:
+                tg.create_task(self._play_greeting(greeting_stream))
 
     async def speak(
         self,
@@ -312,57 +333,97 @@ class CallLoop:
         ``PcmFrame`` to ``transport.send_audio()``. Returns once all frames are
         sent or ``barge_in()`` has cancelled the stream.
 
-        ``barge_in()`` may be called concurrently (from the inbound pump) to
-        cancel the active stream; once cancelled the ``TtsStream`` stops
-        yielding and this coroutine exits cleanly.
+        A new ``speak`` **supersedes** any in-flight stream: it registers its own
+        stream and cancels the previous one, then plays under the playout lock —
+        so the opening greeting and a subsequent agent reply (or two replies)
+        never interleave frames on the wire, and ``barge_in`` always targets the
+        most recent stream. ``barge_in`` may be called concurrently (from the
+        inbound pump) to cancel the active stream; once cancelled the
+        ``TtsStream`` stops yielding and this coroutine exits cleanly.
 
         Args:
             text: The agent's incremental text output.
             on_first_frame: Optional zero-arg callback invoked exactly once, just
-                before the first synthesised frame is sent to the transport (used
-                by the greeting to log the real first-RTP moment). Not called at
-                all if the stream is cancelled before yielding any frame.
+                after the first synthesised frame is successfully sent to the
+                transport (used by the greeting to log the real first-RTP
+                moment). Not called if the stream is cancelled before any frame
+                is sent.
         """
         stream = self._tts.synthesize(text, self._voice)
+        # Register synchronously (no await before this line), then supersede any
+        # previously-active stream so playout is single-owner.
+        previous = self._active_tts_stream
         self._active_tts_stream = stream
+        if previous is not None and previous is not stream:
+            await previous.cancel()
+        await self._play(stream, on_first_frame=on_first_frame)
+
+    async def _play(
+        self,
+        stream: TtsStream,
+        *,
+        on_first_frame: Callable[[], None] | None,
+    ) -> None:
+        """Drain one ``TtsStream`` to ``send_audio`` under the playout lock.
+
+        The lock guarantees only one stream is ever sending at a time; a
+        superseding ``speak`` has already cancelled the prior stream, so the
+        prior ``_play`` exits its loop promptly and releases the lock to this
+        one. ``on_first_frame`` fires once, right after the first frame is
+        actually sent (so a cancelled-before-any-frame stream never logs it).
+        """
         first_frame_pending = on_first_frame is not None
-        try:
-            async for frame in stream:
-                if first_frame_pending and on_first_frame is not None:
-                    on_first_frame()
-                    first_frame_pending = False
-                await self._transport.send_audio(frame)
-        finally:
-            # Clear the reference so barge_in() knows there is no active stream.
-            if self._active_tts_stream is stream:
-                self._active_tts_stream = None
+        async with self._playout_lock:
+            try:
+                async for frame in stream:
+                    await self._transport.send_audio(frame)
+                    if first_frame_pending and on_first_frame is not None:
+                        on_first_frame()
+                        first_frame_pending = False
+            finally:
+                # Clear the reference only if it is still ours (a superseding
+                # speak() may have already pointed it at a newer stream).
+                if self._active_tts_stream is stream:
+                    self._active_tts_stream = None
 
-    async def _greet(self) -> None:
-        """Speak the configured opening greeting immediately on call answer.
+    def _begin_greeting(self) -> TtsStream:
+        """Synthesise + register the greeting stream synchronously (no await).
 
-        Synthesises ``self._greeting`` as a single text chunk and sends it via
-        :meth:`speak`, so the plugin emits RTP before any inbound audio — the
-        caller hears the opening at once and a symmetric-RTP gateway behind NAT
-        latches onto our source tuple (ADR-0002). Logs the synth start and the
-        first outbound RTP frame at INFO so a live call shows the greeting going
-        out. Only called when ``self._greeting`` is non-empty.
+        Called from ``run`` before the TaskGroup starts the pump, so the greeting
+        stream is the active stream before any inbound frame can be processed —
+        a first-frame caller onset therefore barges in correctly. ``synthesize``
+        is a synchronous factory, so this whole method runs without yielding.
+        Logs the synth start at INFO. Only called when ``self._greeting`` is
+        non-empty.
         """
         greeting = self._greeting
         _log.info("greeting: synthesising %d chars", len(greeting))
 
-        def _log_first_rtp() -> None:
-            _log.info("greeting: first RTP sent")
-
         async def _single_chunk() -> AsyncIterator[str]:
             yield greeting
 
-        await self.speak(_single_chunk(), on_first_frame=_log_first_rtp)
+        stream = self._tts.synthesize(_single_chunk(), self._voice)
+        self._active_tts_stream = stream
+        return stream
+
+    async def _play_greeting(self, stream: TtsStream) -> None:
+        """Play the pre-registered greeting stream; log the first RTP frame.
+
+        Runs as its own TaskGroup task so the greeting plays concurrently with
+        the inbound pump (never blocking it) and stops at once on barge-in (the
+        pump cancels ``_active_tts_stream`` — this stream — on a caller onset).
+        """
+
+        def _log_first_rtp() -> None:
+            _log.info("greeting: first RTP sent")
+
+        await self._play(stream, on_first_frame=_log_first_rtp)
 
     async def barge_in(self) -> None:
         """Cancel the in-flight TtsStream for immediate barge-in.
 
         Calls ``cancel()`` on the active ``TtsStream`` if one is in progress,
-        causing ``speak()``'s iteration loop to exit before the next
+        causing ``_play()``'s iteration loop to exit before the next
         ``send_audio`` call. Idempotent: calling when no stream is active is a
         no-op.
         """

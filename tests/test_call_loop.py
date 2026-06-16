@@ -1018,12 +1018,16 @@ class _SlowTtsStream:
 
     async def _iter(self) -> AsyncIterator[PcmFrame]:
         for frame in self._frames:
-            if self._cancelled:
-                return
-            await asyncio.sleep(0)  # cooperative yield so a rival speak() can run
-            if self._cancelled:
+            # cooperative yield so a rival speak() can run; cancel() may flip the
+            # flag across the await. Re-read into a fresh local each time so the
+            # post-await check is not narrowed away by the pre-await one.
+            await asyncio.sleep(0)
+            if self._is_cancelled():
                 return
             yield frame
+
+    def _is_cancelled(self) -> bool:
+        return self._cancelled
 
     async def flush(self) -> None:
         self.flush_called = True

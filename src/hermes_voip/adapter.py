@@ -65,6 +65,7 @@ from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.manager import NewCall, RegistrationManager
+from hermes_voip.media.audio import G711_SAMPLE_RATE
 from hermes_voip.media.call_loop import CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import Codec, RtpMediaTransport
@@ -705,6 +706,17 @@ def _caller_number(from_header: str) -> str:
 def _make_vad(media_cfg: MediaConfig) -> VoiceActivityDetector:
     """Build a VoiceActivityDetector from the media config.
 
+    The detector runs at the **inbound media rate**, the 8 kHz G.711 wire rate
+    (:data:`~hermes_voip.media.audio.G711_SAMPLE_RATE` =
+    :attr:`RtpMediaTransport.inbound_sample_rate`): the call loop feeds it the
+    frames straight off the transport, which decodes G.711 to 8 kHz PCM and does
+    NOT resample before the VAD. silero-vad supports 8 kHz natively, so the
+    detector and its model are both built at 8 kHz; the STT provider separately
+    upsamples 8 kHz → its 16 kHz recogniser rate inside its own feed (ADR-0017).
+    A mismatched detector rate would make ``VoiceActivityDetector.feed`` reject
+    every inbound frame (``frame rate 8000 != detector rate ...``) and crash the
+    call loop — the live no-audio failure this avoids.
+
     Loads the silero-vad ONNX model from ``media_cfg.vad_model_dir`` (or the
     ``HERMES_VOIP_VAD_MODEL_DIR`` environment variable). Requires the ``ml``
     extra (onnxruntime + numpy); raises ``ImportError`` / ``FileNotFoundError``
@@ -714,11 +726,20 @@ def _make_vad(media_cfg: MediaConfig) -> VoiceActivityDetector:
     :func:`~hermes_voip.media.vad.load_silero_model`.
     """
     return VoiceActivityDetector(
-        model=load_silero_model(),
+        model=load_silero_model(G711_SAMPLE_RATE),
+        sample_rate_hz=G711_SAMPLE_RATE,
         threshold=media_cfg.vad_threshold,
     )
 
 
 def _make_endpointer(media_cfg: MediaConfig) -> Endpointer:
-    """Build an Endpointer using the configured trailing-silence threshold."""
-    return Endpointer(silence_ms=media_cfg.endpoint_silence_ms)
+    """Build an Endpointer at the inbound 8 kHz media rate.
+
+    The endpointer counts silero window ordinals, so its rate must match the
+    detector's (:func:`_make_vad`) — the 8 kHz G.711 inbound wire rate — for the
+    window durations (and thus the trailing-silence threshold) to line up.
+    """
+    return Endpointer(
+        silence_ms=media_cfg.endpoint_silence_ms,
+        sample_rate_hz=G711_SAMPLE_RATE,
+    )

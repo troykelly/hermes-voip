@@ -7,8 +7,9 @@ endpointer/ASR/TTS) and the Hermes adapter that owns the Hermes conversation.
 Architecture
 ------------
 ``run()`` runs **three one-directional tasks** under an :class:`asyncio.TaskGroup`
-(Python 3.13). Each task owns exactly one hop, so no task ever both feeds and
-drains two bounded queues — which is what precludes the two-queue deadlock:
+(Python 3.13), plus an optional one-shot **greeting** task. Each pipeline task
+owns exactly one hop, so no task ever both feeds and drains two bounded queues —
+which is what precludes the two-queue deadlock:
 
 * **pump** — consumes ``transport.inbound_audio()``, feeds every frame through
   VAD + endpointer (calling :meth:`barge_in` on a speech ONSET while the agent
@@ -23,6 +24,15 @@ drains two bounded queues — which is what precludes the two-queue deadlock:
 * **delivery** — drains ``transcript_q``; for each transcript it awaits
   ``guard.screen``, folds the result into ``guard_state``, and (when the verdict
   is not REFUSE) awaits ``deliver_turn``. It returns on the marker.
+
+* **greeting** (only when a non-empty ``greeting`` is configured) — synthesises
+  the configured opening line via :meth:`speak` the instant the loop starts,
+  *before and independently of* any inbound audio, then returns. This makes the
+  plugin emit RTP first so the caller hears the opening immediately and a
+  symmetric-RTP gateway behind NAT latches onto our source tuple (opening the
+  return media path). It runs concurrently with the pump, so it never blocks
+  inbound audio, and because :meth:`speak` registers the active ``TtsStream``
+  the pump's barge-in cancels it if the caller talks over it (ADR-0002).
 
 Because the pump only *feeds* ``audio_q`` and the delivery task only *drains*
 ``transcript_q``, the dependency graph is a straight line
@@ -69,6 +79,7 @@ honoured without the call loop needing to know tool semantics.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from typing import Final
@@ -81,6 +92,8 @@ from hermes_voip.providers.guard import GuardVerdict, InjectionGuard
 from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_call
 from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
+
+_log: Final = logging.getLogger(__name__)
 
 #: Maximum audio frames buffered between the pump and the ASR task (back-pressure:
 #: the pump blocks once the ASR task is this far behind). Bounds inbound memory.
@@ -170,9 +183,12 @@ class CallLoop:
             Hermes agent.
         voice: Opaque voice identifier passed to ``tts.synthesize()``.
         call_id: The call/session identifier passed to ``guard.screen()``.
+        greeting: The opening line spoken the instant the loop starts (before any
+            inbound audio). Empty string disables the greeting. Defaults to empty
+            so a caller that does not want one need not pass it.
     """
 
-    def __init__(  # noqa: PLR0913 — 10-arg constructor; all keyword-only, no default
+    def __init__(  # noqa: PLR0913 — 11-arg constructor; all keyword-only
         self,
         *,
         transport: MediaTransport,
@@ -185,6 +201,7 @@ class CallLoop:
         deliver_turn: Callable[[str], Awaitable[None]],
         voice: str,
         call_id: str,
+        greeting: str = "",
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -197,6 +214,7 @@ class CallLoop:
         self._deliver_turn = deliver_turn
         self._voice = voice
         self._call_id = call_id
+        self._greeting = greeting
         # The currently-active TtsStream, or None when the agent is silent.
         # Accessed only from the event loop; no locking required.
         self._active_tts_stream: TtsStream | None = None
@@ -275,8 +293,19 @@ class CallLoop:
             tg.create_task(_pump())
             tg.create_task(_asr())
             tg.create_task(_delivery())
+            # Optional one-shot greeting: speak the configured opening line at
+            # once so RTP flows out before any inbound audio (NAT-latch, ADR-0002).
+            # Concurrent with the pump (never blocks it); barge-in-cancellable via
+            # speak()'s registered TtsStream. Returns after the greeting is sent.
+            if self._greeting:
+                tg.create_task(self._greet())
 
-    async def speak(self, text: AsyncIterator[str]) -> None:
+    async def speak(
+        self,
+        text: AsyncIterator[str],
+        *,
+        on_first_frame: Callable[[], None] | None = None,
+    ) -> None:
         """Synthesise agent text and send frames to the far end.
 
         Drives ``tts.synthesize(text, voice)`` and forwards each output
@@ -289,16 +318,45 @@ class CallLoop:
 
         Args:
             text: The agent's incremental text output.
+            on_first_frame: Optional zero-arg callback invoked exactly once, just
+                before the first synthesised frame is sent to the transport (used
+                by the greeting to log the real first-RTP moment). Not called at
+                all if the stream is cancelled before yielding any frame.
         """
         stream = self._tts.synthesize(text, self._voice)
         self._active_tts_stream = stream
+        first_frame_pending = on_first_frame is not None
         try:
             async for frame in stream:
+                if first_frame_pending and on_first_frame is not None:
+                    on_first_frame()
+                    first_frame_pending = False
                 await self._transport.send_audio(frame)
         finally:
             # Clear the reference so barge_in() knows there is no active stream.
             if self._active_tts_stream is stream:
                 self._active_tts_stream = None
+
+    async def _greet(self) -> None:
+        """Speak the configured opening greeting immediately on call answer.
+
+        Synthesises ``self._greeting`` as a single text chunk and sends it via
+        :meth:`speak`, so the plugin emits RTP before any inbound audio — the
+        caller hears the opening at once and a symmetric-RTP gateway behind NAT
+        latches onto our source tuple (ADR-0002). Logs the synth start and the
+        first outbound RTP frame at INFO so a live call shows the greeting going
+        out. Only called when ``self._greeting`` is non-empty.
+        """
+        greeting = self._greeting
+        _log.info("greeting: synthesising %d chars", len(greeting))
+
+        def _log_first_rtp() -> None:
+            _log.info("greeting: first RTP sent")
+
+        async def _single_chunk() -> AsyncIterator[str]:
+            yield greeting
+
+        await self.speak(_single_chunk(), on_first_frame=_log_first_rtp)
 
     async def barge_in(self) -> None:
         """Cancel the in-flight TtsStream for immediate barge-in.

@@ -33,7 +33,12 @@ from gateway.platform_registry import (
 )
 from gateway.platforms.base import BasePlatformAdapter
 
-from hermes_voip.config import ConfigError, ExtensionConfig, GatewayConfig
+from hermes_voip.config import (
+    ConfigError,
+    ExtensionConfig,
+    GatewayConfig,
+    load_media_config,
+)
 from hermes_voip.manager import InDialog, NewCall, RegistrationManager
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
 from hermes_voip.providers.audio import PcmFrame
@@ -551,6 +556,59 @@ async def test_inbound_invite_registers_call_loop() -> None:
             await asyncio.sleep(0)
 
         assert call_id in adapter._call_info
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_threads_greeting_into_call_loop() -> None:
+    """The adapter must pass the media config's greeting into CallLoop.
+
+    This is the on-answer NAT-latch wiring (ADR-0002): the configured opening
+    line reaches the per-call loop, which speaks it the instant the call is
+    answered so RTP flows out first.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    # Replace the (mocked) media config with a real one carrying a concrete
+    # greeting, so we assert the adapter threads THAT value into CallLoop.
+    adapter._media_cfg = load_media_config(
+        {"HERMES_VOIP_GREETING": "Hello from the gateway."}
+    )
+
+    call_id = new_call_id()
+    invite_raw = _make_invite(call_id=call_id)
+    call_loop_cls = MagicMock(return_value=MagicMock(run=AsyncMock(return_value=None)))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(
+                dialog_id=("call-id", "local-tag", "remote-tag"),
+                ended=False,
+            ),
+        ),
+        patch("hermes_voip.adapter.CallLoop", call_loop_cls),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        invite_req = SipRequest.parse(invite_raw)
+        new_call = NewCall(registration=_ext_config(), invite=invite_req)
+        adapter._on_inbound_invite(new_call)
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    call_loop_cls.assert_called_once()
+    assert call_loop_cls.call_args.kwargs["greeting"] == "Hello from the gateway."
 
 
 # ---------------------------------------------------------------------------

@@ -156,6 +156,7 @@ def _media_config(**overrides: object) -> MediaConfig:
         "vad_threshold": 0.5,
         "endpoint_silence_ms": 500,
         "duplex_mode": "half",
+        "greeting": "",
         "injection_guard": "onnx",
         "injection_guard_model_dir": "/models/guard",
         "dtmf_mode": "auto",

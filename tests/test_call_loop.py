@@ -780,9 +780,13 @@ class _RecordingTtsStream:
         self.cancel_called = False
         self.flush_called = False
         self._cancelled = False
+        self._gen = self._iter()
 
     def __aiter__(self) -> AsyncIterator[PcmFrame]:
-        return self._iter()
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
 
     async def _iter(self) -> AsyncIterator[PcmFrame]:
         async for chunk in self._text:
@@ -909,9 +913,13 @@ class _GatedGreetingTtsStream:
         self.cancel_called = False
         self.flush_called = False
         self._resume = asyncio.Event()
+        self._gen = self._iter()
 
     def __aiter__(self) -> AsyncIterator[PcmFrame]:
-        return self._iter()
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
 
     async def _iter(self) -> AsyncIterator[PcmFrame]:
         # Emit one frame so RTP starts, then park until cancel()/resume.

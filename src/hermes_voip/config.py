@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from hermes_voip.registration import RegistrationConfig
 
 __all__ = [
+    "DEFAULT_GREETING",
     "ConfigError",
     "ExtensionConfig",
     "GatewayConfig",
@@ -44,6 +45,16 @@ __all__ = [
     "load_gateway_config",
     "load_media_config",
 ]
+
+#: The opening line the agent speaks the instant an inbound call is answered,
+#: unless ``HERMES_VOIP_GREETING`` overrides it (ADR-0002 §"NAT / symmetric-RTP
+#: latching"). Speaking on answer makes the plugin send RTP first, which both
+#: lets the caller hear something immediately and gives a symmetric-RTP gateway
+#: behind NAT a source tuple to latch onto so the return media path opens. An
+#: explicitly-empty override disables the greeting entirely.
+DEFAULT_GREETING = (
+    "Hello, you're through to the Hermes voice assistant. How can I help?"
+)
 
 # Scheme tokens accepted for HERMES_SIP_TRANSPORT, mapped to their Via transport
 # tokens (RFC 3261 §7.1 / RFC 7118). Only the two sanctioned transports.
@@ -123,6 +134,10 @@ _DEFAULT_DUPLEX_MODE = "half"
 _DUPLEX_MODES = frozenset({"half", "full"})
 _MIN_VAD_THRESHOLD = 0.0
 _MAX_VAD_THRESHOLD = 1.0
+
+# Opening greeting spoken on inbound-call answer (ADR-0002 NAT-latch). Absent →
+# the friendly DEFAULT_GREETING; present-but-empty (or whitespace) → no greeting.
+_GREETING_KEY = "HERMES_VOIP_GREETING"
 
 # Prompt-injection guard (ADR-0009). Default is the in-process ONNX classifier;
 # the optional loopback sidecar is opt-in (and out of this parser's scope).
@@ -272,6 +287,10 @@ class MediaConfig:
         vad_threshold: Voice-activity probability cut-off in ``[0.0, 1.0]``.
         endpoint_silence_ms: Trailing silence (ms) that ends a caller turn.
         duplex_mode: ``half`` (shipped) or ``full`` (deferred Phase-2 barge-in).
+        greeting: Opening line spoken the instant an inbound call is answered
+            (``DEFAULT_GREETING`` when unset; ``""`` disables it). Speaking on
+            answer sends RTP first — the caller hears it immediately and a
+            symmetric-RTP gateway behind NAT latches onto our source tuple.
         injection_guard: Prompt-injection guard token (``onnx`` in-process default).
         injection_guard_model_dir: Path to the guard's ONNX model dir, or ``None``.
         dtmf_mode: ``auto`` | ``rfc4733`` | ``sip_info`` | ``inband``.
@@ -290,6 +309,7 @@ class MediaConfig:
     vad_threshold: float
     endpoint_silence_ms: int
     duplex_mode: str
+    greeting: str
     injection_guard: str
     injection_guard_model_dir: str | None
     dtmf_mode: str
@@ -394,6 +414,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         duplex_mode=_parse_enum(
             env, _DUPLEX_MODE_KEY, _DUPLEX_MODES, _DEFAULT_DUPLEX_MODE
         ),
+        greeting=_parse_greeting(env),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,
         injection_guard_model_dir=_optional(env, _INJECTION_GUARD_MODEL_DIR_KEY),
@@ -560,6 +581,20 @@ def _parse_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
 def _finite_in_range(value: float, lo: float, hi: float) -> bool:
     """True iff ``value`` is finite (not NaN/inf) and within ``[lo, hi]``."""
     return math.isfinite(value) and lo <= value <= hi
+
+
+def _parse_greeting(env: Mapping[str, str]) -> str:
+    """Parse the opening greeting, distinguishing 'unset' from 'explicitly empty'.
+
+    Unlike :func:`_optional` (which collapses a blank value to ``None``), the
+    greeting must tell apart two intents: *unset* → use the friendly
+    :data:`DEFAULT_GREETING`; *present-but-empty* (``""`` or whitespace) → opt
+    out of any greeting (returns ``""``). A set value is trimmed.
+    """
+    raw = env.get(_GREETING_KEY)
+    if raw is None:  # key absent → friendly default
+        return DEFAULT_GREETING
+    return raw.strip()  # present (incl. empty/whitespace) → verbatim, trimmed
 
 
 def _parse_vad_threshold(env: Mapping[str, str]) -> float:

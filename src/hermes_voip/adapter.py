@@ -575,8 +575,12 @@ class VoipAdapter(BasePlatformAdapter):
         # in-dialog routes installed). ANY failure now — provider/config not
         # ready, VAD/endpointer/CallLoop construction, or the loop itself —
         # must release the RTP engine and both call routes, never leak them.
+        # Initialise to None so teardown's identity check degrades gracefully
+        # to an unconditional pop if _run_call_loop raises before the CallLoop
+        # is returned (e.g. providers not initialised at the very start).
+        this_call_loop: CallLoop | None = None
         try:
-            await self._run_call_loop(
+            this_call_loop = await self._run_call_loop(
                 call_id=call_id,
                 engine=engine,
                 guard_state=guard_state,
@@ -587,6 +591,8 @@ class VoipAdapter(BasePlatformAdapter):
                 engine=engine,
                 transport=transport,
                 dialog_id=session.dialog_id,
+                session=session,
+                call_loop=this_call_loop,
             )
 
     async def _run_call_loop(
@@ -595,8 +601,12 @@ class VoipAdapter(BasePlatformAdapter):
         call_id: str,
         engine: RtpMediaTransport,
         guard_state: GuardSessionState,
-    ) -> None:
-        """Build the per-call ``CallLoop`` and drive it to completion.
+    ) -> CallLoop:
+        """Build the per-call ``CallLoop``, drive it to completion, return it.
+
+        The returned ``CallLoop`` is THIS task's object; the caller passes it to
+        ``_teardown_call`` for the identity-based isolation check that prevents
+        a concurrent task's teardown from removing a still-running call's loop.
 
         Raises if providers/media config are absent or any collaborator
         construction fails; the caller's ``finally`` performs teardown.
@@ -642,14 +652,17 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)
         await call_loop.run()
+        return call_loop
 
-    async def _teardown_call(
+    async def _teardown_call(  # noqa: PLR0913 — six keyword-only params all needed: call_id + engine + transport + dialog_id + session + call_loop for isolation
         self,
         *,
         call_id: str,
         engine: RtpMediaTransport,
         transport: SipOverTlsTransport,
         dialog_id: tuple[str, str, str],
+        session: CallSession | None = None,
+        call_loop: CallLoop | None = None,
     ) -> None:
         """Release every resource an accepted call holds; mark it ended.
 
@@ -657,12 +670,25 @@ class VoipAdapter(BasePlatformAdapter):
         removes the manager + transport in-dialog routes, drops the live
         ``CallLoop``, and flags the call ended. Never raises (teardown of one
         resource must not strand the others).
+
+        ``session`` and ``call_loop`` are the objects owned by THIS call task.
+        When provided, _call_loops and _call_sessions are only cleared if they
+        still hold THIS task's objects — not a newer concurrent task's objects
+        for the same Call-ID. This prevents a concurrent-INVITE race where
+        task_1's teardown removes task_2's live session/loop (the fix for the
+        same-Call-ID gateway-retry isolation bug).
         """
         info = dict(self._call_info.get(call_id, {}))
         info["ended"] = True
         self._call_info[call_id] = info
-        self._call_loops.pop(call_id, None)
-        self._call_sessions.pop(call_id, None)
+        # Identity-check before removing: only pop if the dict still holds OUR
+        # object.  With concurrent tasks sharing the same Call-ID (gateway
+        # retry/fork), a later task may already have replaced our entry; removing
+        # it would orphan the later task's live state (routing, speak delivery).
+        if call_loop is None or self._call_loops.get(call_id) is call_loop:
+            self._call_loops.pop(call_id, None)
+        if session is None or self._call_sessions.get(call_id) is session:
+            self._call_sessions.pop(call_id, None)
         if self._manager is not None:
             self._manager.remove_call(dialog_id)
         transport.remove_call(call_id)

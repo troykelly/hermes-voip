@@ -31,8 +31,13 @@ extra is absent — the error propagates naturally (AGENTS.md rule 37).
   stored to disk or committed (mirrors the TLS-loopback fixture lesson in
   memory ``voip-test-cert-no-committed-key-ephemeral-openssl``).
 - Peer-cert fingerprint verification (:meth:`DtlsEndpoint.verify_peer_fingerprint`)
-  is the caller's responsibility after the handshake — this module provides the
-  tool; the engine must call it before deriving SRTP sessions.
+  is ENFORCED: :meth:`DtlsEndpoint.derive_srtp_sessions` raises
+  :class:`RuntimeError` unless ``verify_peer_fingerprint`` succeeded first
+  (RFC 5763 §5).  Both DTLS roles present and verify a certificate (the context
+  uses ``VERIFY_PEER`` so the server requests a client cert).
+- A fatal DTLS alert during the handshake is not swallowed:
+  :meth:`DtlsEndpoint.feed` / :meth:`DtlsEndpoint.get_outbound_datagrams`
+  re-raise the error and :meth:`DtlsEndpoint.handshake_failed` returns ``True``.
 """
 
 from __future__ import annotations
@@ -443,9 +448,13 @@ class DtlsEndpoint:
     - Call :meth:`feed` to deliver inbound datagrams from the peer.
 
     After the handshake is complete (:meth:`handshake_done` returns ``True``),
-    call :meth:`export_srtp_keying_material` to obtain the RFC 5705 export
-    block, then :meth:`derive_srtp_sessions` to get a ``(inbound, outbound)``
-    :class:`~hermes_voip.media.srtp.SrtpSession` pair.
+    call :meth:`verify_peer_fingerprint` with the peer's SDP ``a=fingerprint``
+    value, THEN :meth:`derive_srtp_sessions` to get a ``(inbound, outbound)``
+    :class:`~hermes_voip.media.srtp.SrtpSession` pair.  ``derive_srtp_sessions``
+    raises :class:`RuntimeError` if fingerprint verification has not succeeded
+    (RFC 5763 §5).  A fatal DTLS alert during the handshake re-raises from
+    :meth:`feed` / :meth:`get_outbound_datagrams` and sets
+    :meth:`handshake_failed`.
 
     **One DtlsEndpoint per call direction.** Construct a fresh endpoint for
     each call; do not re-use an endpoint across calls.

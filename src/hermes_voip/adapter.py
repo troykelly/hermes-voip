@@ -132,6 +132,10 @@ _SIP_PROXY_AUTH = 407
 _SIP_FINAL_FLOOR = 200  # responses at or above this are final
 _SIP_ERROR_FLOOR = 300  # responses at or above this are errors
 
+# Maximum outstanding responses buffered in _QueueSink (N2). A 407 + final
+# = 2; with re-auth it is at most ~4. 32 is generous without being unbounded.
+_SINK_QUEUE_MAX = 32
+
 
 def _make_tls_context(host: str) -> ssl.SSLContext:
     """Build a client TLS context that verifies the server certificate."""
@@ -170,7 +174,10 @@ class _QueueSink:
     """
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[SipResponse] = asyncio.Queue()
+        # Bounded queue (N2): at most _SINK_QUEUE_MAX responses buffered.
+        # An outbound INVITE sees at most ~4 responses (1xx + 407 + 1xx + 2xx);
+        # 32 is well above that without allowing unbounded accumulation.
+        self._queue: asyncio.Queue[SipResponse] = asyncio.Queue(maxsize=_SINK_QUEUE_MAX)
 
     async def on_response(self, response: SipResponse) -> None:
         """Enqueue the response for the INVITE transaction awaiter."""
@@ -647,11 +654,25 @@ class VoipAdapter(BasePlatformAdapter):
                 await transport.send(invite_text2)
                 _log.info("INVITE re-sent with auth: Call-ID %s", call_id)
 
-                # Skip provisional responses (1xx) until a final response.
+                # Skip responses that do not belong to the re-auth transaction.
+                # A retransmitted 407 from the FIRST INVITE (CSeq 1) may arrive
+                # in the sink after we sent the second INVITE (CSeq 2). Accepting
+                # it as the final response causes the call to fail even though the
+                # 2xx for CSeq 2 is in-flight (W1). Filter by CSeq sequence number.
                 while True:
                     response = await sink.get()
-                    if response.status_code >= _SIP_FINAL_FLOOR:
-                        break
+                    if response.status_code < _SIP_FINAL_FLOOR:
+                        continue  # skip provisional responses
+                    if _cseq_num(response) == last_cseq:
+                        break  # final response for OUR transaction
+                    _log.debug(
+                        "INVITE %s: ignoring stale response %d CSeq=%s "
+                        "(expected CSeq=%d)",
+                        call_id,
+                        response.status_code,
+                        response.header("CSeq"),
+                        last_cseq,
+                    )
 
             elif response.status_code < _SIP_FINAL_FLOOR:
                 # Skip unexpected provisional(s) until a final response.
@@ -740,21 +761,26 @@ class VoipAdapter(BasePlatformAdapter):
             )
 
             # --- Send ACK for 2xx (RFC 3261 §17.1.2.1 — TU owns ACK for 2xx) ---
+            # RFC 3261 §13.2.2.4: the 2xx ACK MUST be sent using the dialog's
+            # route set (Record-Route from the 2xx, reversed, as Route headers).
+            # Omitting Route causes any stateful proxy in the chain to reject the
+            # ACK as out-of-dialog (B1).
             ack_cseq_num = int(dialog.local_cseq)
             ack_via = f"SIP/2.0/TLS {local_sent_by};branch={new_branch()};rport"
-            ack_text = build_request(
-                "ACK",
-                dialog.remote_target,
-                [
-                    ("Via", ack_via),
-                    ("Max-Forwards", "70"),
-                    ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
-                    ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
-                    ("Call-ID", call_id),
-                    ("CSeq", f"{ack_cseq_num} ACK"),
-                    ("Contact", local_contact),
-                ],
-            )
+            ack_headers: list[tuple[str, str]] = [
+                ("Via", ack_via),
+                ("Max-Forwards", "70"),
+            ]
+            # Emit Route headers in route-set order (UAC: reversed Record-Route).
+            ack_headers.extend(("Route", route) for route in dialog.route_set)
+            ack_headers += [
+                ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{ack_cseq_num} ACK"),
+                ("Contact", local_contact),
+            ]
+            ack_text = build_request("ACK", dialog.remote_target, ack_headers)
             await transport.send(ack_text)
             _log.info("ACK sent: Call-ID %s", call_id)
 
@@ -973,7 +999,10 @@ class VoipAdapter(BasePlatformAdapter):
             )
         except Exception as exc:  # noqa: BLE001 — SdpError or negotiation failure
             _log.warning("INVITE %s: cannot build SDP answer: %s", call_id, exc)
-            await transport.send(build_response(invite, 500, "Server Internal Error"))
+            # RFC 3261 §13.3.1.4: 488 Not Acceptable Here for media negotiation
+            # failure (e.g. SRTP-only offer with no crypto key available) so the
+            # caller can retry with plain RTP. Reserve 500 for genuine server faults.
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             await engine.stop()
             return
 
@@ -1361,6 +1390,20 @@ class VoipAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _cseq_num(response: SipResponse) -> int:
+    """Return the CSeq sequence number from a SIP response, or 0 on parse failure.
+
+    Used to filter a stale 407 (CSeq N-1) from a re-auth INVITE's final response
+    (CSeq N) when both may be in the _QueueSink simultaneously (W1).
+    """
+    cseq_hdr = response.header("CSeq") or ""
+    # CSeq value: "<number> <method>" (RFC 3261 §20.16).
+    parts = cseq_hdr.split()
+    if parts and parts[0].isdigit():
+        return int(parts[0])
+    return 0
 
 
 def _first_voice_codec(

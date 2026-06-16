@@ -374,6 +374,45 @@ async def test_adapter_concurrent_same_call_id_teardown_isolation() -> None:  # 
             "engine_3 was stopped by task_1's teardown — cross-engine stop (the bug)"
         )
 
+        # --- The dict-clobber invariant (the literal same-Call-ID isolation bug) -
+        # All three INVITEs share one Call-ID, so _call_loops / _call_sessions /
+        # the transport response sink are all keyed by that single string and a
+        # later task's registration OVERWRITES an earlier one's. When task_1's
+        # teardown ran above it must NOT have evicted the still-live entry that now
+        # belongs to a LATER task (task_2 or task_3). Without the identity checks in
+        # _teardown_call this is exactly what breaks: task_1's unconditional
+        # pop(call_id) removes the surviving task's CallLoop / CallSession / sink,
+        # silently killing in-dialog routing and speak() delivery for a live call.
+        #
+        # The registered entry must (a) still be present and (b) belong to a
+        # surviving task — never task_1's own (now-torn-down) objects.
+        surviving_loops = {id(loop) for loop in created_loops[1:]}
+        assert shared_call_id in adapter._call_loops, (
+            "task_1's teardown evicted the shared-Call-ID CallLoop that belongs to "
+            "a still-live task (the same-Call-ID dict-clobber bug)"
+        )
+        assert id(adapter._call_loops[shared_call_id]) in surviving_loops, (
+            "the registered CallLoop for the shared Call-ID is task_1's own (torn "
+            "down) loop, not a surviving task's — teardown clobbered live state"
+        )
+        assert id(adapter._call_loops[shared_call_id]) != id(created_loops[0]), (
+            "task_1's CallLoop is still registered after its own teardown"
+        )
+        assert shared_call_id in adapter._call_sessions, (
+            "task_1's teardown evicted the shared-Call-ID CallSession that belongs "
+            "to a still-live task (the same-Call-ID dict-clobber bug)"
+        )
+        assert shared_call_id in sip_transport._calls, (
+            "task_1's teardown evicted the shared-Call-ID transport response sink "
+            "that belongs to a still-live task (the same-Call-ID dict-clobber bug)"
+        )
+        # The live call must NOT have been flagged ended by task_1's teardown.
+        info = adapter._call_info.get(shared_call_id, {})
+        assert info.get("ended") is not True, (
+            "task_1's teardown flagged the shared-Call-ID call ended while a later "
+            "task is still live (the _call_info clobber)"
+        )
+
         # Unblock all remaining loops so the test ends cleanly.
         for gate in loop_gates:
             gate.set()

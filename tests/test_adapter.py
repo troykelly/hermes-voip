@@ -42,7 +42,22 @@ from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from hermes_voip.adapter import VoipAdapter
+
+
+async def _until(
+    predicate: Callable[[], bool], *, timeout: float = 3.0, step: float = 0.001
+) -> None:
+    """Poll ``predicate`` until true or the timeout elapses (no fixed sleeps)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            msg = "condition not met within the timeout"
+            raise TimeoutError(msg)
+        await asyncio.sleep(step)
 
 
 # ---------------------------------------------------------------------------
@@ -876,40 +891,56 @@ async def test_inbound_invite_ack_and_bye_route_in_dialog() -> None:
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite(call_id=call_id))
 
-    with (
-        patch(
-            "hermes_voip.adapter.RtpMediaTransport",
-            return_value=MagicMock(
-                connect=AsyncMock(return_value=True),
-                stop=AsyncMock(return_value=None),
-                local_port=20002,
+    # Hold the call open: a real CallLoop.run() blocks for the call's lifetime, so
+    # the in-dialog ACK/BYE arrive WHILE the call is active and registered (the
+    # realistic ordering — and the live failure point). A run() that returned
+    # immediately would tear the call down before the ACK/BYE, masking the bug.
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch(
+                "hermes_voip.adapter.RtpMediaTransport",
+                return_value=MagicMock(
+                    connect=AsyncMock(return_value=True),
+                    stop=AsyncMock(return_value=None),
+                    local_port=20002,
+                ),
             ),
-        ),
-        patch(
-            "hermes_voip.adapter.CallLoop",
-            return_value=MagicMock(run=AsyncMock(return_value=None)),
-        ),
-        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
-        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
-        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
-    ):
-        # Real Dialog + real CallSession + real build_response — only media/loop
-        # are faked, so the on-the-wire 200 OK and the registered dialog_id are
-        # exactly what production produces.
-        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
-        for _ in range(20):
-            await asyncio.sleep(0)
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            # Real Dialog + real CallSession + real build_response — only media and
+            # the loop body are faked, so the on-the-wire 200 OK and the registered
+            # dialog_id are exactly what production produces.
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            # Let the handler run up to (and block at) call_loop.run().
+            await _until(lambda: call_id in adapter._call_loops)
 
-    ok = _sent_200_ok(transport)
+            ok = _sent_200_ok(transport)
 
-    # The gateway now sends ACK + BYE in-dialog (echoing our 200 OK To/From).
-    for method in ("ACK", "BYE"):
-        request = _gateway_in_dialog_request(method, ok, call_id=call_id)
-        routing = manager.route_request(request)
-        assert isinstance(routing, InDialog), (
-            f"{method} routed {type(routing).__name__} "
-            f"({getattr(routing, 'reason', '')!r}); To={request.header('To')!r}"
-        )
+            # The gateway now sends ACK + BYE in-dialog (echoing our 200 OK
+            # To/From) while the call is live; both must route to the CallSession.
+            for method in ("ACK", "BYE"):
+                request = _gateway_in_dialog_request(method, ok, call_id=call_id)
+                routing = manager.route_request(request)
+                assert isinstance(routing, InDialog), (
+                    f"{method} routed {type(routing).__name__} "
+                    f"({getattr(routing, 'reason', '')!r}); To={request.header('To')!r}"
+                )
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

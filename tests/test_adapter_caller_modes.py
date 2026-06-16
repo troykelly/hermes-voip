@@ -28,6 +28,7 @@ pytest.importorskip("gateway.platforms.base")
 pytest.importorskip("gateway.config")
 
 from gateway.config import PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_voip.caller_modes import CallerMode, CallerModeConfig, Normalization
 from hermes_voip.config import ExtensionConfig
@@ -43,6 +44,24 @@ if TYPE_CHECKING:
     from hermes_voip.adapter import VoipAdapter
     from hermes_voip.providers.audio import PcmFrame
     from hermes_voip.providers.tts import TtsStream
+
+
+@pytest.fixture(autouse=True)
+def _register_voip_platform() -> None:
+    """Register a throwaway "voip" entry so ``Platform("voip")`` resolves."""
+    if not platform_registry.is_registered("voip"):
+        platform_registry.register(
+            PlatformEntry(
+                name="voip",
+                label="VoIP",
+                adapter_factory=lambda cfg: MagicMock(),
+                check_fn=lambda: True,
+                validate_config=lambda cfg: True,
+                required_env=[],
+                install_hint="",
+                source="plugin",
+            )
+        )
 
 
 # --- fakes (mirrors test_adapter.py, kept local to this module) -------------
@@ -295,8 +314,11 @@ async def test_inbound_grey_sets_privileged_false() -> None:
 
     captured: dict[str, GuardSessionState] = {}
 
-    def _real_guard(call_id: str) -> GuardSessionState:
-        state = GuardSessionState(call_id=call_id)
+    def _real_guard(call_id: str, *, privileged: bool = True) -> GuardSessionState:
+        # Mirror the real GuardSessionState signature so the adapter's
+        # `GuardSessionState(call_id, privileged=...)` call passes through, and we
+        # capture the privileged value the adapter actually chose for this mode.
+        state = GuardSessionState(call_id=call_id, privileged=privileged)
         captured[call_id] = state
         return state
 
@@ -344,8 +366,8 @@ async def test_inbound_allow_sets_privileged_true() -> None:
 
     captured: dict[str, GuardSessionState] = {}
 
-    def _real_guard(call_id: str) -> GuardSessionState:
-        state = GuardSessionState(call_id=call_id)
+    def _real_guard(call_id: str, *, privileged: bool = True) -> GuardSessionState:
+        state = GuardSessionState(call_id=call_id, privileged=privileged)
         captured[call_id] = state
         return state
 

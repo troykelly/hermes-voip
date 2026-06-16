@@ -310,13 +310,21 @@ class CallLoop:
             maxsize=_TRANSCRIPT_QUEUE_MAX
         )
 
-        # End-of-turn signal shared between _pump and _asr (ADR-0008 §wiring).
+        # End-of-turn counter shared between _pump and _asr (ADR-0008 §wiring).
         # The endpointer owns the turn boundary; the ASR recogniser does not
         # (SherpaOnnxASR always yields end_of_turn=False). When the endpointer
-        # fires, _pump sets this event; _asr checks + clears it on the next
-        # is_final transcript and treats that transcript as an end-of-turn.
-        # Both tasks run on the same asyncio event loop so no lock is needed.
-        _eot: asyncio.Event = asyncio.Event()
+        # fires, _pump increments this counter; _asr decrements it once per
+        # is_final transcript (if > 0) and delivers the transcript as end-of-turn.
+        #
+        # Why int instead of asyncio.Event (W2 fix): asyncio.Event is boolean —
+        # two endpointer fires before the ASR produces a is_final collapse to
+        # one signal, so only ONE turn is delivered. An int counter lets each
+        # fire be consumed by exactly one is_final: N fires → N turns.
+        #
+        # Both _pump and _asr run on the same asyncio event loop and never yield
+        # between the int read and write, so no lock is needed: asyncio tasks are
+        # co-operatively scheduled and only yield at explicit ``await`` points.
+        _eot_count: int = 0
 
         async def _pump() -> None:
             """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded).
@@ -333,6 +341,7 @@ class CallLoop:
             *does* perform — barge-in cancelling the TTS stream — goes through
             ``TtsStream.cancel`` (a stop flag, never ``aclose`` from another task).
             """
+            nonlocal _eot_count
             window_index = 0
             frames_received = 0
             async for frame in self._transport.inbound_audio():
@@ -354,10 +363,12 @@ class CallLoop:
                             window_index,
                         )
                 if self._endpointer.advance(window_index):
-                    # ADR-0008: endpointer owns the turn boundary. Signal the ASR
-                    # task so the next is_final transcript is delivered as
-                    # end-of-turn (the recogniser always yields end_of_turn=False).
-                    _eot.set()
+                    # ADR-0008: endpointer owns the turn boundary. Increment the
+                    # EOT counter so the ASR task's next is_final transcript is
+                    # delivered as an end-of-turn. Each increment is consumed by
+                    # exactly one decrement in _asr (W2 fix: int counter counts
+                    # fires; Event is boolean and loses duplicates).
+                    _eot_count += 1
                     _log.info(
                         "pump: end-of-turn at window %d (frames=%d)",
                         window_index,
@@ -391,11 +402,12 @@ class CallLoop:
 
             End-of-turn wiring (ADR-0008): the recogniser always yields
             ``end_of_turn=False``; the turn boundary comes from the endpointer via
-            the ``_eot`` event.  When a transcript is final, we check ``_eot``:
-            if set, clear it and deliver the transcript as an end-of-turn.  The
+            the ``_eot_count`` counter.  When a transcript is final, we check
+            ``_eot_count``: if > 0, decrement and deliver as end-of-turn.  The
             recogniser's own ``end_of_turn`` field is still honoured (fused
             engines like Deepgram Flux set it natively), so this is additive.
             """
+            nonlocal _eot_count
 
             async def _audio_iter() -> AsyncIterator[PcmFrame]:
                 while True:
@@ -410,13 +422,22 @@ class CallLoop:
                     _log.debug("asr: hypothesis %r", transcript.text)
                     prev_text = transcript.text
                 if transcript.is_final:
-                    # Check the endpointer's end-of-turn signal (ADR-0008): the
+                    # Check the endpointer's end-of-turn counter (ADR-0008): the
                     # recogniser always returns end_of_turn=False; the endpointer
-                    # sets _eot when trailing silence fires.  We clear the event
-                    # here — both tasks on the same event loop, no lock needed.
-                    eot_from_endpointer = _eot.is_set()
-                    if eot_from_endpointer:
-                        _eot.clear()
+                    # increments _eot_count when trailing silence fires. We
+                    # consume one count (non-blocking) per is_final — each
+                    # decrement matches exactly one endpointer fire, so N fires
+                    # yield N turns (W2 fix: was asyncio.Event which is boolean
+                    # and collapses multiple fires before the first is_final).
+                    # Both tasks are on the same event loop: no lock needed
+                    # (asyncio is single-threaded; there is no yield between the
+                    # read and the write).
+                    eot_from_endpointer: bool
+                    if _eot_count > 0:
+                        _eot_count -= 1
+                        eot_from_endpointer = True
+                    else:
+                        eot_from_endpointer = False
                     if eot_from_endpointer or transcript.end_of_turn:
                         _log.debug(
                             "asr: delivering turn %r (eot_endpointer=%s, eot_asr=%s)",

@@ -37,7 +37,7 @@ from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardResult, GuardVerdict, InjectionGuard
 from hermes_voip.providers.policy import GuardSessionState
-from hermes_voip.providers.tts import StreamingTTS
+from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.sdp import (
     Codec as SdpCodec,
 )
@@ -81,7 +81,7 @@ async def test_b2_stop_mid_send_audio_returns_cleanly() -> None:
         remote_address="127.0.0.1",
         remote_port=19000,
         codec=Codec.PCMU,
-        sleep=AsyncMock(),  # type: ignore[arg-type]
+        sleep=AsyncMock(),
     )
     await engine.connect()
 
@@ -305,11 +305,11 @@ async def test_w2_two_endpointer_fires_yield_two_turns() -> None:
             super().__init__(silence_ms=200, sample_rate_hz=8000)
             self._count = 0
 
-        def advance(self, window_index: int) -> bool:  # type: ignore[override]
+        def advance(self, window_index: int) -> bool:
             self._count += 1
             return self._count <= 2
 
-        def on_event(self, event: VadEvent) -> None:  # type: ignore[override]
+        def on_event(self, event: VadEvent) -> None:
             pass
 
     class _TwoFrameTransport:
@@ -334,9 +334,11 @@ async def test_w2_two_endpointer_fires_yield_two_turns() -> None:
     class _TwoFinalASR(StreamingASR):
         """Fake ASR: drains audio, then yields two final transcripts."""
 
-        def stream(  # type: ignore[override]
-            self, audio: AsyncIterator[PcmFrame]
-        ) -> AsyncIterator[Transcript]:
+        @property
+        def input_sample_rate(self) -> int:
+            return 8000
+
+        def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
             async def _gen() -> AsyncIterator[Transcript]:
                 async for _ in audio:
                     pass
@@ -364,15 +366,17 @@ async def test_w2_two_endpointer_fires_yield_two_turns() -> None:
     class _NoTts(StreamingTTS):
         """Fake TTS: not used in this test."""
 
-        def synthesize(  # type: ignore[override]
-            self, text: AsyncIterator[str], voice: str
-        ) -> StreamingTTS:
+        @property
+        def output_sample_rate(self) -> int:
+            return 8000
+
+        def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
             raise NotImplementedError
 
     loop = CallLoop(
         transport=_TwoFrameTransport(),  # type: ignore[arg-type]
         asr=_TwoFinalASR(),
-        tts=_NoTts(),  # type: ignore[arg-type]
+        tts=_NoTts(),
         guard=_PassGuard(),
         vad=_NoVad(model=MagicMock(), sample_rate_hz=8000, threshold=0.5),
         endpointer=_TwoFireEndpointer(),

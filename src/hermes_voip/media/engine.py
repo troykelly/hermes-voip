@@ -44,6 +44,7 @@ import asyncio
 import contextlib
 import enum
 import logging
+import random
 import socket
 import struct
 import time
@@ -76,9 +77,11 @@ _log = logging.getLogger(__name__)
 # Default ptime in milliseconds (one packet per 20 ms = 50 pps).
 _DEFAULT_PTIME_MS = 20
 
-# Starting RTP sequence number and timestamp for outbound streams.
-_INITIAL_SEQ = 0
-_INITIAL_TS = 0
+# RFC 3550 §5.1: the initial RTP sequence number and timestamp SHOULD be random
+# to make known-plaintext attacks on SRTP harder and to avoid collision with
+# a prior session on the same SSRC.  Randomised at construction time; tests may
+# inject fixed values via the ``initial_seq`` / ``initial_ts`` constructor kwargs
+# to keep send_audio assertions deterministic.
 
 # A fixed SSRC for the outbound stream — an obvious test fake.
 # (No real PBX should assign 0xCAFEBABE; the repo is public.)
@@ -206,7 +209,7 @@ class RtpMediaTransport:
                          :func:`asyncio.sleep`).  Inject a no-op in tests.
     """
 
-    def __init__(  # noqa: PLR0913 — all params required (two network endpoints, codec, SRTP sessions, timing seams)
+    def __init__(  # noqa: PLR0913, D417 — all params required; only new params added to docstring (others unchanged)
         self,
         *,
         local_address: str,
@@ -221,8 +224,18 @@ class RtpMediaTransport:
         symmetric: bool = True,
         clock: Callable[[], int] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        initial_seq: int | None = None,
+        initial_ts: int | None = None,
     ) -> None:
-        """Construct the engine; no socket is opened until :meth:`connect`."""
+        """Construct the engine; no socket is opened until :meth:`connect`.
+
+        Args:
+            initial_seq: Override the random initial RTP sequence number.
+                Pass a fixed value in tests to make send_audio assertions
+                deterministic (RFC 3550 §5.1 default: random uint16).
+            initial_ts:  Override the random initial RTP timestamp.
+                Pass a fixed value in tests (RFC 3550 §5.1 default: random uint32).
+        """
         self._local_address = local_address
         self._local_port = local_port
         self._remote_address = remote_address
@@ -240,9 +253,16 @@ class RtpMediaTransport:
             sleep if sleep is not None else asyncio.sleep
         )
 
-        # Outbound RTP sequence / timestamp counters (per-session).
-        self._seq: int = _INITIAL_SEQ
-        self._ts: int = _INITIAL_TS
+        # Outbound RTP sequence / timestamp counters (RFC 3550 §5.1: randomised at
+        # construction so a new session does not collide with a prior one on the same
+        # SSRC, and known-plaintext attacks on SRTP are harder). Tests may pass
+        # explicit values via initial_seq / initial_ts for determinism.
+        self._seq: int = (
+            initial_seq if initial_seq is not None else random.randint(0, (1 << 16) - 1)  # noqa: S311 — not cryptographic
+        )
+        self._ts: int = (
+            initial_ts if initial_ts is not None else random.randint(0, (1 << 32) - 1)  # noqa: S311 — not cryptographic
+        )
 
         # Hold state.
         self.on_hold: bool = False
@@ -645,6 +665,17 @@ class RtpMediaTransport:
 
             self._transport.sendto(wire, self._outbound_addr)
             await self._sleep(self._ptime / 1000.0)
+            # Re-read _transport after the sleep: stop() may have nulled it while
+            # this coroutine was suspended. The pre-loop check above caught the
+            # "never connected" case; here we handle "stopped mid-call" cleanly so
+            # that a concurrent stop() during TTS playout does not raise
+            # AttributeError on the next iteration's sendto (B2).
+            # Read through a fresh local so mypy does not treat the post-await
+            # check as unreachable (the narrowing from the pre-loop guard does
+            # not survive across the await point at runtime).
+            transport_after_sleep: asyncio.DatagramTransport | None = self._transport
+            if transport_after_sleep is None:
+                return
 
     @property
     def inbound_sample_rate(self) -> int:

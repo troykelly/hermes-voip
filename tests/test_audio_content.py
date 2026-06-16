@@ -42,7 +42,7 @@ from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.providers.tts import TtsStream
 from hermes_voip.rtp import RtpPacket
-from hermes_voip.stt.resample import FrameUpsampler, pcm16_to_float32
+from hermes_voip.stt.resample import FrameUpsampler
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -413,12 +413,16 @@ def test_rx_content_g711_to_16k_pcm_non_silent() -> None:
         f"RMS={rms_16k:.1f} < threshold {_MIN_RMS:.0f}"
     )
 
-    # Verify the float32 the STT model receives is non-zero.
-    float32_arr = pcm16_to_float32(pcm_16k_total)
-    raw_bytes = float32_arr.tobytes()
-    assert any(b != 0 for b in raw_bytes), (
-        "pcm16_to_float32 produced all-zero float32 from non-silent PCM: "
-        "STT would receive silence"
+    # Verify the 16 kHz PCM samples the STT layer would normalise are non-zero.
+    # pcm16_to_float32 (numpy, ml-extra-only) is not called here — instead we
+    # unpack the int16 samples directly with struct (stdlib) and assert at least
+    # one is non-zero.  An all-zero buffer would normalise to all-zero float32,
+    # which the STT model would silently discard as silence.
+    n_samples_16k = len(pcm_16k_total) // 2
+    samples_16k = struct.unpack(f"<{n_samples_16k}h", pcm_16k_total)
+    assert any(s != 0 for s in samples_16k), (
+        "16 kHz PCM after G.711-decode + 8k->16k upsample is all-zero: "
+        "STT would receive silence (pcm16_to_float32 would produce all-zero float32)"
     )
 
 

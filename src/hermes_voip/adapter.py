@@ -719,13 +719,24 @@ class VoipAdapter(BasePlatformAdapter):
         """Event-driven reconnect loop: wait for connection loss, then reconnect.
 
         Runs as a background task from :meth:`connect`; cancelled by
-        :meth:`disconnect`.
+        :meth:`disconnect`. The ``while True`` avoids a mypy ``[unreachable]``
+        false-positive: after ``await self._lost_event.wait()`` another coroutine
+        may set ``_connected = False`` (``disconnect()``), but mypy's flow
+        narrows the loop condition to ``True`` and sees the post-await check as
+        dead code — it is live at runtime.
         """
-        while self._connected:
-            await self._lost_event.wait()
-            self._lost_event.clear()
+        while True:
             if not self._connected:
                 break
+            await self._lost_event.wait()
+            self._lost_event.clear()
+            # ``disconnect()`` may have set ``_connected = False`` while we were
+            # suspended in the await above; mypy narrows the type to ``True`` at
+            # the earlier guard and flags the body of this check as unreachable —
+            # it is live at runtime because another coroutine can mutate the
+            # attribute during the await.
+            if not self._connected:
+                break  # type: ignore[unreachable]
             await self._reconnect_with_backoff()
 
     async def _reconnect_with_backoff(self) -> None:
@@ -736,7 +747,13 @@ class VoipAdapter(BasePlatformAdapter):
         failures so an operator knows SIP is down.
         """
         attempt = 0
-        while self._connected:
+        # ``while True`` avoids mypy ``[unreachable]`` on post-await ``_connected``
+        # checks: another coroutine (``disconnect()``) may clear ``_connected``
+        # while we await teardown or ``asyncio.sleep``, but mypy's flow-narrowing
+        # would see those checks as dead code if the loop condition were the bool.
+        while True:
+            if not self._connected:
+                return
             # Best-effort teardown of the old manager + transport so the sockets
             # are not leaked.  Any failure here is suppressed (teardown must
             # never prevent the next connect attempt).
@@ -776,8 +793,13 @@ class VoipAdapter(BasePlatformAdapter):
                         "failures; inbound calls go to voicemail until restored",
                         self._consecutive_failures,
                     )
+                # ``disconnect()`` may have set ``_connected = False`` while we
+                # were suspended in the awaits above; mypy narrows the type to
+                # ``True`` at the top-of-loop guard and sees the body of this
+                # check as unreachable — it is live at runtime because another
+                # coroutine can mutate the attribute during an await.
                 if not self._connected:
-                    return
+                    return  # type: ignore[unreachable]
                 await asyncio.sleep(actual_delay)
             else:
                 if attempt > 0:

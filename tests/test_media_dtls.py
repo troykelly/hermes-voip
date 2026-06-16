@@ -253,13 +253,8 @@ class TestSrtpSessionDerivation:
         # Build a plaintext RTP packet.
         payload = b"\xaa\xbb\xcc\xdd" * 10
         pkt = RtpPacket(
-            version=2,
-            padding=False,
-            extension=False,
-            cc=0,
-            marker=False,
             payload_type=0,
-            sequence=1,
+            sequence_number=1,
             timestamp=160,
             ssrc=0xCAFEBABE,
             payload=payload,
@@ -273,7 +268,7 @@ class TestSrtpSessionDerivation:
         decrypted = s_inbound.unprotect(srtp_wire)
         assert decrypted.payload == payload
         assert decrypted.ssrc == pkt.ssrc
-        assert decrypted.sequence == pkt.sequence
+        assert decrypted.sequence_number == pkt.sequence_number
 
     def test_server_to_client_round_trip(
         self, dtls_pair: tuple[DtlsEndpoint, DtlsEndpoint]
@@ -286,13 +281,8 @@ class TestSrtpSessionDerivation:
 
         payload = b"\x11\x22\x33\x44" * 8
         pkt = RtpPacket(
-            version=2,
-            padding=False,
-            extension=False,
-            cc=0,
-            marker=False,
             payload_type=0,
-            sequence=1,
+            sequence_number=1,
             timestamp=160,
             ssrc=0xDEADBEEF,
             payload=payload,
@@ -313,13 +303,8 @@ class TestSrtpSessionDerivation:
         s_inbound_fresh, _ = server.derive_srtp_sessions()
 
         pkt = RtpPacket(
-            version=2,
-            padding=False,
-            extension=False,
-            cc=0,
-            marker=False,
             payload_type=0,
-            sequence=2,
+            sequence_number=2,
             timestamp=320,
             ssrc=0x11223344,
             payload=b"\xff" * 20,
@@ -363,13 +348,8 @@ class TestFromRawKeys:
 
         payload = b"\xde\xad\xbe\xef" * 10
         pkt = RtpPacket(
-            version=2,
-            padding=False,
-            extension=False,
-            cc=0,
-            marker=False,
             payload_type=8,
-            sequence=100,
+            sequence_number=100,
             timestamp=8000,
             ssrc=0xAABBCCDD,
             payload=payload,

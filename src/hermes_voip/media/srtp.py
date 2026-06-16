@@ -1,11 +1,22 @@
-"""SDES-SRTP packet transform (RFC 3711) — AES-CM + HMAC-SHA1 (ADR-0013).
+"""SRTP packet transform (RFC 3711) — AES-CM + HMAC-SHA1 (ADR-0013).
 
-This module implements the two SRTP suites negotiated by SDES (RFC 4568):
+This module implements the two SRTP suites negotiated by SDES (RFC 4568) or
+derived from a DTLS-SRTP handshake (RFC 5764, ADR-0016):
 ``AES_CM_128_HMAC_SHA1_80`` and ``AES_CM_128_HMAC_SHA1_32``.
+
+The keying source is one of:
+
+- **SDES (RFC 4568):** pass a :class:`~hermes_voip.sdp.CryptoAttribute` to
+  the :class:`SrtpSession` constructor — the SDES ``inline:<base64>`` string
+  is decoded and the session keys are derived immediately.
+- **DTLS-SRTP (RFC 5764):** call :meth:`SrtpSession.from_raw_keys` with the
+  raw master key and salt bytes extracted from the RFC 5705 keying-material
+  exporter.  The per-packet transform, ROC/replay logic, and KAT vectors are
+  identical regardless of the keying path.
 
 It is the *payload-level* transform only: the caller (the media transport)
 owns the UDP socket, RTP packetisation (:class:`~hermes_voip.rtp.RtpPacket`),
-and SDES key exchange; this module owns the key derivation, per-packet
+and key exchange; this module owns the key derivation, per-packet
 encryption, authentication, replay protection, and ROC management.
 
 **Dependency gating**: ``cryptography`` is an *optional* dependency declared
@@ -445,9 +456,17 @@ class SrtpSession:
     """SRTP session for ONE direction and ONE SSRC (RFC 3711).
 
     Use one :class:`SrtpSession` per direction (TX / RX): :meth:`protect` on the
-    sender, :meth:`unprotect` on the receiver.  Instantiate with the
-    :class:`~hermes_voip.sdp.CryptoAttribute` from the negotiated SDES
-    ``a=crypto`` line.
+    sender, :meth:`unprotect` on the receiver.  Two keying paths are supported:
+
+    - **SDES (RFC 4568):** ``SrtpSession(crypto_attr, ssrc=…)`` — constructs from
+      the :class:`~hermes_voip.sdp.CryptoAttribute` on the negotiated ``a=crypto``
+      line; the SDES ``inline:<base64>`` string is decoded and the session keys
+      are derived immediately.
+    - **DTLS-SRTP (RFC 5764):** ``SrtpSession.from_raw_keys(key, salt, suite=…)``
+      — constructs from the raw master key and salt bytes exported by the RFC 5705
+      keying-material exporter after a DTLS handshake.  No SDES ``CryptoAttribute``
+      is involved; the per-packet transform, ROC, and replay-window logic are
+      byte-for-byte identical to the SDES path.
 
     **One SSRC per session (RFC 3711 §3.2.3).** The rollover counter and replay
     window form a per-SSRC cryptographic context, so a session is bound to a
@@ -470,7 +489,7 @@ class SrtpSession:
             :meth:`unprotect` on auth failure, replay, or a malformed packet.
     """
 
-    _crypto: CryptoAttribute = field(repr=False)
+    _crypto: CryptoAttribute | None = field(default=None, repr=False)
     #: Session encryption key (k_e), derived at construction.
     _k_e: bytes = field(init=False, repr=False)
     #: Session salt (k_s), derived at construction.
@@ -489,7 +508,11 @@ class SrtpSession:
     _replay_mask: int = field(default=0, init=False, repr=False)
 
     def __init__(self, crypto: CryptoAttribute, *, ssrc: int | None = None) -> None:
-        """Construct an SRTP session and derive session keys from the CryptoAttribute.
+        """Construct an SRTP session from an SDES ``a=crypto`` attribute.
+
+        **SDES keying path (RFC 4568).** Use :meth:`from_raw_keys` for
+        DTLS-SRTP keying (RFC 5764) — it accepts raw master key + salt bytes
+        directly without a ``CryptoAttribute``.
 
         Args:
             crypto: The validated SDES ``a=crypto`` attribute (from
@@ -540,6 +563,80 @@ class SrtpSession:
         self.roc = 0
         self._seq_top = -1
         self._replay_mask = 0
+
+    @classmethod
+    def from_raw_keys(
+        cls,
+        master_key: bytes,
+        master_salt: bytes,
+        *,
+        suite: str,
+        ssrc: int | None = None,
+    ) -> SrtpSession:
+        """Construct an SRTP session from raw DTLS-SRTP keying material (RFC 5764).
+
+        **DTLS-SRTP keying path (RFC 5764 §4.2).** Use the constructor
+        :meth:`__init__` for SDES keying (RFC 4568) with a
+        :class:`~hermes_voip.sdp.CryptoAttribute`.
+
+        After a DTLS handshake, the RFC 5705 exporter (label
+        ``EXTRACTOR-dtls_srtp``) yields a block of raw bytes; split it per
+        RFC 5764 §4.2 and pass each side's master key + salt here to build
+        the inbound and outbound sessions.  The per-packet transform (AES-CM
+        keystream, HMAC-SHA1 auth, ROC, replay window) is identical to the
+        SDES path — only the source of the key material changes.
+
+        Key material is never logged or stored in ``repr``.
+
+        Args:
+            master_key:  Raw 16-byte SRTP master key (AES-128).
+            master_salt: Raw 14-byte SRTP master salt (112-bit).
+            suite: SRTP suite name — ``"AES_CM_128_HMAC_SHA1_80"`` or
+                ``"AES_CM_128_HMAC_SHA1_32"``.
+            ssrc: Optionally pre-bind the session to a known SSRC. When
+                omitted, the session binds to the SSRC of the first packet.
+
+        Returns:
+            A fully initialised :class:`SrtpSession` ready for
+            :meth:`protect` / :meth:`unprotect`.
+
+        Raises:
+            ImportError: If the ``media`` extra (``cryptography``) is not
+                installed.
+            SrtpError: If the suite is unsupported, or if the key or salt
+                length is not exactly 16 / 14 bytes.
+        """
+        _get_crypto()  # raise ImportError early if cryptography is absent
+
+        if len(master_key) != _MASTER_KEY_LEN:
+            msg = (
+                f"SRTP master key must be exactly {_MASTER_KEY_LEN} bytes "
+                f"(got {len(master_key)})"
+            )
+            raise SrtpError(msg)
+        if len(master_salt) != _MASTER_SALT_LEN:
+            msg = (
+                f"SRTP master salt must be exactly {_MASTER_SALT_LEN} bytes "
+                f"(got {len(master_salt)})"
+            )
+            raise SrtpError(msg)
+        if suite not in _AUTH_TAG_LEN:
+            msg = f"unsupported SRTP suite: {suite!r}"
+            raise SrtpError(msg)
+
+        # Build the instance without going through __init__ (which expects a
+        # CryptoAttribute with an SDES inline key-params string).
+        instance = object.__new__(cls)
+        instance._crypto = None  # no SDES attribute on the DTLS keying path
+        instance._tag_len = _AUTH_TAG_LEN[suite]
+        instance._k_e, instance._k_s, instance._k_a = _derive_session_keys(
+            master_key, master_salt
+        )
+        instance._ssrc = ssrc
+        instance.roc = 0
+        instance._seq_top = -1
+        instance._replay_mask = 0
+        return instance
 
     def _bind_ssrc(self, ssrc: int) -> None:
         """Bind the context to ``ssrc`` on first use, or reject a mismatch.

@@ -282,7 +282,7 @@ class CallLoop:
         # a following agent reply never interleave frames on the wire.
         self._playout_lock = asyncio.Lock()
 
-    async def run(self) -> None:
+    async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
         """Run the duplex loop until the transport's inbound stream ends.
 
         Runs three one-directional tasks under an :class:`asyncio.TaskGroup`
@@ -310,6 +310,14 @@ class CallLoop:
             maxsize=_TRANSCRIPT_QUEUE_MAX
         )
 
+        # End-of-turn signal shared between _pump and _asr (ADR-0008 §wiring).
+        # The endpointer owns the turn boundary; the ASR recogniser does not
+        # (SherpaOnnxASR always yields end_of_turn=False). When the endpointer
+        # fires, _pump sets this event; _asr checks + clears it on the next
+        # is_final transcript and treats that transcript as an end-of-turn.
+        # Both tasks run on the same asyncio event loop so no lock is needed.
+        _eot: asyncio.Event = asyncio.Event()
+
         async def _pump() -> None:
             """inbound_audio → VAD/endpoint (+ barge-in) → audio_q (bounded).
 
@@ -326,6 +334,7 @@ class CallLoop:
             ``TtsStream.cancel`` (a stop flag, never ``aclose`` from another task).
             """
             window_index = 0
+            frames_received = 0
             async for frame in self._transport.inbound_audio():
                 for vad_event in self._vad.feed(frame):
                     self._endpointer.on_event(vad_event)
@@ -334,12 +343,38 @@ class CallLoop:
                         vad_event.edge is SpeechEdge.ONSET
                         and self._active_tts_stream is not None
                     ):
+                        _log.debug(
+                            "pump: speech ONSET at window %d → barge-in", window_index
+                        )
                         await self.barge_in()
-                self._endpointer.advance(window_index)
+                    else:
+                        _log.debug(
+                            "pump: VAD %s at window %d",
+                            vad_event.edge.name,
+                            window_index,
+                        )
+                if self._endpointer.advance(window_index):
+                    # ADR-0008: endpointer owns the turn boundary. Signal the ASR
+                    # task so the next is_final transcript is delivered as
+                    # end-of-turn (the recogniser always yields end_of_turn=False).
+                    _eot.set()
+                    _log.info(
+                        "pump: end-of-turn at window %d (frames=%d)",
+                        window_index,
+                        frames_received,
+                    )
                 window_index += 1
+                frames_received += 1
+                if frames_received % 50 == 0:
+                    _log.debug(
+                        "pump: %d frames received, window=%d",
+                        frames_received,
+                        window_index,
+                    )
                 await audio_q.put(frame)
             # End-of-stream marker on the normal path (not a finally): the ASR
             # task is still draining audio_q, so this put cannot block forever.
+            _log.debug("pump: inbound stream ended after %d frames", frames_received)
             await audio_q.put(_END_OF_STREAM)
 
         async def _asr() -> None:
@@ -353,6 +388,13 @@ class CallLoop:
             ``asr.stream`` result is only an
             :class:`~collections.abc.AsyncIterator`, so it is consumed with a
             plain ``async for`` — the protocol does not promise ``aclose``).
+
+            End-of-turn wiring (ADR-0008): the recogniser always yields
+            ``end_of_turn=False``; the turn boundary comes from the endpointer via
+            the ``_eot`` event.  When a transcript is final, we check ``_eot``:
+            if set, clear it and deliver the transcript as an end-of-turn.  The
+            recogniser's own ``end_of_turn`` field is still honoured (fused
+            engines like Deepgram Flux set it natively), so this is additive.
             """
 
             async def _audio_iter() -> AsyncIterator[PcmFrame]:
@@ -362,9 +404,27 @@ class CallLoop:
                         return
                     yield item
 
+            prev_text = ""
             async for transcript in self._asr.stream(_audio_iter()):
-                if transcript.is_final and transcript.end_of_turn:
-                    await transcript_q.put(transcript.text)
+                if transcript.text != prev_text:
+                    _log.debug("asr: hypothesis %r", transcript.text)
+                    prev_text = transcript.text
+                if transcript.is_final:
+                    # Check the endpointer's end-of-turn signal (ADR-0008): the
+                    # recogniser always returns end_of_turn=False; the endpointer
+                    # sets _eot when trailing silence fires.  We clear the event
+                    # here — both tasks on the same event loop, no lock needed.
+                    eot_from_endpointer = _eot.is_set()
+                    if eot_from_endpointer:
+                        _eot.clear()
+                    if eot_from_endpointer or transcript.end_of_turn:
+                        _log.debug(
+                            "asr: delivering turn %r (eot_endpointer=%s, eot_asr=%s)",
+                            transcript.text,
+                            eot_from_endpointer,
+                            transcript.end_of_turn,
+                        )
+                        await transcript_q.put(transcript.text)
             await transcript_q.put(_END_OF_STREAM)
 
         async def _delivery() -> None:

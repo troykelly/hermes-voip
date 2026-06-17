@@ -12,9 +12,13 @@ Architecture:
   the :class:`~hermes_voip.rtp.JitterBuffer`, and decodes each ordered packet to
   a :class:`~hermes_voip.providers.audio.PcmFrame`.
 * :meth:`send_audio` encodes the outbound frame, packs it into an RTP datagram,
-  optionally protects it via SRTP, and sends it to the remote address.  A
-  configurable ``sleep`` callable paces the outbound stream at ``ptime`` ms per
-  frame (injectable so tests drive time without wall-clock delays).
+  optionally protects it via SRTP, and sends it to the remote address.  The
+  outbound stream is **deadline-paced** to one ``ptime`` per packet: each frame
+  sleeps only the time remaining until its scheduled slot (measured on
+  ``pace_clock``) BEFORE the encode + send, so per-frame encode cost (notably
+  G.722's pure-Python encoder) is absorbed into the interval rather than added on
+  top — a steady 50 pps for any codec. Both ``sleep`` and ``pace_clock`` are
+  injectable so tests drive time without wall-clock delays.
 * A ``clock`` callable (also injectable) stamps inbound ``PcmFrame`` objects with
   a monotonic nanosecond timestamp — downstream stages (VAD, STT) rely on this
   for gap-free presentation time.
@@ -26,9 +30,11 @@ packets are silently dropped — their ``SrtpError`` is logged at DEBUG level an
 the event loop continues.  (A bad *incoming* packet is an environmental event,
 not a programming error; dropping it is the correct behaviour here.)
 
-**Timing seam**: ``clock`` defaults to :func:`time.monotonic_ns` and ``sleep``
-defaults to :func:`asyncio.sleep`.  Both are injected by tests.  No code path
-calls the real clock in a way that makes determinism impossible.
+**Timing seam**: ``clock`` (inbound presentation time, ns) defaults to
+:func:`time.monotonic_ns`, ``pace_clock`` (outbound pacing, s) to
+:func:`time.monotonic`, and ``sleep`` to :func:`asyncio.sleep`.  All are injected
+by tests.  No code path calls the real clock in a way that makes determinism
+impossible.
 
 **SRTP type seam**: ``cryptography`` lives in the optional ``media`` extra and is
 absent from the default mypy gate.  Rather than use ``Any`` or cast, we declare
@@ -353,6 +359,7 @@ class RtpMediaTransport:
         jitter_depth: int = 2,
         symmetric: bool = True,
         clock: Callable[[], int] | None = None,
+        pace_clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         initial_seq: int | None = None,
         initial_ts: int | None = None,
@@ -370,6 +377,12 @@ class RtpMediaTransport:
                 media and break the comedia latch (no audio). Set
                 :attr:`payload_type` later (e.g. the outbound path after the 2xx
                 answer) to update it.
+            pace_clock: Monotonic time source in SECONDS used only to pace the
+                outbound RTP stream (the deadline pacer in :meth:`_transmit_frame`
+                sleeps the time remaining to each frame's deadline so per-frame
+                encode cost is absorbed into the 20 ms interval). Distinct from
+                ``clock`` (nanoseconds, inbound presentation time). Defaults to
+                :func:`time.monotonic`; inject a fake to drive pacing deterministically.
             initial_seq: Override the random initial RTP sequence number.
                 Pass a fixed value in tests to make send_audio assertions
                 deterministic (RFC 3550 §5.1 default: random uint16).
@@ -395,6 +408,16 @@ class RtpMediaTransport:
         self._symmetric = symmetric
         self._clock: Callable[[], int] = (
             clock if clock is not None else time.monotonic_ns
+        )
+        # Outbound pacing clock: a monotonic time source in SECONDS used only to
+        # pace the TX stream to a steady ``ptime`` per packet (the deadline pacer in
+        # _transmit_frame). Distinct from ``clock`` (which is in nanoseconds and
+        # stamps inbound presentation time): the pacer needs the wall/loop clock to
+        # measure how much real time a send actually took so it can sleep the
+        # REMAINDER of the ptime, not a flat ptime on top. Defaults to
+        # ``time.monotonic``; tests inject a fake to drive pacing deterministically.
+        self._pace_clock: Callable[[], float] = (
+            pace_clock if pace_clock is not None else time.monotonic
         )
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
@@ -479,6 +502,35 @@ class RtpMediaTransport:
         # (hold stops outbound media). Reset in connect()/stop().
         self._tx_buffer: bytes = b""
 
+        # Outbound pacing deadline (seconds on the ``_pace_clock`` timeline): the
+        # time the NEXT frame is scheduled to go on the wire. ``None`` means no
+        # schedule is anchored yet (the first frame of a stream sends immediately —
+        # critical for the greeting so a NAT'd gateway latches at once — and anchors
+        # the schedule from that instant). Each sent frame advances it by exactly one
+        # ptime, so the pacer sleeps the REMAINING time to the deadline rather than a
+        # flat ptime: a slow per-frame encode (G.722 is pure-Python, ~1.3 ms/frame
+        # and variable) is absorbed into the interval instead of being added on top,
+        # giving a steady 50 pps for any codec. The pacer re-anchors this to ``now``
+        # whenever it has fallen more than one ptime behind (a real idle gap between
+        # TTS utterances), so the next burst does NOT dump back-to-back catching up.
+        # Reset to ``None`` in connect()/stop() so a fresh or re-used engine
+        # re-anchors on its next frame.
+        self._next_send_at: float | None = None
+
+        # In-flight frame slot for the deadline pacer's stop-race (the one yield
+        # point in _transmit_frame is the pacing sleep BETWEEN encode and sendto).
+        # A frame is encoded (the stateful encoder advances, seq/ts are committed
+        # into the bytes) BEFORE the pacing sleep, so on the wire it leaves on a
+        # fixed grid regardless of encode cost. If a concurrent stop() nulls the
+        # transport DURING that sleep, the already-encoded datagram cannot be
+        # re-derived from _tx_buffer (re-encoding would double-advance the stateful
+        # G.722 encoder and reorder the stream), so it is parked HERE and stop()'s
+        # flush sends it FIRST (it is the front of the stream), before the remaining
+        # raw frames in _tx_buffer. Cleared the instant the frame reaches the wire on
+        # the normal path. ``None`` whenever no frame is mid-flight. Reset in
+        # connect()/stop().
+        self._inflight_wire: bytes | None = None
+
         # Stop signal: set by stop(), selected on by the inbound generator so it
         # wakes promptly regardless of recv-queue fullness (a bounded queue can
         # otherwise drop a sentinel datagram and strand the consumer).
@@ -525,6 +577,12 @@ class RtpMediaTransport:
         self._g722_decoder = None
         # Drop any leftover outbound re-framing bytes from a previous call.
         self._tx_buffer = b""
+        # Re-anchor the pacing schedule on the first frame of this call (so a reused
+        # engine does not inherit a stale, long-past deadline that would dump a burst
+        # of packets back-to-back to "catch up").
+        self._next_send_at = None
+        # No frame is mid-flight at the start of a call.
+        self._inflight_wire = None
         # Reset the latch so a reused engine re-latches on its next call: aim
         # back at the SDP-negotiated remote until the first valid inbound packet.
         self._outbound_addr = (self._remote_address, self._remote_port)
@@ -753,17 +811,19 @@ class RtpMediaTransport:
         """Encode and packetise one near-end frame; gate on hold state.
 
         When :attr:`on_hold` is ``True`` the datagram is silently discarded.
-        Otherwise the frame is resampled to the 8 kHz G.711 wire rate (if it
-        arrives at any other rate — e.g. a 24 kHz TTS frame), encoded, packed
-        into an RTP packet (incrementing seq/timestamp), optionally
-        SRTP-protected, and sent to the remote.  The injected ``sleep`` callable
-        paces the stream at ``ptime`` ms.
+        Otherwise the frame is resampled to the codec's wire rate (8 kHz G.711,
+        16 kHz G.722) if it arrives at any other rate — e.g. a 24 kHz TTS frame —
+        re-framed into whole 20 ms slices (carry-buffered across calls so a
+        sub-frame remainder is not silence-padded per chunk), encoded, packed into
+        an RTP packet (incrementing seq/timestamp), optionally SRTP-protected, and
+        sent to the remote. The stream is deadline-paced to one ``ptime`` per packet
+        (see :meth:`_transmit_frame`).
 
         Args:
-            frame: PCM16 audio at ANY sample rate.  A frame already at 8 kHz is
-                encoded directly; any other rate (e.g. the TTS provider's 24 kHz
-                output) is resampled down to 8 kHz first (ADR-0017), so this
-                method never raises on a non-8 kHz frame — it converts.
+            frame: PCM16 audio at ANY sample rate.  A frame already at the wire rate
+                is encoded directly; any other rate (e.g. the TTS provider's 24 kHz
+                output) is resampled to the wire rate first (ADR-0017/0022), so this
+                method never raises on an off-rate frame — it converts.
         """
         if self.on_hold:
             return
@@ -813,19 +873,21 @@ class RtpMediaTransport:
         ts_increment = (self._rtp_clock_rate * self._ptime) // 1000
         chunk_bytes = wire_samples_per_frame * 2  # PCM16 = 2 bytes per sample
 
-        # _tx_buffer is the single ORDERED source of truth for not-yet-sent
-        # outbound audio: append this chunk, then drain whole frames off the FRONT
-        # one at a time, removing each frame ONLY once it is on the wire. So if a
-        # concurrent stop() flushes _tx_buffer mid-drain, every still-unsent frame
-        # (whole frames AND the sub-frame remainder) is in _tx_buffer in order —
-        # stop()'s flush delivers them, never dropping a middle frame, never
-        # re-sending one already on the wire, never reordering the tail ahead.
+        # _tx_buffer is the ORDERED source of truth for not-yet-ENCODED outbound
+        # audio: append this chunk, then drain whole frames off the FRONT one at a
+        # time. _transmit_frame encodes the frame, parks the encoded datagram in
+        # _inflight_wire, then paces (the one yield point) and sends. So at any await
+        # the still-unsent audio is split across exactly two ordered places — the
+        # in-flight encoded datagram (front) and the raw remainder in _tx_buffer — and
+        # stop()'s flush delivers them in that order. No frame is dropped, none
+        # re-sent, none reordered.
         self._tx_buffer += wire_rate_frame.samples
         while len(self._tx_buffer) >= chunk_bytes:
-            # Remove the frame from the buffer BEFORE transmitting: _transmit_frame
-            # awaits a pacing sleep, and a concurrent stop() flushing _tx_buffer
-            # during that sleep must not re-send a frame already on the wire. The
-            # buffer therefore always holds exactly the not-yet-sent audio.
+            # Remove the frame from the buffer as we hand it to _transmit_frame, which
+            # takes ownership: on a clean send the frame is on the wire; on a stop
+            # racing its pacing sleep the (already-encoded) frame lives in
+            # _inflight_wire for the flush. Either way it must NOT remain in
+            # _tx_buffer (that would re-encode/duplicate it).
             chunk, self._tx_buffer = (
                 self._tx_buffer[:chunk_bytes],
                 self._tx_buffer[chunk_bytes:],
@@ -834,10 +896,10 @@ class RtpMediaTransport:
                 chunk, wire_rate_frame.monotonic_ts_ns, ts_increment
             )
             if not sent:
-                # stop() nulled the transport before this frame went out: put it
-                # back at the FRONT (bytes preserved, order kept) and stop
-                # draining. stop()'s flush owns the buffer from here.
-                self._tx_buffer = chunk + self._tx_buffer
+                # stop() nulled the transport during the pacing sleep: the encoded
+                # frame is parked in _inflight_wire and stop()'s flush sends it first,
+                # then the rest of _tx_buffer. Nothing to put back here — stop the
+                # drain; the flush owns delivery from here.
                 return
             # Read _transport through a fresh local so mypy does not treat this as
             # unreachable: the pre-loop guard narrowed self._transport to non-None
@@ -852,26 +914,50 @@ class RtpMediaTransport:
     async def _transmit_frame(
         self, chunk: bytes, monotonic_ts_ns: int, ts_increment: int
     ) -> bool:
-        """Encode + packetise one whole 20 ms frame and send it; pace by ptime.
+        """Encode one 20 ms frame, then deadline-pace, then send it on the wire.
 
         ``chunk`` is one ptime of WIRE-RATE PCM16 (codec-derived rate). ``ts_increment``
         is the RTP timestamp delta for one frame (the RTP CLOCK rate — equal to the
         wire sample count for G.711, but HALF it for G.722: 160 clock units for a
         320-sample wideband frame, RFC 3551).
 
-        Returns whether the frame was put **on the wire**: ``False`` if the
-        transport had already been torn down by a concurrent :meth:`stop` at entry
-        (nothing sent — the caller puts the frame back), ``True`` once the datagram
-        is sent (then the ``ptime`` pacing sleep elapses). The seq/timestamp
-        counters advance only when a datagram is actually emitted. Whether to keep
-        draining after a ``True`` is the caller's decision (it re-checks the
-        transport, which :meth:`stop` may have nulled during the sleep — the frame
-        was still sent).
+        **Deadline pacing** (the G.722 jitter fix): the costly synchronous work — the
+        encode (G.722 is pure-Python, ~1.3 ms/frame and variable), pack, and optional
+        SRTP protect — happens FIRST; only THEN does the method sleep the time
+        remaining until this frame's scheduled deadline (``self._next_send_at``) and
+        ``sendto`` immediately on wake. So the datagram leaves the socket ON the fixed
+        deadline grid regardless of how long the encode took, and the encode cost is
+        absorbed INTO the 20 ms interval rather than added on top — a steady 50 pps
+        for any codec. The old model (``sendto`` then a flat ``sleep(ptime)``) made
+        the realized interval ``ptime + encode``, which drifted audibly on G.722.
+
+        The first frame of a stream finds ``_next_send_at is None``, anchors the grid
+        to ``now``, and sends with no wait (the greeting must go out immediately so a
+        NAT'd gateway latches). A frame that overruns its slot by up to a ptime clamps
+        the wait to zero — no negative sleep, no busy-spin. If the grid has fallen
+        more than one ptime behind (a real idle gap between TTS utterances) it
+        re-anchors to ``now`` so the next burst is paced rather than dumped
+        back-to-back catching up (cross-vendor review finding).
+
+        **Stop race**: the encode commits the stateful encoder and the seq/ts, so the
+        already-built datagram is parked in :attr:`_inflight_wire` across the pacing
+        sleep — the sole yield point. If a concurrent :meth:`stop` nulls the transport
+        during that sleep, this method returns ``False`` leaving the parked datagram
+        for :meth:`_flush_tx_tail` to send FIRST, in order (re-deriving it from
+        ``_tx_buffer`` would double-advance the encoder and reorder the stream). On a
+        clean send the slot is cleared and ``True`` returned. Whether to keep draining
+        after a ``True`` is the caller's decision (it re-checks the transport, which
+        :meth:`stop` may have nulled — the frame was still sent).
         """
-        transport = self._transport
-        if transport is None:
+        if self._transport is None:
             return False
 
+        # Do all the CPU work BEFORE pacing so the encode time is absorbed into the
+        # interval, not added after the send. Encode + pack + protect now, and COMMIT
+        # the seq/ts (the stateful encoder has advanced; the packet bytes bake in this
+        # seq/ts), so a stop racing the pacing sleep below sends exactly these bytes
+        # and the flush that follows continues from the next seq/ts — no collision,
+        # no reorder.
         chunk_frame = PcmFrame(
             samples=chunk,
             sample_rate=self._wire_sample_rate,
@@ -887,11 +973,49 @@ class RtpMediaTransport:
             payload=payload,
         )
         wire = self._srtp_out.protect(pkt) if self._srtp_out is not None else pkt.pack()
-
-        # Advance counters (mod 2^16 for seq, mod 2^32 for ts). The timestamp
-        # advances at the RTP CLOCK rate (codec-derived), not the wire sample count.
         self._seq = (self._seq + 1) % (1 << 16)
         self._ts = (self._ts + ts_increment) % (1 << 32)
+        # Park the encoded datagram so a stop() during the pacing sleep can still send
+        # it (in order) from _flush_tx_tail. Cleared the instant it reaches the wire.
+        self._inflight_wire = wire
+
+        # Deadline pace: wait only the time remaining to this frame's slot, THEN send
+        # on wake, so the datagram leaves on the fixed grid (the encode above is
+        # already done). The first frame anchors the grid and sends immediately.
+        #
+        # Re-anchor a STALE grid (codex review): if the deadline is already more than
+        # one ptime in the past — a real idle gap between TTS chunks/utterances, or a
+        # call that paused — catching up by only +1 ptime per frame would dump the
+        # next burst back-to-back (wait <= 0 for many frames) until the schedule
+        # caught up. So when the schedule has fallen behind by more than a ptime,
+        # snap _next_send_at to ``now``: the first frame after the gap sends
+        # immediately and the rest of the burst paces a steady 20 ms from there.
+        # Adjacent frames in a continuous stream are at most ~ptime behind, so normal
+        # pacing is untouched; only a genuine gap triggers the re-anchor.
+        ptime_s = self._ptime / 1000.0
+        now = self._pace_clock()
+        if self._next_send_at is None or now - self._next_send_at > ptime_s:
+            self._next_send_at = now
+        wait = self._next_send_at - now
+        if wait > 0:
+            await self._sleep(wait)
+
+        # Re-read the transport AFTER the pacing sleep: stop() may have nulled it while
+        # we waited. The explicit ``| None`` annotation defeats mypy's stale narrowing
+        # from the entry guard (it cannot see the concurrent stop() mutation across the
+        # await). If nulled, this frame did NOT go out HERE — report False and leave it
+        # parked in _inflight_wire for stop()'s flush to send first (the lossless,
+        # in-order-on-stop contract the old post-send sleep upheld).
+        transport: asyncio.DatagramTransport | None = self._transport
+        if transport is None:
+            return False
+
+        # The frame is going out on the fixed grid: advance the deadline by exactly one
+        # ptime (a single slow frame does not shift every subsequent packet) and clear
+        # the in-flight slot now that the datagram is on the wire. The anchor block
+        # above guarantees _next_send_at is set (not None) on every path to here.
+        self._next_send_at += ptime_s
+        self._inflight_wire = None
 
         # Log the first packet sent in this call.
         if not self._first_tx_logged:
@@ -928,11 +1052,11 @@ class RtpMediaTransport:
             self._tx_amplitude_period_peak = 0
 
         transport.sendto(wire, self._outbound_addr)
-        await self._sleep(self._ptime / 1000.0)
-        # The frame is on the wire (sent above). stop() may have nulled _transport
-        # during the sleep, but that governs whether the CALLER keeps draining (it
-        # re-checks _transport) — it does not un-send this frame, so we report the
-        # send as successful (True).
+        # The frame is on the wire. Pacing already happened above (the wait preceded
+        # this send so the datagram leaves on the fixed grid); there is deliberately
+        # NO post-send sleep. stop() may null _transport before the caller's NEXT
+        # frame, but that governs whether the caller keeps draining (it re-checks
+        # _transport) — it does not un-send this frame, so report True.
         return True
 
     @property
@@ -1016,6 +1140,12 @@ class RtpMediaTransport:
         if transport is not None and not self.on_hold:
             self._flush_tx_tail(transport)
         self._tx_buffer = b""
+        # Drop any in-flight frame the flush did not send (held call, or stop before
+        # connect): hold/stop-without-socket emit nothing. _flush_tx_tail clears it
+        # when it runs; this covers the paths where it does not.
+        self._inflight_wire = None
+        # Clear the pacing deadline so a reconnected engine re-anchors fresh.
+        self._next_send_at = None
         self._transport = None
         if transport is not None:
             transport.close()
@@ -1027,15 +1157,25 @@ class RtpMediaTransport:
     def _flush_tx_tail(self, transport: asyncio.DatagramTransport) -> None:
         """Emit all buffered outbound audio as final RTP packets, in order.
 
-        Sends every whole wire-rate frame still in :attr:`_tx_buffer` (the send
-        loop can leave several when a concurrent stop bails out mid-drain), then
-        zero-pads the trailing sub-frame remainder up to one whole frame and sends
-        it too, through ``transport`` (the still-open socket), and clears the
-        buffer. A no-op when nothing is buffered. Sent inline (no ``ptime`` pacing)
-        because the call is tearing down; seq advances per emitted frame and the
-        timestamp by the codec's RTP clock increment (160 for G.711 AND G.722),
-        so the wire stays RFC 3550-consistent.
+        Sends, in stream order: first any in-flight frame parked by the deadline
+        pacer (:attr:`_inflight_wire` — a datagram encoded just before a stop nulled
+        the transport mid-pace; it is the FRONT of the stream and already carries its
+        committed seq/ts), then every whole wire-rate frame still in
+        :attr:`_tx_buffer` (the send loop can leave several when a concurrent stop
+        bails out mid-drain), then the trailing sub-frame remainder zero-padded up to
+        one whole frame — all through ``transport`` (the still-open socket), then
+        clears the buffers. A no-op when nothing is buffered. Sent inline (no ``ptime``
+        pacing) because the call is tearing down; seq advances per emitted raw frame
+        and the timestamp by the codec's RTP clock increment (160 for G.711 AND
+        G.722), so the wire stays RFC 3550-consistent.
         """
+        # The in-flight (already-encoded) frame goes out FIRST — it precedes every
+        # raw frame still in _tx_buffer, and re-encoding it from PCM would
+        # double-advance the stateful encoder and reorder the stream. Its seq/ts were
+        # committed at encode time, so just send the bytes.
+        inflight, self._inflight_wire = self._inflight_wire, None
+        if inflight is not None:
+            transport.sendto(inflight, self._outbound_addr)
         tail = self._tx_buffer
         self._tx_buffer = b""
         if not tail:

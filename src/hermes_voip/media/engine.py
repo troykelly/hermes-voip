@@ -1295,20 +1295,24 @@ class RtpMediaTransport:
 
         This method:
 
-        * emits a short LINEAR FADE-OUT on the FRONT of the pending carry buffer
-          (the audio that would have played next), re-framed into whole ``ptime``
-          RTP packets and sent immediately (no pacing — the cut is now), so the last
-          thing on the wire ramps from the current amplitude to silence and does not
+        * bumps the flush generation so a :meth:`send_audio` drain loop parked on its
+          pacing sleep stops emitting the remainder of the superseded utterance;
+        * sends any frame the deadline pacer parked mid-flight FIRST (it is the front
+          of the stream and already encoded — dropping it would desync a G.722
+          decoder, since the encoder already advanced past it);
+        * emits a short LINEAR FADE-OUT on the FRONT of the remaining carry buffer
+          (the audio that would have played next), re-framed into whole ``ptime`` RTP
+          packets and sent immediately (no pacing — the cut is now), so the last thing
+          on the wire ramps from the current amplitude to silence and does not
           click/pop; then
-        * DROPS the rest of the pending buffer and any in-flight (parked) frame, and
-          bumps the flush generation so a :meth:`send_audio` drain loop parked on its
-          pacing sleep stops emitting the remainder of the superseded utterance.
+        * DROPS the rest of the pending buffer.
 
         The fade is computed in the linear PCM16 domain BEFORE the codec encode, so
         G.711 and G.722 are both correct (G.722's stateful encoder simply continues
-        from the faded samples). ``fade_ms`` of 0 drops the buffer with no trailing
-        audio (an instant hard cut). A flush with nothing pending and ``fade_ms`` of
-        0, or while held / before connect, emits nothing.
+        from the faded samples). ``fade_ms`` of 0 emits no fade — only any in-flight
+        frame (one ptime of already-committed audio), then silence: an effectively
+        instant hard cut. While held / before connect, nothing is emitted (even the
+        in-flight frame is dropped — hold/closed-socket stop outbound media).
 
         Args:
             fade_ms: Length of the linear fade-out in milliseconds (``>= 0``). The
@@ -1324,15 +1328,32 @@ class RtpMediaTransport:
         # rest of the chunk it was pacing never goes out).
         self._flush_generation += 1
         pending = self._tx_buffer
-        # Drop the pending carry buffer and any parked (already-encoded) frame: from
-        # here the only audio that goes out is the fade we emit below.
         self._tx_buffer = b""
-        self._inflight_wire = None
+        # Take ownership of any frame the deadline pacer parked mid-flight (a frame
+        # already encoded — encoder state advanced, seq/ts committed — but not yet
+        # on the wire because a pacing sleep was in progress when this flush won).
+        inflight, self._inflight_wire = self._inflight_wire, None
 
         transport = self._transport
-        if transport is None or self.on_hold or fade_ms == 0 or not pending:
-            # Nothing to fade (held / not connected / fade disabled / empty buffer):
-            # the drop above is the whole effect — instant silence.
+        if transport is None or self.on_hold:
+            # Held / not connected: hold stops outbound media and a closed socket
+            # cannot send. Drop everything (the buffer + the in-flight frame) — no
+            # audio goes out. (stop()'s own flush is also gated on on_hold.)
+            return
+
+        # Send the parked in-flight frame FIRST, as-is. It is the FRONT of the stream
+        # and is already encoded, so (a) re-deriving it from PCM would double-advance
+        # the stateful G.722 encoder, and (b) DROPPING it would desync a G.722 decoder
+        # (the encoder advanced past it, the decoder never saw it) — so for codec
+        # continuity it must go out. It is one ptime of already-committed audio; the
+        # fade below continues seamlessly from it (the fade is the next PCM in order),
+        # so there is no amplitude step / click between them.
+        if inflight is not None:
+            transport.sendto(inflight, self._outbound_addr)
+
+        if fade_ms == 0 or not pending:
+            # Fade disabled, or nothing buffered after the in-flight frame: the
+            # in-flight frame (if any) is the whole tail — go silent now.
             return
 
         wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000

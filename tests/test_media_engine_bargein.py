@@ -24,7 +24,7 @@ import struct
 
 import pytest
 
-from hermes_voip.media.audio import decode_ulaw
+from hermes_voip.media.audio import decode_ulaw, encode_ulaw
 from hermes_voip.media.engine import Codec, RtpMediaTransport
 from hermes_voip.media.g722 import G722Decoder
 from hermes_voip.providers.audio import PcmFrame
@@ -237,3 +237,64 @@ async def test_flush_outbound_advances_rtp_sequence() -> None:
     assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), (
         f"fade packet sequence numbers not contiguous/advancing: {seqs}"
     )
+
+
+@pytest.mark.asyncio
+async def test_flush_outbound_sends_inflight_frame_first_then_fade() -> None:
+    """A parked in-flight frame goes out FIRST (as-is), then the fade.
+
+    The deadline pacer can park an already-encoded frame in ``_inflight_wire``
+    across its pacing sleep. Dropping it would desync a G.722 decoder (the encoder
+    advanced past it), so flush_outbound sends it first, then the fade. Here the
+    in-flight frame is a recognisable RTP packet whose payload type / SSRC mark it;
+    the test confirms it precedes the fade packet and the fade still reaches silence.
+    """
+    engine, recorder = await _new_engine(Codec.PCMU)
+    # Park a real, already-encoded full-amplitude frame (one ptime of mu-law) the
+    # way the deadline pacer would, plus a buffer the fade will draw from.
+    inflight_pcm = _const_g711_frame(1, 20_000).samples
+    pkt = RtpPacket(
+        payload_type=0,
+        sequence_number=999,
+        timestamp=12345,
+        ssrc=0xCAFEBABE,
+        payload=encode_ulaw(inflight_pcm),
+    )
+    engine._inflight_wire = pkt.pack()
+    engine._tx_buffer = _const_g711_frame(4, 16_000).samples
+
+    await engine.flush_outbound(fade_ms=20)
+
+    assert len(recorder.packets) >= 2, "expected the in-flight frame plus a fade frame"
+    # First packet is the parked in-flight frame, verbatim (seq 999).
+    first = RtpPacket.parse(recorder.packets[0])
+    assert first.sequence_number == 999, "in-flight frame was not sent first"
+    inflight_samples = _ulaw_payload_samples(recorder.packets[0])
+    assert max(abs(s) for s in inflight_samples) > 15_000, (
+        "in-flight frame should be full amplitude (sent as-is, not faded)"
+    )
+    # The LAST packet is the fade tail and reaches silence.
+    last = _ulaw_payload_samples(recorder.packets[-1])
+    assert abs(last[-1]) <= 64, f"fade did not reach silence: last sample {last[-1]}"
+    # In-flight slot is cleared.
+    assert engine._inflight_wire is None
+
+
+@pytest.mark.asyncio
+async def test_flush_outbound_while_held_emits_nothing() -> None:
+    """A flush while the call is on hold emits nothing (drops in-flight + buffer).
+
+    Hold stops outbound media; a barge-in flush during hold must not push audio
+    (the in-flight frame and the carry buffer are both dropped). Mirrors stop()'s
+    own on_hold gate.
+    """
+    engine, recorder = await _new_engine(Codec.PCMU)
+    engine._inflight_wire = b"\x00" * 50  # would be sent if hold were ignored
+    engine._tx_buffer = _const_g711_frame(4, 16_000).samples
+    engine.on_hold = True
+
+    await engine.flush_outbound(fade_ms=30)
+
+    assert recorder.packets == [], "a held flush must emit no audio"
+    assert engine._tx_buffer == b""
+    assert engine._inflight_wire is None

@@ -58,7 +58,7 @@ class _FakeCtx:
         name: str,
         toolset: str,
         schema: dict[str, object],
-        handler: Callable[..., object],
+        handler: object,
         check_fn: Callable[[], bool] | None = None,
         requires_env: Sequence[str] | None = None,
         is_async: bool = False,
@@ -77,7 +77,7 @@ class _FakeCtx:
             }
         )
 
-    def register_hook(self, hook_name: str, callback: Callable[..., object]) -> None:
+    def register_hook(self, hook_name: str, callback: object) -> None:
         self.hook_calls.append({"hook_name": hook_name, "callback": callback})
 
 

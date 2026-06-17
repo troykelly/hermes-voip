@@ -119,6 +119,7 @@ from hermes_voip.sdp import (
     Codec as SdpCodec,
 )
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
+from hermes_voip.voip_tools import active_voip_adapter, set_active_adapter
 
 if TYPE_CHECKING:
     from hermes_voip.media.srtp import SrtpSession
@@ -354,6 +355,10 @@ class VoipAdapter(BasePlatformAdapter):
         self._connected = True
         self._lost_event = asyncio.Event()
         self._supervisor_task = asyncio.create_task(self._supervise())
+        # Register as the live adapter the agent VoIP tools (hang_up) operate on
+        # (ADR-0026). One voip adapter per gateway process; the tool handler reaches
+        # the per-call session map through this seam.
+        set_active_adapter(self)
         return up
 
     async def _establish(self) -> bool:
@@ -445,6 +450,13 @@ class VoipAdapter(BasePlatformAdapter):
         if not self._connected:
             return
         self._connected = False
+
+        # We are no longer the live adapter for the agent VoIP tools (ADR-0026):
+        # clear the seam so a stale reference cannot end a call on a torn-down
+        # adapter. Only clear if it still points at us (a later adapter may have
+        # superseded us — defensive, though one adapter per process is the norm).
+        if active_voip_adapter() is self:
+            set_active_adapter(None)
 
         # Unblock and cancel the supervisor so it does not attempt a reconnect
         # after we tear down.
@@ -1494,6 +1506,42 @@ class VoipAdapter(BasePlatformAdapter):
         :meth:`_teardown_call`.
         """
         self._agent_hangups.add(call_id)
+
+    def guard_state_for(self, call_id: str) -> GuardSessionState | None:
+        """Return the per-call guard state for ``call_id``, or ``None`` if unknown.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` surface the
+        ``pre_tool_call`` gate reads the call's privilege level + degraded flag
+        from. ``None`` when no live session exists for the call (the gate then
+        fails safe to a least-privilege state).
+        """
+        session = self._call_sessions.get(call_id)
+        return session.guard if session is not None else None
+
+    async def hang_up_call(self, call_id: str) -> bool:
+        """End ``call_id`` as a SOFT agent hangup (ADR-0026); return whether it ended.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``hang_up`` tool calls. Marks the call as agent-initiated (so its teardown
+        classifies AGENT_HANGUP — a NORMAL end that keeps the Hermes session open
+        for follow-up, NOT a hard ``/stop``) and drives
+        :meth:`~hermes_voip.call.CallSession.hang_up`, which sends BYE and stops
+        media. Stopping media ends the call loop, whose ``finally`` runs the
+        teardown chokepoint — so the call-end signal flows through the single path.
+
+        Returns ``False`` (and does nothing) when the call is unknown or already
+        ended, so the tool reports a clear, non-fatal outcome instead of raising.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return False
+        # Mark BEFORE sending BYE so the loop's end (which the BYE triggers by
+        # stopping media) is already classified as an agent hangup when teardown
+        # runs — no race where teardown reads the flag before it is set.
+        self._mark_agent_hangup(call_id)
+        _log.info("agent hang_up tool: ending call %s (BYE + media stop)", call_id)
+        await session.hang_up()
+        return True
 
     def _classify_end_reason(
         self,

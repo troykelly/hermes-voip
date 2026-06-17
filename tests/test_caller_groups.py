@@ -339,6 +339,9 @@ class _FakeCall:
     async def unhold(self) -> None:
         self.holds -= 1
 
+    async def hang_up(self) -> None:
+        self.holds = 0
+
     async def transfer_blind(
         self, target_uri: str, *, referred_by: str | None = None
     ) -> None:

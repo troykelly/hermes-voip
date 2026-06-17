@@ -46,6 +46,7 @@ from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
+from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.providers.tts import TtsStream
 from hermes_voip.sdp import Codec as SdpCodec
 
@@ -977,6 +978,89 @@ async def test_classify_end_reason_exception_is_pipeline_failure() -> None:
     reason = adapter._classify_end_reason(call_id, engine, raised=True)
     assert reason is CallEndReason.PIPELINE_FAILURE
     assert reason.was_failure is True
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_drives_session_bye_and_marks_agent_hangup() -> None:
+    """The VoipToolHost hang_up_call drives the session BYE + marks AGENT_HANGUP.
+
+    ADR-0026: the agent hang_up tool calls this. It must call the live session's
+    ``hang_up`` (sends BYE, stops media) and flag the call agent-initiated so the
+    subsequent teardown classifies AGENT_HANGUP (a SOFT, NORMAL end), not REMOTE_BYE.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    hung_up = False
+
+    class _Session:
+        ended = False
+        guard = GuardSessionState(call_id=call_id, privilege_level=0)
+
+        async def hang_up(self) -> None:
+            nonlocal hung_up
+            hung_up = True
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    ended = await adapter.hang_up_call(call_id)
+
+    assert ended is True
+    assert hung_up is True
+    # The call is now flagged agent-initiated, so a clean end classifies AGENT_HANGUP.
+    engine = MagicMock(media_timed_out=False)
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=False)
+        is CallEndReason.AGENT_HANGUP
+    )
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_unknown_call_returns_false() -> None:
+    """Hanging up an unknown call id is a no-op returning False (clear tool result)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    assert await adapter.hang_up_call("no-such-call") is False
+
+
+@pytest.mark.asyncio
+async def test_guard_state_for_returns_the_call_guard() -> None:
+    """guard_state_for exposes the per-call guard state for the pre_tool_call gate."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+    guard = GuardSessionState(call_id=call_id, privilege_level=2)
+
+    class _Session:
+        ended = False
+
+        def __init__(self, g: GuardSessionState) -> None:
+            self.guard = g
+
+    adapter._call_sessions[call_id] = _Session(guard)  # type: ignore[assignment]  # test double
+
+    assert adapter.guard_state_for(call_id) is guard
+    assert adapter.guard_state_for("unknown") is None
+
+
+@pytest.mark.asyncio
+async def test_connect_registers_adapter_as_the_active_voip_tool_host() -> None:
+    """connect() registers the adapter as the active VoIP-tool adapter (ADR-0026).
+
+    Without this seam the agent hang_up tool handler cannot reach the live call.
+    """
+    from hermes_voip.voip_tools import active_voip_adapter  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    assert active_voip_adapter() is adapter
+    await adapter.disconnect()
+    assert active_voip_adapter() is None
 
 
 # ---------------------------------------------------------------------------

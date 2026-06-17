@@ -1419,6 +1419,14 @@ class VoipAdapter(BasePlatformAdapter):
             # this many ms when a barge-in flushes the queued audio, so the cut is
             # click-free instead of an abrupt pop.
             barge_in_fade_ms=media_cfg.barge_in_fade_ms,
+            # Dead-air comfort filler (ADR-0030): when enabled, emit one short natural
+            # filler on a turn gap that exceeds the delay before the agent's reply
+            # audio starts, so the caller does not think the line dropped. Off by
+            # default (today's behaviour exactly); flushable + model-tag-aware because
+            # it routes through the same speak()/TTS path as a reply.
+            comfort_filler=media_cfg.comfort_filler,
+            comfort_filler_delay_ms=media_cfg.comfort_filler_delay_ms,
+            comfort_filler_phrases=media_cfg.comfort_filler_phrases,
         )
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)

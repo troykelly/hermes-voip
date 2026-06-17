@@ -110,6 +110,19 @@ _AUDIO_QUEUE_MAX: Final[int] = 32
 #: (finding #3): ASR back-pressures rather than buffering an unbounded backlog.
 _TRANSCRIPT_QUEUE_MAX: Final[int] = 32
 
+#: Default comfort-filler phrase set (ADR-0030), used when a CallLoop is constructed
+#: without an explicit set. Each phrase reads naturally on every TTS model (no
+#: bracket tag), so the default never depends on v3 tag rendering. The adapter
+#: normally passes ``MediaConfig.comfort_filler_phrases`` (the same default).
+_DEFAULT_COMFORT_FILLER_PHRASES: Final[tuple[str, ...]] = (
+    "Hmm,",
+    "Let me see,",
+    "One moment,",
+)
+
+#: Default dead-air threshold (ms) before one comfort filler fires (ADR-0030).
+_DEFAULT_COMFORT_FILLER_DELAY_MS: Final[int] = 900
+
 
 class _EndOfStream(Enum):
     """Typed end-of-stream marker passed through the inter-task queues.
@@ -464,6 +477,22 @@ class CallLoop:
             the final frames when a barge-in flushes the outbound audio (ADR-0028),
             so the clean stop is click-free. ``0`` is an instant hard cut. The
             adapter passes ``HERMES_VOIP_BARGE_IN_FADE_MS`` (default 30).
+        comfort_filler: Dead-air comfort filler master switch (ADR-0030), ``False``
+            by default. When ``True``, after a caller turn is delivered the loop
+            schedules a one-shot task that, if the gap exceeds
+            ``comfort_filler_delay_ms`` before the agent's reply audio starts, emits
+            ONE short natural filler ("Hmm,") through the normal TTS/send path, then
+            keeps waiting for the real reply. Fires at most once per gap; cancelled
+            by the real reply (:meth:`speak`) or a barge-in (:meth:`barge_in`). Off =
+            today's behaviour exactly (no filler task is created).
+        comfort_filler_delay_ms: Dead-air threshold (ms) before one filler fires.
+            Must be positive (the adapter passes the validated config value).
+        comfort_filler_phrases: The filler phrase set; one is chosen per gap
+            (round-robin per call). Each phrase reads naturally on every TTS model.
+            Must be non-empty (defaults to the built-in set).
+        sleep: The async sleep seam the comfort-filler delay awaits. Defaults to
+            :func:`asyncio.sleep`; tests inject a controllable sleep for determinism
+            (the loop has no other wall-clock dependency).
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
@@ -485,6 +514,10 @@ class CallLoop:
         barge_in_min_voiced_windows: int = 1,
         barge_in_tail_windows: int = 0,
         barge_in_fade_ms: int = 30,
+        comfort_filler: bool = False,
+        comfort_filler_delay_ms: int = _DEFAULT_COMFORT_FILLER_DELAY_MS,
+        comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -530,6 +563,21 @@ class CallLoop:
         # in-flight stream (cancels it, then takes the lock), so the greeting and
         # a following agent reply never interleave frames on the wire.
         self._playout_lock = asyncio.Lock()
+        # Dead-air comfort filler (ADR-0030).
+        self._comfort_filler = comfort_filler
+        # Delay (seconds) the filler gap awaits before firing. The config value is
+        # validated positive; stored in seconds for the asyncio sleep seam.
+        self._comfort_filler_delay_s = comfort_filler_delay_ms / 1000.0
+        self._comfort_filler_phrases = comfort_filler_phrases
+        self._sleep = sleep
+        # The single in-flight comfort-filler task for the current turn gap, or None
+        # when no gap is pending. ``speak``/``barge_in`` cancel it the instant the
+        # real reply or a barge-in arrives; ``run`` cancels any lingering one at
+        # teardown so the task never leaks. Touched only from the event loop.
+        self._comfort_filler_task: asyncio.Task[None] | None = None
+        # Round-robin index into ``_comfort_filler_phrases`` so a multi-gap call does
+        # not repeat the same filler word every time. Touched only from the loop.
+        self._comfort_filler_index = 0
 
     async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
         """Run the duplex loop until the transport's inbound stream ends.
@@ -801,12 +849,19 @@ class CallLoop:
         else:
             greeting_stream = None
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(_pump())
-            tg.create_task(_asr())
-            tg.create_task(_delivery())
-            if greeting_stream is not None:
-                tg.create_task(self._play_greeting(greeting_stream))
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(_pump())
+                tg.create_task(_asr())
+                tg.create_task(_delivery())
+                if greeting_stream is not None:
+                    tg.create_task(self._play_greeting(greeting_stream))
+        finally:
+            # The comfort filler runs as a tracked task OUTSIDE the TaskGroup (it is
+            # armed per delivered turn, not at loop start), so cancel any lingering
+            # one on every exit path — normal end, error, or cancellation — so it
+            # never outlives the call (ADR-0030; no leaked task).
+            self._cancel_comfort_filler()
 
     async def speak(
         self,
@@ -836,6 +891,27 @@ class CallLoop:
                 moment). Not called if the stream is cancelled before any frame
                 is sent.
         """
+        # The real reply is starting: cancel any pending dead-air comfort filler
+        # (ADR-0030) so it never collides with the agent's opening word. A filler
+        # already PLAYING is superseded by the stream-supersede below (its stream is
+        # cancelled like any in-flight stream); a filler still PENDING on its delay
+        # is cancelled here before it can fire.
+        self._cancel_comfort_filler()
+        await self._speak_text(text, on_first_frame=on_first_frame)
+
+    async def _speak_text(
+        self,
+        text: AsyncIterator[str],
+        *,
+        on_first_frame: Callable[[], None] | None,
+    ) -> None:
+        """Synthesise *text* and play it, superseding any in-flight stream.
+
+        The shared body of :meth:`speak` and the comfort filler: it does NOT touch
+        the comfort-filler task (so the filler can call it without cancelling
+        itself), only the stream-supersede + playout. :meth:`speak` wraps this with
+        the filler-cancel; the filler calls it directly.
+        """
         # Sanitize each text chunk before TTS synthesis so that emoji,
         # markdown markup, and raw URLs are never voiced by the TTS engine.
         # Pass the negotiated wire rate (codec-derived: 8 kHz G.711, 16 kHz G.722)
@@ -854,6 +930,99 @@ class CallLoop:
         if previous is not None and previous is not stream:
             await previous.cancel()
         await self._play(stream, on_first_frame=on_first_frame)
+
+    def _schedule_comfort_filler(self) -> None:
+        """Arm a one-shot dead-air comfort filler for the turn just delivered.
+
+        Called from :meth:`_screen_and_deliver` right after a turn is handed to the
+        agent, only when the filler is enabled. Replaces any prior pending filler
+        (a new turn's gap supersedes an older one) and launches :meth:`_comfort_gap`
+        as a tracked task so it runs concurrently with the agent turn — it never
+        blocks delivery. No-op when the filler is disabled.
+        """
+        if not self._comfort_filler:
+            return
+        # A new turn supersedes any still-pending prior gap.
+        self._cancel_comfort_filler()
+        task = asyncio.create_task(self._comfort_gap())
+        # The task is fire-and-forget (it runs concurrently with the agent turn and
+        # is never awaited), so attach a done-callback to RETRIEVE its result: a
+        # cancellation is the normal stop (reply/barge-in/teardown) and is ignored,
+        # but a synthesis/send failure is LOGGED (rule 37: never silently swallowed)
+        # and is NOT fatal to the call — the filler is a best-effort comfort feature,
+        # so a working call must survive a failed filler and still play the real
+        # reply. Without this callback the exception would surface as an unretrieved
+        # "Task exception was never retrieved" warning.
+        task.add_done_callback(self._on_comfort_filler_done)
+        self._comfort_filler_task = task
+
+    def _on_comfort_filler_done(self, task: asyncio.Task[None]) -> None:
+        """Retrieve a finished filler task's result; log a real failure, ignore cancel.
+
+        A comfort filler is best-effort: a synthesis/send failure is logged at
+        warning and deliberately does not propagate (a failed filler must not kill an
+        otherwise-working call), while a cancellation (the normal reply/barge-in/
+        teardown stop) is expected and ignored. This is a logged, intentional
+        degradation — not a swallowed error.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.warning("comfort filler task failed (call continues): %r", exc)
+
+    def _cancel_comfort_filler(self) -> None:
+        """Cancel and forget the pending comfort-filler task, if any.
+
+        Idempotent and safe to call from the event loop. The filler task nulls its
+        own handle the instant it commits to firing, so this never cancels a filler
+        that is already mid-playout (that case is handled by the stream supersede in
+        :meth:`_speak_text` / the flush in :meth:`barge_in`).
+        """
+        task = self._comfort_filler_task
+        if task is not None:
+            self._comfort_filler_task = None
+            task.cancel()
+
+    def _next_comfort_phrase(self) -> str:
+        """Return the next filler phrase, advancing the per-call round-robin index."""
+        phrases = self._comfort_filler_phrases
+        phrase = phrases[self._comfort_filler_index % len(phrases)]
+        self._comfort_filler_index += 1
+        return phrase
+
+    async def _comfort_gap(self) -> None:
+        """Wait out the dead-air delay; emit ONE filler if no reply has started.
+
+        Awaits the configured delay on the injected sleep seam. If, after the delay,
+        the agent's reply audio has NOT begun (``_tts_audio_active`` is False), emits
+        exactly one short filler utterance through the normal TTS/send path
+        (:meth:`_speak_text`) so it is sanitised, model-conditional-tag-aware
+        (ADR-0027), echo-gate-arming and flushable (ADR-0023/0028) like any agent
+        audio — then returns. Fires at most once: the task ends after one filler.
+
+        Cancellation (a real reply via :meth:`speak`, or a barge-in) raises
+        ``CancelledError`` here, which propagates to end the task without firing —
+        never swallowed (rule 37).
+        """
+        await self._sleep(self._comfort_filler_delay_s)
+        # Commit to firing: drop our own handle FIRST so a reply's speak() that
+        # arrives while we synthesise supersedes the filler STREAM (in _speak_text)
+        # rather than trying to cancel this already-running task.
+        self._comfort_filler_task = None
+        # Guard: if the reply audio already started in the meantime, do not fire (no
+        # collision with the agent's opening word). On a single event loop a reply's
+        # speak() would already have cancelled this task during the sleep; this is
+        # the belt-and-braces check for the moment after the sleep returns.
+        if self._tts_audio_active:
+            return
+        phrase = self._next_comfort_phrase()
+        _log.info("comfort filler: emitting %r on dead air", phrase)
+
+        async def _single_chunk() -> AsyncIterator[str]:
+            yield phrase
+
+        await self._speak_text(_single_chunk(), on_first_frame=None)
 
     async def _play(
         self,
@@ -1004,7 +1173,14 @@ class CallLoop:
         Idempotent and side-effect-free when no stream is active: with nothing to
         cut off there is no queued agent audio to flush, so the engine is left
         untouched (a flush while the agent is silent would be a needless no-op send).
+
+        Also cancels any pending dead-air comfort filler (ADR-0030): a barge-in
+        during the turn gap means the caller is taking the floor, so a filler that
+        has not yet fired must not fire. A filler already PLAYING is the active
+        stream, so it is cancelled + flushed by the steps below like any agent audio.
         """
+        # The caller is interrupting: a pending (not-yet-fired) filler must not fire.
+        self._cancel_comfort_filler()
         stream = self._active_tts_stream
         if stream is not None:
             await stream.cancel()
@@ -1014,8 +1190,17 @@ class CallLoop:
             await self._transport.flush_outbound(fade_ms=self._barge_in_fade_ms)
 
     async def _screen_and_deliver(self, text: str) -> None:
-        """Screen one finalised turn through the guard; deliver if not refused."""
+        """Screen one finalised turn through the guard; deliver if not refused.
+
+        On a non-REFUSE verdict the turn is handed to the agent and, when the
+        comfort filler is enabled (ADR-0030), a one-shot dead-air filler is armed
+        for the gap until the agent's reply audio starts (or a barge-in fires). A
+        REFUSE never reaches the agent, so no gap and no filler.
+        """
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
         if result.verdict is not GuardVerdict.REFUSE:
             await self._deliver_turn(text)
+            # Arm the dead-air comfort filler for the gap now opening between this
+            # delivered turn and the agent's reply audio (no-op when disabled).
+            self._schedule_comfort_filler()

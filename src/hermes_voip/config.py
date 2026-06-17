@@ -201,6 +201,36 @@ _BARGE_IN_TAIL_MS_KEY = "HERMES_VOIP_BARGE_IN_TAIL_MS"
 # it (instant hard cut, for an operator who prefers the abrupt stop).
 _BARGE_IN_FADE_MS_KEY = "HERMES_VOIP_BARGE_IN_FADE_MS"
 _DEFAULT_BARGE_IN_FADE_MS = 30
+
+# Dead-air comfort filler (ADR-0030). On a slow turn there is a gap of pure silence
+# between the caller finishing and the agent's first audio (LLM think time + TTS
+# first-audio latency). On a phone call that reads as a dropped line. When enabled,
+# the call loop emits ONE short, natural human filler ("Hmm,", "Let me see,") on the
+# gap if it lasts longer than the delay, then keeps waiting for the real reply — at
+# most once per gap, cancelled the instant the reply audio or a barge-in arrives.
+# OFF by default: the master switch off is exactly today's behaviour (no filler task
+# is created). The filler routes through the normal speak()/TTS path so it is
+# flushable (ADR-0028) and model-conditional-tag-aware (ADR-0027).
+_COMFORT_FILLER_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER"
+_COMFORT_FILLER_DELAY_MS_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS"
+_COMFORT_FILLER_PHRASES_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES"
+_DEFAULT_COMFORT_FILLER = False
+# 900 ms ≈ long enough that a brisk reply (a few hundred ms) never triggers the
+# filler, short enough that a genuinely slow turn does not leave the caller in
+# silence wondering whether the line dropped.
+_DEFAULT_COMFORT_FILLER_DELAY_MS = 900
+# The phrase set is `|`-separated; one phrase is chosen per gap (round-robin per
+# call). These defaults read naturally on EVERY TTS model (no bracket tag), so the
+# default never depends on v3 tag rendering. An operator running v3 may set a phrase
+# that includes a tag (e.g. "[hesitates] hmm") — it renders on v3 and strips cleanly
+# elsewhere via the per-segment strip (ADR-0027).
+_COMFORT_FILLER_PHRASE_SEP = "|"
+_DEFAULT_COMFORT_FILLER_PHRASES: tuple[str, ...] = (
+    "Hmm,",
+    "Let me see,",
+    "One moment,",
+)
+
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
 # 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
@@ -449,6 +479,14 @@ class MediaConfig:
             MEDIA_TIMEOUT (→ ``/stop``) when no inbound RTP arrives within this
             window, so a silent media/network drop is cleaned up rather than hanging
             the call forever.
+        comfort_filler: Dead-air comfort filler master switch (ADR-0030), ``False``
+            by default (off = today's behaviour exactly). When on, the call loop
+            emits ONE short natural filler on a turn gap that exceeds
+            ``comfort_filler_delay_ms`` before the agent's reply audio starts.
+        comfort_filler_delay_ms: Dead-air threshold (ms) before one filler fires;
+            must be positive (default 900). Inert while ``comfort_filler`` is off.
+        comfort_filler_phrases: The filler phrase set (one chosen per gap, round-robin
+            per call). Each phrase reads naturally on every TTS model; non-empty.
     """
 
     stt_provider: str
@@ -496,6 +534,21 @@ class MediaConfig:
     # hanging the call forever. Defaulted (20) so existing direct constructions stay
     # valid; the parser validates the operator override's bounds.
     media_timeout_secs: int = _DEFAULT_RTP_TIMEOUT_SECS
+    # Dead-air comfort filler (ADR-0030). OFF by default: a slow turn otherwise
+    # leaves the caller in silence (LLM think time + TTS first-audio latency), which
+    # on a phone call reads as a dropped line. When on, the call loop emits ONE short
+    # natural filler ("Hmm,") on the gap after ``comfort_filler_delay_ms`` if no reply
+    # audio has started, then keeps waiting — at most once per gap, cancelled the
+    # instant the reply or a barge-in arrives. Defaulted so existing direct
+    # constructions stay valid; off = today's behaviour exactly.
+    comfort_filler: bool = _DEFAULT_COMFORT_FILLER
+    # Dead-air threshold (ms): how long the gap must last before one filler fires.
+    # Must be strictly positive (validated). Inert while ``comfort_filler`` is off.
+    comfort_filler_delay_ms: int = _DEFAULT_COMFORT_FILLER_DELAY_MS
+    # The filler phrase set; one is chosen per gap (round-robin per call). Each phrase
+    # reads naturally on every TTS model (no bracket tag). A blank override falls back
+    # to the built-in default set; empty members are dropped (parser).
+    comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -547,6 +600,7 @@ class MediaConfig:
         if self.barge_in_fade_ms < 0:
             msg = f"barge_in_fade_ms must be non-negative, got {self.barge_in_fade_ms}"
             raise ConfigError(msg)
+        self._validate_comfort_filler()
         if not (
             _MIN_RTP_TIMEOUT_SECS <= self.media_timeout_secs <= _MAX_RTP_TIMEOUT_SECS
         ):
@@ -615,6 +669,28 @@ class MediaConfig:
                 "a primary failure, or set "
                 f"{_TTS_FALLBACK_KEY}=none to disable failover"
             )
+            raise ConfigError(msg)
+
+    def _validate_comfort_filler(self) -> None:
+        """Validate the dead-air comfort-filler invariants (ADR-0030).
+
+        The delay must be strictly positive (a non-positive dead-air threshold is
+        meaningless); the phrase set must be non-empty and contain no blank phrase
+        (a filler with nothing to say is a silent no-op). These hold regardless of
+        the master switch so a direct :class:`MediaConfig` construction is also
+        self-validating.
+        """
+        if self.comfort_filler_delay_ms <= 0:
+            msg = (
+                f"comfort_filler_delay_ms must be positive, "
+                f"got {self.comfort_filler_delay_ms}"
+            )
+            raise ConfigError(msg)
+        if not self.comfort_filler_phrases:
+            msg = "comfort_filler_phrases must not be empty"
+            raise ConfigError(msg)
+        if any(not phrase.strip() for phrase in self.comfort_filler_phrases):
+            msg = "comfort_filler_phrases must not contain a blank phrase"
             raise ConfigError(msg)
 
     def _validate_tts_tuning(self) -> None:
@@ -722,6 +798,11 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         barge_in_fade_ms=_parse_non_negative_int(
             env, _BARGE_IN_FADE_MS_KEY, _DEFAULT_BARGE_IN_FADE_MS
         ),
+        comfort_filler=_parse_bool(env, _COMFORT_FILLER_KEY, _DEFAULT_COMFORT_FILLER),
+        comfort_filler_delay_ms=_parse_positive_int(
+            env, _COMFORT_FILLER_DELAY_MS_KEY, _DEFAULT_COMFORT_FILLER_DELAY_MS
+        ),
+        comfort_filler_phrases=_parse_comfort_filler_phrases(env),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,
         injection_guard_model_dir=_optional(env, _INJECTION_GUARD_MODEL_DIR_KEY),
@@ -1041,6 +1122,23 @@ def _parse_greeting(env: Mapping[str, str]) -> str:
     if raw is None:  # key absent → friendly default
         return DEFAULT_GREETING
     return raw.strip()  # present (incl. empty/whitespace) → verbatim, trimmed
+
+
+def _parse_comfort_filler_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Parse the `|`-separated comfort-filler phrase set (ADR-0030).
+
+    Each member is trimmed; empty members (e.g. from a trailing or doubled ``|``)
+    are dropped. An unset or all-blank value falls back to the built-in default set
+    (:data:`_DEFAULT_COMFORT_FILLER_PHRASES`) so a misconfigured-empty override never
+    yields a filler with no phrase to speak. The result is always non-empty.
+    """
+    raw = _value(env, _COMFORT_FILLER_PHRASES_KEY)
+    if not raw:
+        return _DEFAULT_COMFORT_FILLER_PHRASES
+    phrases = tuple(
+        part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
+    )
+    return phrases or _DEFAULT_COMFORT_FILLER_PHRASES
 
 
 def _parse_tone_secs(env: Mapping[str, str]) -> float:

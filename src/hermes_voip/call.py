@@ -92,10 +92,18 @@ class CallSignaling(Protocol):
 
 @runtime_checkable
 class CallMedia(Protocol):
-    """The call's media-control seam: hold gating and teardown."""
+    """The call's media-control seam: hold gating, DTMF send, and teardown."""
 
     async def set_hold(self, on_hold: bool) -> None:
         """Gate (hold) or restore (resume) the RTP send and jitter buffer."""
+        ...
+
+    async def send_dtmf(self, digits: str) -> None:
+        """Send ``digits`` as RFC 4733 telephone-event RTP on the active call.
+
+        Raises if the call negotiated no telephone-event payload type (ADR-0031) —
+        DTMF is never silently dropped.
+        """
         ...
 
     async def stop(self) -> None:
@@ -203,6 +211,17 @@ class CallSession:
             await self._reinvite("sendrecv")
             self.on_hold = False
             await self._media.set_hold(False)
+
+    async def send_dtmf(self, digits: str) -> None:
+        """Send ``digits`` as in-call DTMF (RFC 4733 telephone-event, ADR-0031).
+
+        Delegates to the media engine, which emits the named-event RTP on the active
+        call's stream under its own TX mutex (so DTMF never interleaves with audio).
+        No re-INVITE and no hold gating — DTMF rides the established media path.
+        Raises if the call negotiated no telephone-event payload type (the media
+        engine never silently drops the request).
+        """
+        await self._media.send_dtmf(digits)
 
     async def hang_up(self) -> None:
         """End the call: send an in-dialog BYE, mark ended, stop media (ADR-0026).

@@ -967,6 +967,13 @@ class VoipAdapter(BasePlatformAdapter):
                 # outbound packets and the comedia latch use the wire PT, not 9/0/8.
                 engine.payload_type = negotiated_voice.payload_type
 
+            # Adopt the negotiated telephone-event PT for in-call DTMF (ADR-0031), or
+            # None when the answer carried none (send_dtmf then raises). The outbound
+            # engine was built before the answer was known, so set it here.
+            engine.telephone_event_payload_type = _telephone_event_payload_type(
+                agreed_codecs
+            )
+
             _log.info(
                 "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
                 "our advertised RTP %s:%d, answer direction=%s",
@@ -1317,6 +1324,12 @@ class VoipAdapter(BasePlatformAdapter):
             # offer's PT), not the codec's static value — G.722 may negotiate a
             # dynamic PT (e.g. 109) that differs from its static 9.
             payload_type=codec.payload_type,
+            # The negotiated RFC 4733 telephone-event PT for in-call DTMF (ADR-0031),
+            # or None when the offer carried no telephone-event (send_dtmf then
+            # raises rather than guessing a PT).
+            telephone_event_payload_type=_telephone_event_payload_type(
+                agreed_sdp_codecs
+            ),
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
@@ -1714,6 +1727,37 @@ class VoipAdapter(BasePlatformAdapter):
             "agent resume_call tool: resuming call %s (re-INVITE sendrecv)", call_id
         )
         await session.unhold()
+        return True
+
+    async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
+        """Send in-call DTMF on ``call_id`` (RFC 4733, ADR-0031); whether it acted.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``send_dtmf`` tool calls (and the building block of the intercom group's
+        ``open_entry`` DTMF actuation). Drives
+        :meth:`~hermes_voip.call.CallSession.send_dtmf`, which emits the named-event
+        RTP on the active call's stream under the media engine's TX mutex. Returns
+        ``False`` (and does nothing) for an unknown/ended call so the tool reports a
+        clear, non-fatal outcome. The ``pre_tool_call`` gate has already enforced the
+        ELEVATED privilege clamp (and any caller-group ``allowed_tools`` sub-ceiling)
+        before this runs.
+
+        Raises:
+            RuntimeError: if the call negotiated no telephone-event payload type
+                (DTMF is never silently dropped) — surfaced as a clear tool error.
+            ValueError: if ``digits`` contains a non-DTMF character.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return False
+        # Do NOT log the digits: a DTMF string may carry secrets (PINs, card
+        # numbers). Log only the call_id and the digit COUNT.
+        _log.info(
+            "agent send_dtmf tool: sending %d DTMF digit(s) on call %s",
+            len(digits),
+            call_id,
+        )
+        await session.send_dtmf(digits)
         return True
 
     def list_registrations_text(self) -> str:
@@ -2238,6 +2282,24 @@ def _first_voice_codec(
     for c in sdp_codecs:
         if c.encoding.lower() != "telephone-event":
             return c
+    return None
+
+
+def _telephone_event_payload_type(
+    sdp_codecs: tuple[SdpCodec, ...],
+) -> int | None:
+    """Return the NEGOTIATED telephone-event RTP payload type, or None (ADR-0031).
+
+    DTMF over RFC 4733 rides a named-event payload type the SDP negotiates (often a
+    dynamic value the gateway picks, e.g. 101 — but NOT guaranteed). The engine
+    needs the negotiated PT to transmit DTMF; ``None`` (no ``telephone-event`` in
+    the agreed set) means the call cannot send DTMF and ``send_dtmf`` raises rather
+    than guessing. The set has already been filtered to ``_SUPPORTED_ENCODINGS`` by
+    ``negotiate_audio`` (which keeps ``telephone-event`` when offered).
+    """
+    for c in sdp_codecs:
+        if c.encoding.lower() == "telephone-event":
+            return c.payload_type
     return None
 
 

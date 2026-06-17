@@ -873,3 +873,121 @@ def test_media_tone_secs_validates_on_direct_construction() -> None:
             dtmf_inband_enabled=True,
             tone_secs=-1.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs dynamic-voice tuning knobs (HERMES_VOIP_TTS_STABILITY / _STYLE /
+# _SIMILARITY / _SPEAKER_BOOST / _STREAMING_LATENCY).  All optional: unset ->
+# None, so the ElevenLabs provider applies its own dynamic default.  Set values
+# are validated (floats in [0,1]; latency int in [0,4]).  These are the env
+# surface that lets the operator A/B-test voice dynamism without a redeploy.
+# ---------------------------------------------------------------------------
+
+
+def test_media_tts_tuning_defaults_are_none() -> None:
+    """Unset TTS-tuning knobs default to None (provider supplies the dynamic set)."""
+    cfg = load_media_config({})
+    assert cfg.tts_stability is None
+    assert cfg.tts_style is None
+    assert cfg.tts_similarity is None
+    assert cfg.tts_speaker_boost is None
+    assert cfg.tts_streaming_latency is None
+
+
+def test_media_tts_tuning_parsed() -> None:
+    """Each TTS-tuning knob parses to its typed value."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_STABILITY": "0.3",
+            "HERMES_VOIP_TTS_STYLE": "0.15",
+            "HERMES_VOIP_TTS_SIMILARITY": "0.8",
+            "HERMES_VOIP_TTS_SPEAKER_BOOST": "false",
+            "HERMES_VOIP_TTS_STREAMING_LATENCY": "1",
+        }
+    )
+    assert cfg.tts_stability == pytest.approx(0.3)
+    assert cfg.tts_style == pytest.approx(0.15)
+    assert cfg.tts_similarity == pytest.approx(0.8)
+    assert cfg.tts_speaker_boost is False
+    assert cfg.tts_streaming_latency == 1
+
+
+def test_media_tts_stability_bounds_inclusive() -> None:
+    """The stability knob accepts the inclusive [0, 1] endpoints."""
+    assert load_media_config({"HERMES_VOIP_TTS_STABILITY": "0"}).tts_stability == 0.0
+    assert load_media_config({"HERMES_VOIP_TTS_STABILITY": "1"}).tts_stability == 1.0
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HERMES_VOIP_TTS_STABILITY",
+        "HERMES_VOIP_TTS_STYLE",
+        "HERMES_VOIP_TTS_SIMILARITY",
+    ],
+)
+@pytest.mark.parametrize("bad", ["1.5", "-0.1", "nan", "inf", "loud"])
+def test_media_tts_float_knob_out_of_range_rejected(key: str, bad: str) -> None:
+    """A float tuning knob outside [0, 1] (or non-numeric/NaN/inf) is rejected."""
+    with pytest.raises(ConfigError):
+        load_media_config({key: bad})
+
+
+def test_media_tts_speaker_boost_bool_spellings() -> None:
+    """The speaker-boost knob accepts the common boolean spellings."""
+    for raw in ("true", "1", "yes", "on", " True "):
+        cfg = load_media_config({"HERMES_VOIP_TTS_SPEAKER_BOOST": raw})
+        assert cfg.tts_speaker_boost is True
+    for raw in ("false", "0", "no", "off"):
+        cfg = load_media_config({"HERMES_VOIP_TTS_SPEAKER_BOOST": raw})
+        assert cfg.tts_speaker_boost is False
+
+
+def test_media_tts_speaker_boost_bad_bool_rejected() -> None:
+    """A non-boolean speaker-boost value is rejected (fail-fast)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TTS_SPEAKER_BOOST": "maybe"})
+
+
+def test_media_tts_streaming_latency_bounds() -> None:
+    """optimize_streaming_latency accepts ints in [0, 4]."""
+    for value in (0, 1, 2, 3, 4):
+        cfg = load_media_config({"HERMES_VOIP_TTS_STREAMING_LATENCY": str(value)})
+        assert cfg.tts_streaming_latency == value
+
+
+@pytest.mark.parametrize("bad", ["5", "-1", "fast", "1.5"])
+def test_media_tts_streaming_latency_out_of_range_rejected(bad: str) -> None:
+    """A streaming-latency value outside [0, 4] (or non-int) is rejected."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TTS_STREAMING_LATENCY": bad})
+
+
+def test_media_tts_tuning_validates_on_direct_construction() -> None:
+    """An out-of-range tuning value fails in __post_init__, not only via the parser."""
+    with pytest.raises(ConfigError):
+        MediaConfig(
+            stt_provider="sherpa-onnx",
+            stt_model_dir=None,
+            tts_provider="sherpa-kokoro",
+            tts_model=None,
+            tts_voice=None,
+            elevenlabs_api_key=None,
+            deepgram_api_key=None,
+            cartesia_api_key=None,
+            vad_threshold=0.5,
+            endpoint_silence_ms=500,
+            duplex_mode="half",
+            greeting="",
+            rtp_symmetric=True,
+            barge_in_mode="gated",
+            barge_in_min_speech_ms=400,
+            barge_in_tail_ms=250,
+            injection_guard="onnx",
+            injection_guard_model_dir=None,
+            dtmf_mode="auto",
+            dtmf_interdigit_ms=None,
+            dtmf_inband_enabled=True,
+            tone_secs=0.0,
+            tts_stability=1.5,
+        )

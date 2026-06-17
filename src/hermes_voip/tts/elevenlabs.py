@@ -47,11 +47,14 @@ from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
 
 __all__ = [
+    "DEFAULT_VOICE_SETTINGS",
     "ELEVENLABS_PCM_FORMATS",
     "ELEVENLABS_SAMPLE_RATE",
     "FLASH_V2_5_MODEL_ID",
+    "MAX_STREAMING_LATENCY",
     "ElevenLabsRequest",
     "ElevenLabsTTS",
+    "ElevenLabsVoiceSettings",
     "HttpByteStream",
     "HttpCancellation",
     "elevenlabs_pcm_format",
@@ -111,8 +114,113 @@ def elevenlabs_pcm_format(sample_rate: int) -> str:
     return fmt
 
 
-#: The Flash v2.5 model id — the low-latency tier ADR-0007 names as the fallback.
+#: The Flash v2.5 model id — the low-latency tier ADR-0007 names as the fallback,
+#: and the default model. Flash v2.5 is the only ElevenLabs model that both streams
+#: in real time AND is ElevenLabs-recommended for voice agents (~75 ms model
+#: latency): the more *expressive* ``eleven_v3`` tier cannot stream in real time
+#: (its multi-context websocket is unavailable; ElevenLabs states it "can't do
+#: real-time"), and ``eleven_turbo_v2_5`` is superseded by Flash ("use the Flash
+#: models over Turbo in all use cases"). So the dynamism win on the phone path
+#: comes from :data:`DEFAULT_VOICE_SETTINGS` (below), not a model swap. The model is
+#: still operator-selectable via ``HERMES_VOIP_TTS_MODEL`` for off-path A/B tests.
 FLASH_V2_5_MODEL_ID = "eleven_flash_v2_5"
+
+#: The inclusive upper bound of ElevenLabs' ``optimize_streaming_latency`` query
+#: parameter (0 = no optimisation … 4 = max, with the text normaliser disabled).
+MAX_STREAMING_LATENCY = 4
+
+# The inclusive bounds for every ``voice_settings`` float field (ElevenLabs treats
+# these as 0.0-1.0; values outside that band are rejected, never clamped).
+_MIN_SETTING = 0.0
+_MAX_SETTING = 1.0
+
+
+def _check_unit_interval(name: str, value: float) -> None:
+    """Raise ``ValueError`` unless ``value`` is finite and within ``[0.0, 1.0]``.
+
+    Used by :class:`ElevenLabsVoiceSettings` so a misconfigured tuning value fails
+    fast at construction (NaN/inf slip past a naive ``lo <= x <= hi`` test, so they
+    are rejected explicitly), never silently clamped into range.
+
+    Raises:
+        ValueError: If ``value`` is NaN/inf or outside ``[0.0, 1.0]``.
+    """
+    import math  # noqa: PLC0415 - tiny stdlib finite check, no import-time cost
+
+    if not math.isfinite(value) or not _MIN_SETTING <= value <= _MAX_SETTING:
+        msg = (
+            f"{name} must be a finite value in "
+            f"[{_MIN_SETTING}, {_MAX_SETTING}], got {value!r}"
+        )
+        raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class ElevenLabsVoiceSettings:
+    """The ElevenLabs ``voice_settings`` request-body object (one synthesis voice).
+
+    These four floats/flags are the dynamism controls ElevenLabs applies to a
+    voice; sending **no** ``voice_settings`` (the previous behaviour) makes the API
+    fall back to its own defaults — notably ``stability=0.5``, which "can result in
+    a monotonous voice". Supplying them is how a phone agent gets a livelier
+    delivery without changing model. Every float is validated to ``[0.0, 1.0]`` at
+    construction (fail-fast, never clamped).
+
+    Attributes:
+        stability: 0.0-1.0. The primary dynamism dial — *lower* values give a
+            broader emotional range; too low becomes inconsistent between
+            generations. ElevenLabs' own default is 0.5 (flat); the shipped default
+            here is lower (see :data:`DEFAULT_VOICE_SETTINGS`). Cheapest lever and
+            no latency cost.
+        similarity_boost: 0.0-1.0. Clarity / similarity to the source voice;
+            very high values can over-enunciate or reproduce source artefacts.
+        style: 0.0-1.0. Style exaggeration. ``0.0`` is the default and the
+            telephony-safe value: any value above 0 makes the model slightly less
+            stable and *may add latency*, so raise it only deliberately.
+        use_speaker_boost: Boosts similarity to the source speaker (subtle); a
+            small latency cost. Default on.
+    """
+
+    stability: float = 0.5
+    similarity_boost: float = 0.75
+    style: float = 0.0
+    use_speaker_boost: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate every float field is within ``[0.0, 1.0]`` (fail-fast)."""
+        _check_unit_interval("stability", self.stability)
+        _check_unit_interval("similarity_boost", self.similarity_boost)
+        _check_unit_interval("style", self.style)
+
+    def payload(self) -> dict[str, float | bool]:
+        """The JSON object for the request body's ``voice_settings`` field.
+
+        The keys are exactly ElevenLabs' documented field names so the dict drops
+        straight into the synthesis request body.
+        """
+        return {
+            "stability": self.stability,
+            "similarity_boost": self.similarity_boost,
+            "style": self.style,
+            "use_speaker_boost": self.use_speaker_boost,
+        }
+
+
+#: The shipped default ``voice_settings`` — a **dynamic-but-stable** conversational
+#: starting point, the fix for the operator's "flat voice" report. The single
+#: change that matters is ``stability=0.35`` (below ElevenLabs' monotone 0.5
+#: default), which broadens the voice's emotional range at no latency cost while
+#: staying high enough to remain consistent. ``style`` is kept at 0.0 to protect
+#: first-audio latency and stability on the phone path; ``similarity_boost=0.75``
+#: and ``use_speaker_boost=True`` keep the API defaults. Every field is overridable
+#: per deployment via the ``HERMES_VOIP_TTS_*`` env knobs so the operator can A/B
+#: live without a code change.
+DEFAULT_VOICE_SETTINGS = ElevenLabsVoiceSettings(
+    stability=0.35,
+    similarity_boost=0.75,
+    style=0.0,
+    use_speaker_boost=True,
+)
 
 _DEFAULT_BASE_URL = "https://api.elevenlabs.io"
 
@@ -129,22 +237,35 @@ class ElevenLabsRequest:
     Attributes:
         voice_id: The ElevenLabs voice id (path segment of the stream endpoint).
         model_id: The synthesis model id (``eleven_flash_v2_5``).
+        voice_settings: The dynamism controls (stability/style/…) for this voice,
+            serialised into the body's ``voice_settings`` object.
         output_format: The requested audio format (``pcm_8000``).
-        url: The fully-formed stream endpoint URL.
+        url: The fully-formed stream endpoint URL (``optimize_streaming_latency``,
+            when set, rides here as a query param — never in the body).
         headers: The HTTP request headers (auth + content type).
         text: The segment text to synthesise (the JSON body's ``text``).
     """
 
     voice_id: str
     model_id: str
+    voice_settings: ElevenLabsVoiceSettings
     output_format: str
     url: str
     headers: Mapping[str, str] = field(repr=False)
     text: str
 
     def body(self) -> bytes:
-        """The JSON request body bytes (``text`` + ``model_id``)."""
-        payload = {"text": self.text, "model_id": self.model_id}
+        """The JSON request body bytes (``text`` + ``model_id`` + ``voice_settings``).
+
+        The ``voice_settings`` object is what makes the voice dynamic rather than
+        flat: omitting it (the old body) let ElevenLabs apply its monotone
+        ``stability=0.5`` default.
+        """
+        payload: dict[str, object] = {
+            "text": self.text,
+            "model_id": self.model_id,
+            "voice_settings": self.voice_settings.payload(),
+        }
         return json.dumps(payload).encode("utf-8")
 
 
@@ -214,24 +335,32 @@ class HttpByteStream(Protocol):
 
 
 class ElevenLabsTTS:
-    """ElevenLabs Flash v2.5 streaming TTS (StreamingTTS, ADR-0004).
+    """ElevenLabs streaming TTS (StreamingTTS, ADR-0004); Flash v2.5 by default.
 
     Emits ``PcmFrame``s at the telephony wire rate (default 8 kHz = G.711, via
     ``output_format=pcm_8000``) so the media layer encodes with no resample. The
     requested rate is :data:`G711_NARROWBAND_RATE` today because the SDP codec
     menu is G.711-only; the wideband lane (ADR-0005) passes the negotiated codec's
-    rate via ``output_sample_rate`` instead. The API key is held privately and
-    never appears in ``repr`` (secrets are never logged). Inject ``http`` in
-    tests; production uses the urllib transport.
+    rate via ``output_sample_rate`` instead.
+
+    Dynamism is controlled by ``voice_settings`` (default
+    :data:`DEFAULT_VOICE_SETTINGS` — a livelier-than-flat starting point), sent on
+    every synthesis request so the voice is not the API's monotone default; the
+    model and the optional ``optimize_streaming_latency`` query param are likewise
+    configurable. The API key is held privately and never appears in ``repr``
+    (secrets are never logged). Inject ``http`` in tests; production uses the
+    urllib transport.
     """
 
-    def __init__(  # noqa: PLR0913 — all keyword-only config; output_sample_rate is load-bearing (codec→rate)
+    def __init__(  # noqa: PLR0913 — all keyword-only config; output_sample_rate + voice_settings are load-bearing
         self,
         *,
         api_key: str,
         voice: str,
         http: HttpByteStream | None = None,
         model_id: str = FLASH_V2_5_MODEL_ID,
+        voice_settings: ElevenLabsVoiceSettings = DEFAULT_VOICE_SETTINGS,
+        optimize_streaming_latency: int | None = None,
         base_url: str = _DEFAULT_BASE_URL,
         output_sample_rate: int = G711_NARROWBAND_RATE,
     ) -> None:
@@ -244,7 +373,18 @@ class ElevenLabsTTS:
                 an empty ``voice``.
             http: The HTTP byte-stream transport (dependency injection); defaults
                 to the real urllib-backed transport.
-            model_id: The synthesis model id (defaults to Flash v2.5).
+            model_id: The synthesis model id (defaults to Flash v2.5 — the only
+                real-time-streaming, ElevenLabs-recommended voice-agent model).
+            voice_settings: The dynamism controls sent in every request body.
+                Defaults to :data:`DEFAULT_VOICE_SETTINGS` (dynamic-but-stable), so
+                a bare provider is livelier than ElevenLabs' flat default rather
+                than emitting no ``voice_settings`` at all.
+            optimize_streaming_latency: The ElevenLabs latency query param, an int
+                in ``[0, 4]`` or ``None``. ``None`` (the default) sends nothing —
+                the param is deprecated and Flash + ``pcm_8000`` already keep
+                first-audio latency low; set ``1`` to opt in to mild optimisation.
+                ``4`` disables the text normaliser (mispronounces numbers/dates) so
+                it is a deliberate, rarely-correct choice for a phone agent.
             base_url: The API base URL (override for testing/self-host proxies).
             output_sample_rate: The wire rate to request from ElevenLabs, in Hz.
                 Defaults to :data:`G711_NARROWBAND_RATE` (8 kHz), the rate of the
@@ -254,11 +394,20 @@ class ElevenLabsTTS:
                 a rate ElevenLabs can emit natively (see :func:`elevenlabs_pcm_format`).
 
         Raises:
-            ValueError: If ``api_key`` is empty/blank, or ``output_sample_rate`` is
-                not an ElevenLabs-supported PCM rate.
+            ValueError: If ``api_key`` is empty/blank, ``output_sample_rate`` is not
+                an ElevenLabs-supported PCM rate, or ``optimize_streaming_latency``
+                is outside ``[0, 4]``.
         """
         if not api_key.strip():
             msg = "api_key must be a non-empty ElevenLabs credential"
+            raise ValueError(msg)
+        if optimize_streaming_latency is not None and not (
+            0 <= optimize_streaming_latency <= MAX_STREAMING_LATENCY
+        ):
+            msg = (
+                f"optimize_streaming_latency must be in [0, {MAX_STREAMING_LATENCY}] "
+                f"or None, got {optimize_streaming_latency!r}"
+            )
             raise ValueError(msg)
         # Resolve (and validate) the request format from the wire rate now, so an
         # unsupported rate fails fast at construction, not mid-call.
@@ -267,6 +416,8 @@ class ElevenLabsTTS:
         self._api_key = api_key
         self._default_voice = voice
         self._model_id = model_id
+        self._voice_settings = voice_settings
+        self._optimize_streaming_latency = optimize_streaming_latency
         self._base_url = base_url.rstrip("/")
         self._http: HttpByteStream = http if http is not None else _UrllibHttp()
 
@@ -274,13 +425,29 @@ class ElevenLabsTTS:
         """Repr without the credential (secrets never logged)."""
         return (
             f"{type(self).__name__}(voice={self._default_voice!r}, "
-            f"model_id={self._model_id!r}, rate={self._output_sample_rate})"
+            f"model_id={self._model_id!r}, rate={self._output_sample_rate}, "
+            f"stability={self._voice_settings.stability})"
         )
 
     @property
     def output_sample_rate(self) -> int:
         """The requested wire rate (default 8 kHz G.711 → media layer only encodes)."""
         return self._output_sample_rate
+
+    @property
+    def model_id(self) -> str:
+        """The configured synthesis model id (default Flash v2.5)."""
+        return self._model_id
+
+    @property
+    def voice_settings(self) -> ElevenLabsVoiceSettings:
+        """The dynamism controls sent on every request (dynamic-but-stable default)."""
+        return self._voice_settings
+
+    @property
+    def optimize_streaming_latency(self) -> int | None:
+        """The opt-in latency query value, or ``None`` when not sent (the default)."""
+        return self._optimize_streaming_latency
 
     def synthesize(
         self,
@@ -340,12 +507,22 @@ class ElevenLabsTTS:
     def _request(
         self, text: str, voice_id: str, output_format: str
     ) -> ElevenLabsRequest:
-        """Form the streaming-synthesis request for one segment of ``text``."""
-        url = f"{self._base_url}/v1/text-to-speech/{voice_id}/stream"
-        url = f"{url}?output_format={output_format}"
+        """Form the streaming-synthesis request for one segment of ``text``.
+
+        ``output_format`` and (when configured) ``optimize_streaming_latency`` are
+        query params per the ElevenLabs API; ``model_id`` + ``voice_settings`` go in
+        the body (set by :meth:`ElevenLabsRequest.body`).
+        """
+        query = f"output_format={output_format}"
+        if self._optimize_streaming_latency is not None:
+            query = (
+                f"{query}&optimize_streaming_latency={self._optimize_streaming_latency}"
+            )
+        url = f"{self._base_url}/v1/text-to-speech/{voice_id}/stream?{query}"
         return ElevenLabsRequest(
             voice_id=voice_id,
             model_id=self._model_id,
+            voice_settings=self._voice_settings,
             output_format=output_format,
             url=url,
             headers={

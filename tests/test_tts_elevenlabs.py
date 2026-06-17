@@ -21,9 +21,11 @@ import pytest
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts.elevenlabs import (
+    DEFAULT_VOICE_SETTINGS,
     G711_NARROWBAND_RATE,
     ElevenLabsRequest,
     ElevenLabsTTS,
+    ElevenLabsVoiceSettings,
     HttpByteStream,
     HttpCancellation,
     elevenlabs_pcm_format,
@@ -485,3 +487,199 @@ def test_http_byte_stream_protocol_is_satisfied_by_the_fake() -> None:
     conforms: HttpByteStream = http  # fails to type-check unless it matches the seam
     assert conforms is http
     assert http.request is None  # exercise a concrete member so the bind is real
+
+
+# --- dynamic voice_settings (the "flat voice" fix) ---------------------------
+#
+# Today the request body carries ONLY {text, model_id}; ElevenLabs then applies
+# its flat default voice_settings (stability 0.5), which is what the operator
+# hears as "flat". These tests pin that the provider now sends a `voice_settings`
+# object and that its DEFAULT is the dynamic-but-stable starting point
+# (lower stability for broader emotional range), so the audio is more dynamic out
+# of the box — while every field stays operator-tunable.
+
+
+def _body_json(req: ElevenLabsRequest) -> dict[str, object]:
+    """Decode the JSON request body the transport would POST."""
+    import json  # noqa: PLC0415 - test-local decode helper
+
+    decoded: dict[str, object] = json.loads(req.body().decode("utf-8"))
+    return decoded
+
+
+def test_default_voice_settings_are_dynamic_not_flat() -> None:
+    """The shipped default voice_settings favour a dynamic (not flat) delivery.
+
+    ElevenLabs' own default ``stability`` is 0.5 ("can result in a monotonous
+    voice"); our default must be LOWER so the voice has broader emotional range —
+    this is the single biggest dynamism lever and the fix for the "flat" report.
+    The other fields stay at sensible conversational values.
+    """
+    s = DEFAULT_VOICE_SETTINGS
+    assert isinstance(s, ElevenLabsVoiceSettings)
+    # Lower than ElevenLabs' flat 0.5 default -> broader emotional range, but not
+    # so low it becomes inconsistent (the documented dynamic-but-stable band).
+    assert 0.25 <= s.stability < 0.5
+    assert 0.0 <= s.similarity_boost <= 1.0
+    assert 0.0 <= s.style <= 1.0
+    assert s.use_speaker_boost is True
+
+
+@pytest.mark.asyncio
+async def test_request_body_includes_default_voice_settings() -> None:
+    """A bare provider sends voice_settings in the body, defaulting to the dynamic set.
+
+    This is the regression that would FAIL under the old flat-default behaviour:
+    the body used to be ``{text, model_id}`` with no ``voice_settings`` at all, so
+    ElevenLabs applied its monotone 0.5-stability default.
+    """
+    http = _RecordedHttp()
+    tts = _make(http)
+    await _drain(tts.synthesize(_text("Be expressive. "), voice="x"))
+    req = http.request
+    assert req is not None
+    body = _body_json(req)
+    assert "voice_settings" in body
+    vs = body["voice_settings"]
+    assert isinstance(vs, dict)
+    # The exact ElevenLabs request-body field names (API reference).
+    assert vs["stability"] == DEFAULT_VOICE_SETTINGS.stability
+    assert vs["similarity_boost"] == DEFAULT_VOICE_SETTINGS.similarity_boost
+    assert vs["style"] == DEFAULT_VOICE_SETTINGS.style
+    assert vs["use_speaker_boost"] == DEFAULT_VOICE_SETTINGS.use_speaker_boost
+    # And the default settings are the dynamic ones (not flat 0.5 stability).
+    assert vs["stability"] < 0.5
+
+
+@pytest.mark.asyncio
+async def test_configured_voice_settings_override_the_default() -> None:
+    """Operator-supplied voice_settings are sent verbatim (tunable without code)."""
+    settings = ElevenLabsVoiceSettings(
+        stability=0.2,
+        similarity_boost=0.9,
+        style=0.4,
+        use_speaker_boost=False,
+    )
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(
+        api_key=_FAKE_KEY, voice="x", http=http, voice_settings=settings
+    )
+    await _drain(tts.synthesize(_text("Tuned voice. "), voice="x"))
+    req = http.request
+    assert req is not None
+    vs = _body_json(req)["voice_settings"]
+    assert isinstance(vs, dict)
+    assert vs == {
+        "stability": 0.2,
+        "similarity_boost": 0.9,
+        "style": 0.4,
+        "use_speaker_boost": False,
+    }
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.1, float("nan"), float("inf")])
+def test_voice_settings_reject_out_of_range_floats(bad: float) -> None:
+    """Each float field is constrained to [0.0, 1.0] (fail-fast at construction)."""
+    with pytest.raises(ValueError, match="stability"):
+        ElevenLabsVoiceSettings(stability=bad)
+    with pytest.raises(ValueError, match="similarity_boost"):
+        ElevenLabsVoiceSettings(similarity_boost=bad)
+    with pytest.raises(ValueError, match="style"):
+        ElevenLabsVoiceSettings(style=bad)
+
+
+def test_voice_settings_payload_has_only_the_api_fields() -> None:
+    """The serialised settings carry exactly the four documented API keys."""
+    payload = DEFAULT_VOICE_SETTINGS.payload()
+    assert set(payload) == {
+        "stability",
+        "similarity_boost",
+        "style",
+        "use_speaker_boost",
+    }
+
+
+# --- configurable model id ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_model_id_is_configurable() -> None:
+    """The model id is operator-selectable (body field), still defaulting to Flash."""
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(
+        api_key=_FAKE_KEY, voice="x", http=http, model_id="eleven_multilingual_v2"
+    )
+    await _drain(tts.synthesize(_text("Pick a model. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert req.model_id == "eleven_multilingual_v2"
+    assert _body_json(req)["model_id"] == "eleven_multilingual_v2"
+
+
+@pytest.mark.asyncio
+async def test_default_model_id_is_flash_v2_5() -> None:
+    """The default model stays Flash v2.5 (real-time streaming; v3 cannot stream)."""
+    http = _RecordedHttp()
+    tts = _make(http)
+    await _drain(tts.synthesize(_text("Default model. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert req.model_id == _FLASH_V2_5
+
+
+# --- optimize_streaming_latency (opt-in query param) -------------------------
+
+
+@pytest.mark.asyncio
+async def test_streaming_latency_unset_by_default() -> None:
+    """No optimize_streaming_latency is sent by default (it is deprecated/opt-in).
+
+    Low first-audio latency already comes from Flash + pcm_8000; the deprecated
+    ``optimize_streaming_latency`` is only sent when the operator opts in, so the
+    default URL must NOT carry it.
+    """
+    http = _RecordedHttp()
+    tts = _make(http)
+    await _drain(tts.synthesize(_text("No latency hint. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert "optimize_streaming_latency" not in req.url
+
+
+@pytest.mark.asyncio
+async def test_streaming_latency_added_as_query_when_configured() -> None:
+    """When set, optimize_streaming_latency rides as a query param (not the body)."""
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(
+        api_key=_FAKE_KEY, voice="x", http=http, optimize_streaming_latency=1
+    )
+    await _drain(tts.synthesize(_text("Latency 1. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert "optimize_streaming_latency=1" in req.url
+    # It is a query param, never a body field.
+    assert "optimize_streaming_latency" not in _body_json(req)
+
+
+@pytest.mark.parametrize("bad", [-1, 5, 99])
+def test_streaming_latency_out_of_range_rejected(bad: int) -> None:
+    """optimize_streaming_latency must be in [0, 4] (ElevenLabs' allowed values)."""
+    with pytest.raises(ValueError, match="optimize_streaming_latency"):
+        ElevenLabsTTS(
+            api_key=_FAKE_KEY,
+            voice="x",
+            http=_RecordedHttp(),
+            optimize_streaming_latency=bad,
+        )
+
+
+def test_voice_settings_not_exposed_in_repr_does_not_leak_key() -> None:
+    """Adding settings/model to repr still never leaks the API key."""
+    tts = ElevenLabsTTS(
+        api_key=_FAKE_KEY,
+        voice="x",
+        http=_RecordedHttp(),
+        voice_settings=ElevenLabsVoiceSettings(stability=0.3),
+        model_id="eleven_flash_v2_5",
+    )
+    assert _FAKE_KEY not in repr(tts)

@@ -35,10 +35,17 @@ from hermes_voip.providers.build import (
     GuardFactory,
     Providers,
     TtsFactory,
+    _make_elevenlabs_tts,
     build_providers,
 )
 from hermes_voip.providers.guard import GuardResult, GuardVerdict, InjectionGuard
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
+from hermes_voip.tts.elevenlabs import (
+    DEFAULT_VOICE_SETTINGS,
+    FLASH_V2_5_MODEL_ID,
+    ElevenLabsTTS,
+    ElevenLabsVoiceSettings,
+)
 
 # ---------------------------------------------------------------------------
 # Minimal fakes satisfying ADR-0004 Protocol seams without any ml load.
@@ -472,3 +479,75 @@ def test_build_providers_uses_real_default_factory_maps() -> None:
     assert "sherpa-kokoro" in build_mod.DEFAULT_TTS_FACTORIES
     assert "elevenlabs" in build_mod.DEFAULT_TTS_FACTORIES
     assert "onnx" in build_mod.DEFAULT_GUARD_FACTORIES
+
+
+# ---------------------------------------------------------------------------
+# (f) The real ElevenLabs factory wires the dynamic-voice config (no network).
+# `_make_elevenlabs_tts` is exercised directly: the cloud factory loads no ml
+# weights and constructs no socket until a call streams, so building the provider
+# is safe in CI. We assert the configured model_id + voice_settings + streaming
+# latency reach the provider (and that the DEFAULT is the dynamic set, not flat).
+# ---------------------------------------------------------------------------
+
+
+def test_elevenlabs_factory_default_is_dynamic() -> None:
+    """A bare ElevenLabs config builds a provider with the dynamic default voice.
+
+    This is the regression that fails under the old flat default: with no tuning
+    env, the provider must carry the dynamic ``DEFAULT_VOICE_SETTINGS`` (lower
+    stability than ElevenLabs' flat 0.5), the Flash v2.5 model, and no
+    optimize_streaming_latency.
+    """
+    cfg = _media_config(
+        tts_provider="elevenlabs",
+        elevenlabs_api_key="el-fake-key",
+        tts_model=None,
+        tts_voice="21m00Tcm4TlvDq8ikWAM",
+    )
+    tts = _make_elevenlabs_tts(cfg)
+    assert isinstance(tts, ElevenLabsTTS)
+    assert tts.model_id == FLASH_V2_5_MODEL_ID
+    assert tts.voice_settings == DEFAULT_VOICE_SETTINGS
+    assert tts.voice_settings.stability < 0.5  # dynamic, not flat
+    assert tts.optimize_streaming_latency is None
+
+
+def test_elevenlabs_factory_wires_configured_tuning() -> None:
+    """The factory threads tts_model + tuning knobs into the provider."""
+    cfg = _media_config(
+        tts_provider="elevenlabs",
+        elevenlabs_api_key="el-fake-key",
+        tts_model="eleven_multilingual_v2",
+        tts_voice="EXAVITQu4vr4xnSDxMaL",
+        tts_stability=0.3,
+        tts_style=0.15,
+        tts_similarity=0.8,
+        tts_speaker_boost=False,
+        tts_streaming_latency=1,
+    )
+    tts = _make_elevenlabs_tts(cfg)
+    assert isinstance(tts, ElevenLabsTTS)
+    assert tts.model_id == "eleven_multilingual_v2"
+    assert tts.voice_settings == ElevenLabsVoiceSettings(
+        stability=0.3,
+        similarity_boost=0.8,
+        style=0.15,
+        use_speaker_boost=False,
+    )
+    assert tts.optimize_streaming_latency == 1
+
+
+def test_elevenlabs_factory_partial_tuning_falls_back_per_field() -> None:
+    """An unset tuning field falls back to the dynamic default for THAT field only."""
+    cfg = _media_config(
+        tts_provider="elevenlabs",
+        elevenlabs_api_key="el-fake-key",
+        tts_stability=0.42,  # only stability set; the rest keep dynamic defaults
+    )
+    tts = _make_elevenlabs_tts(cfg)
+    assert isinstance(tts, ElevenLabsTTS)
+    default = DEFAULT_VOICE_SETTINGS
+    assert tts.voice_settings.stability == pytest.approx(0.42)
+    assert tts.voice_settings.similarity_boost == default.similarity_boost
+    assert tts.voice_settings.style == default.style
+    assert tts.voice_settings.use_speaker_boost == default.use_speaker_boost

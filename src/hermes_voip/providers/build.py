@@ -160,15 +160,47 @@ def _make_sherpa_kokoro_tts(config: MediaConfig) -> StreamingTTS:
 
 
 def _make_elevenlabs_tts(config: MediaConfig) -> StreamingTTS:
-    """Build the ElevenLabs Flash v2.5 cloud-fallback synthesiser (ADR-0007)."""
+    """Build the ElevenLabs cloud synthesiser (ADR-0007); Flash v2.5 by default.
+
+    Threads the optional ElevenLabs tuning knobs into the provider so the operator
+    can A/B voice dynamism via env without a code change: ``tts_model`` is the model
+    id (default Flash v2.5 — the only real-time-streaming, recommended voice-agent
+    model), and the ``tts_*`` voice-settings knobs build the request's
+    ``voice_settings``. Each unset knob falls back to the dynamic-but-stable
+    :data:`DEFAULT_VOICE_SETTINGS` field (lower-than-flat stability), so a bare
+    ElevenLabs install is already livelier than the API's monotone default.
+    """
     # Cloud provider: no committed model artifact, so no licence gate. The key
     # presence is already enforced by MediaConfig.__post_init__ (fail-fast there).
     api_key = config.elevenlabs_api_key or ""
     voice = config.tts_voice or ""
     from hermes_voip.tts.elevenlabs import (  # noqa: PLC0415
+        DEFAULT_VOICE_SETTINGS,
+        FLASH_V2_5_MODEL_ID,
         G711_NARROWBAND_RATE,
         ElevenLabsTTS,
+        ElevenLabsVoiceSettings,
     )
+
+    # Per-field fallback to the dynamic default: an unset knob keeps the dynamic
+    # value (not a flat one), a set knob overrides only that field. Ranges are
+    # already validated by MediaConfig.__post_init__.
+    default = DEFAULT_VOICE_SETTINGS
+    voice_settings = ElevenLabsVoiceSettings(
+        stability=default.stability
+        if config.tts_stability is None
+        else config.tts_stability,
+        similarity_boost=default.similarity_boost
+        if config.tts_similarity is None
+        else config.tts_similarity,
+        style=default.style if config.tts_style is None else config.tts_style,
+        use_speaker_boost=default.use_speaker_boost
+        if config.tts_speaker_boost is None
+        else config.tts_speaker_boost,
+    )
+    # tts_model is the model id for ElevenLabs (it is a model DIRECTORY only for the
+    # self-host sherpa-kokoro provider); unset keeps the Flash v2.5 default.
+    model_id = config.tts_model or FLASH_V2_5_MODEL_ID
 
     # The provider is built ONCE per process, but the wire rate is per-call
     # (codec-derived). So the construction DEFAULT is the G.711 8 kHz case (no
@@ -178,7 +210,12 @@ def _make_elevenlabs_tts(config: MediaConfig) -> StreamingTTS:
     # 8 kHz default. So this stays the narrowband default; the per-call override is
     # the codec→rate hook, not this line.
     return ElevenLabsTTS(
-        api_key=api_key, voice=voice, output_sample_rate=G711_NARROWBAND_RATE
+        api_key=api_key,
+        voice=voice,
+        model_id=model_id,
+        voice_settings=voice_settings,
+        optimize_streaming_latency=config.tts_streaming_latency,
+        output_sample_rate=G711_NARROWBAND_RATE,
     )
 
 

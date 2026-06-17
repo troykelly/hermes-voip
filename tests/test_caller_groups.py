@@ -834,3 +834,52 @@ def test_load_caller_groups_legacy_rejects_empty_privileged_group(
     allow_file.write_text(json.dumps({"patterns": []}), encoding="utf-8")
     with pytest.raises(ConfigError, match="privilege_level"):
         load_caller_groups({"HERMES_VOIP_CALLER_ALLOW_FILE": str(allow_file)})
+
+
+def test_caller_group_config_rejects_privileged_default_at_construction() -> None:
+    """By-construction clamp: NO CallerGroupConfig may name a privileged default.
+
+    Cross-vendor review (codex, PR #83) found the loader-level checks
+    (_parse_groups_document for the JSON path; the legacy synthesis) are NOT the
+    single chokepoint: classify_caller_group trusts cfg.default_group directly, so
+    a direct ``CallerGroupConfig(default_group=<a level-3 group>, ...)`` — bypassing
+    both loaders — classifies an UNMATCHED caller to privilege_level=3. The
+    operator tenet requires "by construction, regardless of config", so the
+    invariant lives on CallerGroupConfig.__post_init__: a default_group whose
+    privilege_level != 0 is refused at CONSTRUCTION, the one chokepoint every path
+    (JSON loader, legacy synthesis, direct construction, adapter._caller_groups)
+    flows through.
+    """
+    with pytest.raises(ConfigError, match="privilege_level"):
+        CallerGroupConfig(
+            groups=(_operator_group(), _receptionist_group()),
+            group_lists={"operator": (_OPERATOR_NUMBER,), "receptionist": ()},
+            # MISTAKE: a privileged (level-3) group as the unmatched-caller default.
+            default_group="operator",
+            match_order=("operator", "receptionist"),
+            normalization=Normalization.E164,
+        )
+
+
+def test_unmatched_caller_can_never_reach_level_3_by_construction() -> None:
+    """The end-to-end guarantee: a constructed config's default is always level 0.
+
+    Because a privileged default is refused at construction (the test above), any
+    CallerGroupConfig that DOES exist has an unprivileged default, so an unmatched
+    caller is always classified to privilege_level 0 — never operator. A trusted
+    default (level 2) is likewise refused (only level 0 is a valid catch-all).
+    """
+    # A level-2 default is also refused (the catch-all must be the receptionist).
+    with pytest.raises(ConfigError, match="privilege_level"):
+        CallerGroupConfig(
+            groups=(_trusted_group(), _receptionist_group()),
+            group_lists={"trusted": (_TRUSTED_NUMBER,), "receptionist": ()},
+            default_group="trusted",
+            match_order=("trusted", "receptionist"),
+            normalization=Normalization.E164,
+        )
+    # The only constructible default is unprivileged => unmatched is level 0.
+    cfg = _default_config()  # default_group="receptionist" (level 0)
+    cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
+    assert cls.group.privilege_level == 0
+    assert cls.group.privilege_level < 3  # never operator/IRREVERSIBLE

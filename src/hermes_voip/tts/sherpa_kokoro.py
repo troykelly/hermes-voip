@@ -105,6 +105,18 @@ class SherpaKokoroTTS:
         """24 kHz: the media layer downsamples to 8 kHz for G.711 (ADR-0005)."""
         return KOKORO_SAMPLE_RATE
 
+    @property
+    def preserves_audio_tags(self) -> bool:
+        """Always False: Kokoro cannot render ElevenLabs v3 audio tags (ADR-0027).
+
+        So ``synthesize`` strips ``[laughs]``/``[breath]``/… (the
+        :class:`~hermes_voip.tts._stream.PcmFrameStream` default) — otherwise Kokoro
+        would speak the bracketed word. This also makes the failover path correct:
+        when a v3 primary fails over to this Kokoro fallback, the replayed utterance
+        is stripped here, by the provider actually synthesising it.
+        """
+        return False
+
     def synthesize(
         self,
         text: AsyncIterator[str],

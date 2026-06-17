@@ -33,6 +33,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 
 from hermes_voip.providers.audio import PcmFrame
+from hermes_voip.spoken_text import strip_audio_tags
 from hermes_voip.tts.segment import DEFAULT_FIRST_SEGMENT_MAX_CHARS, FlushableSegmenter
 
 # Frames leave the provider with a placeholder timestamp; the media layer
@@ -75,7 +76,7 @@ class PcmFrameStream:
     in one place rather than being duplicated per backend.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only constructor; every param is a real dependency/config knob
         self,
         *,
         text: AsyncIterator[str],
@@ -83,6 +84,7 @@ class PcmFrameStream:
         sample_rate: int,
         stop: threading.Event,
         first_segment_max_chars: int = DEFAULT_FIRST_SEGMENT_MAX_CHARS,
+        preserve_audio_tags: bool = False,
     ) -> None:
         """Wire the stream.
 
@@ -97,6 +99,14 @@ class PcmFrameStream:
                 with the backend so a cooperative producer can observe it.
             first_segment_max_chars: Forwarded to the segmenter (keeps the opening
                 utterance short for first-audio latency, ADR-0007).
+            preserve_audio_tags: Whether ElevenLabs v3 audio-tag cues (``[laughs]``,
+                ``[breath]``, …) are PRESERVED in each segment (``True``) or STRIPPED
+                before synthesis (``False``, the default — ADR-0027). The provider
+                passes its own model capability: a v3-family model preserves them so
+                they render; every other model (Flash/Turbo/Multilingual/Kokoro)
+                strips them so the bracketed word is never voiced literally. Stripping
+                is applied per *segment* (a whole sentence), so a tag split across the
+                agent's streamed chunks is reassembled before it is removed.
         """
         self._segmenter = FlushableSegmenter(
             text, first_segment_max_chars=first_segment_max_chars
@@ -104,6 +114,7 @@ class PcmFrameStream:
         self._open_segment = open_segment
         self._sample_rate = sample_rate
         self._stop = stop
+        self._preserve_audio_tags = preserve_audio_tags
         self._active: AsyncIterator[bytes] | None = None
         self._abort: Callable[[], None] = _noop
         self._frames: AsyncGenerator[PcmFrame] = self._run()
@@ -177,7 +188,17 @@ class PcmFrameStream:
             async for sentence in self._segmenter:
                 if self._stop.is_set():
                     return
-                source = self._open_segment(sentence)
+                # Model-conditional audio tags (ADR-0027): on a model that cannot
+                # render v3 cues, strip the whole ``[tag]`` token from the (whole-
+                # sentence) segment so it is never voiced literally; a v3 model keeps
+                # them. A segment that was ONLY a tag reduces to empty — skip it
+                # (no synthesis request for empty text).
+                speakable = sentence
+                if not self._preserve_audio_tags:
+                    speakable = strip_audio_tags(sentence)
+                    if not speakable:
+                        continue
+                source = self._open_segment(speakable)
                 self._active = source.chunks
                 self._abort = source.abort
                 try:

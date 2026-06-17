@@ -3,10 +3,20 @@
 An opt-in cloud fallback behind the same ``StreamingTTS`` seam (ADR-0004),
 selected at runtime via ``ELEVENLABS_API_KEY`` (the value lives only in the
 gitignored ``.env`` / 1Password; never committed — rules 34/41). It streams the
-Flash v2.5 model's **raw PCM16 @ 24 kHz** (``output_format=pcm_24000``) so the
-provider emits the canonical ``PcmFrame`` currency; the 24->8 kHz downsample and
-G.711 encode stay the media layer's job (ADR-0005), exactly as for the self-host
-default.
+Flash v2.5 model's **raw PCM16 @ 8 kHz** (``output_format=pcm_8000``) — the
+telephony-native rate — so the provider emits the canonical ``PcmFrame`` currency
+already at the G.711 wire rate; the media layer then only G.711-encodes it, with
+**no resample at all** (ADR-0005/0017).
+
+Why 8 kHz, not 24 kHz (ADR-0007 amendment): ElevenLabs streams audio as many
+small chunked-HTTP reads. Requesting ``pcm_24000`` forced a per-stream 24->8 kHz
+downsample of 3x the bytes and amplified the outbound re-framing path's
+per-chunk-boundary artefacts — a contributor to the live "very choppy" defect.
+ElevenLabs can emit ``pcm_8000`` directly, so we ask for the wire rate: zero
+lossy 3:1 resample, 3x less ElevenLabs->box bandwidth, and lower first-audio
+latency. The codec stays the media layer's job (ADR-0004), so we request PCM16
+(not ``ulaw_8000``) and let :class:`~hermes_voip.media.engine.RtpMediaTransport`
+do the G.711 encode.
 
 The HTTP transport is behind the :class:`HttpByteStream` seam and
 **dependency-injected**, so tests drive a recorded PCM response with no network.
@@ -36,17 +46,19 @@ __all__ = [
     "HttpCancellation",
 ]
 
-#: We request raw PCM16 @ 24 kHz so the provider emits ``PcmFrame``s in the same
-#: currency as the self-host default; the media layer downsamples to 8 kHz for
-#: G.711 (ADR-0005). (ElevenLabs can emit native ``ulaw_8000``, but the canonical
-#: provider seam is PCM16 — codec is the media layer, ADR-0004.)
-ELEVENLABS_SAMPLE_RATE = 24_000
+#: We request raw PCM16 at the telephony-native **8 kHz** (``pcm_8000``) so the
+#: provider emits ``PcmFrame``s already at the G.711 wire rate: the media layer
+#: G.711-encodes with NO resample (ADR-0005/0017). This is the ADR-0007 amendment
+#: that fixes the live "very choppy" audio — ``pcm_24000`` forced a lossy 3:1
+#: downsample of 3x the bytes per streamed chunk. We keep PCM16 (not the native
+#: ``ulaw_8000``) because the codec is the media layer's job (ADR-0004).
+ELEVENLABS_SAMPLE_RATE = 8_000
 
 #: The Flash v2.5 model id — the low-latency tier ADR-0007 names as the fallback.
 FLASH_V2_5_MODEL_ID = "eleven_flash_v2_5"
 
 _DEFAULT_BASE_URL = "https://api.elevenlabs.io"
-_OUTPUT_FORMAT = "pcm_24000"
+_OUTPUT_FORMAT = "pcm_8000"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +73,7 @@ class ElevenLabsRequest:
     Attributes:
         voice_id: The ElevenLabs voice id (path segment of the stream endpoint).
         model_id: The synthesis model id (``eleven_flash_v2_5``).
-        output_format: The requested audio format (``pcm_24000``).
+        output_format: The requested audio format (``pcm_8000``).
         url: The fully-formed stream endpoint URL.
         headers: The HTTP request headers (auth + content type).
         text: The segment text to synthesise (the JSON body's ``text``).
@@ -148,7 +160,8 @@ class HttpByteStream(Protocol):
 class ElevenLabsTTS:
     """ElevenLabs Flash v2.5 streaming TTS (StreamingTTS, ADR-0004).
 
-    Emits 24 kHz ``PcmFrame``s built from the ``pcm_24000`` response stream.
+    Emits 8 kHz ``PcmFrame``s built from the ``pcm_8000`` response stream — the
+    telephony wire rate, so the media layer G.711-encodes with no resample.
     The API key is held privately and never appears in ``repr`` (secrets are
     never logged). Inject ``http`` in tests; production uses the urllib transport.
     """
@@ -195,11 +208,11 @@ class ElevenLabsTTS:
 
     @property
     def output_sample_rate(self) -> int:
-        """24 kHz: the media layer downsamples to 8 kHz for G.711 (ADR-0005)."""
+        """8 kHz: already the G.711 wire rate, so the media layer only encodes."""
         return ELEVENLABS_SAMPLE_RATE
 
     def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
-        """Stream agent text in, stream 24 kHz ``PcmFrame``s out (ADR-0004).
+        """Stream agent text in, stream 8 kHz ``PcmFrame``s out (ADR-0004).
 
         Returns a ``TtsStream`` that segments ``text`` and synthesises each
         sentence via a streaming HTTP request; ``voice`` overrides the

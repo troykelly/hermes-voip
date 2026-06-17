@@ -110,3 +110,43 @@ wire and is unaffected.
   8 kHz incur zero overhead (fast-path bypass).
 - The fix is gateway- and provider-agnostic (no vendor assumption about the
   source rate).
+
+## Amendment (2026-06-17): re-frame the outbound stream with a carry buffer (the "very choppy" fix)
+
+- Deciders: agent session (operator-directed live "very choppy" audio fix)
+
+The original `send_audio` re-chunking padded each call's **sub-frame remainder**
+(the `< 160`-sample tail left after slicing into 20 ms G.711 frames) up to a
+whole frame with zeros, on **every call**. That was acoustically invisible for
+sherpa-Kokoro (a few large chunks per utterance → a handful of pads) but became
+the dominant defect for **ElevenLabs**, which streams audio as many small
+chunked-HTTP reads (`_UrllibHttp._CHUNK_BYTES = 4096`). The call loop calls
+`send_audio` **once per producer chunk**, so a stream that delivers ~12 chunks
+per second of audio injected ~12 silence slugs per second — a click/gap at every
+chunk boundary, i.e. the operator's "very choppy". Measured on a 1 s 24 kHz sine
+fed as 4096-byte chunks: **180 ms of injected silence across 12 pad events** (the
+per-chunk padding inflated 8000 → 9440 samples). The defect is independent of the
+sample rate — at 8 kHz a 4096-byte chunk is still `4096 % 320 = 256 ≠ 0`, so it
+pads every chunk too.
+
+`send_audio` now keeps a per-call **outbound re-framing buffer** (`_tx_buffer`,
+wire-rate PCM16 bytes): each call appends the resampled samples, emits only the
+**whole** 160-sample frames, and **carries the sub-frame remainder forward** to
+prepend to the next chunk — so the concatenated outbound stream is
+sample-continuous with **no interior silence**. The residual tail is zero-padded
+to one final frame **exactly once**, in `stop()` (flushed through the still-open
+socket before it closes), so the last utterance's tail is delivered rather than
+stranded. The buffer is reset in `connect()`/`stop()` alongside the existing
+`_tx_resamplers`. The seq/timestamp counters advance only per emitted frame, so
+the RTP wire stays RFC 3550-consistent.
+
+This sits **after** the rate reconciliation above (it re-frames the already-8 kHz
+wire-rate bytes), so it is orthogonal to and composes with the resampler: the
+24 kHz resample path and a native-8 kHz path both produce one continuous stream.
+
+Consequences: the per-chunk silence storm is gone (a streaming cloud TTS plays
+smoothly); padding happens at most once per call, not per chunk; the change is
+provider- and gateway-agnostic (it re-frames whatever wire-rate bytes arrive).
+Within a single call, an utterance's final `< 20 ms` tail can carry into the next
+utterance's first frame — real, sample-continuous audio (never silence), and
+acoustically negligible versus the 180 ms-per-second of gaps it replaces.

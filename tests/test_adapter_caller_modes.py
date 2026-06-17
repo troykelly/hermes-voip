@@ -19,6 +19,8 @@ the hermes-contract CI job; fakes only (``pbx.example.test`` / ext ``1000``).
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,7 +33,7 @@ from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_voip.caller_modes import CallerMode, CallerModeConfig, Normalization
-from hermes_voip.config import ExtensionConfig
+from hermes_voip.config import ConfigError, ExtensionConfig
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 from hermes_voip.providers.build import Providers
@@ -306,6 +308,59 @@ async def test_inbound_deny_sends_603_and_starts_no_call() -> None:
     assert call_id not in adapter._call_sessions
 
 
+# --- connect(): fail loud on a misconfigured privileged caller list ----------
+
+
+@pytest.mark.asyncio
+async def test_connect_fails_loud_on_empty_privileged_allow_file(
+    tmp_path: Path,
+) -> None:
+    """A configured-but-empty allow file must abort startup (ADR-0021 spine).
+
+    HERMES_VOIP_CALLER_ALLOW_FILE is SET but its JSON contains no patterns, so the
+    synthesised operator group (privilege_level=3) would have no members — almost
+    certainly a typo that would otherwise leave a privileged group defined with no
+    way to match it.  The adapter's REAL connect() path must raise ConfigError, not
+    silently start: this is the regression guard for the load path going through
+    the ADR-0020 mode loader.  load_caller_modes / load_caller_groups are NOT
+    patched here — connect() runs the real validation.
+    """
+    allow_file = tmp_path / ".caller-allow.json"
+    allow_file.write_text(json.dumps({"patterns": []}), encoding="utf-8")
+
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    env = dict(_FAKE_ENV)
+    env["HERMES_VOIP_CALLER_ALLOW_FILE"] = str(allow_file)
+    config = PlatformConfig(enabled=True, extra=env)
+
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=MagicMock(
+                host="pbx.example.test",
+                transport="tls",
+                port=5061,
+                extensions=(
+                    MagicMock(
+                        index=0, extension="1000", username="1000", password="fake"
+                    ),
+                ),
+                default_extension=MagicMock(extension="1000"),
+                via_transport="TLS",
+            ),
+        ),
+        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=_FakeTransport()),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=_FakeManager()),
+    ):
+        adapter = VoipAdapter(config)
+        with pytest.raises(ConfigError, match="privilege_level"):
+            await adapter.connect()
+
+
 @pytest.mark.asyncio
 async def test_inbound_grey_sets_privileged_false() -> None:
     transport = _FakeTransport()
@@ -314,11 +369,25 @@ async def test_inbound_grey_sets_privileged_false() -> None:
 
     captured: dict[str, GuardSessionState] = {}
 
-    def _real_guard(call_id: str, *, privileged: bool = True) -> GuardSessionState:
-        # Mirror the real GuardSessionState signature so the adapter's
-        # `GuardSessionState(call_id, privileged=...)` call passes through, and we
-        # capture the privileged value the adapter actually chose for this mode.
-        state = GuardSessionState(call_id=call_id, privileged=privileged)
+    def _real_guard(
+        call_id: str,
+        *,
+        privilege_level: int = 3,
+        degraded: bool = False,
+        privileged: bool | None = None,
+    ) -> GuardSessionState:
+        # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
+        # int, with the privileged bool kept as a back-compat kwarg) so the
+        # adapter's `GuardSessionState(call_id, privilege_level=...)` call passes
+        # through unchanged. We delegate to the REAL GuardSessionState so the
+        # captured state's `.privileged` property is the real level>=3 mapping —
+        # the value the adapter actually chose for this group.
+        state = GuardSessionState(
+            call_id=call_id,
+            privilege_level=privilege_level,
+            degraded=degraded,
+            privileged=privileged,
+        )
         captured[call_id] = state
         return state
 
@@ -366,8 +435,23 @@ async def test_inbound_allow_sets_privileged_true() -> None:
 
     captured: dict[str, GuardSessionState] = {}
 
-    def _real_guard(call_id: str, *, privileged: bool = True) -> GuardSessionState:
-        state = GuardSessionState(call_id=call_id, privileged=privileged)
+    def _real_guard(
+        call_id: str,
+        *,
+        privilege_level: int = 3,
+        degraded: bool = False,
+        privileged: bool | None = None,
+    ) -> GuardSessionState:
+        # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
+        # int, with the privileged bool kept as a back-compat kwarg). Delegating to
+        # the REAL GuardSessionState makes the captured `.privileged` the real
+        # level>=3 mapping the adapter chose for this group.
+        state = GuardSessionState(
+            call_id=call_id,
+            privilege_level=privilege_level,
+            degraded=degraded,
+            privileged=privileged,
+        )
         captured[call_id] = state
         return state
 

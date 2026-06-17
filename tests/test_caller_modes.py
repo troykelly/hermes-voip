@@ -72,14 +72,18 @@ def test_unmatched_caller_defaults_to_grey() -> None:
 def test_allow_listed_caller_is_allow() -> None:
     cls = classify_caller(_TRUSTED, _cfg(allow=(_TRUSTED,)))
     assert cls.mode is CallerMode.ALLOW
-    assert cls.source == "allow"
+    # ADR-0021: the legacy shim synthesises a "operator" group for the allow-list;
+    # source is the group name, not the legacy mode name.
+    assert cls.source == "operator"
     assert cls.matched_pattern == _TRUSTED
 
 
 def test_deny_listed_caller_is_deny() -> None:
     cls = classify_caller(_BLOCKED, _cfg(deny=(_BLOCKED,)))
     assert cls.mode is CallerMode.DENY
-    assert cls.source == "deny"
+    # ADR-0021: the legacy shim synthesises a "blocked" group for the deny-list;
+    # source is the group name, not the legacy mode name.
+    assert cls.source == "blocked"
 
 
 def test_deny_beats_allow_for_a_number_on_both_lists() -> None:
@@ -93,7 +97,9 @@ def test_explicit_grey_pin_overrides_default_allow() -> None:
     cfg = _cfg(grey=(_GREY_PIN,), default_mode=CallerMode.ALLOW)
     cls = classify_caller(_GREY_PIN, cfg)
     assert cls.mode is CallerMode.GREY
-    assert cls.source == "grey"
+    # ADR-0021: the legacy shim synthesises a "receptionist" group for the grey-list;
+    # source is the group name, not the legacy mode name.
+    assert cls.source == "receptionist"
 
 
 def test_default_mode_allow_applies_only_to_unmatched() -> None:
@@ -201,7 +207,10 @@ def test_deny_has_no_persona() -> None:
 def test_classification_is_frozen() -> None:
     cls = classify_caller(_UNKNOWN, _cfg())
     assert isinstance(cls, CallerClassification)
-    with pytest.raises(AttributeError):
+    # ADR-0021: `mode` is now a @property (read-only) on a frozen=True/slots=True
+    # dataclass; Python 3.13 raises TypeError (not AttributeError) when assigning
+    # to a property via slots — both indicate immutability as intended.
+    with pytest.raises((AttributeError, TypeError)):
         cls.mode = CallerMode.ALLOW  # type: ignore[misc]
 
 

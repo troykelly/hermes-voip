@@ -63,11 +63,14 @@ from gateway.platforms.base import (
 
 from hermes_voip.call import CallSession
 from hermes_voip.caller_modes import (
+    CallerGroup,
+    CallerGroupConfig,
     CallerMode,
-    CallerModeConfig,
-    classify_caller,
+    classify_caller_group,
+    group_for_mode,
+    load_caller_groups,
     load_caller_modes,
-    persona_preamble,
+    persona_preamble_for_group,
 )
 from hermes_voip.config import (
     GatewayConfig,
@@ -236,10 +239,12 @@ class VoipAdapter(BasePlatformAdapter):
         self._providers: Providers | None = None
         self._media_cfg: MediaConfig | None = None
         self._gateway_cfg: GatewayConfig | None = None
-        # Caller-mode classification config (ADR-0020): allow/deny/grey lists +
-        # the default mode + normalization. Parsed once from env in connect();
-        # an unmatched caller is GREY (receptionist) by default.
-        self._caller_modes: CallerModeConfig | None = None
+        # Caller-group classification config (ADR-0021): N named trust tiers.
+        # Parsed once from env in connect(); an unmatched caller is the default
+        # group (receptionist, privilege_level=0).  Supersedes ADR-0020 _caller_modes;
+        # legacy HERMES_VOIP_CALLER_{ALLOW,DENY,GREY}_FILE env vars are still
+        # accepted (synthesised by load_caller_groups).
+        self._caller_groups: CallerGroupConfig | None = None
         self._tls_ctx: ssl.SSLContext | None = None
         self._keepalive_interval: float = 30.0
         self._transport: SipOverTlsTransport | None = None
@@ -299,15 +304,25 @@ class VoipAdapter(BasePlatformAdapter):
         self._extra = extra
         gateway_cfg = load_gateway_config(extra)
         media_cfg = load_media_config(extra)
-        # Caller-mode lists (ADR-0020). A misconfigured (malformed) security-
-        # relevant list file raises here — the plugin must fail loudly, never
-        # silently treat a broken allow/deny list as empty (rule 37).
-        caller_modes = load_caller_modes(extra)
+        # Caller-group lists (ADR-0021, backward-compat with ADR-0020 3-file scheme).
+        # A misconfigured (malformed) security-relevant list file raises here — the
+        # plugin must fail loudly, never silently treat a broken allow/deny list as
+        # empty, and never let a privileged group end up with no patterns (rule 37 /
+        # ADR-0021 security spine).
+        #
+        # load_caller_groups handles BOTH the new N-group JSON document
+        # (HERMES_VOIP_CALLER_GROUPS_FILE) and the legacy 3-file scheme, applying all
+        # validation in one place. We inject this module's load_caller_modes as the
+        # legacy mode loader so the ADR-0020 back-compat entry point stays the actual
+        # symbol the classification path runs through (existing callers/tests that
+        # drive classification via `hermes_voip.adapter.load_caller_modes` keep
+        # working unchanged) WITHOUT bypassing the fail-loud validation.
+        caller_groups = load_caller_groups(extra, mode_loader=load_caller_modes)
 
         self._providers = build_providers(media_cfg)
         self._media_cfg = media_cfg
         self._gateway_cfg = gateway_cfg
-        self._caller_modes = caller_modes
+        self._caller_groups = caller_groups
         self._tls_ctx = _make_tls_context(gateway_cfg.host)
         self._keepalive_interval = float(
             extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
@@ -801,14 +816,19 @@ class VoipAdapter(BasePlatformAdapter):
             _log.info("ACK sent: Call-ID %s", call_id)
 
             # --- Wire the CallSession and CallLoop -------------------------
-            # ADR-0020 (amended): an outbound call's remote party (the callee) is
-            # UNTRUSTED — the agent pursues only the operator's task and holds NO
-            # privileged tool, so the session is privileged=False. The same
-            # least-privilege clamp that protects an inbound receptionist protects
-            # the operator on an outbound call: the agent cannot be talked into
-            # transferring the call or leaking operator secrets to the callee.
+            # ADR-0021 (amended from ADR-0020): an outbound call's remote party
+            # (the callee) is UNTRUSTED — privilege_level=0.  The agent pursues
+            # only the operator's task and may NOT invoke ELEVATED/IRREVERSIBLE
+            # tools.  The same least-privilege clamp that protects an inbound
+            # receptionist protects the operator on an outbound call.
+            _outbound_group = CallerGroup(
+                name="outbound",
+                privilege_level=0,
+                persona="outbound",
+                declined_at_sip=False,
+            )
             guard_state = GuardSessionState(
-                call_id, privileged=CallerMode.OUTBOUND.privileged
+                call_id, privilege_level=_outbound_group.privilege_level
             )
             credentials_for_session = DigestCredentials(
                 username=source_ext.username,
@@ -843,6 +863,10 @@ class VoipAdapter(BasePlatformAdapter):
                 "remote_uri": target_uri,
                 "type": "dm",
                 "ended": False,
+                "group": _outbound_group,
+                # ADR-0020 back-compat: the legacy CallerMode for this call. An
+                # outbound call is the OUTBOUND mode (untrusted callee); kept so
+                # callers reading the legacy "mode" key keep working.
                 "mode": CallerMode.OUTBOUND,
             }
 
@@ -936,20 +960,21 @@ class VoipAdapter(BasePlatformAdapter):
             _log.warning("INVITE %s arrived after transport closed — ignored", call_id)
             return
 
-        # --- Caller-mode classification (ADR-0020) --------------------------
+        # --- Caller-group classification (ADR-0021) --------------------------
         # Classify the (forgeable) caller-ID FIRST, before any media work, so a
-        # DENY caller is rejected with 603 Decline in this pre-200-OK window —
-        # no SDP, no RTP engine, no agent surface. ALLOW/GREY proceed; the mode
-        # sets guard_state.privileged and the per-turn persona later.
+        # declined-group caller is rejected with 603 Decline in this pre-200-OK
+        # window — no SDP, no RTP engine, no agent surface.  Non-declined groups
+        # proceed; the group's privilege_level sets guard_state and the per-turn
+        # persona later.
         from_header = invite.header("From") or ""
         caller_number = _caller_number(from_header)
-        caller_modes = self._caller_modes
-        if caller_modes is None:  # connect() populates this before any INVITE
-            msg = f"INVITE {call_id}: caller-mode config not initialised"
+        caller_groups = self._caller_groups
+        if caller_groups is None:  # connect() populates this before any INVITE
+            msg = f"INVITE {call_id}: caller-group config not initialised"
             raise RuntimeError(msg)
-        classification = classify_caller(caller_number, caller_modes)
-        mode = classification.mode
-        if mode is CallerMode.DENY:
+        classification = classify_caller_group(caller_number, caller_groups)
+        group = classification.group
+        if group.declined_at_sip:
             # Audit the deny WITHOUT writing PII to logs: the full caller number,
             # the verbatim From, and the matched deny pattern are all PII, so we
             # log only the call_id, the match source, and a redacted number tail
@@ -957,17 +982,20 @@ class VoipAdapter(BasePlatformAdapter):
             # partial number without dumping the number itself. Caller *content* is
             # never logged here.
             _log.info(
-                "INVITE %s: caller DENIED (source=%s) — 603 Decline; number=%s",
+                "INVITE %s: caller DECLINED (group=%s source=%s) — 603 Decline"
+                "; number=%s",
                 call_id,
+                group.name,
                 classification.source,
                 _redact_number(caller_number),
             )
             await transport.send(build_response(invite, 603, "Decline"))
             return
         _log.info(
-            "INVITE %s: caller mode=%s (source=%s)",
+            "INVITE %s: caller group=%s privilege_level=%d (source=%s)",
             call_id,
-            mode.value,
+            group.name,
+            group.privilege_level,
             classification.source,
         )
 
@@ -1101,10 +1129,10 @@ class VoipAdapter(BasePlatformAdapter):
 
         # --- Register the call for in-dialog routing -----------------------
         # One GuardSessionState per call, shared between CallSession and CallLoop.
-        # ADR-0020: the caller mode sets `privileged` — only an ALLOW (trusted)
-        # caller is privileged; a GREY receptionist call is NOT, so the ADR-0009
-        # gate structurally blocks every ELEVATED/IRREVERSIBLE tool for it.
-        guard_state = GuardSessionState(call_id, privileged=mode.privileged)
+        # ADR-0021: the caller group's privilege_level sets the tool-risk ceiling
+        # (0=receptionist/SAFE-only, 2=trusted/+ELEVATED, 3=operator/+IRREVERSIBLE).
+        # Levels 0 and 3 reproduce ADR-0020's privileged=False/True exactly.
+        guard_state = GuardSessionState(call_id, privilege_level=group.privilege_level)
         credentials = DigestCredentials(
             username=new_call.registration.username,
             password=new_call.registration.password,
@@ -1129,14 +1157,19 @@ class VoipAdapter(BasePlatformAdapter):
         )
 
         # --- Extract caller info from the inbound INVITE -------------------
-        # `mode` (classified at the top of this handler) drives the per-turn
+        # `group` (classified at the top of this handler) drives the per-turn
         # persona preamble in _deliver_turn; persist it on the call info.
         self._call_info[call_id] = {
             "name": caller_number,
             "remote_uri": from_header,
             "type": "dm",
             "ended": False,
-            "mode": mode,
+            "group": group,
+            # ADR-0020 back-compat: the legacy CallerMode this group maps to
+            # (ALLOW for an operator-tier group, GREY otherwise; DENY never
+            # reaches here — it was rejected with 603 above). Kept so callers
+            # reading the legacy "mode" key keep working.
+            "mode": classification.mode,
         }
 
         # --- Build + run CallLoop (leak-safe) ------------------------------
@@ -1297,10 +1330,26 @@ class VoipAdapter(BasePlatformAdapter):
         """
         info = self._call_info.get(call_id, {})
         caller_name = str(info.get("name", call_id))
+        # Resolve the call's CallerGroup: prefer the stored "group" (ADR-0021);
+        # fall back to the legacy "mode" key (ADR-0020 back-compat — a call-info
+        # dict carrying only a CallerMode); finally default to receptionist
+        # (least privilege) if neither is present (should not happen in practice).
+        group_obj = info.get("group")
         mode_obj = info.get("mode")
-        mode = mode_obj if isinstance(mode_obj, CallerMode) else CallerMode.GREY
+        group: CallerGroup
+        if isinstance(group_obj, CallerGroup):
+            group = group_obj
+        elif isinstance(mode_obj, CallerMode):
+            group = group_for_mode(mode_obj)
+        else:
+            group = CallerGroup(
+                name="receptionist",
+                privilege_level=0,
+                persona="receptionist",
+                declined_at_sip=False,
+            )
 
-        spotlighted = _spotlight_turn(mode, caller_name, text)
+        spotlighted = _spotlight_turn(group, caller_name, text)
 
         source = self.build_source(
             chat_id=call_id,
@@ -1567,18 +1616,18 @@ def _defang_fence(text: str) -> str:
     return text.replace("<<<", "< < <").replace(">>>", "> > >")
 
 
-def _spotlight_turn(mode: CallerMode, caller_name: str, text: str) -> str:
-    """Wrap a remote-party turn with the per-mode persona + an untrusted-data block.
+def _spotlight_turn(group: CallerGroup, caller_name: str, text: str) -> str:
+    """Wrap a remote-party turn with the per-group persona + an untrusted-data block.
 
-    The result is: the spotlighted persona directive for ``mode``, an OUTBOUND
+    The result is: the spotlighted persona directive for ``group``, an OUTBOUND
     framing line naming the callee (so the agent knows who it called), and the
     remote party's transcript (with any embedded fence markers defanged) fenced
-    between the untrusted-data markers. Pure; ``mode`` is never ``DENY`` here (a
-    denied call never reaches a turn).
+    between the untrusted-data markers. Pure; ``group.declined_at_sip`` is always
+    False here (a declined call never reaches a turn).
     """
-    preamble = persona_preamble(mode)
+    preamble = persona_preamble_for_group(group)
     framing = ""
-    if mode is CallerMode.OUTBOUND:
+    if group.persona == "outbound":
         framing = (
             f"\nThis is an outbound call that the operator placed to '{caller_name}'. "
             "Open the conversation as the operator's assistant pursuing the "

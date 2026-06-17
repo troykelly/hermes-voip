@@ -213,6 +213,12 @@ class CallerGroupConfig:
            synthesis), which a direct ``CallerGroupConfig(...)`` would otherwise
            bypass.
 
+        4. **Reject a match-all ``"*"`` pattern in a privileged group.** ``"*"`` is
+           an empty-prefix wildcard that matches every caller, so it would grant a
+           level >= 2 group's privilege to every unknown caller on a forgeable
+           caller-ID — the config-driven form of ``default_mode=ALLOW``. Privileged
+           membership must require a specific pattern.
+
         Only the named default group's privilege is validated here; whether
         ``default_group`` names a defined group is a loader-level concern (and
         :func:`classify_caller_group` falls back safely if it does not), so a
@@ -261,6 +267,30 @@ class CallerGroupConfig:
                 "allow-list match, never the default."
             )
             raise ConfigError(msg)
+
+        # 4. Reject the match-all "*" pattern in a PRIVILEGED group. "*" is an
+        #    empty-prefix wildcard (candidate.startswith("") is always True — see
+        #    _matches), so a level >= 2 group listing "*" matches EVERY caller,
+        #    including every unknown one, and grants operator/elevated privilege on a
+        #    forgeable identifier. That is the config-driven re-creation of the
+        #    rejected default_mode=ALLOW: privileged membership must require a
+        #    SPECIFIC pattern, never a blanket match-all. (A "*" in a level-0 group
+        #    is harmless — it is the receptionist, which grants nothing; a specific
+        #    prefix like "+1555550*" remains a valid deliberate block-trust choice.)
+        for g in self.groups:
+            if g.privilege_level >= _MIN_LEVEL_ELEVATED and _PREFIX_WILDCARD in (
+                self.group_lists.get(g.name, ())
+            ):
+                msg = (
+                    f"caller-group {g.name!r} has privilege_level={g.privilege_level}"
+                    f" (>= {_MIN_LEVEL_ELEVATED}) but lists the match-all pattern"
+                    f" {_PREFIX_WILDCARD!r}, which matches EVERY caller (including"
+                    " unknown ones) and would grant that privilege on a forgeable"
+                    " caller-ID. A privileged group must enumerate specific numbers"
+                    " or prefixes — operator/elevated privilege requires a specific"
+                    " allow-list match, never a blanket one."
+                )
+                raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)

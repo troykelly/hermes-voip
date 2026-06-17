@@ -129,6 +129,24 @@ pre-list voices).
 | Charlie | `IKne3meq5aSn9XLyUdCD` | Male, casual, Australian               |
 | Eric    | `cjVigY5qzO86Huf0OWal` | Male, friendly, US                     |
 
+**Expressive voice (ElevenLabs v3 audio tags)** — the ElevenLabs **model** is selectable via
+`HERMES_VOIP_TTS_MODEL`, and both tiers are first-class:
+
+| `HERMES_VOIP_TTS_MODEL` | First-audio (our HTTP `/stream`) | Audio tags |
+| ----------------------- | -------------------------------- | ---------- |
+| `eleven_flash_v2_5` (default) | ~310 ms (measured) | stripped (never spoken) |
+| `eleven_v3`             | ~454 ms (measured) | **rendered** |
+
+On `eleven_v3` the agent can use **audio tags** — inline cues like `[breath]`, `[laughs]`,
+`[sighs]`, `[hesitates]`, `[whispers]`, `[clears throat]` — and they **render** as the intended
+vocal performance. On every other model (Flash/Turbo/Multilingual, and the `sherpa-kokoro`
+fallback) those tags are **stripped** before synthesis, so a bracketed cue is never read aloud
+literally. Both first-audio numbers are fine on the phone path — the **Hermes LLM turn
+dominates** end-to-end latency. (`HERMES_VOIP_TTS_MODEL` is the ElevenLabs model **id** here;
+for `sherpa-kokoro` the same var is the model **directory**.) See
+[ADR-0027](docs/adr/0027-elevenlabs-v3-audio-tags-model-conditional.md) and
+[the voice runbook](docs/runbooks/0004-voip-tts-voice.md).
+
 **Speech-to-text** — `HERMES_VOIP_STT_PROVIDER`:
 
 | Value         | Provider                                          | Default | Credential        |

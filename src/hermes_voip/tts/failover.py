@@ -51,6 +51,7 @@ from hermes_voip.providers.tts import StreamingTTS, TtsStream
 
 __all__ = [
     "FailoverTTS",
+    "SupportsAudioTags",
     "SupportsCallReset",
     "reset_failover_if_supported",
 ]
@@ -69,6 +70,23 @@ class SupportsCallReset(Protocol):
 
     def reset_failover(self) -> None:
         """Reset per-call failover state so a fresh call retries the primary."""
+        ...
+
+
+@runtime_checkable
+class SupportsAudioTags(Protocol):
+    """A provider that declares whether it preserves ElevenLabs v3 audio tags.
+
+    Concrete providers (:class:`~hermes_voip.tts.elevenlabs.ElevenLabsTTS`,
+    :class:`~hermes_voip.tts.sherpa_kokoro.SherpaKokoroTTS`) expose this so the
+    wrapper can mirror the primary's capability (ADR-0027). It is not on the core
+    ``StreamingTTS`` seam — the tag decision is made *inside* each provider's
+    ``synthesize`` — so this is a duck-typed capability check, not a requirement.
+    """
+
+    @property
+    def preserves_audio_tags(self) -> bool:
+        """Whether this provider renders v3 audio tags (kept) or strips them."""
         ...
 
 
@@ -163,6 +181,24 @@ class FailoverTTS:
     def output_sample_rate(self) -> int:
         """Mirror the primary's declared default rate (the media layer reconciles)."""
         return self._primary.output_sample_rate
+
+    @property
+    def preserves_audio_tags(self) -> bool:
+        """Report the PRIMARY's audio-tag capability (ADR-0027).
+
+        The actual per-utterance tag fate is decided inside whichever provider
+        synthesises: the primary keeps or strips tags per its own model, and on a
+        failover the fallback (always a non-tag self-host model) strips them when it
+        re-synthesises the replayed utterance. This property reflects the primary so
+        the configured capability is observable; it is **not** consulted to drive the
+        stripping (each provider does that itself), so a latched fallback does not
+        change it. Duck-typed via :class:`SupportsAudioTags` — a primary without the
+        property is treated as not tag-capable.
+        """
+        primary = self._primary
+        if isinstance(primary, SupportsAudioTags):
+            return primary.preserves_audio_tags
+        return False
 
     def reset_failover(self) -> None:
         """Clear the per-call failover latch so a fresh call retries the primary."""

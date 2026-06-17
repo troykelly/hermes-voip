@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-__all__ = ["sanitize_for_speech"]
+__all__ = ["sanitize_for_speech", "strip_audio_tags"]
 
 # ---------------------------------------------------------------------------
 # Emoji / pictograph codepoint ranges
@@ -143,6 +143,30 @@ _RE_REPEAT_PUNCT: re.Pattern[str] = re.compile(r"([!?.]){2,}")
 # Any whitespace run (including newlines, tabs) → single space.
 _RE_WHITESPACE: re.Pattern[str] = re.compile(r"\s+")
 
+# ElevenLabs v3 audio tag: an inline performance cue in square brackets, e.g.
+# ``[laughs]``, ``[breath]``, ``[clears throat]``, ``[whispers]``. The shape is
+# deliberately narrow so it matches voice cues but NOT a numeric footnote marker
+# (``[3]``), a citation, a single-letter index/variable (``[i]``, ``[x]``), or a
+# long bracketed aside that is really a sentence: it must OPEN with an ASCII letter,
+# then contain at least one MORE letter/space/apostrophe/hyphen (so ≥2 inner chars —
+# every canonical tag is a word ≥5 chars, while ``[i]`` is left intact), up to 32
+# inner characters. (Markdown links ``[text](url)`` are handled earlier in
+# :func:`sanitize_for_speech`, so this never has to disambiguate them.) Used to STRIP
+# tags on a model that cannot interpret them (Flash/Turbo/Multilingual/Kokoro) so the
+# bracketed word is never voiced literally; a v3 model keeps them.
+_RE_AUDIO_TAG: re.Pattern[str] = re.compile(r"\[[A-Za-z][A-Za-z '-]{1,31}\]")
+
+# A *dangling* tag opening at the very end of the text: a ``[`` followed by only
+# tag-name characters (ASCII letters / apostrophes / hyphens, NO spaces) and no
+# closing ``]``. This is what a ``flush()`` mid-tag hands over when a streamed
+# ``[breath]`` is cut after the ``[`` (e.g. ``"Hello [bre"``): the complete-tag
+# regex cannot match it, so on a non-v3 model the fragment would be spoken
+# literally ("bracket b-r-e"). Stripping the dangling open closes that gap. It is
+# intentionally narrow — only an un-closed open that runs to end-of-string with no
+# space — so legitimate mid-sentence prose like ``"choose [a or b"`` (a space
+# follows) or a closed ``"[i]"`` is left intact.
+_RE_DANGLING_TAG_OPEN: re.Pattern[str] = re.compile(r"\[[A-Za-z'-]*$")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -208,6 +232,37 @@ def sanitize_for_speech(text: str) -> str:
 
     # 7. Whitespace normalised
     return _RE_WHITESPACE.sub(" ", text).strip()
+
+
+def strip_audio_tags(text: str) -> str:
+    """Remove ElevenLabs v3 audio-tag tokens (``[laughs]``, ``[breath]``, …).
+
+    Drops the **whole** bracketed cue — brackets *and* the word inside — so a TTS
+    model that cannot interpret v3 audio tags never voices the bracketed word
+    literally (Flash/Turbo/Multilingual would otherwise say "breath" for
+    ``[breath]``). Only audio-tag-*shaped* brackets are removed (see
+    :data:`_RE_AUDIO_TAG`): a numeric footnote like ``[3]`` or a long bracketed
+    aside is left intact. A **dangling** tag-opening at the very end (a
+    ``flush()``-mid-tag fragment like ``"Hello [bre"``) is also dropped (see
+    :data:`_RE_DANGLING_TAG_OPEN`) so a split tag is never voiced either. The space
+    a removed tag occupied is collapsed so no double space remains.
+
+    Pure and synchronous, stdlib-only. Applied at the TTS-provider seam **only on a
+    model that does not support audio tags** — a v3-family model preserves them so
+    the agent's performance cues actually render (ADR-0027).
+
+    Args:
+        text: Spoken-text (already emoji/markdown/URL-sanitised) that may contain
+            inline v3 audio-tag cues.
+
+    Returns:
+        ``text`` with every audio-tag token removed and whitespace collapsed.
+    """
+    stripped = _RE_AUDIO_TAG.sub(" ", text)
+    # Also drop a dangling tag-opening at the tail (a ``flush()`` mid-tag fragment
+    # like ``"Hello [bre"``) so a split tag is never voiced on a non-v3 model.
+    stripped = _RE_DANGLING_TAG_OPEN.sub(" ", stripped)
+    return _RE_WHITESPACE.sub(" ", stripped).strip()
 
 
 def _strip_emoji(text: str) -> str:

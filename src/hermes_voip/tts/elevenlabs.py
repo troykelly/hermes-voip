@@ -52,12 +52,14 @@ __all__ = [
     "ELEVENLABS_SAMPLE_RATE",
     "FLASH_V2_5_MODEL_ID",
     "MAX_STREAMING_LATENCY",
+    "V3_MODEL_ID",
     "ElevenLabsRequest",
     "ElevenLabsTTS",
     "ElevenLabsVoiceSettings",
     "HttpByteStream",
     "HttpCancellation",
     "elevenlabs_pcm_format",
+    "model_supports_audio_tags",
 ]
 
 #: The G.711 narrowband wire rate (PCMU/PCMA are 8000 Hz, RFC 3551). The default
@@ -124,6 +126,37 @@ def elevenlabs_pcm_format(sample_rate: int) -> str:
 #: comes from :data:`DEFAULT_VOICE_SETTINGS` (below), not a model swap. The model is
 #: still operator-selectable via ``HERMES_VOIP_TTS_MODEL`` for off-path A/B tests.
 FLASH_V2_5_MODEL_ID = "eleven_flash_v2_5"
+
+#: The ElevenLabs **v3** model id — the most *expressive* tier, and the one that
+#: renders inline **audio tags** (``[laughs]``, ``[sighs]``, ``[breath]``,
+#: ``[whispers]``, ``[clears throat]``, …) as performance cues. Live-validated on
+#: this plugin's HTTP ``/stream`` path (ADR-0027): first-audio ~454 ms (vs Flash
+#: ~310 ms) — both fine on the phone path since Hermes' LLM time dominates. The
+#: older "v3 can't stream" note applied to the multi-context **websocket** only;
+#: our HTTP streaming path works. ``eleven_v3_conversational`` is Agents-platform
+#: only (401 with a standard TTS key) and is out of scope. Selectable via
+#: ``HERMES_VOIP_TTS_MODEL=eleven_v3``.
+V3_MODEL_ID = "eleven_v3"
+
+#: The prefix every audio-tag-capable model id shares. Only the **v3 family**
+#: (``eleven_v3`` and any future ``eleven_v3*`` this code does not yet name)
+#: interprets audio tags; Flash, Turbo, and Multilingual v2 speak a bracketed cue
+#: literally, so tags are stripped for them (ADR-0027).
+_V3_MODEL_PREFIX = "eleven_v3"
+
+
+def model_supports_audio_tags(model_id: str) -> bool:
+    """Return whether ``model_id`` is a v3-family model that renders audio tags.
+
+    True for ``eleven_v3`` and any ``eleven_v3*`` variant (the expressive tier that
+    interprets inline ``[laughs]``/``[breath]``/… cues); False for every other model
+    (Flash/Turbo/Multilingual), which would voice a bracketed cue literally. Used to
+    decide, per the configured model, whether the synthesiser PRESERVES audio tags
+    (v3) or STRIPS them (everything else) — ADR-0027. The match is case-insensitive
+    and tolerant of surrounding whitespace so a hand-edited env value still resolves.
+    """
+    return model_id.strip().casefold().startswith(_V3_MODEL_PREFIX)
+
 
 #: The inclusive upper bound of ElevenLabs' ``optimize_streaming_latency`` query
 #: parameter (0 = no optimisation … 4 = max, with the text normaliser disabled).
@@ -486,6 +519,16 @@ class ElevenLabsTTS:
         return self._model_id
 
     @property
+    def preserves_audio_tags(self) -> bool:
+        """Whether this model renders v3 audio tags (so they are kept, not stripped).
+
+        True only for the v3 family (``eleven_v3*``); for Flash/Turbo/Multilingual it
+        is False, so :meth:`synthesize` strips ``[laughs]``/``[breath]``/… before the
+        request (the bracketed cue would otherwise be spoken literally — ADR-0027).
+        """
+        return model_supports_audio_tags(self._model_id)
+
+    @property
     def voice_settings(self) -> ElevenLabsVoiceSettings:
         """The dynamism controls sent on every request (dynamic-but-stable default)."""
         return self._voice_settings
@@ -548,6 +591,11 @@ class ElevenLabsTTS:
             open_segment=_open,
             sample_rate=out_rate,
             stop=stop,
+            # Model-conditional audio tags (ADR-0027): preserve v3 cues so they
+            # render; strip them on every other model so a bracketed cue is never
+            # voiced literally. Stripping happens per whole-sentence segment inside
+            # PcmFrameStream (a tag split across streamed chunks is reassembled first).
+            preserve_audio_tags=self.preserves_audio_tags,
         )
 
     def _request(

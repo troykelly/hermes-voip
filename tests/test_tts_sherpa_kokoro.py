@@ -134,6 +134,32 @@ def test_sherpa_kokoro_is_a_streaming_tts() -> None:
     assert tts.output_sample_rate == _OUTPUT_RATE
 
 
+# --- model-conditional audio tags (ADR-0027) ---------------------------------
+#
+# Kokoro cannot interpret ElevenLabs v3 audio tags, so it must STRIP them — never
+# pass ``[breath]`` to the synthesiser (which would speak the word "breath"). The
+# backend records exactly what text it is asked to synthesise, so we assert on it.
+
+
+def test_kokoro_never_preserves_audio_tags() -> None:
+    """Kokoro declares it does NOT preserve audio tags (it cannot render them)."""
+    tts = _tts(_FakeSynth())
+    assert tts.preserves_audio_tags is False
+
+
+@pytest.mark.asyncio
+async def test_kokoro_strips_audio_tags_before_synthesis() -> None:
+    """A ``[breath]`` tag is removed before it reaches the Kokoro backend."""
+    fake = _FakeSynth(chunks_per_call=1)
+    tts = _tts(fake)
+    await _drain(tts.synthesize(_text("Hello [breath] there. "), voice="af"))
+    synthesised = " ".join(fake.requested)
+    assert "[breath]" not in synthesised
+    assert "breath" not in synthesised
+    assert "Hello" in synthesised
+    assert "there" in synthesised
+
+
 # --- streaming: frames flow, at 24 kHz, per sentence -------------------------
 
 

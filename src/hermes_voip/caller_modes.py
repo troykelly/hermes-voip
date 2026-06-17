@@ -166,6 +166,15 @@ class CallerGroupConfig:
             Decline-biased: the first group in the list should be the blocked
             group so a number on both blocked and an allowed list is declined.
         normalization: How raw caller-IDs are canonicalised before matching.
+
+    The ``default_group`` (catch-all for unmatched, forgeable callers) MUST be
+    unprivileged (``privilege_level == 0``): :meth:`__post_init__` raises
+    :class:`ConfigError` otherwise. This is the by-construction enforcement of the
+    operator security tenet — an unmatched caller can NEVER reach operator (or any
+    non-zero) privilege regardless of config, because this is the single chokepoint
+    every path flows through (the JSON loader, the legacy 3-file synthesis, direct
+    construction, and ``adapter._caller_groups``), and :func:`classify_caller_group`
+    returns ``default_group`` verbatim for an unmatched caller.
     """
 
     groups: tuple[CallerGroup, ...]
@@ -173,6 +182,37 @@ class CallerGroupConfig:
     default_group: str
     match_order: tuple[str, ...]
     normalization: Normalization
+
+    def __post_init__(self) -> None:
+        """Reject a privileged default group (fail-loud, the by-construction clamp).
+
+        The default group is the catch-all for unmatched (unknown, forgeable)
+        callers. Caller-ID is a trust hint, not authentication, so the default
+        MUST be unprivileged (``privilege_level == 0``, the receptionist). A
+        privileged default would silently grant that privilege to every unmatched
+        caller — the systemic privilege escalation. This invariant on the
+        constructor backstops the loader-level checks (:func:`_parse_groups_document`,
+        the legacy synthesis), which a direct ``CallerGroupConfig(...)`` would
+        otherwise bypass.
+
+        Only the named default group is validated here; whether ``default_group``
+        names a defined group is a loader-level concern (and
+        :func:`classify_caller_group` falls back safely if it does not), so a
+        missing name is not raised on here — that keeps this invariant a pure,
+        additive security clamp.
+        """
+        default = next((g for g in self.groups if g.name == self.default_group), None)
+        if default is not None and default.privilege_level != 0:
+            msg = (
+                f"default_group={self.default_group!r} has privilege_level="
+                f"{default.privilege_level} but must be 0: the default group is "
+                "the catch-all for unmatched (unknown, forgeable) callers and must "
+                "be unprivileged (the receptionist). A privileged default would "
+                "grant that privilege to every unmatched caller on a spoofable "
+                "identifier — operator/elevated privilege requires an explicit "
+                "allow-list match, never the default."
+            )
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)

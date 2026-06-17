@@ -4,7 +4,7 @@ A gateway that has a registered contact periodically *qualifies* it: it sends an
 out-of-dialog ``OPTIONS`` ping and expects a ``200 OK``. If the UA never answers,
 the registrar marks the endpoint UNREACHABLE and routes inbound calls to
 voicemail **without ever sending an INVITE** (observed live against a real
-Grandstream UCM6304 — zero INVITEs reached the plugin). RFC 3261 §11 makes
+RFC-compliant SIP/UCM gateway — zero INVITEs reached the plugin). RFC 3261 §11 makes
 answering out-of-dialog ``OPTIONS`` mandatory, so keeping the registration
 *qualified* is a UA/transport concern, not the adapter's.
 

@@ -2,7 +2,7 @@
 
 A registrar that gets no ``200 OK`` to its qualify ``OPTIONS`` marks the endpoint
 UNREACHABLE and routes inbound calls to voicemail without ever sending an INVITE
-(observed live against a real Grandstream UCM). The
+(observed live against a real RFC-compliant SIP/UCM gateway). The
 :class:`~hermes_voip.transport.connection.SipOverTlsTransport` therefore answers
 an out-of-dialog ``OPTIONS`` with ``200 OK`` (RFC 3261 §11) and acknowledges an
 unsolicited MWI ``NOTIFY`` with ``200 OK``, *before* falling through to the
@@ -41,7 +41,7 @@ def _gateway() -> GatewayConfig:
 
 
 def _options_ping(*, call_id: str = "opt-call-1") -> str:
-    """A UCM-style out-of-dialog OPTIONS qualify ping (no To-tag)."""
+    """A gateway-style out-of-dialog OPTIONS qualify ping (no To-tag)."""
     return (
         "OPTIONS sip:1000@127.0.0.1:5061;transport=tls SIP/2.0\r\n"
         "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bKopt1;rport\r\n"

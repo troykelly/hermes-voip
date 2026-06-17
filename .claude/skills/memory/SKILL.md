@@ -15,7 +15,7 @@ backed by a local vector store under `.memory/`:
 
 At the start of any non-trivial task, run one or two `qdrant-find` queries about the area
 you're touching (e.g. "decisions about the SIP transport", "gotchas registering against the
-UCM"). Do this before re-deriving anything a past session may have settled.
+SIP gateway"). Do this before re-deriving anything a past session may have settled.
 
 ## Store
 

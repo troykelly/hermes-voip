@@ -315,3 +315,138 @@ async def test_symmetric_latch_accepts_the_negotiated_dynamic_payload_type() -> 
         f"engine did not latch on the negotiated PT {_DYNAMIC_G722_PT} packet "
         f"(outbound_addr={engine._outbound_addr}, expected 127.0.0.1:{sender_port})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Wideband re-framing continuity across odd-sized chunks + the deadline pacer's
+# stop-race (the G.722 jitter fix). G.722's encoder is STATEFUL (sub-band ADPCM
+# predictor + QMF history), so the re-framing buffer must feed it ONE continuous
+# 16 kHz stream in whole 320-sample frames regardless of how the producer chunks
+# arrive — a per-chunk discontinuity would both inject silence AND corrupt the
+# predictor. These mirror the G.711 continuity tests at the 320-sample wideband
+# frame, and lock in that a stop() racing the pacer loses no audio and keeps order.
+# ---------------------------------------------------------------------------
+
+
+def _wideband_counter_pcm(start_sample: int, n_samples: int) -> bytes:
+    """``n_samples`` of a distinct, non-silent 16 kHz wideband tone, by global index.
+
+    A 5 kHz tone (above the G.711 ceiling, so it exercises the high band) phased on
+    the GLOBAL sample index, so concatenating successive slices is one continuous
+    waveform — exactly what the re-framing buffer must reconstruct from odd chunks.
+    """
+    samples = [
+        int(0.4 * 32767 * math.sin(2 * math.pi * 5000.0 * (start_sample + i) / 16_000))
+        for i in range(n_samples)
+    ]
+    return struct.pack(f"<{n_samples}h", *samples)
+
+
+@pytest.mark.asyncio
+async def test_g722_stream_continuous_across_non_320_multiple_chunks() -> None:
+    """Odd-sized 16 kHz chunks encode to the SAME bytes as one continuous pass.
+
+    A streaming TTS hands send_audio a frame per producer chunk whose length is not
+    a multiple of the 320-sample (640-byte) G.722 frame. The re-framing buffer must
+    carry the sub-frame remainder across calls and feed the stateful encoder ONE
+    continuous stream. The discriminating check: the concatenation of all emitted
+    G.722 payloads must equal a single-pass encode of the same total PCM by a fresh
+    G722Encoder — byte-for-byte. A per-chunk silence pad (the "very choppy" bug) or
+    any framing discontinuity would diverge here, because the stateful predictor
+    would see different inputs.
+    """
+    # 11 chunks of 532 samples = 5852 samples total. 532 is deliberately not a
+    # multiple of 320 (a 212-sample remainder rolls forward each chunk). The total
+    # 5852 is also not a whole number of frames (18.2875), so a tail remainder
+    # exists at stop — exercising the final padded flush too.
+    chunk_samples = 532
+    chunk_count = 11
+    total_samples = chunk_samples * chunk_count
+
+    engine = _new_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        for idx in range(chunk_count):
+            pcm = _wideband_counter_pcm(idx * chunk_samples, chunk_samples)
+            await engine.send_audio(
+                PcmFrame(samples=pcm, sample_rate=_G722_SAMPLE_RATE, monotonic_ts_ns=0)
+            )
+        await engine.stop()  # flushes the sub-frame tail (padded once)
+
+    emitted = b"".join(RtpPacket.parse(w).payload for w, _ in recorder.sent)
+
+    # Reference: the same total PCM, zero-padded up to a whole 320-sample frame
+    # exactly once at the end (mirroring stop()'s single tail pad), encoded in ONE
+    # pass by a fresh encoder — the definition of a sample-continuous wideband stream.
+    frame_samples = _AUDIO_SAMPLES_PER_FRAME  # 320
+    remainder = total_samples % frame_samples
+    pad = (frame_samples - remainder) if remainder else 0
+    whole_pcm = b"".join(
+        _wideband_counter_pcm(i * chunk_samples, chunk_samples)
+        for i in range(chunk_count)
+    ) + bytes(pad * 2)
+    expected = G722Encoder().encode(whole_pcm)
+
+    assert emitted == expected, (
+        "G.722 send path is not sample-continuous across odd chunks: the emitted "
+        "octets differ from a single-pass encode of the same PCM (a per-chunk "
+        "discontinuity corrupted the stateful predictor or injected silence)"
+    )
+    # And every emitted packet is exactly one 20 ms wideband frame (160 octets) bar
+    # the last, which is the padded tail — also 160 octets.
+    payload_lens = {len(RtpPacket.parse(w).payload) for w, _ in recorder.sent}
+    assert payload_lens == {160}, (
+        f"every G.722 packet must be one 20 ms frame (160 octets); got {payload_lens}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_g722_stop_mid_playout_flushes_all_frames_in_order() -> None:
+    """A stop() racing the G.722 deadline pacer loses no audio and keeps order.
+
+    The deadline pacer encodes a frame (advancing the stateful encoder + committing
+    seq/ts) BEFORE its pacing sleep, then sends on wake. If stop() nulls the
+    transport during that sleep, the already-encoded datagram must still be
+    delivered — FIRST, ahead of the raw frames stop() flushes from the buffer — or
+    the wideband stream is reordered/dropped. We feed 6 whole frames in one call,
+    tear the engine down from inside the pacing sleep right after the first frame,
+    and assert all 6 frames are on the wire, in strictly increasing RTP sequence,
+    decoding to the original wideband waveform.
+    """
+    n_frames = 6
+    total_samples = n_frames * _AUDIO_SAMPLES_PER_FRAME  # 1920 — exactly 6 frames
+    src_pcm = _wideband_counter_pcm(0, total_samples)
+
+    engine = _new_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        # Pacing sleep that tears the engine down right after the first frame is sent,
+        # exercising the "stop() nulls _transport during the pacing sleep" path with
+        # whole wideband frames still buffered (and one encoded, in-flight) behind it.
+        async def _stop_after_first(_secs: float) -> None:
+            if len(recorder.sent) == 1 and engine._transport is not None:
+                await engine.stop()
+
+        engine._sleep = _stop_after_first
+        await engine.send_audio(
+            PcmFrame(samples=src_pcm, sample_rate=_G722_SAMPLE_RATE, monotonic_ts_ns=0)
+        )
+        await engine.stop()  # idempotent no-op (stop already ran from the sleep)
+
+    packets = [RtpPacket.parse(w) for w, _ in recorder.sent]
+    assert len(packets) == n_frames, (
+        f"expected all {n_frames} G.722 frames across the stop race, got "
+        f"{len(packets)} (a frame was dropped)"
+    )
+    # Strictly increasing, contiguous RTP sequence numbers — no reorder, no gap.
+    seqs = [p.sequence_number for p in packets]
+    assert seqs == list(range(seqs[0], seqs[0] + n_frames)), (
+        f"RTP sequence not contiguous/in-order across the stop race: {seqs}"
+    )
+    # The concatenated payloads decode (one fresh decoder) back to the original
+    # wideband waveform — order preserved and the encoder saw one continuous stream.
+    decoded = G722Decoder().decode(b"".join(p.payload for p in packets))
+    expected = G722Decoder().decode(G722Encoder().encode(src_pcm))
+    assert decoded == expected, (
+        "emitted G.722 audio is reordered or corrupted across the stop race"
+    )

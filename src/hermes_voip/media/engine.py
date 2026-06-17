@@ -75,6 +75,13 @@ from hermes_voip.media.g722 import (
     G722Encoder,
 )
 
+# Opus RATE constants only (plain ints — ADR-0032). Importing them at module scope
+# is safe in the default (no-webrtc) gate: media.opus's opuslib/libopus import is
+# lazy (inside the codec constructors), so this import never pulls opuslib in. The
+# OpusEncoder/OpusDecoder CLASSES are imported lazily inside _encode/_decode, mirroring
+# how the G.722 codec objects are created on first use.
+from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
+
 # SrtpError is defined at srtp.py module level and carries no cryptography
 # dependency (the cryptography backend is imported lazily inside SrtpSession),
 # so importing it here is safe in the default (no-`media`-extra) environment.
@@ -133,17 +140,24 @@ type _Datagram = tuple[bytes, tuple[str, int]]
 
 
 class Codec(enum.Enum):
-    """The audio codec for this media session (the value is the RTP payload type).
+    """The audio codec for this media session (the value is the default payload type).
 
-    PCMU/PCMA are 8 kHz narrowband G.711; G722 is 16 kHz wideband (ADR-0022). The
-    rate behaviour (wire sample rate, RTP clock rate) is NOT encoded by the enum —
-    it lives in :data:`_CODEC_DESCRIPTORS`, because G.722's RTP clock (8000)
-    differs from its audio sample rate (16000) per RFC 3551.
+    PCMU/PCMA are 8 kHz narrowband G.711; G722 is 16 kHz wideband (ADR-0022); OPUS
+    is 48 kHz wideband for the WebRTC wire (ADR-0032). The rate behaviour (wire
+    sample rate, RTP clock rate) is NOT encoded by the enum — it lives in
+    :data:`_CODEC_DESCRIPTORS`, because G.722's RTP clock (8000) differs from its
+    audio sample rate (16000) per RFC 3551 (Opus's clock equals its rate, 48000).
+
+    The enum value is the codec's DEFAULT payload type. PCMU/PCMA/G722 have static
+    PTs (RFC 3551); Opus has no static PT, so its value is the conventional dynamic
+    PT 111 — the wire PT is always the negotiated one (the engine threads
+    ``payload_type`` separately from the codec kind).
     """
 
     PCMU = 0  # mu-law, RTP payload type 0 (8 kHz)
     PCMA = 8  # a-law, RTP payload type 8 (8 kHz)
     G722 = 9  # G.722 wideband, RTP payload type 9 (16 kHz audio, 8 kHz RTP clock)
+    OPUS = 111  # Opus, dynamic PT (48 kHz audio + RTP clock; WebRTC — ADR-0032)
 
 
 class UnsupportedCodecError(ValueError):
@@ -188,39 +202,76 @@ _ENGINE_CODEC_TABLE: Final[dict[tuple[str, int], Codec]] = {
     ("PCMU", G711_SAMPLE_RATE): Codec.PCMU,
     ("PCMA", G711_SAMPLE_RATE): Codec.PCMA,
     ("G722", G722_RTP_CLOCK_RATE): Codec.G722,
+    # Opus (ADR-0032): the rtpmap clock is the 48 kHz audio rate (RFC 7587), so the
+    # KEY matches reality directly — no G.722-style 8000/16000 split. Only carriable
+    # when the webrtc extra (opuslib + libopus) is installed; the codec is advertised
+    # ONLY on the WebRTC path (adapter._WEBRTC_SUPPORTED_ENCODINGS), so a TLS/SDES
+    # offer never reaches an Opus branch and the default gate never needs opuslib.
+    ("OPUS", OPUS_RTP_CLOCK_RATE): Codec.OPUS,
 }
+
+
+# Opus's wire/encode rate is 48 kHz, but the inbound CONVERSATIONAL pipeline (Silero
+# VAD + endpointer + STT) runs at 16 kHz: Silero VAD accepts only 8 kHz or 16 kHz, so
+# 48 kHz inbound is downsampled to 16 kHz before the pipeline sees it (ADR-0032). The
+# wideband content is preserved (16 kHz >> the 8 kHz G.711 path). 16 kHz reuses
+# G.722's analysis rate exactly, so VAD/endpoint/barge-in/STT bookkeeping is unchanged.
+_OPUS_ANALYSIS_RATE: Final[int] = 16_000
 
 
 @dataclass(frozen=True, slots=True)
 class _CodecDescriptor:
     """Per-codec rate facts that drive the engine's RTP/resample bookkeeping.
 
-    Centralises the two rates that differ per codec (and, for G.722, differ from
-    EACH OTHER): the ``wire_sample_rate`` is the rate of the PCM the codec
-    encodes/decodes (8 kHz G.711, 16 kHz G.722) and the rate frames are delivered
-    at (``inbound_sample_rate``) + the rate TTS frames are resampled to before
-    encoding; the ``rtp_clock_rate`` is the RTP timestamp clock (8 kHz for both
-    G.711 and G.722 — RFC 3551 §4.5.2 fixes G.722's clock at 8000 despite the
-    16 kHz audio). The RTP timestamp increment per packet is derived from
-    ``rtp_clock_rate``, the wire chunk size from ``wire_sample_rate`` — so the
-    8000-clock/16000-sample split is handled in ONE place.
+    Centralises the rates that differ per codec (and, for G.722/Opus, differ from
+    EACH OTHER):
+
+    * ``wire_sample_rate`` — the rate of the PCM the codec encodes/decodes (8 kHz
+      G.711, 16 kHz G.722, 48 kHz Opus) and the rate TTS frames are resampled to
+      before encoding (the outbound/encode rate).
+    * ``rtp_clock_rate`` — the RTP timestamp clock (8 kHz for G.711 AND G.722 — RFC
+      3551 §4.5.2 fixes G.722's clock at 8000 despite the 16 kHz audio; 48 kHz for
+      Opus per RFC 7587). The RTP timestamp increment per packet derives from this.
+    * ``analysis_sample_rate`` — the rate the INBOUND conversational pipeline (VAD,
+      endpointer, STT) runs at, i.e. the rate :meth:`inbound_audio` delivers and
+      :attr:`inbound_sample_rate` reports. Equals ``wire_sample_rate`` for G.711 and
+      G.722 (decode delivers the wire PCM directly). For Opus it is 16 kHz, NOT the
+      48 kHz wire rate: Silero VAD accepts only 8/16 kHz, so decoded 48 kHz Opus is
+      downsampled to 16 kHz for the pipeline (the wideband content survives). This is
+      the one place the wire/encode rate and the analysis/decode-delivery rate split.
     """
 
     wire_sample_rate: int
     rtp_clock_rate: int
+    analysis_sample_rate: int
 
 
 # One descriptor per runnable Codec. Exhaustive: every Codec has an entry, so the
 # engine never falls back to a hardcoded rate literal on any codec path.
 _CODEC_DESCRIPTORS: Final[dict[Codec, _CodecDescriptor]] = {
     Codec.PCMU: _CodecDescriptor(
-        wire_sample_rate=G711_SAMPLE_RATE, rtp_clock_rate=G711_SAMPLE_RATE
+        wire_sample_rate=G711_SAMPLE_RATE,
+        rtp_clock_rate=G711_SAMPLE_RATE,
+        analysis_sample_rate=G711_SAMPLE_RATE,
     ),
     Codec.PCMA: _CodecDescriptor(
-        wire_sample_rate=G711_SAMPLE_RATE, rtp_clock_rate=G711_SAMPLE_RATE
+        wire_sample_rate=G711_SAMPLE_RATE,
+        rtp_clock_rate=G711_SAMPLE_RATE,
+        analysis_sample_rate=G711_SAMPLE_RATE,
     ),
     Codec.G722: _CodecDescriptor(
-        wire_sample_rate=G722_SAMPLE_RATE, rtp_clock_rate=G722_RTP_CLOCK_RATE
+        wire_sample_rate=G722_SAMPLE_RATE,
+        rtp_clock_rate=G722_RTP_CLOCK_RATE,
+        analysis_sample_rate=G722_SAMPLE_RATE,
+    ),
+    # Opus (ADR-0032): wire/encode + RTP clock are both 48 kHz (RFC 7587 — unlike
+    # G.722 they coincide, so a 20 ms frame is 960 samples and the timestamp advances
+    # 960). The inbound pipeline runs at 16 kHz (Silero VAD's cap), so decoded 48 kHz
+    # Opus is downsampled to 16 kHz; outbound TTS is resampled up to 48 kHz to encode.
+    Codec.OPUS: _CodecDescriptor(
+        wire_sample_rate=OPUS_SAMPLE_RATE,
+        rtp_clock_rate=OPUS_RTP_CLOCK_RATE,
+        analysis_sample_rate=_OPUS_ANALYSIS_RATE,
     ),
 }
 
@@ -228,6 +279,34 @@ _CODEC_DESCRIPTORS: Final[dict[Codec, _CodecDescriptor]] = {
 def _supported_codec_summary() -> str:
     """A human-readable ``ENCODING/rate`` list of carriable codecs (no PII)."""
     return ", ".join(f"{enc}/{rate}" for enc, rate in _ENGINE_CODEC_TABLE)
+
+
+def _new_opus_encoder() -> _OpusEncode:
+    """Construct an :class:`hermes_voip.media.opus.OpusEncoder` (lazy webrtc import).
+
+    Imported inside the function (not at module scope) so the default no-webrtc gate
+    never pulls opuslib. Returns the narrow :class:`_OpusEncode` Protocol surface the
+    engine uses; the concrete class is structurally assignable.
+
+    Raises:
+        ImportError: If the ``webrtc`` extra (opuslib) or the system libopus is
+            absent (propagated from :class:`~hermes_voip.media.opus.OpusEncoder`).
+    """
+    from hermes_voip.media.opus import OpusEncoder  # noqa: PLC0415 — lazy webrtc import
+
+    return OpusEncoder()
+
+
+def _new_opus_decoder() -> _OpusDecode:
+    """Construct an :class:`hermes_voip.media.opus.OpusDecoder` (lazy webrtc import).
+
+    Raises:
+        ImportError: If the ``webrtc`` extra (opuslib) or the system libopus is
+            absent (propagated from :class:`~hermes_voip.media.opus.OpusDecoder`).
+    """
+    from hermes_voip.media.opus import OpusDecoder  # noqa: PLC0415 — lazy webrtc import
+
+    return OpusDecoder()
 
 
 def codec_for_encoding(encoding: str, clock_rate: int) -> Codec:
@@ -275,6 +354,153 @@ class _SrtpUnprotect(Protocol):
     def unprotect(self, data: bytes) -> RtpPacket:
         """Authenticate and decrypt an inbound SRTP packet."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# Narrow Opus codec Protocol seam (no opuslib import needed at type-check time).
+#
+# media.opus.OpusEncoder/OpusDecoder are imported LAZILY inside _encode/_decode so
+# the default (no-webrtc) gate never pulls opuslib. Declaring these narrow
+# Protocols lets the engine hold/typed the codec objects without importing the
+# concrete classes at module scope — OpusEncoder/OpusDecoder are structurally
+# assignable to them (same as the SRTP seam above).
+# ---------------------------------------------------------------------------
+
+
+class _OpusEncode(Protocol):
+    """The encode method surface of :class:`hermes_voip.media.opus.OpusEncoder`."""
+
+    def encode(self, pcm16: bytes) -> bytes:
+        """Encode one 20 ms 48 kHz PCM16 frame to an Opus packet."""
+        ...
+
+
+class _OpusDecode(Protocol):
+    """The decode method surface of :class:`hermes_voip.media.opus.OpusDecoder`."""
+
+    def decode(self, packet: bytes) -> bytes:
+        """Decode one Opus packet to a 20 ms 48 kHz PCM16 frame."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# WebRTC ICE datagram seam (ADR-0032).
+#
+# On the WebRTC path the ICE agent (aioice, via media.ice.IceConnection) owns the
+# nominated UDP socket and runs STUN consent on it; the engine must NOT bind its
+# own socket but carry SRTP media over the ICE agent's send/recv datagram pipe (the
+# socket-handoff seam ADR-0016 made explicit). A narrow Protocol covers exactly the
+# three async methods the engine drives, so engine.py needs no aioice import and
+# IceConnection is structurally assignable without a cast.
+# ---------------------------------------------------------------------------
+
+
+class _IceDatagramPipe(Protocol):
+    """The async datagram-pipe surface of ``media.ice.IceConnection`` (ADR-0032)."""
+
+    async def send(self, data: bytes) -> None:
+        """Send one datagram over the nominated ICE pair."""
+        ...
+
+    async def recv(self) -> bytes:
+        """Receive the next datagram from the nominated ICE pair."""
+        ...
+
+    async def close(self) -> None:
+        """Close the ICE connection and release its sockets."""
+        ...
+
+
+# RFC 7983 first-byte demux on a single rtcp-mux 5-tuple. After the DTLS handshake
+# completes the engine should see only SRTP/SRTCP; anything else (a late STUN
+# consent packet or a stray DTLS record) is dropped rather than fed to the RTP
+# decoder as garbage. SRTP/SRTCP packets carry the RTP version-2 bits, so the first
+# byte is in 128-191 (RFC 7983 §7, updating RFC 5764 §5.1.2).
+_RFC7983_SRTP_FIRST_BYTE_MIN: Final[int] = 128
+_RFC7983_SRTP_FIRST_BYTE_MAX: Final[int] = 191
+
+
+class _DatagramSink(Protocol):
+    """The synchronous datagram-send surface the engine's TX path uses.
+
+    Both :class:`asyncio.DatagramTransport` (the TLS/UDP path) and
+    :class:`_IceDatagramTransport` (the WebRTC/ICE path, ADR-0032) satisfy it, so
+    the engine holds ``_transport`` as this Protocol and the send sites are
+    transport-agnostic.
+    """
+
+    def sendto(self, data: bytes, addr: tuple[str, int] | None = ...) -> None:
+        """Send one datagram (the ``addr`` is honoured only on the UDP path)."""
+        ...
+
+    def close(self) -> None:
+        """Close the underlying transport."""
+        ...
+
+
+class _IceDatagramTransport:
+    """A synchronous ``DatagramTransport``-shaped adapter over an ICE pipe (ADR-0032).
+
+    The engine's send path calls ``transport.sendto(wire, addr)`` and
+    ``transport.close()`` (and ``is_closing()``); the ICE agent exposes an *async*
+    ``send``. This adapter bridges the two without rewriting the (carefully
+    stop-race-safe, pacing-correct) synchronous send machinery: each ``sendto``
+    schedules ``ice.send(data)`` as a task on the running loop. The engine already
+    serialises its sends under ``_tx_lock`` and creates these tasks in stream order,
+    and aioice's ``send`` enqueues onto its own writer, so the wire order is
+    preserved. The ``addr`` argument is ignored — the ICE-nominated pair IS the
+    destination (there is no comedia latch on the WebRTC path).
+
+    Send-task failures are surfaced via ``on_send_error`` (the engine's
+    transport-loss callback) rather than swallowed (rule 37): a dead ICE pipe ends
+    the call as a transport loss, exactly as a dead UDP socket does.
+    """
+
+    def __init__(
+        self,
+        pipe: _IceDatagramPipe,
+        loop: asyncio.AbstractEventLoop,
+        on_send_error: Callable[[Exception], None],
+    ) -> None:
+        self._pipe = pipe
+        self._loop = loop
+        self._on_send_error = on_send_error
+        self._closing = False
+        # Keep strong references to in-flight send tasks so they are not GC'd before
+        # completing (asyncio only holds weak refs); discarded on done.
+        self._send_tasks: set[asyncio.Task[None]] = set()
+
+    def sendto(self, data: bytes, addr: tuple[str, int] | None = None) -> None:  # noqa: ARG002 — addr ignored: the ICE-nominated pair is the destination
+        """Schedule ``data`` to be sent over the ICE pipe (fire-and-forget)."""
+        if self._closing:
+            return
+        task = self._loop.create_task(self._send(bytes(data)))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+
+    async def _send(self, data: bytes) -> None:
+        """Await the ICE send; report a failure as a transport loss (rule 37)."""
+        try:
+            await self._pipe.send(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — report, don't swallow (rule 37)
+            self._on_send_error(exc)
+
+    def close(self) -> None:
+        """Mark closing and cancel any in-flight send tasks (idempotent).
+
+        The ICE pipe itself is closed by :meth:`RtpMediaTransport.stop` (which awaits
+        it); here we only stop scheduling and cancel pending sends so no task
+        outlives the call.
+        """
+        self._closing = True
+        for task in list(self._send_tasks):
+            task.cancel()
+
+    def is_closing(self) -> bool:
+        """Whether this transport is closing (DatagramTransport surface)."""
+        return self._closing
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +626,19 @@ class RtpMediaTransport:
         watchdog_sleep: Callable[[float], Awaitable[None]] | None = None,
         initial_seq: int | None = None,
         initial_ts: int | None = None,
+        ice_transport: _IceDatagramPipe | None = None,
     ) -> None:
         """Construct the engine; no socket is opened until :meth:`connect`.
+
+        Args:
+            ice_transport: An ICE datagram pipe (WebRTC path, ADR-0032). When
+                supplied, :meth:`connect` does NOT bind a UDP socket: outbound
+                SRTP/RTP is sent via ``ice_transport.send`` and inbound is pumped
+                from ``ice_transport.recv`` (with the RFC 7983 first-byte demux so
+                only SRTP reaches the decoder). ``None`` (the default) is the
+                SIP-over-TLS path: the engine binds its own UDP socket exactly as
+                before. The symmetric-RTP comedia latch is disabled on the ICE path
+                — the ICE-nominated pair is the destination.
 
         Args:
             payload_type: The RTP payload type to send and to accept for the
@@ -467,7 +704,14 @@ class RtpMediaTransport:
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
         self._jitter_depth = jitter_depth
-        self._symmetric = symmetric
+        # The ICE datagram pipe (WebRTC path, ADR-0032), or None for the TLS/UDP
+        # path. When set, connect() routes I/O over it instead of binding a socket;
+        # the comedia latch is force-disabled (the ICE pair is the destination).
+        self._ice: _IceDatagramPipe | None = ice_transport
+        self._symmetric = symmetric and ice_transport is None
+        # The ICE inbound-reader task (populated by connect() on the WebRTC path);
+        # cancelled in stop(). ``None`` on the TLS/UDP path.
+        self._ice_reader: asyncio.Task[None] | None = None
         self._clock: Callable[[], int] = (
             clock if clock is not None else time.monotonic_ns
         )
@@ -536,7 +780,7 @@ class RtpMediaTransport:
         # in send_audio — the frame is dropped cleanly because the call is ending)
         # from "never connected" (programming error — still raises RuntimeError).
         self._ever_connected: bool = False
-        self._transport: asyncio.DatagramTransport | None = None
+        self._transport: _DatagramSink | None = None
         # The UDP protocol object handed to asyncio (populated by connect()).
         # Kept so a transport error/close arriving on it is observable and the
         # transport-loss path is reachable; ``None`` before connect()/after stop().
@@ -562,6 +806,13 @@ class RtpMediaTransport:
         # already-at-wire-rate frames bypass it entirely.
         self._tx_resamplers: dict[int, Resampler] = {}
 
+        # Inbound rate reconciliation (ADR-0032): when the codec's wire/decode rate
+        # exceeds the analysis rate (Opus: decode 48 kHz, deliver 16 kHz to the VAD/
+        # STT), a state-carrying Resampler downsamples each decoded frame. ``None``
+        # for G.711/G.722 (wire rate == analysis rate, no downsample). Created lazily
+        # in _decode on the first Opus frame; reset in connect().
+        self._rx_resampler: Resampler | None = None
+
         # G.722 codec state (ADR-0022): the sub-band ADPCM predictor + QMF history
         # are stateful across packets, so one encoder/decoder lives per call and is
         # reset in connect(). Lazily created (only when the negotiated codec is
@@ -569,6 +820,15 @@ class RtpMediaTransport:
         # stream. ``None`` on a G.711 call.
         self._g722_encoder: G722Encoder | None = None
         self._g722_decoder: G722Decoder | None = None
+
+        # Opus codec state (ADR-0032): like G.722, the encoder/decoder carry
+        # internal predictor history across packets, so one of each lives per call
+        # and is reset in connect(). Lazily created (only when the negotiated codec
+        # is Opus) so the default no-webrtc path never imports opuslib. Typed as the
+        # narrow Protocols media.opus exposes so engine.py needs no opuslib import at
+        # type-check time. ``None`` on a non-Opus call.
+        self._opus_encoder: _OpusEncode | None = None
+        self._opus_decoder: _OpusDecode | None = None
 
         # Outbound 20 ms re-framing buffer (the "very choppy" fix), holding the
         # not-yet-sent wire-rate PCM16 bytes in order. A streaming TTS provider
@@ -649,18 +909,26 @@ class RtpMediaTransport:
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Open a non-blocking UDP socket bound to local_address:local_port.
+        """Open the media transport (a UDP socket, or the ICE pipe on the WebRTC path).
+
+        On the SIP-over-TLS path this binds a non-blocking UDP socket to
+        ``local_address:local_port``. On the WebRTC path (an ``ice_transport`` was
+        supplied, ADR-0032) it binds NO socket: it wraps the ICE pipe in a
+        :class:`_IceDatagramTransport` and starts a background reader pumping
+        ``ice.recv`` (with the RFC 7983 demux) into the inbound queue.
 
         Returns:
             ``True`` on success.  Raises on socket / OS error.
         """
         loop = asyncio.get_running_loop()
-        # Create a bound UDP socket first so port=0 lets the OS choose.
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
-        sock.bind((self._local_address, self._local_port))
-        # Record the OS-assigned port before handing the socket to asyncio.
-        self._local_port = sock.getsockname()[1]
+        sock: socket.socket | None = None
+        if self._ice is None:
+            # Create a bound UDP socket first so port=0 lets the OS choose.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            sock.bind((self._local_address, self._local_port))
+            # Record the OS-assigned port before handing the socket to asyncio.
+            self._local_port = sock.getsockname()[1]
 
         self._recv_queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
@@ -673,6 +941,8 @@ class RtpMediaTransport:
         # Drop any carried outbound-resample state so a reused engine starts a
         # fresh stream (no stale sub-sample phase from a previous call).
         self._tx_resamplers = {}
+        # Drop the inbound downsample state too (ADR-0032 Opus 48->16 kHz path).
+        self._rx_resampler = None
         # Reset the G.722 codec state so a reused engine starts with a fresh
         # predictor/QMF history (a stale predictor would corrupt the start of the
         # new call). It is (re)created lazily by _encode/_decode on first use —
@@ -681,6 +951,11 @@ class RtpMediaTransport:
         # connect() time would miss a connect-as-PCMU-then-G.722 call.
         self._g722_encoder = None
         self._g722_decoder = None
+        # Reset the Opus codec state too (ADR-0032), for the same reason: a reused
+        # engine must start with a fresh encoder/decoder predictor history. Lazily
+        # (re)created by _encode/_decode on first use of an Opus call.
+        self._opus_encoder = None
+        self._opus_decoder = None
         # Drop any leftover outbound re-framing bytes from a previous call.
         self._tx_buffer = b""
         # A fresh call starts at flush generation 0 (no barge-in flush yet).
@@ -691,8 +966,12 @@ class RtpMediaTransport:
         self._next_send_at = None
         # No frame is mid-flight at the start of a call.
         self._inflight_wire = None
+        # A reused engine starts with no ICE reader (a fresh one is created below on
+        # the WebRTC path); stop() cancelled any prior reader.
+        self._ice_reader = None
         # Reset the latch so a reused engine re-latches on its next call: aim
         # back at the SDP-negotiated remote until the first valid inbound packet.
+        # (On the WebRTC/ICE path symmetric is force-disabled, so this never latches.)
         self._outbound_addr = (self._remote_address, self._remote_port)
         self._latched = False
         # Reset one-shot diagnostic flags so a reconnected engine logs the first
@@ -702,6 +981,23 @@ class RtpMediaTransport:
         self._self_ssrc_logged = False
         self._tx_amplitude_chunk_count = 0
         self._tx_amplitude_period_peak = 0
+
+        if self._ice is not None:
+            # WebRTC path (ADR-0032): no socket. Wrap the ICE pipe in the synchronous
+            # DatagramSink adapter the TX path expects, and start the inbound reader
+            # that pumps ICE recv → RFC 7983 demux → the recv queue. A failure of an
+            # outbound ICE send is reported as a transport loss (rule 37), exactly as
+            # a dead UDP socket is.
+            self._protocol = None
+            self._transport = _IceDatagramTransport(
+                self._ice, loop, self._on_ice_send_error
+            )
+            self._ice_reader = loop.create_task(self._ice_recv_loop(self._ice))
+            self._ever_connected = True
+            return True
+
+        # SIP-over-TLS path: bind our own UDP socket.
+        assert sock is not None  # noqa: S101 — invariant: sock is bound when _ice is None
         protocol = _UdpReceiver(self._recv_queue, self._on_transport_lost)
         self._protocol = protocol
 
@@ -731,6 +1027,61 @@ class RtpMediaTransport:
         _log.debug("media transport lost: %s", exc)
         self._media_timed_out = True
         self._stop_event.set()
+
+    def _on_ice_send_error(self, exc: Exception) -> None:
+        """Report a failed outbound ICE send as a transport loss (ADR-0032).
+
+        Routed from :class:`_IceDatagramTransport`'s send task. Mirrors
+        :meth:`_on_transport_lost` for the UDP path: a dead ICE pipe ends the call
+        as a failure (the adapter classifies it → ``/stop``) instead of silently
+        dropping audio (rule 37 — acted upon, not swallowed).
+        """
+        _log.warning("ICE send failed — ending call as transport loss: %s", exc)
+        self._media_timed_out = True
+        self._stop_event.set()
+
+    async def _ice_recv_loop(self, ice: _IceDatagramPipe) -> None:
+        """Pump inbound datagrams from the ICE pipe into the recv queue (ADR-0032).
+
+        Replaces the asyncio ``DatagramProtocol`` callback on the WebRTC path: it
+        ``await``s ``ice.recv()`` and applies the RFC 7983 first-byte demux —
+        forwarding ONLY SRTP/SRTCP (first byte 128-191) to the inbound queue and
+        dropping anything else (a late STUN consent packet or a stray DTLS record,
+        which would be garbage to the RTP decoder). The DTLS handshake is already
+        complete before this loop starts, so non-SRTP traffic is residual.
+
+        The queued source address is the ICE-nominated remote (operational, not a
+        comedia trigger — symmetric is force-disabled on the ICE path). On a
+        ``recv`` failure (the pipe closed/errored) the loop reports a transport loss
+        and exits; ``CancelledError`` (from :meth:`stop`) propagates cleanly. Errors
+        are acted upon, never swallowed (rule 37).
+        """
+        remote = (self._remote_address, self._remote_port)
+        try:
+            while True:
+                data = await ice.recv()
+                if not data:
+                    continue
+                first = data[0]
+                if not (
+                    _RFC7983_SRTP_FIRST_BYTE_MIN
+                    <= first
+                    <= _RFC7983_SRTP_FIRST_BYTE_MAX
+                ):
+                    # Not SRTP/SRTCP — a residual DTLS/STUN datagram. Drop it; never
+                    # feed it to the RTP decoder.
+                    _log.debug(
+                        "ice rx: dropped non-SRTP datagram (first byte %d)", first
+                    )
+                    continue
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._recv_queue.put_nowait((data, remote))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — report as loss, don't swallow (rule 37)
+            _log.warning("ICE recv failed — ending call as transport loss: %s", exc)
+            self._media_timed_out = True
+            self._stop_event.set()
 
     async def disconnect(self) -> None:
         """Tear down media and signalling; idempotent (MediaTransport seam)."""
@@ -1091,7 +1442,7 @@ class RtpMediaTransport:
                 # unreachable: the pre-loop guard narrowed self._transport to non-None
                 # and that narrowing does not survive the await inside _transmit_frame
                 # at runtime (stop() may have nulled it during the pacing sleep).
-                transport_after_send: asyncio.DatagramTransport | None = self._transport
+                transport_after_send: _DatagramSink | None = self._transport
                 if transport_after_send is None:
                     # The frame WAS sent and is already removed from the buffer; the
                     # remaining buffer is owned by stop()'s flush. Stop draining.
@@ -1208,7 +1559,7 @@ class RtpMediaTransport:
         # await). If nulled, this frame did NOT go out HERE — report False and leave it
         # parked in _inflight_wire for stop()'s flush to send first (the lossless,
         # in-order-on-stop contract the old post-send sleep upheld).
-        transport: asyncio.DatagramTransport | None = self._transport
+        transport: _DatagramSink | None = self._transport
         if transport is None:
             return False
 
@@ -1444,14 +1795,24 @@ class RtpMediaTransport:
         return self._descriptor.rtp_clock_rate
 
     @property
-    def inbound_sample_rate(self) -> int:
-        """Rate of frames from :meth:`inbound_audio` — the codec's audio sample rate.
+    def _analysis_sample_rate(self) -> int:
+        """The inbound conversational-pipeline rate (VAD/endpointer/STT delivery).
 
-        8000 Hz for G.711, 16000 Hz for G.722 (ADR-0022). The STT path reads this
-        so a G.722 call feeds the recogniser native 16 kHz audio (no upsample from
-        8 kHz), and the VAD/endpointer build at this rate.
+        Equals the wire rate for G.711 (8 kHz) and G.722 (16 kHz); for Opus it is
+        16 kHz, NOT the 48 kHz wire rate (Silero VAD's 8/16 kHz cap — ADR-0032).
         """
-        return self._wire_sample_rate
+        return self._descriptor.analysis_sample_rate
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        """Rate of frames from :meth:`inbound_audio` — the conversational analysis rate.
+
+        8000 Hz for G.711, 16000 Hz for G.722 (ADR-0022), 16000 Hz for Opus
+        (ADR-0032: downsampled from the 48 kHz wire because Silero VAD accepts only
+        8/16 kHz). The STT path reads this so the recogniser, VAD, and endpointer all
+        build at this rate.
+        """
+        return self._analysis_sample_rate
 
     # ------------------------------------------------------------------
     # CallMedia Protocol
@@ -1592,12 +1953,24 @@ class RtpMediaTransport:
         self._protocol = None
         if transport is not None:
             transport.close()
+        # WebRTC path (ADR-0032): cancel the inbound ICE reader and close the ICE
+        # pipe so aioice releases its sockets. The reader is cancelled (it is parked
+        # on ice.recv()); closing the pipe is idempotent. ``_ice`` is left set (it
+        # identifies this as a WebRTC engine for its lifetime) — but the pipe is now
+        # closed, so a reused WebRTC engine is not supported (fresh engine per call,
+        # the actual usage: the ICE pair + DTLS keys are per-call). Done after the
+        # flush above so the teardown tail had its chance to be scheduled.
+        ice_reader, self._ice_reader = self._ice_reader, None
+        if ice_reader is not None:
+            ice_reader.cancel()
+        if self._ice is not None:
+            await self._ice.close()
         # Set the stop flag so the inbound generator wakes and exits cleanly.
         # Unlike a queued sentinel, this is independent of recv-queue capacity:
         # a full queue cannot drop the signal and strand the consumer.
         self._stop_event.set()
 
-    def _flush_tx_tail(self, transport: asyncio.DatagramTransport) -> None:
+    def _flush_tx_tail(self, transport: _DatagramSink) -> None:
         """Emit all buffered outbound audio as final RTP packets, in order.
 
         Sends, in stream order: first any in-flight frame parked by the deadline
@@ -1632,9 +2005,7 @@ class RtpMediaTransport:
             tail = tail + bytes(chunk_bytes - remainder)
         self._emit_inline_frames(tail, transport)
 
-    def _emit_inline_frames(
-        self, pcm: bytes, transport: asyncio.DatagramTransport
-    ) -> None:
+    def _emit_inline_frames(self, pcm: bytes, transport: _DatagramSink) -> None:
         """Encode + pack + send ``pcm`` as whole ``ptime`` RTP packets, inline.
 
         ``pcm`` MUST be a whole number of wire-rate ``ptime`` frames (the caller
@@ -1728,12 +2099,17 @@ class RtpMediaTransport:
         )
 
     def _decode(self, payload: bytes, ts_ns: int) -> PcmFrame:
-        """Decode an RTP payload to a PcmFrame at the codec's wire rate.
+        """Decode an RTP payload to a PcmFrame at the codec's ANALYSIS rate.
 
-        G.711 (PCMU/PCMA) decodes to 8 kHz; G.722 decodes via the per-call
-        stateful :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz (created
-        lazily on first use so an outbound call that connects as a PCMU
-        placeholder then re-negotiates G.722 still gets a fresh decoder).
+        G.711 (PCMU/PCMA) decodes to 8 kHz; G.722 decodes via the per-call stateful
+        :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz; Opus decodes via the
+        per-call stateful :class:`~hermes_voip.media.opus.OpusDecoder` to 48 kHz and
+        is then DOWNSAMPLED to the 16 kHz analysis rate (ADR-0032 — Silero VAD accepts
+        only 8/16 kHz), via a state-carrying resampler so a continuous stream converts
+        click-free. For G.711/G.722 the wire rate equals the analysis rate, so no
+        resample runs. Each wideband decoder is created lazily on first use so an
+        outbound call that connects as a PCMU placeholder then re-negotiates still gets
+        a fresh one, and the default no-webrtc path never imports opuslib.
         """
         if self._codec is Codec.G722:
             if self._g722_decoder is None:
@@ -1743,22 +2119,52 @@ class RtpMediaTransport:
                 sample_rate=G722_SAMPLE_RATE,
                 monotonic_ts_ns=ts_ns,
             )
+        if self._codec is Codec.OPUS:
+            if self._opus_decoder is None:
+                self._opus_decoder = _new_opus_decoder()
+            decoded = self._opus_decoder.decode(payload)  # 48 kHz PCM16
+            return PcmFrame(
+                samples=self._downsample_to_analysis(decoded, OPUS_SAMPLE_RATE),
+                sample_rate=self._analysis_sample_rate,
+                monotonic_ts_ns=ts_ns,
+            )
         if self._codec is Codec.PCMU:
             return ulaw_to_frame(payload, monotonic_ts_ns=ts_ns)
         return alaw_to_frame(payload, monotonic_ts_ns=ts_ns)
+
+    def _downsample_to_analysis(self, pcm: bytes, decoded_rate: int) -> bytes:
+        """Resample decoded ``pcm`` from ``decoded_rate`` to the analysis rate.
+
+        A no-op when the decoded rate already equals the analysis rate (G.711/G.722).
+        For Opus (48 kHz decoded, 16 kHz analysis) a per-call state-carrying
+        :class:`~hermes_voip.media.audio.Resampler` downsamples each frame so the
+        continuous inbound stream is click-free (ADR-0032).
+        """
+        analysis_rate = self._analysis_sample_rate
+        if decoded_rate == analysis_rate:
+            return pcm
+        if self._rx_resampler is None:
+            self._rx_resampler = Resampler(decoded_rate, analysis_rate)
+        return self._rx_resampler.resample(pcm)
 
     def _encode(self, frame: PcmFrame) -> bytes:
         """Encode a wire-rate PcmFrame to an RTP payload for the codec.
 
         G.711 encodes the 8 kHz frame to mu-law/a-law; G.722 encodes the 16 kHz
         frame via the per-call stateful
-        :class:`~hermes_voip.media.g722.G722Encoder` (created lazily on first use,
-        as for :meth:`_decode`).
+        :class:`~hermes_voip.media.g722.G722Encoder`; Opus encodes the 48 kHz frame
+        via the per-call stateful :class:`~hermes_voip.media.opus.OpusEncoder`
+        (ADR-0032). Each wideband encoder is created lazily on first use (as for
+        :meth:`_decode`).
         """
         if self._codec is Codec.G722:
             if self._g722_encoder is None:
                 self._g722_encoder = G722Encoder()
             return self._g722_encoder.encode(frame.samples)
+        if self._codec is Codec.OPUS:
+            if self._opus_encoder is None:
+                self._opus_encoder = _new_opus_encoder()
+            return self._opus_encoder.encode(frame.samples)
         if self._codec is Codec.PCMU:
             return frame_to_ulaw(frame)
         return frame_to_alaw(frame)

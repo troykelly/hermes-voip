@@ -38,16 +38,24 @@ jobs:
         with:
           version: "0.11.21"
           enable-cache: true
-      - run: uv sync --frozen --extra hermes
+      # The WebRTC inbound-branch adapter test (tests/test_adapter_webrtc.py) needs
+      # the REAL hermes runtime AND the webrtc media stack (pyOpenSSL/aioice for
+      # DTLS/ICE, opuslib + the system libopus for the Opus codec — ADR-0032), so this
+      # job installs all three extras and libopus. Without them the test would skip in
+      # BOTH the hermes-contract job (no webrtc extra) and the webrtc job (no hermes
+      # extra) — i.e. never run. libopus0 is apt-installed explicitly (do not assume
+      # the runner ships it).
+      - run: sudo apt-get update && sudo apt-get install -y libopus0
+      - run: uv sync --frozen --extra hermes --extra webrtc --extra media
       # Type-check the Hermes-dependent modules against the REAL base (these are
       # excluded from the default `uv run mypy` gate; passing them explicitly
-      # bypasses the exclude). The end-to-end test, reconnect supervisor tests, and
-      # the media-concurrency adapter isolation test all drive the real
-      # VoipAdapter, so they are checked + run here too.
-      - run: uv run mypy src/hermes_voip/adapter.py src/hermes_voip/voip_tools.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py
+      # bypasses the exclude). The end-to-end test, reconnect supervisor tests, the
+      # media-concurrency adapter isolation test, and the WebRTC inbound-branch test
+      # all drive the real VoipAdapter, so they are checked + run here too.
+      - run: uv run mypy src/hermes_voip/adapter.py src/hermes_voip/voip_tools.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_webrtc.py tests/test_media_concurrency_hermes.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
-        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_media_concurrency_hermes.py tests/e2e -rs
+        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_webrtc.py tests/test_media_concurrency_hermes.py tests/e2e -rs
 
   # Runs the conversational-provider tests with the optional `ml` extra installed
   # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack
@@ -99,10 +107,16 @@ jobs:
         with:
           version: "0.11.21"
           enable-cache: true
+      # The Opus codec (media/opus.py, ADR-0032) is opuslib (in the webrtc extra) +
+      # the SYSTEM libopus shared library, which opuslib dlopen's at runtime. Install
+      # libopus0 explicitly — do NOT assume the runner ships it (rule 23) — or the
+      # Opus suites (test_media_opus / test_media_engine_opus) would fail to import.
+      - run: sudo apt-get update && sudo apt-get install -y libopus0
       - run: uv sync --frozen --extra webrtc
-      # Prove all three WebRTC building-block libraries load and their modules
-      # are importable: WSS transport (PR-A), DTLS keying (PR-C), ICE (PR-D).
+      # Prove all four WebRTC building-block libraries load and their modules are
+      # importable: WSS transport (PR-A), DTLS keying (PR-C), ICE (PR-D), Opus codec.
       - run: uv run python -c "import websockets; from hermes_voip.transport.ws_connection import WssSipTransport; print('webrtc/wss websockets', websockets.__version__)"
       - run: uv run python -c "import OpenSSL; print('webrtc/dtls pyopenssl', OpenSSL.__version__)"
       - run: uv run python -c "import aioice; from hermes_voip.media.ice import IceConnection, IceCandidate, IceSelectedPair; print('webrtc/ice aioice', aioice.__version__)"
+      - run: uv run python -c "import opuslib, ctypes.util; from hermes_voip.media.opus import OpusEncoder, OpusDecoder; assert ctypes.util.find_library('opus'); print('webrtc/opus libopus loaded')"
       - run: uv run pytest -rs

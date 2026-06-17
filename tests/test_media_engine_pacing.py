@@ -105,7 +105,7 @@ def _install(
     time is modelled.
     """
     harness_recorder = _Recorder(harness)
-    engine._transport = harness_recorder  # type: ignore[assignment]  # recorder satisfies sendto/close/is_closing
+    engine._transport = harness_recorder  # recorder satisfies the _DatagramSink seam
     real_encode = engine._encode
     counter = {"i": 0}
 

@@ -17,9 +17,14 @@ What is built and working today:
 
 - **SIP-over-TLS** registration (single or multiple extensions), inbound INVITE handling,
   and operator-placed outbound calls (RFC 3261 / 3550 / 4566).
-- **Codec negotiation, best-available:** **G.722** 16 kHz wideband is offered first, with
-  **G.711** (PCMU/PCMA) as the universal fallback; the STT/TTS sample rate follows the
-  negotiated codec (ADR-0022).
+- **Codec negotiation, best-available:** on SIP-over-TLS, **G.722** 16 kHz wideband is
+  offered first with **G.711** (PCMU/PCMA) as the universal fallback; on **WebRTC**,
+  **Opus** 48 kHz is offered first with G.711 fallback. The STT/TTS sample rate follows the
+  negotiated codec (ADR-0022/0032).
+- **WebRTC media (inbound):** a WebRTC peer offering `UDP/TLS/RTP/SAVPF` is served as a
+  co-equal to SIP-over-TLS — **DTLS-SRTP** keying (RFC 5763/5764), **ICE** connectivity
+  (RFC 8445, host + STUN srflx; TURN deferred), **Opus** at 48 kHz, and SRTP media over the
+  ICE-selected pair (ADR-0032). Requires the `webrtc` extra + the system `libopus`.
 - **Cascaded media:** streaming STT → the Hermes agent → streaming TTS, with the agent as
   the reasoner (ADR-0003). Audio is telephony-native and emoji-safe (spoken text is
   sanitised before synthesis).
@@ -33,12 +38,15 @@ What is built and working today:
   visitor and open the entry — scoped, by construction, to ONLY that action
   (see [Intercom & DTMF](#intercom--dtmf)).
 
-> **Roadmap (not yet wired — do not rely on these):** WebRTC (SIP-over-WSS) media transport
-> and call-termination session signalling are in progress. The `wss` transport token and
-> the WebRTC building blocks (the `webrtc` extra) exist, but the live media path runs over
-> SIP-over-TLS today. Inbound DTMF receive + the spoof-resistant DTMF confirmation channel
-> (which would unblock call transfer) are deferred — see ADR-0031 §4. Track these in
-> [`docs/adr/`](docs/adr/).
+> **Roadmap (not yet wired — do not rely on these):** the WebRTC **media plane** (DTLS-SRTP
+> + ICE + Opus) is wired for **inbound** calls (ADR-0032), but **outbound** WebRTC
+> origination and SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`
+> driving registration/INVITE over the WSS transport) are still in progress — outbound and
+> registration run over SIP-over-TLS today. **TURN** relay and **trickle** ICE are deferred
+> (host + STUN srflx, non-trickle MVP); WebRTC **video** stays deferred (ADR-0018). Inbound
+> DTMF receive + the spoof-resistant DTMF confirmation channel (which would unblock call
+> transfer) are deferred — see ADR-0031 §4. Live WebRTC validation against a real client is
+> pending. Track these in [`docs/adr/`](docs/adr/).
 
 ## Install & run
 
@@ -56,7 +64,14 @@ The extras (declared in [`pyproject.toml`](pyproject.toml)):
 | `hermes`  | The `hermes-agent` runtime + `hermes` CLI that loads the plugin              |
 | `ml`      | `sherpa-onnx` STT/TTS, `onnxruntime` (VAD + injection guard), `tokenizers`   |
 | `media`   | `cryptography` for SDES-SRTP media encryption (ADR-0013)                     |
-| `webrtc`  | WebRTC building blocks (`aioice`, `pyopenssl`, `websockets`) — roadmap        |
+| `webrtc`  | WebRTC media plane: `aioice` (ICE), `pyopenssl` (DTLS-SRTP), `opuslib` (Opus, needs the system `libopus`), `websockets` (WSS, roadmap) — ADR-0016/0032 |
+
+> **System dependency for WebRTC/Opus:** the `webrtc` extra's Opus codec is `opuslib`, a
+> pure-Python ctypes wrapper that loads the **system `libopus` shared library** at runtime
+> (it bundles no native code). Install it via the OS package manager — e.g.
+> `apt-get install -y libopus0` (the devcontainer image ships it). Without `libopus`, a
+> WebRTC/Opus call fails with a clear `ImportError`; SIP-over-TLS (G.711/G.722) is
+> unaffected.
 
 Then enable the plugin and bring the gateway up — it registers from the `HERMES_SIP_*` /
 `HERMES_VOIP_*` environment:
@@ -167,7 +182,11 @@ not yet wired; selecting one fails fast at provider build.)
 Other media knobs (all optional, with safe defaults): `HERMES_VOIP_GREETING` (opening line;
 empty disables it), `HERMES_VOIP_RTP_SYMMETRIC` (NAT comedia latching, on by default),
 `HERMES_VOIP_VAD_THRESHOLD`, `HERMES_VOIP_ENDPOINT_SILENCE_MS`, and the `HERMES_SIP_DTMF_*`
-DTMF-receive settings. See [`config.py`](src/hermes_voip/config.py) for the full surface.
+DTMF-receive settings. **WebRTC (ADR-0032):** `HERMES_VOIP_ICE_STUN_URLS` is a
+comma-separated list of `stun:` URLs for server-reflexive ICE candidates (e.g.
+`stun:stun.example.test:3478`); empty (the default) is **host-only** ICE (works on a LAN /
+where the peer reaches our host candidates directly). TURN relay is deferred, so its
+reserved keys are unused. See [`config.py`](src/hermes_voip/config.py) for the full surface.
 
 ### Caller groups (trust tiers)
 

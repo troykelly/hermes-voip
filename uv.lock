@@ -549,6 +549,7 @@ ml = [
 ]
 webrtc = [
     { name = "aioice" },
+    { name = "opuslib" },
     { name = "pyopenssl" },
     { name = "websockets" },
 ]
@@ -572,6 +573,7 @@ requires-dist = [
     { name = "hermes-agent", marker = "extra == 'hermes'", specifier = "==0.16.0" },
     { name = "numpy", marker = "extra == 'ml'", specifier = "==2.4.6" },
     { name = "onnxruntime", marker = "extra == 'ml'", specifier = "==1.24.4" },
+    { name = "opuslib", marker = "extra == 'webrtc'", specifier = "==3.0.1" },
     { name = "pyopenssl", marker = "extra == 'webrtc'", specifier = "==26.2.0" },
     { name = "sherpa-onnx", marker = "extra == 'ml'", specifier = "==1.13.2" },
     { name = "tokenizers", marker = "extra == 'ml'", specifier = "==0.23.1" },
@@ -1149,6 +1151,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/55/13/17e87641b89b74552
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/30/844dc675ee6902579b8eef01ed23917cc9319a1c9c0c14ec6e39340c96d0/openai-2.24.0-py3-none-any.whl", hash = "sha256:fed30480d7d6c884303287bde864980a4b137b60553ffbcf9ab4a233b7a73d94", size = 1120122, upload-time = "2026-02-24T20:02:05.669Z" },
 ]
+
+[[package]]
+name = "opuslib"
+version = "3.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/55/826befabb29fd3902bad6d6d7308790894c7ad4d73f051728a0c53d37cd7/opuslib-3.0.1.tar.gz", hash = "sha256:2cb045e5b03e7fc50dfefe431e3404dddddbd8f5961c10c51e32dfb69a044c97", size = 8550, upload-time = "2018-01-16T06:04:42.184Z" }
 
 [[package]]
 name = "packageurl-python"

@@ -56,7 +56,7 @@ class _SendRecorder:
 def _capture_sends(engine: RtpMediaTransport) -> Iterator[_SendRecorder]:
     real = engine._transport
     recorder = _SendRecorder()
-    engine._transport = recorder  # type: ignore[assignment]  # narrow stand-in is sufficient for sendto/close
+    engine._transport = recorder  # _SendRecorder satisfies the _DatagramSink seam
     try:
         yield recorder
     finally:

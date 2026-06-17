@@ -56,11 +56,19 @@ def test_unknown_encoding_raises_unsupported_codec() -> None:
         codec_for_encoding("G729", _G711_RATE)
 
 
-def test_opus_raises_unsupported_codec() -> None:
-    # Opus is out of scope for the current G.711-only engine; advertising it would
-    # be a capability lie. It must RAISE.
+def test_opus_48000_maps_to_engine_opus() -> None:
+    # Opus is now carriable on the WebRTC path (ADR-0032): the engine has Codec.OPUS
+    # at the 48 kHz rtpmap clock (RFC 7587). It is advertised ONLY on the WebRTC menu
+    # (_WEBRTC_SUPPORTED_ENCODINGS), and only because the engine can carry it.
+    assert codec_for_encoding("opus", 48000) is Codec.OPUS
+    assert codec_for_encoding("OPUS", 48000) is Codec.OPUS
+
+
+def test_opus_wrong_rate_raises_unsupported_codec() -> None:
+    # The mapping stays rate-aware: Opus is 48 kHz on the wire (RFC 7587), so an
+    # 8 kHz "opus" rtpmap is not the engine's Opus and must RAISE (no silent default).
     with pytest.raises(UnsupportedCodecError):
-        codec_for_encoding("opus", 48000)
+        codec_for_encoding("opus", 8000)
 
 
 def test_correct_name_wrong_rate_raises() -> None:

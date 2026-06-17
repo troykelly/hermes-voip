@@ -288,6 +288,11 @@ async def _noop(text: str) -> None:
     _ = text  # unused; intentional stub
 
 
+async def _one_chunk(text: str) -> AsyncIterator[str]:
+    """A single-chunk agent-text iterator for speak()."""
+    yield text
+
+
 # ---------------------------------------------------------------------------
 # (a) Finalised turn → exactly ONE deliver_turn with the transcript text
 # ---------------------------------------------------------------------------
@@ -900,6 +905,165 @@ async def test_comfort_filler_cancelled_by_barge_in() -> None:
 
     transport.close_inbound()
     await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_stands_down_once_agent_commits_a_reply() -> None:
+    """Once the agent commits a reply (speak() called), a PENDING filler stands down.
+
+    The filler covers the caller-finish→reply *processing* gap (STT/LLM think time).
+    The agent calls speak() before the delay elapses — even though its TTS first-audio
+    is latent (no reply frame yet) — and the pending filler must NOT fire: the agent
+    has the floor and the reply is imminent (ADR-0030 §"when the filler stands down").
+    Were the filler to fire here it would race the imminent reply and contend on the
+    single playout lock the reply already holds through its TTS latency.
+    """
+    reply_frame = PcmFrame(
+        samples=b"\x30\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+
+    # A TTS whose stream withholds its first frame until the test releases a gate,
+    # modelling TTS first-audio latency (the reply is committed but not yet audible).
+    audio_gate = asyncio.Event()
+
+    class _LatentStream(_FakeTtsStream):
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            await audio_gate.wait()
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
+    class _LatentReplyTTS(_FakeTTS):
+        """Reply stream is latent (gated); a filler stream (if any) is immediate."""
+
+        def __init__(
+            self, reply_frames: list[PcmFrame], filler_frames: list[PcmFrame]
+        ) -> None:
+            super().__init__(filler_frames)
+            self._reply_frames = reply_frames
+            self._first = True
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            # The FIRST synthesize() call is the agent reply (latent); any SECOND
+            # would be a (wrongly-fired) comfort filler.
+            if self._first:
+                self._first = False
+                stream: _FakeTtsStream = _LatentStream(self._reply_frames)
+            else:
+                stream = _FakeTtsStream(self._frames)
+            self.last_stream = stream
+            return stream
+
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _LatentReplyTTS([reply_frame], [filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "filler did not schedule"
+
+    # The agent commits a reply (speak()) before the delay elapses; it parks on the
+    # latent stream (TTS first-audio latency) holding the playout lock.
+    speak_task = asyncio.create_task(loop.speak(_one_chunk("the answer")))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], "reply audio should still be latent"
+
+    # The delay elapses — but the agent has already committed a reply, so the filler
+    # stands down (no filler audio, no second synthesize()).
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "the filler fired after the agent committed a reply"
+    )
+
+    # The reply audio finally arrives; only the reply is heard, never a filler.
+    audio_gate.set()
+    await speak_task
+    assert transport.sent_audio == [reply_frame]
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None:
+    """A filler still PLAYING when the call ends is cancelled — no leaked task.
+
+    The filler parks mid-playout on a blocking send_audio; the inbound stream then
+    ends (call teardown). run() must cancel the in-flight filler task so it does not
+    outlive the call. After run() returns, the filler task is done (cancelled).
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _BlockingHoldOpenTransport(_HoldOpenTransport):
+        """Holds the inbound open AND blocks the first send_audio on a gate."""
+
+        def __init__(self, frames: list[PcmFrame]) -> None:
+            super().__init__(frames)
+            self.first_send_gate = asyncio.Event()
+
+        async def send_audio(self, frame: PcmFrame) -> None:
+            if not self.sent_audio:
+                await self.first_send_gate.wait()
+            self.sent_audio.append(frame)
+
+    sleep = _GatedSleep()
+    transport = _BlockingHoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame, filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    # Release the delay; the filler fires and parks inside _play on the send gate.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # White-box assertion: the filler task handle is kept for the task's whole life
+    # (including playout) so teardown can cancel it — that is the no-leak contract.
+    filler_task = loop._comfort_filler_task
+    assert filler_task is not None, "the filler task should be live (mid-playout)"
+    assert not filler_task.done()
+
+    # End the call while the filler is still parked mid-playout.
+    transport.close_inbound()
+    # Unblock the parked send so the cancelled _play can unwind cleanly.
+    transport.first_send_gate.set()
+    await run_task
+
+    # run()'s teardown must have cancelled the in-flight filler — no leak.
+    assert filler_task.done(), "filler task leaked past the call (not cancelled)"
 
 
 @pytest.mark.asyncio

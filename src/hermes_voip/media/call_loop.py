@@ -571,13 +571,23 @@ class CallLoop:
         self._comfort_filler_phrases = comfort_filler_phrases
         self._sleep = sleep
         # The single in-flight comfort-filler task for the current turn gap, or None
-        # when no gap is pending. ``speak``/``barge_in`` cancel it the instant the
-        # real reply or a barge-in arrives; ``run`` cancels any lingering one at
-        # teardown so the task never leaks. Touched only from the event loop.
+        # when no gap is pending. ``barge_in`` cancels it; ``run`` cancels any
+        # lingering one at teardown so the task never leaks even mid-playout. The
+        # done-callback nulls it on completion. Touched only from the event loop.
         self._comfort_filler_task: asyncio.Task[None] | None = None
         # Round-robin index into ``_comfort_filler_phrases`` so a multi-gap call does
         # not repeat the same filler word every time. Touched only from the loop.
         self._comfort_filler_index = 0
+        # Latched per gap: True once the agent's REAL reply AUDIO (not the filler's
+        # own audio) has begun on the wire during the current gap. The filler
+        # consults this AFTER its delay so it never fires once reply audio has
+        # started — even if that audio already started AND finished within the delay
+        # window (a transient ``_tts_audio_active`` would miss the latter). The gap
+        # is the caller-finish→first-reply-AUDIO window, so it is keyed on audio, NOT
+        # on the reply TEXT arriving (speak() being called): the TTS first-audio
+        # latency is itself dead air the filler must still cover. Reset when a new
+        # gap is armed. Touched only from the event loop.
+        self._gap_reply_audio_started = False
 
     async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
         """Run the duplex loop until the transport's inbound stream ends.
@@ -891,26 +901,36 @@ class CallLoop:
                 moment). Not called if the stream is cancelled before any frame
                 is sent.
         """
-        # The real reply is starting: cancel any pending dead-air comfort filler
-        # (ADR-0030) so it never collides with the agent's opening word. A filler
-        # already PLAYING is superseded by the stream-supersede below (its stream is
-        # cancelled like any in-flight stream); a filler still PENDING on its delay
-        # is cancelled here before it can fire.
+        # The agent is committing to a reply: the comfort filler covers the
+        # caller-finish→reply *processing* gap (STT/LLM think time — the operator's
+        # "while STT/LLM are processing"), and stands down the moment the agent has a
+        # reply to speak (ADR-0030 §"when the filler stands down"). So:
+        #  * cancel a PENDING (not-yet-fired) filler — the agent has the floor now, do
+        #    not start a filler that would race the imminent reply (and, because the
+        #    reply's _play below holds the single playout lock through its own TTS
+        #    first-audio latency, a filler could not cleanly interleave anyway);
+        #  * a filler already PLAYING is superseded by the stream-supersede inside
+        #    _speak_text (its stream is cancelled like any in-flight stream).
+        # The first reply frame also latches `_gap_reply_audio_started` (below) so a
+        # filler that fired-and-finished within the delay is not re-armed for the gap.
         self._cancel_comfort_filler()
-        await self._speak_text(text, on_first_frame=on_first_frame)
+        await self._speak_text(text, on_first_frame=on_first_frame, is_filler=False)
 
     async def _speak_text(
         self,
         text: AsyncIterator[str],
         *,
         on_first_frame: Callable[[], None] | None,
+        is_filler: bool = False,
     ) -> None:
         """Synthesise *text* and play it, superseding any in-flight stream.
 
         The shared body of :meth:`speak` and the comfort filler: it does NOT touch
         the comfort-filler task (so the filler can call it without cancelling
-        itself), only the stream-supersede + playout. :meth:`speak` wraps this with
-        the filler-cancel; the filler calls it directly.
+        itself), only the stream-supersede + playout. ``is_filler`` distinguishes the
+        filler's own playout from a real reply: a real reply's first frame latches
+        ``_gap_reply_audio_started`` (so a pending filler is suppressed), the filler's
+        does not (the filler is not the reply it is covering for).
         """
         # Sanitize each text chunk before TTS synthesis so that emoji,
         # markdown markup, and raw URLs are never voiced by the TTS engine.
@@ -929,7 +949,7 @@ class CallLoop:
         self._active_tts_stream = stream
         if previous is not None and previous is not stream:
             await previous.cancel()
-        await self._play(stream, on_first_frame=on_first_frame)
+        await self._play(stream, on_first_frame=on_first_frame, is_filler=is_filler)
 
     def _schedule_comfort_filler(self) -> None:
         """Arm a one-shot dead-air comfort filler for the turn just delivered.
@@ -944,6 +964,8 @@ class CallLoop:
             return
         # A new turn supersedes any still-pending prior gap.
         self._cancel_comfort_filler()
+        # A fresh gap: the agent's reply audio for THIS turn has not started yet.
+        self._gap_reply_audio_started = False
         task = asyncio.create_task(self._comfort_gap())
         # The task is fire-and-forget (it runs concurrently with the agent turn and
         # is never awaited), so attach a done-callback to RETRIEVE its result: a
@@ -959,12 +981,18 @@ class CallLoop:
     def _on_comfort_filler_done(self, task: asyncio.Task[None]) -> None:
         """Retrieve a finished filler task's result; log a real failure, ignore cancel.
 
-        A comfort filler is best-effort: a synthesis/send failure is logged at
-        warning and deliberately does not propagate (a failed filler must not kill an
-        otherwise-working call), while a cancellation (the normal reply/barge-in/
-        teardown stop) is expected and ignored. This is a logged, intentional
-        degradation — not a swallowed error.
+        Also clears ``_comfort_filler_task`` when this is the current handle, so a
+        naturally-completed filler leaves no stale handle. A comfort filler is
+        best-effort: a synthesis/send failure is logged at warning and deliberately
+        does not propagate (a failed filler must not kill an otherwise-working call),
+        while a cancellation (the normal reply-supersede / barge-in / teardown stop)
+        is expected and ignored. This is a logged, intentional degradation — not a
+        swallowed error.
         """
+        # Clear our handle on completion (only if it is still us — a newer gap may
+        # have already replaced it), so a finished filler is not later cancelled.
+        if self._comfort_filler_task is task:
+            self._comfort_filler_task = None
         if task.cancelled():
             return
         exc = task.exception()
@@ -972,12 +1000,15 @@ class CallLoop:
             _log.warning("comfort filler task failed (call continues): %r", exc)
 
     def _cancel_comfort_filler(self) -> None:
-        """Cancel and forget the pending comfort-filler task, if any.
+        """Cancel and forget the comfort-filler task, if any (pending OR playing).
 
-        Idempotent and safe to call from the event loop. The filler task nulls its
-        own handle the instant it commits to firing, so this never cancels a filler
-        that is already mid-playout (that case is handled by the stream supersede in
-        :meth:`_speak_text` / the flush in :meth:`barge_in`).
+        Idempotent and safe to call from the event loop. Called by :meth:`speak` (the
+        agent has a reply — stand down), :meth:`barge_in` (the caller is taking the
+        floor), and :meth:`run`'s teardown (no leaked task, even one mid-playout).
+        Cancelling a PLAYING filler is harmless: its ``_play`` unwinds via
+        ``aclosing`` and the cancel is ignored by the done-callback. A real reply
+        arriving while the filler plays *also* supersedes the filler stream in
+        :meth:`_speak_text`; the cancel here is the same intent via the task.
         """
         task = self._comfort_filler_task
         if task is not None:
@@ -1001,20 +1032,19 @@ class CallLoop:
         (ADR-0027), echo-gate-arming and flushable (ADR-0023/0028) like any agent
         audio — then returns. Fires at most once: the task ends after one filler.
 
-        Cancellation (a real reply via :meth:`speak`, or a barge-in) raises
-        ``CancelledError`` here, which propagates to end the task without firing —
-        never swallowed (rule 37).
+        A barge-in cancels this task (raising ``CancelledError`` here), which
+        propagates to end it without firing — never swallowed (rule 37). The task
+        keeps its ``_comfort_filler_task`` handle for its whole life (including
+        playout) so ``run``'s teardown can cancel it even mid-stream (no leak); the
+        done-callback clears the handle on completion.
         """
         await self._sleep(self._comfort_filler_delay_s)
-        # Commit to firing: drop our own handle FIRST so a reply's speak() that
-        # arrives while we synthesise supersedes the filler STREAM (in _speak_text)
-        # rather than trying to cancel this already-running task.
-        self._comfort_filler_task = None
-        # Guard: if the reply audio already started in the meantime, do not fire (no
-        # collision with the agent's opening word). On a single event loop a reply's
-        # speak() would already have cancelled this task during the sleep; this is
-        # the belt-and-braces check for the moment after the sleep returns.
-        if self._tts_audio_active:
+        # Suppress the filler iff the agent's REAL reply AUDIO has begun during this
+        # gap (the latch), NOT merely if speak() was called: the TTS first-audio
+        # latency after speak() is itself dead air the filler must still cover. The
+        # latch also catches a reply that started AND finished within the delay (a
+        # transient `_tts_audio_active` would already be back to False by now).
+        if self._gap_reply_audio_started:
             return
         phrase = self._next_comfort_phrase()
         _log.info("comfort filler: emitting %r on dead air", phrase)
@@ -1022,13 +1052,17 @@ class CallLoop:
         async def _single_chunk() -> AsyncIterator[str]:
             yield phrase
 
-        await self._speak_text(_single_chunk(), on_first_frame=None)
+        # Play as the filler (is_filler=True): its own audio must not latch the
+        # reply-started flag. A real reply arriving mid-filler supersedes this
+        # stream via _speak_text's stream-supersede; this task then completes.
+        await self._speak_text(_single_chunk(), on_first_frame=None, is_filler=True)
 
     async def _play(
         self,
         stream: TtsStream,
         *,
         on_first_frame: Callable[[], None] | None,
+        is_filler: bool = False,
     ) -> None:
         """Drain one ``TtsStream`` to ``send_audio`` under the playout lock.
 
@@ -1037,6 +1071,10 @@ class CallLoop:
         prior ``_play`` exits its loop promptly and releases the lock to this
         one. ``on_first_frame`` fires once, right after the first frame is
         actually sent (so a cancelled-before-any-frame stream never logs it).
+        ``is_filler`` marks the dead-air comfort filler's own playout (ADR-0030):
+        when False (a real reply, the greeting, or the tone) the first frame
+        latches ``_gap_reply_audio_started`` so a pending filler is suppressed;
+        the filler's own audio must not latch it (it is not the reply).
 
         The iteration runs under ``contextlib.aclosing`` so the stream is closed
         on EVERY exit path — normal end, barge-in, cancellation, OR a fatal error
@@ -1070,6 +1108,14 @@ class CallLoop:
                         # Set BEFORE on_first_frame so the pump sees it as soon as
                         # the frame is sent.
                         self._tts_audio_active = True
+                        # Dead-air filler suppression (ADR-0030): a REAL reply's first
+                        # frame latches the per-gap flag so a still-pending filler
+                        # does not fire after the reply audio has begun — even if this
+                        # reply finishes within the filler's remaining delay (a
+                        # transient `_tts_audio_active` would miss that). The filler's
+                        # own playout (is_filler) must not latch it.
+                        if not is_filler:
+                            self._gap_reply_audio_started = True
                         if first_frame_pending and on_first_frame is not None:
                             on_first_frame()
                             first_frame_pending = False

@@ -6,6 +6,8 @@ environment is read here. Fakes only (host ``pbx.example.test``, ext ``1000``).
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from hermes_voip.config import (
@@ -562,6 +564,25 @@ def test_media_comfort_filler_bad_boolean_rejected() -> None:
     """An unrecognised boolean spelling for the master switch is rejected."""
     with pytest.raises(ConfigError):
         load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER": "maybe"})
+
+
+def test_mediaconfig_direct_blank_comfort_phrase_rejected() -> None:
+    """A directly-constructed MediaConfig with a blank phrase fails fast (post-init).
+
+    The env parser normalises a blank `|`-list to the default set, but a caller that
+    constructs MediaConfig directly must not be able to smuggle in a blank phrase —
+    a filler with nothing to say is a silent no-op. ``__post_init__`` rejects it.
+    """
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="comfort_filler_phrases"):
+        dataclasses.replace(base, comfort_filler_phrases=("Hmm,", "   "))
+
+
+def test_mediaconfig_direct_empty_comfort_phrases_rejected() -> None:
+    """A directly-constructed MediaConfig with an empty phrase tuple fails fast."""
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="comfort_filler_phrases"):
+        dataclasses.replace(base, comfort_filler_phrases=())
 
 
 def test_media_barge_in_mode_lowercased_and_validated() -> None:

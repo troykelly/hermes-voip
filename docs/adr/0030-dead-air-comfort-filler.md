@@ -55,21 +55,39 @@ turn is being delivered, `_screen_and_deliver` launches a single one-shot **fill
 
 The task fills the gap **at most once** and then returns; a still-pending turn does not loop.
 
-**How the real reply / barge-in cancel it (no race).** `speak()` already *supersedes* the
-active stream (cancels `_active_tts_stream`, then takes the lock) and `barge_in()` already
-cancels + flushes it (ADR-0028). Both now *additionally* cancel the pending filler task and set
-a per-gap "reply started / barged" flag:
+**When the filler stands down (no race).** The filler covers the caller-finish→reply
+*processing* gap — STT/LLM think time, the operator's "while STT/LLM are processing" — and
+stands down the instant the agent has a reply to speak:
 
-- A real reply arriving **during the filler's delay wait** sets the flag and cancels the task, so
-  the post-sleep check sees the flag and the filler never starts (no collision with the agent's
-  opening word).
+- A real reply arriving **during the filler's delay wait** (the common case: the LLM finished
+  before the threshold) cancels the pending filler in `speak()`, so it never starts. The agent
+  has the floor and the reply is imminent.
 - A real reply arriving **while the filler is playing** supersedes it via the existing
-  `speak()` cancel-previous logic — the filler stops yielding and the reply plays.
+  `speak()`/`_speak_text` cancel-previous-stream logic *and* the `speak()` filler-cancel — the
+  filler stops yielding and the reply plays under the single playout lock.
 - A barge-in **during the gap** cancels the pending filler (nothing queued to flush if it never
   started) and, if the filler is already playing, flushes it through the ADR-0028 fade path.
+- `run()`'s teardown cancels any lingering filler task on every exit path — including one
+  **mid-playout** (its task handle is kept for its whole life, not dropped when it fires) — so a
+  filler can never outlive the call.
 
-Because the filler routes through `speak()`/`_play`/`barge_in()`, *flushability and echo-gate
+A per-gap **latch** (`_gap_reply_audio_started`, set by the first *real* reply frame in `_play`,
+reset when a new gap is armed) backs this up: the filler's post-delay check skips firing if reply
+audio has begun during the gap, covering even a reply that started *and finished* within the
+delay window (where the transient `_tts_audio_active` would already be back to false). Suppression
+is keyed on reply **audio** for the completed-reply case, and on the `speak()` commit for the
+pending case.
+
+Because the filler routes through `_speak_text`/`_play`/`barge_in()`, *flushability and echo-gate
 arming are inherited, not re-implemented*.
+
+**Deliberate non-goal: filling TTS first-audio latency after a *fast* LLM.** Once the agent calls
+`speak()`, the reply's `_play` holds the single playout lock through its own TTS first-audio
+latency (~300–450 ms in practice; below the 900 ms default). The filler therefore covers the
+think-time gap and **stands down at the `speak()` commit**, rather than playing a filler that
+would race the imminent reply and contend on the lock. Covering that sub-second post-commit
+latency would require restructuring the playout-lock model (a real risk to the echo-gate /
+barge-in invariants) for marginal benefit, so it is explicitly out of scope.
 
 **Model-aware, clean text (ADR-0027).** The filler text is synthesised through
 `self._tts.synthesize(...)`, so the per-segment `strip_audio_tags` in `tts/_stream.py` already

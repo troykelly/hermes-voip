@@ -306,3 +306,47 @@ async def test_pacing_across_separate_send_audio_calls_holds_the_schedule(
             f"cross-call gap {i} = {gap:.3f} ms drifted from {_PTIME_MS} ms - the "
             f"pacing schedule reset at a send_audio boundary"
         )
+
+
+@pytest.mark.asyncio
+async def test_pacing_reanchors_after_idle_gap_no_packet_burst(
+    harness: _PacingHarness,
+) -> None:
+    """After an idle gap between utterances the next burst is paced, not dumped.
+
+    Cross-vendor review (codex) High finding: a fixed deadline grid that only ever
+    advances by one ptime per frame goes STALE across a real pause between TTS
+    chunks/utterances. When the next multi-frame chunk arrives, the deadline is far
+    in the past, so ``wait <= 0`` for many frames and they are sent BACK-TO-BACK
+    until the stale schedule catches up — a packet burst (worse jitter than the
+    original defect). Repro: one frame, a 1 s idle gap, then a 3-frame burst.
+
+    The pacer must RE-ANCHOR when the deadline is meaningfully stale (more than a
+    ptime in the past): the first frame after the gap sends at ``now`` and the rest
+    of the burst paces a steady 20 ms from there. Without the re-anchor the burst's
+    gaps are ``[~0, ~0]`` (this test's RED); with it they are ``[20, 20]``.
+    """
+    engine = _new_engine(harness, Codec.G722, sample_rate=_G722_SAMPLE_RATE)
+    await engine.connect()
+    # No modelled encode cost here: isolate the idle-gap behaviour from encode jitter
+    # so the assertion is unambiguous.
+    _install(engine, harness, cost_ms=(0.0,))
+
+    # First utterance: a single frame establishes the schedule.
+    await engine.send_audio(_g722_frame(1))
+    # A real silence between utterances/chunks — far longer than one ptime.
+    harness.charge(1.0)
+    # Next utterance arrives as a 3-frame burst in one send_audio call.
+    sends_before = len(harness.send_times)
+    await engine.send_audio(_g722_frame(3))
+    await engine.stop()
+
+    burst = harness.send_times[sends_before:]
+    assert len(burst) == 3, f"expected the 3-frame burst, got {len(burst)} sends"
+    burst_gaps = [(burst[i] - burst[i - 1]) * 1000.0 for i in range(1, len(burst))]
+    for i, gap in enumerate(burst_gaps):
+        assert gap == pytest.approx(_PTIME_MS, abs=0.05), (
+            f"post-idle-gap burst gap {i} = {gap:.3f} ms — frames were dumped "
+            f"back-to-back ({burst_gaps}) instead of paced at {_PTIME_MS} ms; the "
+            f"stale deadline was not re-anchored after the idle gap"
+        )

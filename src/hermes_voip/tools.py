@@ -58,11 +58,22 @@ TOOL_RISKS: dict[str, ToolRisk] = {
     "transfer_blind": ToolRisk.IRREVERSIBLE,
     "transfer_attended": ToolRisk.IRREVERSIBLE,
     "list_registrations": ToolRisk.ELEVATED,
+    # ``place_call`` is IRREVERSIBLE (ADR-0029): the agent dials a real outbound
+    # call. Operator-only (level 3) + non-degraded, exactly the transfer posture.
+    # Its spoof-resistant safeguard is the static HERMES_VOIP_OUTBOUND_ALLOW
+    # allowlist (the dial chokepoint refuses any unlisted target), which stands in
+    # for the ADR-0010 DTMF confirmation the gate would otherwise require — see
+    # ADR-0029 and ``voip_pre_tool_call``.
+    "place_call": ToolRisk.IRREVERSIBLE,
     # ``hang_up`` is SAFE (ADR-0026): ending the call mutates no external state and
     # is something even a level-0 receptionist is told it may do ("end the call
     # politely"). SAFE always runs, so the agent can conclude ANY caller's
     # conversation regardless of privilege or a degraded session — never gated.
     "hang_up": ToolRisk.SAFE,
+    # ``report_call_result`` is SAFE (ADR-0029): the call agent records the outcome
+    # of its OWN call (in-memory, for cross-session reporting); no external state is
+    # mutated, so any call may record its result.
+    "report_call_result": ToolRisk.SAFE,
 }
 
 

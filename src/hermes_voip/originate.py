@@ -16,6 +16,7 @@ from hermes_voip.sdp import CryptoAttribute
 
 __all__ = [
     "OutboundCallFailed",
+    "OutboundCallNotAllowed",
     "build_outbound_invite",
     "build_srtp_crypto_attrs",
 ]
@@ -42,6 +43,28 @@ class OutboundCallFailed(Exception):  # noqa: N818 — "Failed" suffix is intent
         self.status = status
         self.reason = reason
         super().__init__(f"{status} {reason}")
+
+
+class OutboundCallNotAllowed(Exception):  # noqa: N818 — a policy refusal (the dial target is not allowlisted), not a programming error; ADR-0029 public API
+    """The requested dial target is not on the outbound allowlist (ADR-0029).
+
+    Raised by the dial chokepoint (``VoipAdapter.place_call_with_objective``) BEFORE
+    any INVITE is sent, so an unlisted target is never dialled. The hard gate on the
+    agent ``place_call`` tool: ``HERMES_VOIP_OUTBOUND_ALLOW`` is empty by default, so
+    the feature is inert until the operator opts numbers in.
+
+    Attributes:
+        number: The rejected dial target (never logged with surrounding PII; an
+            extension or SIP URI the agent requested).
+    """
+
+    def __init__(self, number: str) -> None:
+        """Initialise with the rejected dial target."""
+        self.number = number
+        super().__init__(
+            f"outbound call to {number!r} is not permitted "
+            "(not on HERMES_VOIP_OUTBOUND_ALLOW)"
+        )
 
 
 def build_srtp_crypto_attrs() -> tuple[CryptoAttribute, CryptoAttribute]:

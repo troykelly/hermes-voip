@@ -58,6 +58,8 @@ class _FakeHost:
         self.held: list[str] = []
         self.resumed: list[str] = []
         self.listed: int = 0
+        self.placed: list[tuple[str, str]] = []
+        self.results: list[tuple[str, str]] = []
 
     def guard_state_for(self, call_id: str) -> GuardSessionState | None:
         return self._guard if self.known else None
@@ -77,6 +79,17 @@ class _FakeHost:
     def list_registrations_text(self) -> str:
         self.listed += 1
         return self._registrations
+
+    async def place_call_with_objective(self, number: str, objective: str) -> str:
+        # ADR-0029 VoipToolHost member (unused by this module's tests; satisfies the
+        # protocol so set_active_adapter type-checks).
+        self.placed.append((number, objective))
+        return "call-out"
+
+    def record_call_result(self, call_id: str, summary: str) -> bool:
+        # ADR-0029 VoipToolHost member (unused by this module's tests).
+        self.results.append((call_id, summary))
+        return self.known and not self.already_ended
 
 
 @pytest.fixture(autouse=True)

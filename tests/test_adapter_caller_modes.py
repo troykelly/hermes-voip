@@ -41,7 +41,7 @@ from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
 
     from hermes_voip.adapter import VoipAdapter
     from hermes_voip.providers.audio import PcmFrame
@@ -581,7 +581,7 @@ async def test_deliver_turn_uses_assistant_preamble_for_allow() -> None:
 # --- ADR-0029: per-call objective brief in the outbound turn + first turn -----
 
 
-async def _collect_events(captured: list[object]) -> None:
+async def _collect_events(captured: Sequence[object]) -> None:
     """Yield to the loop until handle_message's background task captures an event."""
     for _ in range(50):
         if captured:
@@ -589,7 +589,9 @@ async def _collect_events(captured: list[object]) -> None:
         await asyncio.sleep(0.02)
 
 
-def _outbound_info(*, objective: str, origin: tuple[str, str] | None = None) -> dict:
+def _outbound_info(
+    *, objective: str, origin: tuple[str, str] | None = None
+) -> dict[str, object]:
     """An outbound _call_info dict (OUTBOUND group + objective, optional origin)."""
     from hermes_voip.caller_modes import CallerGroup  # noqa: PLC0415
 
@@ -759,7 +761,9 @@ async def test_call_end_reports_result_into_origin_session() -> None:
     assert origin_events, f"no event reached the origin session; got {captured!r}"
     origin = origin_events[0]
     assert getattr(origin, "internal", False) is True
-    assert origin.source.platform.value == "telegram"
+    origin_source = getattr(origin, "source", None)
+    assert origin_source is not None
+    assert getattr(origin_source.platform, "value", None) == "telegram"
     text = getattr(origin, "text", "")
     assert "Booked: table for two at 7pm under the operator's name." in text
     # It names the callee and reads as an outbound-call outcome (not caller speech).

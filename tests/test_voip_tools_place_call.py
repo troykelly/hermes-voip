@@ -65,6 +65,20 @@ class _FakeHost:
         self.results.append((call_id, summary))
         return True
 
+    # The remaining VoipToolHost members are unused by this module's tests; they
+    # satisfy the protocol so set_active_adapter(host) type-checks.
+    async def hang_up_call(self, call_id: str) -> bool:
+        return True
+
+    async def hold_call(self, call_id: str) -> bool:
+        return True
+
+    async def resume_call(self, call_id: str) -> bool:
+        return True
+
+    def list_registrations_text(self) -> str:
+        return ""
+
 
 @pytest.fixture(autouse=True)
 def _reset_active_adapter() -> object:

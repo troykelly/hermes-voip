@@ -612,3 +612,57 @@ def test_elevated_tools_are_not_registered_without_the_gate_hook() -> None:
     assert "hold_call" not in ctx.tool_calls
     assert "resume_call" not in ctx.tool_calls
     assert "list_registrations" not in ctx.tool_calls
+    # place_call is IRREVERSIBLE — also refused without the gate (would be ungated).
+    assert "place_call" not in ctx.tool_calls
+    # report_call_result is SAFE — it still registers (no privilege clamp needed).
+    assert "report_call_result" in ctx.tool_calls
+
+
+# ---------------------------------------------------------------------------
+# Agent-triggered outbound tools exposed through register(ctx) (ADR-0029)
+# ---------------------------------------------------------------------------
+
+
+def test_register_registers_the_outbound_tools() -> None:
+    """register(ctx) exposes place_call (IRREVERSIBLE) + report_call_result (SAFE).
+
+    These wire the agent-triggered outbound feature (ADR-0029) into the runtime: an
+    agent can place a call to accomplish an objective and the call agent can record
+    its outcome. Without this wiring the tools would be dark.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    names = {c["name"] for c in ctx.tool_calls}
+    for tool in ("place_call", "report_call_result"):
+        assert tool in names, f"the {tool!r} tool was not registered"
+
+
+def test_registered_outbound_tools_are_async_with_schemas() -> None:
+    """place_call / report_call_result are async and ship model-readable schemas.
+
+    place_call's schema declares the number + objective params (so the model knows
+    to supply both); report_call_result declares summary.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    place = next(c for c in ctx.tool_calls if c["name"] == "place_call")
+    assert place["is_async"] is True
+    place_schema = place["schema"]
+    assert isinstance(place_schema, dict)
+    place_params = place_schema["parameters"]
+    assert isinstance(place_params, dict)
+    place_props = place_params["properties"]
+    assert isinstance(place_props, dict)
+    assert "number" in place_props
+    assert "objective" in place_props
+
+    report = next(c for c in ctx.tool_calls if c["name"] == "report_call_result")
+    assert report["is_async"] is True
+    report_schema = report["schema"]
+    assert isinstance(report_schema, dict)
+    assert report_schema.get("name") == "report_call_result"
+    assert report_schema.get("description")

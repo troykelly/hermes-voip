@@ -79,6 +79,12 @@ class _FakeHost:
     def list_registrations_text(self) -> str:
         return ""
 
+    async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
+        return True
+
+    async def open_entry(self, call_id: str) -> bool:
+        return True
+
 
 @pytest.fixture(autouse=True)
 def _reset_active_adapter() -> object:

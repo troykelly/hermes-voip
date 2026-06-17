@@ -83,6 +83,12 @@ from hermes_voip.config import (
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.incall import LocalMediaSession
+from hermes_voip.intercom import (
+    IntercomConfig,
+    IntercomOpenMode,
+    IntercomRelayClient,
+    load_intercom_config,
+)
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.media.call_loop import BargeInMode, CallLoop
 from hermes_voip.media.endpoint import Endpointer
@@ -281,6 +287,12 @@ class VoipAdapter(BasePlatformAdapter):
         # legacy HERMES_VOIP_CALLER_{ALLOW,DENY,GREY}_FILE env vars are still
         # accepted (synthesised by load_caller_groups).
         self._caller_groups: CallerGroupConfig | None = None
+        # Intercom entry actuation (ADR-0031): how the intercom group opens a door.
+        # Parsed once from env in connect(); DISABLED until the operator configures a
+        # DTMF open code or a relay endpoint, so open_entry fails loud until then.
+        # The relay client (RELAY mode only) is built once in connect().
+        self._intercom_cfg: IntercomConfig | None = None
+        self._intercom_relay: IntercomRelayClient | None = None
         self._tls_ctx: ssl.SSLContext | None = None
         self._keepalive_interval: float = 30.0
         self._transport: SipOverTlsTransport | None = None
@@ -375,6 +387,16 @@ class VoipAdapter(BasePlatformAdapter):
         # Outbound dial allowlist (ADR-0029): EMPTY by default => the agent
         # ``place_call`` tool is inert until the operator opts numbers in.
         self._outbound_allow = load_outbound_allowlist(extra)
+        # Intercom entry actuation (ADR-0031): DISABLED by default => open_entry
+        # fails loud until the operator configures a DTMF open code or a relay
+        # endpoint. Build the relay client once when in RELAY mode.
+        intercom_cfg = load_intercom_config(extra)
+        self._intercom_cfg = intercom_cfg
+        self._intercom_relay = (
+            IntercomRelayClient(intercom_cfg)
+            if intercom_cfg.open_mode is IntercomOpenMode.RELAY
+            else None
+        )
         self._tls_ctx = _make_tls_context(gateway_cfg.host)
         self._keepalive_interval = float(
             extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
@@ -1759,6 +1781,59 @@ class VoipAdapter(BasePlatformAdapter):
         )
         await session.send_dtmf(digits)
         return True
+
+    async def open_entry(self, call_id: str) -> bool:
+        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the intercom
+        group's ``open_entry`` tool calls. Opens the entry via the configured
+        actuation path:
+
+        * **DTMF** — send the configured open code on the live call (via
+          :meth:`~hermes_voip.call.CallSession.send_dtmf`); or
+        * **RELAY** — call the external relay client.
+
+        Returns ``False`` (and does nothing) for an unknown/ended call so the tool
+        reports a clear, non-fatal outcome. The ``pre_tool_call`` gate has already
+        enforced the ELEVATED clamp and the intercom group's ``allowed_tools``
+        sub-ceiling before this runs.
+
+        Raises:
+            RuntimeError: when no actuation is configured (the default DISABLED
+                mode) — opening a door is never a silent no-op (rule 37); the tool
+                surfaces this as a clear error.
+            IntercomRelayError: when the relay call fails (RELAY mode) — the door
+                was NOT opened, and the failure is reported, never hidden.
+            ValueError: if the configured DTMF open code is invalid (DTMF mode).
+        """
+        cfg = self._intercom_cfg
+        if cfg is None or cfg.open_mode is IntercomOpenMode.DISABLED:
+            msg = (
+                "intercom entry actuation is not configured "
+                "(set HERMES_VOIP_INTERCOM_OPEN_MODE to 'dtmf' or 'relay'); "
+                "refusing to open the entry"
+            )
+            raise RuntimeError(msg)
+
+        if cfg.open_mode is IntercomOpenMode.RELAY:
+            relay = self._intercom_relay
+            if relay is None:  # built in connect() for RELAY mode
+                msg = "intercom relay client not initialised"
+                raise RuntimeError(msg)
+            _log.info("intercom open_entry (relay) for call %s", call_id)
+            # The relay opens the entry directly (it does not need the call). Still
+            # require a live call so a stale tool call cannot open the door.
+            session = self._call_sessions.get(call_id)
+            if session is None or session.ended:
+                return False
+            await relay.open()
+            return True
+
+        # DTMF mode: send the configured open code on the live call. send_dtmf_on_call
+        # already handles the unknown/ended-call (False) + not-negotiated (raise)
+        # cases and logs only the digit count (the open code is sensitive).
+        _log.info("intercom open_entry (dtmf) for call %s", call_id)
+        return await self.send_dtmf_on_call(call_id, cfg.dtmf_digits)
 
     def list_registrations_text(self) -> str:
         """Return a human-readable registration snapshot (ADR-0011/0020; ELEVATED).

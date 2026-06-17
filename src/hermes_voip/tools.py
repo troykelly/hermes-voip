@@ -65,6 +65,22 @@ TOOL_RISKS: dict[str, ToolRisk] = {
     # for the ADR-0010 DTMF confirmation the gate would otherwise require — see
     # ADR-0029 and ``voip_pre_tool_call``.
     "place_call": ToolRisk.IRREVERSIBLE,
+    # ``send_dtmf`` is ELEVATED (ADR-0031): the agent transmits in-call DTMF
+    # (RFC 4733 telephone-event) on the live call. Reversible (a digit is just a
+    # tone) but a mutating action a level-0 untrusted caller must not invoke — so it
+    # needs privilege, not confirmation. The privilege clamp blocks it for a
+    # receptionist/degraded session; a trusted (level >= 2) call gets it.
+    "send_dtmf": ToolRisk.ELEVATED,
+    # ``open_entry`` is ELEVATED (ADR-0031): it actuates the intercom entry
+    # (PHYSICAL access) — via DTMF on the live call or an external relay. ELEVATED,
+    # not IRREVERSIBLE: opening a door for an expected visitor is a reversible
+    # courtesy, not a payment/booking, and the intercom group runs at level 2 (it
+    # has no operator credentials). The least-privilege boundary for the intercom is
+    # the caller group's ``allowed_tools={open_entry}`` SUB-ceiling (ADR-0031 §1) —
+    # so even a spoofed caller-ID reaching the intercom group gets ONLY this action,
+    # never operator tools — combined with this ELEVATED clamp (a level-0 caller
+    # cannot open the door).
+    "open_entry": ToolRisk.ELEVATED,
     # ``hang_up`` is SAFE (ADR-0026): ending the call mutates no external state and
     # is something even a level-0 receptionist is told it may do ("end the call
     # politely"). SAFE always runs, so the agent can conclude ANY caller's

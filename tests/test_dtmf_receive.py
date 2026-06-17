@@ -86,17 +86,24 @@ def _digit_event_train(digit: str, *, start_seq: int, ts: int) -> list[bytes]:
     return packets
 
 
-def _make_engine(*, telephone_event_payload_type: int | None) -> RtpMediaTransport:
+def _make_engine(
+    *,
+    telephone_event_payload_type: int | None,
+    symmetric: bool = True,
+    remote_address: str = "127.0.0.1",
+    remote_port: int = 5004,
+) -> RtpMediaTransport:
     digits: list[str] = []
     engine = RtpMediaTransport(
         local_address="127.0.0.1",
         local_port=0,
-        remote_address="127.0.0.1",
-        remote_port=5004,
+        remote_address=remote_address,
+        remote_port=remote_port,
         codec=Codec.PCMU,
         payload_type=_AUDIO_PT,
         telephone_event_payload_type=telephone_event_payload_type,
         jitter_depth=1,
+        symmetric=symmetric,
         clock=_dummy_clock,
         on_dtmf=digits.append,
     )
@@ -302,3 +309,126 @@ def test_decode_named_event_end_packet() -> None:
     event = DtmfEvent.decode(payload)
     assert event.event == 5
     assert event.end is True
+
+
+# --- cross-vendor review hardening (codex BLOCKING findings) ---
+
+
+@pytest.mark.asyncio
+async def test_dtmf_from_unlatched_source_is_dropped_after_latch() -> None:
+    """A DTMF packet from a source != the latched remote is dropped (codex #1).
+
+    The confirmation channel is a security control, so once the comedia latch has fixed
+    the remote source (on the first audio packet) a telephone-event packet from any
+    OTHER source is a spoof and must NOT surface a digit. The legitimate source's DTMF
+    still surfaces.
+    """
+    legit = ("198.51.100.7", 6000)
+    spoof = ("203.0.113.9", 7000)
+    engine = _make_engine(
+        telephone_event_payload_type=_TE_PT,
+        remote_address=legit[0],
+        remote_port=legit[1],
+    )
+    await engine.connect()
+
+    async def _collect() -> None:
+        async for _frame in engine.inbound_audio():
+            pass
+
+    task = asyncio.create_task(_collect())
+    await asyncio.sleep(0)
+
+    # An audio packet from the legit source latches the remote there.
+    engine._recv_queue.put_nowait((_audio_rtp(0, 0), legit))
+    # A DTMF press from a SPOOFED source — must be dropped (no digit).
+    for packet in _digit_event_train("9", start_seq=10, ts=1000):
+        engine._recv_queue.put_nowait((packet, spoof))
+    # A DTMF press from the LEGIT source — must surface.
+    for packet in _digit_event_train("4", start_seq=20, ts=2000):
+        engine._recv_queue.put_nowait((packet, legit))
+
+    await asyncio.sleep(0.05)
+
+    assert engine._test_digits == ["4"]  # type: ignore[attr-defined]  # spoof dropped
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_unknown_payload_type_is_dropped_not_decoded_as_audio() -> None:
+    """A packet at neither the audio PT nor the telephone-event PT drops (codex #6).
+
+    Inbound RTP must reach the audio decoder ONLY at the negotiated audio PT (and DTMF
+    only at the telephone-event PT). A foreign PT (e.g. comfort noise at PT 13) is
+    dropped, never mis-decoded as G.711 audio — closing the rule-27 'inert + safe' gap.
+    """
+    engine = _make_engine(telephone_event_payload_type=_TE_PT)
+    await engine.connect()
+    frames: list[PcmFrame] = []
+
+    async def _collect() -> None:
+        async for frame in engine.inbound_audio():
+            frames.append(frame)
+
+    task = asyncio.create_task(_collect())
+    await asyncio.sleep(0)
+
+    # A run of packets at PT 13 (comfort noise) — neither audio (0) nor DTMF (96).
+    for seq in range(5):
+        pkt = RtpPacket(
+            payload_type=13,
+            sequence_number=seq,
+            timestamp=seq * _SAMPLES_PER_FRAME,
+            ssrc=_FAKE_SSRC,
+            payload=b"\x00",
+        ).pack()
+        engine._recv_queue.put_nowait((pkt, _FAKE_SRC))
+
+    await asyncio.sleep(0.05)
+
+    assert frames == []  # unknown PT never decoded as audio
+    assert engine._test_digits == []  # type: ignore[attr-defined]
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_well_formed_nondigit_event_does_not_crash() -> None:
+    """A well-formed 4-byte non-digit event (flash=16) is safe (codex #5).
+
+    The whole decode+feed is guarded: a valid telephone-event payload that is not a
+    keypad digit (e.g. flash, event 16) surfaces no digit and never crashes the inbound
+    generator; a following real press still surfaces.
+    """
+    engine = _make_engine(telephone_event_payload_type=_TE_PT)
+    await engine.connect()
+
+    async def _collect() -> None:
+        async for _frame in engine.inbound_audio():
+            pass
+
+    task = asyncio.create_task(_collect())
+    await asyncio.sleep(0)
+
+    # event 16 = flash: a valid 4-byte payload, but NOT a keypad digit.
+    flash = DtmfEvent(event=16, end=True, volume=10, duration=480).encode()
+    engine._recv_queue.put_nowait((_dtmf_rtp(0, 1000, flash, marker=True), _FAKE_SRC))
+    # A real press after must still surface.
+    for packet in _digit_event_train("6", start_seq=1, ts=2000):
+        engine._recv_queue.put_nowait((packet, _FAKE_SRC))
+
+    await asyncio.sleep(0.05)
+
+    assert engine._test_digits == ["6"]  # type: ignore[attr-defined]
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task

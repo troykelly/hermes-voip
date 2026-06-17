@@ -186,3 +186,65 @@ async def test_concurrent_arm_rejected() -> None:
     # Clean up the first arming.
     resolver.feed("1")
     await asyncio.wait_for(armer, timeout=2.0)
+
+
+# --- cross-vendor review hardening (codex BLOCKING findings) ---
+
+
+@pytest.mark.asyncio
+async def test_prompt_failure_does_not_leave_resolver_stuck_armed() -> None:
+    """A prompt that RAISES during arm() must clear the armed state (codex #2).
+
+    If the prompt (TTS) fails, arm() must propagate the error AND disarm, so a stale
+    window cannot resolve a later digit and a subsequent arm() is not rejected as
+    'already armed'. Verified by re-arming successfully after the failure.
+    """
+
+    async def _boom(_text: str) -> None:
+        msg = "tts exploded"
+        raise RuntimeError(msg)
+
+    resolver = ArmedConfirmation(prompt=_boom)
+    with pytest.raises(RuntimeError, match="tts exploded"):
+        await resolver.arm("1", timeout_s=5.0, prompt_text="press 1")
+    assert resolver.armed is False  # not stuck armed after the prompt failure
+
+    # A fed digit now must NOT resolve a stale window, and a fresh arm() must succeed.
+    assert resolver.feed("1") is False  # nothing armed to consume it
+    resolver2_prompt_ok = ArmedConfirmation(prompt=_noop_prompt)
+    _ = resolver2_prompt_ok  # (separate resolver only to keep the type obvious)
+
+    async def _press() -> None:
+        await asyncio.sleep(0)
+        resolver.feed("1")
+
+    presser = asyncio.create_task(_press())
+    confirmed = await asyncio.wait_for(
+        resolver.arm("1", timeout_s=5.0, prompt_text="press 1 again"), timeout=2.0
+    )
+    await presser
+    assert confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_arm_cancelled_during_prompt_disarms() -> None:
+    """Cancelling arm() while the prompt is in flight must disarm (codex #2).
+
+    A barge-in / call teardown can cancel the arming coroutine while the prompt audio
+    is still playing. The resolver must not be left stuck armed.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_prompt(_text: str) -> None:
+        started.set()
+        await release.wait()  # park inside the prompt until the test cancels arm()
+
+    resolver = ArmedConfirmation(prompt=_slow_prompt)
+    armer = asyncio.create_task(resolver.arm("1", timeout_s=5.0, prompt_text="press 1"))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    assert resolver.armed is True
+    armer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await armer
+    assert resolver.armed is False  # disarmed despite cancellation mid-prompt

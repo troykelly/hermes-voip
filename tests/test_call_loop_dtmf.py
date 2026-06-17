@@ -108,6 +108,40 @@ async def test_digit_group_flushed_on_interdigit_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hash_terminated_group_not_lost_by_following_digit() -> None:
+    """A #-terminated group is delivered even if another digit arrives mid-delivery.
+
+    Codex #4: the # delivery and the inter-digit timer must not share one cancellable
+    handle such that a following digit cancels the in-flight delivery and drops the
+    group. Here a slow deliver_turn is in flight when a new digit arrives; the first
+    group must still be delivered, and the new digit must start a fresh group.
+    """
+    delivered: list[str] = []
+    first_delivery_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _capture(text: str) -> None:
+        if text == "[DTMF] 12":
+            first_delivery_started.set()
+            await release_first.wait()  # hold the first delivery open
+        delivered.append(text)
+
+    loop = _make_loop(deliver_turn=_capture)
+    loop.feed_dtmf("1")
+    loop.feed_dtmf("2")
+    loop.feed_dtmf("#")  # schedules delivery of "[DTMF] 12" as a task (sync path)
+    await asyncio.wait_for(first_delivery_started.wait(), timeout=2.0)
+    # A new digit arrives WHILE the first group's delivery is awaiting. It must not
+    # cancel/lose that delivery.
+    loop.feed_dtmf("5")
+    release_first.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert "[DTMF] 12" in delivered  # the #-terminated group was NOT dropped
+
+
+@pytest.mark.asyncio
 async def test_armed_confirmation_consumes_digit_not_delivered_as_turn() -> None:
     """While a confirmation is armed, a digit resolves it and is NOT delivered.
 

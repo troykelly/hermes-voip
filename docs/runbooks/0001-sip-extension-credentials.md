@@ -42,10 +42,11 @@ unknown AOR, `423` = interval too brief) is **step 6 "Registration-only check"**
 as a repeating `401`; rotate via the steps below and re-run it.
 
 Under the **full gateway** (`hermes gateway run -vv`), each extension that logs in emits one
-`INFO` line on the `hermes_voip.manager` logger — `SIP registration established (expires Ns)`
-(one per extension; it carries only the registration lifetime, never the host/extension/
-password — rule 34). Its presence is the live "registration succeeded" signal; its absence
-means the login did not complete (read the SIP response code per the script above).
+`INFO` line on the `hermes_voip.manager` logger — e.g. `SIP registration established (expires
+300s)`, where the number is the granted lifetime (one per extension; the line carries only that
+lifetime, never the host/extension/password — rule 34). Its presence is the live "registration
+succeeded" signal; its absence means the login did not complete (read the SIP response code per
+the script above).
 
 ## Rotate / restore
 

@@ -249,8 +249,9 @@ This is expected for a pip-installed plugin until you add the helper `plugin.yam
 
 **The extension won't register on the gateway** (no inbound calls arrive).
 Run `hermes gateway run -vv` and read the log: a successful login prints
-`SIP registration established (expires Ns)` on the `hermes_voip.manager` logger, so if that
-line is **absent** the registration didn't complete. Common causes: wrong `HERMES_SIP_HOST` /
+`SIP registration established (expires 300s)` (the number is your granted lifetime) on the
+`hermes_voip.manager` logger, so if that line is **absent** the registration didn't complete.
+Common causes: wrong `HERMES_SIP_HOST` /
 `HERMES_SIP_PORT` (TLS is port `5061` by default), a wrong extension password (you'll see the
 gateway repeatedly challenge the login), or a firewall blocking the gateway's SIP-TLS port. The
 [live-validation runbook](docs/runbooks/0002-voip-live-validation.md) has a "registration-only"

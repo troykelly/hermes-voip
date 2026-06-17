@@ -214,11 +214,15 @@ _AEC_FILTER_MS_KEY = "HERMES_VOIP_AEC_FILTER_MS"
 _AEC_BULK_DELAY_MS_KEY = "HERMES_VOIP_AEC_BULK_DELAY_MS"
 _AEC_MU_KEY = "HERMES_VOIP_AEC_MU"
 _DEFAULT_AEC_ENABLED = True
-# 16 ms of adaptive taps captures the dominant energy of a typical line/hybrid echo
-# impulse response while keeping the pure-Python per-frame cost well under the 20 ms
-# ptime budget (measured ~6.8 ms/frame at 16 kHz, ~1.8 ms at 8 kHz — rule 22). 32 ms
-# is available for a longer echo path but costs ~2x the per-frame CPU.
-_DEFAULT_AEC_FILTER_MS = 16
+# 64 ms of adaptive taps so the window spans the realistic echo-RETURN delay, not
+# just the impulse response: a broadband (speech) echo delayed by the round-trip
+# (our ~2-packet jitter buffer + gateway processing ≈ tens of ms) is ONLY cancelled
+# if the filter reaches that far back (verified — a 16 ms filter leaves a 40 ms-
+# delayed broadband echo essentially uncancelled). At 8 kHz this is 512 taps ≈
+# 6.9 ms/frame (34% of the 20 ms ptime). At 16 kHz the engine CAPS the tap count
+# (_AEC_MAX_TAPS) to stay within the per-frame budget, so 16 kHz covers ~32 ms of
+# delay; a longer 16 kHz echo needs HERMES_VOIP_AEC_BULK_DELAY_MS tuning.
+_DEFAULT_AEC_FILTER_MS = 64
 # No fixed bulk delay by default: the adaptive taps cover the echo-return delay.
 _DEFAULT_AEC_BULK_DELAY_MS = 0
 # NLMS step size in (0, 2): 0.30 converges briskly with a low steady-state residual.

@@ -28,16 +28,22 @@ Rates: the canceller runs at the inbound **analysis rate** (8 kHz G.711, 16 kHz
 G.722/Opus). :meth:`push_reference` downsamples an off-analysis-rate reference
 (Opus's 48 kHz wire) to the analysis rate so the two inputs align.
 
-Time alignment: the engine interleaves one :meth:`push_reference` (an outbound
-ptime) with one :meth:`cancel` (an inbound ptime), so within a ``cancel`` frame of
-``n`` samples the LAST near-end sample is aligned with the NEWEST reference sample
-already pushed, and earlier near-end samples with proportionally older reference.
-``bulk_delay`` shifts the whole alignment back by a fixed echo-return delay; the
-adaptive taps absorb the residual fine delay + the room/hybrid impulse response.
+Time alignment: the far-end (reference) and near-end are **sample-synchronous**
+streams — both advance one sample per sample-period from the call start. The engine
+does NOT interleave a push 1:1 with a cancel: on a real call ``push_reference`` (TX)
+runs ahead of ``cancel`` (RX) by the system delay (the greeting plays before any
+inbound; the jitter buffer holds the near-end; async scheduling batches). So the
+canceller consumes the far-end through an **independent read cursor** that advances
+one far-end sample per near-end sample (NOT anchored to the newest push), keeping
+the two time-locked; the adaptive taps then span the echo round-trip delay forward
+from that cursor (``bulk_delay`` skips a known dead delay first). Anchoring on the
+newest push instead — wrong — would point the window at *future* TTS uncorrelated
+with the current echo, diverging the filter and mis-firing the double-talk guard.
 """
 
 from __future__ import annotations
 
+import math
 import struct
 from array import array
 
@@ -125,19 +131,30 @@ class EchoCanceller:
         self._filter_len = filter_len
         self._bulk_delay = bulk_delay
         self._mu = mu
-        # Adaptive tap weights, newest reference sample first (``w[0]`` multiplies
-        # the most recent in-window reference sample). C-double storage for speed.
+        # Adaptive tap weights, newest in-window reference sample first (``w[0]``
+        # multiplies the reference sample at the read cursor). C-double for speed.
         self._w: array[float] = array("d", [0.0] * filter_len)
-        # Far-end (reference) history, OLDEST first; the newest sample is the last
-        # element. A ``cancel`` frame reads, for its oldest near-end sample, back to
-        # ``bulk_delay + filter_len - 1`` samples before that sample's aligned
-        # reference; the alignment maps the newest reference sample to the LAST
-        # near-end sample of the frame. So the history must retain
-        # ``bulk_delay + filter_len`` samples for steady state; we keep generous
-        # headroom (a few ptimes) so a frame longer than one ptime still aligns.
-        self._span = bulk_delay + filter_len
-        self._max_history = self._span + sample_rate  # span + up to 1 s headroom
+        # Far-end (reference) FIFO, OLDEST first. The far-end and near-end are
+        # SAMPLE-SYNCHRONOUS streams (both advance one sample per sample-period from
+        # the call start), so the canceller cannot assume the engine interleaves a
+        # push 1:1 with a cancel — on a real call ``push_reference`` (TX) runs ahead
+        # of ``cancel`` (RX) by the system delay (the greeting plays before any
+        # inbound, the jitter buffer holds the near-end, async scheduling batches).
+        # ``cancel`` therefore consumes the far-end through an INDEPENDENT read
+        # cursor that advances exactly one far-end sample per near-end sample (NOT
+        # anchored to the newest push), so the two stay time-locked; the adaptive
+        # taps span the echo round-trip delay forward from the cursor. ``_read`` is
+        # the index (into ``_x``) of the far-end sample time-aligned with the NEXT
+        # near-end sample; it starts at 0 (the first far-end sample lines up with the
+        # first near-end sample — the echo's lead is then modelled by the taps).
         self._x: array[float] = array("d")
+        self._read = 0
+        # Retain enough trailing far-end past the read cursor for the filter window
+        # (cursor back over bulk_delay + filter_len), plus generous headroom so a
+        # burst of pushes ahead of the cursor is never trimmed away before its
+        # matching near-end arrives (1 s).
+        self._span = bulk_delay + filter_len
+        self._keep_behind = self._span + sample_rate
         # Per-source-rate resampler for an off-analysis-rate reference (Opus 48 kHz
         # → 16 kHz). Created lazily on the first off-rate push; None while the
         # reference already arrives at the analysis rate.
@@ -172,20 +189,19 @@ class EchoCanceller:
         if n == 0:
             return
         self._x.extend(float(s) for s in struct.unpack(f"<{n}h", aligned))
-        # Bound the history: keep only the most recent samples needed (+ headroom).
-        excess = len(self._x) - self._max_history
-        if excess > 0:
-            del self._x[:excess]
+        # The FIFO is trimmed in cancel() relative to the read cursor (not here by
+        # the newest sample), because push runs ahead of cancel and a far-end sample
+        # must survive until its matching near-end has consumed it.
 
     def cancel(self, pcm16: bytes) -> bytes:
         """Return ``pcm16`` with the estimated echo of the reference removed.
 
         Sample-by-sample NLMS over the aligned reference window: for each near-end
         sample form the echo estimate, subtract it, then (outside double-talk) adapt
-        the taps. The newest reference sample aligns with the LAST near-end sample of
-        the frame; earlier near-end samples step back through the history one sample
-        each. Returns exactly the input length — **no buffering, no added latency**.
-        An empty frame returns empty.
+        the taps. The far-end is consumed through the sample-synchronous read cursor
+        (see the module docstring), so the window tracks the near-end timeline rather
+        than the newest push. Returns exactly the input length — **no buffering, no
+        added latency**. An empty frame returns empty.
 
         Args:
             pcm16: One inbound (near-end) frame of PCM16-LE mono at the analysis rate.
@@ -209,29 +225,32 @@ class EchoCanceller:
         flen = self._filter_len
         bulk = self._bulk_delay
         mu = self._mu
+        read = self._read
         xlen = len(x)
-
-        # Double-talk decision for the frame (the barge-in-preserving guard), made
-        # ONCE on energies — see :meth:`_frame_adapts`. It compares the near-end
-        # energy to the aligned REFERENCE energy (not to the current estimate, which
-        # would chicken-and-egg freeze the filter before it ever converges): echo
-        # never exceeds the reference (the gateway attenuates), so near-end energy
-        # well above the reference is the caller talking over the echo → freeze.
-        adapt = self._frame_adapts(near, head_last=xlen - 1 - bulk)
-
-        out: list[int] = [0] * n
         int16_min = _INT16_MIN
         int16_max = _INT16_MAX
         eps = _NLMS_EPS
+
+        # Far-end ECHO-SOURCE index for near[i] is ``read + i`` (the read cursor
+        # advances one far-end sample per near-end sample — see __init__). The window
+        # ends at that source shifted forward by ``bulk`` (skipping a known dead
+        # delay); ``head`` is its newest in-window sample. When the far-end has not
+        # been pushed far enough yet (head past the FIFO end), there is no reference
+        # to subtract and the near-end passes through.
+
+        # Double-talk decision for the frame (the barge-in-preserving guard), made
+        # ONCE on energies over the aligned far-end window of this frame — see
+        # :meth:`_frame_adapts`. Anchored at the LAST sample's head so the guard reads
+        # the SAME reference the estimate uses (not the newest pushed sample, which
+        # runs ahead of the echo and would mis-fire the guard).
+        last_head = min(read + (n - 1) + bulk, xlen - 1)
+        adapt = self._frame_adapts(near, head_last=last_head)
+
+        out: list[int] = [0] * n
         for i in range(n):
-            # Align near[i] with reference: the LAST near-end sample (i == n-1) maps
-            # to the newest reference sample (index xlen-1), shifted back by
-            # bulk_delay; earlier samples step back by (n-1-i). The window's newest
-            # in-window reference sample is ``head``; w[k] multiplies x[head-k].
-            head = xlen - 1 - bulk - (n - 1 - i)
-            if head < 0:
-                # No aligned reference yet (the agent has not spoken far enough back):
-                # nothing to subtract, pass the near-end sample through unchanged.
+            head = read + i + bulk
+            if head >= xlen or head < 0:
+                # No aligned reference yet: pass the near-end sample through unchanged.
                 s = near[i]
                 out[i] = (
                     int16_min if s < int16_min else int16_max if s > int16_max else s
@@ -255,7 +274,10 @@ class EchoCanceller:
                 energy += xv * xv
             s = near[i]
             e = s - est
-            r = int(e)
+            # Round to nearest (not truncate-toward-zero, which biases the residual)
+            # then clamp to int16. ``floor(e + 0.5)`` rounds half up symmetrically for
+            # the small sub-LSB residual here.
+            r = math.floor(e + 0.5)
             out[i] = int16_min if r < int16_min else int16_max if r > int16_max else r
             # NLMS update: w[k] += (mu*e/(||x||^2+eps)) * x[head-k], frozen during
             # double-talk so the uncorrelated caller cannot pull/diverge the filter.
@@ -264,6 +286,16 @@ class EchoCanceller:
                 wr = reversed(range(m))  # tap indices newest-first
                 for k, xv in zip(wr, win, strict=True):
                     w[k] += step * xv
+
+        # Advance the read cursor by this frame's near-end sample count (1:1 with the
+        # far-end), then trim FIFO samples that no future window can reach (older than
+        # the next frame's oldest window start), shifting the cursor by the trim count
+        # so absolute alignment is preserved. Bounds the FIFO across a long call.
+        self._read = read + n
+        trim = self._read - self._keep_behind
+        if trim > 0:
+            del x[:trim]
+            self._read -= trim
 
         return struct.pack(f"<{n}h", *out)
 
@@ -307,15 +339,6 @@ class EchoCanceller:
             return near_ms < _MIN_ESTIMATE_MS_ENERGY
         return near_ms <= (_DOUBLE_TALK_RATIO * _DOUBLE_TALK_RATIO) * ref_ms
 
-    @staticmethod
-    def _clamp(value: float) -> int:
-        """Clamp a float sample to the int16 range and round to int."""
-        if value <= _INT16_MIN:
-            return _INT16_MIN
-        if value >= _INT16_MAX:
-            return _INT16_MAX
-        return int(value)
-
     def _to_analysis_rate(self, pcm16: bytes, sample_rate: int) -> bytes:
         """Downsample a reference frame to the analysis rate (no-op when equal)."""
         if sample_rate == self._rate:
@@ -332,4 +355,5 @@ class EchoCanceller:
         """
         self._w = array("d", [0.0] * self._filter_len)
         self._x = array("d")
+        self._read = 0
         self._ref_resampler = None

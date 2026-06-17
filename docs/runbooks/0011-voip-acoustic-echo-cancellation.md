@@ -57,8 +57,8 @@ Validation (fail-fast at startup, `MediaConfig.__post_init__` → `_validate_aec
   the filter into cancelling them.
 - **No added latency (rule 22).** `cancel` is per-sample and buffer-free — it returns the same
   frame length it was given, with no look-ahead. The added CPU is `O(filter_len)` multiply-adds per
-  sample — measured ~1.8 ms/frame at 8 kHz, ~6.8 ms/frame at 16 kHz at the 16 ms default
-  (well under the 20 ms ptime budget), in `array('d')`.
+  sample — measured ~6.9 ms/frame at 8 kHz (full 64 ms window) and ~13.8 ms/frame at 16 kHz
+  (the 512-tap cap, ~32 ms window), both under the 20 ms ptime budget, in `array('d')`.
 - **No-op when disabled or on an echo-cancelled gateway.** `HERMES_VOIP_AEC_ENABLED=false` builds
   no canceller (the RX/TX taps are no-ops) and restores the 600 ms threshold default. On a gateway
   with its own echo cancellation there is no echo to model and the inbound is uncorrelated with the
@@ -126,11 +126,12 @@ load; a running call keeps the settings it started with).
 
 ## Tuning guidance
 
-- **`HERMES_VOIP_AEC_FILTER_MS`** — longer taps model a longer/more reverberant echo path at more
-  CPU per sample (the cost scales ~linearly: 16 ms ≈ 6.8 ms/frame at 16 kHz, 32 ms ≈ 13.7 ms). The
-  16 ms default captures the dominant energy of a typical line/hybrid echo. Raise (e.g. 24–32 ms)
-  only if echo persists after convergence AND the per-frame budget allows (watch for the media loop
-  falling behind); lower to save CPU if the path is short.
+- **`HERMES_VOIP_AEC_FILTER_MS`** — the window must span the echo-RETURN delay (round-trip), not
+  just the impulse response, or a delayed broadband echo is left uncancelled. The 64 ms default
+  gives a full 64 ms window at 8 kHz (~6.9 ms/frame); the engine caps the tap count at 512
+  (`_AEC_MAX_TAPS`), so 16 kHz is held to ~32 ms (~13.8 ms/frame) for the per-frame budget. Raising
+  this past the cap has no effect (the clamp wins) unless you also accept the cap; lower it only if
+  the echo delay is known-short. For a longer 16 kHz echo, prefer `HERMES_VOIP_AEC_BULK_DELAY_MS`.
 - **`HERMES_VOIP_AEC_BULK_DELAY_MS`** — set this to the gateway's constant echo-return delay if it
   is large and known, so the adaptive taps model only the impulse response after it (a shorter, more
   responsive filter). `0` (the default) lets the taps cover the delay directly.

@@ -134,10 +134,20 @@ _TX_AMPLITUDE_LOG_PERIOD: Final[int] = 50
 
 # Default echo-canceller adaptive-filter length in milliseconds (ADR-0033), the
 # engine's standalone default when no ``aec_filter_ms`` is passed (the adapter always
-# passes the configured value). 16 ms captures the dominant echo energy while keeping
-# the pure-Python per-frame cost well under the 20 ms ptime budget (rule 22): 128 taps
-# at 8 kHz, 256 at 16 kHz. The engine converts ms → taps at the live analysis rate.
-_AEC_DEFAULT_FILTER_MS: Final[int] = 16
+# passes the configured value). 64 ms so the window spans the realistic echo-return
+# delay (round-trip ≈ tens of ms), not just the impulse response. The engine converts
+# ms → taps at the live analysis rate and CAPS them at _AEC_MAX_TAPS.
+_AEC_DEFAULT_FILTER_MS: Final[int] = 64
+
+# Hard ceiling on the echo-canceller tap count, REGARDLESS of the configured
+# ``aec_filter_ms`` x rate (rule 22). The canceller's per-sample cost is O(taps) in
+# pure Python; 512 taps measures ~6.9 ms/frame at 8 kHz and ~13.8 ms at 16 kHz — both
+# safely under the 20 ms ptime. Above this the media loop risks falling behind, so the
+# tap count is clamped here (so the 64 ms default gives a full 64 ms window at 8 kHz
+# but ~32 ms at 16 kHz — the wideband path trades echo-delay reach for the CPU budget;
+# a longer 16 kHz echo needs ``aec_bulk_delay_ms``). An operator who raises
+# ``aec_filter_ms`` past this on a fast host can only do so by accepting the clamp.
+_AEC_MAX_TAPS: Final[int] = 512
 
 # A received datagram paired with the UDP source address it arrived from. The
 # source address is what symmetric-RTP (comedia) latching needs: we send our
@@ -2256,7 +2266,13 @@ class RtpMediaTransport:
             return None
         if self._aec is None:
             rate = self._analysis_sample_rate
+            # Clamp the derived tap count to the CPU-safe ceiling (rule 22): the
+            # per-sample cost is O(taps) in pure Python, so an unbounded tap count
+            # (a high analysis rate x a long filter_ms) could push the per-frame cost
+            # past the ptime and stall the media loop. The 64 ms default therefore
+            # gives a full window at 8 kHz but a capped (~32 ms) one at 16 kHz.
             filter_len = max(1, (rate * self._aec_filter_ms) // 1000)
+            filter_len = min(filter_len, _AEC_MAX_TAPS)
             bulk_delay = (rate * self._aec_bulk_delay_ms) // 1000
             self._aec = EchoCanceller(
                 sample_rate=rate,

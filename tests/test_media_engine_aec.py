@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
 import struct
 
 import pytest
@@ -74,6 +75,13 @@ def _sine(n: int, *, freq_hz: float, amplitude: float) -> list[int]:
     return [int(peak * math.sin(w * i)) for i in range(n)]
 
 
+def _noise(n: int, *, amplitude: float, seed: int) -> list[int]:
+    """Broadband (speech-like) PCM16 noise — a delay is not a 2-tap trick on it."""
+    rng = random.Random(seed)  # noqa: S311 — test signal, not cryptographic
+    peak = amplitude * 32767.0
+    return [int(rng.uniform(-peak, peak)) for _ in range(n)]
+
+
 def _rms(samples: tuple[int, ...]) -> float:
     if not samples:
         return 0.0
@@ -93,7 +101,7 @@ async def _make_engine(*, aec_enabled: bool) -> tuple[RtpMediaTransport, _Record
         initial_seq=0,
         initial_ts=0,
         aec_enabled=aec_enabled,
-        aec_filter_ms=16,  # 128 taps at 8 kHz
+        aec_filter_ms=64,  # 512 taps at 8 kHz — the default; spans a 20 ms echo delay
         aec_bulk_delay_ms=0,
         aec_mu=0.5,
     )
@@ -113,43 +121,45 @@ async def test_engine_cancels_reflected_outbound_on_inbound() -> None:
     """
     engine, _rec = await _make_engine(aec_enabled=True)
 
-    # The echo the gateway sends back: a copy of our outbound tone (a realistic
-    # reflection — same content, attenuated). Build it once.
-    n = _SPF * 60  # 1.2 s
-    tone = _sine(n, freq_hz=600.0, amplitude=0.4)
-    echo = [int(s * 0.7) for s in tone]
+    # Broadband (speech-like) outbound, reflected back DELAYED by one packet (20 ms) —
+    # the realistic gateway echo (a round-trip lag a too-short filter cannot reach).
+    n_packets = 120
+    n = _SPF * n_packets
+    tts = _noise(n, amplitude=0.4, seed=11)
+    echo = [int(s * 0.7) for s in tts]
 
     frames_out: list[PcmFrame] = []
 
     async def _consume() -> None:
         async for frame in engine.inbound_audio():
             frames_out.append(frame)
-            if len(frames_out) >= 60:
+            if len(frames_out) >= n_packets - 1:
                 return
 
     consumer = asyncio.create_task(_consume())
     await asyncio.sleep(0)
 
-    # Interleave: for each 20 ms slot push the outbound reference (send_audio) then
-    # the inbound echo packet, matching how a live call streams both directions.
-    for f in range(60):
-        chunk = tone[f * _SPF : (f + 1) * _SPF]
+    # Interleave: each 20 ms slot pushes the outbound reference (send_audio) then the
+    # inbound echo of the PREVIOUS packet (a 1-packet round-trip delay).
+    for f in range(n_packets):
+        chunk = tts[f * _SPF : (f + 1) * _SPF]
         await engine.send_audio(_sine_frame(chunk))
-        echo_chunk = echo[f * _SPF : (f + 1) * _SPF]
-        pkt = RtpPacket(
-            payload_type=0,
-            sequence_number=f,
-            timestamp=f * _SPF,
-            ssrc=_GATEWAY_SSRC,
-            payload=encode_ulaw(struct.pack(f"<{_SPF}h", *echo_chunk)),
-        ).pack()
-        engine._recv_queue.put_nowait((pkt, _FAKE_SRC))
+        if f >= 1:
+            echo_chunk = echo[(f - 1) * _SPF : f * _SPF]
+            pkt = RtpPacket(
+                payload_type=0,
+                sequence_number=f,
+                timestamp=f * _SPF,
+                ssrc=_GATEWAY_SSRC,
+                payload=encode_ulaw(struct.pack(f"<{_SPF}h", *echo_chunk)),
+            ).pack()
+            engine._recv_queue.put_nowait((pkt, _FAKE_SRC))
         await asyncio.sleep(0)
 
     await asyncio.wait_for(consumer, timeout=5.0)
     await engine.stop()
 
-    assert len(frames_out) >= 40
+    assert len(frames_out) >= 80
     # Echo level on the wire (what arrived) vs residual the engine yielded, both on
     # the converged tail (second half).
     tail = frames_out[len(frames_out) // 2 :]

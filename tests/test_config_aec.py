@@ -18,7 +18,9 @@ def test_aec_defaults() -> None:
     """AEC is on by default with telephony-sensible filter parameters."""
     cfg = load_media_config({})
     assert cfg.aec_enabled is True
-    assert cfg.aec_filter_ms == 16
+    # 64 ms so the window spans the realistic echo-return delay (round-trip), not
+    # just the impulse response; the engine caps the tap count for the CPU budget.
+    assert cfg.aec_filter_ms == 64
     assert cfg.aec_bulk_delay_ms == 0
     assert cfg.aec_mu == pytest.approx(0.30)
 

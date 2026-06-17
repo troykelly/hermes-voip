@@ -19,6 +19,7 @@ energy assertions are exact.
 from __future__ import annotations
 
 import math
+import random
 import struct
 from collections.abc import Sequence
 
@@ -59,6 +60,29 @@ def _sine(
     peak = amplitude * 32767.0
     w = 2.0 * math.pi * freq_hz / rate
     return [int(peak * math.sin(w * i + phase)) for i in range(n)]
+
+
+def _noise(n: int, *, amplitude: float, seed: int) -> list[int]:
+    """``n`` samples of band-broad (white) PCM16 noise — a speech-like reference.
+
+    A delay of a broadband signal is NOT representable by a couple of taps (unlike a
+    pure tone), so cancelling a *delayed* broadband echo genuinely requires the filter
+    to span the delay. Using a tone here would let a short filter cancel any delay and
+    hide an under-sized echo-delay window (the real failure mode).
+    """
+    rng = random.Random(seed)  # noqa: S311 — test signal, not cryptographic
+    peak = amplitude * 32767.0
+    return [int(rng.uniform(-peak, peak)) for _ in range(n)]
+
+
+def _delayed_echo(reference: Sequence[int], *, delay: int, gain: float) -> list[int]:
+    """A pure delayed+attenuated copy: ``echo[n] = gain * reference[n - delay]``."""
+    out = [0] * len(reference)
+    for i in range(len(reference)):
+        j = i - delay
+        if 0 <= j < len(reference):
+            out[i] = int(gain * reference[j])
+    return out
 
 
 def _echo_of(
@@ -142,6 +166,49 @@ def test_cancels_known_reflected_reference_toward_silence() -> None:
     # At least ~12 dB of echo return loss enhancement on the converged tail.
     assert tail_rms < echo_rms * 0.25, (
         f"echo not cancelled: residual_rms={tail_rms:.1f} vs echo_rms={echo_rms:.1f}"
+    )
+
+
+def test_cancels_delayed_broadband_echo_when_window_spans_the_delay() -> None:
+    """A broadband echo delayed by the round-trip is cancelled only by a wide window.
+
+    The real failure mode (cross-vendor review): the gateway reflects the agent's
+    SPEECH (broadband) back after a round-trip delay of tens of ms (our jitter buffer
+    + gateway). A delay of a broadband signal is NOT representable by a couple of taps,
+    so the adaptive filter must reach back PAST the delay to model it. This pins that a
+    window spanning the 40 ms delay (the 64 ms-default tap count) drives the echo to
+    near silence — and, as a guard, that a too-short 16 ms window does NOT (so the test
+    actually exercises the delay reach, not a trivially-cancellable tone).
+    """
+    rate = _G711_RATE
+    n = rate * 2  # 2 s
+    reference = _noise(n, amplitude=0.3, seed=7)
+    delay = (rate * 40) // 1000  # 40 ms round-trip echo delay
+    echo = _delayed_echo(reference, delay=delay, gain=0.6)
+
+    # Wide window (64 ms = 512 taps at 8 kHz — the default) spans the 40 ms delay.
+    wide = EchoCanceller(sample_rate=rate, filter_len=512, bulk_delay=0, mu=0.5)
+    wide_res = _drive(wide, reference=reference, near_end=echo, rate=rate, block=160)
+    # Too-short window (16 ms = 128 taps) cannot reach the 40 ms-delayed echo.
+    narrow = EchoCanceller(sample_rate=rate, filter_len=128, bulk_delay=0, mu=0.5)
+    narrow_res = _drive(
+        narrow, reference=reference, near_end=echo, rate=rate, block=160
+    )
+
+    echo_rms = _rms(_pack(echo))
+    wide_rms = _rms(wide_res[len(wide_res) // 2 :])
+    narrow_rms = _rms(narrow_res[len(narrow_res) // 2 :])
+    assert echo_rms > 200.0
+    # The wide (default) window cancels the delayed broadband echo.
+    assert wide_rms < echo_rms * 0.2, (
+        f"wide window failed to cancel a 40 ms-delayed broadband echo: "
+        f"residual={wide_rms:.1f} echo={echo_rms:.1f}"
+    )
+    # The narrow window does NOT — proving the test exercises the delay reach (and
+    # that the default must be wide enough, which is why it is 64 ms not 16 ms).
+    assert narrow_rms > echo_rms * 0.5, (
+        f"narrow window unexpectedly cancelled a 40 ms echo with a 16 ms reach: "
+        f"residual={narrow_rms:.1f} echo={echo_rms:.1f}"
     )
 
 

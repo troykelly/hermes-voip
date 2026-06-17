@@ -431,12 +431,12 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.barge_in_tail_ms == 250
     # barge-in clean-stop fade (ADR-0028): a short click-free ramp on the cut.
     assert cfg.barge_in_fade_ms == 30
-    # in-process acoustic echo cancellation (ADR-0033): ON by default with a
-    # telephony-sensible 16 ms NLMS filter (captures the dominant echo energy within
-    # the per-frame CPU budget); this is what lets the barge-in threshold above drop
-    # to 200 ms.
+    # in-process acoustic echo cancellation (ADR-0033): ON by default with a 64 ms
+    # NLMS filter (the window spans the realistic echo-return delay; the engine caps
+    # the tap count for the per-frame CPU budget); this is what lets the barge-in
+    # threshold above drop to 200 ms.
     assert cfg.aec_enabled is True
-    assert cfg.aec_filter_ms == 16
+    assert cfg.aec_filter_ms == 64
     assert cfg.aec_bulk_delay_ms == 0
     assert cfg.aec_mu == pytest.approx(0.30)
     # dead-air comfort filler (ADR-0030): OFF by default — today's behaviour

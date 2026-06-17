@@ -56,16 +56,19 @@ stdlib only — the canceller lives in the `media`-extra engine path, which must
 It operates entirely at the inbound **analysis rate** (8 kHz G.711, 16 kHz G.722, 16 kHz for
 Opus — the rate `inbound_audio()` delivers and the VAD/ASR consume). Two inputs:
 
-- **`push_reference(pcm16, *, sample_rate)`** — the engine taps **every outbound wire-rate frame**
-  the instant it goes on the wire (`_transmit_frame` on the paced path; `_emit_inline_frames` on
-  the teardown/fade path). When the wire rate differs from the analysis rate (Opus: 48 kHz wire →
-  16 kHz analysis) the reference is downsampled to the analysis rate by an internal state-carrying
-  `Resampler` (the same conversion the inbound Opus path uses), so the canceller's far-end and
-  near-end are always the same rate. The samples append to a bounded far-end history deque.
+- **`push_reference(pcm16, *, sample_rate)`** — the engine taps the outbound wire-rate PCM the
+  instant it goes on the wire: the paced path (`_transmit_frame`) and the inline teardown/fade burst
+  (`_emit_inline_frames`). The one frame *not* tapped is the deadline-pacer's parked
+  `_inflight_wire` re-sent by `_flush_tx_tail` on a stop-race — its source PCM was discarded after
+  encode (only the RTP bytes survive), so it cannot be pushed; it is a single end-of-call frame, so
+  the missed reference is immaterial (the call is tearing down). When the wire rate differs from the
+  analysis rate (Opus: 48 kHz wire → 16 kHz analysis) the reference is downsampled to the analysis
+  rate by an internal state-carrying `Resampler` (the same conversion the inbound Opus path uses),
+  so the canceller's far-end and near-end are always the same rate. The samples append to a bounded
+  far-end FIFO consumed by `cancel` through a sample-synchronous read cursor (next paragraph).
 - **`cancel(pcm16) -> bytes`** — the engine passes **every decoded inbound analysis-rate frame**
   through this before yielding it. For each near-end sample it forms the echo estimate as the dot
-  product of the `filter_len` adaptive taps with the aligned window of recent far-end samples
-  (starting `bulk_delay` samples back to skip the dead round-trip delay), subtracts it, and
+  product of the `filter_len` adaptive taps with the aligned far-end window, subtracts it, and
   returns the residual. **It returns exactly the samples it was given — no added frame of
   buffering, no extra latency** (the property the task's "must not add perceptible delay"
   requires).
@@ -89,6 +92,29 @@ as residual). When only echo is present (no caller), adaptation runs and the fil
 (it *is* the reference, delayed+filtered), so the adaptive filter learns it and the subtraction
 removes it. The caller's speech is **uncorrelated** with the reference, so the filter cannot model
 it and it survives the subtraction — and the double-talk hold stops the filter from trying.
+
+**Sample-synchronous alignment (not lockstep).** The far-end (the tapped outbound) and the near-end
+(the decoded inbound) are **sample-synchronous streams** — both advance one sample per
+sample-period from the call start. The engine does **not** interleave a push 1:1 with a cancel: the
+TX (`push_reference`) runs **ahead** of the RX (`cancel`) by the system delay (the greeting plays
+before any inbound; the jitter buffer holds the near-end; async scheduling batches I/O). The
+canceller therefore consumes the far-end FIFO through an **independent read cursor** that advances
+exactly one far-end sample per near-end sample, keeping the two time-locked; the adaptive taps then
+span the echo round-trip delay forward from the cursor. Anchoring the window on the *newest* pushed
+sample instead — the naive choice — points it at *future* TTS uncorrelated with the current echo,
+which **diverges** the filter and **mis-fires the double-talk guard** (this was found and fixed in
+cross-vendor review by an engine-level test where TX leads RX by the jitter buffer + scheduling; a
+unit test with 1:1 interleave does not exercise it).
+
+**Convergence window (the residual risk, honestly stated).** A fresh per-call canceller starts with
+zeroed taps, so for the first few hundred ms of the greeting — before the filter has learned the
+echo path — the greeting's echo is **not yet cancelled**. The `gated` barge-in mode is the backstop
+during this window: it requires a **sustained continuous** voiced run (200 ms ≈ 7 windows) to fire,
+and the echo arrives as **short, broken** bursts (ADR-0023's evidence), which do not sustain 7
+continuous windows before the filter converges (NLMS at `mu=0.30` converges within ~100–300 ms on a
+loud reference). So the lowered threshold is safe in combination with `gated`; an operator on a
+gateway with an unusually loud/sustained early echo can raise `HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS`
+rather than disable AEC. The 200 ms default applies only when AEC is enabled and that key is unset.
 
 ### Wiring (engine-internal — no change to the call-loop data flow)
 
@@ -134,13 +160,15 @@ same fakes-only, fully-typed discipline as the rest of the engine.
 - **No added latency on the hot path (rule 22).** `cancel()` is per-sample, in-place,
   buffer-free — it returns the same frame length with no extra ptime of delay (no look-ahead). The
   added CPU is `O(filter_len)` multiply-accumulates per sample, in `array('d')` via sliced/`zip`'d
-  inner loops. **Measured** per-20-ms-frame cost at the 16 ms default: **~1.8 ms at 8 kHz G.711
-  (≈ 9 % of the 20 ms ptime), ~6.8 ms at 16 kHz G.722/Opus (≈ 34 %)** — comfortably under budget,
-  with headroom. The default is **16 ms** (not 32 ms) precisely because pure-Python 32 ms taps at
-  16 kHz measured ~13.7 ms/frame (≈ 69 %), too close to the ptime ceiling; 16 ms captures the
-  dominant echo energy of a telephony hybrid and halves that. The pacing path is unchanged (the TX
-  reference tap is a cheap list append). Only the inbound RX runs `cancel`; the outbound is the
-  cheap tap.
+  inner loops. The default filter is **64 ms** so the adaptive window spans the realistic
+  echo-RETURN delay (the round-trip — our jitter buffer + gateway — not just the impulse response;
+  a too-short window measurably leaves a delayed broadband echo uncancelled), and the engine **caps
+  the tap count at 512** (`_AEC_MAX_TAPS`) for the CPU budget. **Measured** per-20-ms-frame cost at
+  the shipped defaults: **~6.9 ms at 8 kHz G.711 (≈ 34 % of the 20 ms ptime, a full 64 ms window),
+  ~13.8 ms at 16 kHz G.722/Opus (≈ 69 %, the 512-tap cap = ~32 ms window)** — both under budget. The
+  pacing path is unchanged (the TX reference tap is a cheap list append). Only the inbound RX runs
+  `cancel`; the outbound is the cheap tap. A longer 16 kHz echo needs `aec_bulk_delay_ms` tuning
+  (the wideband path trades echo-delay reach for the per-frame CPU ceiling).
 - **No new dependency.** Pure stdlib; the `uv.lock` / licence surface is unchanged (rule 35), and
   the canceller does not pull numpy into the `media`-extra engine path.
 - **AEC is a no-op when disabled** (`HERMES_VOIP_AEC_ENABLED=false`) — the ADR-0023 path is

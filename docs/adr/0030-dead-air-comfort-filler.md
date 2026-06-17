@@ -38,20 +38,23 @@ Constraints that bound the answer:
 Add an **optional, opt-in dead-air comfort filler** owned entirely by `CallLoop`, scheduled
 around the turn hand-off and cancelled the instant the real reply (or a barge-in) arrives.
 
-**Where it fires.** `CallLoop._screen_and_deliver` is the seam: it is the last point before
-the turn leaves for the agent (`await self._deliver_turn(text)`), and the gap closes when the
-agent's reply reaches `speak()` → `_play`'s first sent frame. When the filler is enabled and a
-turn is being delivered, `_screen_and_deliver` launches a single one-shot **filler task** that:
+**Where it fires.** `CallLoop._screen_and_deliver` is the seam. On a non-REFUSE verdict it
+launches a single one-shot **filler task** *before* `await self._deliver_turn(text)` — so the
+delay measures the dead-air gap from the caller-finish moment, and the timer is correct even if a
+`deliver_turn` implementation were to block (rather than relying on it being a non-blocking
+enqueue; the live Hermes `handle_message` is in fact non-blocking, but arming first is robust
+regardless). The gap closes when the agent's reply reaches `speak()` → `_play`'s first sent frame.
+The filler task:
 
 1. waits `delay_ms` (default **900 ms**) on an **injected sleep seam** (`_sleep`, defaulting to
    `asyncio.sleep`; tests inject a controllable sleep for determinism);
-2. after the wait, fires the filler **only if** no agent audio is already on the wire
-   (`self._tts_audio_active is False` — set true by `_play` on the first real reply frame) **and**
-   the gap has not been cancelled. Both checks are atomic relative to `speak()`/`barge_in()`
-   because everything runs on one asyncio event loop with no preemption;
-3. synthesises exactly **one** short filler utterance through the *same* `speak()` path the agent
-   replies use, so the filler is registered as `_active_tts_stream`, plays under the playout lock,
-   and arms the echo gate (`_tts_audio_active`) like any agent audio.
+2. after the wait, fires the filler **only if** no agent audio is on the wire right now
+   (`self._tts_audio_active is False`) and the task has not been cancelled (a reply commit or a
+   barge-in cancels it). The check is atomic relative to `speak()`/`barge_in()` because everything
+   runs on one asyncio event loop with no preemption;
+3. synthesises exactly **one** short filler utterance through the *same* `_speak_text` path the
+   agent replies use, so the filler is registered as `_active_tts_stream`, plays under the playout
+   lock, and arms the echo gate (`_tts_audio_active`) like any agent audio.
 
 The task fills the gap **at most once** and then returns; a still-pending turn does not loop.
 

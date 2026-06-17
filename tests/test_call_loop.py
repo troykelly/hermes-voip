@@ -1166,6 +1166,49 @@ async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None
 
 
 @pytest.mark.asyncio
+async def test_comfort_filler_armed_before_deliver_turn_returns() -> None:
+    """The filler is armed BEFORE deliver_turn is awaited (covers a blocking handoff).
+
+    The filler's delay measures the dead-air gap from the caller-finish moment, so it
+    must be scheduled before `await deliver_turn` — robust even if deliver_turn blocks
+    on agent work. With a deliver_turn that blocks on an event, the filler's delay
+    sleep must already be scheduled while deliver_turn is still parked.
+    """
+    deliver_gate = asyncio.Event()
+    delivered: list[str] = []
+
+    async def blocking_deliver(text: str) -> None:
+        delivered.append(text)
+        await deliver_gate.wait()  # model a deliver_turn that blocks on agent work
+
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("question", True, True)]),
+        tts,
+        sleep=sleep,
+        deliver_turn=blocking_deliver,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # While deliver_turn is still BLOCKED, the filler's delay sleep must already be
+    # scheduled (it was armed before the deliver_turn await).
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if delivered and sleep.calls:
+            break
+    assert delivered == ["question"], "the turn was not delivered"
+    assert sleep.calls, "the filler was not armed before deliver_turn returned"
+
+    # Release deliver_turn and end the call.
+    deliver_gate.set()
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
 async def test_normal_speech_completion_does_not_flush() -> None:
     """A normally-completing utterance (no barge-in) never flushes the engine.
 

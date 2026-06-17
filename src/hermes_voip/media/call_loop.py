@@ -1228,15 +1228,17 @@ class CallLoop:
     async def _screen_and_deliver(self, text: str) -> None:
         """Screen one finalised turn through the guard; deliver if not refused.
 
-        On a non-REFUSE verdict the turn is handed to the agent and, when the
-        comfort filler is enabled (ADR-0030), a one-shot dead-air filler is armed
-        for the gap until the agent's reply audio starts (or a barge-in fires). A
-        REFUSE never reaches the agent, so no gap and no filler.
+        On a non-REFUSE verdict the dead-air comfort filler is armed (ADR-0030) and
+        then the turn is handed to the agent. A REFUSE never reaches the agent, so no
+        gap and no filler.
         """
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
         if result.verdict is not GuardVerdict.REFUSE:
-            await self._deliver_turn(text)
-            # Arm the dead-air comfort filler for the gap now opening between this
-            # delivered turn and the agent's reply audio (no-op when disabled).
+            # Arm the filler BEFORE handing off the turn, so its delay measures the
+            # dead-air gap from the caller-finish moment (this point) — robust even if
+            # ``_deliver_turn`` were to block on agent work, rather than relying on it
+            # being a non-blocking enqueue. The filler task runs concurrently with the
+            # hand-off and the agent turn (no-op when disabled).
             self._schedule_comfort_filler()
+            await self._deliver_turn(text)

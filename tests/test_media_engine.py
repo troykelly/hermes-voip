@@ -1850,3 +1850,253 @@ async def test_latch_logs_peer_media_address(
 
     peer_sock.close()
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# (j) send_dtmf — RFC 4733 telephone-event TX on the active call (ADR-0010/0031)
+# ---------------------------------------------------------------------------
+#
+# The engine wires the (already-tested) dtmf.py generator onto the RTP TX path:
+# emit named-event packets at the NEGOTIATED telephone-event payload type, marker
+# bit on the first packet of each digit, a CONSTANT RTP timestamp across one
+# digit's packets, seq monotonic across the whole burst, the redundant end packets
+# RFC 4733 requires, under the same TX mutex as send_audio. It raises (never
+# silently no-ops) if the telephone-event PT was not negotiated.
+
+import hermes_voip.dtmf as dtmf_module  # noqa: E402 — grouped with the DTMF test block
+
+_TEL_EVENT_PT = 101  # the negotiated telephone-event payload type for these tests
+
+
+def _dtmf_engine(
+    *, telephone_event_payload_type: int | None = _TEL_EVENT_PT
+) -> RtpMediaTransport:
+    """An engine carrying a negotiated telephone-event payload type (or none)."""
+    return RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        telephone_event_payload_type=telephone_event_payload_type,
+        clock=_dummy_clock,
+        sleep=_no_sleep,
+        initial_seq=100,
+        initial_ts=1000,
+    )
+
+
+def _dtmf_packets(recorder: _SendRecorder) -> list[RtpPacket]:
+    """Parse every recorded datagram whose payload type is the telephone-event PT."""
+    out: list[RtpPacket] = []
+    for wire, _dest in recorder.sent:
+        pkt = RtpPacket.parse(wire)
+        if pkt.payload_type == _TEL_EVENT_PT:
+            out.append(pkt)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_uses_negotiated_payload_type_not_hardcoded() -> None:
+    """The DTMF packets carry the NEGOTIATED telephone-event PT, never a literal.
+
+    Construct the engine with a non-101 telephone-event PT and assert every DTMF
+    packet uses it — proving the PT is resolved from negotiation, not hardcoded.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        telephone_event_payload_type=110,  # deliberately NOT 101
+        clock=_dummy_clock,
+        sleep=_no_sleep,
+        initial_seq=100,
+        initial_ts=1000,
+    )
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("1")
+    assert recorder.sent, "send_dtmf must emit telephone-event datagrams"
+    for wire, _dest in recorder.sent:
+        assert RtpPacket.parse(wire).payload_type == 110
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_raises_when_telephone_event_not_negotiated() -> None:
+    """send_dtmf raises (never silently no-ops) if no telephone-event PT exists.
+
+    A call whose offer had no telephone-event must NOT pretend to send DTMF — that
+    would be a silent failure. The engine raises so the tool reports a clear error.
+    """
+    engine = _dtmf_engine(telephone_event_payload_type=None)
+    await engine.connect()
+    with _capture_sends(engine) as recorder, pytest.raises(RuntimeError):
+        await engine.send_dtmf("1")
+    assert not recorder.sent, "no DTMF packet may be sent when PT is unnegotiated"
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_marker_on_first_packet_of_each_digit() -> None:
+    """The marker bit is set on the FIRST packet of each digit, and only there."""
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("12")
+    pkts = _dtmf_packets(recorder)
+    # Group packets by their (constant-per-digit) timestamp to find each digit's
+    # first packet. The first packet of the first digit is index 0; the first
+    # packet of the second digit is the first packet with a new timestamp.
+    markers = [i for i, p in enumerate(pkts) if p.marker]
+    timestamps = [p.timestamp for p in pkts]
+    # Exactly two marked packets — one per digit.
+    assert len(markers) == 2, f"expected 2 marker packets, got {markers}"
+    # The marked packets are each the first occurrence of a distinct timestamp.
+    first_indices = [timestamps.index(ts) for ts in dict.fromkeys(timestamps)]
+    assert markers == first_indices
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_constant_timestamp_within_a_digit() -> None:
+    """All packets of ONE digit share a single RTP timestamp (RFC 4733 §2.5.1)."""
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("5")
+    pkts = _dtmf_packets(recorder)
+    assert len(pkts) >= 4, "a digit emits update packet(s) + 3 redundant end packets"
+    assert len({p.timestamp for p in pkts}) == 1, "one digit ⇒ one RTP timestamp"
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_distinct_timestamp_per_digit() -> None:
+    """Each digit advances the RTP timestamp so the receiver emits each press once."""
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("12")
+    pkts = _dtmf_packets(recorder)
+    seen_ts = list(dict.fromkeys(p.timestamp for p in pkts))
+    assert len(seen_ts) == 2, "two digits ⇒ two distinct RTP timestamps"
+    # Monotonic: the second digit's timestamp is later than the first's.
+    assert seen_ts[1] > seen_ts[0]
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_sequence_numbers_monotonic() -> None:
+    """The seq increments by exactly one per emitted packet across the whole burst."""
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("12")
+    pkts = _dtmf_packets(recorder)
+    seqs = [p.sequence_number for p in pkts]
+    assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), f"non-monotonic: {seqs}"
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_emits_three_end_packets_per_digit() -> None:
+    """Each digit ends with three end-bit packets (RFC 4733 §2.5.1.4 redundancy)."""
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("1")
+    pkts = _dtmf_packets(recorder)
+    end_pkts = [p for p in pkts if (p.payload[1] & 0x80)]  # end bit in byte 1
+    assert len(end_pkts) == 3, f"expected 3 end packets, got {len(end_pkts)}"
+    # The end packets are the LAST three packets of the digit.
+    assert end_pkts == pkts[-3:]
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_round_trips_through_receiver() -> None:
+    """The emitted packets decode back to the exact digits via DtmfReceiver."""
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("19#")
+    pkts = _dtmf_packets(recorder)
+    receiver = dtmf_module.DtmfReceiver()
+    decoded = [
+        d
+        for p in pkts
+        if (
+            d := receiver.feed(
+                dtmf_module.DtmfEvent.decode(p.payload), timestamp=p.timestamp
+            )
+        )
+        is not None
+    ]
+    assert "".join(decoded) == "19#"
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_srtp_protects_each_packet() -> None:
+    """When SRTP is active, every DTMF datagram is SRTP-protected (not plain RTP)."""
+
+    class _RecordingProtect:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def protect(self, packet: RtpPacket) -> bytes:
+            self.calls += 1
+            # A trivial, reversible "protection": tag the packed bytes so the test
+            # can tell a protected datagram from a plain one.
+            return b"SRTP" + packet.pack()
+
+    protector = _RecordingProtect()
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        telephone_event_payload_type=_TEL_EVENT_PT,
+        srtp_outbound=protector,
+        clock=_dummy_clock,
+        sleep=_no_sleep,
+        initial_seq=100,
+        initial_ts=1000,
+    )
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_dtmf("1")
+    assert recorder.sent
+    assert protector.calls == len(recorder.sent), "every DTMF packet must be protected"
+    for wire, _dest in recorder.sent:
+        assert wire.startswith(b"SRTP")
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_does_not_interleave_with_concurrent_send_audio() -> None:
+    """Concurrent send_audio + send_dtmf never share a seq nor interleave packets.
+
+    The two TX coroutines run under the same mutex, so the wire shows a clean,
+    gap-free, strictly-monotonic sequence-number stream with each digit's DTMF
+    packets contiguous (not split by an audio packet) — no seq race.
+    """
+    engine = _dtmf_engine()
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        # Fire an audio send and a DTMF send concurrently.
+        await asyncio.gather(
+            engine.send_audio(_silence_frame()),
+            engine.send_dtmf("1"),
+        )
+    all_pkts = [RtpPacket.parse(w) for w, _d in recorder.sent]
+    seqs = [p.sequence_number for p in all_pkts]
+    # Every sequence number is unique (no two packets — audio or DTMF — collided).
+    assert len(set(seqs)) == len(seqs), f"sequence-number collision: {seqs}"
+    # And the whole stream is contiguous + monotonic (no gap, no reuse).
+    assert sorted(seqs) == list(range(min(seqs), min(seqs) + len(seqs)))
+    # The DTMF packets (same PT) are contiguous — not split by an audio packet.
+    dtmf_idx = [i for i, p in enumerate(all_pkts) if p.payload_type == _TEL_EVENT_PT]
+    assert dtmf_idx == list(range(dtmf_idx[0], dtmf_idx[0] + len(dtmf_idx))), (
+        f"DTMF packets were interleaved with audio: {dtmf_idx}"
+    )
+    await engine.stop()

@@ -409,6 +409,16 @@ enumerate trusted numbers), consistent with the forgeable-caller-ID posture (§1
 > (last-wins), so a duplicate name could otherwise let a level-0 group pass
 > validation while the classifier returns a level-3 group of the same name —
 > forbidding duplicates removes that disagreement (matching the JSON loader).
+> Finally, it **rejects the match-all `"*"` pattern in a privileged group**
+> (`privilege_level >= 2`): `"*"` is an empty-prefix wildcard that matches every
+> caller, so it would grant that privilege to every unknown caller on a forgeable
+> caller-ID — the config-driven form of `default_mode=allow`. A privileged group
+> must enumerate specific numbers/prefixes; a specific prefix (e.g. `+1555550*`)
+> and a `"*"` in the unprivileged receptionist tier remain valid. Net: across the
+> legacy default, the JSON `default_group`, direct construction, post-construction
+> mutation, duplicate names, a missing default name (safe level-0 fallback), and a
+> match-all privileged pattern, an unmatched/unknown caller can never reach
+> operator privilege regardless of config.
 
 **Phasing:**
 

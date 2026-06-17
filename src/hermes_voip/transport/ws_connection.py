@@ -106,7 +106,10 @@ class WssSipTransport:
                 the ``wss://`` host in the WebSocket URI.
             port: The WebSocket port (default ``443`` for ``wss``).
             ws_path: The HTTP upgrade path for the WebSocket endpoint (e.g.
-                ``/ws``); read from ``HERMES_SIP_WS_PATH`` by the adapter.
+                ``/ws``). WSS signalling is not yet wired into the runtime, so
+                no code reads this value from the environment today; the
+                ``HERMES_SIP_WS_PATH`` env var is reserved for that future path
+                (see ADR-0016).
             connect_address: An alternative IP or hostname to dial (e.g.
                 ``127.0.0.1`` in tests); the TLS SNI / hostname verification
                 still uses ``host``.

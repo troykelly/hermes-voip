@@ -216,7 +216,7 @@ only** — inline number lists are rejected. Use either the N-group file
 `HERMES_VOIP_CALLER_GROUPS_FILE`, or the legacy 3-file scheme
 (`HERMES_VOIP_CALLER_{ALLOW,DENY,GREY}_FILE`). An unmatched caller falls to the unprivileged
 default; a privileged default is refused at startup. The full schema and operational steps
-are in the runbook [`docs/runbooks/0003-voip-caller-modes.md`](docs/runbooks/0003-voip-caller-modes.md).
+are in the runbook [`docs/runbooks/0010-voip-caller-modes.md`](docs/runbooks/0010-voip-caller-modes.md).
 
 ```jsonc
 // example caller-list file (fakes only) — { "patterns": [...] }

@@ -404,6 +404,11 @@ enumerate trusted numbers), consistent with the forgeable-caller-ID posture (§1
 > `__post_init__` **snapshots** its inputs to immutable containers
 > (`groups`/`match_order` → tuples, `group_lists` → a read-only `MappingProxyType`)
 > before validating, so the validated state is the same state the classifier reads.
+> It also **rejects duplicate group names**: the default-privilege check scans
+> linearly (first-wins) while `classify_caller_group` resolves a name via a dict
+> (last-wins), so a duplicate name could otherwise let a level-0 group pass
+> validation while the classifier returns a level-3 group of the same name —
+> forbidding duplicates removes that disagreement (matching the JSON loader).
 
 **Phasing:**
 

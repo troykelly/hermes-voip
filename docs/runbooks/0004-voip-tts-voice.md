@@ -76,22 +76,43 @@ keep first-audio latency low. If a measured first-audio number is ever too high,
 safe step (keeps the text normaliser on). **Never `4`** on a phone agent: it disables the text
 normaliser, so numbers/dates/extensions get mispronounced (bad for a receptionist).
 
-## Voice shortlist — swap with one env var
+## Starter voices (ElevenLabs) — swap with one env var
 
-Set `HERMES_VOIP_TTS_VOICE` to a voice id. The account's **TTS-scoped key cannot list voices**
-(`/v1/voices` returns `missing_permissions: voices_read`), and premade names/ids drift over
-time (ElevenLabs default voices expire **2026-12-31**), so **confirm any new voice by a live
-call** (a successful synth proves access). To enumerate the account's real voices, mint a key
-with `voices_read`, store it in 1Password, and `curl -s -H "xi-api-key: $KEY"
+Set `HERMES_VOIP_TTS_VOICE` to a voice id. The plugin accepts **any** ElevenLabs `voice_id`,
+so this list is only a **starting point** — you can point it at one of your own **custom or
+cloned voices** the same way. The `HERMES_VOIP_TTS_*` dynamic settings (`STABILITY`, `STYLE`,
+`SIMILARITY`, `SPEAKER_BOOST`) and the model choice apply to **whichever** voice is selected.
+
+The ids below are ElevenLabs **public premade voices** (the default library, available to
+standard accounts; **availability can vary by plan**). They are **ElevenLabs' ids and may
+change** — the account's **TTS-scoped key cannot list voices** (`/v1/voices` returns
+`missing_permissions: voices_read`) and premade names/ids drift over time (ElevenLabs default
+voices were noted to expire **2026-12-31**), so **confirm any new voice by a live call** — a
+successful synth proves access. To enumerate the account's real voices, mint a key with
+`voices_read`, store it in 1Password, and `curl -s -H "xi-api-key: $KEY"
 https://api.elevenlabs.io/v1/voices` (never echo the key or the header).
 
-| voice_id | Name | Why |
+Each id below was **verified to synthesize (HTTP 200)** with this account's TTS key on
+**2026-06-17** (a tiny `POST /v1/text-to-speech/{id}` with `eleven_flash_v2_5`). The spread
+covers female / male / gender-neutral, different registers, and US / British / Australian
+accents so there is a sensible default for most use cases:
+
+| Name | voice_id | Character (gender / register / accent / style) |
 | --- | --- | --- |
-| `21m00Tcm4TlvDq8ikWAM` | Rachel | The current baseline — calm narration (the "flat" one). |
-| `EXAVITQu4vr4xnSDxMaL` | Sarah | Warm, conversational — strongest livelier-default candidate. |
-| `cgSgspJ2msm6clMCkdW9` | Jessica | Expressive / animated — most dynamic of the shortlist. |
-| `FGY2WhTYpPnrIDTdsKH5` | Laura | Bright, upbeat receptionist warmth. |
-| `pqHfZKP75CvOlQylNhV4` | Bill | Male, calm, trustworthy (if a male voice is wanted). |
+| River | `SAz9YHcvj6GT2YYXdXww` | Gender-neutral, calm, US — a good neutral default. |
+| Rachel | `21m00Tcm4TlvDq8ikWAM` | Female, calm narration, US — the shipped baseline (the "flat" one before `stability=0.35`). |
+| Sarah | `EXAVITQu4vr4xnSDxMaL` | Female, soft, conversational, US — strong livelier-default candidate. |
+| Jessica | `cgSgspJ2msm6clMCkdW9` | Female, expressive / animated, US — most dynamic of the set. |
+| Laura | `FGY2WhTYpPnrIDTdsKH5` | Female, bright, upbeat, US — sassy receptionist warmth. |
+| Alice | `Xb7hH8MSUJpSbSDYk0k2` | Female, clear, **British**. |
+| Liam | `TX3LPaxmHKxFdv7VOQHJ` | Male, younger, US. |
+| Josh | `TxGEqnHWrfWFTfGW9XjX` | Male, younger, deep, US. |
+| Bill | `pqHfZKP75CvOlQylNhV4` | Male, older, deep, trustworthy, US. |
+| Brian | `nPczCjzI2devNBz1zQrb` | Male, deep, narration, US. |
+| George | `JBFqnCBsd6RMkjVDRZzb` | Male, warm, **British**. |
+| Daniel | `onwK4e9ZLuTAKqWW03F9` | Male, authoritative, **British**. |
+| Charlie | `IKne3meq5aSn9XLyUdCD` | Male, casual, **Australian**. |
+| Eric | `cjVigY5qzO86Huf0OWal` | Male, friendly, US. |
 
 Note: dropping `stability` to `0.35` makes **even Rachel** noticeably less flat, so a voice
 swap and the settings change are independent levers.

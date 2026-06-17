@@ -1,7 +1,7 @@
 # ADR-0019: Outbound calling — UAC originate flow (place_call)
 
 - **Date:** 2026-06-16
-- **Status:** Accepted
+- **Status:** Accepted (§4 agent-tool design + §8 Phase 2 superseded by ADR-0029: the gated `place_call` tool ships with a `HERMES_VOIP_OUTBOUND_ALLOW` allowlist as the hard gate, not an ADR-0010 `ConfirmationSource`)
 - **Deciders:** agent session (outbound calling design)
 
 ## Context

@@ -64,6 +64,7 @@ from hermes_voip.media.audio import (
     alaw_to_frame,
     frame_to_alaw,
     frame_to_ulaw,
+    linear_fade_out,
     ulaw_to_frame,
 )
 from hermes_voip.media.g722 import (
@@ -561,6 +562,14 @@ class RtpMediaTransport:
         # (hold stops outbound media). Reset in connect()/stop().
         self._tx_buffer: bytes = b""
 
+        # Barge-in flush generation (ADR-0028). ``flush_outbound`` increments this
+        # to signal any send_audio drain loop currently parked on its pacing sleep
+        # to STOP emitting the rest of its (now-superseded) utterance the instant it
+        # wakes — so the agent goes quiet within ~1 ptime instead of after the whole
+        # buffered chunk paces out. send_audio snapshots the value before its drain
+        # loop and bails if it changed across a pacing sleep. Reset in connect().
+        self._flush_generation: int = 0
+
         # Outbound pacing deadline (seconds on the ``_pace_clock`` timeline): the
         # time the NEXT frame is scheduled to go on the wire. ``None`` means no
         # schedule is anchored yet (the first frame of a stream sends immediately —
@@ -638,6 +647,8 @@ class RtpMediaTransport:
         self._g722_decoder = None
         # Drop any leftover outbound re-framing bytes from a previous call.
         self._tx_buffer = b""
+        # A fresh call starts at flush generation 0 (no barge-in flush yet).
+        self._flush_generation = 0
         # Re-anchor the pacing schedule on the first frame of this call (so a reused
         # engine does not inherit a stale, long-past deadline that would dump a burst
         # of packets back-to-back to "catch up").
@@ -1007,6 +1018,10 @@ class RtpMediaTransport:
         # stop()'s flush delivers them in that order. No frame is dropped, none
         # re-sent, none reordered.
         self._tx_buffer += wire_rate_frame.samples
+        # Snapshot the flush generation for this drain: if a barge-in flush bumps it
+        # mid-drain (ADR-0028), _transmit_frame suppresses the in-flight frame and
+        # this loop stops, so the rest of the now-superseded utterance never goes out.
+        drain_generation = self._flush_generation
         while len(self._tx_buffer) >= chunk_bytes:
             # Remove the frame from the buffer as we hand it to _transmit_frame, which
             # takes ownership: on a clean send the frame is on the wire; on a stop
@@ -1018,13 +1033,17 @@ class RtpMediaTransport:
                 self._tx_buffer[chunk_bytes:],
             )
             sent = await self._transmit_frame(
-                chunk, wire_rate_frame.monotonic_ts_ns, ts_increment
+                chunk,
+                wire_rate_frame.monotonic_ts_ns,
+                ts_increment,
+                flush_generation=drain_generation,
             )
             if not sent:
-                # stop() nulled the transport during the pacing sleep: the encoded
-                # frame is parked in _inflight_wire and stop()'s flush sends it first,
-                # then the rest of _tx_buffer. Nothing to put back here — stop the
-                # drain; the flush owns delivery from here.
+                # Either stop() nulled the transport during the pacing sleep (the
+                # encoded frame is parked in _inflight_wire for stop()'s flush), or a
+                # barge-in flush superseded this utterance (flush_outbound already
+                # cleared _tx_buffer and sent the fade). Either way: stop draining —
+                # the flush owns delivery from here. Nothing to put back.
                 return
             # Read _transport through a fresh local so mypy does not treat this as
             # unreachable: the pre-loop guard narrowed self._transport to non-None
@@ -1037,7 +1056,12 @@ class RtpMediaTransport:
                 return
 
     async def _transmit_frame(
-        self, chunk: bytes, monotonic_ts_ns: int, ts_increment: int
+        self,
+        chunk: bytes,
+        monotonic_ts_ns: int,
+        ts_increment: int,
+        *,
+        flush_generation: int,
     ) -> bool:
         """Encode one 20 ms frame, then deadline-pace, then send it on the wire.
 
@@ -1124,6 +1148,17 @@ class RtpMediaTransport:
         wait = self._next_send_at - now
         if wait > 0:
             await self._sleep(wait)
+
+        # Barge-in flush race (ADR-0028): if flush_outbound() ran during the pacing
+        # sleep it bumped the flush generation, cleared _tx_buffer, and already sent
+        # the fade-to-silence. This pre-flush frame is now superseded — sending it
+        # AFTER the fade would put a full-amplitude packet past the ramp (a click).
+        # Drop it (it is NOT parked in _inflight_wire; flush_outbound nulled that) and
+        # report False so the drain loop stops. Checked before the transport-null /
+        # send below so a flush that did NOT null the transport still suppresses it.
+        if self._flush_generation != flush_generation:
+            self._inflight_wire = None
+            return False
 
         # Re-read the transport AFTER the pacing sleep: stop() may have nulled it while
         # we waited. The explicit ``| None`` annotation defeats mypy's stale narrowing
@@ -1247,6 +1282,95 @@ class RtpMediaTransport:
             self._tx_buffer = b""
         self.on_hold = on_hold
 
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        """Drop the pending outbound audio with a short click-free fade (ADR-0028).
+
+        Called the instant a barge-in is authorised: the agent must go quiet within
+        ~1 packet, NOT after the buffered TTS audio drains. ``TtsStream.cancel()``
+        only stops the call loop *pulling* new frames; the audio already handed to
+        :meth:`send_audio` is re-framed and deadline-paced over real time (a single
+        large TTS chunk can be hundreds of ms on the wire), so without this the
+        caller keeps hearing the agent after they interrupted — the abruptness/delay
+        the operator reported.
+
+        This method:
+
+        * bumps the flush generation so a :meth:`send_audio` drain loop parked on its
+          pacing sleep stops emitting the remainder of the superseded utterance, and
+          DROPS any frame the deadline pacer parked mid-flight (it is one ptime of
+          full-amplitude pre-cut audio — emitting it would extend the agent's speech
+          past the barge-in; only its already-encoded bytes survive, so it cannot be
+          folded into the fade);
+        * emits a short LINEAR FADE-OUT on the FRONT of the carry buffer (the audio
+          that would have played next), re-framed into whole ``ptime`` RTP packets and
+          sent immediately (no pacing — the cut is now), so the last thing on the wire
+          ramps to silence and does not click/pop; then
+        * DROPS the rest of the pending buffer.
+
+        Total audio emitted after a barge-in is therefore at most the fade window
+        (``ceil(fade_ms / ptime)`` packets ≈ 1-2 at the 30 ms default) — within the
+        operator's ~20-40 ms budget, NOT the whole queued utterance. The fade is
+        computed in the linear PCM16 domain BEFORE the codec encode, so G.711 and
+        G.722 are both correct. ``fade_ms`` of 0 emits nothing — an instant hard cut.
+        While held / before connect, nothing is emitted (hold/closed-socket stop
+        outbound media).
+
+        Args:
+            fade_ms: Length of the linear fade-out in milliseconds (``>= 0``). The
+                adapter passes ``HERMES_VOIP_BARGE_IN_FADE_MS`` (default 30).
+
+        Raises:
+            ValueError: If ``fade_ms`` is negative.
+        """
+        if fade_ms < 0:
+            msg = f"fade_ms must be non-negative, got {fade_ms}"
+            raise ValueError(msg)
+        # Supersede any in-flight send_audio drain: it bails when it wakes (so the
+        # rest of the chunk it was pacing never goes out).
+        self._flush_generation += 1
+        pending = self._tx_buffer
+        self._tx_buffer = b""
+        # DROP any frame the deadline pacer parked mid-flight. It is one ptime of
+        # full-amplitude (pre-cut) audio; emitting it would add a full-volume packet
+        # AFTER the barge-in, beyond the fade budget — exactly the "still talking
+        # after I interrupted" the fade exists to avoid. We only hold its already-
+        # ENCODED bytes (its PCM was discarded after encode), so it cannot be folded
+        # into the fade; dropping it is the right call. The seq/ts it consumed are
+        # left spent, so the fade frames below use the NEXT seq/ts — the receiver
+        # sees a single 1-packet sequence gap, which RTP treats as one lost packet
+        # (benign, concealed). For G.722 the encoder advanced past this frame while
+        # the decoder will not see it: the decoder's adaptive sub-band predictor
+        # re-converges within a few frames, and since the fade is ramping to SILENCE
+        # the brief transient is inaudible (it is not a permanent desync).
+        self._inflight_wire = None
+
+        transport = self._transport
+        if transport is None or self.on_hold or fade_ms == 0 or not pending:
+            # Held / not connected / fade disabled / nothing buffered: the drop above
+            # is the whole effect — instant silence, no audio emitted. (stop()'s own
+            # flush is likewise gated on on_hold.)
+            return
+
+        wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000
+        bytes_per_sample = 2
+        fade_samples = (self._wire_sample_rate * fade_ms) // 1000
+        # Fade the FRONT of the buffer (the immediate continuation of what is
+        # playing) so the ramp falls from ~current amplitude to silence; the rest of
+        # the buffer is discarded. Cap is the fade window, so the total audio emitted
+        # after a barge-in is at most ``ceil(fade_ms / ptime)`` packets — within the
+        # operator's ~20-40 ms fade budget, NOT the whole queued utterance. Re-frame
+        # the faded audio into whole ptime packets (zero-pad the final partial once).
+        fade_bytes = (
+            min(fade_samples, len(pending) // bytes_per_sample) * bytes_per_sample
+        )
+        head = pending[:fade_bytes]
+        faded = linear_fade_out(head, fade_samples=len(head) // bytes_per_sample)
+        chunk_bytes = wire_samples_per_frame * bytes_per_sample
+        remainder = len(faded) % chunk_bytes
+        if remainder:
+            faded = faded + bytes(chunk_bytes - remainder)
+        self._emit_inline_frames(faded, transport)
+
     async def stop(self) -> None:
         """Tear down the media plane; close the socket; idempotent.
 
@@ -1310,15 +1434,32 @@ class RtpMediaTransport:
         if not tail:
             return
         wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000
-        ts_increment = (self._rtp_clock_rate * self._ptime) // 1000
         chunk_bytes = wire_samples_per_frame * 2
         # Pad only the trailing partial up to a whole frame; whole frames already
         # buffered are sent as-is, in order, each as its own RTP packet.
         remainder = len(tail) % chunk_bytes
         if remainder:
             tail = tail + bytes(chunk_bytes - remainder)
-        for offset in range(0, len(tail), chunk_bytes):
-            chunk = tail[offset : offset + chunk_bytes]
+        self._emit_inline_frames(tail, transport)
+
+    def _emit_inline_frames(
+        self, pcm: bytes, transport: asyncio.DatagramTransport
+    ) -> None:
+        """Encode + pack + send ``pcm`` as whole ``ptime`` RTP packets, inline.
+
+        ``pcm`` MUST be a whole number of wire-rate ``ptime`` frames (the caller
+        zero-pads any partial). Each frame is encoded with the per-call stateful
+        codec (so a G.722 stream stays continuous), packed at the next seq/ts, and
+        sent immediately with NO pacing — used by the teardown flush
+        (:meth:`_flush_tx_tail`) and the barge-in fade (:meth:`flush_outbound`),
+        both of which deliver a short final burst. seq advances per frame and the
+        timestamp by the codec's RTP clock increment (160 for G.711 AND G.722), so
+        the wire stays RFC 3550-consistent.
+        """
+        ts_increment = (self._rtp_clock_rate * self._ptime) // 1000
+        chunk_bytes = ((self._wire_sample_rate * self._ptime) // 1000) * 2
+        for offset in range(0, len(pcm), chunk_bytes):
+            chunk = pcm[offset : offset + chunk_bytes]
             payload = self._encode(
                 PcmFrame(
                     samples=chunk,

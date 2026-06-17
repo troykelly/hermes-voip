@@ -195,6 +195,12 @@ _GREETING_KEY = "HERMES_VOIP_GREETING"
 _BARGE_IN_MODE_KEY = "HERMES_VOIP_BARGE_IN_MODE"
 _BARGE_IN_MIN_SPEECH_MS_KEY = "HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS"
 _BARGE_IN_TAIL_MS_KEY = "HERMES_VOIP_BARGE_IN_TAIL_MS"
+# Clean-stop fade (ADR-0028): a short linear fade-out on the final outbound frames
+# when a barge-in flushes the agent's queued audio, so the cut is click-free. 30 ms
+# is long enough to remove the click without an audible lingering tail; 0 disables
+# it (instant hard cut, for an operator who prefers the abrupt stop).
+_BARGE_IN_FADE_MS_KEY = "HERMES_VOIP_BARGE_IN_FADE_MS"
+_DEFAULT_BARGE_IN_FADE_MS = 30
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
 # 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
@@ -400,6 +406,10 @@ class MediaConfig:
         barge_in_tail_ms: How long (ms) after the agent's TTS ends the gate keeps
             requiring a sustained run (echo lags the TTS via jitter/network).
             ``0`` disarms the instant TTS ends; must be non-negative.
+        barge_in_fade_ms: Length (ms) of the linear fade-out applied to the final
+            outbound frames when a barge-in flushes the agent's queued audio
+            (ADR-0028), so the clean stop is click-free. Default 30; ``0`` is an
+            instant hard cut; must be non-negative.
         injection_guard: Prompt-injection guard token (``onnx`` in-process default).
         injection_guard_model_dir: Path to the guard's ONNX model dir, or ``None``.
         dtmf_mode: ``auto`` | ``rfc4733`` | ``sip_info`` | ``inband``.
@@ -457,6 +467,7 @@ class MediaConfig:
     barge_in_mode: str
     barge_in_min_speech_ms: int
     barge_in_tail_ms: int
+    barge_in_fade_ms: int
     injection_guard: str
     injection_guard_model_dir: str | None
     dtmf_mode: str
@@ -532,6 +543,9 @@ class MediaConfig:
             raise ConfigError(msg)
         if self.barge_in_tail_ms < 0:
             msg = f"barge_in_tail_ms must be non-negative, got {self.barge_in_tail_ms}"
+            raise ConfigError(msg)
+        if self.barge_in_fade_ms < 0:
+            msg = f"barge_in_fade_ms must be non-negative, got {self.barge_in_fade_ms}"
             raise ConfigError(msg)
         if not (
             _MIN_RTP_TIMEOUT_SECS <= self.media_timeout_secs <= _MAX_RTP_TIMEOUT_SECS
@@ -704,6 +718,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ),
         barge_in_tail_ms=_parse_non_negative_int(
             env, _BARGE_IN_TAIL_MS_KEY, _DEFAULT_BARGE_IN_TAIL_MS
+        ),
+        barge_in_fade_ms=_parse_non_negative_int(
+            env, _BARGE_IN_FADE_MS_KEY, _DEFAULT_BARGE_IN_FADE_MS
         ),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,

@@ -438,6 +438,13 @@ and any native-`end_of_turn` STT (e.g. Deepgram Flux). The first withheld echo f
 - `HERMES_VOIP_BARGE_IN_TAIL_MS` — how long after the agent's TTS ends the gate keeps
   requiring a sustained run (default `250`; echo lags the TTS via the jitter buffer /
   network). `0` disarms the instant TTS ends.
+- `HERMES_VOIP_BARGE_IN_FADE_MS` — clean-stop fade (ADR-0028). When a barge-in is authorised
+  the engine flushes the agent's already-queued near-end audio so it goes quiet within ~1 RTP
+  packet (not after the buffered TTS drains), applying a short linear fade-out over this many
+  ms on the final frames so the cut is click-free. Default `30`; `0` is an instant hard cut.
+  The agent does NOT speak any interruption acknowledgment — the gateway's "Interrupting… I'll
+  respond…" busy-ack (and its Queued/Steered/Subagent siblings) is dropped at the `send()`
+  boundary (`notice_filter.is_interruption_ack`) so it is never synthesised.
 
 If a gateway has its own echo cancellation and you want zero added barge-in latency, set
 `HERMES_VOIP_BARGE_IN_MODE=full`. To stop the agent ever being interrupted, set `off`.

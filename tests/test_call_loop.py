@@ -62,6 +62,10 @@ class _FakeTransport:
     def __init__(self, frames: list[PcmFrame]) -> None:
         self._frames = frames
         self.sent_audio: list[PcmFrame] = []
+        # Number of times flush_outbound was called and the last fade_ms seen — the
+        # barge-in clean-stop assertions (ADR-0028) read these.
+        self.flush_calls: int = 0
+        self.last_flush_fade_ms: int | None = None
 
     @property
     def inbound_sample_rate(self) -> int:
@@ -78,6 +82,10 @@ class _FakeTransport:
 
     async def send_audio(self, frame: PcmFrame) -> None:
         self.sent_audio.append(frame)
+
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        self.flush_calls += 1
+        self.last_flush_fade_ms = fade_ms
 
     async def connect(self) -> bool:
         return True
@@ -433,6 +441,153 @@ async def test_speak_sends_audio_in_order() -> None:
     await loop.speak(_tokens())
 
     assert transport.sent_audio == frames
+
+
+# ---------------------------------------------------------------------------
+# (c2) Authorised barge-in FLUSHES the outbound audio (ADR-0028 clean-stop)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_barge_in_flushes_outbound_audio() -> None:
+    """barge_in() must flush the transport's outbound buffer, not only cancel TTS.
+
+    Cancelling the TtsStream stops PULLING new frames, but already-queued TTS audio
+    keeps pacing out of the engine (the abruptness/delay bug). barge_in() must also
+    call transport.flush_outbound so the agent goes quiet within ~1 packet.
+
+    Strategy mirrors test (c): a blocking transport parks speak() mid-utterance (so
+    the stream is still the active stream), then barge_in() cuts it. The blocked
+    send_audio is released afterward so speak() exits cleanly.
+    """
+    tts_frame = PcmFrame(
+        samples=b"\x10\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    transport = _BlockingTransport([])
+    tts = _FakeTTS([tts_frame, tts_frame, tts_frame])
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        barge_in_fade_ms=33,
+    )
+
+    async def _tokens() -> AsyncIterator[str]:
+        yield "the agent is speaking"
+
+    # speak() parks on the first send_audio gate with the stream registered.
+    speak_task = asyncio.create_task(loop.speak(_tokens()))
+    await asyncio.sleep(0)
+    await loop.barge_in()
+    transport.first_send_gate.set()
+    await speak_task
+
+    assert transport.flush_calls >= 1, "barge_in did not flush the outbound audio"
+    assert transport.last_flush_fade_ms == 33, "the configured fade_ms was not used"
+
+
+@pytest.mark.asyncio
+async def test_barge_in_with_no_active_stream_does_not_flush() -> None:
+    """barge_in() is a no-op (no flush, no error) when the agent is not speaking.
+
+    Flushing the engine when nothing is playing would be a needless side effect;
+    barge_in only flushes when there is an active TTS stream to cut off.
+    """
+    transport = _FakeTransport([])
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+    )
+
+    await loop.barge_in()  # no active stream
+
+    assert transport.flush_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_normal_speech_completion_does_not_flush() -> None:
+    """A normally-completing utterance (no barge-in) never flushes the engine.
+
+    The flush is a barge-in-only action; an utterance that runs to its natural end
+    must let the engine's own stop()/tail logic deliver the residual — flushing it
+    would truncate the legitimate tail.
+    """
+    frames = [
+        PcmFrame(samples=bytes([i, 0]) * 256, sample_rate=16_000, monotonic_ts_ns=i)
+        for i in range(3)
+    ]
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _FakeTTS(frames),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    async def _tokens() -> AsyncIterator[str]:
+        yield "a complete sentence"
+
+    await loop.speak(_tokens())
+
+    assert transport.sent_audio == frames
+    assert transport.flush_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_authorised_full_mode_barge_in_flushes_via_pump() -> None:
+    """An end-to-end FULL-mode barge-in from the pump flushes the outbound audio.
+
+    Drives the real pump→VAD→gate path: a speaking VAD fires an ONSET, FULL mode
+    authorises immediately, the pump calls barge_in(), which flushes. Proves the
+    wiring from the gate's authorisation to the engine flush, not just the direct
+    barge_in() call.
+    """
+    # A few voiced inbound frames so the speaking VAD fires an ONSET in the pump.
+    inbound = [_silence_frame(i) for i in range(4)]
+    transport = _FakeTransport(inbound)
+    # A long-running TTS stream registered as a greeting so it is active when the
+    # pump processes the first inbound frame.
+    tts_frame = PcmFrame(
+        samples=b"\x10\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    tts = _FakeTTS([tts_frame] * 50)
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_speaking_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="hello there caller",
+        barge_in_mode=BargeInMode.FULL,
+        barge_in_fade_ms=30,
+    )
+
+    await loop.run()
+
+    assert transport.flush_calls >= 1, (
+        "an authorised FULL-mode barge-in from the pump did not flush the engine"
+    )
 
 
 @pytest.mark.asyncio

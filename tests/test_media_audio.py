@@ -21,6 +21,7 @@ from hermes_voip.media.audio import (
     encode_ulaw,
     frame_to_alaw,
     frame_to_ulaw,
+    linear_fade_out,
     ulaw_to_frame,
 )
 from hermes_voip.providers.audio import PcmFrame
@@ -66,6 +67,64 @@ def test_resampler_16k_to_8k_roughly_halves_samples() -> None:
     pcm = _pcm16(*([500] * 320))  # 320 samples @ 16 kHz = 20 ms
     out = Resampler(16000, 8000).resample(pcm)
     assert 140 <= len(out) // 2 <= 180  # ~0.5x 320
+
+
+# ---------------------------------------------------------------------------
+# linear_fade_out — click-free ramp on the final frames of a barge-in cut
+# ---------------------------------------------------------------------------
+
+
+def test_linear_fade_out_ramps_last_samples_to_zero() -> None:
+    """The final ``fade_samples`` ramp linearly from full gain down to ~0.
+
+    A constant full-scale signal is the worst case for a hard cut (max click). The
+    fade must leave the head untouched and bring the tail monotonically to near
+    silence, with the very last sample at (or essentially at) zero.
+    """
+    const = 10_000
+    pcm = _pcm16(*([const] * 100))
+    faded = _samples(linear_fade_out(pcm, fade_samples=40))
+
+    # The 60 samples BEFORE the fade window are untouched (full amplitude).
+    assert all(s == const for s in faded[:60])
+    # The fade window ramps DOWN monotonically (each sample <= the previous).
+    tail = faded[60:]
+    assert all(tail[i] <= tail[i - 1] for i in range(1, len(tail)))
+    # It starts near full and ends at (essentially) zero.
+    assert tail[0] >= const - const // 20  # ~first faded sample still near full
+    assert tail[-1] == 0  # last sample is silence — no residual step to click
+
+
+def test_linear_fade_out_is_symmetric_for_negative_signal() -> None:
+    """A full-scale NEGATIVE constant ramps up toward zero (magnitude shrinks)."""
+    const = -12_000
+    pcm = _pcm16(*([const] * 60))
+    faded = _samples(linear_fade_out(pcm, fade_samples=30))
+    tail = faded[30:]
+    # Magnitude shrinks monotonically toward zero (samples rise toward 0).
+    assert all(abs(tail[i]) <= abs(tail[i - 1]) for i in range(1, len(tail)))
+    assert tail[-1] == 0
+
+
+def test_linear_fade_out_clamps_fade_to_buffer_length() -> None:
+    """A fade longer than the buffer fades the WHOLE buffer (no overrun/error)."""
+    pcm = _pcm16(*([8000] * 10))
+    faded = _samples(linear_fade_out(pcm, fade_samples=100))
+    assert len(faded) == 10
+    assert all(faded[i] <= faded[i - 1] for i in range(1, len(faded)))
+    assert faded[-1] == 0
+
+
+def test_linear_fade_out_zero_fade_returns_input_unchanged() -> None:
+    """fade_samples=0 is a no-op (returns the bytes unchanged)."""
+    pcm = _pcm16(1, 2, 3, 4)
+    assert linear_fade_out(pcm, fade_samples=0) == pcm
+
+
+def test_linear_fade_out_preserves_byte_length() -> None:
+    """The faded buffer has the same number of PCM16 samples as the input."""
+    pcm = _pcm16(*([5000] * 50))
+    assert len(linear_fade_out(pcm, fade_samples=20)) == len(pcm)
 
 
 @pytest.mark.parametrize(("from_rate", "to_rate"), [(8000, 16000), (16000, 8000)])

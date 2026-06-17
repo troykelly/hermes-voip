@@ -193,6 +193,9 @@ class _CountingTransport:
     async def send_audio(self, frame: PcmFrame) -> None:
         self.send_count += 1
 
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        _ = fade_ms  # no queued audio in this fake; nothing to flush
+
     async def disconnect(self) -> None:
         pass
 

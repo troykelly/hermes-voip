@@ -460,6 +460,10 @@ class CallLoop:
             ``barge_in_min_speech_ms`` and the inbound rate. Must be ``>= 1``.
         barge_in_tail_windows: How many VAD windows after the agent's TTS stops the
             gate keeps requiring a sustained run (echo lags the TTS). ``>= 0``.
+        barge_in_fade_ms: Length (ms) of the linear fade-out the engine applies to
+            the final frames when a barge-in flushes the outbound audio (ADR-0028),
+            so the clean stop is click-free. ``0`` is an instant hard cut. The
+            adapter passes ``HERMES_VOIP_BARGE_IN_FADE_MS`` (default 30).
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
@@ -480,6 +484,7 @@ class CallLoop:
         barge_in_mode: BargeInMode = BargeInMode.GATED,
         barge_in_min_voiced_windows: int = 1,
         barge_in_tail_windows: int = 0,
+        barge_in_fade_ms: int = 30,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -495,6 +500,10 @@ class CallLoop:
         self._greeting = greeting
         self._tone_secs = tone_secs
         self.barge_in_mode = barge_in_mode
+        # Length (ms) of the linear fade-out the engine applies to the final frames
+        # when a barge-in flushes the outbound audio (ADR-0028), so the cut is
+        # click-free. 0 = instant hard cut.
+        self._barge_in_fade_ms = barge_in_fade_ms
         # The echo-robust barge-in decision (ADR-0023). The pump drives it from
         # VAD edges + the TTS-active state; ``should_barge_in`` says when to fire.
         self._barge_in_gate = BargeInGate(
@@ -976,16 +985,33 @@ class CallLoop:
         await self._play(stream, on_first_frame=_log_first_rtp)
 
     async def barge_in(self) -> None:
-        """Cancel the in-flight TtsStream for immediate barge-in.
+        """Cancel the in-flight TtsStream AND flush queued audio for a clean stop.
 
-        Calls ``cancel()`` on the active ``TtsStream`` if one is in progress,
-        causing ``_play()``'s iteration loop to exit before the next
-        ``send_audio`` call. Idempotent: calling when no stream is active is a
-        no-op.
+        Two steps, because cancelling the stream alone is not enough to make the
+        agent go quiet (ADR-0028):
+
+        1. ``cancel()`` the active ``TtsStream`` so ``_play()``'s loop stops PULLING
+           new frames from the synthesiser.
+        2. ``transport.flush_outbound`` to DROP the audio already handed to the
+           engine — the re-framing carry buffer and any in-flight frame, which the
+           engine otherwise deadline-paces out over real time (a single large TTS
+           chunk is hundreds of ms on the wire). The flush emits a short linear
+           fade-out (``barge_in_fade_ms``) on the final frames so the cut is
+           click-free, then goes silent within ~1 packet. Without step 2 the caller
+           kept hearing the agent for the duration of the already-queued audio after
+           they interrupted — the abruptness/delay the operator reported.
+
+        Idempotent and side-effect-free when no stream is active: with nothing to
+        cut off there is no queued agent audio to flush, so the engine is left
+        untouched (a flush while the agent is silent would be a needless no-op send).
         """
         stream = self._active_tts_stream
         if stream is not None:
             await stream.cancel()
+            # Flush the already-queued near-end audio so the agent goes quiet within
+            # ~1 packet (the cancel only stops pulling NEW frames). Only when a
+            # stream is/was active — nothing queued to flush otherwise.
+            await self._transport.flush_outbound(fade_ms=self._barge_in_fade_ms)
 
     async def _screen_and_deliver(self, text: str) -> None:
         """Screen one finalised turn through the guard; deliver if not refused."""

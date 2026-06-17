@@ -35,6 +35,16 @@ class MediaTransport(Protocol):
         """Encode + packetise one near-end (agent) frame to the gateway."""
         ...
 
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        """Drop pending outbound audio with a short fade-out (barge-in clean stop).
+
+        Called the instant a barge-in is authorised: stop the agent's already-queued
+        near-end audio within ~1 packet (not after the buffer drains), emitting a
+        short linear fade-out (``fade_ms``) on the final frames so the cut does not
+        click. ``fade_ms`` of 0 is an instant hard cut (no audio emitted).
+        """
+        ...
+
     @property
     def inbound_sample_rate(self) -> int:
         """Declared rate of frames yielded by ``inbound_audio()`` (e.g. 8000)."""

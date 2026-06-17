@@ -88,6 +88,8 @@ class FakeTransport:
 
     async def send_audio(self, frame: PcmFrame) -> None: ...
 
+    async def flush_outbound(self, *, fade_ms: int) -> None: ...
+
 
 def test_fakes_satisfy_protocols_statically() -> None:
     # The assignments are what `mypy --strict` verifies; the body exercises the

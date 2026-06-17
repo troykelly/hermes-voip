@@ -318,6 +318,7 @@ async def test_adapter_concurrent_same_call_id_teardown_isolation() -> None:  # 
                 barge_in_mode="gated",
                 barge_in_min_speech_ms=400,
                 barge_in_tail_ms=250,
+                barge_in_fade_ms=30,
             ),
         ),
         patch(
@@ -610,6 +611,7 @@ async def test_concurrent_same_call_id_all_tasks_tracked_and_cancelled() -> None
                 barge_in_mode="gated",
                 barge_in_min_speech_ms=400,
                 barge_in_tail_ms=250,
+                barge_in_fade_ms=30,
             ),
         ),
         patch(

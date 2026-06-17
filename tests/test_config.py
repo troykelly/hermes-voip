@@ -424,6 +424,8 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.barge_in_mode == "gated"
     assert cfg.barge_in_min_speech_ms == 600
     assert cfg.barge_in_tail_ms == 250
+    # barge-in clean-stop fade (ADR-0028): a short click-free ramp on the cut.
+    assert cfg.barge_in_fade_ms == 30
     # injection guard
     assert cfg.injection_guard == "onnx"
     assert cfg.injection_guard_model_dir is None
@@ -457,6 +459,7 @@ def test_media_full_override() -> None:
             "HERMES_VOIP_BARGE_IN_MODE": "full",
             "HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS": "600",
             "HERMES_VOIP_BARGE_IN_TAIL_MS": "150",
+            "HERMES_VOIP_BARGE_IN_FADE_MS": "40",
         }
     )
     assert cfg.stt_provider == "deepgram"
@@ -481,6 +484,19 @@ def test_media_full_override() -> None:
     assert cfg.barge_in_mode == "full"
     assert cfg.barge_in_min_speech_ms == 600
     assert cfg.barge_in_tail_ms == 150
+    assert cfg.barge_in_fade_ms == 40
+
+
+def test_media_barge_in_fade_ms_zero_allowed() -> None:
+    """A fade of 0 ms is valid (instant hard cut, no ramp)."""
+    cfg = load_media_config({"HERMES_VOIP_BARGE_IN_FADE_MS": "0"})
+    assert cfg.barge_in_fade_ms == 0
+
+
+def test_media_barge_in_fade_ms_negative_rejected() -> None:
+    """A negative fade is rejected (fail-fast)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_BARGE_IN_FADE_MS": "-5"})
 
 
 def test_media_barge_in_mode_lowercased_and_validated() -> None:
@@ -944,6 +960,7 @@ def test_media_config_validates_itself_on_direct_construction() -> None:
             barge_in_mode="gated",
             barge_in_min_speech_ms=400,
             barge_in_tail_ms=250,
+            barge_in_fade_ms=30,
             injection_guard="onnx",
             injection_guard_model_dir=None,
             dtmf_mode="auto",
@@ -972,6 +989,7 @@ def test_media_config_rejects_bad_enum_on_direct_construction() -> None:
             barge_in_mode="gated",
             barge_in_min_speech_ms=400,
             barge_in_tail_ms=250,
+            barge_in_fade_ms=30,
             injection_guard="onnx",
             injection_guard_model_dir=None,
             dtmf_mode="auto",
@@ -1042,6 +1060,7 @@ def test_media_tone_secs_validates_on_direct_construction() -> None:
             barge_in_mode="gated",
             barge_in_min_speech_ms=400,
             barge_in_tail_ms=250,
+            barge_in_fade_ms=30,
             injection_guard="onnx",
             injection_guard_model_dir=None,
             dtmf_mode="auto",
@@ -1159,6 +1178,7 @@ def test_media_tts_tuning_validates_on_direct_construction() -> None:
             barge_in_mode="gated",
             barge_in_min_speech_ms=400,
             barge_in_tail_ms=250,
+            barge_in_fade_ms=30,
             injection_guard="onnx",
             injection_guard_model_dir=None,
             dtmf_mode="auto",

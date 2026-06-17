@@ -123,6 +123,53 @@ def frame_to_alaw(frame: PcmFrame) -> bytes:
     return encode_alaw(frame.samples)
 
 
+def linear_fade_out(pcm16: bytes, *, fade_samples: int) -> bytes:
+    """Return ``pcm16`` with its final ``fade_samples`` linearly ramped to silence.
+
+    Applies a linear gain ramp from full (``1.0``) down to ``0.0`` across the LAST
+    ``fade_samples`` PCM16 samples, leaving everything before that window
+    untouched. The ramp brings the very last sample to exactly ``0`` so a hard cut
+    immediately after has no residual step to click/pop — this is the click-free
+    barge-in tail (ADR-0028). It operates purely in the linear PCM16 domain, so it
+    is codec-agnostic: callers fade BEFORE encoding to G.711 or G.722.
+
+    The gain for the ``k``-th sample of an ``L``-sample fade window (``k`` counting
+    ``0 .. L-1`` from the window start) is ``(L - 1 - k) / L`` — i.e. the first
+    faded sample keeps ``(L-1)/L`` of its amplitude and the last keeps ``0``.
+
+    Args:
+        pcm16: PCM16-LE mono bytes (a whole number of 16-bit samples).
+        fade_samples: The number of trailing samples to ramp down. ``0`` returns
+            ``pcm16`` unchanged (no fade). A value larger than the sample count is
+            clamped to fade the whole buffer.
+
+    Returns:
+        A new PCM16-LE buffer of the SAME length, with the trailing window faded.
+
+    Raises:
+        ValueError: If ``pcm16`` is not a whole number of 16-bit samples, or
+            ``fade_samples`` is negative.
+    """
+    _validate_pcm16(pcm16)
+    if fade_samples < 0:
+        msg = f"fade_samples must be non-negative, got {fade_samples}"
+        raise ValueError(msg)
+    if fade_samples == 0 or not pcm16:
+        return pcm16
+
+    total = len(pcm16) // PCM16_BYTES_PER_SAMPLE
+    window = min(fade_samples, total)
+    samples = list(struct.unpack(f"<{total}h", pcm16))
+    start = total - window
+    for k in range(window):
+        # Gain (L-1-k)/L as integer math: scale the sample by the numerator and
+        # divide by L, so the last sample (k == window-1) is exactly zero. Round
+        # toward zero (int() truncation) — the residual is <1 LSB, inaudible.
+        numerator = window - 1 - k
+        samples[start + k] = samples[start + k] * numerator // window
+    return struct.pack(f"<{total}h", *samples)
+
+
 class Resampler:
     """Stateful PCM16 sample-rate converter for one continuous stream.
 

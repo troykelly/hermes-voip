@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,12 +41,19 @@ from hermes_voip.caller_modes import (
     Normalization,
 )
 from hermes_voip.config import ConfigError, ExtensionConfig
+from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.voip_tools import TransferOutcome
+
+
+async def _noop_prompt(_text: str) -> None:
+    """A confirmation-prompt sink that speaks nothing (tests inject the digit)."""
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -1162,3 +1170,133 @@ async def test_open_entry_unknown_call_returns_false() -> None:
         open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
     )
     assert await adapter.open_entry("nope") is False
+
+
+# ===========================================================================
+# transfer_blind_on_call: DTMF-confirmed blind transfer (ADR-0010/0031)
+# ===========================================================================
+#
+# The host method drives the spoof-resistant safeguard: it awaits the per-call
+# ArmedConfirmation, and ONLY when the caller presses the armed confirm digit does it
+# call CallSession.transfer_blind (which sends the RFC 3515 REFER). A wrong digit /
+# timeout returns UNCONFIRMED and the REFER never fires. A call with no bound
+# confirmation (DTMF not negotiated) fails LOUD — never a silent no-op (rule 37).
+
+
+class _FakeTransferSession:
+    """A CallSession stand-in for transfer tests: records REFER targets."""
+
+    def __init__(self, *, ended: bool = False, local_uri: str = "sip:1000@pbx") -> None:
+        self.ended = ended
+        # CallSession.transfer_blind reads the local AOR for Referred-By from
+        # ``self._dialog.local_uri``; the adapter reads it from ``session.dialog``.
+        self.dialog = SimpleNamespace(local_uri=local_uri)
+        self.blind: list[tuple[str, str | None]] = []
+
+    async def transfer_blind(
+        self, target_uri: str, *, referred_by: str | None = None
+    ) -> None:
+        self.blind.append((target_uri, referred_by))
+
+
+def _confirmation_pressing(digit: str) -> ArmedConfirmation:
+    """An ArmedConfirmation whose prompt feeds ``digit`` (deterministic resolution).
+
+    The digit is fed from inside the prompt sink, which ``arm`` awaits AFTER the
+    window is armed — so ``feed`` resolves the live window with no wall-clock wait.
+    """
+    confirmation = ArmedConfirmation(prompt=_noop_prompt)
+
+    async def _prompt(_text: str) -> None:
+        confirmation.feed(digit)
+
+    confirmation._prompt = _prompt  # rebind so the press fires when arm() prompts
+    return confirmation
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_fires_refer_after_confirm() -> None:
+    """A confirmed transfer sends the REFER with the target + a Referred-By AOR."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(local_uri="sip:1000@pbx.example.test")
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
+
+    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert outcome is TransferOutcome.TRANSFERRED
+    assert session.blind == [("sip:1001@pbx.example.test", "sip:1000@pbx.example.test")]
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_wrong_digit_does_not_refer() -> None:
+    """A wrong confirm digit resolves UNCONFIRMED and the REFER never fires."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._dtmf_confirmations[call_id] = _confirmation_pressing("2")  # not "1"
+
+    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert outcome is TransferOutcome.UNCONFIRMED
+    assert session.blind == []  # nothing transferred
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_timeout_does_not_refer() -> None:
+    """No digit before the timeout resolves UNCONFIRMED and the REFER never fires."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    async def _fast_sleep(_seconds: float) -> None:
+        # Fire the timeout the moment the armed window awaits it (no wall-clock wait).
+        return None
+
+    # No digit is ever fed; the timeout seam fires immediately → False.
+    adapter._dtmf_confirmations[call_id] = ArmedConfirmation(
+        prompt=_noop_prompt, sleep=_fast_sleep
+    )
+
+    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert outcome is TransferOutcome.UNCONFIRMED
+    assert session.blind == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_no_confirmation_channel_raises() -> None:
+    """A call with no bound confirmation (no telephone-event) fails LOUD (rule 37)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    # NB: no entry in adapter._dtmf_confirmations for this call.
+
+    with pytest.raises(RuntimeError, match="confirm"):
+        await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert session.blind == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_unknown_call_returns_no_call() -> None:
+    """An unknown/ended call returns NO_CALL (no confirmation prompt, no REFER)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    assert (
+        await adapter.transfer_blind_on_call("nope", "sip:1001@pbx.example.test")
+        is TransferOutcome.NO_CALL
+    )

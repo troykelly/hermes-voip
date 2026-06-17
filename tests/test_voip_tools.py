@@ -33,6 +33,9 @@ from hermes_voip.voip_tools import (
     RESUME_TOOL_SCHEMA,
     SEND_DTMF_TOOL_NAME,
     SEND_DTMF_TOOL_SCHEMA,
+    TRANSFER_BLIND_TOOL_NAME,
+    TRANSFER_BLIND_TOOL_SCHEMA,
+    TransferOutcome,
     active_voip_adapter,
     hang_up_handler,
     hold_call_handler,
@@ -41,6 +44,7 @@ from hermes_voip.voip_tools import (
     resume_call_handler,
     send_dtmf_handler,
     set_active_adapter,
+    transfer_blind_handler,
     voip_pre_tool_call,
 )
 
@@ -68,9 +72,17 @@ class _FakeHost:
         self.results: list[tuple[str, str]] = []
         self.dtmf_sent: list[tuple[str, str]] = []
         self.entries_opened: list[str] = []
+        self.transfers: list[tuple[str, str]] = []
         # When set, send_dtmf_on_call raises this instead of recording (e.g. the
         # telephone-event-not-negotiated RuntimeError).
         self.dtmf_raises: Exception | None = None
+        # transfer_blind_on_call outcome (ADR-0010/0031): the host method returns a
+        # tri-state so the handler can distinguish a fired transfer from an
+        # unconfirmed one from an unknown/ended call. Override per-test.
+        self.transfer_outcome: TransferOutcome = TransferOutcome.TRANSFERRED
+        # When set, transfer_blind_on_call raises this (e.g. a REFER-rejected CallError
+        # or the no-DTMF RuntimeError) so the handler can render a clear tool error.
+        self.transfer_raises: Exception | None = None
 
     def guard_state_for(self, call_id: str) -> GuardSessionState | None:
         return self._guard if self.known else None
@@ -113,6 +125,20 @@ class _FakeHost:
         # ADR-0031 VoipToolHost member: actuate the intercom entry.
         self.entries_opened.append(call_id)
         return self.known and not self.already_ended
+
+    async def transfer_blind_on_call(
+        self, call_id: str, target: str
+    ) -> TransferOutcome:
+        # ADR-0010/0031 VoipToolHost member: DTMF-confirmed blind transfer (REFER).
+        if self.transfer_raises is not None:
+            raise self.transfer_raises
+        if not self.known or self.already_ended:
+            return TransferOutcome.NO_CALL
+        # Only record the (call, target) when the configured outcome is a fired
+        # transfer — an unconfirmed outcome must leave no REFER trace.
+        if self.transfer_outcome is TransferOutcome.TRANSFERRED:
+            self.transfers.append((call_id, target))
+        return self.transfer_outcome
 
 
 @pytest.fixture(autouse=True)
@@ -644,3 +670,275 @@ def test_open_entry_scoped_by_allowed_tools_blocks_other_tools(
         verdict = voip_pre_tool_call(tool_name=blocked, args={})
         assert verdict is not None, f"{blocked} should be blocked by the sub-ceiling"
         assert verdict["action"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# transfer_blind (IRREVERSIBLE) — DTMF-confirmed blind transfer (ADR-0010/0031)
+# ---------------------------------------------------------------------------
+#
+# The spoof-resistant safeguard is the ArmedConfirmation DTMF channel, driven by
+# the host method ``transfer_blind_on_call`` (NOT the sync gate). The gate's role
+# is the privilege clamp ONLY (operator level 3 + non-degraded) — a fail-fast so an
+# unprivileged/degraded caller is blocked BEFORE the confirm prompt is ever spoken.
+# The handler then asks the host to confirm-and-REFER, and the REFER fires ONLY when
+# the host reports TRANSFERRED (i.e. the caller pressed the armed digit).
+
+
+def test_transfer_blind_schema_takes_a_target_string() -> None:
+    """The schema names the tool and takes a single required ``target`` string."""
+    assert TRANSFER_BLIND_TOOL_SCHEMA["name"] == TRANSFER_BLIND_TOOL_NAME
+    assert TRANSFER_BLIND_TOOL_SCHEMA["description"]
+    params = TRANSFER_BLIND_TOOL_SCHEMA["parameters"]
+    assert isinstance(params, dict)
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    assert "target" in props
+    assert params.get("required") == ["target"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_fires_on_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmed transfer resolves the session call and fires the REFER to target.
+
+    The host method returns TRANSFERRED only after the ArmedConfirmation resolves
+    True; the handler reports success and the REFER reached exactly the session's
+    own call with the requested target.
+    """
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.TRANSFERRED
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert host.transfers == [("call-xyz", "sip:1001@pbx.example.test")]
+    assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unconfirmed_does_not_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrong-digit / timeout (UNCONFIRMED) → no transfer, a clear error result.
+
+    This is the load-bearing safety property: even an operator-level call does NOT
+    transfer unless the caller presses the armed confirm digit. The handler reports
+    that nothing was transferred and the host recorded no REFER.
+    """
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.UNCONFIRMED
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert host.transfers == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_requires_a_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing/blank target yields an error and nothing is transferred."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({})
+
+    assert host.transfers == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_no_call_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No call in scope → an error, nothing transferred (the REFER is never built)."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, None)
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert host.transfers == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_no_adapter_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No live adapter → a clear error, never a crash."""
+    _set_chat(monkeypatch, "call-xyz")  # adapter is None (fixture default)
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unavailable_reports_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When DTMF confirmation is not available the handler reports a clear error.
+
+    The host raises RuntimeError (no ArmedConfirmation bound — the call negotiated no
+    telephone-event, so it cannot obtain a spoof-resistant confirmation). The handler
+    surfaces it as a tool error; the transfer is NOT performed (rule 37 — never a
+    silent no-op).
+    """
+    host = _FakeHost()
+    host.transfer_raises = RuntimeError("inbound DTMF confirmation is not available")
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert host.transfers == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_refer_rejected_reports_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A REFER rejected by the gateway (CallError) is surfaced as a tool error."""
+    from hermes_voip.call import CallError  # noqa: PLC0415
+
+    host = _FakeHost()
+    host.transfer_raises = CallError("REFER rejected: 603 Declined")
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert host.transfers == []
+    assert "error" in json.loads(result)
+
+
+# --- the gate OWNS transfer_blind and clamps it to operator level 3 ----------
+
+
+def test_gate_owns_transfer_blind() -> None:
+    """The gate is responsible for transfer_blind (returns a verdict, not None)."""
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    assert TRANSFER_BLIND_TOOL_NAME in vt._voip_tool_names()
+
+
+def test_gate_blocks_transfer_blind_for_receptionist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A level-0 (untrusted) caller is BLOCKED from transfer_blind (no prompt spoken).
+
+    The gate fail-fasts BEFORE the handler runs, so an unprivileged caller never even
+    hears the confirm prompt — the credit-card-attack class cannot reach the REFER.
+    """
+    host = _FakeHost(guard=_receptionist())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(
+        tool_name=TRANSFER_BLIND_TOOL_NAME, args={"target": "sip:1001@pbx.example.test"}
+    )
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_gate_blocks_transfer_blind_for_trusted_level_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A level-2 trusted (colleague) call is BLOCKED from transfer_blind.
+
+    transfer_blind is IRREVERSIBLE (requires level 3); a trusted-but-not-operator
+    caller can hold/resume/send DTMF but cannot initiate a transfer — matching the
+    colleague persona, which states it may NOT initiate transfers.
+    """
+    host = _FakeHost(guard=_trusted())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(
+        tool_name=TRANSFER_BLIND_TOOL_NAME, args={"target": "sip:1001@pbx.example.test"}
+    )
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_gate_blocks_transfer_blind_on_degraded_operator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded (fail-open screened) operator call is BLOCKED from transfer_blind.
+
+    The degraded hard-block applies even at operator level: a missed injection that
+    flips the session degraded cannot then reach a transfer.
+    """
+    host = _FakeHost(
+        guard=GuardSessionState(call_id="c", privilege_level=3, degraded=True)
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(
+        tool_name=TRANSFER_BLIND_TOOL_NAME, args={"target": "sip:1001@pbx.example.test"}
+    )
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_gate_allows_transfer_blind_for_operator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator (level-3, clean) call PASSES the gate (reaches the handler).
+
+    The gate clamps privilege only; the DTMF confirmation is then enforced by the
+    handler/host before the REFER fires (covered by the handler tests above).
+    """
+    host = _FakeHost(guard=_operator())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    assert (
+        voip_pre_tool_call(
+            tool_name=TRANSFER_BLIND_TOOL_NAME,
+            args={"target": "sip:1001@pbx.example.test"},
+        )
+        is None
+    )
+
+
+def test_gate_fails_safe_for_transfer_blind_when_call_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """transfer_blind with no resolvable call state is BLOCKED (fail safe)."""
+    set_active_adapter(None)
+    _set_chat(monkeypatch, None)
+
+    verdict = voip_pre_tool_call(
+        tool_name=TRANSFER_BLIND_TOOL_NAME, args={"target": "sip:1001@pbx.example.test"}
+    )
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_transfer_attended_stays_deferred_not_registered() -> None:
+    """transfer_attended is NOT registered (deferred — no consult-leg origination).
+
+    Rule 6: it must not be a lying stub. The gate must not own it (it is not exposed),
+    and there is no schema/handler for it in the public API. transfer_blind IS exposed;
+    transfer_attended is not.
+    """
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    # transfer_blind is exposed and owned by the gate...
+    assert TRANSFER_BLIND_TOOL_NAME in vt._voip_tool_names()
+    # ...transfer_attended is not registered at all (no name, schema, or handler).
+    assert "transfer_attended" not in vt._voip_tool_names()
+    assert not hasattr(vt, "TRANSFER_ATTENDED_TOOL_NAME")
+    assert not hasattr(vt, "transfer_attended_handler")

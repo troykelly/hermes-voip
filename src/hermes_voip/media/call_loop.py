@@ -96,6 +96,7 @@ from hermes_voip.providers.guard import GuardVerdict, InjectionGuard
 from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_call
 from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
+from hermes_voip.spoken_text import sanitize_for_speech
 
 _log: Final = logging.getLogger(__name__)
 
@@ -167,6 +168,20 @@ class _ToneStream:
     async def aclose(self) -> None:
         """Idempotent teardown; sets the stop flag so further pulls are safe."""
         self._stopped = True
+
+
+async def _sanitize_iter(text: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Yield sanitised text chunks from *text*, stripping emoji/markdown/URLs.
+
+    Each chunk emitted by the agent is passed through
+    :func:`~hermes_voip.spoken_text.sanitize_for_speech` before being forwarded
+    to TTS synthesis. Empty chunks (reduced to nothing by sanitisation) are
+    skipped so the TTS segmenter never receives an empty string.
+    """
+    async for chunk in text:
+        clean = sanitize_for_speech(chunk)
+        if clean:
+            yield clean
 
 
 def gate_voip_tool(
@@ -517,7 +532,9 @@ class CallLoop:
                 moment). Not called if the stream is cancelled before any frame
                 is sent.
         """
-        stream = self._tts.synthesize(text, self._voice)
+        # Sanitize each text chunk before TTS synthesis so that emoji,
+        # markdown markup, and raw URLs are never voiced by the TTS engine.
+        stream = self._tts.synthesize(_sanitize_iter(text), self._voice)
         # Register synchronously (no await before this line), then supersede any
         # previously-active stream so playout is single-owner.
         previous = self._active_tts_stream
@@ -595,7 +612,7 @@ class CallLoop:
         Logs the synth start at INFO. Only called when ``self._greeting`` is
         non-empty.
         """
-        greeting = self._greeting
+        greeting = sanitize_for_speech(self._greeting)
         _log.info("greeting: synthesising %d chars", len(greeting))
 
         async def _single_chunk() -> AsyncIterator[str]:

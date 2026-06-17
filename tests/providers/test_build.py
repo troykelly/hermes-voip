@@ -543,6 +543,11 @@ def test_elevenlabs_factory_partial_tuning_falls_back_per_field() -> None:
     cfg = _media_config(
         tts_provider="elevenlabs",
         elevenlabs_api_key="el-fake-key",
+        # tts_model=None so ElevenLabs uses its Flash v2.5 default: the shared
+        # _media_config default is a Kokoro DIRECTORY path ("/models/tts"), which the
+        # ADR-0025 model_id guard now correctly rejects for ElevenLabs (a path is the
+        # live HTTP 400 foot-gun). This test exercises voice_settings, not the model.
+        tts_model=None,
         tts_stability=0.42,  # only stability set; the rest keep dynamic defaults
     )
     tts = _make_elevenlabs_tts(cfg)

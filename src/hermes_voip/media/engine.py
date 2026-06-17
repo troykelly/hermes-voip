@@ -70,7 +70,12 @@ from hermes_voip.media.srtp import SrtpError
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket
 
-__all__ = ["Codec", "RtpMediaTransport"]
+__all__ = [
+    "Codec",
+    "RtpMediaTransport",
+    "UnsupportedCodecError",
+    "codec_for_encoding",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -110,6 +115,78 @@ class Codec(enum.Enum):
 
     PCMU = 0  # mu-law, RTP payload type 0
     PCMA = 8  # a-law, RTP payload type 8
+
+
+class UnsupportedCodecError(ValueError):
+    """A negotiated SDP codec cannot be carried by the media engine.
+
+    Raised by :func:`codec_for_encoding` when an ``(encoding, clock_rate)`` pair
+    is not in the engine's capability table — there is NO silent fallback (the
+    historical ``else -> PCMA`` mis-map answered calls the engine could not
+    actually carry, yielding dead audio).
+
+    Subclasses :class:`ValueError` so it composes with the SDP-negotiation
+    failure handling (which already maps ``ValueError`` to a 488 reject). The
+    message carries only the structural codec facts (encoding name + clock rate)
+    for diagnostics — never a SIP host, extension, or caller number.
+
+    Attributes:
+        encoding: The offending RTP encoding name (e.g. ``G729``).
+        clock_rate: The offending RTP clock rate in Hz.
+    """
+
+    def __init__(self, encoding: str, clock_rate: int) -> None:
+        """Initialise with the encoding name and clock rate that cannot be carried."""
+        self.encoding = encoding
+        self.clock_rate = clock_rate
+        super().__init__(
+            f"media engine cannot carry codec {encoding}/{clock_rate} "
+            f"(supported: {_supported_codec_summary()})"
+        )
+
+
+# The engine's capability table: the EXACT ``(uppercased encoding, clock_rate)``
+# pairs the RTP encode/decode path can carry, mapped to the runnable ``Codec``.
+# Both G.711 variants are 8 kHz narrowband (RFC 3551 §6). This is the single
+# source of truth for engine capability; the adapter's SDP offer allow-list must
+# never advertise an encoding absent here (the drift guard enforces it). To add a
+# wideband codec, add its encode/decode to the engine AND an entry here first,
+# then widen the adapter's advertised menu — never the reverse.
+_ENGINE_CODEC_TABLE: Final[dict[tuple[str, int], Codec]] = {
+    ("PCMU", G711_SAMPLE_RATE): Codec.PCMU,
+    ("PCMA", G711_SAMPLE_RATE): Codec.PCMA,
+}
+
+
+def _supported_codec_summary() -> str:
+    """A human-readable ``ENCODING/rate`` list of carriable codecs (no PII)."""
+    return ", ".join(f"{enc}/{rate}" for enc, rate in _ENGINE_CODEC_TABLE)
+
+
+def codec_for_encoding(encoding: str, clock_rate: int) -> Codec:
+    """Map an SDP ``(encoding, clock_rate)`` pair to a runnable engine ``Codec``.
+
+    The check is rate-aware: the encoding name alone is insufficient (e.g. a PCMU
+    rtpmap at 16 kHz is not the 8 kHz G.711 the engine carries; and G.722's
+    rtpmap clock of 8000 famously does not match its 16 kHz sample rate — RFC
+    3551 — so future codecs must be matched on the real carriable pair, not the
+    name). The lookup is exhaustive against :data:`_ENGINE_CODEC_TABLE`; there is
+    no catch-all default (AGENTS.md rule 17).
+
+    Args:
+        encoding: The RTP encoding name (case-insensitive, e.g. ``PCMU``).
+        clock_rate: The RTP clock rate in Hz.
+
+    Returns:
+        The engine :class:`Codec` that can carry this pair.
+
+    Raises:
+        UnsupportedCodecError: If the engine cannot carry ``(encoding, clock_rate)``.
+    """
+    codec = _ENGINE_CODEC_TABLE.get((encoding.upper(), clock_rate))
+    if codec is None:
+        raise UnsupportedCodecError(encoding, clock_rate)
+    return codec
 
 
 # ---------------------------------------------------------------------------

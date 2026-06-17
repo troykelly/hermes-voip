@@ -79,7 +79,13 @@ class _ScriptedTTS:
     def output_sample_rate(self) -> int:
         return 24000
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         self.last_stream = _RecordingTtsStream()
         return self.last_stream
 

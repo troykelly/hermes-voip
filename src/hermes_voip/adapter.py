@@ -121,8 +121,12 @@ __all__ = ["VoipAdapter"]
 
 _log = logging.getLogger(__name__)
 
-# Supported G.711 encoding names for SDP negotiation.
-_SUPPORTED_ENCODINGS = ("PCMU", "PCMA", "telephone-event")
+# Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):
+# G.722 (16 kHz wideband) FIRST, then G.711 PCMU/PCMA (the universal fallback),
+# then telephone-event (DTMF). Every voice entry maps to a runnable engine codec
+# (the drift guard enforces it); negotiate_audio honours the peer's offer order and
+# falls back to G.711 when the peer does not offer G.722.
+_SUPPORTED_ENCODINGS = ("G722", "PCMU", "PCMA", "telephone-event")
 
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
@@ -602,20 +606,10 @@ class VoipAdapter(BasePlatformAdapter):
         await engine.connect()
         local_rtp_host = _host_of(local_sent_by)
         session_id = int(time.monotonic() * 1000) & 0xFFFF_FFFF
-        offer_codecs: list[SdpCodec] = [
-            SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
-            SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
-            SdpCodec(
-                payload_type=101,
-                encoding="telephone-event",
-                clock_rate=8000,
-                fmtp="0-16",
-            ),
-        ]
         offer_body = build_audio_offer(
             local_address=local_rtp_host,
             port=engine.local_port,
-            codecs=offer_codecs,
+            codecs=_outbound_offer_codecs(),
             session_id=session_id,
         )
 
@@ -1589,11 +1583,41 @@ def _cseq_num(response: SipResponse) -> int:
 def _first_voice_codec(
     sdp_codecs: tuple[SdpCodec, ...],
 ) -> SdpCodec | None:
-    """Return the first non-DTMF codec from the negotiated set, or None."""
+    """Return the first VOICE codec from the negotiated set, or None.
+
+    A "voice" codec is any non-DTMF entry (telephone-event is named-event RTP, not
+    a media codec). The negotiated set has already been filtered to
+    ``_SUPPORTED_ENCODINGS`` by ``negotiate_audio``, so every voice entry here is a
+    codec the engine carries (G.722 wideband or G.711 narrowband — ADR-0022).
+    Excluding only DTMF (rather than allow-listing G.711) keeps this in step with
+    the menu as codecs are added; the engine-capability check in
+    :func:`_to_engine_codec` remains the final authority on carriability.
+    """
     for c in sdp_codecs:
-        if c.encoding.upper() in ("PCMU", "PCMA"):
+        if c.encoding.lower() != "telephone-event":
             return c
     return None
+
+
+def _outbound_offer_codecs() -> list[SdpCodec]:
+    """The codec list for an outbound INVITE offer, wideband-preferred (ADR-0022).
+
+    G.722 (static payload type 9, 16 kHz wideband — rtpmap clock 8000 per RFC 3551)
+    FIRST so a wideband-capable peer picks it, then G.711 PCMU/PCMA (the universal
+    fallback), then telephone-event (DTMF). Matches ``_SUPPORTED_ENCODINGS`` order;
+    a peer that cannot do G.722 answers G.711 via RFC 3264 negotiation.
+    """
+    return [
+        SdpCodec(payload_type=9, encoding="G722", clock_rate=8000),
+        SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
+        SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
+        SdpCodec(
+            payload_type=101,
+            encoding="telephone-event",
+            clock_rate=8000,
+            fmtp="0-16",
+        ),
+    ]
 
 
 def _to_engine_codec(sdp_codec: SdpCodec) -> Codec:

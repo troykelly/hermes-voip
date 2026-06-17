@@ -167,15 +167,30 @@ async def test_send_audio_encodes_g722_decodable_back_to_wideband() -> None:
     g722_payload = b"".join(RtpPacket.parse(w).payload for w, _ in recorder.sent)
     decoded = G722Decoder().decode(g722_payload)
     out = list(struct.unpack(f"<{len(decoded) // 2}h", decoded))
-    # The decoded stream is 16 kHz and carries real energy at 5 kHz.
+    # The decoded stream is 16 kHz and carries real energy at 5 kHz. G.722's QMF
+    # has a group delay, so we correlate over a small lag window (the honest
+    # fidelity metric for a delayed reconstruction), not at lag 0.
     assert len(out) >= n
     src = list(struct.unpack(f"<{n}h", src_frame.samples))
     lead = 64
-    a, b = src[lead:], out[lead : lead + len(src) - lead]
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    ea = math.sqrt(sum(x * x for x in a)) or 1.0
-    eb = math.sqrt(sum(y * y for y in b)) or 1.0
-    assert dot / (ea * eb) > 0.85, "wideband content lost in the G.722 send path"
+    a, b = src[lead:], out[lead:]
+
+    def _max_xcorr(xa: list[int], xb: list[int], max_lag: int) -> float:
+        best = 0.0
+        for lag in range(max_lag + 1):
+            aa = xa[: len(xa) - lag]
+            bb = xb[lag:]
+            m = min(len(aa), len(bb))
+            aa, bb = aa[:m], bb[:m]
+            dot = sum(x * y for x, y in zip(aa, bb, strict=True))
+            ea = math.sqrt(sum(x * x for x in aa)) or 1.0
+            eb = math.sqrt(sum(y * y for y in bb)) or 1.0
+            best = max(best, dot / (ea * eb))
+        return best
+
+    assert _max_xcorr(a, b, max_lag=40) > 0.9, (
+        "wideband content lost in the G.722 send path"
+    )
 
 
 @pytest.mark.asyncio

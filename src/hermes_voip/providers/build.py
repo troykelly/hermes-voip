@@ -170,12 +170,13 @@ def _make_elevenlabs_tts(config: MediaConfig) -> StreamingTTS:
         ElevenLabsTTS,
     )
 
-    # Request the telephony wire rate so the media layer encodes with NO resample
-    # (the "very choppy" fix, ADR-0007 amendment). This is the G.711 case: the SDP
-    # codec menu (adapter._SUPPORTED_ENCODINGS) is G.711-only today, so 8 kHz is
-    # always the negotiated wire rate. When the wideband lane (ADR-0005: prefer
-    # Opus/G.722) lands, this is the single place to derive the rate from the
-    # negotiated codec (G.722→16000, Opus→48000) instead of the narrowband default.
+    # The provider is built ONCE per process, but the wire rate is per-call
+    # (codec-derived). So the construction DEFAULT is the G.711 8 kHz case (no
+    # resample — the "very choppy" fix, ADR-0007 amendment), and the call loop
+    # passes the negotiated wire rate per call via synthesize(sample_rate=…)
+    # (ADR-0022): a G.722 call requests pcm_16000 natively, a G.711 call keeps this
+    # 8 kHz default. So this stays the narrowband default; the per-call override is
+    # the codec→rate hook, not this line.
     return ElevenLabsTTS(
         api_key=api_key, voice=voice, output_sample_rate=G711_NARROWBAND_RATE
     )

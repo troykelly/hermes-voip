@@ -129,6 +129,7 @@ class _FakeTTS:
     def __init__(self, frames: list[PcmFrame]) -> None:
         self._frames = frames
         self.last_stream: _FakeTtsStream | None = None
+        self.last_sample_rate: int | None = None
 
     @property
     def output_sample_rate(self) -> int:
@@ -138,7 +139,10 @@ class _FakeTTS:
         self,
         text: AsyncIterator[str],
         voice: str,
+        *,
+        sample_rate: int | None = None,
     ) -> TtsStream:
+        self.last_sample_rate = sample_rate
         stream = _FakeTtsStream(self._frames)
         self.last_stream = stream
         return stream
@@ -869,7 +873,13 @@ class _RecordingTTS:
     def output_sample_rate(self) -> int:
         return 16_000
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         _ = voice
         self.calls += 1
         stream = _RecordingTtsStream(text, self._frames)
@@ -1009,7 +1019,13 @@ class _GatedGreetingTTS:
     def output_sample_rate(self) -> int:
         return 16_000
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         _ = text, voice
         stream = _GatedGreetingTtsStream(self._frames)
         self.last_stream = stream
@@ -1110,7 +1126,13 @@ class _SingleStreamTTS:
     def output_sample_rate(self) -> int:
         return 16_000
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         _ = text, voice
         return self._stream
 
@@ -1479,7 +1501,13 @@ class _CooperativePcmTTS:
     def output_sample_rate(self) -> int:
         return _G711_INBOUND_RATE
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         _ = voice
         stop = threading.Event()
         self.last_stop = stop

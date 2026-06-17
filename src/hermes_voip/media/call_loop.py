@@ -534,7 +534,15 @@ class CallLoop:
         """
         # Sanitize each text chunk before TTS synthesis so that emoji,
         # markdown markup, and raw URLs are never voiced by the TTS engine.
-        stream = self._tts.synthesize(_sanitize_iter(text), self._voice)
+        # Pass the negotiated wire rate (codec-derived: 8 kHz G.711, 16 kHz G.722)
+        # so the synthesiser emits the negotiated rate (ADR-0022) — no wideband
+        # thrown away, no needless G.711 resample. The engine still reconciles any
+        # off-rate frames (e.g. Kokoro's fixed 24 kHz) to the wire rate.
+        stream = self._tts.synthesize(
+            _sanitize_iter(text),
+            self._voice,
+            sample_rate=self._transport.inbound_sample_rate,
+        )
         # Register synchronously (no await before this line), then supersede any
         # previously-active stream so playout is single-owner.
         previous = self._active_tts_stream
@@ -618,7 +626,12 @@ class CallLoop:
         async def _single_chunk() -> AsyncIterator[str]:
             yield greeting
 
-        stream = self._tts.synthesize(_single_chunk(), self._voice)
+        # Greeting at the negotiated wire rate too (ADR-0022), same as speak().
+        stream = self._tts.synthesize(
+            _single_chunk(),
+            self._voice,
+            sample_rate=self._transport.inbound_sample_rate,
+        )
         self._active_tts_stream = stream
         return stream
 

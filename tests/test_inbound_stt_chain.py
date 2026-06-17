@@ -223,7 +223,13 @@ class _NoopTTS:
     def output_sample_rate(self) -> int:
         return _SAMPLE_RATE
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         return _SilentTtsStream()
 
 

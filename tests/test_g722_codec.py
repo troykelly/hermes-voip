@@ -69,14 +69,35 @@ def test_encode_rejects_non_pcm16_byte_length() -> None:
         G722Encoder().encode(b"\x00\x00\x00")  # 3 bytes: not whole samples
 
 
+def _max_xcorr(a: list[int], b: list[int], max_lag: int) -> float:
+    """Best normalised cross-correlation of ``a`` vs ``b`` over lags 0..max_lag.
+
+    G.722's QMF has a group delay (~38 samples), so the decoded signal is
+    time-shifted relative to the input. A lag-0 correlation on a tone would
+    measure that phase offset, not fidelity — so we maximise over a small lag
+    window, which is the honest reconstruction-quality metric for a codec with
+    delay (the public-domain reference itself scores ~0.997 here).
+    """
+    best = 0.0
+    for lag in range(max_lag + 1):
+        aa = a[: len(a) - lag]
+        bb = b[lag:]
+        m = min(len(aa), len(bb))
+        aa, bb = aa[:m], bb[:m]
+        dot = sum(x * y for x, y in zip(aa, bb, strict=True))
+        ea = math.sqrt(sum(x * x for x in aa)) or 1.0
+        eb = math.sqrt(sum(y * y for y in bb)) or 1.0
+        best = max(best, dot / (ea * eb))
+    return best
+
+
 def test_round_trip_preserves_a_wideband_tone() -> None:
     # An independent signal (a 5 kHz tone — strictly in the G.722 upper band,
     # ABOVE the 4 kHz G.711 ceiling) survives encode->decode with high fidelity.
     # This is the wideband payoff: a 5 kHz component cannot be carried by 8 kHz
-    # G.711 at all, but G.722 reconstructs it. We assert energy is retained and
-    # the reconstruction correlates strongly with the input (a lossy ADPCM codec
-    # never reproduces samples exactly, so we test correlation + energy, not
-    # equality).
+    # G.711 at all, but G.722 reconstructs it. A lossy ADPCM codec never
+    # reproduces samples exactly, so we test delay-tolerant correlation + energy
+    # retention, not equality.
     n = 1600  # 100 ms at 16 kHz
     src = [
         int(0.5 * 32767 * math.sin(2 * math.pi * 5000 * i / 16_000)) for i in range(n)
@@ -85,18 +106,15 @@ def test_round_trip_preserves_a_wideband_tone() -> None:
     decoded = _unpack(G722Decoder().decode(encoded))
     assert len(decoded) == n
 
-    # Drop the codec's group-delay lead-in (the QMF + ADPCM warm-up) before
-    # comparing, then measure normalised correlation on the steady state.
+    # Drop the codec warm-up, then correlate over the QMF group-delay window.
     lead = 64
-    a = src[lead:]
-    b = decoded[lead:]
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    ea = math.sqrt(sum(x * x for x in a))
-    eb = math.sqrt(sum(y * y for y in b))
-    correlation = dot / (ea * eb)
-    assert correlation > 0.9, f"5 kHz tone correlation too low: {correlation:.3f}"
-    # The decoded 5 kHz energy is within a reasonable band of the source energy
-    # (not collapsed to silence — which is what a narrowband codec would do).
+    a, b = src[lead:], decoded[lead:]
+    correlation = _max_xcorr(a, b, max_lag=40)
+    assert correlation > 0.95, f"5 kHz tone correlation too low: {correlation:.3f}"
+    # The decoded energy is within a reasonable band of the source energy (the
+    # 5 kHz tone is reconstructed, not collapsed to silence as G.711 would).
+    ea = math.sqrt(sum(x * x for x in a)) or 1.0
+    eb = math.sqrt(sum(y * y for y in b)) or 1.0
     assert 0.5 < (eb / ea) < 1.5, f"energy ratio out of band: {eb / ea:.3f}"
 
 

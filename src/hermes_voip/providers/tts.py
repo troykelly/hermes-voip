@@ -44,17 +44,31 @@ class TtsStream(AsyncIterator[PcmFrame], Protocol):
 class StreamingTTS(Protocol):
     """Streaming synthesiser: incremental text in, PCM16 frames out."""
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         """Stream token/sentence text in, stream PCM16 frames out.
 
         ``text`` is the agent's incremental output; the engine begins emitting
         audio before ``text`` completes. ``voice`` is an opaque provider-scoped
         id. This is a synchronous factory returning a ``TtsStream`` — the caller
         iterates the result, it does not ``await`` this call.
+
+        ``sample_rate`` is the negotiated wire rate the call loop requests PER CALL
+        (ADR-0022): the process-wide provider does not know the per-call codec, so
+        the loop passes the codec-derived rate (8 kHz G.711, 16 kHz G.722). A
+        provider that can synthesise at that rate emits it (no wideband thrown away,
+        no needless G.711 resample); a provider whose rate is fixed by its model
+        (e.g. Kokoro at 24 kHz) ignores it and the media layer resamples. ``None``
+        means "use the provider's default rate" (back-compat).
         """
         ...
 
     @property
     def output_sample_rate(self) -> int:
-        """Declared output rate; the media layer resamples to 8 kHz for G.711."""
+        """Declared default output rate; the media layer resamples to the wire rate."""
         ...

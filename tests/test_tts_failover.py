@@ -259,6 +259,41 @@ async def test_primary_failure_does_not_escape_the_stream() -> None:
     assert len(frames) == 1
 
 
+@pytest.mark.asyncio
+async def test_primary_failure_after_audio_truncates_and_latches() -> None:
+    """A mid-utterance primary failure (after frames) latches without double-speak.
+
+    If the primary emits some audio then fails, that audio is already on the wire.
+    The wrapper must NOT replay the utterance (which would double-speak the start) —
+    it ends the utterance (no exception escapes), latches, and a SUBSEQUENT utterance
+    uses the fallback. So this utterance yields ONLY the primary's emitted frames and
+    the fallback is never invoked for it.
+    """
+    primary_emitted = _frame(_G711_RATE, b"\x10\x00")
+    fallback_calls: list[str] = []
+
+    def _primary_stream(text: str, rate: int | None) -> TtsStream:
+        # Emit one frame, then fail (models a dropped connection mid-stream).
+        return _RaisingStream(_http_400(), frames_before=[primary_emitted])
+
+    def _fallback_stream(text: str, rate: int | None) -> TtsStream:
+        fallback_calls.append(text)
+        return _ListStream([_frame(rate or _G711_RATE)], spoken=[])
+
+    primary = _FakeTTS(_primary_stream)
+    fallback = _FakeTTS(_fallback_stream)
+    tts = FailoverTTS(primary=primary, fallback_factory=lambda: fallback)
+
+    # Utterance 1: one primary frame, then failure -> truncate (no replay, no raise).
+    frames = await _drain(tts.synthesize(_text("Partly spoken. "), voice="v"))
+    assert frames == [primary_emitted]
+    assert fallback_calls == [], "must NOT replay a partly-spoken utterance"
+
+    # Utterance 2: latched -> the fallback now handles it.
+    await _drain(tts.synthesize(_text("Next line. "), voice="v"))
+    assert fallback_calls == ["Next line. "]
+
+
 # ---------------------------------------------------------------------------
 # (2) The happy path NEVER touches the fallback (no latency, no construction).
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ Fakes only (``pbx.example.test``, ext ``1000``/``1001``, ``198.51.100.x``).
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -146,6 +147,83 @@ async def test_on_response_registers_and_marks_up() -> None:
     registered = [s for s in manager.snapshot() if s.registered]
     assert len(registered) == 1
     assert registered[0].expires == 300
+
+
+async def test_on_response_logs_registration_established(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful REGISTER emits one INFO line on the manager logger.
+
+    This is the operator-facing "it's working" signal (#30 gap #2): without it
+    the gateway-login success is silent and runbooks have no log to point at. The
+    line carries only the non-sensitive ``expires`` value — never the SIP host,
+    extension, username, or password (rule 34).
+    """
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()
+    with caplog.at_level(logging.INFO, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(transport.sent[0], expires=299))
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager" and r.levelno == logging.INFO
+    ]
+    assert len(records) == 1, (
+        "exactly one INFO registration-established line per successful REGISTER"
+    )
+    message = records[0].getMessage()
+    # The expiry IS surfaced (it is not a secret) — operators read the refresh window.
+    assert "299" in message
+    # rule 34: the message must NOT leak any HERMES_SIP_* value. The fakes here are
+    # the host, the extension/username, and the digest password from ``_gateway()``.
+    for secret in ("pbx.example.test", "1000", "1001", "p1", "p2", "sip:"):
+        assert secret not in message, f"registration log leaked {secret!r}"
+
+
+async def test_on_response_refresh_does_not_re_log_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A REGISTER refresh of an already-up extension does not emit a 2nd INFO line.
+
+    The "established" line marks the transition to registered; periodic refreshes
+    (which also yield a ``Registered`` outcome) would otherwise spam INFO every
+    half-expiry, so they log at DEBUG instead.
+    """
+    transport = _FakeTransport()
+    # refresh_fraction=0.0 schedules the refresh REGISTER immediately after the
+    # first registration, so we can answer that *new* REGISTER (a real refresh,
+    # with its own CSeq) rather than replaying the first response.
+    manager = RegistrationManager(_gateway(), transport, refresh_fraction=0.0)
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    with caplog.at_level(logging.DEBUG, logger="hermes_voip.manager"):
+        # First REGISTER: the transition to up -> one INFO line.
+        await manager.on_response(_ok_for(first_register, expires=300))
+        # The refresh REGISTER fires immediately (refresh_fraction=0.0); answer it.
+        await asyncio.sleep(0.05)
+        refresh_register = next(
+            m
+            for m in transport.sent[1:]
+            if SipRequest.parse(m).header("Call-ID") == call_id
+        )
+        await manager.on_response(_ok_for(refresh_register, expires=300))
+    await manager.aclose()
+
+    info = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager" and r.levelno == logging.INFO
+    ]
+    debug = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager" and r.levelno == logging.DEBUG
+    ]
+    assert len(info) == 1, "only the initial registration logs at INFO, not refreshes"
+    assert len(debug) == 1, "the refresh is logged at DEBUG"
 
 
 async def test_on_response_challenge_resends_authenticated() -> None:

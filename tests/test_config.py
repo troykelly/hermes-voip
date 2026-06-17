@@ -6,6 +6,8 @@ environment is read here. Fakes only (host ``pbx.example.test``, ext ``1000``).
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from hermes_voip.config import (
@@ -426,6 +428,12 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.barge_in_tail_ms == 250
     # barge-in clean-stop fade (ADR-0028): a short click-free ramp on the cut.
     assert cfg.barge_in_fade_ms == 30
+    # dead-air comfort filler (ADR-0030): OFF by default — today's behaviour
+    # exactly; the delay and phrases carry the documented defaults but are inert
+    # while the master switch is off.
+    assert cfg.comfort_filler is False
+    assert cfg.comfort_filler_delay_ms == 900
+    assert cfg.comfort_filler_phrases == ("Hmm,", "Let me see,", "One moment,")
     # injection guard
     assert cfg.injection_guard == "onnx"
     assert cfg.injection_guard_model_dir is None
@@ -497,6 +505,84 @@ def test_media_barge_in_fade_ms_negative_rejected() -> None:
     """A negative fade is rejected (fail-fast)."""
     with pytest.raises(ConfigError):
         load_media_config({"HERMES_VOIP_BARGE_IN_FADE_MS": "-5"})
+
+
+def test_media_comfort_filler_on_and_overrides() -> None:
+    """The comfort filler is opt-in; delay + phrase set are overridable (ADR-0030)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_COMFORT_FILLER": "true",
+            "HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS": "1200",
+            "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES": "uh,|let me check,|hold on,",
+        }
+    )
+    assert cfg.comfort_filler is True
+    assert cfg.comfort_filler_delay_ms == 1200
+    assert cfg.comfort_filler_phrases == ("uh,", "let me check,", "hold on,")
+
+
+def test_media_comfort_filler_default_off_with_default_delay_and_phrases() -> None:
+    """Unset → OFF, with the documented default delay and built-in phrase set."""
+    cfg = load_media_config({})
+    assert cfg.comfort_filler is False
+    assert cfg.comfort_filler_delay_ms == 900
+    assert cfg.comfort_filler_phrases == ("Hmm,", "Let me see,", "One moment,")
+
+
+def test_media_comfort_filler_blank_phrases_fall_back_to_default() -> None:
+    """A blank phrase override collapses to the built-in default set, not empty."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_COMFORT_FILLER": "on",
+            "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES": "   ",
+        }
+    )
+    assert cfg.comfort_filler_phrases == ("Hmm,", "Let me see,", "One moment,")
+
+
+def test_media_comfort_filler_phrases_trims_and_drops_empty_members() -> None:
+    """Each phrase is trimmed; empty members (e.g. a trailing ``|``) are dropped."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES": "  hmm,  | | let me see, |"}
+    )
+    assert cfg.comfort_filler_phrases == ("hmm,", "let me see,")
+
+
+def test_media_comfort_filler_delay_ms_must_be_positive() -> None:
+    """A non-positive comfort-filler delay is rejected (fail-fast)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS": "0"})
+
+
+def test_media_comfort_filler_delay_ms_malformed_rejected() -> None:
+    """A malformed (non-integer) delay is rejected (fail-fast)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS": "soon"})
+
+
+def test_media_comfort_filler_bad_boolean_rejected() -> None:
+    """An unrecognised boolean spelling for the master switch is rejected."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER": "maybe"})
+
+
+def test_mediaconfig_direct_blank_comfort_phrase_rejected() -> None:
+    """A directly-constructed MediaConfig with a blank phrase fails fast (post-init).
+
+    The env parser normalises a blank `|`-list to the default set, but a caller that
+    constructs MediaConfig directly must not be able to smuggle in a blank phrase —
+    a filler with nothing to say is a silent no-op. ``__post_init__`` rejects it.
+    """
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="comfort_filler_phrases"):
+        dataclasses.replace(base, comfort_filler_phrases=("Hmm,", "   "))
+
+
+def test_mediaconfig_direct_empty_comfort_phrases_rejected() -> None:
+    """A directly-constructed MediaConfig with an empty phrase tuple fails fast."""
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="comfort_filler_phrases"):
+        dataclasses.replace(base, comfort_filler_phrases=())
 
 
 def test_media_barge_in_mode_lowercased_and_validated() -> None:

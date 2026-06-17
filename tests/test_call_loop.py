@@ -288,6 +288,11 @@ async def _noop(text: str) -> None:
     _ = text  # unused; intentional stub
 
 
+async def _one_chunk(text: str) -> AsyncIterator[str]:
+    """A single-chunk agent-text iterator for speak()."""
+    yield text
+
+
 # ---------------------------------------------------------------------------
 # (a) Finalised turn → exactly ONE deliver_turn with the transcript text
 # ---------------------------------------------------------------------------
@@ -517,6 +522,690 @@ async def test_barge_in_with_no_active_stream_does_not_flush() -> None:
     await loop.barge_in()  # no active stream
 
     assert transport.flush_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# (g) Dead-air comfort filler (ADR-0030)
+# ---------------------------------------------------------------------------
+
+
+class _GatedSleep:
+    """A controllable ``sleep`` seam for deterministic dead-air tests.
+
+    ``await gated(delay)`` records the requested delay and blocks until the test
+    calls :meth:`release` (or returns at once if already released). This lets a
+    test decide *exactly* when the comfort-filler delay elapses, with no real
+    wall-clock waiting — the deterministic seam ADR-0030 mandates.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+        self._gate = asyncio.Event()
+
+    def release(self) -> None:
+        self._gate.set()
+
+    async def __call__(self, delay: float) -> None:
+        self.calls.append(delay)
+        await self._gate.wait()
+
+
+class _HoldOpenTransport(_FakeTransport):
+    """Transport that delivers preset inbound frames then holds the stream open.
+
+    The inbound generator yields the preset frames, then awaits an event the test
+    controls before ending — so a ``CallLoop.run()`` stays live (its pump/asr/
+    delivery tasks running) while the test drives the comfort filler, instead of
+    ``run()`` returning the instant the short frame list is exhausted.
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__(frames)
+        self._close = asyncio.Event()
+
+    def close_inbound(self) -> None:
+        self._close.set()
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        frames = self._frames
+        close = self._close
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            for frame in frames:
+                yield frame
+            await close.wait()
+
+        return _gen()
+
+
+def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __init__ plus the filler knobs
+    transport: _FakeTransport,
+    asr: StreamingASR,
+    tts: StreamingTTS,
+    *,
+    sleep: Callable[[float], Awaitable[None]],
+    comfort_filler: bool = True,
+    comfort_filler_delay_ms: int = 900,
+    comfort_filler_phrases: tuple[str, ...] = ("Hmm,",),
+    deliver_turn: Callable[[str], Awaitable[None]] | None = None,
+) -> CallLoop:
+    """Build a CallLoop with the comfort filler wired to an injected sleep seam."""
+    return CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=deliver_turn or _noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        comfort_filler=comfort_filler,
+        comfort_filler_delay_ms=comfort_filler_delay_ms,
+        comfort_filler_phrases=comfort_filler_phrases,
+        sleep=sleep,
+    )
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
+    """When the gap exceeds the delay and no reply has started, one filler plays.
+
+    The injected sleep is released (the delay 'elapses') while no agent reply has
+    begun, so the filler synthesises exactly one phrase and sends its frames.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame, filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hello there", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("Hmm,",),
+        deliver_turn=capture,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the turn be delivered and the filler task park on the injected sleep.
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "comfort filler did not schedule a delayed wait"
+    assert delivered == ["hello there"]
+
+    # The delay elapses with no reply: the filler must synthesise + send.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert transport.sent_audio == [filler_frame, filler_frame], (
+        "the comfort filler did not emit its audio after the delay"
+    )
+    # The filler text reached TTS synthesis (one of the configured phrases).
+    assert tts.last_stream is not None
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_uses_configured_phrase_text() -> None:
+    """The filler synthesises one of the configured phrases (model-aware path).
+
+    The phrase text is routed through ``tts.synthesize`` (so the per-segment tag
+    strip / sanitiser of the normal speak path applies). This test captures the
+    text handed to synthesis and asserts it is the configured filler phrase.
+    """
+    captured: list[str] = []
+
+    class _CapturingStream(_FakeTtsStream):
+        """A TtsStream that drains (and records) the text iterator as it plays.
+
+        A real provider consumes the text it is handed; the bare ``_FakeTtsStream``
+        ignores it, so this subclass drains the iterator on first iteration and
+        records each chunk into ``captured`` before emitting the preset frames —
+        faithfully exercising the text the comfort filler routes to synthesis.
+        """
+
+        def __init__(self, frames: list[PcmFrame], text: AsyncIterator[str]) -> None:
+            super().__init__(frames)
+            self._text = text
+
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            async for chunk in self._text:
+                captured.append(chunk)
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
+    class _CapturingTTS(_FakeTTS):
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            stream = _CapturingStream(self._frames, text)
+            self.last_stream = stream
+            return stream
+
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("a question", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("Let me see,",),
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert captured == ["Let me see,"], (
+        f"filler phrase not synthesised verbatim; got {captured!r}"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_does_not_fire_when_reply_starts_first() -> None:
+    """A reply that begins before the delay elapses suppresses the filler entirely.
+
+    The agent's reply (via speak()) starts and emits its first frame BEFORE the
+    injected sleep is released. The post-delay check must see reply audio already
+    on the wire and skip the filler — no collision with the agent's opening word.
+    """
+    reply_frame = PcmFrame(
+        samples=b"\x30\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    # The TTS yields the REPLY frame first (speak), and would yield the filler
+    # frame only if the filler fired — which it must not.
+    tts = _FakeTTS([reply_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "filler did not schedule"
+
+    # The agent replies BEFORE the delay elapses (sleep still gated).
+    async def _reply() -> AsyncIterator[str]:
+        yield "here is my answer"
+
+    await loop.speak(_reply())
+    assert transport.sent_audio == [reply_frame]
+
+    # NOW the delay elapses — but a reply already played, so no filler may fire.
+    _ = filler_frame  # only sent if the filler wrongly fires
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    assert transport.sent_audio == [reply_frame], (
+        "the comfort filler fired even though the reply had already started"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_fires_at_most_once_per_gap() -> None:
+    """Only ONE filler is emitted per turn gap — never a 'hmm hmm hmm' loop.
+
+    Even after the delay elapses and the filler plays, the gap does not re-arm
+    while still waiting: the filler task fires once and returns.
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    # Provide many frames so a re-fire would visibly send more than one phrase's
+    # worth; one fire sends exactly the two frames of a single synthesis.
+    tts = _FakeTTS([filler_frame, filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow question", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    sleep.release()
+    # Pump the loop generously; a looping filler would keep scheduling sleeps.
+    for _ in range(40):
+        await asyncio.sleep(0)
+
+    assert transport.sent_audio == [filler_frame, filler_frame], (
+        "the comfort filler fired more than once for a single gap"
+    )
+    assert len(sleep.calls) == 1, (
+        f"the filler re-scheduled its delay (looped); sleeps={sleep.calls!r}"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_off_by_default_emits_nothing() -> None:
+    """With the filler OFF (the default), no filler audio and no sleep is scheduled.
+
+    Off must be exactly today's behaviour: the loop neither sleeps on a delay nor
+    synthesises any filler.
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hello", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler=False,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(30):
+        await asyncio.sleep(0)
+
+    assert sleep.calls == [], "the filler scheduled a delay while disabled"
+    assert transport.sent_audio == [], "the filler emitted audio while disabled"
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_cancelled_by_barge_in() -> None:
+    """A barge-in during the gap cancels the pending filler — it never fires.
+
+    The filler is parked on its delay when a barge-in occurs. The barge-in must
+    cancel the pending filler so no filler audio is ever emitted (and the flush
+    path is the ADR-0028 one).
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("interrupt me", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "filler did not schedule"
+
+    # Barge-in while the filler is still parked on its delay.
+    await loop.barge_in()
+    # Now release the delay; the filler must have been cancelled and not fire.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    assert transport.sent_audio == [], (
+        "the comfort filler fired after a barge-in cancelled the gap"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_stands_down_once_agent_commits_a_reply() -> None:
+    """Once the agent commits a reply (speak() called), a PENDING filler stands down.
+
+    The filler covers the caller-finish→reply *processing* gap (STT/LLM think time).
+    The agent calls speak() before the delay elapses — even though its TTS first-audio
+    is latent (no reply frame yet) — and the pending filler must NOT fire: the agent
+    has the floor and the reply is imminent (ADR-0030 §"when the filler stands down").
+    Were the filler to fire here it would race the imminent reply and contend on the
+    single playout lock the reply already holds through its TTS latency.
+    """
+    reply_frame = PcmFrame(
+        samples=b"\x30\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+
+    # A TTS whose stream withholds its first frame until the test releases a gate,
+    # modelling TTS first-audio latency (the reply is committed but not yet audible).
+    audio_gate = asyncio.Event()
+
+    class _LatentStream(_FakeTtsStream):
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            await audio_gate.wait()
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
+    class _LatentReplyTTS(_FakeTTS):
+        """Reply stream is latent (gated); a filler stream (if any) is immediate."""
+
+        def __init__(
+            self, reply_frames: list[PcmFrame], filler_frames: list[PcmFrame]
+        ) -> None:
+            super().__init__(filler_frames)
+            self._reply_frames = reply_frames
+            self._first = True
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            # The FIRST synthesize() call is the agent reply (latent); any SECOND
+            # would be a (wrongly-fired) comfort filler.
+            if self._first:
+                self._first = False
+                stream: _FakeTtsStream = _LatentStream(self._reply_frames)
+            else:
+                stream = _FakeTtsStream(self._frames)
+            self.last_stream = stream
+            return stream
+
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _LatentReplyTTS([reply_frame], [filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "filler did not schedule"
+
+    # The agent commits a reply (speak()) before the delay elapses; it parks on the
+    # latent stream (TTS first-audio latency) holding the playout lock.
+    speak_task = asyncio.create_task(loop.speak(_one_chunk("the answer")))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], "reply audio should still be latent"
+
+    # The delay elapses — but the agent has already committed a reply, so the filler
+    # stands down (no filler audio, no second synthesize()).
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "the filler fired after the agent committed a reply"
+    )
+
+    # The reply audio finally arrives; only the reply is heard, never a filler.
+    audio_gate.set()
+    await speak_task
+    assert transport.sent_audio == [reply_frame]
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None:
+    """A filler still PLAYING when the call ends is cancelled — no leaked task.
+
+    The filler parks mid-playout on a blocking send_audio; the inbound stream then
+    ends (call teardown). run() must cancel the in-flight filler task so it does not
+    outlive the call. After run() returns, the filler task is done (cancelled).
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _BlockingHoldOpenTransport(_HoldOpenTransport):
+        """Holds the inbound open AND blocks the first send_audio on a gate."""
+
+        def __init__(self, frames: list[PcmFrame]) -> None:
+            super().__init__(frames)
+            self.first_send_gate = asyncio.Event()
+
+        async def send_audio(self, frame: PcmFrame) -> None:
+            if not self.sent_audio:
+                await self.first_send_gate.wait()
+            self.sent_audio.append(frame)
+
+    sleep = _GatedSleep()
+    transport = _BlockingHoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame, filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    # Release the delay; the filler fires and parks inside _play on the send gate.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # White-box assertion: the filler task handle is kept for the task's whole life
+    # (including playout) so teardown can cancel it — that is the no-leak contract.
+    filler_task = loop._comfort_filler_task
+    assert filler_task is not None, "the filler task should be live (mid-playout)"
+    assert not filler_task.done()
+
+    # End the call while the filler is still parked mid-playout.
+    transport.close_inbound()
+    # Unblock the parked send so the cancelled _play can unwind cleanly.
+    transport.first_send_gate.set()
+    await run_task
+
+    # run()'s teardown must have cancelled the in-flight filler — no leak.
+    assert filler_task.done(), "filler task leaked past the call (not cancelled)"
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None:
+    """The filler must not fire while agent audio is on the wire RIGHT NOW.
+
+    Regression for the case where agent audio (here a long greeting) is already
+    playing when a turn is delivered (arming the filler) — the audio began BEFORE
+    the gap's latch reset, so the per-gap latch alone misses it. The post-delay
+    ``_tts_audio_active`` guard must still suppress the filler so it never supersedes
+    the live agent audio (no dead air while the agent is speaking).
+    """
+    # A greeting stream that plays one frame then parks (gate) — agent audio is
+    # continuously "active" on the wire across the filler's whole delay.
+    greet_frame = PcmFrame(
+        samples=b"\x40\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+    hold = asyncio.Event()
+
+    class _GreetingThenParkStream(_FakeTtsStream):
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            yield greet_frame  # audio is now active on the wire
+            await hold.wait()  # keep the greeting "playing" across the delay
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
+    class _GreetingTTS(_FakeTTS):
+        """Greeting stream parks (long); any filler stream would be immediate."""
+
+        def __init__(
+            self, greet_frames: list[PcmFrame], filler_frames: list[PcmFrame]
+        ) -> None:
+            super().__init__(filler_frames)
+            self._greet_frames = greet_frames
+            self._first = True
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            if self._first:
+                self._first = False
+                stream: _FakeTtsStream = _GreetingThenParkStream(self._greet_frames)
+            else:
+                stream = _FakeTtsStream(self._frames)
+            self.last_stream = stream
+            return stream
+
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _GreetingTTS([greet_frame], [filler_frame])
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([("hello", True, True)]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="hi there",  # the long greeting that stays active
+        comfort_filler=True,
+        comfort_filler_delay_ms=900,
+        comfort_filler_phrases=("Hmm,",),
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting emit its first frame (audio active) and the filler arm.
+    for _ in range(30):
+        await asyncio.sleep(0)
+        if sleep.calls and transport.sent_audio:
+            break
+    assert sleep.calls, "filler did not schedule"
+    assert transport.sent_audio == [greet_frame], "greeting audio should be active"
+
+    # The delay elapses while the greeting audio is STILL active → no filler.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [greet_frame], (
+        "the filler superseded already-playing agent audio (no dead air)"
+    )
+
+    # Let the greeting finish and the call end.
+    hold.set()
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_armed_before_deliver_turn_returns() -> None:
+    """The filler is armed BEFORE deliver_turn is awaited (covers a blocking handoff).
+
+    The filler's delay measures the dead-air gap from the caller-finish moment, so it
+    must be scheduled before `await deliver_turn` — robust even if deliver_turn blocks
+    on agent work. With a deliver_turn that blocks on an event, the filler's delay
+    sleep must already be scheduled while deliver_turn is still parked.
+    """
+    deliver_gate = asyncio.Event()
+    delivered: list[str] = []
+
+    async def blocking_deliver(text: str) -> None:
+        delivered.append(text)
+        await deliver_gate.wait()  # model a deliver_turn that blocks on agent work
+
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("question", True, True)]),
+        tts,
+        sleep=sleep,
+        deliver_turn=blocking_deliver,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # While deliver_turn is still BLOCKED, the filler's delay sleep must already be
+    # scheduled (it was armed before the deliver_turn await).
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if delivered and sleep.calls:
+            break
+    assert delivered == ["question"], "the turn was not delivered"
+    assert sleep.calls, "the filler was not armed before deliver_turn returned"
+
+    # Release deliver_turn and end the call.
+    deliver_gate.set()
+    transport.close_inbound()
+    await run_task
 
 
 @pytest.mark.asyncio

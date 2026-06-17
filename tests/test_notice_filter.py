@@ -76,6 +76,12 @@ def test_home_channel_and_proactive_notices_are_internal(notice: str) -> None:
         # the home-channel onboarding announcement) must still be spoken — the
         # slash-command cue alone is not a notice.
         "To pick a default chat later, run the /sethome command from that app.",
+        # A genuine SUPPORT reply that *explains* how to set a home channel —
+        # mentioning both "/sethome" AND "home channel" — is the agent helping
+        # the caller, not a runtime notice; it must still be spoken (the
+        # onboarding notice is caught by its "No home channel … for" wording).
+        "To set your home channel, type /sethome from this chat.",
+        "Your home channel can be set with /sethome whenever you like.",
         "",
         "   ",
     ],

@@ -1184,13 +1184,24 @@ async def test_open_entry_unknown_call_returns_false() -> None:
 
 
 class _FakeTransferSession:
-    """A CallSession stand-in for transfer tests: records REFER targets."""
+    """A CallSession stand-in for transfer tests: records REFER targets.
 
-    def __init__(self, *, ended: bool = False, local_uri: str = "sip:1000@pbx") -> None:
+    Carries a ``guard`` (default operator-level, clean) because the REFER chokepoint
+    re-checks the privilege clamp itself (defense in depth).
+    """
+
+    def __init__(
+        self,
+        *,
+        ended: bool = False,
+        local_uri: str = "sip:1000@pbx",
+        guard: GuardSessionState | None = None,
+    ) -> None:
         self.ended = ended
         # CallSession.transfer_blind reads the local AOR for Referred-By from
         # ``self._dialog.local_uri``; the adapter reads it from ``session.dialog``.
         self.dialog = SimpleNamespace(local_uri=local_uri)
+        self.guard = guard or GuardSessionState(call_id="c", privilege_level=3)
         self.blind: list[tuple[str, str | None]] = []
 
     async def transfer_blind(
@@ -1300,3 +1311,88 @@ async def test_transfer_blind_on_call_unknown_call_returns_no_call() -> None:
         await adapter.transfer_blind_on_call("nope", "sip:1001@pbx.example.test")
         is TransferOutcome.NO_CALL
     )
+
+
+# --- defense in depth: the REFER chokepoint re-checks the privilege clamp ------
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_blocks_non_operator_before_prompt() -> None:
+    """A level-2 (non-operator) call is BLOCKED at the chokepoint — never prompted.
+
+    Defense in depth: even if the sync gate were bypassed, the host method itself
+    refuses a transfer on a call that is not operator-level — and refuses BEFORE the
+    confirmation prompt, so no prompt is spoken and no confirm window is armed.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(
+        guard=GuardSessionState(call_id="c", privilege_level=2)  # trusted, not operator
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    # A confirmation that would resolve True IF it were ever armed — it must NOT be.
+    confirmation = _confirmation_pressing("1")
+    adapter._dtmf_confirmations[call_id] = confirmation
+
+    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert outcome is TransferOutcome.BLOCKED
+    assert session.blind == []  # no REFER
+    assert confirmation.armed is False  # never armed → never prompted
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_blocks_degraded_operator_before_prompt() -> None:
+    """A degraded operator call is BLOCKED at the chokepoint before the prompt."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(
+        guard=GuardSessionState(call_id="c", privilege_level=3, degraded=True)
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
+
+    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert outcome is TransferOutcome.BLOCKED
+    assert session.blind == []  # no REFER
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_toctou_degrade_during_confirm_blocks() -> None:
+    """A session that goes degraded DURING the confirmation window does NOT transfer.
+
+    The load-bearing TOCTOU fix (cross-vendor review): the caller presses the confirm
+    digit, but a fail-open screen flips the session ``degraded`` (sticky) mid-window.
+    The post-await privilege re-check must then abort the REFER even though
+    ``confirm()`` resolved True.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(
+        guard=GuardSessionState(call_id="c", privilege_level=3)  # clean at start
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    # The prompt sink (awaited INSIDE the armed window) flips the session degraded and
+    # THEN presses the confirm digit → confirm() resolves True, but the post-await
+    # re-check sees degraded and must block.
+    confirmation = ArmedConfirmation(prompt=_noop_prompt)
+
+    async def _degrade_then_press(_text: str) -> None:
+        session.guard.degraded = True
+        confirmation.feed("1")
+
+    confirmation._prompt = _degrade_then_press
+    adapter._dtmf_confirmations[call_id] = confirmation
+
+    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert outcome is TransferOutcome.BLOCKED
+    assert session.blind == []  # confirmed, but degraded-during-window → no REFER

@@ -112,6 +112,12 @@ class TransferOutcome(Enum):
     * ``TRANSFERRED`` — the caller pressed the armed confirm digit; the REFER fired.
     * ``UNCONFIRMED`` — a wrong digit or the confirmation timed out; **no REFER**.
     * ``NO_CALL`` — the call was unknown or had already ended; **no REFER**.
+    * ``BLOCKED`` — the call's OWN privilege gate refused the transfer (it is not an
+      operator-level, non-degraded call). The sync ``pre_tool_call`` gate runs before
+      this method, but the REFER chokepoint re-checks the guard ITSELF (defense in
+      depth), so a session that lost privilege or went ``degraded`` *during* the
+      confirmation window — or any direct/bypass invocation — cannot fire the REFER.
+      **No REFER**.
 
     A *failure* to even obtain a confirmation (no telephone-event negotiated) or a
     REFER the gateway rejects is signalled by an exception, not a member — those are
@@ -121,6 +127,7 @@ class TransferOutcome(Enum):
     TRANSFERRED = "transferred"
     UNCONFIRMED = "unconfirmed"
     NO_CALL = "no_call"
+    BLOCKED = "blocked"
 
 
 #: The Hermes ``chat_id`` (== SIP Call-ID) session-context variable name.
@@ -831,6 +838,11 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
         return json.dumps(
             {"error": "the caller did not confirm the transfer; nobody was transferred"}
         )
+    if outcome is TransferOutcome.BLOCKED:
+        # The REFER chokepoint's own guard re-check refused it (not operator-level /
+        # degraded — possibly a state change during the confirmation window). The
+        # privilege clamp is enforced at the chokepoint, not only at the gate.
+        return json.dumps({"error": "the transfer is not permitted on this call"})
     # NO_CALL — the call is unknown or already ended.
     return json.dumps({"error": "the call is not active (unknown or ended)"})
 

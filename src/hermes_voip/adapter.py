@@ -134,8 +134,10 @@ from hermes_voip.sdp import (
 from hermes_voip.sdp import (
     Codec as SdpCodec,
 )
+from hermes_voip.tools import gate_voip_tool
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
 from hermes_voip.voip_tools import (
+    TRANSFER_BLIND_TOOL_NAME,
     TransferOutcome,
     active_voip_adapter,
     set_active_adapter,
@@ -2226,15 +2228,22 @@ class VoipAdapter(BasePlatformAdapter):
         the person on the call presses the armed confirm digit. The ``Referred-By`` AOR
         is the call's local URI (RFC 3892), so the target sees who referred them.
 
-        The ``pre_tool_call`` gate has already enforced the operator-level (3) +
-        non-degraded privilege clamp (a fail-fast) before this runs, so the confirm
-        prompt is only ever spoken on a privileged, healthy call.
+        The ``pre_tool_call`` gate enforces the operator-level (3) + non-degraded
+        privilege clamp before this runs, but this method **re-enforces it itself**
+        (defense in depth, cross-vendor review): once before the confirm prompt (so a
+        direct/bypass invocation never even prompts) and again AFTER the confirmation
+        await (so a session that went ``degraded`` or lost privilege *during* the
+        window cannot fire the REFER on the confirm digit). The REFER chokepoint is
+        therefore self-protecting, not solely reliant on the gate.
 
         Returns a :class:`~hermes_voip.voip_tools.TransferOutcome`:
 
         * ``TRANSFERRED`` — the caller confirmed; the REFER fired.
         * ``UNCONFIRMED`` — a wrong digit or the confirmation timed out; **no REFER**.
         * ``NO_CALL`` — the call is unknown or already ended; **no REFER**.
+        * ``BLOCKED`` — the call's own privilege clamp refused it (not operator-level /
+          degraded, including a state change during the confirmation window); **no
+          REFER**.
 
         Raises (never a silent no-op — rule 37):
 
@@ -2247,6 +2256,21 @@ class VoipAdapter(BasePlatformAdapter):
         session = self._call_sessions.get(call_id)
         if session is None or session.ended:
             return TransferOutcome.NO_CALL
+        # Defense in depth (cross-vendor review): the REFER chokepoint enforces the
+        # privilege clamp ITSELF, not only via the pre_tool_call gate. The transfer is
+        # IRREVERSIBLE, so ``gate_voip_tool(..., confirmed=True)`` returns True iff
+        # the call is operator-level (3) AND non-degraded — the DTMF press below is the
+        # human confirmation; the gate's ``confirmed=True`` re-applies exactly the
+        # level + degraded clamp (identical to ``CallControlTools._irreversible``).
+        # Fail-fast here so an unprivileged/degraded call (or any direct/bypass
+        # invocation that skipped the hook) never even hears the confirm prompt.
+        if not gate_voip_tool(TRANSFER_BLIND_TOOL_NAME, session.guard, confirmed=True):
+            _log.warning(
+                "agent transfer_blind tool: call %s is not permitted to transfer "
+                "(privilege/degraded clamp); refusing before confirmation",
+                call_id,
+            )
+            return TransferOutcome.BLOCKED
         confirmation = self._dtmf_confirmations.get(call_id)
         if confirmation is None:
             # No spoof-resistant confirmation channel for this call (no telephone-event
@@ -2277,6 +2301,19 @@ class VoipAdapter(BasePlatformAdapter):
         session = self._call_sessions.get(call_id)
         if session is None or session.ended:
             return TransferOutcome.NO_CALL
+        # Re-run the privilege clamp AFTER the await too (the load-bearing TOCTOU fix
+        # from the review): a fail-open screen during the confirmation window can flip
+        # the session ``degraded`` (sticky), and a concurrent re-classification could
+        # lower its privilege — either must abort the REFER even though the caller
+        # pressed the confirm digit. A degraded operator transfer is exactly the
+        # missed-injection case the gate exists to stop.
+        if not gate_voip_tool(TRANSFER_BLIND_TOOL_NAME, session.guard, confirmed=True):
+            _log.warning(
+                "agent transfer_blind tool: call %s lost transfer privilege during "
+                "confirmation (privilege/degraded clamp); REFER NOT sent",
+                call_id,
+            )
+            return TransferOutcome.BLOCKED
         referred_by = session.dialog.local_uri
         _log.info(
             "agent transfer_blind tool: confirmed — transferring call %s (REFER)",

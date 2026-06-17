@@ -739,6 +739,27 @@ async def test_transfer_blind_handler_unconfirmed_does_not_transfer(
 
 
 @pytest.mark.asyncio
+async def test_transfer_blind_handler_blocked_does_not_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A BLOCKED outcome (chokepoint privilege re-check) → no transfer, clear error.
+
+    The host method's own privilege clamp (defense in depth) can refuse the transfer
+    even after the gate passed — e.g. the session went degraded during the confirm
+    window. The handler reports that and the host recorded no REFER.
+    """
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.BLOCKED
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert host.transfers == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
 async def test_transfer_blind_handler_requires_a_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

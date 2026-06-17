@@ -449,13 +449,24 @@ class FakeWebRtcGateway:
         gathers its ICE, and emits a ``UDP/TLS/RTP/SAVPF`` + Opus + ``a=fingerprint`` +
         ICE offer.
 
-        After the plugin's 200 OK arrives (recording the To-tag + SAVPF answer), it
-        sends the ACK and runs the peer's :meth:`WebRtcMediaSession.run_handshake`
-        CONCURRENTLY: the adapter's own ``run_handshake`` is awaited inside
-        ``_setup_webrtc_call`` (it runs as soon as the 200 OK path reaches it), and both
-        ride the SAME linked ICE pipe — so the real DTLS records flow both ways and both
-        sides key SRTP. On return the peer's SRTP pair is stored and the inbound reader
-        (decrypt + Opus-decode of the plugin's media) is running.
+        After the plugin's 200 OK arrives (recording the To-tag + SAVPF answer), it runs
+        the peer's :meth:`WebRtcMediaSession.run_handshake` against the adapter's: the
+        adapter's own ``run_handshake`` is awaited inside ``_setup_webrtc_call`` (right
+        after the 200 OK), and both ride the SAME linked ICE pipe — so the real DTLS
+        records flow both ways and both sides key SRTP. On return the
+        peer's SRTP pair is stored and the inbound reader (decrypt + Opus-decode of the
+        plugin's media) is running.
+
+        The ACK is NOT sent here. The adapter registers the in-dialog route only AFTER
+        its ``run_handshake`` returns (the WebRTC handshake rides the media that only
+        flows once the peer has the answer; the SDES path has no such delay), so the
+        caller must wait until the dialog is established before the ACK can route
+        in-dialog. The test owns the adapter and waits on that observable state
+        (``call_id in adapter._call_loops``) before calling :meth:`send_ack` — a real
+        UAC's earlier ACK would be briefly unroutable during the handshake, which is
+        benign for a 2xx ACK (the dialog still forms and the BYE later routes
+        in-dialog). Keeping the ACK out of this method avoids a nondeterministic
+        scheduler-settle and asserts only what is genuinely guaranteed.
         """
         # The peer is the DTLS CLIENT. RFC 5763 §5: a `passive` offer makes the answerer
         # `active`; conversely, to make the ADAPTER passive/server we offer `actpass` —
@@ -551,15 +562,8 @@ class FakeWebRtcGateway:
 
         # Start the inbound reader: decrypt + Opus-decode the plugin's outbound media.
         self._reader_task = asyncio.ensure_future(self._read_inbound_media())
-
-        # Settle the loop so the adapter task (which returned from ITS run_handshake at
-        # ~the same time) runs its synchronous dialog registration (manager.add_call +
-        # transport.add_call) before the in-dialog ACK arrives — otherwise the ACK
-        # routes
-        # out-of-dialog. A few scheduler turns are enough (no media is in flight yet).
-        for _ in range(10):
-            await asyncio.sleep(0)
-        await self.send_ack(call)
+        # The ACK is sent by the caller via send_ack() once it has observed the dialog
+        # established (see the method docstring) — not here.
         return call
 
     def _peer_ice_factory(self) -> _IceFactory:
@@ -575,13 +579,20 @@ class FakeWebRtcGateway:
     async def _await_invite_ok(
         self, call: WebRtcCall, *, timeout: float
     ) -> SipResponse:
-        """Wait for the plugin's 200 OK to the INVITE (matched by CSeq INVITE)."""
+        """Wait for the plugin's 200 OK to ``call``'s INVITE (by Call-ID + CSeq).
+
+        Scoped to this call's Call-ID (not just status + CSeq method) so the match is
+        unambiguous even if the helper is reused for a second/retried INVITE on the same
+        connection.
+        """
 
         def is_match(raw: str) -> bool:
             if not raw.startswith("SIP/2.0 "):
                 return False
             resp = SipResponse.parse(raw)
             if resp.status_code != 200:
+                return False
+            if resp.header("Call-ID") != call.call_id:
                 return False
             cseq = resp.header("CSeq") or ""
             return cseq.endswith("INVITE")

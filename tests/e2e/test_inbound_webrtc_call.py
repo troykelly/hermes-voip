@@ -495,10 +495,12 @@ async def test_full_inbound_webrtc_call_end_to_end() -> None:  # noqa: PLR0915 �
             # (1) INVITE (WebRTC SAVPF/Opus/DTLS) → 200 OK + the real DTLS handshake.
             # send_invite_and_handshake builds the offer from the peer's real
             # WebRtcMediaSession, sends the INVITE, awaits the 200 OK (recording the
-            # To-tag + the answer), sends the ACK, and runs the peer's side of the DTLS
-            # handshake CONCURRENTLY with the adapter's (the adapter's run_handshake is
-            # awaited inside _setup_webrtc_call before the 200 OK path completes, over
-            # the SAME in-memory ICE pipe).
+            # To-tag + the answer), and runs the peer's side of the DTLS handshake
+            # against the adapter's (the adapter's run_handshake is awaited inside
+            # _setup_webrtc_call after the 200 OK, over the SAME in-memory ICE pipe).
+            # The ACK is sent below, once the dialog is established (the adapter
+            # registers the in-dialog route only after the handshake — see the helper's
+            # docstring).
             call = await gateway.send_invite_and_handshake(to_user=_TO_USER)
 
             # The dialog-forming 200 OK must carry a non-empty To-tag, a SAVPF answer
@@ -520,6 +522,16 @@ async def test_full_inbound_webrtc_call_end_to_end() -> None:  # noqa: PLR0915 �
             )
             assert isinstance(gateway.srtp_inbound, SrtpSession)
             assert isinstance(gateway.srtp_outbound, SrtpSession)
+
+            # The adapter registers the in-dialog route + starts the CallLoop only AFTER
+            # its run_handshake returns (the WebRTC handshake delays it, unlike SDES).
+            # Wait on that observable state — deterministic, no scheduler-settle guess —
+            # THEN send the ACK so it routes in-dialog (a real UAC's earlier ACK would
+            # be briefly unroutable during the handshake, which is benign for a 2xx
+            # ACK).
+            call_id = call.call_id
+            await _until(lambda: call_id in adapter._call_loops, timeout=5.0)
+            await gateway.send_ack(call)
 
             # (2) The greeting flows out as SRTP-protected Opus over the ICE pipe. The
             # peer decrypts it with its DTLS-derived SRTP and Opus-decodes it — proving
@@ -581,7 +593,6 @@ async def test_full_inbound_webrtc_call_end_to_end() -> None:  # noqa: PLR0915 �
             )
 
             # (5) BYE → clean teardown. The CallSession must be removed.
-            call_id = call.call_id
             assert call_id in adapter._call_loops  # call is live before BYE
             await gateway.send_bye(call)
             await gateway.await_response(method="BYE", status=200)
@@ -590,7 +601,12 @@ async def test_full_inbound_webrtc_call_end_to_end() -> None:  # noqa: PLR0915 �
                 "the CallSession/CallLoop was not torn down after BYE"
             )
 
-            # No SIP message was reported unroutable: the ACK and BYE routed in-dialog.
+            # The in-dialog ACK (sent after establishment) and BYE both routed in-dialog
+            # — no SIP message was reported unroutable. (A real caller's ACK during the
+            # handshake could be briefly unroutable before the dialog registers; this
+            # harness sends the ACK post-establishment, so the in-dialog ACK + BYE are
+            # what is asserted here — the To-tag dialog-routing path the SDES e2e
+            # covers.)
             unroutable = [
                 r.getMessage()
                 for r in caplog_handler.records

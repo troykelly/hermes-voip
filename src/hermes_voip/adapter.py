@@ -84,7 +84,12 @@ from hermes_voip.incall import LocalMediaSession
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.media.call_loop import CallLoop
 from hermes_voip.media.endpoint import Endpointer
-from hermes_voip.media.engine import Codec, RtpMediaTransport
+from hermes_voip.media.engine import (
+    Codec,
+    RtpMediaTransport,
+    UnsupportedCodecError,
+    codec_for_encoding,
+)
 from hermes_voip.media.vad import VoiceActivityDetector, load_silero_model
 from hermes_voip.message import (
     SipRequest,
@@ -774,10 +779,18 @@ class VoipAdapter(BasePlatformAdapter):
             # Update the engine codec from the negotiated answer (the engine was
             # constructed with Codec.PCMU as a placeholder before the answer was
             # known; sending with the wrong payload type causes the callee to hear
-            # nothing when they chose PCMA).
+            # nothing when they chose PCMA). The mapping is the engine's final
+            # capability authority: a codec we cannot carry FAILS the call loudly
+            # (488) rather than leaving the engine on a placeholder codec and
+            # streaming dead audio — the outbound mirror of the inbound guard.
             negotiated_voice = _first_voice_codec(agreed_codecs)
             if negotiated_voice is not None:
-                engine._codec = _to_engine_codec(negotiated_voice)
+                try:
+                    engine._codec = _to_engine_codec(negotiated_voice)
+                except UnsupportedCodecError as exc:
+                    raise OutboundCallFailed(
+                        488, f"2xx answer codec not carriable: {exc}"
+                    ) from exc
 
             _log.info(
                 "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
@@ -1025,13 +1038,45 @@ class VoipAdapter(BasePlatformAdapter):
         try:
             agreed_sdp_codecs = negotiate_audio(audio, _SUPPORTED_ENCODINGS)
         except ValueError as exc:
-            _log.warning("INVITE %s: no common codec: %s", call_id, exc)
+            # A call we cannot carry is REJECTED, never answered. Logged at ERROR
+            # (not WARNING) so a refused call is unmistakable, not buried.
+            _log.error(
+                "INVITE %s: REJECTED 488 — no common codec with the offer: %s",
+                call_id,
+                exc,
+            )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
 
         # --- Pick a local media Codec from the negotiated SDP codecs --------
         codec = _first_voice_codec(agreed_sdp_codecs)
         if codec is None:
+            _log.error(
+                "INVITE %s: REJECTED 488 — negotiated set has no voice codec "
+                "(DTMF-only match is not a usable call)",
+                call_id,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            return
+
+        # --- Map the negotiated voice codec to a runnable engine codec ------
+        # BELT-AND-SUSPENDERS: even after negotiate_audio agreed on a name, the
+        # engine's exhaustive, rate-aware capability table is the final authority
+        # on what we can actually carry. A codec we cannot carry must REJECT with
+        # 488 here, BEFORE any RTP engine is opened or any 200 OK is sent — never
+        # an answered-but-dead call. (Today negotiate_audio and the engine table
+        # agree over the G.711 menu; this guard keeps them honest as the menu and
+        # the engine evolve, and turns any future drift into a loud 488, not
+        # silent dead audio.)
+        try:
+            engine_codec = _to_engine_codec(codec)
+        except UnsupportedCodecError as exc:
+            _log.error(
+                "INVITE %s: REJECTED 488 — negotiated codec not carriable by the "
+                "media engine: %s",
+                call_id,
+                exc,
+            )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
 
@@ -1057,7 +1102,7 @@ class VoipAdapter(BasePlatformAdapter):
             local_port=0,  # OS assigns a free port
             remote_address=remote_address,
             remote_port=audio.port,
-            codec=_to_engine_codec(codec),
+            codec=engine_codec,
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
@@ -1544,10 +1589,19 @@ def _first_voice_codec(
 
 
 def _to_engine_codec(sdp_codec: SdpCodec) -> Codec:
-    """Map a negotiated SDP Codec to the engine's ``Codec`` enum."""
-    if sdp_codec.encoding.upper() == "PCMU":
-        return Codec.PCMU
-    return Codec.PCMA
+    """Map a negotiated SDP Codec to a runnable engine ``Codec``.
+
+    Delegates to the engine's exhaustive, rate-aware capability table
+    (:func:`~hermes_voip.media.engine.codec_for_encoding`): a codec the engine
+    cannot carry RAISES :class:`~hermes_voip.media.engine.UnsupportedCodecError`
+    rather than silently mis-mapping to PCMA (the historical bug that answered a
+    call we could not carry, producing dead audio). The check considers the clock
+    rate, not just the encoding name.
+
+    Raises:
+        UnsupportedCodecError: If the engine cannot carry this codec+rate.
+    """
+    return codec_for_encoding(sdp_codec.encoding, sdp_codec.clock_rate)
 
 
 def _effective_address(audio: AudioMedia, offer: SessionDescription) -> str:

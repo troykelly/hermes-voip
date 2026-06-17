@@ -92,21 +92,32 @@ def test_deny_beats_allow_for_a_number_on_both_lists() -> None:
     assert cls.mode is CallerMode.DENY
 
 
-def test_explicit_grey_pin_overrides_default_allow() -> None:
-    # An operator can pin a caller to receptionist even if default were ALLOW.
-    cfg = _cfg(grey=(_GREY_PIN,), default_mode=CallerMode.ALLOW)
+def test_explicit_grey_pin_forces_receptionist() -> None:
+    # An operator can pin a specific caller to the receptionist (grey) group.
+    # (Behaviour change, fix/voip-default-mode-privilege-clamp: the prior version
+    # of this test used default_mode=ALLOW to show the pin overriding a privileged
+    # default; a privileged default is now rejected at construction — see
+    # test_default_mode_allow_is_rejected_at_construction — so the pin is shown
+    # against the safe GREY default. The grey-pin-wins assertion is preserved.)
+    cfg = _cfg(grey=(_GREY_PIN,))
     cls = classify_caller(_GREY_PIN, cfg)
     assert cls.mode is CallerMode.GREY
     # ADR-0021: the legacy shim synthesises a "receptionist" group for the grey-list;
     # source is the group name, not the legacy mode name.
     assert cls.source == "receptionist"
+    assert cls.group.privilege_level == 0
 
 
-def test_default_mode_allow_applies_only_to_unmatched() -> None:
-    cfg = _cfg(default_mode=CallerMode.ALLOW)
-    cls = classify_caller(_UNKNOWN, cfg)
-    assert cls.mode is CallerMode.ALLOW
-    assert cls.source == "default"
+def test_privileged_default_mode_allow_is_refused_not_applied() -> None:
+    # Behaviour change (fix/voip-default-mode-privilege-clamp): this test previously
+    # asserted that default_mode=ALLOW mapped an unmatched caller to ALLOW
+    # ("applies only to unmatched"). That WAS the fail-open privilege-escalation
+    # gap — an unknown, forgeable caller reaching operator privilege_level=3. The
+    # hardened contract refuses the privileged default at construction instead of
+    # applying it, so there is no unmatched-caller-gets-ALLOW path to assert. The
+    # assertion is strengthened from "permissively ALLOW" to "hard ConfigError".
+    with pytest.raises(ConfigError, match="ALLOW"):
+        _cfg(default_mode=CallerMode.ALLOW)
 
 
 # --- normalization ----------------------------------------------------------
@@ -217,6 +228,25 @@ def test_unmatched_caller_can_never_reach_operator_privilege() -> None:
     assert cls.mode is CallerMode.GREY
 
 
+def test_live_shaped_config_grey_default_is_unaffected() -> None:
+    # The LIVE launch uses an explicit allow-list + default=grey (the safe
+    # default). This hardening must NOT change that posture: an allow-listed
+    # caller still gets the operator tier (level 3); an UNMATCHED caller still
+    # falls to the receptionist (level 0), never operator.
+    cfg = _cfg(allow=(_TRUSTED,), default_mode=CallerMode.GREY)
+
+    matched = classify_caller(_TRUSTED, cfg)
+    assert matched.mode is CallerMode.ALLOW
+    assert matched.group.name == "operator"
+    assert matched.group.privilege_level == 3
+
+    unmatched = classify_caller(_UNKNOWN, cfg)
+    assert unmatched.source == "default"
+    assert unmatched.mode is CallerMode.GREY
+    assert unmatched.group.name == "receptionist"
+    assert unmatched.group.privilege_level == 0
+
+
 # --- persona preamble (spotlighted, untrusted-data marked) ------------------
 
 
@@ -301,9 +331,10 @@ def test_load_unset_file_path_is_empty() -> None:
 
 def test_load_configured_but_missing_file_raises(tmp_path: Path) -> None:
     # A path that IS configured but does not exist is a misconfiguration and must
-    # fail LOUDLY (rule 37): silently treating it as empty would, under
-    # default_mode=allow, grant ALLOW to callers a missing deny/grey file was
-    # meant to constrain. unset != configured-but-missing.
+    # fail LOUDLY (rule 37): silently treating a configured-but-missing list as
+    # empty would change the security posture without warning — e.g. an operator's
+    # allow list vanishing would silently drop every trusted caller to the
+    # receptionist (or a missing deny list would stop blocking). unset != missing.
     missing = tmp_path / "does-not-exist.json"
     with pytest.raises(ConfigError):
         load_caller_modes({"HERMES_VOIP_CALLER_ALLOW_FILE": str(missing)})
@@ -327,8 +358,13 @@ def test_load_wrong_shape_file_raises_config_error(tmp_path: Path) -> None:
 
 
 def test_load_default_mode_from_env() -> None:
-    cfg = load_caller_modes({"HERMES_VOIP_CALLER_DEFAULT_MODE": "allow"})
-    assert cfg.default_mode is CallerMode.ALLOW
+    # Behaviour change (fix/voip-default-mode-privilege-clamp): this test previously
+    # loaded default=allow and asserted the loader returned CallerMode.ALLOW. A
+    # privileged default is now refused (see test_load_rejects_default_mode_allow),
+    # so the env-knob-parses-the-default coverage is shown against the only valid
+    # explicit value, GREY (the safe receptionist default). Assertion preserved.
+    cfg = load_caller_modes({"HERMES_VOIP_CALLER_DEFAULT_MODE": "grey"})
+    assert cfg.default_mode is CallerMode.GREY
 
 
 def test_load_rejects_default_mode_deny() -> None:

@@ -945,3 +945,52 @@ def test_caller_group_config_rejects_duplicate_group_names() -> None:
             match_order=("receptionist",),
             normalization=Normalization.E164,
         )
+
+
+def test_caller_group_config_rejects_match_all_wildcard_in_privileged_group() -> None:
+    """A privileged group must not carry the match-all "*" pattern.
+
+    Cross-vendor re-review (codex, PR #83) found that ``"*"`` is an empty-prefix
+    wildcard — ``candidate.startswith("")`` is always True — so a privileged group
+    (level >= 2) listing ``"*"`` matches EVERY caller, including every unknown one,
+    granting operator privilege on a forgeable identifier. That is the config-driven
+    re-creation of the (now-rejected) ``default_mode=allow`` escalation: operator
+    privilege must require a SPECIFIC allow-list match, never a blanket one. It is
+    refused at construction, like the privileged-group-with-no-patterns check.
+    """
+    with pytest.raises(ConfigError, match="privilege_level"):
+        CallerGroupConfig(
+            groups=(
+                CallerGroup("operator", 3, "assistant", False),
+                CallerGroup("receptionist", 0, "receptionist", False),
+            ),
+            # MISTAKE/attack: "*" puts EVERY caller in the operator group.
+            group_lists={"operator": ("*",), "receptionist": ()},
+            default_group="receptionist",
+            match_order=("operator", "receptionist"),
+            normalization=Normalization.E164,
+        )
+
+
+def test_caller_group_config_allows_match_all_in_unprivileged_group() -> None:
+    """A level-0 (receptionist/untrusted) group MAY use "*" — it grants nothing.
+
+    The clamp targets only PRIVILEGED groups. A match-all in the unprivileged
+    default tier is harmless (it is the safe receptionist), and a privileged group
+    with a SPECIFIC prefix (e.g. a trusted block "+1555550*") is still allowed — the
+    operator deliberately trusting a specific range, not everyone.
+    """
+    cfg = CallerGroupConfig(
+        groups=(
+            CallerGroup("operator", 3, "assistant", False),
+            CallerGroup("receptionist", 0, "receptionist", False),
+        ),
+        # "*" on the level-0 group is fine; operator uses a SPECIFIC prefix.
+        group_lists={"operator": ("+1555550*",), "receptionist": ("*",)},
+        default_group="receptionist",
+        match_order=("operator", "receptionist"),
+        normalization=Normalization.E164,
+    )
+    # A specific operator number still reaches level 3; a random caller does NOT.
+    assert classify_caller_group("+15555500001", cfg).group.privilege_level == 3
+    assert classify_caller_group("+19999999999", cfg).group.privilege_level == 0

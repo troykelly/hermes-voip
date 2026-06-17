@@ -1,0 +1,270 @@
+"""In-process NLMS acoustic echo canceller — unit tests (ADR-0033).
+
+The gateway reflects the agent's own TTS back on the inbound leg (a delayed,
+attenuated, filtered copy of the outbound signal we already hold). The canceller
+estimates that echo from the known outbound REFERENCE and subtracts it from the
+inbound NEAR-END before the VAD/ASR see it, so:
+
+* a known reflected reference is cancelled to near-silence (no false VAD onset),
+* a real, uncorrelated near-end signal (the caller) survives the subtraction (a
+  genuine barge-in still triggers), and double-talk does not let the filter eat
+  the caller, and
+* ``cancel`` adds NO algorithmic latency: it returns exactly the samples it was
+  given (no extra frame of buffering).
+
+All deterministic and pure-stdlib (no extra). Audio is synthesised as PCM16 so
+energy assertions are exact.
+"""
+
+from __future__ import annotations
+
+import math
+import struct
+from collections.abc import Sequence
+
+from hermes_voip.media.aec import EchoCanceller
+
+_G711_RATE = 8_000
+_G722_RATE = 16_000
+_OPUS_WIRE_RATE = 48_000
+
+
+# ---------------------------------------------------------------------------
+# PCM helpers (pure stdlib; energy is exact integer math)
+# ---------------------------------------------------------------------------
+
+
+def _pack(samples: Sequence[int]) -> bytes:
+    """Pack int samples to PCM16-LE, clamping to the int16 range."""
+    clamped = [max(-32768, min(32767, int(s))) for s in samples]
+    return struct.pack(f"<{len(clamped)}h", *clamped)
+
+
+def _unpack(pcm16: bytes) -> tuple[int, ...]:
+    return struct.unpack(f"<{len(pcm16) // 2}h", pcm16)
+
+
+def _rms(pcm16: bytes) -> float:
+    """Root-mean-square amplitude of a PCM16 buffer (0.0 for empty)."""
+    vals = _unpack(pcm16)
+    if not vals:
+        return 0.0
+    return math.sqrt(sum(v * v for v in vals) / len(vals))
+
+
+def _sine(
+    n: int, *, freq_hz: float, rate: int, amplitude: float, phase: float = 0.0
+) -> list[int]:
+    """A pure sine of ``n`` PCM16 samples at ``freq_hz`` and ``amplitude`` fraction."""
+    peak = amplitude * 32767.0
+    w = 2.0 * math.pi * freq_hz / rate
+    return [int(peak * math.sin(w * i + phase)) for i in range(n)]
+
+
+def _echo_of(
+    reference: Sequence[int], *, delay: int, gain: float, taps: Sequence[float]
+) -> list[int]:
+    """A deterministic echo: reference convolved with ``taps``, delayed, attenuated.
+
+    Models a realistic echo path: a fixed bulk ``delay`` (samples), an overall
+    ``gain`` attenuation, and a short FIR impulse response ``taps`` (the room /
+    hybrid colouring). ``echo[n] = gain * sum_k taps[k] * reference[n - delay - k]``.
+    """
+    out = [0] * len(reference)
+    for n in range(len(reference)):
+        acc = 0.0
+        for k, c in enumerate(taps):
+            j = n - delay - k
+            if 0 <= j < len(reference):
+                acc += c * reference[j]
+        out[n] = int(gain * acc)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Convergence: a known reflected reference is cancelled toward silence
+# ---------------------------------------------------------------------------
+
+
+def _drive(
+    aec: EchoCanceller,
+    *,
+    reference: Sequence[int],
+    near_end: Sequence[int],
+    rate: int,
+    block: int,
+) -> bytes:
+    """Feed reference + near-end through the AEC in ``block``-sized frames.
+
+    Mirrors the engine wiring: each outbound frame is pushed as the reference,
+    then the matching inbound (near-end) frame is cancelled. Returns the
+    concatenated residual PCM16.
+    """
+    residual = bytearray()
+    for off in range(0, len(near_end), block):
+        ref_chunk = reference[off : off + block]
+        near_chunk = near_end[off : off + block]
+        aec.push_reference(_pack(ref_chunk), sample_rate=rate)
+        residual += aec.cancel(_pack(near_chunk))
+    return bytes(residual)
+
+
+def test_cancels_known_reflected_reference_toward_silence() -> None:
+    """Pure echo (no caller) is driven well below the input echo level.
+
+    The near-end is ONLY the echo of the reference. After the NLMS filter
+    converges the residual energy must collapse — proving the canceller removes
+    the known reflected signal so the VAD never sees it.
+    """
+    rate = _G722_RATE
+    n = rate  # 1 second of audio
+    # The outbound TTS reference: a couple of partials so the filter has spectral
+    # content to lock onto (a single tone is a pathological easy case).
+    reference = [
+        a + b
+        for a, b in zip(
+            _sine(n, freq_hz=320.0, rate=rate, amplitude=0.30),
+            _sine(n, freq_hz=850.0, rate=rate, amplitude=0.18),
+            strict=True,
+        )
+    ]
+    # The echo the gateway reflects back: delayed, attenuated, mildly filtered.
+    echo = _echo_of(reference, delay=12, gain=0.6, taps=(1.0, 0.4, -0.2))
+
+    aec = EchoCanceller(sample_rate=rate, filter_len=256, bulk_delay=0, mu=0.5)
+    residual = _drive(aec, reference=reference, near_end=echo, rate=rate, block=320)
+
+    echo_rms = _rms(_pack(echo))
+    # Measure the residual on the SECOND half, after the filter has converged.
+    tail = residual[len(residual) // 2 :]
+    tail_rms = _rms(tail)
+    assert echo_rms > 200.0, f"test echo too quiet to be meaningful: {echo_rms}"
+    # At least ~12 dB of echo return loss enhancement on the converged tail.
+    assert tail_rms < echo_rms * 0.25, (
+        f"echo not cancelled: residual_rms={tail_rms:.1f} vs echo_rms={echo_rms:.1f}"
+    )
+
+
+def test_disabled_passthrough_does_not_cancel() -> None:
+    """A divergence guard sanity check: with no reference pushed, near-end is intact.
+
+    If nothing is pushed as the reference (e.g. the agent is silent), the filter
+    has nothing to subtract, so a near-end signal passes through unchanged — the
+    canceller never invents a subtraction that would damage caller-only audio.
+    """
+    rate = _G711_RATE
+    n = rate // 2
+    near = _sine(n, freq_hz=440.0, rate=rate, amplitude=0.3)
+    aec = EchoCanceller(sample_rate=rate, filter_len=128, bulk_delay=0, mu=0.5)
+    # No push_reference at all.
+    out = bytearray()
+    for off in range(0, n, 160):
+        out += aec.cancel(_pack(near[off : off + 160]))
+    assert _unpack(bytes(out)) == tuple(near), "caller-only audio must pass through"
+
+
+# ---------------------------------------------------------------------------
+# Double-talk: the caller survives; the echo is still removed
+# ---------------------------------------------------------------------------
+
+
+def test_uncorrelated_near_end_survives_cancellation() -> None:
+    """A real caller talking OVER the echo is not cancelled away (barge-in safe).
+
+    Near-end = caller speech (uncorrelated with the reference) + echo. After the
+    canceller, the caller component must still dominate the residual — i.e. the
+    residual stays close to the caller-only signal, NOT driven to silence. This is
+    the property that lets a genuine barge-in still fire the VAD.
+    """
+    rate = _G722_RATE
+    n = rate
+    reference = _sine(n, freq_hz=300.0, rate=rate, amplitude=0.32)
+    echo = _echo_of(reference, delay=10, gain=0.6, taps=(1.0, 0.3))
+    # The caller: a different frequency, present in the SECOND half only (they cut
+    # in partway). Uncorrelated with the reference.
+    caller = [0] * n
+    caller_half = _sine(n // 2, freq_hz=1700.0, rate=rate, amplitude=0.35)
+    caller[n // 2 :] = caller_half
+    near = [e + c for e, c in zip(echo, caller, strict=True)]
+
+    aec = EchoCanceller(sample_rate=rate, filter_len=256, bulk_delay=0, mu=0.5)
+    residual = _drive(aec, reference=reference, near_end=near, rate=rate, block=320)
+
+    # Compare the residual's second half (caller present) to the caller-only signal.
+    res_tail = _rms(residual[len(residual) // 2 :])
+    caller_rms = _rms(_pack(caller_half))
+    assert caller_rms > 200.0
+    # The caller survives: residual energy where the caller talks is a large
+    # fraction of the caller-only energy (not cancelled toward silence).
+    assert res_tail > caller_rms * 0.6, (
+        f"caller was cancelled away: residual={res_tail:.1f} caller={caller_rms:.1f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# No added latency: cancel returns exactly the input length, frame-by-frame
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_preserves_frame_length_no_buffering() -> None:
+    """``cancel`` returns the same number of samples it was given (no delay).
+
+    A buffering canceller (one that holds a frame to look ahead) would add a ptime
+    of latency to the conversational path. Each ``cancel`` call must return exactly
+    its input frame length so the inbound chain gains zero algorithmic delay.
+    """
+    rate = _G711_RATE
+    aec = EchoCanceller(sample_rate=rate, filter_len=128, bulk_delay=0, mu=0.3)
+    for _ in range(20):
+        aec.push_reference(_pack([100] * 160), sample_rate=rate)
+        out = aec.cancel(_pack([50] * 160))
+        assert len(out) == 160 * 2, "cancel must return exactly the input frame length"
+
+
+def test_cancel_empty_frame_is_empty() -> None:
+    """An empty inbound frame yields an empty residual (no spurious samples)."""
+    aec = EchoCanceller(sample_rate=_G711_RATE, filter_len=64, bulk_delay=0, mu=0.3)
+    assert aec.cancel(b"") == b""
+
+
+# ---------------------------------------------------------------------------
+# Rate alignment: an Opus 48 kHz reference is downsampled to the 16 kHz analysis
+# ---------------------------------------------------------------------------
+
+
+def test_reference_downsampled_to_analysis_rate_for_opus() -> None:
+    """A 48 kHz wire reference still cancels a 16 kHz-analysis-rate echo.
+
+    On the Opus path the outbound reference is 48 kHz but the inbound analysis
+    (and the echo) is 16 kHz. ``push_reference`` must downsample the reference to
+    the analysis rate so the canceller's two inputs align — otherwise the filter
+    could never converge.
+    """
+    analysis = 16_000
+    n_wire = _OPUS_WIRE_RATE  # 1 s of 48 kHz reference
+    n_near = analysis  # 1 s of 16 kHz near-end
+    ref_wire = _sine(n_wire, freq_hz=300.0, rate=_OPUS_WIRE_RATE, amplitude=0.3)
+    # The analysis-rate version of that reference (what the echo is derived from).
+    ref_analysis = _sine(n_near, freq_hz=300.0, rate=analysis, amplitude=0.3)
+    echo = _echo_of(ref_analysis, delay=8, gain=0.6, taps=(1.0, 0.3))
+
+    aec = EchoCanceller(sample_rate=analysis, filter_len=256, bulk_delay=0, mu=0.5)
+    # Push the 48 kHz reference in 20 ms wire frames (960 samples); cancel the
+    # 16 kHz near-end in 20 ms analysis frames (320 samples). Same wall-clock rate.
+    residual = bytearray()
+    wire_block = (_OPUS_WIRE_RATE * 20) // 1000  # 960
+    near_block = (analysis * 20) // 1000  # 320
+    n_frames = n_near // near_block
+    for f in range(n_frames):
+        aec.push_reference(
+            _pack(ref_wire[f * wire_block : (f + 1) * wire_block]),
+            sample_rate=_OPUS_WIRE_RATE,
+        )
+        residual += aec.cancel(_pack(echo[f * near_block : (f + 1) * near_block]))
+
+    echo_rms = _rms(_pack(echo))
+    tail_rms = _rms(residual[len(residual) // 2 :])
+    assert echo_rms > 200.0
+    assert tail_rms < echo_rms * 0.35, (
+        f"opus-rate echo not cancelled: residual={tail_rms:.1f} echo={echo_rms:.1f}"
+    )

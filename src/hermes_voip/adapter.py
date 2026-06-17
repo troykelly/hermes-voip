@@ -99,6 +99,7 @@ from hermes_voip.message import (
     new_branch,
     new_tag,
 )
+from hermes_voip.notice_filter import is_internal_system_notice
 from hermes_voip.originate import OutboundCallFailed, build_outbound_invite
 from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.policy import GuardSessionState
@@ -476,7 +477,24 @@ class VoipAdapter(BasePlatformAdapter):
 
         Returns a ``SendResult``. An unknown ``chat_id`` returns a failure result
         (does not raise) — the call may have already ended.
+
+        Gateway-internal *system notices* (the home-channel onboarding prompt and
+        the cron/kanban "no home channel" delivery errors) are delivered through
+        this same method by the Hermes runtime, indistinguishable from a genuine
+        reply by their arguments (see ``notice_filter``). A live call has no text
+        surface, so such a notice would otherwise be *spoken* to the caller — the
+        "No home channel is set for voip" leak. They are dropped here (logged at
+        debug, never synthesised) and reported as a successful send so the
+        runtime does not treat the drop as a delivery failure and retry.
         """
+        if is_internal_system_notice(content):
+            _log.debug(
+                "dropping internal system notice for %s (not spoken): %.80r",
+                chat_id,
+                content,
+            )
+            return SendResult(success=True, message_id=chat_id)
+
         loop = self._call_loops.get(chat_id)
         if loop is None:
             return SendResult(success=False, error=f"unknown call_id {chat_id!r}")

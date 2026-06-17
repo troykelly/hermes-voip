@@ -1,7 +1,7 @@
 # ADR-0020: Caller modes — allow/deny/grey classification driving assistant vs receptionist behaviour
 
 - **Date:** 2026-06-16
-- **Status:** Accepted
+- **Status:** Accepted (extended by ADR-0021 — the 3 modes become the default 3 caller groups; the `privileged` bool generalizes to a privilege level)
 - **Deciders:** agent session (caller-modes design)
 
 ## Context

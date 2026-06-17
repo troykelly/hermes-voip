@@ -1,0 +1,106 @@
+"""Tests for the call-termination reason taxonomy (ADR-0026).
+
+``CallEndReason`` is the typed enum that classifies WHY a call ended and what the
+plugin signals to the Hermes session: a FAILURE end (``was_failure=True``) injects
+a ``/stop`` hard stop; a NORMAL end injects a plain-text content note the gateway
+replays so Hermes decides stop-vs-followup. The fail-safe is: an unknown /
+ambiguous end is treated as a failure (``/stop``), never as a silent no-op.
+
+This module is in the DEFAULT mypy + pytest gate (it imports no hermes-agent
+runtime): ``CallEndReason`` and its injection-text helper are pure.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hermes_voip.call_end import (
+    NORMAL_END_NOTE,
+    STOP_COMMAND,
+    CallEndReason,
+    injection_text_for_reason,
+)
+
+
+def test_every_reason_has_was_failure_and_can_followup() -> None:
+    """Each member exposes the two typed booleans the chokepoint branches on."""
+    for reason in CallEndReason:
+        # Both are plain ``bool`` (not truthy objects) so the chokepoint's
+        # branch and the once-per-call guard are unambiguous.
+        assert isinstance(reason.was_failure, bool)
+        assert isinstance(reason.can_followup, bool)
+
+
+def test_normal_reasons_are_not_failures_and_allow_followup() -> None:
+    """REMOTE_BYE / AGENT_HANGUP / EOS are normal ends (no failure, follow-up OK)."""
+    for reason in (
+        CallEndReason.REMOTE_BYE,
+        CallEndReason.AGENT_HANGUP,
+        CallEndReason.EOS,
+    ):
+        assert reason.was_failure is False, reason
+        assert reason.can_followup is True, reason
+
+
+def test_failure_reasons_are_failures_and_forbid_followup() -> None:
+    """Every failure reason flags a failure and forbids follow-up (hard stop)."""
+    for reason in (
+        CallEndReason.MEDIA_TIMEOUT,
+        CallEndReason.PIPELINE_FAILURE,
+        CallEndReason.SIP_ERROR,
+        CallEndReason.CONNECTION_LOST,
+        CallEndReason.REGISTRATION_LOST,
+    ):
+        assert reason.was_failure is True, reason
+        assert reason.can_followup is False, reason
+
+
+def test_failure_reason_injects_the_stop_command() -> None:
+    """A failure end injects the gateway-recognised ``/stop`` hard stop verbatim."""
+    assert injection_text_for_reason(CallEndReason.PIPELINE_FAILURE) == STOP_COMMAND
+    assert injection_text_for_reason(CallEndReason.MEDIA_TIMEOUT) == STOP_COMMAND
+    assert STOP_COMMAND == "/stop"
+
+
+def test_normal_reason_injects_the_content_note_not_a_command() -> None:
+    """A normal end injects the plain-text disconnected note (NOT a slash command)."""
+    text = injection_text_for_reason(CallEndReason.REMOTE_BYE)
+    assert text == NORMAL_END_NOTE
+    # The note is NOT a slash command (so the gateway does not treat it as /stop
+    # /new /reset) and it states the line is disconnected so the model does not
+    # try to keep speaking to a dead line.
+    assert not text.startswith("/")
+    lowered = text.lower()
+    assert "disconnect" in lowered or "hung up" in lowered
+
+
+def test_classify_clean_return_normal_vs_agent_hangup() -> None:
+    """A clean loop return classifies as REMOTE_BYE, or AGENT_HANGUP when flagged."""
+    assert CallEndReason.classify_clean_return(agent_hangup=False) is (
+        CallEndReason.REMOTE_BYE
+    )
+    assert CallEndReason.classify_clean_return(agent_hangup=True) is (
+        CallEndReason.AGENT_HANGUP
+    )
+
+
+def test_fail_safe_unknown_end_is_a_failure_stop() -> None:
+    """The fail-safe default for an unknown/ambiguous end is a failure (``/stop``)."""
+    # ``fail_safe`` is the reason the chokepoint uses when it cannot otherwise
+    # classify the end — it MUST be a failure so an ambiguous end hard-stops the
+    # session rather than leaving it dangling or replaying a content note.
+    fail_safe = CallEndReason.fail_safe()
+    assert fail_safe.was_failure is True
+    assert injection_text_for_reason(fail_safe) == STOP_COMMAND
+
+
+@pytest.mark.parametrize("reason", list(CallEndReason))
+def test_injection_text_is_total_over_the_enum(reason: CallEndReason) -> None:
+    """``injection_text_for_reason`` is total: every member maps to a non-empty text."""
+    text = injection_text_for_reason(reason)
+    assert text
+    # Failure ⇔ /stop; normal ⇔ the content note. No third outcome.
+    if reason.was_failure:
+        assert text == STOP_COMMAND
+    else:
+        assert text == NORMAL_END_NOTE

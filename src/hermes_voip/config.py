@@ -108,6 +108,32 @@ _TTS_PROVIDERS = frozenset(
     {"sherpa-kokoro", "piper", "kittentts", "kyutai", "cartesia", "aura2", "elevenlabs"}
 )
 
+# Automatic TTS failover (ADR-0025). When the primary TTS raises during synthesis
+# (HTTP 400 like the live incident, a timeout, a connection error, or any exception
+# from the stream), the system falls back to a self-host synthesiser so the call
+# still gets audio instead of dropping silent. ``HERMES_VOIP_TTS_FALLBACK`` selects
+# the fallback provider token; ``none`` (or empty) disables failover. The DEFAULT
+# follows the primary: a CLOUD primary (which can fail transiently or 400) gets the
+# self-host ``sherpa-kokoro`` fallback; a self-host primary is already the safe local
+# path, so it defaults to no fallback. ``MediaConfig.tts_fallback`` is the resolved
+# token (or ``None`` when failover is off). The fallback must be a known TTS provider
+# and must differ from the primary (a same-provider fallback is useless).
+_TTS_FALLBACK_KEY = "HERMES_VOIP_TTS_FALLBACK"
+# The fallback's OWN model directory (sherpa-kokoro). The shared HERMES_VOIP_TTS_MODEL
+# is the ElevenLabs model id for a cloud primary, NOT a Kokoro directory, so the Kokoro
+# fallback needs its own dir to be loadable on demand. Required (fail loud at startup)
+# when the fallback is sherpa-kokoro, so a primary failure never finds an unbuildable
+# fallback and dies silent.
+_TTS_FALLBACK_MODEL_KEY = "HERMES_VOIP_TTS_FALLBACK_MODEL"
+_TTS_FALLBACK_NONE = "none"
+# Cloud TTS providers that benefit from a self-host fallback by default (they reach
+# a remote API that can 400 / time out / drop). A self-host primary has none.
+_CLOUD_TTS_PROVIDERS = frozenset({"elevenlabs", "cartesia", "aura2"})
+_DEFAULT_CLOUD_TTS_FALLBACK = "sherpa-kokoro"
+# Fallback providers that need a model directory (their factory reads tts_model as a
+# path): a configured fallback of one of these requires HERMES_VOIP_TTS_FALLBACK_MODEL.
+_MODEL_DIR_TTS_PROVIDERS = frozenset({"sherpa-kokoro", "piper", "kittentts", "kyutai"})
+
 # ElevenLabs dynamic-voice tuning (ADR-0007 amendment, 2026-06-17). Optional knobs
 # that let the operator A/B voice dynamism on live calls WITHOUT a code change:
 # they map onto the ElevenLabs request's ``voice_settings`` object + the
@@ -384,6 +410,18 @@ class MediaConfig:
         tts_streaming_latency: ElevenLabs ``optimize_streaming_latency`` query value
             (int in ``[0, 4]``), or ``None`` to send nothing (the default —
             deprecated param; ``4`` disables number/date normalisation).
+        tts_fallback: Automatic TTS failover provider token (ADR-0025), or ``None``
+            when failover is off. When the primary TTS raises during synthesis (the
+            live HTTP 400, a timeout, any exception) the system synthesises via this
+            fallback so the call still gets audio. Defaults to ``sherpa-kokoro`` for a
+            cloud primary and ``None`` for a self-host primary;
+            ``HERMES_VOIP_TTS_FALLBACK=none`` disables it. Must be a known TTS
+            provider that differs from the primary.
+        tts_fallback_model: The failover provider's own model directory (e.g. the
+            Kokoro dir for a ``sherpa-kokoro`` fallback), or ``None``. The shared
+            ``tts_model`` is the cloud primary's model id, so a model-backed self-host
+            fallback needs this dedicated dir; required when ``tts_fallback`` is a
+            model-backed provider so the fallback can load on a primary failure.
     """
 
     stt_provider: str
@@ -416,6 +454,14 @@ class MediaConfig:
     tts_similarity: float | None = None
     tts_speaker_boost: bool | None = None
     tts_streaming_latency: int | None = None
+    # Automatic TTS failover provider token (ADR-0025), or ``None`` when failover
+    # is off. Defaulted to None so existing direct constructions stay valid; the
+    # parser resolves the cloud-primary default (sherpa-kokoro) when unset.
+    tts_fallback: str | None = None
+    # The failover provider's OWN model directory (sherpa-kokoro), or ``None``. The
+    # shared tts_model is the cloud primary's model id, so a model-backed self-host
+    # fallback needs its own dir; required when tts_fallback needs one.
+    tts_fallback_model: str | None = None
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -478,7 +524,52 @@ class MediaConfig:
             )
             raise ConfigError(msg)
         self._validate_tts_tuning()
+        # Cloud keys first: a missing PRIMARY credential is the more fundamental error
+        # (reported before the fallback's own requirements).
         self._require_cloud_keys()
+        self._validate_tts_fallback()
+
+    def _validate_tts_fallback(self) -> None:
+        """Validate the TTS failover provider token (ADR-0025), when set.
+
+        ``None`` (failover off) is always valid. A set token must be a known TTS
+        provider and must differ from the primary ``tts_provider`` — a fallback that
+        is the same provider cannot recover the same failure. A model-backed self-host
+        fallback (e.g. ``sherpa-kokoro``) additionally **requires its own model dir**
+        (:data:`_TTS_FALLBACK_MODEL_KEY`): the shared ``tts_model`` is the cloud
+        primary's model id, not a Kokoro directory, so without a dedicated dir the
+        fallback could not be built and the call would still die silent on the first
+        primary failure — that is rejected here, at startup, not discovered live.
+        """
+        if self.tts_fallback is None:
+            return
+        if self.tts_fallback not in _TTS_PROVIDERS:
+            opts = ", ".join(sorted(_TTS_PROVIDERS))
+            msg = (
+                f"tts_fallback must be one of {{{opts}}} or 'none', "
+                f"got {self.tts_fallback!r}"
+            )
+            raise ConfigError(msg)
+        if self.tts_fallback == self.tts_provider:
+            msg = (
+                f"tts_fallback {self.tts_fallback!r} must differ from the primary "
+                f"tts_provider {self.tts_provider!r} (a same-provider fallback "
+                "cannot recover the primary's failure)"
+            )
+            raise ConfigError(msg)
+        if (
+            self.tts_fallback in _MODEL_DIR_TTS_PROVIDERS
+            and not self.tts_fallback_model
+        ):
+            msg = (
+                f"tts_fallback {self.tts_fallback!r} requires "
+                f"{_TTS_FALLBACK_MODEL_KEY} to be set (the fallback's own model "
+                "directory — the shared HERMES_VOIP_TTS_MODEL is the cloud primary's "
+                "model id, not a Kokoro directory). Set it so the fallback can load on "
+                "a primary failure, or set "
+                f"{_TTS_FALLBACK_KEY}=none to disable failover"
+            )
+            raise ConfigError(msg)
 
     def _validate_tts_tuning(self) -> None:
         """Validate the optional ElevenLabs voice-tuning knobs (when set).
@@ -554,10 +645,11 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ConfigError: if an enum value is unknown, a numeric value is malformed or
             out of range, or a boolean value is unrecognised.
     """
+    tts_provider = _value_lower(env, _TTS_PROVIDER_KEY) or _DEFAULT_TTS_PROVIDER
     return MediaConfig(
         stt_provider=_value_lower(env, _STT_PROVIDER_KEY) or _DEFAULT_STT_PROVIDER,
         stt_model_dir=_optional(env, _STT_MODEL_DIR_KEY),
-        tts_provider=_value_lower(env, _TTS_PROVIDER_KEY) or _DEFAULT_TTS_PROVIDER,
+        tts_provider=tts_provider,
         tts_model=_optional(env, _TTS_MODEL_KEY),
         tts_voice=_optional(env, _TTS_VOICE_KEY),
         elevenlabs_api_key=_optional(env, _ELEVENLABS_API_KEY),
@@ -600,6 +692,8 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             _MIN_TTS_STREAMING_LATENCY,
             _MAX_TTS_STREAMING_LATENCY,
         ),
+        tts_fallback=_parse_tts_fallback(env, tts_provider),
+        tts_fallback_model=_optional(env, _TTS_FALLBACK_MODEL_KEY),
     )
 
 
@@ -824,6 +918,31 @@ def _parse_optional_bounded_int(
         msg = f"{key} must be in [{lo}, {hi}], got {value}"
         raise ConfigError(msg)
     return value
+
+
+def _parse_tts_fallback(env: Mapping[str, str], tts_provider: str) -> str | None:
+    """Resolve the TTS failover provider token (ADR-0025), or ``None`` when off.
+
+    Resolution:
+
+    * ``HERMES_VOIP_TTS_FALLBACK`` set to ``none`` (any case) → ``None`` (off).
+    * set to a provider token → that token (lower-cased).
+    * **unset/blank** → the primary-dependent default: a CLOUD primary
+      (``elevenlabs``/``cartesia``/``aura2``) gets ``sherpa-kokoro`` (so a remote
+      failure recovers locally); a self-host primary gets ``None`` (already safe).
+
+    The token's membership/uniqueness-vs-primary is validated by
+    :meth:`MediaConfig._validate_tts_fallback`; this resolves the value only.
+    """
+    raw = _value_lower(env, _TTS_FALLBACK_KEY)
+    if not raw:
+        # Unset → cloud primary defaults to the self-host fallback, else off.
+        if tts_provider in _CLOUD_TTS_PROVIDERS:
+            return _DEFAULT_CLOUD_TTS_FALLBACK
+        return None
+    if raw == _TTS_FALLBACK_NONE:
+        return None
+    return raw
 
 
 def _finite_in_range(value: float, lo: float, hi: float) -> bool:

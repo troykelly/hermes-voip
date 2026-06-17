@@ -106,6 +106,55 @@ swap and the settings change are independent levers.
 4. Keep the winner in `.env`; the dynamic default (`stability=0.35`, Flash, Rachel) is the
    fallback if a setting regresses quality.
 
+## Automatic failover: ElevenLabs → Kokoro (ADR-0025)
+
+A live cloud-TTS fault must never drop the call. When the primary TTS raises during
+synthesis — an HTTP 400 (see "The model_id 400 trap" below), a timeout, a connection reset,
+or any other exception from the stream — the plugin **automatically falls back to the
+self-host Kokoro synthesiser** so the caller hears the answer in the local voice instead of
+silence. The primary error is **logged at WARNING** (which provider failed and why); it is
+never swallowed.
+
+- **`HERMES_VOIP_TTS_FALLBACK`** — the fallback provider token. **Default: `sherpa-kokoro`**
+  when the primary is a cloud provider (`elevenlabs`/`cartesia`/`aura2`); set to `none` to
+  disable failover; set to another TTS provider token to use that instead. Must differ from
+  the primary (a same-provider fallback can't recover the same fault — rejected at startup).
+- **`HERMES_VOIP_TTS_FALLBACK_MODEL`** — the **Kokoro fallback's own model directory**.
+  **Required** when the fallback is `sherpa-kokoro` (rejected at startup otherwise). The
+  shared `HERMES_VOIP_TTS_MODEL` is the ElevenLabs **model id** for the primary, *not* a
+  Kokoro directory, so the fallback needs its own dir — point it at the local Kokoro model
+  dir (the same one a Kokoro-primary deployment uses). The `ml` extra must be installed so
+  Kokoro can load on demand.
+- **Latch + retry.** After the first primary failure on a call, the rest of that call uses
+  the fallback (no mid-call voice flapping). A **fresh call retries the primary**, so a brief
+  cloud blip self-heals on the next call.
+- **Zero happy-path cost.** The Kokoro fallback model is loaded **only on the first
+  failover** (lazily) and cached — so a healthy ElevenLabs call never loads it. Any primary
+  failure recovers: a streamed fault (HTTP 400 / timeout / dropped connection) *and* a
+  synchronous one (e.g. an unsupported per-call rate).
+
+```
+HERMES_VOIP_TTS_PROVIDER=elevenlabs            # cloud primary
+HERMES_VOIP_TTS_MODEL=eleven_flash_v2_5        # the PRIMARY's ElevenLabs model id (or unset)
+HERMES_VOIP_TTS_FALLBACK=sherpa-kokoro         # default for a cloud primary; `none` disables
+HERMES_VOIP_TTS_FALLBACK_MODEL=/path/to/kokoro # the FALLBACK's Kokoro model dir (ml extra)
+```
+
+### The model_id 400 trap (the live incident root cause)
+
+The live "no audio" incident was an ElevenLabs **HTTP 400 `invalid_uid`** during the greeting
+synth. Root cause: **`HERMES_VOIP_TTS_MODEL` is a model DIRECTORY for `sherpa-kokoro` but the
+model ID for ElevenLabs.** If `.env` points it at a Kokoro directory (e.g. left over from a
+self-host A/B) while `HERMES_VOIP_TTS_PROVIDER=elevenlabs`, the plugin sends that directory
+string as ElevenLabs' `model_id`, which the API rejects with a 400 — and (before ADR-0025)
+the error killed the call. The plugin now **rejects a path-shaped / blank `model_id` at
+startup** with a clear `ConfigError` naming `HERMES_VOIP_TTS_MODEL` (fail loud, not a dead
+call), and the failover above is the safety net for any other cloud fault.
+
+> **Fix:** when `HERMES_VOIP_TTS_PROVIDER=elevenlabs`, set `HERMES_VOIP_TTS_MODEL` to an
+> ElevenLabs **model id** (e.g. `eleven_flash_v2_5`) or leave it **unset** (the Flash default).
+> Never point it at a filesystem path for the ElevenLabs provider.
+
 ## Verify the config parses (no call, no network)
 
 ```bash
@@ -116,8 +165,8 @@ c = load_media_config({
     'HERMES_VOIP_TTS_STABILITY': '0.35', 'HERMES_VOIP_TTS_STYLE': '0.1',
     'HERMES_VOIP_TTS_STREAMING_LATENCY': '1',
 })
-print(c.tts_stability, c.tts_style, c.tts_streaming_latency)"
-# expect: 0.35 0.1 1   (an out-of-range value raises ConfigError instead)
+print(c.tts_stability, c.tts_style, c.tts_streaming_latency, c.tts_fallback)"
+# expect: 0.35 0.1 1 sherpa-kokoro   (cloud primary -> Kokoro fallback by default)
 ```
 
 ## Roll back

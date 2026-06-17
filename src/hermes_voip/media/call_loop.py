@@ -97,6 +97,7 @@ from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_
 from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.spoken_text import sanitize_for_speech
+from hermes_voip.tts.failover import reset_failover_if_supported
 
 _log: Final = logging.getLogger(__name__)
 
@@ -540,6 +541,12 @@ class CallLoop:
             ExceptionGroup: Wrapping any exception raised by a stage task (e.g.
                 a transport, ASR, guard, or delivery failure).
         """
+        # Reset any per-call TTS failover latch (ADR-0025) at call start: the
+        # providers are process-wide, so a FailoverTTS that latched to its self-host
+        # fallback on a PRIOR call must retry the primary on this fresh call. A plain
+        # TTS without the hook is untouched (duck-typed via SupportsCallReset).
+        reset_failover_if_supported(self._tts)
+
         # Bounded queues on a straight pump → asr → delivery line. Both bounded,
         # so memory is bounded; acyclic, so back-pressure never deadlocks.
         audio_q: asyncio.Queue[PcmFrame | _EndOfStream] = asyncio.Queue(

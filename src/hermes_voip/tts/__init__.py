@@ -16,6 +16,11 @@ from hermes_voip.tts.elevenlabs import (
     HttpByteStream,
     HttpCancellation,
 )
+from hermes_voip.tts.failover import (
+    FailoverTTS,
+    SupportsCallReset,
+    reset_failover_if_supported,
+)
 from hermes_voip.tts.segment import (
     FlushableSegmenter,
     SentenceAggregator,
@@ -26,11 +31,14 @@ from hermes_voip.tts.sherpa_kokoro import SherpaKokoroTTS, Synthesizer
 __all__ = [
     "ElevenLabsRequest",
     "ElevenLabsTTS",
+    "FailoverTTS",
     "FlushableSegmenter",
     "HttpByteStream",
     "HttpCancellation",
     "SentenceAggregator",
     "SherpaKokoroTTS",
+    "SupportsCallReset",
     "Synthesizer",
+    "reset_failover_if_supported",
     "segment_stream",
 ]

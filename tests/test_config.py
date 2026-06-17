@@ -403,6 +403,9 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.tts_provider == "sherpa-kokoro"
     assert cfg.tts_model is None
     assert cfg.tts_voice is None
+    # TTS failover (ADR-0025): a self-host primary has no fallback by default
+    # (it is already the safe local path), so the knob resolves to None here.
+    assert cfg.tts_fallback is None
     # cloud keys absent
     assert cfg.elevenlabs_api_key is None
     assert cfg.deepgram_api_key is None
@@ -438,6 +441,7 @@ def test_media_full_override() -> None:
             "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
             "HERMES_VOIP_TTS_MODEL": "eleven_flash_v2_5",
             "HERMES_VOIP_TTS_VOICE": "rachel",
+            "HERMES_VOIP_TTS_FALLBACK_MODEL": "/models/kokoro",
             "ELEVENLABS_API_KEY": "el-secret-token",
             "DEEPGRAM_API_KEY": "dg-secret-token",
             "HERMES_VOIP_VAD_THRESHOLD": "0.75",
@@ -460,6 +464,8 @@ def test_media_full_override() -> None:
     assert cfg.tts_provider == "elevenlabs"
     assert cfg.tts_model == "eleven_flash_v2_5"
     assert cfg.tts_voice == "rachel"
+    assert cfg.tts_fallback == "sherpa-kokoro"  # cloud primary -> Kokoro fallback
+    assert cfg.tts_fallback_model == "/models/kokoro"
     assert cfg.elevenlabs_api_key == "el-secret-token"
     assert cfg.deepgram_api_key == "dg-secret-token"
     assert cfg.vad_threshold == pytest.approx(0.75)
@@ -600,10 +606,145 @@ def test_media_aura2_tts_requires_deepgram_key() -> None:
 
 def test_media_cloud_provider_with_key_accepted() -> None:
     cfg = load_media_config(
-        {"HERMES_VOIP_TTS_PROVIDER": "cartesia", "HERMES_VOIP_CARTESIA_API_KEY": "c-x"}
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "cartesia",
+            "HERMES_VOIP_CARTESIA_API_KEY": "c-x",
+            # cartesia is a cloud primary, so it defaults to a Kokoro fallback that
+            # needs its own model dir (ADR-0025).
+            "HERMES_VOIP_TTS_FALLBACK_MODEL": "/models/kokoro",
+        }
     )
     assert cfg.tts_provider == "cartesia"
     assert cfg.cartesia_api_key == "c-x"
+
+
+# ---- TTS failover (ADR-0025): HERMES_VOIP_TTS_FALLBACK ----------------------
+
+
+def test_media_tts_fallback_defaults_to_kokoro_for_cloud_primary() -> None:
+    """A cloud primary (elevenlabs) defaults its fallback to sherpa-kokoro.
+
+    The live incident: ElevenLabs 400'd and the call died silent. With no explicit
+    ``HERMES_VOIP_TTS_FALLBACK``, a cloud primary gets the self-host Kokoro fallback
+    so a primary failure recovers with audio instead of dropping the call.
+    """
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "ELEVENLABS_API_KEY": "el-x",
+            # the Kokoro fallback needs its own model dir (the shared one is the EL id)
+            "HERMES_VOIP_TTS_FALLBACK_MODEL": "/models/kokoro",
+        }
+    )
+    assert cfg.tts_fallback == "sherpa-kokoro"
+
+
+def test_media_tts_fallback_default_none_for_selfhost_primary() -> None:
+    """A self-host primary (sherpa-kokoro) has no fallback by default."""
+    cfg = load_media_config({})
+    assert cfg.tts_provider == "sherpa-kokoro"
+    assert cfg.tts_fallback is None
+
+
+def test_media_tts_fallback_explicit_none_disables() -> None:
+    """``HERMES_VOIP_TTS_FALLBACK=none`` disables failover for a cloud primary."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "ELEVENLABS_API_KEY": "el-x",
+            "HERMES_VOIP_TTS_FALLBACK": "none",
+        }
+    )
+    assert cfg.tts_fallback is None
+
+
+def test_media_tts_fallback_explicit_provider() -> None:
+    """An explicit fallback provider token is honoured (lower-cased)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "ELEVENLABS_API_KEY": "el-x",
+            "HERMES_VOIP_TTS_FALLBACK": "Sherpa-Kokoro",
+            "HERMES_VOIP_TTS_FALLBACK_MODEL": "/models/kokoro",
+        }
+    )
+    assert cfg.tts_fallback == "sherpa-kokoro"
+
+
+def test_media_tts_fallback_unknown_token_rejected() -> None:
+    """An unknown fallback provider token fails fast at config load."""
+    with pytest.raises(ConfigError, match="tts_fallback"):
+        load_media_config(
+            {
+                "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "el-x",
+                "HERMES_VOIP_TTS_FALLBACK": "espeak",
+            }
+        )
+
+
+def test_media_tts_fallback_must_differ_from_primary() -> None:
+    """The fallback cannot equal the primary (a same-provider fallback is useless)."""
+    with pytest.raises(ConfigError, match="tts_fallback"):
+        load_media_config(
+            {
+                "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "el-x",
+                "HERMES_VOIP_TTS_FALLBACK": "elevenlabs",
+            }
+        )
+
+
+def test_media_kokoro_fallback_requires_its_own_model_dir() -> None:
+    """A sherpa-kokoro fallback fails loud at startup without its own model dir.
+
+    The shared HERMES_VOIP_TTS_MODEL is the ElevenLabs model id for the primary, NOT
+    a Kokoro directory — so the fallback needs HERMES_VOIP_TTS_FALLBACK_MODEL. Without
+    it, the Kokoro fallback could not be built, and the call would still die silent on
+    the first EL failure. Require it at config load so the failure surfaces at startup.
+    """
+    with pytest.raises(ConfigError, match="HERMES_VOIP_TTS_FALLBACK_MODEL"):
+        load_media_config(
+            {
+                "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "el-x",
+                # default fallback = sherpa-kokoro, but no fallback model dir set
+            }
+        )
+
+
+def test_media_kokoro_fallback_with_model_dir_accepted() -> None:
+    """With the fallback model dir set, the cloud + Kokoro-fallback config loads."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "ELEVENLABS_API_KEY": "el-x",
+            "HERMES_VOIP_TTS_FALLBACK_MODEL": "/models/kokoro",
+        }
+    )
+    assert cfg.tts_fallback == "sherpa-kokoro"
+    assert cfg.tts_fallback_model == "/models/kokoro"
+
+
+def test_media_fallback_model_none_when_no_failover() -> None:
+    """tts_fallback_model is None when failover is off (self-host primary)."""
+    cfg = load_media_config({})
+    assert cfg.tts_fallback is None
+    assert cfg.tts_fallback_model is None
+
+
+def test_media_non_model_fallback_does_not_require_fallback_model() -> None:
+    """A fallback needing no model dir (another cloud) is fine without a dir."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "ELEVENLABS_API_KEY": "el-x",
+            "HERMES_VOIP_TTS_FALLBACK": "cartesia",
+            "HERMES_VOIP_CARTESIA_API_KEY": "c-x",
+        }
+    )
+    assert cfg.tts_fallback == "cartesia"
+    assert cfg.tts_fallback_model is None
 
 
 def test_media_blank_optional_is_none_not_empty() -> None:

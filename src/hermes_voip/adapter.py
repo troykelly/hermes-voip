@@ -62,6 +62,7 @@ from gateway.platforms.base import (
 )
 
 from hermes_voip.call import CallSession
+from hermes_voip.call_end import CallEndReason, injection_text_for_reason
 from hermes_voip.caller_modes import (
     CallerGroup,
     CallerGroupConfig,
@@ -285,6 +286,12 @@ class VoipAdapter(BasePlatformAdapter):
         # Active call sessions mirrored here so they can be re-attached after
         # a reconnect: {call_id → CallSession}
         self._call_sessions: dict[str, CallSession] = {}
+        # Call-IDs whose end was initiated by the agent's hang-up tool (ADR-0026).
+        # A SOFT hangup: the tool sends BYE then ends the call loop, so its clean
+        # return classifies as AGENT_HANGUP (a NORMAL end that keeps the session
+        # open for follow-up) rather than REMOTE_BYE. Set by ``_mark_agent_hangup``;
+        # read by ``_classify_end_reason``; discarded in ``_teardown_call``.
+        self._agent_hangups: set[str] = set()
 
         # Outbound call state (ADR-0019).
         # _call_on_connect_fired: True once the CALL_ON_CONNECT trigger has fired
@@ -503,6 +510,26 @@ class VoipAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=chat_id)
 
+        # Post-hangup TTS suppression (ADR-0026): once the call has ended (the
+        # chokepoint set info["ended"]=True and stopped the media engine), there is
+        # NO media path to the caller. A late agent reply — notably the turn the
+        # agent produces in response to the replayed disconnected-note of a NORMAL
+        # end — must NOT be synthesised to the now-disconnected caller. Dropping it
+        # is reported as a FAILED send (not a silent success): the call really is
+        # gone, so the runtime learns the reply was not delivered rather than
+        # believing the caller heard it. Follow-up work happens off the voice path
+        # (background task / outbound callback / another channel), never here.
+        info = self._call_info.get(chat_id)
+        if info is not None and info.get("ended", False):
+            _log.debug(
+                "suppressing send to ended call %s (no media path): %.80r",
+                chat_id,
+                content,
+            )
+            return SendResult(
+                success=False, error=f"call {chat_id!r} has ended; no media path"
+            )
+
         loop = self._call_loops.get(chat_id)
         if loop is None:
             return SendResult(success=False, error=f"unknown call_id {chat_id!r}")
@@ -624,6 +651,9 @@ class VoipAdapter(BasePlatformAdapter):
             srtp_inbound=None,
             srtp_outbound=None,
             symmetric=media_cfg.rtp_symmetric,
+            # RTP-inactivity watchdog (ADR-0026): an outbound call whose media
+            # goes silent ends as MEDIA_TIMEOUT, not an indefinite hang.
+            media_timeout_secs=media_cfg.media_timeout_secs,
         )
         await engine.connect()
         local_rtp_host = _host_of(local_sent_by)
@@ -921,13 +951,21 @@ class VoipAdapter(BasePlatformAdapter):
             async def _run_and_teardown() -> None:
                 """Run the CallLoop then tear down all resources (background task)."""
                 _loop: CallLoop | None = None
+                # Fail-safe True: only a clean return past _run_call_loop sets it
+                # False, so a propagating exception classifies as PIPELINE_FAILURE
+                # (→ /stop) at the chokepoint (ADR-0026).
+                _raised = True
                 try:
                     _loop = await self._run_call_loop(
                         call_id=_bg_call_id,
                         engine=_bg_engine,
                         guard_state=_bg_guard_state,
                     )
+                    _raised = False
                 finally:
+                    _reason = self._classify_end_reason(
+                        _bg_call_id, _bg_engine, raised=_raised
+                    )
                     await self._teardown_call(
                         call_id=_bg_call_id,
                         engine=_bg_engine,
@@ -935,6 +973,7 @@ class VoipAdapter(BasePlatformAdapter):
                         dialog_id=_bg_session.dialog_id,
                         session=_bg_session,
                         call_loop=_loop,
+                        reason=_reason,
                     )
 
             loop_task: asyncio.Task[None] = asyncio.create_task(_run_and_teardown())
@@ -956,6 +995,11 @@ class VoipAdapter(BasePlatformAdapter):
                 transport_cur = self._transport
                 if transport_cur is not None:
                     transport_cur.remove_call(call_id, sink)
+                # A pre-session outbound failure (engine connect, SIP handshake,
+                # dialog/codec wiring) is a SIP_ERROR — a failure end (ADR-0026).
+                # The call never reached the agent, so the /stop signal is a no-op
+                # against a session that was never established; it is emitted for
+                # consistency (every end path flows through the one chokepoint).
                 await self._teardown_call(
                     call_id=call_id,
                     engine=engine,
@@ -963,6 +1007,7 @@ class VoipAdapter(BasePlatformAdapter):
                     dialog_id=dialog_id,
                     session=session,
                     call_loop=None,
+                    reason=CallEndReason.SIP_ERROR,
                 )
 
     # -----------------------------------------------------------------------
@@ -1140,6 +1185,10 @@ class VoipAdapter(BasePlatformAdapter):
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
             # to the peer's real RTP source, not blindly to the SDP address.
             symmetric=media_cfg.rtp_symmetric,
+            # RTP-inactivity watchdog (ADR-0026): a silent media/network drop ends
+            # the call as MEDIA_TIMEOUT instead of hanging the inbound generator
+            # forever. Operator-configurable in [1, 300] s (default 20).
+            media_timeout_secs=media_cfg.media_timeout_secs,
         )
         await engine.connect()
 
@@ -1258,13 +1307,21 @@ class VoipAdapter(BasePlatformAdapter):
         # to an unconditional pop if _run_call_loop raises before the CallLoop
         # is returned (e.g. providers not initialised at the very start).
         this_call_loop: CallLoop | None = None
+        # Track whether the loop ended by raising so the chokepoint can classify
+        # the end (ADR-0026): a raised end is a PIPELINE_FAILURE → /stop; a clean
+        # return is MEDIA_TIMEOUT (engine timed out), AGENT_HANGUP, or REMOTE_BYE.
+        # Start True (the fail-safe): only a clean return past _run_call_loop sets
+        # it False, so any propagating exception classifies as a failure.
+        loop_raised = True
         try:
             this_call_loop = await self._run_call_loop(
                 call_id=call_id,
                 engine=engine,
                 guard_state=guard_state,
             )
+            loop_raised = False
         finally:
+            reason = self._classify_end_reason(call_id, engine, raised=loop_raised)
             await self._teardown_call(
                 call_id=call_id,
                 engine=engine,
@@ -1272,6 +1329,7 @@ class VoipAdapter(BasePlatformAdapter):
                 dialog_id=session.dialog_id,
                 session=session,
                 call_loop=this_call_loop,
+                reason=reason,
             )
 
     async def _run_call_loop(
@@ -1351,7 +1409,7 @@ class VoipAdapter(BasePlatformAdapter):
         await call_loop.run()
         return call_loop
 
-    async def _teardown_call(  # noqa: PLR0913 — six keyword-only params all needed: call_id + engine + transport + dialog_id + session + call_loop for isolation
+    async def _teardown_call(  # noqa: PLR0913 — seven keyword-only params all needed: call_id + engine + transport + dialog_id + session + call_loop + reason for isolation + the Hermes signal
         self,
         *,
         call_id: str,
@@ -1360,13 +1418,22 @@ class VoipAdapter(BasePlatformAdapter):
         dialog_id: tuple[str, str, str],
         session: CallSession | None = None,
         call_loop: CallLoop | None = None,
+        reason: CallEndReason = CallEndReason.PIPELINE_FAILURE,
     ) -> None:
-        """Release every resource an accepted call holds; mark it ended.
+        """Release the call's resources, signal the Hermes session, mark it ended.
 
-        Safe to call after a partial setup failure: stops the RTP engine,
-        removes the manager + transport in-dialog routes, drops the live
-        ``CallLoop``, and flags the call ended. Never raises (teardown of one
-        resource must not strand the others).
+        The SINGLE call-end chokepoint (ADR-0026): reached from every call-end
+        path (inbound finally, outbound background-task finally, outbound
+        pre-session finally), it both releases resources AND signals the Hermes
+        session EXACTLY ONCE — :meth:`_signal_call_end` injects ``/stop`` for a
+        failure ``reason`` or the replayed disconnected note for a normal one.
+        ``reason`` defaults to PIPELINE_FAILURE (the fail-safe): an end whose caller
+        did not classify a reason hard-stops the session rather than dangling.
+
+        Safe to call after a partial setup failure: stops the RTP engine, removes
+        the manager + transport in-dialog routes, drops the live ``CallLoop``, and
+        flags the call ended. Never raises (teardown of one resource must not
+        strand the others — the signal and the engine stop are each best-effort).
 
         ``session`` and ``call_loop`` are the objects owned by THIS call task.
         Every Call-ID-keyed structure is cleared only if it still belongs to THIS
@@ -1375,8 +1442,10 @@ class VoipAdapter(BasePlatformAdapter):
         (retransmission before our 200 OK, or a fork); without these identity
         checks task_1's teardown would evict task_2's live CallLoop, CallSession,
         transport response sink, and call-info (the same-Call-ID isolation bug).
-        The manager route is keyed by the full dialog tuple (Call-ID + both tags),
-        which is already unique per task, so its removal needs no identity check.
+        The call-end SIGNAL rides the same ``is_current`` guard, so a superseded
+        same-Call-ID task never injects a spurious second signal. The manager route
+        is keyed by the full dialog tuple (Call-ID + both tags), which is already
+        unique per task, so its removal needs no identity check.
         """
         # ``is_current`` is True when we are still the registered call for this
         # Call-ID (no newer same-Call-ID task has superseded us). The session
@@ -1384,16 +1453,28 @@ class VoipAdapter(BasePlatformAdapter):
         # When session is None (partial-setup teardown before registration) we
         # are the only task and treat ourselves as current.
         is_current = session is None or self._call_sessions.get(call_id) is session
+        already_ended = bool(self._call_info.get(call_id, {}).get("ended", False))
         if is_current:
             # Only flag the call ended / drop its metadata when WE own it — else a
             # newer same-Call-ID task is live and must keep reporting as active.
+            # Set ``ended`` BEFORE signalling so a late agent reply to the replayed
+            # note is already suppressed by ``send()`` (no media path post-end).
             info = dict(self._call_info.get(call_id, {}))
             info["ended"] = True
             self._call_info[call_id] = info
+            # Signal the Hermes session exactly once: only when WE own the call AND
+            # it was not already flagged ended (a duplicate/retried teardown of the
+            # same task must not re-inject). Reached on every end path through this
+            # single chokepoint.
+            if not already_ended:
+                await self._signal_call_end(call_id, reason)
         if call_loop is None or self._call_loops.get(call_id) is call_loop:
             self._call_loops.pop(call_id, None)
         if session is None or self._call_sessions.get(call_id) is session:
             self._call_sessions.pop(call_id, None)
+        # This call's agent-hangup marker (if any) is consumed: the reason has
+        # already been classified, and a fresh same-Call-ID call must start clean.
+        self._agent_hangups.discard(call_id)
         if self._manager is not None:
             self._manager.remove_call(dialog_id)
         # Identity-checked: only evict the transport response sink if it is still
@@ -1403,6 +1484,103 @@ class VoipAdapter(BasePlatformAdapter):
             await engine.stop()
         except Exception as exc:  # noqa: BLE001 — log; never strand the call routes
             _log.warning("INVITE %s: error stopping media engine: %s", call_id, exc)
+
+    def _mark_agent_hangup(self, call_id: str) -> None:
+        """Record that the agent's hang-up tool initiated this call's end (ADR-0026).
+
+        A SOFT hangup: the tool sends BYE and ends the call loop, so the loop's
+        clean return classifies as AGENT_HANGUP (a NORMAL end that keeps the
+        session open for follow-up) rather than REMOTE_BYE. Consumed and cleared in
+        :meth:`_teardown_call`.
+        """
+        self._agent_hangups.add(call_id)
+
+    def _classify_end_reason(
+        self,
+        call_id: str,
+        engine: RtpMediaTransport,
+        *,
+        raised: bool,
+    ) -> CallEndReason:
+        """Classify why a call ended, for the Hermes signal (ADR-0026).
+
+        Decision order (fail-safe by construction):
+
+        1. ``raised`` — the call loop raised (an ``ExceptionGroup`` from a failed
+           ASR/TTS/guard/transport task, or any pre-``run()`` error): a
+           **PIPELINE_FAILURE** → ``/stop``. This is also the fail-safe for any
+           end we cannot otherwise explain.
+        2. ``engine.media_timed_out`` — the RTP-inactivity watchdog fired or the
+           UDP transport was lost: a **MEDIA_TIMEOUT** → ``/stop`` (the silent-drop
+           reliability fix's signal).
+        3. otherwise a clean return: **AGENT_HANGUP** when this call's hang-up
+           marker is set (a SOFT agent hangup), else **REMOTE_BYE** (the caller
+           hung up / the inbound stream ended) — both NORMAL ends.
+
+        Args:
+            call_id: The call being classified.
+            engine: The call's media engine (read for ``media_timed_out``).
+            raised: Whether the call loop ended by raising.
+
+        Returns:
+            The classified :class:`CallEndReason`.
+        """
+        if raised:
+            return CallEndReason.PIPELINE_FAILURE
+        if engine.media_timed_out:
+            return CallEndReason.MEDIA_TIMEOUT
+        return CallEndReason.classify_clean_return(
+            agent_hangup=call_id in self._agent_hangups
+        )
+
+    async def _signal_call_end(self, call_id: str, reason: CallEndReason) -> None:
+        """Inject the call-end signal into the Hermes session (ADR-0026).
+
+        Hermes 0.16 has no typed session-end/reason API; the only lever is an
+        inbound ``MessageEvent``. This builds an ``internal=True`` event (the
+        ``internal`` flag bypasses user auth) whose text is
+        :func:`injection_text_for_reason(reason)` — ``/stop`` (a gateway-recognised
+        hard stop) for a failure end, or the plain disconnected note (which the
+        gateway REPLAYS as the agent's next turn so Hermes decides stop-vs-followup)
+        for a normal end — and hands it to the inherited ``handle_message``.
+
+        Best-effort, like the rest of teardown: a failure to inject (e.g. the
+        message handler is gone mid-disconnect) is logged, not raised, so one
+        resource's teardown never strands the others. The error is acted upon (the
+        operator sees the call ended without a delivered signal), not silently
+        swallowed — consistent with the engine-stop handling above (rule 37).
+        """
+        text = injection_text_for_reason(reason)
+        _log.info(
+            "call %s ended (%s, failure=%s); signalling Hermes session: %r",
+            call_id,
+            reason.name,
+            reason.was_failure,
+            text,
+        )
+        try:
+            source = self.build_source(
+                chat_id=call_id,
+                chat_name=str(self._call_info.get(call_id, {}).get("name", call_id)),
+                chat_type="dm",
+                user_id=call_id,
+                user_name="system",
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.VOICE,
+                source=source,
+                media_urls=[],
+                internal=True,
+            )
+            await self.handle_message(event)
+        except Exception as exc:  # noqa: BLE001 — best-effort signal; never strand teardown
+            _log.warning(
+                "call %s: failed to signal call-end (%s) to Hermes: %s",
+                call_id,
+                reason.name,
+                exc,
+            )
 
     async def _deliver_turn(self, call_id: str, text: str) -> None:
         """Route a finalized caller transcript to the Hermes agent.

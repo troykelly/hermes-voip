@@ -33,6 +33,7 @@ from gateway.platform_registry import (
 )
 from gateway.platforms.base import BasePlatformAdapter
 
+from hermes_voip.call_end import CallEndReason
 from hermes_voip.config import (
     ConfigError,
     ExtensionConfig,
@@ -797,32 +798,32 @@ async def _captured_handler_adapter() -> tuple[VoipAdapter, list[object]]:
     return adapter, captured
 
 
-def _teardown_args(adapter: VoipAdapter, call_id: str) -> dict[str, object]:
-    """Minimal _teardown_call kwargs with a no-op engine + the fake transport."""
-    engine = MagicMock(stop=AsyncMock(return_value=None))
+async def _teardown(adapter: VoipAdapter, call_id: str, reason: CallEndReason) -> None:
+    """Drive ``_teardown_call`` with a no-op engine + the adapter's fake transport.
+
+    Keeps each test's call explicit (no ``**dict`` splat that would erase the
+    keyword types under ``mypy --strict``).
+    """
     transport = adapter._transport
     assert transport is not None
-    return {
-        "call_id": call_id,
-        "engine": engine,
-        "transport": transport,
-        "dialog_id": (call_id, "lt", "rt"),
-        "session": None,
-    }
+    engine = MagicMock(stop=AsyncMock(return_value=None))
+    await adapter._teardown_call(
+        call_id=call_id,
+        engine=engine,
+        transport=transport,
+        dialog_id=(call_id, "lt", "rt"),
+        session=None,
+        reason=reason,
+    )
 
 
 @pytest.mark.asyncio
 async def test_teardown_failure_injects_stop_command() -> None:
     """A FAILURE end (e.g. pipeline failure) injects ``/stop`` exactly once."""
-    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
-
     adapter, captured = await _captured_handler_adapter()
     call_id = new_call_id()
 
-    await adapter._teardown_call(
-        **_teardown_args(adapter, call_id),
-        reason=CallEndReason.PIPELINE_FAILURE,
-    )
+    await _teardown(adapter, call_id, CallEndReason.PIPELINE_FAILURE)
     await _until(lambda: len(captured) >= 1, timeout=3.0)
 
     assert len(captured) == 1, "the session must be signalled exactly once"
@@ -835,15 +836,12 @@ async def test_teardown_failure_injects_stop_command() -> None:
 @pytest.mark.asyncio
 async def test_teardown_normal_injects_the_replayed_note_not_a_command() -> None:
     """A NORMAL end (remote BYE) injects the disconnected content note, not /stop."""
-    from hermes_voip.call_end import NORMAL_END_NOTE, CallEndReason  # noqa: PLC0415
+    from hermes_voip.call_end import NORMAL_END_NOTE  # noqa: PLC0415
 
     adapter, captured = await _captured_handler_adapter()
     call_id = new_call_id()
 
-    await adapter._teardown_call(
-        **_teardown_args(adapter, call_id),
-        reason=CallEndReason.REMOTE_BYE,
-    )
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
     await _until(lambda: len(captured) >= 1, timeout=3.0)
 
     assert len(captured) == 1
@@ -857,15 +855,12 @@ async def test_teardown_normal_injects_the_replayed_note_not_a_command() -> None
 @pytest.mark.asyncio
 async def test_teardown_agent_hangup_is_a_soft_normal_end() -> None:
     """An AGENT_HANGUP end is SOFT: it injects the replayed note, never /stop."""
-    from hermes_voip.call_end import NORMAL_END_NOTE, CallEndReason  # noqa: PLC0415
+    from hermes_voip.call_end import NORMAL_END_NOTE  # noqa: PLC0415
 
     adapter, captured = await _captured_handler_adapter()
     call_id = new_call_id()
 
-    await adapter._teardown_call(
-        **_teardown_args(adapter, call_id),
-        reason=CallEndReason.AGENT_HANGUP,
-    )
+    await _teardown(adapter, call_id, CallEndReason.AGENT_HANGUP)
     await _until(lambda: len(captured) >= 1, timeout=3.0)
 
     assert len(captured) == 1
@@ -879,14 +874,11 @@ async def test_teardown_signals_exactly_once_even_if_called_twice() -> None:
     The same-Call-ID identity guard (``session``/``_call_sessions``) must also
     gate the call-end signal, so a retried/duplicate teardown never re-injects.
     """
-    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
-
     adapter, captured = await _captured_handler_adapter()
     call_id = new_call_id()
-    args = _teardown_args(adapter, call_id)
 
-    await adapter._teardown_call(**args, reason=CallEndReason.REMOTE_BYE)
-    await adapter._teardown_call(**args, reason=CallEndReason.REMOTE_BYE)
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
     await _until(lambda: len(captured) >= 1, timeout=3.0)
     # Give any erroneous second signal a chance to land before asserting.
     await asyncio.sleep(0.05)
@@ -935,8 +927,6 @@ async def test_run_call_loop_clean_return_then_media_timeout_classifies_timeout(
     (MEDIA_TIMEOUT) → ``/stop``, NOT a clean REMOTE_BYE. This is the wiring that
     turns the silent-drop reliability fix into the right Hermes signal.
     """
-    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
-
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager)
@@ -951,8 +941,6 @@ async def test_run_call_loop_clean_return_then_media_timeout_classifies_timeout(
 @pytest.mark.asyncio
 async def test_classify_end_reason_clean_return_is_remote_bye() -> None:
     """A clean return with media still healthy is REMOTE_BYE (a normal end)."""
-    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
-
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager)
@@ -966,8 +954,6 @@ async def test_classify_end_reason_clean_return_is_remote_bye() -> None:
 @pytest.mark.asyncio
 async def test_classify_end_reason_agent_hangup_flag_wins_for_clean_return() -> None:
     """When the agent hung up (flag set) a clean return classifies AGENT_HANGUP."""
-    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
-
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager)
@@ -982,8 +968,6 @@ async def test_classify_end_reason_agent_hangup_flag_wins_for_clean_return() -> 
 @pytest.mark.asyncio
 async def test_classify_end_reason_exception_is_pipeline_failure() -> None:
     """A raised end (``raised=True``) is a PIPELINE_FAILURE → ``/stop`` (fail-safe)."""
-    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
-
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager)

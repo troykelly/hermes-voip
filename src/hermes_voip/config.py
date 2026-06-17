@@ -213,6 +213,18 @@ _DEFAULT_BARGE_IN_TAIL_MS = 250
 _RTP_SYMMETRIC_KEY = "HERMES_VOIP_RTP_SYMMETRIC"
 _DEFAULT_RTP_SYMMETRIC = True
 
+# RTP-inactivity watchdog (ADR-0026). A silent media/network drop otherwise hangs
+# the call forever (the inbound generator blocks on the recv queue with nothing
+# ever setting the stop event). When no inbound RTP arrives within this window the
+# media engine ends the call as a MEDIA_TIMEOUT (→ a /stop hard stop to Hermes).
+# Operator-configurable in [1, 300] s; the 300 s cap bounds how long a wedged call
+# can persist. Default 20 s — long enough to ride out a brief network hiccup or a
+# held call's silence, short enough that a real drop is cleaned up promptly.
+_RTP_TIMEOUT_SECS_KEY = "HERMES_VOIP_RTP_TIMEOUT_SECS"
+_DEFAULT_RTP_TIMEOUT_SECS = 20
+_MIN_RTP_TIMEOUT_SECS = 1
+_MAX_RTP_TIMEOUT_SECS = 300
+
 # Prompt-injection guard (ADR-0009). Default is the in-process ONNX classifier;
 # the optional loopback sidecar is opt-in (and out of this parser's scope).
 _INJECTION_GUARD_KEY = "HERMES_VOIP_INJECTION_GUARD"
@@ -422,6 +434,11 @@ class MediaConfig:
             ``tts_model`` is the cloud primary's model id, so a model-backed self-host
             fallback needs this dedicated dir; required when ``tts_fallback`` is a
             model-backed provider so the fallback can load on a primary failure.
+        media_timeout_secs: RTP-inactivity watchdog window in seconds (ADR-0026),
+            in ``[1, 300]`` (default 20). The media engine ends the call as a
+            MEDIA_TIMEOUT (→ ``/stop``) when no inbound RTP arrives within this
+            window, so a silent media/network drop is cleaned up rather than hanging
+            the call forever.
     """
 
     stt_provider: str
@@ -462,6 +479,12 @@ class MediaConfig:
     # shared tts_model is the cloud primary's model id, so a model-backed self-host
     # fallback needs its own dir; required when tts_fallback needs one.
     tts_fallback_model: str | None = None
+    # RTP-inactivity watchdog window in seconds (ADR-0026), in [1, 300]. The media
+    # engine ends a call as MEDIA_TIMEOUT (→ /stop) when no inbound RTP arrives
+    # within this window, so a silent media/network drop is cleaned up instead of
+    # hanging the call forever. Defaulted (20) so existing direct constructions stay
+    # valid; the parser validates the operator override's bounds.
+    media_timeout_secs: int = _DEFAULT_RTP_TIMEOUT_SECS
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -509,6 +532,15 @@ class MediaConfig:
             raise ConfigError(msg)
         if self.barge_in_tail_ms < 0:
             msg = f"barge_in_tail_ms must be non-negative, got {self.barge_in_tail_ms}"
+            raise ConfigError(msg)
+        if not (
+            _MIN_RTP_TIMEOUT_SECS <= self.media_timeout_secs <= _MAX_RTP_TIMEOUT_SECS
+        ):
+            msg = (
+                f"media_timeout_secs must be in "
+                f"[{_MIN_RTP_TIMEOUT_SECS}, {_MAX_RTP_TIMEOUT_SECS}], "
+                f"got {self.media_timeout_secs}"
+            )
             raise ConfigError(msg)
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))
@@ -694,6 +726,13 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ),
         tts_fallback=_parse_tts_fallback(env, tts_provider),
         tts_fallback_model=_optional(env, _TTS_FALLBACK_MODEL_KEY),
+        media_timeout_secs=_parse_bounded_int(
+            env,
+            _RTP_TIMEOUT_SECS_KEY,
+            _MIN_RTP_TIMEOUT_SECS,
+            _MAX_RTP_TIMEOUT_SECS,
+            _DEFAULT_RTP_TIMEOUT_SECS,
+        ),
     )
 
 
@@ -913,6 +952,29 @@ def _parse_optional_bounded_int(
     raw = _value(env, key)
     if not raw:
         return None
+    value = _parse_int(raw, key)
+    if not lo <= value <= hi:
+        msg = f"{key} must be in [{lo}, {hi}], got {value}"
+        raise ConfigError(msg)
+    return value
+
+
+def _parse_bounded_int(
+    env: Mapping[str, str], key: str, lo: int, hi: int, default: int
+) -> int:
+    """Parse ``key`` as an int within ``[lo, hi]``, defaulting when unset.
+
+    Unlike :func:`_parse_optional_bounded_int` (which returns ``None`` when unset),
+    a missing value falls back to ``default``. A present value outside ``[lo, hi]``
+    raises (fail-fast, not silently clamped) — the operator's intent to disable a
+    safety watchdog with ``0`` is rejected here, not quietly accepted.
+
+    Raises:
+        ConfigError: If the value is not an integer or is outside ``[lo, hi]``.
+    """
+    raw = _value(env, key)
+    if not raw:
+        return default
     value = _parse_int(raw, key)
     if not lo <= value <= hi:
         msg = f"{key} must be in [{lo}, {hi}], got {value}"

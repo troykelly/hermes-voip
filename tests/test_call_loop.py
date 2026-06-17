@@ -519,6 +519,372 @@ async def test_barge_in_with_no_active_stream_does_not_flush() -> None:
     assert transport.flush_calls == 0
 
 
+# ---------------------------------------------------------------------------
+# (g) Dead-air comfort filler (ADR-0030)
+# ---------------------------------------------------------------------------
+
+
+class _GatedSleep:
+    """A controllable ``sleep`` seam for deterministic dead-air tests.
+
+    ``await gated(delay)`` records the requested delay and blocks until the test
+    calls :meth:`release` (or returns at once if already released). This lets a
+    test decide *exactly* when the comfort-filler delay elapses, with no real
+    wall-clock waiting — the deterministic seam ADR-0030 mandates.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+        self._gate = asyncio.Event()
+
+    def release(self) -> None:
+        self._gate.set()
+
+    async def __call__(self, delay: float) -> None:
+        self.calls.append(delay)
+        await self._gate.wait()
+
+
+class _HoldOpenTransport(_FakeTransport):
+    """Transport that delivers preset inbound frames then holds the stream open.
+
+    The inbound generator yields the preset frames, then awaits an event the test
+    controls before ending — so a ``CallLoop.run()`` stays live (its pump/asr/
+    delivery tasks running) while the test drives the comfort filler, instead of
+    ``run()`` returning the instant the short frame list is exhausted.
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__(frames)
+        self._close = asyncio.Event()
+
+    def close_inbound(self) -> None:
+        self._close.set()
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        frames = self._frames
+        close = self._close
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            for frame in frames:
+                yield frame
+            await close.wait()
+
+        return _gen()
+
+
+def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __init__ plus the filler knobs
+    transport: _FakeTransport,
+    asr: StreamingASR,
+    tts: StreamingTTS,
+    *,
+    sleep: Callable[[float], Awaitable[None]],
+    comfort_filler: bool = True,
+    comfort_filler_delay_ms: int = 900,
+    comfort_filler_phrases: tuple[str, ...] = ("Hmm,",),
+    deliver_turn: Callable[[str], Awaitable[None]] | None = None,
+) -> CallLoop:
+    """Build a CallLoop with the comfort filler wired to an injected sleep seam."""
+    return CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=deliver_turn or _noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        comfort_filler=comfort_filler,
+        comfort_filler_delay_ms=comfort_filler_delay_ms,
+        comfort_filler_phrases=comfort_filler_phrases,
+        sleep=sleep,
+    )
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
+    """When the gap exceeds the delay and no reply has started, one filler plays.
+
+    The injected sleep is released (the delay 'elapses') while no agent reply has
+    begun, so the filler synthesises exactly one phrase and sends its frames.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame, filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hello there", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("Hmm,",),
+        deliver_turn=capture,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the turn be delivered and the filler task park on the injected sleep.
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "comfort filler did not schedule a delayed wait"
+    assert delivered == ["hello there"]
+
+    # The delay elapses with no reply: the filler must synthesise + send.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert transport.sent_audio == [filler_frame, filler_frame], (
+        "the comfort filler did not emit its audio after the delay"
+    )
+    # The filler text reached TTS synthesis (one of the configured phrases).
+    assert tts.last_stream is not None
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_uses_configured_phrase_text() -> None:
+    """The filler synthesises one of the configured phrases (model-aware path).
+
+    The phrase text is routed through ``tts.synthesize`` (so the per-segment tag
+    strip / sanitiser of the normal speak path applies). This test captures the
+    text handed to synthesis and asserts it is the configured filler phrase.
+    """
+    captured: list[str] = []
+
+    class _CapturingTTS(_FakeTTS):
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            async def _drain_then_replay() -> AsyncIterator[str]:
+                async for chunk in text:
+                    captured.append(chunk)
+                    yield chunk
+
+            return super().synthesize(
+                _drain_then_replay(), voice, sample_rate=sample_rate
+            )
+
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("a question", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("Let me see,",),
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert captured == ["Let me see,"], (
+        f"filler phrase not synthesised verbatim; got {captured!r}"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_does_not_fire_when_reply_starts_first() -> None:
+    """A reply that begins before the delay elapses suppresses the filler entirely.
+
+    The agent's reply (via speak()) starts and emits its first frame BEFORE the
+    injected sleep is released. The post-delay check must see reply audio already
+    on the wire and skip the filler — no collision with the agent's opening word.
+    """
+    reply_frame = PcmFrame(
+        samples=b"\x30\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    # The TTS yields the REPLY frame first (speak), and would yield the filler
+    # frame only if the filler fired — which it must not.
+    tts = _FakeTTS([reply_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "filler did not schedule"
+
+    # The agent replies BEFORE the delay elapses (sleep still gated).
+    async def _reply() -> AsyncIterator[str]:
+        yield "here is my answer"
+
+    await loop.speak(_reply())
+    assert transport.sent_audio == [reply_frame]
+
+    # NOW the delay elapses — but a reply already played, so no filler may fire.
+    _ = filler_frame  # only sent if the filler wrongly fires
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    assert transport.sent_audio == [reply_frame], (
+        "the comfort filler fired even though the reply had already started"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_fires_at_most_once_per_gap() -> None:
+    """Only ONE filler is emitted per turn gap — never a 'hmm hmm hmm' loop.
+
+    Even after the delay elapses and the filler plays, the gap does not re-arm
+    while still waiting: the filler task fires once and returns.
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    # Provide many frames so a re-fire would visibly send more than one phrase's
+    # worth; one fire sends exactly the two frames of a single synthesis.
+    tts = _FakeTTS([filler_frame, filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow question", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    sleep.release()
+    # Pump the loop generously; a looping filler would keep scheduling sleeps.
+    for _ in range(40):
+        await asyncio.sleep(0)
+
+    assert transport.sent_audio == [filler_frame, filler_frame], (
+        "the comfort filler fired more than once for a single gap"
+    )
+    assert len(sleep.calls) == 1, (
+        f"the filler re-scheduled its delay (looped); sleeps={sleep.calls!r}"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_off_by_default_emits_nothing() -> None:
+    """With the filler OFF (the default), no filler audio and no sleep is scheduled.
+
+    Off must be exactly today's behaviour: the loop neither sleeps on a delay nor
+    synthesises any filler.
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hello", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler=False,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(30):
+        await asyncio.sleep(0)
+
+    assert sleep.calls == [], "the filler scheduled a delay while disabled"
+    assert transport.sent_audio == [], "the filler emitted audio while disabled"
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_cancelled_by_barge_in() -> None:
+    """A barge-in during the gap cancels the pending filler — it never fires.
+
+    The filler is parked on its delay when a barge-in occurs. The barge-in must
+    cancel the pending filler so no filler audio is ever emitted (and the flush
+    path is the ADR-0028 one).
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("interrupt me", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "filler did not schedule"
+
+    # Barge-in while the filler is still parked on its delay.
+    await loop.barge_in()
+    # Now release the delay; the filler must have been cancelled and not fire.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    assert transport.sent_audio == [], (
+        "the comfort filler fired after a barge-in cancelled the gap"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
 @pytest.mark.asyncio
 async def test_normal_speech_completion_does_not_flush() -> None:
     """A normally-completing utterance (no barge-in) never flushes the engine.

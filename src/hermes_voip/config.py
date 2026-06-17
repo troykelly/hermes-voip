@@ -261,6 +261,13 @@ _DEFAULT_RTP_TIMEOUT_SECS = 20
 _MIN_RTP_TIMEOUT_SECS = 1
 _MAX_RTP_TIMEOUT_SECS = 300
 
+# WebRTC ICE STUN servers (ADR-0032/0016). A comma-separated list of ``stun:`` URLs
+# used to gather server-reflexive (srflx) ICE candidates for the WebRTC media path.
+# Empty (the default) ⇒ host-only ICE (works on a LAN / where the peer reaches our
+# host candidates directly). TURN relay is deferred (ADR-0016 §6). Has no effect on
+# the SIP-over-TLS path. Each member is trimmed; blank members are dropped.
+_ICE_STUN_URLS_KEY = "HERMES_VOIP_ICE_STUN_URLS"
+
 # Prompt-injection guard (ADR-0009). Default is the in-process ONNX classifier;
 # the optional loopback sidecar is opt-in (and out of this parser's scope).
 _INJECTION_GUARD_KEY = "HERMES_VOIP_INJECTION_GUARD"
@@ -549,6 +556,10 @@ class MediaConfig:
     # reads naturally on every TTS model (no bracket tag). A blank override falls back
     # to the built-in default set; empty members are dropped (parser).
     comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES
+    # WebRTC ICE STUN servers (ADR-0032), as ``stun:`` URLs for srflx candidate
+    # gathering. Empty (the default) ⇒ host-only ICE. No effect on the SIP-over-TLS
+    # path. Defaulted so existing direct constructions stay valid.
+    ice_stun_urls: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -831,6 +842,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             _MAX_RTP_TIMEOUT_SECS,
             _DEFAULT_RTP_TIMEOUT_SECS,
         ),
+        ice_stun_urls=_parse_ice_stun_urls(env),
     )
 
 
@@ -1139,6 +1151,21 @@ def _parse_comfort_filler_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
         part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
     )
     return phrases or _DEFAULT_COMFORT_FILLER_PHRASES
+
+
+def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Parse the comma-separated ``HERMES_VOIP_ICE_STUN_URLS`` list (ADR-0032).
+
+    Each member is trimmed; blank members (from a trailing/doubled comma or an
+    all-blank value) are dropped. An unset or all-blank value yields an empty tuple
+    (host-only ICE). No ``stun:`` scheme validation here — the ICE layer
+    (:func:`hermes_voip.media.ice._parse_stun_url`) validates each URL when it
+    builds the agent, so a bad URL fails loudly at use, not silently at parse.
+    """
+    raw = _value(env, _ICE_STUN_URLS_KEY)
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _parse_tone_secs(env: Mapping[str, str]) -> float:

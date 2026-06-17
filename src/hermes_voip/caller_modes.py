@@ -104,9 +104,27 @@ _PREFIX_WILDCARD = "*"
 _E164_STRIP = re.compile(r"[^0-9+]")
 _DIGITS_ONLY = re.compile(r"[^0-9]")
 
+# Any decimal digit — used to decide whether a pattern carries a real discriminator.
+_HAS_DIGIT = re.compile(r"[0-9]")
+
 # Minimum privilege level for each non-SAFE tool risk class (ADR-0021 §1 table).
 _MIN_LEVEL_ELEVATED = 2
 _MIN_LEVEL_IRREVERSIBLE = 3
+
+
+def _is_blanket_pattern(pattern: str) -> bool:
+    """Whether ``pattern`` matches (nearly) every caller — no specific discriminator.
+
+    A pattern is "blanket" if it carries **no digit**: ``"*"`` (empty-prefix wildcard,
+    matches all), ``"+*"`` (matches every E.164-normalized caller — they all start
+    ``+``), exact ``"+"`` (matches the digitless-normalized artifact), ``""`` /
+    whitespace, etc. Such a pattern in a *privileged* group would grant that privilege
+    to unknown callers on a forgeable identifier. A pattern with at least one digit
+    (``"+1*"``, ``"1000"``, ``"+15555550100"``) carries a real discriminator and is a
+    deliberate, specific operator choice. Used by
+    :meth:`CallerGroupConfig.__post_init__` to clamp privileged groups.
+    """
+    return _HAS_DIGIT.search(pattern) is None
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +231,13 @@ class CallerGroupConfig:
            synthesis), which a direct ``CallerGroupConfig(...)`` would otherwise
            bypass.
 
-        4. **Reject a match-all ``"*"`` pattern in a privileged group.** ``"*"`` is
-           an empty-prefix wildcard that matches every caller, so it would grant a
-           level >= 2 group's privilege to every unknown caller on a forgeable
-           caller-ID — the config-driven form of ``default_mode=ALLOW``. Privileged
-           membership must require a specific pattern.
+        4. **Reject a blanket (digitless) pattern in a privileged group.** A pattern
+           with no digit — ``"*"`` (matches all), ``"+*"`` (matches every
+           E.164-normalized caller), exact ``"+"`` (the digitless artifact), ``""`` —
+           matches (nearly) every caller, so it would grant a level >= 2 group's
+           privilege to every unknown caller on a forgeable caller-ID (the
+           config-driven form of ``default_mode=ALLOW``). Privileged membership must
+           require a specific, digit-bearing pattern.
 
         Only the named default group's privilege is validated here; whether
         ``default_group`` names a defined group is a loader-level concern (and
@@ -268,27 +288,33 @@ class CallerGroupConfig:
             )
             raise ConfigError(msg)
 
-        # 4. Reject the match-all "*" pattern in a PRIVILEGED group. "*" is an
-        #    empty-prefix wildcard (candidate.startswith("") is always True — see
-        #    _matches), so a level >= 2 group listing "*" matches EVERY caller,
-        #    including every unknown one, and grants operator/elevated privilege on a
-        #    forgeable identifier. That is the config-driven re-creation of the
-        #    rejected default_mode=ALLOW: privileged membership must require a
-        #    SPECIFIC pattern, never a blanket match-all. (A "*" in a level-0 group
-        #    is harmless — it is the receptionist, which grants nothing; a specific
-        #    prefix like "+1555550*" remains a valid deliberate block-trust choice.)
+        # 4. Reject a BLANKET pattern in a PRIVILEGED group. A pattern with no digit
+        #    matches (nearly) every caller: "*" (empty-prefix wildcard, matches all),
+        #    "+*" (matches every E.164-normalized caller — they all start "+"), exact
+        #    "+" (matches a digitless caller's normalized "+"), "" / whitespace. In a
+        #    level >= 2 group that grants operator/elevated privilege to unknown
+        #    callers on a forgeable identifier — the config-driven re-creation of the
+        #    rejected default_mode=ALLOW. Privileged membership must require a SPECIFIC
+        #    (digit-bearing) pattern. (A blanket pattern in a level-0 group is harmless
+        #    — it is the receptionist, which grants nothing; a digit-bearing prefix
+        #    like "+1*" or "+1555550*" remains a valid deliberate block-trust choice.)
         for g in self.groups:
-            if g.privilege_level >= _MIN_LEVEL_ELEVATED and _PREFIX_WILDCARD in (
-                self.group_lists.get(g.name, ())
-            ):
+            if g.privilege_level < _MIN_LEVEL_ELEVATED:
+                continue
+            blanket = next(
+                (p for p in self.group_lists.get(g.name, ()) if _is_blanket_pattern(p)),
+                None,
+            )
+            if blanket is not None:
                 msg = (
                     f"caller-group {g.name!r} has privilege_level={g.privilege_level}"
-                    f" (>= {_MIN_LEVEL_ELEVATED}) but lists the match-all pattern"
-                    f" {_PREFIX_WILDCARD!r}, which matches EVERY caller (including"
-                    " unknown ones) and would grant that privilege on a forgeable"
-                    " caller-ID. A privileged group must enumerate specific numbers"
-                    " or prefixes — operator/elevated privilege requires a specific"
-                    " allow-list match, never a blanket one."
+                    f" (>= {_MIN_LEVEL_ELEVATED}) but lists the blanket pattern"
+                    f" {blanket!r}, which carries no digit and so matches (nearly)"
+                    " every caller — including unknown ones — and would grant that"
+                    " privilege on a forgeable caller-ID. A privileged group must"
+                    " enumerate specific numbers or digit-bearing prefixes:"
+                    " operator/elevated privilege requires a specific allow-list"
+                    " match, never a blanket one."
                 )
                 raise ConfigError(msg)
 
@@ -438,11 +464,18 @@ def _normalize(raw: str, normalization: Normalization) -> str:
     # E164: keep a single leading '+' and the digits; drop the rest. If there is
     # no '+' and the first character is a digit 1-9, prepend '+'.
     kept = _E164_STRIP.sub("", stripped)
+    # A digitless caller-ID (anonymous / "Restricted" / blank) has no E.164
+    # identity: return "" rather than a spurious "+". NB ``"" in "123456789"`` is
+    # True in Python (empty string is a substring of every str), so the digit test
+    # below MUST guard against an empty ``kept`` first — otherwise a digitless
+    # caller would normalize to "+" and match a "+"/"+*" pattern (a privilege leak).
+    if not _DIGITS_ONLY.sub("", kept):
+        return ""
     if kept.startswith("+"):
         kept = "+" + kept[1:].replace("+", "")
     else:
         kept = kept.replace("+", "")
-        if kept[:1] in "123456789":
+        if kept[0] in "123456789":
             kept = "+" + kept
     return kept
 

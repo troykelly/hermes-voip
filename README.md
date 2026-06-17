@@ -106,9 +106,10 @@ picks the inbound fallback. The single and indexed schemes must not be mixed.
 
 The defaults select the **fully-offline self-host** path (no cloud, no API key). That path
 still requires you to point at the pinned local model directories — `HERMES_VOIP_TTS_MODEL`
-(Kokoro), `HERMES_VOIP_STT_MODEL_DIR` (zipformer), and `HERMES_VOIP_INJECTION_GUARD_MODEL_DIR`
-(the DeBERTa injection guard) — or provider build fails fast. Selection is config-only
-([`config.py`](src/hermes_voip/config.py),
+(Kokoro), `HERMES_VOIP_STT_MODEL_DIR` (zipformer), `HERMES_VOIP_INJECTION_GUARD_MODEL_DIR`
+(the DeBERTa injection guard), and `HERMES_VOIP_VAD_MODEL_DIR` (the silero-vad model that
+endpoints every inbound call — the weights are never downloaded) — or provider/VAD build
+fails fast. Selection is config-only ([`config.py`](src/hermes_voip/config.py),
 [`providers/build.py`](src/hermes_voip/providers/build.py)).
 
 **Text-to-speech** — `HERMES_VOIP_TTS_PROVIDER`:
@@ -122,6 +123,16 @@ Both are first-class. `sherpa-kokoro` is the default (local, no API key). `eleve
 streams Flash v2.5 and emits PCM natively at the negotiated wire rate (8 kHz for G.711,
 16 kHz for G.722). Set the voice with `HERMES_VOIP_TTS_VOICE` and the Kokoro model directory
 with `HERMES_VOIP_TTS_MODEL`.
+
+**Automatic TTS failover** (ADR-0025): if the primary synthesiser raises mid-call (an HTTP
+error, a timeout, a dropped stream), the call falls back to a second synthesiser so the
+caller still hears audio instead of silence. `HERMES_VOIP_TTS_FALLBACK` selects the fallback
+provider; **by default a cloud primary (`elevenlabs`) falls back to local `sherpa-kokoro`**
+(a self-host primary defaults to no fallback, being already local), and
+`HERMES_VOIP_TTS_FALLBACK=none` disables it. A `sherpa-kokoro` fallback needs its **own**
+model directory, `HERMES_VOIP_TTS_FALLBACK_MODEL` (the shared `HERMES_VOIP_TTS_MODEL` is the
+ElevenLabs model **id** for a cloud primary, not a Kokoro path) — it is validated at startup,
+so a misconfigured fallback fails loudly rather than going silent on the first primary error.
 
 **Starter voices (ElevenLabs)** — a place to begin. These are ElevenLabs **public premade
 voices** (the default library, available to standard accounts; availability can vary by plan

@@ -72,6 +72,10 @@ def test_home_channel_and_proactive_notices_are_internal(notice: str) -> None:
         "I can set that home channel up for you in the lounge if you like.",
         "The answer is eleven.",
         "Let me check the channel guide and the cron schedule for you.",
+        # A genuine reply that merely *mentions* the /sethome command (without
+        # the home-channel onboarding announcement) must still be spoken — the
+        # slash-command cue alone is not a notice.
+        "To pick a default chat later, run the /sethome command from that app.",
         "",
         "   ",
     ],
@@ -79,7 +83,7 @@ def test_home_channel_and_proactive_notices_are_internal(notice: str) -> None:
 def test_genuine_agent_replies_are_not_internal(reply: str) -> None:
     """A genuine reply is never an internal notice.
 
-    Even replies that mention 'channel' or 'cron' as ordinary words must pass
-    the guard so the caller still hears them.
+    Even replies that mention 'channel', 'cron', or a slash-command as ordinary
+    words must pass the guard so the caller still hears them.
     """
     assert is_internal_system_notice(reply) is False

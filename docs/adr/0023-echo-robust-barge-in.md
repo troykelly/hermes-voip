@@ -104,7 +104,11 @@ of the active `TtsStream`. The stream is registered before its first frame (TTS 
 startup latency), and during that pre-playout window nothing has been transmitted, so there is
 no echo and a real short caller turn must reach the ASR. Barge-in still targets the registered
 stream from the instant it registers (a caller can cut off the greeting before its first frame);
-only the *echo withholding* waits for real outbound audio.
+only the *echo withholding* waits for real outbound audio. Across a superseding `speak()` (a new
+utterance replacing an in-flight one), the new stream's `_play` disarms the flag the moment it
+acquires the single playout lock — which the lock guarantees is *after* the superseded stream
+has fully torn down — so a stale "audio active" from the prior stream cannot keep the gate armed
+through the new stream's own pre-playout latency.
 
 **Playout tail.** Echo can lag the TTS by tens to a few hundred ms (jitter buffer + network),
 so the gate stays armed for `HERMES_VOIP_BARGE_IN_TAIL_MS` (default **250 ms**) of window

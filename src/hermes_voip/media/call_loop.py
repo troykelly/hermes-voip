@@ -860,6 +860,14 @@ class CallLoop:
         peak_amplitude = 0
         tts_sample_rate = 0
         async with self._playout_lock:
+            # This stream now owns playout. The lock serialises _play calls, so any
+            # superseding-prior stream's _play has fully finished (its finally has
+            # run) before we get here — so THIS stream has not emitted audio yet:
+            # disarm the echo gate until our own first frame (ADR-0023, codex C').
+            # Without this, a superseded prior stream's stale `_tts_audio_active`
+            # could leave the gate armed through THIS stream's synthesis latency,
+            # withholding a real short caller turn in that pre-playout gap.
+            self._tts_audio_active = False
             try:
                 async with contextlib.aclosing(stream):
                     async for frame in stream:

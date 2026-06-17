@@ -2287,6 +2287,150 @@ async def test_short_real_turn_before_first_tts_frame_is_delivered() -> None:
     )
 
 
+class _EmitThenParkStream:
+    """A TtsStream that emits its first frame (arming the gate) then parks.
+
+    Stays the active, audio-emitting stream until ``cancel()`` (a superseding
+    ``speak()``) unblocks it — modelling a stream that is mid-playout when a newer
+    one supersedes it. Because it has emitted a frame, it has set
+    ``_tts_audio_active``; because it is superseded (not finished), its ``_play``
+    finalizer will not clear the flag (it no longer owns ``_active_tts_stream``).
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        self._frames = frames
+        self.cancel_called = False
+        self._cancelled = False
+        self._resume = asyncio.Event()
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
+        if self._frames:
+            yield self._frames[0]  # arm the gate
+        await self._resume.wait()  # park until superseded/cancelled
+        if not self._cancelled:
+            for frame in self._frames[1:]:
+                yield frame
+
+    async def flush(self) -> None:
+        pass
+
+    async def cancel(self) -> None:
+        self.cancel_called = True
+        self._cancelled = True
+        self._resume.set()
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        self._resume.set()
+        await self._gen.aclose()
+
+
+class _SupersedingTTS:
+    """StreamingTTS returning stream A first, then a pre-playout-latency stream B.
+
+    Models a superseding ``speak()``: A emits audio then parks (still active), then
+    B supersedes it but has synthesis latency before its first frame. Used to prove
+    the echo gate disarms for B's pre-playout window even though A had armed it and
+    A's finalizer cannot clear it (codex C').
+    """
+
+    def __init__(
+        self,
+        a_frames: list[PcmFrame],
+        b_frames: list[PcmFrame],
+        b_emit: asyncio.Event,
+    ) -> None:
+        self._a = _EmitThenParkStream(a_frames)
+        self._b = _PrePlayoutGreetingStream(b_frames, b_emit)
+        self._calls = 0
+        self.a_stream = self._a
+        self.b_stream = self._b
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = text, voice
+        self._calls += 1
+        return self._a if self._calls == 1 else self._b
+
+
+@pytest.mark.asyncio
+async def test_superseding_speak_disarms_echo_gate_for_pre_playout() -> None:
+    """A superseding speak() must not leave the echo gate armed for B's pre-playout.
+
+    Stream A emits audio (arming the gate), then speak(B) supersedes A. B has
+    synthesis latency before its first frame. The playout lock serialises A's
+    teardown before B's _play runs, so B's _play disarms ``_tts_audio_active``
+    until B's own first frame — even though A's _play finalizer cannot clear it
+    (A no longer owns ``_active_tts_stream``). Asserts the flag is False during B's
+    pre-playout gap (codex C'); without the fix it stays True from A.
+    """
+    a_frames = [_greeting_frame(1), _greeting_frame(2)]
+    b_emit = asyncio.Event()
+    b_frames = [_greeting_frame(3)]
+    tts = _SupersedingTTS(a_frames, b_frames, b_emit)
+    transport = _FakeTransport([])
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    async def _tokens(word: str) -> AsyncIterator[str]:
+        yield word
+
+    # Play A (it emits frames → arms the echo gate). _SlowTtsStream yields each
+    # frame after a cooperative sleep(0), so pump the loop until A's first frame
+    # has been sent and the gate is armed.
+    a_task = asyncio.create_task(loop.speak(_tokens("first")))
+    armed_by_a = False
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if loop._tts_audio_active:
+            armed_by_a = True
+            break
+    assert armed_by_a, "A's audio should have armed the gate"
+
+    # Supersede with B (synthesis latency: B emits no frame until b_emit is set).
+    b_task = asyncio.create_task(loop.speak(_tokens("second")))
+    # Let A tear down and B's _play acquire the lock (which disarms the gate).
+    for _ in range(8):
+        await asyncio.sleep(0)
+
+    # During B's pre-playout latency the gate must be DISARMED (B has sent no
+    # audio yet; A's stale True must not persist). Read into a local so the bool
+    # literal narrowing does not make mypy treat the rest as unreachable.
+    armed_during_b_pre_playout = loop._tts_audio_active
+    assert armed_during_b_pre_playout is False, (
+        "echo gate must disarm during a superseding stream's pre-playout latency"
+    )
+
+    # Release B's audio and let both speaks finish; the gate re-arms on B's frame.
+    b_emit.set()
+    await asyncio.wait_for(asyncio.gather(a_task, b_task), timeout=5.0)
+
+
 @pytest.mark.asyncio
 async def test_gated_default_mode_when_unspecified() -> None:
     """A CallLoop built without barge-in args defaults to gated, min 1 window.

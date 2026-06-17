@@ -223,6 +223,31 @@ def test_register_install_hint_is_non_empty() -> None:
     assert hint  # non-empty
 
 
+def test_register_install_hint_names_the_working_enable_mechanism() -> None:
+    """The install hint must point at the enable mechanism that actually works.
+
+    Rule 27 (no aspirational docs): ``hermes plugins enable hermes-voip`` fails for
+    a pip/entry-point plugin (the CLI's ``_plugin_exists`` is filesystem-only, so it
+    prints "Plugin 'hermes-voip' is not installed or bundled." and exits 1) UNLESS a
+    directory ``plugin.yaml`` stub is installed. The runtime gate that genuinely
+    decides activation is ``plugins.enabled`` in ``config.yaml``. The operator-facing
+    hint must therefore name ``plugins.enabled`` (the mechanism that always works),
+    not direct the operator to a bare CLI command that fails out of the box.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    hint = ctx.calls[0]["install_hint"]
+    assert isinstance(hint, str)
+    # Names the working runtime enable key.
+    assert "plugins.enabled" in hint
+    # Does NOT instruct the bare CLI enable as THE activation step (it fails for an
+    # entry-point plugin without the stub). Phrasing that mentions the command only
+    # as the stub-enabled affordance is fine; the unconditional imperative is not.
+    assert "Run `hermes plugins enable hermes-voip` to activate" not in hint
+
+
 # ---------------------------------------------------------------------------
 # (d) register is exported from hermes_voip.__init__
 # ---------------------------------------------------------------------------

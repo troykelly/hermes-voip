@@ -84,9 +84,24 @@ def gate_voip_tool(
 
     An unknown tool name is **denied** (fail closed, rule 37): the gate never
     silently allows an unrecognised action.
+
+    **ADR-0031 sub-ceiling.** When ``state.allowed_tools`` is non-empty it is a
+    per-session allow-list checked BEFORE the level/risk gate: any tool not in the
+    set is blocked here, so a caller group (e.g. the intercom group) can scope a
+    session to ONLY a named set of tools. The check can only REMOVE tools — a tool
+    in the allow-list still has to pass :func:`gate_tool_call` (its level/risk
+    clamp), so the allow-list never grants a tool above the session's privilege
+    level. An EMPTY allow-list (the default) means "no sub-ceiling" and reproduces
+    the level-only behaviour exactly. The risk lookup runs first so an UNKNOWN tool
+    is denied even if it appears in the allow-list (the gate cannot register a tool
+    it has no risk class for).
     """
     risk = TOOL_RISKS.get(tool_name)
     if risk is None:
+        return False
+    if state.allowed_tools and tool_name not in state.allowed_tools:
+        # Scoped session: this tool is outside the group's allow-list. Remove it
+        # regardless of the level (the sub-ceiling never grants, only removes).
         return False
     return gate_tool_call(risk, state, confirmed=confirmed)
 

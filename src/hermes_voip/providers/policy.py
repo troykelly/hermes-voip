@@ -61,18 +61,27 @@ class GuardSessionState:
         degraded: True once any fail-open screen occurred; never un-sets in-call.
         privilege_level: The tool-risk ceiling for this session (0/2/3).
             Set from the caller group at INVITE time (ADR-0021).
+        allowed_tools: An optional per-session tool allow-list — a SUB-ceiling
+            below ``privilege_level`` (ADR-0031). EMPTY (the default) means "no
+            sub-ceiling": the level alone gates, reproducing every existing
+            decision. A NON-EMPTY set scopes the session to ONLY those tool names:
+            :func:`~hermes_voip.tools.gate_voip_tool` blocks any tool not listed
+            BEFORE the level/risk check, so the set can only REMOVE tools, never
+            grant one above the level. Set from the caller group at INVITE time
+            (the intercom group is scoped to just its entry action).
         flagged_turns: Identifiers of turns flagged for audit during the call.
     """
 
     __slots__ = (
         "_turns_seen",
+        "allowed_tools",
         "call_id",
         "degraded",
         "flagged_turns",
         "privilege_level",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — each arg is an independent session-state field; the back-compat ``privileged`` kwarg + the ADR-0031 ``allowed_tools`` sub-ceiling both have to live alongside the four existing fields
         self,
         call_id: str,
         degraded: bool = False,
@@ -80,6 +89,7 @@ class GuardSessionState:
         flagged_turns: tuple[str, ...] = (),
         *,
         privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
     ) -> None:
         """Construct session state.
 
@@ -93,10 +103,15 @@ class GuardSessionState:
                 ``privilege_level``: ``True`` → 3, ``False`` → 0.  Raise
                 ``TypeError`` if both ``privilege_level`` is explicitly non-default
                 AND ``privileged`` is supplied simultaneously.
+            allowed_tools: Optional tool-name allow-list (ADR-0031). EMPTY (the
+                default) = no sub-ceiling (level-only gating, the existing
+                behaviour). A NON-EMPTY set scopes the session to ONLY those tools
+                (a sub-ceiling that can only remove, never grant above the level).
         """
         self.call_id = call_id
         self.degraded = degraded
         self.flagged_turns = flagged_turns
+        self.allowed_tools = allowed_tools
         self._turns_seen = 0
         if privileged is not None:
             # Backward-compat: map old bool kwarg → level.
@@ -139,6 +154,7 @@ class GuardSessionState:
             f"GuardSessionState(call_id={self.call_id!r},"
             f" degraded={self.degraded!r},"
             f" privilege_level={self.privilege_level!r},"
+            f" allowed_tools={sorted(self.allowed_tools)!r},"
             f" flagged_turns={self.flagged_turns!r})"
         )
 

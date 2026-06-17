@@ -157,17 +157,27 @@ class CallerGroup:
             3 = +IRREVERSIBLE (operator / full assistant — still subject to
                 ADR-0010 confirmation + non-degraded session).
         persona: Short token selecting the spotlighted preamble:
-            "assistant", "colleague", "receptionist", or "outbound".
+            "assistant", "colleague", "receptionist", "outbound", or "intercom".
             Must be ``""`` when ``declined_at_sip`` is True (the group never
             reaches a turn).
         declined_at_sip: True means 603 Decline at INVITE; the group name and
             membership are still used for classification and audit.
+        allowed_tools: An optional tool-name allow-list — a SUB-ceiling below
+            ``privilege_level`` (ADR-0031). EMPTY (the default) = no sub-ceiling
+            (the level alone gates). A NON-EMPTY set scopes a call in this group to
+            ONLY those tools: it is threaded onto the call's
+            :class:`~hermes_voip.providers.policy.GuardSessionState` so the tool
+            gate removes every other tool. It can only REMOVE tools, never grant
+            one above ``privilege_level``. The intercom group uses this to expose
+            ONLY its entry action (``open_entry`` / ``send_dtmf``), so even a
+            spoofed caller-ID reaching the group cannot reach operator tools.
     """
 
     name: str
     privilege_level: int
     persona: str
     declined_at_sip: bool
+    allowed_tools: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1028,6 +1038,26 @@ def _load_groups_file(path_str: str, normalization: Normalization) -> CallerGrou
     return _parse_groups_document(data, normalization)
 
 
+def _parse_allowed_tools(index: int, raw_group: Mapping[str, object]) -> frozenset[str]:
+    """Parse a group's optional ``allowed_tools`` array (ADR-0031).
+
+    Absent ⇒ the empty frozenset (no sub-ceiling; level-only gating). Present ⇒
+    must be a list of strings; any other shape is a fail-loud :class:`ConfigError`
+    (rule 37 — a typo'd tool-scope must not silently widen access). Blank entries
+    are dropped so trailing whitespace is forgiving.
+    """
+    raw = raw_group.get("allowed_tools")
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
+        msg = (
+            f"{_GROUPS_FILE_KEY}: groups[{index}].allowed_tools must be a list of "
+            "strings (tool names) when present"
+        )
+        raise ConfigError(msg)
+    return frozenset(t.strip() for t in raw if t.strip())
+
+
 def _parse_groups_document(  # noqa: PLR0912,PLR0915 — sequential validation of a rich JSON document; extraction would only move the complexity elsewhere
     data: dict[str, object], normalization: Normalization
 ) -> CallerGroupConfig:
@@ -1070,12 +1100,14 @@ def _parse_groups_document(  # noqa: PLR0912,PLR0915 — sequential validation o
                 "reaches a turn and must not have a persona"
             )
             raise ConfigError(msg)
+        allowed_tools = _parse_allowed_tools(i, raw_g)
         groups.append(
             CallerGroup(
                 name=name,
                 privilege_level=privilege_level,
                 persona=persona,
                 declined_at_sip=declined_at_sip,
+                allowed_tools=allowed_tools,
             )
         )
 

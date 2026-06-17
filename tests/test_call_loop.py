@@ -1555,7 +1555,7 @@ async def test_barge_in_during_greeting_no_aclose_race(
 
 
 # ---------------------------------------------------------------------------
-# SELF-ECHO BARGE-IN (ADR-0022) — the gateway reflects the agent's own TTS back
+# SELF-ECHO BARGE-IN (ADR-0023) — the gateway reflects the agent's own TTS back
 # on the inbound path; the VAD transcribes it as the caller, and a single ONSET
 # barged the agent in, ending its own turn (the live self-interruption loop,
 # call 20260617_033116). In the default ``gated`` mode, while TTS is playing a

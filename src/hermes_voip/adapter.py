@@ -1293,7 +1293,7 @@ class VoipAdapter(BasePlatformAdapter):
         async def _deliver(text: str) -> None:
             await self._deliver_turn(call_id, text)
 
-        # Echo-robust barge-in (ADR-0022): convert the ms thresholds to VAD window
+        # Echo-robust barge-in (ADR-0023): convert the ms thresholds to VAD window
         # counts at the engine's inbound rate (same conversion the endpointer uses
         # for silence_ms) so the gate's window clock lines up with the VAD's.
         barge_in_mode = _barge_in_mode(media_cfg.barge_in_mode)
@@ -1321,7 +1321,7 @@ class VoipAdapter(BasePlatformAdapter):
             tone_secs=media_cfg.tone_secs,
             # Echo-robust barge-in: ``gated`` (default) requires a sustained voiced
             # run to interrupt while the agent's TTS plays, so the gateway echoing
-            # the agent's own audio back cannot self-interrupt it (ADR-0022).
+            # the agent's own audio back cannot self-interrupt it (ADR-0023).
             barge_in_mode=barge_in_mode,
             barge_in_min_voiced_windows=barge_in_min_voiced_windows,
             barge_in_tail_windows=barge_in_tail_windows,

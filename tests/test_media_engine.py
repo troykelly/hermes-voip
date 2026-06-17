@@ -40,7 +40,7 @@ from hermes_voip.rtp import RtpPacket
 
 # Our own outbound SSRC (white-box: read from the engine module so the test
 # tracks the constant). Inbound packets carrying THIS SSRC are our own audio
-# looped back (self-loopback) and must be dropped before VAD/ASR (ADR-0022).
+# looped back (self-loopback) and must be dropped before VAD/ASR (ADR-0023).
 _OUR_SSRC: int = engine_module._OUTBOUND_SSRC
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Self-loopback SSRC drop (ADR-0022): an inbound packet carrying OUR OWN
+# Self-loopback SSRC drop (ADR-0023): an inbound packet carrying OUR OWN
 # outbound SSRC is our own audio looped back; it must never reach the jitter
 # buffer / VAD / ASR (it would self-interrupt the agent). A foreign-SSRC packet
 # is unaffected — this is defense-in-depth, distinct from the gateway-echo case.

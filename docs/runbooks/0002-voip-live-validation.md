@@ -370,7 +370,7 @@ the gateway/PSTN reflects the agent's rendered TTS back on the inbound path (a 2
 or a gateway without echo cancellation), the VAD transcribes it as the caller, and a barge-in
 ends the agent's turn — a self-interruption loop.
 
-Diagnose the echo source first (ADR-0022):
+Diagnose the echo source first (ADR-0023):
 
 - Compare the `rtp tx: first packet -> <addr>` and `rtp rx: first packet <- <addr>` INFO
   lines. If RX is from the **gateway's** media address (the same address TX targets), the
@@ -379,7 +379,7 @@ Diagnose the echo source first (ADR-0022):
   carrying our own SSRC `0xCAFEBABE` before it reaches the VAD/ASR — a `rtp rx: dropping
   inbound packet with our own SSRC … (self-loopback)` DEBUG line).
 
-Fix (shipped, on by default — ADR-0022): **echo-robust barge-in**. While the agent's TTS is
+Fix (shipped, on by default — ADR-0023): **echo-robust barge-in**. While the agent's TTS is
 playing (and for a short tail after), a barge-in counts only when the inbound speech is a
 SUSTAINED voiced run, so short echo blips cannot interrupt but a genuine sustained
 interruption still does. The same gate also **withholds the echoed audio from the STT** while

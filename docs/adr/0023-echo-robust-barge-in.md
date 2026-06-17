@@ -1,4 +1,4 @@
-# ADR-0022: Echo-robust barge-in — sustained-speech gating during TTS playout (extends ADR-0008)
+# ADR-0023: Echo-robust barge-in — sustained-speech gating during TTS playout (extends ADR-0008)
 
 - **Date:** 2026-06-17
 - **Status:** Accepted

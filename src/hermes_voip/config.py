@@ -139,7 +139,7 @@ _MAX_VAD_THRESHOLD = 1.0
 # the friendly DEFAULT_GREETING; present-but-empty (or whitespace) → no greeting.
 _GREETING_KEY = "HERMES_VOIP_GREETING"
 
-# Echo-robust barge-in (ADR-0022). The gateway can reflect the agent's own TTS
+# Echo-robust barge-in (ADR-0023). The gateway can reflect the agent's own TTS
 # back on the inbound path (no echo cancellation), and the VAD/ASR transcribe it
 # as the caller — a single ONSET then barged the agent in, ending its own turn (a
 # self-interruption loop). Mode `gated` (default) requires a SUSTAINED voiced run
@@ -332,7 +332,7 @@ class MediaConfig:
             peer's real source tuple (the first valid inbound RTP packet) for NAT
             traversal — ``True`` by default. ``False`` always honours the SDP
             ``c=``/``m=`` address.
-        barge_in_mode: Echo-robust barge-in mode (ADR-0022): ``gated`` (default —
+        barge_in_mode: Echo-robust barge-in mode (ADR-0023): ``gated`` (default —
             require a sustained voiced run while TTS plays), ``full`` (legacy
             immediate barge-in on any onset), or ``off`` (never barge in).
         barge_in_min_speech_ms: In ``gated`` mode, the minimum sustained voiced

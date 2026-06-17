@@ -261,7 +261,7 @@ class VoiceActivityDetector:
 
         Equivalently, the count of windows scored so far on the current call
         (it starts at ``0`` and increments by one per scored window, resetting at
-        :meth:`reset`). The barge-in gate (ADR-0022) reads this to measure how
+        :meth:`reset`). The barge-in gate (ADR-0023) reads this to measure how
         many windows a voiced run has lasted *between* VAD edges, so a sustained
         interruption fires mid-run rather than only at the next edge.
         """

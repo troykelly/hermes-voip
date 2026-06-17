@@ -126,7 +126,7 @@ _END_OF_STREAM: Final[_EndOfStream] = _EndOfStream.MARKER
 
 
 class BargeInMode(Enum):
-    """How an inbound speech onset is allowed to interrupt the agent (ADR-0022).
+    """How an inbound speech onset is allowed to interrupt the agent (ADR-0023).
 
     * ``OFF`` — never barge in; the agent always finishes its turn.
     * ``GATED`` — (default) while the agent's TTS is playing (and for a short tail
@@ -144,7 +144,7 @@ class BargeInMode(Enum):
 
 
 class BargeInGate:
-    """Echo-robust barge-in decision (ADR-0022).
+    """Echo-robust barge-in decision (ADR-0023).
 
     The live self-interruption bug: the gateway reflects the agent's own TTS back
     on the inbound path, the VAD/ASR transcribe it as the caller, and a single
@@ -447,7 +447,7 @@ class CallLoop:
             resample entirely (``HERMES_VOIP_TEST_TONE`` env var).  When set,
             ``greeting`` is ignored.  ``0.0`` (the default) means normal
             operation.
-        barge_in_mode: Echo-robust barge-in mode (ADR-0022). ``GATED`` (default)
+        barge_in_mode: Echo-robust barge-in mode (ADR-0023). ``GATED`` (default)
             requires a sustained voiced run to interrupt while the agent's TTS is
             playing (and a short tail after), so the gateway echoing the agent's
             own TTS back cannot self-interrupt it; a genuine sustained
@@ -494,7 +494,7 @@ class CallLoop:
         self._greeting = greeting
         self._tone_secs = tone_secs
         self.barge_in_mode = barge_in_mode
-        # The echo-robust barge-in decision (ADR-0022). The pump drives it from
+        # The echo-robust barge-in decision (ADR-0023). The pump drives it from
         # VAD edges + the TTS-active state; ``should_barge_in`` says when to fire.
         self._barge_in_gate = BargeInGate(
             mode=barge_in_mode,
@@ -575,7 +575,7 @@ class CallLoop:
             window_index = 0
             frames_received = 0
             # Track the agent's TTS-active state across frames so the barge-in
-            # gate (ADR-0022) can arm a post-TTS echo tail at the True→False edge.
+            # gate (ADR-0023) can arm a post-TTS echo tail at the True→False edge.
             prev_tts_active = self._active_tts_stream is not None
             # One-shot DEBUG flag: log the first echo frame withheld from the ASR
             # so the operator sees the gate engage once without flooding the log.
@@ -622,7 +622,7 @@ class CallLoop:
                         latest_vad_window,
                     )
                     await self.barge_in()
-                # Echo-robust turn gate (ADR-0022, codex findings #1/#A): while the
+                # Echo-robust turn gate (ADR-0023, codex findings #1/#A): while the
                 # agent's TTS is playing (or in the tail) and the current speech run
                 # is NOT an authorised barge-in, the inbound audio is the gateway's
                 # echo of the agent's own speech. WITHHOLD it from the ASR entirely

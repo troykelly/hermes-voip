@@ -515,7 +515,7 @@ class RtpMediaTransport:
                     _log.debug("malformed RTP datagram — dropped: %s", exc)
                     continue
 
-            # Self-loopback drop (ADR-0022): a packet carrying OUR OWN outbound
+            # Self-loopback drop (ADR-0023): a packet carrying OUR OWN outbound
             # SSRC is our own audio reflected back onto the inbound path. Feeding
             # it to the jitter buffer / VAD / ASR would transcribe the agent's own
             # speech as the caller and self-interrupt the agent. Drop it BEFORE the

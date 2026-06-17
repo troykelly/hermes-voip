@@ -1,4 +1,4 @@
-"""TDD tests for the echo-robust barge-in gate (ADR-0022).
+"""TDD tests for the echo-robust barge-in gate (ADR-0023).
 
 The gate decides whether an inbound speech onset should interrupt the agent's
 TTS. The live self-interruption bug (call ``20260617_033116``): the gateway
@@ -185,7 +185,7 @@ def test_off_mode_never_barges_in_even_on_sustained_speech() -> None:
 
 
 def test_full_mode_barges_in_on_first_onset_during_tts() -> None:
-    """``full`` reproduces the pre-ADR-0022 behaviour: ONSET → immediate barge-in.
+    """``full`` reproduces the pre-ADR-0023 behaviour: ONSET → immediate barge-in.
 
     This is correct only on an echo-cancelled gateway; it is the explicit opt-in
     to maximum interactivity (and what the live bug exhibited before the fix).

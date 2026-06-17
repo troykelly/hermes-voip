@@ -185,9 +185,9 @@ class CallerGroupConfig:
     normalization: Normalization
 
     def __post_init__(self) -> None:
-        """Snapshot inputs to immutable containers, then reject a privileged default.
+        """Snapshot inputs, reject duplicate names, then reject a privileged default.
 
-        Two responsibilities, both load-bearing for the by-construction security
+        Three responsibilities, all load-bearing for the by-construction security
         clamp:
 
         1. **Snapshot (durability).** ``groups``/``match_order`` are coerced to
@@ -198,7 +198,12 @@ class CallerGroupConfig:
            mutable list and mutates it after construction cannot retroactively
            escalate the default group, because the config holds its own snapshot.
 
-        2. **Reject a privileged default (fail-loud).** The default group is the
+        2. **Reject duplicate group names.** Unique names are required so the
+           linear default-privilege check (first-wins) and the classifier's
+           name→group dict (last-wins) cannot resolve a duplicate name to different
+           groups — a privilege-escalation bypass otherwise.
+
+        3. **Reject a privileged default (fail-loud).** The default group is the
            catch-all for unmatched (unknown, forgeable) callers. Caller-ID is a
            trust hint, not authentication, so the default MUST be unprivileged
            (``privilege_level == 0``, the receptionist). A privileged default would
@@ -226,7 +231,24 @@ class CallerGroupConfig:
             ),
         )
 
-        # 2. Reject a privileged default group (against the snapshotted groups).
+        # 2. Reject duplicate group names. Names must be unique because
+        #    classify_caller_group resolves a group by name via a dict
+        #    (``{g.name: g for g in groups}``, last-wins) while the default-privilege
+        #    check below scans linearly (first-wins). With a duplicate name those two
+        #    resolutions disagree, which is a privilege-escalation bypass (a level-0
+        #    group could shadow a level-3 group of the same name for validation while
+        #    the classifier picks the level-3 one). Forbidding duplicates removes the
+        #    ambiguity entirely (matches the JSON loader and the name-unique invariant).
+        names = [g.name for g in self.groups]
+        if len(set(names)) != len(names):
+            msg = (
+                "group names must be unique: duplicate names make the default-group "
+                "privilege check and the classifier resolve to different groups (a "
+                "privilege-escalation bypass). Give each group a distinct name."
+            )
+            raise ConfigError(msg)
+
+        # 3. Reject a privileged default group (against the snapshotted groups).
         default = next((g for g in self.groups if g.name == self.default_group), None)
         if default is not None and default.privilege_level != 0:
             msg = (

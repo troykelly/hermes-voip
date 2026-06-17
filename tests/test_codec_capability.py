@@ -86,3 +86,27 @@ def test_unsupported_codec_error_message_carries_encoding_and_rate() -> None:
     text = str(err)
     assert "G729" in text
     assert str(_G711_RATE) in text
+
+
+# ---------------------------------------------------------------------------
+# G.722 wideband capability (ADR-0022): the engine now carries G.722.
+# ---------------------------------------------------------------------------
+
+
+def test_g722_8000_maps_to_engine_g722() -> None:
+    # RFC 3551: G.722's rtpmap clock rate is 8000 (even though the audio is
+    # sampled at 16 kHz), so the capability key is ("G722", 8000) — the engine
+    # must map exactly that pair to the runnable G.722 codec.
+    assert codec_for_encoding("G722", _G711_RATE) is Codec.G722
+
+
+def test_g722_name_match_is_case_insensitive() -> None:
+    assert codec_for_encoding("g722", _G711_RATE) is Codec.G722
+
+
+def test_g722_at_16000_clock_raises() -> None:
+    # The carriable pair is ("G722", 8000) per RFC 3551; a (mistaken) G722 rtpmap
+    # advertised at a 16000 clock is NOT what we negotiate and must RAISE rather
+    # than silently map — the rate is part of the key, the famous G.722 trap.
+    with pytest.raises(UnsupportedCodecError):
+        codec_for_encoding("G722", 16000)

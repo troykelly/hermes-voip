@@ -431,6 +431,51 @@ async def test_speak_sends_audio_in_order() -> None:
     assert transport.sent_audio == frames
 
 
+@pytest.mark.asyncio
+async def test_speak_passes_the_negotiated_wire_rate_to_tts() -> None:
+    """The call loop tells the TTS the negotiated wire rate (ADR-0022).
+
+    The process-wide TTS provider does not know the per-call codec; the call loop
+    does (via ``transport.inbound_sample_rate``, which is codec-derived: 8 kHz
+    G.711, 16 kHz G.722). So the loop passes that rate into ``synthesize`` so the
+    synthesiser emits the negotiated rate (no wideband thrown away, no needless
+    G.711 resample). The fake transport reports 16 kHz (the G.722 case).
+    """
+
+    class _CapturingTTS:
+        def __init__(self) -> None:
+            self.rates: list[int | None] = []
+
+        @property
+        def output_sample_rate(self) -> int:
+            return 16_000
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.rates.append(sample_rate)
+            return _FakeTtsStream([])
+
+    tts = _CapturingTTS()
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport, _FakeASR([]), tts, _FakeGuard([_allow_result()]), _noop
+    )
+
+    async def _tokens() -> AsyncIterator[str]:
+        yield "hello"
+
+    await loop.speak(_tokens())
+
+    # The loop forwarded the transport's (codec-derived) wire rate to synthesize.
+    assert tts.rates == [transport.inbound_sample_rate]
+    assert tts.rates == [16_000]
+
+
 # ---------------------------------------------------------------------------
 # (e) Degraded guard_state → IRREVERSIBLE tool blocked via gate_voip_tool
 # ---------------------------------------------------------------------------

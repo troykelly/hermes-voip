@@ -1,8 +1,14 @@
 # ADR-0017: Rate reconciliation at the media seam — outbound TTS→8 kHz in `send_audio`, inbound 8 kHz→16 kHz before the recogniser
 
-- Status: Accepted
+- Status: Accepted (amended by ADR-0022)
 - Date: 2026-06-16
 - Deciders: agent session (operator-directed live no-audio fix)
+
+> **Amendment (ADR-0022, 2026-06-17):** the media wire rate is **no longer unconditionally
+> 8 kHz**. It is derived from the negotiated codec: 8 kHz for G.711, **16 kHz for G.722**
+> (wideband). `send_audio` still resamples any TTS frame to the wire rate (now codec-derived),
+> and the inbound path delivers frames at the codec's true sample rate — so the G.722 inbound
+> audio reaches the recogniser at native 16 kHz rather than upsampled from 8 kHz. See ADR-0022.
 - Supersedes/relates: ADR-0004 (PcmFrame currency), ADR-0005 (media plane),
   ADR-0006 (STT), ADR-0007 (TTS)
 

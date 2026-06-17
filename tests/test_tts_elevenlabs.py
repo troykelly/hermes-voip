@@ -267,6 +267,55 @@ async def test_wideband_rate_requests_matching_pcm_format() -> None:
     assert "output_format=pcm_16000" in req.url
 
 
+@pytest.mark.asyncio
+async def test_per_call_sample_rate_overrides_the_construction_default() -> None:
+    """``synthesize(sample_rate=…)`` selects the rate PER CALL (ADR-0022).
+
+    The provider is built once (process-wide) but the negotiated codec is
+    per-call, so the call loop passes the negotiated wire rate into ``synthesize``.
+    A G.722 call (16 kHz) must request ``pcm_16000`` and emit 16 kHz frames even
+    though the provider's construction default is the 8 kHz G.711 case — the rate
+    follows the negotiated codec, not the construction default.
+    """
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(api_key=_FAKE_KEY, voice="x", http=http)  # default 8 kHz
+    assert tts.output_sample_rate == _G711_WIRE_RATE
+    frames = await _drain(
+        tts.synthesize(_text("Wideband per call. "), voice="x", sample_rate=16_000)
+    )
+    assert frames
+    assert all(f.sample_rate == 16_000 for f in frames)
+    req = http.request
+    assert req is not None
+    assert req.output_format == "pcm_16000"
+    assert "output_format=pcm_16000" in req.url
+
+
+@pytest.mark.asyncio
+async def test_per_call_sample_rate_none_uses_construction_default() -> None:
+    # The G.711 case: no per-call override -> the 8 kHz construction default, so
+    # the choppiness fix (no resample for G.711) is preserved.
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(api_key=_FAKE_KEY, voice="x", http=http)
+    frames = await _drain(
+        tts.synthesize(_text("Narrowband default. "), voice="x", sample_rate=None)
+    )
+    assert frames
+    assert all(f.sample_rate == _G711_WIRE_RATE for f in frames)
+    req = http.request
+    assert req is not None
+    assert req.output_format == "pcm_8000"
+
+
+@pytest.mark.asyncio
+async def test_per_call_unsupported_rate_rejected() -> None:
+    # A per-call rate ElevenLabs cannot emit fails loudly (no silent fallback).
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(api_key=_FAKE_KEY, voice="x", http=http)
+    with pytest.raises(ValueError, match="no native PCM output"):
+        tts.synthesize(_text("Bad rate. "), voice="x", sample_rate=12_345)
+
+
 def test_unsupported_output_rate_rejected_at_construction() -> None:
     """A wire rate ElevenLabs cannot emit fails fast at construction, not mid-call."""
     with pytest.raises(ValueError, match="no native PCM output"):

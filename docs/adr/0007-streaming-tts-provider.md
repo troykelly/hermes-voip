@@ -1,8 +1,17 @@
 # ADR-0007: Streaming TTS: self-host sherpa-onnx + Kokoro (default); Cartesia/Aura-2/ElevenLabs cloud fallbacks
 
 - **Date:** 2026-06-14
-- **Status:** Accepted
+- **Status:** Accepted (amended by ADR-0022)
 - **Deciders:** agent session (VoIP architecture, post-research)
+
+> **Amendment (ADR-0022, 2026-06-17):** the TTS output rate **follows the negotiated codec**.
+> The single codec-gated rate hook introduced by the PR #82 choppiness fix
+> (`ElevenLabsTTS(output_sample_rate=…)`) is generalised: the negotiated wire rate is threaded
+> into the call loop and passed to the synthesiser per call via an optional
+> `StreamingTTS.synthesize(..., sample_rate=…)` argument. ElevenLabs emits the negotiated rate
+> natively (8 kHz for G.711 — preserving the no-resample choppiness fix — 16 kHz for G.722, so
+> wideband is not downsampled away). Kokoro's intrinsic 24 kHz is downsampled by the engine to
+> the wire rate (24→16 for G.722, 24→8 for G.711). See ADR-0022.
 
 ## Context
 

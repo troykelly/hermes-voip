@@ -136,6 +136,89 @@ def test_negotiate_raises_when_no_common_audio_codec() -> None:
         negotiate_audio(sdp.audio, supported=("OPUS",))
 
 
+# ---------------------------------------------------------------------------
+# G.722 wideband negotiation (ADR-0022): prefer G.722, fall back to G.711, and
+# the engine must actually carry whatever was chosen (capability never drifts
+# ahead of negotiation). This is the SUPPORTED menu the adapter advertises.
+# ---------------------------------------------------------------------------
+
+# The adapter's advertised order: G.722 first (wideband-preferred), then G.711,
+# then DTMF. Kept here as a literal so the negotiation test is default-gate-safe
+# (the adapter constant itself is exercised by the hermes-contract job).
+_SUPPORTED = ("G722", "PCMU", "PCMA", "telephone-event")
+
+_OFFER_G722_AND_G711 = (
+    "v=0\r\n"
+    "o=- 9 9 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 40004 RTP/AVP 9 0 8 101\r\n"
+    "a=rtpmap:9 G722/8000\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+_OFFER_G711_ONLY = (
+    "v=0\r\n"
+    "o=- 9 9 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 40006 RTP/AVP 0 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def test_g722_static_payload_9_parses_without_rtpmap() -> None:
+    # RFC 3551 assigns G.722 the static payload type 9 at clock 8000; a peer may
+    # offer it with no a=rtpmap. The parser's static table must resolve it.
+    text = (
+        "v=0\r\no=- 9 9 IN IP4 192.0.2.3\r\ns=-\r\nc=IN IP4 192.0.2.3\r\n"
+        "t=0 0\r\nm=audio 40004 RTP/AVP 9\r\na=sendrecv\r\n"
+    )
+    audio = SessionDescription.parse(text).audio
+    assert audio is not None
+    by_pt = {c.payload_type: c for c in audio.codecs}
+    assert by_pt[9].encoding == "G722"
+    assert by_pt[9].clock_rate == 8000
+
+
+def test_negotiate_prefers_g722_when_offered() -> None:
+    # Offer [G722, PCMU, PCMA, DTMF] against our menu -> G722 wins (offer order
+    # promotes it first), and the chosen voice codec is carriable by the engine.
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+    from hermes_voip.media.engine import codec_for_encoding  # noqa: PLC0415
+
+    audio = SessionDescription.parse(_OFFER_G722_AND_G711).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_SUPPORTED)
+    assert chosen[0].encoding == "G722"
+    # The negotiated voice codec maps to a runnable engine codec.
+    assert codec_for_encoding(chosen[0].encoding, chosen[0].clock_rate) is (
+        EngineCodec.G722
+    )
+
+
+def test_negotiate_falls_back_to_g711_when_g722_absent() -> None:
+    # Offer [PCMU, DTMF] only -> PCMU wins (G.722 not offered), engine carries it.
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+    from hermes_voip.media.engine import codec_for_encoding  # noqa: PLC0415
+
+    audio = SessionDescription.parse(_OFFER_G711_ONLY).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_SUPPORTED)
+    voice = [c for c in chosen if c.encoding.lower() != "telephone-event"]
+    assert voice[0].encoding == "PCMU"
+    assert codec_for_encoding(voice[0].encoding, voice[0].clock_rate) is (
+        EngineCodec.PCMU
+    )
+
+
 def test_build_audio_offer_round_trips() -> None:
     codecs = (
         Codec(payload_type=0, encoding="PCMU", clock_rate=8000),

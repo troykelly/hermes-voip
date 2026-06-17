@@ -58,7 +58,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, Protocol
 
-from hermes_voip.dtmf import event_payloads
+from hermes_voip.dtmf import DtmfEvent, DtmfReceiver, event_payloads
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
     Resampler,
@@ -604,7 +604,7 @@ class RtpMediaTransport:
                          :func:`asyncio.sleep`).  Inject a no-op in tests.
     """
 
-    def __init__(  # noqa: PLR0913, D417 — all params required; only new params added to docstring (others unchanged)
+    def __init__(  # noqa: PLR0913, PLR0915, D417 — all params required (incl. the ADR-0010 on_dtmf receive callback); the body is a flat sequence of per-call field initialisers, not branching logic — splitting it would only scatter the call's state across helpers
         self,
         *,
         local_address: str,
@@ -614,6 +614,7 @@ class RtpMediaTransport:
         codec: Codec,
         payload_type: int | None = None,
         telephone_event_payload_type: int | None = None,
+        on_dtmf: Callable[[str], None] | None = None,
         ptime: int = _DEFAULT_PTIME_MS,
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
@@ -659,6 +660,18 @@ class RtpMediaTransport:
                 101 (the gateway may have negotiated a different dynamic PT) nor
                 silently no-ops. Set :attr:`telephone_event_payload_type` later
                 (the outbound path, after the 2xx answer echoes the PT).
+            on_dtmf: Callback invoked with each RECEIVED DTMF digit (ADR-0010), or
+                ``None`` to ignore inbound DTMF. The inbound generator demuxes RTP at
+                the negotiated ``telephone_event_payload_type`` to a per-call
+                :class:`~hermes_voip.dtmf.DtmfReceiver`, which collapses RFC 4733's
+                redundant end packets so this fires EXACTLY ONCE per key-press (a
+                digit ``"0"``-``"9"`` / ``"*"`` / ``"#"`` / ``"A"``-``"D"``). It is a
+                plain sync callable run on the event loop (the controller routes the
+                digit to the armed-confirmation resolver or a menu buffer); it must
+                not block. Inert when ``telephone_event_payload_type`` is ``None``
+                (no DTMF was negotiated) — a stray telephone-event-PT packet is then
+                just an unknown PT and is dropped, never decoded as audio. Settable
+                later via :attr:`on_dtmf` (the outbound path wires it after answer).
             pace_clock: Monotonic time source in SECONDS used only to pace the
                 outbound RTP stream (the deadline pacer in :meth:`_transmit_frame`
                 sleeps the time remaining to each frame's deadline so per-frame
@@ -700,6 +713,13 @@ class RtpMediaTransport:
         # raises if None (never a hardcoded 101, never a silent no-op). Settable
         # after construction (the outbound path adopts the answer's PT).
         self._telephone_event_payload_type: int | None = telephone_event_payload_type
+        # Inbound DTMF receive (ADR-0010): the callback fired once per decoded digit,
+        # and the per-call RFC 4733 decoder that collapses the redundant end packets.
+        # The decoder is re-created in connect() so a reused engine starts a clean
+        # digit history. ``_on_dtmf`` None ⇒ inbound DTMF is ignored (the demux still
+        # drops telephone-event packets so they never reach the audio decoder).
+        self._on_dtmf: Callable[[str], None] | None = on_dtmf
+        self._dtmf_receiver: DtmfReceiver = DtmfReceiver()
         self._ptime = ptime
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
@@ -932,6 +952,10 @@ class RtpMediaTransport:
 
         self._recv_queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
+        # Fresh inbound DTMF decoder so a reused engine starts with an empty
+        # recently-seen-timestamp window (a stale window could suppress a real first
+        # press of the new call). The ``on_dtmf`` callback is preserved across calls.
+        self._dtmf_receiver = DtmfReceiver()
         self._stop_event = asyncio.Event()
         self._pending = None
         # Fresh TX lock so a reused engine never inherits a held lock (ADR-0031).
@@ -1103,7 +1127,7 @@ class RtpMediaTransport:
         """
         return self._inbound_gen()
 
-    async def _inbound_gen(self) -> AsyncIterator[PcmFrame]:
+    async def _inbound_gen(self) -> AsyncIterator[PcmFrame]:  # noqa: PLR0912 — the inbound RX path is a single linear demux (SRTP/parse → self-loopback drop → DTMF divert → latch → jitter → decode); each stage is a guard-and-continue that belongs in one place, not fragmented across helpers
         """Internal async generator implementing inbound_audio.
 
         Terminates when :meth:`stop` sets the stop flag (even if the recv queue
@@ -1156,10 +1180,54 @@ class RtpMediaTransport:
                     )
                 continue
 
-            # The datagram is genuine RTP (it parsed / authenticated) and is not
-            # our own loopback: this is the only point at which a comedia latch may
-            # fire (anti-spoofing — garbage that does not parse never reaches here).
+            # The datagram is genuine RTP (it parsed / authenticated) and is not our
+            # own loopback: this is the only point at which a comedia latch may fire
+            # (anti-spoofing — garbage that does not parse never reaches here). Run the
+            # latch FIRST, for every packet, so the inbound DTMF demux below sees the
+            # SAME established remote-source state as audio (the latch is a no-op for a
+            # DTMF packet — _maybe_latch only latches on the negotiated audio PT — so
+            # this does not let DTMF move the destination). Cross-vendor review: the
+            # confirmation channel must not be processed in a pre-latch window the audio
+            # path never has.
             self._maybe_latch(rtp_pkt, source)
+
+            # Inbound payload-type dispatch (ADR-0010 + cross-vendor review). Exactly
+            # three outcomes, no catch-all that mis-decodes:
+            #   * the NEGOTIATED telephone-event PT → RFC 4733 DTMF (never the audio
+            #     decoder — a 4-byte named-event payload decoded as G.711 is garbage);
+            #   * the negotiated audio PT → the jitter buffer + audio decode below;
+            #   * anything else (comfort noise, a stray/unknown PT, or a spoofed
+            #     telephone-event PT when none was negotiated) → DROP. The engine has
+            #     never PT-filtered inbound audio before; filtering here closes the
+            #     rule-27 'inert + safe when no DTMF negotiated' gap (an unknown PT is
+            #     no longer mis-decoded as audio) and bounds what reaches either path.
+            te_pt = self._telephone_event_payload_type
+            if te_pt is not None and rtp_pkt.payload_type == te_pt:
+                # Spoof source-binding (cross-vendor review #1): the confirmation
+                # channel is a security control, so once the comedia latch has fixed
+                # the remote source, a DTMF packet from any OTHER source is a spoof and
+                # is dropped — stricter than the audio path, deliberately. Before the
+                # latch (or with symmetric off) we accept it, exactly as audio is
+                # accepted before the latch.
+                if self._symmetric and self._latched and source != self._outbound_addr:
+                    _log.warning(
+                        "dtmf rx: dropping telephone-event packet from unlatched "
+                        "source %s:%d (latched remote is %s:%d) — possible spoof",
+                        source[0],
+                        source[1],
+                        self._outbound_addr[0],
+                        self._outbound_addr[1],
+                    )
+                    continue
+                self._handle_inbound_dtmf(rtp_pkt)
+                continue
+            if rtp_pkt.payload_type != self._payload_type:
+                # Neither audio nor DTMF: drop rather than mis-decode as G.711.
+                _log.debug(
+                    "rtp rx: dropping packet with unhandled payload type %d",
+                    rtp_pkt.payload_type,
+                )
+                continue
 
             if not self._first_rx_logged:
                 self._first_rx_logged = True
@@ -1744,6 +1812,52 @@ class RtpMediaTransport:
         # Silent inter-digit gap: pace it so a repeated digit is two events.
         if gap_ms > 0:
             await self._sleep(gap_ms / 1000.0)
+
+    def _handle_inbound_dtmf(self, packet: RtpPacket) -> None:
+        """Decode one inbound telephone-event packet and surface a completed digit.
+
+        Called by the inbound generator for every packet at the negotiated
+        telephone-event PT (ADR-0010). The 4-byte named-event payload is decoded and
+        fed to the per-call :class:`~hermes_voip.dtmf.DtmfReceiver` at the packet's RTP
+        timestamp; the receiver returns the digit only on the FIRST end packet of a
+        press (collapsing RFC 4733's redundant end packets and de-duplicating reordered
+        ones), so ``on_dtmf`` fires exactly once per key-press.
+
+        A malformed named-event packet is DROPPED with a DEBUG log rather than crashing
+        the inbound generator — a corrupt inbound packet is an environmental event, not
+        a programming error (the same posture as a malformed RTP datagram above). The
+        ``ValueError`` guard spans BOTH the 4-byte ``decode`` AND the receiver ``feed``
+        (cross-vendor review #5): a well-formed payload whose event code is not a keypad
+        digit (e.g. flash, event 16) is already surfaced as ``None`` by the receiver,
+        but wrapping ``feed`` too means any future value-domain error in the digit
+        mapping is contained to a single dropped packet, not a torn-down call. Any
+        non-``ValueError`` exception still propagates (rule 37).
+        """
+        if self._on_dtmf is None:
+            return  # inbound DTMF ignored; the packet is still kept off the audio path
+        try:
+            event = DtmfEvent.decode(packet.payload)
+            digit = self._dtmf_receiver.feed(event, timestamp=packet.timestamp)
+        except ValueError as exc:
+            _log.debug("malformed telephone-event packet — dropped: %s", exc)
+            return
+        if digit is not None:
+            _log.info("dtmf rx: digit %r", digit)
+            self._on_dtmf(digit)
+
+    @property
+    def on_dtmf(self) -> Callable[[str], None] | None:
+        """The callback fired once per RECEIVED DTMF digit, or ``None`` (ADR-0010).
+
+        Settable after construction — the outbound path wires it after the call is up
+        (mirroring :attr:`telephone_event_payload_type`). ``None`` ignores inbound
+        DTMF; the demux still keeps telephone-event packets off the audio decoder.
+        """
+        return self._on_dtmf
+
+    @on_dtmf.setter
+    def on_dtmf(self, value: Callable[[str], None] | None) -> None:
+        self._on_dtmf = value
 
     @property
     def telephone_event_payload_type(self) -> int | None:

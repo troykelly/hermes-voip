@@ -708,13 +708,16 @@ def test_media_values_are_trimmed() -> None:
             "DEEPGRAM_API_KEY": "dg-x",  # deepgram (cloud) requires its key
             "HERMES_VOIP_TTS_VOICE": "  rachel  ",
             "HERMES_VOIP_VAD_THRESHOLD": "  0.3 ",
-            "HERMES_SIP_DTMF_MODE": "  sip_info  ",
+            # A supported mode (rfc4733) with surrounding whitespace — trims to the
+            # bare token. (sip_info / inband are rejected at load, ADR-0010, so this
+            # asserts trimming on a value that survives validation.)
+            "HERMES_SIP_DTMF_MODE": "  rfc4733  ",
         }
     )
     assert cfg.stt_provider == "deepgram"
     assert cfg.tts_voice == "rachel"
     assert cfg.vad_threshold == pytest.approx(0.3)
-    assert cfg.dtmf_mode == "sip_info"
+    assert cfg.dtmf_mode == "rfc4733"
 
 
 def test_media_provider_tokens_lowercased() -> None:
@@ -936,9 +939,19 @@ def test_media_dtmf_inband_bool_accepts_common_spellings() -> None:
         assert cfg.dtmf_inband_enabled is False
 
 
-def test_media_all_dtmf_modes_accepted() -> None:
-    for mode in ("auto", "rfc4733", "sip_info", "inband"):
+def test_media_supported_dtmf_modes_accepted() -> None:
+    """RFC 4733 is the shipped receive path: only auto / rfc4733 load (ADR-0010).
+
+    Replaces the prior "all four modes accepted" test: accepting sip_info / inband
+    was the rule-27 drift (the config advertised receive backends the code lacked).
+    Those two now fail loud at load (asserted in test_dtmf_config.py); here we lock
+    that the two SUPPORTED modes still load and round-trip.
+    """
+    for mode in ("auto", "rfc4733"):
         assert load_media_config({"HERMES_SIP_DTMF_MODE": mode}).dtmf_mode == mode
+    for unsupported in ("sip_info", "inband"):
+        with pytest.raises(ConfigError):
+            load_media_config({"HERMES_SIP_DTMF_MODE": unsupported})
 
 
 def test_media_all_duplex_modes_accepted() -> None:

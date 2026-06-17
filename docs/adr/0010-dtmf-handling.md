@@ -124,14 +124,27 @@ Concrete shape:
   through a registered tool (`ctx.register_tool`, ADR-0002/ADR-0004) so a model turn can
   request "press 1-2-3-4".
 
-  > **Implementation status (ADR-0031).** The **RFC 4733 send path is SHIPPED**:
-  > `RtpMediaTransport.send_dtmf(digits, …)` emits the named-event train on the active
-  > call at the *negotiated* telephone-event payload type (raises if it was not
-  > negotiated — never a hardcoded 101), under the engine TX mutex shared with
-  > `send_audio`; it is exposed as the gated `send_dtmf` agent tool (ELEVATED) and is the
-  > actuation primitive for the intercom `open_entry` DTMF mode. The **SIP INFO** and
-  > **in-band** send modes, and the **inbound receive + armed-confirmation resolver** (the
-  > next bullet), remain DEFERRED — see ADR-0031 §4 for the receive/transfer blocker.
+  > **Implementation status (ADR-0031, amended for RFC 4733 receive).** The
+  > **RFC 4733 send path is SHIPPED**: `RtpMediaTransport.send_dtmf(digits, …)` emits the
+  > named-event train on the active call at the *negotiated* telephone-event payload type
+  > (raises if it was not negotiated — never a hardcoded 101), under the engine TX mutex
+  > shared with `send_audio`; it is exposed as the gated `send_dtmf` agent tool (ELEVATED)
+  > and is the actuation primitive for the intercom `open_entry` DTMF mode.
+  >
+  > The **RFC 4733 RECEIVE path is now also SHIPPED** (the feat/voip-dtmf-receive lane):
+  > `RtpMediaTransport` demuxes inbound RTP at the negotiated telephone-event payload
+  > type to a per-call `DtmfReceiver` (in `_inbound_gen`, BEFORE the jitter buffer, so a
+  > named-event payload is never decoded as audio), collapses RFC 4733's redundant end
+  > packets, and fires an `on_dtmf` callback once per key-press. The adapter wires
+  > `on_dtmf → CallLoop.feed_dtmf` for every call (inbound and outbound) that negotiated
+  > telephone-event. The **armed-confirmation resolver is SHIPPED** too: `ArmedConfirmation`
+  > (`hermes_voip.dtmf_confirm`) is the spoof-resistant channel — it satisfies the existing
+  > `ConfirmationSource` protocol (`async confirm() → bool`), so it is a drop-in for
+  > `CallControlTools._irreversible`, **which unblocks `transfer_blind`**. The **SIP INFO**
+  > and **in-band** mechanisms (both send AND receive) remain DEFERRED — and are now
+  > rejected at config load rather than silently inert (see the Configuration bullet).
+  > Attended transfer remains additionally blocked (ADR-0031 §4: no consult-leg Dialog
+  > origination).
 
 - **Surfacing inbound digits — no fake transcript.** Because Hermes has no DTMF
   `MessageType`, the call/turn controller (ADR-0003) consumes the `DtmfDigit` stream
@@ -145,6 +158,15 @@ Concrete shape:
     `MessageEvent(text="[DTMF] 1234")` so a normal turn can act on menu input.
   Which path is active is owned by the controller's call state, not guessed per digit.
 
+  > **As built (RFC 4733 receive lane).** The controller is `CallLoop`: the engine's
+  > `on_dtmf` fires `CallLoop.feed_dtmf(digit)`, which routes by call state exactly as
+  > above. While an `ArmedConfirmation` (bound via `CallLoop.bind_confirmation`) is
+  > armed, the digit resolves it through `ArmedConfirmation.feed` and is NOT surfaced —
+  > the spoof-resistant control path. Otherwise the digit joins a buffer delivered as
+  > `deliver_turn("[DTMF] 1234")` on a `#` terminator or after
+  > `HERMES_SIP_DTMF_INTERDIGIT_MS`. The "expected length" terminator is not yet wired
+  > (only `#` and the inter-digit timeout) — a future menu-driven tool can add it.
+
 - **Configuration / env.** Behaviour is env-driven and gateway-agnostic, read at runtime
   (the test gateway's real connection details stay only in the gitignored `.env` /
   1Password per CLAUDE.md and rule 34):
@@ -154,11 +176,37 @@ Concrete shape:
   unreliable in-band last resort outright). Tests and examples use the obvious fakes
   (host `pbx.example.test`, extension `1000`).
 
+  > **As built (no inert key — rule 27).** Because only RFC 4733 is implemented (send
+  > AND receive), `HERMES_SIP_DTMF_MODE` accepts ONLY `auto` and `rfc4733`; `sip_info`
+  > and `inband` are **rejected at config load** with a loud `ConfigError` rather than
+  > parsed into a value that does nothing. Each surviving key drives a real outcome:
+  > `resolve_dtmf_receive_mode(config, telephone_event_payload_type)`
+  > (`hermes_voip.dtmf_config`) maps the mode + `HERMES_SIP_DTMF_INBAND_ENABLED` + the
+  > negotiated telephone-event PT to a `DtmfReceiveMode` (`RFC4733` /  `DISABLED` /
+  > `UNAVAILABLE`); the adapter wires the receiver on `RFC4733`, logs a WARNING on
+  > `UNAVAILABLE` (DTMF was wanted but the gateway negotiated no telephone-event), and
+  > stays silent on `DISABLED`. `HERMES_SIP_DTMF_INBAND_ENABLED` changes which of
+  > `DISABLED`/`UNAVAILABLE` a no-telephone-event call resolves to (it does NOT enable an
+  > in-band detector — that backend is unbuilt). `HERMES_SIP_DTMF_INTERDIGIT_MS` is the
+  > inbound menu-group delivery timeout (default 2000 ms when unset).
+
 - **File paths.** `src/hermes_voip/dtmf/` holds `detector.py` (protocol + mode
   negotiation), `rfc4733.py` (event-payload codec + RTP state machine), `sip_info.py`,
   `inband.py` (Goertzel), and `generate.py` (outbound). Tests live under
   `tests/dtmf/`; per rule 18 each codec lands red-first with vector fixtures (e.g.
   a captured RFC 4733 packet train) before implementation.
+
+  > **As built.** The single shipped mechanism (RFC 4733) made the planned package
+  > split unnecessary. Actual layout: `src/hermes_voip/dtmf.py` (the 4-byte
+  > telephone-event payload codec, digit↔event map, outbound `event_payloads`, and the
+  > `DtmfReceiver` redundant-end collapse), `src/hermes_voip/dtmf_confirm.py`
+  > (`ArmedConfirmation`), and `src/hermes_voip/dtmf_config.py` (`DtmfReceiveMode` +
+  > `resolve_dtmf_receive_mode`). Send/receive RTP framing lives on
+  > `RtpMediaTransport` (`media/engine.py`); surfacing lives on `CallLoop`
+  > (`media/call_loop.py`). Tests: `tests/test_dtmf.py`, `tests/test_dtmf_receive.py`,
+  > `tests/test_dtmf_confirm.py`, `tests/test_dtmf_config.py`,
+  > `tests/test_call_loop_dtmf.py`. The `sip_info.py` / `inband.py` / `detector.py`
+  > backends arrive only if/when those deferred mechanisms are built.
 
 ## Consequences
 

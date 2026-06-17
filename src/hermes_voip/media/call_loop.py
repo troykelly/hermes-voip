@@ -85,7 +85,7 @@ import math
 import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
-from typing import Final
+from typing import Final, Protocol
 
 from hermes_voip.media.audio import generate_tone_frames
 from hermes_voip.media.endpoint import Endpointer
@@ -122,6 +122,36 @@ _DEFAULT_COMFORT_FILLER_PHRASES: Final[tuple[str, ...]] = (
 
 #: Default dead-air threshold (ms) before one comfort filler fires (ADR-0030).
 _DEFAULT_COMFORT_FILLER_DELAY_MS: Final[int] = 900
+
+#: Default inter-digit gap (ms) after which a buffered DTMF group is delivered as a
+#: menu turn when no ``#`` terminator arrives (ADR-0010). Used when the adapter passes
+#: ``dtmf_interdigit_ms=None`` (the config key was unset). 2 s is comfortably longer
+#: than a human's between-key gap so a single multi-digit entry is not split.
+_DEFAULT_DTMF_INTERDIGIT_MS: Final[int] = 2000
+
+#: The DTMF group terminator: a ``#`` ends the current digit group immediately (the
+#: conventional "enter" key for keypad data entry), ADR-0010.
+_DTMF_TERMINATOR: Final[str] = "#"
+
+#: The tag prefixing a delivered DTMF menu group, so a model turn can never confuse a
+#: keypress for spoken words (ADR-0010 §surfacing). Digits never pass through STT/LLM
+#: as a fake transcript; they arrive clearly marked.
+_DTMF_TURN_PREFIX: Final[str] = "[DTMF] "
+
+
+class _DtmfConfirmationSink(Protocol):
+    """The narrow surface the call loop drives on the armed-confirmation resolver.
+
+    The loop offers each received digit to a bound confirmation while it is armed;
+    ``feed`` returns whether it CONSUMED the digit (a window was armed and unresolved),
+    so the loop knows not to also surface the digit as a menu turn. Concretely a
+    :class:`hermes_voip.dtmf_confirm.ArmedConfirmation`; the Protocol keeps the call
+    loop decoupled from that module (the adapter wires the concrete resolver).
+    """
+
+    def feed(self, digit: str) -> bool:
+        """Offer one received DTMF digit; return whether an armed window consumed it."""
+        ...
 
 
 class _EndOfStream(Enum):
@@ -490,9 +520,15 @@ class CallLoop:
         comfort_filler_phrases: The filler phrase set; one is chosen per gap
             (round-robin per call). Each phrase reads naturally on every TTS model.
             Must be non-empty (defaults to the built-in set).
-        sleep: The async sleep seam the comfort-filler delay awaits. Defaults to
-            :func:`asyncio.sleep`; tests inject a controllable sleep for determinism
-            (the loop has no other wall-clock dependency).
+        dtmf_interdigit_ms: Inter-digit gap (ms) after which a buffered DTMF menu
+            group is delivered when no ``#`` terminator arrives (ADR-0010 §surfacing).
+            ``None`` (the config key unset) uses the built-in default (2000 ms). The
+            adapter passes ``MediaConfig.dtmf_interdigit_ms``. Only used for inbound
+            DTMF the controller surfaces as a menu turn — a digit consumed by an armed
+            confirmation never starts this timer.
+        sleep: The async sleep seam the comfort-filler delay AND the DTMF inter-digit
+            timer await. Defaults to :func:`asyncio.sleep`; tests inject a controllable
+            sleep for determinism (the loop has no other wall-clock dependency).
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
@@ -517,6 +553,7 @@ class CallLoop:
         comfort_filler: bool = False,
         comfort_filler_delay_ms: int = _DEFAULT_COMFORT_FILLER_DELAY_MS,
         comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES,
+        dtmf_interdigit_ms: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
@@ -578,6 +615,195 @@ class CallLoop:
         # Round-robin index into ``_comfort_filler_phrases`` so a multi-gap call does
         # not repeat the same filler word every time. Touched only from the loop.
         self._comfort_filler_index = 0
+
+        # Inbound DTMF surfacing (ADR-0010). The engine fires :meth:`feed_dtmf` for
+        # each received digit; the controller routes it (NOT the engine): while a
+        # confirmation is armed the digit resolves it directly (a control action,
+        # spoof-resistant); otherwise the digit joins a buffered group delivered as a
+        # tagged ``[DTMF] …`` menu turn on a ``#`` terminator or an inter-digit timeout.
+        self._dtmf_interdigit_s = (
+            dtmf_interdigit_ms
+            if dtmf_interdigit_ms is not None
+            else _DEFAULT_DTMF_INTERDIGIT_MS
+        ) / 1000.0
+        # The optional armed-confirmation resolver bound for this call (an object with
+        # ``feed(digit) -> bool``; concretely a ``hermes_voip.dtmf_confirm.Armed-
+        # Confirmation``). ``None`` until :meth:`bind_confirmation` wires one.
+        self._confirmation: _DtmfConfirmationSink | None = None
+        # The digits accumulated for the current (unterminated) menu group, in order.
+        self._dtmf_buffer: list[str] = []
+        # The single in-flight inter-digit flush TIMER, or None when no group is
+        # pending. Each new digit cancels + reschedules it; a terminator / teardown
+        # cancels it. Touched only from the event loop. Distinct from the delivery
+        # tasks below: cancelling the timer must never drop an in-flight delivery.
+        self._dtmf_flush_task: asyncio.Task[None] | None = None
+        # In-flight menu-group DELIVERY tasks (review #4). A delivery snapshots the
+        # buffer at its firing instant and runs here, NOT in ``_dtmf_flush_task``, so a
+        # following digit's timer (re)arm cannot cancel it — the group is never lost.
+        # Strong refs held until done (asyncio keeps only weak refs); cancelled + joined
+        # at loop teardown.
+        self._dtmf_delivery_tasks: set[asyncio.Task[None]] = set()
+
+    def bind_confirmation(self, confirmation: _DtmfConfirmationSink) -> None:
+        """Bind the armed-confirmation resolver received digits route to (ADR-0010).
+
+        While the bound resolver is armed, :meth:`feed_dtmf` hands it each digit and
+        does NOT surface the digit as a menu turn — keeping the spoof-resistant
+        confirmation channel off the STT/LLM path. The adapter binds the per-call
+        resolver after constructing the loop.
+        """
+        self._confirmation = confirmation
+
+    def feed_dtmf(self, digit: str) -> None:
+        """Route one RECEIVED DTMF ``digit`` (the engine's ``on_dtmf`` callback).
+
+        Synchronous (the engine fires it on the event loop). Routing:
+
+        * if a bound confirmation resolver is armed and CONSUMES the digit, stop —
+          the digit resolved a control action and must never become a menu turn;
+        * otherwise buffer the digit; a ``#`` terminator delivers the group at once,
+          and any other digit (re)arms the inter-digit flush timer.
+
+        Delivery and the timer are async, so this schedules them as tracked tasks (the
+        engine callback cannot await). :meth:`feed_dtmf_async` is the awaitable twin
+        the tests use to drive delivery deterministically.
+        """
+        if self._route_confirmation(digit):
+            return
+        if digit == _DTMF_TERMINATOR:
+            # Terminator: snapshot the buffer NOW (synchronously) and dispatch the
+            # group as an uncancellable delivery task. Snapshotting before the await
+            # means a following digit starts a fresh group and can NEVER cancel/lose
+            # this one (cross-vendor review #4).
+            self._cancel_dtmf_flush_timer()
+            self._dispatch_dtmf_group(self._take_dtmf_group())
+        else:
+            self._dtmf_buffer.append(digit)
+            self._arm_dtmf_flush_timer()
+
+    async def feed_dtmf_async(self, digit: str) -> None:
+        """Awaitable twin of :meth:`feed_dtmf` (delivers synchronously on a terminator).
+
+        Identical routing, but a ``#`` terminator AWAITS the group delivery rather
+        than scheduling it as a task — used by tests (and any awaiting caller) to
+        observe the delivered turn deterministically. A non-terminator digit (re)arms
+        the inter-digit timer exactly as :meth:`feed_dtmf` does.
+        """
+        if self._route_confirmation(digit):
+            return
+        if digit == _DTMF_TERMINATOR:
+            self._cancel_dtmf_flush_timer()
+            await self._deliver_dtmf_group(self._take_dtmf_group())
+        else:
+            self._dtmf_buffer.append(digit)
+            self._arm_dtmf_flush_timer()
+
+    def _route_confirmation(self, digit: str) -> bool:
+        """Offer ``digit`` to a bound, armed confirmation; return whether consumed."""
+        confirmation = self._confirmation
+        if confirmation is None:
+            return False
+        return confirmation.feed(digit)
+
+    def _take_dtmf_group(self) -> str:
+        """Atomically take + clear the buffered digits (the ``#`` terminator aside).
+
+        Synchronous, so the snapshot is taken at the firing instant: a following digit
+        appends to the now-empty buffer, a fresh group, and cannot alter the one just
+        taken (cross-vendor review #4). Returns ``""`` when nothing is buffered.
+        """
+        digits = "".join(self._dtmf_buffer)
+        self._dtmf_buffer = []
+        return digits
+
+    def _arm_dtmf_flush_timer(self) -> None:
+        """(Re)start the inter-digit timer so a multi-digit entry flushes as one group.
+
+        Each new non-terminator digit cancels the prior timer and starts a fresh one,
+        so the group is delivered only once ``dtmf_interdigit_ms`` elapses with no
+        further digit (or a ``#`` arrives first). No-op if the buffer is empty. This
+        TIMER is the only thing a following digit cancels — an in-flight DELIVERY task
+        is tracked separately and is never cancelled by a new digit (review #4).
+        """
+        self._cancel_dtmf_flush_timer()
+        if not self._dtmf_buffer:
+            return
+        self._dtmf_flush_task = asyncio.create_task(self._dtmf_flush_after_gap())
+        self._dtmf_flush_task.add_done_callback(self._on_dtmf_timer_done)
+
+    def _cancel_dtmf_flush_timer(self) -> None:
+        """Cancel and forget the inter-digit flush timer, if any (idempotent)."""
+        task = self._dtmf_flush_task
+        if task is not None:
+            self._dtmf_flush_task = None
+            task.cancel()
+
+    def _on_dtmf_timer_done(self, task: asyncio.Task[None]) -> None:
+        """Clear the timer handle on completion; propagate nothing (cancel is normal).
+
+        The timer's only job is to await the gap then dispatch a delivery (or be
+        cancelled by a new digit / terminator). Its own body cannot fail — the
+        delivery it dispatches runs in a SEPARATE tracked task whose result is handled
+        by :meth:`_on_dtmf_delivery_done` — so here we only clear the handle and ignore
+        the expected cancellation.
+        """
+        if self._dtmf_flush_task is task:
+            self._dtmf_flush_task = None
+
+    def _dispatch_dtmf_group(self, digits: str) -> None:
+        """Deliver a (already-snapshotted) digit group as an UNCANCELLABLE tracked task.
+
+        The task is held in ``_dtmf_delivery_tasks`` (NOT ``_dtmf_flush_task``), so a
+        following digit's timer (re)arm cannot cancel an in-flight delivery (review #4)
+        — the group is never silently dropped. A strong reference is kept until the
+        task completes (asyncio holds only a weak ref); the done-callback discards it
+        and logs any failure (rule 37). A no-op when ``digits`` is empty.
+        """
+        if not digits:
+            return
+        task = asyncio.create_task(self._deliver_dtmf_group(digits))
+        self._dtmf_delivery_tasks.add(task)
+        task.add_done_callback(self._on_dtmf_delivery_done)
+
+    def _on_dtmf_delivery_done(self, task: asyncio.Task[None]) -> None:
+        """Discard a finished delivery task; log a failure (rule 37), ignore cancel.
+
+        A delivery routes through ``deliver_turn``; a failure there is logged and is
+        non-fatal (a dropped menu group must not kill an otherwise-working call). A
+        cancellation only happens at loop teardown.
+        """
+        self._dtmf_delivery_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.warning("DTMF group delivery failed (call continues): %r", exc)
+
+    async def _dtmf_flush_after_gap(self) -> None:
+        """Wait the inter-digit gap, then dispatch the buffered group as a menu turn.
+
+        A new digit cancels this (raising ``CancelledError`` here, which propagates to
+        end it without delivering — rule 37); a terminator delivers directly. The
+        snapshot is taken AFTER the sleep (so all digits up to the gap are included)
+        and dispatched as an uncancellable delivery task (review #4).
+        """
+        await self._sleep(self._dtmf_interdigit_s)
+        self._dispatch_dtmf_group(self._take_dtmf_group())
+
+    async def _deliver_dtmf_group(self, digits: str) -> None:
+        """Deliver an already-snapshotted ``digits`` group as a tagged ``[DTMF]`` turn.
+
+        A no-op when ``digits`` is empty (a terminator with nothing buffered). The
+        digits are delivered to the agent via ``deliver_turn`` with the ``[DTMF]`` tag
+        (never a fake STT transcript), so a normal turn can act on keypad menu input.
+        The buffer was already taken by :meth:`_take_dtmf_group` at the firing instant,
+        so this method holds no shared state a concurrent feed could race.
+        """
+        if not digits:
+            return
+        text = f"{_DTMF_TURN_PREFIX}{digits}"
+        _log.info("dtmf: delivering menu group %r", text)
+        await self._deliver_turn(text)
 
     async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
         """Run the duplex loop until the transport's inbound stream ends.
@@ -871,6 +1097,22 @@ class CallLoop:
             self._cancel_comfort_filler()
             if filler is not None:
                 await asyncio.wait({filler})
+            # The inbound-DTMF tasks (ADR-0010) are likewise tracked outside the
+            # TaskGroup (armed per received digit): the inter-digit TIMER and any
+            # in-flight group DELIVERY tasks. Cancel + JOIN them all so none outlives
+            # the call. Best-effort join (like the filler): each task's result is
+            # handled by its own done-callback (rule 37) and must not mask the loop's
+            # teardown. Snapshot the delivery set before cancelling (the callbacks
+            # mutate it).
+            dtmf_tasks: set[asyncio.Task[None]] = set(self._dtmf_delivery_tasks)
+            dtmf_timer = self._dtmf_flush_task
+            self._cancel_dtmf_flush_timer()
+            if dtmf_timer is not None:
+                dtmf_tasks.add(dtmf_timer)
+            for delivery in dtmf_tasks:
+                delivery.cancel()
+            if dtmf_tasks:
+                await asyncio.wait(dtmf_tasks)
 
     async def speak(
         self,

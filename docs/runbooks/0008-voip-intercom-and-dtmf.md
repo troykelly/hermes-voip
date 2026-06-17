@@ -108,11 +108,37 @@ HERMES_VOIP_INTERCOM_RELAY_TIMEOUT_S=5     # request timeout seconds (> 0)
 URL (off the event loop). A non-2xx response or a network error raises
 `IntercomRelayError` and the tool reports a clear failure (the door was NOT opened).
 
-### 3. In-call DTMF (no intercom needed)
+### 3. In-call DTMF send (no intercom needed)
 
 `send_dtmf(digits)` is registered for **every** privileged call. No extra config — it
 just needs the gateway to negotiate `telephone-event`. Use it for IVR menus / keypad
 entry on outbound or trusted calls.
+
+### 4. Inbound DTMF receive (the caller presses keys) — ADR-0010
+
+Inbound DTMF is decoded from RFC 4733 telephone-event RTP and surfaced by the call
+controller (`CallLoop`), not the engine: (1) while an irreversible tool has ARMED a
+confirmation, a digit resolves it directly (the spoof-resistant channel that gates
+transfer — ADR-0009); (2) otherwise a digit group (terminated by `#` or the inter-digit
+gap) is delivered to the agent as a tagged `[DTMF] 1234` turn. Digits never pass through
+STT / the LLM as a fake transcript. Wired for **every** call (inbound and outbound) whose
+gateway negotiated `telephone-event` — the adapter wires `engine.on_dtmf` to the loop and
+binds a per-call `ArmedConfirmation` in `_wire_dtmf_receive`.
+
+No extra config is required for the default behaviour. The three env keys (all optional)
+now drive real behaviour (no inert key):
+
+```sh
+# Receive mechanism. ONLY auto / rfc4733 are implemented; sip_info / inband are REJECTED
+# at config load (a loud ConfigError) — never a key that silently does nothing.
+HERMES_SIP_DTMF_MODE=auto              # auto (default) | rfc4733
+# Gap (ms) after which a buffered menu group with no '#' terminator is delivered.
+HERMES_SIP_DTMF_INTERDIGIT_MS=2000     # unset => built-in default (2000); must be > 0
+# Whether the (unbuilt) in-band last-resort detector is permitted. Default true. On a
+# call where the gateway negotiated no telephone-event this flag only changes whether the
+# missing-DTMF state is logged loud (true => UNAVAILABLE) or quiet (false => DISABLED).
+HERMES_SIP_DTMF_INBAND_ENABLED=true
+```
 
 ## Where the secret lives + rotation
 
@@ -146,6 +172,22 @@ entry on outbound or trusted calls.
 - **Least-privilege.** From an intercom call, a request to "transfer me" / "list the
   extensions" must be refused — those tools are removed by the `allowed_tools`
   sub-ceiling. (Covered by `tests/test_voip_tools.py::test_open_entry_scoped_by_allowed_tools_blocks_other_tools`.)
+- **DTMF receive config (fail-loud check).** An unsupported mode fails at startup, not
+  at key-press time:
+  ```sh
+  uv run python -c "from hermes_voip.config import load_media_config as L; \
+    L({'HERMES_SIP_DTMF_MODE':'sip_info'})"
+  # -> ConfigError: dtmf_mode 'sip_info' is not supported for DTMF receive ...
+  uv run python -c "from hermes_voip.config import load_media_config as L; \
+    print(L({'HERMES_SIP_DTMF_MODE':'rfc4733'}).dtmf_mode)"   # -> rfc4733
+  ```
+- **DTMF receive live (pending operator redeploy + a real call).** On a call whose
+  gateway negotiated `telephone-event`, the answer log shows `inbound DTMF receive active
+  (RFC 4733, PT <n>)`; pressing keys logs `dtmf rx: digit '<d>'` (the digit is
+  operational, not a secret) and — for a menu group — `dtmf: delivering menu group
+  '[DTMF] 1234'`. If the gateway negotiated NO telephone-event the log shows a single
+  WARNING `inbound DTMF receive ... UNAVAILABLE` (with `HERMES_SIP_DTMF_INBAND_ENABLED`
+  true) rather than silence.
 
 ## Roll back / disable
 
@@ -160,6 +202,6 @@ entry on outbound or trusted calls.
 ## Related
 
 - ADR-0031 (this feature's WHY); ADR-0021 (caller groups + the `allowed_tools` clause);
-  ADR-0010 (DTMF; the send path is shipped, inbound receive + the armed-confirmation
-  resolver remain deferred — ADR-0031 §4); ADR-0009 (the tool gate).
+  ADR-0010 (DTMF; the RFC 4733 send AND receive paths + the armed-confirmation resolver
+  are now shipped — SIP INFO / in-band remain deferred); ADR-0009 (the tool gate).
 - `docs/runbooks/0003-voip-caller-modes.md` (the caller-groups file + JSON schema).

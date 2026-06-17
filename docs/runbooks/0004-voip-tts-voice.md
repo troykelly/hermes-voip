@@ -29,7 +29,7 @@ HERMES_VOIP_TTS_STABILITY=0.35             # main dynamism dial: LOWER = more ex
 HERMES_VOIP_TTS_STYLE=0.0                  # 0 on telephony; 0.10-0.15 adds drama (costs latency)
 HERMES_VOIP_TTS_SIMILARITY=0.75            # clarity / similarity to the source voice
 HERMES_VOIP_TTS_SPEAKER_BOOST=true         # subtle similarity boost
-# HERMES_VOIP_TTS_MODEL=eleven_flash_v2_5  # keep Flash (see "Model choice")
+# HERMES_VOIP_TTS_MODEL=eleven_flash_v2_5  # default; or eleven_v3 for expressive + audio tags
 # HERMES_VOIP_TTS_STREAMING_LATENCY=1      # deprecated; leave UNSET (see "Latency")
 ```
 
@@ -37,21 +37,52 @@ Every knob is optional: **unset => the dynamic default for that field**. A bare 
 install is already livelier than the API default. Out-of-range values fail fast at startup
 (`ConfigError`): floats must be in `[0.0, 1.0]`, `*_STREAMING_LATENCY` an int in `[0, 4]`.
 
-## Model choice — keep Flash v2.5, tune the voice (do NOT swap to v3 or Turbo)
+## Model choice — Flash (default, low-latency) OR v3 (expressive, audio tags)
 
-Verified against current ElevenLabs docs (2026-06-17):
+`HERMES_VOIP_TTS_MODEL` selects the ElevenLabs model **id** (it is a model **directory** only
+for the self-host `sherpa-kokoro` provider). Two models are **first-class, operator-selectable
+tiers** (ADR-0027) — set the env var and redeploy:
 
-| Model | Streams in real time? | Latency | Expressiveness | Verdict |
+| Model | First-audio (our HTTP `/stream`) | Audio tags? | Expressiveness | Use it when |
 | --- | --- | --- | --- | --- |
-| `eleven_flash_v2_5` (default) | Yes (HTTP `/stream` + WS) | ~75 ms model | Lowest of the lineup | **Keep.** Only model that is both real-time *and* ElevenLabs-recommended for voice agents. |
-| `eleven_turbo_v2_5` | Yes | ~250-300 ms | Marginally above Flash | Superseded — ElevenLabs: "use the Flash models over Turbo in all use cases." |
-| `eleven_multilingual_v2` | Yes | Several-hundred ms | High | Only viable *streaming* step-up, but a real first-audio regression on a phone call. Off-path A/B only. |
-| `eleven_v3` | **No** (multi-context WS unavailable; "can't do real-time") | Higher | Most expressive | **Unusable on the phone path** — would break streaming. |
+| `eleven_flash_v2_5` (**default**) | **~310 ms** (measured) | **No** — stripped | Lowest of the lineup; `voice_settings` add dynamism | Lowest latency matters; the default. |
+| `eleven_v3` | **~454 ms** (measured) | **Yes** — rendered | Most expressive | You want the agent's `[breath]`/`[laughs]`/… cues to perform. |
+| `eleven_turbo_v2_5` | ~250-300 ms model | No — stripped | Marginally above Flash | Rarely — superseded by Flash ("use the Flash models over Turbo in all use cases"). |
+| `eleven_multilingual_v2` | several-hundred ms | No — stripped | High | Off-path A/B only — a real first-audio regression on a call. |
 
-So the dynamism win on telephony comes from **`voice_settings`**, not a model swap.
-`HERMES_VOIP_TTS_MODEL` (the model **id** for ElevenLabs — it is a model **directory** only for
-the self-host `sherpa-kokoro` provider) stays at `eleven_flash_v2_5`; change it only for a
-deliberate off-path experiment.
+Both measured latencies are fine on the phone path: the **Hermes LLM turn dominates**
+end-to-end latency, so the ~140 ms Flash→v3 delta is immaterial. The earlier note that
+"`eleven_v3` can't stream" applied to ElevenLabs' multi-context **websocket** only — **v3
+works on our HTTP `/stream` path** (live-validated, ADR-0027).
+
+> `eleven_v3_conversational` is a **different** model (the Agents platform): it returns **401**
+> with a standard TTS key and is **out of scope** (Hermes is the agent, not the ElevenLabs
+> Agents platform). Do not set `HERMES_VOIP_TTS_MODEL` to it.
+
+On `eleven_flash_v2_5` the dynamism win comes from **`voice_settings`** (below), not the model;
+on `eleven_v3` you additionally get rendered audio tags.
+
+## Expressive voice — ElevenLabs v3 audio tags (model-conditional)
+
+The agent (gpt-5.5) spontaneously emits **audio tags** — inline performance cues in square
+brackets — and on **`eleven_v3`** they **render** as the intended delivery
+(operator-confirmed effective). On any other model they would be spoken **literally**
+("breath" for `[breath]`), so the plugin handles them **per model** (ADR-0027):
+
+- **On `eleven_v3` (and any future `eleven_v3*`): tags are PRESERVED** and reach the API, so
+  they render.
+- **On every other model** (`eleven_flash_v2_5`, `eleven_turbo_v2_5`, `eleven_multilingual_v2`,
+  **and the `sherpa-kokoro` fallback**): the **whole `[tag]` token is STRIPPED** before
+  synthesis, so nothing is voiced. This is enforced **inside whichever provider actually
+  synthesises**, so the **Kokoro failover** (ADR-0025) strips tags on the replayed utterance
+  even when the v3 primary tried to preserve them — the caller never hears a literal tag.
+- Emoji / markdown / URL stripping (PR #80) is unchanged on **every** model.
+
+Supported audio tags (the canonical vocabulary; not exhaustive — v3 understands more):
+`[laughs]`, `[sighs]`, `[exhales]`, `[breath]` / `[breathes]`, `[hesitates]`, `[pauses]`,
+`[stammers]`, `[whispers]`, `[clears throat]`. A numeric footnote like `[3]` or a long
+bracketed aside is **not** treated as a tag (left intact). To use tags, just set
+`HERMES_VOIP_TTS_MODEL=eleven_v3` and let the agent emit them — no other config needed.
 
 ## voice_settings — what each knob does
 

@@ -323,3 +323,23 @@ operator's live A/B after redeploy (rule 26). Tests pin that the body now carrie
 no-settings default fails the suite), that the knobs validate ranges fail-fast, and
 that `_make_elevenlabs_tts` threads them in with per-field fallback to the dynamic
 default.
+
+## Amendment (2026-06-17): `eleven_v3` IS usable on our HTTP path + audio tags are model-conditional (see ADR-0027)
+
+- Deciders: agent session, operator-directed (live-validated)
+
+The previous amendment's line that `eleven_v3` "cannot stream in real time" reflected
+ElevenLabs' note about its **multi-context websocket** and is **corrected by live
+validation**: `eleven_v3` works on **this plugin's HTTP `/stream` path** (the path the
+plugin uses). Measured first-audio on our `/stream`: **Flash ~310 ms, v3 ~454 ms** — both
+fine, because the Hermes LLM turn dominates end-to-end latency. So **`eleven_v3` is a
+first-class, operator-selectable expressive tier** (`HERMES_VOIP_TTS_MODEL=eleven_v3`)
+alongside the low-latency Flash default — not "unusable on the phone path".
+
+On `eleven_v3` the agent's spontaneous **audio tags** (`[breath]`, `[laughs]`, `[sighs]`, …)
+render as vocal performance. **Tag handling is now MODEL-CONDITIONAL** (ADR-0027): preserved
+on the v3 family, stripped entirely on every non-v3 model (Flash/Turbo/Multilingual/Kokoro,
+incl. the ADR-0025 Kokoro failover) so a bracketed cue is never spoken literally. Emoji /
+markdown / URL stripping (PR #80) is unchanged. `eleven_v3_conversational` stays **excluded**
+(Agents-platform-only; 401 with a standard TTS key). The full rationale, the per-provider
+capability design, and the failover-correctness argument are in **ADR-0027**.

@@ -182,6 +182,50 @@ async def test_on_response_logs_registration_established(
         assert secret not in message, f"registration log leaked {secret!r}"
 
 
+async def test_on_response_refresh_does_not_re_log_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A REGISTER refresh of an already-up extension does not emit a 2nd INFO line.
+
+    The "established" line marks the transition to registered; periodic refreshes
+    (which also yield a ``Registered`` outcome) would otherwise spam INFO every
+    half-expiry, so they log at DEBUG instead.
+    """
+    transport = _FakeTransport()
+    # refresh_fraction=0.0 schedules the refresh REGISTER immediately after the
+    # first registration, so we can answer that *new* REGISTER (a real refresh,
+    # with its own CSeq) rather than replaying the first response.
+    manager = RegistrationManager(_gateway(), transport, refresh_fraction=0.0)
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    with caplog.at_level(logging.DEBUG, logger="hermes_voip.manager"):
+        # First REGISTER: the transition to up -> one INFO line.
+        await manager.on_response(_ok_for(first_register, expires=300))
+        # The refresh REGISTER fires immediately (refresh_fraction=0.0); answer it.
+        await asyncio.sleep(0.05)
+        refresh_register = next(
+            m
+            for m in transport.sent[1:]
+            if SipRequest.parse(m).header("Call-ID") == call_id
+        )
+        await manager.on_response(_ok_for(refresh_register, expires=300))
+    await manager.aclose()
+
+    info = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager" and r.levelno == logging.INFO
+    ]
+    debug = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager" and r.levelno == logging.DEBUG
+    ]
+    assert len(info) == 1, "only the initial registration logs at INFO, not refreshes"
+    assert len(debug) == 1, "the refresh is logged at DEBUG"
+
+
 async def test_on_response_challenge_resends_authenticated() -> None:
     transport = _FakeTransport()
     manager = RegistrationManager(_gateway(), transport)

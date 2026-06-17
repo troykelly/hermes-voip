@@ -197,15 +197,26 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 you installed the helper file from Step 3, `hermes-voip` also appears in the table with its
 description and version.
 
-**Did it register on the gateway, and does a call go through?** Start the gateway with verbose
-logging and watch the log as you place a test call:
+**Did it register on the gateway?** Start the gateway with verbose logging:
 
 ```bash
 hermes gateway run -vv
 ```
 
-When you **dial the extension**, the plugin logs the call's progress at `INFO` under the
-`hermes_voip.adapter` logger. A healthy inbound call prints, in order:
+As soon as an extension logs in successfully, the plugin prints one line at `INFO` under the
+`hermes_voip.manager` logger:
+
+```
+SIP registration established (expires 300s)
+```
+
+That line — one per extension that comes up — is your "the gateway login works" signal (it
+carries only the registration lifetime, never your host, extension, or password). If it never
+appears, jump to [Troubleshooting](#troubleshooting).
+
+**Does a call go through?** With the gateway still running, **dial the extension**. The plugin
+logs the call's progress at `INFO` under the `hermes_voip.adapter` logger. A healthy inbound
+call prints, in order:
 
 ```
 INVITE received: Call-ID …, registration ext 1000
@@ -237,7 +248,9 @@ This is expected for a pip-installed plugin until you add the helper `plugin.yam
 [the enable runbook](docs/runbooks/0011-voip-enable-plugin.md).
 
 **The extension won't register on the gateway** (no inbound calls arrive).
-Run `hermes gateway run -vv` and read the log. Common causes: wrong `HERMES_SIP_HOST` /
+Run `hermes gateway run -vv` and read the log: a successful login prints
+`SIP registration established (expires Ns)` on the `hermes_voip.manager` logger, so if that
+line is **absent** the registration didn't complete. Common causes: wrong `HERMES_SIP_HOST` /
 `HERMES_SIP_PORT` (TLS is port `5061` by default), a wrong extension password (you'll see the
 gateway repeatedly challenge the login), or a firewall blocking the gateway's SIP-TLS port. The
 [live-validation runbook](docs/runbooks/0002-voip-live-validation.md) has a "registration-only"

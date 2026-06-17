@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ from hermes_voip.registration import (
     RegistrationFlow,
     Retry,
 )
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "DialogConsumer",
@@ -244,10 +247,22 @@ class RegistrationManager:
         if isinstance(outcome, Challenged | Retry):
             await self._transport.send(outcome.request)
         elif isinstance(outcome, Registered):
+            was_registered = state.registered
             state.registered = True
             state.expires = outcome.expires
             self._up.set()
             self._schedule_refresh(state, outcome.expires)
+            # Operator-facing "gateway login is up" signal (the runbooks point at
+            # this line). Log the transition to registered at INFO; subsequent
+            # refreshes of an already-up registration are DEBUG to avoid noise.
+            # rule 34: NEVER log the SIP host/extension/username/password — only
+            # the non-sensitive expiry. With N extensions a per-line identifier
+            # would be the (PII) extension number, so it is deliberately omitted;
+            # the count of these lines is how many extensions came up.
+            if was_registered:
+                _log.debug("SIP registration refreshed (expires %ss)", outcome.expires)
+            else:
+                _log.info("SIP registration established (expires %ss)", outcome.expires)
         elif isinstance(outcome, Failed):
             state.registered = False
         else:

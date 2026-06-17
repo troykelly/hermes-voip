@@ -10,15 +10,17 @@ Runs in the DEFAULT (no-extra) gate — the G.722 codec is pure Python.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import math
+import socket
 import struct
 from collections.abc import Iterator
 
 import pytest
 
 from hermes_voip.media.engine import Codec, RtpMediaTransport
-from hermes_voip.media.g722 import G722Decoder
+from hermes_voip.media.g722 import G722Decoder, G722Encoder
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.rtp import RtpPacket
 
@@ -218,3 +220,93 @@ async def test_g711_timestamp_still_advances_by_160() -> None:
     assert len(packets) >= 2
     ts_delta = (packets[1].timestamp - packets[0].timestamp) % (1 << 32)
     assert ts_delta == 160
+
+
+# ---------------------------------------------------------------------------
+# Negotiated RTP payload type (codex review finding): G.722 may be offered at a
+# DYNAMIC payload type (RFC 3551 reserves static PT 9, but gateways do use dynamic
+# PTs and the SDP answer mirrors the offer's PT). The engine must send and latch
+# on the NEGOTIATED payload type, not the codec's static enum value — otherwise we
+# advertise PT N but send PT 9, and inbound PT-N packets never trigger the NAT
+# (comedia) latch -> no audio. (Masked for G.711: PCMU/PCMA are always 0/8.)
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_G722_PT = 109
+
+
+@pytest.mark.asyncio
+async def test_outbound_uses_the_negotiated_dynamic_payload_type() -> None:
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.G722,
+        payload_type=_DYNAMIC_G722_PT,  # the negotiated (dynamic) PT, not 9
+        sleep=_no_sleep,
+        initial_seq=0,
+        initial_ts=0,
+    )
+    await engine.connect()
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_wideband_frame(_AUDIO_SAMPLES_PER_FRAME))
+        await engine.stop()
+    assert recorder.sent, "no RTP emitted"
+    pkt = RtpPacket.parse(recorder.sent[0][0])
+    assert pkt.payload_type == _DYNAMIC_G722_PT, (
+        f"engine sent PT {pkt.payload_type}, expected the negotiated "
+        f"{_DYNAMIC_G722_PT} (sending the static codec PT 9 is the bug)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_symmetric_latch_accepts_the_negotiated_dynamic_payload_type() -> None:
+    # The comedia latch must fire on a genuine inbound RTP packet bearing the
+    # NEGOTIATED payload type. Drive one inbound datagram with PT 109 through the
+    # real receive path and assert the engine latched onto its source.
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.G722,
+        payload_type=_DYNAMIC_G722_PT,
+        sleep=_no_sleep,
+        symmetric=True,
+    )
+    await engine.connect()
+    engine_port = engine.local_port
+    # A genuine inbound G.722 RTP packet at the negotiated PT 109, from a distinct
+    # source tuple (so a successful latch is observable as a moved _outbound_addr).
+    g722_payload = G722Encoder().encode(
+        struct.pack(f"<{_AUDIO_SAMPLES_PER_FRAME}h", *([0] * _AUDIO_SAMPLES_PER_FRAME))
+    )
+    pkt = RtpPacket(
+        payload_type=_DYNAMIC_G722_PT,
+        sequence_number=0,
+        timestamp=0,
+        ssrc=0xDEADBEEF,
+        payload=g722_payload,
+    ).pack()
+
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sender.sendto(pkt, ("127.0.0.1", engine_port))
+        sender_addr = sender.getsockname()
+
+        async def _one() -> None:
+            async for _frame in engine.inbound_audio():
+                return
+
+        task: asyncio.Task[None] = asyncio.create_task(_one())
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        sender.close()
+        await engine.stop()
+
+    # The engine latched its outbound destination onto the packet's real source —
+    # proof the PT-109 packet was accepted as the negotiated audio stream.
+    assert engine._outbound_addr == sender_addr, (
+        f"engine did not latch on the negotiated PT {_DYNAMIC_G722_PT} packet "
+        f"(outbound_addr={engine._outbound_addr}, sender={sender_addr})"
+    )

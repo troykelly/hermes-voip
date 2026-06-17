@@ -40,9 +40,10 @@ media = [
 # (Apache-2.0 / BSD-3-Clause); no copyleft.
 #
 # pyOpenSSL 26.2.0 (Apache-2.0): DTLS handshake + RFC 5705 keying-material
-# export (media/dtls.py, PR-C). Accepts cryptography==46.x (our media-extra
-# pin); fixes CVE-2026-27448 and CVE-2026-27459 present in 25.3.0.
-# pyopenssl==26.3.0 requires cryptography>=49, which would force a KAT re-run.
+# export (media/dtls.py, PR-C). Requires cryptography>=46,<49, so it accepts our
+# media-extra pin (cryptography==48.0.1); fixes CVE-2026-27448 and CVE-2026-27459
+# present in 25.3.0. pyopenssl==26.3.0 requires cryptography>=49, which would
+# force a KAT re-run, so it stays pinned here until that bump is taken on purpose.
 #
 # websockets 16.0 (BSD-3-Clause): SIP-over-Secure-WebSocket client (RFC 6455 /
 # RFC 7118, transport/ws_connection.py, PR-A). Pure-Python, asyncio-native.

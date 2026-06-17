@@ -135,7 +135,11 @@ from hermes_voip.sdp import (
     Codec as SdpCodec,
 )
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
-from hermes_voip.voip_tools import active_voip_adapter, set_active_adapter
+from hermes_voip.voip_tools import (
+    TransferOutcome,
+    active_voip_adapter,
+    set_active_adapter,
+)
 
 if TYPE_CHECKING:
     from hermes_voip.media.srtp import SrtpSession
@@ -2207,6 +2211,79 @@ class VoipAdapter(BasePlatformAdapter):
         # cases and logs only the digit count (the open code is sensitive).
         _log.info("intercom open_entry (dtmf) for call %s", call_id)
         return await self.send_dtmf_on_call(call_id, cfg.dtmf_digits)
+
+    async def transfer_blind_on_call(
+        self, call_id: str, target: str
+    ) -> TransferOutcome:
+        """DTMF-confirmed blind transfer of ``call_id`` to ``target`` (ADR-0010/0031).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``transfer_blind`` tool calls — and the spoof-resistant chokepoint for the
+        IRREVERSIBLE transfer. It does NOT transfer on the agent's say-so: it awaits
+        the call's per-call :class:`~hermes_voip.dtmf_confirm.ArmedConfirmation` (which
+        speaks "press 1 to confirm" and waits for the keypad press), and sends the RFC
+        3515 REFER via :meth:`~hermes_voip.call.CallSession.transfer_blind` ONLY when
+        the person on the call presses the armed confirm digit. The ``Referred-By`` AOR
+        is the call's local URI (RFC 3892), so the target sees who referred them.
+
+        The ``pre_tool_call`` gate has already enforced the operator-level (3) +
+        non-degraded privilege clamp (a fail-fast) before this runs, so the confirm
+        prompt is only ever spoken on a privileged, healthy call.
+
+        Returns a :class:`~hermes_voip.voip_tools.TransferOutcome`:
+
+        * ``TRANSFERRED`` — the caller confirmed; the REFER fired.
+        * ``UNCONFIRMED`` — a wrong digit or the confirmation timed out; **no REFER**.
+        * ``NO_CALL`` — the call is unknown or already ended; **no REFER**.
+
+        Raises (never a silent no-op — rule 37):
+
+        * ``RuntimeError`` — the call has no bound confirmation channel (it negotiated
+          no telephone-event, so a spoof-resistant keypad confirmation is impossible);
+          the agent must not be able to transfer a caller with no human confirmation.
+        * :class:`~hermes_voip.call.CallError` — the gateway rejected the REFER
+          (propagated from ``CallSession.transfer_blind``).
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return TransferOutcome.NO_CALL
+        confirmation = self._dtmf_confirmations.get(call_id)
+        if confirmation is None:
+            # No spoof-resistant confirmation channel for this call (no telephone-event
+            # negotiated). Refuse LOUDLY — an IRREVERSIBLE transfer must never fire
+            # without the keypad confirmation, and a silent drop would be worse than a
+            # clear error (rule 37). The handler renders this as a tool error.
+            msg = (
+                "inbound DTMF confirmation is not available on this call "
+                "(no telephone-event negotiated); refusing to transfer without "
+                "spoof-resistant confirmation"
+            )
+            raise RuntimeError(msg)
+        _log.info(
+            "agent transfer_blind tool: awaiting DTMF confirmation to transfer call %s",
+            call_id,
+        )
+        confirmed = await confirmation.confirm()
+        if not confirmed:
+            _log.info(
+                "agent transfer_blind tool: caller did NOT confirm; call %s not "
+                "transferred",
+                call_id,
+            )
+            return TransferOutcome.UNCONFIRMED
+        # Re-validate after the await (TOCTOU): the confirmation was sought for THIS
+        # call; if it ended while the prompt/window was in flight, do not REFER a stale
+        # session. Re-read the map rather than trusting the earlier reference.
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return TransferOutcome.NO_CALL
+        referred_by = session.dialog.local_uri
+        _log.info(
+            "agent transfer_blind tool: confirmed — transferring call %s (REFER)",
+            call_id,
+        )
+        await session.transfer_blind(target, referred_by=referred_by)
+        return TransferOutcome.TRANSFERRED
 
     def list_registrations_text(self) -> str:
         """Return a human-readable registration snapshot (ADR-0011/0020; ELEVATED).

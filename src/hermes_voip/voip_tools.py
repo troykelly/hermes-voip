@@ -15,15 +15,18 @@ Tools exposed (each registered via ``ctx.register_tool`` and gated by the shared
   read-only, but discloses internal extension metadata an untrusted caller must
   not enumerate, so it is clamped to a privileged session.
 
-The IRREVERSIBLE transfer tools (``transfer_blind`` / ``transfer_attended``) are
-**deliberately NOT exposed here**. The REFER itself is implemented
-(:meth:`hermes_voip.call.CallSession.transfer_blind`), but the
-``IRREVERSIBLE`` gate requires a spoof-resistant ADR-0010 DTMF confirmation, and
-that confirmation channel is **not wired into the live adapter** (there is no
-armed-DTMF resolver feeding ``confirmed=True``). Exposing a transfer tool would
-therefore create an always-blocked no-op, which rule 6 forbids — so transfer is
-deferred-not-registered until the DTMF confirmation channel lands (and, for
-attended transfer, until an agent-driven consultation-leg origination exists).
+* ``transfer_blind`` — IRREVERSIBLE (ADR-0010/0011/0031): hand the current caller
+  to another extension / SIP URI via a blind REFER. Operator-only; the REFER fires
+  ONLY after the person on the call presses the armed ADR-0010 DTMF confirm digit
+  (the spoof-resistant safeguard — see ``transfer_blind_on_call``), so a missed
+  prompt injection cannot transfer the caller on a "yes" alone.
+
+The one transfer still **deliberately NOT exposed here** is ``transfer_attended``.
+Its REFER+Replaces is implemented, but an attended transfer needs a consultation
+:class:`~hermes_voip.dialog.Dialog` the agent cannot originate (no consult-leg
+origination path exists — ADR-0031 §4 / the ADR-0011 finding). Registering it would
+be a lying stub, which rule 6 forbids — so it is deferred-not-registered until that
+origination path lands.
 
 Design constraints:
 
@@ -52,6 +55,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.originate import OutboundCallNotAllowed
@@ -75,7 +79,10 @@ __all__ = [
     "RESUME_TOOL_SCHEMA",
     "SEND_DTMF_TOOL_NAME",
     "SEND_DTMF_TOOL_SCHEMA",
+    "TRANSFER_BLIND_TOOL_NAME",
+    "TRANSFER_BLIND_TOOL_SCHEMA",
     "VOIP_TOOLSET",
+    "TransferOutcome",
     "VoipToolHost",
     "active_voip_adapter",
     "hang_up_handler",
@@ -88,10 +95,33 @@ __all__ = [
     "resume_call_handler",
     "send_dtmf_handler",
     "set_active_adapter",
+    "transfer_blind_handler",
     "voip_pre_tool_call",
 ]
 
 _log = logging.getLogger(__name__)
+
+
+class TransferOutcome(Enum):
+    """The tri-state result of a DTMF-confirmed blind transfer (ADR-0010/0031).
+
+    The host method :meth:`VoipToolHost.transfer_blind_on_call` returns this so the
+    handler distinguishes a fired REFER from a *refused-by-the-caller* one from a
+    stale call — each maps to a distinct tool-result message:
+
+    * ``TRANSFERRED`` — the caller pressed the armed confirm digit; the REFER fired.
+    * ``UNCONFIRMED`` — a wrong digit or the confirmation timed out; **no REFER**.
+    * ``NO_CALL`` — the call was unknown or had already ended; **no REFER**.
+
+    A *failure* to even obtain a confirmation (no telephone-event negotiated) or a
+    REFER the gateway rejects is signalled by an exception, not a member — those are
+    loud errors, never a silent no-op (rule 37).
+    """
+
+    TRANSFERRED = "transferred"
+    UNCONFIRMED = "unconfirmed"
+    NO_CALL = "no_call"
+
 
 #: The Hermes ``chat_id`` (== SIP Call-ID) session-context variable name.
 _SESSION_CHAT_ID_ENV = "HERMES_SESSION_CHAT_ID"
@@ -295,6 +325,47 @@ OPEN_ENTRY_TOOL_SCHEMA: dict[str, object] = {
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
+#: ``transfer_blind`` — IRREVERSIBLE (ADR-0010/0011/0031): hand the CURRENT caller to
+#: another extension / SIP URI via a blind REFER (RFC 3515). Operator-only (privilege
+#: level 3, non-degraded). Its spoof-resistant safeguard is the ADR-0010 DTMF
+#: confirmation: the REFER fires ONLY after the person on the call presses the armed
+#: confirm digit (``transfer_blind_on_call`` awaits the per-call ArmedConfirmation),
+#: so a missed prompt injection cannot transfer the caller on a "yes" alone.
+#: ``transfer_attended`` is deliberately NOT exposed — it needs a consult-leg Dialog
+#: the agent cannot originate (deferred, ADR-0031 §4).
+TRANSFER_BLIND_TOOL_NAME = "transfer_blind"
+
+#: ``transfer_blind`` schema. ``target`` is the destination (an extension or SIP URI)
+#: the current caller is handed to. The call being transferred is the session's own
+#: call (resolved from the session context) — the model picks the destination, never
+#: which call to transfer. The transfer is confirmed by a keypad press on the call
+#: before it fires (see the description); an un-confirmed request transfers nobody.
+TRANSFER_BLIND_TOOL_SCHEMA: dict[str, object] = {
+    "name": TRANSFER_BLIND_TOOL_NAME,
+    "description": (
+        "Transfer the current caller to another extension or SIP address (a blind "
+        "transfer — you hand them off and leave the call). Provide the destination "
+        "as 'target'. Only available to the operator on a trusted, healthy call. "
+        "IMPORTANT: the transfer does NOT happen on your say-so alone — the person on "
+        "the call is asked to press a key on their phone to confirm, and the transfer "
+        "only goes through if they do. If they do not confirm, nobody is transferred."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": (
+                    "The transfer destination: an extension (e.g. '1001') or a SIP "
+                    "URI (e.g. 'sip:1001@pbx.example.test')."
+                ),
+            },
+        },
+        "required": ["target"],
+        "additionalProperties": False,
+    },
+}
+
 
 @runtime_checkable
 class VoipToolHost(Protocol):
@@ -363,6 +434,29 @@ class VoipToolHost(Protocol):
         Returns whether it acted (``False`` for an unknown/ended call). The
         actuation path (in-call DTMF or an external relay) is the adapter's concern;
         the tool only requests the entry on the current call.
+        """
+        ...
+
+    async def transfer_blind_on_call(
+        self, call_id: str, target: str
+    ) -> TransferOutcome:
+        """DTMF-confirmed blind transfer of ``call_id`` to ``target`` (ADR-0010/0031).
+
+        The spoof-resistant chokepoint: awaits the call's per-call
+        :class:`~hermes_voip.dtmf_confirm.ArmedConfirmation` (prompts the person on
+        the call to press the confirm digit) and sends the RFC 3515 REFER via
+        :meth:`hermes_voip.call.CallSession.transfer_blind` **only** when the caller
+        confirms. Returns a :class:`TransferOutcome`:
+
+        * ``TRANSFERRED`` — confirmed; the REFER fired.
+        * ``UNCONFIRMED`` — a wrong digit / timeout; no REFER.
+        * ``NO_CALL`` — the call was unknown or had already ended; no REFER.
+
+        Raises (never a silent no-op — rule 37):
+
+        * ``RuntimeError`` — the call has no bound confirmation channel (it negotiated
+          no telephone-event, so a spoof-resistant keypad confirmation is impossible).
+        * :class:`~hermes_voip.call.CallError` — the gateway rejected the REFER.
         """
         ...
 
@@ -687,6 +781,73 @@ async def open_entry_handler(
     return json.dumps({"result": "Entry opened."})
 
 
+async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch the model must be able to tell apart (no adapter / no call / no target / transfer-failed / transferred / not-confirmed / call-ended); collapsing them would hide which outcome occurred
+    args: Mapping[str, object] | None = None,
+    **_kwargs: object,
+) -> str:
+    """Tool handler: DTMF-confirmed blind transfer of the current call (IRREVERSIBLE).
+
+    Resolves the call from the Hermes session context (its ``chat_id`` is the SIP
+    Call-ID), reads the ``target`` destination from the tool args, and asks the live
+    adapter to confirm-then-transfer via
+    :meth:`VoipToolHost.transfer_blind_on_call`. The REFER fires **only** when the
+    person on the call presses the armed confirm digit; a wrong digit or a timeout
+    transfers nobody.
+
+    Returns the JSON tool-result contract: ``{"result": …}`` once the transfer is
+    initiated (TRANSFERRED), or ``{"error": …}`` when no adapter/call is in scope,
+    ``target`` is missing, the caller did not confirm (UNCONFIRMED), the call ended
+    (NO_CALL), the call cannot obtain a spoof-resistant confirmation (no
+    telephone-event negotiated), or the gateway rejected the REFER. The call to
+    transfer is fixed to the session's own call — the model only chooses the target.
+
+    The ``pre_tool_call`` gate has already enforced the operator-level (3) +
+    non-degraded privilege clamp before this runs (a fail-fast: an unprivileged or
+    degraded caller is blocked before the confirm prompt is ever spoken). The DTMF
+    confirmation here is the irreversibility safeguard — the live, per-call analogue
+    of ``place_call``'s static allowlist.
+    """
+    adapter = _ACTIVE_ADAPTER
+    if adapter is None:
+        return json.dumps({"error": "no active VoIP adapter; cannot transfer the call"})
+    call_id = _current_call_id()
+    if call_id is None:
+        return json.dumps({"error": "no active call in this session to transfer"})
+    target = _str_arg(args, "target")
+    if not target:
+        return json.dumps(
+            {"error": "transfer_blind requires a 'target' to transfer to"}
+        )
+    try:
+        outcome = await adapter.transfer_blind_on_call(call_id, target)
+    except RuntimeError as exc:
+        # No confirmation channel (no telephone-event) OR the gateway rejected the
+        # REFER (CallError is a RuntimeError). Surface it clearly — nobody was
+        # transferred, and the failure is reported, never hidden (rule 37).
+        return json.dumps({"error": f"transfer failed: {exc}"})
+    if outcome is TransferOutcome.TRANSFERRED:
+        return json.dumps({"result": f"Transfer to {target} initiated."})
+    if outcome is TransferOutcome.UNCONFIRMED:
+        return json.dumps(
+            {"error": "the caller did not confirm the transfer; nobody was transferred"}
+        )
+    # NO_CALL — the call is unknown or already ended.
+    return json.dumps({"error": "the call is not active (unknown or ended)"})
+
+
+# The IRREVERSIBLE tools whose confirmation is enforced at a deeper chokepoint, not in
+# the sync ``pre_tool_call`` hook (which cannot speak a prompt / await DTMF). The gate
+# passes ``confirmed=True`` for these so ``gate_tool_call`` applies the level-3 +
+# non-degraded clamp as a fail-fast; the real per-action safeguard runs later:
+# ``place_call`` -> the static outbound allowlist (ADR-0029); ``transfer_blind`` -> the
+# live ADR-0010 DTMF ArmedConfirmation in ``transfer_blind_on_call`` (the REFER fires
+# ONLY on the armed confirm digit). This is a fixed property of the tool, NOT a model
+# input — see :func:`voip_pre_tool_call`.
+_CONFIRMED_AT_CHOKEPOINT: frozenset[str] = frozenset(
+    {PLACE_CALL_TOOL_NAME, TRANSFER_BLIND_TOOL_NAME}
+)
+
+
 def voip_pre_tool_call(
     tool_name: str = "",
     args: Mapping[str, object] | None = None,  # noqa: ARG001 — hook arity; args unused by the VoIP gate
@@ -703,25 +864,36 @@ def voip_pre_tool_call(
 
     The privilege clamp is the security spine: ``hang_up`` and ``report_call_result``
     are SAFE (never blocked); ``hold_call`` / ``resume_call`` / ``list_registrations``
-    are ELEVATED; ``place_call`` is IRREVERSIBLE. So a level-0 (untrusted/
-    receptionist) caller — or any ``degraded`` session — is BLOCKED from the
-    ELEVATED/IRREVERSIBLE tools here even if a prompt injection coaxes the model into
-    calling one, and ``place_call`` additionally requires the operator level (3). An
-    unknown call context falls back to a level-0 state, so it can never accidentally
-    grant a privileged tool (fail safe).
+    / ``send_dtmf`` are ELEVATED; ``place_call`` and ``transfer_blind`` are
+    IRREVERSIBLE. So a level-0 (untrusted/receptionist) caller — or any ``degraded``
+    session — is BLOCKED from the ELEVATED/IRREVERSIBLE tools here even if a prompt
+    injection coaxes the model into calling one, and ``place_call`` /
+    ``transfer_blind`` additionally require the operator level (3). An unknown call
+    context falls back to a level-0 state, so it can never accidentally grant a
+    privileged tool (fail safe).
 
-    **The ``confirmed`` argument (ADR-0029).** The ADR-0010 spoof-resistant DTMF
-    confirmation channel is not wired into the live adapter, so a model-set
-    confirmation must never be trusted. For every tool EXCEPT ``place_call`` this
-    gate passes ``confirmed=False`` (those tools are SAFE/ELEVATED and never consult
-    it). ``place_call`` is the one IRREVERSIBLE tool exposed, and its *irreversibility
-    safeguard is the static, operator-curated ``HERMES_VOIP_OUTBOUND_ALLOW``
-    allowlist* (enforced inside ``place_call_with_objective`` before any dial), which
-    is MORE spoof-resistant than an in-band DTMF tone a remote party shares the
-    channel with — see ADR-0029. So for ``place_call`` the gate's job is the privilege
-    clamp (operator level 3 + non-degraded), and it passes ``confirmed=True`` to let
-    ``gate_tool_call`` apply exactly that clamp; the allowlist stands in for
-    confirmation. This is NOT a model-set flag: it is a fixed property of the tool.
+    **The ``confirmed`` argument (ADR-0010/0029).** A model-set confirmation is never
+    trusted — ``confirmed`` here is a fixed per-tool property, not a model input. For
+    every SAFE/ELEVATED tool the gate passes ``confirmed=False`` (they never consult
+    it). The two IRREVERSIBLE tools, ``place_call`` and ``transfer_blind``, are gated
+    WITH ``confirmed=True`` so ``gate_tool_call`` applies exactly the *privilege* part
+    of the IRREVERSIBLE clamp (operator level 3 + non-degraded) here at the gate; the
+    actual irreversibility safeguard then runs deeper, NOT in this sync hook:
+
+    * ``place_call`` — its safeguard is the static, operator-curated
+      ``HERMES_VOIP_OUTBOUND_ALLOW`` allowlist, enforced inside
+      ``place_call_with_objective`` before any dial (ADR-0029).
+    * ``transfer_blind`` — its safeguard is the **live ADR-0010 DTMF confirmation**:
+      ``transfer_blind_on_call`` awaits the per-call ``ArmedConfirmation`` and fires
+      the REFER only when the person on the call presses the armed confirm digit. The
+      gate cannot run that here (it is async and speaks a prompt), so the gate's job
+      is the *fail-fast* privilege clamp — an unprivileged or degraded caller is
+      blocked BEFORE any confirm prompt is ever spoken — and the handler enforces the
+      confirmation before any caller is transferred.
+
+    Passing ``confirmed=True`` for these two is therefore exact, not a stub: it makes
+    the gate apply the privilege clamp, while the real per-action safeguard lives at
+    the dial / REFER chokepoint where it can be enforced for real.
     """
     if tool_name not in _voip_tool_names():
         return None  # not a VoIP tool — defer (this hook fires for ALL tools)
@@ -735,12 +907,14 @@ def voip_pre_tool_call(
         state = adapter.guard_state_for(call_id)
     if state is None:
         state = GuardSessionState(call_id=call_id or "", privilege_level=0)
-    # ``confirmed`` is a fixed per-tool property, never a model input. Only
-    # ``place_call`` (IRREVERSIBLE) is gated WITH confirmation satisfied — its hard
-    # gate is the allowlist (see docstring); the level-3 + non-degraded clamp is what
-    # ``gate_tool_call`` then enforces. Every other tool is SAFE/ELEVATED and ignores
-    # ``confirmed``, so passing False for them is exact, not a stub.
-    confirmed = tool_name == PLACE_CALL_TOOL_NAME
+    # ``confirmed`` is a fixed per-tool property, never a model input. The two
+    # IRREVERSIBLE tools (``place_call``, ``transfer_blind``) are gated WITH
+    # confirmation satisfied so ``gate_tool_call`` applies the level-3 + non-degraded
+    # clamp here (a fail-fast); their REAL irreversibility safeguard — the outbound
+    # allowlist / the live DTMF confirmation — runs at the dial / REFER chokepoint
+    # (see docstring). Every other tool is SAFE/ELEVATED and ignores ``confirmed``, so
+    # passing False for them is exact, not a stub.
+    confirmed = tool_name in _CONFIRMED_AT_CHOKEPOINT
     if not gate_voip_tool(tool_name, state, confirmed=confirmed):
         return {
             "action": "block",
@@ -754,8 +928,10 @@ def _voip_tool_names() -> frozenset[str]:
 
     Must list EVERY tool :func:`register_voip_tools` registers: a tool absent here
     would have the gate ``return None`` (defer) for it, bypassing the privilege
-    clamp. The IRREVERSIBLE transfer tools are intentionally absent because they
-    are not registered (deferred — no spoof-resistant DTMF confirmation wired).
+    clamp. ``transfer_blind`` IS registered (its spoof-resistant DTMF confirmation
+    channel landed) and so is owned here; ``transfer_attended`` is intentionally
+    absent because it is NOT registered (deferred — no agent-driven consult-leg
+    Dialog origination exists; ADR-0031 §4).
     """
     return frozenset(
         {
@@ -767,6 +943,7 @@ def _voip_tool_names() -> frozenset[str]:
             REPORT_RESULT_TOOL_NAME,
             SEND_DTMF_TOOL_NAME,
             OPEN_ENTRY_TOOL_NAME,
+            TRANSFER_BLIND_TOOL_NAME,
         }
     )
 
@@ -791,9 +968,11 @@ class _ToolSpec:
 
 
 # Every tool exposed to the agent (the gate's ``_voip_tool_names`` MUST cover the
-# same set). The IRREVERSIBLE transfer tools are intentionally absent — deferred,
-# not registered, until a spoof-resistant DTMF confirmation channel is wired
-# (registering an always-blocked transfer would be a no-op, rule 6).
+# same set). ``transfer_blind`` (IRREVERSIBLE) IS exposed — its spoof-resistant DTMF
+# confirmation channel landed, so the REFER fires only on a real keypad confirm.
+# ``transfer_attended`` is the one transfer still ABSENT — deferred, not registered,
+# because no agent-driven consult-leg Dialog origination exists (ADR-0031 §4); a
+# lying stub would violate rule 6.
 _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
     _ToolSpec(
         name=HANG_UP_TOOL_NAME,
@@ -858,6 +1037,14 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         description="Open the intercom entry for an expected visitor (gated).",
         emoji="\U0001f6aa",  # door
         requires_gate=True,  # ELEVATED — physical access; never register ungated
+    ),
+    _ToolSpec(
+        name=TRANSFER_BLIND_TOOL_NAME,
+        schema=TRANSFER_BLIND_TOOL_SCHEMA,
+        handler=transfer_blind_handler,
+        description="Transfer the current caller to another number (operator only).",
+        emoji="\U0001f504",  # counterclockwise arrows (transfer)
+        requires_gate=True,  # IRREVERSIBLE — never register without the privilege gate
     ),
 )
 

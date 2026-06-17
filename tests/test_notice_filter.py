@@ -172,6 +172,11 @@ def test_interruption_acks_are_internal_notices(ack: str) -> None:
         "Let me steer the conversation back to the booking.",
         "The current task is to confirm your appointment for Tuesday.",
         "I have to interrupt the music to tell you the meeting moved.",
+        # An opening phrase WITHOUT the gateway's paired tail is not the ack: the
+        # matcher requires both halves, so a reply that merely echoes one opening
+        # (e.g. a board-game agent) is still spoken (codex review hardening).
+        "You're queued for the next turn after Dana finishes her move.",
+        "I steered into current run mode by mistake — let me redo that.",
         "",
         "   ",
     ],

@@ -1296,23 +1296,24 @@ class RtpMediaTransport:
         This method:
 
         * bumps the flush generation so a :meth:`send_audio` drain loop parked on its
-          pacing sleep stops emitting the remainder of the superseded utterance;
-        * sends any frame the deadline pacer parked mid-flight FIRST (it is the front
-          of the stream and already encoded — dropping it would desync a G.722
-          decoder, since the encoder already advanced past it);
-        * emits a short LINEAR FADE-OUT on the FRONT of the remaining carry buffer
-          (the audio that would have played next), re-framed into whole ``ptime`` RTP
-          packets and sent immediately (no pacing — the cut is now), so the last thing
-          on the wire ramps from the current amplitude to silence and does not
-          click/pop; then
+          pacing sleep stops emitting the remainder of the superseded utterance, and
+          DROPS any frame the deadline pacer parked mid-flight (it is one ptime of
+          full-amplitude pre-cut audio — emitting it would extend the agent's speech
+          past the barge-in; only its already-encoded bytes survive, so it cannot be
+          folded into the fade);
+        * emits a short LINEAR FADE-OUT on the FRONT of the carry buffer (the audio
+          that would have played next), re-framed into whole ``ptime`` RTP packets and
+          sent immediately (no pacing — the cut is now), so the last thing on the wire
+          ramps to silence and does not click/pop; then
         * DROPS the rest of the pending buffer.
 
-        The fade is computed in the linear PCM16 domain BEFORE the codec encode, so
-        G.711 and G.722 are both correct (G.722's stateful encoder simply continues
-        from the faded samples). ``fade_ms`` of 0 emits no fade — only any in-flight
-        frame (one ptime of already-committed audio), then silence: an effectively
-        instant hard cut. While held / before connect, nothing is emitted (even the
-        in-flight frame is dropped — hold/closed-socket stop outbound media).
+        Total audio emitted after a barge-in is therefore at most the fade window
+        (``ceil(fade_ms / ptime)`` packets ≈ 1-2 at the 30 ms default) — within the
+        operator's ~20-40 ms budget, NOT the whole queued utterance. The fade is
+        computed in the linear PCM16 domain BEFORE the codec encode, so G.711 and
+        G.722 are both correct. ``fade_ms`` of 0 emits nothing — an instant hard cut.
+        While held / before connect, nothing is emitted (hold/closed-socket stop
+        outbound media).
 
         Args:
             fade_ms: Length of the linear fade-out in milliseconds (``>= 0``). The
@@ -1329,40 +1330,36 @@ class RtpMediaTransport:
         self._flush_generation += 1
         pending = self._tx_buffer
         self._tx_buffer = b""
-        # Take ownership of any frame the deadline pacer parked mid-flight (a frame
-        # already encoded — encoder state advanced, seq/ts committed — but not yet
-        # on the wire because a pacing sleep was in progress when this flush won).
-        inflight, self._inflight_wire = self._inflight_wire, None
+        # DROP any frame the deadline pacer parked mid-flight. It is one ptime of
+        # full-amplitude (pre-cut) audio; emitting it would add a full-volume packet
+        # AFTER the barge-in, beyond the fade budget — exactly the "still talking
+        # after I interrupted" the fade exists to avoid. We only hold its already-
+        # ENCODED bytes (its PCM was discarded after encode), so it cannot be folded
+        # into the fade; dropping it is the right call. The seq/ts it consumed are
+        # left spent, so the fade frames below use the NEXT seq/ts — the receiver
+        # sees a single 1-packet sequence gap, which RTP treats as one lost packet
+        # (benign, concealed). For G.722 the encoder advanced past this frame while
+        # the decoder will not see it: the decoder's adaptive sub-band predictor
+        # re-converges within a few frames, and since the fade is ramping to SILENCE
+        # the brief transient is inaudible (it is not a permanent desync).
+        self._inflight_wire = None
 
         transport = self._transport
-        if transport is None or self.on_hold:
-            # Held / not connected: hold stops outbound media and a closed socket
-            # cannot send. Drop everything (the buffer + the in-flight frame) — no
-            # audio goes out. (stop()'s own flush is also gated on on_hold.)
-            return
-
-        # Send the parked in-flight frame FIRST, as-is. It is the FRONT of the stream
-        # and is already encoded, so (a) re-deriving it from PCM would double-advance
-        # the stateful G.722 encoder, and (b) DROPPING it would desync a G.722 decoder
-        # (the encoder advanced past it, the decoder never saw it) — so for codec
-        # continuity it must go out. It is one ptime of already-committed audio; the
-        # fade below continues seamlessly from it (the fade is the next PCM in order),
-        # so there is no amplitude step / click between them.
-        if inflight is not None:
-            transport.sendto(inflight, self._outbound_addr)
-
-        if fade_ms == 0 or not pending:
-            # Fade disabled, or nothing buffered after the in-flight frame: the
-            # in-flight frame (if any) is the whole tail — go silent now.
+        if transport is None or self.on_hold or fade_ms == 0 or not pending:
+            # Held / not connected / fade disabled / nothing buffered: the drop above
+            # is the whole effect — instant silence, no audio emitted. (stop()'s own
+            # flush is likewise gated on on_hold.)
             return
 
         wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000
         bytes_per_sample = 2
         fade_samples = (self._wire_sample_rate * fade_ms) // 1000
         # Fade the FRONT of the buffer (the immediate continuation of what is
-        # playing) so the ramp is continuous from the current amplitude to silence;
-        # the rest of the buffer is discarded. Re-frame the faded audio into whole
-        # ptime packets (zero-pad the final partial up to one frame, once).
+        # playing) so the ramp falls from ~current amplitude to silence; the rest of
+        # the buffer is discarded. Cap is the fade window, so the total audio emitted
+        # after a barge-in is at most ``ceil(fade_ms / ptime)`` packets — within the
+        # operator's ~20-40 ms fade budget, NOT the whole queued utterance. Re-frame
+        # the faded audio into whole ptime packets (zero-pad the final partial once).
         fade_bytes = (
             min(fade_samples, len(pending) // bytes_per_sample) * bytes_per_sample
         )

@@ -69,21 +69,24 @@ _NO_HOME_CHANNEL_RE = re.compile(
 # user message arrives while the agent is still running, the runtime delivers one
 # of these via ``adapter.send()`` — so on a live call it is SPOKEN to the caller,
 # the "Interrupting… I'll respond…" artifact the operator hears on barge-in. Each
-# member opens with a distinctive runtime *announcement* of the busy mode that
-# natural conversational speech does not reproduce verbatim; we key on those
-# openings (an optional " (…elapsed/iteration/running…)" status detail may follow
-# the opening before the sentence ends, so the anchors do not span ``.``):
-#   * interrupt: "⚡ Interrupting current task… I'll respond to your message shortly."
-#   * queued:    "⏳ Queued for the next turn… I'll respond once the current task…"
-#   * steered:   "⏩ Steered into current run… Your message arrives after the next…"
-#   * subagent:  "⏳ Subagent working… your message is queued for when it finishes…"
-# The emoji glyphs are TTS-dependent (some voices skip them) so they are NOT part
-# of the match — only the wording is.
+# member opens with a distinctive runtime *announcement* of the busy mode and ends
+# with a distinctive tail; the regex pairs the two (per mode) so a genuine reply
+# that merely echoes one half is not silenced. The four (opening -> tail) pairs:
+#   interrupt -> opens "Interrupting current task", tail "I'll respond"
+#   queued    -> opens "Queued for the next turn",  tail "I'll respond"
+#   steered   -> opens "Steered into current run",  tail "Your message arrives"
+#   subagent  -> opens "Subagent working",          tail "your message is queued"
+# The optional " (N min elapsed, iteration X/Y, running: <tool>)." status detail —
+# which ends the opening sentence with a period — can sit between the two halves, so
+# the gap (``_ACK_GAP``) allows up to ~one short clause (90 chars incl. that period)
+# but not arbitrary prose. Emoji glyphs are TTS-dependent and NOT matched; only the
+# wording is. (Natural conversational speech does not reproduce a full pair verbatim.)
+_ACK_GAP = r"[^\n]{0,90}?"
 _INTERRUPTION_ACK_RE = re.compile(
-    r"\binterrupting\s+current\s+task\b"
-    r"|\bqueued\s+for\s+the\s+next\s+turn\b"
-    r"|\bsteered\s+into\s+current\s+run\b"
-    r"|\bsubagent\s+working\b[^.\n]*?\byour\s+message\s+is\s+queued\b",
+    rf"\binterrupting\s+current\s+task\b{_ACK_GAP}\bi['\u2019]?ll\s+respond\b"
+    rf"|\bqueued\s+for\s+the\s+next\s+turn\b{_ACK_GAP}\bi['\u2019]?ll\s+respond\b"
+    rf"|\bsteered\s+into\s+current\s+run\b{_ACK_GAP}\byour\s+message\s+arrives\b"
+    rf"|\bsubagent\s+working\b{_ACK_GAP}\byour\s+message\s+is\s+queued\b",
     re.IGNORECASE,
 )
 

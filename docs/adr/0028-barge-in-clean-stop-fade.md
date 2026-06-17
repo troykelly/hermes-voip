@@ -59,7 +59,13 @@ those inline (no pacing — the cut is now). The fade is computed in the **linea
 before the codec encode**, so G.711 and G.722 are both correct (G.722's stateful encoder simply
 continues from the faded samples). Default **30 ms**; `0` is an instant hard cut for an operator
 who prefers the abrupt stop. The fade brings the last sample to exactly 0 so there is no residual
-step to click.
+step to click. **Total audio emitted after a barge-in is bounded by the fade window**
+(`ceil(fade_ms / ptime)` packets ≈ 1–2 at 30 ms) — the parked in-flight frame is *dropped*, not
+sent, so the agent never adds a full-amplitude packet past the cut. The dropped frame leaves a
+single spent RTP sequence number (a benign 1-packet gap the receiver conceals like any lost
+packet); for G.722 the decoder's adaptive sub-band predictor is briefly one frame behind but
+re-converges within a few frames — inaudible because the fade is already ramping to silence (this
+is a transient, **not** a permanent desync).
 
 **3. Never synthesise the interruption acknowledgment (`notice_filter.is_interruption_ack`).** The
 existing `send()`-boundary guard `is_internal_system_notice` — which already drops the home-channel
@@ -112,6 +118,12 @@ flush otherwise).
 - **Fade the *back* of the pending buffer.** Rejected: the audio currently playing is the front of
   the queue, so a continuous ramp-to-silence must start from the front; fading the back would leave
   a full-amplitude gap before the ramp.
+- **Send the parked in-flight frame first (for G.722 continuity), then fade.** Considered and
+  rejected (cross-vendor review): it adds a full-amplitude packet *after* the barge-in, extending
+  the agent's speech past the cut — exactly what the operator asked to stop. The in-flight frame's
+  PCM is already gone (only its encoded bytes survive) so it cannot be faded; dropping it caps the
+  post-barge-in audio to the fade window, and the resulting 1-packet gap / brief G.722 predictor
+  transient is benign (concealed; masked by the ramp to silence).
 - **Mute via `set_hold(True)`.** `set_hold` drops the buffer but emits no fade and is a
   call-control state (hold), not a one-shot cut; a dedicated `flush_outbound` keeps the semantics
   clear and adds the fade.

@@ -20,6 +20,7 @@ on both paths.
 
 from __future__ import annotations
 
+import asyncio
 import struct
 
 import pytest
@@ -240,44 +241,103 @@ async def test_flush_outbound_advances_rtp_sequence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_flush_outbound_sends_inflight_frame_first_then_fade() -> None:
-    """A parked in-flight frame goes out FIRST (as-is), then the fade.
+async def test_flush_outbound_drops_parked_inflight_frame() -> None:
+    """A parked full-amplitude in-flight frame is DROPPED, not emitted.
 
-    The deadline pacer can park an already-encoded frame in ``_inflight_wire``
-    across its pacing sleep. Dropping it would desync a G.722 decoder (the encoder
-    advanced past it), so flush_outbound sends it first, then the fade. Here the
-    in-flight frame is a recognisable RTP packet whose payload type / SSRC mark it;
-    the test confirms it precedes the fade packet and the fade still reaches silence.
+    The deadline pacer can park an already-encoded frame in ``_inflight_wire``. It
+    is one ptime of full-amplitude pre-cut audio; emitting it would extend the
+    agent's speech past the barge-in (beyond the fade budget). flush_outbound drops
+    it: the only packets on the wire are the fade (which reaches silence), and the
+    parked frame's distinctive sequence number never appears.
     """
     engine, recorder = await _new_engine(Codec.PCMU)
-    # Park a real, already-encoded full-amplitude frame (one ptime of mu-law) the
-    # way the deadline pacer would, plus a buffer the fade will draw from.
     inflight_pcm = _const_g711_frame(1, 20_000).samples
-    pkt = RtpPacket(
+    parked = RtpPacket(
         payload_type=0,
-        sequence_number=999,
+        sequence_number=999,  # distinctive: must NOT appear on the wire
         timestamp=12345,
         ssrc=0xCAFEBABE,
         payload=encode_ulaw(inflight_pcm),
     )
-    engine._inflight_wire = pkt.pack()
+    engine._inflight_wire = parked.pack()
     engine._tx_buffer = _const_g711_frame(4, 16_000).samples
 
     await engine.flush_outbound(fade_ms=20)
 
-    assert len(recorder.packets) >= 2, "expected the in-flight frame plus a fade frame"
-    # First packet is the parked in-flight frame, verbatim (seq 999).
-    first = RtpPacket.parse(recorder.packets[0])
-    assert first.sequence_number == 999, "in-flight frame was not sent first"
-    inflight_samples = _ulaw_payload_samples(recorder.packets[0])
-    assert max(abs(s) for s in inflight_samples) > 15_000, (
-        "in-flight frame should be full amplitude (sent as-is, not faded)"
-    )
-    # The LAST packet is the fade tail and reaches silence.
+    seqs = [RtpPacket.parse(p).sequence_number for p in recorder.packets]
+    assert 999 not in seqs, "the parked in-flight full-amplitude frame must be dropped"
+    assert recorder.packets, "the fade itself should still be emitted"
     last = _ulaw_payload_samples(recorder.packets[-1])
     assert abs(last[-1]) <= 64, f"fade did not reach silence: last sample {last[-1]}"
-    # In-flight slot is cleared.
     assert engine._inflight_wire is None
+
+
+@pytest.mark.parametrize("codec", [Codec.PCMU, Codec.G722])
+@pytest.mark.asyncio
+async def test_flush_outbound_after_real_pacing_keeps_rtp_seq_monotonic(
+    codec: Codec,
+) -> None:
+    """A flush racing a REAL paced send keeps RTP seq strictly monotonic (no dup).
+
+    Drives the genuine path: send_audio paces real frames out through a deferred
+    sleep so a frame is parked in-flight (encoded, seq/ts committed) when the flush
+    runs; flush_outbound drops it and emits the fade. The union of every sequence
+    number that reaches the wire must be strictly increasing with no duplicate — the
+    spent seq of the dropped frame leaves at most a benign 1-packet gap, never a
+    collision between the in-flight frame and a fade frame (codex finding 4). Run for
+    BOTH PCMU and G.722 (whose RTP clock differs from its sample rate).
+    """
+    clock = _Clock()
+    # A sleep that lets the FIRST pacing wait park forever (until released), so a
+    # frame sits in _inflight_wire across the flush, then proceeds normally.
+    release = asyncio.Event()
+    first_wait_seen = asyncio.Event()
+    base_sleep = clock.sleep
+
+    async def _parking_sleep(secs: float) -> None:
+        if not first_wait_seen.is_set():
+            first_wait_seen.set()
+            await release.wait()
+            return
+        await base_sleep(secs)
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=codec,
+        sleep=_parking_sleep,
+        pace_clock=clock.now,
+        initial_seq=100,
+        initial_ts=0,
+    )
+    await engine.connect()
+    recorder = _CapturingTransport()
+    engine._transport = recorder  # type: ignore[assignment]  # recorder satisfies sendto/close/is_closing
+
+    rate = _G722_RATE if codec is Codec.G722 else _G711_RATE
+    spf = _G722_SAMPLES_PER_FRAME if codec is Codec.G722 else _G711_SAMPLES_PER_FRAME
+    big = PcmFrame(
+        samples=struct.pack(f"<{spf * 8}h", *([12_000] * (spf * 8))),
+        sample_rate=rate,
+        monotonic_ts_ns=0,
+    )
+    send_task = asyncio.create_task(engine.send_audio(big))
+    # Let send_audio reach (and park on) its first pacing sleep with a frame
+    # in-flight. The very first frame anchors the grid (wait 0) and sends, the
+    # SECOND parks — so wait until a frame is genuinely parked in _inflight_wire.
+    await first_wait_seen.wait()
+    await asyncio.sleep(0)
+    assert engine._inflight_wire is not None, "expected a frame parked in-flight"
+
+    await engine.flush_outbound(fade_ms=40)
+    release.set()
+    await send_task
+
+    seqs = [RtpPacket.parse(p).sequence_number for p in recorder.packets]
+    assert seqs == sorted(seqs), f"sequence numbers not monotonic: {seqs}"
+    assert len(seqs) == len(set(seqs)), f"duplicate RTP sequence number: {seqs}"
 
 
 @pytest.mark.asyncio
@@ -289,7 +349,7 @@ async def test_flush_outbound_while_held_emits_nothing() -> None:
     own on_hold gate.
     """
     engine, recorder = await _new_engine(Codec.PCMU)
-    engine._inflight_wire = b"\x00" * 50  # would be sent if hold were ignored
+    engine._inflight_wire = b"\x00" * 50
     engine._tx_buffer = _const_g711_frame(4, 16_000).samples
     engine.on_hold = True
 

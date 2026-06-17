@@ -390,6 +390,16 @@ enumerate trusted numbers), consistent with the forgeable-caller-ID posture (§1
 > privilege requires an explicit allow-list **match**. (`deny`/`outbound` defaults
 > were already rejected.) This is a least-privilege fail-**safe**: misconfiguration
 > degrades to *more* restriction (everyone receptionist), never to open privilege.
+>
+> A cross-vendor review of the fix found the loader-level checks were not the
+> single chokepoint (a direct `CallerGroupConfig(default_group=<a level-3 group>)`
+> bypassed them, since `classify_caller_group` trusts `default_group`). The
+> by-construction invariant therefore also lives on **`CallerGroupConfig.__post_init__`**
+> (raises `ConfigError` for a default group with `privilege_level != 0`): every
+> path that produces a config — the JSON loader, the legacy 3-file synthesis,
+> direct construction, and `adapter._caller_groups` — flows through that
+> constructor, so an unmatched caller can never be classified into a privileged
+> default regardless of how the config was built.
 
 **Phasing:**
 

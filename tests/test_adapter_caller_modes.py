@@ -32,8 +32,15 @@ pytest.importorskip("gateway.config")
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
-from hermes_voip.caller_modes import CallerMode, CallerModeConfig, Normalization
+from hermes_voip.caller_modes import (
+    CallerGroup,
+    CallerGroupConfig,
+    CallerMode,
+    CallerModeConfig,
+    Normalization,
+)
 from hermes_voip.config import ConfigError, ExtensionConfig
+from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 from hermes_voip.providers.build import Providers
@@ -381,6 +388,7 @@ async def test_inbound_grey_sets_privileged_false() -> None:
         privilege_level: int = 3,
         degraded: bool = False,
         privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
     ) -> GuardSessionState:
         # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
         # int, with the privileged bool kept as a back-compat kwarg) so the
@@ -393,6 +401,7 @@ async def test_inbound_grey_sets_privileged_false() -> None:
             privilege_level=privilege_level,
             degraded=degraded,
             privileged=privileged,
+            allowed_tools=allowed_tools,
         )
         captured[call_id] = state
         return state
@@ -447,6 +456,7 @@ async def test_inbound_allow_sets_privileged_true() -> None:
         privilege_level: int = 3,
         degraded: bool = False,
         privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
     ) -> GuardSessionState:
         # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
         # int, with the privileged bool kept as a back-compat kwarg). Delegating to
@@ -457,6 +467,7 @@ async def test_inbound_allow_sets_privileged_true() -> None:
             privilege_level=privilege_level,
             degraded=degraded,
             privileged=privileged,
+            allowed_tools=allowed_tools,
         )
         captured[call_id] = state
         return state
@@ -493,6 +504,97 @@ async def test_inbound_allow_sets_privileged_true() -> None:
 
     assert call_id in captured
     assert captured[call_id].privileged is True  # ALLOW => assistant, privileged
+
+
+@pytest.mark.asyncio
+async def test_inbound_intercom_group_threads_allowed_tools_into_guard_state() -> None:
+    """The matched group's allowed_tools reaches the LIVE GuardSessionState (ADR-0031).
+
+    This is the load-bearing wiring: without it the intercom sub-ceiling never reaches
+    the gate and a spoofed intercom caller would keep every level-2 tool. The test
+    drives an inbound INVITE whose caller maps to an intercom group (level 2,
+    allowed_tools={open_entry}) and asserts the captured guard state carries that set.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    # Replace the loaded groups with an intercom group matching caller "9999".
+    intercom = CallerGroup(
+        name="intercom",
+        privilege_level=2,
+        persona="intercom",
+        declined_at_sip=False,
+        allowed_tools=frozenset({"open_entry"}),
+    )
+    receptionist = CallerGroup(
+        name="receptionist",
+        privilege_level=0,
+        persona="receptionist",
+        declined_at_sip=False,
+    )
+    adapter._caller_groups = CallerGroupConfig(
+        groups=(intercom, receptionist),
+        group_lists={"intercom": ("9999",), "receptionist": ()},
+        default_group="receptionist",
+        match_order=("intercom", "receptionist"),
+        normalization=Normalization.NONE,
+    )
+
+    captured: dict[str, GuardSessionState] = {}
+
+    def _real_guard(
+        call_id: str,
+        *,
+        privilege_level: int = 3,
+        degraded: bool = False,
+        privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
+    ) -> GuardSessionState:
+        state = GuardSessionState(
+            call_id=call_id,
+            privilege_level=privilege_level,
+            degraded=degraded,
+            privileged=privileged,
+            allowed_tools=allowed_tools,
+        )
+        captured[call_id] = state
+        return state
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(caller="9999", call_id=call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+                inbound_sample_rate=8000,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(dialog_id=("c", "l", "r"), ended=False),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", side_effect=_real_guard),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        new_call = NewCall(registration=_ext_config(), invite=invite)
+        adapter._on_inbound_invite(new_call)
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    assert call_id in captured
+    # The intercom group's sub-ceiling reached the live guard state (level 2, scoped).
+    assert captured[call_id].privilege_level == 2
+    assert captured[call_id].allowed_tools == frozenset({"open_entry"})
 
 
 # --- persona preamble + untrusted-data delimiting in _deliver_turn -----------
@@ -944,3 +1046,119 @@ async def test_malicious_summary_does_not_inject_command_into_origin() -> None:
     assert "\n" not in text
     assert "\r" not in text
     assert text.count(_UNTRUSTED_CLOSE) == 1
+
+
+# ===========================================================================
+# Intercom entry actuation: send_dtmf_on_call + open_entry (ADR-0031)
+# ===========================================================================
+
+
+class _FakeCallSession:
+    """A minimal CallSession stand-in for the entry-actuation tests."""
+
+    def __init__(self, *, ended: bool = False) -> None:
+        self.ended = ended
+        self.dtmf: list[str] = []
+
+    async def send_dtmf(self, digits: str) -> None:
+        self.dtmf.append(digits)
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_on_call_drives_the_session() -> None:
+    """send_dtmf_on_call forwards the digits to the call's session."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    acted = await adapter.send_dtmf_on_call(call_id, "123")
+
+    assert acted is True
+    assert session.dtmf == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_on_call_unknown_call_returns_false() -> None:
+    """An unknown/ended call is a no-op returning False (no crash)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    assert await adapter.send_dtmf_on_call("nope", "1") is False
+
+
+@pytest.mark.asyncio
+async def test_open_entry_dtmf_mode_sends_the_open_code() -> None:
+    """open_entry in DTMF mode sends the configured open code on the call."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
+    )
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    opened = await adapter.open_entry(call_id)
+
+    assert opened is True
+    assert session.dtmf == ["9"]  # the door-open DTMF code was sent
+
+
+@pytest.mark.asyncio
+async def test_open_entry_relay_mode_calls_the_relay() -> None:
+    """open_entry in RELAY mode invokes the relay client (no DTMF on the call)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    opened_calls: list[str] = []
+
+    class _FakeRelay:
+        async def open(self) -> None:
+            opened_calls.append("open")
+
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.RELAY,
+        relay_url="https://relay.example.test/open",
+    )
+    adapter._intercom_relay = _FakeRelay()  # type: ignore[assignment]  # fake relay client
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    opened = await adapter.open_entry(call_id)
+
+    assert opened is True
+    assert opened_calls == ["open"]
+    assert session.dtmf == []  # relay mode does NOT send DTMF
+
+
+@pytest.mark.asyncio
+async def test_open_entry_disabled_mode_raises() -> None:
+    """open_entry with the default DISABLED mode fails LOUD (no silent no-op)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(open_mode=IntercomOpenMode.DISABLED)
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    with pytest.raises(RuntimeError, match="intercom"):
+        await adapter.open_entry(call_id)
+
+
+@pytest.mark.asyncio
+async def test_open_entry_unknown_call_returns_false() -> None:
+    """open_entry on an unknown/ended call is a no-op returning False."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
+    )
+    assert await adapter.open_entry("nope") is False

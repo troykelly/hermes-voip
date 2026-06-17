@@ -83,6 +83,12 @@ from hermes_voip.config import (
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.incall import LocalMediaSession
+from hermes_voip.intercom import (
+    IntercomConfig,
+    IntercomOpenMode,
+    IntercomRelayClient,
+    load_intercom_config,
+)
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.media.call_loop import BargeInMode, CallLoop
 from hermes_voip.media.endpoint import Endpointer
@@ -281,6 +287,12 @@ class VoipAdapter(BasePlatformAdapter):
         # legacy HERMES_VOIP_CALLER_{ALLOW,DENY,GREY}_FILE env vars are still
         # accepted (synthesised by load_caller_groups).
         self._caller_groups: CallerGroupConfig | None = None
+        # Intercom entry actuation (ADR-0031): how the intercom group opens a door.
+        # Parsed once from env in connect(); DISABLED until the operator configures a
+        # DTMF open code or a relay endpoint, so open_entry fails loud until then.
+        # The relay client (RELAY mode only) is built once in connect().
+        self._intercom_cfg: IntercomConfig | None = None
+        self._intercom_relay: IntercomRelayClient | None = None
         self._tls_ctx: ssl.SSLContext | None = None
         self._keepalive_interval: float = 30.0
         self._transport: SipOverTlsTransport | None = None
@@ -375,6 +387,16 @@ class VoipAdapter(BasePlatformAdapter):
         # Outbound dial allowlist (ADR-0029): EMPTY by default => the agent
         # ``place_call`` tool is inert until the operator opts numbers in.
         self._outbound_allow = load_outbound_allowlist(extra)
+        # Intercom entry actuation (ADR-0031): DISABLED by default => open_entry
+        # fails loud until the operator configures a DTMF open code or a relay
+        # endpoint. Build the relay client once when in RELAY mode.
+        intercom_cfg = load_intercom_config(extra)
+        self._intercom_cfg = intercom_cfg
+        self._intercom_relay = (
+            IntercomRelayClient(intercom_cfg)
+            if intercom_cfg.open_mode is IntercomOpenMode.RELAY
+            else None
+        )
         self._tls_ctx = _make_tls_context(gateway_cfg.host)
         self._keepalive_interval = float(
             extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
@@ -967,6 +989,13 @@ class VoipAdapter(BasePlatformAdapter):
                 # outbound packets and the comedia latch use the wire PT, not 9/0/8.
                 engine.payload_type = negotiated_voice.payload_type
 
+            # Adopt the negotiated telephone-event PT for in-call DTMF (ADR-0031), or
+            # None when the answer carried none (send_dtmf then raises). The outbound
+            # engine was built before the answer was known, so set it here.
+            engine.telephone_event_payload_type = _telephone_event_payload_type(
+                agreed_codecs
+            )
+
             _log.info(
                 "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
                 "our advertised RTP %s:%d, answer direction=%s",
@@ -1016,7 +1045,12 @@ class VoipAdapter(BasePlatformAdapter):
                 declined_at_sip=False,
             )
             guard_state = GuardSessionState(
-                call_id, privilege_level=_outbound_group.privilege_level
+                call_id,
+                privilege_level=_outbound_group.privilege_level,
+                # ADR-0031: thread the group's tool sub-ceiling (empty for the
+                # outbound group — level-only — but kept for consistency with the
+                # inbound path so the wiring is uniform and future-proof).
+                allowed_tools=_outbound_group.allowed_tools,
             )
             credentials_for_session = DigestCredentials(
                 username=source_ext.username,
@@ -1317,6 +1351,12 @@ class VoipAdapter(BasePlatformAdapter):
             # offer's PT), not the codec's static value — G.722 may negotiate a
             # dynamic PT (e.g. 109) that differs from its static 9.
             payload_type=codec.payload_type,
+            # The negotiated RFC 4733 telephone-event PT for in-call DTMF (ADR-0031),
+            # or None when the offer carried no telephone-event (send_dtmf then
+            # raises rather than guessing a PT).
+            telephone_event_payload_type=_telephone_event_payload_type(
+                agreed_sdp_codecs
+            ),
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
@@ -1395,7 +1435,16 @@ class VoipAdapter(BasePlatformAdapter):
         # ADR-0021: the caller group's privilege_level sets the tool-risk ceiling
         # (0=receptionist/SAFE-only, 2=trusted/+ELEVATED, 3=operator/+IRREVERSIBLE).
         # Levels 0 and 3 reproduce ADR-0020's privileged=False/True exactly.
-        guard_state = GuardSessionState(call_id, privilege_level=group.privilege_level)
+        # ADR-0031: the group's allowed_tools is the per-session SUB-ceiling (empty =
+        # no sub-ceiling = level-only; a non-empty set — e.g. the intercom group's
+        # {open_entry} — scopes the call to ONLY those tools). THREADING THIS IS
+        # LOAD-BEARING: without it the sub-ceiling never reaches the live gate and a
+        # spoofed intercom caller would keep every level-2 tool.
+        guard_state = GuardSessionState(
+            call_id,
+            privilege_level=group.privilege_level,
+            allowed_tools=group.allowed_tools,
+        )
         credentials = DigestCredentials(
             username=new_call.registration.username,
             password=new_call.registration.password,
@@ -1715,6 +1764,90 @@ class VoipAdapter(BasePlatformAdapter):
         )
         await session.unhold()
         return True
+
+    async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
+        """Send in-call DTMF on ``call_id`` (RFC 4733, ADR-0031); whether it acted.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``send_dtmf`` tool calls (and the building block of the intercom group's
+        ``open_entry`` DTMF actuation). Drives
+        :meth:`~hermes_voip.call.CallSession.send_dtmf`, which emits the named-event
+        RTP on the active call's stream under the media engine's TX mutex. Returns
+        ``False`` (and does nothing) for an unknown/ended call so the tool reports a
+        clear, non-fatal outcome. The ``pre_tool_call`` gate has already enforced the
+        ELEVATED privilege clamp (and any caller-group ``allowed_tools`` sub-ceiling)
+        before this runs.
+
+        Raises:
+            RuntimeError: if the call negotiated no telephone-event payload type
+                (DTMF is never silently dropped) — surfaced as a clear tool error.
+            ValueError: if ``digits`` contains a non-DTMF character.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return False
+        # Do NOT log the digits: a DTMF string may carry secrets (PINs, card
+        # numbers). Log only the call_id and the digit COUNT.
+        _log.info(
+            "agent send_dtmf tool: sending %d DTMF digit(s) on call %s",
+            len(digits),
+            call_id,
+        )
+        await session.send_dtmf(digits)
+        return True
+
+    async def open_entry(self, call_id: str) -> bool:
+        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the intercom
+        group's ``open_entry`` tool calls. Opens the entry via the configured
+        actuation path:
+
+        * **DTMF** — send the configured open code on the live call (via
+          :meth:`~hermes_voip.call.CallSession.send_dtmf`); or
+        * **RELAY** — call the external relay client.
+
+        Returns ``False`` (and does nothing) for an unknown/ended call so the tool
+        reports a clear, non-fatal outcome. The ``pre_tool_call`` gate has already
+        enforced the ELEVATED clamp and the intercom group's ``allowed_tools``
+        sub-ceiling before this runs.
+
+        Raises:
+            RuntimeError: when no actuation is configured (the default DISABLED
+                mode) — opening a door is never a silent no-op (rule 37); the tool
+                surfaces this as a clear error.
+            IntercomRelayError: when the relay call fails (RELAY mode) — the door
+                was NOT opened, and the failure is reported, never hidden.
+            ValueError: if the configured DTMF open code is invalid (DTMF mode).
+        """
+        cfg = self._intercom_cfg
+        if cfg is None or cfg.open_mode is IntercomOpenMode.DISABLED:
+            msg = (
+                "intercom entry actuation is not configured "
+                "(set HERMES_VOIP_INTERCOM_OPEN_MODE to 'dtmf' or 'relay'); "
+                "refusing to open the entry"
+            )
+            raise RuntimeError(msg)
+
+        if cfg.open_mode is IntercomOpenMode.RELAY:
+            relay = self._intercom_relay
+            if relay is None:  # built in connect() for RELAY mode
+                msg = "intercom relay client not initialised"
+                raise RuntimeError(msg)
+            _log.info("intercom open_entry (relay) for call %s", call_id)
+            # The relay opens the entry directly (it does not need the call). Still
+            # require a live call so a stale tool call cannot open the door.
+            session = self._call_sessions.get(call_id)
+            if session is None or session.ended:
+                return False
+            await relay.open()
+            return True
+
+        # DTMF mode: send the configured open code on the live call. send_dtmf_on_call
+        # already handles the unknown/ended-call (False) + not-negotiated (raise)
+        # cases and logs only the digit count (the open code is sensitive).
+        _log.info("intercom open_entry (dtmf) for call %s", call_id)
+        return await self.send_dtmf_on_call(call_id, cfg.dtmf_digits)
 
     def list_registrations_text(self) -> str:
         """Return a human-readable registration snapshot (ADR-0011/0020; ELEVATED).
@@ -2238,6 +2371,24 @@ def _first_voice_codec(
     for c in sdp_codecs:
         if c.encoding.lower() != "telephone-event":
             return c
+    return None
+
+
+def _telephone_event_payload_type(
+    sdp_codecs: tuple[SdpCodec, ...],
+) -> int | None:
+    """Return the NEGOTIATED telephone-event RTP payload type, or None (ADR-0031).
+
+    DTMF over RFC 4733 rides a named-event payload type the SDP negotiates (often a
+    dynamic value the gateway picks, e.g. 101 — but NOT guaranteed). The engine
+    needs the negotiated PT to transmit DTMF; ``None`` (no ``telephone-event`` in
+    the agreed set) means the call cannot send DTMF and ``send_dtmf`` raises rather
+    than guessing. The set has already been filtered to ``_SUPPORTED_ENCODINGS`` by
+    ``negotiate_audio`` (which keeps ``telephone-event`` when offered).
+    """
+    for c in sdp_codecs:
+        if c.encoding.lower() == "telephone-event":
+            return c.payload_type
     return None
 
 

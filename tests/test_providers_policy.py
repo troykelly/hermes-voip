@@ -117,3 +117,28 @@ def test_flagged_turns_accumulate_across_a_call() -> None:
     state.record(_flagged(GuardVerdict.ALLOW))  # not flagged
     state.record(_flagged(GuardVerdict.RESTRICT))  # flagged
     assert len(state.flagged_turns) == 2
+
+
+# --- ADR-0031: allowed_tools sub-ceiling on GuardSessionState -----------------
+#
+# A caller group may carry an explicit allow-list of tool names (the intercom
+# group is scoped to ONLY the entry action). The list is a SUB-ceiling: it can
+# only REMOVE tools, never grant a tool above the privilege level. It lives on
+# the per-session guard state as ``allowed_tools`` (an empty frozenset = no
+# allow-list = level-only behaviour, the existing default).
+
+
+def test_allowed_tools_defaults_to_empty_frozenset() -> None:
+    # Back-compat: a session constructed without allowed_tools has an empty
+    # frozenset, which the gate treats as "no sub-ceiling" (level-only).
+    state = GuardSessionState(call_id="c1")
+    assert state.allowed_tools == frozenset()
+
+
+def test_allowed_tools_is_stored_as_given() -> None:
+    state = GuardSessionState(
+        call_id="c1", privilege_level=2, allowed_tools=frozenset({"open_entry"})
+    )
+    assert state.allowed_tools == frozenset({"open_entry"})
+    # It does not perturb the other state.
+    assert state.privilege_level == 2

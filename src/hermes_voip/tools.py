@@ -65,6 +65,22 @@ TOOL_RISKS: dict[str, ToolRisk] = {
     # for the ADR-0010 DTMF confirmation the gate would otherwise require — see
     # ADR-0029 and ``voip_pre_tool_call``.
     "place_call": ToolRisk.IRREVERSIBLE,
+    # ``send_dtmf`` is ELEVATED (ADR-0031): the agent transmits in-call DTMF
+    # (RFC 4733 telephone-event) on the live call. Reversible (a digit is just a
+    # tone) but a mutating action a level-0 untrusted caller must not invoke — so it
+    # needs privilege, not confirmation. The privilege clamp blocks it for a
+    # receptionist/degraded session; a trusted (level >= 2) call gets it.
+    "send_dtmf": ToolRisk.ELEVATED,
+    # ``open_entry`` is ELEVATED (ADR-0031): it actuates the intercom entry
+    # (PHYSICAL access) — via DTMF on the live call or an external relay. ELEVATED,
+    # not IRREVERSIBLE: opening a door for an expected visitor is a reversible
+    # courtesy, not a payment/booking, and the intercom group runs at level 2 (it
+    # has no operator credentials). The least-privilege boundary for the intercom is
+    # the caller group's ``allowed_tools={open_entry}`` SUB-ceiling (ADR-0031 §1) —
+    # so even a spoofed caller-ID reaching the intercom group gets ONLY this action,
+    # never operator tools — combined with this ELEVATED clamp (a level-0 caller
+    # cannot open the door).
+    "open_entry": ToolRisk.ELEVATED,
     # ``hang_up`` is SAFE (ADR-0026): ending the call mutates no external state and
     # is something even a level-0 receptionist is told it may do ("end the call
     # politely"). SAFE always runs, so the agent can conclude ANY caller's
@@ -77,6 +93,17 @@ TOOL_RISKS: dict[str, ToolRisk] = {
 }
 
 
+# Tools that require an EXPLICIT per-group ``allowed_tools`` grant to be reachable —
+# stricter than the generic sub-ceiling (ADR-0031). ``open_entry`` actuates PHYSICAL
+# access (a door / gate); it is meaningful ONLY for the intercom caller group, which
+# grants it explicitly via ``allowed_tools={"open_entry"}``. Without this set, the
+# generic rule (empty ``allowed_tools`` ⇒ no sub-ceiling ⇒ level-only) would let ANY
+# privileged (level >= 2) call open the door. A grant-only tool is therefore blocked
+# unless it is explicitly listed in the session's ``allowed_tools`` — even for a
+# level-3 operator and even when the set is otherwise empty.
+_GRANT_ONLY_TOOLS: frozenset[str] = frozenset({"open_entry"})
+
+
 def gate_voip_tool(
     tool_name: str, state: GuardSessionState, *, confirmed: bool
 ) -> bool:
@@ -84,9 +111,37 @@ def gate_voip_tool(
 
     An unknown tool name is **denied** (fail closed, rule 37): the gate never
     silently allows an unrecognised action.
+
+    **ADR-0031 sub-ceiling.** When ``state.allowed_tools`` is non-empty it is a
+    per-session allow-list checked BEFORE the level/risk gate: any tool not in the
+    set is blocked here, so a caller group (e.g. the intercom group) can scope a
+    session to ONLY a named set of tools. The check can only REMOVE tools — a tool
+    in the allow-list still has to pass :func:`gate_tool_call` (its level/risk
+    clamp), so the allow-list never grants a tool above the session's privilege
+    level. An EMPTY allow-list (the default) means "no sub-ceiling" and reproduces
+    the level-only behaviour exactly. The risk lookup runs first so an UNKNOWN tool
+    is denied even if it appears in the allow-list (the gate cannot register a tool
+    it has no risk class for).
+
+    **ADR-0031 grant-only tools.** A tool in :data:`_GRANT_ONLY_TOOLS`
+    (``open_entry`` — physical access) is reachable ONLY when the session's
+    ``allowed_tools`` *explicitly* lists it. This is stricter than the generic
+    empty-set rule: it blocks ``open_entry`` for an ordinary level-3 operator (whose
+    ``allowed_tools`` is empty), so the door can be opened ONLY from the intercom
+    group that grants ``open_entry`` deliberately — never from any other privileged
+    call. It still cannot grant ABOVE the level (the level/risk clamp runs after).
     """
     risk = TOOL_RISKS.get(tool_name)
     if risk is None:
+        return False
+    if tool_name in _GRANT_ONLY_TOOLS and tool_name not in state.allowed_tools:
+        # Grant-only (physical-access) tool with no explicit grant: blocked even for
+        # an operator and even when allowed_tools is empty. Only a group that lists
+        # it (the intercom group) may reach it.
+        return False
+    if state.allowed_tools and tool_name not in state.allowed_tools:
+        # Scoped session: this tool is outside the group's allow-list. Remove it
+        # regardless of the level (the sub-ceiling never grants, only removes).
         return False
     return gate_tool_call(risk, state, confirmed=confirmed)
 

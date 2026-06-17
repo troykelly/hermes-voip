@@ -124,6 +124,15 @@ Concrete shape:
   through a registered tool (`ctx.register_tool`, ADR-0002/ADR-0004) so a model turn can
   request "press 1-2-3-4".
 
+  > **Implementation status (ADR-0031).** The **RFC 4733 send path is SHIPPED**:
+  > `RtpMediaTransport.send_dtmf(digits, …)` emits the named-event train on the active
+  > call at the *negotiated* telephone-event payload type (raises if it was not
+  > negotiated — never a hardcoded 101), under the engine TX mutex shared with
+  > `send_audio`; it is exposed as the gated `send_dtmf` agent tool (ELEVATED) and is the
+  > actuation primitive for the intercom `open_entry` DTMF mode. The **SIP INFO** and
+  > **in-band** send modes, and the **inbound receive + armed-confirmation resolver** (the
+  > next bullet), remain DEFERRED — see ADR-0031 §4 for the receive/transfer blocker.
+
 - **Surfacing inbound digits — no fake transcript.** Because Hermes has no DTMF
   `MessageType`, the call/turn controller (ADR-0003) consumes the `DtmfDigit` stream
   directly and routes by context rather than laundering digits into a speech turn:

@@ -45,9 +45,13 @@ class _FakeMedia:
     def __init__(self) -> None:
         self.holds: list[bool] = []
         self.stopped = False
+        self.dtmf: list[str] = []
 
     async def set_hold(self, on_hold: bool) -> None:
         self.holds.append(on_hold)
+
+    async def send_dtmf(self, digits: str) -> None:
+        self.dtmf.append(digits)
 
     async def stop(self) -> None:
         self.stopped = True
@@ -140,6 +144,18 @@ async def test_unhold_resumes_and_ungates_media() -> None:
     await task
     assert session.on_hold is False
     assert media.holds == [False]
+
+
+async def test_send_dtmf_delegates_to_media_without_reinvite() -> None:
+    """CallSession.send_dtmf forwards the digits to media; no re-INVITE (ADR-0031)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    await session.send_dtmf("12#")
+    assert media.dtmf == ["12#"]
+    # DTMF rides the established media path — no hold gating, no re-INVITE.
+    assert media.holds == []
+    with pytest.raises(AssertionError):  # no INVITE was ever sent
+        _last_request(signaling, "INVITE")
 
 
 async def test_hold_skips_provisional_then_completes() -> None:

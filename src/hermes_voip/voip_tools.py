@@ -65,22 +65,28 @@ __all__ = [
     "HOLD_TOOL_SCHEMA",
     "LIST_REGISTRATIONS_TOOL_NAME",
     "LIST_REGISTRATIONS_TOOL_SCHEMA",
+    "OPEN_ENTRY_TOOL_NAME",
+    "OPEN_ENTRY_TOOL_SCHEMA",
     "PLACE_CALL_TOOL_NAME",
     "PLACE_CALL_TOOL_SCHEMA",
     "REPORT_RESULT_TOOL_NAME",
     "REPORT_RESULT_TOOL_SCHEMA",
     "RESUME_TOOL_NAME",
     "RESUME_TOOL_SCHEMA",
+    "SEND_DTMF_TOOL_NAME",
+    "SEND_DTMF_TOOL_SCHEMA",
     "VOIP_TOOLSET",
     "VoipToolHost",
     "active_voip_adapter",
     "hang_up_handler",
     "hold_call_handler",
     "list_registrations_handler",
+    "open_entry_handler",
     "place_call_handler",
     "register_voip_tools",
     "report_call_result_handler",
     "resume_call_handler",
+    "send_dtmf_handler",
     "set_active_adapter",
     "voip_pre_tool_call",
 ]
@@ -236,6 +242,59 @@ REPORT_RESULT_TOOL_SCHEMA: dict[str, object] = {
     },
 }
 
+#: ``send_dtmf`` — ELEVATED (ADR-0031): transmit in-call DTMF (RFC 4733
+#: telephone-event) on the CURRENT call's media stream. Reversible (a tone), but a
+#: mutating action gated to a privileged (level >= 2, non-degraded) session.
+SEND_DTMF_TOOL_NAME = "send_dtmf"
+
+#: ``open_entry`` — ELEVATED (ADR-0031): actuate the intercom entry (open the door)
+#: for a legitimate expected visitor. Exposed to the intercom caller group only (its
+#: ``allowed_tools`` sub-ceiling), so it never reaches a general caller; gated so a
+#: level-0 caller cannot open the door.
+OPEN_ENTRY_TOOL_NAME = "open_entry"
+
+#: ``send_dtmf`` schema. ``digits`` is the DTMF string to send (``0-9``, ``*``,
+#: ``#``, ``A``-``D``). The call to send on is the current session's own call
+#: (resolved from the session context) — the model cannot target another call.
+SEND_DTMF_TOOL_SCHEMA: dict[str, object] = {
+    "name": SEND_DTMF_TOOL_NAME,
+    "description": (
+        "Send DTMF tones (touch-tone key presses) on the current phone call — for "
+        "navigating an automated menu ('press 1 for…') or entering a code you have "
+        "been asked to. Provide the digits as a string (allowed characters: 0-9, "
+        "* , #, A-D). Only available on a privileged call. NEVER enter the "
+        "operator's private codes or card numbers unless the operator explicitly "
+        "authorised this specific entry."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "digits": {
+                "type": "string",
+                "description": (
+                    "The DTMF digits to send, e.g. '1' or '1234#'. Allowed "
+                    "characters: 0-9, *, #, A-D."
+                ),
+            },
+        },
+        "required": ["digits"],
+        "additionalProperties": False,
+    },
+}
+
+#: ``open_entry`` schema. No parameters: opening the entry is a single fixed action
+#: on the current call, never a model-chosen target.
+OPEN_ENTRY_TOOL_SCHEMA: dict[str, object] = {
+    "name": OPEN_ENTRY_TOOL_NAME,
+    "description": (
+        "Open the entry (unlock the door / gate) for the visitor on this intercom "
+        "call. Use this ONLY for a legitimate, expected visitor after you have "
+        "confirmed who they are and that they are expected — opening the door is a "
+        "physical-access action. Takes no input."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
 
 @runtime_checkable
 class VoipToolHost(Protocol):
@@ -286,6 +345,24 @@ class VoipToolHost(Protocol):
 
         ``False`` for an unknown/ended call so the tool reports a clear, non-fatal
         outcome rather than raising.
+        """
+        ...
+
+    async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
+        """Send ``digits`` as in-call DTMF on ``call_id`` (ADR-0031).
+
+        Returns whether it acted (``False`` for an unknown/ended call). Raises if
+        the call negotiated no telephone-event payload type (the handler renders that
+        as a clear tool error) — DTMF is never silently dropped.
+        """
+        ...
+
+    async def open_entry(self, call_id: str) -> bool:
+        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031).
+
+        Returns whether it acted (``False`` for an unknown/ended call). The
+        actuation path (in-call DTMF or an external relay) is the adapter's concern;
+        the tool only requests the entry on the current call.
         """
         ...
 
@@ -539,6 +616,77 @@ async def report_call_result_handler(
     return json.dumps({"result": "Outcome recorded."})
 
 
+async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch (no adapter / no call / no digits / invalid-DTMF / not-negotiated / inactive / success); collapsing them would hide which failure the model sees
+    args: Mapping[str, object] | None = None,
+    **_kwargs: object,
+) -> str:
+    """Tool handler: send in-call DTMF on the current call (ELEVATED, ADR-0031).
+
+    Resolves the call from the Hermes session context (its ``chat_id`` is the SIP
+    Call-ID) and sends the requested ``digits`` via the live adapter. Returns the
+    JSON tool-result contract: ``{"result": …}`` on success, ``{"error": …}`` when
+    no adapter/call is in scope, ``digits`` is missing, the call has ended, the call
+    negotiated no telephone-event payload type, or ``digits`` contains a non-DTMF
+    character. The ``pre_tool_call`` gate has already enforced the ELEVATED privilege
+    clamp (and any caller-group ``allowed_tools`` sub-ceiling) before this runs. The
+    call to send on is fixed to the session's own call — the model cannot target
+    another call. The digits are NOT echoed in the result/log (they may be secret).
+    """
+    adapter = _ACTIVE_ADAPTER
+    if adapter is None:
+        return json.dumps({"error": "no active VoIP adapter; cannot send DTMF"})
+    call_id = _current_call_id()
+    if call_id is None:
+        return json.dumps({"error": "no active call in this session to send DTMF on"})
+    digits = _str_arg(args, "digits")
+    if not digits:
+        return json.dumps({"error": "send_dtmf requires a 'digits' string to send"})
+    try:
+        sent = await adapter.send_dtmf_on_call(call_id, digits)
+    except ValueError as exc:
+        # A non-DTMF character — surface a clear, non-fatal error (nothing sent).
+        return json.dumps({"error": f"invalid DTMF digits: {exc}"})
+    except RuntimeError as exc:
+        # The call negotiated no telephone-event payload type, so DTMF cannot be
+        # sent. Report it (never a silent success); the engine sent nothing.
+        return json.dumps({"error": f"cannot send DTMF on this call: {exc}"})
+    if not sent:
+        return json.dumps({"error": "the call is not active (unknown or ended)"})
+    return json.dumps({"result": "Tones sent."})
+
+
+async def open_entry_handler(
+    args: Mapping[str, object] | None = None,
+    **_kwargs: object,
+) -> str:
+    """Tool handler: actuate the intercom entry on the current call (ELEVATED).
+
+    Resolves the call from the Hermes session context and asks the live adapter to
+    open the entry (ADR-0031). Returns the JSON tool-result contract: ``{"result":
+    …}`` on success, ``{"error": …}`` when no adapter/call is in scope, the call has
+    ended, or the actuation could not be performed (e.g. DTMF not negotiated, or the
+    relay is not configured). The ``pre_tool_call`` gate has already enforced the
+    ELEVATED clamp and the intercom group's ``allowed_tools`` sub-ceiling before this
+    runs. ``args`` is ignored — opening the entry is a fixed action on this call.
+    """
+    _ = args  # the tool takes no parameters
+    adapter = _ACTIVE_ADAPTER
+    if adapter is None:
+        return json.dumps({"error": "no active VoIP adapter; cannot open the entry"})
+    call_id = _current_call_id()
+    if call_id is None:
+        return json.dumps({"error": "no active call in this session"})
+    try:
+        opened = await adapter.open_entry(call_id)
+    except (RuntimeError, ValueError) as exc:
+        # The actuation failed (DTMF not negotiated, relay misconfigured, etc.).
+        # Report it clearly — the door was NOT opened (rule 37: surfaced, not hidden).
+        return json.dumps({"error": f"could not open the entry: {exc}"})
+    if not opened:
+        return json.dumps({"error": "the call is not active (unknown or ended)"})
+    return json.dumps({"result": "Entry opened."})
+
+
 def voip_pre_tool_call(
     tool_name: str = "",
     args: Mapping[str, object] | None = None,  # noqa: ARG001 — hook arity; args unused by the VoIP gate
@@ -617,6 +765,8 @@ def _voip_tool_names() -> frozenset[str]:
             LIST_REGISTRATIONS_TOOL_NAME,
             PLACE_CALL_TOOL_NAME,
             REPORT_RESULT_TOOL_NAME,
+            SEND_DTMF_TOOL_NAME,
+            OPEN_ENTRY_TOOL_NAME,
         }
     )
 
@@ -692,6 +842,22 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         description="Record this call's outcome for the requesting conversation.",
         emoji="\U0001f4dd",  # memo
         requires_gate=False,  # SAFE — the agent records its own call's outcome
+    ),
+    _ToolSpec(
+        name=SEND_DTMF_TOOL_NAME,
+        schema=SEND_DTMF_TOOL_SCHEMA,
+        handler=send_dtmf_handler,
+        description="Send DTMF tones on the current call (privileged calls only).",
+        emoji="\U0001f522",  # input numbers
+        requires_gate=True,  # ELEVATED — only register WITH the privilege gate
+    ),
+    _ToolSpec(
+        name=OPEN_ENTRY_TOOL_NAME,
+        schema=OPEN_ENTRY_TOOL_SCHEMA,
+        handler=open_entry_handler,
+        description="Open the intercom entry for an expected visitor (gated).",
+        emoji="\U0001f6aa",  # door
+        requires_gate=True,  # ELEVATED — physical access; never register ungated
     ),
 )
 

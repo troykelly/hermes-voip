@@ -58,6 +58,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, Protocol
 
+from hermes_voip.dtmf import event_payloads
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
     Resampler,
@@ -95,6 +96,13 @@ _log = logging.getLogger(__name__)
 
 # Default ptime in milliseconds (one packet per 20 ms = 50 pps).
 _DEFAULT_PTIME_MS = 20
+
+# RFC 4733 DTMF defaults (ADR-0010/0031). A 100 ms tone with a 70 ms inter-digit
+# gap is comfortably within the ITU-T Q.24 minimums (>= 40 ms tone, >= 40 ms gap)
+# and is what most gateways/IVRs expect; the named-event volume is -10 dBm0.
+_DEFAULT_DTMF_TONE_MS = 100
+_DEFAULT_DTMF_GAP_MS = 70
+_DEFAULT_DTMF_VOLUME = 10
 
 # RFC 3550 §5.1: the initial RTP sequence number and timestamp SHOULD be random
 # to make known-plaintext attacks on SRTP harder and to avoid collision with
@@ -379,6 +387,7 @@ class RtpMediaTransport:
         remote_port: int,
         codec: Codec,
         payload_type: int | None = None,
+        telephone_event_payload_type: int | None = None,
         ptime: int = _DEFAULT_PTIME_MS,
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
@@ -405,6 +414,14 @@ class RtpMediaTransport:
                 media and break the comedia latch (no audio). Set
                 :attr:`payload_type` later (e.g. the outbound path after the 2xx
                 answer) to update it.
+            telephone_event_payload_type: The NEGOTIATED RFC 4733 telephone-event
+                RTP payload type for in-call DTMF (ADR-0010/0031), or ``None`` when
+                the offer carried no ``telephone-event`` (so the call cannot send
+                DTMF). :meth:`send_dtmf` uses this PT for every named-event packet
+                and RAISES when it is ``None`` — it never falls back to a hardcoded
+                101 (the gateway may have negotiated a different dynamic PT) nor
+                silently no-ops. Set :attr:`telephone_event_payload_type` later
+                (the outbound path, after the 2xx answer echoes the PT).
             pace_clock: Monotonic time source in SECONDS used only to pace the
                 outbound RTP stream (the deadline pacer in :meth:`_transmit_frame`
                 sleeps the time remaining to each frame's deadline so per-frame
@@ -441,6 +458,11 @@ class RtpMediaTransport:
         # dynamic-PT codec like G.722 (RFC 3551 reserves static 9, but gateways use
         # dynamic PTs and the answer echoes the offer's PT).
         self._payload_type: int = codec.value if payload_type is None else payload_type
+        # The negotiated RFC 4733 telephone-event RTP payload type for DTMF
+        # (ADR-0010/0031), or None when the offer had no telephone-event. send_dtmf
+        # raises if None (never a hardcoded 101, never a silent no-op). Settable
+        # after construction (the outbound path adopts the answer's PT).
+        self._telephone_event_payload_type: int | None = telephone_event_payload_type
         self._ptime = ptime
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
@@ -610,6 +632,18 @@ class RtpMediaTransport:
         # returned first by the next _next_datagram() call.
         self._pending: _Datagram | None = None
 
+        # Outbound TX serialization (ADR-0031): send_audio (one re-framed TTS
+        # chunk) and send_dtmf (one DTMF burst) are the two TX coroutines that
+        # ``await`` BETWEEN per-packet sends (their pacing sleeps), so they could
+        # otherwise interleave packets and race the shared _seq/_ts/_outbound_addr.
+        # Each holds this lock for the duration of its send, so the wire shows a
+        # clean, strictly-monotonic sequence with each digit's DTMF packets
+        # contiguous. The synchronous flushes (stop()/_flush_tx_tail,
+        # flush_outbound) emit without awaiting between packets, so they run atomic
+        # relative to these two and need no lock. Re-created in connect() so a reused
+        # engine starts with a fresh, unheld lock.
+        self._tx_lock: asyncio.Lock = asyncio.Lock()
+
     # ------------------------------------------------------------------
     # MediaTransport Protocol
     # ------------------------------------------------------------------
@@ -632,6 +666,8 @@ class RtpMediaTransport:
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
         self._stop_event = asyncio.Event()
         self._pending = None
+        # Fresh TX lock so a reused engine never inherits a held lock (ADR-0031).
+        self._tx_lock = asyncio.Lock()
         # A reused engine starts a fresh call: it has not timed out yet.
         self._media_timed_out = False
         # Drop any carried outbound-resample state so a reused engine starts a
@@ -1017,43 +1053,49 @@ class RtpMediaTransport:
         # in-flight encoded datagram (front) and the raw remainder in _tx_buffer — and
         # stop()'s flush delivers them in that order. No frame is dropped, none
         # re-sent, none reordered.
-        self._tx_buffer += wire_rate_frame.samples
-        # Snapshot the flush generation for this drain: if a barge-in flush bumps it
-        # mid-drain (ADR-0028), _transmit_frame suppresses the in-flight frame and
-        # this loop stops, so the rest of the now-superseded utterance never goes out.
-        drain_generation = self._flush_generation
-        while len(self._tx_buffer) >= chunk_bytes:
-            # Remove the frame from the buffer as we hand it to _transmit_frame, which
-            # takes ownership: on a clean send the frame is on the wire; on a stop
-            # racing its pacing sleep the (already-encoded) frame lives in
-            # _inflight_wire for the flush. Either way it must NOT remain in
-            # _tx_buffer (that would re-encode/duplicate it).
-            chunk, self._tx_buffer = (
-                self._tx_buffer[:chunk_bytes],
-                self._tx_buffer[chunk_bytes:],
-            )
-            sent = await self._transmit_frame(
-                chunk,
-                wire_rate_frame.monotonic_ts_ns,
-                ts_increment,
-                flush_generation=drain_generation,
-            )
-            if not sent:
-                # Either stop() nulled the transport during the pacing sleep (the
-                # encoded frame is parked in _inflight_wire for stop()'s flush), or a
-                # barge-in flush superseded this utterance (flush_outbound already
-                # cleared _tx_buffer and sent the fade). Either way: stop draining —
-                # the flush owns delivery from here. Nothing to put back.
-                return
-            # Read _transport through a fresh local so mypy does not treat this as
-            # unreachable: the pre-loop guard narrowed self._transport to non-None
-            # and that narrowing does not survive the await inside _transmit_frame
-            # at runtime (stop() may have nulled it during the pacing sleep).
-            transport_after_send: asyncio.DatagramTransport | None = self._transport
-            if transport_after_send is None:
-                # The frame WAS sent and is already removed from the buffer; the
-                # remaining buffer is owned by stop()'s flush. Stop draining.
-                return
+        # Hold the TX lock across the whole drain (ADR-0031) so a concurrent
+        # send_dtmf cannot interleave its packets into this utterance nor race the
+        # shared _seq/_ts/_tx_buffer. The lock releases on every exit path
+        # (including the early returns below) because it is an ``async with``.
+        async with self._tx_lock:
+            self._tx_buffer += wire_rate_frame.samples
+            # Snapshot the flush generation for this drain: if a barge-in flush bumps
+            # it mid-drain (ADR-0028), _transmit_frame suppresses the in-flight frame
+            # and this loop stops, so the rest of the superseded utterance never goes
+            # out.
+            drain_generation = self._flush_generation
+            while len(self._tx_buffer) >= chunk_bytes:
+                # Remove the frame from the buffer as we hand it to _transmit_frame,
+                # which takes ownership: on a clean send the frame is on the wire; on a
+                # stop racing its pacing sleep the (already-encoded) frame lives in
+                # _inflight_wire for the flush. Either way it must NOT remain in
+                # _tx_buffer (that would re-encode/duplicate it).
+                chunk, self._tx_buffer = (
+                    self._tx_buffer[:chunk_bytes],
+                    self._tx_buffer[chunk_bytes:],
+                )
+                sent = await self._transmit_frame(
+                    chunk,
+                    wire_rate_frame.monotonic_ts_ns,
+                    ts_increment,
+                    flush_generation=drain_generation,
+                )
+                if not sent:
+                    # Either stop() nulled the transport during the pacing sleep (the
+                    # encoded frame is parked in _inflight_wire for stop()'s flush), or
+                    # a barge-in flush superseded this utterance (flush_outbound already
+                    # cleared _tx_buffer and sent the fade). Either way: stop draining —
+                    # the flush owns delivery from here. Nothing to put back.
+                    return
+                # Read _transport through a fresh local so mypy does not treat this as
+                # unreachable: the pre-loop guard narrowed self._transport to non-None
+                # and that narrowing does not survive the await inside _transmit_frame
+                # at runtime (stop() may have nulled it during the pacing sleep).
+                transport_after_send: asyncio.DatagramTransport | None = self._transport
+                if transport_after_send is None:
+                    # The frame WAS sent and is already removed from the buffer; the
+                    # remaining buffer is owned by stop()'s flush. Stop draining.
+                    return
 
     async def _transmit_frame(
         self,
@@ -1218,6 +1260,154 @@ class RtpMediaTransport:
         # frame, but that governs whether the caller keeps draining (it re-checks
         # _transport) — it does not un-send this frame, so report True.
         return True
+
+    async def send_dtmf(
+        self,
+        digits: str,
+        *,
+        tone_ms: int = _DEFAULT_DTMF_TONE_MS,
+        gap_ms: int = _DEFAULT_DTMF_GAP_MS,
+        volume: int = _DEFAULT_DTMF_VOLUME,
+    ) -> None:
+        """Send ``digits`` as RFC 4733 telephone-event RTP on the active call.
+
+        Wires the (separately-tested) :func:`hermes_voip.dtmf.event_payloads`
+        generator onto this engine's TX path (ADR-0010/0031). For EACH digit it
+        emits named-event packets at the NEGOTIATED telephone-event payload type,
+        with:
+
+        * the **marker bit set on the first packet** of the digit (RFC 4733 §2.5.1:
+          the start of a new event), and clear on the rest;
+        * a **constant RTP timestamp** across all of that digit's packets (the event
+          start time — duration grows in the payload, the RTP timestamp does not);
+        * the engine's outbound **SSRC** and a **monotonic sequence number** shared
+          with the audio stream (so the receiver sees one coherent RTP stream);
+        * the **three redundant end packets** RFC 4733 §2.5.1.4 requires (already
+          produced by ``event_payloads``);
+        * **SRTP protection** when SRTP is active (same as audio).
+
+        Between digits the RTP timestamp advances by the tone duration and a silent
+        inter-digit gap is paced, so a repeated digit is a distinct event the far
+        end registers separately. The whole burst runs under the **same TX mutex as
+        :meth:`send_audio`**, so DTMF never interleaves with audio nor races the
+        shared seq/timestamp.
+
+        Args:
+            digits: The DTMF string to send (``0-9``, ``*``, ``#``, ``A``-``D``;
+                case-insensitive). Empty ⇒ a no-op (nothing to send).
+            tone_ms: Per-digit tone duration in milliseconds (default 100).
+            gap_ms: Silent inter-digit gap in milliseconds (default 70).
+            volume: Named-event power in -dBm0 (0-63; default 10).
+
+        Raises:
+            RuntimeError: If the telephone-event payload type was not negotiated
+                (the call's offer had no ``telephone-event``) — DTMF is NOT sent
+                and the failure is explicit, never a silent no-op. Also if the
+                engine was never connected.
+            ValueError: If ``digits`` contains a non-DTMF character (propagated from
+                :func:`~hermes_voip.dtmf.digit_to_event`), or ``tone_ms`` is outside
+                the representable event-duration range.
+        """
+        if not digits:
+            return
+        event_pt = self._telephone_event_payload_type
+        if event_pt is None:
+            msg = (
+                "cannot send DTMF: no telephone-event payload type was negotiated "
+                "for this call (the SDP offer carried no 'telephone-event'). DTMF "
+                "is not sent — this is an explicit failure, not a silent no-op."
+            )
+            raise RuntimeError(msg)
+
+        # The tone duration and the per-update step are in RTP CLOCK units. For both
+        # G.711 and G.722 the RTP clock is 8000 (RFC 3551), so the named-event
+        # duration counts at 8 kHz regardless of the audio sample rate.
+        ts_increment = (self._rtp_clock_rate * self._ptime) // 1000
+        total_duration = (self._rtp_clock_rate * tone_ms) // 1000
+
+        # One TX critical section for the whole burst (ADR-0031): serialised against
+        # send_audio so packets never interleave and the shared seq/ts never races.
+        async with self._tx_lock:
+            for digit in digits:
+                await self._send_one_dtmf_digit(
+                    digit,
+                    event_pt=event_pt,
+                    total_duration=total_duration,
+                    step=ts_increment,
+                    volume=volume,
+                    gap_ms=gap_ms,
+                )
+
+    async def _send_one_dtmf_digit(  # noqa: PLR0913 — each arg is an independent per-digit RFC 4733 parameter resolved once in send_dtmf and threaded through; bundling them into an object would only move the surface
+        self,
+        digit: str,
+        *,
+        event_pt: int,
+        total_duration: int,
+        step: int,
+        volume: int,
+        gap_ms: int,
+    ) -> None:
+        """Emit one digit's telephone-event packets, then advance ts + pace the gap.
+
+        Caller holds :attr:`_tx_lock`. All packets carry a CONSTANT timestamp
+        (``self._ts`` at entry); the marker bit is set on the first only; seq
+        advances per packet. After the digit, ``self._ts`` advances by
+        ``total_duration`` so the next digit/audio is a distinct, later event, and a
+        ``gap_ms`` silent gap is paced. A transport nulled mid-burst (a concurrent
+        :meth:`stop`) ends the send cleanly (the call is tearing down).
+        """
+        digit_ts = self._ts
+        ptime_s = self._ptime / 1000.0
+        first = True
+        for payload in event_payloads(
+            digit, total_duration=total_duration, step=step, volume=volume
+        ):
+            transport = self._transport
+            if transport is None:
+                # The call is tearing down (stop() nulled the transport). Abandon the
+                # rest of the burst cleanly rather than raising through the call loop.
+                return
+            pkt = RtpPacket(
+                payload_type=event_pt,
+                sequence_number=self._seq,
+                timestamp=digit_ts,
+                ssrc=_OUTBOUND_SSRC,
+                payload=payload,
+                marker=first,
+            )
+            wire = (
+                self._srtp_out.protect(pkt)
+                if self._srtp_out is not None
+                else pkt.pack()
+            )
+            self._seq = (self._seq + 1) % (1 << 16)
+            transport.sendto(wire, self._outbound_addr)
+            first = False
+            # Pace the next packet one ptime later (the redundant end packets are
+            # paced too, so the named-event stream keeps a steady 50 pps).
+            await self._sleep(ptime_s)
+        # Advance the RTP timestamp past this tone so the next digit (or audio) is a
+        # distinct, later event the far end registers separately.
+        self._ts = (self._ts + total_duration) % (1 << 32)
+        # Silent inter-digit gap: pace it so a repeated digit is two events.
+        if gap_ms > 0:
+            await self._sleep(gap_ms / 1000.0)
+
+    @property
+    def telephone_event_payload_type(self) -> int | None:
+        """The negotiated RFC 4733 telephone-event RTP payload type, or ``None``.
+
+        ``None`` when the call's offer carried no ``telephone-event`` (so
+        :meth:`send_dtmf` raises rather than guessing a PT). Settable after
+        construction — the outbound path adopts the answer's telephone-event PT,
+        mirroring the :attr:`payload_type` / ``engine._codec`` update.
+        """
+        return self._telephone_event_payload_type
+
+    @telephone_event_payload_type.setter
+    def telephone_event_payload_type(self, value: int | None) -> None:
+        self._telephone_event_payload_type = value
 
     @property
     def payload_type(self) -> int:

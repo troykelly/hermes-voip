@@ -28,11 +28,17 @@ What is built and working today:
 - **Caller trust tiers** (caller groups): an inbound caller or an outbound callee is
   **untrusted unless allow-listed**, with least-privilege tool gating
   (see [Caller groups](#caller-groups-trust-tiers)).
+- **In-call DTMF + intercom**: the agent can send DTMF tones (IVR navigation / keypad
+  entry) on a privileged call, and an **intercom caller mode** can screen a door/gate
+  visitor and open the entry — scoped, by construction, to ONLY that action
+  (see [Intercom & DTMF](#intercom--dtmf)).
 
-> **Roadmap (not yet wired — do not rely on these):** WebRTC (SIP-over-WSS) media transport,
-> DTMF-send + intercom, and call-termination session signalling are in progress. The
-> `wss` transport token and the WebRTC building blocks (the `webrtc` extra) exist, but the
-> live media path runs over SIP-over-TLS today. Track these in [`docs/adr/`](docs/adr/).
+> **Roadmap (not yet wired — do not rely on these):** WebRTC (SIP-over-WSS) media transport
+> and call-termination session signalling are in progress. The `wss` transport token and
+> the WebRTC building blocks (the `webrtc` extra) exist, but the live media path runs over
+> SIP-over-TLS today. Inbound DTMF receive + the spoof-resistant DTMF confirmation channel
+> (which would unblock call transfer) are deferred — see ADR-0031 §4. Track these in
+> [`docs/adr/`](docs/adr/).
 
 ## Install & run
 
@@ -213,6 +219,29 @@ This is gated hard:
 
 Operational steps are in the runbook
 [`docs/runbooks/0007-voip-outbound-calling.md`](docs/runbooks/0007-voip-outbound-calling.md).
+
+### Intercom & DTMF
+
+The agent can **send DTMF tones** on a live call — `send_dtmf(digits)` (ELEVATED, ADR-0031)
+— for IVR navigation ("press 1 for…") or keypad entry. It emits RFC 4733 telephone-events
+at the **negotiated** payload type and raises a clear error if the gateway negotiated none
+(never a silent drop); the digits are never logged (they may be a PIN).
+
+An **intercom caller mode** answers a door/gate intercom, screens the visitor, and opens
+the entry — `open_entry` (ADR-0031) — for a legitimate expected visitor. Configure it as a
+caller group at **`privilege_level` 2** with **`allowed_tools: ["open_entry"]`**: the tool
+gate then removes every other tool, so a **spoofed caller-ID landing in the intercom group
+can reach ONLY the entry action** — never operator tools or secrets. There are two
+operator-chosen actuation paths (`HERMES_VOIP_INTERCOM_OPEN_MODE`, default **disabled** so
+`open_entry` refuses until configured):
+
+- **`dtmf`** — send a configured open code (`HERMES_VOIP_INTERCOM_DTMF`, e.g. `9`) on the call;
+- **`relay`** — POST to an external relay / smart-lock (`HERMES_VOIP_INTERCOM_RELAY_URL`,
+  **https only**; bearer token from `HERMES_VOIP_INTERCOM_RELAY_TOKEN` — 1Password, never
+  committed).
+
+Full setup, the group JSON, and rotation are in the runbook
+[`docs/runbooks/0008-voip-intercom-and-dtmf.md`](docs/runbooks/0008-voip-intercom-and-dtmf.md).
 
 ## Development
 

@@ -165,13 +165,15 @@ the operator asked for ("limited access"). The level is an ordered ceiling — a
 existing `degraded`/`confirmed` checks apply unchanged. A backward-compat `privileged`
 property (`level >= 3`) keeps every existing `state.privileged` caller working.
 
-> **Optional explicit tool allowlist (deferred to Phase 2, not Phase 1).** A group *may*
-> additionally carry an explicit `allowed_tools: frozenset[str]` to express "this tier may
-> hold/resume but **not** `list_registrations`" — a sub-ceiling checked **before** the
-> level. It only ever *removes* tools (it cannot grant above the level), so it cannot widen
-> the attack surface. Phase 1 ships the integer level only (it covers the operator's stated
-> tiers); the allowlist lands in Phase 2 if a tier needs finer granularity than the three
-> levels give.
+> **Optional explicit tool allowlist (SHIPPED by ADR-0031; was deferred from Phase 1).** A
+> group *may* additionally carry an explicit `allowed_tools: frozenset[str]` to express
+> "this tier may hold/resume but **not** `list_registrations`" — a sub-ceiling checked
+> **before** the level. It only ever *removes* tools (it cannot grant above the level), so
+> it cannot widen the attack surface. Phase 1 shipped the integer level only; **ADR-0031
+> implemented this allowlist** (`CallerGroup.allowed_tools`, threaded onto
+> `GuardSessionState.allowed_tools` and enforced in `gate_voip_tool` before the level
+> check) because the intercom caller mode needs to scope a session to ONLY its entry action
+> — exactly the finer granularity this clause anticipated.
 
 **Classification (deny-biased, ordered, first match wins)** — generalizes ADR-0020 §1 from
 a fixed `deny > allow > grey > default` to a configurable `match_order`:

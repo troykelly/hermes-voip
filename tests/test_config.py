@@ -415,9 +415,11 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.greeting != ""
     # symmetric-RTP (comedia) latching is ON by default
     assert cfg.rtp_symmetric is True
-    # echo-robust barge-in (ADR-0022): gated by default, telephony thresholds
+    # echo-robust barge-in (ADR-0022): gated by default, telephony thresholds.
+    # The default min-speech clears the longest observed gateway-echo burst
+    # (~15 VAD windows ≈ 480 ms), so a 600 ms default has margin above it.
     assert cfg.barge_in_mode == "gated"
-    assert cfg.barge_in_min_speech_ms == 400
+    assert cfg.barge_in_min_speech_ms == 600
     assert cfg.barge_in_tail_ms == 250
     # injection guard
     assert cfg.injection_guard == "onnx"

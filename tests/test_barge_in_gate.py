@@ -215,3 +215,115 @@ def test_gate_fires_at_most_once_per_onset() -> None:
                 extra_true += 1
     assert first == _MIN_WINDOWS - 1
     assert extra_true == 0
+
+
+# ---------------------------------------------------------------------------
+# delivery_suppressed — the SECOND echo route (codex finding #1): even when a
+# short echo blip does NOT call barge_in(), it is still transcribed and the
+# endpointer fires an end-of-turn on its trailing silence — delivering the
+# echoed fragment to the agent as a CALLER turn (another "agent interrupts
+# itself" path). While armed and the speech run was not an authorised barge-in,
+# the turn delivery must be suppressed; a sustained (authorised) run still
+# delivers, and outside playout/tail nothing is suppressed.
+# ---------------------------------------------------------------------------
+
+
+def test_delivery_suppressed_for_unauthorised_echo_during_tts() -> None:
+    """An echo blip's end-of-turn (after its OFFSET) is suppressed during TTS.
+
+    The blip never reaches the sustained threshold, so it is unauthorised echo.
+    The endpointer fires on the trailing silence (OFFSET already cleared the run
+    state), and at THAT point the gate must still report delivery suppressed —
+    so the echoed fragment is never delivered as a caller turn.
+    """
+    gate = _make_gate()
+    gate.tts_active(True)
+    gate.on_event(_onset(100))
+    for w in range(100, 106):  # 6 voiced windows — below threshold
+        gate.should_barge_in(w)
+    gate.on_event(_offset(106))  # echo dips; run state cleared
+    # The endpointer would fire on a later silent window (e.g. 113); the echo
+    # must be suppressed there because it was never an authorised barge-in.
+    assert gate.delivery_suppressed(113) is True
+
+
+def test_delivery_not_suppressed_for_authorised_sustained_run() -> None:
+    """A sustained (authorised) interruption's turn is NOT suppressed.
+
+    Once the run fires a barge-in it is authorised, so its transcript may be
+    delivered — even though the gate was armed when the run began.
+    """
+    gate = _make_gate()
+    gate.tts_active(True)
+    gate.on_event(_onset(200))
+    fired = False
+    for w in range(200, 200 + _MIN_WINDOWS + 2):
+        fired = fired or gate.should_barge_in(w)
+    assert fired is True
+    # The authorised run may deliver its turn (the agent is being interrupted).
+    assert gate.delivery_suppressed(200 + _MIN_WINDOWS + 1) is False
+
+
+def test_delivery_not_suppressed_when_not_armed() -> None:
+    """With the agent silent (not armed), turn delivery is never suppressed.
+
+    Normal caller turns during silence must always be delivered — the gate only
+    suppresses echo while the agent's TTS plays (and the tail).
+    """
+    gate = _make_gate()
+    # tts never active, no tail → not armed.
+    gate.on_event(_onset(10))
+    gate.should_barge_in(10)
+    gate.on_event(_offset(12))
+    assert gate.delivery_suppressed(20) is False
+
+
+def test_delivery_suppression_resets_on_new_onset() -> None:
+    """A fresh ONSET clears the prior run's authorisation.
+
+    After an authorised barge-in, a SUBSEQUENT short echo blip (new onset, below
+    threshold) while still armed must be suppressed again — authorisation does
+    not leak across runs.
+    """
+    gate = _make_gate()
+    gate.tts_active(True)
+    # First: an authorised sustained run.
+    gate.on_event(_onset(0))
+    for w in range(0, _MIN_WINDOWS + 1):
+        gate.should_barge_in(w)
+    # Then a new short echo blip — must NOT inherit the prior authorisation.
+    blip_onset = _MIN_WINDOWS + 20
+    gate.on_event(_onset(blip_onset))
+    for w in range(blip_onset, blip_onset + 4):
+        gate.should_barge_in(w)
+    gate.on_event(_offset(blip_onset + 4))
+    assert gate.delivery_suppressed(blip_onset + 11) is True
+
+
+def test_off_mode_suppresses_all_delivery_during_tts() -> None:
+    """``off`` mode never authorises a barge-in, so echo delivery stays suppressed.
+
+    With barge-in disabled, no inbound speech during TTS is an authorised
+    interruption, so none of it is delivered as a caller turn while armed.
+    """
+    gate = _make_gate(BargeInMode.OFF)
+    gate.tts_active(True)
+    gate.on_event(_onset(0))
+    for w in range(0, 100):
+        gate.should_barge_in(w)
+    gate.on_event(_offset(100))
+    assert gate.delivery_suppressed(110) is True
+
+
+def test_full_mode_does_not_suppress_delivery() -> None:
+    """``full`` mode authorises any onset, so it never suppresses turn delivery.
+
+    ``full`` is the legacy immediate-barge-in path for echo-cancelled gateways;
+    it treats every onset as a real interruption, so the turn is delivered.
+    """
+    gate = _make_gate(BargeInMode.FULL)
+    gate.tts_active(True)
+    gate.on_event(_onset(0))
+    gate.should_barge_in(0)
+    gate.on_event(_offset(3))
+    assert gate.delivery_suppressed(10) is False

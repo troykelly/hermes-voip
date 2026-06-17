@@ -1791,6 +1791,129 @@ async def test_full_mode_short_blip_barges_in_legacy_behaviour() -> None:
     assert tts.last_stream.cancel_called is True
 
 
+class _DrainThenFinalASR:
+    """ASR fake that drains ALL inbound audio, THEN yields one endpointer-style final.
+
+    Mirrors the sherpa ASR: it consumes the whole audio stream and yields a single
+    ``is_final`` transcript with ``end_of_turn=False`` (the endpointer owns the
+    turn boundary). Because the final is emitted only after every frame is drained,
+    the endpointer has already fired its end-of-turn by then — so whether the turn
+    is delivered depends solely on whether the pump suppressed the endpointer's EOT
+    for unauthorised echo. This makes the suppression the deterministic variable.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    @property
+    def input_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        text = self._text
+
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:  # drain the whole stream first
+                pass
+            yield Transcript(
+                text=text, is_final=True, end_of_turn=False, confidence=1.0
+            )
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_gated_echo_blip_during_tts_delivers_no_turn() -> None:
+    """An echo blip during TTS must NOT be delivered as a caller turn (codex #1).
+
+    The deeper self-interruption route: even when a short echo blip does not call
+    ``barge_in()``, the endpointer still fires an end-of-turn on its trailing
+    silence and the ASR's final fragment is delivered to the agent as caller
+    input — re-triggering an interrupt. While the agent's TTS is playing and the
+    speech was not an authorised (sustained) barge-in, the turn delivery must be
+    suppressed. Here a 6-window echo blip (below threshold) is followed by enough
+    silent windows to fire the endpointer; ``deliver_turn`` must NEVER be called.
+
+    Discriminating: ``_DrainThenFinalASR`` emits its final only AFTER the
+    endpointer has fired (it drains all audio first), so the turn is delivered iff
+    the endpointer EOT was NOT suppressed — i.e. the test fails without the fix.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # 6 voiced echo windows, then 30 silent windows (> the 16-window endpointer
+    # silence at 8 kHz) so the endpointer fires an end-of-turn on the echo while
+    # the long greeting is still playing (the gate is armed throughout).
+    blip = [0.95] * 6 + [0.0] * 30
+    vad = _scripted_vad_8k(blip)
+    tts = _LongSlowGreetingTTS(n_frames=120)
+    transport = _ScriptedInboundTransport(len(blip))
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_DrainThenFinalASR("NO"),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent is giving a long spoken answer here.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == [], (
+        "echoed speech during TTS playout must not be delivered as a caller turn"
+    )
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is False
+
+
+@pytest.mark.asyncio
+async def test_gated_normal_turn_during_silence_still_delivered() -> None:
+    """A real caller turn during SILENCE (agent not speaking) still delivers.
+
+    No-regression guard for the delivery suppression: with no greeting/TTS the
+    gate is never armed, so a finalised end-of-turn is delivered normally. (This
+    mirrors the existing end-of-turn delivery path, now with the gate present.)
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    loop = CallLoop(
+        transport=_Transport8k([_silence_frame_8k(0)]),
+        asr=_FakeASR([("hello there", True, True)]),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",  # no TTS → gate never armed
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+    assert delivered == ["hello there"]
+
+
 @pytest.mark.asyncio
 async def test_gated_default_mode_when_unspecified() -> None:
     """A CallLoop built without barge-in args defaults to gated, min 1 window.

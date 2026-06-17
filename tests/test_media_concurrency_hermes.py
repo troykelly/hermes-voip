@@ -98,6 +98,8 @@ class _NullTTS:
         self,
         text: AsyncIterator[str],
         voice: str,
+        *,
+        sample_rate: int | None = None,
     ) -> TtsStream:
         return _NullTtsStream()
 

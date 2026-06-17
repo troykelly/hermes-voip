@@ -216,7 +216,13 @@ class _FakeTtsStream:
 
 
 class _FakeTTS:
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         return _FakeTtsStream()  # type: ignore[return-value]
 
 
@@ -1534,3 +1540,241 @@ def test_supported_voice_encodings_never_drift_ahead_of_engine() -> None:
             f"supported menu encoding {encoding!r} does not map to a runnable "
             f"engine codec — the advertised menu drifted ahead of the engine"
         )
+
+
+# ---------------------------------------------------------------------------
+# G.722 wideband menu + offer order + negotiation (ADR-0022). The advertised menu
+# now leads with G.722 (wideband), and an offered G.722 is answered with G.722;
+# a G.711-only offer still answers G.711 (fallback).
+# ---------------------------------------------------------------------------
+
+
+def test_supported_menu_leads_with_g722_then_g711() -> None:
+    from hermes_voip.adapter import _SUPPORTED_ENCODINGS  # noqa: PLC0415
+
+    voice = [e for e in _SUPPORTED_ENCODINGS if e.lower() != "telephone-event"]
+    # G.722 is advertised FIRST (wideband-preferred), then G.711 PCMU/PCMA.
+    assert voice[0] == "G722"
+    assert "PCMU" in voice
+    assert "PCMA" in voice
+
+
+def test_outbound_offer_lists_g722_first() -> None:
+    # The outbound INVITE offer must put G.722 (PT 9) ahead of the G.711 payloads
+    # so a wideband-capable peer picks it; G.711 stays as the fallback.
+    from hermes_voip.adapter import _outbound_offer_codecs  # noqa: PLC0415
+
+    codecs = _outbound_offer_codecs()
+    voice = [c for c in codecs if c.encoding.lower() != "telephone-event"]
+    assert voice[0].encoding == "G722"
+    assert voice[0].payload_type == 9
+    assert {c.encoding for c in voice} >= {"G722", "PCMU", "PCMA"}
+
+
+_FAKE_SDP_OFFER_G722 = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 9 0 8\r\n"
+    "a=rtpmap:9 G722/8000\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite_g722(call_id: str) -> str:
+    content_length = len(_FAKE_SDP_OFFER_G722.encode("utf-8"))
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKg722\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:5061;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER_G722}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_g722_offer_answers_200_with_g722() -> None:
+    """A G.722-first offer is answered 200 OK with G.722 in the answer SDP.
+
+    The engine is mocked (no socket), but the answer SDP is built from the REAL
+    offer via build_audio_answer + the real _SUPPORTED_ENCODINGS, so this proves
+    the wideband codec is negotiated and advertised back when offered.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite_g722(call_id=call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20004,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    assert ok.status_code == 200
+    assert not _responses_with_status(transport, "SIP/2.0 488"), (
+        f"a carriable G.722 offer was wrongly rejected; sent: {transport.sent!r}"
+    )
+    # The answer SDP advertises G.722 (PT 9) — the wideband codec was negotiated.
+    assert "a=rtpmap:9 G722/8000" in ok.body, (
+        f"answer SDP did not select G.722; body:\n{ok.body}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_g722_engine_opened_with_g722_codec() -> None:
+    """The RtpMediaTransport is constructed with the G.722 engine codec.
+
+    Proves the negotiated G.722 actually reaches the media engine (codec=G722),
+    not just the SDP answer — so the wire really carries G.722.
+    """
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite_g722(call_id=call_id))
+
+    captured: dict[str, object] = {}
+
+    def _capture_engine(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
+        return MagicMock(
+            connect=AsyncMock(return_value=True),
+            stop=AsyncMock(return_value=None),
+            local_port=20006,
+        )
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", side_effect=_capture_engine),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    assert captured.get("codec") is EngineCodec.G722, (
+        f"engine was not opened with the G.722 codec; got {captured.get('codec')!r}"
+    )
+    # The negotiated RTP payload type (static 9 here) is passed to the engine so
+    # outbound packets + the comedia latch use the wire PT, not just the codec kind.
+    assert captured.get("payload_type") == 9, (
+        f"engine not opened with the negotiated PT; "
+        f"got {captured.get('payload_type')!r}"
+    )
+
+
+_FAKE_SDP_OFFER_G722_DYNAMIC_PT = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 109 0\r\n"
+    "a=rtpmap:109 G722/8000\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_g722_dynamic_pt_opens_engine_with_that_pt() -> None:
+    """A G.722 offer at a DYNAMIC payload type opens the engine with THAT PT.
+
+    Cross-vendor review finding: RFC 3551 reserves G.722's static PT 9, but
+    gateways do offer it at a dynamic PT, and the answer mirrors the offer's PT. If
+    the engine sent the static 9 while we advertised 109, the gateway would drop our
+    media and the comedia latch would reject inbound PT-109 packets (no audio). The
+    engine must therefore be opened with the negotiated PT 109, not 9.
+    """
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    content_length = len(_FAKE_SDP_OFFER_G722_DYNAMIC_PT.encode("utf-8"))
+    invite_raw = (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKg722dyn\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:5061;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER_G722_DYNAMIC_PT}"
+    )
+    invite = SipRequest.parse(invite_raw)
+
+    captured: dict[str, object] = {}
+
+    def _capture_engine(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
+        return MagicMock(
+            connect=AsyncMock(return_value=True),
+            stop=AsyncMock(return_value=None),
+            local_port=20008,
+        )
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", side_effect=_capture_engine),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    assert ok.status_code == 200
+    # Answer echoes the dynamic PT 109 (RFC 3264).
+    assert "a=rtpmap:109 G722/8000" in ok.body
+    assert captured.get("codec") is EngineCodec.G722
+    assert captured.get("payload_type") == 109, (
+        f"engine not opened with the negotiated dynamic PT 109; "
+        f"got {captured.get('payload_type')!r} (sending static 9 is the bug)"
+    )

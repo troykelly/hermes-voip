@@ -149,6 +149,26 @@ async def test_streams_pcm16_frames_at_output_rate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_per_call_sample_rate_is_accepted_but_model_rate_is_fixed() -> None:
+    """Kokoro accepts the per-call ``sample_rate`` seam but emits its fixed rate.
+
+    The call loop passes the negotiated wire rate to every provider uniformly
+    (ADR-0022). Kokoro's model rate is an intrinsic 24 kHz — it cannot retune — so
+    it accepts the argument (the seam is uniform across providers) and still emits
+    24 kHz; the media engine downsamples 24->wire (24->16 for G.722, 24->8 for
+    G.711). The point: passing a wideband rate must NOT break Kokoro, and must NOT
+    silently relabel its frames at a rate it did not actually produce.
+    """
+    fake = _FakeSynth(chunks_per_call=2)
+    tts = _tts(fake)
+    frames = await _drain(
+        tts.synthesize(_text("Wideband call. "), voice="af", sample_rate=16_000)
+    )
+    assert frames
+    assert all(f.sample_rate == _OUTPUT_RATE for f in frames)  # still 24 kHz
+
+
+@pytest.mark.asyncio
 async def test_synthesises_each_sentence_separately_in_order() -> None:
     """The text stream is segmented and each sentence synthesised in order."""
     fake = _FakeSynth(chunks_per_call=1)

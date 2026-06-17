@@ -269,6 +269,47 @@ async def test_sherpa_asr_upsamples_8k_inbound_to_16k_before_feeding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sherpa_asr_feeds_g722_16k_inbound_natively_without_upsampling() -> None:
+    """G.722 inbound frames (16 kHz) are fed to the recogniser AS-IS (ADR-0022).
+
+    On a G.722 call the engine delivers native 16 kHz audio — already the
+    recogniser's rate — so the STT feed must pass it straight through, NOT upsample
+    it. The discriminating assertion: the fed sample count equals the input sample
+    count (a wrongly-applied 8k->16k upsample would ~double it, and feeding it as
+    8 kHz would mislabel native wideband). This is the STT half of the wideband
+    accuracy win: the recogniser sees real 16 kHz, not 8 kHz upsampled to 16 kHz.
+    """
+    pytest.importorskip("numpy")  # the decode loop / resample need numpy
+    recognizer = _FakeRecognizer([_Script("hi", endpoint=True)])
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+
+    input_samples = 320  # 20 ms at 16 kHz (the G.722 audio rate)
+    native_16k = PcmFrame(
+        samples=struct.pack(
+            f"<{input_samples}h",
+            *[((i % 32) - 16) * 8 for i in range(input_samples)],
+        ),
+        sample_rate=_RATE,  # 16 kHz — what the G.722 engine yields
+        monotonic_ts_ns=0,
+    )
+    _ = [t async for t in asr.stream(_frames(native_16k))]
+
+    stream = recognizer.last_stream
+    assert stream is not None
+    assert stream.fed, "the recogniser must have been fed at least one waveform"
+    assert all(r == _RATE for r in stream.fed_rates), (
+        f"all fed rates must be {_RATE}, got {stream.fed_rates}"
+    )
+    # The first fed waveform is the real audio at its NATIVE 16 kHz count — no
+    # upsample doubling (which would be ~640) and no truncation.
+    fed = _fed_sample_count(stream.fed[0])
+    assert fed == input_samples, (
+        f"native 16 kHz G.722 audio must be fed unchanged ({input_samples} "
+        f"samples), got {fed} (it was wrongly resampled)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_sherpa_asr_suppresses_empty_hypotheses() -> None:
     """An empty decode result is not emitted as a transcript (no blank partials).
 

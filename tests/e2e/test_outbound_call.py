@@ -121,7 +121,13 @@ class _FakeTTS:
     def __init__(self) -> None:
         self.synth_texts: list[str] = []
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         sample = (4096).to_bytes(2, "little", signed=True)
         frame = PcmFrame(
             samples=sample * _SAMPLES_PER_FRAME_24K,

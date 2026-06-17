@@ -1,8 +1,15 @@
 # ADR-0005: In-process media/transport — aiortc-behind-SIP-over-TLS as leading candidate (spike-confirmed), audioop-lts
 
 - **Date:** 2026-06-14
-- **Status:** Accepted
+- **Status:** Accepted (amended by ADR-0022)
 - **Deciders:** agent session (VoIP architecture, post-research)
+
+> **Amendment (ADR-0022, 2026-06-17):** the "negotiate by capability, prefer wideband"
+> mandate is now realised on the SIP path. The advertised codec menu
+> (`adapter._SUPPORTED_ENCODINGS`) and the outbound offer order are **G.722 (wideband, 16 kHz)
+> first, then PCMU/PCMA (G.711 fallback), then telephone-event**; the engine carries G.722 via
+> a vendored public-domain pure-Python codec. RFC 3264 negotiation honours the peer's order and
+> falls back to G.711 when G.722 is not offered. See ADR-0022.
 
 ## Context
 

@@ -282,15 +282,37 @@ class ElevenLabsTTS:
         """The requested wire rate (default 8 kHz G.711 → media layer only encodes)."""
         return self._output_sample_rate
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
-        """Stream agent text in, stream wire-rate ``PcmFrame``s out (ADR-0004).
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        """Stream agent text in, stream wire-rate ``PcmFrame``s out (ADR-0004/0022).
 
         Returns a ``TtsStream`` that segments ``text`` and synthesises each
         sentence via a streaming HTTP request; ``voice`` overrides the
-        construction default when non-empty. Frames are emitted at
-        :attr:`output_sample_rate` (default 8 kHz = G.711).
+        construction default when non-empty.
+
+        ``sample_rate`` (the negotiated wire rate the call loop passes per call)
+        OVERRIDES the construction default for this call: ElevenLabs can emit
+        ``pcm_8000``/``pcm_16000``/… natively, so a G.722 call (16 kHz) requests
+        ``pcm_16000`` and emits 16 kHz frames — the rate follows the codec, with no
+        upsample-from-8k and no downsample. ``None`` uses the construction default
+        (the 8 kHz G.711 case, preserving the no-resample choppiness fix). An
+        unsupported rate raises :class:`ValueError` here (no silent fallback).
         """
         voice_id = voice or self._default_voice
+        # Resolve the per-call rate/format: a per-call override follows the
+        # negotiated codec; None keeps the construction default. Validated now (an
+        # unsupported rate raises at the synthesize call, not mid-stream).
+        out_rate = self._output_sample_rate if sample_rate is None else sample_rate
+        out_format = (
+            self._output_format
+            if sample_rate is None
+            else elevenlabs_pcm_format(sample_rate)
+        )
         stop = threading.Event()
 
         def _open(sentence: str) -> SegmentSource:
@@ -301,7 +323,7 @@ class ElevenLabsTTS:
             # stream_from_thread (so teardown joins the worker). Without it the
             # worker stays parked in read() until the join timeout (the bug fixed).
             cancel = HttpCancellation()
-            request = self._request(sentence, voice_id)
+            request = self._request(sentence, voice_id, out_format)
             chunks = stream_from_thread(
                 lambda: self._http.open(request, cancel),
                 on_cancel=cancel.close,
@@ -311,18 +333,20 @@ class ElevenLabsTTS:
         return PcmFrameStream(
             text=text,
             open_segment=_open,
-            sample_rate=self._output_sample_rate,
+            sample_rate=out_rate,
             stop=stop,
         )
 
-    def _request(self, text: str, voice_id: str) -> ElevenLabsRequest:
+    def _request(
+        self, text: str, voice_id: str, output_format: str
+    ) -> ElevenLabsRequest:
         """Form the streaming-synthesis request for one segment of ``text``."""
         url = f"{self._base_url}/v1/text-to-speech/{voice_id}/stream"
-        url = f"{url}?output_format={self._output_format}"
+        url = f"{url}?output_format={output_format}"
         return ElevenLabsRequest(
             voice_id=voice_id,
             model_id=self._model_id,
-            output_format=self._output_format,
+            output_format=output_format,
             url=url,
             headers={
                 "xi-api-key": self._api_key,

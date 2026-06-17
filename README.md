@@ -212,7 +212,7 @@ This is gated hard:
   has no home channel of its own). A call triggered by an agent always reports to its origin.
 
 Operational steps are in the runbook
-[`docs/runbooks/0006-voip-outbound-calling.md`](docs/runbooks/0006-voip-outbound-calling.md).
+[`docs/runbooks/0007-voip-outbound-calling.md`](docs/runbooks/0007-voip-outbound-calling.md).
 
 ## Development
 

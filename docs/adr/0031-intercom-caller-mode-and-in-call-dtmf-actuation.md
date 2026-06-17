@@ -126,24 +126,38 @@ logged or returned).
     legitimate tokenless setup). The DTMF open code is sensitive too: an invalid-code
     `ConfigError` reports only the offending character POSITION, never the code.
 
-### 4. DTMF-receive armed-confirmation resolver + transfer — DEFERRED (named blocker)
+### 4. DTMF-receive armed-confirmation resolver + transfer
+
+> **Update (the feat/voip-transfer-blind-tool lane).** The inbound DTMF-receive
+> subsystem + the `ArmedConfirmation` resolver shipped in PR #104 (the
+> feat/voip-dtmf-receive-confirm lane), and **`transfer_blind` is now SHIPPED as a live
+> agent tool**. `voip_tools.register_voip_tools` registers `transfer_blind(target)`
+> (IRREVERSIBLE, operator level 3 + non-degraded); the adapter's `transfer_blind_on_call`
+> awaits the call's per-call `ArmedConfirmation` and sends the RFC 3515 REFER
+> (`CallSession.transfer_blind`) **only** when the person on the call presses the armed
+> confirm digit. A wrong digit / timeout transfers nobody; a call with no telephone-event
+> negotiated refuses loudly (rule 37). **`transfer_attended` stays DEFERRED** for the one
+> reason below that still holds (no consult-leg origination). The original deferral
+> rationale is kept below for the record.
 
 Wiring `DtmfReceiver` into the **inbound** path (an `on_dtmf` callback emitted from
 `engine._inbound_gen` before the audio decode, since telephone-event packets ride a
 different payload type than the decoded voice stream) plus an armed-confirmation state
 machine that feeds `confirmed=True` to the ADR-0010 gate — and thereby registering the
-deferred `transfer_blind` tool — is **not** shipped here. Two reasons:
+deferred `transfer_blind` tool — was **not** shipped in the original intercom lane. Two
+reasons applied:
 
 1. it is a separate subsystem (inbound media-path change + a confirmation state machine)
-   whose partial landing would violate rule 6; and
+   whose partial landing would violate rule 6 — **now resolved** (PR #104 shipped it +
+   this lane shipped `transfer_blind`); and
 2. `transfer_attended` is **uncarriable** regardless — it needs a consultation `Dialog`
    the agent cannot produce (no consultation-leg origination path exists), per the
-   ADR-0011 / PR #96 finding.
+   ADR-0011 / PR #96 finding. **This still holds**, so `transfer_attended` remains
+   deferred-not-registered (registering it would be a lying stub, rule 6).
 
-`transfer_blind` therefore stays deferred-not-registered (registering it with a
-model-untrusted `confirmed=False` would be an always-blocked no-op). This is tracked as a
-clean follow-up; the `send_dtmf` TX path shipped here is the prerequisite the resolver
-will build on (the receive half + the gate-resolve are what remain).
+The `send_dtmf` TX path shipped in the original intercom lane was the prerequisite the
+resolver built on; the receive half + the gate-resolve (PR #104) and the live
+`transfer_blind` tool (this lane) complete the blind-transfer story.
 
 ## Consequences
 
@@ -166,7 +180,9 @@ will build on (the receive half + the gate-resolve are what remain).
 - **No new third-party dependency** (the relay uses stdlib `urllib`), so the supply-chain
   / licence surface (rule 35) is unchanged.
 - **Deferred debt is named, not hidden:** the inbound DTMF-confirmation resolver +
-  `transfer_blind`. The blocker (`transfer_attended`'s missing consult leg) is recorded.
+  `transfer_blind` were the original deferrals — **both now shipped** (PR #104 + the
+  feat/voip-transfer-blind-tool lane). The one remaining deferral is `transfer_attended`,
+  blocked by its missing consult-leg Dialog origination (recorded in §4).
 
 ## Alternatives considered
 
@@ -180,4 +196,5 @@ will build on (the receive half + the gate-resolve are what remain).
 | Add `httpx`/`aiohttp` for the relay POST | A new runtime dependency (licence/advisory/supply-chain surface, rule 35/40) for a single rare POST. Stdlib `urllib` in a worker thread is dependency-free and sufficient. |
 | Inline the relay token in an env list / config file | The token is a secret; an inline value leaks into process listings / shell history / the public repo. It is a `*_TOKEN` env var read from 1Password, `repr=False`, never logged. |
 | Allow an `http://` relay URL | The `Authorization: Bearer` header would travel in cleartext. `load_intercom_config` requires `https://`. |
-| Ship the inbound DTMF-confirmation resolver + `transfer_blind` now | A separate subsystem (inbound media-path change + confirmation state machine) whose partial landing violates rule 6; and `transfer_attended` is uncarriable without a consult-leg origination path. Deferred with the blocker named (§4). |
+| Ship the inbound DTMF-confirmation resolver + `transfer_blind` in THIS intercom lane | A separate subsystem (inbound media-path change + confirmation state machine) whose partial landing in this lane would have violated rule 6. Deferred at the time with the blocker named (§4), then shipped in their own lanes: the resolver + receive path in PR #104, and the live `transfer_blind` tool in the feat/voip-transfer-blind-tool lane. Only `transfer_attended` (uncarriable without a consult-leg origination path) remains deferred. |
+| Gate `transfer_blind`'s `target` with an outbound-allowlist (like `place_call`) | Considered (raised by the cross-vendor review as the residual risk). Rejected for the blind transfer: unlike `place_call` — which originates a NEW outbound leg to an untrusted callee with **no human in the loop**, so the static `HERMES_VOIP_OUTBOUND_ALLOW` is its only safeguard — `transfer_blind` hands the EXISTING call to a target only after the operator-level party on the live call **presses the armed DTMF confirm digit**. The live human confirmation by the level-3 party IS the per-call, per-target authorization. A reused `OUTBOUND_ALLOW` is semantically wrong (an internal extension one would transfer to is not a number one would auto-dial), and a NEW transfer-allowlist would ship either inert (an always-blocked no-op, rule 6) or permissive (no added safety). The residual risk (a prompt-injected target the operator confirms without scrutiny) is mitigated by the operator-only level-3 clamp + the confirmation step; a destination allowlist is a recordable future hardening if a real need appears. |

@@ -41,10 +41,22 @@ __all__ = ["register", "validate_voip_config"]
 _log = logging.getLogger(__name__)
 
 # Install hint shown by ``hermes plugins list``.
+#
+# IMPORTANT (rule 27): ``hermes plugins enable hermes-voip`` does NOT work for this
+# pip/entry-point plugin out of the box — the CLI's enable/list path is
+# filesystem-only and never consults importlib entry points, so it prints
+# "Plugin 'hermes-voip' is not installed or bundled." and exits 1. The mechanism
+# the runtime actually honours is the ``plugins.enabled`` list in Hermes'
+# ``config.yaml`` (the gateway loads the entry-point plugin when "hermes-voip" is
+# in that list). The hint therefore names that working mechanism; the optional
+# directory ``plugin.yaml`` stub (see docs/runbooks/0011) is what makes the
+# ``hermes plugins enable`` CLI affordance work, and is documented there.
 _INSTALL_HINT = (
     "Set HERMES_SIP_HOST, HERMES_SIP_EXTENSION, and HERMES_SIP_PASSWORD "
     "(or indexed HERMES_SIP_EXTENSION_<n>/PASSWORD_<n> for multiple registrations). "
-    "Run `hermes plugins enable hermes-voip` to activate the plugin."
+    "Enable the plugin by adding 'hermes-voip' to plugins.enabled in Hermes' "
+    "config.yaml (hermes config path), then run `hermes gateway run`. See the "
+    "hermes-voip README for the full quickstart."
 )
 
 # The required HERMES_SIP_* environment variable names.

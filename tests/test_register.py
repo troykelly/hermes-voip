@@ -223,6 +223,31 @@ def test_register_install_hint_is_non_empty() -> None:
     assert hint  # non-empty
 
 
+def test_register_install_hint_names_the_working_enable_mechanism() -> None:
+    """The install hint must point at the enable mechanism that actually works.
+
+    Rule 27 (no aspirational docs): ``hermes plugins enable hermes-voip`` fails for
+    a pip/entry-point plugin (the CLI's ``_plugin_exists`` is filesystem-only, so it
+    prints "Plugin 'hermes-voip' is not installed or bundled." and exits 1) UNLESS a
+    directory ``plugin.yaml`` stub is installed. The runtime gate that genuinely
+    decides activation is ``plugins.enabled`` in ``config.yaml``. The operator-facing
+    hint must therefore name ``plugins.enabled`` (the mechanism that always works),
+    not direct the operator to a bare CLI command that fails out of the box.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    hint = ctx.calls[0]["install_hint"]
+    assert isinstance(hint, str)
+    # Names the working runtime enable key.
+    assert "plugins.enabled" in hint
+    # Does NOT instruct the bare CLI enable as THE activation step (it fails for an
+    # entry-point plugin without the stub). Phrasing that mentions the command only
+    # as the stub-enabled affordance is fine; the unconditional imperative is not.
+    assert "Run `hermes plugins enable hermes-voip` to activate" not in hint
+
+
 # ---------------------------------------------------------------------------
 # (d) register is exported from hermes_voip.__init__
 # ---------------------------------------------------------------------------
@@ -546,21 +571,33 @@ def test_register_registers_the_in_call_control_tools() -> None:
         assert tool in names, f"the {tool!r} tool was not registered"
 
 
-def test_register_does_not_expose_the_transfer_tools() -> None:
-    """The IRREVERSIBLE transfer tools are NOT exposed (deferred, not a no-op).
+def test_register_exposes_transfer_blind_but_not_attended() -> None:
+    """``transfer_blind`` IS exposed (ADR-0010/0031); ``transfer_attended`` is not.
 
-    transfer_blind/transfer_attended need a spoof-resistant ADR-0010 DTMF
-    confirmation channel that is not wired into the live adapter; exposing a
-    transfer tool would make it an always-blocked no-op (rule 6). It is therefore
-    deferred-not-registered until that channel lands.
+    The spoof-resistant ADR-0010 DTMF confirmation channel landed (PR #104
+    ``ArmedConfirmation``), so ``transfer_blind`` is no longer an always-blocked
+    no-op: it is registered and the REFER fires only on a real keypad confirm. The
+    one transfer still deferred is ``transfer_attended`` — it needs a consultation
+    Dialog the agent cannot originate (ADR-0031 §4), so registering it would be a
+    lying stub (rule 6). It stays deferred-not-registered.
     """
     from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
     names = {c["name"] for c in ctx.tool_calls}
-    assert "transfer_blind" not in names
-    assert "transfer_attended" not in names
+    assert "transfer_blind" in names, "transfer_blind should now be registered"
+    assert "transfer_attended" not in names, "transfer_attended must stay deferred"
+    # transfer_blind is async and ships a model-readable schema with a target param.
+    blind = next(c for c in ctx.tool_calls if c["name"] == "transfer_blind")
+    assert blind["is_async"] is True
+    schema = blind["schema"]
+    assert isinstance(schema, dict)
+    params = schema.get("parameters")
+    assert isinstance(params, dict)
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    assert "target" in props
 
 
 def test_registered_control_tools_are_async_with_schemas() -> None:

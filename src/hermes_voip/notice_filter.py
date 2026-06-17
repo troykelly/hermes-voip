@@ -41,12 +41,6 @@ from __future__ import annotations
 
 import re
 
-# The Hermes setup slash-command that the home-channel onboarding notice tells
-# the user to run (``gateway.run._handle_message``: ``/sethome`` for most
-# platforms, ``/hermes sethome`` for Slack's single-parent-command dispatch).
-# A genuine spoken reply never instructs the user to type a Hermes command.
-_SETHOME_COMMAND_RE = re.compile(r"/(?:hermes\s+)?sethome\b", re.IGNORECASE)
-
 # The "no home channel …" announcement shared verbatim by the whole proactive
 # family in hermes-agent 0.16.0:
 #   * ``gateway.run._handle_message``      — "No home channel is set for {P}."
@@ -62,6 +56,18 @@ _NO_HOME_CHANNEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The home-channel onboarding *prompt* (``gateway.run._handle_message``) also
+# closes with a call-to-action: the Hermes setup slash-command (``/sethome``,
+# or ``/hermes sethome`` for Slack's single-parent-command dispatch) tied to
+# making "this chat your home channel". The ``_NO_HOME_CHANNEL_RE`` announcement
+# above already matches that prompt; this pair is defence-in-depth for any
+# onboarding variant phrased without the "no home channel … for" stem. Match
+# the COMMAND only when it co-occurs with the "home channel" phrase, so the
+# structural marker is the onboarding instruction as a whole — a genuine reply
+# that merely mentions the command in passing is not dropped.
+_SETHOME_COMMAND_RE = re.compile(r"/(?:hermes\s+)?sethome\b", re.IGNORECASE)
+_HOME_CHANNEL_PHRASE_RE = re.compile(r"\bhome\s+channel\b", re.IGNORECASE)
+
 
 def is_internal_system_notice(content: str) -> bool:
     """Return ``True`` when ``content`` is a gateway-internal system notice.
@@ -70,11 +76,16 @@ def is_internal_system_notice(content: str) -> bool:
     onboarding prompt and the cron/kanban "no home channel" delivery errors —
     so the voip adapter can drop it instead of speaking it to the caller.
 
-    The check is structural about that family (slash-command instruction, or a
-    "no home channel … for …" announcement) and is intentionally conservative:
-    a genuine conversational reply that merely *mentions* a home channel, a
-    channel, or cron in passing is not a notice and passes through unchanged.
+    The check is structural about that family: either a "no home channel … for
+    …" *announcement* (which natural speech does not produce), or the home-
+    channel onboarding *instruction* (the Hermes ``/sethome`` setup command
+    co-occurring with the "home channel" phrase). It is intentionally
+    conservative — a genuine conversational reply that merely *mentions* a home
+    channel, a channel, cron, or the command name in passing is not a notice
+    and passes through unchanged.
     """
+    if _NO_HOME_CHANNEL_RE.search(content):
+        return True
     return bool(
-        _SETHOME_COMMAND_RE.search(content) or _NO_HOME_CHANNEL_RE.search(content)
+        _SETHOME_COMMAND_RE.search(content) and _HOME_CHANNEL_PHRASE_RE.search(content)
     )

@@ -129,6 +129,48 @@ FLASH_V2_5_MODEL_ID = "eleven_flash_v2_5"
 #: parameter (0 = no optimisation … 4 = max, with the text normaliser disabled).
 MAX_STREAMING_LATENCY = 4
 
+
+def _validate_model_id(model_id: str) -> None:
+    """Reject a ``model_id`` that is blank or a filesystem path (the 400 foot-gun).
+
+    The live HTTP 400 root cause (ADR-0025): the shared ``HERMES_VOIP_TTS_MODEL``
+    env knob is a model **directory** for the self-host ``sherpa-kokoro`` provider
+    but the model **id** for ElevenLabs. A deployment that points it at a Kokoro
+    directory (e.g. for a self-host A/B) while selecting ``provider=elevenlabs``
+    sends that directory string verbatim as ``model_id``; ElevenLabs then returns
+    ``400 invalid_uid`` mid-call — which (before this guard) rose out of the call's
+    TaskGroup and dropped the call with NO audio. Reproduced live: a valid id
+    (``eleven_flash_v2_5``) returns HTTP 200, while ``model_id="/opt/models/kokoro"``
+    or ``"kokoro-multi-lang-v1_0"`` returns 400.
+
+    A legitimate ElevenLabs model id (``eleven_flash_v2_5``, ``eleven_multilingual_v2``,
+    …) contains no path separator and is non-blank, so this rejects only the
+    misconfiguration — failing fast at construction (a startup ``ConfigError``)
+    rather than as a per-call 400. The ``HERMES_VOIP_TTS_MODEL`` name is in the
+    message so the operator sees exactly which knob to fix.
+
+    Raises:
+        ValueError: If ``model_id`` is empty/blank, or contains a forward slash or a
+            backslash (i.e. looks like a filesystem path — the Kokoro-dir foot-gun).
+    """
+    if not model_id.strip():
+        msg = (
+            "model_id must be a non-empty ElevenLabs model id "
+            "(e.g. 'eleven_flash_v2_5'); set HERMES_VOIP_TTS_MODEL to a model id, "
+            "not a blank value"
+        )
+        raise ValueError(msg)
+    if "/" in model_id or "\\" in model_id:
+        msg = (
+            f"model_id {model_id!r} looks like a filesystem path, not an ElevenLabs "
+            "model id. HERMES_VOIP_TTS_MODEL is a model DIRECTORY for the "
+            "sherpa-kokoro provider but the model ID for ElevenLabs — set it to a "
+            "model id such as 'eleven_flash_v2_5' when HERMES_VOIP_TTS_PROVIDER="
+            "elevenlabs (a path value causes a live HTTP 400 that drops the call)"
+        )
+        raise ValueError(msg)
+
+
 # The inclusive bounds for every ``voice_settings`` float field (ElevenLabs treats
 # these as 0.0-1.0; values outside that band are rejected, never clamped).
 _MIN_SETTING = 0.0
@@ -401,6 +443,10 @@ class ElevenLabsTTS:
         if not api_key.strip():
             msg = "api_key must be a non-empty ElevenLabs credential"
             raise ValueError(msg)
+        # Reject a path-shaped / blank model id at construction — the live HTTP 400
+        # foot-gun (a Kokoro model dir leaking through the shared HERMES_VOIP_TTS_MODEL
+        # knob). Fail fast here, not as a per-call 400 that kills the call (ADR-0025).
+        _validate_model_id(model_id)
         if optimize_streaming_latency is not None and not (
             0 <= optimize_streaming_latency <= MAX_STREAMING_LATENCY
         ):

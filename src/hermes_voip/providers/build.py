@@ -307,9 +307,36 @@ def build_providers(
             family licence gate.
     """
     asr = _dispatch("asr", asr_factories, config.stt_provider, config)
-    tts = _dispatch("tts", tts_factories, config.tts_provider, config)
+    tts = _resolve_tts(tts_factories, config)
     guard = _dispatch("guard", guard_factories, config.injection_guard, config)
     return Providers(asr=asr, tts=tts, guard=guard)
+
+
+def _resolve_tts(
+    tts_factories: Mapping[str, TtsFactory], config: MediaConfig
+) -> StreamingTTS:
+    """Build the primary TTS, wrapping it in failover when a fallback is configured.
+
+    The primary is dispatched as usual. When ``config.tts_fallback`` is set
+    (ADR-0025), the primary is wrapped in a
+    :class:`~hermes_voip.tts.failover.FailoverTTS` whose ``fallback_factory`` builds
+    the fallback provider via the SAME factory map — but **lazily** (only on the
+    first failover), so the fallback's model is not loaded on the happy path. A
+    primary synthesis failure then recovers by synthesising via the fallback so the
+    call still gets audio instead of dropping silent.
+    """
+    primary = _dispatch("tts", tts_factories, config.tts_provider, config)
+    fallback_token = config.tts_fallback
+    if fallback_token is None:
+        return primary
+    from hermes_voip.tts.failover import FailoverTTS  # noqa: PLC0415 - lazy, no ml load
+
+    def _build_fallback() -> StreamingTTS:
+        # Built only on the first failover (and cached by FailoverTTS): the fallback
+        # provider's licence gate / model load runs lazily, not on the happy path.
+        return _dispatch("tts", tts_factories, fallback_token, config)
+
+    return FailoverTTS(primary=primary, fallback_factory=_build_fallback)
 
 
 def _dispatch[T](

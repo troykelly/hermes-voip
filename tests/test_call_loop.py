@@ -24,7 +24,7 @@ from typing import Final
 
 import pytest
 
-from hermes_voip.media.call_loop import CallLoop, gate_voip_tool
+from hermes_voip.media.call_loop import BargeInMode, CallLoop, gate_voip_tool
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR, Transcript
@@ -1552,3 +1552,243 @@ async def test_barge_in_during_greeting_no_aclose_race(
         "unexpected RuntimeWarnings during barge-in teardown: "
         f"{[str(w.message) for w in runtime_warnings]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# SELF-ECHO BARGE-IN (ADR-0022) — the gateway reflects the agent's own TTS back
+# on the inbound path; the VAD transcribes it as the caller, and a single ONSET
+# barged the agent in, ending its own turn (the live self-interruption loop,
+# call 20260617_033116). In the default ``gated`` mode, while TTS is playing a
+# barge-in needs a SUSTAINED voiced run — short echo blips must NOT interrupt,
+# but a genuine sustained interruption still must.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedVadModel:
+    """A :class:`VadModel` that returns a preset probability per scored window.
+
+    One probability is consumed per window; once the script is exhausted it
+    returns ``0.0`` (silence) forever. Stateless beyond the cursor, so the
+    detector's hysteresis state machine still derives ONSET/OFFSET edges.
+    """
+
+    def __init__(self, probabilities: list[float]) -> None:
+        self._probs = probabilities
+        self._cursor = 0
+
+    def __call__(self, window_pcm16: bytes, sample_rate: int) -> float:
+        _ = window_pcm16, sample_rate
+        if self._cursor < len(self._probs):
+            value = self._probs[self._cursor]
+            self._cursor += 1
+            return value
+        return 0.0
+
+
+def _scripted_vad_8k(probabilities: list[float]) -> VoiceActivityDetector:
+    """An 8 kHz silero VAD driven by a per-window probability script."""
+    return VoiceActivityDetector(
+        model=_ScriptedVadModel(probabilities),
+        sample_rate_hz=_G711_INBOUND_RATE,
+    )
+
+
+def _one_window_frame_8k() -> PcmFrame:
+    """Exactly one 8 kHz silero window (256 samples → 512 bytes)."""
+    return PcmFrame(
+        samples=bytes(512), sample_rate=_G711_INBOUND_RATE, monotonic_ts_ns=0
+    )
+
+
+class _ScriptedInboundTransport(_FakeTransport):
+    """8 kHz transport that releases its (one-window) frames on a gate.
+
+    Each call to :meth:`inbound_audio` yields ``len(frames)`` one-window frames,
+    but only after ``release`` is set, so a greeting can register its active TTS
+    stream before any inbound audio is processed (mirrors a live call where the
+    echo arrives once the agent is already speaking).
+    """
+
+    def __init__(self, n_frames: int) -> None:
+        super().__init__([_one_window_frame_8k() for _ in range(n_frames)])
+        self.release = asyncio.Event()
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        frames = self._frames
+        release = self.release
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            await release.wait()
+            for frame in frames:
+                yield frame
+
+        return _gen()
+
+
+def _build_barge_in_loop(  # noqa: PLR0913 — test factory mirrors CallLoop's keyword surface
+    transport: _FakeTransport,
+    vad: VoiceActivityDetector,
+    tts: StreamingTTS,
+    *,
+    mode: BargeInMode,
+    min_voiced_windows: int,
+    greeting: str,
+) -> CallLoop:
+    return CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting=greeting,
+        barge_in_mode=mode,
+        barge_in_min_voiced_windows=min_voiced_windows,
+        barge_in_tail_windows=8,
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_short_echo_during_tts_does_not_barge_in() -> None:
+    """A SHORT echo blip while the greeting plays must NOT cancel it (gated mode).
+
+    Reproduces the live self-interruption: the agent is speaking (greeting TTS
+    active), and the inbound stream carries a short voiced run (echo of the
+    agent's own audio) — here 6 voiced windows then silence, below the 13-window
+    sustained threshold. The greeting stream must run to completion uncancelled.
+    """
+    # 6 voiced windows (echo blip) then silence; below the 13-window threshold.
+    blip = [0.95] * 6 + [0.0] * 20
+    vad = _scripted_vad_8k(blip)
+    # The greeting emits its frames over multiple windows so the gate is armed
+    # (TTS active) across the whole echo blip.
+    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    transport = _ScriptedInboundTransport(len(blip))
+
+    loop = _build_barge_in_loop(
+        transport,
+        vad,
+        tts,
+        mode=BargeInMode.GATED,
+        min_voiced_windows=13,
+        greeting="The agent is giving a long spoken answer here.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting start + register its stream, then release the echo frames.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is False, (
+        "short echo blip during TTS playout must NOT barge in (gated mode)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_sustained_speech_during_tts_barges_in() -> None:
+    """A SUSTAINED voiced run while the greeting plays MUST cancel it (gated).
+
+    A genuine caller interruption keeps voicing past the 13-window threshold with
+    no offset — barge-in must still fire so the agent stops. This proves the gate
+    preserves intentional barge-in (it does not simply disable it during TTS).
+    """
+    # 30 continuous voiced windows → well past the 13-window threshold.
+    sustained = [0.95] * 30
+    vad = _scripted_vad_8k(sustained)
+    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    transport = _ScriptedInboundTransport(len(sustained))
+
+    loop = _build_barge_in_loop(
+        transport,
+        vad,
+        tts,
+        mode=BargeInMode.GATED,
+        min_voiced_windows=13,
+        greeting="The agent starts a long answer but the caller cuts in.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True, (
+        "a sustained caller interruption during TTS must still barge in"
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_mode_short_blip_barges_in_legacy_behaviour() -> None:
+    """``full`` mode reproduces the pre-fix behaviour: first ONSET barges in.
+
+    This documents that the legacy immediate-barge-in path still exists for
+    echo-cancelled gateways — and that it is exactly what made the short echo
+    blip self-interrupt before ``gated`` became the default.
+    """
+    blip = [0.95] * 6 + [0.0] * 20
+    vad = _scripted_vad_8k(blip)
+    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    transport = _ScriptedInboundTransport(len(blip))
+
+    loop = _build_barge_in_loop(
+        transport,
+        vad,
+        tts,
+        mode=BargeInMode.FULL,
+        min_voiced_windows=13,
+        greeting="The agent speaks and any onset cuts it off in full mode.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True
+
+
+@pytest.mark.asyncio
+async def test_gated_default_mode_when_unspecified() -> None:
+    """A CallLoop built without barge-in args defaults to gated, min 1 window.
+
+    The default constructor (used by older call sites / tests) must not regress:
+    with no inbound echo and an active greeting, the greeting completes; the
+    default mode is ``gated``. (The adapter supplies real thresholds; the
+    constructor default is a safe immediate-ish gate.)
+    """
+    tts = _GatedGreetingTTS([_greeting_frame(1)])
+    transport = _Transport8k([])  # no inbound audio at all
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="A short greeting with no inbound audio.",
+    )
+    assert loop.barge_in_mode is BargeInMode.GATED
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+    # With no inbound audio nothing barges in; the greeting ran.
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is False

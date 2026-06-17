@@ -415,6 +415,10 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.greeting != ""
     # symmetric-RTP (comedia) latching is ON by default
     assert cfg.rtp_symmetric is True
+    # echo-robust barge-in (ADR-0022): gated by default, telephony thresholds
+    assert cfg.barge_in_mode == "gated"
+    assert cfg.barge_in_min_speech_ms == 400
+    assert cfg.barge_in_tail_ms == 250
     # injection guard
     assert cfg.injection_guard == "onnx"
     assert cfg.injection_guard_model_dir is None
@@ -444,6 +448,9 @@ def test_media_full_override() -> None:
             "HERMES_SIP_DTMF_INBAND_ENABLED": "false",
             "HERMES_VOIP_GREETING": "Hi from the test gateway.",
             "HERMES_VOIP_RTP_SYMMETRIC": "false",
+            "HERMES_VOIP_BARGE_IN_MODE": "full",
+            "HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS": "600",
+            "HERMES_VOIP_BARGE_IN_TAIL_MS": "150",
         }
     )
     assert cfg.stt_provider == "deepgram"
@@ -463,6 +470,39 @@ def test_media_full_override() -> None:
     assert cfg.dtmf_inband_enabled is False
     assert cfg.greeting == "Hi from the test gateway."
     assert cfg.rtp_symmetric is False
+    assert cfg.barge_in_mode == "full"
+    assert cfg.barge_in_min_speech_ms == 600
+    assert cfg.barge_in_tail_ms == 150
+
+
+def test_media_barge_in_mode_lowercased_and_validated() -> None:
+    """``HERMES_VOIP_BARGE_IN_MODE`` is lower-cased and constrained to the enum."""
+    cfg = load_media_config({"HERMES_VOIP_BARGE_IN_MODE": "OFF"})
+    assert cfg.barge_in_mode == "off"
+
+
+def test_media_barge_in_mode_unknown_rejected() -> None:
+    """An unknown barge-in mode is rejected (fail-fast, no silent fallback)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_BARGE_IN_MODE": "loud"})
+
+
+def test_media_barge_in_min_speech_ms_must_be_positive() -> None:
+    """A non-positive minimum-speech window is rejected (would be instant)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS": "0"})
+
+
+def test_media_barge_in_tail_ms_zero_allowed() -> None:
+    """A tail of 0 ms is valid (gate disarms the instant TTS ends)."""
+    cfg = load_media_config({"HERMES_VOIP_BARGE_IN_TAIL_MS": "0"})
+    assert cfg.barge_in_tail_ms == 0
+
+
+def test_media_barge_in_tail_ms_negative_rejected() -> None:
+    """A negative tail is rejected (fail-fast)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_BARGE_IN_TAIL_MS": "-5"})
 
 
 def test_media_greeting_explicit_empty_disables_greeting() -> None:

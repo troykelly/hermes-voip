@@ -30,6 +30,7 @@ from hermes_voip.caller_modes import (
     CallerMode,
     CallerModeConfig,
     Normalization,
+    _normalize,  # pure helper — unit-tested directly for the digitless edge case
     classify_caller,
     load_caller_modes,
     persona_preamble,
@@ -147,6 +148,20 @@ def test_none_normalization_is_verbatim() -> None:
     assert classify_caller("1000", cfg).mode is CallerMode.ALLOW
     # ...and a punctuated form does NOT match under NONE.
     assert classify_caller("+1000", cfg).mode is CallerMode.GREY
+
+
+def test_e164_normalizes_a_digitless_caller_to_empty_not_plus() -> None:
+    # A digitless / anonymous / blank caller-ID must normalize to "" — NOT to "+".
+    # (Bug fix, PR #83: the old guard `kept[:1] in "123456789"` was True for the
+    # empty string — "" is a substring of every str in Python — so a digitless
+    # caller spuriously became "+", which then matched a "+"/"+*" pattern. A
+    # caller with no number must carry no E.164 identity.)
+    assert _normalize("", Normalization.E164) == ""
+    assert _normalize("anonymous", Normalization.E164) == ""
+    assert _normalize("Restricted", Normalization.E164) == ""
+    # A real number still normalizes correctly (regression guard).
+    assert _normalize("15551230001", Normalization.E164) == "+15551230001"
+    assert _normalize("+1 (555) 123-0001", Normalization.E164) == "+15551230001"
 
 
 def test_raw_form_also_matches_when_gateway_does_not_normalize() -> None:

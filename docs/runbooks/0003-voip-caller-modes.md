@@ -129,10 +129,18 @@ Patterns: exact value or `*`-suffixed literal prefix. The default group **must**
 | `HERMES_VOIP_CALLER_ALLOW_FILE` | path to allow-list JSON | unset → empty |
 | `HERMES_VOIP_CALLER_DENY_FILE` | path to deny-list JSON | unset → empty |
 | `HERMES_VOIP_CALLER_GREY_FILE` | path to grey-pin JSON | unset → empty |
-| `HERMES_VOIP_CALLER_DEFAULT_MODE` | `grey` (safe default) \| `allow` | `grey` |
+| `HERMES_VOIP_CALLER_DEFAULT_MODE` | `grey` only — the safe receptionist default | `grey` |
 | `HERMES_VOIP_CALLER_NORMALIZATION` | `e164` \| `strip-plus` \| `none` | `e164` |
 
 List-file format: `{ "patterns": ["+15555550100", "1000", "+15550*"] }`.
+
+> **Privileged default is refused (fail-loud).** Only `grey` is a valid
+> `HERMES_VOIP_CALLER_DEFAULT_MODE`. `allow` is **rejected at startup with a
+> `ConfigError`**: it would put every unmatched (unknown, forgeable) caller in the
+> `operator` group at `privilege_level=3` — operator privilege on a spoofable
+> identifier. Caller-ID is a trust hint, not authentication: operator privilege
+> requires an explicit allow-list match, never the catch-all default. This mirrors
+> the groups-file path, which rejects a `default_group` whose `privilege_level != 0`.
 
 When BOTH options are configured (`HERMES_VOIP_CALLER_GROUPS_FILE` AND legacy `*_FILE` vars),
 the groups file takes precedence and the legacy vars are ignored.

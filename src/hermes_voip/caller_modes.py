@@ -51,6 +51,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 
 from hermes_voip.config import ConfigError
 
@@ -103,9 +104,27 @@ _PREFIX_WILDCARD = "*"
 _E164_STRIP = re.compile(r"[^0-9+]")
 _DIGITS_ONLY = re.compile(r"[^0-9]")
 
+# Any decimal digit — used to decide whether a pattern carries a real discriminator.
+_HAS_DIGIT = re.compile(r"[0-9]")
+
 # Minimum privilege level for each non-SAFE tool risk class (ADR-0021 §1 table).
 _MIN_LEVEL_ELEVATED = 2
 _MIN_LEVEL_IRREVERSIBLE = 3
+
+
+def _is_blanket_pattern(pattern: str) -> bool:
+    """Whether ``pattern`` matches (nearly) every caller — no specific discriminator.
+
+    A pattern is "blanket" if it carries **no digit**: ``"*"`` (empty-prefix wildcard,
+    matches all), ``"+*"`` (matches every E.164-normalized caller — they all start
+    ``+``), exact ``"+"`` (matches the digitless-normalized artifact), ``""`` /
+    whitespace, etc. Such a pattern in a *privileged* group would grant that privilege
+    to unknown callers on a forgeable identifier. A pattern with at least one digit
+    (``"+1*"``, ``"1000"``, ``"+15555550100"``) carries a real discriminator and is a
+    deliberate, specific operator choice. Used by
+    :meth:`CallerGroupConfig.__post_init__` to clamp privileged groups.
+    """
+    return _HAS_DIGIT.search(pattern) is None
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +185,15 @@ class CallerGroupConfig:
             Decline-biased: the first group in the list should be the blocked
             group so a number on both blocked and an allowed list is declined.
         normalization: How raw caller-IDs are canonicalised before matching.
+
+    The ``default_group`` (catch-all for unmatched, forgeable callers) MUST be
+    unprivileged (``privilege_level == 0``): :meth:`__post_init__` raises
+    :class:`ConfigError` otherwise. This is the by-construction enforcement of the
+    operator security tenet — an unmatched caller can NEVER reach operator (or any
+    non-zero) privilege regardless of config, because this is the single chokepoint
+    every path flows through (the JSON loader, the legacy 3-file synthesis, direct
+    construction, and ``adapter._caller_groups``), and :func:`classify_caller_group`
+    returns ``default_group`` verbatim for an unmatched caller.
     """
 
     groups: tuple[CallerGroup, ...]
@@ -173,6 +201,122 @@ class CallerGroupConfig:
     default_group: str
     match_order: tuple[str, ...]
     normalization: Normalization
+
+    def __post_init__(self) -> None:
+        """Snapshot inputs, reject duplicate names, then reject a privileged default.
+
+        Three responsibilities, all load-bearing for the by-construction security
+        clamp:
+
+        1. **Snapshot (durability).** ``groups``/``match_order`` are coerced to
+           tuples and ``group_lists`` to a read-only :class:`MappingProxyType` over
+           a copied dict (with tuple values), via ``object.__setattr__`` (the
+           dataclass is ``frozen``). This makes the validated state the *same*
+           immutable state the classifier later reads: a caller who passes a
+           mutable list and mutates it after construction cannot retroactively
+           escalate the default group, because the config holds its own snapshot.
+
+        2. **Reject duplicate group names.** Unique names are required so the
+           linear default-privilege check (first-wins) and the classifier's
+           name→group dict (last-wins) cannot resolve a duplicate name to different
+           groups — a privilege-escalation bypass otherwise.
+
+        3. **Reject a privileged default (fail-loud).** The default group is the
+           catch-all for unmatched (unknown, forgeable) callers. Caller-ID is a
+           trust hint, not authentication, so the default MUST be unprivileged
+           (``privilege_level == 0``, the receptionist). A privileged default would
+           silently grant that privilege to every unmatched caller — the systemic
+           privilege escalation. This invariant on the constructor backstops the
+           loader-level checks (:func:`_parse_groups_document`, the legacy
+           synthesis), which a direct ``CallerGroupConfig(...)`` would otherwise
+           bypass.
+
+        4. **Reject a blanket (digitless) pattern in a privileged group.** A pattern
+           with no digit — ``"*"`` (matches all), ``"+*"`` (matches every
+           E.164-normalized caller), exact ``"+"`` (the digitless artifact), ``""`` —
+           matches (nearly) every caller, so it would grant a level >= 2 group's
+           privilege to every unknown caller on a forgeable caller-ID (the
+           config-driven form of ``default_mode=ALLOW``). Privileged membership must
+           require a specific, digit-bearing pattern.
+
+        Only the named default group's privilege is validated here; whether
+        ``default_group`` names a defined group is a loader-level concern (and
+        :func:`classify_caller_group` falls back safely if it does not), so a
+        missing name is not raised on here — that keeps this invariant a pure,
+        additive security clamp.
+        """
+        # 1. Snapshot to immutable containers (the dataclass is frozen, so set via
+        #    object.__setattr__). Validation below reads these snapshots.
+        object.__setattr__(self, "groups", tuple(self.groups))
+        object.__setattr__(self, "match_order", tuple(self.match_order))
+        object.__setattr__(
+            self,
+            "group_lists",
+            MappingProxyType(
+                {name: tuple(patterns) for name, patterns in self.group_lists.items()}
+            ),
+        )
+
+        # 2. Reject duplicate group names. Names must be unique because
+        #    classify_caller_group resolves a group by name via a dict
+        #    (``{g.name: g for g in groups}``, last-wins) while the default-privilege
+        #    check below scans linearly (first-wins). With a duplicate name those two
+        #    resolutions disagree, which is a privilege-escalation bypass (a level-0
+        #    group could shadow a level-3 group of the same name for validation while
+        #    the classifier picks the level-3 one). Forbidding duplicates removes the
+        #    ambiguity entirely (matches the JSON loader and the name-unique invariant).
+        names = [g.name for g in self.groups]
+        if len(set(names)) != len(names):
+            msg = (
+                "group names must be unique: duplicate names make the default-group "
+                "privilege check and the classifier resolve to different groups (a "
+                "privilege-escalation bypass). Give each group a distinct name."
+            )
+            raise ConfigError(msg)
+
+        # 3. Reject a privileged default group (against the snapshotted groups).
+        default = next((g for g in self.groups if g.name == self.default_group), None)
+        if default is not None and default.privilege_level != 0:
+            msg = (
+                f"default_group={self.default_group!r} has privilege_level="
+                f"{default.privilege_level} but must be 0: the default group is "
+                "the catch-all for unmatched (unknown, forgeable) callers and must "
+                "be unprivileged (the receptionist). A privileged default would "
+                "grant that privilege to every unmatched caller on a spoofable "
+                "identifier — operator/elevated privilege requires an explicit "
+                "allow-list match, never the default."
+            )
+            raise ConfigError(msg)
+
+        # 4. Reject a BLANKET pattern in a PRIVILEGED group. A pattern with no digit
+        #    matches (nearly) every caller: "*" (empty-prefix wildcard, matches all),
+        #    "+*" (matches every E.164-normalized caller — they all start "+"), exact
+        #    "+" (matches a digitless caller's normalized "+"), "" / whitespace. In a
+        #    level >= 2 group that grants operator/elevated privilege to unknown
+        #    callers on a forgeable identifier — the config-driven re-creation of the
+        #    rejected default_mode=ALLOW. Privileged membership must require a SPECIFIC
+        #    (digit-bearing) pattern. (A blanket pattern in a level-0 group is harmless
+        #    — it is the receptionist, which grants nothing; a digit-bearing prefix
+        #    like "+1*" or "+1555550*" remains a valid deliberate block-trust choice.)
+        for g in self.groups:
+            if g.privilege_level < _MIN_LEVEL_ELEVATED:
+                continue
+            blanket = next(
+                (p for p in self.group_lists.get(g.name, ()) if _is_blanket_pattern(p)),
+                None,
+            )
+            if blanket is not None:
+                msg = (
+                    f"caller-group {g.name!r} has privilege_level={g.privilege_level}"
+                    f" (>= {_MIN_LEVEL_ELEVATED}) but lists the blanket pattern"
+                    f" {blanket!r}, which carries no digit and so matches (nearly)"
+                    " every caller — including unknown ones — and would grant that"
+                    " privilege on a forgeable caller-ID. A privileged group must"
+                    " enumerate specific numbers or digit-bearing prefixes:"
+                    " operator/elevated privilege requires a specific allow-list"
+                    " match, never a blanket one."
+                )
+                raise ConfigError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,11 +391,15 @@ class CallerModeConfig:
     Attributes:
         allow: Allow-list patterns (exact or ``*``-suffixed prefix).
         deny: Deny-list patterns.
-        grey: Explicit grey pins (force receptionist even if ``default_mode``
-            were ``ALLOW``).
-        default_mode: Mode for an unmatched caller — ``GREY`` unless overridden.
-            ``DENY`` is not a permitted default (it would block every unknown
-            caller); :func:`load_caller_modes` rejects it.
+        grey: Explicit grey pins (force receptionist for a specific caller).
+        default_mode: Mode for an unmatched caller — only ``GREY`` (receptionist,
+            ``privilege_level=0``) is permitted. ``ALLOW`` is rejected because it
+            would map every unmatched (unknown, forgeable) caller to the operator
+            group at ``privilege_level=3`` (the IRREVERSIBLE tier) — a fail-open
+            privilege escalation. ``DENY`` (would block every unknown caller) and
+            ``OUTBOUND`` (an outbound-only mode) are likewise rejected.
+            :meth:`__post_init__` enforces this, so the fail-open state cannot be
+            constructed at all.
         normalization: How raw caller-IDs are canonicalised before matching.
     """
 
@@ -262,7 +410,37 @@ class CallerModeConfig:
     normalization: Normalization
 
     def __post_init__(self) -> None:
-        """Reject a ``DENY`` default — it would block every unmatched caller."""
+        """Reject any unsafe default mode (fail-loud, rule 37).
+
+        Caller-ID is forgeable SIP identity — a trust HINT, never authentication
+        — so an UNMATCHED caller must NEVER reach operator privilege by
+        construction (the operator security tenet). The default (catch-all) mode
+        is therefore clamped to the unprivileged receptionist (``GREY``):
+
+        * ``ALLOW`` would place every unmatched caller in the ``operator`` group
+          at ``privilege_level=3`` (the IRREVERSIBLE tier) — a privilege
+          escalation on a forgeable identifier. Refused here, mirroring the
+          N-group JSON path which rejects a ``default_group`` with
+          ``privilege_level != 0`` (:func:`_parse_groups_document`). Operator
+          privilege requires an explicit allow-list MATCH, never the default.
+        * ``DENY`` would block every unknown caller (a foot-gun).
+        * ``OUTBOUND`` is an outbound-only mode with no inbound-default meaning.
+
+        Refusing at construction makes the fail-open state un-constructible:
+        :func:`load_caller_modes`, :func:`classify_caller`, and the adapter path
+        all fail loud, regardless of config.
+        """
+        if self.default_mode is CallerMode.ALLOW:
+            msg = (
+                "default_mode must not be ALLOW: it would map every unmatched "
+                "(unknown, forgeable) caller to the operator group at "
+                "privilege_level=3 (the IRREVERSIBLE tier) — a fail-open "
+                "privilege escalation. Caller-ID is a forgeable trust hint, not "
+                "authentication: operator privilege requires an explicit "
+                "allow-list match, never the default. Use GREY (the safe default) "
+                "and enumerate trusted numbers in the allow list."
+            )
+            raise ConfigError(msg)
         if self.default_mode is CallerMode.DENY:
             msg = "default_mode must not be DENY (it would block every unknown caller)"
             raise ConfigError(msg)
@@ -286,11 +464,18 @@ def _normalize(raw: str, normalization: Normalization) -> str:
     # E164: keep a single leading '+' and the digits; drop the rest. If there is
     # no '+' and the first character is a digit 1-9, prepend '+'.
     kept = _E164_STRIP.sub("", stripped)
+    # A digitless caller-ID (anonymous / "Restricted" / blank) has no E.164
+    # identity: return "" rather than a spurious "+". NB ``"" in "123456789"`` is
+    # True in Python (empty string is a substring of every str), so the digit test
+    # below MUST guard against an empty ``kept`` first — otherwise a digitless
+    # caller would normalize to "+" and match a "+"/"+*" pattern (a privilege leak).
+    if not _DIGITS_ONLY.sub("", kept):
+        return ""
     if kept.startswith("+"):
         kept = "+" + kept[1:].replace("+", "")
     else:
         kept = kept.replace("+", "")
-        if kept[:1] in "123456789":
+        if kept[0] in "123456789":
             kept = "+" + kept
     return kept
 
@@ -436,10 +621,13 @@ def caller_mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
     match order.  ``adapter.connect`` uses this to drive the new N-group
     classifier from a (possibly test-injected) legacy :func:`load_caller_modes`
     result, so the ADR-0020 surface keeps working unchanged.
-    """
-    default_is_allow = cfg.default_mode is CallerMode.ALLOW
-    default_name = "operator" if default_is_allow else "receptionist"
 
+    The default (unmatched-caller) group is always the unprivileged
+    ``receptionist`` (``privilege_level=0``): :meth:`CallerModeConfig.__post_init__`
+    guarantees ``cfg.default_mode is GREY`` (a privileged ``ALLOW`` default is
+    rejected at construction), so an unmatched caller can never fall to the
+    ``operator`` group through this shim.
+    """
     group_lists: dict[str, tuple[str, ...]] = {
         "operator": cfg.allow,
         "receptionist": cfg.grey,
@@ -448,7 +636,7 @@ def caller_mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
     return CallerGroupConfig(
         groups=_DEFAULT_THREE_GROUPS,
         group_lists=group_lists,
-        default_group=default_name,
+        default_group="receptionist",
         match_order=("blocked", "operator", "receptionist"),
         normalization=cfg.normalization,
     )
@@ -652,7 +840,16 @@ def _parse_normalization(env: Mapping[str, str]) -> Normalization:
 
 
 def _parse_default_mode(env: Mapping[str, str]) -> CallerMode:
-    """Parse ``HERMES_VOIP_CALLER_DEFAULT_MODE`` (``grey``/``allow``); default grey."""
+    """Parse ``HERMES_VOIP_CALLER_DEFAULT_MODE``; default ``grey``.
+
+    Recognises the tokens ``grey`` and ``allow`` (an unknown token raises
+    :class:`ConfigError` here). ``allow`` parses to :attr:`CallerMode.ALLOW` but
+    is then **rejected by** :meth:`CallerModeConfig.__post_init__` — a privileged
+    default would escalate every unmatched, forgeable caller to operator
+    privilege. The rejection lives at construction (one source of truth, mirroring
+    the JSON path which parses then rejects a privileged ``default_group``), so
+    ``load_caller_modes`` fails loud on ``allow`` regardless of this parse.
+    """
     token = (env.get(_DEFAULT_MODE_KEY) or "").strip().lower()
     if not token:
         return CallerMode.GREY

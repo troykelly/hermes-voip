@@ -834,3 +834,175 @@ def test_load_caller_groups_legacy_rejects_empty_privileged_group(
     allow_file.write_text(json.dumps({"patterns": []}), encoding="utf-8")
     with pytest.raises(ConfigError, match="privilege_level"):
         load_caller_groups({"HERMES_VOIP_CALLER_ALLOW_FILE": str(allow_file)})
+
+
+def test_caller_group_config_rejects_privileged_default_at_construction() -> None:
+    """By-construction clamp: NO CallerGroupConfig may name a privileged default.
+
+    Cross-vendor review (codex, PR #83) found the loader-level checks
+    (_parse_groups_document for the JSON path; the legacy synthesis) are NOT the
+    single chokepoint: classify_caller_group trusts cfg.default_group directly, so
+    a direct ``CallerGroupConfig(default_group=<a level-3 group>, ...)`` — bypassing
+    both loaders — classifies an UNMATCHED caller to privilege_level=3. The
+    operator tenet requires "by construction, regardless of config", so the
+    invariant lives on CallerGroupConfig.__post_init__: a default_group whose
+    privilege_level != 0 is refused at CONSTRUCTION, the one chokepoint every path
+    (JSON loader, legacy synthesis, direct construction, adapter._caller_groups)
+    flows through.
+    """
+    with pytest.raises(ConfigError, match="privilege_level"):
+        CallerGroupConfig(
+            groups=(_operator_group(), _receptionist_group()),
+            group_lists={"operator": (_OPERATOR_NUMBER,), "receptionist": ()},
+            # MISTAKE: a privileged (level-3) group as the unmatched-caller default.
+            default_group="operator",
+            match_order=("operator", "receptionist"),
+            normalization=Normalization.E164,
+        )
+
+
+def test_unmatched_caller_can_never_reach_level_3_by_construction() -> None:
+    """The end-to-end guarantee: a constructed config's default is always level 0.
+
+    Because a privileged default is refused at construction (the test above), any
+    CallerGroupConfig that DOES exist has an unprivileged default, so an unmatched
+    caller is always classified to privilege_level 0 — never operator. A trusted
+    default (level 2) is likewise refused (only level 0 is a valid catch-all).
+    """
+    # A level-2 default is also refused (the catch-all must be the receptionist).
+    with pytest.raises(ConfigError, match="privilege_level"):
+        CallerGroupConfig(
+            groups=(_trusted_group(), _receptionist_group()),
+            group_lists={"trusted": (_TRUSTED_NUMBER,), "receptionist": ()},
+            default_group="trusted",
+            match_order=("trusted", "receptionist"),
+            normalization=Normalization.E164,
+        )
+    # The only constructible default is unprivileged => unmatched is level 0.
+    cfg = _default_config()  # default_group="receptionist" (level 0)
+    cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
+    assert cls.group.privilege_level == 0
+    assert cls.group.privilege_level < 3  # never operator/IRREVERSIBLE
+
+
+def test_caller_group_config_snapshots_groups_against_post_construction_mutation() -> (
+    None
+):
+    """The construction clamp must be durable: snapshot inputs to immutable tuples.
+
+    Cross-vendor re-review (codex, PR #83) found that, although a privileged
+    default is rejected at construction, ``groups`` is only annotated as a tuple —
+    a caller passing a mutable list could construct with an unprivileged default
+    (passing validation) then mutate the list element to privilege_level=3
+    afterward, and ``classify_caller_group`` would read the mutated group for an
+    unmatched caller. ``CallerGroupConfig.__post_init__`` must therefore SNAPSHOT
+    ``groups`` (and the other sequence inputs) into immutable containers, so the
+    validated state IS the state the classifier uses.
+    """
+    # Build with a MUTABLE list and an unprivileged default (passes validation).
+    mutable_groups = [_receptionist_group()]
+    cfg = CallerGroupConfig(
+        groups=mutable_groups,  # type: ignore[arg-type]  # deliberately a list — the attack vector under test
+        group_lists={"receptionist": ()},
+        default_group="receptionist",
+        match_order=("receptionist",),
+        normalization=Normalization.E164,
+    )
+    # Attacker mutates the original list AFTER construction to escalate the default.
+    mutable_groups[0] = CallerGroup(
+        name="receptionist",
+        privilege_level=3,
+        persona="assistant",
+        declined_at_sip=False,
+    )
+    # The config must have snapshotted its own tuple => the unmatched caller is
+    # STILL level 0, unaffected by the post-construction mutation.
+    cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
+    assert cls.group.privilege_level == 0
+
+
+def test_caller_group_config_rejects_duplicate_group_names() -> None:
+    """Duplicate group names must be refused at construction (no level-0/level-3 split).
+
+    Cross-vendor re-review (codex, PR #83) found a duplicate-name bypass: with two
+    groups sharing a name (a level-0 receptionist FIRST, a level-3 receptionist
+    SECOND), ``__post_init__``'s linear ``next(...)`` default check matches the
+    first (level 0, passes), but ``classify_caller_group`` builds
+    ``{g.name: g for g in groups}`` which keeps the LAST (level 3) — so an unmatched
+    caller is classified level 3. The two resolutions disagree. Rejecting duplicate
+    names at construction (matching the JSON loader and the documented name-unique
+    invariant) removes the ambiguity, so neither path can pick a privileged default.
+    """
+    with pytest.raises(ConfigError, match="unique"):
+        CallerGroupConfig(
+            groups=(
+                CallerGroup("receptionist", 0, "receptionist", False),
+                # MISTAKE/attack: a second group with the SAME name, escalated.
+                CallerGroup("receptionist", 3, "assistant", False),
+            ),
+            group_lists={"receptionist": ()},
+            default_group="receptionist",
+            match_order=("receptionist",),
+            normalization=Normalization.E164,
+        )
+
+
+@pytest.mark.parametrize("blanket", ["*", "+*", "+", "", "++*", "  ", "+ *"])
+def test_caller_group_config_rejects_blanket_pattern_in_privileged_group(
+    blanket: str,
+) -> None:
+    """A privileged group must not carry a pattern with no specific discriminator.
+
+    Cross-vendor re-review (codex, PR #83) found several "match (almost) everything"
+    patterns that grant a privileged group to unknown callers on a forgeable ID:
+    ``"*"`` (empty-prefix wildcard), ``"+*"`` (matches every E.164-normalized caller —
+    every normalized number starts with ``+``), and exact ``"+"`` (a digitless caller
+    normalizes to ``"+"``). All are the config-driven form of the rejected
+    ``default_mode=allow``: operator/elevated privilege must require a SPECIFIC
+    allow-list match. A privileged-group pattern whose significant part (after
+    removing a trailing ``*`` and any leading ``+``/whitespace) is empty is refused
+    at construction.
+    """
+    with pytest.raises(ConfigError, match="privilege_level"):
+        CallerGroupConfig(
+            groups=(
+                CallerGroup("operator", 3, "assistant", False),
+                CallerGroup("receptionist", 0, "receptionist", False),
+            ),
+            group_lists={"operator": (blanket,), "receptionist": ()},
+            default_group="receptionist",
+            match_order=("operator", "receptionist"),
+            normalization=Normalization.E164,
+        )
+
+
+def test_caller_group_config_allows_specific_patterns_in_privileged_group() -> None:
+    """A level-0 group MAY use "*"; a privileged group MAY use a SPECIFIC prefix.
+
+    The clamp targets only blanket patterns in PRIVILEGED groups. A match-all in the
+    unprivileged default tier is harmless (it grants nothing), and a privileged group
+    with a digit-bearing prefix — a country block ``"+1*"`` or a narrower
+    ``"+1555550*"`` — is the operator deliberately trusting a SPECIFIC range, which
+    stays valid (it carries a real discriminator, unlike ``"+*"``).
+    """
+    cfg = CallerGroupConfig(
+        groups=(
+            CallerGroup("operator", 3, "assistant", False),
+            CallerGroup("trusted", 2, "colleague", False),
+            CallerGroup("receptionist", 0, "receptionist", False),
+        ),
+        # "*" on the level-0 group is fine; privileged groups use SPECIFIC prefixes.
+        group_lists={
+            "operator": ("+1555550*",),
+            "trusted": ("+1*",),  # broad but digit-bearing => a deliberate choice
+            "receptionist": ("*",),
+        },
+        default_group="receptionist",
+        match_order=("operator", "trusted", "receptionist"),
+        normalization=Normalization.E164,
+    )
+    # A specific operator number reaches level 3; a +1 number reaches the trusted
+    # tier (level 2); a non-+1 / unknown caller falls to the receptionist (level 0).
+    assert classify_caller_group("+15555500001", cfg).group.privilege_level == 3
+    assert classify_caller_group("+12125550001", cfg).group.privilege_level == 2
+    assert classify_caller_group("+447700900001", cfg).group.privilege_level == 0

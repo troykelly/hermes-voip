@@ -365,7 +365,7 @@ New `HERMES_VOIP_*` env vars (parsed by `load_caller_modes`; documented with fak
 | `HERMES_VOIP_CALLER_ALLOW_FILE` | Path to allow-list JSON | unset => empty |
 | `HERMES_VOIP_CALLER_DENY_FILE` | Path to deny-list JSON | unset => empty |
 | `HERMES_VOIP_CALLER_GREY_FILE` | Path to grey-list JSON (optional explicit pins) | unset => empty |
-| `HERMES_VOIP_CALLER_DEFAULT_MODE` | Mode for an unmatched caller: `grey`/`allow`/`deny` | `grey` |
+| `HERMES_VOIP_CALLER_DEFAULT_MODE` | Mode for an unmatched caller: `grey` only (the safe receptionist default) | `grey` |
 | `HERMES_VOIP_CALLER_NORMALIZATION` | `e164`/`strip-plus`/`none` | `e164` |
 | `HERMES_VOIP_DENY_MODE` | `reject` (603) / `decline` (answer+TTS+BYE) | `reject` (Phase 2 adds `decline`) |
 
@@ -374,9 +374,56 @@ is GREY (receptionist)**. This is the safe default — an operator who installs 
 and sets up no lists gets a screening receptionist for everyone and an assistant for
 nobody, never the reverse. Privileged assistant access is strictly opt-in (you must
 enumerate trusted numbers), consistent with the forgeable-caller-ID posture (§1).
-Setting `HERMES_VOIP_CALLER_DEFAULT_MODE=allow` is supported but is a deliberate,
-documented loosening (it makes every unknown caller a full assistant on spoofable
-caller-ID) and is **not** recommended.
+
+> **Amendment (2026-06-17, fail-open hardening).** An earlier draft described
+> `HERMES_VOIP_CALLER_DEFAULT_MODE=allow` as a "supported but not recommended"
+> loosening. That was a **fail-open privilege-escalation gap**: it mapped every
+> unmatched (unknown, forgeable) caller into the synthesised `operator` group at
+> `privilege_level=3` (the IRREVERSIBLE tier) with no error, so an unknown caller
+> could reach operator-level tools. Under the operator security tenet — caller-ID
+> is a forgeable trust **hint**, never authentication, so an unmatched caller must
+> **never** reach operator privilege by construction — a privileged default is now
+> **refused**: `HERMES_VOIP_CALLER_DEFAULT_MODE=allow` raises `ConfigError` at
+> config construction (`CallerModeConfig.__post_init__`), exactly mirroring the
+> ADR-0021 N-group JSON path, which already rejects a `default_group` with
+> `privilege_level != 0`. The **only** permitted default is `grey`; operator
+> privilege requires an explicit allow-list **match**. (`deny`/`outbound` defaults
+> were already rejected.) This is a least-privilege fail-**safe**: misconfiguration
+> degrades to *more* restriction (everyone receptionist), never to open privilege.
+>
+> A cross-vendor review of the fix found the loader-level checks were not the
+> single chokepoint (a direct `CallerGroupConfig(default_group=<a level-3 group>)`
+> bypassed them, since `classify_caller_group` trusts `default_group`). The
+> by-construction invariant therefore also lives on **`CallerGroupConfig.__post_init__`**
+> (raises `ConfigError` for a default group with `privilege_level != 0`): every
+> path that produces a config — the JSON loader, the legacy 3-file synthesis,
+> direct construction, and `adapter._caller_groups` — flows through that
+> constructor, so an unmatched caller can never be classified into a privileged
+> default regardless of how the config was built. To make this durable against a
+> hostile caller that passes a mutable sequence and mutates it after construction,
+> `__post_init__` **snapshots** its inputs to immutable containers
+> (`groups`/`match_order` → tuples, `group_lists` → a read-only `MappingProxyType`)
+> before validating, so the validated state is the same state the classifier reads.
+> It also **rejects duplicate group names**: the default-privilege check scans
+> linearly (first-wins) while `classify_caller_group` resolves a name via a dict
+> (last-wins), so a duplicate name could otherwise let a level-0 group pass
+> validation while the classifier returns a level-3 group of the same name —
+> forbidding duplicates removes that disagreement (matching the JSON loader).
+> Finally, it **rejects a blanket (digitless) pattern in a privileged group**
+> (`privilege_level >= 2`): a pattern with no digit — `"*"` (empty-prefix wildcard,
+> matches all), `"+*"` (matches every E.164-normalized caller, since every normalized
+> number starts `+`), exact `"+"` (matches a digitless caller's normalized form), `""`
+> — matches (nearly) every caller, so it would grant that privilege to unknown callers
+> on a forgeable caller-ID (the config-driven form of `default_mode=allow`). A
+> privileged group must use a digit-bearing pattern; a specific prefix (`+1*`,
+> `+1555550*`) and a blanket pattern in the unprivileged receptionist tier remain
+> valid. A **related normalization fix** stops a digitless/anonymous caller-ID from
+> normalizing to `"+"` (it now normalizes to `""`), closing the matching half of the
+> `"+"`/`"+*"` leak. Net: across the legacy default, the JSON `default_group`, direct
+> construction, post-construction mutation, duplicate names, a missing default name
+> (safe level-0 fallback), and a blanket/digitless privileged pattern, an
+> unmatched/unknown/anonymous caller can never reach operator privilege regardless of
+> config.
 
 **Phasing:**
 

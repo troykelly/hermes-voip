@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import unicodedata
 
-from hermes_voip.spoken_text import sanitize_for_speech
+from hermes_voip.spoken_text import sanitize_for_speech, strip_audio_tags
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -289,3 +289,89 @@ class TestEndToEnd:
         result = sanitize_for_speech("Wow!!! Great job!!!")
         # Multiple identical punctuation marks should be collapsed to one
         assert "!!!" not in result
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs v3 audio tags (model-conditional, ADR-0027)
+# ---------------------------------------------------------------------------
+#
+# ElevenLabs v3 renders inline audio tags like ``[laughs]`` / ``[breath]`` as
+# performance cues; a non-v3 model (Flash/Turbo/Multilingual/Kokoro) would speak
+# the bracketed word LITERALLY. ``strip_audio_tags`` removes the whole ``[tag]``
+# token (not just the brackets) so nothing is voiced on a non-tag model. The
+# model-conditional preserve/strip decision is made at the provider seam; this
+# tests the pure stripping primitive and that the existing emoji/markdown/URL
+# entry point (``sanitize_for_speech``) leaves tags ALONE (it is the
+# provider-agnostic layer; the provider decides the tag fate).
+
+# The canonical ElevenLabs v3 audio-tag vocabulary the agent emits spontaneously.
+_AUDIO_TAGS = (
+    "[laughs]",
+    "[sighs]",
+    "[exhales]",
+    "[breath]",
+    "[breathes]",
+    "[hesitates]",
+    "[pauses]",
+    "[stammers]",
+    "[whispers]",
+    "[clears throat]",
+)
+
+
+class TestStripAudioTags:
+    def test_single_tag_removed_entirely(self) -> None:
+        # The WHOLE token goes, not just the brackets — "breath" must not remain.
+        assert strip_audio_tags("Hello [breath] there") == "Hello there"
+
+    def test_every_canonical_tag_removed(self) -> None:
+        for tag in _AUDIO_TAGS:
+            word = tag.strip("[]")
+            result = strip_audio_tags(f"Well {tag} okay")
+            assert tag not in result
+            # The bare bracketed word must not survive to be spoken literally.
+            assert word.split()[0] not in result.split()
+            assert "[" not in result
+            assert "]" not in result
+
+    def test_multiple_tags_removed(self) -> None:
+        result = strip_audio_tags("[laughs] That's funny [sighs] but true.")
+        assert "[" not in result
+        assert "]" not in result
+        assert "laughs" not in result
+        assert "sighs" not in result
+        assert "funny" in result
+        assert "true" in result
+
+    def test_no_double_space_after_removal(self) -> None:
+        result = strip_audio_tags("one [pauses] two")
+        assert "  " not in result
+        assert result == "one two"
+
+    def test_plain_text_unchanged(self) -> None:
+        text = "No tags here at all, just words."
+        assert strip_audio_tags(text) == text
+
+    def test_leaves_non_tag_brackets_with_digits(self) -> None:
+        # A reference like "[3]" is not an audio-tag-shaped cue; do not eat it.
+        text = "See footnote [3] for details."
+        assert strip_audio_tags(text) == text
+
+
+class TestSanitizeLeavesAudioTags:
+    """The emoji/markdown/URL entry point does NOT strip audio tags itself.
+
+    Tag handling is model-conditional and decided at the provider seam, so the
+    provider-agnostic ``sanitize_for_speech`` must pass a bare ``[tag]`` through
+    untouched (while still stripping emoji/markdown/URLs) — otherwise tags could
+    never reach a v3 model.
+    """
+
+    def test_bare_tag_passes_through(self) -> None:
+        assert sanitize_for_speech("Hello [laughs] world") == "Hello [laughs] world"
+
+    def test_tag_survives_while_emoji_and_markdown_stripped(self) -> None:
+        result = sanitize_for_speech("Sure! \U0001f60a Here's the **plan** [sighs].")
+        assert "[sighs]" in result
+        assert not _has_emoji_codepoint(result)
+        assert "*" not in result

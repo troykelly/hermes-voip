@@ -23,6 +23,7 @@ from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts.elevenlabs import (
     DEFAULT_VOICE_SETTINGS,
     G711_NARROWBAND_RATE,
+    V3_MODEL_ID,
     ElevenLabsRequest,
     ElevenLabsTTS,
     ElevenLabsVoiceSettings,
@@ -625,6 +626,69 @@ async def test_default_model_id_is_flash_v2_5() -> None:
     req = http.request
     assert req is not None
     assert req.model_id == _FLASH_V2_5
+
+
+# --- model-conditional audio tags (ADR-0027) ---------------------------------
+#
+# ElevenLabs v3 renders inline audio tags ([laughs]/[breath]/...) as performance
+# cues; Flash/Turbo/Multilingual speak the bracketed word literally. The provider
+# therefore PRESERVES tags only on a v3-family model and STRIPS them otherwise.
+# The synthesised request body's ``text`` is what reaches ElevenLabs, so these
+# assert on it. Emoji/markdown/URL stripping is the call-loop layer's job, not
+# the provider's, so these inputs carry only tags.
+
+
+def test_v3_model_preserves_audio_tags_capability() -> None:
+    """A v3-family model declares it preserves audio tags; Flash does not."""
+    v3 = ElevenLabsTTS(
+        api_key=_FAKE_KEY, voice="x", http=_RecordedHttp(), model_id=V3_MODEL_ID
+    )
+    flash = _make(_RecordedHttp())
+    assert v3.preserves_audio_tags is True
+    assert flash.preserves_audio_tags is False
+
+
+@pytest.mark.asyncio
+async def test_v3_model_keeps_audio_tags_in_request() -> None:
+    """On eleven_v3 the audio tags reach the API intact (v3 renders them)."""
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(api_key=_FAKE_KEY, voice="x", http=http, model_id=V3_MODEL_ID)
+    await _drain(tts.synthesize(_text("Hello [breath] there [laughs]. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert "[breath]" in req.text
+    assert "[laughs]" in req.text
+
+
+@pytest.mark.asyncio
+async def test_flash_model_strips_audio_tags_from_request() -> None:
+    """On Flash the audio tags are removed before synthesis (never spoken aloud)."""
+    http = _RecordedHttp()
+    tts = _make(http)  # default Flash v2.5
+    await _drain(tts.synthesize(_text("Hello [breath] there [laughs]. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert "[breath]" not in req.text
+    assert "[laughs]" not in req.text
+    # The bracketed words must not survive as literal speakable text.
+    assert "breath" not in req.text
+    assert "laughs" not in req.text
+    assert "Hello" in req.text
+    assert "there" in req.text
+
+
+@pytest.mark.asyncio
+async def test_multilingual_model_strips_audio_tags() -> None:
+    """A non-v3 streaming model (multilingual v2) also strips tags."""
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(
+        api_key=_FAKE_KEY, voice="x", http=http, model_id="eleven_multilingual_v2"
+    )
+    await _drain(tts.synthesize(_text("Okay [sighs] fine. "), voice="x"))
+    req = http.request
+    assert req is not None
+    assert "[sighs]" not in req.text
+    assert "sighs" not in req.text
 
 
 # --- optimize_streaming_latency (opt-in query param) -------------------------

@@ -20,7 +20,7 @@ These tests pin the contract with fakes only (no network, no ml weights):
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
 
@@ -230,6 +230,79 @@ class _DeferredStream:
 
 async def _drain(stream: TtsStream) -> list[PcmFrame]:
     return [frame async for frame in stream]
+
+
+# ---------------------------------------------------------------------------
+# (0) Model-conditional audio tags across the failover seam (ADR-0027).
+# ---------------------------------------------------------------------------
+#
+# The sharp edge: the primary is v3 (PRESERVES audio tags), but the Kokoro
+# fallback CANNOT render them. When failover re-synthesises the utterance on the
+# fallback, the tags must be STRIPPED — matching the provider that actually
+# synthesises, not the primary's capability. These wire REAL providers (a v3
+# ElevenLabs primary whose HTTP transport fails, a real Kokoro fallback with a
+# recording fake backend) so the production composition is what is verified.
+
+
+class _AlwaysRaiseHttp:
+    """An ElevenLabs HTTP transport that raises before any byte (the 400 case).
+
+    ``open`` raises on invocation; ``ElevenLabsTTS.synthesize`` defers the call to a
+    worker thread (``stream_from_thread``), so the failure surfaces on the consumer's
+    first ``__anext__`` — exactly when the real ``urlopen`` 400 surfaces, triggering
+    failover before any audio frame.
+    """
+
+    def open(self, request: object, cancel: object) -> Iterator[bytes]:
+        raise ConnectionError("elevenlabs upstream down")
+
+
+class _RecordingSynth:
+    """A Kokoro ``Synthesizer`` backend that records the text it synthesises."""
+
+    def __init__(self) -> None:
+        self.requested: list[str] = []
+
+    def synthesize(self, text: str, stop: Callable[[], bool]) -> Iterator[bytes]:
+        self.requested.append(text)
+        yield b"\x01\x00\x02\x00"
+
+
+@pytest.mark.asyncio
+async def test_failover_to_kokoro_strips_audio_tags_v3_primary() -> None:
+    """v3 primary fails → Kokoro fallback synthesises the utterance WITHOUT tags.
+
+    The primary (eleven_v3) preserves tags, but the moment failover hands the
+    replayed utterance to the Kokoro fallback, Kokoro must strip them — otherwise
+    Kokoro would speak the literal word "breath". This proves the per-utterance
+    sanitisation matches the provider actually synthesising.
+    """
+    from hermes_voip.tts.elevenlabs import V3_MODEL_ID, ElevenLabsTTS  # noqa: PLC0415
+    from hermes_voip.tts.sherpa_kokoro import SherpaKokoroTTS  # noqa: PLC0415
+
+    primary = ElevenLabsTTS(
+        api_key="sk_fake_for_tests",
+        voice="v",
+        http=_AlwaysRaiseHttp(),
+        model_id=V3_MODEL_ID,
+    )
+    backend = _RecordingSynth()
+    fallback = SherpaKokoroTTS(synthesizer_factory=lambda: backend)
+    tts = FailoverTTS(primary=primary, fallback_factory=lambda: fallback)
+
+    frames = await _drain(
+        tts.synthesize(_text("Hello [breath] there [laughs]. "), voice="v")
+    )
+
+    assert frames, "the fallback must still produce audio"
+    synthesised = " ".join(backend.requested)
+    assert synthesised, "the Kokoro fallback must have synthesised the utterance"
+    assert "[breath]" not in synthesised
+    assert "[laughs]" not in synthesised
+    assert "breath" not in synthesised
+    assert "laughs" not in synthesised
+    assert "Hello" in synthesised
+    assert "there" in synthesised
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +628,28 @@ def test_failover_is_a_streaming_tts() -> None:
     )
     assert isinstance(tts, StreamingTTS)
     assert tts.output_sample_rate == _G711_RATE
+
+
+def test_failover_preserves_audio_tags_mirrors_primary() -> None:
+    """The wrapper reports the PRIMARY's tag capability (a v3 primary preserves).
+
+    A real call's tag fate is decided per-utterance inside whichever provider
+    actually synthesises (the fallback always strips); this property reflects the
+    primary so the configured capability is observable on the wrapper too.
+    """
+    from hermes_voip.tts.elevenlabs import V3_MODEL_ID, ElevenLabsTTS  # noqa: PLC0415
+
+    v3_primary = ElevenLabsTTS(
+        api_key="sk_fake_for_tests",
+        voice="v",
+        http=_AlwaysRaiseHttp(),
+        model_id=V3_MODEL_ID,
+    )
+    tts = FailoverTTS(
+        primary=v3_primary,
+        fallback_factory=lambda: _FakeTTS(lambda t, r: _ListStream([], spoken=[])),
+    )
+    assert tts.preserves_audio_tags is True
 
 
 # ---------------------------------------------------------------------------

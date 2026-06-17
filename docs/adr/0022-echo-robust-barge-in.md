@@ -79,14 +79,24 @@ the pending onset (the blip is dismissed). A new ONSET re-arms. The VAD exposes 
 a continuous interruption fires promptly at the threshold rather than waiting for the caller to
 pause.
 
-**Suppressing echo turn delivery (route 2).** While the gate is armed and the most-recent
-speech run was **not** an authorised barge-in, the call loop **suppresses the endpointer's
-end-of-turn** for that run (it does not increment the end-of-turn counter the ASR consumes), so
-the echoed fragment is never delivered as a caller turn. The gate tracks a per-run
-"authorised" flag that is set when a barge-in fires and **persists through the run's trailing
-silence** (where the endpointer fires), and is reset only on the *next* ONSET — so
-authorisation never leaks across runs, and an authorised sustained interruption (which also
-cancelled the TTS, leaving the agent silent) still delivers its transcript.
+**Suppressing echo turn delivery (route 2).** While the gate is armed and the current speech
+run is **not** an authorised barge-in, the call loop **withholds the inbound audio from the
+ASR entirely** (it does not forward the frame onto the ASR queue, and it does not advance the
+end-of-turn boundary). Because the recogniser never *sees* the echo, no echo transcript is
+produced — closing the turn-delivery route on **both** end-of-turn paths: the endpointer's
+trailing-silence boundary *and* a fused recogniser's own `end_of_turn` (e.g. Deepgram Flux sets
+it natively; suppressing only the endpointer counter would leave that path open). The gate
+tracks a per-run "authorised" flag set when a barge-in fires; it persists through the run's
+trailing silence and is reset only on the *next* ONSET (so authorisation never leaks across
+runs). An authorised sustained interruption (which also cancels the TTS) un-gates the audio
+from that point on, so its transcript flows to the ASR and is delivered. The gate's
+authorisation is driven on **every** inbound frame, not only while TTS is active, so a
+sustained run that authorises *during the post-TTS tail* still delivers its turn.
+
+The cost is that the first ~`barge_in_min_speech_ms` of a genuine interruption is withheld from
+the ASR (it is transcribed from the authorisation point on); this start-clip is bounded by the
+threshold, acceptable for an interruption, and avoided entirely on an echo-cancelled gateway by
+setting `full`.
 
 **Playout tail.** Echo can lag the TTS by tens to a few hundred ms (jitter buffer + network),
 so the gate stays armed for `HERMES_VOIP_BARGE_IN_TAIL_MS` (default **250 ms**) of window

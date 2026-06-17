@@ -1823,9 +1823,14 @@ class _DrainThenFinalASR:
         async def _gen() -> AsyncIterator[Transcript]:
             async for _frame in audio:  # drain only the frames the pump forwards
                 self.frames_drained += 1
-            yield Transcript(
-                text=text, is_final=True, end_of_turn=end_of_turn, confidence=1.0
-            )
+            # A real recogniser yields a transcript only when it actually received
+            # audio. If the pump withheld ALL frames (echo during TTS), it gets
+            # nothing and yields nothing — so withheld echo produces no turn on any
+            # end-of-turn path (endpointer OR native).
+            if self.frames_drained > 0:
+                yield Transcript(
+                    text=text, is_final=True, end_of_turn=end_of_turn, confidence=1.0
+                )
 
         return _gen()
 
@@ -2076,6 +2081,88 @@ async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
     assert delivered == ["hello operator"], (
         "a sustained real turn that authorises during the tail must be delivered"
     )
+
+
+class _PerFrameFinalASR:
+    """ASR fake that yields one end-of-turn-less final per frame it RECEIVES.
+
+    Like the sherpa ASR, every forwarded frame produces an ``is_final`` hypothesis
+    with ``end_of_turn=False`` (the endpointer owns the boundary). Frames the pump
+    withholds (echo) never reach it, so it emits nothing for them. Used to prove the
+    endpointer does not accumulate stale echo silence: only a real turn's endpointer
+    end-of-turn may promote a final to a delivered turn.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.frames_drained = 0
+
+    @property
+    def input_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        text = self._text
+
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:
+                self.frames_drained += 1
+                yield Transcript(
+                    text=text, is_final=True, end_of_turn=False, confidence=1.0
+                )
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_echo_then_tail_expiry_does_not_leak_eot_into_next_turn() -> None:
+    """A withheld echo run must not arm the endpointer for a later real turn.
+
+    Regression for the stale-silence edge: an echo blip during TTS, then TTS + the
+    tail end with NO real speech, then later a genuine caller turn during silence.
+    The echo's OFFSET must not have armed the endpointer (it was withheld), so the
+    only end-of-turn is the real turn's own — exactly one delivery, with the real
+    text. If the withheld echo leaked into the endpointer, a spurious end-of-turn
+    after tail expiry would consume the real turn's first final prematurely.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # Echo (6 voiced) during a SHORT greeting + tail, then long silence past the
+    # tail, then a real turn (voiced) followed by endpointer silence.
+    script = [0.95] * 6 + [0.0] * 40 + [0.95] * 4 + [0.0] * 20
+    vad = _scripted_vad_8k(script)
+    tts = _LongSlowGreetingTTS(n_frames=8)  # greeting ends early; tail then expires
+    transport = _ScriptedInboundTransport(len(script))
+    asr = _PerFrameFinalASR("real turn")
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="Hi.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    # Exactly one real turn delivered; no spurious echo-driven turn.
+    assert delivered == ["real turn"]
 
 
 @pytest.mark.asyncio

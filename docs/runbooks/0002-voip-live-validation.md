@@ -382,11 +382,12 @@ Diagnose the echo source first (ADR-0022):
 Fix (shipped, on by default — ADR-0022): **echo-robust barge-in**. While the agent's TTS is
 playing (and for a short tail after), a barge-in counts only when the inbound speech is a
 SUSTAINED voiced run, so short echo blips cannot interrupt but a genuine sustained
-interruption still does. The same gate also **suppresses the end-of-turn delivery** of an
-unauthorised echo run, so the echoed fragment is never handed to the agent as a caller turn
-(the second self-interruption route — the live `asr: delivering turn 'NO'` →
-`interrupted_during_api_call` path). A suppressed echo turn logs
-`pump: end-of-turn at window N SUPPRESSED (echo during TTS playout)` at DEBUG. Controls:
+interruption still does. The same gate also **withholds the echoed audio from the STT** while
+the agent is speaking and the run is unauthorised, so the echo is never transcribed and so
+never handed to the agent as a caller turn — closing the second self-interruption route (the
+live `asr: delivering turn 'NO'` → `interrupted_during_api_call` path) on both the endpointer
+and any native-`end_of_turn` STT (e.g. Deepgram Flux). The first withheld echo frame logs
+`pump: withholding echo audio from ASR at window N …` at DEBUG. Controls:
 
 - `HERMES_VOIP_BARGE_IN_MODE` — `gated` (default), `full` (legacy immediate barge-in; only
   correct on an echo-cancelled gateway), or `off` (never barge in).

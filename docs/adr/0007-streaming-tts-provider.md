@@ -262,3 +262,64 @@ DSP stage — all while the `StreamingTTS`/`PcmFrame` seam (ADR-0004) is unchang
 `output_sample_rate == 8000` so a regression to 24 kHz fails the suite, AND assert
 a non-default rate (16 kHz) requests `pcm_16000` so the rate is provably codec-
 driven rather than a constant.
+
+## Amendment (2026-06-17): ElevenLabs voice is **dynamic by default** + tunable (`voice_settings`), not a flat Flash default
+
+- Deciders: agent session (operator-directed "the voice is flat" feedback)
+
+The operator found the live ElevenLabs voice **flat**. Root cause: the provider's
+synthesis request body carried only `{text, model_id}` and **no `voice_settings`**,
+so ElevenLabs applied its own default `stability=0.5` — which its docs describe as
+possibly producing "a monotonous voice". We were never sending the dynamism
+controls at all.
+
+**Research finding (verified against current ElevenLabs docs, 2026-06-17) — the fix
+is settings, not a model swap.** The genuinely more *expressive* models do not fit
+the real-time phone path: `eleven_v3` (the expressive tier) **cannot stream in real
+time** (its multi-context websocket is unavailable; ElevenLabs explicitly states it
+"can't do real-time"), and `eleven_turbo_v2_5` is **superseded by Flash**
+("we recommend using the Flash models over Turbo in all use cases"; Turbo's only
+edge is marginal prosody at ~250–300 ms vs Flash ~75 ms). `eleven_multilingual_v2`
+streams but at several-hundred-ms first-audio — a real regression on a call. So
+`eleven_flash_v2_5` stays the default model (the only one that is both real-time and
+ElevenLabs-recommended for voice agents), and the dynamism comes from
+`voice_settings` — chiefly **lowering `stability`**, which broadens emotional range
+at *no latency cost*.
+
+**Decision.** The ElevenLabs provider now sends a `voice_settings` object on every
+request, defaulting to a **dynamic-but-stable** set: `stability=0.35` (below the flat
+0.5), `similarity_boost=0.75`, `style=0.0` (kept 0 to protect telephony first-audio
+latency + stability), `use_speaker_boost=true`. The model id, every `voice_settings`
+field, and the (deprecated) `optimize_streaming_latency` query param are
+**operator-tunable via env without a code change** — the surface the operator A/B's
+on live calls:
+
+- `HERMES_VOIP_TTS_MODEL` — ElevenLabs model **id** (default `eleven_flash_v2_5`).
+  (For the self-host `sherpa-kokoro` provider this same key is a model *directory* —
+  the meaning is provider-specific.)
+- `HERMES_VOIP_TTS_STABILITY` / `_STYLE` / `_SIMILARITY` — floats in `[0.0, 1.0]`.
+- `HERMES_VOIP_TTS_SPEAKER_BOOST` — boolean.
+- `HERMES_VOIP_TTS_STREAMING_LATENCY` — int in `[0, 4]`; **unset by default**
+  (deprecated param; `4` disables number/date normalisation, wrong for a
+  receptionist). Each tuning knob defaults to **None** at the config layer, meaning
+  "the provider supplies its dynamic default for that field", so a bare ElevenLabs
+  install is already livelier than the API default rather than flat.
+
+`voice_settings` and `model_id` are **body** fields; `output_format` and
+`optimize_streaming_latency` are **query** params (ElevenLabs API reference). The
+streaming websocket-style architecture and the `pcm_8000` no-resample choppiness fix
+are unchanged. A voice swap (`HERMES_VOIP_TTS_VOICE`) is an independent lever; a
+premade shortlist (Rachel/Sarah/Jessica/Laura/Bill) is documented in
+`docs/runbooks/0004-voip-tts-voice.md`. Note the account's TTS-scoped key cannot
+enumerate voices (`/v1/voices` → `missing_permissions: voices_read`), so a new voice
+id is confirmed by a successful live synth, and the **default voice stays Rachel**
+(verified working live) — the dynamism default applies to whatever voice is set.
+
+Consequences: the default ElevenLabs voice is materially more dynamic out of the box
+(a lower-stability delivery on the same model/voice) at no latency cost, and the
+operator can tune dynamism per deployment from env alone. Validation is the
+operator's live A/B after redeploy (rule 26). Tests pin that the body now carries
+`voice_settings`, that the default is the dynamic set (a regression to the flat
+no-settings default fails the suite), that the knobs validate ranges fail-fast, and
+that `_make_elevenlabs_tts` threads them in with per-field fallback to the dynamic
+default.

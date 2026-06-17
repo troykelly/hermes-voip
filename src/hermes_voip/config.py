@@ -108,6 +108,25 @@ _TTS_PROVIDERS = frozenset(
     {"sherpa-kokoro", "piper", "kittentts", "kyutai", "cartesia", "aura2", "elevenlabs"}
 )
 
+# ElevenLabs dynamic-voice tuning (ADR-0007 amendment, 2026-06-17). Optional knobs
+# that let the operator A/B voice dynamism on live calls WITHOUT a code change:
+# they map onto the ElevenLabs request's ``voice_settings`` object + the
+# ``optimize_streaming_latency`` query param. Each is provider-agnostic at this
+# layer — unset (``None``) means "the ElevenLabs provider applies its dynamic
+# default" (a lower-than-flat stability), so the default install is already livelier
+# than ElevenLabs' monotone 0.5; a self-host provider simply ignores them.
+_TTS_STABILITY_KEY = "HERMES_VOIP_TTS_STABILITY"
+_TTS_STYLE_KEY = "HERMES_VOIP_TTS_STYLE"
+_TTS_SIMILARITY_KEY = "HERMES_VOIP_TTS_SIMILARITY"
+_TTS_SPEAKER_BOOST_KEY = "HERMES_VOIP_TTS_SPEAKER_BOOST"
+_TTS_STREAMING_LATENCY_KEY = "HERMES_VOIP_TTS_STREAMING_LATENCY"
+# The ElevenLabs voice_settings floats are 0.0-1.0; optimize_streaming_latency is
+# an int in [0, 4] (0 = none ... 4 = max, text-normaliser off).
+_MIN_TTS_SETTING = 0.0
+_MAX_TTS_SETTING = 1.0
+_MIN_TTS_STREAMING_LATENCY = 0
+_MAX_TTS_STREAMING_LATENCY = 4
+
 # Cloud credentials, consumed by the cloud providers when selected. These are
 # the env-var *names* (not secrets); the values are read by reference only and
 # never logged (see MediaConfig repr-suppressed fields).
@@ -317,7 +336,9 @@ class MediaConfig:
         stt_provider: Streaming-STT provider token (``sherpa-onnx`` default).
         stt_model_dir: Filesystem path to the pinned STT model dir, or ``None``.
         tts_provider: Streaming-TTS provider token (``sherpa-kokoro`` default).
-        tts_model: Provider-specific model id / voice-pack, or ``None``.
+        tts_model: Provider-specific model id / voice-pack, or ``None``. For
+            sherpa-kokoro this is the model *directory*; for ElevenLabs it is the
+            synthesis model id (``None`` → the provider's Flash v2.5 default).
         tts_voice: Provider-specific voice id, or ``None``.
         elevenlabs_api_key: ElevenLabs credential (by reference; never logged).
         deepgram_api_key: Deepgram credential (by reference; never logged).
@@ -350,6 +371,19 @@ class MediaConfig:
             tone for this many seconds at 8 kHz (bypassing TTS + resample) so the
             operator can isolate the RTP transport layer from TTS issues.
             ``0.0`` (the default) means normal operation (TTS greeting).
+        tts_stability: ElevenLabs ``voice_settings.stability`` in ``[0.0, 1.0]``, or
+            ``None`` to use the provider's dynamic default. *Lower* = more
+            expressive/varied (the main dynamism dial); too low = inconsistent.
+        tts_style: ElevenLabs ``voice_settings.style`` in ``[0.0, 1.0]``, or
+            ``None`` for the provider default (``0.0``). Above 0 adds expression but
+            costs stability and may add latency — raise deliberately.
+        tts_similarity: ElevenLabs ``voice_settings.similarity_boost`` in
+            ``[0.0, 1.0]``, or ``None`` for the provider default.
+        tts_speaker_boost: ElevenLabs ``voice_settings.use_speaker_boost``, or
+            ``None`` for the provider default (``True``).
+        tts_streaming_latency: ElevenLabs ``optimize_streaming_latency`` query value
+            (int in ``[0, 4]``), or ``None`` to send nothing (the default —
+            deprecated param; ``4`` disables number/date normalisation).
     """
 
     stt_provider: str
@@ -374,6 +408,14 @@ class MediaConfig:
     dtmf_interdigit_ms: int | None
     dtmf_inband_enabled: bool
     tone_secs: float
+    # ElevenLabs dynamic-voice tuning. Defaulted to None so existing direct
+    # constructions stay valid and an unset knob means "provider default" (a
+    # dynamic-but-stable voice), not a flat override.
+    tts_stability: float | None = None
+    tts_style: float | None = None
+    tts_similarity: float | None = None
+    tts_speaker_boost: bool | None = None
+    tts_streaming_latency: int | None = None
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -435,7 +477,40 @@ class MediaConfig:
                 f"got {self.tone_secs!r}"
             )
             raise ConfigError(msg)
+        self._validate_tts_tuning()
         self._require_cloud_keys()
+
+    def _validate_tts_tuning(self) -> None:
+        """Validate the optional ElevenLabs voice-tuning knobs (when set).
+
+        Each float must be finite and within ``[0.0, 1.0]``; the streaming-latency
+        int must be within ``[0, 4]``. ``None`` (unset) is always valid — the
+        provider then applies its dynamic default for that field.
+        """
+        for name, value in (
+            ("tts_stability", self.tts_stability),
+            ("tts_style", self.tts_style),
+            ("tts_similarity", self.tts_similarity),
+        ):
+            if value is not None and not _finite_in_range(
+                value, _MIN_TTS_SETTING, _MAX_TTS_SETTING
+            ):
+                msg = (
+                    f"{name} must be a finite value in "
+                    f"[{_MIN_TTS_SETTING}, {_MAX_TTS_SETTING}], got {value!r}"
+                )
+                raise ConfigError(msg)
+        if self.tts_streaming_latency is not None and not (
+            _MIN_TTS_STREAMING_LATENCY
+            <= self.tts_streaming_latency
+            <= _MAX_TTS_STREAMING_LATENCY
+        ):
+            msg = (
+                f"tts_streaming_latency must be in "
+                f"[{_MIN_TTS_STREAMING_LATENCY}, {_MAX_TTS_STREAMING_LATENCY}], "
+                f"got {self.tts_streaming_latency}"
+            )
+            raise ConfigError(msg)
 
     def _require_cloud_keys(self) -> None:
         """A selected cloud provider must have its credential set (fail-fast)."""
@@ -515,6 +590,16 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _DTMF_INBAND_ENABLED_KEY, _DEFAULT_DTMF_INBAND_ENABLED
         ),
         tone_secs=_parse_tone_secs(env),
+        tts_stability=_parse_optional_unit_float(env, _TTS_STABILITY_KEY),
+        tts_style=_parse_optional_unit_float(env, _TTS_STYLE_KEY),
+        tts_similarity=_parse_optional_unit_float(env, _TTS_SIMILARITY_KEY),
+        tts_speaker_boost=_parse_optional_bool(env, _TTS_SPEAKER_BOOST_KEY),
+        tts_streaming_latency=_parse_optional_bounded_int(
+            env,
+            _TTS_STREAMING_LATENCY_KEY,
+            _MIN_TTS_STREAMING_LATENCY,
+            _MAX_TTS_STREAMING_LATENCY,
+        ),
     )
 
 
@@ -682,6 +767,63 @@ def _parse_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     falsy = ", ".join(sorted(_FALSE_TOKENS))
     msg = f"{key} must be a boolean ({truthy} / {falsy}), got {raw!r}"
     raise ConfigError(msg)
+
+
+def _parse_optional_bool(env: Mapping[str, str], key: str) -> bool | None:
+    """Parse ``key`` as a boolean, or ``None`` when unset (no default applied).
+
+    Unlike :func:`_parse_bool` there is no fallback value: an unset knob stays
+    ``None`` so a downstream provider can supply its own default. A present-but-
+    unrecognised spelling still raises.
+    """
+    if not _value(env, key):
+        return None
+    return _parse_bool(env, key, default=False)
+
+
+def _parse_optional_unit_float(env: Mapping[str, str], key: str) -> float | None:
+    """Parse ``key`` as a float in ``[0.0, 1.0]``, or ``None`` when unset.
+
+    NaN/inf and out-of-range values raise (NaN slips past a naive ``lo <= x <= hi``
+    test, so :func:`_finite_in_range` rejects it explicitly). Used by the ElevenLabs
+    voice-tuning knobs, whose ``voice_settings`` floats are 0.0-1.0.
+
+    Raises:
+        ConfigError: If the value is non-numeric, NaN/inf, or outside ``[0, 1]``.
+    """
+    raw = _value(env, key)
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        msg = f"{key} must be a number in [0.0, 1.0], got {raw!r}"
+        raise ConfigError(msg) from exc
+    if not _finite_in_range(value, _MIN_TTS_SETTING, _MAX_TTS_SETTING):
+        msg = (
+            f"{key} must be a finite value in "
+            f"[{_MIN_TTS_SETTING}, {_MAX_TTS_SETTING}], got {raw!r}"
+        )
+        raise ConfigError(msg)
+    return value
+
+
+def _parse_optional_bounded_int(
+    env: Mapping[str, str], key: str, lo: int, hi: int
+) -> int | None:
+    """Parse ``key`` as an int within ``[lo, hi]``, or ``None`` when unset.
+
+    Raises:
+        ConfigError: If the value is not an integer or is outside ``[lo, hi]``.
+    """
+    raw = _value(env, key)
+    if not raw:
+        return None
+    value = _parse_int(raw, key)
+    if not lo <= value <= hi:
+        msg = f"{key} must be in [{lo}, {hi}], got {value}"
+        raise ConfigError(msg)
+    return value
 
 
 def _finite_in_range(value: float, lo: float, hi: float) -> bool:

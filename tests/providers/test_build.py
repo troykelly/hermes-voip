@@ -526,6 +526,7 @@ def test_elevenlabs_factory_wires_configured_tuning() -> None:
         tts_streaming_latency=1,
     )
     tts = _make_elevenlabs_tts(cfg)
+    assert isinstance(tts, ElevenLabsTTS)
     assert tts.model_id == "eleven_multilingual_v2"
     assert tts.voice_settings == ElevenLabsVoiceSettings(
         stability=0.3,
@@ -544,6 +545,7 @@ def test_elevenlabs_factory_partial_tuning_falls_back_per_field() -> None:
         tts_stability=0.42,  # only stability set; the rest keep dynamic defaults
     )
     tts = _make_elevenlabs_tts(cfg)
+    assert isinstance(tts, ElevenLabsTTS)
     default = DEFAULT_VOICE_SETTINGS
     assert tts.voice_settings.stability == pytest.approx(0.42)
     assert tts.voice_settings.similarity_boost == default.similarity_boost

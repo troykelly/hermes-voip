@@ -683,3 +683,99 @@ def test_voice_settings_not_exposed_in_repr_does_not_leak_key() -> None:
         model_id="eleven_flash_v2_5",
     )
     assert _FAKE_KEY not in repr(tts)
+
+
+# --- model_id guard: the live HTTP 400 root cause (ADR-0025) -----------------
+#
+# The live incident: a G.722 call 400'd during the greeting synth and the call
+# died silent. Reproduced against the live API: the request the plugin builds is
+# WELL-FORMED (HTTP 200) for ``model_id=eleven_flash_v2_5``, but the shared
+# ``HERMES_VOIP_TTS_MODEL`` knob is a model DIRECTORY for sherpa-kokoro and the
+# model ID for ElevenLabs — so a Kokoro dir leaking into ``model_id`` is sent
+# verbatim and ElevenLabs rejects it with HTTP 400 ``invalid_uid``. The guard
+# turns that foot-gun into a fail-fast ValueError at construction (a startup
+# ConfigError) instead of a per-call 400 that kills the call. These tests would
+# FAIL before the guard (the bad model_id was accepted, then 400'd live).
+
+
+def test_model_id_that_looks_like_a_path_is_rejected() -> None:
+    """A filesystem-path ``model_id`` (the Kokoro-dir foot-gun) fails fast.
+
+    ``HERMES_VOIP_TTS_MODEL`` is a model DIRECTORY for sherpa-kokoro; if it leaks
+    into the ElevenLabs ``model_id`` the live API returns HTTP 400 ``invalid_uid``.
+    The guard rejects a slash-bearing model id at construction, naming the env var,
+    so the misconfiguration surfaces at startup — not as a dead call.
+    """
+    with pytest.raises(ValueError, match="HERMES_VOIP_TTS_MODEL"):
+        ElevenLabsTTS(
+            api_key=_FAKE_KEY,
+            voice="x",
+            http=_RecordedHttp(),
+            model_id="/opt/models/kokoro",
+        )
+
+
+def test_model_id_with_backslash_is_rejected() -> None:
+    """A backslash path (Windows-style) model id is also rejected as path-shaped."""
+    with pytest.raises(ValueError, match="HERMES_VOIP_TTS_MODEL"):
+        ElevenLabsTTS(
+            api_key=_FAKE_KEY,
+            voice="x",
+            http=_RecordedHttp(),
+            model_id="models\\kokoro",
+        )
+
+
+def test_blank_model_id_is_rejected() -> None:
+    """An empty/whitespace ``model_id`` (live: 400 'No ID for voice') fails fast."""
+    with pytest.raises(ValueError, match="model_id"):
+        ElevenLabsTTS(
+            api_key=_FAKE_KEY,
+            voice="x",
+            http=_RecordedHttp(),
+            model_id="   ",
+        )
+
+
+def test_valid_elevenlabs_model_id_is_accepted() -> None:
+    """A legitimate ElevenLabs model id (no slash) passes the guard untouched."""
+    for good in ("eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"):
+        tts = ElevenLabsTTS(
+            api_key=_FAKE_KEY, voice="x", http=_RecordedHttp(), model_id=good
+        )
+        assert tts.model_id == good
+
+
+@pytest.mark.asyncio
+async def test_g722_16k_request_is_well_formed_per_contract() -> None:
+    """The request the plugin builds for a 16 kHz G.722 call matches the accepted shape.
+
+    A regression guard for the live 400: with the default (valid) model id and the
+    dynamic default voice_settings, the request for a per-call 16 kHz rate carries a
+    valid (non-path, non-empty) ``model_id``, ``output_format=pcm_16000``, and the
+    exact ElevenLabs body field names — i.e. the shape that returns HTTP 200 live.
+    """
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(api_key=_FAKE_KEY, voice="River", http=http)
+    await _drain(
+        tts.synthesize(
+            _text("Hello there from Hermes. "), voice="River", sample_rate=16_000
+        )
+    )
+    req = http.request
+    assert req is not None
+    # model_id is a valid ElevenLabs id — NOT a path, NOT empty (the 400 trigger).
+    assert req.model_id == _FLASH_V2_5
+    assert "/" not in req.model_id
+    assert req.model_id.strip() != ""
+    # 16 kHz G.722 -> pcm_16000 in URL and as the request format.
+    assert req.output_format == "pcm_16000"
+    assert "output_format=pcm_16000" in req.url
+    # The body carries exactly the accepted ElevenLabs fields.
+    body = _body_json(req)
+    assert set(body) == {"text", "model_id", "voice_settings"}
+    vs = body["voice_settings"]
+    assert isinstance(vs, dict)
+    assert set(vs) == {"stability", "similarity_boost", "style", "use_speaker_boost"}
+    # Keep the dynamic-voice intent (stability 0.35 etc.) intact through the fix.
+    assert vs["stability"] == DEFAULT_VOICE_SETTINGS.stability

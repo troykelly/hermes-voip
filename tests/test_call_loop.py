@@ -2540,3 +2540,51 @@ async def test_gated_default_mode_when_unspecified() -> None:
     # With no inbound audio nothing barges in; the greeting ran to completion.
     assert tts.last_stream is not None
     assert tts.last_stream.cancel_called is False
+
+
+# ---------------------------------------------------------------------------
+# (z) Per-call TTS failover reset (ADR-0025): run() un-latches a FailoverTTS at
+# the start of each call so a fresh call retries the primary provider. The hook
+# is duck-typed via SupportsCallReset, so a plain TTS is untouched.
+# ---------------------------------------------------------------------------
+
+
+class _ResettableTTS(_FakeTTS):
+    """A StreamingTTS fake that records reset_failover() calls (SupportsCallReset)."""
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__(frames)
+        self.reset_calls = 0
+
+    def reset_failover(self) -> None:
+        self.reset_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_run_resets_failover_latch_at_call_start() -> None:
+    """run() calls reset_failover() on a supporting TTS so a fresh call retries."""
+    tts = _ResettableTTS([])
+    loop = _build_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+    await loop.run()
+    assert tts.reset_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_require_reset_hook_on_plain_tts() -> None:
+    """A plain TTS without reset_failover() runs unaffected (no crash, no hook)."""
+    tts = _FakeTTS([])  # no reset_failover method
+    loop = _build_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+    # Must complete cleanly even though the TTS has no reset hook.
+    await loop.run()

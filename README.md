@@ -1,301 +1,504 @@
-# hermes-voip
+# hermes-voip — give your Hermes agent a phone number
 
-A [Hermes](https://hermes-agent.nousresearch.com/) plugin that gives a Hermes agent **full
-two-way conversational voice** over telephony. It registers as an extension on any
-RFC-compliant **SIP-over-TLS** voice gateway, bridges live call audio through a
-speech-to-text → agent → text-to-speech loop, and speaks back to the caller — inbound calls
-and operator-placed outbound calls alike.
+**Your [Hermes](https://hermes-agent.nousresearch.com/) assistant, now on the phone.**
+`hermes-voip` lets your agent **answer calls** and **make calls** — a real, two-way spoken
+conversation, not a phone tree. Someone rings; your agent picks up, listens, and talks back in
+a natural voice. You ask it to "call the restaurant and book a table for two at seven"; it
+dials, has the conversation, and tells you how it went.
 
-## What this is
+It runs entirely on **your own** voice gateway — no third-party calling service in the middle,
+no per-minute calling bill, your audio never has to leave infrastructure you control. You can
+even keep the whole voice pipeline **offline** (local speech recognition and a local voice),
+or plug in a cloud voice if you prefer it. Either way, you own it.
 
-A **Python package** (a Hermes plugin) — not a standalone service. The Hermes runtime loads
-it (it registers a `voip` platform), so this repository makes **no hosting or platform
-assumptions**. Gateway connection details (host, extension, password) are configuration,
-supplied via `HERMES_SIP_*` environment variables and never committed — the repo is public.
+It plugs into **any** standards-compliant phone gateway (a SIP-over-TLS PBX, or a WebRTC
+client), so it works with the phone system you already have.
 
-What is built and working today:
+---
 
-- **SIP-over-TLS** registration (single or multiple extensions), inbound INVITE handling,
-  and operator-placed outbound calls (RFC 3261 / 3550 / 4566).
-- **Codec negotiation, best-available:** on SIP-over-TLS, **G.722** 16 kHz wideband is
-  offered first with **G.711** (PCMU/PCMA) as the universal fallback; on **WebRTC**,
-  **Opus** 48 kHz is offered first with G.711 fallback. The STT/TTS sample rate follows the
-  negotiated codec (ADR-0022/0032).
-- **WebRTC media (inbound):** a WebRTC peer offering `UDP/TLS/RTP/SAVPF` is served as a
-  co-equal to SIP-over-TLS — **DTLS-SRTP** keying (RFC 5763/5764), **ICE** connectivity
-  (RFC 8445, host + STUN srflx; TURN deferred), **Opus** at 48 kHz, and SRTP media over the
-  ICE-selected pair (ADR-0032). Requires the `webrtc` extra + the system `libopus`.
-- **Cascaded media:** streaming STT → the Hermes agent → streaming TTS, with the agent as
-  the reasoner (ADR-0003). Audio is telephony-native and emoji-safe (spoken text is
-  sanitised before synthesis).
-- **Two selectable TTS providers** and **two selectable STT providers** — local self-host or
-  cloud — chosen by config (see [Conversational media](#conversational-media-stt--tts)).
-- **Caller trust tiers** (caller groups): an inbound caller or an outbound callee is
-  **untrusted unless allow-listed**, with least-privilege tool gating
-  (see [Caller groups](#caller-groups-trust-tiers)).
-- **In-call DTMF + intercom**: the agent can send DTMF tones (IVR navigation / keypad
-  entry) on a privileged call, and an **intercom caller mode** can screen a door/gate
-  visitor and open the entry — scoped, by construction, to ONLY that action
-  (see [Intercom & DTMF](#intercom--dtmf)).
+## What it does for you
 
-> **Roadmap (not yet wired — do not rely on these):** the WebRTC **media plane** (DTLS-SRTP
-> + ICE + Opus) is wired for **inbound** calls (ADR-0032), but **outbound** WebRTC
-> origination and SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`
-> driving registration/INVITE over the WSS transport) are still in progress — outbound and
-> registration run over SIP-over-TLS today. **TURN** relay and **trickle** ICE are deferred
-> (host + STUN srflx, non-trickle MVP); WebRTC **video** stays deferred (ADR-0018). Inbound
-> DTMF receive + the spoof-resistant DTMF confirmation channel (which would unblock call
-> transfer) are deferred — see ADR-0031 §4. Live WebRTC validation against a real client is
-> pending. Track these in [`docs/adr/`](docs/adr/).
+- **Answers your calls, like a great receptionist.** Inbound callers reach your agent, which
+  greets them, understands what they want, and helps — or screens and takes a message.
+- **Makes calls on your behalf.** Hand it a task ("call the clinic and ask their first
+  opening next week") and it places the call, talks to whoever answers, and reports back.
+- **Sounds human.** A natural greeting the instant the call connects, a real voice, and it
+  can be interrupted mid-sentence just like a person — you don't have to wait for it to finish.
+- **Knows who it's talking to.** Recognise trusted callers and give them more; treat unknown
+  numbers as strangers and keep them at arm's length. Block nuisance callers before they ever
+  ring through.
+- **Handles the keypad.** It can press buttons for you to get through an automated menu
+  ("press 1 for bookings"), and it can screen a door/gate intercom and buzz an expected
+  visitor in.
+- **Stays up.** Reconnects automatically if the line drops, and keeps the conversation alive
+  through a brief blip.
 
-## Install & run
+You stay in control: it's **your** gateway, **your** keys, and the powerful actions (placing
+calls, opening a door, transferring a line) are **off by default** until you switch them on.
 
-The plugin core is light (only `audioop-lts`); the Hermes runtime, the local-inference ML
-stack, and the media/transport libraries live in **extras**. Install all of them:
+---
 
-```bash
-uv sync --frozen --all-extras   # hermes + ml + media + webrtc extras
+## How it works (the short version)
+
+`hermes-voip` is a **plugin** for Hermes — a small add-on the Hermes runtime loads. It is not
+a separate service you have to host and babysit; if you already run Hermes, you add this and
+point it at your phone gateway.
+
+```
+   ☎  caller  ⇄  your SIP / WebRTC gateway  ⇄  hermes-voip  ⇄  your Hermes agent
+                                                  │
+                                          speech in ↔ speech out
 ```
 
-The extras (declared in [`pyproject.toml`](pyproject.toml)):
+When a call comes in (or your agent places one), the plugin turns the caller's speech into
+text, gives it to your Hermes agent, takes the agent's reply, and speaks it back — continuously,
+both directions, for the whole call. Everything is configured with a handful of settings; there
+is no code to write.
 
-| Extra     | What it provides                                                              |
-| --------- | ---------------------------------------------------------------------------- |
-| `hermes`  | The `hermes-agent` runtime + `hermes` CLI that loads the plugin              |
-| `ml`      | `sherpa-onnx` STT/TTS, `onnxruntime` (VAD + injection guard), `tokenizers`   |
-| `media`   | `cryptography` for SDES-SRTP media encryption (ADR-0013)                     |
-| `webrtc`  | WebRTC media plane: `aioice` (ICE), `pyopenssl` (DTLS-SRTP), `opuslib` (Opus, needs the system `libopus`), `websockets` (WSS, roadmap) — ADR-0016/0032 |
+---
 
-> **System dependency for WebRTC/Opus:** the `webrtc` extra's Opus codec is `opuslib`, a
-> pure-Python ctypes wrapper that loads the **system `libopus` shared library** at runtime
-> (it bundles no native code). Install it via the OS package manager — e.g.
-> `apt-get install -y libopus0` (the devcontainer image ships it). Without `libopus`, a
-> WebRTC/Opus call fails with a clear `ImportError`; SIP-over-TLS (G.711/G.722) is
-> unaffected.
+## Quickstart — from zero to a first answered call
 
-Then enable the plugin and bring the gateway up — it registers from the `HERMES_SIP_*` /
-`HERMES_VOIP_*` environment:
+You need three things, then three steps.
+
+**You'll need:**
+
+1. **Hermes**, with an LLM backend already configured (the "brain" your agent uses to think —
+   any OpenAI / OpenRouter / Anthropic-compatible model Hermes supports). If `hermes chat`
+   already talks to a model, you're set.
+2. **A phone gateway you can register an extension on** — a SIP-over-TLS PBX (or a WebRTC
+   client). You'll need its address, an extension number, and that extension's password.
+3. **A voice** for your agent to speak with — either the **built-in offline** voice (free, no
+   account; you point it at locally-downloaded model files), or a **cloud voice**
+   (an [ElevenLabs](https://elevenlabs.io/) key). See [Choosing a voice](#choosing-a-voice).
+
+### Step 1 — Install
+
+The plugin's core is tiny; everything heavy (the Hermes runtime, the speech engines, the
+phone/media libraries) is installed as **extras**. Install them all:
 
 ```bash
+uv sync --frozen --all-extras
+```
+
+> **One system library for WebRTC/Opus calls.** If you'll take **WebRTC** calls, the Opus
+> audio codec needs the system **`libopus`** shared library at runtime — install it with your
+> OS package manager (e.g. `apt-get install -y libopus0`; the project devcontainer already
+> ships it). Plain SIP-over-TLS calls (G.711 / G.722) don't need it. Without `libopus`, only a
+> WebRTC/Opus call is affected, and it fails with a clear error rather than silently.
+
+### Step 2 — Tell it about your gateway and your voice
+
+Copy the example environment file to a private, untracked `.env` and fill in your real values
+(the file is gitignored — your secrets never get committed):
+
+```bash
+cp .env.example .env
+```
+
+A minimal `.env` to answer your first call with the **offline** voice looks like this (the
+hosts/extensions/paths here are **fake examples** — use your own):
+
+```bash
+# --- Your phone gateway (required) ---
+HERMES_SIP_HOST=pbx.example.test       # your gateway's address
+HERMES_SIP_EXTENSION=1000              # the extension to register as
+HERMES_SIP_PASSWORD=your-sip-password  # that extension's password
+
+# --- The offline voice + ears (point these at your downloaded model folders) ---
+HERMES_VOIP_TTS_MODEL=/path/to/kokoro-voice-model        # the voice
+HERMES_VOIP_STT_MODEL_DIR=/path/to/speech-to-text-model  # the ears
+HERMES_VOIP_VAD_MODEL_DIR=/path/to/silero-vad-model      # detects when the caller stops talking
+HERMES_VOIP_INJECTION_GUARD_MODEL_DIR=/path/to/guard-model  # safety screen on caller speech
+
+# --- Optional: the line your agent says when it answers ---
+HERMES_VOIP_GREETING=Hello, you're through to the Hermes voice assistant. How can I help?
+```
+
+Prefer a **cloud voice** instead of downloading models? Swap the four model paths above for:
+
+```bash
+HERMES_VOIP_TTS_PROVIDER=elevenlabs
+ELEVENLABS_API_KEY=your-elevenlabs-key
+HERMES_VOIP_STT_PROVIDER=deepgram
+DEEPGRAM_API_KEY=your-deepgram-key
+```
+
+(You can mix and match — e.g. a cloud voice with offline ears. See
+[Configuration](#configuration). The offline path needs the model folders because the plugin
+never downloads model weights for you; see [the live-validation runbook](docs/runbooks/0002-voip-live-validation.md)
+for exactly which files go where.)
+
+### Step 3 — Turn it on and run
+
+Hermes only loads a plugin you've **enabled**. The easiest way is a one-time helper file that
+also makes the plugin show up in `hermes plugins list` — then the natural enable command works:
+
+```bash
+# 1. Install the helper file so Hermes' CLI can see the plugin (one time):
+mkdir -p ~/.hermes/plugins/hermes-voip
+cp packaging/hermes-plugins/hermes-voip/plugin.yaml ~/.hermes/plugins/hermes-voip/plugin.yaml
+
+# 2. Enable it:
 hermes plugins enable hermes-voip
+
+# 3. Start Hermes — the plugin registers your extension on the gateway automatically:
 hermes gateway run
 ```
 
-## Configuration
+> **Why the helper file?** Hermes' `hermes plugins enable` / `hermes plugins list` commands
+> only look on disk, so a pip-installed plugin like this one is invisible to them out of the
+> box (the command would say *"Plugin 'hermes-voip' is not installed or bundled"*). The tiny
+> [`plugin.yaml`](packaging/hermes-plugins/hermes-voip/plugin.yaml) above is a description-only
+> stub that makes the CLI recognise the plugin — it carries no code, so the real plugin still
+> loads from its normal pip install. Full details + how to reverse it:
+> [the enable runbook](docs/runbooks/0011-voip-enable-plugin.md).
 
-All configuration is environment variables. Copy [`.env.example`](.env.example) to a
-gitignored `.env` and fill in real values from 1Password. **Never commit real host /
-extension / password values** — the examples below are fakes.
+**Prefer not to add the helper file?** You can enable the plugin by editing Hermes' config
+directly instead — open the file printed by `hermes config path` (usually
+`~/.hermes/config.yaml`) and add:
 
-### Gateway connection (`HERMES_SIP_*`)
-
-| Variable                    | Required | Default | Notes                                          |
-| --------------------------- | -------- | ------- | ---------------------------------------------- |
-| `HERMES_SIP_HOST`           | yes      | —       | Gateway FQDN (the SIP registrar), e.g. `pbx.example.test` |
-| `HERMES_SIP_EXTENSION`      | yes      | —       | Extension / SIP user-part, e.g. `1000`         |
-| `HERMES_SIP_PASSWORD`       | yes      | —       | Digest-auth password                           |
-| `HERMES_SIP_USERNAME`       | no       | extension | Digest-auth username                         |
-| `HERMES_SIP_PORT`           | no       | `5061` (tls) | Signalling port                           |
-| `HERMES_SIP_TRANSPORT`      | no       | `tls`   | `tls` (working) or `wss` (roadmap)             |
-
-For **multiple registrations**, use the indexed form `HERMES_SIP_EXTENSION_<n>` +
-`HERMES_SIP_PASSWORD_<n>` (optional `HERMES_SIP_USERNAME_<n>`); `HERMES_SIP_DEFAULT_EXTENSION`
-picks the inbound fallback. The single and indexed schemes must not be mixed.
-
-### Conversational media (STT / TTS)
-
-The defaults select the **fully-offline self-host** path (no cloud, no API key). That path
-still requires you to point at the pinned local model directories — `HERMES_VOIP_TTS_MODEL`
-(Kokoro), `HERMES_VOIP_STT_MODEL_DIR` (zipformer), `HERMES_VOIP_INJECTION_GUARD_MODEL_DIR`
-(the DeBERTa injection guard), and `HERMES_VOIP_VAD_MODEL_DIR` (the silero-vad model that
-endpoints every inbound call — the weights are never downloaded) — or provider/VAD build
-fails fast. Selection is config-only ([`config.py`](src/hermes_voip/config.py),
-[`providers/build.py`](src/hermes_voip/providers/build.py)).
-
-**Text-to-speech** — `HERMES_VOIP_TTS_PROVIDER`:
-
-| Value           | Provider                                            | Default | Credential          |
-| --------------- | --------------------------------------------------- | ------- | ------------------- |
-| `sherpa-kokoro` | Local Kokoro-82M via sherpa-onnx (self-host, free) | **yes** | none (needs `HERMES_VOIP_TTS_MODEL`) |
-| `elevenlabs`    | ElevenLabs Flash v2.5 realtime WebSocket (cloud)   | no      | `ELEVENLABS_API_KEY` |
-
-Both are first-class. `sherpa-kokoro` is the default (local, no API key). `elevenlabs`
-streams Flash v2.5 and emits PCM natively at the negotiated wire rate (8 kHz for G.711,
-16 kHz for G.722). Set the voice with `HERMES_VOIP_TTS_VOICE` and the Kokoro model directory
-with `HERMES_VOIP_TTS_MODEL`.
-
-**Automatic TTS failover** (ADR-0025): if the primary synthesiser raises mid-call (an HTTP
-error, a timeout, a dropped stream), the call falls back to a second synthesiser so the
-caller still hears audio instead of silence. `HERMES_VOIP_TTS_FALLBACK` selects the fallback
-provider; **by default a cloud primary (`elevenlabs`) falls back to local `sherpa-kokoro`**
-(a self-host primary defaults to no fallback, being already local), and
-`HERMES_VOIP_TTS_FALLBACK=none` disables it. A `sherpa-kokoro` fallback needs its **own**
-model directory, `HERMES_VOIP_TTS_FALLBACK_MODEL` (the shared `HERMES_VOIP_TTS_MODEL` is the
-ElevenLabs model **id** for a cloud primary, not a Kokoro path) — it is validated at startup,
-so a misconfigured fallback fails loudly rather than going silent on the first primary error.
-
-**Starter voices (ElevenLabs)** — a place to begin. These are ElevenLabs **public premade
-voices** (the default library, available to standard accounts; availability can vary by plan
-and ElevenLabs may change the ids). Swap with `HERMES_VOIP_TTS_VOICE=<id>` — the plugin
-accepts **any** ElevenLabs `voice_id`, including your own custom or cloned voices. The dynamic
-`HERMES_VOIP_TTS_*` settings (`STABILITY`, `STYLE`, `SIMILARITY`, `SPEAKER_BOOST`) apply to
-whichever voice you choose. The fuller table and tuning guidance live in
-[the voice runbook](docs/runbooks/0004-voip-tts-voice.md). Each id below was verified to
-synthesize (HTTP 200) on 2026-06-17; confirm a swap on a live call (the TTS-scoped key cannot
-pre-list voices).
-
-| Name    | `voice_id`             | Character                              |
-| ------- | ---------------------- | -------------------------------------- |
-| River   | `SAz9YHcvj6GT2YYXdXww` | Gender-neutral, calm, US               |
-| Rachel  | `21m00Tcm4TlvDq8ikWAM` | Female, calm narration, US (default)   |
-| Sarah   | `EXAVITQu4vr4xnSDxMaL` | Female, soft, conversational, US       |
-| Jessica | `cgSgspJ2msm6clMCkdW9` | Female, expressive / animated, US      |
-| Laura   | `FGY2WhTYpPnrIDTdsKH5` | Female, bright, upbeat, US             |
-| Alice   | `Xb7hH8MSUJpSbSDYk0k2` | Female, clear, British                 |
-| Liam    | `TX3LPaxmHKxFdv7VOQHJ` | Male, younger, US                      |
-| Josh    | `TxGEqnHWrfWFTfGW9XjX` | Male, younger, deep, US                |
-| Bill    | `pqHfZKP75CvOlQylNhV4` | Male, older, deep, trustworthy, US     |
-| Brian   | `nPczCjzI2devNBz1zQrb` | Male, deep, narration, US              |
-| George  | `JBFqnCBsd6RMkjVDRZzb` | Male, warm, British                    |
-| Daniel  | `onwK4e9ZLuTAKqWW03F9` | Male, authoritative, British           |
-| Charlie | `IKne3meq5aSn9XLyUdCD` | Male, casual, Australian               |
-| Eric    | `cjVigY5qzO86Huf0OWal` | Male, friendly, US                     |
-
-**Expressive voice (ElevenLabs v3 audio tags)** — the ElevenLabs **model** is selectable via
-`HERMES_VOIP_TTS_MODEL`, and both tiers are first-class:
-
-| `HERMES_VOIP_TTS_MODEL` | First-audio (our HTTP `/stream`) | Audio tags |
-| ----------------------- | -------------------------------- | ---------- |
-| `eleven_flash_v2_5` (default) | ~310 ms (measured) | stripped (never spoken) |
-| `eleven_v3`             | ~454 ms (measured) | **rendered** |
-
-On `eleven_v3` the agent can use **audio tags** — inline cues like `[breath]`, `[laughs]`,
-`[sighs]`, `[hesitates]`, `[whispers]`, `[clears throat]` — and they **render** as the intended
-vocal performance. On every other model (Flash/Turbo/Multilingual, and the `sherpa-kokoro`
-fallback) those tags are **stripped** before synthesis, so a bracketed cue is never read aloud
-literally. Both first-audio numbers are fine on the phone path — the **Hermes LLM turn
-dominates** end-to-end latency. (`HERMES_VOIP_TTS_MODEL` is the ElevenLabs model **id** here;
-for `sherpa-kokoro` the same var is the model **directory**.) See
-[ADR-0027](docs/adr/0027-elevenlabs-v3-audio-tags-model-conditional.md) and
-[the voice runbook](docs/runbooks/0004-voip-tts-voice.md).
-
-**Speech-to-text** — `HERMES_VOIP_STT_PROVIDER`:
-
-| Value         | Provider                                          | Default | Credential        |
-| ------------- | ------------------------------------------------- | ------- | ----------------- |
-| `sherpa-onnx` | Local streaming zipformer (self-host, free)       | **yes** | `HERMES_VOIP_STT_MODEL_DIR` |
-| `deepgram`    | Deepgram streaming (cloud)                         | no      | `DEEPGRAM_API_KEY` |
-
-A selected cloud provider must have its credential set, and a selected self-host provider its
-model directory, or provider build fails fast. (Other TTS tokens are reserved in config but
-not yet wired; selecting one fails fast at provider build.)
-
-Other media knobs (all optional, with safe defaults): `HERMES_VOIP_GREETING` (opening line;
-empty disables it), `HERMES_VOIP_RTP_SYMMETRIC` (NAT comedia latching, on by default),
-`HERMES_VOIP_VAD_THRESHOLD`, `HERMES_VOIP_ENDPOINT_SILENCE_MS`, and the `HERMES_SIP_DTMF_*`
-DTMF-receive settings. **WebRTC (ADR-0032):** `HERMES_VOIP_ICE_STUN_URLS` is a
-comma-separated list of `stun:` URLs for server-reflexive ICE candidates (e.g.
-`stun:stun.example.test:3478`); empty (the default) is **host-only** ICE (works on a LAN /
-where the peer reaches our host candidates directly). TURN relay is deferred, so its
-reserved keys are unused. See [`config.py`](src/hermes_voip/config.py) for the full surface.
-
-### Caller groups (trust tiers)
-
-The remote party on **any** call — an inbound caller **or** an outbound callee — is
-**untrusted unless allow-listed**. Caller-ID is forgeable and is **not** authentication; a
-caller group is a privilege **ceiling**, never a bypass (ADR-0020 / ADR-0021). Callers are
-sorted into named trust tiers by `privilege_level`:
-
-- **0 (receptionist)** — SAFE tools only; the default for any unmatched caller.
-- **2 (trusted)** — adds ELEVATED tools (e.g. hold/resume).
-- **3 (operator/assistant)** — adds IRREVERSIBLE tools (e.g. transfer), which **still**
-  require per-action confirmation and a non-degraded session.
-
-Caller numbers are PII, so they live in **gitignored JSON files** referenced by env **paths
-only** — inline number lists are rejected. Use either the N-group file
-`HERMES_VOIP_CALLER_GROUPS_FILE`, or the legacy 3-file scheme
-(`HERMES_VOIP_CALLER_{ALLOW,DENY,GREY}_FILE`). An unmatched caller falls to the unprivileged
-default; a privileged default is refused at startup. The full schema and operational steps
-are in the runbook [`docs/runbooks/0010-voip-caller-modes.md`](docs/runbooks/0010-voip-caller-modes.md).
-
-```jsonc
-// example caller-list file (fakes only) — { "patterns": [...] }
-// exact value OR a "*"-suffixed literal prefix
-{ "patterns": ["+15555550100", "1000", "+1555550*"] }
+```yaml
+plugins:
+  enabled:
+    - hermes-voip
 ```
 
-### Outbound calling (agent-triggered)
+then run `hermes gateway run`. This is exactly what `hermes plugins enable` does once the
+helper file is in place. (Note: `hermes config set plugins.enabled '[...]'` does **not** work
+for this — it stores the value as text, not a list — so edit the YAML by hand if you go this
+route.)
 
-The agent can **place** a call to accomplish a task on the operator's behalf — e.g. "call
-the restaurant and book a table for two at 7" — via the `place_call(number, objective)` tool
-(ADR-0029). The call runs as its own concurrent conversation that **opens with the
-objective**, and when it ends the **outcome is reported back to the conversation that asked
-for it** (the call agent records it with `report_call_result(summary)`; failures report too).
+That's it. **Dial your extension from any phone** and your agent answers.
 
-This is gated hard:
+---
 
-- **`HERMES_VOIP_OUTBOUND_ALLOW`** — a comma-separated allowlist of permitted dial targets
-  (extensions and/or SIP URIs). **Empty by default**, so the feature is **inert** until you
-  opt numbers in; any un-listed target is refused before dialling. This is the hard gate (it
-  stands in for an in-band DTMF confirmation, which a remote party shares the channel with).
-- `place_call` is **IRREVERSIBLE** and clamped to an **operator** (level-3), **non-degraded**
-  session — an untrusted inbound caller can never trigger an outbound call, even via a prompt
-  injection. The callee is untrusted: the resulting call runs unprivileged, so it cannot
-  itself place a further call or transfer. **Never put operator secrets in the objective.**
-- **`HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`** (optional, `platform:chat_id`) — where the outcome
-  of a call **not** triggered by an agent turn (the `HERMES_VOIP_CALL_ON_CONNECT` / cron path,
-  which has no originating session) is reported. Unset → such outcomes are logged only (voip
-  has no home channel of its own). A call triggered by an agent always reports to its origin.
+## Verify it's working
 
-Operational steps are in the runbook
-[`docs/runbooks/0007-voip-outbound-calling.md`](docs/runbooks/0007-voip-outbound-calling.md).
-
-### Intercom & DTMF
-
-The agent can **send DTMF tones** on a live call — `send_dtmf(digits)` (ELEVATED, ADR-0031)
-— for IVR navigation ("press 1 for…") or keypad entry. It emits RFC 4733 telephone-events
-at the **negotiated** payload type and raises a clear error if the gateway negotiated none
-(never a silent drop); the digits are never logged (they may be a PIN).
-
-An **intercom caller mode** answers a door/gate intercom, screens the visitor, and opens
-the entry — `open_entry` (ADR-0031) — for a legitimate expected visitor. Configure it as a
-caller group at **`privilege_level` 2** with **`allowed_tools: ["open_entry"]`**: the tool
-gate then removes every other tool, so a **spoofed caller-ID landing in the intercom group
-can reach ONLY the entry action** — never operator tools or secrets. There are two
-operator-chosen actuation paths (`HERMES_VOIP_INTERCOM_OPEN_MODE`, default **disabled** so
-`open_entry` refuses until configured):
-
-- **`dtmf`** — send a configured open code (`HERMES_VOIP_INTERCOM_DTMF`, e.g. `9`) on the call;
-- **`relay`** — POST to an external relay / smart-lock (`HERMES_VOIP_INTERCOM_RELAY_URL`,
-  **https only**; bearer token from `HERMES_VOIP_INTERCOM_RELAY_TOKEN` — 1Password, never
-  committed).
-
-Full setup, the group JSON, and rotation are in the runbook
-[`docs/runbooks/0008-voip-intercom-and-dtmf.md`](docs/runbooks/0008-voip-intercom-and-dtmf.md).
-
-## Development
-
-Standardized devcontainer. Toolchain standards: [`docs/stack.md`](docs/stack.md). Working
-rules every change follows: [`AGENTS.md`](AGENTS.md).
+**Is the plugin loaded?** Ask Hermes to show its plugins with debug output on:
 
 ```bash
-uv sync --all-extras     # install (CI: uv sync --frozen)
+HERMES_PLUGINS_DEBUG=1 hermes plugins list
+```
+
+`HERMES_PLUGINS_DEBUG=1` makes Hermes print what it discovers and loads as it starts up. If
+you installed the helper file from Step 3, `hermes-voip` also appears in the table with its
+description and version.
+
+**Did it register on the gateway, and does a call go through?** Start the gateway with verbose
+logging and watch the log as you place a test call:
+
+```bash
+hermes gateway run -vv
+```
+
+When you **dial the extension**, the plugin logs the call's progress at `INFO` under the
+`hermes_voip.adapter` logger. A healthy inbound call prints, in order:
+
+```
+INVITE received: Call-ID …, registration ext 1000
+INVITE …: caller group=receptionist privilege_level=0 (source=default)
+INVITE …: SDP offer — RTP/AVP, remote RTP …, payload types G722,telephone-event
+INVITE …: SDP answer built — local RTP …, codecs G722,telephone-event
+INVITE …: 200 OK sent (To-tag …)
+INVITE …: CallSession registered — dialog_id …
+INVITE …: CallLoop started
+```
+
+Seeing `CallLoop started` (and then hearing the greeting) means the full path is up: your
+gateway reached the plugin, the call was answered, and the speech loop is running. The exact
+codec on the `SDP answer built` line (`G722` for wideband, `PCMU`/`PCMA` for standard) tells
+you which audio quality the call negotiated.
+
+The complete, step-by-step live bring-up — including downloading the offline models, wiring the
+LLM backend, and a registration-only check that proves the gateway login works **before** you
+place a call — is in [the live-validation runbook](docs/runbooks/0002-voip-live-validation.md).
+
+---
+
+## Troubleshooting
+
+**`hermes plugins enable hermes-voip` says "not installed or bundled".**
+This is expected for a pip-installed plugin until you add the helper `plugin.yaml` from
+[Step 3](#step-3--turn-it-on-and-run). Either add that file, or enable the plugin by editing
+`config.yaml` directly (also shown in Step 3). See
+[the enable runbook](docs/runbooks/0011-voip-enable-plugin.md).
+
+**The extension won't register on the gateway** (no inbound calls arrive).
+Run `hermes gateway run -vv` and read the log. Common causes: wrong `HERMES_SIP_HOST` /
+`HERMES_SIP_PORT` (TLS is port `5061` by default), a wrong extension password (you'll see the
+gateway repeatedly challenge the login), or a firewall blocking the gateway's SIP-TLS port. The
+[live-validation runbook](docs/runbooks/0002-voip-live-validation.md) has a "registration-only"
+check that isolates the login from everything else, and lists the exact SIP response codes
+(`401`/`403`/`404`/`423`) and what each means.
+
+**The call connects but there's no audio — or only one direction.**
+Almost always a network-address (NAT) issue: the gateway can't reach the address the plugin
+advertised for the audio stream. The plugin already handles this two ways and **both are on by
+default** — it speaks its greeting the instant it answers (opening the return path), and it
+latches onto the caller's real audio address automatically. Confirm you see the
+`greeting: first RTP sent` and `rtp: latched to …` lines in the `-vv` log. The full
+diagnosis-and-fix checklist is
+[in the live-validation runbook](docs/runbooks/0002-voip-live-validation.md#8a-troubleshooting--call-answers-but-there-is-no-audio).
+
+**A WebRTC/Opus call fails with an import error.**
+Install the system `libopus` library (`apt-get install -y libopus0`) and make sure you ran
+`uv sync --frozen --all-extras` (the `webrtc` extra). SIP-over-TLS calls are unaffected.
+
+**The agent keeps interrupting itself / cuts off mid-reply.**
+Your gateway is echoing the agent's own voice back, and the plugin briefly hears it as the
+caller. The plugin guards against this by default (it only treats *sustained* speech as a real
+interruption). If echo still slips through, raise `HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS`; on a
+gateway that already cancels echo, set `HERMES_VOIP_BARGE_IN_MODE=full` for snappier
+interruption. Details:
+[live-validation runbook §8c](docs/runbooks/0002-voip-live-validation.md#8c-troubleshooting--the-agent-interrupts-itself--cuts-off-mid-reply).
+
+---
+
+## Features
+
+What is built and working today:
+
+- **Inbound and outbound calls** over **SIP-over-TLS** — register one or many extensions,
+  answer incoming calls, and place calls your agent initiates (RFC 3261 / 3550 / 4566).
+- **Best-available audio quality, automatically.** On SIP-over-TLS the plugin offers **G.722**
+  wideband first and falls back to standard **G.711**; on **WebRTC** it offers **Opus**. No
+  per-call tuning — it negotiates the best both sides support.
+- **WebRTC calls (inbound)** — a WebRTC client is a first-class caller, with encrypted media
+  (DTLS-SRTP), connectivity handling (ICE), and Opus audio. Needs the `webrtc` extra +
+  `libopus`.
+- **A natural spoken conversation** — streaming speech-to-text → your Hermes agent → streaming
+  text-to-speech, with the agent doing the thinking. Spoken output is cleaned up for the phone
+  (no emoji read aloud).
+- **A choice of voices and ears** — run fully **offline** (local recognition + a local voice)
+  or use a **cloud** voice/recognition, picked entirely by settings. See
+  [Choosing a voice](#choosing-a-voice).
+- **Caller recognition (caller groups)** — treat callers differently by who they are: a
+  trusted assistant for you, a careful receptionist for strangers, and an automatic block for
+  nuisance numbers. See [Knowing who's calling](#knowing-whos-calling-caller-groups).
+- **Keypad + intercom** — your agent can press keypad digits to get through automated menus,
+  and an **intercom mode** can screen a door/gate visitor and buzz them in — locked down to
+  *only* that action. See [Keypad & intercom](#keypad--intercom).
+- **Resilience** — automatic reconnect, a watchdog that cleanly ends a silently-dropped call,
+  and a backup voice that takes over if a cloud voice fails mid-call so the caller never hears
+  dead silence.
+
+> **On the roadmap (not yet — don't rely on these):** **outbound** WebRTC calls and SIP
+> signalling over Secure-WebSocket are in progress (registration and outbound run over
+> SIP-over-TLS today); TURN relay, trickle ICE, and WebRTC **video** are deferred; and a
+> spoof-resistant keypad-confirmation channel (which would unlock call **transfer**) is still
+> to come. The current state of each is tracked in [`docs/adr/`](docs/adr/).
+
+---
+
+## Configuration
+
+Everything is set with environment variables in your gitignored `.env` (copy from
+[`.env.example`](.env.example), which documents every option with fake example values).
+**Never commit real host / extension / password / phone-number values** — the repo is public.
+
+### Your gateway (`HERMES_SIP_*`)
+
+| Variable                | Required | Default        | What it is                                     |
+| ----------------------- | -------- | -------------- | ---------------------------------------------- |
+| `HERMES_SIP_HOST`       | yes      | —              | Your gateway's address, e.g. `pbx.example.test` |
+| `HERMES_SIP_EXTENSION`  | yes      | —              | The extension to register as, e.g. `1000`      |
+| `HERMES_SIP_PASSWORD`   | yes      | —              | That extension's password                      |
+| `HERMES_SIP_USERNAME`   | no       | the extension  | Login username, if it differs from the extension |
+| `HERMES_SIP_PORT`       | no       | `5061` (TLS)   | Signalling port                                |
+| `HERMES_SIP_TRANSPORT`  | no       | `tls`          | `tls` (working) — `wss` is on the roadmap      |
+
+**More than one extension?** Use the numbered form `HERMES_SIP_EXTENSION_<n>` +
+`HERMES_SIP_PASSWORD_<n>` (and optional `HERMES_SIP_USERNAME_<n>`), with
+`HERMES_SIP_DEFAULT_EXTENSION` choosing which one takes inbound calls. Don't mix the single and
+numbered forms.
+
+### Choosing a voice
+
+By default the plugin uses the **fully-offline** path — local speech recognition and a local
+voice, no account and no per-use cost. That path needs you to point at the locally-downloaded
+model folders (`HERMES_VOIP_TTS_MODEL`, `HERMES_VOIP_STT_MODEL_DIR`,
+`HERMES_VOIP_INJECTION_GUARD_MODEL_DIR`, `HERMES_VOIP_VAD_MODEL_DIR`) — the plugin doesn't
+download model weights for you, so a missing folder fails fast with a clear error rather than a
+mystery. Which files go in each folder is in
+[the live-validation runbook](docs/runbooks/0002-voip-live-validation.md).
+
+**The voice — `HERMES_VOIP_TTS_PROVIDER`:**
+
+| Value           | Voice                                                | Default | Needs                                  |
+| --------------- | ---------------------------------------------------- | ------- | -------------------------------------- |
+| `sherpa-kokoro` | Local Kokoro voice (offline, free)                   | **yes** | `HERMES_VOIP_TTS_MODEL` (a folder)     |
+| `elevenlabs`    | ElevenLabs realtime cloud voice                      | no      | `ELEVENLABS_API_KEY`                   |
+
+**The ears — `HERMES_VOIP_STT_PROVIDER`:**
+
+| Value         | Recognition                                          | Default | Needs                                  |
+| ------------- | ---------------------------------------------------- | ------- | -------------------------------------- |
+| `sherpa-onnx` | Local streaming recognition (offline, free)          | **yes** | `HERMES_VOIP_STT_MODEL_DIR` (a folder) |
+| `deepgram`    | Deepgram streaming cloud recognition                 | no      | `DEEPGRAM_API_KEY`                     |
+
+A selected cloud option must have its key set, and a selected offline option its model folder,
+or the plugin stops at startup with a clear message. (A few other provider names are reserved in
+the config but not yet wired; selecting one fails fast.)
+
+**Never hear silence on a cloud hiccup (automatic failover).** If a cloud voice fails partway
+through a call (an outage, a timeout), the plugin falls back to a second voice so the caller
+keeps hearing audio. By default a cloud voice (`elevenlabs`) falls back to the local
+`sherpa-kokoro` voice; set `HERMES_VOIP_TTS_FALLBACK=none` to disable it. A local fallback needs
+its own folder, `HERMES_VOIP_TTS_FALLBACK_MODEL` (because the shared `HERMES_VOIP_TTS_MODEL` is
+the ElevenLabs voice **id** when your primary is cloud, not a folder) — it's checked at startup
+so a misconfigured fallback fails loudly instead of going silent later.
+
+**Picking and tuning a cloud voice.** Set `HERMES_VOIP_TTS_VOICE` to any ElevenLabs `voice_id`
+(including your own custom or cloned voices). A palette of verified starter voices, the
+expressive `eleven_v3` model (with `[breath]` / `[laughs]` style audio tags), and the dynamism
+dials (`HERMES_VOIP_TTS_STABILITY`, `STYLE`, `SIMILARITY`, `SPEAKER_BOOST`) are all documented
+in [the voice runbook](docs/runbooks/0004-voip-tts-voice.md).
+
+### The conversation feel (optional)
+
+Every one of these has a sensible default — set them only to tune the experience.
+
+| Variable                              | Default            | What it does                                                                 |
+| ------------------------------------- | ------------------ | --------------------------------------------------------------------------- |
+| `HERMES_VOIP_GREETING`                | a friendly line    | What the agent says the instant it answers. Set empty to stay silent on answer. |
+| `HERMES_VOIP_TTS_COMFORT_FILLER`      | `false`            | On a slow reply, play one short natural filler ("Hmm,") so the line doesn't sound dropped. |
+| `HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS` | `900`          | How long a silent gap must last before that filler plays.                    |
+| `HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES` | built-in set    | The filler phrases, `\|`-separated (e.g. `Hmm,\|Let me see,\|One moment,`).    |
+| `HERMES_VOIP_BARGE_IN_MODE`           | `gated`            | How the caller interrupts the agent: `gated` (echo-safe), `full` (instant), `off`. |
+| `HERMES_VOIP_RTP_SYMMETRIC`           | `true`             | Auto-latch onto the caller's real audio address (NAT-friendly). Leave on unless your gateway needs the SDP address honoured strictly. |
+| `HERMES_VOIP_RTP_TIMEOUT_SECS`        | `20` (range 1–300) | End a call this many seconds after the audio goes silent (a safety watchdog so a silently-dropped call never hangs forever). |
+
+The full set of media knobs — VAD sensitivity, end-of-speech timing, keepalive interval,
+clean-stop fade, WebRTC STUN servers (`HERMES_VOIP_ICE_STUN_URLS`), DTMF receive settings — is
+documented in [`.env.example`](.env.example) and [`config.py`](src/hermes_voip/config.py).
+
+### Knowing who's calling (caller groups)
+
+The person on the other end of **any** call — someone calling **in**, or someone your agent
+calls **out** to — is treated as **untrusted unless you've listed them**. A caller's number is
+easy to fake, so it's a *hint*, never a password; a caller group raises a **ceiling** on what
+the agent may do, it never unlocks a shortcut.
+
+You sort callers into named groups, each with a privilege level:
+
+- **Receptionist (level 0)** — the default for anyone you haven't listed. Safe actions only:
+  greet, help, take a message. It cannot be talked into anything more, even if the caller
+  insists.
+- **Trusted (level 2)** — adds everyday call controls (like hold/resume).
+- **Operator (level 3)** — your own tier; adds the powerful actions (like transfer), which
+  *still* require an explicit confirmation each time.
+
+Because phone numbers are personal data, the lists live in **gitignored files** that you point
+at by **path** — you never put numbers in the committed config. Point one variable at a single
+groups file:
+
+```bash
+HERMES_VOIP_CALLER_GROUPS_FILE=/run/secrets/hermes-caller-groups.json
+```
+
+…and that file describes your groups and which numbers belong to each (numbers here are **fake
+examples**):
+
+```jsonc
+{
+  "groups": [
+    { "name": "operator",     "privilege_level": 3, "persona": "assistant",    "declined_at_sip": false },
+    { "name": "trusted",      "privilege_level": 2, "persona": "colleague",    "declined_at_sip": false },
+    { "name": "receptionist", "privilege_level": 0, "persona": "receptionist", "declined_at_sip": false },
+    { "name": "blocked",      "privilege_level": 0, "persona": "",             "declined_at_sip": true  }
+  ],
+  "lists": {
+    "operator": ["+15555550100", "+15555550101"],
+    "trusted":  ["+15555550200"],
+    "blocked":  ["+15550*"]
+  },
+  "default_group": "receptionist",
+  "match_order": ["blocked", "operator", "trusted", "receptionist"],
+  "normalization": "e164"
+}
+```
+
+A number can be exact (`+15555550100`) or a `*`-suffixed prefix (`+15550*`). An unrecognised
+caller falls to the default group, which **must** be an unprivileged one (the plugin refuses to
+start otherwise). A `blocked` group is hung up at ring time with a polite decline, before the
+agent is ever involved. The complete schema, the security model, and how to keep the lists in
+1Password are in [the caller-groups runbook](docs/runbooks/0010-voip-caller-modes.md).
+
+> If your Hermes gateway runs its own caller-pairing flow, set `GATEWAY_ALLOW_ALL_USERS=true`
+> in the **gateway** config so caller groups become the single front door. The runbook explains
+> why.
+
+### Letting your agent place calls
+
+Your agent can **call out** to get something done — "call the restaurant and book a table for
+two at seven" — with the `place_call(number, objective)` tool. The call runs as its own
+conversation that opens with the objective, and the result is reported back to whoever asked.
+
+This is **off by default and deliberately hard to misuse:**
+
+- **`HERMES_VOIP_OUTBOUND_ALLOW`** is an allow-list of numbers your agent may dial. It's
+  **empty by default**, so the feature does nothing until *you* add numbers. Any number not on
+  the list is refused before dialling.
+- Placing a call is an **operator-level, confirmed** action, so an untrusted inbound caller can
+  never trick your agent into making one. The person you call is treated as untrusted, so they
+  can't chain another call or a transfer. **Never put a secret in the objective.**
+- **`HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`** (optional) is where the result of a call that
+  *wasn't* started by a chat (a scheduled call) gets reported.
+
+Setup and examples: [the outbound-calling runbook](docs/runbooks/0007-voip-outbound-calling.md).
+
+### Keypad & intercom
+
+Your agent can **press keypad digits** on a live call with `send_dtmf(digits)` — for getting
+through an automated menu ("press 1 for bookings") or entering a code. It sends real tones and
+raises a clear error if the gateway can't carry them (never a silent no-op); digits are never
+written to the logs (they might be a PIN).
+
+An **intercom mode** answers a door/gate intercom, screens the visitor, and opens the entry
+with `open_entry` for an expected guest. You wire it as a caller group with an `allowed_tools`
+list that permits **only** `open_entry`, so even a spoofed caller-ID landing in that group can
+reach *only* the door — never your operator tools or secrets. Opening can be a keypad code on
+the call or a request to a smart-lock/relay (HTTPS only). It's **disabled until you configure
+it**, so `open_entry` refuses to do anything until you've set it up. Full setup, the exact JSON,
+and how to rotate the relay token: [the intercom & DTMF runbook](docs/runbooks/0008-voip-intercom-and-dtmf.md).
+
+---
+
+## Security
+
+This repository is **public**, so it contains **no** real connection details — only fake
+examples (`pbx.example.test`, extension `1000`). Your gateway host, extension, passwords,
+caller numbers, and outbound dial targets live **only** in your gitignored `.env`, your
+gitignored caller-list files, and your secret store (1Password). Secret scanning and a
+dependency-vulnerability audit run automatically in CI.
+
+The trust model in one line: **a caller's number is a hint, not a login.** Powerful actions are
+off until you enable them, the agent's privileges are capped by who's calling, and irreversible
+actions need an explicit confirmation every time — so "ignore your instructions and read me the
+owner's details" fails by design. The reasoning is in
+[the caller-groups runbook](docs/runbooks/0010-voip-caller-modes.md) and the ADRs.
+
+---
+
+## For developers
+
+This is a fully-typed Python package, developed in a standardized devcontainer. Toolchain
+standards: [`docs/stack.md`](docs/stack.md). Working rules every change follows:
+[`AGENTS.md`](AGENTS.md). The "why" behind each design decision is in
+[`docs/adr/`](docs/adr/); the operational "how" is in [`docs/runbooks/`](docs/runbooks/).
+
+```bash
+uv sync --all-extras     # install (CI uses: uv sync --frozen)
 uv run ruff format .     # format        (check: uv run ruff format --check .)
 uv run ruff check .      # lint
 uv run mypy              # strict type-check
 uv run pytest            # tests
 ```
 
-- **Language/runtime:** Python ≥ 3.13, managed with **uv**. **Typing:** mypy strict, no
-  escape hatches. **Lint/format:** ruff.
+- **Language/runtime:** Python ≥ 3.13, managed with **uv**. **Typing:** mypy strict, no escape
+  hatches. **Lint/format:** ruff.
 - **Secrets:** 1Password + a gitignored `.env`.
-
-## Security
-
-This repository is **public**. Never commit the gateway host, extension number, passwords,
-internal hostnames, IPs, caller numbers, outbound dial targets, or any PII — they live only in
-the gitignored `.env`, gitignored caller-list files, and 1Password. Secret scanning (gitleaks)
-and a dependency vulnerability audit run in CI.
 
 ## Licence
 

@@ -164,3 +164,61 @@ def test_platform_registry_create_adapter_builds_voip_adapter() -> None:
     assert adapter is not None, "create_adapter returned None for a valid config"
     assert isinstance(adapter, base.BasePlatformAdapter)
     assert isinstance(adapter, VoipAdapter)
+
+
+# ---------------------------------------------------------------------------
+# Call-termination signal mechanism (ADR-0026). The plugin signals call-end to
+# the Hermes session by injecting a MessageEvent: a FAILURE end injects the
+# gateway control command ``/stop`` (a hard stop), a NORMAL end injects a plain
+# content note the gateway REPLAYS as the next turn. These contract tests pin
+# both halves against the REAL gateway command/interrupt machinery so a version
+# bump that changes how ``/stop`` is recognised (or makes the note look like a
+# control interrupt) fails here, not silently in production.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_command_is_recognised_by_the_real_gateway() -> None:
+    """A FAILURE end injects ``/stop``; the gateway must recognise it as a command.
+
+    ``/stop`` must be (a) parsed as the ``stop`` command from MessageEvent.text and
+    (b) in the gateway's active-session-bypass command set, so injecting it while a
+    turn is in flight actually stops the session (a hard stop) rather than being
+    delivered to the agent as content.
+    """
+    base = _hermes("gateway.platforms.base")
+    commands = _hermes("hermes_cli.commands")
+    from hermes_voip.call_end import STOP_COMMAND  # noqa: PLC0415
+
+    event = base.MessageEvent(
+        text=STOP_COMMAND,
+        message_type=base.MessageType.VOICE,
+        source=None,
+    )
+    assert event.is_command() is True
+    assert event.get_command() == "stop"
+    # The bypass set is what lets /stop interrupt an in-flight session (a hard
+    # stop), which is the whole point of injecting it for a FAILURE end.
+    assert "stop" in commands.ACTIVE_SESSION_BYPASS_COMMANDS
+
+
+def test_normal_end_note_replays_and_is_not_a_control_interrupt() -> None:
+    """A NORMAL end injects a content note the gateway REPLAYS (not a hard stop).
+
+    The note must be neither a slash command (so the gateway does not treat it as
+    /stop /new /reset) nor one of the gateway's ``_CONTROL_INTERRUPT_MESSAGES``
+    (which are dropped with no replay). Failing either, Hermes would not get the
+    turn and could not decide stop-vs-followup — the operator's design intent.
+    """
+    base = _hermes("gateway.platforms.base")
+    run = _hermes("gateway.run")
+    from hermes_voip.call_end import NORMAL_END_NOTE  # noqa: PLC0415
+
+    event = base.MessageEvent(
+        text=NORMAL_END_NOTE,
+        message_type=base.MessageType.VOICE,
+        source=None,
+    )
+    # Not a command → delivered to the agent as a turn, not parsed as /stop etc.
+    assert event.is_command() is False
+    # Not a control-interrupt reason → replayed as the next user turn, not dropped.
+    assert run._is_control_interrupt_message(NORMAL_END_NOTE) is False

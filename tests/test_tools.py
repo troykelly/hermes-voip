@@ -150,8 +150,9 @@ async def test_list_registrations_allowed_on_privileged_call() -> None:
 @pytest.mark.asyncio
 async def test_list_registrations_blocked_on_unprivileged_call() -> None:
     # An untrusted (unprivileged) call cannot enumerate registrations (ADR-0020).
+    # ADR-0021: `privileged` is read-only; construct with privilege_level=0.
     call = _FakeCall()
-    call.guard.privileged = False
+    call.guard = GuardSessionState(call_id="call-1", privilege_level=0)
     result = await _tools(call).list_registrations()
     assert result.allowed is False
 

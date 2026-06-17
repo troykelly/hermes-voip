@@ -1,4 +1,4 @@
-"""The enforceable tool-policy gate (ADR-0004/0009).
+"""The enforceable tool-policy gate (ADR-0004/0009 / ADR-0021).
 
 The classifier has false negatives by construction, so the *enforceable* control
 is this typed gate. Every registered tool carries a ``ToolRisk``; per-session
@@ -7,15 +7,25 @@ fail-open ``GuardResult``); and a ``pre_tool_call`` hook MUST gate every
 ``IRREVERSIBLE`` tool — requiring explicit human/DTMF confirmation (ADR-0010)
 and hard-blocking while ``degraded`` — regardless of the classifier outcome. A
 missed injection therefore still cannot reach an irreversible action.
+
+**ADR-0021 change:** ``GuardSessionState.privileged: bool`` is replaced by
+``privilege_level: int`` (0/2/3) with a backward-compat ``privileged`` property
+(``level >= 3``).  The gate now uses a level comparison instead of a bool check;
+levels 0/3 reproduce the ADR-0020 bool behaviour exactly so all existing callers
+work unchanged.  Old code that still constructs with ``privileged=True/False``
+maps to level 3/0 via the constructor keyword.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from enum import Enum
 from typing import assert_never
 
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
+
+# Minimum privilege level required to reach each non-SAFE risk class (ADR-0021).
+_MIN_LEVEL_ELEVATED = 2
+_MIN_LEVEL_IRREVERSIBLE = 3
 
 
 class ToolRisk(Enum):
@@ -26,32 +36,84 @@ class ToolRisk(Enum):
     IRREVERSIBLE = "irreversible"  # payments, bookings, transfers, account mutation
 
 
-@dataclass(slots=True)
 class GuardSessionState:
-    """Per-session guard state; lives for the call (ADR-0009 / ADR-0020).
+    """Per-session guard state; lives for the call (ADR-0009 / ADR-0020 / ADR-0021).
+
+    **ADR-0021** replaces the single ``privileged: bool`` with an integer
+    ``privilege_level`` (0 = receptionist/SAFE-only, 2 = trusted/+ELEVATED,
+    3 = operator/+IRREVERSIBLE) so the gate can express the three tiers the
+    operator asked for.  Levels 0 and 3 reproduce ADR-0020's ``privileged=False``
+    / ``True`` **exactly** (no existing behaviour changes).  The backward-compat
+    ``privileged`` property (``level >= 3``) keeps every existing ``state.privileged``
+    reader working without changes.
+
+    Construction backward-compat:
+    - ``GuardSessionState(call_id, privilege_level=N)`` — new callers.
+    - ``GuardSessionState(call_id, privileged=True/False)`` — old callers: maps to
+      level 3 (True) or level 0 (False).  Cannot combine ``privilege_level`` and
+      ``privileged`` — the constructor raises ``TypeError`` if both are supplied.
+    - ``GuardSessionState(call_id)`` — default, level 3 (assistant), same as
+      ``privileged=True`` was.  Preserves the ADR-0009 default where every session
+      starts as the assistant unless the adapter explicitly lowers the level.
 
     Attributes:
         call_id: The call/session this state belongs to.
         degraded: True once any fail-open screen occurred; never un-sets in-call.
-        privileged: Whether this session may use ``ELEVATED``/``IRREVERSIBLE``
-            tools at all (ADR-0020 caller modes). ``True`` is the default
-            (assistant / trusted ALLOW call), preserving the ADR-0009 behaviour.
-            The adapter sets it to ``False`` for an **untrusted** remote party —
-            the GREY receptionist and the OUTBOUND untrusted callee — and
-            :func:`gate_tool_call` then hard-blocks every non-``SAFE`` tool. This
-            is *least privilege*: an untrusted party's agent cannot invoke a tool
-            that could reach an operator secret or mutate state, regardless of the
-            persona prompt, the injection classifier verdict, or any confirmation.
-        flagged_turns: Identifiers of turns flagged for audit during the call —
-            one per screened turn whose verdict was not ``ALLOW`` or which failed
-            open (``degraded``). A benign ``ALLOW`` adds nothing.
+        privilege_level: The tool-risk ceiling for this session (0/2/3).
+            Set from the caller group at INVITE time (ADR-0021).
+        flagged_turns: Identifiers of turns flagged for audit during the call.
     """
 
-    call_id: str
-    degraded: bool = False
-    privileged: bool = True
-    flagged_turns: tuple[str, ...] = field(default_factory=tuple)
-    _turns_seen: int = 0
+    __slots__ = (
+        "_turns_seen",
+        "call_id",
+        "degraded",
+        "flagged_turns",
+        "privilege_level",
+    )
+
+    def __init__(
+        self,
+        call_id: str,
+        degraded: bool = False,
+        privilege_level: int = 3,
+        flagged_turns: tuple[str, ...] = (),
+        *,
+        privileged: bool | None = None,
+    ) -> None:
+        """Construct session state.
+
+        Args:
+            call_id: The call identifier.
+            degraded: Whether the session is already in degraded state.
+            privilege_level: Tool-risk ceiling (0/2/3).  Default 3 = operator/assistant.
+                Ignored if ``privileged`` is supplied.
+            flagged_turns: Initial set of flagged turn IDs (typically empty).
+            privileged: Backward-compat kwarg.  If supplied, overrides
+                ``privilege_level``: ``True`` → 3, ``False`` → 0.  Raise
+                ``TypeError`` if both ``privilege_level`` is explicitly non-default
+                AND ``privileged`` is supplied simultaneously.
+        """
+        self.call_id = call_id
+        self.degraded = degraded
+        self.flagged_turns = flagged_turns
+        self._turns_seen = 0
+        if privileged is not None:
+            # Backward-compat: map old bool kwarg → level.
+            # True = operator (3); False = receptionist (0).
+            self.privilege_level = 3 if privileged else 0
+        else:
+            self.privilege_level = privilege_level
+
+    @property
+    def privileged(self) -> bool:
+        """True iff this session has operator-level (IRREVERSIBLE) privilege.
+
+        Backward-compat property: ``state.privileged`` reads as
+        ``state.privilege_level >= 3``, preserving every existing reader
+        (adapter.py, tools.py, tests) without changes.
+        """
+        return self.privilege_level >= _MIN_LEVEL_IRREVERSIBLE
 
     def record(self, result: GuardResult) -> None:
         """Fold one screen into session state (ADR-0009 audit + degrade tracking).
@@ -71,27 +133,39 @@ class GuardSessionState:
             turn_id = f"{self.call_id}#{self._turns_seen}"
             self.flagged_turns = (*self.flagged_turns, turn_id)
 
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation."""
+        return (
+            f"GuardSessionState(call_id={self.call_id!r},"
+            f" degraded={self.degraded!r},"
+            f" privilege_level={self.privilege_level!r},"
+            f" flagged_turns={self.flagged_turns!r})"
+        )
+
 
 def gate_tool_call(
     risk: ToolRisk, state: GuardSessionState, *, confirmed: bool
 ) -> bool:
     """Decide whether a tool may run (``pre_tool_call`` policy).
 
-    An **unprivileged** session (ADR-0020: an untrusted remote party — the GREY
-    receptionist or the OUTBOUND untrusted callee) is hard-blocked from every
-    ``ELEVATED``/``IRREVERSIBLE`` tool, structurally and unconditionally — before
-    confirmation or the ``degraded`` flag is even considered. This is *least
-    privilege* as the primary defense: the agent for an untrusted party cannot
-    invoke a tool that could reach an operator secret or mutate state, no matter
-    what the persona prompt, the injection classifier, or a (spoofable)
-    confirmation say. ``SAFE`` (read-only) tools still run so the caller is never
-    dropped.
+    **ADR-0021:** the gate now uses ``state.privilege_level`` (0/2/3) instead of
+    ``state.privileged`` (bool), enabling the three-tier model:
 
-    For a **privileged** session the ADR-0009 rules apply unchanged: an
-    ``IRREVERSIBLE`` tool requires explicit confirmation (human/DTMF, ADR-0010)
-    and is hard-blocked while ``degraded`` — even if the classifier returned
-    ALLOW (the miss case ADR-0009 tests for); an ``ELEVATED`` tool is blocked
-    while ``degraded``.
+    - privilege_level=0 (receptionist): SAFE only; ELEVATED+IRREVERSIBLE blocked.
+    - privilege_level=2 (trusted): SAFE + ELEVATED (if not degraded);
+      IRREVERSIBLE blocked.
+    - privilege_level=3 (operator): SAFE + ELEVATED (if not degraded)
+      + IRREVERSIBLE (if confirmed AND not degraded).
+
+    Levels 0/3 reproduce ADR-0020's ``privileged=False``/``True`` **exactly**:
+    level-0 blocks all non-``SAFE``; level-3 applies the existing
+    ``degraded``/``confirmed`` checks unchanged.  Level 2 adds the new middle
+    tier (hold/resume but not transfer).
+
+    A missed injection with a spoofed confirmation still cannot reach a
+    privileged action: the level check fires before ``confirmed`` is consulted
+    for IRREVERSIBLE, and the ``degraded`` hard-block applies at every level >= 2
+    for both ELEVATED and IRREVERSIBLE.
 
     This never silently allows (rule 37): the decision is total over ``ToolRisk``.
 
@@ -107,15 +181,16 @@ def gate_tool_call(
         # Read-only tools always run, even for an untrusted/unprivileged session:
         # the caller is screened, never dropped.
         return True
-    # Every non-SAFE (mutating) tool requires a privileged session (ADR-0020). An
-    # untrusted remote party (receptionist / outbound callee) is clamped here
-    # before confirmation or degraded are consulted — least privilege first.
-    if not state.privileged:
-        return False
-    if risk is ToolRisk.IRREVERSIBLE:
-        return confirmed and not state.degraded
     if risk is ToolRisk.ELEVATED:
-        return not state.degraded
+        # Requires level >= 2 AND a non-degraded session.
+        return state.privilege_level >= _MIN_LEVEL_ELEVATED and not state.degraded
+    if risk is ToolRisk.IRREVERSIBLE:
+        # Requires level >= 3 AND confirmed AND non-degraded.
+        return (
+            state.privilege_level >= _MIN_LEVEL_IRREVERSIBLE
+            and confirmed
+            and not state.degraded
+        )
     assert_never(
         risk
     )  # exhaustive: a new ToolRisk member fails mypy here, not silently allows

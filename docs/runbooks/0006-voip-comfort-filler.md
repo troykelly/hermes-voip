@@ -44,9 +44,11 @@ Validation (fail-fast at startup, `MediaConfig.__post_init__` → `_validate_com
 - **Never on a fast reply; stands down at the reply commit.** The filler is armed when a caller
   turn is delivered and waits the delay. It covers the STT/LLM *processing* gap and stands down
   the instant the agent commits a reply (calls `speak()`) — a pending filler is cancelled then, so
-  it never collides with the imminent reply. (A reply that started and finished within the delay
-  is also caught by a per-gap audio latch.) Filling the sub-second TTS first-audio latency *after*
-  a fast LLM is a deliberate non-goal (ADR-0030) — the reply already owns the playout lock by then.
+  it never collides with the imminent reply. At the delay boundary it also fires only if no agent
+  audio is playing right now (so it never supersedes a greeting or a prior reply still on the
+  wire). Filling the sub-second TTS first-audio latency *after* a fast LLM, and the rare corner
+  where agent audio overlaps the delay boundary then ends before a slow reply, are deliberate
+  non-goals (ADR-0030) — both degrade to silence (today's behaviour), never a regression.
 - **At most once per gap.** The filler task fires once and returns; a still-pending slow turn
   does not loop ("hmm hmm hmm").
 - **Flushable + barge-in-safe (ADR-0023/0028).** The filler routes through the same

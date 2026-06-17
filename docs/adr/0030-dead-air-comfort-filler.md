@@ -71,21 +71,26 @@ stands down the instant the agent has a reply to speak:
   **mid-playout** (its task handle is kept for its whole life, not dropped when it fires) — so a
   filler can never outlive the call.
 
-The filler's post-delay check fires **only on genuine dead air**, guarded by *two* conditions —
-it fires only if **both** are false:
+Suppression is enforced by *two* independent mechanisms:
 
-- `_tts_audio_active` — whether agent audio is on the wire *right now*. This catches audio that
-  began **before** the gap was armed (a greeting, or a prior reply, still playing — whose
-  first-frame latch predates the gap's latch reset); firing then would supersede live agent
-  audio, which is not dead air.
-- `_gap_reply_audio_started` — a per-gap latch set by the first *real* reply frame in `_play`
-  (and reset when a new gap is armed). This catches a reply for *this* gap that started **and
-  finished** within the delay window, where the transient `_tts_audio_active` is already back to
-  false by the check.
+- **The `speak()` commit-cancel** — every real reply goes through `speak()`, which cancels a
+  pending filler at the reply commit (before the delay even elapses in the common case). This is
+  the primary reply-suppression; it is why no per-gap "reply audio" latch is needed (a latch on
+  *any* non-filler frame would also wrongly count the greeting/tone as the reply).
+- **The post-delay `_tts_audio_active` check** — even if the delay elapses, the filler fires only
+  if no agent audio is on the wire *right now*. This catches audio that began **before** the gap
+  was armed (a greeting, or a prior reply, still playing); firing then would supersede live agent
+  speech, which is not dead air. It is the "fire only on genuine dead air" guard.
 
-(Plus the `speak()` commit-time cancel handles the common pending case before the delay even
-elapses.) The ADR's "fire only on genuine dead air" invariant is therefore enforced by the
-runtime check, not only by the `speak()` cancel.
+**Known limitation (deliberate, ADR-recorded).** The filler is one-shot: it checks
+`_tts_audio_active` once, at the delay boundary. If agent audio is still playing at that instant
+and then *ends* while the real reply is still slow, the gap from that audio's end to the reply is
+not filled (the task has already returned). This requires agent audio to overlap the delay
+boundary — uncommon, since a caller turn is normally delivered only after the agent has gone
+quiet — and it degrades to today's behaviour (silence) for that corner, never a regression. A
+re-measuring loop (wait for audio to clear, then re-check) was considered and rejected: it adds
+race surface (the playout lock, a poll) for a rare corner, against this repo's bias toward
+fewer concurrency hazards.
 
 Because the filler routes through `_speak_text`/`_play`/`barge_in()`, *flushability and echo-gate
 arming are inherited, not re-implemented*.

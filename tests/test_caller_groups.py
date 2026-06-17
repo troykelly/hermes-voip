@@ -566,6 +566,99 @@ def _write_groups_json(tmp_path: Path, data: object, name: str = "g.json") -> Pa
     return f
 
 
+# --- ADR-0031: CallerGroup.allowed_tools (a per-group tool sub-ceiling) --------
+#
+# A group may scope a session to ONLY a named set of tools (the intercom group is
+# scoped to its entry action). The set lives on CallerGroup and is threaded onto
+# the session guard state so gate_voip_tool can remove every other tool.
+
+
+def test_caller_group_allowed_tools_defaults_to_empty() -> None:
+    # A group with no allowed_tools (the common case) has an empty frozenset,
+    # which means "no sub-ceiling" — every existing group keeps level-only gating.
+    group = CallerGroup(
+        name="operator",
+        privilege_level=3,
+        persona="assistant",
+        declined_at_sip=False,
+    )
+    assert group.allowed_tools == frozenset()
+
+
+def test_caller_group_allowed_tools_is_stored() -> None:
+    group = CallerGroup(
+        name="intercom",
+        privilege_level=2,
+        persona="intercom",
+        declined_at_sip=False,
+        allowed_tools=frozenset({"open_entry"}),
+    )
+    assert group.allowed_tools == frozenset({"open_entry"})
+
+
+def test_groups_json_parses_allowed_tools(tmp_path: Path) -> None:
+    # The N-group JSON document may carry an "allowed_tools" array per group; it
+    # parses into the CallerGroup's allowed_tools frozenset.
+    groups_file = _write_groups_json(
+        tmp_path,
+        {
+            "groups": [
+                {
+                    "name": "intercom",
+                    "privilege_level": 2,
+                    "persona": "intercom",
+                    "declined_at_sip": False,
+                    "allowed_tools": ["open_entry"],
+                },
+                {
+                    "name": "receptionist",
+                    "privilege_level": 0,
+                    "persona": "receptionist",
+                    "declined_at_sip": False,
+                },
+            ],
+            "lists": {"intercom": [_FAKE_EXT]},
+            "default_group": "receptionist",
+            "match_order": ["intercom", "receptionist"],
+        },
+    )
+    cfg = load_caller_groups({"HERMES_VOIP_CALLER_GROUPS_FILE": str(groups_file)})
+    intercom = next(g for g in cfg.groups if g.name == "intercom")
+    assert intercom.allowed_tools == frozenset({"open_entry"})
+    # A group with no allowed_tools key still parses to the empty default.
+    receptionist = next(g for g in cfg.groups if g.name == "receptionist")
+    assert receptionist.allowed_tools == frozenset()
+
+
+def test_groups_json_rejects_non_list_allowed_tools(tmp_path: Path) -> None:
+    # allowed_tools must be a list of strings; a malformed value fails loud.
+    groups_file = _write_groups_json(
+        tmp_path,
+        {
+            "groups": [
+                {
+                    "name": "intercom",
+                    "privilege_level": 2,
+                    "persona": "intercom",
+                    "declined_at_sip": False,
+                    "allowed_tools": "open_entry",
+                },
+                {
+                    "name": "receptionist",
+                    "privilege_level": 0,
+                    "persona": "receptionist",
+                    "declined_at_sip": False,
+                },
+            ],
+            "lists": {"intercom": [_FAKE_EXT]},
+            "default_group": "receptionist",
+            "match_order": ["intercom", "receptionist"],
+        },
+    )
+    with pytest.raises(ConfigError, match="allowed_tools"):
+        load_caller_groups({"HERMES_VOIP_CALLER_GROUPS_FILE": str(groups_file)})
+
+
 def test_load_caller_groups_rejects_privileged_group_with_no_patterns(
     tmp_path: Path,
 ) -> None:

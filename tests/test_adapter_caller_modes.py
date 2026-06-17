@@ -881,11 +881,16 @@ def test_outbound_result_text_neutralises_a_malicious_summary() -> None:
     # Single line — a callee cannot smuggle a '\n/stop' command line.
     assert "\n" not in report
     assert "\r" not in report
-    # The fence markers the callee tried to forge are defanged (broken up).
-    assert "<<<END_UNTRUSTED_CALLER_TRANSCRIPT>>>" not in report
-    # The untrusted summary is fenced as data inside the report.
+    # The summary is fenced as data inside the report, and the callee CANNOT forge a
+    # second fence to break out: there is EXACTLY ONE open + ONE close marker (the
+    # legitimate pair the builder added; the callee's forged close was defanged).
     assert _UNTRUSTED_OPEN in report
     assert _UNTRUSTED_CLOSE in report
+    assert report.count(_UNTRUSTED_CLOSE) == 1
+    assert report.count(_UNTRUSTED_OPEN) == 1
+    # The callee's original (pre-defang) forged close marker is the same literal as
+    # the legitimate close; the by-construction guarantee is the exactly-one count
+    # above (the defang broke the callee's '>>>' run apart, leaving only our pair).
 
 
 @pytest.mark.asyncio
@@ -933,9 +938,9 @@ async def test_malicious_summary_does_not_inject_command_into_origin() -> None:
     ]
     assert origin_events, f"no origin report captured; got {captured!r}"
     text = getattr(origin_events[0], "text", "")
-    # The injected origin text is neutralised: not a command, single line, fence
-    # markers defanged — the untrusted summary cannot forge control/trusted text.
+    # The injected origin text is neutralised: not a command, single line, and the
+    # untrusted summary cannot forge a second fence to break out (exactly one pair).
     assert not text.lstrip().startswith("/")
     assert "\n" not in text
     assert "\r" not in text
-    assert "<<<END_UNTRUSTED_CALLER_TRANSCRIPT>>>" not in text
+    assert text.count(_UNTRUSTED_CLOSE) == 1

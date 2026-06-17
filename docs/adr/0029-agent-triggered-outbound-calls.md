@@ -116,22 +116,41 @@ the operator opts numbers in.
 
 - **Delivery on call-end.** `_teardown_call` → `_signal_call_end` already injects the
   end signal into the call's OWN session (ADR-0026). This ADR adds: when
-  `_call_info[cid]["origin"]` is set, also inject a *second* `MessageEvent(text="[Out­
-  bound call to <number> ended (<reason>): <summary>]", internal=True, source=<the
-  origin SessionSource>)` into the ORIGIN session — so agent A tells the user how the
-  call went. Built by constructing `SessionSource(platform=Platform(origin_platform),
-  chat_id=origin_chat_id, …)` directly (`build_source` hard-codes `self.platform`, so
-  it cannot target a foreign platform). Failure outcomes (busy / no-answer / declined
-  / pipeline failure) report too — the summary defaults to the classified reason when
-  the agent recorded none.
+  `_call_info[cid]["origin"]` is set, also inject a *second* `MessageEvent` (a
+  single-line `[Outbound call to '<callee>' ended (<reason>). Result …]`,
+  `internal=True`, source = the origin `SessionSource`) into the ORIGIN session — so
+  agent A tells the user how the call went. Built by constructing
+  `SessionSource(platform=Platform(origin_platform), chat_id=origin_chat_id, …)`
+  directly (`build_source` hard-codes `self.platform`, so it cannot target a foreign
+  platform). Failure outcomes (busy / no-answer / declined / pipeline failure) report
+  too — the summary defaults to the classified reason when the agent recorded none.
 
-- **No-origin fallback.** When there is no origin (the env-trigger / cron path), the
-  only delivery path that works is the built-in `send_message` tool to a configured
-  channel — VoIP has no home channel of its own, so a proactive notification *into*
-  voip is impossible (it always fails "No home channel set for voip"). The fallback
-  uses `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` (a `platform:chat_id` target) when set,
-  delivered via the live gateway's `send_message` path; with neither origin nor a
-  configured channel the outcome is logged only.
+- **The result summary is UNTRUSTED and is sanitised before cross-session injection.**
+  The `report_call_result` summary is recorded by the call agent on an untrusted-callee
+  call, then injected `internal=True` into the *origin* session — so a hostile callee
+  could try to make the summary forge a Hermes command (`/stop`), a control-interrupt
+  string, system framing, or the untrusted-data fence, hijacking the origin session.
+  `_outbound_result_text` therefore (a) **collapses all whitespace** (newlines/CR/tabs)
+  to single spaces so no `\n/command` line can be smuggled, (b) **caps the length**
+  (bounds a flooding payload), (c) **defangs the spotlight fence**, and (d) emits the
+  whole report as a single `[…]`-bracketed line (so it never begins with `/` and is not
+  a command) with the summary **fenced as untrusted DATA** between the
+  `UNTRUSTED_CALLER_TRANSCRIPT` markers — exactly one legitimate fence pair the callee
+  cannot break out of. The callee identity is sanitised the same way (it too is
+  untrusted on an outbound call). This closes the cross-vendor review's one BLOCKING
+  finding.
+
+- **No-origin fallback.** When there is no origin (the env-trigger / cron path), VoIP
+  has no home channel of its own, so a proactive notification *into* voip is impossible
+  (it always fails "No home channel set for voip"). The fallback uses
+  `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` (a `platform:chat_id` target) when set,
+  delivered by the SAME foreign-session injection the origin report uses (a
+  `MessageEvent` whose `source` names the configured channel — the path the built-in
+  `send_message` tool would also take). The `tools.send_message_tool` symbol is *not*
+  imported, because a sibling module in the hermes-agent `tools` package has a syntax
+  error mypy cannot parse under `follow_untyped_imports`; reusing the
+  `gateway.*`-only foreign-session injection keeps the type-check clean. With neither
+  origin nor a configured channel the outcome is logged only.
 
 ### Hermes gaps recorded (so a future session does not re-derive them)
 

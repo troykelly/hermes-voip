@@ -279,10 +279,20 @@ class _UdpReceiver(asyncio.DatagramProtocol):
     The engine creates one instance and passes it to
     ``loop.create_datagram_endpoint``.  The queue is drained by
     :meth:`RtpMediaTransport.inbound_audio`.
+
+    ``on_lost`` is the engine's transport-loss callback (ADR-0026): a fatal socket
+    error (``error_received``) or an ERROR socket close (``connection_lost`` with
+    an exception) reports the loss so the engine can end the call as a failure
+    instead of leaving the inbound generator blocked forever on a dead socket.
     """
 
-    def __init__(self, queue: asyncio.Queue[_Datagram]) -> None:
+    def __init__(
+        self,
+        queue: asyncio.Queue[_Datagram],
+        on_lost: Callable[[Exception | None], None],
+    ) -> None:
         self._queue = queue
+        self._on_lost = on_lost
         self._transport: asyncio.BaseTransport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -301,13 +311,28 @@ class _UdpReceiver(asyncio.DatagramProtocol):
             _log.debug("inbound queue full — datagram dropped from %s", addr)
 
     def error_received(self, exc: Exception) -> None:
-        """Log ICMP / socket errors; do not propagate (env error, rule 37)."""
-        _log.debug("UDP error received: %s", exc)
+        """Report a fatal ICMP / socket error as a transport loss (ADR-0026).
+
+        Previously DEBUG-only, which left a call hanging on a dead socket (e.g. an
+        unreachable destination surfaced here as ICMP port-unreachable). Reporting
+        it via ``on_lost`` ends the call as a failure (→ ``/stop``): the loss is
+        now acted upon, never swallowed (rule 37).
+        """
+        _log.warning("UDP error received — ending call as transport loss: %s", exc)
+        self._on_lost(exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
-        """The socket was closed."""
+        """The socket was closed.
+
+        A clean close (``exc is None``) is our own :meth:`stop` /
+        ``transport.close()`` — the engine has already set its stop event, so this
+        is a no-op. An ERROR close (``exc`` set) is an unexpected transport drop:
+        report it as a loss so the inbound generator ends the call as a failure
+        (ADR-0026), replacing the old DEBUG-only no-op that hung the call.
+        """
         if exc is not None:
-            _log.debug("UDP connection lost: %s", exc)
+            _log.warning("UDP connection lost — ending call: %s", exc)
+            self._on_lost(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -358,9 +383,11 @@ class RtpMediaTransport:
         srtp_outbound: _SrtpProtect | None = None,
         jitter_depth: int = 2,
         symmetric: bool = True,
+        media_timeout_secs: float = 0.0,
         clock: Callable[[], int] | None = None,
         pace_clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        watchdog_sleep: Callable[[float], Awaitable[None]] | None = None,
         initial_seq: int | None = None,
         initial_ts: int | None = None,
     ) -> None:
@@ -383,6 +410,18 @@ class RtpMediaTransport:
                 encode cost is absorbed into the 20 ms interval). Distinct from
                 ``clock`` (nanoseconds, inbound presentation time). Defaults to
                 :func:`time.monotonic`; inject a fake to drive pacing deterministically.
+            media_timeout_secs: RTP-inactivity watchdog window in SECONDS (ADR-0026).
+                When positive, the inbound generator ends the call if no datagram
+                arrives within this window (re-armed on every datagram), recording
+                :attr:`media_timed_out` so the adapter classifies MEDIA_TIMEOUT →
+                ``/stop``. ``0.0`` (the default) disables the watchdog — the engine
+                then ends only on a received BYE or :meth:`stop` (the legacy
+                behaviour). This is the reliability fix for a silent media/network
+                drop, which otherwise blocks the inbound generator forever.
+            watchdog_sleep: Async callable the inactivity watchdog awaits for one
+                window (default :func:`asyncio.sleep`). Inject an event-gated
+                coroutine in tests to fire the deadline deterministically without a
+                wall-clock wait. Distinct from ``sleep`` (outbound pacing).
             initial_seq: Override the random initial RTP sequence number.
                 Pass a fixed value in tests to make send_audio assertions
                 deterministic (RFC 3550 §5.1 default: random uint16).
@@ -421,6 +460,15 @@ class RtpMediaTransport:
         )
         self._sleep: Callable[[float], Awaitable[None]] = (
             sleep if sleep is not None else asyncio.sleep
+        )
+        # RTP-inactivity watchdog (ADR-0026). ``_media_timeout_secs > 0`` arms a
+        # no-media deadline in the inbound generator; ``_watchdog_sleep`` is the
+        # coroutine it awaits for one window (injectable for deterministic tests).
+        # A silent media/network drop otherwise blocks the inbound generator
+        # forever — this is the reliability fix behind call-termination.
+        self._media_timeout_secs = media_timeout_secs
+        self._watchdog_sleep: Callable[[float], Awaitable[None]] = (
+            watchdog_sleep if watchdog_sleep is not None else asyncio.sleep
         )
 
         # Outbound RTP sequence / timestamp counters (RFC 3550 §5.1: randomised at
@@ -466,6 +514,17 @@ class RtpMediaTransport:
         # from "never connected" (programming error — still raises RuntimeError).
         self._ever_connected: bool = False
         self._transport: asyncio.DatagramTransport | None = None
+        # The UDP protocol object handed to asyncio (populated by connect()).
+        # Kept so a transport error/close arriving on it is observable and the
+        # transport-loss path is reachable; ``None`` before connect()/after stop().
+        self._protocol: _UdpReceiver | None = None
+        # Set True when the call ended abnormally on the media plane: the RTP
+        # inactivity watchdog fired, or the UDP transport was lost (ADR-0026). The
+        # adapter reads this after the call loop returns to classify the end as a
+        # failure (MEDIA_TIMEOUT / CONNECTION_LOST → ``/stop``) rather than a clean
+        # REMOTE_BYE/EOS. Distinct from a received BYE, which stops media WITHOUT
+        # setting this.
+        self._media_timed_out: bool = False
         self._recv_queue: asyncio.Queue[_Datagram] = asyncio.Queue(
             maxsize=_QUEUE_MAXSIZE
         )
@@ -564,6 +623,8 @@ class RtpMediaTransport:
         self._jitter = JitterBuffer(target_depth=self._jitter_depth)
         self._stop_event = asyncio.Event()
         self._pending = None
+        # A reused engine starts a fresh call: it has not timed out yet.
+        self._media_timed_out = False
         # Drop any carried outbound-resample state so a reused engine starts a
         # fresh stream (no stale sub-sample phase from a previous call).
         self._tx_resamplers = {}
@@ -594,7 +655,8 @@ class RtpMediaTransport:
         self._self_ssrc_logged = False
         self._tx_amplitude_chunk_count = 0
         self._tx_amplitude_period_peak = 0
-        protocol = _UdpReceiver(self._recv_queue)
+        protocol = _UdpReceiver(self._recv_queue, self._on_transport_lost)
+        self._protocol = protocol
 
         transport, _ = await loop.create_datagram_endpoint(
             lambda: protocol,
@@ -606,6 +668,22 @@ class RtpMediaTransport:
         self._transport = transport
         self._ever_connected = True
         return True
+
+    def _on_transport_lost(self, exc: Exception | None) -> None:
+        """End the call when the UDP transport is lost (ADR-0026).
+
+        Invoked from the :class:`_UdpReceiver` on a fatal ``error_received`` or an
+        ERROR ``connection_lost``. Records the media-loss flag (so the adapter
+        classifies the end as a failure → ``/stop``) and sets the stop event so the
+        inbound generator wakes and ends — the silent-drop call no longer hangs.
+        Idempotent: a second loss after stop is harmless (the flag stays set; the
+        event is already set). The exception is logged (DEBUG) here, not re-raised,
+        because it arrives on the event loop, not a call path — but it is acted
+        upon, never swallowed (rule 37).
+        """
+        _log.debug("media transport lost: %s", exc)
+        self._media_timed_out = True
+        self._stop_event.set()
 
     async def disconnect(self) -> None:
         """Tear down media and signalling; idempotent (MediaTransport seam)."""
@@ -747,24 +825,33 @@ class RtpMediaTransport:
     async def _next_datagram(self) -> _Datagram | None:
         """Await the next inbound datagram, or return ``None`` if stopped.
 
-        Races :meth:`asyncio.Queue.get` against the stop flag so the consumer
-        wakes promptly when :meth:`stop` is called — even when the bounded recv
-        queue is full and a sentinel datagram could not be enqueued.  When both
-        are ready, the stop flag wins (we never start draining a full queue that
-        a caller has asked us to abandon).
+        Races :meth:`asyncio.Queue.get` against the stop flag — AND, when the RTP
+        inactivity watchdog is armed (``_media_timeout_secs > 0``), against a
+        no-media deadline (ADR-0026). The consumer wakes promptly when :meth:`stop`
+        is called even with the bounded recv queue full, and the call ends instead
+        of hanging when media goes silent. When the stop flag and a delivered
+        datagram tie, the stop flag wins (we never start draining a queue the
+        caller asked us to abandon); a delivered datagram beats the watchdog.
 
-        ``asyncio.CancelledError`` from the awaited tasks propagates to the
-        caller (rule 37).  Both race tasks are always cancelled AND awaited
-        before this method returns or propagates, so no task is ever left
-        pending (no "Task was destroyed but it is pending" warning).
+        The deadline RE-ARMS on every datagram: a returned datagram ends this call,
+        and the next :meth:`_next_datagram` call creates a FRESH watchdog task, so a
+        live call (continuous media) never reaches the deadline. The watchdog firing
+        sets :attr:`_media_timed_out` and the stop event so the call is classified
+        as a failure (MEDIA_TIMEOUT) — distinct from a clean BYE.
 
-        Rollback is lossless: if the stop flag wins a race in which a datagram
-        had already been dequeued, that datagram is parked in :attr:`_pending`
-        (never re-queued, so a full queue cannot drop it) and returned first by
-        the next call.
+        ``asyncio.CancelledError`` from the awaited tasks propagates to the caller
+        (rule 37). Every race task is cancelled AND awaited before this method
+        returns or propagates, so no task is left pending (no "Task was destroyed
+        but it is pending" warning).
+
+        Rollback is lossless: if the stop flag wins a race in which a datagram had
+        already been dequeued, that datagram is parked in :attr:`_pending` (never
+        re-queued, so a full queue cannot drop it) and returned first by the next
+        call.
 
         Returns:
-            The next datagram, or ``None`` when the stop flag is set.
+            The next datagram, or ``None`` when the stop flag is set or the
+            inactivity watchdog fires.
         """
         # A datagram rolled back from a previous stop-tie is delivered first,
         # in order, independent of recv-queue capacity.
@@ -781,21 +868,34 @@ class RtpMediaTransport:
             self._recv_queue.get()
         )
         stop_task: asyncio.Task[bool] = asyncio.ensure_future(self._stop_event.wait())
+        # The inactivity-watchdog racer (ADR-0026), only when armed. A fresh task per
+        # call re-arms the deadline on every datagram. ``None`` when the watchdog is
+        # off (``_media_timeout_secs <= 0``) — the legacy stop/BYE-only behaviour.
+        watchdog_task: asyncio.Task[None] | None = None
+        if self._media_timeout_secs > 0:
+            watchdog_task = asyncio.ensure_future(
+                self._watchdog_sleep(self._media_timeout_secs)
+            )
+        race_tasks: tuple[asyncio.Task[object], ...] = (
+            (get_task, stop_task)
+            if watchdog_task is None
+            else (get_task, stop_task, watchdog_task)
+        )
         try:
             await asyncio.wait(
-                {get_task, stop_task},
+                set(race_tasks),
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            # Cancel whichever task did not complete, then AWAIT both so their
+            # Cancel whichever tasks did not complete, then AWAIT all so their
             # cancellation is fully processed before we return — nothing is left
-            # pending.  return_exceptions=True absorbs the CancelledError of the
-            # losing task; a cancellation of THIS coroutine still propagates out
-            # of the await below (and thus out of _next_datagram) per rule 37.
-            for task in (get_task, stop_task):
+            # pending. return_exceptions=True absorbs the CancelledError of the
+            # losers; a cancellation of THIS coroutine still propagates out of the
+            # gather below (and thus out of _next_datagram) per rule 37.
+            for task in race_tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(get_task, stop_task, return_exceptions=True)
+            await asyncio.gather(*race_tasks, return_exceptions=True)
 
         # Stop wins over a delivered datagram (abandon a full queue on stop).
         if stop_task.done() and not stop_task.cancelled():
@@ -805,7 +905,32 @@ class RtpMediaTransport:
                 self._pending = get_task.result()
             return None
 
-        return get_task.result()
+        # A delivered datagram beats the watchdog: hand it back (and re-arm the
+        # deadline on the next call). Checked BEFORE the watchdog so a packet that
+        # arrived in the same loop step as the deadline is never discarded.
+        if get_task.done() and not get_task.cancelled():
+            return get_task.result()
+
+        # The inactivity watchdog fired (no datagram within the window): end the
+        # call as a media timeout (the silent-drop call no longer hangs forever).
+        if (
+            watchdog_task is not None
+            and watchdog_task.done()
+            and not watchdog_task.cancelled()
+        ):
+            self._media_timed_out = True
+            self._stop_event.set()
+            _log.warning(
+                "rtp: no inbound media for %.1fs — ending call (MEDIA_TIMEOUT)",
+                self._media_timeout_secs,
+            )
+            return None
+
+        # No racer produced a result without being cancelled — only reachable if a
+        # cancellation of THIS coroutine is in flight, which the gather above
+        # re-raises. Returning None is the safe, call-ending default (rule 37: no
+        # silent hang). In practice the gather propagates the CancelledError first.
+        return None
 
     async def send_audio(self, frame: PcmFrame) -> None:
         """Encode and packetise one near-end frame; gate on hold state.
@@ -1147,6 +1272,10 @@ class RtpMediaTransport:
         # Clear the pacing deadline so a reconnected engine re-anchors fresh.
         self._next_send_at = None
         self._transport = None
+        # Drop the protocol reference: closing the transport below fires a clean
+        # connection_lost(None) on it (a no-op now), and a stopped engine holds no
+        # live socket. Re-created in connect() for a reused engine.
+        self._protocol = None
         if transport is not None:
             transport.close()
         # Set the stop flag so the inbound generator wakes and exits cleanly.
@@ -1221,6 +1350,18 @@ class RtpMediaTransport:
     def local_port(self) -> int:
         """The local UDP port (OS-assigned when 0 was passed to __init__)."""
         return self._local_port
+
+    @property
+    def media_timed_out(self) -> bool:
+        """Whether the call ended abnormally on the media plane (ADR-0026).
+
+        ``True`` once the RTP-inactivity watchdog fired (no datagram within the
+        configured window) or the UDP transport was lost. The adapter reads this
+        after the call loop returns to classify the end as a failure (MEDIA_TIMEOUT
+        / CONNECTION_LOST → ``/stop``) rather than a clean REMOTE_BYE/EOS. A
+        received BYE stops media WITHOUT setting this (a normal end).
+        """
+        return self._media_timed_out
 
     # ------------------------------------------------------------------
     # Internal codec helpers

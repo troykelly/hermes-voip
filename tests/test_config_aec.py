@@ -18,7 +18,7 @@ def test_aec_defaults() -> None:
     """AEC is on by default with telephony-sensible filter parameters."""
     cfg = load_media_config({})
     assert cfg.aec_enabled is True
-    assert cfg.aec_filter_ms == 32
+    assert cfg.aec_filter_ms == 16
     assert cfg.aec_bulk_delay_ms == 0
     assert cfg.aec_mu == pytest.approx(0.30)
 
@@ -97,14 +97,16 @@ def test_aec_filter_ms_must_be_positive() -> None:
 
 def test_aec_mu_must_be_in_open_unit_interval() -> None:
     """The NLMS step size ``mu`` is in (0, 2); 0 and >= 2 are rejected."""
-    with pytest.raises(ConfigError, match="aec_mu"):
+    with pytest.raises(ConfigError, match="HERMES_VOIP_AEC_MU"):
         load_media_config({"HERMES_VOIP_AEC_MU": "0"})
-    with pytest.raises(ConfigError, match="aec_mu"):
+    with pytest.raises(ConfigError, match="HERMES_VOIP_AEC_MU"):
         load_media_config({"HERMES_VOIP_AEC_MU": "2"})
-    with pytest.raises(ConfigError, match="aec_mu"):
+    with pytest.raises(ConfigError, match="HERMES_VOIP_AEC_MU"):
         load_media_config({"HERMES_VOIP_AEC_MU": "2.5"})
 
 
 def test_aec_bulk_delay_ms_must_be_non_negative() -> None:
-    with pytest.raises(ConfigError, match="aec_bulk_delay_ms"):
+    # _parse_non_negative_int rejects a negative at parse time (its regex matches
+    # only non-negative integers), naming the env key in the message.
+    with pytest.raises(ConfigError, match="HERMES_VOIP_AEC_BULK_DELAY_MS"):
         load_media_config({"HERMES_VOIP_AEC_BULK_DELAY_MS": "-5"})

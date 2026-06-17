@@ -421,13 +421,24 @@ def test_media_defaults_when_env_empty() -> None:
     # symmetric-RTP (comedia) latching is ON by default
     assert cfg.rtp_symmetric is True
     # echo-robust barge-in (ADR-0023): gated by default, telephony thresholds.
-    # The default min-speech clears the longest observed gateway-echo burst
-    # (~15 VAD windows ≈ 480 ms), so a 600 ms default has margin above it.
     assert cfg.barge_in_mode == "gated"
-    assert cfg.barge_in_min_speech_ms == 600
+    # AEC-aware barge-in threshold (ADR-0033): with the in-process echo canceller ON
+    # by default, the gateway's reflected TTS is cancelled before the VAD, so the
+    # 600 ms echo-safety margin (ADR-0023) is unnecessary and the default drops to a
+    # responsive 200 ms. (HERMES_VOIP_AEC_ENABLED=false restores 600 ms — see
+    # test_config_aec.py.)
+    assert cfg.barge_in_min_speech_ms == 200
     assert cfg.barge_in_tail_ms == 250
     # barge-in clean-stop fade (ADR-0028): a short click-free ramp on the cut.
     assert cfg.barge_in_fade_ms == 30
+    # in-process acoustic echo cancellation (ADR-0033): ON by default with a
+    # telephony-sensible 16 ms NLMS filter (captures the dominant echo energy within
+    # the per-frame CPU budget); this is what lets the barge-in threshold above drop
+    # to 200 ms.
+    assert cfg.aec_enabled is True
+    assert cfg.aec_filter_ms == 16
+    assert cfg.aec_bulk_delay_ms == 0
+    assert cfg.aec_mu == pytest.approx(0.30)
     # dead-air comfort filler (ADR-0030): OFF by default — today's behaviour
     # exactly; the delay and phrases carry the documented defaults but are inert
     # while the master switch is off.

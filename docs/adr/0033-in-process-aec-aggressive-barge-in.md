@@ -114,7 +114,7 @@ keeps their value; the AEC-aware default applies only when the key is unset.
 | Env var | `MediaConfig` field | Default | Meaning |
 | --- | --- | --- | --- |
 | `HERMES_VOIP_AEC_ENABLED` | `aec_enabled` | `true` | Master switch for the in-process echo canceller. `false` = the ADR-0023 sustained-gate-only behaviour (no canceller). |
-| `HERMES_VOIP_AEC_FILTER_MS` | `aec_filter_ms` | `32` | Adaptive-filter length in ms (taps = `ms × analysis_rate / 1000`). Spans the room/hybrid impulse response; longer = more echo paths modelled, more CPU/sample. |
+| `HERMES_VOIP_AEC_FILTER_MS` | `aec_filter_ms` | `16` | Adaptive-filter length in ms (taps = `ms × analysis_rate / 1000`). Spans the room/hybrid impulse response; longer = more echo paths modelled, more CPU/sample. 16 ms captures the dominant echo energy within the pure-Python per-frame budget (see *Consequences*); 32 ms is available for a longer path at ~2× the CPU. |
 | `HERMES_VOIP_AEC_BULK_DELAY_MS` | `aec_bulk_delay_ms` | `0` | A fixed reference delay (ms) skipped before the adaptive window, for a gateway with a large constant echo-return delay. `0` lets the adaptive taps cover the delay directly. |
 | `HERMES_VOIP_AEC_MU` | `aec_mu` | `0.30` | NLMS step size in `(0, 2)`. Higher converges faster, higher steady-state residual. |
 | `HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS` | `barge_in_min_speech_ms` | **`200` when AEC on, else `600`** | Sustained voiced run (ms) to barge in during playout/tail (ADR-0023). The AEC-aware default. |
@@ -132,10 +132,15 @@ same fakes-only, fully-typed discipline as the rest of the engine.
   ONSET), a real uncorrelated near-end signal survives (ONSET still fires), and the lowered
   threshold does not self-interrupt on echo through the full engine + `BargeInGate`.
 - **No added latency on the hot path (rule 22).** `cancel()` is per-sample, in-place,
-  buffer-free — it returns the same frame length with no extra ptime of delay. The added CPU is
-  `O(filter_len)` multiply-accumulates per sample (≈ 256 taps × 16 k samples/s ≈ 4 M MAC/s at
-  16 kHz, 32 ms taps) in `array('d')`; measured per-frame cost is reported in the PR, and the
-  pacing path is unchanged (the TX tap is a cheap append).
+  buffer-free — it returns the same frame length with no extra ptime of delay (no look-ahead). The
+  added CPU is `O(filter_len)` multiply-accumulates per sample, in `array('d')` via sliced/`zip`'d
+  inner loops. **Measured** per-20-ms-frame cost at the 16 ms default: **~1.8 ms at 8 kHz G.711
+  (≈ 9 % of the 20 ms ptime), ~6.8 ms at 16 kHz G.722/Opus (≈ 34 %)** — comfortably under budget,
+  with headroom. The default is **16 ms** (not 32 ms) precisely because pure-Python 32 ms taps at
+  16 kHz measured ~13.7 ms/frame (≈ 69 %), too close to the ptime ceiling; 16 ms captures the
+  dominant echo energy of a telephony hybrid and halves that. The pacing path is unchanged (the TX
+  reference tap is a cheap list append). Only the inbound RX runs `cancel`; the outbound is the
+  cheap tap.
 - **No new dependency.** Pure stdlib; the `uv.lock` / licence surface is unchanged (rule 35), and
   the canceller does not pull numpy into the `media`-extra engine path.
 - **AEC is a no-op when disabled** (`HERMES_VOIP_AEC_ENABLED=false`) — the ADR-0023 path is
@@ -162,7 +167,7 @@ same fakes-only, fully-typed discipline as the rest of the engine.
   filters, but it needs an FFT (numpy — banned in this path) and introduces a **block of
   algorithmic latency** (it processes a block at a time), violating the no-perceptible-delay
   requirement. The time-domain sample-by-sample NLMS adds zero algorithmic delay; our filter is
-  short (32 ms) so its per-sample cost is acceptable.
+  short (16 ms default) so its per-sample cost is acceptable (measured in *Consequences*).
 - **Energy/spectral subtraction without a reference.** Cannot distinguish the agent's echo from
   the caller — exactly the failure ADR-0023 documented for a level-only gate. Reference-based
   cancellation is the robust, gateway-agnostic answer.

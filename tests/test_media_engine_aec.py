@@ -93,8 +93,8 @@ async def _make_engine(*, aec_enabled: bool) -> tuple[RtpMediaTransport, _Record
         initial_seq=0,
         initial_ts=0,
         aec_enabled=aec_enabled,
-        aec_filter_len=128,
-        aec_bulk_delay=0,
+        aec_filter_ms=16,  # 128 taps at 8 kHz
+        aec_bulk_delay_ms=0,
         aec_mu=0.5,
     )
     await engine.connect()
@@ -219,14 +219,26 @@ async def test_engine_aec_disabled_passes_echo_through() -> None:
 
 @pytest.mark.asyncio
 async def test_engine_default_enables_aec() -> None:
-    """The engine constructs an AEC by default (aec_enabled defaults to True)."""
-    engine = RtpMediaTransport(
-        local_address="127.0.0.1",
-        local_port=0,
-        remote_address="127.0.0.1",
-        remote_port=5004,
-        codec=Codec.PCMU,
-    )
-    await engine.connect()
-    assert engine._aec is not None
+    """AEC is enabled by default and becomes active on the first outbound frame.
+
+    The canceller is created LAZILY at the current analysis rate (like the
+    G.722/Opus codecs) because the outbound path re-sets the codec after connect()
+    but before media; building it at connect-time would pin the placeholder rate.
+    So ``_aec_enabled`` is True by default and ``_aec`` materialises on first use.
+    """
+    engine, _rec = await _make_engine(aec_enabled=True)
+    assert engine._aec_enabled is True
+    assert engine._aec is None  # not built until the first reference push
+    await engine.send_audio(_sine_frame([100] * _SPF))
+    assert engine._aec is not None  # built on the first outbound frame
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_engine_aec_disabled_builds_no_canceller() -> None:
+    """With AEC disabled, no canceller is ever built (the RX/TX taps are no-ops)."""
+    engine, _rec = await _make_engine(aec_enabled=False)
+    assert engine._aec_enabled is False
+    await engine.send_audio(_sine_frame([100] * _SPF))
+    assert engine._aec is None
     await engine.stop()

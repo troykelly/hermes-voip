@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from typing import Final, Protocol
 
 from hermes_voip.dtmf import DtmfEvent, DtmfReceiver, event_payloads
+from hermes_voip.media.aec import EchoCanceller
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
     Resampler,
@@ -130,6 +131,13 @@ _QUEUE_MAXSIZE = 512
 # This replaces the old "first 3 chunks only" approach, which always logged 0
 # because the TTS synthesiser has a brief silent lead-in before actual speech.
 _TX_AMPLITUDE_LOG_PERIOD: Final[int] = 50
+
+# Default echo-canceller adaptive-filter length in milliseconds (ADR-0033), the
+# engine's standalone default when no ``aec_filter_ms`` is passed (the adapter always
+# passes the configured value). 16 ms captures the dominant echo energy while keeping
+# the pure-Python per-frame cost well under the 20 ms ptime budget (rule 22): 128 taps
+# at 8 kHz, 256 at 16 kHz. The engine converts ms → taps at the live analysis rate.
+_AEC_DEFAULT_FILTER_MS: Final[int] = 16
 
 # A received datagram paired with the UDP source address it arrived from. The
 # source address is what symmetric-RTP (comedia) latching needs: we send our
@@ -628,6 +636,10 @@ class RtpMediaTransport:
         initial_seq: int | None = None,
         initial_ts: int | None = None,
         ice_transport: _IceDatagramPipe | None = None,
+        aec_enabled: bool = True,
+        aec_filter_ms: int = _AEC_DEFAULT_FILTER_MS,
+        aec_bulk_delay_ms: int = 0,
+        aec_mu: float = 0.30,
     ) -> None:
         """Construct the engine; no socket is opened until :meth:`connect`.
 
@@ -850,6 +862,26 @@ class RtpMediaTransport:
         self._opus_encoder: _OpusEncode | None = None
         self._opus_decoder: _OpusDecode | None = None
 
+        # In-process acoustic echo canceller (ADR-0033). The gateway reflects our
+        # outbound TTS back on the inbound leg; the canceller subtracts the KNOWN
+        # outbound reference from each decoded inbound frame BEFORE the VAD/ASR see
+        # it, so the reflected echo cannot false-trigger barge-in (which lets the
+        # barge-in sustained threshold drop — aggressive barge-in). The TX path taps
+        # every outbound wire-rate frame as the reference (``_push_aec_reference``);
+        # the RX path runs every decoded frame through ``cancel`` (``_inbound_gen``).
+        # It runs at the codec's ANALYSIS rate, which is only final once connect()
+        # has the negotiated codec (the outbound path re-sets ``_codec`` after
+        # construction), so the canceller is (re)created lazily at first use; these
+        # store the constructor params (in MILLISECONDS — rate-independent) until
+        # then, and ``_ensure_aec`` converts ms → samples at the live analysis rate.
+        # ``None`` when AEC is disabled — the RX/TX taps are then no-ops and the
+        # ADR-0023 sustained gate is the only echo defence.
+        self._aec_enabled = aec_enabled
+        self._aec_filter_ms = aec_filter_ms
+        self._aec_bulk_delay_ms = aec_bulk_delay_ms
+        self._aec_mu = aec_mu
+        self._aec: EchoCanceller | None = None
+
         # Outbound 20 ms re-framing buffer (the "very choppy" fix), holding the
         # not-yet-sent wire-rate PCM16 bytes in order. A streaming TTS provider
         # (e.g. ElevenLabs over chunked HTTP) hands send_audio one frame PER
@@ -980,6 +1012,13 @@ class RtpMediaTransport:
         # (re)created by _encode/_decode on first use of an Opus call.
         self._opus_encoder = None
         self._opus_decoder = None
+        # Reset the echo canceller too (ADR-0033): a reused engine must start with a
+        # zeroed adaptive filter + empty reference history (a stale echo path would
+        # mis-cancel the start of the new call). Like the G.722/Opus codecs it is
+        # (re)created lazily on first reference/cancel, at the CURRENT analysis rate —
+        # the outbound path re-sets ``_codec`` after connect() but before media, so
+        # building it here (as PCMU) would pin the wrong rate for a G.722/Opus call.
+        self._aec = None
         # Drop any leftover outbound re-framing bytes from a previous call.
         self._tx_buffer = b""
         # A fresh call starts at flush generation 0 (no barge-in flush yet).
@@ -1252,6 +1291,13 @@ class RtpMediaTransport:
                 # Decode G.711 payload to PcmFrame.
                 ts_ns = self._clock()
                 frame = self._decode(output.payload, ts_ns)
+                # Acoustic echo cancellation (ADR-0033): subtract the KNOWN outbound
+                # TTS reference (tapped in the TX path) from this inbound frame
+                # BEFORE the VAD/ASR see it, so the gateway's reflected echo cannot
+                # false-trigger barge-in. A no-op when AEC is disabled. Runs at the
+                # analysis rate (the rate _decode delivers), so far-end and near-end
+                # align. Buffer-free (no added latency, rule 22).
+                frame = self._cancel_echo(frame)
                 yield frame
 
     def _maybe_latch(self, packet: RtpPacket, source: tuple[str, int]) -> None:
@@ -1673,6 +1719,13 @@ class RtpMediaTransport:
             self._tx_amplitude_period_peak = 0
 
         transport.sendto(wire, self._outbound_addr)
+        # Tap this outbound frame as the AEC reference (ADR-0033): it is the signal
+        # the gateway will reflect back, so the canceller subtracts it from the
+        # matching inbound frames. Pushed AFTER sendto so the reference is recorded
+        # only for audio actually on the wire, in send order. ``chunk`` is wire-rate
+        # PCM16; ``push_reference`` downsamples to the analysis rate if they differ
+        # (Opus). A no-op when AEC is disabled.
+        self._push_aec_reference(chunk)
         # The frame is on the wire. Pacing already happened above (the wait preceded
         # this send so the datagram leaves on the fixed grid); there is deliberately
         # NO post-send sleep. stop() may null _transport before the caller's NEXT
@@ -2157,6 +2210,10 @@ class RtpMediaTransport:
             self._seq = (self._seq + 1) % (1 << 16)
             self._ts = (self._ts + ts_increment) % (1 << 32)
             transport.sendto(wire, self._outbound_addr)
+            # Tap the inline burst as the AEC reference too (ADR-0033): the teardown
+            # tail and the barge-in fade are outbound audio the gateway can reflect,
+            # so the canceller must see them as well. ``chunk`` is wire-rate PCM16.
+            self._push_aec_reference(chunk)
 
     # ------------------------------------------------------------------
     # Discovered port (after connect with local_port=0)
@@ -2178,6 +2235,64 @@ class RtpMediaTransport:
         received BYE stops media WITHOUT setting this (a normal end).
         """
         return self._media_timed_out
+
+    # ------------------------------------------------------------------
+    # Acoustic echo cancellation (ADR-0033)
+    # ------------------------------------------------------------------
+
+    def _ensure_aec(self) -> EchoCanceller | None:
+        """Return the per-call echo canceller, creating it lazily (or ``None``).
+
+        ``None`` when AEC is disabled. Otherwise created on first use at the CURRENT
+        analysis rate — deferred (like the G.722/Opus codec objects) because the
+        outbound path re-sets ``self._codec`` (and hence the analysis rate) after
+        :meth:`connect` but before any media, so building it at connect-time would
+        pin the placeholder PCMU rate for a G.722/Opus call. The filter length and
+        bulk delay are stored in ms (rate-independent) and converted to samples here
+        at the live analysis rate; a configured ``aec_filter_ms`` always yields at
+        least one tap.
+        """
+        if not self._aec_enabled:
+            return None
+        if self._aec is None:
+            rate = self._analysis_sample_rate
+            filter_len = max(1, (rate * self._aec_filter_ms) // 1000)
+            bulk_delay = (rate * self._aec_bulk_delay_ms) // 1000
+            self._aec = EchoCanceller(
+                sample_rate=rate,
+                filter_len=filter_len,
+                bulk_delay=bulk_delay,
+                mu=self._aec_mu,
+            )
+        return self._aec
+
+    def _push_aec_reference(self, chunk: bytes) -> None:
+        """Tap one outbound wire-rate frame as the echo-canceller reference.
+
+        ``chunk`` is wire-rate PCM16 (the encoded frame's source PCM). The canceller
+        downsamples it to the analysis rate if they differ (Opus 48→16 kHz). A no-op
+        when AEC is disabled. Never raises on a whole-sample chunk.
+        """
+        aec = self._ensure_aec()
+        if aec is not None:
+            aec.push_reference(chunk, sample_rate=self._wire_sample_rate)
+
+    def _cancel_echo(self, frame: PcmFrame) -> PcmFrame:
+        """Return ``frame`` with the known outbound echo cancelled (ADR-0033).
+
+        ``frame`` is one decoded inbound frame at the analysis rate. Subtracts the
+        estimated echo of the tapped outbound reference and returns the residual at
+        the same rate/length (buffer-free — no added latency). Returns ``frame``
+        unchanged when AEC is disabled or the frame is empty.
+        """
+        aec = self._ensure_aec()
+        if aec is None or not frame.samples:
+            return frame
+        return PcmFrame(
+            samples=aec.cancel(frame.samples),
+            sample_rate=frame.sample_rate,
+            monotonic_ts_ns=frame.monotonic_ts_ns,
+        )
 
     # ------------------------------------------------------------------
     # Internal codec helpers

@@ -202,6 +202,36 @@ _BARGE_IN_TAIL_MS_KEY = "HERMES_VOIP_BARGE_IN_TAIL_MS"
 _BARGE_IN_FADE_MS_KEY = "HERMES_VOIP_BARGE_IN_FADE_MS"
 _DEFAULT_BARGE_IN_FADE_MS = 30
 
+# In-process acoustic echo cancellation (ADR-0033). The gateway reflects the agent's
+# own TTS back on the inbound leg; the canceller subtracts the KNOWN outbound
+# reference from each inbound frame before the VAD/ASR see it, so the reflected echo
+# cannot false-trigger barge-in — which lets the barge-in sustained threshold drop
+# (aggressive barge-in) without re-opening ADR-0023's self-interruption loop. On by
+# default; `false` reverts to the sustained-gate-only behaviour. The filter is a
+# pure-stdlib NLMS adaptive filter (no new dependency) running at the analysis rate.
+_AEC_ENABLED_KEY = "HERMES_VOIP_AEC_ENABLED"
+_AEC_FILTER_MS_KEY = "HERMES_VOIP_AEC_FILTER_MS"
+_AEC_BULK_DELAY_MS_KEY = "HERMES_VOIP_AEC_BULK_DELAY_MS"
+_AEC_MU_KEY = "HERMES_VOIP_AEC_MU"
+_DEFAULT_AEC_ENABLED = True
+# 16 ms of adaptive taps captures the dominant energy of a typical line/hybrid echo
+# impulse response while keeping the pure-Python per-frame cost well under the 20 ms
+# ptime budget (measured ~6.8 ms/frame at 16 kHz, ~1.8 ms at 8 kHz — rule 22). 32 ms
+# is available for a longer echo path but costs ~2x the per-frame CPU.
+_DEFAULT_AEC_FILTER_MS = 16
+# No fixed bulk delay by default: the adaptive taps cover the echo-return delay.
+_DEFAULT_AEC_BULK_DELAY_MS = 0
+# NLMS step size in (0, 2): 0.30 converges briskly with a low steady-state residual.
+_DEFAULT_AEC_MU = 0.30
+_MIN_AEC_MU = 0.0
+_MAX_AEC_MU = 2.0
+# The barge-in sustained threshold (ms) when AEC is ON: with the echo cancelled the
+# 600 ms echo-safety margin is unnecessary, so the threshold drops to a responsive
+# 200 ms (≈ 7 VAD windows) — still long enough that a single spurious VAD blip does
+# not barge in. Applied only when HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS is unset; an
+# explicit value always wins. AEC off → the 600 ms default (ADR-0023) is restored.
+_DEFAULT_BARGE_IN_MIN_SPEECH_MS_AEC = 200
+
 # Dead-air comfort filler (ADR-0030). On a slow turn there is a gap of pure silence
 # between the caller finishing and the agent's first audio (LLM think time + TTS
 # first-audio latency). On a phone call that reads as a dropped line. When enabled,
@@ -568,6 +598,23 @@ class MediaConfig:
     # gathering. Empty (the default) ⇒ host-only ICE. No effect on the SIP-over-TLS
     # path. Defaulted so existing direct constructions stay valid.
     ice_stun_urls: tuple[str, ...] = ()
+    # In-process acoustic echo cancellation (ADR-0033). On by default: the gateway
+    # reflects the agent's TTS back, and the canceller subtracts the known outbound
+    # reference from each inbound frame before the VAD/ASR see it, so the echo cannot
+    # false-trigger barge-in — which is what lets the barge-in threshold drop to a
+    # responsive 200 ms (see ``barge_in_min_speech_ms``). ``aec_enabled=False``
+    # reverts to ADR-0023's sustained-gate-only behaviour. Defaulted so existing
+    # direct constructions stay valid.
+    aec_enabled: bool = _DEFAULT_AEC_ENABLED
+    # The adaptive-filter length (ms) — taps = ms x analysis_rate / 1000. Spans the
+    # echo path's impulse response; must be positive (validated).
+    aec_filter_ms: int = _DEFAULT_AEC_FILTER_MS
+    # A fixed reference delay (ms) skipped before the adaptive window, for a gateway
+    # with a large constant echo-return delay; 0 lets the taps cover it. Non-negative.
+    aec_bulk_delay_ms: int = _DEFAULT_AEC_BULK_DELAY_MS
+    # NLMS step size in the OPEN interval (0, 2); higher converges faster with a
+    # higher steady-state residual (validated).
+    aec_mu: float = _DEFAULT_AEC_MU
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -619,6 +666,7 @@ class MediaConfig:
         if self.barge_in_fade_ms < 0:
             msg = f"barge_in_fade_ms must be non-negative, got {self.barge_in_fade_ms}"
             raise ConfigError(msg)
+        self._validate_aec()
         self._validate_comfort_filler()
         if not (
             _MIN_RTP_TIMEOUT_SECS <= self.media_timeout_secs <= _MAX_RTP_TIMEOUT_SECS
@@ -725,6 +773,30 @@ class MediaConfig:
             msg = "comfort_filler_phrases must not contain a blank phrase"
             raise ConfigError(msg)
 
+    def _validate_aec(self) -> None:
+        """Validate the acoustic-echo-cancellation invariants (ADR-0033).
+
+        The filter length must be strictly positive (a zero-tap filter cancels
+        nothing); the bulk delay must be non-negative; the NLMS step ``mu`` must be
+        in the OPEN interval ``(0, 2)`` — ``0`` never adapts and ``>= 2`` diverges.
+        These hold regardless of ``aec_enabled`` so a direct :class:`MediaConfig`
+        construction is self-validating.
+        """
+        if self.aec_filter_ms <= 0:
+            msg = f"aec_filter_ms must be positive, got {self.aec_filter_ms}"
+            raise ConfigError(msg)
+        if self.aec_bulk_delay_ms < 0:
+            msg = (
+                f"aec_bulk_delay_ms must be non-negative, got {self.aec_bulk_delay_ms}"
+            )
+            raise ConfigError(msg)
+        if not _MIN_AEC_MU < self.aec_mu < _MAX_AEC_MU:
+            msg = (
+                f"aec_mu must be in the open interval "
+                f"({_MIN_AEC_MU}, {_MAX_AEC_MU}), got {self.aec_mu}"
+            )
+            raise ConfigError(msg)
+
     def _validate_tts_tuning(self) -> None:
         """Validate the optional ElevenLabs voice-tuning knobs (when set).
 
@@ -800,6 +872,17 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             out of range, or a boolean value is unrecognised.
     """
     tts_provider = _value_lower(env, _TTS_PROVIDER_KEY) or _DEFAULT_TTS_PROVIDER
+    # AEC-aware barge-in threshold default (ADR-0033): with AEC ON the reflected
+    # echo is cancelled before the VAD, so the 600 ms echo-safety margin (ADR-0023)
+    # is unnecessary and the threshold drops to a responsive 200 ms. AEC OFF keeps
+    # the 600 ms default. An explicit HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS always wins
+    # (the parse below uses this only as the fallback when the key is unset).
+    aec_enabled = _parse_bool(env, _AEC_ENABLED_KEY, _DEFAULT_AEC_ENABLED)
+    barge_in_min_speech_default = (
+        _DEFAULT_BARGE_IN_MIN_SPEECH_MS_AEC
+        if aec_enabled
+        else _DEFAULT_BARGE_IN_MIN_SPEECH_MS
+    )
     return MediaConfig(
         stt_provider=_value_lower(env, _STT_PROVIDER_KEY) or _DEFAULT_STT_PROVIDER,
         stt_model_dir=_optional(env, _STT_MODEL_DIR_KEY),
@@ -822,7 +905,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _BARGE_IN_MODE_KEY, _BARGE_IN_MODES, _DEFAULT_BARGE_IN_MODE
         ),
         barge_in_min_speech_ms=_parse_positive_int(
-            env, _BARGE_IN_MIN_SPEECH_MS_KEY, _DEFAULT_BARGE_IN_MIN_SPEECH_MS
+            env, _BARGE_IN_MIN_SPEECH_MS_KEY, barge_in_min_speech_default
         ),
         barge_in_tail_ms=_parse_non_negative_int(
             env, _BARGE_IN_TAIL_MS_KEY, _DEFAULT_BARGE_IN_TAIL_MS
@@ -864,6 +947,14 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             _DEFAULT_RTP_TIMEOUT_SECS,
         ),
         ice_stun_urls=_parse_ice_stun_urls(env),
+        aec_enabled=aec_enabled,
+        aec_filter_ms=_parse_positive_int(
+            env, _AEC_FILTER_MS_KEY, _DEFAULT_AEC_FILTER_MS
+        ),
+        aec_bulk_delay_ms=_parse_non_negative_int(
+            env, _AEC_BULK_DELAY_MS_KEY, _DEFAULT_AEC_BULK_DELAY_MS
+        ),
+        aec_mu=_parse_aec_mu(env),
     )
 
 
@@ -1208,6 +1299,35 @@ def _parse_tone_secs(env: Mapping[str, str]) -> float:
         raise ConfigError(msg) from exc
     if not math.isfinite(value) or value < 0:
         msg = f"{_TEST_TONE_KEY} must be a non-negative number, got {raw!r}"
+        raise ConfigError(msg)
+    return value
+
+
+def _parse_aec_mu(env: Mapping[str, str]) -> float:
+    """Parse the NLMS step ``HERMES_VOIP_AEC_MU`` as a float in the open ``(0, 2)``.
+
+    ``0`` never adapts and ``>= 2`` diverges, so both bounds are exclusive (NaN/inf
+    are rejected too). Absent → the default. ADR-0033.
+
+    Raises:
+        ConfigError: If the value is non-numeric, NaN/inf, or outside ``(0, 2)``.
+    """
+    raw = _value(env, _AEC_MU_KEY)
+    if not raw:
+        return _DEFAULT_AEC_MU
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        msg = (
+            f"{_AEC_MU_KEY} must be a number in "
+            f"({_MIN_AEC_MU}, {_MAX_AEC_MU}), got {raw!r}"
+        )
+        raise ConfigError(msg) from exc
+    if not math.isfinite(value) or not _MIN_AEC_MU < value < _MAX_AEC_MU:
+        msg = (
+            f"{_AEC_MU_KEY} must be a finite number in the open interval "
+            f"({_MIN_AEC_MU}, {_MAX_AEC_MU}), got {raw!r}"
+        )
         raise ConfigError(msg)
     return value
 

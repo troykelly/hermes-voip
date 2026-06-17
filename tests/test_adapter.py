@@ -1691,3 +1691,90 @@ async def test_inbound_invite_g722_engine_opened_with_g722_codec() -> None:
     assert captured.get("codec") is EngineCodec.G722, (
         f"engine was not opened with the G.722 codec; got {captured.get('codec')!r}"
     )
+    # The negotiated RTP payload type (static 9 here) is passed to the engine so
+    # outbound packets + the comedia latch use the wire PT, not just the codec kind.
+    assert captured.get("payload_type") == 9, (
+        f"engine not opened with the negotiated PT; "
+        f"got {captured.get('payload_type')!r}"
+    )
+
+
+_FAKE_SDP_OFFER_G722_DYNAMIC_PT = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 109 0\r\n"
+    "a=rtpmap:109 G722/8000\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_g722_dynamic_pt_opens_engine_with_that_pt() -> None:
+    """A G.722 offer at a DYNAMIC payload type opens the engine with THAT PT.
+
+    Cross-vendor review finding: RFC 3551 reserves G.722's static PT 9, but
+    gateways do offer it at a dynamic PT, and the answer mirrors the offer's PT. If
+    the engine sent the static 9 while we advertised 109, the gateway would drop our
+    media and the comedia latch would reject inbound PT-109 packets (no audio). The
+    engine must therefore be opened with the negotiated PT 109, not 9.
+    """
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    content_length = len(_FAKE_SDP_OFFER_G722_DYNAMIC_PT.encode("utf-8"))
+    invite_raw = (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKg722dyn\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:5061;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER_G722_DYNAMIC_PT}"
+    )
+    invite = SipRequest.parse(invite_raw)
+
+    captured: dict[str, object] = {}
+
+    def _capture_engine(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
+        return MagicMock(
+            connect=AsyncMock(return_value=True),
+            stop=AsyncMock(return_value=None),
+            local_port=20008,
+        )
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", side_effect=_capture_engine),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    assert ok.status_code == 200
+    # Answer echoes the dynamic PT 109 (RFC 3264).
+    assert "a=rtpmap:109 G722/8000" in ok.body
+    assert captured.get("codec") is EngineCodec.G722
+    assert captured.get("payload_type") == 109, (
+        f"engine not opened with the negotiated dynamic PT 109; "
+        f"got {captured.get('payload_type')!r} (sending static 9 is the bug)"
+    )

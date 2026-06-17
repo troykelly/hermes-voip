@@ -793,6 +793,10 @@ class VoipAdapter(BasePlatformAdapter):
                     raise OutboundCallFailed(
                         488, f"2xx answer codec not carriable: {exc}"
                     ) from exc
+                # Also adopt the negotiated RTP payload type (the answer's PT may be
+                # a dynamic value for G.722, differing from the codec's static PT) so
+                # outbound packets and the comedia latch use the wire PT, not 9/0/8.
+                engine.payload_type = negotiated_voice.payload_type
 
             _log.info(
                 "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
@@ -1105,6 +1109,10 @@ class VoipAdapter(BasePlatformAdapter):
             remote_address=remote_address,
             remote_port=audio.port,
             codec=engine_codec,
+            # Send + latch on the NEGOTIATED RTP payload type (the answer echoes the
+            # offer's PT), not the codec's static value — G.722 may negotiate a
+            # dynamic PT (e.g. 109) that differs from its static 9.
+            payload_type=codec.payload_type,
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media

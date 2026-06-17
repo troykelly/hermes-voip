@@ -291,8 +291,12 @@ async def test_symmetric_latch_accepts_the_negotiated_dynamic_payload_type() -> 
 
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        # Bind the sender to a concrete loopback port so the engine sees a stable,
+        # known source tuple (an unbound socket's getsockname() reports 0.0.0.0,
+        # which is not what the engine receives).
+        sender.bind(("127.0.0.1", 0))
+        sender_port = sender.getsockname()[1]
         sender.sendto(pkt, ("127.0.0.1", engine_port))
-        sender_addr = sender.getsockname()
 
         async def _one() -> None:
             async for _frame in engine.inbound_audio():
@@ -305,8 +309,9 @@ async def test_symmetric_latch_accepts_the_negotiated_dynamic_payload_type() -> 
         await engine.stop()
 
     # The engine latched its outbound destination onto the packet's real source —
-    # proof the PT-109 packet was accepted as the negotiated audio stream.
-    assert engine._outbound_addr == sender_addr, (
+    # proof the PT-109 packet was accepted as the negotiated audio stream (it moved
+    # off the negotiated remote 5004 onto the sender's actual tuple).
+    assert engine._outbound_addr == ("127.0.0.1", sender_port), (
         f"engine did not latch on the negotiated PT {_DYNAMIC_G722_PT} packet "
-        f"(outbound_addr={engine._outbound_addr}, sender={sender_addr})"
+        f"(outbound_addr={engine._outbound_addr}, expected 127.0.0.1:{sender_port})"
     )

@@ -346,6 +346,7 @@ class RtpMediaTransport:
         remote_address: str,
         remote_port: int,
         codec: Codec,
+        payload_type: int | None = None,
         ptime: int = _DEFAULT_PTIME_MS,
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
@@ -359,6 +360,16 @@ class RtpMediaTransport:
         """Construct the engine; no socket is opened until :meth:`connect`.
 
         Args:
+            payload_type: The RTP payload type to send and to accept for the
+                symmetric-RTP latch. Defaults to the codec's STATIC payload type
+                (``codec.value``). Pass the NEGOTIATED payload type when it differs
+                from the static one — G.722 may be offered/answered at a dynamic PT,
+                and the SDP answer mirrors the offer's PT, so the wire PT can be
+                e.g. 109 while ``Codec.G722.value`` is 9. Sending the static PT
+                while advertising a dynamic one would make the gateway drop our
+                media and break the comedia latch (no audio). Set
+                :attr:`payload_type` later (e.g. the outbound path after the 2xx
+                answer) to update it.
             initial_seq: Override the random initial RTP sequence number.
                 Pass a fixed value in tests to make send_audio assertions
                 deterministic (RFC 3550 §5.1 default: random uint16).
@@ -370,6 +381,13 @@ class RtpMediaTransport:
         self._remote_address = remote_address
         self._remote_port = remote_port
         self._codec = codec
+        # The RTP payload type on the wire: the negotiated PT if given, else the
+        # codec's static PT. Used for both outbound packets and the comedia latch's
+        # acceptance check (see _maybe_latch). Kept separate from _codec because the
+        # codec KIND (encode/decode + rate) and the wire PT are independent for a
+        # dynamic-PT codec like G.722 (RFC 3551 reserves static 9, but gateways use
+        # dynamic PTs and the answer echoes the offer's PT).
+        self._payload_type: int = codec.value if payload_type is None else payload_type
         self._ptime = ptime
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
@@ -634,7 +652,7 @@ class RtpMediaTransport:
         """
         if not self._symmetric or self._latched:
             return
-        if packet.payload_type != self._codec.value:
+        if packet.payload_type != self._payload_type:
             return  # not the negotiated audio stream — not a latch trigger
         self._latched = True
         if source == self._outbound_addr:
@@ -838,7 +856,7 @@ class RtpMediaTransport:
         payload = self._encode(chunk_frame)
 
         pkt = RtpPacket(
-            payload_type=self._codec.value,
+            payload_type=self._payload_type,
             sequence_number=self._seq,
             timestamp=self._ts,
             ssrc=_OUTBOUND_SSRC,
@@ -858,7 +876,7 @@ class RtpMediaTransport:
                 "rtp tx: first packet -> %s:%d pt=%d ssrc=0x%08x",
                 self._outbound_addr[0],
                 self._outbound_addr[1],
-                self._codec.value,
+                self._payload_type,
                 _OUTBOUND_SSRC,
             )
 
@@ -892,6 +910,21 @@ class RtpMediaTransport:
         # re-checks _transport) — it does not un-send this frame, so we report the
         # send as successful (True).
         return True
+
+    @property
+    def payload_type(self) -> int:
+        """The RTP payload type on the wire (sent + accepted by the comedia latch).
+
+        Defaults to the codec's static PT; set to the NEGOTIATED PT when it differs
+        (the outbound path updates it after the 2xx answer, mirroring the
+        ``engine._codec`` update). Kept distinct from the codec kind because a
+        dynamic-PT codec (G.722) can negotiate a wire PT other than its static one.
+        """
+        return self._payload_type
+
+    @payload_type.setter
+    def payload_type(self, value: int) -> None:
+        self._payload_type = value
 
     @property
     def _descriptor(self) -> _CodecDescriptor:
@@ -1001,7 +1034,7 @@ class RtpMediaTransport:
                 )
             )
             pkt = RtpPacket(
-                payload_type=self._codec.value,
+                payload_type=self._payload_type,
                 sequence_number=self._seq,
                 timestamp=self._ts,
                 ssrc=_OUTBOUND_SSRC,

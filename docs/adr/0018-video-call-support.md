@@ -314,11 +314,11 @@ audio stream (G.711 PCMU 64 kbps + overhead ≈ 77 kbps). Total ≈ 231 kbps, we
 
 ### 5. Inbound video
 
-#### 5a. v1 (shipped) — receive-and-discard
+#### 5a. v1 scope — receive-and-discard
 
 Inbound video RTP (the caller's camera feed) is, in v1, **received at the UDP socket level
-and immediately discarded** — no decode, no buffer, no codec context. This is the shipped
-v1 behaviour and it keeps the critical path clean: no decoder runs while the core audio and
+and immediately discarded** — no decode, no buffer, no codec context. This is the v1-scope
+behaviour and it keeps the critical path clean: no decoder runs while the core audio and
 outbound video paths are brought up. The discard happens in the `RtpVideoTransport` receive
 path before any payload inspection:
 

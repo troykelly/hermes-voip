@@ -27,6 +27,7 @@ import pytest
 
 from hermes_voip.caller_modes import (
     CallerClassification,
+    CallerGroup,
     CallerMode,
     CallerModeConfig,
     Normalization,
@@ -34,6 +35,7 @@ from hermes_voip.caller_modes import (
     classify_caller,
     load_caller_modes,
     persona_preamble,
+    persona_preamble_for_group,
 )
 from hermes_voip.config import ConfigError
 
@@ -311,6 +313,48 @@ def test_every_persona_preamble_mentions_the_hang_up_tool(mode: CallerMode) -> N
     assert "hang_up" in lowered
     # ... and the cue for WHEN to use it, so it is invoked at the right moment.
     assert "goodbye" in lowered or "conclude" in lowered or "end the call" in lowered
+
+
+def test_assistant_preamble_names_the_in_call_control_tools() -> None:
+    """The operator's ASSISTANT persona names the ELEVATED control tools (ADR-0011).
+
+    The agent will not call a tool it is not told about, so the privileged persona
+    must name hold_call / resume_call / list_registrations and when to use them.
+    """
+    lowered = persona_preamble(CallerMode.ALLOW).lower()
+    assert "hold_call" in lowered
+    assert "resume_call" in lowered
+    assert "list_registrations" in lowered
+
+
+def test_colleague_preamble_names_the_in_call_control_tools() -> None:
+    """The level-2 trusted-colleague persona also names the ELEVATED control tools."""
+    colleague = CallerGroup(
+        name="trusted",
+        privilege_level=2,
+        persona="colleague",
+        declined_at_sip=False,
+    )
+    lowered = persona_preamble_for_group(colleague).lower()
+    assert "hold_call" in lowered
+    assert "resume_call" in lowered
+    assert "list_registrations" in lowered
+
+
+@pytest.mark.parametrize("mode", [CallerMode.GREY, CallerMode.OUTBOUND])
+def test_untrusted_personas_do_not_name_the_control_tools(mode: CallerMode) -> None:
+    """The level-0 receptionist / outbound personas do NOT name the ELEVATED tools.
+
+    The privilege gate blocks hold/resume/list for these untrusted callers, so
+    naming the tools would be misleading (rule 27 — no aspirational text). They
+    still keep hang_up (SAFE, offered to every tier).
+    """
+    lowered = persona_preamble(mode).lower()
+    assert "hold_call" not in lowered
+    assert "resume_call" not in lowered
+    assert "list_registrations" not in lowered
+    # hang_up remains available to every persona.
+    assert "hang_up" in lowered
 
 
 def test_classification_is_frozen() -> None:

@@ -83,8 +83,11 @@ picks the inbound fallback. The single and indexed schemes must not be mixed.
 
 ### Conversational media (STT / TTS)
 
-Every key has a safe default, so a bare install runs the **fully-offline self-host** path.
-Selection is config-only ([`config.py`](src/hermes_voip/config.py),
+The defaults select the **fully-offline self-host** path (no cloud, no API key). That path
+still requires you to point at the pinned local model directories — `HERMES_VOIP_TTS_MODEL`
+(Kokoro), `HERMES_VOIP_STT_MODEL_DIR` (zipformer), and `HERMES_VOIP_INJECTION_GUARD_MODEL_DIR`
+(the DeBERTa injection guard) — or provider build fails fast. Selection is config-only
+([`config.py`](src/hermes_voip/config.py),
 [`providers/build.py`](src/hermes_voip/providers/build.py)).
 
 **Text-to-speech** — `HERMES_VOIP_TTS_PROVIDER`:
@@ -106,8 +109,9 @@ with `HERMES_VOIP_TTS_MODEL`.
 | `sherpa-onnx` | Local streaming zipformer (self-host, free)       | **yes** | `HERMES_VOIP_STT_MODEL_DIR` |
 | `deepgram`    | Deepgram streaming (cloud)                         | no      | `DEEPGRAM_API_KEY` |
 
-A selected cloud provider must have its credential set, or startup fails fast. (Other tokens
-are reserved in config but not yet wired; selecting one fails fast at provider build.)
+A selected cloud provider must have its credential set, and a selected self-host provider its
+model directory, or provider build fails fast. (Other TTS tokens are reserved in config but
+not yet wired; selecting one fails fast at provider build.)
 
 Other media knobs (all optional, with safe defaults): `HERMES_VOIP_GREETING` (opening line;
 empty disables it), `HERMES_VOIP_RTP_SYMMETRIC` (NAT comedia latching, on by default),

@@ -41,7 +41,7 @@ only — never a tracked file (the repo is PUBLIC).
 ### 1. Wire the intercom caller group
 
 Add an `intercom` group to the caller-groups JSON (see
-`docs/runbooks/0003-voip-caller-modes.md` for the file location + `HERMES_VOIP_CALLER_GROUPS_FILE`).
+`docs/runbooks/0010-voip-caller-modes.md` for the file location + `HERMES_VOIP_CALLER_GROUPS_FILE`).
 The `persona` is `intercom`; the `allowed_tools` array is the load-bearing
 least-privilege control:
 
@@ -204,4 +204,4 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
 - ADR-0031 (this feature's WHY); ADR-0021 (caller groups + the `allowed_tools` clause);
   ADR-0010 (DTMF; the RFC 4733 send AND receive paths + the armed-confirmation resolver
   are now shipped — SIP INFO / in-band remain deferred); ADR-0009 (the tool gate).
-- `docs/runbooks/0003-voip-caller-modes.md` (the caller-groups file + JSON schema).
+- `docs/runbooks/0010-voip-caller-modes.md` (the caller-groups file + JSON schema).

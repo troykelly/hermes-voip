@@ -14,7 +14,7 @@ def sip_address_of_record(extension: str, host: str) -> str:
 
     Args:
         extension: The extension, e.g. from the ``HERMES_SIP_EXTENSION`` env var.
-        host: The gateway FQDN, e.g. from ``HERMES_SIP_SERVER_HOST``.
+        host: The gateway FQDN, e.g. from ``HERMES_SIP_HOST``.
 
     Returns:
         A ``sip:`` URI of the form ``sip:<extension>@<host>``.

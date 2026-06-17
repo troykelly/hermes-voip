@@ -314,11 +314,25 @@ async def test_inbound_grey_sets_privileged_false() -> None:
 
     captured: dict[str, GuardSessionState] = {}
 
-    def _real_guard(call_id: str, *, privileged: bool = True) -> GuardSessionState:
-        # Mirror the real GuardSessionState signature so the adapter's
-        # `GuardSessionState(call_id, privileged=...)` call passes through, and we
-        # capture the privileged value the adapter actually chose for this mode.
-        state = GuardSessionState(call_id=call_id, privileged=privileged)
+    def _real_guard(
+        call_id: str,
+        *,
+        privilege_level: int = 3,
+        degraded: bool = False,
+        privileged: bool | None = None,
+    ) -> GuardSessionState:
+        # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
+        # int, with the privileged bool kept as a back-compat kwarg) so the
+        # adapter's `GuardSessionState(call_id, privilege_level=...)` call passes
+        # through unchanged. We delegate to the REAL GuardSessionState so the
+        # captured state's `.privileged` property is the real level>=3 mapping —
+        # the value the adapter actually chose for this group.
+        state = GuardSessionState(
+            call_id=call_id,
+            privilege_level=privilege_level,
+            degraded=degraded,
+            privileged=privileged,
+        )
         captured[call_id] = state
         return state
 
@@ -366,8 +380,23 @@ async def test_inbound_allow_sets_privileged_true() -> None:
 
     captured: dict[str, GuardSessionState] = {}
 
-    def _real_guard(call_id: str, *, privileged: bool = True) -> GuardSessionState:
-        state = GuardSessionState(call_id=call_id, privileged=privileged)
+    def _real_guard(
+        call_id: str,
+        *,
+        privilege_level: int = 3,
+        degraded: bool = False,
+        privileged: bool | None = None,
+    ) -> GuardSessionState:
+        # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
+        # int, with the privileged bool kept as a back-compat kwarg). Delegating to
+        # the REAL GuardSessionState makes the captured `.privileged` the real
+        # level>=3 mapping the adapter chose for this group.
+        state = GuardSessionState(
+            call_id=call_id,
+            privilege_level=privilege_level,
+            degraded=degraded,
+            privileged=privileged,
+        )
         captured[call_id] = state
         return state
 

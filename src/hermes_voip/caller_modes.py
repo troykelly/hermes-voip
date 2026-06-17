@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -669,7 +669,11 @@ def _parse_default_mode(env: Mapping[str, str]) -> CallerMode:
 # ---------------------------------------------------------------------------
 
 
-def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
+def load_caller_groups(
+    env: Mapping[str, str],
+    *,
+    mode_loader: Callable[[Mapping[str, str]], CallerModeConfig] | None = None,
+) -> CallerGroupConfig:
     """Parse the caller-groups env scheme into an immutable :class:`CallerGroupConfig`.
 
     Priority:
@@ -681,6 +685,15 @@ def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
     Inline number-list env vars are **rejected** (PII leak risk).  A configured-but-
     missing list file raises :class:`ConfigError` (rule 37).  Numbers are never
     logged; only per-group counts.
+
+    Args:
+        env: The environment mapping to read list-file paths and knobs from.
+        mode_loader: The loader used for the legacy 3-file branch — defaults to
+            :func:`load_caller_modes`.  ``adapter.connect`` injects its own
+            (back-compat, patchable) ``load_caller_modes`` reference so the legacy
+            classification path goes through the ADR-0020 shim entry point while
+            keeping ALL of this function's validation (including the privileged-
+            group-with-no-patterns fail-loud check) on the real startup path.
 
     Raises:
         ConfigError: inline list var set, file missing/malformed, bad privilege
@@ -702,20 +715,28 @@ def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
     if groups_file_path:
         return _load_groups_file(groups_file_path, normalization)
 
-    # --- 2. Legacy 3-file synthesis -----------------------------------------
-    allow = _load_list(env, _ALLOW_FILE_KEY)
-    deny = _load_list(env, _DENY_FILE_KEY)
-    grey = _load_list(env, _GREY_FILE_KEY)
-    default_mode = _parse_default_mode(env)
-    default_is_allow = default_mode is CallerMode.ALLOW
-    default_group_name = "operator" if default_is_allow else "receptionist"
+    # --- 2. Legacy 3-file synthesis (via the ADR-0020 mode loader) ----------
+    # The 3-file scheme IS the ADR-0020 caller-mode scheme, so go through the
+    # mode loader (which reads the same env keys) and convert.  The validation
+    # below runs regardless of which loader produced the config.  ``load_caller_modes``
+    # is defined later in the module, so it is resolved here rather than as a
+    # default argument value (which would evaluate at definition time).
+    loader = mode_loader if mode_loader is not None else load_caller_modes
+    mode_cfg = loader(env)
+    return _legacy_groups_from_mode_config(mode_cfg, env)
 
-    groups: tuple[CallerGroup, ...] = _DEFAULT_THREE_GROUPS
-    group_lists: dict[str, tuple[str, ...]] = {
-        "operator": allow,
-        "receptionist": grey,
-        "blocked": deny,
-    }
+
+def _legacy_groups_from_mode_config(
+    mode_cfg: CallerModeConfig, env: Mapping[str, str]
+) -> CallerGroupConfig:
+    """Synthesise + validate the default three groups from a legacy mode config.
+
+    Shared by :func:`load_caller_groups` (legacy branch) and the adapter, so the
+    privileged-group-no-patterns fail-loud check (ADR-0021 security spine) runs on
+    every legacy startup path, not only when ``load_caller_groups`` is called
+    directly.
+    """
+    group_config = caller_mode_config_to_groups(mode_cfg)
 
     # Security: same invariant as _parse_groups_document — a privileged group
     # with no patterns is almost certainly a typo. But only raise when the
@@ -727,11 +748,15 @@ def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
         "operator": _ALLOW_FILE_KEY,
         # "receptionist" is level-0; "blocked" is declined — no check needed.
     }
-    for g in groups:
+    for g in group_config.groups:
         if g.privilege_level < _MIN_LEVEL_ELEVATED:
             continue
         env_key = _privileged_file_keys.get(g.name)
-        if env_key and env.get(env_key, "").strip() and not group_lists.get(g.name):
+        if (
+            env_key
+            and env.get(env_key, "").strip()
+            and not group_config.group_lists.get(g.name)
+        ):
             msg = (
                 f"caller-group {g.name!r} has privilege_level={g.privilege_level}"
                 f" (>= 2) but its pattern list is empty — configured via"
@@ -744,19 +769,13 @@ def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
     _log.info(
         "caller-groups (legacy 3-file): operator=%d blocked=%d receptionist=%d "
         "default=%s normalization=%s",
-        len(allow),
-        len(deny),
-        len(grey),
-        default_group_name,
-        normalization.value,
+        len(group_config.group_lists.get("operator", ())),
+        len(group_config.group_lists.get("blocked", ())),
+        len(group_config.group_lists.get("receptionist", ())),
+        group_config.default_group,
+        group_config.normalization.value,
     )
-    return CallerGroupConfig(
-        groups=groups,
-        group_lists=group_lists,
-        default_group=default_group_name,
-        match_order=("blocked", "operator", "receptionist"),
-        normalization=normalization,
-    )
+    return group_config
 
 
 def _load_groups_file(path_str: str, normalization: Normalization) -> CallerGroupConfig:

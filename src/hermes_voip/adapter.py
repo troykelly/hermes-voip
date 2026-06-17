@@ -66,7 +66,6 @@ from hermes_voip.caller_modes import (
     CallerGroup,
     CallerGroupConfig,
     CallerMode,
-    caller_mode_config_to_groups,
     classify_caller_group,
     group_for_mode,
     load_caller_groups,
@@ -132,11 +131,6 @@ _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
 # the first successful registration — useful for an AFK test or a scheduled call.
 # The flag prevents re-firing on reconnect (the flag is permanent once set).
 _CALL_ON_CONNECT_KEY = "HERMES_VOIP_CALL_ON_CONNECT"
-
-# HERMES_VOIP_CALLER_GROUPS_FILE: when set, the N-group JSON document is the
-# caller-classification source (load_caller_groups); when unset, the adapter uses
-# the ADR-0020 load_caller_modes shim + caller_mode_config_to_groups instead.
-_CALLER_GROUPS_FILE_KEY = "HERMES_VOIP_CALLER_GROUPS_FILE"
 
 # Maximum time to wait for a final response to an outbound INVITE (seconds).
 # RFC 3261 §14.1: Timer B / Timer F = 64*T1 ≈ 32 s.
@@ -313,19 +307,17 @@ class VoipAdapter(BasePlatformAdapter):
         # Caller-group lists (ADR-0021, backward-compat with ADR-0020 3-file scheme).
         # A misconfigured (malformed) security-relevant list file raises here — the
         # plugin must fail loudly, never silently treat a broken allow/deny list as
-        # empty (rule 37).
+        # empty, and never let a privileged group end up with no patterns (rule 37 /
+        # ADR-0021 security spine).
         #
-        # The N-group JSON document (HERMES_VOIP_CALLER_GROUPS_FILE) is the new
-        # surface; when it is NOT set we go through the ADR-0020 load_caller_modes
-        # shim and convert its CallerModeConfig to the equivalent CallerGroupConfig.
-        # Routing the legacy path through load_caller_modes keeps the ADR-0020
-        # back-compat entry point live (existing callers/tests that drive
-        # classification via load_caller_modes keep working unchanged), while the
-        # N-group file path stays on load_caller_groups.
-        if (extra.get(_CALLER_GROUPS_FILE_KEY) or "").strip():
-            caller_groups = load_caller_groups(extra)
-        else:
-            caller_groups = caller_mode_config_to_groups(load_caller_modes(extra))
+        # load_caller_groups handles BOTH the new N-group JSON document
+        # (HERMES_VOIP_CALLER_GROUPS_FILE) and the legacy 3-file scheme, applying all
+        # validation in one place. We inject this module's load_caller_modes as the
+        # legacy mode loader so the ADR-0020 back-compat entry point stays the actual
+        # symbol the classification path runs through (existing callers/tests that
+        # drive classification via `hermes_voip.adapter.load_caller_modes` keep
+        # working unchanged) WITHOUT bypassing the fail-loud validation.
+        caller_groups = load_caller_groups(extra, mode_loader=load_caller_modes)
 
         self._providers = build_providers(media_cfg)
         self._media_cfg = media_cfg

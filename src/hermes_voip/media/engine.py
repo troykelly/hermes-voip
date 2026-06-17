@@ -75,6 +75,13 @@ from hermes_voip.media.g722 import (
     G722Encoder,
 )
 
+# Opus RATE constants only (plain ints — ADR-0032). Importing them at module scope
+# is safe in the default (no-webrtc) gate: media.opus's opuslib/libopus import is
+# lazy (inside the codec constructors), so this import never pulls opuslib in. The
+# OpusEncoder/OpusDecoder CLASSES are imported lazily inside _encode/_decode, mirroring
+# how the G.722 codec objects are created on first use.
+from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
+
 # SrtpError is defined at srtp.py module level and carries no cryptography
 # dependency (the cryptography backend is imported lazily inside SrtpSession),
 # so importing it here is safe in the default (no-`media`-extra) environment.
@@ -133,17 +140,24 @@ type _Datagram = tuple[bytes, tuple[str, int]]
 
 
 class Codec(enum.Enum):
-    """The audio codec for this media session (the value is the RTP payload type).
+    """The audio codec for this media session (the value is the default payload type).
 
-    PCMU/PCMA are 8 kHz narrowband G.711; G722 is 16 kHz wideband (ADR-0022). The
-    rate behaviour (wire sample rate, RTP clock rate) is NOT encoded by the enum —
-    it lives in :data:`_CODEC_DESCRIPTORS`, because G.722's RTP clock (8000)
-    differs from its audio sample rate (16000) per RFC 3551.
+    PCMU/PCMA are 8 kHz narrowband G.711; G722 is 16 kHz wideband (ADR-0022); OPUS
+    is 48 kHz wideband for the WebRTC wire (ADR-0032). The rate behaviour (wire
+    sample rate, RTP clock rate) is NOT encoded by the enum — it lives in
+    :data:`_CODEC_DESCRIPTORS`, because G.722's RTP clock (8000) differs from its
+    audio sample rate (16000) per RFC 3551 (Opus's clock equals its rate, 48000).
+
+    The enum value is the codec's DEFAULT payload type. PCMU/PCMA/G722 have static
+    PTs (RFC 3551); Opus has no static PT, so its value is the conventional dynamic
+    PT 111 — the wire PT is always the negotiated one (the engine threads
+    ``payload_type`` separately from the codec kind).
     """
 
     PCMU = 0  # mu-law, RTP payload type 0 (8 kHz)
     PCMA = 8  # a-law, RTP payload type 8 (8 kHz)
     G722 = 9  # G.722 wideband, RTP payload type 9 (16 kHz audio, 8 kHz RTP clock)
+    OPUS = 111  # Opus, dynamic PT (48 kHz audio + RTP clock; WebRTC — ADR-0032)
 
 
 class UnsupportedCodecError(ValueError):
@@ -188,6 +202,12 @@ _ENGINE_CODEC_TABLE: Final[dict[tuple[str, int], Codec]] = {
     ("PCMU", G711_SAMPLE_RATE): Codec.PCMU,
     ("PCMA", G711_SAMPLE_RATE): Codec.PCMA,
     ("G722", G722_RTP_CLOCK_RATE): Codec.G722,
+    # Opus (ADR-0032): the rtpmap clock is the 48 kHz audio rate (RFC 7587), so the
+    # KEY matches reality directly — no G.722-style 8000/16000 split. Only carriable
+    # when the webrtc extra (opuslib + libopus) is installed; the codec is advertised
+    # ONLY on the WebRTC path (adapter._WEBRTC_SUPPORTED_ENCODINGS), so a TLS/SDES
+    # offer never reaches an Opus branch and the default gate never needs opuslib.
+    ("OPUS", OPUS_RTP_CLOCK_RATE): Codec.OPUS,
 }
 
 
@@ -222,12 +242,47 @@ _CODEC_DESCRIPTORS: Final[dict[Codec, _CodecDescriptor]] = {
     Codec.G722: _CodecDescriptor(
         wire_sample_rate=G722_SAMPLE_RATE, rtp_clock_rate=G722_RTP_CLOCK_RATE
     ),
+    # Opus (ADR-0032): the wire PCM rate AND the RTP clock are both 48 kHz — unlike
+    # G.722 they coincide, so a 20 ms frame is 960 samples and the RTP timestamp
+    # advances by 960. The engine's rate-follows-codec machinery then carries Opus
+    # with no special-casing (TTS resamples to 48 kHz; STT gets native 48 kHz).
+    Codec.OPUS: _CodecDescriptor(
+        wire_sample_rate=OPUS_SAMPLE_RATE, rtp_clock_rate=OPUS_RTP_CLOCK_RATE
+    ),
 }
 
 
 def _supported_codec_summary() -> str:
     """A human-readable ``ENCODING/rate`` list of carriable codecs (no PII)."""
     return ", ".join(f"{enc}/{rate}" for enc, rate in _ENGINE_CODEC_TABLE)
+
+
+def _new_opus_encoder() -> _OpusEncode:
+    """Construct an :class:`hermes_voip.media.opus.OpusEncoder` (lazy webrtc import).
+
+    Imported inside the function (not at module scope) so the default no-webrtc gate
+    never pulls opuslib. Returns the narrow :class:`_OpusEncode` Protocol surface the
+    engine uses; the concrete class is structurally assignable.
+
+    Raises:
+        ImportError: If the ``webrtc`` extra (opuslib) or the system libopus is
+            absent (propagated from :class:`~hermes_voip.media.opus.OpusEncoder`).
+    """
+    from hermes_voip.media.opus import OpusEncoder  # noqa: PLC0415 — lazy webrtc import
+
+    return OpusEncoder()
+
+
+def _new_opus_decoder() -> _OpusDecode:
+    """Construct an :class:`hermes_voip.media.opus.OpusDecoder` (lazy webrtc import).
+
+    Raises:
+        ImportError: If the ``webrtc`` extra (opuslib) or the system libopus is
+            absent (propagated from :class:`~hermes_voip.media.opus.OpusDecoder`).
+    """
+    from hermes_voip.media.opus import OpusDecoder  # noqa: PLC0415 — lazy webrtc import
+
+    return OpusDecoder()
 
 
 def codec_for_encoding(encoding: str, clock_rate: int) -> Codec:
@@ -274,6 +329,33 @@ class _SrtpUnprotect(Protocol):
 
     def unprotect(self, data: bytes) -> RtpPacket:
         """Authenticate and decrypt an inbound SRTP packet."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Narrow Opus codec Protocol seam (no opuslib import needed at type-check time).
+#
+# media.opus.OpusEncoder/OpusDecoder are imported LAZILY inside _encode/_decode so
+# the default (no-webrtc) gate never pulls opuslib. Declaring these narrow
+# Protocols lets the engine hold/typed the codec objects without importing the
+# concrete classes at module scope — OpusEncoder/OpusDecoder are structurally
+# assignable to them (same as the SRTP seam above).
+# ---------------------------------------------------------------------------
+
+
+class _OpusEncode(Protocol):
+    """The encode method surface of :class:`hermes_voip.media.opus.OpusEncoder`."""
+
+    def encode(self, pcm16: bytes) -> bytes:
+        """Encode one 20 ms 48 kHz PCM16 frame to an Opus packet."""
+        ...
+
+
+class _OpusDecode(Protocol):
+    """The decode method surface of :class:`hermes_voip.media.opus.OpusDecoder`."""
+
+    def decode(self, packet: bytes) -> bytes:
+        """Decode one Opus packet to a 20 ms 48 kHz PCM16 frame."""
         ...
 
 
@@ -570,6 +652,15 @@ class RtpMediaTransport:
         self._g722_encoder: G722Encoder | None = None
         self._g722_decoder: G722Decoder | None = None
 
+        # Opus codec state (ADR-0032): like G.722, the encoder/decoder carry
+        # internal predictor history across packets, so one of each lives per call
+        # and is reset in connect(). Lazily created (only when the negotiated codec
+        # is Opus) so the default no-webrtc path never imports opuslib. Typed as the
+        # narrow Protocols media.opus exposes so engine.py needs no opuslib import at
+        # type-check time. ``None`` on a non-Opus call.
+        self._opus_encoder: _OpusEncode | None = None
+        self._opus_decoder: _OpusDecode | None = None
+
         # Outbound 20 ms re-framing buffer (the "very choppy" fix), holding the
         # not-yet-sent wire-rate PCM16 bytes in order. A streaming TTS provider
         # (e.g. ElevenLabs over chunked HTTP) hands send_audio one frame PER
@@ -681,6 +772,11 @@ class RtpMediaTransport:
         # connect() time would miss a connect-as-PCMU-then-G.722 call.
         self._g722_encoder = None
         self._g722_decoder = None
+        # Reset the Opus codec state too (ADR-0032), for the same reason: a reused
+        # engine must start with a fresh encoder/decoder predictor history. Lazily
+        # (re)created by _encode/_decode on first use of an Opus call.
+        self._opus_encoder = None
+        self._opus_decoder = None
         # Drop any leftover outbound re-framing bytes from a previous call.
         self._tx_buffer = b""
         # A fresh call starts at flush generation 0 (no barge-in flush yet).
@@ -1731,9 +1827,12 @@ class RtpMediaTransport:
         """Decode an RTP payload to a PcmFrame at the codec's wire rate.
 
         G.711 (PCMU/PCMA) decodes to 8 kHz; G.722 decodes via the per-call
-        stateful :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz (created
-        lazily on first use so an outbound call that connects as a PCMU
-        placeholder then re-negotiates G.722 still gets a fresh decoder).
+        stateful :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz; Opus
+        decodes via the per-call stateful
+        :class:`~hermes_voip.media.opus.OpusDecoder` to 48 kHz (ADR-0032). Each
+        wideband decoder is created lazily on first use so an outbound call that
+        connects as a PCMU placeholder then re-negotiates still gets a fresh one,
+        and the default no-webrtc path never imports opuslib.
         """
         if self._codec is Codec.G722:
             if self._g722_decoder is None:
@@ -1741,6 +1840,14 @@ class RtpMediaTransport:
             return PcmFrame(
                 samples=self._g722_decoder.decode(payload),
                 sample_rate=G722_SAMPLE_RATE,
+                monotonic_ts_ns=ts_ns,
+            )
+        if self._codec is Codec.OPUS:
+            if self._opus_decoder is None:
+                self._opus_decoder = _new_opus_decoder()
+            return PcmFrame(
+                samples=self._opus_decoder.decode(payload),
+                sample_rate=OPUS_SAMPLE_RATE,
                 monotonic_ts_ns=ts_ns,
             )
         if self._codec is Codec.PCMU:
@@ -1752,13 +1859,19 @@ class RtpMediaTransport:
 
         G.711 encodes the 8 kHz frame to mu-law/a-law; G.722 encodes the 16 kHz
         frame via the per-call stateful
-        :class:`~hermes_voip.media.g722.G722Encoder` (created lazily on first use,
-        as for :meth:`_decode`).
+        :class:`~hermes_voip.media.g722.G722Encoder`; Opus encodes the 48 kHz frame
+        via the per-call stateful :class:`~hermes_voip.media.opus.OpusEncoder`
+        (ADR-0032). Each wideband encoder is created lazily on first use (as for
+        :meth:`_decode`).
         """
         if self._codec is Codec.G722:
             if self._g722_encoder is None:
                 self._g722_encoder = G722Encoder()
             return self._g722_encoder.encode(frame.samples)
+        if self._codec is Codec.OPUS:
+            if self._opus_encoder is None:
+                self._opus_encoder = _new_opus_encoder()
+            return self._opus_encoder.encode(frame.samples)
         if self._codec is Codec.PCMU:
             return frame_to_ulaw(frame)
         return frame_to_alaw(frame)

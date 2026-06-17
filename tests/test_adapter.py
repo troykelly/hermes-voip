@@ -46,6 +46,7 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
+from hermes_voip.sdp import Codec as SdpCodec
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1302,3 +1303,234 @@ async def test_run_call_loop_builds_detectors_at_engine_inbound_rate() -> None:
 
     assert vad_rates == [8_000]
     assert endpointer_rates == [8_000]
+
+
+# ---------------------------------------------------------------------------
+# Operator invariant: before answering, verify we support a codec+rate pair; if
+# not, DON'T answer — reject with 488 and log a CLEAR error, never fail silently.
+# An offer with NO supported voice codec (G.729 / PT 18 only) must be rejected
+# with 488 Not Acceptable Here, MUST NOT receive a 200 OK, and MUST be logged
+# loudly (ERROR), so a rejected call is never buried at WARNING.
+# ---------------------------------------------------------------------------
+
+# A G.729-only offer: the engine carries G.711 only, so this shares NO voice
+# codec with us. ``telephone-event`` (DTMF) is included to prove a DTMF-only
+# match is still not a usable call. Fakes only — synthetic PT numbers, no PII.
+_FAKE_SDP_OFFER_NO_COMMON_CODEC = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 18 101\r\n"
+    "a=rtpmap:18 G729/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=fmtp:101 0-16\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite_no_common_codec(call_id: str) -> str:
+    body = _FAKE_SDP_OFFER_NO_COMMON_CODEC
+    content_length = len(body.encode("utf-8"))
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKfake\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:60000;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{body}"
+    )
+
+
+def _responses_with_status(transport: _FakeTransport, prefix: str) -> list[str]:
+    """All SIP responses the adapter sent whose start-line begins with ``prefix``."""
+    return [m for m in transport.sent if m.startswith(prefix)]
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_no_common_codec_rejects_488_no_200ok(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No common voice codec => 488 sent, NO 200 OK, and a CLEAR error logged.
+
+    The operator invariant: we must not answer a call whose codec we cannot
+    carry. An offer for G.729 only (the engine is G.711-only) shares no voice
+    codec, so the handler must send ``488 Not Acceptable Here``, must NOT send a
+    ``200 OK`` answer, and must surface the rejection at ERROR (not bury it at
+    WARNING) so a refused call is unmistakable in the logs.
+    """
+    import logging  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite_no_common_codec(call_id))
+
+    # If negotiation were (wrongly) to proceed, these media collaborators would be
+    # exercised; they are faked so a leak past the reject is observable as a 200 OK.
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        caplog.at_level(logging.ERROR, logger="hermes_voip.adapter"),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    # A 488 Not Acceptable Here was sent ...
+    rejections = _responses_with_status(transport, "SIP/2.0 488")
+    assert rejections, (
+        "the adapter did not reject the no-common-codec INVITE with 488; "
+        f"sent: {transport.sent!r}"
+    )
+    # ... and crucially NO 200 OK answer (we must never answer a call we cannot
+    # carry).
+    answers = _responses_with_status(transport, "SIP/2.0 200")
+    assert not answers, (
+        "the adapter answered (200 OK) a call whose codec it cannot carry; "
+        f"sent: {transport.sent!r}"
+    )
+
+    # The rejection is logged LOUDLY (ERROR), not buried at WARNING.
+    error_records = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and record.name == "hermes_voip.adapter"
+        and call_id in record.getMessage()
+    ]
+    assert error_records, (
+        "the no-common-codec rejection was not logged at ERROR for this call_id; "
+        f"records: {[(r.levelname, r.getMessage()) for r in caplog.records]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_pcmu_pcma_offer_still_answers_200ok() -> None:
+    """Happy-path regression: a normal PCMU/PCMA offer still answers 200 OK.
+
+    The capability guard must not break a carriable call: the standard G.711 offer
+    (PCMU + PCMA) negotiates and is answered with a 200 OK exactly as before.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(call_id=call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    assert ok.status_code == 200
+    # No 488 on the happy path.
+    assert not _responses_with_status(transport, "SIP/2.0 488"), (
+        f"a carriable PCMU/PCMA offer was wrongly rejected; sent: {transport.sent!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _to_engine_codec: the adapter's SDP->engine bridge must delegate to the
+# engine's exhaustive capability map — a negotiated voice codec the engine
+# cannot carry RAISES (the old ``else -> PCMA`` silently mis-mapped it), and the
+# advertised ``_SUPPORTED_ENCODINGS`` menu can never drift ahead of the engine.
+# ---------------------------------------------------------------------------
+
+
+def _sdp_codec(encoding: str, payload_type: int, clock_rate: int = 8000) -> SdpCodec:
+    return SdpCodec(payload_type=payload_type, encoding=encoding, clock_rate=clock_rate)
+
+
+def test_to_engine_codec_maps_pcmu_and_pcma() -> None:
+    from hermes_voip.adapter import _to_engine_codec  # noqa: PLC0415
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+
+    assert _to_engine_codec(_sdp_codec("PCMU", 0)) is EngineCodec.PCMU
+    assert _to_engine_codec(_sdp_codec("PCMA", 8)) is EngineCodec.PCMA
+
+
+def test_to_engine_codec_unsupported_raises_not_silent_pcma() -> None:
+    # THE BUG: the old ``else -> PCMA`` returned PCMA for ANY non-PCMU encoding,
+    # so a G.729 offer would be answered as a PCMA call the engine cannot carry ->
+    # dead/wrong audio. It must RAISE the capability error instead.
+    from hermes_voip.adapter import _to_engine_codec  # noqa: PLC0415
+    from hermes_voip.media.engine import UnsupportedCodecError  # noqa: PLC0415
+
+    with pytest.raises(UnsupportedCodecError):
+        _to_engine_codec(_sdp_codec("G729", 18))
+
+
+def test_to_engine_codec_rejects_wrong_clock_rate() -> None:
+    # CODEC AND RATE: a PCMU rtpmap at 16 kHz is not carriable by the 8 kHz engine.
+    from hermes_voip.adapter import _to_engine_codec  # noqa: PLC0415
+    from hermes_voip.media.engine import UnsupportedCodecError  # noqa: PLC0415
+
+    with pytest.raises(UnsupportedCodecError):
+        _to_engine_codec(_sdp_codec("PCMU", 0, clock_rate=16000))
+
+
+def test_supported_voice_encodings_never_drift_ahead_of_engine() -> None:
+    """DRIFT GUARD: every voice entry in ``_SUPPORTED_ENCODINGS`` is carriable.
+
+    ``telephone-event`` (DTMF, RFC 4733) is excluded — it is named-event RTP, not
+    routed through the engine's PCM encode/decode path. Every *voice* encoding the
+    adapter advertises in its offer allow-list MUST map to a real engine ``Codec``
+    without raising; otherwise the menu is advertising a capability the engine
+    does not have. (This is what lets a future codec be added safely: add it to
+    the engine first, then the menu.)
+    """
+    from hermes_voip.adapter import _SUPPORTED_ENCODINGS  # noqa: PLC0415
+    from hermes_voip.media.engine import (  # noqa: PLC0415
+        Codec as EngineCodec,
+    )
+    from hermes_voip.media.engine import (  # noqa: PLC0415
+        codec_for_encoding,
+    )
+
+    voice = [e for e in _SUPPORTED_ENCODINGS if e.lower() != "telephone-event"]
+    assert voice, "expected at least one voice encoding in the supported menu"
+    for encoding in voice:
+        result = codec_for_encoding(encoding, 8000)
+        assert isinstance(result, EngineCodec), (
+            f"supported menu encoding {encoding!r} does not map to a runnable "
+            f"engine codec — the advertised menu drifted ahead of the engine"
+        )

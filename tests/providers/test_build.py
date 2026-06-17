@@ -571,6 +571,7 @@ def test_build_wraps_primary_in_failover_when_fallback_configured() -> None:
         tts_provider="elevenlabs",
         elevenlabs_api_key="el-fake-key",
         tts_fallback="sherpa-kokoro",
+        tts_fallback_model="/models/kokoro",
     )
     fake_primary = _FakeTTS()
     fake_fallback = _FakeTTS()
@@ -613,6 +614,7 @@ def test_build_failover_fallback_is_lazy_not_built_until_needed() -> None:
         tts_provider="elevenlabs",
         elevenlabs_api_key="el-fake-key",
         tts_fallback="sherpa-kokoro",
+        tts_fallback_model="/models/kokoro",
     )
     build_providers(
         cfg,
@@ -626,3 +628,39 @@ def test_build_failover_fallback_is_lazy_not_built_until_needed() -> None:
     # Building the providers must NOT have constructed the fallback (it is only
     # built on first failover): zero happy-path cost (no Kokoro model load).
     assert fallback_built == 0
+
+
+def test_build_fallback_factory_sees_fallback_model_as_tts_model() -> None:
+    """The lazy Kokoro fallback is built with tts_fallback_model as ITS model dir.
+
+    The shared HERMES_VOIP_TTS_MODEL is the ElevenLabs model id for the primary, not
+    a Kokoro directory — so the fallback factory must receive the dedicated
+    HERMES_VOIP_TTS_FALLBACK_MODEL as the config's tts_model when it builds Kokoro.
+    Otherwise the Kokoro fallback could not load and the call would still die silent.
+    """
+    seen_fallback_model: list[str | None] = []
+
+    def _capture_fallback(c: MediaConfig) -> StreamingTTS:
+        seen_fallback_model.append(c.tts_model)
+        return _FakeTTS()
+
+    cfg = _media_config(
+        tts_provider="elevenlabs",
+        elevenlabs_api_key="el-fake-key",
+        tts_model="eleven_flash_v2_5",  # the PRIMARY's EL model id
+        tts_fallback="sherpa-kokoro",
+        tts_fallback_model="/models/kokoro",  # the FALLBACK's Kokoro dir
+    )
+    tts = build_providers(
+        cfg,
+        asr_factories=_fake_asr_factories(),
+        tts_factories={
+            "elevenlabs": lambda _c: _FakeTTS(),
+            "sherpa-kokoro": _capture_fallback,
+        },
+        guard_factories=_fake_guard_factories(),
+    ).tts
+    assert isinstance(tts, FailoverTTS)
+    # Trigger the lazy fallback build and assert it saw the Kokoro dir (not the EL id).
+    tts._ensure_fallback()
+    assert seen_fallback_model == ["/models/kokoro"]

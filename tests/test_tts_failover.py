@@ -152,6 +152,34 @@ class _FakeTTS:
         return _DeferredStream(_collect, voice, sample_rate, self)
 
 
+class _SyncRaisingTTS:
+    """A ``StreamingTTS`` whose ``synthesize`` raises SYNCHRONOUSLY (not on iterate).
+
+    Models a real provider that validates eagerly in the synchronous factory — e.g.
+    ``ElevenLabsTTS.synthesize`` raises ``ValueError`` for an unsupported per-call
+    sample rate before any stream is iterated. The failover must recover from these
+    too (the spec is "ANY primary failure"), not only from failures raised while
+    iterating frames.
+    """
+
+    def __init__(self, exc: BaseException, *, default_rate: int = _G711_RATE) -> None:
+        self._exc = exc
+        self._default_rate = default_rate
+
+    @property
+    def output_sample_rate(self) -> int:
+        return self._default_rate
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        raise self._exc
+
+
 class _DeferredStream:
     """Resolves the (async) text on first pull, then delegates to the scripted stream.
 
@@ -257,6 +285,33 @@ async def test_primary_failure_does_not_escape_the_stream() -> None:
     # Must NOT raise ConnectionError — recovered into fallback audio.
     frames = await _drain(tts.synthesize(_text("Recover me. "), voice="v"))
     assert len(frames) == 1
+
+
+@pytest.mark.asyncio
+async def test_synchronous_primary_synthesize_failure_falls_back() -> None:
+    """A primary whose synthesize() raises SYNCHRONOUSLY still falls back to audio.
+
+    Real providers validate eagerly in the synchronous factory (e.g. ElevenLabs
+    rejects an unsupported per-call sample rate in synthesize()). That failure must
+    also trigger failover — the spec is "ANY primary failure", not only failures
+    raised while iterating frames. Before the fix this exception escaped the wrapper.
+    """
+    fallback_calls: list[str] = []
+
+    def _fallback_stream(text: str, rate: int | None) -> TtsStream:
+        fallback_calls.append(text)
+        return _ListStream([_frame(rate or _G711_RATE)], spoken=[])
+
+    primary = _SyncRaisingTTS(ValueError("no native PCM output for 12345 Hz"))
+    fallback = _FakeTTS(_fallback_stream)
+    tts = FailoverTTS(primary=primary, fallback_factory=lambda: fallback)
+
+    # Must NOT raise the ValueError — recovered into fallback audio.
+    frames = await _drain(tts.synthesize(_text("Sync fail. "), voice="v"))
+    assert len(frames) == 1
+    assert fallback_calls == ["Sync fail. "]
+    # And the wrapper latched (a sync failure is still a failure for this call).
+    assert tts._latched is True
 
 
 @pytest.mark.asyncio

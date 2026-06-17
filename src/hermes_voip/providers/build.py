@@ -329,12 +329,21 @@ def _resolve_tts(
     fallback_token = config.tts_fallback
     if fallback_token is None:
         return primary
+    from dataclasses import replace  # noqa: PLC0415 - lazy, only on the failover path
+
     from hermes_voip.tts.failover import FailoverTTS  # noqa: PLC0415 - lazy, no ml load
+
+    # The fallback provider reads `tts_model` as ITS model (a directory for the
+    # self-host Kokoro fallback), but the shared `tts_model` here is the cloud
+    # primary's model id — so build the fallback against a config whose `tts_model` is
+    # the dedicated `tts_fallback_model`. (ADR-0025 / codex finding: otherwise the
+    # Kokoro fallback gets a bogus model dir and cannot load on a primary failure.)
+    fallback_config = replace(config, tts_model=config.tts_fallback_model)
 
     def _build_fallback() -> StreamingTTS:
         # Built only on the first failover (and cached by FailoverTTS): the fallback
         # provider's licence gate / model load runs lazily, not on the happy path.
-        return _dispatch("tts", tts_factories, fallback_token, config)
+        return _dispatch("tts", tts_factories, fallback_token, fallback_config)
 
     return FailoverTTS(primary=primary, fallback_factory=_build_fallback)
 

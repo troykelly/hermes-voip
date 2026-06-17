@@ -412,6 +412,10 @@ def test_env_enablement_elevenlabs_key_survives_load_media_config(
     monkeypatch.setenv("HERMES_SIP_PASSWORD", "fake-password")
     monkeypatch.setenv("HERMES_VOIP_TTS_PROVIDER", "elevenlabs")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "el-fake-key-for-test")
+    # Disable TTS failover so this test stays focused on the key surviving (a cloud
+    # primary otherwise requires HERMES_VOIP_TTS_FALLBACK_MODEL for its Kokoro
+    # fallback — ADR-0025 — which is exercised by the dedicated config tests).
+    monkeypatch.setenv("HERMES_VOIP_TTS_FALLBACK", "none")
     monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
 
     extra = _env_enablement()

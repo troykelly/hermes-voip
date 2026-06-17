@@ -94,6 +94,23 @@ disables failover. `build_providers` wraps the primary TTS in `FailoverTTS` when
 is configured, passing a `fallback_factory` that builds the fallback provider via the same
 factory map (so the Kokoro licence gate still runs, lazily).
 
+**The fallback's own model dir (`HERMES_VOIP_TTS_FALLBACK_MODEL`).** The shared
+`HERMES_VOIP_TTS_MODEL` is the *cloud primary's model id* (e.g. `eleven_flash_v2_5`), **not**
+a Kokoro directory — so a `sherpa-kokoro` fallback cannot reuse it (the `sherpa-kokoro`
+factory reads `tts_model` as a model *directory*). The fallback therefore has its **own**
+`HERMES_VOIP_TTS_FALLBACK_MODEL` (`MediaConfig.tts_fallback_model`): `build_providers` builds
+the fallback against `dataclasses.replace(config, tts_model=config.tts_fallback_model)`, and
+a model-backed self-host fallback **requires** it — validated at config load, so the failure
+is a **startup `ConfigError`**, never an unbuildable fallback discovered on the first live
+primary failure (the call would otherwise still die silent). A non-model fallback (another
+cloud) needs no dir.
+
+**Synchronous and streamed primary failures both recover.** `synthesize()` is a *synchronous*
+factory that can raise eagerly (e.g. ElevenLabs rejecting an unsupported per-call sample
+rate), so opening the primary stream is wrapped in the same failover path as a streamed (HTTP
+400 / timeout) failure — the wrapper recovers from **any** primary failure, not only those
+raised while iterating frames.
+
 ### 2. ElevenLabs `model_id` guard (fail loud, not a runtime 400)
 
 `ElevenLabsTTS.__init__` now **rejects a `model_id` that is empty/blank or looks like a

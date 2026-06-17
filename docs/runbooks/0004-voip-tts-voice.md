@@ -119,19 +119,25 @@ never swallowed.
   when the primary is a cloud provider (`elevenlabs`/`cartesia`/`aura2`); set to `none` to
   disable failover; set to another TTS provider token to use that instead. Must differ from
   the primary (a same-provider fallback can't recover the same fault — rejected at startup).
+- **`HERMES_VOIP_TTS_FALLBACK_MODEL`** — the **Kokoro fallback's own model directory**.
+  **Required** when the fallback is `sherpa-kokoro` (rejected at startup otherwise). The
+  shared `HERMES_VOIP_TTS_MODEL` is the ElevenLabs **model id** for the primary, *not* a
+  Kokoro directory, so the fallback needs its own dir — point it at the local Kokoro model
+  dir (the same one a Kokoro-primary deployment uses). The `ml` extra must be installed so
+  Kokoro can load on demand.
 - **Latch + retry.** After the first primary failure on a call, the rest of that call uses
   the fallback (no mid-call voice flapping). A **fresh call retries the primary**, so a brief
   cloud blip self-heals on the next call.
 - **Zero happy-path cost.** The Kokoro fallback model is loaded **only on the first
-  failover** (lazily) and cached — so a healthy ElevenLabs call never loads it. For the
-  fallback to be able to load on demand, the `ml` extra and the Kokoro model dir
-  (`HERMES_VOIP_TTS_MODEL` is the model **directory** for sherpa-kokoro) must be present in
-  the deployment.
+  failover** (lazily) and cached — so a healthy ElevenLabs call never loads it. Any primary
+  failure recovers: a streamed fault (HTTP 400 / timeout / dropped connection) *and* a
+  synchronous one (e.g. an unsupported per-call rate).
 
 ```
-HERMES_VOIP_TTS_PROVIDER=elevenlabs        # cloud primary
-HERMES_VOIP_TTS_FALLBACK=sherpa-kokoro     # default for a cloud primary; `none` disables
-# the Kokoro model dir must exist so the fallback can load on demand (ml extra installed)
+HERMES_VOIP_TTS_PROVIDER=elevenlabs            # cloud primary
+HERMES_VOIP_TTS_MODEL=eleven_flash_v2_5        # the PRIMARY's ElevenLabs model id (or unset)
+HERMES_VOIP_TTS_FALLBACK=sherpa-kokoro         # default for a cloud primary; `none` disables
+HERMES_VOIP_TTS_FALLBACK_MODEL=/path/to/kokoro # the FALLBACK's Kokoro model dir (ml extra)
 ```
 
 ### The model_id 400 trap (the live incident root cause)

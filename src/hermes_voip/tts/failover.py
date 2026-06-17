@@ -232,14 +232,14 @@ class _FailoverStream:
         return self
 
     async def __anext__(self) -> PcmFrame:
-        if self._active is None and not self._started:
-            self._started = True
-            self._active = self._owner._primary.synthesize(
-                self._tee, self._voice, sample_rate=self._sample_rate
-            )
+        if not await self._ensure_started():
+            # The primary's synchronous synthesize() failed AND the utterance could
+            # not be replayed (only possible if it had emitted audio — impossible at
+            # open). Defensive: end the stream.
+            raise StopAsyncIteration  # pragma: no cover - open emits no audio
         while True:
             active = self._active
-            if active is None:  # pragma: no cover - defensive; _started set above
+            if active is None:  # pragma: no cover - defensive; _ensure_started sets it
                 raise StopAsyncIteration
             try:
                 frame = await active.__anext__()
@@ -262,6 +262,33 @@ class _FailoverStream:
             else:
                 self._emitted = True
                 return frame
+
+    async def _ensure_started(self) -> bool:
+        """Open the primary stream once; recover via the fallback on a SYNC failure.
+
+        The primary's ``synthesize`` is a synchronous factory that can raise eagerly
+        (e.g. ElevenLabs rejects an unsupported per-call sample rate) — so opening it
+        is wrapped in the same failover path as a streamed failure (codec/ADR-0025).
+        Returns ``True`` once a stream (primary or fallback) is active, ``False`` only
+        if recovery decided the utterance is finished (never at open, since no audio
+        has been emitted yet).
+        """
+        if self._started:
+            return self._active is not None or self._failed_over
+        self._started = True
+        try:
+            self._active = self._owner._primary.synthesize(
+                self._tee, self._voice, sample_rate=self._sample_rate
+            )
+        except StopAsyncIteration:  # pragma: no cover - not raised by a sync factory
+            raise
+        # A synchronous synthesize() failure (e.g. ElevenLabs rejecting an unsupported
+        # per-call rate) must recover via the fallback too — caught broadly on purpose,
+        # then logged at WARNING in _begin_fallback (never swallowed; re-raised if the
+        # fallback also fails — rule 37).
+        except Exception as exc:  # noqa: BLE001 - ANY primary open failure must recover
+            return await self._begin_fallback(exc)
+        return True
 
     async def _begin_fallback(self, exc: BaseException) -> bool:
         """Recover from a primary failure: log, latch, and open the fallback.
@@ -300,13 +327,11 @@ class _FailoverStream:
         """Forward ``flush`` to the active stream (open the primary if not yet started).
 
         The call loop's first-audio lever forces buffered text to synthesis; ensure a
-        stream exists so the flush reaches a real provider stream.
+        stream exists so the flush reaches a real provider stream. Opening goes through
+        :meth:`_ensure_started`, so a synchronous primary failure here also recovers
+        via the fallback rather than escaping.
         """
-        if self._active is None and not self._started:
-            self._started = True
-            self._active = self._owner._primary.synthesize(
-                self._tee, self._voice, sample_rate=self._sample_rate
-            )
+        await self._ensure_started()
         if self._active is not None:
             await self._active.flush()
 

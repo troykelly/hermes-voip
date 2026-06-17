@@ -291,6 +291,21 @@ def test_outbound_preamble_is_task_scoped_and_resists_steering() -> None:
     assert "secret" in lowered or "credential" in lowered
 
 
+def test_outbound_preamble_names_report_call_result() -> None:
+    """The OUTBOUND persona tells the agent to report the outcome (ADR-0029).
+
+    The agent will not call a tool it is not told about. ``report_call_result``
+    is SAFE and reachable at the outbound (level-0) tier, and the cross-session
+    outcome report only fires if the agent calls it before hanging up, so the
+    outbound persona must name it and cue WHEN to use it.
+    """
+    lowered = persona_preamble(CallerMode.OUTBOUND).lower()
+    assert "report_call_result" in lowered
+    # ... and a cue for WHEN (before ending the call) so it is recorded.
+    assert "before" in lowered
+    assert "hang_up" in lowered or "end the call" in lowered
+
+
 def test_deny_has_no_persona() -> None:
     # DENY never reaches a turn; asking for its persona is a programming error.
     with pytest.raises(ValueError, match="DENY"):
@@ -319,12 +334,15 @@ def test_assistant_preamble_names_the_in_call_control_tools() -> None:
     """The operator's ASSISTANT persona names the ELEVATED control tools (ADR-0011).
 
     The agent will not call a tool it is not told about, so the privileged persona
-    must name hold_call / resume_call / list_registrations and when to use them.
+    must name hold_call / resume_call / list_registrations / send_dtmf and when to
+    use them. ``send_dtmf`` is ELEVATED (level >= 2), so it is reachable by this
+    persona and must be named for IVR / keypad navigation.
     """
     lowered = persona_preamble(CallerMode.ALLOW).lower()
     assert "hold_call" in lowered
     assert "resume_call" in lowered
     assert "list_registrations" in lowered
+    assert "send_dtmf" in lowered
 
 
 def test_colleague_preamble_names_the_in_call_control_tools() -> None:
@@ -339,20 +357,25 @@ def test_colleague_preamble_names_the_in_call_control_tools() -> None:
     assert "hold_call" in lowered
     assert "resume_call" in lowered
     assert "list_registrations" in lowered
+    assert "send_dtmf" in lowered
 
 
 @pytest.mark.parametrize("mode", [CallerMode.GREY, CallerMode.OUTBOUND])
 def test_untrusted_personas_do_not_name_the_control_tools(mode: CallerMode) -> None:
     """The level-0 receptionist / outbound personas do NOT name the ELEVATED tools.
 
-    The privilege gate blocks hold/resume/list for these untrusted callers, so
-    naming the tools would be misleading (rule 27 — no aspirational text). They
-    still keep hang_up (SAFE, offered to every tier).
+    The privilege gate blocks hold/resume/list/send_dtmf for these untrusted
+    callers (all ELEVATED, level >= 2), so naming the tools would be misleading
+    (rule 27 — no aspirational text). They still keep hang_up (SAFE, offered to
+    every tier).
     """
     lowered = persona_preamble(mode).lower()
     assert "hold_call" not in lowered
     assert "resume_call" not in lowered
     assert "list_registrations" not in lowered
+    # send_dtmf is ELEVATED (level >= 2); the level-0 gate blocks it for the
+    # receptionist and the outbound callee, so neither persona names it.
+    assert "send_dtmf" not in lowered
     # hang_up remains available to every persona.
     assert "hang_up" in lowered
 

@@ -510,8 +510,11 @@ class RtpMediaTransport:
         # ptime, so the pacer sleeps the REMAINING time to the deadline rather than a
         # flat ptime: a slow per-frame encode (G.722 is pure-Python, ~1.3 ms/frame
         # and variable) is absorbed into the interval instead of being added on top,
-        # giving a steady 50 pps for any codec. Reset to ``None`` in connect()/stop()
-        # so a fresh or re-used engine re-anchors on its next frame.
+        # giving a steady 50 pps for any codec. The pacer re-anchors this to ``now``
+        # whenever it has fallen more than one ptime behind (a real idle gap between
+        # TTS utterances), so the next burst does NOT dump back-to-back catching up.
+        # Reset to ``None`` in connect()/stop() so a fresh or re-used engine
+        # re-anchors on its next frame.
         self._next_send_at: float | None = None
 
         # In-flight frame slot for the deadline pacer's stop-race (the one yield
@@ -930,9 +933,11 @@ class RtpMediaTransport:
 
         The first frame of a stream finds ``_next_send_at is None``, anchors the grid
         to ``now``, and sends with no wait (the greeting must go out immediately so a
-        NAT'd gateway latches). If a frame overruns its slot (the deadline is already
-        past) the wait clamps to zero — no negative sleep, no busy-spin — and the grid
-        continues from the next slot.
+        NAT'd gateway latches). A frame that overruns its slot by up to a ptime clamps
+        the wait to zero — no negative sleep, no busy-spin. If the grid has fallen
+        more than one ptime behind (a real idle gap between TTS utterances) it
+        re-anchors to ``now`` so the next burst is paced rather than dumped
+        back-to-back catching up (cross-vendor review finding).
 
         **Stop race**: the encode commits the stateful encoder and the seq/ts, so the
         already-built datagram is parked in :attr:`_inflight_wire` across the pacing
@@ -977,8 +982,19 @@ class RtpMediaTransport:
         # Deadline pace: wait only the time remaining to this frame's slot, THEN send
         # on wake, so the datagram leaves on the fixed grid (the encode above is
         # already done). The first frame anchors the grid and sends immediately.
+        #
+        # Re-anchor a STALE grid (codex review): if the deadline is already more than
+        # one ptime in the past — a real idle gap between TTS chunks/utterances, or a
+        # call that paused — catching up by only +1 ptime per frame would dump the
+        # next burst back-to-back (wait <= 0 for many frames) until the schedule
+        # caught up. So when the schedule has fallen behind by more than a ptime,
+        # snap _next_send_at to ``now``: the first frame after the gap sends
+        # immediately and the rest of the burst paces a steady 20 ms from there.
+        # Adjacent frames in a continuous stream are at most ~ptime behind, so normal
+        # pacing is untouched; only a genuine gap triggers the re-anchor.
+        ptime_s = self._ptime / 1000.0
         now = self._pace_clock()
-        if self._next_send_at is None:
+        if self._next_send_at is None or now - self._next_send_at > ptime_s:
             self._next_send_at = now
         wait = self._next_send_at - now
         if wait > 0:
@@ -996,8 +1012,9 @@ class RtpMediaTransport:
 
         # The frame is going out on the fixed grid: advance the deadline by exactly one
         # ptime (a single slow frame does not shift every subsequent packet) and clear
-        # the in-flight slot now that the datagram is on the wire.
-        self._next_send_at += self._ptime / 1000.0
+        # the in-flight slot now that the datagram is on the wire. The anchor block
+        # above guarantees _next_send_at is set (not None) on every path to here.
+        self._next_send_at += ptime_s
         self._inflight_wire = None
 
         # Log the first packet sent in this call.

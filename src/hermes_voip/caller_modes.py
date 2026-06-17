@@ -247,11 +247,15 @@ class CallerModeConfig:
     Attributes:
         allow: Allow-list patterns (exact or ``*``-suffixed prefix).
         deny: Deny-list patterns.
-        grey: Explicit grey pins (force receptionist even if ``default_mode``
-            were ``ALLOW``).
-        default_mode: Mode for an unmatched caller — ``GREY`` unless overridden.
-            ``DENY`` is not a permitted default (it would block every unknown
-            caller); :func:`load_caller_modes` rejects it.
+        grey: Explicit grey pins (force receptionist for a specific caller).
+        default_mode: Mode for an unmatched caller — only ``GREY`` (receptionist,
+            ``privilege_level=0``) is permitted. ``ALLOW`` is rejected because it
+            would map every unmatched (unknown, forgeable) caller to the operator
+            group at ``privilege_level=3`` (the IRREVERSIBLE tier) — a fail-open
+            privilege escalation. ``DENY`` (would block every unknown caller) and
+            ``OUTBOUND`` (an outbound-only mode) are likewise rejected.
+            :meth:`__post_init__` enforces this, so the fail-open state cannot be
+            constructed at all.
         normalization: How raw caller-IDs are canonicalised before matching.
     """
 
@@ -262,7 +266,37 @@ class CallerModeConfig:
     normalization: Normalization
 
     def __post_init__(self) -> None:
-        """Reject a ``DENY`` default — it would block every unmatched caller."""
+        """Reject any unsafe default mode (fail-loud, rule 37).
+
+        Caller-ID is forgeable SIP identity — a trust HINT, never authentication
+        — so an UNMATCHED caller must NEVER reach operator privilege by
+        construction (the operator security tenet). The default (catch-all) mode
+        is therefore clamped to the unprivileged receptionist (``GREY``):
+
+        * ``ALLOW`` would place every unmatched caller in the ``operator`` group
+          at ``privilege_level=3`` (the IRREVERSIBLE tier) — a privilege
+          escalation on a forgeable identifier. Refused here, mirroring the
+          N-group JSON path which rejects a ``default_group`` with
+          ``privilege_level != 0`` (:func:`_parse_groups_document`). Operator
+          privilege requires an explicit allow-list MATCH, never the default.
+        * ``DENY`` would block every unknown caller (a foot-gun).
+        * ``OUTBOUND`` is an outbound-only mode with no inbound-default meaning.
+
+        Refusing at construction makes the fail-open state un-constructible:
+        :func:`load_caller_modes`, :func:`classify_caller`, and the adapter path
+        all fail loud, regardless of config.
+        """
+        if self.default_mode is CallerMode.ALLOW:
+            msg = (
+                "default_mode must not be ALLOW: it would map every unmatched "
+                "(unknown, forgeable) caller to the operator group at "
+                "privilege_level=3 (the IRREVERSIBLE tier) — a fail-open "
+                "privilege escalation. Caller-ID is a forgeable trust hint, not "
+                "authentication: operator privilege requires an explicit "
+                "allow-list match, never the default. Use GREY (the safe default) "
+                "and enumerate trusted numbers in the allow list."
+            )
+            raise ConfigError(msg)
         if self.default_mode is CallerMode.DENY:
             msg = "default_mode must not be DENY (it would block every unknown caller)"
             raise ConfigError(msg)
@@ -436,10 +470,13 @@ def caller_mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
     match order.  ``adapter.connect`` uses this to drive the new N-group
     classifier from a (possibly test-injected) legacy :func:`load_caller_modes`
     result, so the ADR-0020 surface keeps working unchanged.
-    """
-    default_is_allow = cfg.default_mode is CallerMode.ALLOW
-    default_name = "operator" if default_is_allow else "receptionist"
 
+    The default (unmatched-caller) group is always the unprivileged
+    ``receptionist`` (``privilege_level=0``): :meth:`CallerModeConfig.__post_init__`
+    guarantees ``cfg.default_mode is GREY`` (a privileged ``ALLOW`` default is
+    rejected at construction), so an unmatched caller can never fall to the
+    ``operator`` group through this shim.
+    """
     group_lists: dict[str, tuple[str, ...]] = {
         "operator": cfg.allow,
         "receptionist": cfg.grey,
@@ -448,7 +485,7 @@ def caller_mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
     return CallerGroupConfig(
         groups=_DEFAULT_THREE_GROUPS,
         group_lists=group_lists,
-        default_group=default_name,
+        default_group="receptionist",
         match_order=("blocked", "operator", "receptionist"),
         normalization=cfg.normalization,
     )
@@ -652,7 +689,16 @@ def _parse_normalization(env: Mapping[str, str]) -> Normalization:
 
 
 def _parse_default_mode(env: Mapping[str, str]) -> CallerMode:
-    """Parse ``HERMES_VOIP_CALLER_DEFAULT_MODE`` (``grey``/``allow``); default grey."""
+    """Parse ``HERMES_VOIP_CALLER_DEFAULT_MODE``; default ``grey``.
+
+    Recognises the tokens ``grey`` and ``allow`` (an unknown token raises
+    :class:`ConfigError` here). ``allow`` parses to :attr:`CallerMode.ALLOW` but
+    is then **rejected by** :meth:`CallerModeConfig.__post_init__` — a privileged
+    default would escalate every unmatched, forgeable caller to operator
+    privilege. The rejection lives at construction (one source of truth, mirroring
+    the JSON path which parses then rejects a privileged ``default_group``), so
+    ``load_caller_modes`` fails loud on ``allow`` regardless of this parse.
+    """
     token = (env.get(_DEFAULT_MODE_KEY) or "").strip().lower()
     if not token:
         return CallerMode.GREY

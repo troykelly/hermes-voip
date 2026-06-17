@@ -788,6 +788,14 @@ class VoipAdapter(BasePlatformAdapter):
                 try:
                     engine._codec = _to_engine_codec(negotiated_voice)
                 except UnsupportedCodecError as exc:
+                    # Defense-in-depth (unreachable over the current menu, since
+                    # negotiate_audio above already rejects an offer whose voice
+                    # codec is outside _SUPPORTED_ENCODINGS): if the advertised
+                    # menu ever drifts ahead of the engine table, FAIL the call
+                    # loudly here rather than leave the engine on a placeholder
+                    # codec and stream dead audio. OutboundCallFailed propagates to
+                    # the caller (never swallowed) — the outbound mirror of the
+                    # inbound guard.
                     raise OutboundCallFailed(
                         488, f"2xx answer codec not carriable: {exc}"
                     ) from exc

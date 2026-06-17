@@ -454,6 +454,73 @@ async def test_send_known_call_id_calls_loop_speak() -> None:
     assert "hello agent" in spoken
 
 
+# The exact home-channel onboarding notice the Hermes runtime delivers to a
+# platform adapter's send() on the first turn of a session with no
+# ``VOIP_HOME_CHANNEL`` (verified text of ``gateway.run._handle_message`` in
+# hermes-agent 0.16.0). The runtime routes it through ``adapter.send`` exactly
+# like a genuine reply, so without a guard it is synthesised as audio — the
+# operator-reported "No home channel is set for voip" leak.
+_HOME_CHANNEL_NOTICE = (
+    "\U0001f4ec No home channel is set for Voip. "
+    "A home channel is where Hermes delivers cron job results "
+    "and cross-platform messages.\n\n"
+    "Type /sethome to make this chat your home channel, "
+    "or ignore to skip."
+)
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_notice_is_not_spoken() -> None:
+    """A gateway home-channel/proactive notice must never reach the caller.
+
+    The runtime delivers it via ``send()`` during a live call; the adapter
+    drops it (logged, not synthesised) and reports success so the runtime does
+    not treat the drop as a delivery failure and retry.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, _HOME_CHANNEL_NOTICE)
+
+    # Dropped, not spoken — and reported success (no retry storm).
+    assert result.success
+    assert spoken == []
+
+
+@pytest.mark.asyncio
+async def test_send_genuine_reply_still_spoken_alongside_notice_guard() -> None:
+    """The notice guard must not over-filter genuine conversational replies."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    reply = "Sure, I can set up that home channel in the lounge for you."
+    result = await adapter.send(call_id, reply)
+    assert result.success
+    assert reply in spoken
+
+
 # ---------------------------------------------------------------------------
 # (c) get_chat_info returns {name, type} for live + ended + unknown calls
 # ---------------------------------------------------------------------------

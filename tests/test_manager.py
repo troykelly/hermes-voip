@@ -12,6 +12,7 @@ Fakes only (``pbx.example.test``, ext ``1000``/``1001``, ``198.51.100.x``).
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -146,6 +147,39 @@ async def test_on_response_registers_and_marks_up() -> None:
     registered = [s for s in manager.snapshot() if s.registered]
     assert len(registered) == 1
     assert registered[0].expires == 300
+
+
+async def test_on_response_logs_registration_established(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful REGISTER emits one INFO line on the manager logger.
+
+    This is the operator-facing "it's working" signal (#30 gap #2): without it
+    the gateway-login success is silent and runbooks have no log to point at. The
+    line carries only the non-sensitive ``expires`` value — never the SIP host,
+    extension, username, or password (rule 34).
+    """
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()
+    with caplog.at_level(logging.INFO, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(transport.sent[0], expires=299))
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager" and r.levelno == logging.INFO
+    ]
+    assert len(records) == 1, (
+        "exactly one INFO registration-established line per successful REGISTER"
+    )
+    message = records[0].getMessage()
+    # The expiry IS surfaced (it is not a secret) — operators read the refresh window.
+    assert "299" in message
+    # rule 34: the message must NOT leak any HERMES_SIP_* value. The fakes here are
+    # the host, the extension/username, and the digest password from ``_gateway()``.
+    for secret in ("pbx.example.test", "1000", "1001", "p1", "p2", "sip:"):
+        assert secret not in message, f"registration log leaked {secret!r}"
 
 
 async def test_on_response_challenge_resends_authenticated() -> None:

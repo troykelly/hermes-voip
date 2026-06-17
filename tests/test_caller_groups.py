@@ -468,6 +468,32 @@ def test_persona_preamble_for_group_with_custom_persona_field() -> None:
     assert len(text) > 0
 
 
+def test_persona_preamble_for_group_intercom() -> None:
+    """The intercom persona (ADR-0031): tight, untrusted-fenced, entry-only.
+
+    It must establish the door-screening role, mark the visitor as untrusted, and
+    forbid disclosing anything beyond the entry decision — distinct from the other
+    personas.
+    """
+    group = CallerGroup(
+        name="intercom",
+        privilege_level=2,
+        persona="intercom",
+        declined_at_sip=False,
+        allowed_tools=frozenset({"open_entry"}),
+    )
+    text = persona_preamble_for_group(group)
+    lowered = text.lower()
+    assert lowered  # there IS a preamble
+    # Establishes the entry-screening role (door/entry/visitor wording).
+    assert "visitor" in lowered or "entry" in lowered or "door" in lowered
+    # Marks the visitor's words as untrusted data.
+    assert "untrusted" in lowered
+    # Distinct from the receptionist + operator personas.
+    assert text != persona_preamble_for_group(_receptionist_group())
+    assert text != persona_preamble_for_group(_operator_group())
+
+
 # ===========================================================================
 # load_caller_groups — new groups-file path
 # ===========================================================================

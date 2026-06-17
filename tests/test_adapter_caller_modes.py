@@ -34,6 +34,7 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_voip.caller_modes import CallerMode, CallerModeConfig, Normalization
 from hermes_voip.config import ConfigError, ExtensionConfig
+from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 from hermes_voip.providers.build import Providers
@@ -944,3 +945,119 @@ async def test_malicious_summary_does_not_inject_command_into_origin() -> None:
     assert "\n" not in text
     assert "\r" not in text
     assert text.count(_UNTRUSTED_CLOSE) == 1
+
+
+# ===========================================================================
+# Intercom entry actuation: send_dtmf_on_call + open_entry (ADR-0031)
+# ===========================================================================
+
+
+class _FakeCallSession:
+    """A minimal CallSession stand-in for the entry-actuation tests."""
+
+    def __init__(self, *, ended: bool = False) -> None:
+        self.ended = ended
+        self.dtmf: list[str] = []
+
+    async def send_dtmf(self, digits: str) -> None:
+        self.dtmf.append(digits)
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_on_call_drives_the_session() -> None:
+    """send_dtmf_on_call forwards the digits to the call's session."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    acted = await adapter.send_dtmf_on_call(call_id, "123")
+
+    assert acted is True
+    assert session.dtmf == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_on_call_unknown_call_returns_false() -> None:
+    """An unknown/ended call is a no-op returning False (no crash)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    assert await adapter.send_dtmf_on_call("nope", "1") is False
+
+
+@pytest.mark.asyncio
+async def test_open_entry_dtmf_mode_sends_the_open_code() -> None:
+    """open_entry in DTMF mode sends the configured open code on the call."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
+    )
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    opened = await adapter.open_entry(call_id)
+
+    assert opened is True
+    assert session.dtmf == ["9"]  # the door-open DTMF code was sent
+
+
+@pytest.mark.asyncio
+async def test_open_entry_relay_mode_calls_the_relay() -> None:
+    """open_entry in RELAY mode invokes the relay client (no DTMF on the call)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    opened_calls: list[str] = []
+
+    class _FakeRelay:
+        async def open(self) -> None:
+            opened_calls.append("open")
+
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.RELAY,
+        relay_url="https://relay.example.test/open",
+    )
+    adapter._intercom_relay = _FakeRelay()  # type: ignore[assignment]  # fake relay client
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    opened = await adapter.open_entry(call_id)
+
+    assert opened is True
+    assert opened_calls == ["open"]
+    assert session.dtmf == []  # relay mode does NOT send DTMF
+
+
+@pytest.mark.asyncio
+async def test_open_entry_disabled_mode_raises() -> None:
+    """open_entry with the default DISABLED mode fails LOUD (no silent no-op)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(open_mode=IntercomOpenMode.DISABLED)
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    with pytest.raises(RuntimeError, match="intercom"):
+        await adapter.open_entry(call_id)
+
+
+@pytest.mark.asyncio
+async def test_open_entry_unknown_call_returns_false() -> None:
+    """open_entry on an unknown/ended call is a no-op returning False."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
+    )
+    assert await adapter.open_entry("nope") is False

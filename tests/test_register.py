@@ -524,3 +524,55 @@ def test_register_is_resilient_to_a_ctx_without_register_tool() -> None:
     ctx = _PlatformOnlyCtx()
     register(ctx)  # must not raise even though register_tool/register_hook are absent
     assert ctx.calls == ["voip"]
+
+
+# ---------------------------------------------------------------------------
+# In-call control tools exposed through register(ctx) (ADR-0011 §3)
+# ---------------------------------------------------------------------------
+
+
+def test_register_registers_the_in_call_control_tools() -> None:
+    """register(ctx) exposes hold_call / resume_call / list_registrations.
+
+    These were built + unit-tested in tools.py but were dark (only hang_up was
+    registered); this wires them to the runtime so the agent can call them.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    names = {c["name"] for c in ctx.tool_calls}
+    for tool in ("hold_call", "resume_call", "list_registrations"):
+        assert tool in names, f"the {tool!r} tool was not registered"
+
+
+def test_register_does_not_expose_the_transfer_tools() -> None:
+    """The IRREVERSIBLE transfer tools are NOT exposed (deferred, not a no-op).
+
+    transfer_blind/transfer_attended need a spoof-resistant ADR-0010 DTMF
+    confirmation channel that is not wired into the live adapter; exposing a
+    transfer tool would make it an always-blocked no-op (rule 6). It is therefore
+    deferred-not-registered until that channel lands.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    names = {c["name"] for c in ctx.tool_calls}
+    assert "transfer_blind" not in names
+    assert "transfer_attended" not in names
+
+
+def test_registered_control_tools_are_async_with_schemas() -> None:
+    """Each exposed control tool is async and ships a model-readable JSON schema."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    for tool_name in ("hold_call", "resume_call", "list_registrations"):
+        tool = next(c for c in ctx.tool_calls if c["name"] == tool_name)
+        assert tool["is_async"] is True, f"{tool_name} must be async"
+        schema = tool["schema"]
+        assert isinstance(schema, dict)
+        assert schema.get("name") == tool_name
+        assert schema.get("description")

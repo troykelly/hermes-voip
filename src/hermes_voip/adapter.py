@@ -103,6 +103,7 @@ from hermes_voip.media.vad import (
     load_silero_model,
     windows_for_ms,
 )
+from hermes_voip.media.webrtc_session import WebRtcMediaSession
 from hermes_voip.message import (
     SipRequest,
     SipResponse,
@@ -125,6 +126,7 @@ from hermes_voip.sdp import (
     SessionDescription,
     build_audio_answer,
     build_audio_offer,
+    build_webrtc_answer,
     negotiate_audio,
 )
 from hermes_voip.sdp import (
@@ -140,12 +142,34 @@ __all__ = ["VoipAdapter"]
 
 _log = logging.getLogger(__name__)
 
+
+class _MediaNegotiationRejected(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Internal signal: the call was rejected (488) inside a media-setup helper.
+
+    Raised by :meth:`VoipAdapter._setup_sdes_call` / ``_setup_webrtc_call`` after
+    they have already sent the 488 and torn down any partial media, so the inbound
+    handler returns without answering. Not an error — a clean ``return`` channel
+    that keeps the 488-and-teardown logic inside the per-path helper (rule 6: the
+    call is fully un-answered, never half-set-up).
+    """
+
+
 # Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):
 # G.722 (16 kHz wideband) FIRST, then G.711 PCMU/PCMA (the universal fallback),
 # then telephone-event (DTMF). Every voice entry maps to a runnable engine codec
 # (the drift guard enforces it); negotiate_audio honours the peer's offer order and
 # falls back to G.711 when the peer does not offer G.722.
 _SUPPORTED_ENCODINGS = ("G722", "PCMU", "PCMA", "telephone-event")
+
+# Supported encodings advertised on the WebRTC (DTLS-SRTP) path, Opus-first
+# (ADR-0032/0005): Opus (48 kHz, the WebRTC codec) preferred, then G.711 PCMU/PCMA
+# fallback, then telephone-event. negotiate_audio honours the peer's offer order, so
+# a peer that prefers G.711 still gets it. Opus appears here ONLY because the engine
+# can now carry it (the WebRTC drift guard enforces advertise-only-if-carry, like the
+# SDES menu). The WebRTC path requires the ``webrtc`` extra (opuslib + libopus for
+# Opus, pyOpenSSL/aioice for DTLS/ICE); a WebRTC offer to a host without it fails the
+# call loudly (ImportError) rather than answering dead — never a silent miss.
+_WEBRTC_SUPPORTED_ENCODINGS = ("opus", "PCMU", "PCMA", "telephone-event")
 
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
@@ -1201,7 +1225,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_tasks.setdefault(call_id, set()).add(task)
         task.add_done_callback(lambda t: self._on_call_task_done(call_id, t))
 
-    async def _handle_inbound_invite(  # noqa: PLR0915,PLR0911 — RFC 3261 INVITE handling requires these sequential reject-early guard steps (each a 488/603 early return); extraction would only move the complexity elsewhere
+    async def _handle_inbound_invite(  # noqa: PLR0911,PLR0912,PLR0915 — RFC 3261 INVITE handling requires these sequential reject-early guard steps (each a 488/603 early return) plus the SDES/WebRTC media branch; extraction would only move the complexity elsewhere
         self, new_call: NewCall
     ) -> None:
         """Async body of _on_inbound_invite; wires the full call stack."""
@@ -1279,8 +1303,15 @@ class VoipAdapter(BasePlatformAdapter):
             ",".join(c.encoding for c in audio.codecs),
         )
 
+        # WebRTC (UDP/TLS/RTP/SAVPF) offers negotiate against the Opus-first menu and
+        # take the DTLS-SRTP / ICE answer path (ADR-0032); everything else uses the
+        # SDES / plain-RTP G.711-G.722 menu. The detection is the profile token
+        # (offer.audio.is_webrtc); the codec-capability and no-answer-on-failure
+        # invariants below apply identically to both.
+        is_webrtc = audio.is_webrtc
+        supported = _WEBRTC_SUPPORTED_ENCODINGS if is_webrtc else _SUPPORTED_ENCODINGS
         try:
-            agreed_sdp_codecs = negotiate_audio(audio, _SUPPORTED_ENCODINGS)
+            agreed_sdp_codecs = negotiate_audio(audio, supported)
         except ValueError as exc:
             # A call we cannot carry is REJECTED, never answered. Logged at ERROR
             # (not WARNING) so a refused call is unmistakable, not buried.
@@ -1335,100 +1366,55 @@ class VoipAdapter(BasePlatformAdapter):
             transport="TLS",
         )
 
-        # --- Open the media engine ------------------------------------------
+        # --- Open the media engine + answer (SDES or WebRTC path) -----------
         media_cfg = self._media_cfg
         if media_cfg is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: media config not initialised"
             raise RuntimeError(msg)
-        remote_address = _effective_address(audio, offer)
-        engine = RtpMediaTransport(
-            local_address="0.0.0.0",  # noqa: S104 — bind to all interfaces for RTP
-            local_port=0,  # OS assigns a free port
-            remote_address=remote_address,
-            remote_port=audio.port,
-            codec=engine_codec,
-            # Send + latch on the NEGOTIATED RTP payload type (the answer echoes the
-            # offer's PT), not the codec's static value — G.722 may negotiate a
-            # dynamic PT (e.g. 109) that differs from its static 9.
-            payload_type=codec.payload_type,
-            # The negotiated RFC 4733 telephone-event PT for in-call DTMF (ADR-0031),
-            # or None when the offer carried no telephone-event (send_dtmf then
-            # raises rather than guessing a PT).
-            telephone_event_payload_type=_telephone_event_payload_type(
-                agreed_sdp_codecs
-            ),
-            srtp_inbound=_srtp_from_audio(audio, outbound=False),
-            srtp_outbound=_srtp_from_audio(audio, outbound=True),
-            # Symmetric-RTP (comedia) latching for NAT traversal: send our media
-            # to the peer's real RTP source, not blindly to the SDP address.
-            symmetric=media_cfg.rtp_symmetric,
-            # RTP-inactivity watchdog (ADR-0026): a silent media/network drop ends
-            # the call as MEDIA_TIMEOUT instead of hanging the inbound generator
-            # forever. Operator-configurable in [1, 300] s (default 20).
-            media_timeout_secs=media_cfg.media_timeout_secs,
-        )
-        await engine.connect()
-
-        # --- Build the SDP answer ------------------------------------------
         # Advertise the runtime's REAL local interface for RTP — the same host as
         # the SIP Contact (the transport's local socket address). The 127.0.0.1
         # loopback placeholder makes the gateway send RTP to its own loopback, so
         # audio never flows. (Behind NAT this is the private interface address;
-        # reaching it from a public gateway needs symmetric-RTP latching or an
-        # outbound greeting first — see docs/runbooks/0002-voip-live-validation.md.)
+        # reaching it from a public gateway needs symmetric-RTP latching, an
+        # outbound greeting first, or — on WebRTC — ICE.)
         local_rtp_host = _host_of(transport.local_sent_by)
-        local_media = LocalMediaSession(
-            local_address=local_rtp_host,
-            port=engine.local_port,
-            codecs=agreed_sdp_codecs,
-            session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
-        )
         try:
-            answer_sdp = build_audio_answer(
-                offer,
-                local_address=local_media.local_address,
-                port=local_media.port,
-                supported=list(_SUPPORTED_ENCODINGS),
-                session_id=local_media.session_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — SdpError or negotiation failure
-            _log.warning("INVITE %s: cannot build SDP answer: %s", call_id, exc)
-            # RFC 3261 §13.3.1.4: 488 Not Acceptable Here for media negotiation
-            # failure (e.g. SRTP-only offer with no crypto key available) so the
-            # caller can retry with plain RTP. Reserve 500 for genuine server faults.
-            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
-            await engine.stop()
+            if is_webrtc:
+                engine, local_media = await self._setup_webrtc_call(
+                    invite=invite,
+                    offer=offer,
+                    audio=audio,
+                    agreed_sdp_codecs=agreed_sdp_codecs,
+                    engine_codec=engine_codec,
+                    codec=codec,
+                    transport=transport,
+                    local_tag=local_tag,
+                    local_contact=local_contact,
+                    local_rtp_host=local_rtp_host,
+                    media_cfg=media_cfg,
+                    call_id=call_id,
+                )
+            else:
+                engine, local_media = await self._setup_sdes_call(
+                    invite=invite,
+                    offer=offer,
+                    audio=audio,
+                    agreed_sdp_codecs=agreed_sdp_codecs,
+                    engine_codec=engine_codec,
+                    codec=codec,
+                    transport=transport,
+                    local_tag=local_tag,
+                    local_contact=local_contact,
+                    local_rtp_host=local_rtp_host,
+                    media_cfg=media_cfg,
+                    call_id=call_id,
+                )
+        except _MediaNegotiationRejected:
+            # The 488 was already sent and any partial media torn down inside the
+            # setup helper. Nothing more to do — the call was never answered.
             return
-
-        _log.info(
-            "INVITE %s: SDP answer built — local RTP %s:%d, codecs %s",
-            call_id,
-            local_media.local_address,
-            local_media.port,
-            ",".join(c.encoding for c in agreed_sdp_codecs),
-        )
-
-        # --- Send 200 OK with the SDP answer --------------------------------
-        # The To-tag is REQUIRED on a dialog-forming 2xx (RFC 3261 §12.1.1): it
-        # is our dialog local tag, and the peer echoes it on every in-dialog
-        # request (ACK/BYE/re-INVITE). Without it the gateway's ACK/BYE carry no
-        # To-tag and the manager routes them out-of-dialog — the call answers but
-        # never establishes a routable dialog (the live UCM6304 no-audio failure).
-        # It must match dialog.local_tag so the registered dialog_id matches the
-        # routed key.
-        ok_response = build_response(
-            invite,
-            200,
-            "OK",
-            to_tag=local_tag,
-            extra_headers=(
-                ("Contact", local_contact),
-                ("Content-Type", "application/sdp"),
-            ),
-            body=answer_sdp,
-        )
-        await transport.send(ok_response)
-        _log.info("INVITE %s: 200 OK sent (To-tag %s)", call_id, local_tag)
+        # On return the engine is connected and the 200 OK has been sent; execution
+        # continues to the shared dialog-registration + CallLoop tail below.
 
         # --- Register the call for in-dialog routing -----------------------
         # One GuardSessionState per call, shared between CallSession and CallLoop.
@@ -1517,6 +1503,263 @@ class VoipAdapter(BasePlatformAdapter):
                 call_loop=this_call_loop,
                 reason=reason,
             )
+
+    async def _setup_sdes_call(  # noqa: PLR0913 — the inbound handler's locals threaded through; the alternative is one giant method
+        self,
+        *,
+        invite: SipRequest,
+        offer: SessionDescription,
+        audio: AudioMedia,
+        agreed_sdp_codecs: tuple[SdpCodec, ...],
+        engine_codec: Codec,
+        codec: SdpCodec,
+        transport: SipOverTlsTransport,
+        local_tag: str,
+        local_contact: str,
+        local_rtp_host: str,
+        media_cfg: MediaConfig,
+        call_id: str,
+    ) -> tuple[RtpMediaTransport, LocalMediaSession]:
+        """Open the SDES/plain-RTP media engine, build + send the 200 OK answer.
+
+        The SIP-over-TLS path (ADR-0013): the engine binds its own UDP socket, the
+        answer is SDES (``a=crypto`` echoing the offered tag/suite with our key) or
+        plain RTP/AVP, and the 200 OK is sent. Returns the connected engine + the
+        :class:`LocalMediaSession`. On a media-negotiation failure it sends the 488,
+        stops the engine, and raises :class:`_MediaNegotiationRejected`.
+        """
+        remote_address = _effective_address(audio, offer)
+        engine = RtpMediaTransport(
+            local_address="0.0.0.0",  # noqa: S104 — bind to all interfaces for RTP
+            local_port=0,  # OS assigns a free port
+            remote_address=remote_address,
+            remote_port=audio.port,
+            codec=engine_codec,
+            # Send + latch on the NEGOTIATED RTP payload type (the answer echoes the
+            # offer's PT), not the codec's static value — G.722 may negotiate a
+            # dynamic PT (e.g. 109) that differs from its static 9.
+            payload_type=codec.payload_type,
+            # The negotiated RFC 4733 telephone-event PT for in-call DTMF (ADR-0031),
+            # or None when the offer carried no telephone-event (send_dtmf then
+            # raises rather than guessing a PT).
+            telephone_event_payload_type=_telephone_event_payload_type(
+                agreed_sdp_codecs
+            ),
+            srtp_inbound=_srtp_from_audio(audio, outbound=False),
+            srtp_outbound=_srtp_from_audio(audio, outbound=True),
+            # Symmetric-RTP (comedia) latching for NAT traversal: send our media
+            # to the peer's real RTP source, not blindly to the SDP address.
+            symmetric=media_cfg.rtp_symmetric,
+            # RTP-inactivity watchdog (ADR-0026): a silent media/network drop ends
+            # the call as MEDIA_TIMEOUT instead of hanging the inbound generator
+            # forever. Operator-configurable in [1, 300] s (default 20).
+            media_timeout_secs=media_cfg.media_timeout_secs,
+        )
+        await engine.connect()
+
+        local_media = LocalMediaSession(
+            local_address=local_rtp_host,
+            port=engine.local_port,
+            codecs=agreed_sdp_codecs,
+            session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
+        )
+        try:
+            answer_sdp = build_audio_answer(
+                offer,
+                local_address=local_media.local_address,
+                port=local_media.port,
+                supported=list(_SUPPORTED_ENCODINGS),
+                session_id=local_media.session_id,
+            )
+        except Exception as exc:
+            _log.warning("INVITE %s: cannot build SDP answer: %s", call_id, exc)
+            # RFC 3261 §13.3.1.4: 488 Not Acceptable Here for media negotiation
+            # failure (e.g. SRTP-only offer with no crypto key available) so the
+            # caller can retry with plain RTP. Reserve 500 for genuine server faults.
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            await engine.stop()
+            raise _MediaNegotiationRejected from exc
+
+        _log.info(
+            "INVITE %s: SDP answer built — local RTP %s:%d, codecs %s",
+            call_id,
+            local_media.local_address,
+            local_media.port,
+            ",".join(c.encoding for c in agreed_sdp_codecs),
+        )
+        await self._send_answer_200(
+            invite=invite,
+            transport=transport,
+            local_tag=local_tag,
+            local_contact=local_contact,
+            answer_sdp=answer_sdp,
+            call_id=call_id,
+        )
+        return engine, local_media
+
+    async def _setup_webrtc_call(  # noqa: PLR0913 — the inbound handler's locals threaded through
+        self,
+        *,
+        invite: SipRequest,
+        offer: SessionDescription,
+        audio: AudioMedia,
+        agreed_sdp_codecs: tuple[SdpCodec, ...],
+        engine_codec: Codec,
+        codec: SdpCodec,
+        transport: SipOverTlsTransport,
+        local_tag: str,
+        local_contact: str,
+        local_rtp_host: str,
+        media_cfg: MediaConfig,
+        call_id: str,
+    ) -> tuple[RtpMediaTransport, LocalMediaSession]:
+        """Run the WebRTC media setup: ICE gather → answer → 200 OK → DTLS → engine.
+
+        The DTLS-SRTP / ICE path (ADR-0032). Unlike the SDES path, the DTLS handshake
+        rides the media that only flows once the peer has our answer, so the order is:
+        gather ICE + build the SAVPF answer (our fingerprint/setup/ICE) → send the 200
+        OK → run ICE + DTLS over the ICE pipe → derive SRTP → construct the engine over
+        the ICE pipe. On any failure the 488 (or 500) is sent, the session is closed,
+        and :class:`_MediaNegotiationRejected` is raised — the call is never
+        half-answered.
+
+        Returns the connected engine (carrying SRTP over the ICE pipe) + the
+        :class:`LocalMediaSession`.
+        """
+        # The offered a=setup decides our DTLS role; WebRtcMediaSession picks it.
+        session = WebRtcMediaSession(
+            offer_setup=audio.setup,
+            stun_urls=media_cfg.ice_stun_urls,
+        )
+        try:
+            await session.prepare()  # gather ICE; expose fingerprint/setup/creds
+            local_media = LocalMediaSession(
+                local_address=local_rtp_host,
+                # The ICE candidates carry the real media address/port; the m-line
+                # port is advisory. Use a non-zero placeholder (RFC 4566 disallows 0,
+                # which would signal a declined stream).
+                port=9,
+                codecs=agreed_sdp_codecs,
+                session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
+            )
+            answer_sdp = build_webrtc_answer(
+                offer,
+                local_address=local_media.local_address,
+                port=local_media.port,
+                supported=list(_WEBRTC_SUPPORTED_ENCODINGS),
+                fingerprint=session.fingerprint,
+                setup=session.setup,
+                ice_ufrag=session.ice_ufrag,
+                ice_pwd=session.ice_pwd,
+                ice_candidates=session.ice_candidates,
+                session_id=local_media.session_id,
+            )
+        except Exception as exc:
+            _log.warning("INVITE %s: cannot build WebRTC answer: %s", call_id, exc)
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            await session.close()
+            raise _MediaNegotiationRejected from exc
+
+        _log.info(
+            "INVITE %s: WebRTC SDP answer built — setup=%s, codecs %s",
+            call_id,
+            session.setup.value,
+            ",".join(c.encoding for c in agreed_sdp_codecs),
+        )
+        # Send the 200 OK BEFORE the handshake: the peer needs our answer
+        # (fingerprint + ICE creds + candidates) to start the ICE checks and DTLS.
+        await self._send_answer_200(
+            invite=invite,
+            transport=transport,
+            local_tag=local_tag,
+            local_contact=local_contact,
+            answer_sdp=answer_sdp,
+            call_id=call_id,
+        )
+
+        # Run ICE connectivity + the DTLS-SRTP handshake (over the ICE pipe), then
+        # derive the SRTP sessions. A failure here is AFTER the 200 OK, so the
+        # nascent dialog is torn down with a BYE-less stop and the call setup aborts
+        # (the handler's caller treats _MediaNegotiationRejected as "do not proceed").
+        peer_fingerprint = audio.fingerprint
+        if peer_fingerprint is None or audio.ice_ufrag is None or audio.ice_pwd is None:
+            _log.error(
+                "INVITE %s: WebRTC offer missing fingerprint/ICE credentials — abort",
+                call_id,
+            )
+            await session.close()
+            raise _MediaNegotiationRejected
+        try:
+            srtp_inbound, srtp_outbound = await session.run_handshake(
+                peer_fingerprint=peer_fingerprint,
+                peer_ice_ufrag=audio.ice_ufrag,
+                peer_ice_pwd=audio.ice_pwd,
+                peer_candidates=audio.ice_candidates,
+            )
+        except Exception:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
+            # A DTLS/ICE failure (fingerprint mismatch, no connectivity, handshake
+            # timeout). The call was answered (200 OK sent) but cannot be keyed —
+            # close ICE and abort setup. Re-raised as the internal reject signal so
+            # the inbound handler stops without building a CallLoop on dead media.
+            _log.exception("INVITE %s: WebRTC ICE/DTLS handshake failed", call_id)
+            await session.close()
+            raise _MediaNegotiationRejected from None
+
+        engine = RtpMediaTransport(
+            local_address="0.0.0.0",  # noqa: S104 — unused on the ICE path (no socket bound)
+            local_port=0,
+            # The ICE-nominated pair is the destination; these are placeholders the
+            # ICE seam ignores (no comedia latch on WebRTC).
+            remote_address=_effective_address(audio, offer) or "0.0.0.0",  # noqa: S104
+            remote_port=audio.port or 9,
+            codec=engine_codec,
+            payload_type=codec.payload_type,
+            telephone_event_payload_type=_telephone_event_payload_type(
+                agreed_sdp_codecs
+            ),
+            # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
+            srtp_inbound=srtp_inbound,
+            srtp_outbound=srtp_outbound,
+            # Carry media over the ICE datagram pipe instead of a bound UDP socket.
+            ice_transport=session.ice,
+            media_timeout_secs=media_cfg.media_timeout_secs,
+        )
+        await engine.connect()
+        _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
+        return engine, local_media
+
+    async def _send_answer_200(  # noqa: PLR0913 — the dialog-forming 200 OK needs all of these to build the response
+        self,
+        *,
+        invite: SipRequest,
+        transport: SipOverTlsTransport,
+        local_tag: str,
+        local_contact: str,
+        answer_sdp: str,
+        call_id: str,
+    ) -> None:
+        """Send the dialog-forming 200 OK carrying the SDP answer (shared seam).
+
+        The To-tag is REQUIRED on a dialog-forming 2xx (RFC 3261 §12.1.1): it is our
+        dialog local tag, and the peer echoes it on every in-dialog request
+        (ACK/BYE/re-INVITE). Without it the gateway's ACK/BYE carry no To-tag and the
+        manager routes them out-of-dialog — the call answers but never establishes a
+        routable dialog. It must match ``dialog.local_tag`` so the registered
+        dialog_id matches the routed key.
+        """
+        ok_response = build_response(
+            invite,
+            200,
+            "OK",
+            to_tag=local_tag,
+            extra_headers=(
+                ("Contact", local_contact),
+                ("Content-Type", "application/sdp"),
+            ),
+            body=answer_sdp,
+        )
+        await transport.send(ok_response)
+        _log.info("INVITE %s: 200 OK sent (To-tag %s)", call_id, local_tag)
 
     async def _run_call_loop(
         self,

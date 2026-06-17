@@ -42,6 +42,7 @@ from hermes_voip.media.dtls import DtlsEndpoint, DtlsRole
 from hermes_voip.media.ice import IceCandidate, IceConnection
 from hermes_voip.media.srtp import SrtpSession
 from hermes_voip.sdp import Fingerprint, SetupRole
+from hermes_voip.sdp import IceCandidate as SdpIceCandidate
 
 __all__ = ["WebRtcMediaSession", "answer_setup_for_offer"]
 
@@ -232,9 +233,18 @@ class WebRtcMediaSession:
         return self._ice.local_pwd
 
     @property
-    def ice_candidates(self) -> list[IceCandidate]:
-        """Our gathered ICE candidates for the SDP ``a=candidate`` lines."""
-        return self._ice.local_candidates
+    def ice_candidates(self) -> list[SdpIceCandidate]:
+        """Our gathered ICE candidates as SDP candidates for the ``a=candidate`` lines.
+
+        The ICE layer's :class:`hermes_voip.media.ice.IceCandidate` (aioice shape:
+        ``host``/``type``) is reconciled to the SDP layer's
+        :class:`hermes_voip.sdp.IceCandidate` (``address``/``typ`` + ``render()``)
+        via the canonical SDP ``a=candidate`` string both agree on — the integration
+        point the ICE module flags (its ``to_sdp`` ↔ sdp's ``parse``).
+        """
+        return [
+            SdpIceCandidate.parse(cand.to_sdp()) for cand in self._ice.local_candidates
+        ]
 
     @property
     def ice(self) -> _IcePipe:
@@ -251,7 +261,7 @@ class WebRtcMediaSession:
         peer_fingerprint: Fingerprint,
         peer_ice_ufrag: str,
         peer_ice_pwd: str,
-        peer_candidates: Sequence[IceCandidate] = (),
+        peer_candidates: Sequence[SdpIceCandidate] = (),
     ) -> tuple[SrtpSession, SrtpSession]:
         """Run ICE connectivity + the DTLS handshake, returning the SRTP pair.
 
@@ -280,9 +290,12 @@ class WebRtcMediaSession:
             raise RuntimeError(msg)
 
         # Apply the peer's ICE credentials + candidates (non-trickle: all up front).
+        # The peer's candidates come from the parsed offer as SDP candidates
+        # (``address``/``typ``); reconcile each to the ICE layer's candidate
+        # (``host``/``type``) via the canonical ``a=candidate`` string both agree on.
         self._ice.set_remote_credentials(peer_ice_ufrag, peer_ice_pwd)
         for cand in peer_candidates:
-            await self._ice.add_remote_candidate(cand)
+            await self._ice.add_remote_candidate(IceCandidate.from_sdp(cand.render()))
         await self._ice.add_remote_candidate(None)  # end-of-candidates
 
         # Run ICE connectivity checks (nominates a pair; raises on failure).

@@ -35,6 +35,8 @@ from hermes_voip.media.opus import OPUS_FRAME_SAMPLES, OpusDecoder, OpusEncoder
 
 _OPUS_SAMPLE_RATE = 48_000
 _OPUS_RTP_CLOCK = 48_000
+# Inbound conversational pipeline runs at 16 kHz (Silero VAD cap; ADR-0032).
+_OPUS_ANALYSIS_RATE = 16_000
 _PTIME_MS = 20
 _SAMPLES_PER_FRAME = (_OPUS_SAMPLE_RATE * _PTIME_MS) // 1000  # 960
 _RTP_TS_PER_FRAME = (_OPUS_RTP_CLOCK * _PTIME_MS) // 1000  # 960
@@ -61,7 +63,7 @@ class _SendRecorder:
 @contextlib.contextmanager
 def _capture_sends(engine: RtpMediaTransport) -> Iterator[_SendRecorder]:
     recorder = _SendRecorder()
-    engine._transport = recorder  # type: ignore[assignment]  # narrow stand-in for sendto/close
+    engine._transport = recorder  # _SendRecorder satisfies the _DatagramSink seam
     try:
         yield recorder
     finally:
@@ -108,9 +110,14 @@ def test_codec_for_encoding_maps_opus() -> None:
         codec_for_encoding("opus", 8_000)
 
 
-def test_inbound_sample_rate_is_48k_for_opus() -> None:
-    """A WebRTC/Opus call delivers inbound audio at the native 48 kHz."""
-    assert _new_engine().inbound_sample_rate == _OPUS_SAMPLE_RATE
+def test_inbound_sample_rate_is_analysis_rate_for_opus() -> None:
+    """Inbound Opus is delivered at the 16 kHz analysis rate, not the 48 kHz wire.
+
+    Silero VAD accepts only 8/16 kHz, so the engine downsamples decoded 48 kHz Opus
+    to 16 kHz for the VAD/endpointer/STT pipeline (ADR-0032). The wire/encode rate
+    stays 48 kHz (asserted by the send tests).
+    """
+    assert _new_engine().inbound_sample_rate == _OPUS_ANALYSIS_RATE
 
 
 @pytest.mark.asyncio
@@ -139,8 +146,8 @@ async def test_send_audio_emits_opus_rtp_decodable_back() -> None:
 
 
 @pytest.mark.asyncio
-async def test_inbound_opus_packet_decodes_to_48k_pcm_frame() -> None:
-    """An inbound Opus RTP packet is decoded to a 48 kHz PcmFrame by the engine."""
+async def test_inbound_opus_packet_decodes_to_analysis_rate_pcm_frame() -> None:
+    """An inbound Opus RTP packet decodes + downsamples to a 16 kHz analysis frame."""
     engine = _new_engine()
     await engine.connect()
     engine_port = engine.local_port
@@ -168,8 +175,12 @@ async def test_inbound_opus_packet_decodes_to_48k_pcm_frame() -> None:
         await engine.stop()
 
     assert frame is not None
-    assert frame.sample_rate == _OPUS_SAMPLE_RATE
-    assert len(frame.samples) == OPUS_FRAME_SAMPLES * 2
+    # Downsampled 48 kHz -> 16 kHz analysis rate: 960 samples become 320 (640 bytes).
+    assert frame.sample_rate == _OPUS_ANALYSIS_RATE
+    expected_analysis_samples = (
+        OPUS_FRAME_SAMPLES * _OPUS_ANALYSIS_RATE // _OPUS_SAMPLE_RATE
+    )
+    assert len(frame.samples) == expected_analysis_samples * 2
 
 
 def socket_send(port: int, data: bytes) -> socket.socket:

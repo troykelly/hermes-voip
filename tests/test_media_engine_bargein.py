@@ -84,7 +84,7 @@ async def _new_engine(codec: Codec) -> tuple[RtpMediaTransport, _CapturingTransp
     )
     await engine.connect()
     recorder = _CapturingTransport()
-    engine._transport = recorder  # type: ignore[assignment]  # recorder satisfies sendto/close/is_closing
+    engine._transport = recorder  # recorder satisfies the _DatagramSink seam
     return engine, recorder
 
 
@@ -314,7 +314,7 @@ async def test_flush_outbound_after_real_pacing_keeps_rtp_seq_monotonic(
     )
     await engine.connect()
     recorder = _CapturingTransport()
-    engine._transport = recorder  # type: ignore[assignment]  # recorder satisfies sendto/close/is_closing
+    engine._transport = recorder  # recorder satisfies the _DatagramSink seam
 
     rate = _G722_RATE if codec is Codec.G722 else _G711_RATE
     spf = _G722_SAMPLES_PER_FRAME if codec is Codec.G722 else _G711_SAMPLES_PER_FRAME

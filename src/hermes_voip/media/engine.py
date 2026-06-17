@@ -211,43 +211,67 @@ _ENGINE_CODEC_TABLE: Final[dict[tuple[str, int], Codec]] = {
 }
 
 
+# Opus's wire/encode rate is 48 kHz, but the inbound CONVERSATIONAL pipeline (Silero
+# VAD + endpointer + STT) runs at 16 kHz: Silero VAD accepts only 8 kHz or 16 kHz, so
+# 48 kHz inbound is downsampled to 16 kHz before the pipeline sees it (ADR-0032). The
+# wideband content is preserved (16 kHz >> the 8 kHz G.711 path). 16 kHz reuses
+# G.722's analysis rate exactly, so VAD/endpoint/barge-in/STT bookkeeping is unchanged.
+_OPUS_ANALYSIS_RATE: Final[int] = 16_000
+
+
 @dataclass(frozen=True, slots=True)
 class _CodecDescriptor:
     """Per-codec rate facts that drive the engine's RTP/resample bookkeeping.
 
-    Centralises the two rates that differ per codec (and, for G.722, differ from
-    EACH OTHER): the ``wire_sample_rate`` is the rate of the PCM the codec
-    encodes/decodes (8 kHz G.711, 16 kHz G.722) and the rate frames are delivered
-    at (``inbound_sample_rate``) + the rate TTS frames are resampled to before
-    encoding; the ``rtp_clock_rate`` is the RTP timestamp clock (8 kHz for both
-    G.711 and G.722 — RFC 3551 §4.5.2 fixes G.722's clock at 8000 despite the
-    16 kHz audio). The RTP timestamp increment per packet is derived from
-    ``rtp_clock_rate``, the wire chunk size from ``wire_sample_rate`` — so the
-    8000-clock/16000-sample split is handled in ONE place.
+    Centralises the rates that differ per codec (and, for G.722/Opus, differ from
+    EACH OTHER):
+
+    * ``wire_sample_rate`` — the rate of the PCM the codec encodes/decodes (8 kHz
+      G.711, 16 kHz G.722, 48 kHz Opus) and the rate TTS frames are resampled to
+      before encoding (the outbound/encode rate).
+    * ``rtp_clock_rate`` — the RTP timestamp clock (8 kHz for G.711 AND G.722 — RFC
+      3551 §4.5.2 fixes G.722's clock at 8000 despite the 16 kHz audio; 48 kHz for
+      Opus per RFC 7587). The RTP timestamp increment per packet derives from this.
+    * ``analysis_sample_rate`` — the rate the INBOUND conversational pipeline (VAD,
+      endpointer, STT) runs at, i.e. the rate :meth:`inbound_audio` delivers and
+      :attr:`inbound_sample_rate` reports. Equals ``wire_sample_rate`` for G.711 and
+      G.722 (decode delivers the wire PCM directly). For Opus it is 16 kHz, NOT the
+      48 kHz wire rate: Silero VAD accepts only 8/16 kHz, so decoded 48 kHz Opus is
+      downsampled to 16 kHz for the pipeline (the wideband content survives). This is
+      the one place the wire/encode rate and the analysis/decode-delivery rate split.
     """
 
     wire_sample_rate: int
     rtp_clock_rate: int
+    analysis_sample_rate: int
 
 
 # One descriptor per runnable Codec. Exhaustive: every Codec has an entry, so the
 # engine never falls back to a hardcoded rate literal on any codec path.
 _CODEC_DESCRIPTORS: Final[dict[Codec, _CodecDescriptor]] = {
     Codec.PCMU: _CodecDescriptor(
-        wire_sample_rate=G711_SAMPLE_RATE, rtp_clock_rate=G711_SAMPLE_RATE
+        wire_sample_rate=G711_SAMPLE_RATE,
+        rtp_clock_rate=G711_SAMPLE_RATE,
+        analysis_sample_rate=G711_SAMPLE_RATE,
     ),
     Codec.PCMA: _CodecDescriptor(
-        wire_sample_rate=G711_SAMPLE_RATE, rtp_clock_rate=G711_SAMPLE_RATE
+        wire_sample_rate=G711_SAMPLE_RATE,
+        rtp_clock_rate=G711_SAMPLE_RATE,
+        analysis_sample_rate=G711_SAMPLE_RATE,
     ),
     Codec.G722: _CodecDescriptor(
-        wire_sample_rate=G722_SAMPLE_RATE, rtp_clock_rate=G722_RTP_CLOCK_RATE
+        wire_sample_rate=G722_SAMPLE_RATE,
+        rtp_clock_rate=G722_RTP_CLOCK_RATE,
+        analysis_sample_rate=G722_SAMPLE_RATE,
     ),
-    # Opus (ADR-0032): the wire PCM rate AND the RTP clock are both 48 kHz — unlike
-    # G.722 they coincide, so a 20 ms frame is 960 samples and the RTP timestamp
-    # advances by 960. The engine's rate-follows-codec machinery then carries Opus
-    # with no special-casing (TTS resamples to 48 kHz; STT gets native 48 kHz).
+    # Opus (ADR-0032): wire/encode + RTP clock are both 48 kHz (RFC 7587 — unlike
+    # G.722 they coincide, so a 20 ms frame is 960 samples and the timestamp advances
+    # 960). The inbound pipeline runs at 16 kHz (Silero VAD's cap), so decoded 48 kHz
+    # Opus is downsampled to 16 kHz; outbound TTS is resampled up to 48 kHz to encode.
     Codec.OPUS: _CodecDescriptor(
-        wire_sample_rate=OPUS_SAMPLE_RATE, rtp_clock_rate=OPUS_RTP_CLOCK_RATE
+        wire_sample_rate=OPUS_SAMPLE_RATE,
+        rtp_clock_rate=OPUS_RTP_CLOCK_RATE,
+        analysis_sample_rate=_OPUS_ANALYSIS_RATE,
     ),
 }
 
@@ -782,6 +806,13 @@ class RtpMediaTransport:
         # already-at-wire-rate frames bypass it entirely.
         self._tx_resamplers: dict[int, Resampler] = {}
 
+        # Inbound rate reconciliation (ADR-0032): when the codec's wire/decode rate
+        # exceeds the analysis rate (Opus: decode 48 kHz, deliver 16 kHz to the VAD/
+        # STT), a state-carrying Resampler downsamples each decoded frame. ``None``
+        # for G.711/G.722 (wire rate == analysis rate, no downsample). Created lazily
+        # in _decode on the first Opus frame; reset in connect().
+        self._rx_resampler: Resampler | None = None
+
         # G.722 codec state (ADR-0022): the sub-band ADPCM predictor + QMF history
         # are stateful across packets, so one encoder/decoder lives per call and is
         # reset in connect(). Lazily created (only when the negotiated codec is
@@ -910,6 +941,8 @@ class RtpMediaTransport:
         # Drop any carried outbound-resample state so a reused engine starts a
         # fresh stream (no stale sub-sample phase from a previous call).
         self._tx_resamplers = {}
+        # Drop the inbound downsample state too (ADR-0032 Opus 48->16 kHz path).
+        self._rx_resampler = None
         # Reset the G.722 codec state so a reused engine starts with a fresh
         # predictor/QMF history (a stale predictor would corrupt the start of the
         # new call). It is (re)created lazily by _encode/_decode on first use —
@@ -1762,14 +1795,24 @@ class RtpMediaTransport:
         return self._descriptor.rtp_clock_rate
 
     @property
-    def inbound_sample_rate(self) -> int:
-        """Rate of frames from :meth:`inbound_audio` — the codec's audio sample rate.
+    def _analysis_sample_rate(self) -> int:
+        """The inbound conversational-pipeline rate (VAD/endpointer/STT delivery).
 
-        8000 Hz for G.711, 16000 Hz for G.722 (ADR-0022). The STT path reads this
-        so a G.722 call feeds the recogniser native 16 kHz audio (no upsample from
-        8 kHz), and the VAD/endpointer build at this rate.
+        Equals the wire rate for G.711 (8 kHz) and G.722 (16 kHz); for Opus it is
+        16 kHz, NOT the 48 kHz wire rate (Silero VAD's 8/16 kHz cap — ADR-0032).
         """
-        return self._wire_sample_rate
+        return self._descriptor.analysis_sample_rate
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        """Rate of frames from :meth:`inbound_audio` — the conversational analysis rate.
+
+        8000 Hz for G.711, 16000 Hz for G.722 (ADR-0022), 16000 Hz for Opus
+        (ADR-0032: downsampled from the 48 kHz wire because Silero VAD accepts only
+        8/16 kHz). The STT path reads this so the recogniser, VAD, and endpointer all
+        build at this rate.
+        """
+        return self._analysis_sample_rate
 
     # ------------------------------------------------------------------
     # CallMedia Protocol
@@ -2056,15 +2099,17 @@ class RtpMediaTransport:
         )
 
     def _decode(self, payload: bytes, ts_ns: int) -> PcmFrame:
-        """Decode an RTP payload to a PcmFrame at the codec's wire rate.
+        """Decode an RTP payload to a PcmFrame at the codec's ANALYSIS rate.
 
-        G.711 (PCMU/PCMA) decodes to 8 kHz; G.722 decodes via the per-call
-        stateful :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz; Opus
-        decodes via the per-call stateful
-        :class:`~hermes_voip.media.opus.OpusDecoder` to 48 kHz (ADR-0032). Each
-        wideband decoder is created lazily on first use so an outbound call that
-        connects as a PCMU placeholder then re-negotiates still gets a fresh one,
-        and the default no-webrtc path never imports opuslib.
+        G.711 (PCMU/PCMA) decodes to 8 kHz; G.722 decodes via the per-call stateful
+        :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz; Opus decodes via the
+        per-call stateful :class:`~hermes_voip.media.opus.OpusDecoder` to 48 kHz and
+        is then DOWNSAMPLED to the 16 kHz analysis rate (ADR-0032 — Silero VAD accepts
+        only 8/16 kHz), via a state-carrying resampler so a continuous stream converts
+        click-free. For G.711/G.722 the wire rate equals the analysis rate, so no
+        resample runs. Each wideband decoder is created lazily on first use so an
+        outbound call that connects as a PCMU placeholder then re-negotiates still gets
+        a fresh one, and the default no-webrtc path never imports opuslib.
         """
         if self._codec is Codec.G722:
             if self._g722_decoder is None:
@@ -2077,14 +2122,30 @@ class RtpMediaTransport:
         if self._codec is Codec.OPUS:
             if self._opus_decoder is None:
                 self._opus_decoder = _new_opus_decoder()
+            decoded = self._opus_decoder.decode(payload)  # 48 kHz PCM16
             return PcmFrame(
-                samples=self._opus_decoder.decode(payload),
-                sample_rate=OPUS_SAMPLE_RATE,
+                samples=self._downsample_to_analysis(decoded, OPUS_SAMPLE_RATE),
+                sample_rate=self._analysis_sample_rate,
                 monotonic_ts_ns=ts_ns,
             )
         if self._codec is Codec.PCMU:
             return ulaw_to_frame(payload, monotonic_ts_ns=ts_ns)
         return alaw_to_frame(payload, monotonic_ts_ns=ts_ns)
+
+    def _downsample_to_analysis(self, pcm: bytes, decoded_rate: int) -> bytes:
+        """Resample decoded ``pcm`` from ``decoded_rate`` to the analysis rate.
+
+        A no-op when the decoded rate already equals the analysis rate (G.711/G.722).
+        For Opus (48 kHz decoded, 16 kHz analysis) a per-call state-carrying
+        :class:`~hermes_voip.media.audio.Resampler` downsamples each frame so the
+        continuous inbound stream is click-free (ADR-0032).
+        """
+        analysis_rate = self._analysis_sample_rate
+        if decoded_rate == analysis_rate:
+            return pcm
+        if self._rx_resampler is None:
+            self._rx_resampler = Resampler(decoded_rate, analysis_rate)
+        return self._rx_resampler.resample(pcm)
 
     def _encode(self, frame: PcmFrame) -> bytes:
         """Encode a wire-rate PcmFrame to an RTP payload for the codec.

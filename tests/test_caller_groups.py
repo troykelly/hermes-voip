@@ -919,3 +919,29 @@ def test_caller_group_config_snapshots_groups_against_post_construction_mutation
     # STILL level 0, unaffected by the post-construction mutation.
     cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
     assert cls.group.privilege_level == 0
+
+
+def test_caller_group_config_rejects_duplicate_group_names() -> None:
+    """Duplicate group names must be refused at construction (no level-0/level-3 split).
+
+    Cross-vendor re-review (codex, PR #83) found a duplicate-name bypass: with two
+    groups sharing a name (a level-0 receptionist FIRST, a level-3 receptionist
+    SECOND), ``__post_init__``'s linear ``next(...)`` default check matches the
+    first (level 0, passes), but ``classify_caller_group`` builds
+    ``{g.name: g for g in groups}`` which keeps the LAST (level 3) — so an unmatched
+    caller is classified level 3. The two resolutions disagree. Rejecting duplicate
+    names at construction (matching the JSON loader and the documented name-unique
+    invariant) removes the ambiguity, so neither path can pick a privileged default.
+    """
+    with pytest.raises(ConfigError, match="unique"):
+        CallerGroupConfig(
+            groups=(
+                CallerGroup("receptionist", 0, "receptionist", False),
+                # MISTAKE/attack: a second group with the SAME name, escalated.
+                CallerGroup("receptionist", 3, "assistant", False),
+            ),
+            group_lists={"receptionist": ()},
+            default_group="receptionist",
+            match_order=("receptionist",),
+            normalization=Normalization.E164,
+        )

@@ -208,6 +208,14 @@ class BargeInGate:
         # True once a barge-in has fired for the current run, so the same run does
         # not re-fire on every later window (which would spam barge_in()).
         self._fired_for_run = False
+        # True iff the MOST RECENT speech run was an authorised (real) barge-in.
+        # Unlike ``_fired_for_run`` (cleared on OFFSET so the gate can re-arm),
+        # this PERSISTS through the run's trailing silence — the endpointer fires
+        # its end-of-turn there, and ``delivery_suppressed`` consults this to drop
+        # an unauthorised echo turn. Reset only on a NEW onset (a fresh run is
+        # unauthorised until it earns a barge-in), so authorisation never leaks
+        # across runs.
+        self._last_run_authorised = False
 
     def tts_active(self, active: bool) -> None:
         """Record whether the agent's TTS is currently playing.
@@ -247,7 +255,15 @@ class BargeInGate:
         if event.edge is SpeechEdge.ONSET:
             self._onset_window = event.frame_index
             self._fired_for_run = False
+            # A fresh run is unauthorised until it earns a barge-in: clear the
+            # persisted authorisation so the prior run's verdict cannot leak into
+            # this one (e.g. an authorised interruption followed by a short echo
+            # blip must still have its blip-turn suppressed).
+            self._last_run_authorised = False
         else:  # SpeechEdge.OFFSET — voicing stopped; the candidate run ends.
+            # Clear only the live-run state so the gate can re-arm; KEEP
+            # ``_last_run_authorised`` so the endpointer's end-of-turn on the
+            # trailing silence still knows whether this run was a real barge-in.
             self._onset_window = None
             self._fired_for_run = False
 
@@ -268,15 +284,37 @@ class BargeInGate:
         if self.mode is BargeInMode.FULL or not self._armed(current_window):
             # Immediate barge-in: any onset interrupts (full mode, or gated while
             # the agent is silent — nothing to echo).
-            self._fired_for_run = True
-            return True
+            return self._fire()
         # Gated + armed: require a SUSTAINED run. Inclusive of the onset window,
         # ``current_window - onset + 1`` windows have been voiced.
         voiced_windows = current_window - self._onset_window + 1
         if voiced_windows >= self._min_voiced_windows:
-            self._fired_for_run = True
-            return True
+            return self._fire()
         return False
+
+    def _fire(self) -> bool:
+        """Latch the barge-in for the current run and authorise its turn."""
+        self._fired_for_run = True
+        self._last_run_authorised = True
+        return True
+
+    def delivery_suppressed(self, current_window: int) -> bool:
+        """Whether an end-of-turn at this window is unauthorised echo to be dropped.
+
+        Even when a short echo blip does not fire ``should_barge_in`` (so it never
+        cancels the TTS), the endpointer still fires an end-of-turn on the echo's
+        trailing silence and the recogniser's final fragment would be delivered to
+        the agent as a caller turn — re-triggering an interrupt. The call loop
+        calls this when the endpointer fires; it returns ``True`` (drop the turn)
+        while the gate is armed (the agent's TTS is playing, or within the echo
+        tail) AND the most-recent speech run was NOT an authorised barge-in.
+
+        A genuine sustained interruption authorises its run (``should_barge_in``
+        fired and also cancelled the TTS, so the agent is no longer speaking),
+        so its transcript is delivered. Outside playout/tail nothing is
+        suppressed — normal caller turns during silence always deliver.
+        """
+        return self._armed(current_window) and not self._last_run_authorised
 
 
 class _ToneStream:
@@ -580,12 +618,28 @@ class CallLoop:
                     # delivered as an end-of-turn. Each increment is consumed by
                     # exactly one decrement in _asr (W2 fix: int counter counts
                     # fires; Event is boolean and loses duplicates).
-                    _eot_count += 1
-                    _log.info(
-                        "pump: end-of-turn at window %d (frames=%d)",
-                        window_index,
-                        frames_received,
-                    )
+                    #
+                    # Echo-robust turn gate (ADR-0022, codex finding #1): while the
+                    # agent's TTS is playing (or in the tail) and the just-ended
+                    # speech run was NOT an authorised barge-in, this end-of-turn is
+                    # the gateway's echo of the agent's own speech — suppress it so
+                    # the echoed fragment is never delivered to the agent as a
+                    # caller turn (the second self-interruption route). A genuine
+                    # sustained interruption authorised its run (and cancelled the
+                    # TTS), so it is delivered normally.
+                    if self._barge_in_gate.delivery_suppressed(latest_vad_window):
+                        _log.debug(
+                            "pump: end-of-turn at window %d SUPPRESSED "
+                            "(echo during TTS playout)",
+                            window_index,
+                        )
+                    else:
+                        _eot_count += 1
+                        _log.info(
+                            "pump: end-of-turn at window %d (frames=%d)",
+                            window_index,
+                            frames_received,
+                        )
                 window_index += 1
                 frames_received += 1
                 if frames_received % 50 == 0:

@@ -152,7 +152,11 @@ _BARGE_IN_MIN_SPEECH_MS_KEY = "HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS"
 _BARGE_IN_TAIL_MS_KEY = "HERMES_VOIP_BARGE_IN_TAIL_MS"
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
-_DEFAULT_BARGE_IN_MIN_SPEECH_MS = 400
+# 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
+# burst (~15 windows ≈ 480 ms in the live log), with margin, so echo never
+# reaches the sustained-barge-in threshold while a real interruption (which
+# sustains well beyond 600 ms) still does.
+_DEFAULT_BARGE_IN_MIN_SPEECH_MS = 600
 _DEFAULT_BARGE_IN_TAIL_MS = 250
 
 # Symmetric-RTP (comedia) latching for NAT traversal (ADR-0005 §NAT). When on

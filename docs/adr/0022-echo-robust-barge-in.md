@@ -38,7 +38,16 @@ bursts are 2–15 VAD windows (~64–480 ms) and are repeatedly punctuated by OF
 agent's speech ebbs and the reflected energy dips below the exit threshold. A genuine human
 interruption is **sustained**: a person who means to cut in keeps talking for several hundred
 milliseconds continuously. That difference — *sustained continuous voicing* vs *short broken
-blips* — is separable without an AEC.
+blips* — is separable without an AEC, **provided the sustained threshold is set above the
+longest observed echo burst** (≈15 windows ≈ 480 ms in the live log) with margin.
+
+**Two echo routes, not one.** Echo can self-interrupt the agent by *two* independent paths,
+and both must be closed: (1) a VAD speech ONSET cancels the agent's TTS (barge-in); and (2)
+the echo is *transcribed* and the endpointer fires an end-of-turn on its trailing silence, so
+the echoed fragment is **delivered to the agent as a caller turn** — which itself starts a new
+agent turn (the live log's `asr: delivering turn 'NO'` immediately followed by
+`reason=interrupted_during_api_call`). Gating only the barge-in (route 1) leaves route 2 open,
+so the gate must *also* suppress the turn delivery for unauthorised echo.
 
 ## Decision
 
@@ -63,11 +72,21 @@ gate, while armed (TTS playing or in the tail), records the window ordinal of a 
 and then, on each subsequent processed window, checks how many **consecutive** voiced windows
 have elapsed since that onset. It fires the barge-in once that count reaches
 `barge_in_min_voiced_windows` (derived by rounding **up** from
-`HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS`, default **400 ms** → 13 windows at 8 kHz). An OFFSET
-before the threshold disarms the pending onset (the blip is dismissed). A new ONSET re-arms.
-The VAD exposes a read-only `window_index` so the gate can measure the run live (mid-run),
-not only at the next edge — so a continuous interruption fires promptly at the threshold rather
-than waiting for the caller to pause.
+`HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS`, default **600 ms** → 19 windows at 8 kHz — above the
+≈15-window longest observed echo burst, with margin). An OFFSET before the threshold disarms
+the pending onset (the blip is dismissed). A new ONSET re-arms. The VAD exposes a read-only
+`window_index` so the gate can measure the run live (mid-run), not only at the next edge — so
+a continuous interruption fires promptly at the threshold rather than waiting for the caller to
+pause.
+
+**Suppressing echo turn delivery (route 2).** While the gate is armed and the most-recent
+speech run was **not** an authorised barge-in, the call loop **suppresses the endpointer's
+end-of-turn** for that run (it does not increment the end-of-turn counter the ASR consumes), so
+the echoed fragment is never delivered as a caller turn. The gate tracks a per-run
+"authorised" flag that is set when a barge-in fires and **persists through the run's trailing
+silence** (where the endpointer fires), and is reset only on the *next* ONSET — so
+authorisation never leaks across runs, and an authorised sustained interruption (which also
+cancelled the TTS, leaving the agent silent) still delivers its transcript.
 
 **Playout tail.** Echo can lag the TTS by tens to a few hundred ms (jitter buffer + network),
 so the gate stays armed for `HERMES_VOIP_BARGE_IN_TAIL_MS` (default **250 ms**) of window
@@ -80,7 +99,7 @@ All thresholds are configurable with telephony-sensible defaults, parsed in `con
 | Env var | `MediaConfig` field | Default | Meaning |
 | --- | --- | --- | --- |
 | `HERMES_VOIP_BARGE_IN_MODE` | `barge_in_mode` | `gated` | `off` \| `gated` \| `full` |
-| `HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS` | `barge_in_min_speech_ms` | `400` | Min sustained voiced run (ms) to barge in during playout/tail |
+| `HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS` | `barge_in_min_speech_ms` | `600` | Min sustained voiced run (ms) to barge in / deliver a turn during playout/tail |
 | `HERMES_VOIP_BARGE_IN_TAIL_MS` | `barge_in_tail_ms` | `250` | How long after TTS ends the gate stays armed (ms) |
 
 **Defense-in-depth — drop our own SSRC.** Independently of the echo gate, the media engine
@@ -93,11 +112,12 @@ is logged once per call at DEBUG with the offending SSRC.
 
 ## Consequences
 
-- The self-interruption loop is removed: short echo blips during the agent's turn no longer
-  end the turn. Verified by deterministic tests (`tests/test_call_loop.py`,
-  `tests/test_barge_in_gate.py`, `tests/test_media_engine_ssrc_drop`): echo-shaped broken runs
-  during playout do **not** barge in; a sustained run **does**; normal end-of-turn delivery
-  during silence is unchanged.
+- The self-interruption loop is removed on **both** routes: short echo blips during the agent's
+  turn no longer cancel the TTS (route 1) **and** are no longer delivered to the agent as a
+  caller turn (route 2). Verified by deterministic tests (`tests/test_call_loop.py`,
+  `tests/test_barge_in_gate.py`, `tests/test_media_engine.py`): echo-shaped broken runs during
+  playout do **not** barge in and deliver **no** turn; a sustained run **does** barge in and its
+  turn **is** delivered; normal end-of-turn delivery during silence is unchanged.
 - Genuine barge-in is preserved (a sustained interruption still stops the agent) — the
   capability ADR-0008 deferred is now delivered in its `gated` form, without an AEC.
 - `gated` adds up to `barge_in_min_speech_ms` of latency to an *intentional* barge-in **during

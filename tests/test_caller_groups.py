@@ -776,3 +776,61 @@ def test_legacy_persona_preamble_still_works() -> None:
     assert "receptionist" in persona_preamble(CallerMode.GREY).lower()
     with pytest.raises(ValueError, match="DENY"):
         persona_preamble(CallerMode.DENY)
+
+
+# ===========================================================================
+# Security invariants (BLOCKED findings from cross-vendor review — ADR-0021)
+# ===========================================================================
+
+
+def test_load_caller_groups_rejects_privileged_default_group(
+    tmp_path: Path,
+) -> None:
+    """BLOCKED-1 fix: default_group with privilege_level > 0 must raise ConfigError.
+
+    An operator who accidentally sets default_group to a privileged group would
+    silently grant operator-level privilege to every unmatched (unknown) caller.
+    The loader must reject this at startup with a clear error.
+    """
+    groups_file = _write_groups_json(
+        tmp_path,
+        {
+            "groups": [
+                {
+                    "name": "operator",
+                    "privilege_level": 3,
+                    "persona": "assistant",
+                    "declined_at_sip": False,
+                },
+                {
+                    "name": "receptionist",
+                    "privilege_level": 0,
+                    "persona": "receptionist",
+                    "declined_at_sip": False,
+                },
+            ],
+            "lists": {"operator": [_OPERATOR_NUMBER], "receptionist": []},
+            # MISTAKE: setting the privileged "operator" group as the default.
+            "default_group": "operator",
+            "match_order": ["operator", "receptionist"],
+            "normalization": "e164",
+        },
+    )
+    with pytest.raises(ConfigError, match="privilege_level"):
+        load_caller_groups({"HERMES_VOIP_CALLER_GROUPS_FILE": str(groups_file)})
+
+
+def test_load_caller_groups_legacy_rejects_empty_privileged_group(
+    tmp_path: Path,
+) -> None:
+    """BLOCKED-2 fix: legacy 3-file path also rejects privileged group with no patterns.
+
+    If HERMES_VOIP_CALLER_ALLOW_FILE is set but the file contains no patterns,
+    the synthesised "operator" group (privilege_level=3) has no patterns —
+    almost certainly a typo. The loader must fail loudly at startup.
+    """
+    # Create an empty allow-file (valid JSON but no patterns).
+    allow_file = tmp_path / ".caller-allow.json"
+    allow_file.write_text(json.dumps({"patterns": []}), encoding="utf-8")
+    with pytest.raises(ConfigError, match="privilege_level"):
+        load_caller_groups({"HERMES_VOIP_CALLER_ALLOW_FILE": str(allow_file)})

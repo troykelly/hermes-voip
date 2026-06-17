@@ -685,6 +685,29 @@ def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
         "blocked": deny,
     }
 
+    # Security: same invariant as _parse_groups_document — a privileged group
+    # with no patterns is almost certainly a typo. But only raise when the
+    # operator ACTIVELY CONFIGURED the file path (the env var is SET); an
+    # unset var means "no allow list" which is valid (everyone is receptionist).
+    # A SET var that produces an empty list means the file is missing entries
+    # or was cleared — that is almost certainly a misconfiguration.
+    _privileged_file_keys = {
+        "operator": _ALLOW_FILE_KEY,
+        # "receptionist" is level-0; "blocked" is declined — no check needed.
+    }
+    for g in groups:
+        if g.privilege_level < _MIN_LEVEL_ELEVATED:
+            continue
+        env_key = _privileged_file_keys.get(g.name)
+        if env_key and env.get(env_key, "").strip() and not group_lists.get(g.name):
+            msg = (
+                f"caller-group {g.name!r} has privilege_level={g.privilege_level}"
+                f" (>= 2) but its pattern list is empty — configured via"
+                f" {env_key!r}. A privileged group with no patterns is almost"
+                " certainly a typo. Add at least one pattern or unset the var."
+            )
+            raise ConfigError(msg)
+
     # PII-safe summary: counts only, never the patterns.
     _log.info(
         "caller-groups (legacy 3-file): operator=%d blocked=%d receptionist=%d "
@@ -824,6 +847,19 @@ def _parse_groups_document(  # noqa: PLR0912,PLR0915 — sequential validation o
         msg = (
             f"{_GROUPS_FILE_KEY}: default_group={default_group!r} does not name "
             "a group in 'groups'"
+        )
+        raise ConfigError(msg)
+    # Security: the default group (catch-all for unmatched callers) MUST have
+    # privilege_level=0. An operator mistake that sets default_group to a
+    # privileged group would silently grant operator-level privilege to every
+    # unmatched caller — a systemic privilege-escalation defect.
+    _default_level = group_by_name[default_group].privilege_level
+    if _default_level != 0:
+        msg = (
+            f"{_GROUPS_FILE_KEY}: default_group={default_group!r} has "
+            f"privilege_level={_default_level} but must be 0 — the default "
+            "group is the catch-all for unmatched callers and must be "
+            "unprivileged (receptionist)."
         )
         raise ConfigError(msg)
 

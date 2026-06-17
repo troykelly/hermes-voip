@@ -1792,18 +1792,25 @@ async def test_full_mode_short_blip_barges_in_legacy_behaviour() -> None:
 
 
 class _DrainThenFinalASR:
-    """ASR fake that drains ALL inbound audio, THEN yields one endpointer-style final.
+    """ASR fake that drains the audio it RECEIVES, then yields one final per turn.
 
-    Mirrors the sherpa ASR: it consumes the whole audio stream and yields a single
-    ``is_final`` transcript with ``end_of_turn=False`` (the endpointer owns the
-    turn boundary). Because the final is emitted only after every frame is drained,
-    the endpointer has already fired its end-of-turn by then — so whether the turn
-    is delivered depends solely on whether the pump suppressed the endpointer's EOT
-    for unauthorised echo. This makes the suppression the deterministic variable.
+    Mirrors a streaming ASR: it consumes the audio stream and yields ``is_final``
+    transcripts. ``end_of_turn`` is configurable — ``False`` models the sherpa ASR
+    (the endpointer owns the boundary; ADR-0008), ``True`` models a fused engine
+    like Deepgram Flux that sets the turn boundary natively. Because the final is
+    emitted only after the audio it gets is drained, the test makes the *delivery
+    suppression* the deterministic variable.
+
+    Crucially it only ever sees the frames the pump actually FORWARDS — echo that
+    the pump drops from the ASR input never reaches here, so an echo transcript is
+    never produced on EITHER end-of-turn path. It records how many frames it drew
+    so a test can assert the pump withheld the echo.
     """
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, end_of_turn: bool = False) -> None:
         self._text = text
+        self._end_of_turn = end_of_turn
+        self.frames_drained = 0
 
     @property
     def input_sample_rate(self) -> int:
@@ -1811,12 +1818,13 @@ class _DrainThenFinalASR:
 
     def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
         text = self._text
+        end_of_turn = self._end_of_turn
 
         async def _gen() -> AsyncIterator[Transcript]:
-            async for _frame in audio:  # drain the whole stream first
-                pass
+            async for _frame in audio:  # drain only the frames the pump forwards
+                self.frames_drained += 1
             yield Transcript(
-                text=text, is_final=True, end_of_turn=False, confidence=1.0
+                text=text, is_final=True, end_of_turn=end_of_turn, confidence=1.0
             )
 
         return _gen()
@@ -1912,6 +1920,162 @@ async def test_gated_normal_turn_during_silence_still_delivered() -> None:
     )
     await asyncio.wait_for(loop.run(), timeout=5.0)
     assert delivered == ["hello there"]
+
+
+@pytest.mark.asyncio
+async def test_gated_echo_with_native_asr_eot_delivers_no_turn() -> None:
+    """Echo during TTS must not deliver a turn even with a NATIVE-EOT ASR (codex #A).
+
+    A fused recogniser (e.g. Deepgram Flux) sets ``end_of_turn=True`` itself, which
+    ``_asr`` honours independently of the endpointer counter. Suppressing only the
+    endpointer EOT therefore would NOT stop echo from being delivered via a native
+    EOT. The robust fix withholds the echo audio from the ASR entirely while the
+    gate is armed and the run is unauthorised, so NO echo transcript is produced on
+    either path. Assert: no turn delivered, and the ASR drew far fewer frames than
+    were sent (the echo was withheld).
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    blip = [0.95] * 6 + [0.0] * 30
+    vad = _scripted_vad_8k(blip)
+    tts = _LongSlowGreetingTTS(n_frames=120)
+    transport = _ScriptedInboundTransport(len(blip))
+    asr = _DrainThenFinalASR("NO", end_of_turn=True)  # native EOT (Deepgram-style)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent is giving a long spoken answer here.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == [], (
+        "echo with a native-EOT ASR must not be delivered as a caller turn"
+    )
+    # The echo audio was withheld from the ASR (it saw far fewer than 36 frames).
+    assert asr.frames_drained < len(blip), (
+        "the pump must withhold echo frames from the ASR during TTS playout"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_sustained_barge_in_cancels_and_delivers_transcript() -> None:
+    """A sustained interruption during TTS both CANCELS the agent AND delivers.
+
+    Integrated proof (codex noted the cancel was tested but not the delivery): a
+    sustained caller run past the threshold cancels the playing greeting (barge-in)
+    AND its transcript is delivered as a caller turn — the run is authorised, so its
+    turn is not suppressed. A native-EOT ASR finalises the (authorised) turn.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    sustained = [0.95] * 30  # well past the 13-window threshold, no offset
+    vad = _scripted_vad_8k(sustained)
+    tts = _LongSlowGreetingTTS(n_frames=120)
+    transport = _ScriptedInboundTransport(len(sustained))
+    asr = _DrainThenFinalASR("please stop", end_of_turn=True)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent starts a long answer but the caller cuts in.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True, "sustained run must cancel the agent"
+    assert delivered == ["please stop"], (
+        "an authorised sustained interruption must deliver its transcript"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
+    """A real caller turn that authorises during the post-TTS tail delivers (codex #B).
+
+    The gate stays armed for a tail after TTS ends. A SUSTAINED run during that tail
+    must authorise itself and deliver its turn — it must not be suppressed as echo
+    just because TTS recently stopped. A LARGE tail (40 windows > the 13-window
+    threshold) is used so the run reaches its sustained threshold while still in the
+    tail: the pump must drive the gate's authorisation while armed (not only while
+    TTS is active), or the whole run is withheld from the ASR and nothing delivers.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # A short greeting (ends fast) arms a long tail; then a sustained caller run.
+    script = [0.0] * 3 + [0.95] * 30
+    vad = _scripted_vad_8k(script)
+    tts = _LongSlowGreetingTTS(n_frames=2)  # greeting ends fast → long tail follows
+    transport = _ScriptedInboundTransport(len(script))
+    asr = _DrainThenFinalASR("hello operator", end_of_turn=True)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="Hi.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=40,  # tail outlasts the threshold → authorise in tail
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == ["hello operator"], (
+        "a sustained real turn that authorises during the tail must be delivered"
+    )
 
 
 @pytest.mark.asyncio

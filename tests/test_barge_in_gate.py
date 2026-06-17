@@ -327,3 +327,25 @@ def test_full_mode_does_not_suppress_delivery() -> None:
     gate.should_barge_in(0)
     gate.on_event(_offset(3))
     assert gate.delivery_suppressed(10) is False
+
+
+def test_sustained_run_beginning_in_tail_authorises_and_is_not_suppressed() -> None:
+    """A sustained run that begins in the post-TTS tail authorises itself (codex #B).
+
+    The gate is armed during the tail, so a SUSTAINED run beginning there must be
+    allowed to barge in (and so deliver its turn): it must not be suppressed as
+    echo just because TTS recently stopped. The caller drives ``should_barge_in``
+    while armed (including the tail).
+    """
+    gate = _make_gate()
+    gate.tts_active(True)
+    gate.tts_active(False)
+    gate.tail_from(100)  # tail covers 100..107
+    # A sustained run begins inside the tail at window 101.
+    gate.on_event(_onset(101))
+    fired = False
+    for w in range(101, 101 + _MIN_WINDOWS + 2):
+        fired = fired or gate.should_barge_in(w)
+    assert fired is True, "a sustained run starting in the tail must barge in"
+    # …and because it is authorised, its end-of-turn must not be suppressed.
+    assert gate.delivery_suppressed(101 + _MIN_WINDOWS + 1) is False

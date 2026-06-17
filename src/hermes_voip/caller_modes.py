@@ -62,8 +62,10 @@ __all__ = [
     "CallerMode",
     "CallerModeConfig",
     "Normalization",
+    "caller_mode_config_to_groups",
     "classify_caller",
     "classify_caller_group",
+    "group_for_mode",
     "load_caller_groups",
     "load_caller_modes",
     "persona_preamble",
@@ -384,47 +386,96 @@ def classify_caller(raw_caller: str, cfg: CallerModeConfig) -> CallerClassificat
     ``cfg.default_mode`` (``GREY`` unless explicitly loosened).  The match is run
     against both the normalized and the raw forms.  Pure; runs once per call.
     """
-    groups_cfg = _mode_config_to_groups(cfg)
+    groups_cfg = caller_mode_config_to_groups(cfg)
     return classify_caller_group(raw_caller, groups_cfg)
 
 
-def _mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
-    """Convert an ADR-0020 CallerModeConfig to a CallerGroupConfig (internal)."""
+# The three canonical default groups the ADR-0020 modes map to (ADR-0021 §2).
+# Single source of truth for the legacy synthesis (load_caller_groups,
+# caller_mode_config_to_groups) and the mode→group back-compat shim
+# (group_for_mode): operator ↔ ALLOW, receptionist ↔ GREY/default, blocked ↔ DENY.
+_OPERATOR_GROUP = CallerGroup(
+    name="operator",
+    privilege_level=3,
+    persona="assistant",
+    declined_at_sip=False,
+)
+_RECEPTIONIST_GROUP = CallerGroup(
+    name="receptionist",
+    privilege_level=0,
+    persona="receptionist",
+    declined_at_sip=False,
+)
+_BLOCKED_GROUP = CallerGroup(
+    name="blocked",
+    privilege_level=0,
+    persona="",
+    declined_at_sip=True,
+)
+# The OUTBOUND mode has no place in the inbound match scheme (it is never matched
+# against a caller list); it maps to a level-0 "outbound" persona group so the
+# untrusted-callee preamble is selected (ADR-0020 §3, amended).
+_OUTBOUND_GROUP = CallerGroup(
+    name="outbound",
+    privilege_level=0,
+    persona="outbound",
+    declined_at_sip=False,
+)
+_DEFAULT_THREE_GROUPS: tuple[CallerGroup, ...] = (
+    _OPERATOR_GROUP,
+    _RECEPTIONIST_GROUP,
+    _BLOCKED_GROUP,
+)
+
+
+def caller_mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
+    """Convert an ADR-0020 :class:`CallerModeConfig` to a :class:`CallerGroupConfig`.
+
+    Back-compat shim: the legacy 3-mode allow/deny/grey config is the default
+    three-group config (operator/receptionist/blocked) with the same deny-biased
+    match order.  ``adapter.connect`` uses this to drive the new N-group
+    classifier from a (possibly test-injected) legacy :func:`load_caller_modes`
+    result, so the ADR-0020 surface keeps working unchanged.
+    """
     default_is_allow = cfg.default_mode is CallerMode.ALLOW
     default_name = "operator" if default_is_allow else "receptionist"
 
-    groups: tuple[CallerGroup, ...] = (
-        CallerGroup(
-            name="operator",
-            privilege_level=3,
-            persona="assistant",
-            declined_at_sip=False,
-        ),
-        CallerGroup(
-            name="receptionist",
-            privilege_level=0,
-            persona="receptionist",
-            declined_at_sip=False,
-        ),
-        CallerGroup(
-            name="blocked",
-            privilege_level=0,
-            persona="",
-            declined_at_sip=True,
-        ),
-    )
     group_lists: dict[str, tuple[str, ...]] = {
         "operator": cfg.allow,
         "receptionist": cfg.grey,
         "blocked": cfg.deny,
     }
     return CallerGroupConfig(
-        groups=groups,
+        groups=_DEFAULT_THREE_GROUPS,
         group_lists=group_lists,
         default_group=default_name,
         match_order=("blocked", "operator", "receptionist"),
         normalization=cfg.normalization,
     )
+
+
+def group_for_mode(mode: CallerMode) -> CallerGroup:
+    """Return the canonical :class:`CallerGroup` for an ADR-0020 :class:`CallerMode`.
+
+    The inverse of :attr:`CallerClassification.mode` — maps the legacy enum back
+    onto the default group an operator gets without writing a groups file, so a
+    call carrying only a legacy ``mode`` (e.g. an outbound call, or an ADR-0020
+    call-info dict) can still select the right persona/privilege via the N-group
+    surface.  ``DENY`` has no group here: a denied call is rejected at SIP and
+    never reaches a turn, so asking for its group is a programming error (mirrors
+    :func:`persona_preamble`).
+
+    Raises:
+        ValueError: for ``DENY`` — a denied call never reaches a turn.
+    """
+    if mode is CallerMode.ALLOW:
+        return _OPERATOR_GROUP
+    if mode is CallerMode.GREY:
+        return _RECEPTIONIST_GROUP
+    if mode is CallerMode.OUTBOUND:
+        return _OUTBOUND_GROUP
+    msg = "DENY calls never reach a turn; group_for_mode(DENY) is invalid"
+    raise ValueError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -659,26 +710,7 @@ def load_caller_groups(env: Mapping[str, str]) -> CallerGroupConfig:
     default_is_allow = default_mode is CallerMode.ALLOW
     default_group_name = "operator" if default_is_allow else "receptionist"
 
-    groups: tuple[CallerGroup, ...] = (
-        CallerGroup(
-            name="operator",
-            privilege_level=3,
-            persona="assistant",
-            declined_at_sip=False,
-        ),
-        CallerGroup(
-            name="receptionist",
-            privilege_level=0,
-            persona="receptionist",
-            declined_at_sip=False,
-        ),
-        CallerGroup(
-            name="blocked",
-            privilege_level=0,
-            persona="",
-            declined_at_sip=True,
-        ),
-    )
+    groups: tuple[CallerGroup, ...] = _DEFAULT_THREE_GROUPS
     group_lists: dict[str, tuple[str, ...]] = {
         "operator": allow,
         "receptionist": grey,

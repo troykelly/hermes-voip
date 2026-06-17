@@ -65,8 +65,12 @@ from hermes_voip.call import CallSession
 from hermes_voip.caller_modes import (
     CallerGroup,
     CallerGroupConfig,
+    CallerMode,
+    caller_mode_config_to_groups,
     classify_caller_group,
+    group_for_mode,
     load_caller_groups,
+    load_caller_modes,
     persona_preamble_for_group,
 )
 from hermes_voip.config import (
@@ -128,6 +132,11 @@ _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
 # the first successful registration — useful for an AFK test or a scheduled call.
 # The flag prevents re-firing on reconnect (the flag is permanent once set).
 _CALL_ON_CONNECT_KEY = "HERMES_VOIP_CALL_ON_CONNECT"
+
+# HERMES_VOIP_CALLER_GROUPS_FILE: when set, the N-group JSON document is the
+# caller-classification source (load_caller_groups); when unset, the adapter uses
+# the ADR-0020 load_caller_modes shim + caller_mode_config_to_groups instead.
+_CALLER_GROUPS_FILE_KEY = "HERMES_VOIP_CALLER_GROUPS_FILE"
 
 # Maximum time to wait for a final response to an outbound INVITE (seconds).
 # RFC 3261 §14.1: Timer B / Timer F = 64*T1 ≈ 32 s.
@@ -305,7 +314,18 @@ class VoipAdapter(BasePlatformAdapter):
         # A misconfigured (malformed) security-relevant list file raises here — the
         # plugin must fail loudly, never silently treat a broken allow/deny list as
         # empty (rule 37).
-        caller_groups = load_caller_groups(extra)
+        #
+        # The N-group JSON document (HERMES_VOIP_CALLER_GROUPS_FILE) is the new
+        # surface; when it is NOT set we go through the ADR-0020 load_caller_modes
+        # shim and convert its CallerModeConfig to the equivalent CallerGroupConfig.
+        # Routing the legacy path through load_caller_modes keeps the ADR-0020
+        # back-compat entry point live (existing callers/tests that drive
+        # classification via load_caller_modes keep working unchanged), while the
+        # N-group file path stays on load_caller_groups.
+        if (extra.get(_CALLER_GROUPS_FILE_KEY) or "").strip():
+            caller_groups = load_caller_groups(extra)
+        else:
+            caller_groups = caller_mode_config_to_groups(load_caller_modes(extra))
 
         self._providers = build_providers(media_cfg)
         self._media_cfg = media_cfg
@@ -852,6 +872,10 @@ class VoipAdapter(BasePlatformAdapter):
                 "type": "dm",
                 "ended": False,
                 "group": _outbound_group,
+                # ADR-0020 back-compat: the legacy CallerMode for this call. An
+                # outbound call is the OUTBOUND mode (untrusted callee); kept so
+                # callers reading the legacy "mode" key keep working.
+                "mode": CallerMode.OUTBOUND,
             }
 
             # Capture local variables for the background task closure.
@@ -1149,6 +1173,11 @@ class VoipAdapter(BasePlatformAdapter):
             "type": "dm",
             "ended": False,
             "group": group,
+            # ADR-0020 back-compat: the legacy CallerMode this group maps to
+            # (ALLOW for an operator-tier group, GREY otherwise; DENY never
+            # reaches here — it was rejected with 603 above). Kept so callers
+            # reading the legacy "mode" key keep working.
+            "mode": classification.mode,
         }
 
         # --- Build + run CallLoop (leak-safe) ------------------------------
@@ -1309,17 +1338,24 @@ class VoipAdapter(BasePlatformAdapter):
         """
         info = self._call_info.get(call_id, {})
         caller_name = str(info.get("name", call_id))
+        # Resolve the call's CallerGroup: prefer the stored "group" (ADR-0021);
+        # fall back to the legacy "mode" key (ADR-0020 back-compat — a call-info
+        # dict carrying only a CallerMode); finally default to receptionist
+        # (least privilege) if neither is present (should not happen in practice).
         group_obj = info.get("group")
-        # Fallback to receptionist group if not set (should not happen in practice).
-        _fallback = CallerGroup(
-            name="receptionist",
-            privilege_level=0,
-            persona="receptionist",
-            declined_at_sip=False,
-        )
-        group: CallerGroup = (
-            group_obj if isinstance(group_obj, CallerGroup) else _fallback
-        )
+        mode_obj = info.get("mode")
+        group: CallerGroup
+        if isinstance(group_obj, CallerGroup):
+            group = group_obj
+        elif isinstance(mode_obj, CallerMode):
+            group = group_for_mode(mode_obj)
+        else:
+            group = CallerGroup(
+                name="receptionist",
+                privilege_level=0,
+                persona="receptionist",
+                declined_at_sip=False,
+            )
 
         spotlighted = _spotlight_turn(group, caller_name, text)
 

@@ -140,11 +140,20 @@ Concrete shape:
   > telephone-event. The **armed-confirmation resolver is SHIPPED** too: `ArmedConfirmation`
   > (`hermes_voip.dtmf_confirm`) is the spoof-resistant channel — it satisfies the existing
   > `ConfirmationSource` protocol (`async confirm() → bool`), so it is a drop-in for
-  > `CallControlTools._irreversible`, **which unblocks `transfer_blind`**. The **SIP INFO**
-  > and **in-band** mechanisms (both send AND receive) remain DEFERRED — and are now
-  > rejected at config load rather than silently inert (see the Configuration bullet).
-  > Attended transfer remains additionally blocked (ADR-0031 §4: no consult-leg Dialog
-  > origination).
+  > `CallControlTools._irreversible`. **`transfer_blind` is now SHIPPED as a live agent
+  > tool** (the feat/voip-transfer-blind-tool lane): `voip_tools.register_voip_tools`
+  > registers `transfer_blind(target)` (IRREVERSIBLE, operator level 3 + non-degraded),
+  > and the adapter's `transfer_blind_on_call` awaits the per-call `ArmedConfirmation`
+  > and sends the RFC 3515 REFER (`CallSession.transfer_blind`, with a `Referred-By` AOR)
+  > **only** when the person on the call presses the armed confirm digit — a wrong digit
+  > or a timeout transfers nobody, and a call that negotiated no telephone-event refuses
+  > LOUDLY (never a silent no-op). The `pre_tool_call` gate clamps privilege as a
+  > fail-fast (an unprivileged/degraded caller is blocked before the confirm prompt is
+  > ever spoken). The **SIP INFO** and **in-band** mechanisms (both send AND receive)
+  > remain DEFERRED — and are now rejected at config load rather than silently inert (see
+  > the Configuration bullet). **Attended transfer remains DEFERRED** (ADR-0031 §4: no
+  > agent-driven consult-leg Dialog origination), so `transfer_attended` stays
+  > not-registered.
 
 - **Surfacing inbound digits — no fake transcript.** Because Hermes has no DTMF
   `MessageType`, the call/turn controller (ADR-0003) consumes the `DtmfDigit` stream

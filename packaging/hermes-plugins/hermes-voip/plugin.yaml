@@ -1,0 +1,30 @@
+# hermes-voip — Hermes CLI plugin metadata stub (DESCRIPTION ONLY; carries no code).
+#
+# Copy this directory to your Hermes user-plugins dir so the `hermes plugins`
+# CLI recognises the plugin:
+#
+#   mkdir -p ~/.hermes/plugins/hermes-voip
+#   cp packaging/hermes-plugins/hermes-voip/plugin.yaml ~/.hermes/plugins/hermes-voip/plugin.yaml
+#   hermes plugins enable hermes-voip
+#
+# WHY THIS EXISTS: hermes-voip is installed as a pip / entry-point plugin (group
+# `hermes_agent.plugins`). Hermes' `hermes plugins list` and `hermes plugins
+# enable` commands only scan the filesystem plugin directories — they never look
+# at importlib entry points — so without a directory like this one the CLI cannot
+# see the plugin and `hermes plugins enable hermes-voip` fails with
+# "Plugin 'hermes-voip' is not installed or bundled." (exit 1).
+#
+# This stub fixes ONLY the CLI affordance: it makes the plugin appear in
+# `hermes plugins list` (with the name/version/description below) and lets
+# `hermes plugins enable hermes-voip` succeed (it adds "hermes-voip" to
+# plugins.enabled in config.yaml — the list the runtime actually honours).
+#
+# It deliberately ships NO __init__.py / register(), so the plugin's real code is
+# still loaded exactly once, from its normal pip entry point — there is no double
+# registration. See docs/runbooks/0011-voip-enable-plugin.md.
+#
+# Keep name/version/description in sync with pyproject.toml.
+name: hermes-voip
+kind: platform
+version: "0.0.0"
+description: "Two-way voice over telephony (SIP-over-TLS / WebRTC) for a Hermes agent — answer and place calls."

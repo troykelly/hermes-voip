@@ -51,6 +51,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 
 from hermes_voip.config import ConfigError
 
@@ -184,23 +185,48 @@ class CallerGroupConfig:
     normalization: Normalization
 
     def __post_init__(self) -> None:
-        """Reject a privileged default group (fail-loud, the by-construction clamp).
+        """Snapshot inputs to immutable containers, then reject a privileged default.
 
-        The default group is the catch-all for unmatched (unknown, forgeable)
-        callers. Caller-ID is a trust hint, not authentication, so the default
-        MUST be unprivileged (``privilege_level == 0``, the receptionist). A
-        privileged default would silently grant that privilege to every unmatched
-        caller — the systemic privilege escalation. This invariant on the
-        constructor backstops the loader-level checks (:func:`_parse_groups_document`,
-        the legacy synthesis), which a direct ``CallerGroupConfig(...)`` would
-        otherwise bypass.
+        Two responsibilities, both load-bearing for the by-construction security
+        clamp:
 
-        Only the named default group is validated here; whether ``default_group``
-        names a defined group is a loader-level concern (and
+        1. **Snapshot (durability).** ``groups``/``match_order`` are coerced to
+           tuples and ``group_lists`` to a read-only :class:`MappingProxyType` over
+           a copied dict (with tuple values), via ``object.__setattr__`` (the
+           dataclass is ``frozen``). This makes the validated state the *same*
+           immutable state the classifier later reads: a caller who passes a
+           mutable list and mutates it after construction cannot retroactively
+           escalate the default group, because the config holds its own snapshot.
+
+        2. **Reject a privileged default (fail-loud).** The default group is the
+           catch-all for unmatched (unknown, forgeable) callers. Caller-ID is a
+           trust hint, not authentication, so the default MUST be unprivileged
+           (``privilege_level == 0``, the receptionist). A privileged default would
+           silently grant that privilege to every unmatched caller — the systemic
+           privilege escalation. This invariant on the constructor backstops the
+           loader-level checks (:func:`_parse_groups_document`, the legacy
+           synthesis), which a direct ``CallerGroupConfig(...)`` would otherwise
+           bypass.
+
+        Only the named default group's privilege is validated here; whether
+        ``default_group`` names a defined group is a loader-level concern (and
         :func:`classify_caller_group` falls back safely if it does not), so a
         missing name is not raised on here — that keeps this invariant a pure,
         additive security clamp.
         """
+        # 1. Snapshot to immutable containers (the dataclass is frozen, so set via
+        #    object.__setattr__). Validation below reads these snapshots.
+        object.__setattr__(self, "groups", tuple(self.groups))
+        object.__setattr__(self, "match_order", tuple(self.match_order))
+        object.__setattr__(
+            self,
+            "group_lists",
+            MappingProxyType(
+                {name: tuple(patterns) for name, patterns in self.group_lists.items()}
+            ),
+        )
+
+        # 2. Reject a privileged default group (against the snapshotted groups).
         default = next((g for g in self.groups if g.name == self.default_group), None)
         if default is not None and default.privilege_level != 0:
             msg = (

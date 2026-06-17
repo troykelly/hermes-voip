@@ -337,9 +337,13 @@ OPEN_ENTRY_TOOL_SCHEMA: dict[str, object] = {
 #: level 3, non-degraded). Its spoof-resistant safeguard is the ADR-0010 DTMF
 #: confirmation: the REFER fires ONLY after the person on the call presses the armed
 #: confirm digit (``transfer_blind_on_call`` awaits the per-call ArmedConfirmation),
-#: so a missed prompt injection cannot transfer the caller on a "yes" alone.
-#: ``transfer_attended`` is deliberately NOT exposed — it needs a consult-leg Dialog
-#: the agent cannot originate (deferred, ADR-0031 §4).
+#: so a missed prompt injection cannot transfer the caller on a "yes" alone. The
+#: ``target`` is model-chosen and deliberately NOT allow-listed (unlike ``place_call``,
+#: whose new untrusted outbound leg has no human in the loop): the operator-level party
+#: on the live call confirming the keypad press IS the per-call, per-target
+#: authorization (ADR-0031 alternatives — a destination allowlist is a recorded future
+#: hardening, not shipped). ``transfer_attended`` is deliberately NOT exposed — it needs
+#: a consult-leg Dialog the agent cannot originate (deferred, ADR-0031 §4).
 TRANSFER_BLIND_TOOL_NAME = "transfer_blind"
 
 #: ``transfer_blind`` schema. ``target`` is the destination (an extension or SIP URI)

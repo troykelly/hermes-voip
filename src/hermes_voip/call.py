@@ -23,7 +23,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Protocol, runtime_checkable
 
-from hermes_voip.dialog import Dialog, InDialogRequest
+from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.incall import (
     Glare,
@@ -203,6 +203,33 @@ class CallSession:
             await self._reinvite("sendrecv")
             self.on_hold = False
             await self._media.set_hold(False)
+
+    async def hang_up(self) -> None:
+        """End the call: send an in-dialog BYE, mark ended, stop media (ADR-0026).
+
+        The UAC side of a BYE — the agent-initiated counterpart of :meth:`_on_bye`
+        (which handles a BYE the *peer* sends). It builds an in-dialog BYE
+        (advancing the dialog CSeq — ADR-0011 invariant 1), sends it on the
+        signalling transport, flags the session ended, and stops the media engine.
+        Stopping the media ends the conversational loop, so the call task's
+        teardown classifies the end as AGENT_HANGUP (a SOFT, NORMAL end that keeps
+        the Hermes session open for follow-up, never a hard ``/stop``).
+
+        Idempotent: once the session has ended (a prior ``hang_up`` or an inbound
+        BYE), this is a no-op — the dialog is gone, so a second BYE must not be
+        sent. We do NOT wait for the BYE's 200 response: the call is over the
+        moment we send BYE + stop media, and the gateway may never deliver a final
+        response on a dropped media path (the same rationale as not blocking
+        teardown on a network round-trip).
+        """
+        async with self._lock:
+            if self.ended:
+                return
+            request = build_in_dialog_request(self._dialog, "BYE")
+            self._dialog = request.dialog
+            self.ended = True
+            await self._signaling.send(request.text)
+            await self._media.stop()
 
     async def transfer_blind(
         self, target_uri: str, *, referred_by: str | None = None

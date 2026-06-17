@@ -295,6 +295,24 @@ def test_deny_has_no_persona() -> None:
         persona_preamble(CallerMode.DENY)
 
 
+@pytest.mark.parametrize(
+    "mode", [CallerMode.GREY, CallerMode.ALLOW, CallerMode.OUTBOUND]
+)
+def test_every_persona_preamble_mentions_the_hang_up_tool(mode: CallerMode) -> None:
+    """Each persona tells the agent it may end the call with the hang-up tool.
+
+    ADR-0026: the agent will not call a tool it is not told about, so every
+    spoken persona names the ``hang_up`` tool and when to use it (conversation
+    concluded / the caller says goodbye). Without this the tool exists but the
+    model never invokes it.
+    """
+    text = persona_preamble(mode)
+    lowered = text.lower()
+    assert "hang_up" in lowered
+    # ... and the cue for WHEN to use it, so it is invoked at the right moment.
+    assert "goodbye" in lowered or "conclude" in lowered or "end the call" in lowered
+
+
 def test_classification_is_frozen() -> None:
     cls = classify_caller(_UNKNOWN, _cfg())
     assert isinstance(cls, CallerClassification)

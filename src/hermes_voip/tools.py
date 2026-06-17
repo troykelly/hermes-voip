@@ -58,6 +58,11 @@ TOOL_RISKS: dict[str, ToolRisk] = {
     "transfer_blind": ToolRisk.IRREVERSIBLE,
     "transfer_attended": ToolRisk.IRREVERSIBLE,
     "list_registrations": ToolRisk.ELEVATED,
+    # ``hang_up`` is SAFE (ADR-0026): ending the call mutates no external state and
+    # is something even a level-0 receptionist is told it may do ("end the call
+    # politely"). SAFE always runs, so the agent can conclude ANY caller's
+    # conversation regardless of privilege or a degraded session — never gated.
+    "hang_up": ToolRisk.SAFE,
 }
 
 
@@ -98,6 +103,10 @@ class ControllableCall(Protocol):
 
     async def unhold(self) -> None:
         """Resume the held caller."""
+        ...
+
+    async def hang_up(self) -> None:
+        """End the call (send BYE, stop media) — the SOFT agent hangup (ADR-0026)."""
         ...
 
     async def transfer_blind(
@@ -181,6 +190,18 @@ class CallControlTools:
         return await self._reversible(
             "resume_call", lambda call: call.unhold(), "resumed"
         )
+
+    async def hang_up(self) -> ToolResult:
+        """End the call — the SOFT agent hangup (``SAFE``, ADR-0026).
+
+        Sends a BYE and stops media via the call's :meth:`ControllableCall.hang_up`
+        (which routes the end through the adapter chokepoint as AGENT_HANGUP — a
+        NORMAL end that keeps the Hermes session open for follow-up). SAFE, so the
+        gate never blocks it: any caller's conversation may be concluded by the
+        agent, even on a degraded or level-0 (receptionist) session. With no active
+        call it returns a not-allowed result rather than raising.
+        """
+        return await self._reversible("hang_up", lambda call: call.hang_up(), "ended")
 
     async def transfer_blind(
         self, target_uri: str, *, referred_by: str | None = None

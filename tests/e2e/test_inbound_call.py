@@ -581,7 +581,14 @@ async def test_full_inbound_call_end_to_end() -> None:  # noqa: PLR0915 — one 
     delivered_turns: list[str] = []
 
     async def _echo_agent(event: MessageEvent) -> str:
-        delivered_turns.append(event.text)
+        # Record only real CALLER turns, not the internal call-end signal event
+        # (ADR-0026): the BYE teardown injects an ``internal=True`` MessageEvent
+        # (here the replayed disconnected note) through this same handler, and the
+        # test asserts EXACTLY one turn was delivered — so the signal must not be
+        # counted as a caller turn. The runtime gates lifecycle on ``internal``;
+        # the test mirrors that.
+        if not getattr(event, "internal", False):
+            delivered_turns.append(event.text)
         return f"echo: {event.text}"
 
     try:

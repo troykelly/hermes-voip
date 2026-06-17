@@ -1,7 +1,8 @@
 # ADR-0011: Multiple registrations + in-call control (hold, blind/attended transfer)
 
 - **Date:** 2026-06-14
-- **Status:** Accepted
+- **Status:** Accepted (extended by ADR-0026: BYE was SIP-only here; ADR-0026 adds an
+  agent-initiated `CallSession.hang_up` BYE and signals call-end to the Hermes session)
 - **Deciders:** agent session (operator requirement)
 
 ## Context

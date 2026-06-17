@@ -1,7 +1,8 @@
 # ADR-0002: VoIP as a kind:platform plugin that owns the real-time media plane in-process
 
 - **Date:** 2026-06-14
-- **Status:** Accepted
+- **Status:** Accepted (call-termination semantics added by ADR-0026: the plugin signals
+  call-end — failure vs normal — to the Hermes session from the `_teardown_call` chokepoint)
 - **Deciders:** agent session (VoIP architecture, post-research)
 
 ## Context

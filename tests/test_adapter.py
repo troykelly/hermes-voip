@@ -33,6 +33,7 @@ from gateway.platform_registry import (
 )
 from gateway.platforms.base import BasePlatformAdapter
 
+from hermes_voip.call_end import CallEndReason
 from hermes_voip.config import (
     ConfigError,
     ExtensionConfig,
@@ -45,6 +46,7 @@ from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
+from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.providers.tts import TtsStream
 from hermes_voip.sdp import Codec as SdpCodec
 
@@ -772,6 +774,293 @@ async def test_deliver_turn_builds_voice_message_event() -> None:
     # (ADR-0020); assert the transcript is present rather than a bare equal.
     assert "voice turn" in getattr(event, "text", "")
     assert getattr(event, "message_type", None) == MessageType.VOICE
+
+
+# ---------------------------------------------------------------------------
+# Call-termination → Hermes session signal (ADR-0026). _teardown_call is the
+# single chokepoint reached from every call-end path; it must signal the Hermes
+# session EXACTLY ONCE per call with the right text: a FAILURE end injects /stop
+# (a hard stop), a NORMAL end injects the replayed disconnected note. The signal
+# is an internal=True MessageEvent (bypasses auth) via the real handle_message.
+# ---------------------------------------------------------------------------
+
+
+async def _captured_handler_adapter() -> tuple[VoipAdapter, list[object]]:
+    """Build an adapter wired to a capturing message handler (real base path)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+    return adapter, captured
+
+
+async def _teardown(adapter: VoipAdapter, call_id: str, reason: CallEndReason) -> None:
+    """Drive ``_teardown_call`` with a no-op engine + the adapter's fake transport.
+
+    Keeps each test's call explicit (no ``**dict`` splat that would erase the
+    keyword types under ``mypy --strict``).
+    """
+    transport = adapter._transport
+    assert transport is not None
+    engine = MagicMock(stop=AsyncMock(return_value=None))
+    await adapter._teardown_call(
+        call_id=call_id,
+        engine=engine,
+        transport=transport,
+        dialog_id=(call_id, "lt", "rt"),
+        session=None,
+        reason=reason,
+    )
+
+
+@pytest.mark.asyncio
+async def test_teardown_failure_injects_stop_command() -> None:
+    """A FAILURE end (e.g. pipeline failure) injects ``/stop`` exactly once."""
+    adapter, captured = await _captured_handler_adapter()
+    call_id = new_call_id()
+
+    await _teardown(adapter, call_id, CallEndReason.PIPELINE_FAILURE)
+    await _until(lambda: len(captured) >= 1, timeout=3.0)
+
+    assert len(captured) == 1, "the session must be signalled exactly once"
+    event = captured[0]
+    assert getattr(event, "text", None) == "/stop"
+    # internal=True bypasses user auth so the adapter-injected event is accepted.
+    assert getattr(event, "internal", False) is True
+
+
+@pytest.mark.asyncio
+async def test_teardown_normal_injects_the_replayed_note_not_a_command() -> None:
+    """A NORMAL end (remote BYE) injects the disconnected content note, not /stop."""
+    from hermes_voip.call_end import NORMAL_END_NOTE  # noqa: PLC0415
+
+    adapter, captured = await _captured_handler_adapter()
+    call_id = new_call_id()
+
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
+    await _until(lambda: len(captured) >= 1, timeout=3.0)
+
+    assert len(captured) == 1
+    event = captured[0]
+    text = getattr(event, "text", "")
+    assert text == NORMAL_END_NOTE
+    assert not text.startswith("/"), "a normal end must NOT inject a slash command"
+    assert getattr(event, "internal", False) is True
+
+
+@pytest.mark.asyncio
+async def test_teardown_agent_hangup_is_a_soft_normal_end() -> None:
+    """An AGENT_HANGUP end is SOFT: it injects the replayed note, never /stop."""
+    from hermes_voip.call_end import NORMAL_END_NOTE  # noqa: PLC0415
+
+    adapter, captured = await _captured_handler_adapter()
+    call_id = new_call_id()
+
+    await _teardown(adapter, call_id, CallEndReason.AGENT_HANGUP)
+    await _until(lambda: len(captured) >= 1, timeout=3.0)
+
+    assert len(captured) == 1
+    assert getattr(captured[0], "text", "") == NORMAL_END_NOTE
+
+
+@pytest.mark.asyncio
+async def test_teardown_signals_exactly_once_even_if_called_twice() -> None:
+    """Teardown is idempotent on the signal: a double teardown signals only once.
+
+    The same-Call-ID identity guard (``session``/``_call_sessions``) must also
+    gate the call-end signal, so a retried/duplicate teardown never re-injects.
+    """
+    adapter, captured = await _captured_handler_adapter()
+    call_id = new_call_id()
+
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
+    await _until(lambda: len(captured) >= 1, timeout=3.0)
+    # Give any erroneous second signal a chance to land before asserting.
+    await asyncio.sleep(0.05)
+
+    assert len(captured) == 1, "a duplicate teardown must not re-signal the session"
+
+
+@pytest.mark.asyncio
+async def test_send_is_suppressed_after_the_call_has_ended() -> None:
+    """Post-hangup TTS is suppressed: send() to an ended call does not speak.
+
+    Once the chokepoint has signalled call-end (info["ended"]=True), a late agent
+    reply (e.g. the replayed-note turn the agent answers) must NOT be synthesised
+    to the now-disconnected caller — there is no media path. send() returns a
+    non-success result and never touches the (stopped) call loop.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    spoke = False
+
+    async def _speak(_chunks: object) -> None:
+        nonlocal spoke
+        spoke = True
+
+    # A live loop is registered, but the call is flagged ended (post-teardown).
+    adapter._call_loops[call_id] = MagicMock(speak=_speak)
+    adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": True}
+
+    result = await adapter.send(call_id, "a late reply")
+
+    assert spoke is False, "an ended call must not synthesise TTS to the caller"
+    assert getattr(result, "success", True) is False
+
+
+@pytest.mark.asyncio
+async def test_run_call_loop_clean_return_then_media_timeout_classifies_timeout() -> (
+    None
+):
+    """A clean loop return with the engine timed-out classifies as MEDIA_TIMEOUT.
+
+    When ``run()`` returns but ``engine.media_timed_out`` is True (the RTP
+    watchdog or a transport loss ended the call), the end is a FAILURE
+    (MEDIA_TIMEOUT) → ``/stop``, NOT a clean REMOTE_BYE. This is the wiring that
+    turns the silent-drop reliability fix into the right Hermes signal.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    engine = MagicMock(media_timed_out=True)
+    reason = adapter._classify_end_reason(call_id, engine, raised=False)
+    assert reason is CallEndReason.MEDIA_TIMEOUT
+    assert reason.was_failure is True
+
+
+@pytest.mark.asyncio
+async def test_classify_end_reason_clean_return_is_remote_bye() -> None:
+    """A clean return with media still healthy is REMOTE_BYE (a normal end)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    engine = MagicMock(media_timed_out=False)
+    reason = adapter._classify_end_reason(call_id, engine, raised=False)
+    assert reason is CallEndReason.REMOTE_BYE
+
+
+@pytest.mark.asyncio
+async def test_classify_end_reason_agent_hangup_flag_wins_for_clean_return() -> None:
+    """When the agent hung up (flag set) a clean return classifies AGENT_HANGUP."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+    adapter._mark_agent_hangup(call_id)
+
+    engine = MagicMock(media_timed_out=False)
+    reason = adapter._classify_end_reason(call_id, engine, raised=False)
+    assert reason is CallEndReason.AGENT_HANGUP
+
+
+@pytest.mark.asyncio
+async def test_classify_end_reason_exception_is_pipeline_failure() -> None:
+    """A raised end (``raised=True``) is a PIPELINE_FAILURE → ``/stop`` (fail-safe)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    engine = MagicMock(media_timed_out=False)
+    reason = adapter._classify_end_reason(call_id, engine, raised=True)
+    assert reason is CallEndReason.PIPELINE_FAILURE
+    assert reason.was_failure is True
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_drives_session_bye_and_marks_agent_hangup() -> None:
+    """The VoipToolHost hang_up_call drives the session BYE + marks AGENT_HANGUP.
+
+    ADR-0026: the agent hang_up tool calls this. It must call the live session's
+    ``hang_up`` (sends BYE, stops media) and flag the call agent-initiated so the
+    subsequent teardown classifies AGENT_HANGUP (a SOFT, NORMAL end), not REMOTE_BYE.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    hung_up = False
+
+    class _Session:
+        ended = False
+        guard = GuardSessionState(call_id=call_id, privilege_level=0)
+
+        async def hang_up(self) -> None:
+            nonlocal hung_up
+            hung_up = True
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    ended = await adapter.hang_up_call(call_id)
+
+    assert ended is True
+    assert hung_up is True
+    # The call is now flagged agent-initiated, so a clean end classifies AGENT_HANGUP.
+    engine = MagicMock(media_timed_out=False)
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=False)
+        is CallEndReason.AGENT_HANGUP
+    )
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_unknown_call_returns_false() -> None:
+    """Hanging up an unknown call id is a no-op returning False (clear tool result)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    assert await adapter.hang_up_call("no-such-call") is False
+
+
+@pytest.mark.asyncio
+async def test_guard_state_for_returns_the_call_guard() -> None:
+    """guard_state_for exposes the per-call guard state for the pre_tool_call gate."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+    guard = GuardSessionState(call_id=call_id, privilege_level=2)
+
+    class _Session:
+        ended = False
+
+        def __init__(self, g: GuardSessionState) -> None:
+            self.guard = g
+
+    adapter._call_sessions[call_id] = _Session(guard)  # type: ignore[assignment]  # test double
+
+    assert adapter.guard_state_for(call_id) is guard
+    assert adapter.guard_state_for("unknown") is None
+
+
+@pytest.mark.asyncio
+async def test_connect_registers_adapter_as_the_active_voip_tool_host() -> None:
+    """connect() registers the adapter as the active VoIP-tool adapter (ADR-0026).
+
+    Without this seam the agent hang_up tool handler cannot reach the live call.
+    """
+    from hermes_voip.voip_tools import active_voip_adapter  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    assert active_voip_adapter() is adapter
+    await adapter.disconnect()
+    assert active_voip_adapter() is None
 
 
 # ---------------------------------------------------------------------------

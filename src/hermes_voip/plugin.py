@@ -224,3 +224,12 @@ def register(ctx: PluginContextProtocol) -> None:
         env_enablement_fn=_env_enablement,
         is_connected=_is_connected,
     )
+
+    # Register the agent-facing VoIP tools (the hang_up tool) + the pre_tool_call
+    # gate (ADR-0026). Without this the agent has no way to end a call. Imported
+    # lazily so a bare ``import hermes_voip.plugin`` stays light; the helper itself
+    # imports no hermes runtime and is resilient to a ctx that lacks
+    # register_tool/register_hook (older hermes-agent) — the platform still registers.
+    from hermes_voip.voip_tools import register_voip_tools  # noqa: PLC0415
+
+    register_voip_tools(ctx)

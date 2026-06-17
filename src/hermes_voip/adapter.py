@@ -82,6 +82,8 @@ from hermes_voip.config import (
 )
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
+from hermes_voip.dtmf_config import DtmfReceiveMode, resolve_dtmf_receive_mode
+from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.intercom import (
     IntercomConfig,
@@ -330,6 +332,12 @@ class VoipAdapter(BasePlatformAdapter):
 
         # Per-call state: {call_id → CallLoop}
         self._call_loops: dict[str, CallLoop] = {}
+        # Per-call armed-confirmation resolver (ADR-0010), present only while a call
+        # has inbound RFC 4733 DTMF receive active: {call_id → ArmedConfirmation}. The
+        # engine's on_dtmf routes digits to the loop, which feeds this resolver while a
+        # confirmation is armed (the spoof-resistant channel an irreversible tool uses).
+        # Dropped in _teardown_call so a resolver never outlives its call.
+        self._dtmf_confirmations: dict[str, ArmedConfirmation] = {}
         # Per-call metadata: {call_id → {name, remote_uri, type, ended}}
         self._call_info: dict[str, dict[str, object]] = {}
         # Background tasks per Call-ID. A gateway can deliver multiple overlapping
@@ -553,6 +561,7 @@ class VoipAdapter(BasePlatformAdapter):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._call_tasks.clear()
         self._call_loops.clear()
+        self._dtmf_confirmations.clear()
         self._call_sessions.clear()
 
         manager = self._manager
@@ -1879,11 +1888,79 @@ class VoipAdapter(BasePlatformAdapter):
             comfort_filler=media_cfg.comfort_filler,
             comfort_filler_delay_ms=media_cfg.comfort_filler_delay_ms,
             comfort_filler_phrases=media_cfg.comfort_filler_phrases,
+            # Inbound DTMF menu-group aggregation timeout (ADR-0010): a buffered group
+            # with no ``#`` terminator is delivered after this gap. None => the loop's
+            # built-in default. Drives real behaviour for HERMES_SIP_DTMF_INTERDIGIT_MS.
+            dtmf_interdigit_ms=media_cfg.dtmf_interdigit_ms,
         )
         self._call_loops[call_id] = call_loop
+        # Wire inbound DTMF receive (ADR-0010): resolve the per-call receive mode from
+        # config + the negotiated telephone-event PT, and when RFC 4733 is active wire
+        # the engine's on_dtmf demux to the loop's router and bind the armed-
+        # confirmation resolver (the spoof-resistant channel that unblocks transfer).
+        self._wire_dtmf_receive(
+            call_id=call_id, engine=engine, call_loop=call_loop, media_cfg=media_cfg
+        )
         _log.info("INVITE %s: CallLoop started", call_id)
         await call_loop.run()
         return call_loop
+
+    def _wire_dtmf_receive(
+        self,
+        *,
+        call_id: str,
+        engine: RtpMediaTransport,
+        call_loop: CallLoop,
+        media_cfg: MediaConfig,
+    ) -> None:
+        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0010).
+
+        Resolves :func:`resolve_dtmf_receive_mode` from the call's ``dtmf_mode`` /
+        ``dtmf_inband_enabled`` and the engine's negotiated telephone-event PT, and:
+
+        * ``RFC4733`` — wire the engine's ``on_dtmf`` demux to the loop's digit router
+          and bind a per-call :class:`~hermes_voip.dtmf_confirm.ArmedConfirmation` (so
+          an irreversible tool can obtain a spoof-resistant keypad confirmation — the
+          channel that unblocks ``transfer_blind``). The confirmation prompt is spoken
+          through the loop's TTS path;
+        * ``UNAVAILABLE`` — DTMF receive was wanted but cannot run (no telephone-event
+          negotiated); log a WARNING so the gap is operator-visible, and leave
+          ``on_dtmf`` unset (received nothing to route);
+        * ``DISABLED`` — a clean no-DTMF call; nothing wired.
+
+        This is the load-bearing step that takes the config keys + the receiver out of
+        "parsed/built but unwired" into the live path (rule 6).
+        """
+        mode = resolve_dtmf_receive_mode(
+            media_cfg, telephone_event_payload_type=engine.telephone_event_payload_type
+        )
+        if mode is DtmfReceiveMode.RFC4733:
+
+            async def _speak_prompt(text: str) -> None:
+                async def _chunk() -> AsyncIterator[str]:
+                    yield text
+
+                await call_loop.speak(_chunk())
+
+            confirmation = ArmedConfirmation(prompt=_speak_prompt)
+            call_loop.bind_confirmation(confirmation)
+            engine.on_dtmf = call_loop.feed_dtmf
+            self._dtmf_confirmations[call_id] = confirmation
+            _log.info(
+                "INVITE %s: inbound DTMF receive active (RFC 4733, PT %s)",
+                call_id,
+                engine.telephone_event_payload_type,
+            )
+        elif mode is DtmfReceiveMode.UNAVAILABLE:
+            _log.warning(
+                "INVITE %s: DTMF receive requested (mode %s) but no telephone-event "
+                "was negotiated and SIP INFO / in-band receive are not implemented — "
+                "inbound DTMF is UNAVAILABLE on this call",
+                call_id,
+                media_cfg.dtmf_mode,
+            )
+        else:
+            _log.debug("INVITE %s: inbound DTMF receive disabled", call_id)
 
     async def _teardown_call(  # noqa: PLR0913 — seven keyword-only params all needed: call_id + engine + transport + dialog_id + session + call_loop + reason for isolation + the Hermes signal
         self,
@@ -1946,6 +2023,10 @@ class VoipAdapter(BasePlatformAdapter):
                 await self._signal_call_end(call_id, reason)
         if call_loop is None or self._call_loops.get(call_id) is call_loop:
             self._call_loops.pop(call_id, None)
+            # The per-call DTMF confirmation resolver dies with the loop (ADR-0010).
+            # Gated on the same loop-identity check so a superseding same-Call-ID
+            # task's resolver is not evicted.
+            self._dtmf_confirmations.pop(call_id, None)
         if session is None or self._call_sessions.get(call_id) is session:
             self._call_sessions.pop(call_id, None)
         # This call's agent-hangup marker (if any) is consumed: the reason has

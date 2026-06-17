@@ -23,16 +23,16 @@ import pytest
 
 from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.media.call_loop import CallLoop
-from hermes_voip.media.endpoint import Endpointer
-from hermes_voip.media.vad import VoiceActivityDetector
 from hermes_voip.providers.policy import GuardSessionState
 
-# Reuse the fakes from the main call-loop suite (same package, importable by path).
+# Reuse the fakes + builders from the main call-loop suite (same package).
 from tests.test_call_loop import (
     _FakeASR,
     _FakeGuard,
     _FakeTransport,
     _FakeTTS,
+    _make_endpointer,
+    _make_vad,
 )
 
 
@@ -50,9 +50,9 @@ def _make_loop(
         transport=_FakeTransport([]),
         asr=_FakeASR([]),
         tts=_FakeTTS([]),
-        guard=_FakeGuard(),
-        vad=VoiceActivityDetector(threshold=0.5, sample_rate_hz=16_000),
-        endpointer=Endpointer(silence_ms=600, sample_rate_hz=16_000),
+        guard=_FakeGuard([]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
         guard_state=GuardSessionState(call_id="c1"),
         deliver_turn=deliver_turn,
         voice="",

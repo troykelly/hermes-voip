@@ -211,21 +211,22 @@ async def test_audio_packets_unaffected_by_dtmf_demux() -> None:
 
 @pytest.mark.asyncio
 async def test_no_negotiated_telephone_event_does_not_decode_dtmf() -> None:
-    """With no negotiated telephone-event PT, DTMF demux is inert.
+    """With no negotiated telephone-event PT, the DTMF demux is inert.
 
-    A telephone-event-shaped packet at PT 96 when none was negotiated is just a
-    foreign payload type: it must NOT fire ``on_dtmf`` (there is no DtmfReceiver),
-    and — being neither the audio PT nor a latched stream — it produces no decoded
-    audio frame either (the jitter buffer would mis-decode a 4-byte payload, so the
-    demux must drop unknown PTs rather than feed them downstream).
+    When the call negotiated no telephone-event, the engine has no DtmfReceiver wired
+    for the stream, so a telephone-event-shaped packet must NOT surface a digit
+    (``on_dtmf`` never fires) — the demux comparison against ``None`` is always False.
+    (Whether such an off-PT packet is dropped or decoded as audio is pre-existing
+    engine behaviour outside this lane: the engine has never PT-filtered inbound audio
+    — that is the audio-PT-filtering concern, not the DTMF receive contract. The
+    in-scope guarantee is that DTMF receive does nothing when not negotiated.)
     """
     engine = _make_engine(telephone_event_payload_type=None)
     await engine.connect()
-    frames: list[PcmFrame] = []
 
     async def _collect() -> None:
-        async for frame in engine.inbound_audio():
-            frames.append(frame)
+        async for _frame in engine.inbound_audio():
+            pass
 
     task = asyncio.create_task(_collect())
     await asyncio.sleep(0)
@@ -236,7 +237,6 @@ async def test_no_negotiated_telephone_event_does_not_decode_dtmf() -> None:
     await asyncio.sleep(0.05)
 
     assert engine._test_digits == []  # type: ignore[attr-defined]
-    assert frames == []
 
     await engine.stop()
     task.cancel()

@@ -275,12 +275,20 @@ _INJECTION_GUARD_MODEL_DIR_KEY = "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR"
 _DEFAULT_INJECTION_GUARD = "onnx"
 _INJECTION_GUARDS = frozenset({"onnx", "sidecar"})
 
-# DTMF (ADR-0010). Default `auto` negotiates RFC 4733 and falls back per offer.
+# DTMF (ADR-0010). Default `auto` negotiates RFC 4733 from the offer. RFC 4733 is
+# the SHIPPED receive path (in-call DTMF -> the spoof-resistant confirmation channel);
+# SIP INFO and in-band receive are NOT implemented. The full spelling set is the
+# vocabulary the ADR defines; `_DTMF_RECEIVE_SUPPORTED_MODES` is the subset a call can
+# actually run — a mode in `_DTMF_MODES` but NOT in the supported subset is rejected at
+# load (a loud ConfigError) so no mode value silently does nothing (rule-27).
 _DTMF_MODE_KEY = "HERMES_SIP_DTMF_MODE"
 _DTMF_INTERDIGIT_MS_KEY = "HERMES_SIP_DTMF_INTERDIGIT_MS"
 _DTMF_INBAND_ENABLED_KEY = "HERMES_SIP_DTMF_INBAND_ENABLED"
 _DEFAULT_DTMF_MODE = "auto"
 _DTMF_MODES = frozenset({"auto", "rfc4733", "sip_info", "inband"})
+#: The DTMF modes a call can actually run today (RFC 4733 receive is shipped; `auto`
+#: negotiates it). `sip_info` / `inband` receive are deferred (ADR-0010) and rejected.
+_DTMF_RECEIVE_SUPPORTED_MODES = frozenset({"auto", "rfc4733"})
 _DEFAULT_DTMF_INBAND_ENABLED = True
 
 # Tone diagnostic (operator-use only).  When set to a positive number of
@@ -624,6 +632,19 @@ class MediaConfig:
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))
             msg = f"dtmf_mode must be one of {{{allowed}}}, got {self.dtmf_mode!r}"
+            raise ConfigError(msg)
+        if self.dtmf_mode not in _DTMF_RECEIVE_SUPPORTED_MODES:
+            # The value is a valid ADR-0010 mode name but its receive backend is not
+            # implemented (RFC 4733 is the shipped path; SIP INFO / in-band are
+            # deferred). Fail LOUD rather than parse a key that would silently do
+            # nothing (rule-27): an operator who asks for an unsupported mechanism
+            # must be told, not quietly given no DTMF.
+            supported = ", ".join(sorted(_DTMF_RECEIVE_SUPPORTED_MODES))
+            msg = (
+                f"dtmf_mode {self.dtmf_mode!r} is not supported for DTMF receive — "
+                f"only {{{supported}}} are implemented (SIP INFO and in-band receive "
+                f"are deferred, ADR-0010). Set HERMES_SIP_DTMF_MODE to one of them."
+            )
             raise ConfigError(msg)
         _require_enum("stt_provider", self.stt_provider, _STT_PROVIDERS)
         _require_enum("tts_provider", self.tts_provider, _TTS_PROVIDERS)

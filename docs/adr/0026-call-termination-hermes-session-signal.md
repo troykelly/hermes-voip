@@ -1,7 +1,7 @@
 # ADR-0026: Call-termination → Hermes session lifecycle signal
 
 - **Date:** 2026-06-17
-- **Status:** Accepted (amends ADR-0002 termination semantics; amends ADR-0011 where BYE was SIP-only)
+- **Status:** Accepted (amends ADR-0002 termination semantics; amends ADR-0011 where BYE was SIP-only; amended by ADR-0029 — the call-end injection now ALSO targets a FOREIGN origin session for agent-triggered outbound calls)
 - **Deciders:** agent session (VoIP reliability), operator-directed (workflow wf_d9668c30-daa)
 
 ## Context

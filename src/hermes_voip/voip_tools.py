@@ -54,6 +54,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from hermes_voip.originate import OutboundCallNotAllowed
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.tools import gate_voip_tool
 
@@ -64,6 +65,10 @@ __all__ = [
     "HOLD_TOOL_SCHEMA",
     "LIST_REGISTRATIONS_TOOL_NAME",
     "LIST_REGISTRATIONS_TOOL_SCHEMA",
+    "PLACE_CALL_TOOL_NAME",
+    "PLACE_CALL_TOOL_SCHEMA",
+    "REPORT_RESULT_TOOL_NAME",
+    "REPORT_RESULT_TOOL_SCHEMA",
     "RESUME_TOOL_NAME",
     "RESUME_TOOL_SCHEMA",
     "VOIP_TOOLSET",
@@ -72,7 +77,9 @@ __all__ = [
     "hang_up_handler",
     "hold_call_handler",
     "list_registrations_handler",
+    "place_call_handler",
     "register_voip_tools",
+    "report_call_result_handler",
     "resume_call_handler",
     "set_active_adapter",
     "voip_pre_tool_call",
@@ -148,6 +155,87 @@ LIST_REGISTRATIONS_TOOL_SCHEMA: dict[str, object] = {
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
+#: ``place_call`` — IRREVERSIBLE (ADR-0029): the agent places an OUTBOUND call to a
+#: target on the operator's allowlist, with a per-call objective. Operator-only
+#: (privilege level 3, non-degraded); the dial target must be on
+#: ``HERMES_VOIP_OUTBOUND_ALLOW`` (the hard gate).
+PLACE_CALL_TOOL_NAME = "place_call"
+
+#: ``report_call_result`` — SAFE (ADR-0029): the call agent records the outcome of
+#: ITS OWN call before hanging up, so the originating conversation can be told how
+#: the call went. Resolved from the session context (chat_id == Call-ID), so the
+#: agent can only report on the call it is currently handling.
+REPORT_RESULT_TOOL_NAME = "report_call_result"
+
+#: ``place_call`` schema. ``number`` is the dial target (an extension or SIP URI on
+#: the operator's allowlist); ``objective`` is the goal of the call (e.g. "book a
+#: table for two at 7pm"). Both are required: an objectiveless call would open mutely
+#: with no reason to give the callee. The tool returns the new call's id immediately
+#: — the call then runs as its own concurrent conversation (ADR-0029).
+PLACE_CALL_TOOL_SCHEMA: dict[str, object] = {
+    "name": PLACE_CALL_TOOL_NAME,
+    "description": (
+        "Place an outbound phone call to a permitted number to accomplish a specific "
+        "objective on the operator's behalf (for example, calling a restaurant to "
+        "book a table). The number MUST be one the operator has pre-approved; an "
+        "un-approved number is refused. Provide a clear, self-contained objective — "
+        "the call runs as its own conversation that opens with that goal, and you "
+        "will be told the outcome when it finishes. Returns the call id; the call "
+        "proceeds in the background (this does not wait for the call to end). Only "
+        "available to the operator on a trusted, healthy session. NEVER include the "
+        "operator's private credentials or secrets in the objective — the person you "
+        "call is untrusted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "number": {
+                "type": "string",
+                "description": (
+                    "The dial target: an extension or SIP URI the operator has "
+                    "approved for outbound calling."
+                ),
+            },
+            "objective": {
+                "type": "string",
+                "description": (
+                    "The goal of the call, stated as a self-contained task (e.g. "
+                    "'book a table for two at 7pm tonight under the name Smith'). "
+                    "Must not contain operator secrets."
+                ),
+            },
+        },
+        "required": ["number", "objective"],
+        "additionalProperties": False,
+    },
+}
+
+#: ``report_call_result`` schema. ``summary`` is a short outcome the originating
+#: conversation is told (e.g. "Booked for 7pm, 2 people"). The call to report on is
+#: the current session's own call (resolved from the session context) — the model
+#: cannot target another call.
+REPORT_RESULT_TOOL_SCHEMA: dict[str, object] = {
+    "name": REPORT_RESULT_TOOL_NAME,
+    "description": (
+        "Record the outcome of THIS call so the conversation that requested it can "
+        "be told how it went. Call this once the objective is resolved (succeeded or "
+        "not), just before ending the call. Provide a short, factual summary of the "
+        "result (for example, 'Booked a table for two at 7pm under Smith' or 'They "
+        "are fully booked tonight')."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "A short, factual summary of the call's outcome.",
+            },
+        },
+        "required": ["summary"],
+        "additionalProperties": False,
+    },
+}
+
 
 @runtime_checkable
 class VoipToolHost(Protocol):
@@ -179,6 +267,26 @@ class VoipToolHost(Protocol):
 
     def list_registrations_text(self) -> str:
         """Return a human-readable snapshot of the gateway registrations."""
+        ...
+
+    async def place_call_with_objective(self, number: str, objective: str) -> str:
+        """Place an outbound call pursuing ``objective``; return the new Call-ID.
+
+        Captures the originating session (for result reporting) and enforces the
+        outbound allowlist BEFORE dialling. Raises
+        :class:`~hermes_voip.originate.OutboundCallNotAllowed` when ``number`` is not
+        permitted (so the handler reports a clear refusal and nothing is dialled).
+        Returns immediately once the call loop is running (the call proceeds in the
+        background) — it does NOT await the whole call.
+        """
+        ...
+
+    def record_call_result(self, call_id: str, summary: str) -> bool:
+        """Record the agent's outcome summary for ``call_id``; return whether stored.
+
+        ``False`` for an unknown/ended call so the tool reports a clear, non-fatal
+        outcome rather than raising.
+        """
         ...
 
 
@@ -355,12 +463,88 @@ async def list_registrations_handler(
     return json.dumps({"result": adapter.list_registrations_text()})
 
 
+def _str_arg(args: Mapping[str, object] | None, key: str) -> str:
+    """Return a trimmed string tool argument, or ``""`` when absent/non-string.
+
+    Tool arguments arrive as an untyped mapping (the model fills them); a missing or
+    wrong-typed value is treated as empty so the handler can return a clear error
+    rather than dialling/recording garbage.
+    """
+    if args is None:
+        return ""
+    value = args.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+async def place_call_handler(
+    args: Mapping[str, object] | None = None,
+    **_kwargs: object,
+) -> str:
+    """Tool handler: place an outbound call pursuing an objective (IRREVERSIBLE).
+
+    Reads ``number`` + ``objective`` from the tool args, then calls the live
+    adapter's :meth:`VoipToolHost.place_call_with_objective`. Returns the JSON
+    tool-result contract: ``{"call_id": …}`` IMMEDIATELY on success (ASYNC — it does
+    NOT await the whole call; the call runs as its own background conversation), or
+    ``{"error": …}`` when no adapter is in scope, an argument is missing, or the
+    target is not on the allowlist (the dial is then never made).
+
+    The ``pre_tool_call`` gate has already enforced the operator-level (3) +
+    non-degraded privilege clamp before this runs; the allowlist (enforced inside
+    ``place_call_with_objective``) is the hard irreversibility gate.
+    """
+    adapter = _ACTIVE_ADAPTER
+    if adapter is None:
+        return json.dumps({"error": "no active VoIP adapter; cannot place a call"})
+    number = _str_arg(args, "number")
+    objective = _str_arg(args, "objective")
+    if not number:
+        return json.dumps({"error": "place_call requires a 'number' to dial"})
+    if not objective:
+        return json.dumps({"error": "place_call requires an 'objective' for the call"})
+    try:
+        call_id = await adapter.place_call_with_objective(number, objective)
+    except OutboundCallNotAllowed as exc:
+        # The hard gate refused the target — surface a clear, non-fatal error; the
+        # number was NOT dialled. (The error message names the rejected target.)
+        return json.dumps({"error": str(exc)})
+    return json.dumps({"call_id": call_id})
+
+
+async def report_call_result_handler(
+    args: Mapping[str, object] | None = None,
+    **_kwargs: object,
+) -> str:
+    """Tool handler: record THIS call's outcome for cross-session reporting (SAFE).
+
+    Resolves the call from the Hermes session context (its ``chat_id`` is the SIP
+    Call-ID) and records the ``summary`` on the live adapter so the call-end bridge
+    can report it to the originating conversation (ADR-0029). Returns the JSON
+    tool-result contract: ``{"result": …}`` on success, ``{"error": …}`` when no
+    adapter/call is in scope or the call already ended. The call to report on is
+    fixed to the session's own call — the model cannot target another call.
+    """
+    adapter = _ACTIVE_ADAPTER
+    if adapter is None:
+        return json.dumps({"error": "no active VoIP adapter; cannot record the result"})
+    call_id = _current_call_id()
+    if call_id is None:
+        return json.dumps({"error": "no active call in this session to report on"})
+    summary = _str_arg(args, "summary")
+    if not summary:
+        return json.dumps({"error": "report_call_result requires a 'summary'"})
+    recorded = adapter.record_call_result(call_id, summary)
+    if not recorded:
+        return json.dumps({"error": "the call is not active (unknown or ended)"})
+    return json.dumps({"result": "Outcome recorded."})
+
+
 def voip_pre_tool_call(
     tool_name: str = "",
     args: Mapping[str, object] | None = None,  # noqa: ARG001 — hook arity; args unused by the VoIP gate
     **_kwargs: object,
 ) -> dict[str, str] | None:
-    """``pre_tool_call`` gate for the VoIP tools (ADR-0009/0011/0020/0026).
+    """``pre_tool_call`` gate for the VoIP tools (ADR-0009/0011/0020/0026/0029).
 
     The Hermes runtime invokes every registered ``pre_tool_call`` hook before a
     tool runs and blocks the tool when a hook returns
@@ -369,19 +553,27 @@ def voip_pre_tool_call(
     guard state (privilege level + degraded flag); a tool name we do not own is
     not ours to judge, so we return ``None`` (defer to other hooks / allow).
 
-    The privilege clamp is the security spine: ``hang_up`` is SAFE (never blocked),
-    but ``hold_call`` / ``resume_call`` / ``list_registrations`` are ELEVATED, so a
-    level-0 (untrusted/receptionist) caller — or any ``degraded`` session — is
-    BLOCKED here even if a prompt injection coaxes the model into calling the tool.
-    An unknown call context falls back to a level-0 state, so it can never
-    accidentally grant a privileged tool (fail safe).
+    The privilege clamp is the security spine: ``hang_up`` and ``report_call_result``
+    are SAFE (never blocked); ``hold_call`` / ``resume_call`` / ``list_registrations``
+    are ELEVATED; ``place_call`` is IRREVERSIBLE. So a level-0 (untrusted/
+    receptionist) caller — or any ``degraded`` session — is BLOCKED from the
+    ELEVATED/IRREVERSIBLE tools here even if a prompt injection coaxes the model into
+    calling one, and ``place_call`` additionally requires the operator level (3). An
+    unknown call context falls back to a level-0 state, so it can never accidentally
+    grant a privileged tool (fail safe).
 
-    ``confirmed`` is hard-wired ``False`` here: a model-influenced confirmation
-    would defeat the ADR-0010 spoof-resistant requirement, and the spoof-resistant
-    DTMF confirmation channel is not wired into the live adapter. No IRREVERSIBLE
-    VoIP tool is exposed, so no tool depends on ``confirmed`` today; the moment one
-    is, its confirmation MUST be sourced from the DTMF control path, never from a
-    tool argument.
+    **The ``confirmed`` argument (ADR-0029).** The ADR-0010 spoof-resistant DTMF
+    confirmation channel is not wired into the live adapter, so a model-set
+    confirmation must never be trusted. For every tool EXCEPT ``place_call`` this
+    gate passes ``confirmed=False`` (those tools are SAFE/ELEVATED and never consult
+    it). ``place_call`` is the one IRREVERSIBLE tool exposed, and its *irreversibility
+    safeguard is the static, operator-curated ``HERMES_VOIP_OUTBOUND_ALLOW``
+    allowlist* (enforced inside ``place_call_with_objective`` before any dial), which
+    is MORE spoof-resistant than an in-band DTMF tone a remote party shares the
+    channel with — see ADR-0029. So for ``place_call`` the gate's job is the privilege
+    clamp (operator level 3 + non-degraded), and it passes ``confirmed=True`` to let
+    ``gate_tool_call`` apply exactly that clamp; the allowlist stands in for
+    confirmation. This is NOT a model-set flag: it is a fixed property of the tool.
     """
     if tool_name not in _voip_tool_names():
         return None  # not a VoIP tool — defer (this hook fires for ALL tools)
@@ -395,10 +587,13 @@ def voip_pre_tool_call(
         state = adapter.guard_state_for(call_id)
     if state is None:
         state = GuardSessionState(call_id=call_id or "", privilege_level=0)
-    # ``confirmed=False`` always (see docstring): the ADR-0010 confirmation channel
-    # is out-of-band DTMF, never a tool argument. Every exposed tool is SAFE or
-    # ELEVATED — neither consults ``confirmed`` — so this is exact, not a stub.
-    if not gate_voip_tool(tool_name, state, confirmed=False):
+    # ``confirmed`` is a fixed per-tool property, never a model input. Only
+    # ``place_call`` (IRREVERSIBLE) is gated WITH confirmation satisfied — its hard
+    # gate is the allowlist (see docstring); the level-3 + non-degraded clamp is what
+    # ``gate_tool_call`` then enforces. Every other tool is SAFE/ELEVATED and ignores
+    # ``confirmed``, so passing False for them is exact, not a stub.
+    confirmed = tool_name == PLACE_CALL_TOOL_NAME
+    if not gate_voip_tool(tool_name, state, confirmed=confirmed):
         return {
             "action": "block",
             "message": f"The {tool_name} tool is not permitted on this call.",
@@ -420,6 +615,8 @@ def _voip_tool_names() -> frozenset[str]:
             HOLD_TOOL_NAME,
             RESUME_TOOL_NAME,
             LIST_REGISTRATIONS_TOOL_NAME,
+            PLACE_CALL_TOOL_NAME,
+            REPORT_RESULT_TOOL_NAME,
         }
     )
 
@@ -479,6 +676,22 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         description="List this system's phone registrations (privileged calls only).",
         emoji="\U0001f4cb",  # clipboard
         requires_gate=True,  # ELEVATED — discloses internal extension metadata
+    ),
+    _ToolSpec(
+        name=PLACE_CALL_TOOL_NAME,
+        schema=PLACE_CALL_TOOL_SCHEMA,
+        handler=place_call_handler,
+        description="Place an outbound call to an approved number (operator only).",
+        emoji="\U0001f4de",  # telephone receiver
+        requires_gate=True,  # IRREVERSIBLE — never register without the privilege gate
+    ),
+    _ToolSpec(
+        name=REPORT_RESULT_TOOL_NAME,
+        schema=REPORT_RESULT_TOOL_SCHEMA,
+        handler=report_call_result_handler,
+        description="Record this call's outcome for the requesting conversation.",
+        emoji="\U0001f4dd",  # memo
+        requires_gate=False,  # SAFE — the agent records its own call's outcome
     ),
 )
 

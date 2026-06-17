@@ -576,3 +576,271 @@ async def test_deliver_turn_uses_assistant_preamble_for_allow() -> None:
 # loopback gateway in tests/e2e/test_outbound_call.py, where the caller-mode
 # assertions (privileged=False + callee identity + OUTBOUND mode) ride on the real
 # place_call path — see test_outbound_call_runs_unprivileged_with_callee_identity.
+
+
+# --- ADR-0029: per-call objective brief in the outbound turn + first turn -----
+
+
+async def _collect_events(captured: list[object]) -> None:
+    """Yield to the loop until handle_message's background task captures an event."""
+    for _ in range(50):
+        if captured:
+            return
+        await asyncio.sleep(0.02)
+
+
+def _outbound_info(*, objective: str, origin: tuple[str, str] | None = None) -> dict:
+    """An outbound _call_info dict (OUTBOUND group + objective, optional origin)."""
+    from hermes_voip.caller_modes import CallerGroup  # noqa: PLC0415
+
+    info: dict[str, object] = {
+        "name": "1000",
+        "remote_uri": "sip:1000@pbx.example.test",
+        "type": "dm",
+        "ended": False,
+        "group": CallerGroup(
+            name="outbound",
+            privilege_level=0,
+            persona="outbound",
+            declined_at_sip=False,
+        ),
+        "objective": objective,
+    }
+    if origin is not None:
+        info["origin"] = origin
+    return info
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_includes_objective_in_outbound_preamble() -> None:
+    """On an outbound call the per-call objective rides in the spotlighted preamble.
+
+    So every turn keeps the agent on the operator's task with the untrusted callee.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[str] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(getattr(event, "text", ""))
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _outbound_info(
+        objective="book a table for two at 7pm"
+    )
+
+    await adapter._deliver_turn(call_id, "hello, this is the restaurant")
+    await _collect_events(captured)
+
+    assert captured
+    text = captured[0]
+    assert "book a table for two at 7pm" in text
+    # The callee's words are still present and fenced as untrusted data.
+    assert "hello, this is the restaurant" in text
+    assert "untrusted" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_objective_injected_as_first_turn_into_the_call_session() -> None:
+    """The objective is injected as the call session's FIRST turn (chat == Call-ID).
+
+    So the call agent OPENS with the goal instead of waiting mutely for the callee.
+    The injected event is internal (synthetic) and lands in the call's OWN session.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _outbound_info(objective="confirm the delivery time")
+
+    await adapter._inject_objective_first_turn(call_id)
+    await _collect_events(captured)
+
+    assert captured
+    event = captured[0]
+    text = getattr(event, "text", "")
+    assert "confirm the delivery time" in text
+    # Synthetic (internal) and routed to the call's own session (chat_id == Call-ID).
+    assert getattr(event, "internal", False) is True
+    source = getattr(event, "source", None)
+    assert source is not None
+    assert source.chat_id == call_id
+
+
+@pytest.mark.asyncio
+async def test_no_objective_first_turn_when_objective_absent() -> None:
+    """A call without an objective (inbound / no-objective outbound) injects nothing."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {
+        "name": "9999",
+        "remote_uri": "sip:9999@pbx.example.test",
+        "type": "dm",
+        "ended": False,
+        "mode": CallerMode.GREY,
+    }
+
+    await adapter._inject_objective_first_turn(call_id)
+    # Give any erroneous background task a chance to fire.
+    for _ in range(10):
+        await asyncio.sleep(0.02)
+
+    assert captured == []
+
+
+# --- ADR-0029: async result reporting into the ORIGIN session ----------------
+
+
+@pytest.mark.asyncio
+async def test_call_end_reports_result_into_origin_session() -> None:
+    """A finished outbound call reports its outcome into the ORIGINATING session.
+
+    The end signal still goes to the call's own session (ADR-0026); ADDITIONALLY,
+    when an origin was captured at trigger time, a second internal MessageEvent is
+    injected into that FOREIGN session (e.g. the Telegram chat that asked for the
+    call) carrying the recorded result — so the originating agent tells the user.
+    """
+    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    info = _outbound_info(
+        objective="book a table for two at 7pm", origin=("telegram", "12345")
+    )
+    info["result"] = "Booked: table for two at 7pm under the operator's name."
+    adapter._call_info[call_id] = info
+
+    # Two events expected: the call's own end signal (ADR-0026) + the origin report.
+    expected_events = 2
+    await adapter._signal_call_end(call_id, CallEndReason.REMOTE_BYE)
+    for _ in range(50):
+        if len(captured) >= expected_events:
+            break
+        await asyncio.sleep(0.02)
+
+    # One event lands in the ORIGIN (telegram:12345) session with the result text.
+    origin_events = [
+        e
+        for e in captured
+        if getattr(getattr(e, "source", None), "chat_id", None) == "12345"
+    ]
+    assert origin_events, f"no event reached the origin session; got {captured!r}"
+    origin = origin_events[0]
+    assert getattr(origin, "internal", False) is True
+    assert origin.source.platform.value == "telegram"
+    text = getattr(origin, "text", "")
+    assert "Booked: table for two at 7pm under the operator's name." in text
+    # It names the callee and reads as an outbound-call outcome (not caller speech).
+    assert "1000" in text
+
+
+@pytest.mark.asyncio
+async def test_call_end_reports_failure_outcome_into_origin_when_no_result() -> None:
+    """A FAILED outbound call (busy/declined/pipeline) still reports to the origin.
+
+    When the call agent recorded no result (e.g. the callee never answered), the
+    origin report falls back to the classified end reason so the originating agent
+    can still tell the user the call did not succeed.
+    """
+    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    # No "result" key — the call failed before the agent could record one.
+    adapter._call_info[call_id] = _outbound_info(
+        objective="book a table", origin=("telegram", "12345")
+    )
+
+    await adapter._signal_call_end(call_id, CallEndReason.SIP_ERROR)
+    for _ in range(50):
+        if len(captured) >= 1:
+            break
+        await asyncio.sleep(0.02)
+
+    origin_events = [
+        e
+        for e in captured
+        if getattr(getattr(e, "source", None), "chat_id", None) == "12345"
+    ]
+    assert origin_events, f"no failure report reached the origin; got {captured!r}"
+    text = getattr(origin_events[0], "text", "").lower()
+    # The report mentions the call ended / did not succeed (the reason rides as text).
+    assert "ended" in text or "call" in text
+
+
+@pytest.mark.asyncio
+async def test_call_end_no_origin_does_not_inject_into_a_foreign_session() -> None:
+    """With no origin captured (env-trigger/cron path), no FOREIGN session is targeted.
+
+    The call's own end signal still fires (ADR-0026), but there is no second,
+    foreign-session injection — the no-origin fallback is send_message to a
+    configured channel, exercised separately.
+    """
+    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    # Outbound info with NO origin key.
+    adapter._call_info[call_id] = _outbound_info(objective="book a table")
+
+    await adapter._signal_call_end(call_id, CallEndReason.REMOTE_BYE)
+    await _collect_events(captured)
+
+    # Every captured event is the call's OWN session (chat_id == Call-ID); none is a
+    # foreign-session report.
+    for event in captured:
+        source = getattr(event, "source", None)
+        assert source is not None
+        assert source.chat_id == call_id

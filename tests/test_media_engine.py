@@ -641,6 +641,97 @@ async def test_send_audio_24k_stream_is_continuous_across_chunks() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_stop_mid_playout_flushes_all_buffered_audio_in_order() -> None:
+    """A stop() racing the send loop loses NO buffered audio and preserves order.
+
+    Adversarial-review regression: send_audio drains whole frames off the FRONT of
+    the re-framing buffer, removing each only after it is on the wire; stop() then
+    flushes whatever remains. So a stop() that fires mid-drain (here: from inside
+    the pacing sleep after the first frame) must still deliver every later whole
+    frame AND the partial tail, in order — never dropping a middle frame nor
+    reordering the tail ahead of it. We feed 5 frames' worth (800 samples) in one
+    call; the decoded concatenation of ALL emitted packets must equal the input.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        initial_seq=0,
+        initial_ts=0,
+    )
+    await engine.connect()
+
+    input_samples = 5 * _SAMPLES_PER_FRAME  # 800 — exactly 5 whole frames
+
+    with _capture_sends(engine) as recorder:
+        # Pacing sleep that tears the engine down right after the first frame is
+        # sent — exercising the "stop() nulls _transport during the sleep" path
+        # with whole frames still buffered behind it.
+        async def _stop_after_first(_secs: float) -> None:
+            if len(recorder.sent) == 1 and engine._transport is not None:
+                await engine.stop()
+
+        engine._sleep = _stop_after_first
+        await engine.send_audio(_counter_chunk(0, input_samples, G711_SAMPLE_RATE))
+        # stop() already ran from inside the sleep (its flush sent the rest); a
+        # second stop() is a harmless idempotent no-op.
+        await engine.stop()
+
+    payloads = [RtpPacket.parse(wire).payload for wire, _dest in recorder.sent]
+    emitted = b"".join(payloads)
+    # mu-law is one byte/sample: 800 input samples emit exactly 800 (5 frames),
+    # nothing dropped, nothing padded (the input is a whole number of frames).
+    assert len(emitted) == input_samples, (
+        f"expected {input_samples} samples delivered across the stop race, "
+        f"got {len(emitted)} (a middle frame was dropped)"
+    )
+    # Order preserved: decoding back equals a direct encode of the whole input.
+    from hermes_voip.media.audio import decode_ulaw, encode_ulaw  # noqa: PLC0415
+
+    original = _counter_chunk(0, input_samples, G711_SAMPLE_RATE).samples
+    assert decode_ulaw(emitted) == decode_ulaw(encode_ulaw(original)), (
+        "emitted audio is reordered or corrupted across the stop race"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hold_drops_buffered_remainder_no_stale_audio_on_resume() -> None:
+    """set_hold(True) drops the buffered sub-frame tail (hold stops outbound).
+
+    Adversarial-review regression: a partial-frame remainder buffered before hold
+    must NOT survive to be prepended to post-resume audio, nor be emitted by a
+    stop()-while-held. We send a non-frame-multiple chunk (a remainder is left
+    buffered), hold (which must clear it), then confirm a stop() while held emits
+    nothing — the buffered tail is gone.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    # 240 samples = 1.5 frames -> 80-sample remainder buffered after one frame.
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_counter_chunk(0, 240, G711_SAMPLE_RATE))
+        assert engine._tx_buffer, "precondition: a sub-frame remainder is buffered"
+
+        await engine.set_hold(True)
+        assert engine._tx_buffer == b"", "set_hold(True) must drop the buffered tail"
+
+        sent_before_stop = len(recorder.sent)
+        await engine.stop()  # while held: must flush nothing
+        assert len(recorder.sent) == sent_before_stop, (
+            "stop() while held emitted buffered audio — hold must stop outbound media"
+        )
+
+
 # ---------------------------------------------------------------------------
 # (d) set_hold stops outbound media
 # ---------------------------------------------------------------------------

@@ -165,9 +165,20 @@ def _make_elevenlabs_tts(config: MediaConfig) -> StreamingTTS:
     # presence is already enforced by MediaConfig.__post_init__ (fail-fast there).
     api_key = config.elevenlabs_api_key or ""
     voice = config.tts_voice or ""
-    from hermes_voip.tts.elevenlabs import ElevenLabsTTS  # noqa: PLC0415
+    from hermes_voip.tts.elevenlabs import (  # noqa: PLC0415
+        G711_NARROWBAND_RATE,
+        ElevenLabsTTS,
+    )
 
-    return ElevenLabsTTS(api_key=api_key, voice=voice)
+    # Request the telephony wire rate so the media layer encodes with NO resample
+    # (the "very choppy" fix, ADR-0007 amendment). This is the G.711 case: the SDP
+    # codec menu (adapter._SUPPORTED_ENCODINGS) is G.711-only today, so 8 kHz is
+    # always the negotiated wire rate. When the wideband lane (ADR-0005: prefer
+    # Opus/G.722) lands, this is the single place to derive the rate from the
+    # negotiated codec (G.722→16000, Opus→48000) instead of the narrowband default.
+    return ElevenLabsTTS(
+        api_key=api_key, voice=voice, output_sample_rate=G711_NARROWBAND_RATE
+    )
 
 
 def _make_onnx_guard(config: MediaConfig) -> InjectionGuard:

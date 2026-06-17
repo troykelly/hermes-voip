@@ -306,16 +306,18 @@ class RtpMediaTransport:
         # output matches a single pass); 8 kHz frames bypass it entirely.
         self._tx_resamplers: dict[int, Resampler] = {}
 
-        # Outbound 20 ms re-framing buffer (the "very choppy" fix). A streaming
-        # TTS provider (e.g. ElevenLabs over chunked HTTP) hands send_audio one
-        # frame PER NETWORK CHUNK, and a chunk is rarely a whole multiple of the
-        # 160-sample (320-byte) G.711 frame. We must NOT zero-pad each chunk's
-        # sub-frame remainder to a full frame — that injects a slug of silence at
-        # every chunk boundary (a click/gap per chunk == "very choppy"). Instead
-        # the leftover wire-rate PCM16 bytes are carried here and prepended to the
-        # next chunk, so the concatenated outbound stream is sample-continuous.
-        # The residual is padded to a final frame exactly once, in stop(), so the
-        # last utterance's tail is not stranded when the call tears down.
+        # Outbound 20 ms re-framing buffer (the "very choppy" fix), holding the
+        # not-yet-sent wire-rate PCM16 bytes in order. A streaming TTS provider
+        # (e.g. ElevenLabs over chunked HTTP) hands send_audio one frame PER
+        # NETWORK CHUNK, and a chunk is rarely a whole multiple of the 160-sample
+        # (320-byte) G.711 frame. We must NOT zero-pad each chunk's sub-frame
+        # remainder to a full frame — that injects a slug of silence at every
+        # chunk boundary (a click/gap per chunk == "very choppy"). Instead bytes
+        # accumulate here and send_audio drains whole frames off the front, so the
+        # concatenated outbound stream is sample-continuous. The residual partial
+        # is padded to a final frame exactly once, in stop()'s flush, so the last
+        # utterance's tail is delivered not stranded; set_hold(True) drops it
+        # (hold stops outbound media). Reset in connect()/stop().
         self._tx_buffer: bytes = b""
 
         # Stop signal: set by stop(), selected on by the inbound generator so it
@@ -617,19 +619,40 @@ class RtpMediaTransport:
         samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
         chunk_bytes = samples_per_frame * 2  # PCM16 = 2 bytes per sample
 
-        buffered = self._tx_buffer + wire_rate_frame.samples
-        whole = len(buffered) - (len(buffered) % chunk_bytes)
-        # Carry the sub-frame remainder to the next call (no mid-stream padding).
-        self._tx_buffer = buffered[whole:]
-
-        for offset in range(0, whole, chunk_bytes):
+        # _tx_buffer is the single ORDERED source of truth for not-yet-sent
+        # outbound audio: append this chunk, then drain whole frames off the FRONT
+        # one at a time, removing each frame ONLY once it is on the wire. So if a
+        # concurrent stop() flushes _tx_buffer mid-drain, every still-unsent frame
+        # (whole frames AND the sub-frame remainder) is in _tx_buffer in order —
+        # stop()'s flush delivers them, never dropping a middle frame, never
+        # re-sending one already on the wire, never reordering the tail ahead.
+        self._tx_buffer += wire_rate_frame.samples
+        while len(self._tx_buffer) >= chunk_bytes:
+            # Remove the frame from the buffer BEFORE transmitting: _transmit_frame
+            # awaits a pacing sleep, and a concurrent stop() flushing _tx_buffer
+            # during that sleep must not re-send a frame already on the wire. The
+            # buffer therefore always holds exactly the not-yet-sent audio.
+            chunk, self._tx_buffer = (
+                self._tx_buffer[:chunk_bytes],
+                self._tx_buffer[chunk_bytes:],
+            )
             sent = await self._transmit_frame(
-                buffered[offset : offset + chunk_bytes],
-                wire_rate_frame.monotonic_ts_ns,
-                samples_per_frame,
+                chunk, wire_rate_frame.monotonic_ts_ns, samples_per_frame
             )
             if not sent:
-                # stop() nulled the transport mid-playout: drop the rest cleanly.
+                # stop() nulled the transport before this frame went out: put it
+                # back at the FRONT (bytes preserved, order kept) and stop
+                # draining. stop()'s flush owns the buffer from here.
+                self._tx_buffer = chunk + self._tx_buffer
+                return
+            # Read _transport through a fresh local so mypy does not treat this as
+            # unreachable: the pre-loop guard narrowed self._transport to non-None
+            # and that narrowing does not survive the await inside _transmit_frame
+            # at runtime (stop() may have nulled it during the pacing sleep).
+            transport_after_send: asyncio.DatagramTransport | None = self._transport
+            if transport_after_send is None:
+                # The frame WAS sent and is already removed from the buffer; the
+                # remaining buffer is owned by stop()'s flush. Stop draining.
                 return
 
     async def _transmit_frame(
@@ -637,11 +660,14 @@ class RtpMediaTransport:
     ) -> bool:
         """Encode + packetise one whole 20 ms frame and send it; pace by ptime.
 
-        Returns ``False`` (without sending) when the transport has been torn down
-        by a concurrent :meth:`stop` — the caller then drops the rest of the
-        stream cleanly. Returns ``True`` after the datagram is sent and the
-        ``ptime`` pacing sleep has elapsed. The seq/timestamp counters advance
-        only when a datagram is actually emitted.
+        Returns whether the frame was put **on the wire**: ``False`` if the
+        transport had already been torn down by a concurrent :meth:`stop` at entry
+        (nothing sent — the caller puts the frame back), ``True`` once the datagram
+        is sent (then the ``ptime`` pacing sleep elapses). The seq/timestamp
+        counters advance only when a datagram is actually emitted. Whether to keep
+        draining after a ``True`` is the caller's decision (it re-checks the
+        transport, which :meth:`stop` may have nulled during the sleep — the frame
+        was still sent).
         """
         transport = self._transport
         if transport is None:
@@ -703,10 +729,11 @@ class RtpMediaTransport:
 
         transport.sendto(wire, self._outbound_addr)
         await self._sleep(self._ptime / 1000.0)
-        # Re-read _transport after the sleep: stop() may have nulled it while this
-        # coroutine was suspended, so report that to the caller (which drops the
-        # rest of the stream) rather than letting the next sendto raise (B2).
-        return self._transport is not None
+        # The frame is on the wire (sent above). stop() may have nulled _transport
+        # during the sleep, but that governs whether the CALLER keeps draining (it
+        # re-checks _transport) — it does not un-send this frame, so we report the
+        # send as successful (True).
+        return True
 
     @property
     def inbound_sample_rate(self) -> int:
@@ -720,9 +747,16 @@ class RtpMediaTransport:
     async def set_hold(self, on_hold: bool) -> None:
         """Gate or restore outbound media (hold = stop sending; idempotent).
 
+        Entering hold also DROPS any buffered outbound remainder (the < 20 ms
+        sub-frame tail carried by the re-framing buffer), so stale pre-hold audio
+        is not prepended to the stream after resume nor flushed by a stop-while-
+        held — "hold stops outbound media" holds for the buffered tail too.
+
         Args:
             on_hold: ``True`` to hold; ``False`` to resume.
         """
+        if on_hold:
+            self._tx_buffer = b""
         self.on_hold = on_hold
 
     async def stop(self) -> None:
@@ -730,15 +764,19 @@ class RtpMediaTransport:
 
         Safe to call multiple times or before :meth:`connect`.
 
-        Flushes any buffered sub-frame outbound tail (zero-padded to one final
-        160-sample frame) through the still-open socket BEFORE closing it, so the
-        last utterance's residual audio is delivered rather than stranded in the
-        re-framing buffer. This pads at most once per call — not per chunk — so it
-        is not a source of the per-chunk choppiness it replaces.
+        Flushes any buffered outbound audio (the unsent whole frames plus a final
+        zero-padded partial) through the still-open socket BEFORE closing it, so
+        the last utterance's residual audio is delivered rather than stranded in
+        the re-framing buffer. The partial is padded at most once — not per chunk
+        — so this is not a source of the per-chunk choppiness it replaces. The
+        flush is skipped while :attr:`on_hold` (hold stops outbound media), and
+        :meth:`set_hold` clears the buffer on entry, so a stop-while-held emits
+        nothing.
         """
         transport = self._transport
-        if transport is not None:
+        if transport is not None and not self.on_hold:
             self._flush_tx_tail(transport)
+        self._tx_buffer = b""
         self._transport = None
         if transport is not None:
             transport.close()
@@ -748,14 +786,15 @@ class RtpMediaTransport:
         self._stop_event.set()
 
     def _flush_tx_tail(self, transport: asyncio.DatagramTransport) -> None:
-        """Emit the buffered sub-frame outbound remainder as one final frame.
+        """Emit all buffered outbound audio as final RTP packets, in order.
 
-        Pads the residual wire-rate bytes in :attr:`_tx_buffer` up to a whole
-        160-sample G.711 frame and sends a single RTP packet through ``transport``
-        (the still-open socket), then clears the buffer. A no-op when nothing is
-        buffered. Sent inline (no ``ptime`` pacing) because the call is tearing
-        down; the seq/timestamp counters still advance by one frame so the wire
-        stays RFC 3550-consistent.
+        Sends every whole 160-sample frame still in :attr:`_tx_buffer` (the send
+        loop can leave several when a concurrent stop bails out mid-drain), then
+        zero-pads the trailing sub-frame remainder up to one whole frame and sends
+        it too, through ``transport`` (the still-open socket), and clears the
+        buffer. A no-op when nothing is buffered. Sent inline (no ``ptime`` pacing)
+        because the call is tearing down; seq/timestamp advance per emitted frame
+        so the wire stays RFC 3550-consistent.
         """
         tail = self._tx_buffer
         self._tx_buffer = b""
@@ -763,21 +802,31 @@ class RtpMediaTransport:
             return
         samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
         chunk_bytes = samples_per_frame * 2
-        padded = tail + bytes(chunk_bytes - len(tail))
-        payload = self._encode(
-            PcmFrame(samples=padded, sample_rate=G711_SAMPLE_RATE, monotonic_ts_ns=0)
-        )
-        pkt = RtpPacket(
-            payload_type=self._codec.value,
-            sequence_number=self._seq,
-            timestamp=self._ts,
-            ssrc=_OUTBOUND_SSRC,
-            payload=payload,
-        )
-        wire = self._srtp_out.protect(pkt) if self._srtp_out is not None else pkt.pack()
-        self._seq = (self._seq + 1) % (1 << 16)
-        self._ts = (self._ts + samples_per_frame) % (1 << 32)
-        transport.sendto(wire, self._outbound_addr)
+        # Pad only the trailing partial up to a whole frame; whole frames already
+        # buffered are sent as-is, in order, each as its own RTP packet.
+        remainder = len(tail) % chunk_bytes
+        if remainder:
+            tail = tail + bytes(chunk_bytes - remainder)
+        for offset in range(0, len(tail), chunk_bytes):
+            chunk = tail[offset : offset + chunk_bytes]
+            payload = self._encode(
+                PcmFrame(samples=chunk, sample_rate=G711_SAMPLE_RATE, monotonic_ts_ns=0)
+            )
+            pkt = RtpPacket(
+                payload_type=self._codec.value,
+                sequence_number=self._seq,
+                timestamp=self._ts,
+                ssrc=_OUTBOUND_SSRC,
+                payload=payload,
+            )
+            wire = (
+                self._srtp_out.protect(pkt)
+                if self._srtp_out is not None
+                else pkt.pack()
+            )
+            self._seq = (self._seq + 1) % (1 << 16)
+            self._ts = (self._ts + samples_per_frame) % (1 << 32)
+            transport.sendto(wire, self._outbound_addr)
 
     # ------------------------------------------------------------------
     # Discovered port (after connect with local_port=0)

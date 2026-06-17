@@ -188,7 +188,7 @@ streaming order, `TtsStream.flush()` end-of-utterance framing, and mid-stream
 | A single hard-wired engine | Deployments span CPU-only, GPU, and "operator already pays a cloud vendor"; one fixed engine cannot serve all and contradicts the swappable-provider seam (ADR-0004). |
 
 
-## Amendment (2026-06-17): ElevenLabs requests `pcm_8000` (telephony-native), not `pcm_24000`
+## Amendment (2026-06-17): ElevenLabs requests the telephony wire rate (codec-gated; `pcm_8000` for G.711), not `pcm_24000`
 
 - Deciders: agent session (operator-directed live "very choppy" audio fix)
 
@@ -206,28 +206,50 @@ first-audio latency — with **no quality benefit** on an 8 kHz G.711 wire (the
 narrowband codec discards everything above ~3.4 kHz regardless). ElevenLabs
 supports `pcm_8000` directly.
 
-**Decision:** the ElevenLabs provider now requests **`output_format=pcm_8000`**
-and declares `output_sample_rate = 8000`. The frames it emits are already at the
-G.711 wire rate, so `RtpMediaTransport._to_wire_rate` takes its byte-exact
-fast-path (no resampler is constructed for the stream) and the media layer only
-G.711-encodes. We keep **PCM16** (not the also-native `ulaw_8000`) because the
-codec is the media layer's job (ADR-0004) and `PcmFrame` is the PCM16 currency —
-requesting raw µ-law would break that contract and force a passthrough path
-through the whole TTS→media seam for marginal gain (one `lin2ulaw` call).
+**Decision:** the ElevenLabs provider requests PCM16 at the **telephony wire
+rate** — `output_format=pcm_8000`, `output_sample_rate = 8000` **by default**.
+The frames it emits are then already at the G.711 wire rate, so
+`RtpMediaTransport._to_wire_rate` takes its byte-exact fast-path (no resampler is
+constructed for the stream) and the media layer only G.711-encodes. We keep
+**PCM16** (not the also-native `ulaw_8000`) because the codec is the media layer's
+job (ADR-0004) and `PcmFrame` is the PCM16 currency — requesting raw µ-law would
+break that contract and force a passthrough path through the whole TTS→media seam
+for marginal gain (one `lin2ulaw` call).
 
-This is a deliberate, **narrow** exception to ADR-0017 alternative #2 ("resample
-inside the provider — rejected, keeps providers gateway-specific"). It is *not*
-gateway-specific: **8 kHz is the universal PSTN/G.711 narrowband rate** (RFC 3551
-PCMU/PCMA are defined at 8000 Hz), so asking a cloud TTS for 8 kHz couples it to
-the telephony wire in general, not to any one gateway. The self-host engines
-(Kokoro 24 kHz) are unchanged — they have no native 8 kHz mode and the media
-layer still reconciles their rate (ADR-0017). Only the cloud providers that
-natively offer the wire rate (ElevenLabs `pcm_8000`; Cartesia/Aura-2 native
-mulaw, already noted above) request it.
+**Codec-gated, not a hardcoded narrowband pin.** The requested rate is the
+**G.711 case of a codec→rate mapping**, not an unconditional `8000`. It is 8 kHz
+because the SDP codec menu this plugin advertises today (`adapter._SUPPORTED_
+ENCODINGS` = PCMU/PCMA/telephone-event) is G.711-only, so the negotiated wire is
+always 8 kHz (RFC 3551 PCMU/PCMA are defined at 8000 Hz). The provider takes the
+rate as a constructor argument (`output_sample_rate`, default
+`G711_NARROWBAND_RATE`); `_make_elevenlabs_tts` passes the G.711 narrowband rate
+explicitly, with that build site documented as the single place to derive the
+rate from the negotiated codec. A `pcm_<rate>` format helper
+(`elevenlabs_pcm_format`) maps the rate to ElevenLabs' supported PCM formats
+(8000/16000/22050/24000/44100) and **raises** for an unsupported rate (fail fast
+at construction, never a silent lossy fallback). This matters because **ADR-0005
+mandates wideband** ("prefer Opus, negotiate by capability"): when that lane lands
+and the menu advertises G.722/Opus, the TTS rate must FOLLOW the negotiated codec
+(G.722→16 kHz `pcm_16000`; Opus→48 kHz, resampled) — burying an unconditional
+8 kHz request here would instead throw negotiated wideband away by downsampling
+TTS to 8 kHz. The mapping makes that generalization a one-line extension at the
+build site, not a rewrite.
 
-Consequences: zero outbound resample on the ElevenLabs path, ~3× less provider
-egress bandwidth, lower first-audio latency, and one fewer lossy DSP stage — all
-while the `StreamingTTS`/`PcmFrame` seam (ADR-0004) is unchanged (only the
-provider's declared `output_sample_rate` and the requested `output_format`
-differ). Tests pin `output_format == "pcm_8000"` and `output_sample_rate == 8000`
-(the G.711 wire rate) so a regression to 24 kHz fails the suite.
+This is a deliberate, **narrow** refinement of ADR-0017 alternative #2 ("resample
+inside the provider — rejected, keeps providers gateway-specific"). Asking a cloud
+TTS for the *negotiated wire rate* is **not** gateway-specific — it couples the
+provider to the telephony wire in general (whatever codec was negotiated), not to
+any one gateway. The self-host engines (Kokoro 24 kHz) are unchanged — they have
+no native telephony-rate mode and the media layer still reconciles their rate
+(ADR-0017). Only the cloud providers that natively offer the wire rate (ElevenLabs
+`pcm_8000`/`pcm_16000`/…; Cartesia/Aura-2 native mulaw, already noted above)
+request it.
+
+Consequences: zero outbound resample on the ElevenLabs path at the G.711 rate,
+~3× less provider egress bandwidth, lower first-audio latency, and one fewer lossy
+DSP stage — all while the `StreamingTTS`/`PcmFrame` seam (ADR-0004) is unchanged
+(only the provider's declared `output_sample_rate` and the requested
+`output_format` differ). Tests pin the default `output_format == "pcm_8000"` /
+`output_sample_rate == 8000` so a regression to 24 kHz fails the suite, AND assert
+a non-default rate (16 kHz) requests `pcm_16000` so the rate is provably codec-
+driven rather than a constant.

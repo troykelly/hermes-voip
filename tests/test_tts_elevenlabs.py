@@ -21,10 +21,12 @@ import pytest
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts.elevenlabs import (
+    G711_NARROWBAND_RATE,
     ElevenLabsRequest,
     ElevenLabsTTS,
     HttpByteStream,
     HttpCancellation,
+    elevenlabs_pcm_format,
 )
 
 # The telephony-native G.711 wire rate (ADR-0007 amendment): ElevenLabs is asked
@@ -214,6 +216,66 @@ async def test_request_body_carries_the_segmented_text() -> None:
     req = http.request
     assert req is not None
     assert req.text == "One sentence only."
+
+
+# --- requested rate follows the codec (not a hardcoded 8 kHz pin) ------------
+
+
+def test_default_rate_is_g711_narrowband() -> None:
+    """The DEFAULT requested rate is the G.711 narrowband 8 kHz (today's only lane).
+
+    8 kHz is requested because the SDP codec menu is G.711-only — it is the
+    narrowband CASE of a codec->rate map, the value `_make_elevenlabs_tts` passes.
+    """
+    assert G711_NARROWBAND_RATE == _G711_WIRE_RATE
+    tts = _make(_RecordedHttp())
+    assert tts.output_sample_rate == G711_NARROWBAND_RATE
+
+
+def test_elevenlabs_pcm_format_maps_supported_rates() -> None:
+    """The codec->format helper maps each supported wire rate to its pcm_<rate>."""
+    assert elevenlabs_pcm_format(8_000) == "pcm_8000"
+    assert elevenlabs_pcm_format(16_000) == "pcm_16000"  # G.722 wideband lane
+    assert elevenlabs_pcm_format(24_000) == "pcm_24000"
+
+
+def test_elevenlabs_pcm_format_rejects_unsupported_rate() -> None:
+    """An unsupported wire rate fails loudly, not by silent lossy fallback."""
+    with pytest.raises(ValueError, match="no native PCM output for 12345 Hz"):
+        elevenlabs_pcm_format(12_345)
+
+
+@pytest.mark.asyncio
+async def test_wideband_rate_requests_matching_pcm_format() -> None:
+    """A non-default (wideband) rate requests the MATCHING pcm format, not pcm_8000.
+
+    Proves the request rate is NOT an unconditional 8 kHz pin: constructing the
+    provider at 16 kHz (the G.722 lane the wideband work will negotiate) requests
+    ``pcm_16000`` and emits 16 kHz frames — the rate follows the codec.
+    """
+    http = _RecordedHttp()
+    tts = ElevenLabsTTS(
+        api_key=_FAKE_KEY, voice="x", http=http, output_sample_rate=16_000
+    )
+    assert tts.output_sample_rate == 16_000
+    frames = await _drain(tts.synthesize(_text("Wideband please. "), voice="x"))
+    assert frames
+    assert all(f.sample_rate == 16_000 for f in frames)
+    req = http.request
+    assert req is not None
+    assert req.output_format == "pcm_16000"
+    assert "output_format=pcm_16000" in req.url
+
+
+def test_unsupported_output_rate_rejected_at_construction() -> None:
+    """A wire rate ElevenLabs cannot emit fails fast at construction, not mid-call."""
+    with pytest.raises(ValueError, match="no native PCM output"):
+        ElevenLabsTTS(
+            api_key=_FAKE_KEY,
+            voice="x",
+            http=_RecordedHttp(),
+            output_sample_rate=11_025,
+        )
 
 
 # --- secret hygiene ----------------------------------------------------------

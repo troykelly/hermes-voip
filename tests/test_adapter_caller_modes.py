@@ -32,7 +32,13 @@ pytest.importorskip("gateway.config")
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
-from hermes_voip.caller_modes import CallerMode, CallerModeConfig, Normalization
+from hermes_voip.caller_modes import (
+    CallerGroup,
+    CallerGroupConfig,
+    CallerMode,
+    CallerModeConfig,
+    Normalization,
+)
 from hermes_voip.config import ConfigError, ExtensionConfig
 from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
@@ -382,6 +388,7 @@ async def test_inbound_grey_sets_privileged_false() -> None:
         privilege_level: int = 3,
         degraded: bool = False,
         privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
     ) -> GuardSessionState:
         # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
         # int, with the privileged bool kept as a back-compat kwarg) so the
@@ -394,6 +401,7 @@ async def test_inbound_grey_sets_privileged_false() -> None:
             privilege_level=privilege_level,
             degraded=degraded,
             privileged=privileged,
+            allowed_tools=allowed_tools,
         )
         captured[call_id] = state
         return state
@@ -448,6 +456,7 @@ async def test_inbound_allow_sets_privileged_true() -> None:
         privilege_level: int = 3,
         degraded: bool = False,
         privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
     ) -> GuardSessionState:
         # Mirror the real GuardSessionState constructor (ADR-0021: privilege_level
         # int, with the privileged bool kept as a back-compat kwarg). Delegating to
@@ -458,6 +467,7 @@ async def test_inbound_allow_sets_privileged_true() -> None:
             privilege_level=privilege_level,
             degraded=degraded,
             privileged=privileged,
+            allowed_tools=allowed_tools,
         )
         captured[call_id] = state
         return state
@@ -494,6 +504,97 @@ async def test_inbound_allow_sets_privileged_true() -> None:
 
     assert call_id in captured
     assert captured[call_id].privileged is True  # ALLOW => assistant, privileged
+
+
+@pytest.mark.asyncio
+async def test_inbound_intercom_group_threads_allowed_tools_into_guard_state() -> None:
+    """The matched group's allowed_tools reaches the LIVE GuardSessionState (ADR-0031).
+
+    This is the load-bearing wiring: without it the intercom sub-ceiling never reaches
+    the gate and a spoofed intercom caller would keep every level-2 tool. The test
+    drives an inbound INVITE whose caller maps to an intercom group (level 2,
+    allowed_tools={open_entry}) and asserts the captured guard state carries that set.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    # Replace the loaded groups with an intercom group matching caller "9999".
+    intercom = CallerGroup(
+        name="intercom",
+        privilege_level=2,
+        persona="intercom",
+        declined_at_sip=False,
+        allowed_tools=frozenset({"open_entry"}),
+    )
+    receptionist = CallerGroup(
+        name="receptionist",
+        privilege_level=0,
+        persona="receptionist",
+        declined_at_sip=False,
+    )
+    adapter._caller_groups = CallerGroupConfig(
+        groups=(intercom, receptionist),
+        group_lists={"intercom": ("9999",), "receptionist": ()},
+        default_group="receptionist",
+        match_order=("intercom", "receptionist"),
+        normalization=Normalization.NONE,
+    )
+
+    captured: dict[str, GuardSessionState] = {}
+
+    def _real_guard(
+        call_id: str,
+        *,
+        privilege_level: int = 3,
+        degraded: bool = False,
+        privileged: bool | None = None,
+        allowed_tools: frozenset[str] = frozenset(),
+    ) -> GuardSessionState:
+        state = GuardSessionState(
+            call_id=call_id,
+            privilege_level=privilege_level,
+            degraded=degraded,
+            privileged=privileged,
+            allowed_tools=allowed_tools,
+        )
+        captured[call_id] = state
+        return state
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(caller="9999", call_id=call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+                inbound_sample_rate=8000,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(dialog_id=("c", "l", "r"), ended=False),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", side_effect=_real_guard),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        new_call = NewCall(registration=_ext_config(), invite=invite)
+        adapter._on_inbound_invite(new_call)
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    assert call_id in captured
+    # The intercom group's sub-ceiling reached the live guard state (level 2, scoped).
+    assert captured[call_id].privilege_level == 2
+    assert captured[call_id].allowed_tools == frozenset({"open_entry"})
 
 
 # --- persona preamble + untrusted-data delimiting in _deliver_turn -----------

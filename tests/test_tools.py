@@ -203,6 +203,36 @@ def test_allowed_tools_does_not_resurrect_unknown_tools() -> None:
     assert gate_voip_tool("delete_everything", scoped, confirmed=True) is False
 
 
+# --- ADR-0031: grant-only tools (open_entry) require an EXPLICIT allow-list grant
+
+
+def test_open_entry_blocked_without_an_explicit_grant_even_for_operator() -> None:
+    # open_entry is a "grant-only" tool: physical access. An operator (level 3) with
+    # NO allowed_tools (the common case — empty = no sub-ceiling for normal tools)
+    # must NOT be able to open the door; only a group that EXPLICITLY lists open_entry
+    # (the intercom group) can. This is stricter than the generic empty-set rule.
+    operator = GuardSessionState(call_id="call-1", privilege_level=3)
+    assert operator.allowed_tools == frozenset()
+    assert gate_voip_tool("open_entry", operator, confirmed=True) is False
+
+
+def test_open_entry_allowed_only_with_explicit_grant() -> None:
+    # The intercom group grants open_entry explicitly -> it is reachable (at level 2).
+    intercom = GuardSessionState(
+        call_id="call-1",
+        privilege_level=2,
+        allowed_tools=frozenset({"open_entry"}),
+    )
+    assert gate_voip_tool("open_entry", intercom, confirmed=False) is True
+
+
+def test_grant_only_does_not_affect_normal_tools() -> None:
+    # A normal ELEVATED tool (hold_call) is unaffected by the grant-only rule: an
+    # operator with no sub-ceiling still gets it (the generic empty-set semantics).
+    operator = GuardSessionState(call_id="call-1", privilege_level=3)
+    assert gate_voip_tool("hold_call", operator, confirmed=False) is True
+
+
 # ---- list_registrations (ELEVATED) -----------------------------------------
 
 

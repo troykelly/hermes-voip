@@ -93,6 +93,17 @@ TOOL_RISKS: dict[str, ToolRisk] = {
 }
 
 
+# Tools that require an EXPLICIT per-group ``allowed_tools`` grant to be reachable —
+# stricter than the generic sub-ceiling (ADR-0031). ``open_entry`` actuates PHYSICAL
+# access (a door / gate); it is meaningful ONLY for the intercom caller group, which
+# grants it explicitly via ``allowed_tools={"open_entry"}``. Without this set, the
+# generic rule (empty ``allowed_tools`` ⇒ no sub-ceiling ⇒ level-only) would let ANY
+# privileged (level >= 2) call open the door. A grant-only tool is therefore blocked
+# unless it is explicitly listed in the session's ``allowed_tools`` — even for a
+# level-3 operator and even when the set is otherwise empty.
+_GRANT_ONLY_TOOLS: frozenset[str] = frozenset({"open_entry"})
+
+
 def gate_voip_tool(
     tool_name: str, state: GuardSessionState, *, confirmed: bool
 ) -> bool:
@@ -111,9 +122,22 @@ def gate_voip_tool(
     the level-only behaviour exactly. The risk lookup runs first so an UNKNOWN tool
     is denied even if it appears in the allow-list (the gate cannot register a tool
     it has no risk class for).
+
+    **ADR-0031 grant-only tools.** A tool in :data:`_GRANT_ONLY_TOOLS`
+    (``open_entry`` — physical access) is reachable ONLY when the session's
+    ``allowed_tools`` *explicitly* lists it. This is stricter than the generic
+    empty-set rule: it blocks ``open_entry`` for an ordinary level-3 operator (whose
+    ``allowed_tools`` is empty), so the door can be opened ONLY from the intercom
+    group that grants ``open_entry`` deliberately — never from any other privileged
+    call. It still cannot grant ABOVE the level (the level/risk clamp runs after).
     """
     risk = TOOL_RISKS.get(tool_name)
     if risk is None:
+        return False
+    if tool_name in _GRANT_ONLY_TOOLS and tool_name not in state.allowed_tools:
+        # Grant-only (physical-access) tool with no explicit grant: blocked even for
+        # an operator and even when allowed_tools is empty. Only a group that lists
+        # it (the intercom group) may reach it.
         return False
     if state.allowed_tools and tool_name not in state.allowed_tools:
         # Scoped session: this tool is outside the group's allow-list. Remove it

@@ -52,7 +52,18 @@ both `voip_pre_tool_call` and `CallControlTools` flow through):
   level/risk clamp, so the allowlist never grants a tool **above** the level.
 
 The N-group JSON document parses an optional per-group `allowed_tools` array; a non-list
-value is a fail-loud `ConfigError`.
+value is a fail-loud `ConfigError`. The matched group's `allowed_tools` is **threaded
+onto the live `GuardSessionState` at INVITE time** (both the inbound and outbound
+construction sites) — without that wiring the sub-ceiling never reaches the gate, so it
+is the load-bearing line, covered by an adapter regression test.
+
+**Grant-only tools.** A small set of tools (`_GRANT_ONLY_TOOLS = {"open_entry"}`) is
+reachable ONLY when the session's `allowed_tools` *explicitly* lists it — stricter than
+the generic empty-set rule. `open_entry` actuates physical access, so it must be
+unreachable from an ordinary level-3 operator call (whose `allowed_tools` is empty);
+only the intercom group, which lists it deliberately, can open the door. This closes a
+gap a cross-vendor review caught (a globally-ELEVATED `open_entry` would otherwise be
+callable by any privileged non-intercom call).
 
 ### 2. `engine.send_dtmf` — RFC 4733 TX on the active call (wires ADR-0010 §Generation)
 
@@ -108,6 +119,12 @@ logged or returned).
     reason class (no token, no URL).
   - **default `disabled`** ⇒ `open_entry` **raises** (rule 37 — opening a door is never a
     silent no-op, and a misconfiguration never silently opens one either).
+  - **Secret hygiene:** the relay token is `repr=False` and never logged; relay errors
+    carry only the HTTP status / failure class (no token, no URL). A relay configured
+    with NO token logs a **loud startup WARNING** (an unauthenticated door-opener must be
+    visible — but it is not hard-failed, since a network-isolated / mTLS relay is a
+    legitimate tokenless setup). The DTMF open code is sensitive too: an invalid-code
+    `ConfigError` reports only the offending character POSITION, never the code.
 
 ### 4. DTMF-receive armed-confirmation resolver + transfer — DEFERRED (named blocker)
 

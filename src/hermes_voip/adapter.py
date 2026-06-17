@@ -1045,7 +1045,12 @@ class VoipAdapter(BasePlatformAdapter):
                 declined_at_sip=False,
             )
             guard_state = GuardSessionState(
-                call_id, privilege_level=_outbound_group.privilege_level
+                call_id,
+                privilege_level=_outbound_group.privilege_level,
+                # ADR-0031: thread the group's tool sub-ceiling (empty for the
+                # outbound group — level-only — but kept for consistency with the
+                # inbound path so the wiring is uniform and future-proof).
+                allowed_tools=_outbound_group.allowed_tools,
             )
             credentials_for_session = DigestCredentials(
                 username=source_ext.username,
@@ -1430,7 +1435,16 @@ class VoipAdapter(BasePlatformAdapter):
         # ADR-0021: the caller group's privilege_level sets the tool-risk ceiling
         # (0=receptionist/SAFE-only, 2=trusted/+ELEVATED, 3=operator/+IRREVERSIBLE).
         # Levels 0 and 3 reproduce ADR-0020's privileged=False/True exactly.
-        guard_state = GuardSessionState(call_id, privilege_level=group.privilege_level)
+        # ADR-0031: the group's allowed_tools is the per-session SUB-ceiling (empty =
+        # no sub-ceiling = level-only; a non-empty set — e.g. the intercom group's
+        # {open_entry} — scopes the call to ONLY those tools). THREADING THIS IS
+        # LOAD-BEARING: without it the sub-ceiling never reaches the live gate and a
+        # spoofed intercom caller would keep every level-2 tool.
+        guard_state = GuardSessionState(
+            call_id,
+            privilege_level=group.privilege_level,
+            allowed_tools=group.allowed_tools,
+        )
         credentials = DigestCredentials(
             username=new_call.registration.username,
             password=new_call.registration.password,

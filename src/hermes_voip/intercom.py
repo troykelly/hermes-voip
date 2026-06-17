@@ -209,14 +209,17 @@ def _load_dtmf_config(env: Mapping[str, str]) -> IntercomConfig:
         )
         raise ConfigError(msg)
     # Validate every character is a real DTMF digit — a typo must fail at load, not
-    # send garbage at door-open time.
-    for ch in digits:
+    # send garbage at door-open time. The open code is SENSITIVE (a door code), so the
+    # error must NOT echo it: config errors are commonly logged, and the value would
+    # leak. Report only the offending character POSITION, never the code.
+    for i, ch in enumerate(digits):
         try:
             digit_to_event(ch)
         except ValueError as exc:
             msg = (
-                f"{_DTMF_KEY}={digits!r} is not a valid DTMF code "
-                "(allowed characters: 0-9, *, #, A-D)"
+                f"{_DTMF_KEY} is not a valid DTMF code: character at position {i} is "
+                "not a DTMF digit (allowed characters: 0-9, *, #, A-D). "
+                "(The code itself is not shown — it is sensitive.)"
             )
             raise ConfigError(msg) from exc
     return IntercomConfig(open_mode=IntercomOpenMode.DTMF, dtmf_digits=digits)
@@ -240,6 +243,18 @@ def _load_relay_config(env: Mapping[str, str]) -> IntercomConfig:
         )
         raise ConfigError(msg)
     token = (env.get(_RELAY_TOKEN_KEY) or "").strip()
+    if not token:
+        # Physical-access actuation with NO bearer token: the relay is unauthenticated
+        # unless the endpoint enforces auth another way (mTLS / IP allowlist / a secret
+        # in the path). We do NOT hard-fail (a deliberately network-isolated relay is
+        # legitimate), but warn LOUDLY so an accidentally open door-opener is visible.
+        _log.warning(
+            "%s is unset: the intercom relay will be called WITHOUT an Authorization "
+            "bearer token. Ensure the relay endpoint enforces authentication another "
+            "way (mTLS / IP allowlist), or set %s (from 1Password).",
+            _RELAY_TOKEN_KEY,
+            _RELAY_TOKEN_KEY,
+        )
     method = (env.get(_RELAY_METHOD_KEY) or "").strip().upper() or _DEFAULT_RELAY_METHOD
     if method not in _ALLOWED_RELAY_METHODS:
         opts = ", ".join(_ALLOWED_RELAY_METHODS)

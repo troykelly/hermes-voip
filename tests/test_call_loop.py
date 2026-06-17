@@ -666,6 +666,27 @@ async def test_comfort_filler_uses_configured_phrase_text() -> None:
     """
     captured: list[str] = []
 
+    class _CapturingStream(_FakeTtsStream):
+        """A TtsStream that drains (and records) the text iterator as it plays.
+
+        A real provider consumes the text it is handed; the bare ``_FakeTtsStream``
+        ignores it, so this subclass drains the iterator on first iteration and
+        records each chunk into ``captured`` before emitting the preset frames —
+        faithfully exercising the text the comfort filler routes to synthesis.
+        """
+
+        def __init__(self, frames: list[PcmFrame], text: AsyncIterator[str]) -> None:
+            super().__init__(frames)
+            self._text = text
+
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            async for chunk in self._text:
+                captured.append(chunk)
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
     class _CapturingTTS(_FakeTTS):
         def synthesize(
             self,
@@ -674,14 +695,10 @@ async def test_comfort_filler_uses_configured_phrase_text() -> None:
             *,
             sample_rate: int | None = None,
         ) -> TtsStream:
-            async def _drain_then_replay() -> AsyncIterator[str]:
-                async for chunk in text:
-                    captured.append(chunk)
-                    yield chunk
-
-            return super().synthesize(
-                _drain_then_replay(), voice, sample_rate=sample_rate
-            )
+            self.last_sample_rate = sample_rate
+            stream = _CapturingStream(self._frames, text)
+            self.last_stream = stream
+            return stream
 
     filler_frame = PcmFrame(
         samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1

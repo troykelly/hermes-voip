@@ -50,8 +50,19 @@ media = [
 #
 # aioice 0.10.2 (BSD-3-Clause): ICE agent for WebRTC connectivity (RFC 8445,
 # media/ice.py, PR-D). Transitive deps: dnspython (ISC), ifaddr (MIT).
+#
+# opuslib 3.0.1 (BSD-3-Clause): pure-Python ctypes binding to libopus (the Opus
+# encoder/decoder for the WebRTC wire codec, media/opus.py — ADR-0032). It is a
+# py3-only wrapper that carries NO compiled extension; it dlopen's the SYSTEM
+# libopus shared library (``ctypes.util.find_library('opus')`` → ``libopus.so.0``)
+# at first use. libopus (BSD-3-Clause) is therefore a RUNTIME system dependency
+# the host must provide: the devcontainer image ships ``libopus0`` and the
+# ``webrtc`` + ``supply-chain`` CI jobs ``apt-get install -y libopus0`` before the
+# suite. media/opus.py raises a clear ImportError when either the wheel or the
+# shared library is absent (rule 37). No FFmpeg/PyAV (LGPL) is pulled in.
 webrtc = [
     "aioice==0.10.2",
+    "opuslib==3.0.1",
     "pyopenssl==26.2.0",
     "websockets==16.0",
 ]
@@ -198,6 +209,19 @@ follow_untyped_imports = true
 # when the devcontainer has the webrtc extra active.
 [[tool.mypy.overrides]]
 module = ["websockets.*"]
+ignore_missing_imports = true
+
+# ``opuslib`` lives in the optional ``webrtc`` extra and ships no ``py.typed``
+# (its ``Decoder.decode`` even returns ``bytes | Any``). ``media/opus.py`` declares
+# narrow local Protocols over the ``importlib``-loaded module surface — the same
+# escape-hatch-free strategy as media/dtls.py / media/ice.py — so it never imports
+# ``opuslib`` names directly under ``TYPE_CHECKING``. ``ignore_missing_imports`` is
+# used ONLY for the optional-extra guard (the ``importlib.import_module("opuslib")``
+# call), exactly like the ``websockets`` override above: the webrtc CI job installs
+# opuslib + libopus and runs the full Opus suite against the real library, so this
+# override hides no runtime failure.
+[[tool.mypy.overrides]]
+module = ["opuslib.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

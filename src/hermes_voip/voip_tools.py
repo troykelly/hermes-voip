@@ -426,13 +426,21 @@ def _voip_tool_names() -> frozenset[str]:
 
 @dataclass(frozen=True, slots=True)
 class _ToolSpec:
-    """One agent tool to register: its name, schema, handler, summary, and emoji."""
+    """One agent tool to register: name, schema, handler, summary, emoji, gating.
+
+    ``requires_gate`` is True for a tool whose privilege clamp lives in the
+    ``pre_tool_call`` hook (every non-SAFE tool). Such a tool MUST NOT be
+    registered unless the hook is installed — otherwise it would be reachable
+    ungated (a level-0 caller could invoke it). ``hang_up`` is SAFE and needs no
+    clamp, so it registers regardless of the hook.
+    """
 
     name: str
     schema: dict[str, object]
     handler: object
     description: str
     emoji: str
+    requires_gate: bool
 
 
 # Every tool exposed to the agent (the gate's ``_voip_tool_names`` MUST cover the
@@ -446,6 +454,7 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         handler=hang_up_handler,
         description="End the current phone call when the conversation is done.",
         emoji="\U0001f4f4",  # mobile phone off
+        requires_gate=False,  # SAFE — runs for any caller, needs no privilege clamp
     ),
     _ToolSpec(
         name=HOLD_TOOL_NAME,
@@ -453,6 +462,7 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         handler=hold_call_handler,
         description="Place the current caller on hold (privileged calls only).",
         emoji="⏸️",  # pause button
+        requires_gate=True,  # ELEVATED — only register WITH the privilege gate
     ),
     _ToolSpec(
         name=RESUME_TOOL_NAME,
@@ -460,6 +470,7 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         handler=resume_call_handler,
         description="Resume a caller you placed on hold (privileged calls only).",
         emoji="▶️",  # play button
+        requires_gate=True,  # ELEVATED
     ),
     _ToolSpec(
         name=LIST_REGISTRATIONS_TOOL_NAME,
@@ -467,6 +478,7 @@ _VOIP_TOOLS: tuple[_ToolSpec, ...] = (
         handler=list_registrations_handler,
         description="List this system's phone registrations (privileged calls only).",
         emoji="\U0001f4cb",  # clipboard
+        requires_gate=True,  # ELEVATED — discloses internal extension metadata
     ),
 )
 
@@ -480,32 +492,52 @@ def register_voip_tools(ctx: object) -> None:
     privilege clamp governs every one. The IRREVERSIBLE transfer tools are NOT
     registered (deferred — see the module docstring).
 
-    Best-effort and resilient: a runtime whose ``PluginContext`` predates
-    ``register_tool`` / ``register_hook`` (older hermes-agent) simply does not get
-    the tools — the platform still registers. Mirrors the ``getattr`` guard
-    :func:`hermes_voip.plugin.register` already uses for ``register_platform``.
+    **Fail-closed gating.** The ELEVATED tools' privilege clamp lives in the
+    ``pre_tool_call`` hook, so they are registered ONLY when the hook is also
+    installed. If a (hypothetical/older) ``PluginContext`` had ``register_tool``
+    but no ``register_hook``, registering an ELEVATED tool would leave it reachable
+    ungated — a level-0 caller could then hold/resume the call or enumerate the
+    operator's registrations. So the hook is installed FIRST and a tool whose
+    ``requires_gate`` is True is skipped (with a warning) when the hook is absent.
+    ``hang_up`` is SAFE and needs no clamp, so it registers regardless.
+
+    Best-effort and resilient otherwise: a runtime whose ``PluginContext`` predates
+    ``register_tool`` simply does not get the tools — the platform still registers.
+    Mirrors the ``getattr`` guard :func:`hermes_voip.plugin.register` already uses
+    for ``register_platform``.
 
     Args:
         ctx: The Hermes ``PluginContext`` (typed ``object`` at this boundary —
             this module imports no hermes runtime).
     """
-    register_tool: _RegisterTool | None = getattr(ctx, "register_tool", None)
-    if register_tool is not None:
-        for spec in _VOIP_TOOLS:
-            register_tool(
-                spec.name,
-                VOIP_TOOLSET,
-                spec.schema,
-                spec.handler,
-                is_async=True,
-                description=spec.description,
-                emoji=spec.emoji,
-            )
-    else:
-        _log.warning("register(ctx): ctx has no register_tool — VoIP tools skipped")
-
+    # Install the privilege-clamp hook FIRST so the gate is in place before any
+    # ELEVATED tool is registered (fail closed — see the docstring).
     register_hook: _RegisterHook | None = getattr(ctx, "register_hook", None)
+    gate_installed = register_hook is not None
     if register_hook is not None:
         register_hook("pre_tool_call", voip_pre_tool_call)
     else:
         _log.warning("register(ctx): ctx has no register_hook — VoIP tool gate skipped")
+
+    register_tool: _RegisterTool | None = getattr(ctx, "register_tool", None)
+    if register_tool is None:
+        _log.warning("register(ctx): ctx has no register_tool — VoIP tools skipped")
+        return
+    for spec in _VOIP_TOOLS:
+        if spec.requires_gate and not gate_installed:
+            # The clamp is missing — refuse to expose a privileged tool ungated.
+            _log.warning(
+                "register(ctx): no pre_tool_call gate — skipping ELEVATED VoIP "
+                "tool %r (would be reachable without its privilege clamp)",
+                spec.name,
+            )
+            continue
+        register_tool(
+            spec.name,
+            VOIP_TOOLSET,
+            spec.schema,
+            spec.handler,
+            is_async=True,
+            description=spec.description,
+            emoji=spec.emoji,
+        )

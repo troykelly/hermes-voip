@@ -576,3 +576,39 @@ def test_registered_control_tools_are_async_with_schemas() -> None:
         assert isinstance(schema, dict)
         assert schema.get("name") == tool_name
         assert schema.get("description")
+
+
+def test_elevated_tools_are_not_registered_without_the_gate_hook() -> None:
+    """FAIL CLOSED: no register_hook → the ELEVATED tools are NOT registered.
+
+    With register_tool but NO register_hook, only SAFE hang_up registers.
+    The ELEVATED tools' privilege clamp lives in the pre_tool_call hook. If a ctx
+    could register tools but not the hook, registering hold/resume/list would leave
+    them reachable UNGATED — a level-0 caller could hold/resume the call or
+    enumerate the operator's registrations. So they must be skipped when the gate
+    cannot be installed; hang_up (SAFE) needs no clamp and still registers.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    class _NoHookCtx:
+        """A ctx that can register tools but has NO register_hook (no gate)."""
+
+        def __init__(self) -> None:
+            self.tool_calls: list[str] = []
+
+        def register_platform(self, name: str, *a: object, **k: object) -> None:
+            pass
+
+        def register_tool(self, name: str, *a: object, **k: object) -> None:
+            self.tool_calls.append(name)
+
+        # NOTE: deliberately NO register_hook attribute.
+
+    ctx = _NoHookCtx()
+    register(ctx)  # must not raise
+    # SAFE hang_up still registers (no clamp needed).
+    assert "hang_up" in ctx.tool_calls
+    # The ELEVATED tools are refused — they would be ungated without the hook.
+    assert "hold_call" not in ctx.tool_calls
+    assert "resume_call" not in ctx.tool_calls
+    assert "list_registrations" not in ctx.tool_calls

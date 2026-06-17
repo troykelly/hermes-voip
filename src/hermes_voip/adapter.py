@@ -1543,6 +1543,63 @@ class VoipAdapter(BasePlatformAdapter):
         await session.hang_up()
         return True
 
+    async def hold_call(self, call_id: str) -> bool:
+        """Place ``call_id`` on hold (ADR-0011); return whether a call was held.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``hold_call`` tool calls. Drives
+        :meth:`~hermes_voip.call.CallSession.hold` (re-INVITE ``sendonly`` + media
+        gate). Returns ``False`` (and does nothing) when the call is unknown or has
+        already ended, so the tool reports a clear, non-fatal outcome instead of
+        raising. The ``pre_tool_call`` gate has already cleared the privilege check
+        (ELEVATED) before this runs; this is the action half only.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return False
+        _log.info("agent hold_call tool: holding call %s (re-INVITE sendonly)", call_id)
+        await session.hold()
+        return True
+
+    async def resume_call(self, call_id: str) -> bool:
+        """Resume the held ``call_id`` (ADR-0011); return whether a call was resumed.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``resume_call`` tool calls. Drives
+        :meth:`~hermes_voip.call.CallSession.unhold` (re-INVITE ``sendrecv`` +
+        media un-gate). Returns ``False`` (and does nothing) when the call is
+        unknown or has already ended.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return False
+        _log.info(
+            "agent resume_call tool: resuming call %s (re-INVITE sendrecv)", call_id
+        )
+        await session.unhold()
+        return True
+
+    def list_registrations_text(self) -> str:
+        """Return a human-readable registration snapshot (ADR-0011/0020; ELEVATED).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
+        ``list_registrations`` tool calls. A **process-wide** read of the
+        registration manager (not a per-call action), so it takes no Call-ID; the
+        ``pre_tool_call`` gate has already enforced that the *calling* session is
+        privileged (ELEVATED discloses internal extension metadata, ADR-0020) before
+        this runs. Mirrors :meth:`hermes_voip.tools.CallControlTools.list_registrations`
+        formatting. Returns a clear sentinel when the manager is not yet up rather
+        than raising.
+        """
+        manager = self._manager
+        if manager is None:
+            return "no registration manager (not connected)"
+        lines = [
+            f"{s.extension}: {'registered' if s.registered else 'down'}"
+            for s in manager.snapshot()
+        ]
+        return "; ".join(lines) if lines else "no registrations configured"
+
     def _classify_end_reason(
         self,
         call_id: str,

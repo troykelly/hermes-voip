@@ -1,9 +1,16 @@
-"""Tests for the agent VoIP tool wiring (hang_up handler + gate) — ADR-0026.
+"""Tests for the agent VoIP tool wiring (handlers + gate) — ADR-0026 / ADR-0011.
 
 These exercise :mod:`hermes_voip.voip_tools` against a fake ``VoipToolHost`` and a
 monkeypatched session-context reader, so they run in the DEFAULT gate (no
 hermes-agent runtime). The plugin-registration side (``register(ctx)`` calling
 ``ctx.register_tool``) is covered by ``tests/test_register.py``.
+
+Beyond ``hang_up`` (ADR-0026) this also covers the in-call control tools exposed
+through the same mechanism (ADR-0011 §3): ``hold_call`` / ``resume_call`` and
+``list_registrations`` (all ``ELEVATED``). The IRREVERSIBLE transfer tools are
+NOT exposed (their spoof-resistant ADR-0010 DTMF confirmation channel is not
+wired into the live adapter, so an exposed transfer tool would be an always-blocked
+no-op — rule 6); the tests assert the gate would block them at level 0.
 """
 
 from __future__ import annotations
@@ -16,15 +23,24 @@ from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.voip_tools import (
     HANG_UP_TOOL_NAME,
     HANG_UP_TOOL_SCHEMA,
+    HOLD_TOOL_NAME,
+    HOLD_TOOL_SCHEMA,
+    LIST_REGISTRATIONS_TOOL_NAME,
+    LIST_REGISTRATIONS_TOOL_SCHEMA,
+    RESUME_TOOL_NAME,
+    RESUME_TOOL_SCHEMA,
     active_voip_adapter,
     hang_up_handler,
+    hold_call_handler,
+    list_registrations_handler,
+    resume_call_handler,
     set_active_adapter,
     voip_pre_tool_call,
 )
 
 
 class _FakeHost:
-    """A fake ``VoipToolHost``: records hang_up calls and serves guard state."""
+    """A fake ``VoipToolHost``: records control calls and serves guard state."""
 
     def __init__(
         self,
@@ -32,11 +48,16 @@ class _FakeHost:
         known: bool = True,
         already_ended: bool = False,
         guard: GuardSessionState | None = None,
+        registrations: str = "1000: registered",
     ) -> None:
         self.known = known
         self.already_ended = already_ended
         self._guard = guard
+        self._registrations = registrations
         self.hung_up: list[str] = []
+        self.held: list[str] = []
+        self.resumed: list[str] = []
+        self.listed: int = 0
 
     def guard_state_for(self, call_id: str) -> GuardSessionState | None:
         return self._guard if self.known else None
@@ -44,6 +65,18 @@ class _FakeHost:
     async def hang_up_call(self, call_id: str) -> bool:
         self.hung_up.append(call_id)
         return self.known and not self.already_ended
+
+    async def hold_call(self, call_id: str) -> bool:
+        self.held.append(call_id)
+        return self.known and not self.already_ended
+
+    async def resume_call(self, call_id: str) -> bool:
+        self.resumed.append(call_id)
+        return self.known and not self.already_ended
+
+    def list_registrations_text(self) -> str:
+        self.listed += 1
+        return self._registrations
 
 
 @pytest.fixture(autouse=True)
@@ -161,3 +194,232 @@ def test_pre_tool_call_fails_safe_when_call_unknown(
     # SAFE → allowed (None) even with no resolvable state; the key property is no
     # crash and no accidental privilege grant.
     assert voip_pre_tool_call(tool_name=HANG_UP_TOOL_NAME, args={}) is None
+
+
+# ---------------------------------------------------------------------------
+# In-call control tools: hold_call / resume_call / list_registrations (ADR-0011)
+# ---------------------------------------------------------------------------
+
+
+def _operator() -> GuardSessionState:
+    """An operator (level-3, clean) call state — allows the ELEVATED control tools."""
+    return GuardSessionState(call_id="c", privilege_level=3)
+
+
+def _receptionist() -> GuardSessionState:
+    """A receptionist (level-0, clean) call state — SAFE only."""
+    return GuardSessionState(call_id="c", privilege_level=0)
+
+
+def test_control_tool_schemas_name_the_tools_and_take_no_params() -> None:
+    """Each control tool's schema names the tool, describes it, and takes no params.
+
+    The call to act on is the session's own call (resolved from the session
+    context), never a model-chosen target — so none of these tools expose a
+    parameter the model could point at another call.
+    """
+    for name, schema in (
+        (HOLD_TOOL_NAME, HOLD_TOOL_SCHEMA),
+        (RESUME_TOOL_NAME, RESUME_TOOL_SCHEMA),
+        (LIST_REGISTRATIONS_TOOL_NAME, LIST_REGISTRATIONS_TOOL_SCHEMA),
+    ):
+        assert schema["name"] == name
+        assert schema["description"]
+        params = schema["parameters"]
+        assert isinstance(params, dict)
+        assert params.get("properties") == {}
+
+
+@pytest.mark.asyncio
+async def test_hold_call_handler_holds_the_session_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hold_call resolves the session's call (chat_id == Call-ID) and holds it."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await hold_call_handler({})
+
+    assert host.held == ["call-xyz"]
+    assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_resume_call_handler_resumes_the_session_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resume_call resolves the session's call and resumes it."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await resume_call_handler({})
+
+    assert host.resumed == ["call-xyz"]
+    assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_list_registrations_handler_returns_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """list_registrations reads the adapter's registration snapshot (no call needed).
+
+    It is a process-wide read (the manager's registrations), not a per-call action,
+    so it does not depend on a current chat_id.
+    """
+    host = _FakeHost(registrations="1000: registered; 1001: down")
+    set_active_adapter(host)
+    _set_chat(monkeypatch, None)
+
+    result = await list_registrations_handler({})
+
+    assert host.listed == 1
+    payload = json.loads(result)
+    assert payload.get("result") == "1000: registered; 1001: down"
+
+
+@pytest.mark.asyncio
+async def test_hold_call_handler_with_no_adapter_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No live adapter → a clear error result, never a crash."""
+    _set_chat(monkeypatch, "call-xyz")  # adapter is None (fixture default)
+    result = await hold_call_handler({})
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_hold_call_handler_with_no_session_call_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No call in scope (no chat_id) → an error result, no call held."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, None)
+
+    result = await hold_call_handler({})
+
+    assert host.held == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_resume_call_handler_already_ended_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A call that already ended → an error result (does not claim success)."""
+    host = _FakeHost(already_ended=True)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await resume_call_handler({})
+
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_list_registrations_handler_with_no_adapter_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No live adapter → a clear error result for the read-only tool too."""
+    _set_chat(monkeypatch, None)
+    result = await list_registrations_handler({})
+    assert "error" in json.loads(result)
+
+
+# --- the pre_tool_call gate now OWNS the control tools (privilege clamp) ----
+
+
+def test_gate_owns_the_control_tools() -> None:
+    """The gate is responsible for hold/resume/list (returns a verdict, not None).
+
+    A tool the gate does not own returns None (defer); these must NOT defer — the
+    privilege clamp judges them.
+    """
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    owned = vt._voip_tool_names()
+    assert HOLD_TOOL_NAME in owned
+    assert RESUME_TOOL_NAME in owned
+    assert LIST_REGISTRATIONS_TOOL_NAME in owned
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [HOLD_TOOL_NAME, RESUME_TOOL_NAME, LIST_REGISTRATIONS_TOOL_NAME],
+)
+def test_gate_blocks_elevated_tools_for_receptionist(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """A level-0 (untrusted) caller is BLOCKED from every ELEVATED control tool.
+
+    This is the security spine: an unprivileged/receptionist caller cannot hold,
+    resume, or enumerate the operator's registrations, even if a prompt injection
+    coaxes the model into calling the tool.
+    """
+    host = _FakeHost(guard=_receptionist())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(tool_name=tool_name, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [HOLD_TOOL_NAME, RESUME_TOOL_NAME, LIST_REGISTRATIONS_TOOL_NAME],
+)
+def test_gate_allows_elevated_tools_for_operator(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """An operator (level-3, clean) call is ALLOWED every ELEVATED control tool."""
+    host = _FakeHost(guard=_operator())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    assert voip_pre_tool_call(tool_name=tool_name, args={}) is None
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [HOLD_TOOL_NAME, RESUME_TOOL_NAME, LIST_REGISTRATIONS_TOOL_NAME],
+)
+def test_gate_blocks_elevated_tools_on_degraded_session(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """A degraded (fail-open screened) operator call is BLOCKED from ELEVATED tools.
+
+    The ``degraded`` hard-block applies even at operator level: a missed injection
+    that flips the session degraded cannot then reach hold/resume/list.
+    """
+    host = _FakeHost(
+        guard=GuardSessionState(call_id="c", privilege_level=3, degraded=True)
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(tool_name=tool_name, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_gate_fails_safe_for_elevated_tool_when_call_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ELEVATED tool with no resolvable call state is BLOCKED (fail safe).
+
+    When the adapter/call is out of scope the gate falls back to a level-0 state,
+    so an unknown context cannot accidentally grant an ELEVATED action.
+    """
+    set_active_adapter(None)
+    _set_chat(monkeypatch, None)
+
+    verdict = voip_pre_tool_call(tool_name=HOLD_TOOL_NAME, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"

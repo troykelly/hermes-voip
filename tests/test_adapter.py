@@ -41,7 +41,12 @@ from hermes_voip.config import (
     MediaConfig,
     load_media_config,
 )
-from hermes_voip.manager import InDialog, NewCall, RegistrationManager
+from hermes_voip.manager import (
+    InDialog,
+    NewCall,
+    RegistrationManager,
+    RegistrationStatus,
+)
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
@@ -170,8 +175,11 @@ class _ConnectOrderTransport(_FakeTransport):
 class _FakeManager:
     """Minimal stand-in for RegistrationManager."""
 
-    def __init__(self, *, is_up: bool = True) -> None:
+    def __init__(
+        self, *, is_up: bool = True, snapshot: tuple[RegistrationStatus, ...] = ()
+    ) -> None:
         self._is_up = is_up
+        self._snapshot = snapshot
         self._calls: dict[tuple[str, str, str], object] = {}
         self.connected = False
         self.closed = False
@@ -192,6 +200,9 @@ class _FakeManager:
 
     def remove_call(self, dialog_id: tuple[str, str, str]) -> None:
         self._calls.pop(dialog_id, None)
+
+    def snapshot(self) -> tuple[RegistrationStatus, ...]:
+        return self._snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1056,101 @@ async def test_guard_state_for_returns_the_call_guard() -> None:
 
     assert adapter.guard_state_for(call_id) is guard
     assert adapter.guard_state_for("unknown") is None
+
+
+@pytest.mark.asyncio
+async def test_hold_call_drives_session_hold() -> None:
+    """The VoipToolHost hold_call drives the live session's hold (re-INVITE sendonly).
+
+    ADR-0011: the agent hold_call tool calls this. It must call the live session's
+    ``hold`` and return True; an unknown/ended call returns False (clear tool result).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    held = False
+
+    class _Session:
+        ended = False
+        guard = GuardSessionState(call_id=call_id, privilege_level=2)
+
+        async def hold(self) -> None:
+            nonlocal held
+            held = True
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    assert await adapter.hold_call(call_id) is True
+    assert held is True
+    # Unknown call → no-op False.
+    assert await adapter.hold_call("no-such-call") is False
+
+
+@pytest.mark.asyncio
+async def test_resume_call_drives_session_unhold() -> None:
+    """The VoipToolHost resume_call drives the session's unhold (re-INVITE sendrecv)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    resumed = False
+
+    class _Session:
+        ended = False
+        guard = GuardSessionState(call_id=call_id, privilege_level=2)
+
+        async def unhold(self) -> None:
+            nonlocal resumed
+            resumed = True
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    assert await adapter.resume_call(call_id) is True
+    assert resumed is True
+    assert await adapter.resume_call("no-such-call") is False
+
+
+@pytest.mark.asyncio
+async def test_hold_call_on_ended_session_returns_false() -> None:
+    """hold_call on an already-ended call is a no-op returning False (clear result)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    class _Session:
+        ended = True
+        guard = GuardSessionState(call_id=call_id, privilege_level=2)
+
+        async def hold(self) -> None:  # pragma: no cover — must not be reached
+            raise AssertionError("hold must not run on an ended call")
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    assert await adapter.hold_call(call_id) is False
+
+
+@pytest.mark.asyncio
+async def test_list_registrations_text_reports_the_manager_snapshot() -> None:
+    """VoipToolHost list_registrations_text formats the manager snapshot (ADR-0011)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(
+        is_up=True,
+        snapshot=(
+            RegistrationStatus(extension="1000", index=0, registered=True, expires=60),
+            RegistrationStatus(
+                extension="1001", index=1, registered=False, expires=None
+            ),
+        ),
+    )
+    adapter = await _build_adapter(transport, manager)
+
+    text = adapter.list_registrations_text()
+
+    assert text == "1000: registered; 1001: down"
 
 
 @pytest.mark.asyncio

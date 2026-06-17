@@ -1613,19 +1613,57 @@ class VoipAdapter(BasePlatformAdapter):
         media_cfg: MediaConfig,
         call_id: str,
     ) -> tuple[RtpMediaTransport, LocalMediaSession]:
-        """Run the WebRTC media setup: ICE gather → answer → 200 OK → DTLS → engine.
+        """Run the WebRTC media setup: validate → ICE → answer/200 OK → DTLS → engine.
 
-        The DTLS-SRTP / ICE path (ADR-0032). Unlike the SDES path, the DTLS handshake
-        rides the media that only flows once the peer has our answer, so the order is:
-        gather ICE + build the SAVPF answer (our fingerprint/setup/ICE) → send the 200
-        OK → run ICE + DTLS over the ICE pipe → derive SRTP → construct the engine over
-        the ICE pipe. On any failure the 488 (or 500) is sent, the session is closed,
-        and :class:`_MediaNegotiationRejected` is raised — the call is never
-        half-answered.
+        The DTLS-SRTP / ICE path (ADR-0032). The DTLS handshake rides the media that
+        only flows once the peer has our answer, so the order is:
+
+        1. Validate the mandatory WebRTC SDP attributes (peer ``a=fingerprint`` +
+           ``a=ice-ufrag``/``a=ice-pwd``) AND preflight the Opus codec dependency
+           (the ``webrtc`` extra + system ``libopus``) — all BEFORE any answer, so a
+           malformed offer or a missing libopus is a CLEAN 488 (never answered, never
+           answered-but-dead).
+        2. Gather ICE, build + send the SAVPF answer + 200 OK.
+        3. Run ICE + DTLS over the ICE pipe, derive SRTP, construct the engine.
+
+        A failure in step 1 sends 488 and raises :class:`_MediaNegotiationRejected`
+        (a clean pre-answer reject). A failure in step 3 is necessarily AFTER the 200
+        OK (the handshake needs the peer to have our answer): the call WAS answered,
+        so it is not a 488 — the ICE session is closed and ``_MediaNegotiationRejected``
+        is raised so the inbound handler's ``finally`` tears the answered call down
+        (no CallLoop is built on dead media). Either way the call never proceeds with
+        unkeyed media.
 
         Returns the connected engine (carrying SRTP over the ICE pipe) + the
         :class:`LocalMediaSession`.
         """
+        # --- Pre-answer validation (BLOCKING-fix): reject malformed offers and a
+        # missing Opus dependency BEFORE the 200 OK, so we never answer-then-fail.
+        peer_fingerprint = audio.fingerprint
+        if peer_fingerprint is None or audio.ice_ufrag is None or audio.ice_pwd is None:
+            _log.error(
+                "INVITE %s: REJECTED 488 — WebRTC offer missing fingerprint/ICE "
+                "credentials (a=fingerprint / a=ice-ufrag / a=ice-pwd)",
+                call_id,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected
+        try:
+            # Preflight the negotiated engine codec's runtime dependency: for Opus this
+            # forces the opuslib + system-libopus import so a host missing libopus is a
+            # clean 488 here, not an answered-but-dead call (the engine would otherwise
+            # only discover it on the first encode/decode, after the 200 OK).
+            _preflight_codec_dependency(engine_codec)
+        except ImportError as exc:
+            _log.error(
+                "INVITE %s: REJECTED 488 — WebRTC codec dependency unavailable "
+                "(install the 'webrtc' extra + system libopus): %s",
+                call_id,
+                exc,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected from exc
+
         # The offered a=setup decides our DTLS role; WebRtcMediaSession picks it.
         session = WebRtcMediaSession(
             offer_setup=audio.setup,
@@ -1655,6 +1693,9 @@ class VoipAdapter(BasePlatformAdapter):
                 session_id=local_media.session_id,
             )
         except Exception as exc:
+            # Any ICE-gather / answer-build failure before the 200 OK is a clean
+            # pre-answer reject (488), the ICE session is closed, and we re-raise the
+            # internal reject signal — so this except never swallows (rule 37).
             _log.warning("INVITE %s: cannot build WebRTC answer: %s", call_id, exc)
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             await session.close()
@@ -1678,17 +1719,11 @@ class VoipAdapter(BasePlatformAdapter):
         )
 
         # Run ICE connectivity + the DTLS-SRTP handshake (over the ICE pipe), then
-        # derive the SRTP sessions. A failure here is AFTER the 200 OK, so the
-        # nascent dialog is torn down with a BYE-less stop and the call setup aborts
-        # (the handler's caller treats _MediaNegotiationRejected as "do not proceed").
-        peer_fingerprint = audio.fingerprint
-        if peer_fingerprint is None or audio.ice_ufrag is None or audio.ice_pwd is None:
-            _log.error(
-                "INVITE %s: WebRTC offer missing fingerprint/ICE credentials — abort",
-                call_id,
-            )
-            await session.close()
-            raise _MediaNegotiationRejected
+        # derive the SRTP sessions. A failure here is AFTER the 200 OK (the handshake
+        # needs the peer to have our answer), so this is NOT a 488 reject: the call was
+        # answered, the ICE session is closed, and _MediaNegotiationRejected is raised
+        # so the inbound handler's finally tears the answered call down (no CallLoop on
+        # dead media). The mandatory attributes were already validated pre-answer.
         try:
             srtp_inbound, srtp_outbound = await session.run_handshake(
                 peer_fingerprint=peer_fingerprint,
@@ -2670,6 +2705,27 @@ def _to_engine_codec(sdp_codec: SdpCodec) -> Codec:
         UnsupportedCodecError: If the engine cannot carry this codec+rate.
     """
     return codec_for_encoding(sdp_codec.encoding, sdp_codec.clock_rate)
+
+
+def _preflight_codec_dependency(engine_codec: Codec) -> None:
+    """Force the negotiated codec's runtime dependency to import, or raise (ADR-0032).
+
+    Called BEFORE the WebRTC 200 OK so a host missing a codec's runtime dependency
+    rejects the call cleanly instead of answering then failing on the first frame.
+    Opus needs the ``webrtc`` extra (``opuslib``) + the system ``libopus``; the G.711
+    and G.722 codecs are pure-Python/stdlib and always available, so this is a no-op
+    for them.
+
+    Raises:
+        ImportError: If the negotiated codec's runtime dependency is unavailable
+            (e.g. Opus without ``opuslib`` / ``libopus``).
+    """
+    if engine_codec is Codec.OPUS:
+        # Lazy import: keeps adapter.py's module-load light and the opuslib/libopus
+        # dependency confined to the WebRTC/Opus path (ADR-0014 gating).
+        from hermes_voip.media.opus import ensure_opus_available  # noqa: PLC0415
+
+        ensure_opus_available()
 
 
 def _effective_address(audio: AudioMedia, offer: SessionDescription) -> str:

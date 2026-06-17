@@ -46,6 +46,7 @@ __all__ = [
     "OPUS_SAMPLE_RATE",
     "OpusDecoder",
     "OpusEncoder",
+    "ensure_opus_available",
 ]
 
 #: The audio sample rate Opus encodes/decodes for the WebRTC wire (48 kHz).
@@ -157,6 +158,25 @@ def _get_opuslib() -> _OpuslibModule:
         raise ImportError(msg) from exc
     else:
         return mod
+
+
+def ensure_opus_available() -> None:
+    """Raise :class:`ImportError` unless the Opus codec can actually run.
+
+    A pre-flight the adapter calls BEFORE answering a WebRTC/Opus call (ADR-0032): it
+    forces the ``opuslib`` import AND the system ``libopus`` load (by constructing a
+    throwaway encoder), so a host missing either is a clean call REJECT rather than an
+    answered-but-dead call discovered only on the first encode. A no-op for codecs
+    that do not need Opus — callers gate on the negotiated codec.
+
+    Raises:
+        ImportError: If the ``webrtc`` extra (``opuslib``) or the system ``libopus``
+            shared library is unavailable.
+    """
+    # Constructing the encoder triggers _get_opuslib() (the import + the ctypes
+    # libopus load via opuslib's loader), which is exactly the runtime path a real
+    # call exercises; it is cheap (one libopus encoder) and discarded immediately.
+    OpusEncoder()
 
 
 def _check_frame(pcm16: bytes) -> None:

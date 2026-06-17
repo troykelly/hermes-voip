@@ -89,8 +89,17 @@ The WebRTC path:
 6. Feeds the derived SRTP sessions + the connected `IceConnection` into
    `RtpMediaTransport`, which then carries SRTP media over the ICE pipe.
 
-If any step fails the call is **rejected (488/500) and never half-answered** — the
-no-answer-on-failure invariant (ADR-0005) holds identically to the SDES path.
+**Validation ordering (no answer-then-fail).** The mandatory WebRTC SDP attributes
+(peer `a=fingerprint` + `a=ice-ufrag`/`a=ice-pwd`) and the Opus codec runtime
+dependency (`opuslib` + the system `libopus`) are validated/preflighted **before**
+the 200 OK: a malformed offer or a missing libopus is a clean **488 pre-answer
+reject**, never an answered-but-dead call. The DTLS handshake itself is necessarily
+**after** the 200 OK (the peer needs our answer to start it), so a handshake/ICE/
+fingerprint-mismatch failure there tears the **answered** call down (close ICE +
+abort setup → the inbound handler's `finally` releases it) rather than masquerading
+as a 488. Either way the call never proceeds to the conversation loop on unkeyed
+media — the no-answer-on-failure invariant (ADR-0005) holds identically to the SDES
+path (cross-vendor review BLOCKING findings, 2026-06-17).
 
 ### 3. ICE socket seam in `RtpMediaTransport`
 

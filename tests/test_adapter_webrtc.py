@@ -482,3 +482,77 @@ def test_webrtc_supported_encodings_never_drift_ahead_of_engine() -> None:
             pytest.fail(
                 f"WebRTC menu advertises {enc}/{rate} the engine cannot carry: {exc}"
             )
+
+
+# A WebRTC profile offer MISSING the mandatory DTLS fingerprint + ICE credentials
+# (RFC 5763/8839). It must be REJECTED 488 BEFORE any 200 OK (ADR-0032 pre-answer
+# validation; codex review BLOCKING-1).
+_WEBRTC_OFFER_NO_FP = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _sent_status(transport: _FakeTransport, code: int) -> bool:
+    return any(m.startswith(f"SIP/2.0 {code}") for m in transport.sent)
+
+
+@pytest.mark.asyncio
+async def test_webrtc_offer_missing_fingerprint_is_rejected_before_answer() -> None:
+    """A SAVPF offer with no a=fingerprint/ICE creds is 488'd BEFORE any 200 OK."""
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_OFFER_NO_FP, call_id))
+
+    webrtc_ctor = MagicMock()
+    with patch("hermes_voip.adapter.WebRtcMediaSession", webrtc_ctor):
+        adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            NewCall(registration=_ext_config(), invite=invite)
+        )
+        await _until(lambda: _sent_status(transport, 488))
+
+    # A clean 488 reject: no 200 OK, no WebRTC session ever constructed, no call loop.
+    assert _sent_status(transport, 488)
+    assert not _sent_status(transport, 200)
+    webrtc_ctor.assert_not_called()
+    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_webrtc_missing_opus_dependency_is_rejected_before_answer() -> None:
+    """A WebRTC/Opus call with no libopus/opuslib is 488'd BEFORE any 200 OK.
+
+    Preflighting the Opus dependency before the answer prevents an answered-but-dead
+    call (codex review BLOCKING-2). We simulate the missing dependency by patching the
+    adapter's preflight import target to raise ImportError.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_OFFER, call_id))
+
+    webrtc_ctor = MagicMock()
+    with (
+        patch("hermes_voip.adapter.WebRtcMediaSession", webrtc_ctor),
+        patch(
+            "hermes_voip.media.opus.ensure_opus_available",
+            side_effect=ImportError("libopus not found"),
+        ),
+    ):
+        adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            NewCall(registration=_ext_config(), invite=invite)
+        )
+        await _until(lambda: _sent_status(transport, 488))
+
+    assert _sent_status(transport, 488)
+    assert not _sent_status(transport, 200)
+    # The codec dependency is preflighted BEFORE the WebRtcMediaSession is built.
+    webrtc_ctor.assert_not_called()
+    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]

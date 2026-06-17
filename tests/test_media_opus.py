@@ -24,6 +24,7 @@ from hermes_voip.media.opus import (
     OPUS_SAMPLE_RATE,
     OpusDecoder,
     OpusEncoder,
+    ensure_opus_available,
 )
 
 # Guard: the codec classes need opuslib + libopus; skip the round-trip suite when
@@ -123,3 +124,8 @@ def test_encoder_and_decoder_are_independent_per_instance() -> None:
     p1 = OpusEncoder().encode(pcm)
     p2 = OpusEncoder().encode(pcm)
     assert p1 == p2
+
+
+def test_ensure_opus_available_succeeds_when_libopus_present() -> None:
+    """ensure_opus_available() is a no-op (no raise) when opuslib + libopus load."""
+    ensure_opus_available()  # must not raise in this (webrtc-extra) environment

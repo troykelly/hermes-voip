@@ -461,6 +461,47 @@ async def test_flush_synthesises_buffered_text_while_input_is_still_open() -> No
             await consumer
 
 
+@pytest.mark.asyncio
+async def test_flush_mid_tag_does_not_leak_fragment_on_flash() -> None:
+    """A flush() mid-tag on Flash never sends an incomplete tag fragment (ADR-0027).
+
+    Codex review repro: a streamed ``[breath]`` cut after the ``[`` leaves
+    ``"Hello [bre"`` in the segmenter; flush() must not hand that to a non-v3 model
+    (which would voice "bracket b-r-e"). The dangling tag-opening is stripped, so the
+    request text is just ``"Hello"`` (and never contains the fragment).
+    """
+    http = _RecordedHttp()
+    tts = _make(http)  # default Flash v2.5 — a non-tag model
+    text = _OpenEndedText("Hello [bre")
+    stream = tts.synthesize(text, voice="x")
+
+    drained: list[PcmFrame] = []
+
+    async def _consume() -> None:
+        async for frame in stream:
+            drained.append(frame)
+
+    consumer = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(text.consumed.wait(), timeout=1.0)
+        await stream.flush()
+
+        async def _has_request() -> None:
+            while http.request is None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_has_request(), timeout=1.0)
+        assert http.request is not None
+        assert "[bre" not in http.request.text
+        assert "[" not in http.request.text
+        assert http.request.text == "Hello"
+    finally:
+        await stream.cancel()
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
 # --- errors propagate (rule 37) ---------------------------------------------
 
 

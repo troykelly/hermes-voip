@@ -749,6 +749,39 @@ async def test_deliver_turn_includes_objective_in_outbound_preamble() -> None:
 
 
 @pytest.mark.asyncio
+async def test_outbound_turn_instructs_reporting_the_result() -> None:
+    """The outbound objective framing names report_call_result (ADR-0029).
+
+    The cross-session outcome report only reaches the originating conversation if
+    the agent calls ``report_call_result`` before hanging up. The agent will not
+    call a tool it is not told about, so the spotlighted outbound framing must
+    instruct recording the result via that tool.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    captured: list[str] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(getattr(event, "text", ""))
+
+    adapter.set_message_handler(_handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _outbound_info(
+        objective="book a table for two at 7pm"
+    )
+
+    await adapter._deliver_turn(call_id, "hello, this is the restaurant")
+    await _collect_events(captured)
+
+    assert captured
+    text = captured[0]
+    assert "report_call_result" in text
+
+
+@pytest.mark.asyncio
 async def test_objective_injected_as_first_turn_into_the_call_session() -> None:
     """The objective is injected as the call session's FIRST turn (chat == Call-ID).
 

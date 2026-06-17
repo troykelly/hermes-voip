@@ -117,6 +117,12 @@ def test_tool_risk_map_is_correct() -> None:
     # ELEVATED (ADR-0020): list_registrations discloses internal extension
     # metadata, so an untrusted/unprivileged caller must not enumerate it.
     assert TOOL_RISKS["list_registrations"] is ToolRisk.ELEVATED
+    # ELEVATED (ADR-0031): send_dtmf transmits in-call DTMF — reversible but a
+    # mutating action a level-0 caller must not invoke. open_entry actuates the
+    # intercom entry (physical access) and is likewise gated (ELEVATED), with the
+    # intercom group's allowed_tools sub-ceiling restricting it to that group.
+    assert TOOL_RISKS["send_dtmf"] is ToolRisk.ELEVATED
+    assert TOOL_RISKS["open_entry"] is ToolRisk.ELEVATED
 
 
 def test_gate_voip_tool_unknown_tool_denied() -> None:

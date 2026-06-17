@@ -27,13 +27,19 @@ from hermes_voip.voip_tools import (
     HOLD_TOOL_SCHEMA,
     LIST_REGISTRATIONS_TOOL_NAME,
     LIST_REGISTRATIONS_TOOL_SCHEMA,
+    OPEN_ENTRY_TOOL_NAME,
+    OPEN_ENTRY_TOOL_SCHEMA,
     RESUME_TOOL_NAME,
     RESUME_TOOL_SCHEMA,
+    SEND_DTMF_TOOL_NAME,
+    SEND_DTMF_TOOL_SCHEMA,
     active_voip_adapter,
     hang_up_handler,
     hold_call_handler,
     list_registrations_handler,
+    open_entry_handler,
     resume_call_handler,
+    send_dtmf_handler,
     set_active_adapter,
     voip_pre_tool_call,
 )
@@ -60,6 +66,11 @@ class _FakeHost:
         self.listed: int = 0
         self.placed: list[tuple[str, str]] = []
         self.results: list[tuple[str, str]] = []
+        self.dtmf_sent: list[tuple[str, str]] = []
+        self.entries_opened: list[str] = []
+        # When set, send_dtmf_on_call raises this instead of recording (e.g. the
+        # telephone-event-not-negotiated RuntimeError).
+        self.dtmf_raises: Exception | None = None
 
     def guard_state_for(self, call_id: str) -> GuardSessionState | None:
         return self._guard if self.known else None
@@ -89,6 +100,18 @@ class _FakeHost:
     def record_call_result(self, call_id: str, summary: str) -> bool:
         # ADR-0029 VoipToolHost member (unused by this module's tests).
         self.results.append((call_id, summary))
+        return self.known and not self.already_ended
+
+    async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
+        # ADR-0031 VoipToolHost member: in-call DTMF send.
+        if self.dtmf_raises is not None:
+            raise self.dtmf_raises
+        self.dtmf_sent.append((call_id, digits))
+        return self.known and not self.already_ended
+
+    async def open_entry(self, call_id: str) -> bool:
+        # ADR-0031 VoipToolHost member: actuate the intercom entry.
+        self.entries_opened.append(call_id)
         return self.known and not self.already_ended
 
 
@@ -436,3 +459,188 @@ def test_gate_fails_safe_for_elevated_tool_when_call_unknown(
 
     assert verdict is not None
     assert verdict["action"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# send_dtmf (ELEVATED) + open_entry (intercom entry actuation) — ADR-0031
+# ---------------------------------------------------------------------------
+
+
+def _trusted() -> GuardSessionState:
+    """A level-2 trusted call state — allows ELEVATED tools (e.g. send_dtmf)."""
+    return GuardSessionState(call_id="c", privilege_level=2)
+
+
+def test_send_dtmf_schema_takes_a_digits_string() -> None:
+    assert SEND_DTMF_TOOL_SCHEMA["name"] == SEND_DTMF_TOOL_NAME
+    assert SEND_DTMF_TOOL_SCHEMA["description"]
+    params = SEND_DTMF_TOOL_SCHEMA["parameters"]
+    assert isinstance(params, dict)
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    assert "digits" in props
+    assert params.get("required") == ["digits"]
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_handler_sends_on_the_session_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """send_dtmf resolves the session's call and sends the requested digits."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await send_dtmf_handler({"digits": "123"})
+
+    assert host.dtmf_sent == [("call-xyz", "123")]
+    assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_handler_requires_digits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing/blank digits argument yields an error, sends nothing."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await send_dtmf_handler({})
+
+    assert host.dtmf_sent == []
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_handler_reports_unnegotiated_telephone_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the engine raises (no telephone-event PT), the tool reports a clear error.
+
+    The engine raises rather than silently dropping DTMF; the handler converts that
+    into a tool error result so the model learns it could not send — never a crash.
+    """
+    host = _FakeHost()
+    host.dtmf_raises = RuntimeError("no telephone-event payload type negotiated")
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await send_dtmf_handler({"digits": "1"})
+
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_handler_no_call_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No call in scope → an error, nothing sent."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, None)
+
+    result = await send_dtmf_handler({"digits": "1"})
+
+    assert host.dtmf_sent == []
+    assert "error" in json.loads(result)
+
+
+def test_send_dtmf_is_elevated_blocked_for_receptionist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """send_dtmf is ELEVATED: a level-0 receptionist call is BLOCKED by the gate."""
+    host = _FakeHost(guard=_receptionist())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(tool_name=SEND_DTMF_TOOL_NAME, args={"digits": "1"})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_send_dtmf_allowed_for_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """send_dtmf (ELEVATED) is allowed for a level-2 trusted call."""
+    host = _FakeHost(guard=_trusted())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    assert (
+        voip_pre_tool_call(tool_name=SEND_DTMF_TOOL_NAME, args={"digits": "1"}) is None
+    )
+
+
+# --- open_entry: the intercom entry action ------------------------------------
+
+
+def test_open_entry_schema_takes_no_params() -> None:
+    assert OPEN_ENTRY_TOOL_SCHEMA["name"] == OPEN_ENTRY_TOOL_NAME
+    assert OPEN_ENTRY_TOOL_SCHEMA["description"]
+    params = OPEN_ENTRY_TOOL_SCHEMA["parameters"]
+    assert isinstance(params, dict)
+    # No parameters: opening the door is a fixed action, never a model-chosen target.
+    assert params.get("properties") == {}
+
+
+@pytest.mark.asyncio
+async def test_open_entry_handler_actuates_on_the_session_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_entry resolves the session's call and actuates the entry."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-door")
+
+    result = await open_entry_handler({})
+
+    assert host.entries_opened == ["call-door"]
+    assert "result" in json.loads(result)
+
+
+def test_open_entry_is_gated_blocked_for_receptionist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_entry is gated (ELEVATED): a level-0 receptionist call is BLOCKED.
+
+    The intercom group runs at level 2 with an allowed_tools sub-ceiling, so it
+    passes; a level-0 caller (the fail-safe default for an unknown context) does not.
+    """
+    host = _FakeHost(guard=_receptionist())
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    verdict = voip_pre_tool_call(tool_name=OPEN_ENTRY_TOOL_NAME, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_open_entry_scoped_by_allowed_tools_blocks_other_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An intercom session (allowed_tools={open_entry}) cannot reach hold_call.
+
+    This is the intercom least-privilege guarantee at the gate: even though the
+    group is level 2 (which would otherwise permit hold_call), the allowed_tools
+    sub-ceiling removes every tool but open_entry — so a spoofed caller-ID reaching
+    the intercom group gets ONLY the entry action.
+    """
+    intercom_state = GuardSessionState(
+        call_id="c",
+        privilege_level=2,
+        allowed_tools=frozenset({OPEN_ENTRY_TOOL_NAME}),
+    )
+    host = _FakeHost(guard=intercom_state)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    # open_entry is permitted...
+    assert voip_pre_tool_call(tool_name=OPEN_ENTRY_TOOL_NAME, args={}) is None
+    # ...but every other tool (hold_call, list_registrations, send_dtmf) is blocked.
+    for blocked in (HOLD_TOOL_NAME, LIST_REGISTRATIONS_TOOL_NAME, SEND_DTMF_TOOL_NAME):
+        verdict = voip_pre_tool_call(tool_name=blocked, args={})
+        assert verdict is not None, f"{blocked} should be blocked by the sub-ceiling"
+        assert verdict["action"] == "block"

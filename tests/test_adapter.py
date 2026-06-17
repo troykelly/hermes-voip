@@ -1344,7 +1344,7 @@ async def test_connect_brings_transport_up_before_building_manager() -> None:
 # Regression (live inbound-call failure, 2026-06-16): the 200 OK answering an
 # inbound INVITE MUST carry our dialog To-tag, so the gateway's subsequent
 # in-dialog ACK/BYE route back to the established CallSession instead of going
-# out-of-dialog. The live UCM6304 call showed the caller "answered immediately"
+# out-of-dialog. The live gateway call showed the caller "answered immediately"
 # but heard no audio, and the plugin logged the ACK and BYE as
 # ``out-of-dialog ACK`` / ``out-of-dialog BYE`` — the dialog_id the adapter
 # registered (local tag present) never matched the routed key (no tag on the
@@ -1431,7 +1431,7 @@ def _sent_200_ok(transport: _FakeTransport) -> SipResponse:
 async def test_inbound_invite_ack_and_bye_route_in_dialog() -> None:
     """A call we answer must route its own ACK/BYE in-dialog (not out-of-dialog).
 
-    Reproduces the live UCM6304 failure: with no To-tag on the 200 OK, the
+    Reproduces the live gateway failure: with no To-tag on the 200 OK, the
     gateway's ACK/BYE were ``Unroutable`` (``out-of-dialog``) and the call never
     established a routable dialog. The fix puts our dialog tag on the 200 OK's
     ``To`` so the manager routes the ACK/BYE to the CallSession.

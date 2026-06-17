@@ -20,7 +20,7 @@ from hermes_voip.message import SipRequest
 
 
 def _options(*, call_id: str = "opt-call-1", cseq: str = "1 OPTIONS") -> SipRequest:
-    """A realistic UCM-style out-of-dialog OPTIONS qualify ping (no To-tag)."""
+    """A realistic gateway-style out-of-dialog OPTIONS qualify ping (no To-tag)."""
     raw = (
         "OPTIONS sip:1000@127.0.0.1:5061;transport=tls SIP/2.0\r\n"
         "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bKopt1;rport\r\n"

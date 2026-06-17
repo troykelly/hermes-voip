@@ -59,7 +59,7 @@ latch state resets in `connect()` so a reused engine re-latches on its next call
 
 ## Consequences
 
-- Two-way audio now works for the live NAT'd inbound call (UCM6304-behind-NAT)
+- Two-way audio now works for the live NAT'd inbound call (gateway-behind-NAT)
   even where the peer routes RTP by its own private/wrong SDP address — the engine
   follows the real media source. The greeting (send-first) and this latch
   (send-to-real-source) together cover the common comedia gateway end to end.

@@ -579,14 +579,12 @@ class CallLoop:
         # not repeat the same filler word every time. Touched only from the loop.
         self._comfort_filler_index = 0
         # Latched per gap: True once the agent's REAL reply AUDIO (not the filler's
-        # own audio) has begun on the wire during the current gap. The filler
-        # consults this AFTER its delay so it never fires once reply audio has
-        # started — even if that audio already started AND finished within the delay
-        # window (a transient ``_tts_audio_active`` would miss the latter). The gap
-        # is the caller-finish→first-reply-AUDIO window, so it is keyed on audio, NOT
-        # on the reply TEXT arriving (speak() being called): the TTS first-audio
-        # latency is itself dead air the filler must still cover. Reset when a new
-        # gap is armed. Touched only from the event loop.
+        # own audio) has begun on the wire during the current gap. It backs up the
+        # ``speak()`` stand-down (which cancels a pending filler at the reply commit)
+        # for the case where the reply started AND finished within the delay window —
+        # there the transient ``_tts_audio_active`` is already back to False by the
+        # post-delay check, but the latch still records that reply audio happened.
+        # Reset when a new gap is armed. Touched only from the event loop.
         self._gap_reply_audio_started = False
 
     async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
@@ -868,10 +866,19 @@ class CallLoop:
                     tg.create_task(self._play_greeting(greeting_stream))
         finally:
             # The comfort filler runs as a tracked task OUTSIDE the TaskGroup (it is
-            # armed per delivered turn, not at loop start), so cancel any lingering
-            # one on every exit path — normal end, error, or cancellation — so it
-            # never outlives the call (ADR-0030; no leaked task).
+            # armed per delivered turn, not at loop start). On every exit path —
+            # normal end, error, or cancellation — cancel it AND JOIN it so it fully
+            # unwinds (it may be mid-_play / inside send_audio / closing the TTS
+            # stream via aclosing) before run() returns: no task continues running
+            # past the call (ADR-0030; no leaked task). Capture the handle first
+            # (``_cancel_comfort_filler`` nulls it). ``asyncio.wait`` joins the task
+            # WITHOUT re-raising its result here — a filler error is best-effort and
+            # already logged by ``_on_comfort_filler_done`` (rule 37: logged, not
+            # swallowed), and must not mask the loop's own teardown/exception.
+            filler = self._comfort_filler_task
             self._cancel_comfort_filler()
+            if filler is not None:
+                await asyncio.wait({filler})
 
     async def speak(
         self,
@@ -1039,12 +1046,17 @@ class CallLoop:
         done-callback clears the handle on completion.
         """
         await self._sleep(self._comfort_filler_delay_s)
-        # Suppress the filler iff the agent's REAL reply AUDIO has begun during this
-        # gap (the latch), NOT merely if speak() was called: the TTS first-audio
-        # latency after speak() is itself dead air the filler must still cover. The
-        # latch also catches a reply that started AND finished within the delay (a
-        # transient `_tts_audio_active` would already be back to False by now).
-        if self._gap_reply_audio_started:
+        # Do not fire unless there is GENUINELY dead air right now. Two complementary
+        # guards (ADR-0030):
+        #  * `_tts_audio_active` — agent audio is on the wire RIGHT NOW (e.g. the
+        #    greeting, or a prior reply, still playing — possibly one that began
+        #    BEFORE this gap was armed, so its first-frame latch predates the gap's
+        #    latch reset). Firing now would supersede live agent audio: not dead air.
+        #  * `_gap_reply_audio_started` — the agent's reply audio for THIS gap has
+        #    already begun (and may have finished within the delay, where the
+        #    transient `_tts_audio_active` is back to False). Suppress then too.
+        # Either being set means there was/is no dead air to fill.
+        if self._tts_audio_active or self._gap_reply_audio_started:
             return
         phrase = self._next_comfort_phrase()
         _log.info("comfort filler: emitting %r on dead air", phrase)

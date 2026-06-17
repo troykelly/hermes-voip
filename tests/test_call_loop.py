@@ -1067,6 +1067,105 @@ async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None
 
 
 @pytest.mark.asyncio
+async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None:
+    """The filler must not fire while agent audio is on the wire RIGHT NOW.
+
+    Regression for the case where agent audio (here a long greeting) is already
+    playing when a turn is delivered (arming the filler) — the audio began BEFORE
+    the gap's latch reset, so the per-gap latch alone misses it. The post-delay
+    ``_tts_audio_active`` guard must still suppress the filler so it never supersedes
+    the live agent audio (no dead air while the agent is speaking).
+    """
+    # A greeting stream that plays one frame then parks (gate) — agent audio is
+    # continuously "active" on the wire across the filler's whole delay.
+    greet_frame = PcmFrame(
+        samples=b"\x40\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+    hold = asyncio.Event()
+
+    class _GreetingThenParkStream(_FakeTtsStream):
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            yield greet_frame  # audio is now active on the wire
+            await hold.wait()  # keep the greeting "playing" across the delay
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
+    class _GreetingTTS(_FakeTTS):
+        """Greeting stream parks (long); any filler stream would be immediate."""
+
+        def __init__(
+            self, greet_frames: list[PcmFrame], filler_frames: list[PcmFrame]
+        ) -> None:
+            super().__init__(filler_frames)
+            self._greet_frames = greet_frames
+            self._first = True
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            if self._first:
+                self._first = False
+                stream: _FakeTtsStream = _GreetingThenParkStream(self._greet_frames)
+            else:
+                stream = _FakeTtsStream(self._frames)
+            self.last_stream = stream
+            return stream
+
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _GreetingTTS([greet_frame], [filler_frame])
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([("hello", True, True)]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="hi there",  # the long greeting that stays active
+        comfort_filler=True,
+        comfort_filler_delay_ms=900,
+        comfort_filler_phrases=("Hmm,",),
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting emit its first frame (audio active) and the filler arm.
+    for _ in range(30):
+        await asyncio.sleep(0)
+        if sleep.calls and transport.sent_audio:
+            break
+    assert sleep.calls, "filler did not schedule"
+    assert transport.sent_audio == [greet_frame], "greeting audio should be active"
+
+    # The delay elapses while the greeting audio is STILL active → no filler.
+    sleep.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [greet_frame], (
+        "the filler superseded already-playing agent audio (no dead air)"
+    )
+
+    # Let the greeting finish and the call end.
+    hold.set()
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
 async def test_normal_speech_completion_does_not_flush() -> None:
     """A normally-completing utterance (no barge-in) never flushes the engine.
 

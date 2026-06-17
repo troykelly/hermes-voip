@@ -71,12 +71,21 @@ stands down the instant the agent has a reply to speak:
   **mid-playout** (its task handle is kept for its whole life, not dropped when it fires) — so a
   filler can never outlive the call.
 
-A per-gap **latch** (`_gap_reply_audio_started`, set by the first *real* reply frame in `_play`,
-reset when a new gap is armed) backs this up: the filler's post-delay check skips firing if reply
-audio has begun during the gap, covering even a reply that started *and finished* within the
-delay window (where the transient `_tts_audio_active` would already be back to false). Suppression
-is keyed on reply **audio** for the completed-reply case, and on the `speak()` commit for the
-pending case.
+The filler's post-delay check fires **only on genuine dead air**, guarded by *two* conditions —
+it fires only if **both** are false:
+
+- `_tts_audio_active` — whether agent audio is on the wire *right now*. This catches audio that
+  began **before** the gap was armed (a greeting, or a prior reply, still playing — whose
+  first-frame latch predates the gap's latch reset); firing then would supersede live agent
+  audio, which is not dead air.
+- `_gap_reply_audio_started` — a per-gap latch set by the first *real* reply frame in `_play`
+  (and reset when a new gap is armed). This catches a reply for *this* gap that started **and
+  finished** within the delay window, where the transient `_tts_audio_active` is already back to
+  false by the check.
+
+(Plus the `speak()` commit-time cancel handles the common pending case before the delay even
+elapses.) The ADR's "fire only on genuine dead air" invariant is therefore enforced by the
+runtime check, not only by the `speak()` cancel.
 
 Because the filler routes through `_speak_text`/`_play`/`barge_in()`, *flushability and echo-gate
 arming are inherited, not re-implemented*.

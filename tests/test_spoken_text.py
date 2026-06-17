@@ -357,6 +357,21 @@ class TestStripAudioTags:
         text = "See footnote [3] for details."
         assert strip_audio_tags(text) == text
 
+    def test_dangling_tag_opening_at_end_removed(self) -> None:
+        # A flush() mid-tag can hand over an UN-terminated tag fragment ("[bre").
+        # On a non-tag model this must not be voiced ("bracket b-r-e"), so a
+        # trailing tag-shaped open with no closing ``]`` is dropped.
+        assert strip_audio_tags("Hello [bre") == "Hello"
+        assert strip_audio_tags("Wait [cle") == "Wait"
+        assert strip_audio_tags("done [") == "done"
+
+    def test_dangling_open_is_only_stripped_at_the_tail(self) -> None:
+        # An un-closed '[' followed by more text on the SAME segment is not a
+        # split tag (the sentence continued past it), so it is left intact — only
+        # a tag-shaped open that runs to end-of-string is treated as a split tag.
+        assert strip_audio_tags("the array [i] holds") == "the array [i] holds"
+        assert strip_audio_tags("choose [a or b") == "choose [a or b"
+
 
 class TestSanitizeLeavesAudioTags:
     """The emoji/markdown/URL entry point does NOT strip audio tags itself.

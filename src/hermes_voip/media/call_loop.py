@@ -89,7 +89,7 @@ from typing import Final
 
 from hermes_voip.media.audio import generate_tone_frames
 from hermes_voip.media.endpoint import Endpointer
-from hermes_voip.media.vad import SpeechEdge, VoiceActivityDetector
+from hermes_voip.media.vad import SpeechEdge, VadEvent, VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardVerdict, InjectionGuard
@@ -123,6 +123,160 @@ class _EndOfStream(Enum):
 
 #: The sole end-of-stream marker value (see :class:`_EndOfStream`).
 _END_OF_STREAM: Final[_EndOfStream] = _EndOfStream.MARKER
+
+
+class BargeInMode(Enum):
+    """How an inbound speech onset is allowed to interrupt the agent (ADR-0022).
+
+    * ``OFF`` — never barge in; the agent always finishes its turn.
+    * ``GATED`` — (default) while the agent's TTS is playing (and for a short tail
+      after), a barge-in counts only once it is a SUSTAINED voiced run, so short
+      echo blips (the gateway reflecting our own TTS back) cannot interrupt but a
+      genuine sustained interruption still does. Outside playout/tail any onset
+      barges in immediately (nothing to echo when the agent is silent).
+    * ``FULL`` — any speech onset barges in immediately, even during playout
+      (correct only on a gateway with its own echo cancellation).
+    """
+
+    OFF = "off"
+    GATED = "gated"
+    FULL = "full"
+
+
+class BargeInGate:
+    """Echo-robust barge-in decision (ADR-0022).
+
+    The live self-interruption bug: the gateway reflects the agent's own TTS back
+    on the inbound path, the VAD/ASR transcribe it as the caller, and a single
+    speech ONSET barged the agent in — ending its own turn. Echo arrives as SHORT,
+    broken voiced runs (repeatedly OFFSET as the reflected energy dips); a genuine
+    human interruption is a SUSTAINED continuous voiced run. This gate separates
+    the two by *duration* without an acoustic echo canceller.
+
+    Drive it from the inbound pump:
+
+    * :meth:`tts_active` — call every iteration with whether the agent's TTS is
+      currently playing (``_active_tts_stream is not None``). The gate is *armed*
+      whenever TTS is active.
+    * :meth:`tail_from` — call at the window where TTS *stops* to keep the gate
+      armed for ``tail_windows`` more windows (echo lags the TTS via the jitter
+      buffer / network).
+    * :meth:`on_event` — feed every :class:`VadEvent`. ONSET starts a candidate
+      voiced run; OFFSET ends it (an echo blip is dismissed here).
+    * :meth:`should_barge_in` — call once per processed window with the current
+      window ordinal; returns ``True`` exactly once when a barge-in should fire.
+
+    While armed in ``GATED`` mode a barge-in fires only once the candidate run has
+    lasted ``min_voiced_windows`` (inclusive of the onset window). While NOT armed
+    (agent silent, past the tail), ``GATED`` behaves like ``FULL``: an onset barges
+    in immediately. ``OFF`` never fires; ``FULL`` always fires on the onset.
+    """
+
+    def __init__(
+        self, *, mode: BargeInMode, min_voiced_windows: int, tail_windows: int
+    ) -> None:
+        """Create a gate.
+
+        Args:
+            mode: The :class:`BargeInMode`.
+            min_voiced_windows: In ``GATED`` mode while armed, the minimum
+                consecutive voiced windows (inclusive of the onset window) before
+                a barge-in fires. Must be ``>= 1``.
+            tail_windows: How many windows after TTS stops the gate stays armed.
+                ``>= 0``.
+
+        Raises:
+            ValueError: If ``min_voiced_windows < 1`` or ``tail_windows < 0``.
+        """
+        if min_voiced_windows < 1:
+            msg = f"min_voiced_windows must be >= 1, got {min_voiced_windows}"
+            raise ValueError(msg)
+        if tail_windows < 0:
+            msg = f"tail_windows must be >= 0, got {tail_windows}"
+            raise ValueError(msg)
+        self.mode = mode
+        self._min_voiced_windows = min_voiced_windows
+        self._tail_windows = tail_windows
+        self._tts_active = False
+        # Inclusive last window ordinal the post-TTS tail covers, or None when no
+        # tail is pending. While the current window is <= this, the gate is armed
+        # even though TTS has stopped (echo lags the TTS).
+        self._tail_until: int | None = None
+        # Window ordinal of the current candidate voiced run's ONSET, or None when
+        # no run is in progress (no speech / ended by OFFSET / already fired).
+        self._onset_window: int | None = None
+        # True once a barge-in has fired for the current run, so the same run does
+        # not re-fire on every later window (which would spam barge_in()).
+        self._fired_for_run = False
+
+    def tts_active(self, active: bool) -> None:
+        """Record whether the agent's TTS is currently playing.
+
+        While active the gate is armed (gated mode requires a sustained run). The
+        caller pairs a True→False transition with :meth:`tail_from` to keep the
+        gate armed across the echo tail.
+        """
+        self._tts_active = active
+
+    def tail_from(self, current_window: int) -> None:
+        """Arm the post-TTS tail for ``tail_windows`` windows from ``current_window``.
+
+        Called when the active TTS stream ends. Echo can arrive shortly after the
+        last TTS frame (jitter buffer + network), so the gate keeps requiring a
+        sustained run until ``current_window + tail_windows - 1`` (inclusive). A
+        ``tail_windows`` of 0 leaves the tail already expired (disarm at once).
+        """
+        if self._tail_windows == 0:
+            self._tail_until = current_window - 1
+        else:
+            self._tail_until = current_window + self._tail_windows - 1
+
+    def _armed(self, current_window: int) -> bool:
+        """Whether the gate currently requires a sustained run (gated mode)."""
+        if self._tts_active:
+            return True
+        return self._tail_until is not None and current_window <= self._tail_until
+
+    def on_event(self, event: VadEvent) -> None:
+        """Update the candidate voiced run from a VAD edge.
+
+        ONSET starts a fresh candidate run (clears the fired latch so a new
+        interruption after one fired can fire again); OFFSET ends the run — the
+        key step that dismisses a short echo blip before it reaches the threshold.
+        """
+        if event.edge is SpeechEdge.ONSET:
+            self._onset_window = event.frame_index
+            self._fired_for_run = False
+        else:  # SpeechEdge.OFFSET — voicing stopped; the candidate run ends.
+            self._onset_window = None
+            self._fired_for_run = False
+
+    def should_barge_in(self, current_window: int) -> bool:
+        """Return ``True`` exactly once when a barge-in should fire this window.
+
+        Args:
+            current_window: The ordinal of the window just processed.
+
+        Returns:
+            ``True`` to barge in now, else ``False``. Returns ``True`` at most once
+            per candidate voiced run (latched until the run ends / a new onset).
+        """
+        if self.mode is BargeInMode.OFF:
+            return False
+        if self._onset_window is None or self._fired_for_run:
+            return False
+        if self.mode is BargeInMode.FULL or not self._armed(current_window):
+            # Immediate barge-in: any onset interrupts (full mode, or gated while
+            # the agent is silent — nothing to echo).
+            self._fired_for_run = True
+            return True
+        # Gated + armed: require a SUSTAINED run. Inclusive of the onset window,
+        # ``current_window - onset + 1`` windows have been voiced.
+        voiced_windows = current_window - self._onset_window + 1
+        if voiced_windows >= self._min_voiced_windows:
+            self._fired_for_run = True
+            return True
+        return False
 
 
 class _ToneStream:
@@ -255,9 +409,21 @@ class CallLoop:
             resample entirely (``HERMES_VOIP_TEST_TONE`` env var).  When set,
             ``greeting`` is ignored.  ``0.0`` (the default) means normal
             operation.
+        barge_in_mode: Echo-robust barge-in mode (ADR-0022). ``GATED`` (default)
+            requires a sustained voiced run to interrupt while the agent's TTS is
+            playing (and a short tail after), so the gateway echoing the agent's
+            own TTS back cannot self-interrupt it; a genuine sustained
+            interruption still does. ``FULL`` is the legacy immediate barge-in;
+            ``OFF`` disables barge-in.
+        barge_in_min_voiced_windows: In ``GATED`` mode, the minimum consecutive
+            voiced VAD windows (inclusive of the onset window) before a barge-in
+            counts while armed. The adapter derives this from
+            ``barge_in_min_speech_ms`` and the inbound rate. Must be ``>= 1``.
+        barge_in_tail_windows: How many VAD windows after the agent's TTS stops the
+            gate keeps requiring a sustained run (echo lags the TTS). ``>= 0``.
     """
 
-    def __init__(  # noqa: PLR0913 — 12-arg constructor; all keyword-only
+    def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
         self,
         *,
         transport: MediaTransport,
@@ -272,6 +438,9 @@ class CallLoop:
         call_id: str,
         greeting: str = "",
         tone_secs: float = 0.0,
+        barge_in_mode: BargeInMode = BargeInMode.GATED,
+        barge_in_min_voiced_windows: int = 1,
+        barge_in_tail_windows: int = 0,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -286,6 +455,14 @@ class CallLoop:
         self._call_id = call_id
         self._greeting = greeting
         self._tone_secs = tone_secs
+        self.barge_in_mode = barge_in_mode
+        # The echo-robust barge-in decision (ADR-0022). The pump drives it from
+        # VAD edges + the TTS-active state; ``should_barge_in`` says when to fire.
+        self._barge_in_gate = BargeInGate(
+            mode=barge_in_mode,
+            min_voiced_windows=barge_in_min_voiced_windows,
+            tail_windows=barge_in_tail_windows,
+        )
         # The currently-active TtsStream, or None when the agent is silent.
         # Written synchronously (``synthesize`` is a sync factory) before any
         # await, so a single ``speak``/greeting always registers its stream
@@ -359,24 +536,44 @@ class CallLoop:
             nonlocal _eot_count
             window_index = 0
             frames_received = 0
+            # Track the agent's TTS-active state across frames so the barge-in
+            # gate (ADR-0022) can arm a post-TTS echo tail at the True→False edge.
+            prev_tts_active = self._active_tts_stream is not None
             async for frame in self._transport.inbound_audio():
                 for vad_event in self._vad.feed(frame):
                     self._endpointer.on_event(vad_event)
-                    # Speech onset while the agent is speaking → barge-in.
-                    if (
-                        vad_event.edge is SpeechEdge.ONSET
-                        and self._active_tts_stream is not None
-                    ):
-                        _log.debug(
-                            "pump: speech ONSET at window %d → barge-in", window_index
-                        )
-                        await self.barge_in()
-                    else:
-                        _log.debug(
-                            "pump: VAD %s at window %d",
-                            vad_event.edge.name,
-                            window_index,
-                        )
+                    # Feed the edge to the echo-robust barge-in gate. ONSET starts
+                    # a candidate voiced run; OFFSET ends it (dismissing a short
+                    # echo blip). The gate's window clock is the VAD window ordinal
+                    # carried on the edge, NOT the per-frame counter below.
+                    self._barge_in_gate.on_event(vad_event)
+                    _log.debug(
+                        "pump: VAD %s at vad-window %d",
+                        vad_event.edge.name,
+                        vad_event.frame_index,
+                    )
+                # Drive the barge-in gate once per frame at the latest scored VAD
+                # window. ``window_index`` (the VAD property) is the NEXT window
+                # ordinal, so the last scored window is one less; -1 before any
+                # window is scored is harmless (no onset is pending then). The gate
+                # is armed whenever the agent's TTS is playing, plus a short tail
+                # after it stops, during which a sustained run is required.
+                tts_active = self._active_tts_stream is not None
+                latest_vad_window = self._vad.window_index - 1
+                if prev_tts_active and not tts_active:
+                    # The agent just stopped speaking: keep gating across the echo
+                    # tail (echo lags the TTS via the jitter buffer / network).
+                    self._barge_in_gate.tail_from(latest_vad_window)
+                self._barge_in_gate.tts_active(tts_active)
+                prev_tts_active = tts_active
+                if tts_active and self._barge_in_gate.should_barge_in(
+                    latest_vad_window
+                ):
+                    _log.debug(
+                        "pump: sustained speech at vad-window %d → barge-in",
+                        latest_vad_window,
+                    )
+                    await self.barge_in()
                 if self._endpointer.advance(window_index):
                     # ADR-0008: endpointer owns the turn boundary. Increment the
                     # EOT counter so the ASR task's next is_final transcript is

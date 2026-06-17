@@ -1604,9 +1604,11 @@ class _ScriptedInboundTransport(_FakeTransport):
     """8 kHz transport that releases its (one-window) frames on a gate.
 
     Each call to :meth:`inbound_audio` yields ``len(frames)`` one-window frames,
-    but only after ``release`` is set, so a greeting can register its active TTS
-    stream before any inbound audio is processed (mirrors a live call where the
-    echo arrives once the agent is already speaking).
+    but only after ``release`` is set, and with a cooperative ``sleep(0)`` between
+    frames so the concurrent greeting playout task interleaves window-by-window
+    (mirrors a live call where the echo arrives once the agent is speaking). One
+    inbound frame is exactly one 8 kHz silero window, so the VAD window ordinal
+    advances by one per frame.
     """
 
     def __init__(self, n_frames: int) -> None:
@@ -1624,9 +1626,36 @@ class _ScriptedInboundTransport(_FakeTransport):
         async def _gen() -> AsyncIterator[PcmFrame]:
             await release.wait()
             for frame in frames:
+                await asyncio.sleep(0)  # let the greeting playout interleave
                 yield frame
 
         return _gen()
+
+
+class _LongSlowGreetingTTS:
+    """StreamingTTS returning a fresh self-completing slow greeting per call.
+
+    Each ``synthesize`` returns a new :class:`_SlowTtsStream` that yields many
+    frames, one per cooperative ``sleep(0)``, so the greeting stays the active TTS
+    stream across the whole inbound echo run AND completes on its own when no
+    barge-in cancels it (so ``run()`` terminates). ``cancel()`` stops it promptly.
+    """
+
+    def __init__(self, n_frames: int) -> None:
+        self._n_frames = n_frames
+        self.last_stream: _SlowTtsStream | None = None
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = text, voice
+        stream = _SlowTtsStream(
+            [_greeting_frame(i % 250) for i in range(self._n_frames)]
+        )
+        self.last_stream = stream
+        return stream
 
 
 def _build_barge_in_loop(  # noqa: PLR0913 — test factory mirrors CallLoop's keyword surface
@@ -1668,9 +1697,9 @@ async def test_gated_short_echo_during_tts_does_not_barge_in() -> None:
     # 6 voiced windows (echo blip) then silence; below the 13-window threshold.
     blip = [0.95] * 6 + [0.0] * 20
     vad = _scripted_vad_8k(blip)
-    # The greeting emits its frames over multiple windows so the gate is armed
-    # (TTS active) across the whole echo blip.
-    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    # A long self-completing greeting stays the active TTS stream across the whole
+    # echo blip (so the gate is armed) and finishes on its own when not cancelled.
+    tts = _LongSlowGreetingTTS(n_frames=60)
     transport = _ScriptedInboundTransport(len(blip))
 
     loop = _build_barge_in_loop(
@@ -1706,7 +1735,7 @@ async def test_gated_sustained_speech_during_tts_barges_in() -> None:
     # 30 continuous voiced windows → well past the 13-window threshold.
     sustained = [0.95] * 30
     vad = _scripted_vad_8k(sustained)
-    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    tts = _LongSlowGreetingTTS(n_frames=60)
     transport = _ScriptedInboundTransport(len(sustained))
 
     loop = _build_barge_in_loop(
@@ -1740,7 +1769,7 @@ async def test_full_mode_short_blip_barges_in_legacy_behaviour() -> None:
     """
     blip = [0.95] * 6 + [0.0] * 20
     vad = _scripted_vad_8k(blip)
-    tts = _GatedGreetingTTS([_greeting_frame(1), _greeting_frame(2)])
+    tts = _LongSlowGreetingTTS(n_frames=60)
     transport = _ScriptedInboundTransport(len(blip))
 
     loop = _build_barge_in_loop(
@@ -1771,7 +1800,7 @@ async def test_gated_default_mode_when_unspecified() -> None:
     default mode is ``gated``. (The adapter supplies real thresholds; the
     constructor default is a safe immediate-ish gate.)
     """
-    tts = _GatedGreetingTTS([_greeting_frame(1)])
+    tts = _LongSlowGreetingTTS(n_frames=3)
     transport = _Transport8k([])  # no inbound audio at all
 
     loop = CallLoop(
@@ -1789,6 +1818,6 @@ async def test_gated_default_mode_when_unspecified() -> None:
     )
     assert loop.barge_in_mode is BargeInMode.GATED
     await asyncio.wait_for(loop.run(), timeout=5.0)
-    # With no inbound audio nothing barges in; the greeting ran.
+    # With no inbound audio nothing barges in; the greeting ran to completion.
     assert tts.last_stream is not None
     assert tts.last_stream.cancel_called is False

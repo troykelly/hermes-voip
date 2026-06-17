@@ -360,6 +360,42 @@ handler failure is logged at `ERROR` **with its traceback**. Read these first.
   3. **Correct public address in the SDP** (rport/STUN/configured external IP) is
      the alternative for gateways that honour the SDP address literally.
 
+### 8b. Troubleshooting — the agent interrupts itself / cuts off mid-reply
+
+Symptom: the agent starts a spoken reply, then the log shows
+`agent.conversation_loop: Turn ended: reason=interrupted_during_api_call`, and the ASR
+finalises one- or two-word fragments of the agent's OWN answer (e.g. `'IT'`, `'UPON'`,
+`'NO'`) while it is speaking — even though the caller is silent. This is **gateway echo**:
+the gateway/PSTN reflects the agent's rendered TTS back on the inbound path (a 2-wire hybrid
+or a gateway without echo cancellation), the VAD transcribes it as the caller, and a barge-in
+ends the agent's turn — a self-interruption loop.
+
+Diagnose the echo source first (ADR-0022):
+
+- Compare the `rtp tx: first packet -> <addr>` and `rtp rx: first packet <- <addr>` INFO
+  lines. If RX is from the **gateway's** media address (the same address TX targets), the
+  echo is external (gateway reflection) — the common case. If RX were from our **own** local
+  RTP address, it would be a self-loopback instead (the engine already drops inbound RTP
+  carrying our own SSRC `0xCAFEBABE` before it reaches the VAD/ASR — a `rtp rx: dropping
+  inbound packet with our own SSRC … (self-loopback)` DEBUG line).
+
+Fix (shipped, on by default — ADR-0022): **echo-robust barge-in**. While the agent's TTS is
+playing (and for a short tail after), a barge-in counts only when the inbound speech is a
+SUSTAINED voiced run, so short echo blips cannot interrupt but a genuine sustained
+interruption still does. Controls:
+
+- `HERMES_VOIP_BARGE_IN_MODE` — `gated` (default), `full` (legacy immediate barge-in; only
+  correct on an echo-cancelled gateway), or `off` (never barge in).
+- `HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS` — minimum sustained voiced speech (ms) to interrupt
+  during playout (default `400`). Raise it if echo still slips through; lower it for snappier
+  intentional barge-in on a clean line.
+- `HERMES_VOIP_BARGE_IN_TAIL_MS` — how long after the agent's TTS ends the gate keeps
+  requiring a sustained run (default `250`; echo lags the TTS via the jitter buffer /
+  network). `0` disarms the instant TTS ends.
+
+If a gateway has its own echo cancellation and you want zero added barge-in latency, set
+`HERMES_VOIP_BARGE_IN_MODE=full`. To stop the agent ever being interrupted, set `off`.
+
 ## 9. Teardown
 
 - Stop the validation process / gateway with `Ctrl-C` (the driver above calls

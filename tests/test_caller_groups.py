@@ -883,3 +883,39 @@ def test_unmatched_caller_can_never_reach_level_3_by_construction() -> None:
     cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
     assert cls.group.privilege_level == 0
     assert cls.group.privilege_level < 3  # never operator/IRREVERSIBLE
+
+
+def test_caller_group_config_snapshots_groups_against_post_construction_mutation() -> (
+    None
+):
+    """The construction clamp must be durable: snapshot inputs to immutable tuples.
+
+    Cross-vendor re-review (codex, PR #83) found that, although a privileged
+    default is rejected at construction, ``groups`` is only annotated as a tuple —
+    a caller passing a mutable list could construct with an unprivileged default
+    (passing validation) then mutate the list element to privilege_level=3
+    afterward, and ``classify_caller_group`` would read the mutated group for an
+    unmatched caller. ``CallerGroupConfig.__post_init__`` must therefore SNAPSHOT
+    ``groups`` (and the other sequence inputs) into immutable containers, so the
+    validated state IS the state the classifier uses.
+    """
+    # Build with a MUTABLE list and an unprivileged default (passes validation).
+    mutable_groups = [_receptionist_group()]
+    cfg = CallerGroupConfig(
+        groups=mutable_groups,  # type: ignore[arg-type]  # deliberately a list — the attack vector under test
+        group_lists={"receptionist": ()},
+        default_group="receptionist",
+        match_order=("receptionist",),
+        normalization=Normalization.E164,
+    )
+    # Attacker mutates the original list AFTER construction to escalate the default.
+    mutable_groups[0] = CallerGroup(
+        name="receptionist",
+        privilege_level=3,
+        persona="assistant",
+        declined_at_sip=False,
+    )
+    # The config must have snapshotted its own tuple => the unmatched caller is
+    # STILL level 0, unaffected by the post-construction mutation.
+    cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
+    assert cls.group.privilege_level == 0

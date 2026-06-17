@@ -188,6 +188,32 @@ are in the runbook [`docs/runbooks/0003-voip-caller-modes.md`](docs/runbooks/000
 { "patterns": ["+15555550100", "1000", "+1555550*"] }
 ```
 
+### Outbound calling (agent-triggered)
+
+The agent can **place** a call to accomplish a task on the operator's behalf — e.g. "call
+the restaurant and book a table for two at 7" — via the `place_call(number, objective)` tool
+(ADR-0029). The call runs as its own concurrent conversation that **opens with the
+objective**, and when it ends the **outcome is reported back to the conversation that asked
+for it** (the call agent records it with `report_call_result(summary)`; failures report too).
+
+This is gated hard:
+
+- **`HERMES_VOIP_OUTBOUND_ALLOW`** — a comma-separated allowlist of permitted dial targets
+  (extensions and/or SIP URIs). **Empty by default**, so the feature is **inert** until you
+  opt numbers in; any un-listed target is refused before dialling. This is the hard gate (it
+  stands in for an in-band DTMF confirmation, which a remote party shares the channel with).
+- `place_call` is **IRREVERSIBLE** and clamped to an **operator** (level-3), **non-degraded**
+  session — an untrusted inbound caller can never trigger an outbound call, even via a prompt
+  injection. The callee is untrusted: the resulting call runs unprivileged, so it cannot
+  itself place a further call or transfer. **Never put operator secrets in the objective.**
+- **`HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`** (optional, `platform:chat_id`) — where the outcome
+  of a call **not** triggered by an agent turn (the `HERMES_VOIP_CALL_ON_CONNECT` / cron path,
+  which has no originating session) is reported. Unset → such outcomes are logged only (voip
+  has no home channel of its own). A call triggered by an agent always reports to its origin.
+
+Operational steps are in the runbook
+[`docs/runbooks/0006-voip-outbound-calling.md`](docs/runbooks/0006-voip-outbound-calling.md).
+
 ## Development
 
 Standardized devcontainer. Toolchain standards: [`docs/stack.md`](docs/stack.md). Working
@@ -208,9 +234,9 @@ uv run pytest            # tests
 ## Security
 
 This repository is **public**. Never commit the gateway host, extension number, passwords,
-internal hostnames, IPs, caller numbers, or any PII — they live only in the gitignored `.env`,
-gitignored caller-list files, and 1Password. Secret scanning (gitleaks) and a dependency
-vulnerability audit run in CI.
+internal hostnames, IPs, caller numbers, outbound dial targets, or any PII — they live only in
+the gitignored `.env`, gitignored caller-list files, and 1Password. Secret scanning (gitleaks)
+and a dependency vulnerability audit run in CI.
 
 ## Licence
 

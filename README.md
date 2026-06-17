@@ -102,6 +102,33 @@ streams Flash v2.5 and emits PCM natively at the negotiated wire rate (8 kHz for
 16 kHz for G.722). Set the voice with `HERMES_VOIP_TTS_VOICE` and the Kokoro model directory
 with `HERMES_VOIP_TTS_MODEL`.
 
+**Starter voices (ElevenLabs)** — a place to begin. These are ElevenLabs **public premade
+voices** (the default library, available to standard accounts; availability can vary by plan
+and ElevenLabs may change the ids). Swap with `HERMES_VOIP_TTS_VOICE=<id>` — the plugin
+accepts **any** ElevenLabs `voice_id`, including your own custom or cloned voices. The dynamic
+`HERMES_VOIP_TTS_*` settings (`STABILITY`, `STYLE`, `SIMILARITY`, `SPEAKER_BOOST`) apply to
+whichever voice you choose. The fuller table and tuning guidance live in
+[the voice runbook](docs/runbooks/0004-voip-tts-voice.md). Each id below was verified to
+synthesize (HTTP 200) on 2026-06-17; confirm a swap on a live call (the TTS-scoped key cannot
+pre-list voices).
+
+| Name    | `voice_id`             | Character                              |
+| ------- | ---------------------- | -------------------------------------- |
+| River   | `SAz9YHcvj6GT2YYXdXww` | Gender-neutral, calm, US               |
+| Rachel  | `21m00Tcm4TlvDq8ikWAM` | Female, calm narration, US (default)   |
+| Sarah   | `EXAVITQu4vr4xnSDxMaL` | Female, soft, conversational, US       |
+| Jessica | `cgSgspJ2msm6clMCkdW9` | Female, expressive / animated, US      |
+| Laura   | `FGY2WhTYpPnrIDTdsKH5` | Female, bright, upbeat, US             |
+| Alice   | `Xb7hH8MSUJpSbSDYk0k2` | Female, clear, British                 |
+| Liam    | `TX3LPaxmHKxFdv7VOQHJ` | Male, younger, US                      |
+| Josh    | `TxGEqnHWrfWFTfGW9XjX` | Male, younger, deep, US                |
+| Bill    | `pqHfZKP75CvOlQylNhV4` | Male, older, deep, trustworthy, US     |
+| Brian   | `nPczCjzI2devNBz1zQrb` | Male, deep, narration, US              |
+| George  | `JBFqnCBsd6RMkjVDRZzb` | Male, warm, British                    |
+| Daniel  | `onwK4e9ZLuTAKqWW03F9` | Male, authoritative, British           |
+| Charlie | `IKne3meq5aSn9XLyUdCD` | Male, casual, Australian               |
+| Eric    | `cjVigY5qzO86Huf0OWal` | Male, friendly, US                     |
+
 **Speech-to-text** — `HERMES_VOIP_STT_PROVIDER`:
 
 | Value         | Provider                                          | Default | Credential        |

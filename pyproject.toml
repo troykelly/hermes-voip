@@ -165,7 +165,15 @@ files = ["src", "tests"]
 # likewise import the real runtime and are excluded from the default gate (they
 # ``importorskip`` and run in that same CI job). ``tests/e2e/_fake_gateway.py``
 # imports no runtime and stays in this gate.
-exclude = '(^|/)(src/hermes_voip/adapter\.py|tests/test_adapter\.py|tests/test_adapter_caller_modes\.py|tests/test_adapter_reconnect\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py)$'
+#
+# ``src/hermes_voip/voip_tools.py`` references a hermes runtime module
+# (``gateway.session_context``) — lazily, inside the tool handler, so a bare
+# ``import hermes_voip`` stays light at RUNTIME — but mypy still analyses that body
+# and the module is absent from the default (no-``hermes``-extra) install. Rather
+# than launder it with ``# type: ignore[import-not-found]`` (rule 17), it joins the
+# hermes-contract type-check (which installs the extra and resolves the real
+# symbols via ``follow_untyped_imports``), same as ``adapter.py``.
+exclude = '(^|/)(src/hermes_voip/adapter\.py|src/hermes_voip/voip_tools\.py|tests/test_adapter\.py|tests/test_adapter_caller_modes\.py|tests/test_adapter_reconnect\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py)$'
 
 # hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
 # (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``

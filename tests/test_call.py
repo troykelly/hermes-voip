@@ -322,6 +322,61 @@ async def test_inbound_bye_answers_200_and_stops_media() -> None:
     assert media.stopped is True
 
 
+async def test_hang_up_sends_bye_and_stops_media() -> None:
+    """The agent hang-up tool path: send an in-dialog BYE, mark ended, stop media.
+
+    ADR-0026 SOFT agent hangup: ``hang_up`` is the UAC side of a BYE — it sends a
+    BYE request to the peer (advancing the dialog CSeq), flags the session ended,
+    and stops the media engine (which ends the call loop so teardown classifies
+    AGENT_HANGUP). Mirrors :meth:`_on_bye` but as the BYE *sender*.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+
+    await session.hang_up()
+
+    bye = _last_request(signaling, "BYE")
+    assert bye.method == "BYE"
+    # In-dialog BYE: addressed to the peer's contact, carrying both dialog tags.
+    assert "tag=ours" in (bye.header("From") or "")
+    assert "tag=theirs" in (bye.header("To") or "")
+    assert (bye.header("Call-ID") or "") == "call-1"
+    # CSeq advanced past the dialog's local_cseq (2) — every request we send
+    # uses a fresh, higher CSeq (ADR-0011 invariant 1).
+    cseq = bye.header("CSeq") or ""
+    assert cseq.endswith("BYE")
+    assert int(cseq.split()[0]) == 3
+    assert session.ended is True
+    assert media.stopped is True
+
+
+async def test_hang_up_is_idempotent() -> None:
+    """A second hang_up after the call already ended is a harmless no-op.
+
+    Once ended (by a prior hang_up or an inbound BYE), hang_up must not send a
+    second BYE — the dialog is gone. This keeps the agent calling the tool twice
+    (or racing an inbound BYE) from emitting a spurious second BYE.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+
+    await session.hang_up()
+    byes_after_first = sum(
+        1
+        for t in signaling.sent
+        if not t.startswith("SIP/2.0 ") and SipRequest.parse(t).method == "BYE"
+    )
+    await session.hang_up()
+    byes_after_second = sum(
+        1
+        for t in signaling.sent
+        if not t.startswith("SIP/2.0 ") and SipRequest.parse(t).method == "BYE"
+    )
+
+    assert byes_after_first == 1
+    assert byes_after_second == 1, "a second hang_up must not send another BYE"
+
+
 async def test_inbound_reinvite_hold_answers_recvonly_and_holds() -> None:
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media)

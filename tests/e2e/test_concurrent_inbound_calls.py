@@ -395,7 +395,15 @@ async def test_concurrent_inbound_calls_isolated_media_and_teardown() -> None:  
     delivered_turns: list[str] = []
 
     async def _echo_agent(event: MessageEvent) -> str:
-        delivered_turns.append(event.text)
+        # Record only real CALLER turns, not the internal call-end signal events
+        # (ADR-0026): a call's teardown injects an ``internal=True`` MessageEvent
+        # (the ``/stop`` for a failure end or the replayed disconnected note for a
+        # normal one), which arrives through this same handler. Counting those as
+        # delivered turns would let one call's end-signal land in another call's
+        # turn slot. The runtime gates real lifecycle on the ``internal`` flag; the
+        # test mirrors that, asserting on genuine caller speech only.
+        if not getattr(event, "internal", False):
+            delivered_turns.append(event.text)
         return f"echo: {event.text}"
 
     try:

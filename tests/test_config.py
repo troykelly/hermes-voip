@@ -513,6 +513,41 @@ def test_media_barge_in_tail_ms_negative_rejected() -> None:
         load_media_config({"HERMES_VOIP_BARGE_IN_TAIL_MS": "-5"})
 
 
+def test_media_rtp_timeout_defaults_to_20s() -> None:
+    """The RTP-inactivity watchdog window defaults to 20 s (ADR-0026)."""
+    cfg = load_media_config({})
+    assert cfg.media_timeout_secs == 20
+
+
+def test_media_rtp_timeout_override_accepted() -> None:
+    """A valid override within [1, 300] is taken verbatim."""
+    cfg = load_media_config({"HERMES_VOIP_RTP_TIMEOUT_SECS": "45"})
+    assert cfg.media_timeout_secs == 45
+
+
+def test_media_rtp_timeout_max_300_accepted() -> None:
+    """The maximum (300 s) is accepted (inclusive bound)."""
+    cfg = load_media_config({"HERMES_VOIP_RTP_TIMEOUT_SECS": "300"})
+    assert cfg.media_timeout_secs == 300
+
+
+def test_media_rtp_timeout_above_max_rejected() -> None:
+    """A value above the 300 s cap is rejected (fail-fast, not silently clamped)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_RTP_TIMEOUT_SECS": "301"})
+
+
+def test_media_rtp_timeout_zero_rejected() -> None:
+    """0 is rejected: the watchdog floor is 1 s (a 0 here is a misconfiguration).
+
+    (The engine accepts ``media_timeout_secs=0`` as 'disabled', but the operator
+    knob requires a positive window in [1, 300] — disabling the safety watchdog is
+    not a configuration we expose, since a silent drop would then hang forever.)
+    """
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_RTP_TIMEOUT_SECS": "0"})
+
+
 def test_media_greeting_explicit_empty_disables_greeting() -> None:
     """An explicitly-empty HERMES_VOIP_GREETING means 'no greeting' (kept ``""``).
 

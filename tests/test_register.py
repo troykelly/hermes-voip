@@ -22,10 +22,12 @@ from hermes_voip.hermes_surface import (
 
 
 class _FakeCtx:
-    """Fake PluginContextProtocol that records register_platform calls."""
+    """Fake PluginContextProtocol recording register_platform/tool/hook calls."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.tool_calls: list[dict[str, object]] = []
+        self.hook_calls: list[dict[str, object]] = []
 
     def register_platform(  # noqa: PLR0913 — mirrors hermes-agent's register_platform arity exactly
         self,
@@ -50,6 +52,33 @@ class _FakeCtx:
                 **entry_kwargs,
             }
         )
+
+    def register_tool(  # noqa: PLR0913 — mirrors hermes-agent's register_tool arity
+        self,
+        name: str,
+        toolset: str,
+        schema: dict[str, object],
+        handler: object,
+        check_fn: Callable[[], bool] | None = None,
+        requires_env: Sequence[str] | None = None,
+        is_async: bool = False,
+        description: str = "",
+        emoji: str = "",
+        override: bool = False,
+    ) -> None:
+        self.tool_calls.append(
+            {
+                "name": name,
+                "toolset": toolset,
+                "schema": schema,
+                "handler": handler,
+                "is_async": is_async,
+                "description": description,
+            }
+        )
+
+    def register_hook(self, hook_name: str, callback: object) -> None:
+        self.hook_calls.append({"hook_name": hook_name, "callback": callback})
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +451,76 @@ def test_env_enablement_elevenlabs_key_survives_load_media_config(
     # Must not raise ConfigError about missing ELEVENLABS_API_KEY.
     media = load_media_config(extra)
     assert media.elevenlabs_api_key == "el-fake-key-for-test"
+
+
+# ---------------------------------------------------------------------------
+# (z) register(ctx) wires the agent hang_up tool through the pre_tool_call gate
+#     (ADR-0026). The plugin previously registered ONLY the platform, so the agent
+#     had no way to end a call. The tool is registered with a pre_tool_call hook
+#     that gates it through gate_voip_tool.
+# ---------------------------------------------------------------------------
+
+
+def test_register_registers_the_hang_up_tool() -> None:
+    """register(ctx) must register an agent-facing hang_up/end_call tool."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    names = {c["name"] for c in ctx.tool_calls}
+    assert "hang_up" in names, "the agent hang_up tool was not registered"
+
+
+def test_hang_up_tool_is_async_with_a_schema() -> None:
+    """The hang_up tool is async and ships a JSON schema (so the model can call it)."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    tool = next(c for c in ctx.tool_calls if c["name"] == "hang_up")
+    assert tool["is_async"] is True
+    schema = tool["schema"]
+    assert isinstance(schema, dict)
+    # A tool schema the model reads must at least name the tool + describe it.
+    assert schema.get("name") == "hang_up"
+    assert schema.get("description")
+
+
+def test_register_registers_a_pre_tool_call_gate() -> None:
+    """register(ctx) must register a pre_tool_call hook (the tool-policy gate)."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    hook_names = {h["hook_name"] for h in ctx.hook_calls}
+    assert "pre_tool_call" in hook_names, "no pre_tool_call gate was registered"
+
+
+def test_register_still_registers_the_platform_once() -> None:
+    """Adding tool/hook registration must not disturb the single platform register."""
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    ctx = _FakeCtx()
+    register(ctx)
+    assert len(ctx.calls) == 1
+    assert ctx.calls[0]["name"] == "voip"
+
+
+def test_register_is_resilient_to_a_ctx_without_register_tool() -> None:
+    """An older ctx lacking register_tool/register_hook still registers the platform.
+
+    The tool/hook wiring is best-effort (guarded by getattr like register_platform),
+    so a runtime that predates register_tool does not break plugin load.
+    """
+    from hermes_voip.plugin import register  # noqa: PLC0415
+
+    class _PlatformOnlyCtx:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def register_platform(self, name: str, *args: object, **kwargs: object) -> None:
+            self.calls.append(name)
+
+    ctx = _PlatformOnlyCtx()
+    register(ctx)  # must not raise even though register_tool/register_hook are absent
+    assert ctx.calls == ["voip"]

@@ -27,6 +27,7 @@ class _FakeCall:
         self.guard = GuardSessionState(call_id="call-1", degraded=degraded)
         self.held = 0
         self.resumed = 0
+        self.hung_up = 0
         self.blind_targets: list[str] = []
         self.attended: list[Dialog] = []
 
@@ -35,6 +36,9 @@ class _FakeCall:
 
     async def unhold(self) -> None:
         self.resumed += 1
+
+    async def hang_up(self) -> None:
+        self.hung_up += 1
 
     async def transfer_blind(
         self, target_uri: str, *, referred_by: str | None = None
@@ -182,6 +186,50 @@ async def test_resume_call_runs_when_not_degraded() -> None:
     result = await _tools(call).resume_call()
     assert result.allowed is True
     assert call.resumed == 1
+
+
+# ---- hang up (SAFE) — ADR-0026 ---------------------------------------------
+
+
+def test_hang_up_call_is_safe_risk() -> None:
+    """``hang_up`` is SAFE: any caller's conversation may be concluded by the agent.
+
+    Ending the call mutates no external state and is something even a level-0
+    receptionist is told it may do ("end the call politely"). SAFE tools always
+    run, so the agent can hang up regardless of privilege or degraded state.
+    """
+    assert TOOL_RISKS["hang_up"] is ToolRisk.SAFE
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_runs_and_ends_the_call() -> None:
+    """``hang_up`` runs the call's hang_up verb (sends BYE, ends the call)."""
+    call = _FakeCall()
+    result = await _tools(call).hang_up()
+    assert result.allowed is True
+    assert call.hung_up == 1
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_runs_even_when_degraded() -> None:
+    """A degraded session can still hang up (SAFE is never gated by degrade)."""
+    call = _FakeCall(degraded=True)
+    result = await _tools(call).hang_up()
+    assert result.allowed is True
+    assert call.hung_up == 1
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_with_no_active_call_is_a_no_op() -> None:
+    """Hanging up with no bound call returns a not-allowed result, no crash."""
+    result = await _tools(None).hang_up()
+    assert result.allowed is False
+
+
+def test_gate_voip_tool_allows_hang_up_for_unprivileged_caller() -> None:
+    """The gate permits ``hang_up`` for a level-0 receptionist (SAFE always runs)."""
+    receptionist = GuardSessionState(call_id="c", privilege_level=0)
+    assert gate_voip_tool("hang_up", receptionist, confirmed=False) is True
 
 
 # ---- transfer (IRREVERSIBLE) — invariant 3 ---------------------------------

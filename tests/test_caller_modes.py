@@ -171,6 +171,52 @@ def test_only_allow_is_privileged() -> None:
     assert CallerMode.DENY.privileged is False
 
 
+# --- fail-loud on a privileged default (the privilege-escalation clamp) ------
+#
+# Hardening (fix/voip-default-mode-privilege-clamp): an UNMATCHED caller must
+# NEVER reach operator privilege (privilege_level=3, the IRREVERSIBLE tier) by
+# construction, regardless of config. Caller-ID is forgeable SIP identity — a
+# trust HINT, never authentication — so least privilege is the default and
+# operator privilege requires an explicit allow-list MATCH, never the catch-all
+# default. The legacy path therefore fails LOUD exactly like the N-group JSON
+# path (caller_modes._parse_groups_document rejects a default_group with
+# privilege_level != 0): `HERMES_VOIP_CALLER_DEFAULT_MODE=allow` maps the
+# unmatched caller to the operator group (level 3), which is rejected at config
+# CONSTRUCTION so load_caller_modes(), classify_caller(), AND the adapter path
+# all fail loud — there is no way to construct the fail-open state.
+
+
+def test_default_mode_allow_is_rejected_at_construction() -> None:
+    # default_mode=ALLOW would map every unmatched (unknown, forgeable) caller to
+    # the operator group at privilege_level=3 — the IRREVERSIBLE tier. That is the
+    # fail-open privilege-escalation gap; constructing it must raise (rule 37,
+    # mirrors the DENY/OUTBOUND rejections already in __post_init__).
+    with pytest.raises(ConfigError, match="ALLOW"):
+        _cfg(default_mode=CallerMode.ALLOW)
+
+
+def test_load_rejects_default_mode_allow() -> None:
+    # The env-driven loader must fail loud too: HERMES_VOIP_CALLER_DEFAULT_MODE=allow
+    # is the documented "loosening" that grants operator privilege to unmatched
+    # callers on a forgeable identifier — now refused, matching the N-group JSON
+    # path's rejection of a privileged default_group.
+    with pytest.raises(ConfigError, match="ALLOW"):
+        load_caller_modes({"HERMES_VOIP_CALLER_DEFAULT_MODE": "allow"})
+
+
+def test_unmatched_caller_can_never_reach_operator_privilege() -> None:
+    # The by-construction guarantee: there is NO legacy CallerModeConfig whose
+    # default places an unmatched caller at privilege_level >= 2. The only way to
+    # construct a config is default_mode=GREY (level 0), so an unknown caller is
+    # always the unprivileged receptionist. (A privileged default raises above.)
+    cfg = _cfg()  # the only constructible default is GREY
+    cls = classify_caller(_UNKNOWN, cfg)
+    assert cls.source == "default"
+    assert cls.group.privilege_level == 0
+    assert cls.group.privilege_level < 2  # never ELEVATED/IRREVERSIBLE
+    assert cls.mode is CallerMode.GREY
+
+
 # --- persona preamble (spotlighted, untrusted-data marked) ------------------
 
 

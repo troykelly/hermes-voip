@@ -49,6 +49,41 @@ from typing import Final, Protocol, runtime_checkable
 
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 
+_MS_PER_SECOND: Final[int] = 1000
+
+
+def windows_for_ms(duration_ms: int, sample_rate_hz: int) -> int:
+    """Convert a millisecond duration to a count of silero windows (rounding up).
+
+    One silero window is :data:`SILERO_WINDOW_SAMPLES` samples (256 at 8 kHz,
+    512 at 16 kHz) = 32 ms at either native rate. The count rounds **up** so a
+    threshold is never reached *earlier* than the configured duration (matching
+    the endpointer's silence-window conversion). A positive ``duration_ms`` always
+    yields at least one window, so a configured minimum never collapses to an
+    instantaneous trigger.
+
+    Args:
+        duration_ms: A non-negative duration in milliseconds.
+        sample_rate_hz: ``8000`` or ``16000`` (a native silero rate).
+
+    Returns:
+        The number of windows that span at least ``duration_ms``. ``0`` only when
+        ``duration_ms`` is ``0``.
+
+    Raises:
+        ValueError: If the rate is not a native silero rate, or ``duration_ms``
+            is negative.
+    """
+    if sample_rate_hz not in SILERO_WINDOW_SAMPLES:
+        msg = f"sample_rate_hz must be 8000 or 16000, got {sample_rate_hz}"
+        raise ValueError(msg)
+    if duration_ms < 0:
+        msg = f"duration_ms must be non-negative, got {duration_ms}"
+        raise ValueError(msg)
+    window_ms = SILERO_WINDOW_SAMPLES[sample_rate_hz] / sample_rate_hz * _MS_PER_SECOND
+    return math.ceil(duration_ms / window_ms)
+
+
 # numpy / onnxruntime are NOT statically imported here: the optional ``ml`` extra
 # is absent in the default gate (and its mypy job), and onnxruntime ships no
 # ``py.typed`` even when present — so a static ``import`` would error differently
@@ -66,6 +101,7 @@ __all__ = [
     "VadModel",
     "VoiceActivityDetector",
     "load_silero_model",
+    "windows_for_ms",
 ]
 
 #: silero-vad's required window size (mono samples) per native sample rate. The
@@ -218,6 +254,18 @@ class VoiceActivityDetector:
         self._buffer = bytearray()
         self._in_speech = False
         self._next_index = 0
+
+    @property
+    def window_index(self) -> int:
+        """The ordinal of the NEXT window this detector will score.
+
+        Equivalently, the count of windows scored so far on the current call
+        (it starts at ``0`` and increments by one per scored window, resetting at
+        :meth:`reset`). The barge-in gate (ADR-0023) reads this to measure how
+        many windows a voiced run has lasted *between* VAD edges, so a sustained
+        interruption fires mid-run rather than only at the next edge.
+        """
+        return self._next_index
 
     def feed(self, frame: PcmFrame) -> Iterator[VadEvent]:
         """Push one PCM frame; yield any onset/offset edges it produced.

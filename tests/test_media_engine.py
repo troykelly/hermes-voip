@@ -31,11 +31,17 @@ from collections.abc import Iterator
 
 import pytest
 
+import hermes_voip.media.engine as engine_module
 from hermes_voip.media.audio import G711_SAMPLE_RATE, encode_ulaw
 from hermes_voip.media.engine import Codec, RtpMediaTransport
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.rtp import RtpPacket
+
+# Our own outbound SSRC (white-box: read from the engine module so the test
+# tracks the constant). Inbound packets carrying THIS SSRC are our own audio
+# looped back (self-loopback) and must be dropped before VAD/ASR (ADR-0023).
+_OUR_SSRC: int = engine_module._OUTBOUND_SSRC
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -289,6 +295,130 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
     assert len(frames) == 4
     for frame in frames:
         assert frame.sample_rate == G711_SAMPLE_RATE
+
+    await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# Self-loopback SSRC drop (ADR-0023): an inbound packet carrying OUR OWN
+# outbound SSRC is our own audio looped back; it must never reach the jitter
+# buffer / VAD / ASR (it would self-interrupt the agent). A foreign-SSRC packet
+# is unaffected — this is defense-in-depth, distinct from the gateway-echo case.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inbound_packets_with_our_own_ssrc_are_dropped() -> None:
+    """Packets whose SSRC equals our outbound SSRC are dropped before decode.
+
+    Discriminating white-box test: inject a RUN of self-SSRC packets (seqs 0..4)
+    and NOTHING else. With ``jitter_depth=1`` a genuine stream of five ordered
+    packets would readily yield decoded frames; here the SSRC filter must drop
+    every one, so the inbound iterator yields NOTHING within a generous window.
+    A non-dropping engine yields at least one frame and fails the timeout assert.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        jitter_depth=1,
+        clock=_dummy_clock,
+    )
+    await engine.connect()
+
+    payload = _ulaw_silence()
+    frames: list[PcmFrame] = []
+
+    async def _collect() -> None:
+        async for _frame in engine.inbound_audio():
+            frames.append(_frame)
+
+    task = asyncio.create_task(_collect())
+    await asyncio.sleep(0)
+
+    # Five ordered packets, ALL carrying OUR OWN SSRC → every one must be dropped.
+    for seq in range(5):
+        engine._recv_queue.put_nowait(
+            (
+                _make_rtp(seq, seq * _SAMPLES_PER_FRAME, payload, ssrc=_OUR_SSRC),
+                _FAKE_SRC,
+            )
+        )
+
+    # Give the consumer ample time to process the queue; it must yield no frame.
+    await asyncio.sleep(0.1)
+    assert frames == [], "self-SSRC (looped-back) packets must never decode to frames"
+
+    # Sanity: a foreign-SSRC packet on the SAME engine DOES decode (the filter is
+    # specific to our SSRC, not a blanket drop).
+    engine._recv_queue.put_nowait(
+        (_make_rtp(5, 5 * _SAMPLES_PER_FRAME, payload, ssrc=_FAKE_SSRC), _FAKE_SRC)
+    )
+    engine._recv_queue.put_nowait(
+        (_make_rtp(6, 6 * _SAMPLES_PER_FRAME, payload, ssrc=_FAKE_SSRC), _FAKE_SRC)
+    )
+    await asyncio.sleep(0.1)
+    assert len(frames) >= 1, "a foreign-SSRC packet must still decode"
+    for frame in frames:
+        assert frame.sample_rate == G711_SAMPLE_RATE
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_self_ssrc_packet_does_not_latch_outbound_addr() -> None:
+    """A dropped self-SSRC packet must not latch the comedia outbound address.
+
+    The self-SSRC drop happens before ``_maybe_latch``, so our own looped-back
+    packet can never move the outbound destination onto a spoofed/own source.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        jitter_depth=1,
+        clock=_dummy_clock,
+        symmetric=True,
+    )
+    await engine.connect()
+    original_addr = engine._outbound_addr
+
+    frames: list[PcmFrame] = []
+    got_one = asyncio.Event()
+
+    async def _collect() -> None:
+        async for _frame in engine.inbound_audio():
+            frames.append(_frame)
+            got_one.set()
+            break
+
+    task = asyncio.create_task(_collect())
+    await asyncio.sleep(0)
+
+    payload = _ulaw_silence()
+    spoof_src = ("203.0.113.99", 9999)
+    # Our own SSRC from a NEW source tuple: if not dropped, _maybe_latch would
+    # move _outbound_addr to spoof_src. The drop must prevent that.
+    engine._recv_queue.put_nowait((_make_rtp(0, 0, payload, ssrc=_OUR_SSRC), spoof_src))
+    # Then a genuine far-end packet so _collect can complete.
+    engine._recv_queue.put_nowait(
+        (_make_rtp(1, _SAMPLES_PER_FRAME, payload, ssrc=_FAKE_SSRC), _FAKE_SRC)
+    )
+
+    await asyncio.wait_for(got_one.wait(), timeout=2.0)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    # The latch moved (if at all) only onto the genuine far-end source, never the
+    # spoofed self-SSRC source.
+    assert engine._outbound_addr != spoof_src
+    assert engine._outbound_addr in (original_addr, _FAKE_SRC)
 
     await engine.stop()
 

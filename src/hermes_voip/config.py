@@ -139,6 +139,26 @@ _MAX_VAD_THRESHOLD = 1.0
 # the friendly DEFAULT_GREETING; present-but-empty (or whitespace) → no greeting.
 _GREETING_KEY = "HERMES_VOIP_GREETING"
 
+# Echo-robust barge-in (ADR-0023). The gateway can reflect the agent's own TTS
+# back on the inbound path (no echo cancellation), and the VAD/ASR transcribe it
+# as the caller — a single ONSET then barged the agent in, ending its own turn (a
+# self-interruption loop). Mode `gated` (default) requires a SUSTAINED voiced run
+# while the agent's TTS plays (and for a short tail after) before a barge-in
+# counts, so short echo blips never interrupt but a genuine interruption still
+# does. `full` is the legacy immediate barge-in (for echo-cancelled gateways);
+# `off` disables barge-in entirely.
+_BARGE_IN_MODE_KEY = "HERMES_VOIP_BARGE_IN_MODE"
+_BARGE_IN_MIN_SPEECH_MS_KEY = "HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS"
+_BARGE_IN_TAIL_MS_KEY = "HERMES_VOIP_BARGE_IN_TAIL_MS"
+_DEFAULT_BARGE_IN_MODE = "gated"
+_BARGE_IN_MODES = frozenset({"off", "gated", "full"})
+# 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
+# burst (~15 windows ≈ 480 ms in the live log), with margin, so echo never
+# reaches the sustained-barge-in threshold while a real interruption (which
+# sustains well beyond 600 ms) still does.
+_DEFAULT_BARGE_IN_MIN_SPEECH_MS = 600
+_DEFAULT_BARGE_IN_TAIL_MS = 250
+
 # Symmetric-RTP (comedia) latching for NAT traversal (ADR-0005 §NAT). When on
 # (the default) the media engine latches its outbound destination onto the peer's
 # real RTP source — the source tuple of the first valid inbound RTP packet —
@@ -312,6 +332,15 @@ class MediaConfig:
             peer's real source tuple (the first valid inbound RTP packet) for NAT
             traversal — ``True`` by default. ``False`` always honours the SDP
             ``c=``/``m=`` address.
+        barge_in_mode: Echo-robust barge-in mode (ADR-0023): ``gated`` (default —
+            require a sustained voiced run while TTS plays), ``full`` (legacy
+            immediate barge-in on any onset), or ``off`` (never barge in).
+        barge_in_min_speech_ms: In ``gated`` mode, the minimum sustained voiced
+            run (ms) required to barge in while the agent's TTS is playing (or in
+            the tail after). Must be positive. Short echo blips never reach it.
+        barge_in_tail_ms: How long (ms) after the agent's TTS ends the gate keeps
+            requiring a sustained run (echo lags the TTS via jitter/network).
+            ``0`` disarms the instant TTS ends; must be non-negative.
         injection_guard: Prompt-injection guard token (``onnx`` in-process default).
         injection_guard_model_dir: Path to the guard's ONNX model dir, or ``None``.
         dtmf_mode: ``auto`` | ``rfc4733`` | ``sip_info`` | ``inband``.
@@ -336,6 +365,9 @@ class MediaConfig:
     duplex_mode: str
     greeting: str
     rtp_symmetric: bool
+    barge_in_mode: str
+    barge_in_min_speech_ms: int
+    barge_in_tail_ms: int
     injection_guard: str
     injection_guard_model_dir: str | None
     dtmf_mode: str
@@ -373,6 +405,22 @@ class MediaConfig:
         if self.duplex_mode not in _DUPLEX_MODES:
             allowed = ", ".join(sorted(_DUPLEX_MODES))
             msg = f"duplex_mode must be one of {{{allowed}}}, got {self.duplex_mode!r}"
+            raise ConfigError(msg)
+        if self.barge_in_mode not in _BARGE_IN_MODES:
+            allowed = ", ".join(sorted(_BARGE_IN_MODES))
+            msg = (
+                f"barge_in_mode must be one of {{{allowed}}}, "
+                f"got {self.barge_in_mode!r}"
+            )
+            raise ConfigError(msg)
+        if self.barge_in_min_speech_ms <= 0:
+            msg = (
+                f"barge_in_min_speech_ms must be positive, "
+                f"got {self.barge_in_min_speech_ms}"
+            )
+            raise ConfigError(msg)
+        if self.barge_in_tail_ms < 0:
+            msg = f"barge_in_tail_ms must be non-negative, got {self.barge_in_tail_ms}"
             raise ConfigError(msg)
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))
@@ -449,6 +497,15 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ),
         greeting=_parse_greeting(env),
         rtp_symmetric=_parse_bool(env, _RTP_SYMMETRIC_KEY, _DEFAULT_RTP_SYMMETRIC),
+        barge_in_mode=_parse_enum(
+            env, _BARGE_IN_MODE_KEY, _BARGE_IN_MODES, _DEFAULT_BARGE_IN_MODE
+        ),
+        barge_in_min_speech_ms=_parse_positive_int(
+            env, _BARGE_IN_MIN_SPEECH_MS_KEY, _DEFAULT_BARGE_IN_MIN_SPEECH_MS
+        ),
+        barge_in_tail_ms=_parse_non_negative_int(
+            env, _BARGE_IN_TAIL_MS_KEY, _DEFAULT_BARGE_IN_TAIL_MS
+        ),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,
         injection_guard_model_dir=_optional(env, _INJECTION_GUARD_MODEL_DIR_KEY),
@@ -584,6 +641,20 @@ def _parse_positive_int(env: Mapping[str, str], key: str, default: int) -> int:
         msg = f"{key} must be positive, got {value}"
         raise ConfigError(msg)
     return value
+
+
+def _parse_non_negative_int(env: Mapping[str, str], key: str, default: int) -> int:
+    """Parse ``key`` as a ``>= 0`` integer, defaulting when unset.
+
+    Unlike :func:`_parse_positive_int`, ``0`` is accepted (e.g. a barge-in tail of
+    0 ms means "disarm the instant TTS ends"). The shared ``_parse_int`` already
+    rejects negatives (its regex matches only non-negative integers), so a
+    malformed or negative value raises :class:`ConfigError`.
+    """
+    raw = _value(env, key)
+    if not raw:
+        return default
+    return _parse_int(raw, key)
 
 
 def _parse_optional_positive_int(env: Mapping[str, str], key: str) -> int | None:

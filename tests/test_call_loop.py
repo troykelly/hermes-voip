@@ -24,7 +24,7 @@ from typing import Final
 
 import pytest
 
-from hermes_voip.media.call_loop import CallLoop, gate_voip_tool
+from hermes_voip.media.call_loop import BargeInMode, CallLoop, gate_voip_tool
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR, Transcript
@@ -1625,3 +1625,918 @@ async def test_barge_in_during_greeting_no_aclose_race(
         "unexpected RuntimeWarnings during barge-in teardown: "
         f"{[str(w.message) for w in runtime_warnings]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# SELF-ECHO BARGE-IN (ADR-0023) — the gateway reflects the agent's own TTS back
+# on the inbound path; the VAD transcribes it as the caller, and a single ONSET
+# barged the agent in, ending its own turn (the live self-interruption loop,
+# call 20260617_033116). In the default ``gated`` mode, while TTS is playing a
+# barge-in needs a SUSTAINED voiced run — short echo blips must NOT interrupt,
+# but a genuine sustained interruption still must.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedVadModel:
+    """A :class:`VadModel` that returns a preset probability per scored window.
+
+    One probability is consumed per window; once the script is exhausted it
+    returns ``0.0`` (silence) forever. Stateless beyond the cursor, so the
+    detector's hysteresis state machine still derives ONSET/OFFSET edges.
+    """
+
+    def __init__(self, probabilities: list[float]) -> None:
+        self._probs = probabilities
+        self._cursor = 0
+
+    def __call__(self, window_pcm16: bytes, sample_rate: int) -> float:
+        _ = window_pcm16, sample_rate
+        if self._cursor < len(self._probs):
+            value = self._probs[self._cursor]
+            self._cursor += 1
+            return value
+        return 0.0
+
+
+def _scripted_vad_8k(probabilities: list[float]) -> VoiceActivityDetector:
+    """An 8 kHz silero VAD driven by a per-window probability script."""
+    return VoiceActivityDetector(
+        model=_ScriptedVadModel(probabilities),
+        sample_rate_hz=_G711_INBOUND_RATE,
+    )
+
+
+def _one_window_frame_8k() -> PcmFrame:
+    """Exactly one 8 kHz silero window (256 samples → 512 bytes)."""
+    return PcmFrame(
+        samples=bytes(512), sample_rate=_G711_INBOUND_RATE, monotonic_ts_ns=0
+    )
+
+
+class _ScriptedInboundTransport(_FakeTransport):
+    """8 kHz transport that releases its (one-window) frames on a gate.
+
+    Each call to :meth:`inbound_audio` yields ``len(frames)`` one-window frames,
+    but only after ``release`` is set, and with a cooperative ``sleep(0)`` between
+    frames so the concurrent greeting playout task interleaves window-by-window
+    (mirrors a live call where the echo arrives once the agent is speaking). One
+    inbound frame is exactly one 8 kHz silero window, so the VAD window ordinal
+    advances by one per frame.
+    """
+
+    def __init__(self, n_frames: int) -> None:
+        super().__init__([_one_window_frame_8k() for _ in range(n_frames)])
+        self.release = asyncio.Event()
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        frames = self._frames
+        release = self.release
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            await release.wait()
+            for frame in frames:
+                await asyncio.sleep(0)  # let the greeting playout interleave
+                yield frame
+
+        return _gen()
+
+
+class _LongSlowGreetingTTS:
+    """StreamingTTS returning a fresh self-completing slow greeting per call.
+
+    Each ``synthesize`` returns a new :class:`_SlowTtsStream` that yields many
+    frames, one per cooperative ``sleep(0)``, so the greeting stays the active TTS
+    stream across the whole inbound echo run AND completes on its own when no
+    barge-in cancels it (so ``run()`` terminates). ``cancel()`` stops it promptly.
+    """
+
+    def __init__(self, n_frames: int) -> None:
+        self._n_frames = n_frames
+        self.last_stream: _SlowTtsStream | None = None
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(
+        self, text: AsyncIterator[str], voice: str, *, sample_rate: int | None = None
+    ) -> TtsStream:
+        _ = text, voice, sample_rate
+        stream = _SlowTtsStream(
+            [_greeting_frame(i % 250) for i in range(self._n_frames)]
+        )
+        self.last_stream = stream
+        return stream
+
+
+def _build_barge_in_loop(  # noqa: PLR0913 — test factory mirrors CallLoop's keyword surface
+    transport: _FakeTransport,
+    vad: VoiceActivityDetector,
+    tts: StreamingTTS,
+    *,
+    mode: BargeInMode,
+    min_voiced_windows: int,
+    greeting: str,
+) -> CallLoop:
+    return CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting=greeting,
+        barge_in_mode=mode,
+        barge_in_min_voiced_windows=min_voiced_windows,
+        barge_in_tail_windows=8,
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_short_echo_during_tts_does_not_barge_in() -> None:
+    """A SHORT echo blip while the greeting plays must NOT cancel it (gated mode).
+
+    Reproduces the live self-interruption: the agent is speaking (greeting TTS
+    active), and the inbound stream carries a short voiced run (echo of the
+    agent's own audio) — here 6 voiced windows then silence, below the 13-window
+    sustained threshold. The greeting stream must run to completion uncancelled.
+    """
+    # 6 voiced windows (echo blip) then silence; below the 13-window threshold.
+    blip = [0.95] * 6 + [0.0] * 20
+    vad = _scripted_vad_8k(blip)
+    # A long self-completing greeting stays the active TTS stream across the whole
+    # echo blip (so the gate is armed) and finishes on its own when not cancelled.
+    tts = _LongSlowGreetingTTS(n_frames=60)
+    transport = _ScriptedInboundTransport(len(blip))
+
+    loop = _build_barge_in_loop(
+        transport,
+        vad,
+        tts,
+        mode=BargeInMode.GATED,
+        min_voiced_windows=13,
+        greeting="The agent is giving a long spoken answer here.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting start + register its stream, then release the echo frames.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is False, (
+        "short echo blip during TTS playout must NOT barge in (gated mode)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_sustained_speech_during_tts_barges_in() -> None:
+    """A SUSTAINED voiced run while the greeting plays MUST cancel it (gated).
+
+    A genuine caller interruption keeps voicing past the 13-window threshold with
+    no offset — barge-in must still fire so the agent stops. This proves the gate
+    preserves intentional barge-in (it does not simply disable it during TTS).
+    """
+    # 30 continuous voiced windows → well past the 13-window threshold.
+    sustained = [0.95] * 30
+    vad = _scripted_vad_8k(sustained)
+    tts = _LongSlowGreetingTTS(n_frames=60)
+    transport = _ScriptedInboundTransport(len(sustained))
+
+    loop = _build_barge_in_loop(
+        transport,
+        vad,
+        tts,
+        mode=BargeInMode.GATED,
+        min_voiced_windows=13,
+        greeting="The agent starts a long answer but the caller cuts in.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True, (
+        "a sustained caller interruption during TTS must still barge in"
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_mode_short_blip_barges_in_legacy_behaviour() -> None:
+    """``full`` mode reproduces the pre-fix behaviour: first ONSET barges in.
+
+    This documents that the legacy immediate-barge-in path still exists for
+    echo-cancelled gateways — and that it is exactly what made the short echo
+    blip self-interrupt before ``gated`` became the default.
+    """
+    blip = [0.95] * 6 + [0.0] * 20
+    vad = _scripted_vad_8k(blip)
+    tts = _LongSlowGreetingTTS(n_frames=60)
+    transport = _ScriptedInboundTransport(len(blip))
+
+    loop = _build_barge_in_loop(
+        transport,
+        vad,
+        tts,
+        mode=BargeInMode.FULL,
+        min_voiced_windows=13,
+        greeting="The agent speaks and any onset cuts it off in full mode.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True
+
+
+class _DrainThenFinalASR:
+    """ASR fake that drains the audio it RECEIVES, then yields one final per turn.
+
+    Mirrors a streaming ASR: it consumes the audio stream and yields ``is_final``
+    transcripts. ``end_of_turn`` is configurable — ``False`` models the sherpa ASR
+    (the endpointer owns the boundary; ADR-0008), ``True`` models a fused engine
+    like Deepgram Flux that sets the turn boundary natively. Because the final is
+    emitted only after the audio it gets is drained, the test makes the *delivery
+    suppression* the deterministic variable.
+
+    Crucially it only ever sees the frames the pump actually FORWARDS — echo that
+    the pump drops from the ASR input never reaches here, so an echo transcript is
+    never produced on EITHER end-of-turn path. It records how many frames it drew
+    so a test can assert the pump withheld the echo.
+    """
+
+    def __init__(self, text: str, *, end_of_turn: bool = False) -> None:
+        self._text = text
+        self._end_of_turn = end_of_turn
+        self.frames_drained = 0
+
+    @property
+    def input_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        text = self._text
+        end_of_turn = self._end_of_turn
+
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:  # drain only the frames the pump forwards
+                self.frames_drained += 1
+            # A real recogniser yields a transcript only when it actually received
+            # audio. If the pump withheld ALL frames (echo during TTS), it gets
+            # nothing and yields nothing — so withheld echo produces no turn on any
+            # end-of-turn path (endpointer OR native).
+            if self.frames_drained > 0:
+                yield Transcript(
+                    text=text, is_final=True, end_of_turn=end_of_turn, confidence=1.0
+                )
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_gated_echo_blip_during_tts_delivers_no_turn() -> None:
+    """An echo blip during TTS must NOT be delivered as a caller turn (codex #1).
+
+    The deeper self-interruption route: even when a short echo blip does not call
+    ``barge_in()``, the endpointer still fires an end-of-turn on its trailing
+    silence and the ASR's final fragment is delivered to the agent as caller
+    input — re-triggering an interrupt. While the agent's TTS is playing and the
+    speech was not an authorised (sustained) barge-in, the turn delivery must be
+    suppressed. Here a 6-window echo blip (below threshold) is followed by enough
+    silent windows to fire the endpointer; ``deliver_turn`` must NEVER be called.
+
+    Discriminating: ``_DrainThenFinalASR`` emits its final only AFTER the
+    endpointer has fired (it drains all audio first), so the turn is delivered iff
+    the endpointer EOT was NOT suppressed — i.e. the test fails without the fix.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # 6 voiced echo windows, then 30 silent windows (> the 16-window endpointer
+    # silence at 8 kHz) so the endpointer fires an end-of-turn on the echo while
+    # the long greeting is still playing (the gate is armed throughout).
+    blip = [0.95] * 6 + [0.0] * 30
+    vad = _scripted_vad_8k(blip)
+    tts = _LongSlowGreetingTTS(n_frames=120)
+    transport = _ScriptedInboundTransport(len(blip))
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_DrainThenFinalASR("NO"),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent is giving a long spoken answer here.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == [], (
+        "echoed speech during TTS playout must not be delivered as a caller turn"
+    )
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is False
+
+
+@pytest.mark.asyncio
+async def test_gated_normal_turn_during_silence_still_delivered() -> None:
+    """A real caller turn during SILENCE (agent not speaking) still delivers.
+
+    No-regression guard for the delivery suppression: with no greeting/TTS the
+    gate is never armed, so a finalised end-of-turn is delivered normally. (This
+    mirrors the existing end-of-turn delivery path, now with the gate present.)
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    loop = CallLoop(
+        transport=_Transport8k([_silence_frame_8k(0)]),
+        asr=_FakeASR([("hello there", True, True)]),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",  # no TTS → gate never armed
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+    assert delivered == ["hello there"]
+
+
+@pytest.mark.asyncio
+async def test_gated_echo_with_native_asr_eot_delivers_no_turn() -> None:
+    """Echo during TTS must not deliver a turn even with a NATIVE-EOT ASR (codex #A).
+
+    A fused recogniser (e.g. Deepgram Flux) sets ``end_of_turn=True`` itself, which
+    ``_asr`` honours independently of the endpointer counter. Suppressing only the
+    endpointer EOT therefore would NOT stop echo from being delivered via a native
+    EOT. The robust fix withholds the echo audio from the ASR entirely while the
+    gate is armed and the run is unauthorised, so NO echo transcript is produced on
+    either path. Assert: no turn delivered, and the ASR drew far fewer frames than
+    were sent (the echo was withheld).
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    blip = [0.95] * 6 + [0.0] * 30
+    vad = _scripted_vad_8k(blip)
+    tts = _LongSlowGreetingTTS(n_frames=120)
+    transport = _ScriptedInboundTransport(len(blip))
+    asr = _DrainThenFinalASR("NO", end_of_turn=True)  # native EOT (Deepgram-style)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent is giving a long spoken answer here.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == [], (
+        "echo with a native-EOT ASR must not be delivered as a caller turn"
+    )
+    # The echo audio was withheld from the ASR (it saw far fewer than 36 frames).
+    assert asr.frames_drained < len(blip), (
+        "the pump must withhold echo frames from the ASR during TTS playout"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_sustained_barge_in_cancels_and_delivers_transcript() -> None:
+    """A sustained interruption during TTS both CANCELS the agent AND delivers.
+
+    Integrated proof (codex noted the cancel was tested but not the delivery): a
+    sustained caller run past the threshold cancels the playing greeting (barge-in)
+    AND its transcript is delivered as a caller turn — the run is authorised, so its
+    turn is not suppressed. A native-EOT ASR finalises the (authorised) turn.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    sustained = [0.95] * 30  # well past the 13-window threshold, no offset
+    vad = _scripted_vad_8k(sustained)
+    tts = _LongSlowGreetingTTS(n_frames=120)
+    transport = _ScriptedInboundTransport(len(sustained))
+    asr = _DrainThenFinalASR("please stop", end_of_turn=True)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent starts a long answer but the caller cuts in.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is True, "sustained run must cancel the agent"
+    assert delivered == ["please stop"], (
+        "an authorised sustained interruption must deliver its transcript"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
+    """A real caller turn that authorises during the post-TTS tail delivers (codex #B).
+
+    The gate stays armed for a tail after TTS ends. A SUSTAINED run during that tail
+    must authorise itself and deliver its turn — it must not be suppressed as echo
+    just because TTS recently stopped. A LARGE tail (40 windows > the 13-window
+    threshold) is used so the run reaches its sustained threshold while still in the
+    tail: the pump must drive the gate's authorisation while armed (not only while
+    TTS is active), or the whole run is withheld from the ASR and nothing delivers.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # A short greeting (ends fast) arms a long tail; then a sustained caller run.
+    script = [0.0] * 3 + [0.95] * 30
+    vad = _scripted_vad_8k(script)
+    tts = _LongSlowGreetingTTS(n_frames=2)  # greeting ends fast → long tail follows
+    transport = _ScriptedInboundTransport(len(script))
+    asr = _DrainThenFinalASR("hello operator", end_of_turn=True)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="Hi.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=40,  # tail outlasts the threshold → authorise in tail
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == ["hello operator"], (
+        "a sustained real turn that authorises during the tail must be delivered"
+    )
+
+
+class _PerFrameFinalASR:
+    """ASR fake that yields one end-of-turn-less final per frame it RECEIVES.
+
+    Like the sherpa ASR, every forwarded frame produces an ``is_final`` hypothesis
+    with ``end_of_turn=False`` (the endpointer owns the boundary). Frames the pump
+    withholds (echo) never reach it, so it emits nothing for them. Used to prove the
+    endpointer does not accumulate stale echo silence: only a real turn's endpointer
+    end-of-turn may promote a final to a delivered turn.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.frames_drained = 0
+
+    @property
+    def input_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        text = self._text
+
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:
+                self.frames_drained += 1
+                yield Transcript(
+                    text=text, is_final=True, end_of_turn=False, confidence=1.0
+                )
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_echo_then_tail_expiry_does_not_leak_eot_into_next_turn() -> None:
+    """A withheld echo run must not arm the endpointer for a later real turn.
+
+    Regression for the stale-silence edge: an echo blip during TTS, then TTS + the
+    tail end with NO real speech, then later a genuine caller turn during silence.
+    The echo's OFFSET must not have armed the endpointer (it was withheld), so the
+    only end-of-turn is the real turn's own — exactly one delivery, with the real
+    text. If the withheld echo leaked into the endpointer, a spurious end-of-turn
+    after tail expiry would consume the real turn's first final prematurely.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # Echo (6 voiced) during a SHORT greeting + tail, then long silence past the
+    # tail, then a real turn (voiced) followed by endpointer silence.
+    script = [0.95] * 6 + [0.0] * 40 + [0.95] * 4 + [0.0] * 20
+    vad = _scripted_vad_8k(script)
+    tts = _LongSlowGreetingTTS(n_frames=8)  # greeting ends early; tail then expires
+    transport = _ScriptedInboundTransport(len(script))
+    asr = _PerFrameFinalASR("real turn")
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="Hi.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    # Exactly one real turn delivered; no spurious echo-driven turn.
+    assert delivered == ["real turn"]
+
+
+class _PrePlayoutGreetingStream:
+    """A greeting TtsStream that registers but WITHHOLDS its first frame until told.
+
+    Models TTS synthesis/startup latency: the stream is the active stream (so
+    barge-in can target it) but emits no audio yet. A test sets ``emit`` to release
+    the first frame. While parked, ``_tts_audio_active`` stays False, so the echo
+    gate must NOT be armed — a real short caller turn in this window must reach the
+    ASR (codex finding C).
+    """
+
+    def __init__(self, frames: list[PcmFrame], emit: asyncio.Event) -> None:
+        self._frames = frames
+        self._emit = emit
+        self.cancel_called = False
+        self._cancelled = False
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
+        await self._emit.wait()  # synthesis latency: no audio until released
+        for frame in self._frames:
+            if self._cancelled:
+                return
+            yield frame
+
+    async def flush(self) -> None:
+        pass
+
+    async def cancel(self) -> None:
+        self.cancel_called = True
+        self._cancelled = True
+        self._emit.set()  # unblock the parked generator so it can finish
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        self._emit.set()
+        await self._gen.aclose()
+
+
+class _PrePlayoutGreetingTTS:
+    """StreamingTTS returning a single pre-playout-latency greeting stream."""
+
+    def __init__(self, frames: list[PcmFrame], emit: asyncio.Event) -> None:
+        self._frames = frames
+        self._emit = emit
+        self.last_stream: _PrePlayoutGreetingStream | None = None
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(
+        self, text: AsyncIterator[str], voice: str, *, sample_rate: int | None = None
+    ) -> TtsStream:
+        _ = text, voice, sample_rate
+        stream = _PrePlayoutGreetingStream(self._frames, self._emit)
+        self.last_stream = stream
+        return stream
+
+
+@pytest.mark.asyncio
+async def test_short_real_turn_before_first_tts_frame_is_delivered() -> None:
+    """A short real caller turn during TTS synthesis latency is delivered (codex C).
+
+    The greeting stream is registered (so barge-in could target it) but emits no
+    audio yet — the echo gate must NOT arm on mere registration, only once audio is
+    actually on the wire. A SHORT (sub-threshold) caller turn that arrives in this
+    pre-playout window is genuine (nothing has been transmitted, so it cannot be
+    echo) and must reach the ASR + be delivered. After it ends the greeting audio
+    is released so the loop completes.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # A short caller turn (4 voiced windows, below the 13-window barge-in
+    # threshold), then enough silence to fire the endpointer end-of-turn.
+    script = [0.95] * 4 + [0.0] * 24
+    vad = _scripted_vad_8k(script)
+    emit = asyncio.Event()
+    tts = _PrePlayoutGreetingTTS([_greeting_frame(1), _greeting_frame(2)], emit)
+    transport = _ScriptedInboundTransport(len(script))
+    asr = _DrainThenFinalASR("hello", end_of_turn=False)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="A greeting that is still synthesising while the caller speaks.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting register (no audio yet) and the pump start; deliver the
+    # short caller turn entirely within the pre-playout window.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    # Drain the inbound turn, then release the greeting audio so run() completes.
+    for _ in range(30):
+        await asyncio.sleep(0)
+    emit.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == ["hello"], (
+        "a short real caller turn during TTS synthesis latency must be delivered"
+    )
+
+
+class _EmitThenParkStream:
+    """A TtsStream that emits its first frame (arming the gate) then parks.
+
+    Stays the active, audio-emitting stream until ``cancel()`` (a superseding
+    ``speak()``) unblocks it — modelling a stream that is mid-playout when a newer
+    one supersedes it. Because it has emitted a frame, it has set
+    ``_tts_audio_active``; because it is superseded (not finished), its ``_play``
+    finalizer will not clear the flag (it no longer owns ``_active_tts_stream``).
+    """
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        self._frames = frames
+        self.cancel_called = False
+        self._cancelled = False
+        self._resume = asyncio.Event()
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
+        if self._frames:
+            yield self._frames[0]  # arm the gate
+        await self._resume.wait()  # park until superseded/cancelled
+        if not self._cancelled:
+            for frame in self._frames[1:]:
+                yield frame
+
+    async def flush(self) -> None:
+        pass
+
+    async def cancel(self) -> None:
+        self.cancel_called = True
+        self._cancelled = True
+        self._resume.set()
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        self._resume.set()
+        await self._gen.aclose()
+
+
+class _SupersedingTTS:
+    """StreamingTTS returning stream A first, then a pre-playout-latency stream B.
+
+    Models a superseding ``speak()``: A emits audio then parks (still active), then
+    B supersedes it but has synthesis latency before its first frame. Used to prove
+    the echo gate disarms for B's pre-playout window even though A had armed it and
+    A's finalizer cannot clear it (codex C').
+    """
+
+    def __init__(
+        self,
+        a_frames: list[PcmFrame],
+        b_frames: list[PcmFrame],
+        b_emit: asyncio.Event,
+    ) -> None:
+        self._a = _EmitThenParkStream(a_frames)
+        self._b = _PrePlayoutGreetingStream(b_frames, b_emit)
+        self._calls = 0
+        self.a_stream = self._a
+        self.b_stream = self._b
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(
+        self, text: AsyncIterator[str], voice: str, *, sample_rate: int | None = None
+    ) -> TtsStream:
+        _ = text, voice, sample_rate
+        self._calls += 1
+        return self._a if self._calls == 1 else self._b
+
+
+@pytest.mark.asyncio
+async def test_superseding_speak_disarms_echo_gate_for_pre_playout() -> None:
+    """A superseding speak() must not leave the echo gate armed for B's pre-playout.
+
+    Stream A emits audio (arming the gate), then speak(B) supersedes A. B has
+    synthesis latency before its first frame. The playout lock serialises A's
+    teardown before B's _play runs, so B's _play disarms ``_tts_audio_active``
+    until B's own first frame — even though A's _play finalizer cannot clear it
+    (A no longer owns ``_active_tts_stream``). Asserts the flag is False during B's
+    pre-playout gap (codex C'); without the fix it stays True from A.
+    """
+    a_frames = [_greeting_frame(1), _greeting_frame(2)]
+    b_emit = asyncio.Event()
+    b_frames = [_greeting_frame(3)]
+    tts = _SupersedingTTS(a_frames, b_frames, b_emit)
+    transport = _FakeTransport([])
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    async def _tokens(word: str) -> AsyncIterator[str]:
+        yield word
+
+    # Play A (it emits frames → arms the echo gate). _SlowTtsStream yields each
+    # frame after a cooperative sleep(0), so pump the loop until A's first frame
+    # has been sent and the gate is armed.
+    a_task = asyncio.create_task(loop.speak(_tokens("first")))
+    armed_by_a = False
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if loop._tts_audio_active:
+            armed_by_a = True
+            break
+    assert armed_by_a, "A's audio should have armed the gate"
+
+    # Supersede with B (synthesis latency: B emits no frame until b_emit is set).
+    b_task = asyncio.create_task(loop.speak(_tokens("second")))
+    # Let A tear down and B's _play acquire the lock (which disarms the gate).
+    for _ in range(8):
+        await asyncio.sleep(0)
+
+    # During B's pre-playout latency the gate must be DISARMED (B has sent no
+    # audio yet; A's stale True must not persist). Read into a local so the bool
+    # literal narrowing does not make mypy treat the rest as unreachable.
+    armed_during_b_pre_playout = loop._tts_audio_active
+    assert armed_during_b_pre_playout is False, (
+        "echo gate must disarm during a superseding stream's pre-playout latency"
+    )
+
+    # Release B's audio and let both speaks finish; the gate re-arms on B's frame.
+    b_emit.set()
+    await asyncio.wait_for(asyncio.gather(a_task, b_task), timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_gated_default_mode_when_unspecified() -> None:
+    """A CallLoop built without barge-in args defaults to gated, min 1 window.
+
+    The default constructor (used by older call sites / tests) must not regress:
+    with no inbound echo and an active greeting, the greeting completes; the
+    default mode is ``gated``. (The adapter supplies real thresholds; the
+    constructor default is a safe immediate-ish gate.)
+    """
+    tts = _LongSlowGreetingTTS(n_frames=3)
+    transport = _Transport8k([])  # no inbound audio at all
+
+    loop = CallLoop(
+        transport=transport,
+        asr=_FakeASR([]),
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=_make_vad_8k(),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=_noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="A short greeting with no inbound audio.",
+    )
+    assert loop.barge_in_mode is BargeInMode.GATED
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+    # With no inbound audio nothing barges in; the greeting ran to completion.
+    assert tts.last_stream is not None
+    assert tts.last_stream.cancel_called is False

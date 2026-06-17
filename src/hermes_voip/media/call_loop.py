@@ -89,7 +89,7 @@ from typing import Final
 
 from hermes_voip.media.audio import generate_tone_frames
 from hermes_voip.media.endpoint import Endpointer
-from hermes_voip.media.vad import SpeechEdge, VoiceActivityDetector
+from hermes_voip.media.vad import SpeechEdge, VadEvent, VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardVerdict, InjectionGuard
@@ -123,6 +123,198 @@ class _EndOfStream(Enum):
 
 #: The sole end-of-stream marker value (see :class:`_EndOfStream`).
 _END_OF_STREAM: Final[_EndOfStream] = _EndOfStream.MARKER
+
+
+class BargeInMode(Enum):
+    """How an inbound speech onset is allowed to interrupt the agent (ADR-0023).
+
+    * ``OFF`` — never barge in; the agent always finishes its turn.
+    * ``GATED`` — (default) while the agent's TTS is playing (and for a short tail
+      after), a barge-in counts only once it is a SUSTAINED voiced run, so short
+      echo blips (the gateway reflecting our own TTS back) cannot interrupt but a
+      genuine sustained interruption still does. Outside playout/tail any onset
+      barges in immediately (nothing to echo when the agent is silent).
+    * ``FULL`` — any speech onset barges in immediately, even during playout
+      (correct only on a gateway with its own echo cancellation).
+    """
+
+    OFF = "off"
+    GATED = "gated"
+    FULL = "full"
+
+
+class BargeInGate:
+    """Echo-robust barge-in decision (ADR-0023).
+
+    The live self-interruption bug: the gateway reflects the agent's own TTS back
+    on the inbound path, the VAD/ASR transcribe it as the caller, and a single
+    speech ONSET barged the agent in — ending its own turn. Echo arrives as SHORT,
+    broken voiced runs (repeatedly OFFSET as the reflected energy dips); a genuine
+    human interruption is a SUSTAINED continuous voiced run. This gate separates
+    the two by *duration* without an acoustic echo canceller.
+
+    Drive it from the inbound pump:
+
+    * :meth:`tts_active` — call every iteration with whether the agent's TTS is
+      currently playing (``_active_tts_stream is not None``). The gate is *armed*
+      whenever TTS is active.
+    * :meth:`tail_from` — call at the window where TTS *stops* to keep the gate
+      armed for ``tail_windows`` more windows (echo lags the TTS via the jitter
+      buffer / network).
+    * :meth:`on_event` — feed every :class:`VadEvent`. ONSET starts a candidate
+      voiced run; OFFSET ends it (an echo blip is dismissed here).
+    * :meth:`should_barge_in` — call once per processed window with the current
+      window ordinal; returns ``True`` exactly once when a barge-in should fire.
+
+    While armed in ``GATED`` mode a barge-in fires only once the candidate run has
+    lasted ``min_voiced_windows`` (inclusive of the onset window). While NOT armed
+    (agent silent, past the tail), ``GATED`` behaves like ``FULL``: an onset barges
+    in immediately. ``OFF`` never fires; ``FULL`` always fires on the onset.
+    """
+
+    def __init__(
+        self, *, mode: BargeInMode, min_voiced_windows: int, tail_windows: int
+    ) -> None:
+        """Create a gate.
+
+        Args:
+            mode: The :class:`BargeInMode`.
+            min_voiced_windows: In ``GATED`` mode while armed, the minimum
+                consecutive voiced windows (inclusive of the onset window) before
+                a barge-in fires. Must be ``>= 1``.
+            tail_windows: How many windows after TTS stops the gate stays armed.
+                ``>= 0``.
+
+        Raises:
+            ValueError: If ``min_voiced_windows < 1`` or ``tail_windows < 0``.
+        """
+        if min_voiced_windows < 1:
+            msg = f"min_voiced_windows must be >= 1, got {min_voiced_windows}"
+            raise ValueError(msg)
+        if tail_windows < 0:
+            msg = f"tail_windows must be >= 0, got {tail_windows}"
+            raise ValueError(msg)
+        self.mode = mode
+        self._min_voiced_windows = min_voiced_windows
+        self._tail_windows = tail_windows
+        self._tts_active = False
+        # Inclusive last window ordinal the post-TTS tail covers, or None when no
+        # tail is pending. While the current window is <= this, the gate is armed
+        # even though TTS has stopped (echo lags the TTS).
+        self._tail_until: int | None = None
+        # Window ordinal of the current candidate voiced run's ONSET, or None when
+        # no run is in progress (no speech / ended by OFFSET / already fired).
+        self._onset_window: int | None = None
+        # True once a barge-in has fired for the current run, so the same run does
+        # not re-fire on every later window (which would spam barge_in()).
+        self._fired_for_run = False
+        # True iff the MOST RECENT speech run was an authorised (real) barge-in.
+        # Unlike ``_fired_for_run`` (cleared on OFFSET so the gate can re-arm),
+        # this PERSISTS through the run's trailing silence — the endpointer fires
+        # its end-of-turn there, and ``delivery_suppressed`` consults this to drop
+        # an unauthorised echo turn. Reset only on a NEW onset (a fresh run is
+        # unauthorised until it earns a barge-in), so authorisation never leaks
+        # across runs.
+        self._last_run_authorised = False
+
+    def tts_active(self, active: bool) -> None:
+        """Record whether the agent's TTS is currently playing.
+
+        While active the gate is armed (gated mode requires a sustained run). The
+        caller pairs a True→False transition with :meth:`tail_from` to keep the
+        gate armed across the echo tail.
+        """
+        self._tts_active = active
+
+    def tail_from(self, current_window: int) -> None:
+        """Arm the post-TTS tail for ``tail_windows`` windows from ``current_window``.
+
+        Called when the active TTS stream ends. Echo can arrive shortly after the
+        last TTS frame (jitter buffer + network), so the gate keeps requiring a
+        sustained run until ``current_window + tail_windows - 1`` (inclusive). A
+        ``tail_windows`` of 0 leaves the tail already expired (disarm at once).
+        """
+        if self._tail_windows == 0:
+            self._tail_until = current_window - 1
+        else:
+            self._tail_until = current_window + self._tail_windows - 1
+
+    def _armed(self, current_window: int) -> bool:
+        """Whether the gate currently requires a sustained run (gated mode)."""
+        if self._tts_active:
+            return True
+        return self._tail_until is not None and current_window <= self._tail_until
+
+    def on_event(self, event: VadEvent) -> None:
+        """Update the candidate voiced run from a VAD edge.
+
+        ONSET starts a fresh candidate run (clears the fired latch so a new
+        interruption after one fired can fire again); OFFSET ends the run — the
+        key step that dismisses a short echo blip before it reaches the threshold.
+        """
+        if event.edge is SpeechEdge.ONSET:
+            self._onset_window = event.frame_index
+            self._fired_for_run = False
+            # A fresh run is unauthorised until it earns a barge-in: clear the
+            # persisted authorisation so the prior run's verdict cannot leak into
+            # this one (e.g. an authorised interruption followed by a short echo
+            # blip must still have its blip-turn suppressed).
+            self._last_run_authorised = False
+        else:  # SpeechEdge.OFFSET — voicing stopped; the candidate run ends.
+            # Clear only the live-run state so the gate can re-arm; KEEP
+            # ``_last_run_authorised`` so the endpointer's end-of-turn on the
+            # trailing silence still knows whether this run was a real barge-in.
+            self._onset_window = None
+            self._fired_for_run = False
+
+    def should_barge_in(self, current_window: int) -> bool:
+        """Return ``True`` exactly once when a barge-in should fire this window.
+
+        Args:
+            current_window: The ordinal of the window just processed.
+
+        Returns:
+            ``True`` to barge in now, else ``False``. Returns ``True`` at most once
+            per candidate voiced run (latched until the run ends / a new onset).
+        """
+        if self.mode is BargeInMode.OFF:
+            return False
+        if self._onset_window is None or self._fired_for_run:
+            return False
+        if self.mode is BargeInMode.FULL or not self._armed(current_window):
+            # Immediate barge-in: any onset interrupts (full mode, or gated while
+            # the agent is silent — nothing to echo).
+            return self._fire()
+        # Gated + armed: require a SUSTAINED run. Inclusive of the onset window,
+        # ``current_window - onset + 1`` windows have been voiced.
+        voiced_windows = current_window - self._onset_window + 1
+        if voiced_windows >= self._min_voiced_windows:
+            return self._fire()
+        return False
+
+    def _fire(self) -> bool:
+        """Latch the barge-in for the current run and authorise its turn."""
+        self._fired_for_run = True
+        self._last_run_authorised = True
+        return True
+
+    def delivery_suppressed(self, current_window: int) -> bool:
+        """Whether an end-of-turn at this window is unauthorised echo to be dropped.
+
+        Even when a short echo blip does not fire ``should_barge_in`` (so it never
+        cancels the TTS), the endpointer still fires an end-of-turn on the echo's
+        trailing silence and the recogniser's final fragment would be delivered to
+        the agent as a caller turn — re-triggering an interrupt. The call loop
+        calls this when the endpointer fires; it returns ``True`` (drop the turn)
+        while the gate is armed (the agent's TTS is playing, or within the echo
+        tail) AND the most-recent speech run was NOT an authorised barge-in.
+
+        A genuine sustained interruption authorises its run (``should_barge_in``
+        fired and also cancelled the TTS, so the agent is no longer speaking),
+        so its transcript is delivered. Outside playout/tail nothing is
+        suppressed — normal caller turns during silence always deliver.
+        """
+        return self._armed(current_window) and not self._last_run_authorised
 
 
 class _ToneStream:
@@ -255,9 +447,21 @@ class CallLoop:
             resample entirely (``HERMES_VOIP_TEST_TONE`` env var).  When set,
             ``greeting`` is ignored.  ``0.0`` (the default) means normal
             operation.
+        barge_in_mode: Echo-robust barge-in mode (ADR-0023). ``GATED`` (default)
+            requires a sustained voiced run to interrupt while the agent's TTS is
+            playing (and a short tail after), so the gateway echoing the agent's
+            own TTS back cannot self-interrupt it; a genuine sustained
+            interruption still does. ``FULL`` is the legacy immediate barge-in;
+            ``OFF`` disables barge-in.
+        barge_in_min_voiced_windows: In ``GATED`` mode, the minimum consecutive
+            voiced VAD windows (inclusive of the onset window) before a barge-in
+            counts while armed. The adapter derives this from
+            ``barge_in_min_speech_ms`` and the inbound rate. Must be ``>= 1``.
+        barge_in_tail_windows: How many VAD windows after the agent's TTS stops the
+            gate keeps requiring a sustained run (echo lags the TTS). ``>= 0``.
     """
 
-    def __init__(  # noqa: PLR0913 — 12-arg constructor; all keyword-only
+    def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
         self,
         *,
         transport: MediaTransport,
@@ -272,6 +476,9 @@ class CallLoop:
         call_id: str,
         greeting: str = "",
         tone_secs: float = 0.0,
+        barge_in_mode: BargeInMode = BargeInMode.GATED,
+        barge_in_min_voiced_windows: int = 1,
+        barge_in_tail_windows: int = 0,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -286,11 +493,28 @@ class CallLoop:
         self._call_id = call_id
         self._greeting = greeting
         self._tone_secs = tone_secs
+        self.barge_in_mode = barge_in_mode
+        # The echo-robust barge-in decision (ADR-0023). The pump drives it from
+        # VAD edges + the TTS-active state; ``should_barge_in`` says when to fire.
+        self._barge_in_gate = BargeInGate(
+            mode=barge_in_mode,
+            min_voiced_windows=barge_in_min_voiced_windows,
+            tail_windows=barge_in_tail_windows,
+        )
         # The currently-active TtsStream, or None when the agent is silent.
         # Written synchronously (``synthesize`` is a sync factory) before any
         # await, so a single ``speak``/greeting always registers its stream
         # before it yields control; read by ``barge_in`` from the same loop.
         self._active_tts_stream: TtsStream | None = None
+        # Whether the agent's TTS is actually emitting audio on the wire (the
+        # first frame has been sent and the stream has not ended). This — NOT the
+        # mere registration of ``_active_tts_stream`` — is what arms the echo gate
+        # (ADR-0023, codex finding C): during the TTS synthesis/startup latency no
+        # audio has gone out, so there is no echo yet, and a real short caller turn
+        # in that pre-playout window must NOT be withheld from the ASR. Barge-in
+        # still targets ``_active_tts_stream`` from the moment it registers (a
+        # caller can cut off the greeting before its first frame).
+        self._tts_audio_active: bool = False
         # Serialises near-end playout so only ONE TtsStream is ever draining to
         # ``transport.send_audio`` at a time. A new ``speak`` supersedes any
         # in-flight stream (cancels it, then takes the lock), so the greeting and
@@ -359,36 +583,87 @@ class CallLoop:
             nonlocal _eot_count
             window_index = 0
             frames_received = 0
+            # Track the agent's TTS-audio-active state across frames so the echo
+            # gate (ADR-0023) can arm a post-TTS tail at the True→False edge.
+            prev_tts_active = self._tts_audio_active
+            # One-shot DEBUG flag: log the first echo frame withheld from the ASR
+            # so the operator sees the gate engage once without flooding the log.
+            echo_drop_logged = False
             async for frame in self._transport.inbound_audio():
-                for vad_event in self._vad.feed(frame):
-                    self._endpointer.on_event(vad_event)
-                    # Speech onset while the agent is speaking → barge-in.
-                    if (
-                        vad_event.edge is SpeechEdge.ONSET
-                        and self._active_tts_stream is not None
-                    ):
-                        _log.debug(
-                            "pump: speech ONSET at window %d → barge-in", window_index
-                        )
-                        await self.barge_in()
-                    else:
-                        _log.debug(
-                            "pump: VAD %s at window %d",
-                            vad_event.edge.name,
-                            window_index,
-                        )
-                if self._endpointer.advance(window_index):
-                    # ADR-0008: endpointer owns the turn boundary. Increment the
-                    # EOT counter so the ASR task's next is_final transcript is
-                    # delivered as an end-of-turn. Each increment is consumed by
-                    # exactly one decrement in _asr (W2 fix: int counter counts
-                    # fires; Event is boolean and loses duplicates).
-                    _eot_count += 1
-                    _log.info(
-                        "pump: end-of-turn at window %d (frames=%d)",
-                        window_index,
-                        frames_received,
+                # Collect this frame's VAD edges. They drive the barge-in gate
+                # unconditionally (it must see echo to keep its run state correct),
+                # but the ENDPOINTER must only see edges from audio that actually
+                # reaches the ASR — feeding it echo edges would let a stale echo
+                # OFFSET fire a spurious end-of-turn once the gate later disarms.
+                frame_events = list(self._vad.feed(frame))
+                for vad_event in frame_events:
+                    # ONSET starts a candidate voiced run; OFFSET ends it (dismissing
+                    # a short echo blip). The gate's window clock is the VAD window
+                    # ordinal on the edge, NOT the per-frame counter below.
+                    self._barge_in_gate.on_event(vad_event)
+                    _log.debug(
+                        "pump: VAD %s at vad-window %d",
+                        vad_event.edge.name,
+                        vad_event.frame_index,
                     )
+                # ``window_index`` (the VAD property) is the NEXT window ordinal, so
+                # the last scored window is one less; -1 before any window is scored
+                # is harmless (no onset is pending then). The echo gate is armed
+                # whenever the agent's TTS is actually emitting audio on the wire
+                # (``_tts_audio_active``) — NOT merely while a stream is registered:
+                # during TTS synthesis latency no audio has gone out, so there is no
+                # echo and a real short caller turn must not be withheld (codex
+                # finding C). A short tail after audio stops covers the echo lag.
+                tts_audio = self._tts_audio_active
+                latest_vad_window = self._vad.window_index - 1
+                if prev_tts_active and not tts_audio:
+                    # The agent's audio just stopped: keep gating across the echo
+                    # tail (echo lags the TTS via the jitter buffer / network).
+                    self._barge_in_gate.tail_from(latest_vad_window)
+                self._barge_in_gate.tts_active(tts_audio)
+                prev_tts_active = tts_audio
+                # Drive the gate's authorisation on EVERY frame (codex finding #B),
+                # not only while TTS is active: a sustained run that authorises
+                # during the post-TTS tail must still count, or its turn would be
+                # withheld below. ``should_barge_in`` fires (and authorises the run)
+                # under the gate's own armed/sustained rules; ``barge_in()`` is a
+                # no-op when no TTS stream is active, so calling it unconditionally
+                # is safe.
+                if self._barge_in_gate.should_barge_in(latest_vad_window):
+                    _log.debug(
+                        "pump: barge-in authorised at vad-window %d",
+                        latest_vad_window,
+                    )
+                    await self.barge_in()
+                # Echo-robust turn gate (ADR-0023, codex findings #1/#A): while the
+                # agent's TTS is playing (or in the tail) and the current speech run
+                # is NOT an authorised barge-in, the inbound audio is the gateway's
+                # echo of the agent's own speech. WITHHOLD it from the ASR entirely
+                # (do not forward the frame, do not feed/advance the endpointer), so
+                # no echo transcript is ever produced — on the endpointer path OR a
+                # native-EOT recogniser's own end_of_turn (e.g. Deepgram Flux). A
+                # genuine sustained interruption authorises its run (and cancels the
+                # TTS), after which audio flows and its transcript is delivered.
+                suppress_echo = self._barge_in_gate.delivery_suppressed(
+                    latest_vad_window
+                )
+                if not suppress_echo:
+                    # Only now (real audio bound for the ASR) does the endpointer see
+                    # the edges and tick — so a withheld echo run never arms it.
+                    for vad_event in frame_events:
+                        self._endpointer.on_event(vad_event)
+                    if self._endpointer.advance(window_index):
+                        # ADR-0008: endpointer owns the turn boundary. Increment the
+                        # EOT counter so the ASR task's next is_final transcript is
+                        # delivered as end-of-turn. Each increment is consumed by
+                        # exactly one decrement in _asr (W2 fix: an int counts fires;
+                        # an Event is boolean and loses duplicates).
+                        _eot_count += 1
+                        _log.info(
+                            "pump: end-of-turn at window %d (frames=%d)",
+                            window_index,
+                            frames_received,
+                        )
                 window_index += 1
                 frames_received += 1
                 if frames_received % 50 == 0:
@@ -397,6 +672,19 @@ class CallLoop:
                         frames_received,
                         window_index,
                     )
+                if suppress_echo:
+                    # Drop the echoed frame from the ASR input (see above). The VAD
+                    # and the barge-in gate were still driven on it (so a sustained
+                    # run is still detected); only the recogniser and the endpointer
+                    # never see it.
+                    if not echo_drop_logged:
+                        echo_drop_logged = True
+                        _log.debug(
+                            "pump: withholding echo audio from ASR at window %d "
+                            "(unauthorised speech during TTS playout/tail)",
+                            window_index,
+                        )
+                    continue
                 await audio_q.put(frame)
             # End-of-stream marker on the normal path (not a finally): the ASR
             # task is still draining audio_q, so this put cannot block forever.
@@ -580,10 +868,23 @@ class CallLoop:
         peak_amplitude = 0
         tts_sample_rate = 0
         async with self._playout_lock:
+            # This stream now owns playout. The lock serialises _play calls, so any
+            # superseding-prior stream's _play has fully finished (its finally has
+            # run) before we get here — so THIS stream has not emitted audio yet:
+            # disarm the echo gate until our own first frame (ADR-0023, codex C').
+            # Without this, a superseded prior stream's stale `_tts_audio_active`
+            # could leave the gate armed through THIS stream's synthesis latency,
+            # withholding a real short caller turn in that pre-playout gap.
+            self._tts_audio_active = False
             try:
                 async with contextlib.aclosing(stream):
                     async for frame in stream:
                         await self._transport.send_audio(frame)
+                        # Echo-gate arming (ADR-0023): real outbound audio is now on
+                        # the wire, so any inbound audio from here can be its echo.
+                        # Set BEFORE on_first_frame so the pump sees it as soon as
+                        # the frame is sent.
+                        self._tts_audio_active = True
                         if first_frame_pending and on_first_frame is not None:
                             on_first_frame()
                             first_frame_pending = False
@@ -598,9 +899,13 @@ class CallLoop:
                             peak_amplitude = max(peak_amplitude, frame_peak)
             finally:
                 # Clear the reference only if it is still ours (a superseding
-                # speak() may have already pointed it at a newer stream).
+                # speak() may have already pointed it at a newer stream). Disarm the
+                # echo gate when our audio stops — but only if a superseding speak()
+                # has not already started a NEW stream's audio (then the flag
+                # belongs to that newer stream and must stay set).
                 if self._active_tts_stream is stream:
                     self._active_tts_stream = None
+                    self._tts_audio_active = False
         if total_samples > 0 and tts_sample_rate > 0:
             duration_ms = math.floor(total_samples * 1000 / tts_sample_rate)
             _log.info(

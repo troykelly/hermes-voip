@@ -82,7 +82,7 @@ from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.manager import NewCall, RegistrationManager
-from hermes_voip.media.call_loop import CallLoop
+from hermes_voip.media.call_loop import BargeInMode, CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import (
     Codec,
@@ -90,7 +90,11 @@ from hermes_voip.media.engine import (
     UnsupportedCodecError,
     codec_for_encoding,
 )
-from hermes_voip.media.vad import VoiceActivityDetector, load_silero_model
+from hermes_voip.media.vad import (
+    VoiceActivityDetector,
+    load_silero_model,
+    windows_for_ms,
+)
 from hermes_voip.message import (
     SipRequest,
     SipResponse,
@@ -1309,6 +1313,15 @@ class VoipAdapter(BasePlatformAdapter):
         async def _deliver(text: str) -> None:
             await self._deliver_turn(call_id, text)
 
+        # Echo-robust barge-in (ADR-0023): convert the ms thresholds to VAD window
+        # counts at the engine's inbound rate (same conversion the endpointer uses
+        # for silence_ms) so the gate's window clock lines up with the VAD's.
+        barge_in_mode = _barge_in_mode(media_cfg.barge_in_mode)
+        barge_in_min_voiced_windows = windows_for_ms(
+            media_cfg.barge_in_min_speech_ms, inbound_rate
+        )
+        barge_in_tail_windows = windows_for_ms(media_cfg.barge_in_tail_ms, inbound_rate)
+
         call_loop = CallLoop(
             transport=engine,
             asr=providers.asr,
@@ -1326,6 +1339,12 @@ class VoipAdapter(BasePlatformAdapter):
             # Tone diagnostic: when set, plays a 440 Hz sine at 8 kHz bypassing
             # TTS + resample entirely so the operator can isolate transport issues.
             tone_secs=media_cfg.tone_secs,
+            # Echo-robust barge-in: ``gated`` (default) requires a sustained voiced
+            # run to interrupt while the agent's TTS plays, so the gateway echoing
+            # the agent's own audio back cannot self-interrupt it (ADR-0023).
+            barge_in_mode=barge_in_mode,
+            barge_in_min_voiced_windows=barge_in_min_voiced_windows,
+            barge_in_tail_windows=barge_in_tail_windows,
         )
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)
@@ -1774,6 +1793,16 @@ def _make_vad(media_cfg: MediaConfig, *, sample_rate_hz: int) -> VoiceActivityDe
         sample_rate_hz=sample_rate_hz,
         threshold=media_cfg.vad_threshold,
     )
+
+
+def _barge_in_mode(token: str) -> BargeInMode:
+    """Map the validated ``MediaConfig.barge_in_mode`` token to the enum.
+
+    ``load_media_config`` has already constrained the token to
+    ``off``/``gated``/``full`` (fail-fast), so this is a total mapping over the
+    enum values — no catch-all default (AGENTS.md rule 17).
+    """
+    return BargeInMode(token)
 
 
 def _make_endpointer(media_cfg: MediaConfig, *, sample_rate_hz: int) -> Endpointer:

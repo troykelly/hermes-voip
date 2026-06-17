@@ -349,7 +349,9 @@ async def _build_adapter(
                 via_transport="TLS",
             ),
         ),
-        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch(
             "hermes_voip.adapter._make_tls_context",
@@ -408,7 +410,9 @@ async def test_connect_returns_false_when_manager_down() -> None:
 
     with (
         patch("hermes_voip.adapter.load_gateway_config", return_value=MagicMock()),
-        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
         patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
@@ -608,6 +612,7 @@ async def test_inbound_invite_registers_call_loop() -> None:
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(
@@ -663,6 +668,7 @@ async def test_inbound_invite_threads_greeting_into_call_loop() -> None:
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(
@@ -802,6 +808,7 @@ async def test_each_call_gets_distinct_guard_state() -> None:
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(
@@ -858,6 +865,7 @@ async def test_inbound_invite_failure_after_200ok_releases_resources() -> None:
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
         local_port=20002,
+        inbound_sample_rate=8_000,
     )
     call_id = new_call_id()
     dialog_id = ("cid", "lt", "rt")
@@ -1004,7 +1012,9 @@ async def _build_adapter_with_real_manager(
             "hermes_voip.adapter.load_gateway_config",
             return_value=_real_gateway_config(),
         ),
-        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
         patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
@@ -1054,6 +1064,7 @@ async def test_inbound_invite_ack_and_bye_route_in_dialog() -> None:
                     connect=AsyncMock(return_value=True),
                     stop=AsyncMock(return_value=None),
                     local_port=20002,
+                    inbound_sample_rate=8_000,
                 ),
             ),
             patch(
@@ -1119,6 +1130,7 @@ async def test_inbound_invite_200ok_carries_dialog_to_tag() -> None:
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(
@@ -1175,6 +1187,7 @@ async def test_inbound_invite_sdp_answer_advertises_real_local_rtp_address() -> 
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(
@@ -1237,6 +1250,7 @@ async def test_inbound_handler_exception_is_logged_with_traceback(
                 connect=AsyncMock(side_effect=boom),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
@@ -1456,6 +1470,7 @@ async def test_inbound_invite_no_common_codec_rejects_488_no_200ok(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(
@@ -1519,6 +1534,7 @@ async def test_inbound_invite_pcmu_pcma_offer_still_answers_200ok() -> None:
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
                 local_port=20002,
+                inbound_sample_rate=8_000,
             ),
         ),
         patch(

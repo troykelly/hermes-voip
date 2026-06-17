@@ -427,6 +427,9 @@ class RtpMediaTransport:
         # RTP packet at INFO so the media path is visible in the operator log.
         self._first_tx_logged: bool = False
         self._first_rx_logged: bool = False
+        # One-shot flag: log the first self-loopback (our own SSRC) inbound packet
+        # we drop, so the operator sees it once without flooding the log.
+        self._self_ssrc_logged: bool = False
         # Rolling TX amplitude tracking: every _TX_AMPLITUDE_LOG_PERIOD packets
         # emit one INFO line showing the peak seen in that window.  Counts and
         # resets on each period boundary so a slow TTS lead-in (which is silent)
@@ -530,6 +533,7 @@ class RtpMediaTransport:
         # outbound and inbound packets of the new call.
         self._first_tx_logged = False
         self._first_rx_logged = False
+        self._self_ssrc_logged = False
         self._tx_amplitude_chunk_count = 0
         self._tx_amplitude_period_peak = 0
         protocol = _UdpReceiver(self._recv_queue)
@@ -598,9 +602,29 @@ class RtpMediaTransport:
                     _log.debug("malformed RTP datagram — dropped: %s", exc)
                     continue
 
-            # The datagram is genuine RTP (it parsed / authenticated): this is
-            # the only point at which a comedia latch may fire (anti-spoofing —
-            # garbage that does not parse never reaches here).
+            # Self-loopback drop (ADR-0023): a packet carrying OUR OWN outbound
+            # SSRC is our own audio reflected back onto the inbound path. Feeding
+            # it to the jitter buffer / VAD / ASR would transcribe the agent's own
+            # speech as the caller and self-interrupt the agent. Drop it BEFORE the
+            # comedia latch so a looped-back packet can never move the outbound
+            # destination either. (This is the correct fix for a self-loopback; it
+            # does NOT catch gateway echo, which re-originates under the gateway's
+            # own SSRC — the call loop's barge-in gate handles that case.)
+            if rtp_pkt.ssrc == _OUTBOUND_SSRC:
+                if not self._self_ssrc_logged:
+                    self._self_ssrc_logged = True
+                    _log.debug(
+                        "rtp rx: dropping inbound packet with our own SSRC "
+                        "0x%08x from %s:%d (self-loopback)",
+                        rtp_pkt.ssrc,
+                        source[0],
+                        source[1],
+                    )
+                continue
+
+            # The datagram is genuine RTP (it parsed / authenticated) and is not
+            # our own loopback: this is the only point at which a comedia latch may
+            # fire (anti-spoofing — garbage that does not parse never reaches here).
             self._maybe_latch(rtp_pkt, source)
 
             if not self._first_rx_logged:

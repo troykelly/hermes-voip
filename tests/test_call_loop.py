@@ -2165,6 +2165,128 @@ async def test_echo_then_tail_expiry_does_not_leak_eot_into_next_turn() -> None:
     assert delivered == ["real turn"]
 
 
+class _PrePlayoutGreetingStream:
+    """A greeting TtsStream that registers but WITHHOLDS its first frame until told.
+
+    Models TTS synthesis/startup latency: the stream is the active stream (so
+    barge-in can target it) but emits no audio yet. A test sets ``emit`` to release
+    the first frame. While parked, ``_tts_audio_active`` stays False, so the echo
+    gate must NOT be armed — a real short caller turn in this window must reach the
+    ASR (codex finding C).
+    """
+
+    def __init__(self, frames: list[PcmFrame], emit: asyncio.Event) -> None:
+        self._frames = frames
+        self._emit = emit
+        self.cancel_called = False
+        self._cancelled = False
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
+        await self._emit.wait()  # synthesis latency: no audio until released
+        for frame in self._frames:
+            if self._cancelled:
+                return
+            yield frame
+
+    async def flush(self) -> None:
+        pass
+
+    async def cancel(self) -> None:
+        self.cancel_called = True
+        self._cancelled = True
+        self._emit.set()  # unblock the parked generator so it can finish
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        self._emit.set()
+        await self._gen.aclose()
+
+
+class _PrePlayoutGreetingTTS:
+    """StreamingTTS returning a single pre-playout-latency greeting stream."""
+
+    def __init__(self, frames: list[PcmFrame], emit: asyncio.Event) -> None:
+        self._frames = frames
+        self._emit = emit
+        self.last_stream: _PrePlayoutGreetingStream | None = None
+
+    @property
+    def output_sample_rate(self) -> int:
+        return _G711_INBOUND_RATE
+
+    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        _ = text, voice
+        stream = _PrePlayoutGreetingStream(self._frames, self._emit)
+        self.last_stream = stream
+        return stream
+
+
+@pytest.mark.asyncio
+async def test_short_real_turn_before_first_tts_frame_is_delivered() -> None:
+    """A short real caller turn during TTS synthesis latency is delivered (codex C).
+
+    The greeting stream is registered (so barge-in could target it) but emits no
+    audio yet — the echo gate must NOT arm on mere registration, only once audio is
+    actually on the wire. A SHORT (sub-threshold) caller turn that arrives in this
+    pre-playout window is genuine (nothing has been transmitted, so it cannot be
+    echo) and must reach the ASR + be delivered. After it ends the greeting audio
+    is released so the loop completes.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # A short caller turn (4 voiced windows, below the 13-window barge-in
+    # threshold), then enough silence to fire the endpointer end-of-turn.
+    script = [0.95] * 4 + [0.0] * 24
+    vad = _scripted_vad_8k(script)
+    emit = asyncio.Event()
+    tts = _PrePlayoutGreetingTTS([_greeting_frame(1), _greeting_frame(2)], emit)
+    transport = _ScriptedInboundTransport(len(script))
+    asr = _DrainThenFinalASR("hello", end_of_turn=False)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="A greeting that is still synthesising while the caller speaks.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=8,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the greeting register (no audio yet) and the pump start; deliver the
+    # short caller turn entirely within the pre-playout window.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    # Drain the inbound turn, then release the greeting audio so run() completes.
+    for _ in range(30):
+        await asyncio.sleep(0)
+    emit.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == ["hello"], (
+        "a short real caller turn during TTS synthesis latency must be delivered"
+    )
+
+
 @pytest.mark.asyncio
 async def test_gated_default_mode_when_unspecified() -> None:
     """A CallLoop built without barge-in args defaults to gated, min 1 window.

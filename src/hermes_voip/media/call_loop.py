@@ -506,6 +506,15 @@ class CallLoop:
         # await, so a single ``speak``/greeting always registers its stream
         # before it yields control; read by ``barge_in`` from the same loop.
         self._active_tts_stream: TtsStream | None = None
+        # Whether the agent's TTS is actually emitting audio on the wire (the
+        # first frame has been sent and the stream has not ended). This — NOT the
+        # mere registration of ``_active_tts_stream`` — is what arms the echo gate
+        # (ADR-0023, codex finding C): during the TTS synthesis/startup latency no
+        # audio has gone out, so there is no echo yet, and a real short caller turn
+        # in that pre-playout window must NOT be withheld from the ASR. Barge-in
+        # still targets ``_active_tts_stream`` from the moment it registers (a
+        # caller can cut off the greeting before its first frame).
+        self._tts_audio_active: bool = False
         # Serialises near-end playout so only ONE TtsStream is ever draining to
         # ``transport.send_audio`` at a time. A new ``speak`` supersedes any
         # in-flight stream (cancels it, then takes the lock), so the greeting and
@@ -574,9 +583,9 @@ class CallLoop:
             nonlocal _eot_count
             window_index = 0
             frames_received = 0
-            # Track the agent's TTS-active state across frames so the barge-in
-            # gate (ADR-0023) can arm a post-TTS echo tail at the True→False edge.
-            prev_tts_active = self._active_tts_stream is not None
+            # Track the agent's TTS-audio-active state across frames so the echo
+            # gate (ADR-0023) can arm a post-TTS tail at the True→False edge.
+            prev_tts_active = self._tts_audio_active
             # One-shot DEBUG flag: log the first echo frame withheld from the ASR
             # so the operator sees the gate engage once without flooding the log.
             echo_drop_logged = False
@@ -599,16 +608,20 @@ class CallLoop:
                     )
                 # ``window_index`` (the VAD property) is the NEXT window ordinal, so
                 # the last scored window is one less; -1 before any window is scored
-                # is harmless (no onset is pending then). The gate is armed whenever
-                # the agent's TTS is playing, plus a short tail after it stops.
-                tts_active = self._active_tts_stream is not None
+                # is harmless (no onset is pending then). The echo gate is armed
+                # whenever the agent's TTS is actually emitting audio on the wire
+                # (``_tts_audio_active``) — NOT merely while a stream is registered:
+                # during TTS synthesis latency no audio has gone out, so there is no
+                # echo and a real short caller turn must not be withheld (codex
+                # finding C). A short tail after audio stops covers the echo lag.
+                tts_audio = self._tts_audio_active
                 latest_vad_window = self._vad.window_index - 1
-                if prev_tts_active and not tts_active:
-                    # The agent just stopped speaking: keep gating across the echo
+                if prev_tts_active and not tts_audio:
+                    # The agent's audio just stopped: keep gating across the echo
                     # tail (echo lags the TTS via the jitter buffer / network).
                     self._barge_in_gate.tail_from(latest_vad_window)
-                self._barge_in_gate.tts_active(tts_active)
-                prev_tts_active = tts_active
+                self._barge_in_gate.tts_active(tts_audio)
+                prev_tts_active = tts_audio
                 # Drive the gate's authorisation on EVERY frame (codex finding #B),
                 # not only while TTS is active: a sustained run that authorises
                 # during the post-TTS tail must still count, or its turn would be
@@ -851,6 +864,11 @@ class CallLoop:
                 async with contextlib.aclosing(stream):
                     async for frame in stream:
                         await self._transport.send_audio(frame)
+                        # Echo-gate arming (ADR-0023): real outbound audio is now on
+                        # the wire, so any inbound audio from here can be its echo.
+                        # Set BEFORE on_first_frame so the pump sees it as soon as
+                        # the frame is sent.
+                        self._tts_audio_active = True
                         if first_frame_pending and on_first_frame is not None:
                             on_first_frame()
                             first_frame_pending = False
@@ -865,9 +883,13 @@ class CallLoop:
                             peak_amplitude = max(peak_amplitude, frame_peak)
             finally:
                 # Clear the reference only if it is still ours (a superseding
-                # speak() may have already pointed it at a newer stream).
+                # speak() may have already pointed it at a newer stream). Disarm the
+                # echo gate when our audio stops — but only if a superseding speak()
+                # has not already started a NEW stream's audio (then the flag
+                # belongs to that newer stream and must stay set).
                 if self._active_tts_stream is stream:
                     self._active_tts_stream = None
+                    self._tts_audio_active = False
         if total_samples > 0 and tts_sample_rate > 0:
             duration_ms = math.floor(total_samples * 1000 / tts_sample_rate)
             _log.info(

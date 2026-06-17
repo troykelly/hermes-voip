@@ -1180,27 +1180,54 @@ class RtpMediaTransport:
                     )
                 continue
 
-            # Inbound DTMF demux (ADR-0010): a packet whose payload type is the
-            # NEGOTIATED telephone-event PT carries an RFC 4733 named event, NOT
-            # audio. Route it to the per-call DtmfReceiver and CONTINUE — it must
-            # never reach the jitter buffer / audio decoder (a 4-byte named-event
-            # payload decoded as G.711 is garbage). The receiver collapses the
-            # triplicated end packets, so a decoded digit fires ``on_dtmf`` exactly
-            # once. Inert when no telephone-event PT was negotiated (the comparison
-            # against None is always False), so a stray telephone-event-shaped packet
-            # on an audio-only call is simply an unknown PT: it does not latch (the
-            # latch requires the audio PT) and the jitter buffer drops a payload it
-            # cannot order/decode. Checked BEFORE the comedia latch because a DTMF
-            # packet is not the audio stream and must not influence the latch.
+            # The datagram is genuine RTP (it parsed / authenticated) and is not our
+            # own loopback: this is the only point at which a comedia latch may fire
+            # (anti-spoofing — garbage that does not parse never reaches here). Run the
+            # latch FIRST, for every packet, so the inbound DTMF demux below sees the
+            # SAME established remote-source state as audio (the latch is a no-op for a
+            # DTMF packet — _maybe_latch only latches on the negotiated audio PT — so
+            # this does not let DTMF move the destination). Cross-vendor review: the
+            # confirmation channel must not be processed in a pre-latch window the audio
+            # path never has.
+            self._maybe_latch(rtp_pkt, source)
+
+            # Inbound payload-type dispatch (ADR-0010 + cross-vendor review). Exactly
+            # three outcomes, no catch-all that mis-decodes:
+            #   * the NEGOTIATED telephone-event PT → RFC 4733 DTMF (never the audio
+            #     decoder — a 4-byte named-event payload decoded as G.711 is garbage);
+            #   * the negotiated audio PT → the jitter buffer + audio decode below;
+            #   * anything else (comfort noise, a stray/unknown PT, or a spoofed
+            #     telephone-event PT when none was negotiated) → DROP. The engine has
+            #     never PT-filtered inbound audio before; filtering here closes the
+            #     rule-27 'inert + safe when no DTMF negotiated' gap (an unknown PT is
+            #     no longer mis-decoded as audio) and bounds what reaches either path.
             te_pt = self._telephone_event_payload_type
             if te_pt is not None and rtp_pkt.payload_type == te_pt:
+                # Spoof source-binding (cross-vendor review #1): the confirmation
+                # channel is a security control, so once the comedia latch has fixed
+                # the remote source, a DTMF packet from any OTHER source is a spoof and
+                # is dropped — stricter than the audio path, deliberately. Before the
+                # latch (or with symmetric off) we accept it, exactly as audio is
+                # accepted before the latch.
+                if self._symmetric and self._latched and source != self._outbound_addr:
+                    _log.warning(
+                        "dtmf rx: dropping telephone-event packet from unlatched "
+                        "source %s:%d (latched remote is %s:%d) — possible spoof",
+                        source[0],
+                        source[1],
+                        self._outbound_addr[0],
+                        self._outbound_addr[1],
+                    )
+                    continue
                 self._handle_inbound_dtmf(rtp_pkt)
                 continue
-
-            # The datagram is genuine RTP (it parsed / authenticated) and is not
-            # our own loopback: this is the only point at which a comedia latch may
-            # fire (anti-spoofing — garbage that does not parse never reaches here).
-            self._maybe_latch(rtp_pkt, source)
+            if rtp_pkt.payload_type != self._payload_type:
+                # Neither audio nor DTMF: drop rather than mis-decode as G.711.
+                _log.debug(
+                    "rtp rx: dropping packet with unhandled payload type %d",
+                    rtp_pkt.payload_type,
+                )
+                continue
 
             if not self._first_rx_logged:
                 self._first_rx_logged = True
@@ -1796,20 +1823,24 @@ class RtpMediaTransport:
         press (collapsing RFC 4733's redundant end packets and de-duplicating reordered
         ones), so ``on_dtmf`` fires exactly once per key-press.
 
-        A malformed (non-4-byte) payload is DROPPED with a DEBUG log rather than
-        crashing the inbound generator — a corrupt named-event packet is an
-        environmental event, not a programming error (the same posture as a malformed
-        RTP datagram above). The decode raises only ``ValueError`` for a bad length;
-        any other exception would propagate (rule 37).
+        A malformed named-event packet is DROPPED with a DEBUG log rather than crashing
+        the inbound generator — a corrupt inbound packet is an environmental event, not
+        a programming error (the same posture as a malformed RTP datagram above). The
+        ``ValueError`` guard spans BOTH the 4-byte ``decode`` AND the receiver ``feed``
+        (cross-vendor review #5): a well-formed payload whose event code is not a keypad
+        digit (e.g. flash, event 16) is already surfaced as ``None`` by the receiver,
+        but wrapping ``feed`` too means any future value-domain error in the digit
+        mapping is contained to a single dropped packet, not a torn-down call. Any
+        non-``ValueError`` exception still propagates (rule 37).
         """
         if self._on_dtmf is None:
             return  # inbound DTMF ignored; the packet is still kept off the audio path
         try:
             event = DtmfEvent.decode(packet.payload)
+            digit = self._dtmf_receiver.feed(event, timestamp=packet.timestamp)
         except ValueError as exc:
-            _log.debug("malformed telephone-event payload — dropped: %s", exc)
+            _log.debug("malformed telephone-event packet — dropped: %s", exc)
             return
-        digit = self._dtmf_receiver.feed(event, timestamp=packet.timestamp)
         if digit is not None:
             _log.info("dtmf rx: digit %r", digit)
             self._on_dtmf(digit)

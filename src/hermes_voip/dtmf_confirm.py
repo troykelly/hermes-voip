@@ -148,17 +148,27 @@ class ArmedConfirmation:
         self._expected = normalised
         _log.info("dtmf confirm: armed (await digit, %.0fs window)", timeout_s)
 
-        # Speak the prompt AFTER arming so a digit pressed during the prompt audio is
-        # already routed to this window (feed() resolves it), never dropped.
-        await self._prompt(prompt_text)
-
-        timeout_task = loop.create_task(self._expire(pending, timeout_s))
+        # Everything after arming runs under try/finally so the window is ALWAYS
+        # disarmed on exit — including if the prompt raises or this coroutine is
+        # CANCELLED while the prompt audio is in flight (cross-vendor review #2). Were
+        # the prompt awaited before the try, a TTS failure / barge-in cancel would
+        # leave ``_pending`` set: a later digit would resolve a stale window and the
+        # next arm() would be wrongly rejected as 'already armed'.
+        timeout_task: asyncio.Task[None] | None = None
         try:
+            # Speak the prompt AFTER arming so a digit pressed during the prompt audio
+            # is already routed to this window (feed() resolves it), never dropped.
+            await self._prompt(prompt_text)
+            # Arm the no-digit timeout only once the prompt has been delivered (the
+            # window the caller is told about starts now).
+            timeout_task = loop.create_task(self._expire(pending, timeout_s))
             return await pending
         finally:
-            # Window closed (resolved by a digit or the timeout): cancel the timer if
-            # still pending and clear the armed state so the next arm() starts clean.
-            timeout_task.cancel()
+            # Window closed (resolved, timed out, prompt-failed, or cancelled): cancel
+            # the timer if it was created, and clear the armed state so the next arm()
+            # starts clean — never stuck armed.
+            if timeout_task is not None:
+                timeout_task.cancel()
             self._pending = None
             self._expected = None
 

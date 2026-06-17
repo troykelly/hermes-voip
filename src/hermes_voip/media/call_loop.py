@@ -632,10 +632,17 @@ class CallLoop:
         self._confirmation: _DtmfConfirmationSink | None = None
         # The digits accumulated for the current (unterminated) menu group, in order.
         self._dtmf_buffer: list[str] = []
-        # The single in-flight inter-digit flush timer, or None when no group is
+        # The single in-flight inter-digit flush TIMER, or None when no group is
         # pending. Each new digit cancels + reschedules it; a terminator / teardown
-        # cancels it. Touched only from the event loop.
+        # cancels it. Touched only from the event loop. Distinct from the delivery
+        # tasks below: cancelling the timer must never drop an in-flight delivery.
         self._dtmf_flush_task: asyncio.Task[None] | None = None
+        # In-flight menu-group DELIVERY tasks (review #4). A delivery snapshots the
+        # buffer at its firing instant and runs here, NOT in ``_dtmf_flush_task``, so a
+        # following digit's timer (re)arm cannot cancel it — the group is never lost.
+        # Strong refs held until done (asyncio keeps only weak refs); cancelled + joined
+        # at loop teardown.
+        self._dtmf_delivery_tasks: set[asyncio.Task[None]] = set()
 
     def bind_confirmation(self, confirmation: _DtmfConfirmationSink) -> None:
         """Bind the armed-confirmation resolver received digits route to (ADR-0010).
@@ -663,11 +670,15 @@ class CallLoop:
         """
         if self._route_confirmation(digit):
             return
-        self._buffer_digit(digit)
         if digit == _DTMF_TERMINATOR:
+            # Terminator: snapshot the buffer NOW (synchronously) and dispatch the
+            # group as an uncancellable delivery task. Snapshotting before the await
+            # means a following digit starts a fresh group and can NEVER cancel/lose
+            # this one (cross-vendor review #4).
             self._cancel_dtmf_flush_timer()
-            self._schedule_dtmf_delivery()
+            self._dispatch_dtmf_group(self._take_dtmf_group())
         else:
+            self._dtmf_buffer.append(digit)
             self._arm_dtmf_flush_timer()
 
     async def feed_dtmf_async(self, digit: str) -> None:
@@ -680,11 +691,11 @@ class CallLoop:
         """
         if self._route_confirmation(digit):
             return
-        self._buffer_digit(digit)
         if digit == _DTMF_TERMINATOR:
             self._cancel_dtmf_flush_timer()
-            await self._deliver_dtmf_group()
+            await self._deliver_dtmf_group(self._take_dtmf_group())
         else:
+            self._dtmf_buffer.append(digit)
             self._arm_dtmf_flush_timer()
 
     def _route_confirmation(self, digit: str) -> bool:
@@ -694,23 +705,31 @@ class CallLoop:
             return False
         return confirmation.feed(digit)
 
-    def _buffer_digit(self, digit: str) -> None:
-        """Append ``digit`` to the current menu group (the ``#`` terminator aside)."""
-        if digit != _DTMF_TERMINATOR:
-            self._dtmf_buffer.append(digit)
+    def _take_dtmf_group(self) -> str:
+        """Atomically take + clear the buffered digits (the ``#`` terminator aside).
+
+        Synchronous, so the snapshot is taken at the firing instant: a following digit
+        appends to the now-empty buffer, a fresh group, and cannot alter the one just
+        taken (cross-vendor review #4). Returns ``""`` when nothing is buffered.
+        """
+        digits = "".join(self._dtmf_buffer)
+        self._dtmf_buffer = []
+        return digits
 
     def _arm_dtmf_flush_timer(self) -> None:
         """(Re)start the inter-digit timer so a multi-digit entry flushes as one group.
 
         Each new non-terminator digit cancels the prior timer and starts a fresh one,
         so the group is delivered only once ``dtmf_interdigit_ms`` elapses with no
-        further digit (or a ``#`` arrives first). No-op if the buffer is empty.
+        further digit (or a ``#`` arrives first). No-op if the buffer is empty. This
+        TIMER is the only thing a following digit cancels — an in-flight DELIVERY task
+        is tracked separately and is never cancelled by a new digit (review #4).
         """
         self._cancel_dtmf_flush_timer()
         if not self._dtmf_buffer:
             return
         self._dtmf_flush_task = asyncio.create_task(self._dtmf_flush_after_gap())
-        self._dtmf_flush_task.add_done_callback(self._on_dtmf_flush_done)
+        self._dtmf_flush_task.add_done_callback(self._on_dtmf_timer_done)
 
     def _cancel_dtmf_flush_timer(self) -> None:
         """Cancel and forget the inter-digit flush timer, if any (idempotent)."""
@@ -719,52 +738,69 @@ class CallLoop:
             self._dtmf_flush_task = None
             task.cancel()
 
-    def _on_dtmf_flush_done(self, task: asyncio.Task[None]) -> None:
-        """Clear the timer handle on completion; log a real failure, ignore cancel.
+    def _on_dtmf_timer_done(self, task: asyncio.Task[None]) -> None:
+        """Clear the timer handle on completion; propagate nothing (cancel is normal).
 
-        Delivering a DTMF group routes through ``deliver_turn``; a failure there is
-        logged (rule 37: not swallowed) and is non-fatal to the call (a dropped menu
-        group must not kill an otherwise-working call). A cancellation (a new digit
-        re-armed the timer, a terminator pre-empted it, or teardown) is expected.
+        The timer's only job is to await the gap then dispatch a delivery (or be
+        cancelled by a new digit / terminator). Its own body cannot fail — the
+        delivery it dispatches runs in a SEPARATE tracked task whose result is handled
+        by :meth:`_on_dtmf_delivery_done` — so here we only clear the handle and ignore
+        the expected cancellation.
         """
         if self._dtmf_flush_task is task:
             self._dtmf_flush_task = None
+
+    def _dispatch_dtmf_group(self, digits: str) -> None:
+        """Deliver a (already-snapshotted) digit group as an UNCANCELLABLE tracked task.
+
+        The task is held in ``_dtmf_delivery_tasks`` (NOT ``_dtmf_flush_task``), so a
+        following digit's timer (re)arm cannot cancel an in-flight delivery (review #4)
+        — the group is never silently dropped. A strong reference is kept until the
+        task completes (asyncio holds only a weak ref); the done-callback discards it
+        and logs any failure (rule 37). A no-op when ``digits`` is empty.
+        """
+        if not digits:
+            return
+        task = asyncio.create_task(self._deliver_dtmf_group(digits))
+        self._dtmf_delivery_tasks.add(task)
+        task.add_done_callback(self._on_dtmf_delivery_done)
+
+    def _on_dtmf_delivery_done(self, task: asyncio.Task[None]) -> None:
+        """Discard a finished delivery task; log a failure (rule 37), ignore cancel.
+
+        A delivery routes through ``deliver_turn``; a failure there is logged and is
+        non-fatal (a dropped menu group must not kill an otherwise-working call). A
+        cancellation only happens at loop teardown.
+        """
+        self._dtmf_delivery_tasks.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
             _log.warning("DTMF group delivery failed (call continues): %r", exc)
 
-    def _schedule_dtmf_delivery(self) -> None:
-        """Deliver the buffered group as a tracked task (sync ``feed_dtmf`` path)."""
-        self._cancel_dtmf_flush_timer()
-        if not self._dtmf_buffer:
-            return
-        self._dtmf_flush_task = asyncio.create_task(self._deliver_dtmf_group())
-        self._dtmf_flush_task.add_done_callback(self._on_dtmf_flush_done)
-
     async def _dtmf_flush_after_gap(self) -> None:
-        """Wait the inter-digit gap, then deliver the buffered group as a menu turn.
+        """Wait the inter-digit gap, then dispatch the buffered group as a menu turn.
 
         A new digit cancels this (raising ``CancelledError`` here, which propagates to
-        end it without delivering — rule 37); a terminator delivers directly.
+        end it without delivering — rule 37); a terminator delivers directly. The
+        snapshot is taken AFTER the sleep (so all digits up to the gap are included)
+        and dispatched as an uncancellable delivery task (review #4).
         """
         await self._sleep(self._dtmf_interdigit_s)
-        await self._deliver_dtmf_group()
+        self._dispatch_dtmf_group(self._take_dtmf_group())
 
-    async def _deliver_dtmf_group(self) -> None:
-        """Deliver the buffered digits as one tagged ``[DTMF] …`` turn, then clear.
+    async def _deliver_dtmf_group(self, digits: str) -> None:
+        """Deliver an already-snapshotted ``digits`` group as a tagged ``[DTMF]`` turn.
 
-        A no-op when the buffer is empty (a terminator with nothing buffered, or a
-        double-delivery race). The digits are delivered to the agent via
-        ``deliver_turn`` with the ``[DTMF]`` tag (never a fake STT transcript), so a
-        normal turn can act on keypad menu input. Cleared BEFORE the await so a
-        re-entrant feed during delivery starts a fresh group.
+        A no-op when ``digits`` is empty (a terminator with nothing buffered). The
+        digits are delivered to the agent via ``deliver_turn`` with the ``[DTMF]`` tag
+        (never a fake STT transcript), so a normal turn can act on keypad menu input.
+        The buffer was already taken by :meth:`_take_dtmf_group` at the firing instant,
+        so this method holds no shared state a concurrent feed could race.
         """
-        if not self._dtmf_buffer:
+        if not digits:
             return
-        digits = "".join(self._dtmf_buffer)
-        self._dtmf_buffer = []
         text = f"{_DTMF_TURN_PREFIX}{digits}"
         _log.info("dtmf: delivering menu group %r", text)
         await self._deliver_turn(text)
@@ -1061,15 +1097,22 @@ class CallLoop:
             self._cancel_comfort_filler()
             if filler is not None:
                 await asyncio.wait({filler})
-            # The inbound-DTMF inter-digit flush timer (ADR-0010) is likewise a tracked
-            # task outside the TaskGroup (armed per received digit). Cancel + JOIN it so
-            # an in-flight group delivery / pending timer never outlives the call. Same
-            # best-effort join as the filler: its result is handled by
-            # ``_on_dtmf_flush_done`` (rule 37) and must not mask the loop's teardown.
+            # The inbound-DTMF tasks (ADR-0010) are likewise tracked outside the
+            # TaskGroup (armed per received digit): the inter-digit TIMER and any
+            # in-flight group DELIVERY tasks. Cancel + JOIN them all so none outlives
+            # the call. Best-effort join (like the filler): each task's result is
+            # handled by its own done-callback (rule 37) and must not mask the loop's
+            # teardown. Snapshot the delivery set before cancelling (the callbacks
+            # mutate it).
+            dtmf_tasks: set[asyncio.Task[None]] = set(self._dtmf_delivery_tasks)
             dtmf_timer = self._dtmf_flush_task
             self._cancel_dtmf_flush_timer()
             if dtmf_timer is not None:
-                await asyncio.wait({dtmf_timer})
+                dtmf_tasks.add(dtmf_timer)
+            for delivery in dtmf_tasks:
+                delivery.cancel()
+            if dtmf_tasks:
+                await asyncio.wait(dtmf_tasks)
 
     async def speak(
         self,

@@ -197,23 +197,27 @@ async def test_prompt_failure_does_not_leave_resolver_stuck_armed() -> None:
 
     If the prompt (TTS) fails, arm() must propagate the error AND disarm, so a stale
     window cannot resolve a later digit and a subsequent arm() is not rejected as
-    'already armed'. Verified by re-arming successfully after the failure.
+    'already armed'. A prompt that fails once then succeeds proves the disarm on the
+    SAME resolver (it is reusable after a prompt failure).
     """
+    calls = {"n": 0}
 
-    async def _boom(_text: str) -> None:
-        msg = "tts exploded"
-        raise RuntimeError(msg)
+    async def _boom_then_ok(_text: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            msg = "tts exploded"
+            raise RuntimeError(msg)
+        # second arming: prompt succeeds
 
-    resolver = ArmedConfirmation(prompt=_boom)
+    resolver = ArmedConfirmation(prompt=_boom_then_ok)
     with pytest.raises(RuntimeError, match="tts exploded"):
         await resolver.arm("1", timeout_s=5.0, prompt_text="press 1")
     assert resolver.armed is False  # not stuck armed after the prompt failure
 
-    # A fed digit now must NOT resolve a stale window, and a fresh arm() must succeed.
-    assert resolver.feed("1") is False  # nothing armed to consume it
-    resolver2_prompt_ok = ArmedConfirmation(prompt=_noop_prompt)
-    _ = resolver2_prompt_ok  # (separate resolver only to keep the type obvious)
+    # A fed digit now must NOT resolve a stale window (nothing is armed to consume it).
+    assert resolver.feed("1") is False
 
+    # A fresh arming on the SAME resolver succeeds (not rejected as 'already armed').
     async def _press() -> None:
         await asyncio.sleep(0)
         resolver.feed("1")

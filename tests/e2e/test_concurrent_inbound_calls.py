@@ -169,7 +169,13 @@ class _FakeTTS:
     def output_sample_rate(self) -> int:
         return _KOKORO_RATE
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         _ = voice
         sample = (4096).to_bytes(2, "little", signed=True)
         frame = PcmFrame(

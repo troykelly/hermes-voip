@@ -140,7 +140,13 @@ class _FakeTtsStream:
 
 
 class _FakeTTS:
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         return _FakeTtsStream()  # type: ignore[return-value]
 
 

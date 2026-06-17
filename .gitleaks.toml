@@ -1,12 +1,20 @@
 # gitleaks configuration for hermes-voip (scanned in CI: `gitleaks git --redact --verbose .`).
 #
 # Keeps the FULL default rule set (no detection is removed) and allowlists only
-# the synthetic SRTP test vectors in tests/test_sdp.py. Those are deterministic
-# fake SDES `key||salt` values — base64 of byte ranges 0..29 / 100..129 / 0..28
-# (see the comments at tests/test_sdp.py) — exercising RFC 4568 `a=crypto`
-# parse/validate; they are NOT real keys. gitleaks' generic-api-key rule flags
-# their high entropy as a false positive, and because the scan walks full git
-# history the literals cannot be removed without rewriting the TDD red commit.
+# (a) the synthetic SRTP test vectors in tests/test_sdp.py and (b) the
+# deterministic G.722 known-answer codec bytes in tests/g722_kat_vectors.py.
+#
+# (a) The SDP vectors are deterministic fake SDES `key||salt` values — base64 of
+# byte ranges 0..29 / 100..129 / 0..28 (see the comments at tests/test_sdp.py) —
+# exercising RFC 4568 `a=crypto` parse/validate; they are NOT real keys. gitleaks'
+# generic-api-key rule flags their high entropy as a false positive, and because
+# the scan walks full git history the literals cannot be removed without rewriting
+# the TDD red commit.
+#
+# (b) tests/g722_kat_vectors.py holds a hex string of G.722-encoded audio bytes
+# (the public-domain ITU reference codec's output for a synthetic 16 kHz signal,
+# ADR-0022). It is lossy-compressed AUDIO, not a credential; its high hex entropy
+# can otherwise trip the generic high-entropy heuristic.
 #
 # Invariant (AGENTS.md rule 34): this repo is PUBLIC and holds NO real secrets in
 # tracked files. Real connection material (SIP host/extension/password) lives only
@@ -19,3 +27,7 @@ useDefault = true
 [[allowlists]]
 description = "Synthetic SRTP test vectors (fake SDES key||salt) in the SDP a=crypto tests — not real secrets"
 paths = ['''tests/test_sdp\.py''']
+
+[[allowlists]]
+description = "Deterministic G.722-encoded AUDIO known-answer bytes (public-domain reference codec output) — not a secret (ADR-0022)"
+paths = ['''tests/g722_kat_vectors\.py''']

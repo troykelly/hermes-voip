@@ -49,6 +49,7 @@ import socket
 import struct
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Final, Protocol
 
 from hermes_voip.media.audio import (
@@ -58,6 +59,12 @@ from hermes_voip.media.audio import (
     frame_to_alaw,
     frame_to_ulaw,
     ulaw_to_frame,
+)
+from hermes_voip.media.g722 import (
+    G722_RTP_CLOCK_RATE,
+    G722_SAMPLE_RATE,
+    G722Decoder,
+    G722Encoder,
 )
 
 # SrtpError is defined at srtp.py module level and carries no cryptography
@@ -111,10 +118,17 @@ type _Datagram = tuple[bytes, tuple[str, int]]
 
 
 class Codec(enum.Enum):
-    """The G.711 codec variant for this media session."""
+    """The audio codec for this media session (the value is the RTP payload type).
 
-    PCMU = 0  # mu-law, RTP payload type 0
-    PCMA = 8  # a-law, RTP payload type 8
+    PCMU/PCMA are 8 kHz narrowband G.711; G722 is 16 kHz wideband (ADR-0022). The
+    rate behaviour (wire sample rate, RTP clock rate) is NOT encoded by the enum —
+    it lives in :data:`_CODEC_DESCRIPTORS`, because G.722's RTP clock (8000)
+    differs from its audio sample rate (16000) per RFC 3551.
+    """
+
+    PCMU = 0  # mu-law, RTP payload type 0 (8 kHz)
+    PCMA = 8  # a-law, RTP payload type 8 (8 kHz)
+    G722 = 9  # G.722 wideband, RTP payload type 9 (16 kHz audio, 8 kHz RTP clock)
 
 
 class UnsupportedCodecError(ValueError):
@@ -147,14 +161,52 @@ class UnsupportedCodecError(ValueError):
 
 # The engine's capability table: the EXACT ``(uppercased encoding, clock_rate)``
 # pairs the RTP encode/decode path can carry, mapped to the runnable ``Codec``.
-# Both G.711 variants are 8 kHz narrowband (RFC 3551 §6). This is the single
-# source of truth for engine capability; the adapter's SDP offer allow-list must
-# never advertise an encoding absent here (the drift guard enforces it). To add a
-# wideband codec, add its encode/decode to the engine AND an entry here first,
-# then widen the adapter's advertised menu — never the reverse.
+# Both G.711 variants are 8 kHz narrowband (RFC 3551 §6); G.722 (ADR-0022) is
+# wideband at the static ``G722/8000`` rtpmap — note the rtpmap clock is 8000 even
+# though the audio is 16 kHz (RFC 3551 §4.5.2), so the KEY is ("G722", 8000). This
+# is the single source of truth for engine capability; the adapter's SDP offer
+# allow-list must never advertise an encoding absent here (the drift guard
+# enforces it). To add a codec, add its encode/decode + descriptor to the engine
+# AND an entry here first, then widen the adapter's advertised menu — never the
+# reverse.
 _ENGINE_CODEC_TABLE: Final[dict[tuple[str, int], Codec]] = {
     ("PCMU", G711_SAMPLE_RATE): Codec.PCMU,
     ("PCMA", G711_SAMPLE_RATE): Codec.PCMA,
+    ("G722", G722_RTP_CLOCK_RATE): Codec.G722,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _CodecDescriptor:
+    """Per-codec rate facts that drive the engine's RTP/resample bookkeeping.
+
+    Centralises the two rates that differ per codec (and, for G.722, differ from
+    EACH OTHER): the ``wire_sample_rate`` is the rate of the PCM the codec
+    encodes/decodes (8 kHz G.711, 16 kHz G.722) and the rate frames are delivered
+    at (``inbound_sample_rate``) + the rate TTS frames are resampled to before
+    encoding; the ``rtp_clock_rate`` is the RTP timestamp clock (8 kHz for both
+    G.711 and G.722 — RFC 3551 §4.5.2 fixes G.722's clock at 8000 despite the
+    16 kHz audio). The RTP timestamp increment per packet is derived from
+    ``rtp_clock_rate``, the wire chunk size from ``wire_sample_rate`` — so the
+    8000-clock/16000-sample split is handled in ONE place.
+    """
+
+    wire_sample_rate: int
+    rtp_clock_rate: int
+
+
+# One descriptor per runnable Codec. Exhaustive: every Codec has an entry, so the
+# engine never falls back to a hardcoded rate literal on any codec path.
+_CODEC_DESCRIPTORS: Final[dict[Codec, _CodecDescriptor]] = {
+    Codec.PCMU: _CodecDescriptor(
+        wire_sample_rate=G711_SAMPLE_RATE, rtp_clock_rate=G711_SAMPLE_RATE
+    ),
+    Codec.PCMA: _CodecDescriptor(
+        wire_sample_rate=G711_SAMPLE_RATE, rtp_clock_rate=G711_SAMPLE_RATE
+    ),
+    Codec.G722: _CodecDescriptor(
+        wire_sample_rate=G722_SAMPLE_RATE, rtp_clock_rate=G722_RTP_CLOCK_RATE
+    ),
 }
 
 
@@ -294,6 +346,7 @@ class RtpMediaTransport:
         remote_address: str,
         remote_port: int,
         codec: Codec,
+        payload_type: int | None = None,
         ptime: int = _DEFAULT_PTIME_MS,
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
@@ -307,6 +360,16 @@ class RtpMediaTransport:
         """Construct the engine; no socket is opened until :meth:`connect`.
 
         Args:
+            payload_type: The RTP payload type to send and to accept for the
+                symmetric-RTP latch. Defaults to the codec's STATIC payload type
+                (``codec.value``). Pass the NEGOTIATED payload type when it differs
+                from the static one — G.722 may be offered/answered at a dynamic PT,
+                and the SDP answer mirrors the offer's PT, so the wire PT can be
+                e.g. 109 while ``Codec.G722.value`` is 9. Sending the static PT
+                while advertising a dynamic one would make the gateway drop our
+                media and break the comedia latch (no audio). Set
+                :attr:`payload_type` later (e.g. the outbound path after the 2xx
+                answer) to update it.
             initial_seq: Override the random initial RTP sequence number.
                 Pass a fixed value in tests to make send_audio assertions
                 deterministic (RFC 3550 §5.1 default: random uint16).
@@ -318,6 +381,13 @@ class RtpMediaTransport:
         self._remote_address = remote_address
         self._remote_port = remote_port
         self._codec = codec
+        # The RTP payload type on the wire: the negotiated PT if given, else the
+        # codec's static PT. Used for both outbound packets and the comedia latch's
+        # acceptance check (see _maybe_latch). Kept separate from _codec because the
+        # codec KIND (encode/decode + rate) and the wire PT are independent for a
+        # dynamic-PT codec like G.722 (RFC 3551 reserves static 9, but gateways use
+        # dynamic PTs and the answer echoes the offer's PT).
+        self._payload_type: int = codec.value if payload_type is None else payload_type
         self._ptime = ptime
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
@@ -378,13 +448,22 @@ class RtpMediaTransport:
         )
         self._jitter: JitterBuffer = JitterBuffer(target_depth=jitter_depth)
 
-        # Outbound rate reconciliation (ADR-0017): a TTS provider emits frames at
-        # its own output rate (e.g. sherpa-Kokoro at 24 kHz), but the G.711 wire
-        # is fixed at 8 kHz. send_audio resamples any non-8 kHz frame down to the
-        # wire rate before encoding. We keep one state-carrying Resampler PER
-        # source rate so a continuous stream resamples click-free (frame-by-frame
-        # output matches a single pass); 8 kHz frames bypass it entirely.
+        # Outbound rate reconciliation (ADR-0017/0022): a TTS provider emits frames
+        # at its own output rate (e.g. sherpa-Kokoro at 24 kHz), but the wire rate
+        # is the negotiated codec's (8 kHz G.711, 16 kHz G.722). send_audio
+        # resamples any off-wire-rate frame to the wire rate before encoding. We
+        # keep one state-carrying Resampler PER source rate so a continuous stream
+        # resamples click-free (frame-by-frame output matches a single pass);
+        # already-at-wire-rate frames bypass it entirely.
         self._tx_resamplers: dict[int, Resampler] = {}
+
+        # G.722 codec state (ADR-0022): the sub-band ADPCM predictor + QMF history
+        # are stateful across packets, so one encoder/decoder lives per call and is
+        # reset in connect(). Lazily created (only when the negotiated codec is
+        # G.722) and re-created on connect() so a reused engine starts a fresh
+        # stream. ``None`` on a G.711 call.
+        self._g722_encoder: G722Encoder | None = None
+        self._g722_decoder: G722Decoder | None = None
 
         # Outbound 20 ms re-framing buffer (the "very choppy" fix), holding the
         # not-yet-sent wire-rate PCM16 bytes in order. A streaming TTS provider
@@ -436,6 +515,14 @@ class RtpMediaTransport:
         # Drop any carried outbound-resample state so a reused engine starts a
         # fresh stream (no stale sub-sample phase from a previous call).
         self._tx_resamplers = {}
+        # Reset the G.722 codec state so a reused engine starts with a fresh
+        # predictor/QMF history (a stale predictor would corrupt the start of the
+        # new call). It is (re)created lazily by _encode/_decode on first use —
+        # the OUTBOUND path reassigns self._codec from a PCMU placeholder to the
+        # negotiated codec AFTER connect() but BEFORE any media, so creating it at
+        # connect() time would miss a connect-as-PCMU-then-G.722 call.
+        self._g722_encoder = None
+        self._g722_decoder = None
         # Drop any leftover outbound re-framing bytes from a previous call.
         self._tx_buffer = b""
         # Reset the latch so a reused engine re-latches on its next call: aim
@@ -589,7 +676,7 @@ class RtpMediaTransport:
         """
         if not self._symmetric or self._latched:
             return
-        if packet.payload_type != self._codec.value:
+        if packet.payload_type != self._payload_type:
             return  # not the negotiated audio stream — not a latch trigger
         self._latched = True
         if source == self._outbound_addr:
@@ -699,17 +786,17 @@ class RtpMediaTransport:
         # Re-frame the resampled 8 kHz PCM into standard 20 ms (160-sample)
         # slices and emit one RTP packet per WHOLE slice.
         #
-        # WHY (silence at the gateway): a G.711 telephony RTP packet carries
-        # exactly 160 samples (20 ms at 8 kHz = 160 bytes payload). TTS providers
-        # hand send_audio a frame per producer chunk, NOT per 20 ms: sherpa-Kokoro
-        # emits a few huge chunks (17 000-56 000 samples at 24 kHz -> 5 931-18 630
-        # at 8 kHz), and ElevenLabs streams MANY small HTTP chunks. Sending one
-        # oversized payload makes the gateway silently discard it (the tone path
-        # was immune because generate_tone_frames() already yields 160-sample
-        # frames), so we MUST split into 160-sample packets.
+        # WHY (silence at the gateway): one telephony RTP packet carries exactly
+        # one ptime of WIRE-RATE audio (G.711: 160 samples = 20 ms @ 8 kHz; G.722:
+        # 320 samples = 20 ms @ 16 kHz). TTS providers hand send_audio a frame per
+        # producer chunk, NOT per 20 ms: sherpa-Kokoro emits a few huge chunks and
+        # ElevenLabs streams MANY small HTTP chunks. Sending one oversized payload
+        # makes the gateway silently discard it (the tone path was immune because
+        # generate_tone_frames() already yields whole frames), so we MUST split
+        # into whole wire-rate frames.
         #
         # WHY (the "very choppy" fix): a producer chunk is rarely a whole multiple
-        # of 160 samples, so each call leaves a sub-frame remainder. Zero-padding
+        # of one frame, so each call leaves a sub-frame remainder. Zero-padding
         # that remainder to a full frame on EVERY call injects a slug of silence
         # at every chunk boundary -- inaudible as a single event for Kokoro's few
         # chunks, but a click/gap per HTTP chunk for ElevenLabs (~12+ per second)
@@ -717,8 +804,14 @@ class RtpMediaTransport:
         # self._tx_buffer and prepend them to the next chunk, so the concatenated
         # outbound stream is sample-continuous (no interior silence). The residual
         # tail is padded to one final frame exactly once, in stop().
-        samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
-        chunk_bytes = samples_per_frame * 2  # PCM16 = 2 bytes per sample
+        #
+        # The chunk size is at the WIRE sample rate (codec-derived), but the RTP
+        # timestamp advances at the RTP CLOCK rate (also codec-derived). For G.711
+        # these are equal; for G.722 they differ (320-sample frame, +160 clock) —
+        # RFC 3551's 8000-clock/16000-sample quirk, handled via the descriptor.
+        wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000
+        ts_increment = (self._rtp_clock_rate * self._ptime) // 1000
+        chunk_bytes = wire_samples_per_frame * 2  # PCM16 = 2 bytes per sample
 
         # _tx_buffer is the single ORDERED source of truth for not-yet-sent
         # outbound audio: append this chunk, then drain whole frames off the FRONT
@@ -738,7 +831,7 @@ class RtpMediaTransport:
                 self._tx_buffer[chunk_bytes:],
             )
             sent = await self._transmit_frame(
-                chunk, wire_rate_frame.monotonic_ts_ns, samples_per_frame
+                chunk, wire_rate_frame.monotonic_ts_ns, ts_increment
             )
             if not sent:
                 # stop() nulled the transport before this frame went out: put it
@@ -757,9 +850,14 @@ class RtpMediaTransport:
                 return
 
     async def _transmit_frame(
-        self, chunk: bytes, monotonic_ts_ns: int, samples_per_frame: int
+        self, chunk: bytes, monotonic_ts_ns: int, ts_increment: int
     ) -> bool:
         """Encode + packetise one whole 20 ms frame and send it; pace by ptime.
+
+        ``chunk`` is one ptime of WIRE-RATE PCM16 (codec-derived rate). ``ts_increment``
+        is the RTP timestamp delta for one frame (the RTP CLOCK rate — equal to the
+        wire sample count for G.711, but HALF it for G.722: 160 clock units for a
+        320-sample wideband frame, RFC 3551).
 
         Returns whether the frame was put **on the wire**: ``False`` if the
         transport had already been torn down by a concurrent :meth:`stop` at entry
@@ -776,13 +874,13 @@ class RtpMediaTransport:
 
         chunk_frame = PcmFrame(
             samples=chunk,
-            sample_rate=G711_SAMPLE_RATE,
+            sample_rate=self._wire_sample_rate,
             monotonic_ts_ns=monotonic_ts_ns,
         )
         payload = self._encode(chunk_frame)
 
         pkt = RtpPacket(
-            payload_type=self._codec.value,
+            payload_type=self._payload_type,
             sequence_number=self._seq,
             timestamp=self._ts,
             ssrc=_OUTBOUND_SSRC,
@@ -790,9 +888,10 @@ class RtpMediaTransport:
         )
         wire = self._srtp_out.protect(pkt) if self._srtp_out is not None else pkt.pack()
 
-        # Advance counters (mod 2^16 for seq, mod 2^32 for ts).
+        # Advance counters (mod 2^16 for seq, mod 2^32 for ts). The timestamp
+        # advances at the RTP CLOCK rate (codec-derived), not the wire sample count.
         self._seq = (self._seq + 1) % (1 << 16)
-        self._ts = (self._ts + samples_per_frame) % (1 << 32)
+        self._ts = (self._ts + ts_increment) % (1 << 32)
 
         # Log the first packet sent in this call.
         if not self._first_tx_logged:
@@ -801,7 +900,7 @@ class RtpMediaTransport:
                 "rtp tx: first packet -> %s:%d pt=%d ssrc=0x%08x",
                 self._outbound_addr[0],
                 self._outbound_addr[1],
-                self._codec.value,
+                self._payload_type,
                 _OUTBOUND_SSRC,
             )
 
@@ -837,9 +936,48 @@ class RtpMediaTransport:
         return True
 
     @property
+    def payload_type(self) -> int:
+        """The RTP payload type on the wire (sent + accepted by the comedia latch).
+
+        Defaults to the codec's static PT; set to the NEGOTIATED PT when it differs
+        (the outbound path updates it after the 2xx answer, mirroring the
+        ``engine._codec`` update). Kept distinct from the codec kind because a
+        dynamic-PT codec (G.722) can negotiate a wire PT other than its static one.
+        """
+        return self._payload_type
+
+    @payload_type.setter
+    def payload_type(self, value: int) -> None:
+        self._payload_type = value
+
+    @property
+    def _descriptor(self) -> _CodecDescriptor:
+        """Rate descriptor for the CURRENT codec.
+
+        Read live so it reflects a codec re-set after construction (the outbound
+        path reassigns ``self._codec`` from a placeholder before connect()).
+        """
+        return _CODEC_DESCRIPTORS[self._codec]
+
+    @property
+    def _wire_sample_rate(self) -> int:
+        """The PCM rate this codec encodes/decodes (8 kHz G.711, 16 kHz G.722)."""
+        return self._descriptor.wire_sample_rate
+
+    @property
+    def _rtp_clock_rate(self) -> int:
+        """The RTP timestamp clock rate for this codec (8 kHz for G.711 AND G.722)."""
+        return self._descriptor.rtp_clock_rate
+
+    @property
     def inbound_sample_rate(self) -> int:
-        """Rate of frames from :meth:`inbound_audio` (always 8000 Hz for G.711)."""
-        return G711_SAMPLE_RATE
+        """Rate of frames from :meth:`inbound_audio` — the codec's audio sample rate.
+
+        8000 Hz for G.711, 16000 Hz for G.722 (ADR-0022). The STT path reads this
+        so a G.722 call feeds the recogniser native 16 kHz audio (no upsample from
+        8 kHz), and the VAD/endpointer build at this rate.
+        """
+        return self._wire_sample_rate
 
     # ------------------------------------------------------------------
     # CallMedia Protocol
@@ -889,20 +1027,22 @@ class RtpMediaTransport:
     def _flush_tx_tail(self, transport: asyncio.DatagramTransport) -> None:
         """Emit all buffered outbound audio as final RTP packets, in order.
 
-        Sends every whole 160-sample frame still in :attr:`_tx_buffer` (the send
+        Sends every whole wire-rate frame still in :attr:`_tx_buffer` (the send
         loop can leave several when a concurrent stop bails out mid-drain), then
         zero-pads the trailing sub-frame remainder up to one whole frame and sends
         it too, through ``transport`` (the still-open socket), and clears the
         buffer. A no-op when nothing is buffered. Sent inline (no ``ptime`` pacing)
-        because the call is tearing down; seq/timestamp advance per emitted frame
+        because the call is tearing down; seq advances per emitted frame and the
+        timestamp by the codec's RTP clock increment (160 for G.711 AND G.722),
         so the wire stays RFC 3550-consistent.
         """
         tail = self._tx_buffer
         self._tx_buffer = b""
         if not tail:
             return
-        samples_per_frame = (G711_SAMPLE_RATE * self._ptime) // 1000
-        chunk_bytes = samples_per_frame * 2
+        wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000
+        ts_increment = (self._rtp_clock_rate * self._ptime) // 1000
+        chunk_bytes = wire_samples_per_frame * 2
         # Pad only the trailing partial up to a whole frame; whole frames already
         # buffered are sent as-is, in order, each as its own RTP packet.
         remainder = len(tail) % chunk_bytes
@@ -911,10 +1051,14 @@ class RtpMediaTransport:
         for offset in range(0, len(tail), chunk_bytes):
             chunk = tail[offset : offset + chunk_bytes]
             payload = self._encode(
-                PcmFrame(samples=chunk, sample_rate=G711_SAMPLE_RATE, monotonic_ts_ns=0)
+                PcmFrame(
+                    samples=chunk,
+                    sample_rate=self._wire_sample_rate,
+                    monotonic_ts_ns=0,
+                )
             )
             pkt = RtpPacket(
-                payload_type=self._codec.value,
+                payload_type=self._payload_type,
                 sequence_number=self._seq,
                 timestamp=self._ts,
                 ssrc=_OUTBOUND_SSRC,
@@ -926,7 +1070,7 @@ class RtpMediaTransport:
                 else pkt.pack()
             )
             self._seq = (self._seq + 1) % (1 << 16)
-            self._ts = (self._ts + samples_per_frame) % (1 << 32)
+            self._ts = (self._ts + ts_increment) % (1 << 32)
             transport.sendto(wire, self._outbound_addr)
 
     # ------------------------------------------------------------------
@@ -943,40 +1087,66 @@ class RtpMediaTransport:
     # ------------------------------------------------------------------
 
     def _to_wire_rate(self, frame: PcmFrame) -> PcmFrame:
-        """Return ``frame`` resampled to the 8 kHz G.711 wire rate (ADR-0017).
+        """Return ``frame`` resampled to the codec's wire rate (ADR-0017/0022).
 
-        A frame already at :data:`G711_SAMPLE_RATE` is returned unchanged (no
-        resampler touches it, so the 8 kHz fast path is byte-exact). A frame at
-        any other rate — typically the TTS provider's 24 kHz output — is
-        downsampled to 8 kHz using a per-source-rate, state-carrying
-        :class:`~hermes_voip.media.audio.Resampler`, so a continuous stream
-        converts click-free (frame-by-frame output equals a single pass). This
-        is a conversion, not an error: ``send_audio`` therefore never raises on a
-        non-8 kHz frame.
+        The wire rate is codec-derived (8 kHz G.711, 16 kHz G.722). A frame already
+        at the wire rate is returned unchanged (no resampler touches it, so the
+        fast path is byte-exact). A frame at any other rate — typically the TTS
+        provider's 24 kHz output — is resampled to the wire rate using a
+        per-source-rate, state-carrying :class:`~hermes_voip.media.audio.Resampler`,
+        so a continuous stream converts click-free (frame-by-frame output equals a
+        single pass). This is a conversion, not an error: ``send_audio`` therefore
+        never raises on an off-rate frame. For a G.722 call this downsamples a
+        24 kHz Kokoro frame to 16 kHz (wideband preserved) rather than to 8 kHz.
 
         The output frame keeps the source ``monotonic_ts_ns`` (the presentation
         clock is unaffected by the rate change) and is stamped at the wire rate.
         """
-        if frame.sample_rate == G711_SAMPLE_RATE:
+        wire_rate = self._wire_sample_rate
+        if frame.sample_rate == wire_rate:
             return frame
         resampler = self._tx_resamplers.get(frame.sample_rate)
         if resampler is None:
-            resampler = Resampler(frame.sample_rate, G711_SAMPLE_RATE)
+            resampler = Resampler(frame.sample_rate, wire_rate)
             self._tx_resamplers[frame.sample_rate] = resampler
         return PcmFrame(
             samples=resampler.resample(frame.samples),
-            sample_rate=G711_SAMPLE_RATE,
+            sample_rate=wire_rate,
             monotonic_ts_ns=frame.monotonic_ts_ns,
         )
 
     def _decode(self, payload: bytes, ts_ns: int) -> PcmFrame:
-        """Decode a G.711 RTP payload to a PcmFrame."""
+        """Decode an RTP payload to a PcmFrame at the codec's wire rate.
+
+        G.711 (PCMU/PCMA) decodes to 8 kHz; G.722 decodes via the per-call
+        stateful :class:`~hermes_voip.media.g722.G722Decoder` to 16 kHz (created
+        lazily on first use so an outbound call that connects as a PCMU
+        placeholder then re-negotiates G.722 still gets a fresh decoder).
+        """
+        if self._codec is Codec.G722:
+            if self._g722_decoder is None:
+                self._g722_decoder = G722Decoder()
+            return PcmFrame(
+                samples=self._g722_decoder.decode(payload),
+                sample_rate=G722_SAMPLE_RATE,
+                monotonic_ts_ns=ts_ns,
+            )
         if self._codec is Codec.PCMU:
             return ulaw_to_frame(payload, monotonic_ts_ns=ts_ns)
         return alaw_to_frame(payload, monotonic_ts_ns=ts_ns)
 
     def _encode(self, frame: PcmFrame) -> bytes:
-        """Encode a PcmFrame to a G.711 RTP payload."""
+        """Encode a wire-rate PcmFrame to an RTP payload for the codec.
+
+        G.711 encodes the 8 kHz frame to mu-law/a-law; G.722 encodes the 16 kHz
+        frame via the per-call stateful
+        :class:`~hermes_voip.media.g722.G722Encoder` (created lazily on first use,
+        as for :meth:`_decode`).
+        """
+        if self._codec is Codec.G722:
+            if self._g722_encoder is None:
+                self._g722_encoder = G722Encoder()
+            return self._g722_encoder.encode(frame.samples)
         if self._codec is Codec.PCMU:
             return frame_to_ulaw(frame)
         return frame_to_alaw(frame)

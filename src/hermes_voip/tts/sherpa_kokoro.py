@@ -105,14 +105,29 @@ class SherpaKokoroTTS:
         """24 kHz: the media layer downsamples to 8 kHz for G.711 (ADR-0005)."""
         return KOKORO_SAMPLE_RATE
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
-        """Stream agent text in, stream 24 kHz ``PcmFrame``s out (ADR-0004).
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        """Stream agent text in, stream 24 kHz ``PcmFrame``s out (ADR-0004/0022).
 
         Returns a ``TtsStream``: an async iterator of frames that also exposes
         ``flush()`` and ``cancel()``. The engine begins emitting audio before
         ``text`` completes (synthesis starts at the first completed sentence).
         ``voice`` overrides the construction default when non-empty.
+
+        ``sample_rate`` (the call loop's per-call negotiated wire rate, ADR-0022)
+        is ACCEPTED for a uniform provider seam but IGNORED: Kokoro-82M's output
+        rate is an intrinsic 24 kHz the model cannot retune. Frames are emitted at
+        :data:`KOKORO_SAMPLE_RATE` and the media engine downsamples to the wire
+        rate (24->16 kHz for G.722, 24->8 kHz for G.711). Accepting (not rejecting)
+        the argument lets the loop pass the rate uniformly to every provider;
+        relabelling frames at a rate Kokoro did not produce would be a lie.
         """
+        del sample_rate  # intrinsic 24 kHz model rate; see docstring
         synthesizer = self._backend(voice or self._default_voice)
         stop = threading.Event()
 

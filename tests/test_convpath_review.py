@@ -370,7 +370,13 @@ async def test_w2_two_endpointer_fires_yield_two_turns() -> None:
         def output_sample_rate(self) -> int:
             return 8000
 
-        def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
             raise NotImplementedError
 
     loop = CallLoop(

@@ -330,6 +330,8 @@ class _NullTTS:
         self,
         text: AsyncIterator[str],
         voice: str,
+        *,
+        sample_rate: int | None = None,
     ) -> TtsStream:
         return _NullTtsStream()
 
@@ -445,7 +447,13 @@ async def test_two_concurrent_call_loops_run_independently() -> None:
         def output_sample_rate(self) -> int:
             return G711_SAMPLE_RATE
 
-        def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
             return _GreetingTtsStream()
 
     # Transport A: 3 inbound frames (the loop ends after the pump drains them).
@@ -785,7 +793,13 @@ class _RealGreetingTTS:
     def output_sample_rate(self) -> int:
         return G711_SAMPLE_RATE
 
-    def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
         _ = voice
         stop = threading.Event()
         self.last_stop = stop

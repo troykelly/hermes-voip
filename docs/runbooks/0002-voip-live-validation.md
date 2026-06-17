@@ -360,7 +360,47 @@ handler failure is logged at `ERROR` **with its traceback**. Read these first.
   3. **Correct public address in the SDP** (rport/STUN/configured external IP) is
      the alternative for gateways that honour the SDP address literally.
 
-### 8b. Troubleshooting — the agent interrupts itself / cuts off mid-reply
+### 8b. Verify which codec the call negotiated (G.722 wideband vs G.711)
+
+The plugin negotiates the **best available** audio codec (ADR-0005/0022): it offers
+**G.722 (16 kHz wideband) first**, then **G.711 PCMU/PCMA** (the universal fallback),
+then `telephone-event` (DTMF). RFC 3264 negotiation honours the gateway's preference
+order, so the call uses G.722 when the gateway offers it and G.711 otherwise — no
+config knob, no per-gateway tuning. To confirm which one a given call used:
+
+```bash
+# The adapter logs the agreed codec set in the SDP-answer line (INFO).
+grep -E "SDP answer built|codecs " /tmp/hermes-voip-live.log | tail -5
+# expect e.g.:  SDP answer built — local RTP <ip>:<port>, codecs G722,telephone-event
+#         (or)  ... codecs PCMU,telephone-event        when the gateway offered only G.711
+```
+
+```bash
+# The first outbound RTP packet logs the RTP payload type actually on the wire:
+#   pt=9  -> G.722 wideband     pt=0 -> PCMU (G.711 µ-law)     pt=8 -> PCMA (G.711 a-law)
+grep -E "rtp tx: first packet" /tmp/hermes-voip-live.log | tail -3
+```
+
+What to expect end-to-end on a **G.722** call (the wideband win):
+
+- The SDP answer's `m=audio` line leads with payload type `9` and carries
+  `a=rtpmap:9 G722/8000` (the rtpmap clock is **8000 even though the audio is
+  16 kHz** — RFC 3551 §4.5.2; this is correct, not a bug).
+- Each 20 ms RTP packet is **160 octets** and the **RTP timestamp advances by 160**
+  per packet (the 8 kHz clock), not 320 — the engine derives this from the codec
+  descriptor, so it is automatic.
+- STT runs on **native 16 kHz** audio (no upsample-from-8k) and TTS is requested at
+  16 kHz (ElevenLabs natively; Kokoro's 24 kHz is downsampled 24→16, not 24→8) — so
+  both transcription accuracy and playback quality improve.
+
+If a gateway you expect to support G.722 still lands on G.711, check its own SDP
+**offer** (the `SDP offer` INFO line lists the codecs it offered): we can only pick
+G.722 if the gateway offers it. If the gateway offers an **unsupported** codec only
+(no G.722 and no G.711), the call is **rejected with `488 Not Acceptable Here`** and
+logged at `ERROR` — never answered-but-dead. Nothing about codec selection requires
+touching the gateway from our side.
+
+### 8c. Troubleshooting — the agent interrupts itself / cuts off mid-reply
 
 Symptom: the agent starts a spoken reply, then the log shows
 `agent.conversation_loop: Turn ended: reason=interrupted_during_api_call`, and the ASR

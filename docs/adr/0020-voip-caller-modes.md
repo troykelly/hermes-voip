@@ -399,7 +399,11 @@ enumerate trusted numbers), consistent with the forgeable-caller-ID posture (§1
 > path that produces a config — the JSON loader, the legacy 3-file synthesis,
 > direct construction, and `adapter._caller_groups` — flows through that
 > constructor, so an unmatched caller can never be classified into a privileged
-> default regardless of how the config was built.
+> default regardless of how the config was built. To make this durable against a
+> hostile caller that passes a mutable sequence and mutates it after construction,
+> `__post_init__` **snapshots** its inputs to immutable containers
+> (`groups`/`match_order` → tuples, `group_lists` → a read-only `MappingProxyType`)
+> before validating, so the validated state is the same state the classifier reads.
 
 **Phasing:**
 

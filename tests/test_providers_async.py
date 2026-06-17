@@ -129,6 +129,9 @@ class _LoopbackTransport:
     async def send_audio(self, frame: PcmFrame) -> None:
         self.sent.append(frame)
 
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        _ = fade_ms  # loopback fake has no outbound queue to flush
+
 
 async def _drain_frames(frames: AsyncIterator[PcmFrame]) -> list[PcmFrame]:
     return [frame async for frame in frames]

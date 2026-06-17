@@ -455,9 +455,16 @@ async def test_barge_in_flushes_outbound_audio() -> None:
     Cancelling the TtsStream stops PULLING new frames, but already-queued TTS audio
     keeps pacing out of the engine (the abruptness/delay bug). barge_in() must also
     call transport.flush_outbound so the agent goes quiet within ~1 packet.
+
+    Strategy mirrors test (c): a blocking transport parks speak() mid-utterance (so
+    the stream is still the active stream), then barge_in() cuts it. The blocked
+    send_audio is released afterward so speak() exits cleanly.
     """
-    transport = _FakeTransport([])
-    tts = _FakeTTS([])
+    tts_frame = PcmFrame(
+        samples=b"\x10\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    transport = _BlockingTransport([])
+    tts = _FakeTTS([tts_frame, tts_frame, tts_frame])
     loop = CallLoop(
         transport=transport,
         asr=_FakeASR([]),
@@ -475,10 +482,11 @@ async def test_barge_in_flushes_outbound_audio() -> None:
     async def _tokens() -> AsyncIterator[str]:
         yield "the agent is speaking"
 
-    # Register a stream so barge_in has something to cancel.
+    # speak() parks on the first send_audio gate with the stream registered.
     speak_task = asyncio.create_task(loop.speak(_tokens()))
     await asyncio.sleep(0)
     await loop.barge_in()
+    transport.first_send_gate.set()
     await speak_task
 
     assert transport.flush_calls >= 1, "barge_in did not flush the outbound audio"

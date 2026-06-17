@@ -5,14 +5,18 @@ adapter's ``send()`` through the *same* call signature:
 
 1. The genuine agent reply — natural language meant for the user.
 2. Operational/proactive **notices** the runtime authors itself: the
-   home-channel onboarding prompt ("No home channel is set for …"), and the
-   cron/kanban "no home channel configured" delivery errors.
+   home-channel onboarding prompt ("No home channel is set for …"), the
+   cron/kanban "no home channel configured" delivery errors, AND the
+   **busy/interrupt acknowledgments** it sends when a new user message arrives
+   while the agent is still running ("⚡ Interrupting current task. I'll respond
+   to your message shortly." and its Queued/Steered/Subagent siblings).
 
 On a text platform a notice renders harmlessly as a chat message. ``voip`` is a
 per-call, live-audio platform with **no text surface and no persistent home
 channel** (every call is an ephemeral session). A notice that reaches the voip
 adapter's ``send()`` is therefore synthesised as TTS and *spoken to the caller*
-— the operator-reported "No home channel is set for voip" leak.
+— the operator-reported "No home channel is set for voip" leak, and the
+"Interrupting… I'll respond…" artifact a caller hears the instant they barge in.
 
 Verified against ``hermes-agent==0.16.0`` that the two kinds are
 indistinguishable at the ``send()`` boundary by their arguments:
@@ -60,19 +64,65 @@ _NO_HOME_CHANNEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The gateway's busy/interrupt-acknowledgment family (hermes-agent: the
+# ``_handle_active_session_busy_message`` block in ``gateway.run``). When a new
+# user message arrives while the agent is still running, the runtime delivers one
+# of these via ``adapter.send()`` — so on a live call it is SPOKEN to the caller,
+# the "Interrupting… I'll respond…" artifact the operator hears on barge-in. Each
+# member opens with a distinctive runtime *announcement* of the busy mode that
+# natural conversational speech does not reproduce verbatim; we key on those
+# openings (an optional " (…elapsed/iteration/running…)" status detail may follow
+# the opening before the sentence ends, so the anchors do not span ``.``):
+#   * interrupt: "⚡ Interrupting current task… I'll respond to your message shortly."
+#   * queued:    "⏳ Queued for the next turn… I'll respond once the current task…"
+#   * steered:   "⏩ Steered into current run… Your message arrives after the next…"
+#   * subagent:  "⏳ Subagent working… your message is queued for when it finishes…"
+# The emoji glyphs are TTS-dependent (some voices skip them) so they are NOT part
+# of the match — only the wording is.
+_INTERRUPTION_ACK_RE = re.compile(
+    r"\binterrupting\s+current\s+task\b"
+    r"|\bqueued\s+for\s+the\s+next\s+turn\b"
+    r"|\bsteered\s+into\s+current\s+run\b"
+    r"|\bsubagent\s+working\b[^.\n]*?\byour\s+message\s+is\s+queued\b",
+    re.IGNORECASE,
+)
+
+
+def is_interruption_ack(content: str) -> bool:
+    """Return ``True`` when ``content`` is a gateway busy/interrupt acknowledgment.
+
+    Recognises the runtime's "busy ack" family — the message it sends when a new
+    user message (a barge-in) arrives mid-turn: "Interrupting current task … I'll
+    respond …" and its Queued / Steered / Subagent siblings. On a live call these
+    reach ``send()`` and would be *spoken* to the caller (the "Interrupting… I'll
+    respond…" artifact), so the voip adapter drops them — after a barge-in the
+    agent goes silent and processes the caller's input, it does not announce the
+    interruption.
+
+    Conservative by design: it keys on the runtime's distinctive *announcement*
+    openings, so a genuine reply that merely mentions interrupting, queues, or
+    steering as ordinary words ("Sorry to interrupt, your taxi's here.") is not an
+    ack and is still spoken.
+    """
+    return bool(_INTERRUPTION_ACK_RE.search(content))
+
 
 def is_internal_system_notice(content: str) -> bool:
     """Return ``True`` when ``content`` is a gateway-internal system notice.
 
-    Recognises the home-channel / proactive-delivery control family — the
-    onboarding prompt and the cron/kanban "no home channel" delivery errors —
-    so the voip adapter can drop it instead of speaking it to the caller.
+    Recognises two runtime-authored families the voip adapter must never speak to
+    the caller:
 
-    The check is structural about that family: a "no home channel … set|
-    configured … for …" *announcement*, which natural speech does not produce.
-    It is intentionally conservative — a genuine conversational reply that
-    merely *mentions* a home channel, a channel, cron, or the ``/sethome``
-    command (even while explaining how to set a home channel) is not a notice
-    and passes through unchanged.
+    * the home-channel / proactive-delivery control family — the onboarding prompt
+      and the cron/kanban "no home channel" delivery errors (a "no home channel …
+      set|configured … for …" announcement), and
+    * the busy/interrupt-acknowledgment family (see :func:`is_interruption_ack`) —
+      the "Interrupting… I'll respond…" artifact and its siblings.
+
+    Both checks are structural about their family's announcement wording, which
+    natural speech does not produce. It is intentionally conservative — a genuine
+    conversational reply that merely *mentions* a home channel, a channel, cron,
+    the ``/sethome`` command, or interrupting/queuing as ordinary words is not a
+    notice and passes through unchanged.
     """
-    return bool(_NO_HOME_CHANNEL_RE.search(content))
+    return bool(_NO_HOME_CHANNEL_RE.search(content)) or is_interruption_ack(content)

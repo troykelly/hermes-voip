@@ -1415,6 +1415,10 @@ class VoipAdapter(BasePlatformAdapter):
             barge_in_mode=barge_in_mode,
             barge_in_min_voiced_windows=barge_in_min_voiced_windows,
             barge_in_tail_windows=barge_in_tail_windows,
+            # Clean-stop fade (ADR-0028): the engine ramps the final frames down over
+            # this many ms when a barge-in flushes the queued audio, so the cut is
+            # click-free instead of an abrupt pop.
+            barge_in_fade_ms=media_cfg.barge_in_fade_ms,
         )
         self._call_loops[call_id] = call_loop
         _log.info("INVITE %s: CallLoop started", call_id)

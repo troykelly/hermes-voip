@@ -177,6 +177,7 @@ def _media_config(**overrides: object) -> MediaConfig:
         "barge_in_mode": "gated",
         "barge_in_min_speech_ms": 400,
         "barge_in_tail_ms": 250,
+        "barge_in_fade_ms": 30,
         "injection_guard": "onnx",
         "injection_guard_model_dir": "/models/guard",
         "dtmf_mode": "auto",

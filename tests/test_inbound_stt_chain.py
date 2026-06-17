@@ -134,6 +134,9 @@ class _FiniteTransport:
     async def send_audio(self, frame: PcmFrame) -> None:
         self.sent_audio.append(frame)
 
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        _ = fade_ms  # barge-in flush is a no-op for this fake transport
+
     async def connect(self) -> bool:
         return True
 

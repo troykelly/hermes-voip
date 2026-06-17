@@ -234,6 +234,9 @@ class _EndingTransport:
         await self.first_send_gate.wait()
         self.sent_audio.append(frame)
 
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        _ = fade_ms  # barge-in flush is a no-op for this fake transport
+
     async def connect(self) -> bool:
         return True
 
@@ -765,6 +768,9 @@ class _AwaitingInboundTransport:
             msg = "synthetic fatal send_audio failure (greeting crash repro)"
             raise RuntimeError(msg)
         self.sent_audio.append(frame)
+
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        _ = fade_ms  # barge-in flush is a no-op for this fake transport
 
     async def connect(self) -> bool:
         return True

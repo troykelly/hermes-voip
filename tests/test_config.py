@@ -495,6 +495,33 @@ def test_media_full_override() -> None:
     assert cfg.barge_in_fade_ms == 40
 
 
+def test_media_ice_stun_urls_default_empty() -> None:
+    """No STUN config => host-only ICE (empty tuple) — ADR-0032."""
+    cfg = load_media_config({})
+    assert cfg.ice_stun_urls == ()
+
+
+def test_media_ice_stun_urls_parsed_comma_separated() -> None:
+    """HERMES_VOIP_ICE_STUN_URLS is a comma-separated stun: URL list (trimmed)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_ICE_STUN_URLS": (
+                "stun:stun.example.test:3478, stun:stun2.example.test:19302"
+            )
+        }
+    )
+    assert cfg.ice_stun_urls == (
+        "stun:stun.example.test:3478",
+        "stun:stun2.example.test:19302",
+    )
+
+
+def test_media_ice_stun_urls_blank_members_dropped() -> None:
+    """Blank entries between commas are dropped; an all-blank value => empty."""
+    cfg = load_media_config({"HERMES_VOIP_ICE_STUN_URLS": " , ,"})
+    assert cfg.ice_stun_urls == ()
+
+
 def test_media_barge_in_fade_ms_zero_allowed() -> None:
     """A fade of 0 ms is valid (instant hard cut, no ramp)."""
     cfg = load_media_config({"HERMES_VOIP_BARGE_IN_FADE_MS": "0"})

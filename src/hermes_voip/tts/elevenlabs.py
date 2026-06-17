@@ -3,10 +3,29 @@
 An opt-in cloud fallback behind the same ``StreamingTTS`` seam (ADR-0004),
 selected at runtime via ``ELEVENLABS_API_KEY`` (the value lives only in the
 gitignored ``.env`` / 1Password; never committed — rules 34/41). It streams the
-Flash v2.5 model's **raw PCM16 @ 24 kHz** (``output_format=pcm_24000``) so the
-provider emits the canonical ``PcmFrame`` currency; the 24->8 kHz downsample and
-G.711 encode stay the media layer's job (ADR-0005), exactly as for the self-host
-default.
+Flash v2.5 model's **raw PCM16 @ 8 kHz** (``output_format=pcm_8000``) — the
+telephony-native rate — so the provider emits the canonical ``PcmFrame`` currency
+already at the G.711 wire rate; the media layer then only G.711-encodes it, with
+**no resample at all** (ADR-0005/0017).
+
+Why 8 kHz, not 24 kHz (ADR-0007 amendment): ElevenLabs streams audio as many
+small chunked-HTTP reads. Requesting ``pcm_24000`` forced a per-stream 24->8 kHz
+downsample of 3x the bytes and amplified the outbound re-framing path's
+per-chunk-boundary artefacts — a contributor to the live "very choppy" defect.
+ElevenLabs can emit ``pcm_8000`` directly, so we ask for the wire rate: zero
+lossy 3:1 resample, 3x less ElevenLabs->box bandwidth, and lower first-audio
+latency. The codec stays the media layer's job (ADR-0004), so we request PCM16
+(not ``ulaw_8000``) and let :class:`~hermes_voip.media.engine.RtpMediaTransport`
+do the G.711 encode.
+
+The requested rate is **not** an unconditional 8 kHz pin: it is the G.711 *case*
+of a codec→rate mapping. ``output_sample_rate`` (default
+:data:`G711_NARROWBAND_RATE`) is 8 kHz because the SDP codec menu the plugin
+advertises today (``adapter._SUPPORTED_ENCODINGS``) is G.711-only, so the
+negotiated wire is always 8 kHz. When the wideband lane (ADR-0005: prefer
+Opus/G.722, negotiate by capability) lands, the negotiated codec's rate is passed
+in instead (G.722→16000, Opus→48000 — see :func:`elevenlabs_pcm_format`), so the
+TTS rate FOLLOWS the codec rather than throwing wideband away by downsampling.
 
 The HTTP transport is behind the :class:`HttpByteStream` seam and
 **dependency-injected**, so tests drive a recorded PCM response with no network.
@@ -28,25 +47,74 @@ from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
 
 __all__ = [
+    "ELEVENLABS_PCM_FORMATS",
     "ELEVENLABS_SAMPLE_RATE",
     "FLASH_V2_5_MODEL_ID",
     "ElevenLabsRequest",
     "ElevenLabsTTS",
     "HttpByteStream",
     "HttpCancellation",
+    "elevenlabs_pcm_format",
 ]
 
-#: We request raw PCM16 @ 24 kHz so the provider emits ``PcmFrame``s in the same
-#: currency as the self-host default; the media layer downsamples to 8 kHz for
-#: G.711 (ADR-0005). (ElevenLabs can emit native ``ulaw_8000``, but the canonical
-#: provider seam is PCM16 — codec is the media layer, ADR-0004.)
-ELEVENLABS_SAMPLE_RATE = 24_000
+#: The G.711 narrowband wire rate (PCMU/PCMA are 8000 Hz, RFC 3551). The default
+#: requested rate, because the SDP codec menu this plugin advertises today is
+#: G.711-only (``adapter._SUPPORTED_ENCODINGS``), so the negotiated wire is always
+#: 8 kHz. When the wideband lane (ADR-0005: prefer Opus/G.722, negotiate by
+#: capability) lands, the requested rate FOLLOWS the negotiated codec (G.722→16k,
+#: Opus→48k) — pass that rate into :class:`ElevenLabsTTS` rather than re-pinning
+#: 8 kHz here. This is NOT a second hardcoded narrowband pin: it is the G.711
+#: *case* of a codec→rate mapping, defaulted because G.711 is the only lane today.
+G711_NARROWBAND_RATE = 8_000
+
+#: We request raw PCM16 at the telephony wire rate so the provider emits
+#: ``PcmFrame``s already at that rate and the media layer encodes with NO resample
+#: (ADR-0005/0017) — the ADR-0007 amendment that fixes the live "very choppy"
+#: audio (``pcm_24000`` forced a lossy 3:1 downsample of 3x the bytes per streamed
+#: chunk). We keep PCM16 (not the native ``ulaw_8000``) because the codec is the
+#: media layer's job (ADR-0004). Default 8 kHz = G.711 (:data:`G711_NARROWBAND_RATE`).
+ELEVENLABS_SAMPLE_RATE = G711_NARROWBAND_RATE
+
+#: ElevenLabs' supported raw-PCM ``output_format`` values, keyed by sample rate
+#: (the API exposes ``pcm_8000``/``pcm_16000``/``pcm_22050``/``pcm_24000``/
+#: ``pcm_44100``). 8/16/24 kHz cover the telephony codec lanes we will negotiate
+#: (G.711 8k now; G.722 16k and Opus — resampled — under the wideband lane).
+ELEVENLABS_PCM_FORMATS: Mapping[int, str] = {
+    8_000: "pcm_8000",
+    16_000: "pcm_16000",
+    22_050: "pcm_22050",
+    24_000: "pcm_24000",
+    44_100: "pcm_44100",
+}
+
+
+def elevenlabs_pcm_format(sample_rate: int) -> str:
+    """Return the ElevenLabs raw-PCM ``output_format`` for ``sample_rate``.
+
+    Maps a telephony wire sample rate to the matching ``pcm_<rate>`` request
+    value. Raises ``ValueError`` for a rate ElevenLabs cannot emit natively
+    (rather than silently falling back to a resampled rate) — so a future
+    wideband codec whose rate is unsupported fails loudly at construction instead
+    of degrading audio at runtime.
+
+    Raises:
+        ValueError: If ``sample_rate`` is not an ElevenLabs-supported PCM rate.
+    """
+    fmt = ELEVENLABS_PCM_FORMATS.get(sample_rate)
+    if fmt is None:
+        supported = ", ".join(str(r) for r in sorted(ELEVENLABS_PCM_FORMATS))
+        msg = (
+            f"ElevenLabs has no native PCM output for {sample_rate} Hz "
+            f"(supported: {supported})"
+        )
+        raise ValueError(msg)
+    return fmt
+
 
 #: The Flash v2.5 model id — the low-latency tier ADR-0007 names as the fallback.
 FLASH_V2_5_MODEL_ID = "eleven_flash_v2_5"
 
 _DEFAULT_BASE_URL = "https://api.elevenlabs.io"
-_OUTPUT_FORMAT = "pcm_24000"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +129,7 @@ class ElevenLabsRequest:
     Attributes:
         voice_id: The ElevenLabs voice id (path segment of the stream endpoint).
         model_id: The synthesis model id (``eleven_flash_v2_5``).
-        output_format: The requested audio format (``pcm_24000``).
+        output_format: The requested audio format (``pcm_8000``).
         url: The fully-formed stream endpoint URL.
         headers: The HTTP request headers (auth + content type).
         text: The segment text to synthesise (the JSON body's ``text``).
@@ -148,12 +216,16 @@ class HttpByteStream(Protocol):
 class ElevenLabsTTS:
     """ElevenLabs Flash v2.5 streaming TTS (StreamingTTS, ADR-0004).
 
-    Emits 24 kHz ``PcmFrame``s built from the ``pcm_24000`` response stream.
-    The API key is held privately and never appears in ``repr`` (secrets are
-    never logged). Inject ``http`` in tests; production uses the urllib transport.
+    Emits ``PcmFrame``s at the telephony wire rate (default 8 kHz = G.711, via
+    ``output_format=pcm_8000``) so the media layer encodes with no resample. The
+    requested rate is :data:`G711_NARROWBAND_RATE` today because the SDP codec
+    menu is G.711-only; the wideband lane (ADR-0005) passes the negotiated codec's
+    rate via ``output_sample_rate`` instead. The API key is held privately and
+    never appears in ``repr`` (secrets are never logged). Inject ``http`` in
+    tests; production uses the urllib transport.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — all keyword-only config; output_sample_rate is load-bearing (codec→rate)
         self,
         *,
         api_key: str,
@@ -161,6 +233,7 @@ class ElevenLabsTTS:
         http: HttpByteStream | None = None,
         model_id: str = FLASH_V2_5_MODEL_ID,
         base_url: str = _DEFAULT_BASE_URL,
+        output_sample_rate: int = G711_NARROWBAND_RATE,
     ) -> None:
         """Create the provider.
 
@@ -173,13 +246,24 @@ class ElevenLabsTTS:
                 to the real urllib-backed transport.
             model_id: The synthesis model id (defaults to Flash v2.5).
             base_url: The API base URL (override for testing/self-host proxies).
+            output_sample_rate: The wire rate to request from ElevenLabs, in Hz.
+                Defaults to :data:`G711_NARROWBAND_RATE` (8 kHz), the rate of the
+                only codec lane (G.711) the plugin negotiates today, so the media
+                layer encodes with no resample. The wideband lane (ADR-0005) sets
+                this to the negotiated codec's rate (e.g. 16000 for G.722). Must be
+                a rate ElevenLabs can emit natively (see :func:`elevenlabs_pcm_format`).
 
         Raises:
-            ValueError: If ``api_key`` is empty/blank.
+            ValueError: If ``api_key`` is empty/blank, or ``output_sample_rate`` is
+                not an ElevenLabs-supported PCM rate.
         """
         if not api_key.strip():
             msg = "api_key must be a non-empty ElevenLabs credential"
             raise ValueError(msg)
+        # Resolve (and validate) the request format from the wire rate now, so an
+        # unsupported rate fails fast at construction, not mid-call.
+        self._output_format = elevenlabs_pcm_format(output_sample_rate)
+        self._output_sample_rate = output_sample_rate
         self._api_key = api_key
         self._default_voice = voice
         self._model_id = model_id
@@ -190,20 +274,21 @@ class ElevenLabsTTS:
         """Repr without the credential (secrets never logged)."""
         return (
             f"{type(self).__name__}(voice={self._default_voice!r}, "
-            f"model_id={self._model_id!r})"
+            f"model_id={self._model_id!r}, rate={self._output_sample_rate})"
         )
 
     @property
     def output_sample_rate(self) -> int:
-        """24 kHz: the media layer downsamples to 8 kHz for G.711 (ADR-0005)."""
-        return ELEVENLABS_SAMPLE_RATE
+        """The requested wire rate (default 8 kHz G.711 → media layer only encodes)."""
+        return self._output_sample_rate
 
     def synthesize(self, text: AsyncIterator[str], voice: str) -> TtsStream:
-        """Stream agent text in, stream 24 kHz ``PcmFrame``s out (ADR-0004).
+        """Stream agent text in, stream wire-rate ``PcmFrame``s out (ADR-0004).
 
         Returns a ``TtsStream`` that segments ``text`` and synthesises each
         sentence via a streaming HTTP request; ``voice`` overrides the
-        construction default when non-empty.
+        construction default when non-empty. Frames are emitted at
+        :attr:`output_sample_rate` (default 8 kHz = G.711).
         """
         voice_id = voice or self._default_voice
         stop = threading.Event()
@@ -226,18 +311,18 @@ class ElevenLabsTTS:
         return PcmFrameStream(
             text=text,
             open_segment=_open,
-            sample_rate=ELEVENLABS_SAMPLE_RATE,
+            sample_rate=self._output_sample_rate,
             stop=stop,
         )
 
     def _request(self, text: str, voice_id: str) -> ElevenLabsRequest:
         """Form the streaming-synthesis request for one segment of ``text``."""
         url = f"{self._base_url}/v1/text-to-speech/{voice_id}/stream"
-        url = f"{url}?output_format={_OUTPUT_FORMAT}"
+        url = f"{url}?output_format={self._output_format}"
         return ElevenLabsRequest(
             voice_id=voice_id,
             model_id=self._model_id,
-            output_format=_OUTPUT_FORMAT,
+            output_format=self._output_format,
             url=url,
             headers={
                 "xi-api-key": self._api_key,

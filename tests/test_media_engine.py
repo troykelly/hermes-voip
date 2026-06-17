@@ -25,6 +25,7 @@ import contextlib
 import gc
 import logging
 import socket
+import struct
 import warnings
 from collections.abc import Iterator
 
@@ -480,6 +481,255 @@ async def test_send_audio_resamples_24k_for_pcma_too() -> None:
     assert len(pkt.payload) == _WIRE_SAMPLES
 
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# (b3) send_audio is sample-continuous ACROSS streaming chunks (no per-chunk
+#      silence padding) — the "very choppy" ElevenLabs regression.
+# ---------------------------------------------------------------------------
+#
+# A streaming TTS provider (ElevenLabs over chunked HTTP) hands the call loop one
+# PcmFrame per network chunk; the call loop calls send_audio once per frame. The
+# chunk byte-length is NOT a multiple of the 20 ms (160-sample = 320-byte) G.711
+# frame, so each send_audio call left a sub-frame remainder. The defect: that
+# remainder was ZERO-PADDED to a whole frame on EVERY call, injecting a slug of
+# silence at every chunk boundary -> the caller hears a click/gap per chunk
+# ("very choppy"). The fix: carry the sub-frame remainder forward across calls so
+# the concatenated stream is sample-continuous; pad at most once, at end-of-stream.
+#
+# 1024 bytes = 512 samples @ 8 kHz = 3.2 frames -> a 0.2-frame (64-byte) remainder
+# every chunk. With the bug, each of the 10 chunks below grows to 4 whole frames
+# (one pad each); without it, 10 * 512 = 5120 samples == exactly 32 frames total.
+# 512 PCM16 samples @ 8 kHz — deliberately not a 160-sample frame multiple.
+_STREAM_CHUNK_BYTES = 1024
+_STREAM_CHUNK_COUNT = 10
+
+
+def _counter_chunk(start_sample: int, sample_count: int, rate: int) -> PcmFrame:
+    """A frame of distinct, NON-silent PCM16 samples at ``rate``.
+
+    Each sample is a positive value derived from its global index. The amplitudes
+    are well clear of zero (>= 4096) so they survive G.711 companding as non-zero
+    codes — mu-/a-law quantise tiny magnitudes (|x| < ~8) to the same bucket as
+    silence, so a too-small probe would decode to 0 and be indistinguishable from
+    an injected silence slug. Values stay inside int16 with margin.
+    """
+    samples = b"".join(
+        # Map index -> a value in [4096, 4096 + 63*256]; strictly positive and far
+        # from zero so the round-trip never lands on a 0x0000 (= injected silence).
+        (4096 + ((start_sample + i) % 64) * 256).to_bytes(2, "little", signed=True)
+        for i in range(sample_count)
+    )
+    return PcmFrame(samples=samples, sample_rate=rate, monotonic_ts_ns=0)
+
+
+@pytest.mark.asyncio
+async def test_send_audio_8k_stream_has_no_per_chunk_silence_padding() -> None:
+    """Streaming 8 kHz chunks are sample-continuous — no silence slug per chunk.
+
+    Reproduces the "very choppy" ElevenLabs defect: feeding a sequence of chunks
+    whose byte length is NOT a multiple of the 160-sample G.711 frame must emit a
+    sample-continuous stream. The total emitted sample count must equal the total
+    INPUT sample count (5120), proving no per-chunk zero padding was inserted; the
+    bug pads each of the 10 chunks up to 640 samples -> 6400 emitted (1280 samples
+    of injected silence == 160 ms of gaps).
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    chunk_samples = _STREAM_CHUNK_BYTES // 2  # 512
+    # stop() runs INSIDE the recorder so its end-of-stream tail flush (if any) is
+    # captured too — here 5120 samples is exactly 32 frames, so nothing is padded.
+    with _capture_sends(engine) as recorder:
+        for idx in range(_STREAM_CHUNK_COUNT):
+            await engine.send_audio(
+                _counter_chunk(idx * chunk_samples, chunk_samples, G711_SAMPLE_RATE)
+            )
+        await engine.stop()
+
+    payloads = [RtpPacket.parse(wire).payload for wire, _dest in recorder.sent]
+    # G.711 (mu-law) is one byte per sample, so payload length == sample count.
+    total_emitted = sum(len(p) for p in payloads)
+    input_samples = _STREAM_CHUNK_COUNT * chunk_samples  # 5120
+
+    # The whole point: no per-chunk padding. Every emitted sample is a real input
+    # sample (the buffered remainder is carried forward, not zero-filled), so the
+    # stream is exactly the input length with NO mid-stream silence slugs.
+    assert total_emitted == input_samples, (
+        f"expected {input_samples} continuous samples, got {total_emitted} "
+        f"(={total_emitted - input_samples} samples of injected silence)"
+    )
+
+    # And decoding the concatenated payload back to PCM16 must contain NO interior
+    # silence run the source never emitted (every source sample is far from zero).
+    from hermes_voip.media.audio import decode_ulaw  # noqa: PLC0415 - test-local
+
+    decoded = decode_ulaw(b"".join(payloads))
+    sample_words = struct.unpack_from(f"<{len(decoded) // 2}h", decoded)
+    assert 0 not in sample_words, (
+        "decoded stream contains a 0x0000 sample the source never emitted — "
+        "a silence slug was injected at a chunk boundary"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_audio_24k_stream_is_continuous_across_chunks() -> None:
+    """Streaming 24 kHz chunks resample to a sample-continuous 8 kHz stream.
+
+    The same regression on the resample path (sherpa-Kokoro / ElevenLabs pcm_24000):
+    feeding many small 24 kHz chunks must produce the SAME 8 kHz audio as one pass,
+    with no per-chunk padding. The emitted sample count must equal a single
+    stateful 24->8 kHz resample of the concatenated input (which the engine's own
+    Resampler computes), not that count inflated by one pad per chunk.
+    """
+    from hermes_voip.media.audio import Resampler  # noqa: PLC0415 - test-local
+
+    rate = 24_000
+    # 24 kHz chunk of 1024 samples -> ~341 samples @ 8 kHz: never a frame multiple.
+    chunk_samples = 1024
+    chunk_count = 12
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    chunks = [
+        _counter_chunk(i * chunk_samples, chunk_samples, rate)
+        for i in range(chunk_count)
+    ]
+    # stop() runs INSIDE the recorder so the final buffered tail (padded to ONE
+    # frame, once) is captured along with the streamed frames.
+    with _capture_sends(engine) as recorder:
+        for frame in chunks:
+            await engine.send_audio(frame)
+        await engine.stop()
+
+    emitted = sum(len(RtpPacket.parse(w).payload) for w, _ in recorder.sent)
+
+    # Reference: a single stateful pass of the whole input through 24->8 kHz.
+    ref = Resampler(rate, G711_SAMPLE_RATE)
+    ref_samples = sum(len(ref.resample(f.samples)) // 2 for f in chunks)
+
+    samples_per_frame = _SAMPLES_PER_FRAME  # 160
+    # The continuous stream is the single-pass resample length padded UP to a whole
+    # frame EXACTLY ONCE (the end-of-stream tail flush), never one pad per chunk.
+    expected = (
+        (ref_samples + samples_per_frame - 1) // samples_per_frame
+    ) * samples_per_frame
+    assert emitted == expected, (
+        f"expected {expected} samples (single-pass resample {ref_samples} padded to "
+        f"one frame), got {emitted}"
+    )
+    # And the total over-send is strictly less than one frame — proof the padding
+    # happened once for the whole stream, not per chunk (the bug added ~12 frames).
+    assert 0 <= emitted - ref_samples < samples_per_frame, (
+        f"over-send {emitted - ref_samples} >= one frame ({samples_per_frame}): "
+        "per-chunk padding regressed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_mid_playout_flushes_all_buffered_audio_in_order() -> None:
+    """A stop() racing the send loop loses NO buffered audio and preserves order.
+
+    Adversarial-review regression: send_audio drains whole frames off the FRONT of
+    the re-framing buffer, removing each only after it is on the wire; stop() then
+    flushes whatever remains. So a stop() that fires mid-drain (here: from inside
+    the pacing sleep after the first frame) must still deliver every later whole
+    frame AND the partial tail, in order — never dropping a middle frame nor
+    reordering the tail ahead of it. We feed 5 frames' worth (800 samples) in one
+    call; the decoded concatenation of ALL emitted packets must equal the input.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        initial_seq=0,
+        initial_ts=0,
+    )
+    await engine.connect()
+
+    input_samples = 5 * _SAMPLES_PER_FRAME  # 800 — exactly 5 whole frames
+
+    with _capture_sends(engine) as recorder:
+        # Pacing sleep that tears the engine down right after the first frame is
+        # sent — exercising the "stop() nulls _transport during the sleep" path
+        # with whole frames still buffered behind it.
+        async def _stop_after_first(_secs: float) -> None:
+            if len(recorder.sent) == 1 and engine._transport is not None:
+                await engine.stop()
+
+        engine._sleep = _stop_after_first
+        await engine.send_audio(_counter_chunk(0, input_samples, G711_SAMPLE_RATE))
+        # stop() already ran from inside the sleep (its flush sent the rest); a
+        # second stop() is a harmless idempotent no-op.
+        await engine.stop()
+
+    payloads = [RtpPacket.parse(wire).payload for wire, _dest in recorder.sent]
+    emitted = b"".join(payloads)
+    # mu-law is one byte/sample: 800 input samples emit exactly 800 (5 frames),
+    # nothing dropped, nothing padded (the input is a whole number of frames).
+    assert len(emitted) == input_samples, (
+        f"expected {input_samples} samples delivered across the stop race, "
+        f"got {len(emitted)} (a middle frame was dropped)"
+    )
+    # Order preserved: decoding back equals a direct encode of the whole input.
+    from hermes_voip.media.audio import decode_ulaw, encode_ulaw  # noqa: PLC0415
+
+    original = _counter_chunk(0, input_samples, G711_SAMPLE_RATE).samples
+    assert decode_ulaw(emitted) == decode_ulaw(encode_ulaw(original)), (
+        "emitted audio is reordered or corrupted across the stop race"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hold_drops_buffered_remainder_no_stale_audio_on_resume() -> None:
+    """set_hold(True) drops the buffered sub-frame tail (hold stops outbound).
+
+    Adversarial-review regression: a partial-frame remainder buffered before hold
+    must NOT survive to be prepended to post-resume audio, nor be emitted by a
+    stop()-while-held. We send a non-frame-multiple chunk (a remainder is left
+    buffered), hold (which must clear it), then confirm a stop() while held emits
+    nothing — the buffered tail is gone.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    # 240 samples = 1.5 frames -> 80-sample remainder buffered after one frame.
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_counter_chunk(0, 240, G711_SAMPLE_RATE))
+        assert engine._tx_buffer, "precondition: a sub-frame remainder is buffered"
+
+        await engine.set_hold(True)
+        assert engine._tx_buffer == b"", "set_hold(True) must drop the buffered tail"
+
+        sent_before_stop = len(recorder.sent)
+        await engine.stop()  # while held: must flush nothing
+        assert len(recorder.sent) == sent_before_stop, (
+            "stop() while held emitted buffered audio — hold must stop outbound media"
+        )
 
 
 # ---------------------------------------------------------------------------

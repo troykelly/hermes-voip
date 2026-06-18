@@ -1829,11 +1829,14 @@ class VoipAdapter(BasePlatformAdapter):
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected from exc
 
-        # The offered a=setup decides our DTLS role; WebRtcMediaSession picks it.
+        # The offered a=setup + the HERMES_VOIP_WEBRTC_DTLS_SETUP knob decide our DTLS
+        # role; WebRtcMediaSession picks it (RFC 8842 active answerer by default for an
+        # actpass offer — ADR-0050).
         # STUN gathers srflx candidates; TURN (ADR-0034) gathers a relay candidate
         # when operator-provided credentials are configured (empty ⇒ host/STUN only).
         session = WebRtcMediaSession(
             offer_setup=audio.setup,
+            answer_setup=media_cfg.webrtc_dtls_setup,
             stun_urls=media_cfg.ice_stun_urls,
             turn_urls=media_cfg.ice_turn_urls,
             turn_username=media_cfg.ice_turn_username,

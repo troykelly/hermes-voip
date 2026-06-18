@@ -84,7 +84,7 @@ class _FakeHost:
     async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
         return True
 
-    async def open_entry(self, call_id: str) -> bool:
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         return True
 
     async def transfer_blind_on_call(

@@ -126,6 +126,14 @@ from hermes_voip.message import (
     new_call_id,
     new_tag,
 )
+from hermes_voip.multi_intercom import (
+    IntercomEntry,
+    MultiIntercomConfig,
+    Opening,
+    OpeningType,
+    fire_webhook_opening,
+    load_multi_intercom_config,
+)
 from hermes_voip.notice_filter import is_internal_system_notice
 from hermes_voip.originate import (
     OutboundCallFailed,
@@ -363,6 +371,13 @@ class VoipAdapter(BasePlatformAdapter):
         # The relay client (RELAY mode only) is built once in connect().
         self._intercom_cfg: IntercomConfig | None = None
         self._intercom_relay: IntercomRelayClient | None = None
+        # Multi-intercom NAMED openings (ADR-0045): multiple intercom caller-IDs, each
+        # with a named opening set (door/gate/garage), each opening a DTMF code OR a
+        # webhook. EMPTY by default (the legacy single-intercom path above applies);
+        # populated from HERMES_VOIP_INTERCOM_CONFIG_FILE in connect(). A call whose
+        # caller-ID matches an entry stores it on _call_info[call_id]['intercom_entry']
+        # so open_entry(name) is scoped to ONLY that intercom's openings.
+        self._multi_intercom: MultiIntercomConfig = MultiIntercomConfig(entries=())
         self._tls_ctx: ssl.SSLContext | None = None
         self._keepalive_interval: float = 30.0
         self._transport: SignalingTransport | None = None
@@ -479,6 +494,11 @@ class VoipAdapter(BasePlatformAdapter):
             if intercom_cfg.open_mode is IntercomOpenMode.RELAY
             else None
         )
+        # Multi-intercom NAMED openings (ADR-0045): opt-in via
+        # HERMES_VOIP_INTERCOM_CONFIG_FILE; empty otherwise. Loaded once here so a
+        # malformed document (bad type / invalid DTMF code / non-https webhook URL)
+        # fails LOUD at startup, never at door-open time (rule 37).
+        self._multi_intercom = load_multi_intercom_config(extra)
         self._tls_ctx = _make_tls_context(gateway_cfg.host)
         self._keepalive_interval = float(
             extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
@@ -2033,6 +2053,11 @@ class VoipAdapter(BasePlatformAdapter):
             is_webrtc=is_webrtc,
             transport=via_transport,
         )
+        # ADR-0045: match the caller-ID against the multi-intercom config. A match
+        # binds this call to that intercom's NAMED opening set, scoping open_entry(name)
+        # to ONLY those openings. Caller-ID is forgeable (never auth) — the per-opening
+        # secret + the ELEVATED/allowed_tools gate are the protection, not the match.
+        intercom_entry = self._multi_intercom.match(caller_number)
         self._call_info[call_id] = {
             "name": caller_number,
             "remote_uri": from_header,
@@ -2047,6 +2072,11 @@ class VoipAdapter(BasePlatformAdapter):
             # ADR-0052: the rich, structured inbound-call context (forgeable).
             "context": call_context,
         }
+        if intercom_entry is not None:
+            # ADR-0045: bind the matched intercom's NAMED opening set to this call so
+            # open_entry(name) is scoped to ONLY these openings (and surface the NAMES,
+            # never the secret codes/urls, to the agent below).
+            self._call_info[call_id]["intercom_entry"] = intercom_entry
 
         # --- Seed the agent's first turn with the rich call context (ADR-0052) ---
         # Inject the labelled, untrusted call-context block as the call's first system
@@ -2823,16 +2853,40 @@ class VoipAdapter(BasePlatformAdapter):
         await session.send_dtmf(digits)
         return True
 
-    async def open_entry(self, call_id: str) -> bool:
-        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031).
+    def _intercom_entry_for_call(self, call_id: str) -> IntercomEntry | None:
+        """The multi-intercom entry bound to ``call_id`` at INVITE time, or None."""
+        entry = self._call_info.get(call_id, {}).get("intercom_entry")
+        return entry if isinstance(entry, IntercomEntry) else None
+
+    async def _fire_webhook_opening(self, opening: Opening) -> None:
+        """Actuate a WEBHOOK opening (ADR-0045) — a seam the tests can override.
+
+        Delegates to :func:`hermes_voip.multi_intercom.fire_webhook_opening` (the
+        blocking ``urllib`` request runs off the event loop). The url/headers/body are
+        never logged (they may carry secrets).
+        """
+        await fire_webhook_opening(opening)
+
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
+        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031/0045).
 
         The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the intercom
-        group's ``open_entry`` tool calls. Opens the entry via the configured
-        actuation path:
+        group's ``open_entry`` tool calls.
 
-        * **DTMF** — send the configured open code on the live call (via
-          :meth:`~hermes_voip.call.CallSession.send_dtmf`); or
-        * **RELAY** — call the external relay client.
+        **Multi-intercom (ADR-0045).** When this call's caller-ID matched a
+        multi-intercom entry at setup, ``name`` selects one of that intercom's NAMED
+        openings (door / gate / garage), scoped to ONLY that intercom's set:
+
+        * a ``name`` not in the calling intercom's set raises :class:`ValueError`
+          (the door is never opened by a name the intercom does not own);
+        * each opening actuates via its own DTMF code or its own webhook.
+
+        ``name`` defaults to the sole opening when the intercom has exactly one; an
+        ambiguous ``None`` with several openings raises (the agent must choose).
+
+        **Single-intercom (ADR-0031, back-compat).** When the call matched no
+        multi-intercom entry, ``name`` is ignored and the legacy single actuation path
+        (the ``HERMES_VOIP_INTERCOM_*`` env scheme) applies: DTMF open code or relay.
 
         Returns ``False`` (and does nothing) for an unknown/ended call so the tool
         reports a clear, non-fatal outcome. The ``pre_tool_call`` gate has already
@@ -2840,13 +2894,64 @@ class VoipAdapter(BasePlatformAdapter):
         sub-ceiling before this runs.
 
         Raises:
-            RuntimeError: when no actuation is configured (the default DISABLED
-                mode) — opening a door is never a silent no-op (rule 37); the tool
-                surfaces this as a clear error.
-            IntercomRelayError: when the relay call fails (RELAY mode) — the door
-                was NOT opened, and the failure is reported, never hidden.
-            ValueError: if the configured DTMF open code is invalid (DTMF mode).
+            ValueError: a ``name`` outside the calling intercom's set, or an ambiguous
+                ``None`` name on a multi-opening intercom, or an invalid DTMF code.
+            RuntimeError: when no actuation is configured for a non-multi caller (the
+                default DISABLED single-intercom mode) — opening a door is never a
+                silent no-op (rule 37).
+            IntercomRelayError / WebhookError: when the relay/webhook call fails — the
+                door was NOT opened, and the failure is reported, never hidden.
         """
+        entry = self._intercom_entry_for_call(call_id)
+        if entry is not None:
+            return await self._open_named_entry(call_id, entry, name)
+        return await self._open_legacy_entry(call_id)
+
+    async def _open_named_entry(
+        self, call_id: str, entry: IntercomEntry, name: str | None
+    ) -> bool:
+        """Open a NAMED opening, scoped to the calling intercom's set (ADR-0045)."""
+        resolved = self._resolve_opening_name(entry, name)
+        opening = entry.openings[resolved]
+        if opening.type is OpeningType.WEBHOOK:
+            # Require a live call so a stale tool call cannot open the entry; the
+            # webhook itself does not need the media leg.
+            session = self._call_sessions.get(call_id)
+            if session is None or session.ended:
+                return False
+            _log.info("intercom open_entry (webhook) %r for call %s", resolved, call_id)
+            await self._fire_webhook_opening(opening)
+            return True
+        # DTMF opening: send the opening's own open code on the live call (send_dtmf
+        # handles unknown/ended -> False and not-negotiated -> raise; logs only the
+        # digit count — the open code is sensitive).
+        _log.info("intercom open_entry (dtmf) %r for call %s", resolved, call_id)
+        return await self.send_dtmf_on_call(call_id, opening.dtmf_code)
+
+    @staticmethod
+    def _resolve_opening_name(entry: IntercomEntry, name: str | None) -> str:
+        """Resolve + validate the opening name against the intercom set (fail-loud)."""
+        names = entry.opening_names()
+        if name is None:
+            if len(names) == 1:
+                return names[0]
+            available = ", ".join(sorted(names))
+            msg = (
+                "this intercom has multiple openings; specify which one to open. "
+                f"Available openings: {available}"
+            )
+            raise ValueError(msg)
+        if name not in entry.openings:
+            available = ", ".join(sorted(names))
+            msg = (
+                f"opening {name!r} is not one of this intercom's openings. "
+                f"Available openings: {available}"
+            )
+            raise ValueError(msg)
+        return name
+
+    async def _open_legacy_entry(self, call_id: str) -> bool:
+        """The ADR-0031 single-intercom actuation path (back-compat)."""
         cfg = self._intercom_cfg
         if cfg is None or cfg.open_mode is IntercomOpenMode.DISABLED:
             msg = (
@@ -3253,6 +3358,27 @@ class VoipAdapter(BasePlatformAdapter):
             return  # no rich context (e.g. an outbound call) — nothing to seed
         caller = str(info.get("name", call_id))
         text = render_call_context_block(context)
+        # ADR-0045: when this call matched a multi-intercom entry, surface the
+        # available opening NAMES (never the secret codes/urls) so the agent knows
+        # which entry it can open via open_entry(name=...). This line is operator
+        # configuration (not caller-supplied), so it is TRUSTED — it is appended to the
+        # rendered block as a fixed system note, not defanged.
+        #
+        # THREAT-MODEL NOTE (ADR-0045 decision 4): WHICH name set is shown is selected
+        # by the matched intercom entry, and that match keys off a FORGEABLE caller-ID
+        # (ADR-0020/0021). A spoofer presenting an intercom's caller-ID can thus make
+        # this trusted note appear and learn the opening NAMES — but never the
+        # codes/urls/tokens (server-side, repr-suppressed) and never an actual opening:
+        # open_entry stays ELEVATED + grant-only, so a name grants nothing without the
+        # operator's prior authorization of that caller into the intercom group.
+        entry = self._intercom_entry_for_call(call_id)
+        if entry is not None:
+            names = ", ".join(sorted(entry.opening_names()))
+            text = (
+                f"{text}\n[System: this is an INTERCOM. You can open the following "
+                f"named entries with open_entry(name=...): {names}. Open one ONLY for "
+                "a legitimate, expected visitor.]"
+            )
         try:
             # ADR-0035: the rich call-context seed lands on the call's channel so it
             # shares the same session as the turns it precedes.

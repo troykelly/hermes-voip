@@ -43,10 +43,11 @@ class _SkillRecordingCtx:
     description="")`` arity so :func:`hermes_voip.plugin.register` can call it
     exactly as it would the real runtime. The real implementation calls
     ``path.exists()`` / ``path.name`` on the argument, so ``path`` MUST be a
-    :class:`~pathlib.Path` (a ``str`` raises ``AttributeError`` inside the runtime —
-    this is asserted against the real hermes-agent in
-    ``tests/test_hermes_contract.py``). The platform/tool/hook registrations are
-    accepted and ignored — this fake exists to capture the SKILL registrations.
+    :class:`~pathlib.Path` (a ``str`` would raise ``AttributeError`` inside the
+    runtime). ``test_each_registered_skill_path_exists_with_valid_frontmatter`` below
+    asserts every registered skill is passed a :class:`~pathlib.Path`. The
+    platform/tool/hook registrations are accepted and ignored — this fake exists to
+    capture the SKILL registrations.
     """
 
     def __init__(self) -> None:
@@ -91,7 +92,7 @@ def test_each_registered_skill_path_exists_with_valid_frontmatter() -> None:
         assert name in by_name, f"bundled skill {name!r} was not registered"
         path_obj = by_name[name]["path"]
         # The real runtime requires a Path (it calls path.exists()/path.name); a str
-        # raises inside hermes-agent (pinned by tests/test_hermes_contract.py).
+        # would raise inside hermes-agent. This assertion is the contract guard.
         assert isinstance(path_obj, Path), f"{name}: path must be a pathlib.Path"
         skill_path = path_obj
         assert skill_path.exists(), f"{name}: registered path {path_obj!r} missing"

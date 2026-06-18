@@ -39,6 +39,12 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 #: The subdirectory (under the ``hermes_voip`` package) the skills live in.
+#:
+#: This data directory ``hermes_voip/skills/`` coexists intentionally with this
+#: ``hermes_voip/skills.py`` module: Python lets a module and a sibling data
+#: subdirectory share a name because the subdirectory has no ``__init__.py`` (it is
+#: package data, not a subpackage). Adding ``hermes_voip/skills/__init__.py`` would
+#: turn it into a subpackage and collide with this module — so it must NOT exist.
 _SKILLS_DIRNAME = "skills"
 
 #: The skill manifest filename Hermes reads (one per skill directory).
@@ -139,6 +145,12 @@ def skill_file_path(name: str) -> Path:
     """
     resource = files(__package__) / _SKILLS_DIRNAME / name / _SKILL_FILENAME
     with as_file(resource) as path:
+        # Assumption: ``hermes_voip`` is loaded from a real directory, not a
+        # zipimport. For a directory-backed resource ``as_file`` returns the actual
+        # on-disk path and its context-manager exit is a no-op, so the Path stays
+        # valid after the ``with`` block. (For a zipimport target ``as_file`` would
+        # extract to a temp file that is deleted on exit, making the returned path
+        # stale — not a configuration hermes uses, but the constraint is documented.)
         return Path(path).resolve()
 
 
@@ -148,9 +160,10 @@ class _RegisterSkill(Protocol):
     Mirrors hermes-agent 0.16.0's
     ``PluginContext.register_skill(name, path: Path, description="")`` exactly: the
     real implementation calls ``path.exists()`` / ``path.name`` on the argument, so
-    it MUST be a :class:`~pathlib.Path` (a ``str`` raises ``AttributeError`` inside
-    the runtime — verified by ``tests/test_hermes_contract.py``). ``description`` is
-    optional there, so passing it is exact, not a stub.
+    it MUST be a :class:`~pathlib.Path` (a ``str`` would raise ``AttributeError``
+    inside the runtime). ``tests/test_register_skills.py`` asserts every registered
+    skill is passed a :class:`~pathlib.Path`. ``description`` is optional there, so
+    passing it is exact, not a stub.
     """
 
     def __call__(self, name: str, path: Path, description: str = "") -> None:

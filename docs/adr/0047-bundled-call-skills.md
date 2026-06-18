@@ -85,7 +85,8 @@ prompt's `<available_skills>` index — the agent loads it on demand via the
 - The skills ship with the wheel and resolve via `importlib.resources`, so they work
   for both directory-install and pip/entry-point install.
 - One corrected test contract: `register_skill` takes a `Path`, not a `str` (the
-  real runtime calls `path.exists()`); pinned by `tests/test_hermes_contract.py`.
+  real runtime calls `path.exists()`); `tests/test_register_skills.py` asserts every
+  registered skill is passed a `pathlib.Path`.
 
 ## Alternatives considered
 

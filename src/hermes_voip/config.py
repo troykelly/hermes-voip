@@ -65,6 +65,10 @@ _DEFAULT_TRANSPORT = "tls"
 _DEFAULT_EXPIRES = 300
 _DEFAULT_USER_AGENT = "hermes-voip/0"
 
+# WebSocket signalling (SIP-over-WSS, RFC 7118 / ADR-0016 §6 / ADR-0037). Only
+# meaningful when HERMES_SIP_TRANSPORT=wss; harmlessly defaulted otherwise.
+_DEFAULT_WS_PATH = "/ws"
+
 _MIN_PORT = 1
 _MAX_PORT = 65535
 
@@ -74,6 +78,10 @@ _TRANSPORT_KEY = "HERMES_SIP_TRANSPORT"
 _EXPIRES_KEY = "HERMES_SIP_EXPIRES"
 _USER_AGENT_KEY = "HERMES_SIP_USER_AGENT"
 _DEFAULT_EXTENSION_KEY = "HERMES_SIP_DEFAULT_EXTENSION"
+_WS_PATH_KEY = "HERMES_SIP_WS_PATH"
+# S105 noqa: this is the env-var NAME, not a password value — the SEPARATE WSS
+# digest credential is read from this key at runtime (ADR-0037 §3), never hardcoded.
+_WS_PASSWORD_KEY = "HERMES_SIP_WS_PASSWORD"  # noqa: S105
 
 _BARE_EXTENSION = "HERMES_SIP_EXTENSION"
 _BARE_PASSWORD = "HERMES_SIP_PASSWORD"  # noqa: S105 — env var name, not a secret
@@ -382,6 +390,13 @@ class GatewayConfig:
         user_agent: The ``User-Agent`` header value for every registration.
         extensions: All configured extensions, ordered by ``index`` ascending.
         default_index: The ``index`` of the inbound-fallback registration.
+        ws_path: The WebSocket upgrade path for the SIP-over-WSS transport
+            (RFC 7118; default ``/ws``). Only read on the ``wss`` transport.
+        ws_password: An optional digest-password override for the ``wss``
+            endpoint (ADR-0037). When set on a ``wss`` gateway it replaces the
+            per-extension SIP password in the digest; ``None`` (the default)
+            falls back to the per-extension SIP password. A **secret** —
+            repr-suppressed so it never reaches a log line.
     """
 
     host: str
@@ -391,6 +406,8 @@ class GatewayConfig:
     user_agent: str
     extensions: tuple[ExtensionConfig, ...]
     default_index: int
+    ws_path: str = _DEFAULT_WS_PATH
+    ws_password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Enforce the invariants the type promises, not just the parser.
@@ -444,10 +461,17 @@ class GatewayConfig:
         if ext not in self.extensions:
             msg = f"extension {ext.extension!r} is not configured on this gateway"
             raise ConfigError(msg)
+        # ADR-0037: a WebRTC/WSS gateway edge commonly authenticates against a
+        # SEPARATE credential than the SIP-TLS edge. On the wss transport, the
+        # optional ws_password overrides the per-extension SIP password; unset
+        # (or any tls transport) falls back to the per-extension SIP password.
+        password = ext.password
+        if self.transport == "wss" and self.ws_password is not None:
+            password = self.ws_password
         return RegistrationConfig(
             aor=f"sip:{ext.extension}@{self.host}",
             username=ext.username,
-            password=ext.password,
+            password=password,
             contact=contact,
             local_sent_by=local_sent_by,
             transport=self.via_transport,
@@ -998,6 +1022,10 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
     port = _parse_port(env, transport)
     expires = _parse_expires(env)
     user_agent = _value(env, _USER_AGENT_KEY) or _DEFAULT_USER_AGENT
+    ws_path = _value(env, _WS_PATH_KEY) or _DEFAULT_WS_PATH
+    # The separate WSS digest credential (ADR-0037): read by name; the value lives
+    # only in .env / 1Password. None ⇒ fall back to the per-extension SIP password.
+    ws_password = _value(env, _WS_PASSWORD_KEY) or None
 
     extensions = _parse_extensions(env)
     default_index = _resolve_default_index(env, extensions)
@@ -1010,6 +1038,8 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
         user_agent=user_agent,
         extensions=extensions,
         default_index=default_index,
+        ws_path=ws_path,
+        ws_password=ws_password,
     )
 
 

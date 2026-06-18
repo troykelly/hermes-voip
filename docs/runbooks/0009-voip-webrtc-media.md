@@ -23,7 +23,7 @@ design). This runbook is the operational HOW.
 | ICE **consent freshness** (RFC 7675) — long calls behind NAT drop deterministically | **Wired** (ADR-0034; aioice-native, surfaced) |
 | **Trickle** ICE — SDP primitives (`a=ice-options:trickle`, `a=end-of-candidates`) + half-trickle answer | **Wired** (ADR-0034) |
 | **Outbound** WebRTC origination (our own offer) | **Deferred** — outbound runs over SIP-over-TLS |
-| SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Deferred** — registration/INVITE run over TLS |
+| SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Wired** (ADR-0037); see "SIP-over-WSS signalling" — full live validation needs the operator's WSS port + credential |
 | Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |
 | **Live** validation against a real WebRTC client | **Pending** the operator's redeploy |
@@ -31,7 +31,8 @@ design). This runbook is the operational HOW.
 ## Prerequisites
 
 1. **The `webrtc` extra** (`uv sync --extra webrtc` / `--all-extras`): `aioice` (ICE),
-   `pyopenssl` (DTLS-SRTP), `opuslib` (Opus), `websockets` (WSS — roadmap).
+   `pyopenssl` (DTLS-SRTP), `opuslib` (Opus), `websockets` (SIP-over-WSS signalling —
+   required when `HERMES_SIP_TRANSPORT=wss`).
 2. **The system `libopus` shared library** — `opuslib` is a pure-Python ctypes wrapper that
    `dlopen`s `libopus` at runtime (it bundles no native code):
 
@@ -48,6 +49,46 @@ design). This runbook is the operational HOW.
    uv run python -c "import ctypes.util; print(ctypes.util.find_library('opus'))"
    # -> libopus.so.0
    ```
+
+## SIP-over-WSS signalling (`HERMES_SIP_TRANSPORT=wss` — ADR-0037)
+
+To register and receive calls over a gateway's **Secure-WebSocket** edge (the WebRTC
+signalling transport, RFC 7118) instead of SIP-over-TLS, select the WSS transport. The
+adapter then builds `WssSipTransport` (subprotocol `sip`, WSS Via, `transport=ws`
+Outbound Contact) instead of `SipOverTlsTransport`; a SAVPF/DTLS/ICE INVITE arriving over
+it flows into the same WebRTC media path above.
+
+| Item | Value |
+| --- | --- |
+| Transport selector | `HERMES_SIP_TRANSPORT=wss` (default `tls`) |
+| Endpoint | `wss://${HERMES_SIP_HOST}:${HERMES_SIP_PORT}${HERMES_SIP_WS_PATH}` |
+| WS port | `HERMES_SIP_PORT` (default `443` for `wss`; set the gateway's real WSS port) |
+| WS path | `HERMES_SIP_WS_PATH` (default `/ws`) |
+| WS credential | `HERMES_SIP_WS_PASSWORD` — the SEPARATE WSS digest password; **unset ⇒ falls back to `HERMES_SIP_PASSWORD`** |
+| Read by | `hermes_voip.config.load_gateway_config` → `GatewayConfig.transport / ws_path / ws_password` |
+| Applied at | `adapter._establish()` selects the transport class; `registration_config()` applies the WS password override on `wss` |
+
+- **A WebRTC/WSS gateway edge is commonly a different port + a different digest password**
+  than the SIP-TLS edge. Set `HERMES_SIP_PORT` to the WSS port and, if the WSS endpoint
+  uses its own credential, `HERMES_SIP_WS_PASSWORD`. The password is a **secret** —
+  `repr`-suppressed on `GatewayConfig` (never logged); keep the value in `.env` /
+  1Password, never a tracked file. If the WSS edge shares the SIP password, leave
+  `HERMES_SIP_WS_PASSWORD` unset (the documented fallback).
+- **`wss://` verifies the gateway certificate** with the same TLS context the SIP-TLS
+  transport uses (no `verify=False`); the SNI host is `HERMES_SIP_HOST` even when behind
+  a numeric address.
+- **One transport per process.** `HERMES_SIP_TRANSPORT` selects `tls` **or** `wss`; the
+  plugin does not run both registration stacks at once.
+- **Outbound is still SIP-over-TLS.** Selecting `wss` does not yet route the agent's
+  `place_call` over the WebSocket (outbound WebRTC origination is deferred, ADR-0032 §5);
+  inbound over WSS is wired end-to-end.
+- **Live WSS validation is the operator step.** Unit tests prove transport selection +
+  the WSS Contact/Via + the SAVPF-over-WSS → `is_webrtc` routing + the credential override
+  (see "How to verify"). A **full live WSS REGISTER + call** needs the operator's real WSS
+  **port + `HERMES_SIP_WS_PASSWORD`** in `.env` and a plugin restart, validated like the
+  live-gateway path (runbook 0002). A prior live probe saw a `401` on the gateway's
+  Secure-WebSocket REGISTER for the test extension; the plugin now emits the correct RFC
+  7118 REGISTER, so the remaining variable is the gateway-side endpoint + credential.
 
 ## The STUN knob
 
@@ -191,6 +232,21 @@ trickles; that would be tasked into a signalling lane (it is a latency optimisat
   pipe and asserts the role-mirrored SRTP cross-decrypts. The adapter branch (the full
   is_webrtc path) is exercised by `tests/test_adapter_webrtc.py` in the `hermes-contract` CI
   job (which installs hermes + webrtc + media + libopus).
+
+- **SIP-over-WSS signalling (ADR-0037, no live gateway):**
+
+  ```
+  uv run pytest tests/test_adapter_wss_signalling.py \
+                tests/transport/test_ws_connection.py \
+                tests/test_config.py -k "ws_path or ws_password or wss or registration_config"
+  ```
+
+  Proves `_establish()` selects `WssSipTransport` for `transport=wss` (and the TLS
+  transport for `tls`) wiring the same inbound observers; that the WSS REGISTER uses a
+  `WSS` Via + `transport=ws` Contact; that a SAVPF/Opus/DTLS INVITE delivered over a faked
+  WSS transport routes into the `is_webrtc` branch (the dialog + call context advertise
+  `WSS`); and that `HERMES_SIP_WS_PASSWORD` overrides the digest on `wss` and falls back to
+  `HERMES_SIP_PASSWORD` when unset.
 
 - **Live (pending the operator's redeploy + a WebRTC client):** point a WebRTC client at the
   extension; in the operator log expect `WebRTC SDP answer built — setup=…`, `webrtc: DTLS-SRTP

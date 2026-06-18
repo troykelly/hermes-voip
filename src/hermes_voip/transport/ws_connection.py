@@ -106,10 +106,10 @@ class WssSipTransport:
                 the ``wss://`` host in the WebSocket URI.
             port: The WebSocket port (default ``443`` for ``wss``).
             ws_path: The HTTP upgrade path for the WebSocket endpoint (e.g.
-                ``/ws``). WSS signalling is not yet wired into the runtime, so
-                no code reads this value from the environment today; the
-                ``HERMES_SIP_WS_PATH`` env var is reserved for that future path
-                (see ADR-0016).
+                ``/ws``). The runtime supplies this from ``HERMES_SIP_WS_PATH``
+                via :attr:`~hermes_voip.config.GatewayConfig.ws_path` when
+                ``HERMES_SIP_TRANSPORT=wss`` selects this transport in
+                ``adapter._establish()`` (ADR-0037; default ``/ws``).
             connect_address: An alternative IP or hostname to dial (e.g.
                 ``127.0.0.1`` in tests); the TLS SNI / hostname verification
                 still uses ``host``.
@@ -293,8 +293,17 @@ class WssSipTransport:
         """Register a call's response sink so its responses route to it by Call-ID."""
         self._calls[call_id] = sink
 
-    def remove_call(self, call_id: str) -> None:
-        """Forget a call; drop any tracked client transactions for it."""
+    def remove_call(self, call_id: str, sink: CallResponseSink | None = None) -> None:
+        """Forget a call; drop any tracked client transactions for it.
+
+        Mirrors :meth:`SipOverTlsTransport.remove_call`: when ``sink`` is given
+        the registration is only removed if it is still that exact sink (an
+        overlapping INVITE sharing a Call-ID may have overwritten the entry, so
+        an earlier call's teardown must not evict the live later one). With
+        ``sink=None`` the removal is unconditional.
+        """
+        if sink is not None and self._calls.get(call_id) is not sink:
+            return
         self._calls.pop(call_id, None)
         for key in [k for k in self._client_txns if k[0] == call_id]:
             del self._client_txns[key]

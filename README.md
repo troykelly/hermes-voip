@@ -325,11 +325,11 @@ What is built and working today:
   and a backup voice that takes over if a cloud voice fails mid-call so the caller never hears
   dead silence.
 
-> **On the roadmap (not yet — don't rely on these):** **outbound** WebRTC calls and SIP
-> signalling over Secure-WebSocket are in progress (registration and outbound run over
-> SIP-over-TLS today); TURN relay, trickle ICE, and WebRTC **video** are deferred; and a
-> spoof-resistant keypad-confirmation channel (which would unlock call **transfer**) is still
-> to come. The current state of each is tracked in [`docs/adr/`](docs/adr/).
+> **On the roadmap (not yet — don't rely on these):** **outbound** WebRTC calls (your agent
+> placing a WebRTC call) run over SIP-over-TLS today; WebRTC **video** is deferred. (SIP
+> signalling over **Secure-WebSocket** for *inbound* WebRTC is now wired — set
+> `HERMES_SIP_TRANSPORT=wss`; full live validation needs your gateway's WSS port +
+> credential.) The current state of each is tracked in [`docs/adr/`](docs/adr/).
 
 ---
 
@@ -347,8 +347,15 @@ Everything is set with environment variables in your gitignored `.env` (copy fro
 | `HERMES_SIP_EXTENSION`  | yes      | —              | The extension to register as, e.g. `1000`      |
 | `HERMES_SIP_PASSWORD`   | yes      | —              | That extension's password                      |
 | `HERMES_SIP_USERNAME`   | no       | the extension  | Login username, if it differs from the extension |
-| `HERMES_SIP_PORT`       | no       | `5061` (TLS)   | Signalling port                                |
-| `HERMES_SIP_TRANSPORT`  | no       | `tls`          | `tls` (working) — `wss` is on the roadmap      |
+| `HERMES_SIP_PORT`       | no       | `5061` (TLS) / `443` (WSS) | Signalling port                     |
+| `HERMES_SIP_TRANSPORT`  | no       | `tls`          | `tls` or `wss` (SIP-over-Secure-WebSocket)     |
+| `HERMES_SIP_WS_PATH`    | no       | `/ws`          | WebSocket upgrade path (only when `wss`)       |
+| `HERMES_SIP_WS_PASSWORD`| no       | the SIP password | Separate WSS digest password, if your gateway's WebRTC edge differs (only when `wss`) |
+
+**Using WebRTC over a Secure-WebSocket?** Set `HERMES_SIP_TRANSPORT=wss` and point
+`HERMES_SIP_PORT` at your gateway's WebRTC/WSS port. If that endpoint uses a different
+password than the SIP-TLS one, set `HERMES_SIP_WS_PASSWORD` (a secret — `.env` only);
+otherwise it falls back to `HERMES_SIP_PASSWORD`.
 
 **More than one extension?** Use the numbered form `HERMES_SIP_EXTENSION_<n>` +
 `HERMES_SIP_PASSWORD_<n>` (and optional `HERMES_SIP_USERNAME_<n>`), with

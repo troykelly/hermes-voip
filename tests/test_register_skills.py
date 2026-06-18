@@ -39,10 +39,14 @@ _FRONTMATTER_RE = re.compile(r"\A---\r?\n(?P<body>.*?)\r?\n---\r?\n", re.DOTALL)
 class _SkillRecordingCtx:
     """A PluginContext stand-in recording register_skill (+ the other hooks).
 
-    Mirrors the real ``PluginContext.register_skill(name, path, description="")``
-    arity so :func:`hermes_voip.plugin.register` can call it exactly as it would the
-    real runtime. The platform/tool/hook registrations are accepted and ignored —
-    this fake exists to capture the SKILL registrations.
+    Mirrors the real ``PluginContext.register_skill(name, path: Path,
+    description="")`` arity so :func:`hermes_voip.plugin.register` can call it
+    exactly as it would the real runtime. The real implementation calls
+    ``path.exists()`` / ``path.name`` on the argument, so ``path`` MUST be a
+    :class:`~pathlib.Path` (a ``str`` raises ``AttributeError`` inside the runtime —
+    this is asserted against the real hermes-agent in
+    ``tests/test_hermes_contract.py``). The platform/tool/hook registrations are
+    accepted and ignored — this fake exists to capture the SKILL registrations.
     """
 
     def __init__(self) -> None:
@@ -58,7 +62,7 @@ class _SkillRecordingCtx:
     def register_hook(self, hook_name: str, callback: object) -> None:
         return None
 
-    def register_skill(self, name: str, path: str, description: str = "") -> None:
+    def register_skill(self, name: str, path: Path, description: str = "") -> None:
         self.skill_calls.append(
             {"name": name, "path": path, "description": description}
         )
@@ -86,8 +90,10 @@ def test_each_registered_skill_path_exists_with_valid_frontmatter() -> None:
     for name in _EXPECTED_SKILLS:
         assert name in by_name, f"bundled skill {name!r} was not registered"
         path_obj = by_name[name]["path"]
-        assert isinstance(path_obj, str), f"{name}: path must be a str"
-        skill_path = Path(path_obj)
+        # The real runtime requires a Path (it calls path.exists()/path.name); a str
+        # raises inside hermes-agent (pinned by tests/test_hermes_contract.py).
+        assert isinstance(path_obj, Path), f"{name}: path must be a pathlib.Path"
+        skill_path = path_obj
         assert skill_path.exists(), f"{name}: registered path {path_obj!r} missing"
         assert skill_path.is_file(), f"{name}: registered path is not a file"
         assert skill_path.name == "SKILL.md", (

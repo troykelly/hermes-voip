@@ -85,7 +85,18 @@ and `audio` are already in scope, and the result is persisted on
 `_call_info[call_id]["context"]` beside the existing keys. A new
 `_inject_call_context_first_turn(call_id)` — best-effort, `internal=True`, mirroring
 `_inject_objective_first_turn` — injects the rendered block as the call's first system turn.
-It runs for **inbound** calls (the outbound path keeps the objective seed).
+It runs for **inbound** calls (the outbound path keeps the objective seed) and is **awaited
+before `_run_call_loop` starts the media pump**, so the context turn is delivered ahead of
+any caller transcript (deterministic "first turn", not a race with the first utterance). The
+injection catches and logs its own failure, so awaiting it never strands the call.
+
+**Repeatable-header + ordering correctness.** `Diversion` / `History-Info` values are
+flattened both across header lines and across the top-level commas that RFC 3261 §7.3.1
+allows within one field (a comma inside `"…"` / `<…>` is not a separator), so a gateway that
+combines hops comma-separated is parsed correctly. `History-Info` entries are sorted by their
+RFC 7044 dotted-decimal `index` (numeric per component, so `1.10` follows `1.2`); a
+missing/malformed index sorts last in received order (stable). Header-parameter splitting is
+likewise quoted-string-aware (`reason="no;answer"` is one parameter).
 
 ## Consequences
 

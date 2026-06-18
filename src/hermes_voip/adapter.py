@@ -1518,20 +1518,16 @@ class VoipAdapter(BasePlatformAdapter):
         }
 
         # --- Seed the agent's first turn with the rich call context (ADR-0033) ---
-        # Inject the labelled, untrusted call-context block as the call's first
-        # system turn so the agent knows who called, what was dialled, and how the
-        # call reached it before the caller speaks. Scheduled as its own tracked
-        # task (mirroring the outbound objective seed) so it runs concurrently with
-        # the CallLoop and never blocks call setup; best-effort, so a failure to
-        # inject is logged, not raised. Outbound calls carry the objective seed
+        # Inject the labelled, untrusted call-context block as the call's first system
+        # turn so the agent knows who called, what was dialled, and how the call reached
+        # it BEFORE the caller speaks. Awaited HERE, before _run_call_loop starts the
+        # media pump, so the context turn is delivered ahead of any caller transcript
+        # (the loop only begins consuming inbound audio after this returns) — making
+        # "first turn" deterministic, not a race with the first caller utterance. The
+        # injection is best-effort (it catches and logs its own failure internally), so
+        # awaiting it can never strand the call. Outbound calls carry the objective seed
         # instead (no "context" key), so this is a no-op there.
-        context_turn_task: asyncio.Task[None] = asyncio.create_task(
-            self._inject_call_context_first_turn(call_id)
-        )
-        self._call_tasks.setdefault(call_id, set()).add(context_turn_task)
-        context_turn_task.add_done_callback(
-            lambda t: self._on_call_task_done(call_id, t)
-        )
+        await self._inject_call_context_first_turn(call_id)
 
         # --- Build + run CallLoop (leak-safe) ------------------------------
         # Everything from here on has already accepted the call (200 OK sent,

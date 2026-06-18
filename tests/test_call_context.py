@@ -267,6 +267,106 @@ def test_referred_by_and_reason() -> None:
     assert ctx.reason == 'SIP;cause=302;text="Moved Temporarily"'
 
 
+def test_diversion_comma_combined_in_one_header_line() -> None:
+    # RFC 3261 §7.3.1: a repeatable header MAY combine values comma-separated in a
+    # single field. Both hops must be recovered (not parsed as one polluted hop).
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            (
+                "Diversion",
+                "<sip:1001@pbx.example.test>;reason=no-answer;counter=1, "
+                "<sip:1000@pbx.example.test>;reason=unconditional;counter=2",
+            ),
+        ]
+    )
+    assert len(ctx.diversion) == 2
+    assert ctx.diversion[0].uri == "sip:1001@pbx.example.test"
+    assert ctx.diversion[0].reason == "no-answer"
+    assert ctx.diversion[1].uri == "sip:1000@pbx.example.test"
+    assert ctx.diversion[1].counter == 2
+
+
+def test_diversion_comma_inside_uri_is_not_a_separator() -> None:
+    # A comma inside the <uri> (e.g. an escaped header) must NOT split the hop.
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            ("Diversion", "<sip:1000@pbx.example.test?h=1,2>;reason=no-answer"),
+        ]
+    )
+    assert len(ctx.diversion) == 1
+    assert ctx.diversion[0].uri == "sip:1000@pbx.example.test?h=1,2"
+    assert ctx.diversion[0].reason == "no-answer"
+
+
+def test_diversion_quoted_semicolon_in_reason_param() -> None:
+    # A ';' inside a quoted-string param value must NOT split the param.
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            ("Diversion", '<sip:1000@pbx.example.test>;reason="no;answer";counter=1'),
+        ]
+    )
+    assert ctx.diversion[0].reason == "no;answer"
+    assert ctx.diversion[0].counter == 1
+
+
+def test_history_info_comma_combined_in_one_header_line() -> None:
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            (
+                "History-Info",
+                "<sip:1000@pbx.example.test>;index=1, "
+                "<sip:1001@pbx.example.test>;index=1.1;cause=302",
+            ),
+        ]
+    )
+    assert len(ctx.history_info) == 2
+    assert ctx.history_info[0].index == "1"
+    assert ctx.history_info[1].index == "1.1"
+    assert ctx.history_info[1].cause == 302
+
+
+def test_history_info_sorted_by_rfc7044_index() -> None:
+    # Entries arriving out of order are presented in RFC 7044 index (chain) order.
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            ("History-Info", "<sip:c@pbx.example.test>;index=1.2"),
+            ("History-Info", "<sip:a@pbx.example.test>;index=1"),
+            ("History-Info", "<sip:b@pbx.example.test>;index=1.1"),
+        ]
+    )
+    assert [e.index for e in ctx.history_info] == ["1", "1.1", "1.2"]
+
+
+def test_history_info_dotted_index_sorts_numerically_not_lexically() -> None:
+    # 1.10 must sort AFTER 1.2 (numeric per component), not before it (lexical).
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            ("History-Info", "<sip:a@pbx.example.test>;index=1.10"),
+            ("History-Info", "<sip:b@pbx.example.test>;index=1.2"),
+        ]
+    )
+    assert [e.index for e in ctx.history_info] == ["1.2", "1.10"]
+
+
+def test_history_info_malformed_index_sorts_last_stably() -> None:
+    # A missing/malformed index sorts after well-formed ones, keeping received order.
+    ctx = _ctx(
+        [
+            ("From", "<sip:2000@pbx.example.test>;tag=abc"),
+            ("History-Info", "<sip:bad@pbx.example.test>;index=not-a-number"),
+            ("History-Info", "<sip:good@pbx.example.test>;index=1"),
+        ]
+    )
+    assert ctx.history_info[0].uri == "sip:good@pbx.example.test"
+    assert ctx.history_info[1].uri == "sip:bad@pbx.example.test"
+
+
 # --------------------------------------------------------------------------- #
 # Device / context                                                           #
 # --------------------------------------------------------------------------- #

@@ -5,7 +5,9 @@ SIP INVITE reveals — caller identity, the number that was dialled, the forward
 (who/why the call was redirected), the calling device, and the negotiated media — and hands
 it to the agent as the call's **first turn**: a single, clearly-labelled *untrusted* "call
 context" block. The agent can then screen the caller, recognise a door intercom, or route
-the conversation, knowing how the call reached it before anyone speaks.
+the conversation, knowing how the call reached it before anyone speaks. The block is
+delivered **before** the media pump starts, so it always precedes the first caller
+utterance (it is not racing the caller's speech).
 
 There is **no configuration** for this feature. It is always on for inbound calls and adds
 one internal first turn per call; nothing to enable, no env var, no file. (Outbound calls
@@ -38,8 +40,8 @@ Absent fields are omitted (no empty lines). The exact headers read:
 |---|---|
 | Caller name / number / address | `From` (display-name + user-part), `P-Asserted-Identity` (RFC 3325, `sip:`+`tel:`), `Remote-Party-ID` (`privacy=`/`screen=`), `Privacy` (RFC 3323). The **asserted** identity prefers PAI → Remote-Party-ID → `From`. |
 | Dialled number / address | `Request-URI`, `To`. |
-| Forwarded-from chain | `Diversion` (RFC 5806 — repeatable, one hop per header, `reason=`/`counter=`/`privacy=`). |
-| Retarget history | `History-Info` (RFC 7044 — repeatable, `index=` order, `cause=`). |
+| Forwarded-from chain | `Diversion` (RFC 5806 — repeatable; one hop per header **or** comma-combined in one field, `reason=`/`counter=`/`privacy=`). |
+| Retarget history | `History-Info` (RFC 7044 — repeatable; presented in `index=` chain order, `cause=`). |
 | Referred by / Reason | `Referred-By` (RFC 3892), `Reason` (RFC 3326). |
 | Calling device / context | `User-Agent` (door/intercom panels self-identify here), `Call-Info`, `Contact`, `Allow`, `Supported`, `Subject`, `Organization`. |
 | Media / transport | negotiated codec, SRTP on/off, WebRTC vs SIP, the signalling transport. |

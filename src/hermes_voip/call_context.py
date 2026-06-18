@@ -110,28 +110,80 @@ def _user_part(uri: str) -> str | None:
     return None
 
 
+def _split_top_level(value: str, delimiter: str) -> list[str]:
+    """Split ``value`` on ``delimiter``, but only at the TOP level (RFC 3261 grammar).
+
+    A delimiter inside a ``"..."`` quoted-string or a ``<...>`` name-addr is NOT a
+    separator. This is the splitter the SIP grammar requires for both the comma that
+    joins repeatable-header values into one field (RFC 3261 §7.3.1) and the ``;`` that
+    separates header parameters — a comma inside ``<sip:a@b?h=1,2>`` or a ``;`` inside
+    ``reason="no;answer"`` must not split. Empty pieces are dropped by the callers.
+    Lenient: an unterminated quote/angle just runs to the end (never raises).
+    """
+    pieces: list[str] = []
+    current: list[str] = []
+    in_quote = False
+    angle_depth = 0
+    for char in value:
+        if char == '"':
+            in_quote = not in_quote
+            current.append(char)
+        elif char == "<" and not in_quote:
+            angle_depth += 1
+            current.append(char)
+        elif char == ">" and not in_quote and angle_depth > 0:
+            angle_depth -= 1
+            current.append(char)
+        elif char == delimiter and not in_quote and angle_depth == 0:
+            pieces.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    pieces.append("".join(current))
+    return pieces
+
+
 def _header_params(value: str) -> dict[str, str]:
     """Parse the ``;name=value`` header parameters of a SIP value into a dict.
 
     Parameters are taken from AFTER the name-addr ``<uri>`` (so a ``;`` inside the URI
     is not mistaken for a parameter separator); for a bare addr-spec the parameters are
-    everything after the first ``;``. Names are lower-cased; values have one layer of
-    quotes stripped. A valueless flag parameter maps to the empty string. Lenient.
+    everything after the first top-level ``;``. The ``;`` split respects quoted-strings
+    (``reason="no;answer"`` is one param). Names are lower-cased; values have one layer
+    of quotes stripped. A valueless flag parameter maps to the empty string. Lenient.
     """
-    close_angle = value.find(">")
+    # Params follow the name-addr ``<uri>``: take everything after the URI's CLOSING
+    # angle (the first ``>`` after the first ``<``), so neither a ';' inside the URI
+    # nor a later ``>`` inside a param value (e.g. +sip.instance="<urn:uuid:…>") is
+    # mistaken for the URI boundary.
+    open_angle = value.find("<")
+    close_angle = value.find(">", open_angle) if open_angle != -1 else -1
     tail = value[close_angle + 1 :] if close_angle != -1 else value
-    # For a bare addr-spec the URI itself precedes the first ';'; drop it.
+    # For a bare addr-spec the URI itself precedes the first ';'; drop it (top-level
+    # ';' only — a ';' inside a quoted display-name or URI is not a param boundary).
     if close_angle == -1:
-        first_semi = tail.find(";")
-        tail = tail[first_semi:] if first_semi != -1 else ""
+        _head, found, rest = _split_first_top_level(tail, ";")
+        tail = f";{rest}" if found else ""
     params: dict[str, str] = {}
-    for raw_part in tail.split(";"):
+    for raw_part in _split_top_level(tail, ";"):
         part = raw_part.strip()
         if not part:
             continue
         name, sep, raw = part.partition("=")
         params[name.strip().lower()] = _strip_quotes(raw.strip()) if sep else ""
     return params
+
+
+def _split_first_top_level(value: str, delimiter: str) -> tuple[str, bool, str]:
+    """Partition ``value`` at the FIRST top-level ``delimiter`` (quote/angle aware).
+
+    Returns ``(head, found, tail)`` like ``str.partition`` but skipping a delimiter that
+    sits inside a ``"..."`` quoted-string or a ``<...>`` span. Lenient.
+    """
+    pieces = _split_top_level(value, delimiter)
+    if len(pieces) == 1:
+        return pieces[0], False, ""
+    return pieces[0], True, delimiter.join(pieces[1:])
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +257,41 @@ def _parse_history_info(raw: str) -> HistoryInfoEntry:
         cause=cause,
         raw=raw,
     )
+
+
+def _repeatable_values(field_values: tuple[str, ...]) -> list[str]:
+    """Flatten a repeatable header's field values into individual member values.
+
+    RFC 3261 §7.3.1: a header that may appear multiple times may EITHER appear on
+    several lines OR be combined comma-separated into one field value. ``headers_all``
+    returns one string per physical line; this further splits each on top-level commas
+    (respecting ``"..."`` and ``<...>``), so ``Diversion: <a>;r=x, <b>;r=y`` yields two
+    members. Empty members (e.g. a trailing comma) are dropped. Order is preserved.
+    """
+    members: list[str] = []
+    for field_value in field_values:
+        for piece in _split_top_level(field_value, ","):
+            stripped = piece.strip()
+            if stripped:
+                members.append(stripped)
+    return members
+
+
+def _history_info_sort_key(entry: HistoryInfoEntry) -> tuple[int, tuple[int, ...]]:
+    """RFC 7044 ordering key for a History-Info entry: the dotted-decimal ``index``.
+
+    The ``index`` (e.g. ``1``, ``1.1``, ``1.2.1``) is the hierarchical chain position.
+    Returns ``(0, parsed_tuple)`` for a well-formed numeric dotted index so entries sort
+    by chain position, or ``(1, ())`` for a missing/malformed index so those sort last
+    in their received order (a stable sort preserves it). Never raises.
+    """
+    index = entry.index
+    if index is None:
+        return (1, ())
+    parts = index.split(".")
+    if all(part.isdigit() for part in parts) and parts != [""]:
+        return (0, tuple(int(part) for part in parts))
+    return (1, ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +405,23 @@ def extract_call_context(
 
     request_uri = invite.request_uri
 
+    # Redirection chains: each repeatable header may be split across lines AND
+    # comma-combined within a line (RFC 3261 §7.3.1) — flatten both. History-Info is
+    # ordered by its RFC 7044 ``index`` (a stable sort keeps received order for
+    # missing/malformed indices), so the rendered retarget chain reads in chain order.
+    diversion = tuple(
+        _parse_diversion(v) for v in _repeatable_values(invite.headers_all("Diversion"))
+    )
+    history_info = tuple(
+        sorted(
+            (
+                _parse_history_info(v)
+                for v in _repeatable_values(invite.headers_all("History-Info"))
+            ),
+            key=_history_info_sort_key,
+        )
+    )
+
     return InboundCallContext(
         from_uri=from_uri,
         from_number=_user_part(from_uri),
@@ -333,10 +437,8 @@ def extract_call_context(
         request_uri=request_uri,
         dialled_number=_user_part(request_uri),
         to=invite.header("To"),
-        diversion=tuple(_parse_diversion(v) for v in invite.headers_all("Diversion")),
-        history_info=tuple(
-            _parse_history_info(v) for v in invite.headers_all("History-Info")
-        ),
+        diversion=diversion,
+        history_info=history_info,
         referred_by=invite.header("Referred-By"),
         reason=invite.header("Reason"),
         user_agent=invite.header("User-Agent"),

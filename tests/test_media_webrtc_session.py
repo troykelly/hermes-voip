@@ -304,12 +304,16 @@ async def test_derive_video_srtp_session_shares_dtls_keys_bound_to_video_ssrc() 
     server_ice, client_ice = _linked_ice(
         ("svrU", "svrPwwwwwwwwwwwwww"), ("cliU", "cliPwwwwwwwwwwwwww")
     )
+    # Post-ADR-0050 (RFC 8842 active-answerer): an actpass offer makes the answerer
+    # ACTIVE, so to get one DTLS server + one DTLS client the "server" side answers
+    # an ``active`` offer (=> passive/server) and the "client" answers ``passive``
+    # (=> active/client). Mirrors the other handshake tests in this module.
     server = WebRtcMediaSession(
-        offer_setup=SetupRole("actpass"),
+        offer_setup=SetupRole("active"),  # => this side is passive/server
         ice_factory=lambda **_kw: server_ice,
     )
     client = WebRtcMediaSession(
-        offer_setup=SetupRole("passive"),
+        offer_setup=SetupRole("passive"),  # => this side is active/client
         ice_factory=lambda **_kw: client_ice,
     )
     await asyncio.gather(server.prepare(), client.prepare())

@@ -317,7 +317,7 @@ decode).
 
 | Env var | Meaning | Default |
 | --- | --- | --- |
-| `HERMES_VOIP_VIDEO_SOURCE_PATH` | Path to a pre-encoded **H.264 Annex-B** elementary-stream file (e.g. `clip.h264`). Set ⇒ video answer is `a=sendrecv` and the file is packetised (RFC 6184) + looped over the BUNDLE'd video SRTP stream. **Unset ⇒ `a=inactive`** (the m-line is kept so BUNDLE stays intact, but no video is sent). | unset (inactive) |
+| `HERMES_VOIP_VIDEO_SOURCE_PATH` | Path to a pre-encoded **H.264 Annex-B** elementary-stream file (e.g. `clip.h264`). Set ⇒ video answer is `a=sendonly` (we send video but discard inbound — never `a=sendrecv`, which would risk a silent inbound-audio outage; ADR-0044 §2a) and the file is packetised (RFC 6184) + looped over the BUNDLE'd video SRTP stream. **Unset ⇒ `a=inactive`** (the m-line is kept so BUNDLE stays intact, but no video is sent). Note: the offer must advertise H.264 `packetization-mode=1`; a mode-0-only offer is declined (`a=inactive`). | unset (inactive) |
 | `HERMES_VOIP_VIDEO_FPS` | The source's frame rate (1–60); the 90 kHz RTP timestamp advances `90000//fps` per frame. | `10` |
 
 Produce the source file **offline** with any tool (the plugin never encodes), e.g.:
@@ -334,8 +334,9 @@ config, the value is read from the env var and never committed.
 ### Verify
 
 - A WebRTC video offer is answered with `m=video <port> UDP/TLS/RTP/SAVPF <pt>` carrying
-  `a=group:BUNDLE`, `a=mid`, the negotiated `a=rtpmap:<pt> H264/90000`, and `a=sendrecv`
-  (source configured) or `a=inactive` (no source). Confirm in the 200 OK SDP.
+  `a=group:BUNDLE`, `a=mid`, the negotiated `a=rtpmap:<pt> H264/90000`, and `a=sendonly`
+  (source configured) or `a=inactive` (no source, or H.264 mode-0-only offer). Confirm in
+  the 200 OK SDP — the answer never carries `a=sendrecv` for video.
 - With a source set, the log shows
   `INVITE <id>: WebRTC outbound video started (ssrc=…, N NAL(s), F fps)`.
 - A configured-but-unreadable source is logged

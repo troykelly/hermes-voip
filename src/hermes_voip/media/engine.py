@@ -128,6 +128,10 @@ _DEFAULT_DTMF_VOLUME = 10
 # A fixed SSRC for the outbound stream — an obvious test fake.
 # (No real PBX should assign 0xCAFEBABE; the repo is public.)
 _OUTBOUND_SSRC: int = 0xCAFEBABE
+# Public alias of the fixed outbound (audio) SSRC, so the WebRTC video sender
+# (ADR-0044) can EXCLUDE it when randomising the BUNDLE'd video SSRC — a
+# collision would confuse the shared-5-tuple demux of audio vs video.
+OUTBOUND_AUDIO_SSRC: int = _OUTBOUND_SSRC
 
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512

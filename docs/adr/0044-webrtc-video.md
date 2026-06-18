@@ -2,8 +2,9 @@
 
 - **Date:** 2026-06-18
 - **Status:** Accepted (supersedes the encoder/codec-library decision of ADR-0018
-  §2 and §4; ADR-0018's overall shape — additive `m=video`, pre-encode-and-loop,
-  inbound discard, `m=video port 0` graceful decline — still holds)
+  §2 and §4, **and the `a=sendrecv` directionality of ADR-0018 §1d** — see §2a;
+  ADR-0018's overall shape — additive `m=video`, pre-encode-and-loop, inbound
+  discard, `m=video port 0` graceful decline — still holds)
 - **Deciders:** agent session (WebRTC video lane) — operator direction
 
 ## Context
@@ -57,7 +58,8 @@ re-introduce the heap-corrupting path by accident.
   and the resulting RTP packets are looped on the video SRTP stream (seq/ts
   rewritten per loop iteration; SPS/PPS + the first IDR re-sent at the start of
   each loop so a peer that joins mid-stream re-synchronises). The SDP answer's
-  video m-line is `a=sendrecv` (we contribute a track).
+  video m-line is **`a=sendonly`** — we contribute a track but do **not** solicit
+  inbound video (see §2a).
 - **Unset** → the answer's video m-line is **`a=inactive`** (we keep the m-line so
   BUNDLE stays intact, but advertise no media flow) and **no video sender task is
   started**. RFC-correct for a BUNDLE offer: the m-line count and order are
@@ -66,6 +68,29 @@ re-introduce the heap-corrupting path by accident.
 
 A call **with no `m=video`** is answered **exactly as today** — no video m-line is
 added, no video code runs. This is the audio-only regression invariant.
+
+### 2a. Direction is `a=sendonly` (sourced) / `a=inactive` (not) — never `a=sendrecv`
+
+When a source is configured we answer **`a=sendonly`**, not `a=sendrecv`, even
+though we have a track to contribute. The reason is a **silent-inbound-audio-outage
+hazard on the shared BUNDLE 5-tuple**:
+
+- audio and video share one ICE 5-tuple and one DTLS handshake (§4), but each
+  SRTP stream is bound to a single SSRC (one ROC + replay state);
+- the **inbound audio** `SrtpSession` is created **without a pre-bound SSRC**
+  (`media/dtls.py` `derive_srtp_sessions` calls `SrtpSession.from_raw_keys` with
+  no `ssrc=`), so it binds to the **first** inbound SSRC it authenticates;
+- answering `a=sendrecv` on video invites the gateway to **send inbound video** on
+  that same 5-tuple. If an inbound video packet arrives before the first inbound
+  audio packet, the audio session binds to the **video** SSRC, and every later
+  inbound audio packet then fails the SSRC check and is **silently dropped** — a
+  one-way-audio call with no error surfaced.
+
+Because the plugin **discards all inbound video anyway** (§5), there is no reason
+to solicit it. `a=sendonly` tells the peer not to send video at all, which removes
+the race entirely without needing to pre-bind the audio SRTP SSRC. An unset source
+answers `a=inactive` (no flow in either direction). We **never** emit `a=sendrecv`
+for video.
 
 ### 3. RFC 6184 packetisation
 
@@ -89,6 +114,16 @@ boundary cases (NAL exactly at, one over, and well over the MTU budget; first/la
 fragment flags; marker placement; NAL-header F/NRI propagation) and the
 single-NAL/STAP-A paths.
 
+**Codec selection requires `packetization-mode=1`.** Because the packetiser
+FU-A-fragments any large NAL, it can only honour an H.264 mode that permits FU-A
+— i.e. RFC 6184 **packetization-mode=1**. `negotiate_video_h264` therefore selects
+**only** an offered H.264 codec whose `fmtp` declares `packetization-mode=1`; it
+**declines** (returns `None` → `a=inactive`, no video) when the offer carries only
+`packetization-mode=0` codecs, or H.264 with no `packetization-mode` at all (whose
+RFC 6184 §8.1 default is mode 0). Emitting FU-A under a mode-0 contract would be a
+spec violation, so we answer no video rather than send packets the peer's
+single-NAL-only depacketiser may reject.
+
 ### 4. Transport — reuse the BUNDLE'd DTLS-SRTP + ICE pipe
 
 WebRTC offers carry `a=group:BUNDLE` with all DTLS/ICE credentials at the session
@@ -102,17 +137,21 @@ audio engine uses, so no new transport machinery.
 
 The video stream uses its own SSRC and payload type (distinct from audio), so the
 peer demultiplexes audio vs video by SSRC on the shared 5-tuple (RFC 8843 §9.2).
+The video SSRC is randomised **excluding** the fixed outbound audio SSRC
+(`engine.OUTBOUND_AUDIO_SSRC`, `0xCAFEBABE`): the generator redraws on the
+(astronomically rare) collision, so audio and video never share an SSRC and the
+peer's per-SSRC demux is never ambiguous.
 
 ### 5. Inbound video — discard (ADR-0018 §5a unchanged)
 
-Inbound video RTP is accepted in SDP (the m-line is answered) but **not decoded**.
-There is no decoder dependency and no video receive loop wired in this lane — the
-agent has no use for the caller's pixels (the future "1 fps vision snapshot",
-ADR-0018 §5b, remains backlog and is explicitly **not** built here). On the shared
-BUNDLE 5-tuple the audio engine already drains and SRTP-unprotects every inbound
-datagram; a video-SSRC packet that fails the audio SRTP context is dropped
-harmlessly, which keeps inbound handling a no-op for video without a separate
-receive path.
+Inbound video RTP is **not solicited** (the video m-line is answered `a=sendonly`
+or `a=inactive`, never `a=sendrecv` — §2a) and **not decoded**. There is no decoder
+dependency and no video receive loop wired in this lane — the agent has no use for
+the caller's pixels (the future "1 fps vision snapshot", ADR-0018 §5b, remains
+backlog and is explicitly **not** built here). Because we answer `a=sendonly`, a
+conformant peer sends no inbound video at all, so the inbound-SRTP-binding race
+(§2a) cannot occur; the audio engine drains and SRTP-unprotects only the inbound
+audio stream it expects.
 
 ## Scope / deferred (rule 6)
 
@@ -128,13 +167,26 @@ receive path.
 - **VP8** is not offered or packetised (ADR-0018 listed it; this lane is H.264
   only, matching what the test gateway offers — ADR-0042 recorded the gateway's
   `m=video` lines are H.264 `42E016`/`42E01F`).
+- **H.264 `packetization-mode=0`-only offers are declined** (§3): we answer no
+  video (`a=inactive`) rather than emit FU-A under a mode-0 contract.
+- **The answer mirrors only the audio + (optional) video m-lines.** The
+  `build_webrtc_answer` body emits exactly one `m=audio` and, when video is
+  negotiated, one BUNDLE'd `m=video`. **Any additional m-line the offer carries —
+  e.g. a second `m=video` (slides), `m=application` (SCTP/data-channel), or a
+  duplicate `m=audio` — is NOT mirrored in the answer.** This is a deliberate
+  scope limit (rule 6): the plugin negotiates one audio + one video stream and no
+  data channel. A strict RFC 8843 answerer mirrors every offered m-line (rejecting
+  unsupported ones with `port 0`); the test gateway (ADR-0042) tolerates the
+  reduced answer, so the fuller mirror is **named, not built** here. Revisit if a
+  gateway requires every offered m-line to be echoed.
 - **RTCP for video** (SR/RR) is deferred until a gateway requires it.
 
 ## Consequences
 
-- A WebRTC video offer is answered with a real (sendrecv, when sourced) or inert
-  (inactive, when not) `m=video` line instead of being dropped — the call is no
-  longer rejected/re-INVITE'd for lack of a video answer.
+- A WebRTC video offer is answered with a real (`sendonly`, when sourced) or inert
+  (`inactive`, when not) `m=video` line instead of being dropped — the call is no
+  longer rejected/re-INVITE'd for lack of a video answer, and the `sendonly`
+  direction removes the inbound-SRTP-binding hazard (§2a).
 - **Zero new dependencies**, zero licence/advisory surface (rule 35): no codec
   library enters the tree. The heap-corruption foot-gun is closed by construction
   and guarded by an import-assertion test.

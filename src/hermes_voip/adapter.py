@@ -107,6 +107,7 @@ from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.media.call_loop import BargeInMode, CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import (
+    OUTBOUND_AUDIO_SSRC,
     Codec,
     RtpMediaTransport,
     UnsupportedCodecError,
@@ -1862,9 +1863,11 @@ class VoipAdapter(BasePlatformAdapter):
                 session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
             )
             # Video (ADR-0044): if the offer carries m=video and we can packetise
-            # the negotiated codec (H.264), build a BUNDLE'd video answer. When a
-            # source is configured we answer a=sendrecv and loop it post-handshake;
-            # without a source we answer a=inactive (RFC-correct, no outbound video).
+            # the negotiated codec (H.264 packetization-mode=1), build a BUNDLE'd
+            # video answer. When a source is configured we answer a=sendonly (we
+            # discard inbound video, so never a=sendrecv) and loop it
+            # post-handshake; without a source we answer a=inactive (RFC-correct,
+            # no outbound video).
             video_answer, video_nals = _resolve_webrtc_video(offer, media_cfg)
             answer_sdp = build_webrtc_answer(
                 offer,
@@ -1976,7 +1979,7 @@ class VoipAdapter(BasePlatformAdapter):
         )
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
-        # Outbound video (ADR-0044): only when we answered a=sendrecv (a source is
+        # Outbound video (ADR-0044): only when we answered a=sendonly (a source is
         # configured + an H.264 codec was negotiated). The sender rides the SAME
         # BUNDLE'd ICE pipe + a video-SSRC SRTP session derived from the same DTLS
         # handshake, looping the pre-packetised Annex-B source. Lifecycle is bound
@@ -2008,7 +2011,13 @@ class VoipAdapter(BasePlatformAdapter):
         sender are registered per call so :meth:`_teardown_call` stops + cancels
         them; the task is added to ``_call_tasks`` so ``disconnect`` cancels it too.
         """
+        # Randomise the BUNDLE'd video SSRC, EXCLUDING the fixed outbound audio
+        # SSRC: a collision would confuse the shared-5-tuple demux of audio vs
+        # video on the one ICE pipe (ADR-0044). Redraw on the (astronomically
+        # rare) collision rather than offset-adjust, so the SSRC stays uniform.
         video_ssrc = random.randint(0, (1 << 32) - 1)  # noqa: S311 — RTP SSRC, not cryptographic
+        while video_ssrc == OUTBOUND_AUDIO_SSRC:
+            video_ssrc = random.randint(0, (1 << 32) - 1)  # noqa: S311 — RTP SSRC, not cryptographic
         video_srtp = session.derive_outbound_srtp_session(ssrc=video_ssrc)
         sender = RtpVideoSender(
             nals=nals,
@@ -3291,12 +3300,12 @@ def _resolve_webrtc_video(
     """Resolve the WebRTC video answer + source NALs for an offer (ADR-0044).
 
     Returns ``(None, [])`` when the offer has no ``m=video`` or offers no H.264
-    codec we can packetise — the call proceeds audio-only (no video m-line). When
-    the offer carries an H.264 ``m=video``:
+    ``packetization-mode=1`` codec we can packetise — the call proceeds audio-only
+    (no video m-line). When the offer carries a usable H.264 ``m=video``:
 
     * a configured + readable ``HERMES_VOIP_VIDEO_SOURCE_PATH`` yields an
-      ``active`` :class:`VideoAnswer` (a=sendrecv) and the parsed Annex-B NAL
-      units to loop;
+      ``active`` :class:`VideoAnswer` (a=sendonly — we send video but discard all
+      inbound video) and the parsed Annex-B NAL units to loop;
     * an unset/unreadable source yields an **inactive** answer (a=inactive — the
       RFC-correct "present but no media" BUNDLE answer) and no NALs.
 

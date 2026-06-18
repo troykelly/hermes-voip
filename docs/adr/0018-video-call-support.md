@@ -111,9 +111,17 @@ a WebRTC-specific grouping).
 
 #### 1d. Directionality — `a=sendrecv` vs `a=sendonly`
 
+> **Superseded by ADR-0044 §2a.** The `a=sendrecv` recommendation below predates the
+> BUNDLE / shared-5-tuple media plane. On a BUNDLE'd WebRTC call the inbound audio
+> `SrtpSession` binds to the first inbound SSRC it sees; soliciting inbound video with
+> `a=sendrecv` lets an early video packet bind audio-SRTP to the video SSRC and silently
+> kill inbound audio. The shipped behaviour is **`a=sendonly`** (sourced) / `a=inactive`
+> (not) — never `a=sendrecv` for video. See ADR-0044 §2a.
+
 The agent sends video (the looping clip) and receives video (the caller's camera feed) at
 the SDP level, but **the inbound video payload is immediately discarded** (section 5). The
-correct direction attribute is therefore **`a=sendrecv`**, not `a=sendonly`. Rationale:
+direction attribute originally chosen here was **`a=sendrecv`**, not `a=sendonly`.
+Rationale (now superseded — see the note above):
 
 - `a=sendonly` tells the peer not to send video at all. Some gateways and SIP endpoints
   interpret this strictly and drop their video track; that is operationally fine, but it

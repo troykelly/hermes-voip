@@ -520,9 +520,11 @@ class VideoAnswer:
     """Our chosen ``m=video`` answer parameters (ADR-0044).
 
     Built by the adapter from :func:`negotiate_video_h264` plus the configured
-    video source: ``active=True`` (a source is configured) answers ``a=sendrecv``;
-    ``active=False`` (no source) answers ``a=inactive`` — RFC-correct for a
-    BUNDLE offer that keeps the m-line so the group stays intact.
+    video source: ``active=True`` (a source is configured) answers ``a=sendonly``
+    (we send video but discard all inbound video, so we never solicit it with
+    ``a=sendrecv`` — see :func:`_build_video_section`); ``active=False`` (no
+    source) answers ``a=inactive`` — RFC-correct for a BUNDLE offer that keeps the
+    m-line so the group stays intact.
 
     Attributes:
         codec: The H.264 codec we accept (payload type + ``H264/90000`` + the
@@ -916,26 +918,32 @@ def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec,
 def negotiate_video_h264(offer: VideoMedia) -> Codec | None:
     """Choose the H.264 codec to answer for a video offer (ADR-0044).
 
-    Selects an offered H.264 codec, preferring one whose ``fmtp`` declares
-    ``packetization-mode=1`` (FU-A capable — required to fragment large IDR
-    frames) over a mode-0 (single-NAL-only) codec. Returns ``None`` when the
-    offer carries no H.264 codec (e.g. a VP8-only offer): the adapter then
-    declines video (no source on a codec we cannot packetise).
+    Selects an offered H.264 codec that declares ``packetization-mode=1`` in its
+    ``fmtp`` (FU-A capable — required to fragment large IDR frames). Returns
+    ``None`` — declining video — when:
+
+    * the offer carries no H.264 codec (e.g. a VP8-only offer); OR
+    * every offered H.264 codec is ``packetization-mode=0`` (or omits
+      ``packetization-mode``, whose RFC 6184 §8.1 default is mode 0). Our RFC 6184
+      packetiser FU-A-fragments any large NAL, which violates the mode-0
+      single-NAL-only contract, so we MUST NOT emit FU-A under mode 0 — we decline
+      video instead and the adapter answers ``a=inactive``.
 
     Args:
         offer: The peer's offered video media.
 
     Returns:
-        The chosen H.264 :class:`Codec` (with its offered ``fmtp`` preserved), or
-        ``None`` if no H.264 codec is offered.
+        A ``packetization-mode=1`` H.264 :class:`Codec` (with its offered ``fmtp``
+        preserved), or ``None`` if none is offered.
     """
-    h264 = [c for c in offer.codecs if c.encoding.lower() == _H264]
-    if not h264:
-        return None
-    for codec in h264:
-        if codec.fmtp is not None and _PACKETIZATION_MODE_1 in codec.fmtp:
+    for codec in offer.codecs:
+        if (
+            codec.encoding.lower() == _H264
+            and codec.fmtp is not None
+            and _PACKETIZATION_MODE_1 in codec.fmtp
+        ):
             return codec
-    return h264[0]
+    return None
 
 
 def _order_opus_first(codecs: Sequence[Codec]) -> tuple[Codec, ...]:
@@ -1061,10 +1069,18 @@ def _build_video_section(video: VideoAnswer) -> list[str]:
 
     Shares the audio section's DTLS fingerprint + ICE + setup (BUNDLE, RFC 8843),
     so this section carries NO fingerprint/ICE of its own — only the negotiated
-    H.264 codec, ``a=rtcp-mux``, the ``a=mid``, and the direction. ``a=sendrecv``
-    when a source is configured (``active``); ``a=inactive`` otherwise — the
-    RFC-correct "present but no media" answer that keeps the BUNDLE group intact.
-    The m-line keeps a real (non-zero) port so the group stays valid.
+    H.264 codec, ``a=rtcp-mux``, the ``a=mid``, and the direction. ``a=sendonly``
+    when a source is configured (``active``); ``a=inactive`` otherwise.
+
+    We answer ``a=sendonly`` (never ``a=sendrecv``) even when sending: the plugin
+    discards ALL inbound video, and ``a=sendrecv`` would solicit inbound video
+    onto the shared BUNDLE 5-tuple. The inbound-audio :class:`SrtpSession` is not
+    pre-bound to an SSRC (``media/dtls.py`` ``derive_srtp_sessions``), so an early
+    inbound video packet would bind it to the video SSRC and then silently drop
+    all inbound audio — a silent inbound-audio outage. ``a=sendonly`` tells the
+    peer not to send video at all, eliminating the race. ``a=inactive`` (no
+    source) is the RFC-correct "present but no media" answer that keeps the BUNDLE
+    group intact. The m-line keeps a real (non-zero) port so the group stays valid.
     """
     # A real placeholder port (RFC 4566 disallows 0, which would *decline* the
     # stream and break the BUNDLE group); the real address is the shared ICE pipe.
@@ -1072,7 +1088,7 @@ def _build_video_section(video: VideoAnswer) -> list[str]:
     lines.extend(_rtpmap_lines(video.codec))
     lines.append("a=rtcp-mux")
     lines.append(f"a=mid:{video.mid}")
-    lines.append("a=sendrecv" if video.active else "a=inactive")
+    lines.append("a=sendonly" if video.active else "a=inactive")
     return lines
 
 

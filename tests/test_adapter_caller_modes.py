@@ -46,6 +46,7 @@ from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
+from hermes_voip.multi_intercom import IntercomEntry, Opening, OpeningType
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
@@ -1214,6 +1215,124 @@ async def test_open_entry_unknown_call_returns_false() -> None:
         open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
     )
     assert await adapter.open_entry("nope") is False
+
+
+# ===========================================================================
+# Multi-intercom NAMED openings, per-call scoping (ADR-0045, #38)
+# ===========================================================================
+
+
+def _intercom_entry() -> IntercomEntry:
+    """An intercom with a DTMF 'door' + a webhook 'gate' (fakes only)."""
+    return IntercomEntry(
+        caller_id="9999",
+        openings={
+            "door": Opening(name="door", type=OpeningType.DTMF, dtmf_code="9"),
+            "gate": Opening(
+                name="gate",
+                type=OpeningType.WEBHOOK,
+                method="POST",
+                url="https://relay.example.test/gate",
+                headers={},
+                body="",
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_opening_dtmf_sends_that_codes_dtmf() -> None:
+    """open_entry('door') on a matched multi-intercom sends that opening's DTMF."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {"intercom_entry": _intercom_entry()}
+
+    opened = await adapter.open_entry(call_id, "door")
+
+    assert opened is True
+    assert session.dtmf == ["9"]
+
+
+@pytest.mark.asyncio
+async def test_named_opening_webhook_calls_the_webhook() -> None:
+    """open_entry('gate') actuates the named webhook opening (no DTMF)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {"intercom_entry": _intercom_entry()}
+
+    fired: list[Opening] = []
+
+    async def _fake_fire(opening: Opening) -> None:
+        fired.append(opening)
+
+    adapter._fire_webhook_opening = _fake_fire  # type: ignore[assignment, method-assign]  # test seam
+
+    opened = await adapter.open_entry(call_id, "gate")
+
+    assert opened is True
+    assert [o.name for o in fired] == ["gate"]
+    assert session.dtmf == []  # webhook openings never send DTMF
+
+
+@pytest.mark.asyncio
+async def test_opening_name_not_in_set_is_rejected() -> None:
+    """A name not in the calling intercom's set is rejected (scoping, fail-loud)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {"intercom_entry": _intercom_entry()}
+
+    with pytest.raises(ValueError, match="garage"):
+        await adapter.open_entry(call_id, "garage")
+    assert session.dtmf == []  # nothing actuated
+
+
+@pytest.mark.asyncio
+async def test_non_intercom_caller_with_name_cannot_open() -> None:
+    """A non-intercom caller (no matched entry) cannot open a named entry."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    # DISABLED single-intercom config + NO matched multi-intercom entry.
+    adapter._intercom_cfg = IntercomConfig(open_mode=IntercomOpenMode.DISABLED)
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {}  # not an intercom caller
+
+    with pytest.raises((ValueError, RuntimeError)):
+        await adapter.open_entry(call_id, "door")
+    assert session.dtmf == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_open_entry_no_name_still_works() -> None:
+    """Back-compat: open_entry(call_id) with no name uses the legacy single path."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
+    )
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    opened = await adapter.open_entry(call_id)
+
+    assert opened is True
+    assert session.dtmf == ["9"]
 
 
 # ===========================================================================

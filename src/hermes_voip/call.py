@@ -25,6 +25,12 @@ from typing import Protocol, runtime_checkable
 
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
+from hermes_voip.dtmf import DtmfSendMode
+from hermes_voip.dtmf_sipinfo import (
+    DTMF_RELAY_CONTENT_TYPE,
+    build_dtmf_relay_body,
+    parse_dtmf_info,
+)
 from hermes_voip.incall import (
     Glare,
     HoldConfirmed,
@@ -127,6 +133,8 @@ class CallSession:
         local_media: LocalMediaSession,
         credentials: DigestCredentials,
         on_refer: ReferHandler | None = None,
+        dtmf_send_mode: DtmfSendMode = DtmfSendMode.RFC4733,
+        on_dtmf: Callable[[str], None] | None = None,
         response_timeout: float = _DEFAULT_RESPONSE_TIMEOUT,
     ) -> None:
         """Bind the call to its dialog, transport seams, and guard state."""
@@ -137,6 +145,16 @@ class CallSession:
         self._local_media = local_media
         self._credentials = credentials
         self._refer_handler = on_refer
+        # The resolved DTMF send backend (ADR-0036): in SIP_INFO mode :meth:`send_dtmf`
+        # emits in-dialog INFO requests; otherwise it delegates to the media engine
+        # (RFC 4733 / in-band). Settable so the adapter can resolve it after answer.
+        self._dtmf_send_mode = dtmf_send_mode
+        # Callback fired once per RECEIVED SIP-INFO DTMF digit (ADR-0036), or None to
+        # ignore inbound INFO DTMF. The adapter wires this to ``CallLoop.feed_dtmf`` —
+        # the SAME router the engine's RFC 4733 / in-band ``on_dtmf`` feeds, so digit
+        # surfacing is uniform across all three receive backends. Settable after
+        # construction (the loop is built after this session).
+        self.on_dtmf: Callable[[str], None] | None = on_dtmf
         self._response_timeout = response_timeout
         self._pending: dict[int, asyncio.Queue[SipResponse]] = {}
         self._lock = asyncio.Lock()
@@ -213,15 +231,88 @@ class CallSession:
             await self._media.set_hold(False)
 
     async def send_dtmf(self, digits: str) -> None:
-        """Send ``digits`` as in-call DTMF (RFC 4733 telephone-event, ADR-0031).
+        """Send ``digits`` as in-call DTMF via the resolved backend (ADR-0010/0034).
 
-        Delegates to the media engine, which emits the named-event RTP on the active
-        call's stream under its own TX mutex (so DTMF never interleaves with audio).
-        No re-INVITE and no hold gating — DTMF rides the established media path.
-        Raises if the call negotiated no telephone-event payload type (the media
-        engine never silently drops the request).
+        In SIP-INFO send mode this emits one in-dialog ``INFO`` per digit
+        (:meth:`send_dtmf_info`). Otherwise it delegates to the media engine, which
+        emits RFC 4733 named-event RTP (or synthesises in-band tones) on the active
+        call's stream under its own TX mutex (so DTMF never interleaves with audio). No
+        re-INVITE and no hold gating — DTMF rides the established dialog/media path.
+        Raises if the resolved backend cannot run (e.g. RFC 4733 with no negotiated
+        telephone-event); DTMF is never silently dropped (rule 6/37).
         """
+        if self._dtmf_send_mode is DtmfSendMode.SIP_INFO:
+            await self.send_dtmf_info(digits)
+            return
         await self._media.send_dtmf(digits)
+
+    async def send_dtmf_info(self, digits: str, *, duration_ms: int = 160) -> None:
+        """Send ``digits`` as SIP INFO DTMF: one in-dialog ``INFO`` each (ADR-0036).
+
+        Builds an ``application/dtmf-relay`` body for each digit and sends it as an
+        in-dialog ``INFO`` request (advancing the dialog CSeq — the ADR-0011 invariant),
+        awaiting the FINAL response for each before the next so a rejection is not
+        silently swallowed (cross-vendor review). A ``401``/``407`` challenge is met
+        once with credentials (like re-INVITE/REFER); any ``>= 400`` final response
+        raises :class:`CallError` (the digit was NOT accepted — never reported as sent).
+        Under the call lock so it does not race a concurrent re-INVITE/REFER on the same
+        dialog.
+
+        Args:
+            digits: The DTMF string to send (``0-9``, ``*``, ``#``, ``A``-``D``;
+                case-insensitive). Empty ⇒ a no-op.
+            duration_ms: The advisory ``Duration=`` value per digit (positive).
+
+        Raises:
+            ValueError: If ``digits`` contains a non-DTMF character (propagated from
+                :func:`~hermes_voip.dtmf_sipinfo.build_dtmf_relay_body`), or
+                ``duration_ms`` is not positive — raised BEFORE any INFO is sent so a
+                bad digit never emits a partial burst.
+            CallError: If the gateway rejects an ``INFO`` (a ``>= 400`` final response,
+                including after an auth retry) — the digit was not accepted.
+        """
+        if not digits:
+            return
+        bodies = [build_dtmf_relay_body(d, duration_ms=duration_ms) for d in digits]
+        async with self._lock:
+            for body in bodies:
+                await self._send_one_dtmf_info(body)
+
+    async def _send_one_dtmf_info(self, body: str) -> None:
+        """Send one DTMF ``INFO`` body, await its final response, raise on error.
+
+        Caller holds :attr:`_lock`. Mirrors :meth:`_refer`'s build → await → re-auth →
+        raise-on-error shape: a ``401``/``407`` is answered once with credentials, and
+        any ``>= 400`` final response is a :class:`CallError`.
+        """
+        request = build_in_dialog_request(
+            self._dialog,
+            "INFO",
+            extra_headers=(("Content-Type", DTMF_RELAY_CONTENT_TYPE),),
+            body=body,
+        )
+        self._dialog = request.dialog
+        response = await self._send_and_await_final(
+            request.text, self._dialog.local_cseq
+        )
+        if response.status_code in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
+            auth = self._authorization(response, "INFO")
+            retry = build_in_dialog_request(
+                self._dialog,
+                "INFO",
+                extra_headers=(
+                    ("Content-Type", DTMF_RELAY_CONTENT_TYPE),
+                    auth,
+                ),
+                body=body,
+            )
+            self._dialog = retry.dialog
+            response = await self._send_and_await_final(
+                retry.text, self._dialog.local_cseq
+            )
+        if response.status_code >= _FIRST_ERROR_STATUS:
+            msg = f"DTMF INFO rejected: {response.status_code} {response.reason}"
+            raise CallError(msg)
 
     async def hang_up(self) -> None:
         """End the call: send an in-dialog BYE, mark ended, stop media (ADR-0026).
@@ -363,7 +454,7 @@ class CallSession:
     # --- inbound in-dialog requests (DialogConsumer) ------------------------
 
     async def handle_request(self, request: SipRequest) -> None:
-        """Answer an inbound in-dialog request (re-INVITE/REFER/NOTIFY/BYE/ACK)."""
+        """Answer an inbound in-dialog request (re-INVITE/REFER/NOTIFY/BYE/INFO/ACK)."""
         method = request.method
         if method == "INVITE":
             await self._on_reinvite(request)
@@ -373,10 +464,29 @@ class CallSession:
             await self._on_notify(request)
         elif method == "REFER":
             await self._on_refer(request)
+        elif method == "INFO":
+            await self._on_info(request)
         elif method == "ACK":
             return  # confirms our 2xx answer to an inbound re-INVITE; no response
         else:
             await self._signaling.send(build_response(request, 501, "Not Implemented"))
+
+    async def _on_info(self, request: SipRequest) -> None:
+        """Answer an inbound ``INFO`` (SIP INFO DTMF receive, ADR-0036).
+
+        Every in-dialog ``INFO`` is acknowledged ``200 OK`` (per RFC 6086 it must get a
+        final response). When the body is a DTMF relay/simple body, the parsed digit is
+        surfaced through :attr:`on_dtmf` (the same router the engine's RFC 4733 /
+        in-band receive feeds) — so an inbound keypad press resolves an armed
+        confirmation or
+        joins a menu group exactly as the other backends do. A non-DTMF INFO (e.g. a
+        media-control body) is acknowledged but surfaces nothing, and an INFO with no
+        bound sink is acknowledged and dropped (never crashes the dialog).
+        """
+        await self._signaling.send(build_response(request, 200, "OK"))
+        digit = parse_dtmf_info(request.header("Content-Type") or "", request.body)
+        if digit is not None and self.on_dtmf is not None:
+            self.on_dtmf(digit)
 
     async def _on_reinvite(self, request: SipRequest) -> None:
         routing = classify_inbound_reinvite(

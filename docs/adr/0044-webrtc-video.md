@@ -54,11 +54,17 @@ re-introduce the heap-corrupting path by accident.
 ### 2. Outbound source — `HERMES_VOIP_VIDEO_SOURCE_PATH`
 
 - **Set** → the file is read at call setup, split into NAL units (Annex-B
-  start-code framing, both 3- and 4-byte start codes), packetised per RFC 6184,
-  and the resulting RTP packets are looped on the video SRTP stream (seq/ts
-  rewritten per loop iteration; SPS/PPS + the first IDR re-sent at the start of
-  each loop so a peer that joins mid-stream re-synchronises). The SDP answer's
-  video m-line is **`a=sendonly`** — we contribute a track but do **not** solicit
+  start-code framing, both 3- and 4-byte start codes), grouped into access units
+  (one primary coded picture each — multi-slice pictures stay one access unit,
+  §3), packetised per RFC 6184, and the resulting RTP packets are **replayed
+  verbatim in file order** on the video SRTP stream each loop: a fresh,
+  monotonically-advancing sequence number per packet and a `+90000/fps`
+  timestamp per access unit. The sender does **not** re-inject parameter sets at
+  the loop boundary — a peer that joins mid-stream re-synchronises only once the
+  file wraps back to its leading SPS/PPS. For reliable mid-stream join the
+  operator encodes the source with parameter sets repeated ahead of every IDR
+  (x264 `repeat-headers=1` / ffmpeg `-bsf:v dump_extra`). The SDP answer's video
+  m-line is **`a=sendonly`** — we contribute a track but do **not** solicit
   inbound video (see §2a).
 - **Unset** → the answer's video m-line is **`a=inactive`** (we keep the m-line so
   BUNDLE stays intact, but advertise no media flow) and **no video sender task is
@@ -160,9 +166,11 @@ audio stream it expects.
   separate `a=crypto` per video m-line, separate port) is **not** built here —
   named, not done.
 - **Static/Annex-B file only.** The source is whatever H.264 Annex-B bytes the
-  operator supplies (a single-frame still or a multi-frame clip both work — the
-  packetiser does not care). Producing that file is an operator/offline step; the
-  plugin never encodes.
+  operator supplies — a single-frame still or a multi-frame clip both work,
+  including **multi-slice** coded pictures (the access-unit grouping detects
+  picture boundaries via the slice header's `first_mb_in_slice` and AUD NALs, so
+  all slices of one picture share one RTP timestamp + marker, §3). Producing that
+  file is an operator/offline step; the plugin never encodes.
 - **No inbound decode** (ADR-0018 §5b vision snapshot stays backlog).
 - **VP8** is not offered or packetised (ADR-0018 listed it; this lane is H.264
   only, matching what the test gateway offers — ADR-0042 recorded the gateway's

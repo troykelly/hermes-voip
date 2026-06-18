@@ -26,6 +26,7 @@ import binascii
 import contextlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 
 # RFC 3551 static payload types we may see without an explicit a=rtpmap.
 _STATIC_PAYLOADS: dict[int, tuple[str, int]] = {
@@ -52,9 +53,12 @@ _DEFAULT_CLOCK_RATE = 8000
 # Video RTP runs on a 90 kHz clock (RFC 3551 §4); ADR-0044.
 VIDEO_DEFAULT_CLOCK_RATE = 90000
 _H264 = "h264"
-# H.264 fmtp packetisation-mode (RFC 6184 §8.1): mode 1 (FU-A) is preferred over
-# mode 0 (single-NAL only) so large IDR frames can be fragmented.
-_PACKETIZATION_MODE_1 = "packetization-mode=1"
+# H.264 fmtp packetisation-mode (RFC 6184 §8.1): mode 1 (FU-A) is required so
+# large IDR frames can be FU-A fragmented; mode 0 (single-NAL only) is declined.
+# The value is matched by an exact fmtp-parameter parse, not a substring — a
+# substring "packetization-mode=1" also (wrongly) matches "...=10"/"x-...=1".
+_PACKETIZATION_MODE_KEY = "packetization-mode"
+_PACKETIZATION_MODE_FU_A = "1"
 _SECURE_PROFILE = "RTP/SAVP"
 _PLAIN_PROFILE = "RTP/AVP"
 # WebRTC DTLS-SRTP profile (ADR-0016, RFC 5764 / RFC 4585).
@@ -515,27 +519,88 @@ class VideoMedia:
         return self.protocol == _WEBRTC_PROFILE
 
 
+class VideoAnswerMode(Enum):
+    """How we answer an offered ``m=video`` section (ADR-0044).
+
+    * ``SENDONLY`` — a source is configured: we send video (and discard ALL
+      inbound video, so never ``a=sendrecv`` — see :func:`_build_video_section`).
+    * ``INACTIVE`` — an H.264 codec is acceptable but no source is configured:
+      ``a=inactive`` on a real port keeps the BUNDLE'd m-line present, no flow.
+    * ``REJECTED`` — the offered video has no codec we can packetise (VP8-only,
+      ``packetization-mode=0``, or a non-WebRTC transport profile): the m-line is
+      rejected with port 0 (RFC 3264 §6) and excluded from the BUNDLE group
+      (RFC 8843 §7.3.3), but KEPT so the answer's m-line count/order matches the
+      offer (RFC 3264 §5.1). Dropping the m-line entirely is a malformed answer.
+    """
+
+    SENDONLY = "sendonly"
+    INACTIVE = "inactive"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True, slots=True)
 class VideoAnswer:
     """Our chosen ``m=video`` answer parameters (ADR-0044).
 
     Built by the adapter from :func:`negotiate_video_h264` plus the configured
-    video source: ``active=True`` (a source is configured) answers ``a=sendonly``
-    (we send video but discard all inbound video, so we never solicit it with
-    ``a=sendrecv`` — see :func:`_build_video_section`); ``active=False`` (no
-    source) answers ``a=inactive`` — RFC-correct for a BUNDLE offer that keeps the
-    m-line so the group stays intact.
+    video source. Use the :meth:`sendonly` / :meth:`inactive` / :meth:`rejected`
+    constructors so the ``(mode, codec)`` invariant holds: a REJECTED answer
+    carries no negotiated ``codec`` (there is none); SENDONLY/INACTIVE always do.
 
     Attributes:
-        codec: The H.264 codec we accept (payload type + ``H264/90000`` + the
-            offered ``fmtp`` we echo).
         mid: The video media identification to mirror (RFC 8843 BUNDLE).
-        active: Whether we send video (a source is configured).
+        mode: How the ``m=video`` is answered (see :class:`VideoAnswerMode`).
+        proto: The transport profile echoed on the answer m-line (the offered
+            profile — ``UDP/TLS/RTP/SAVPF`` for a WebRTC video stream).
+        payload_type: The format listed on the m-line — the negotiated H.264
+            payload type (SENDONLY/INACTIVE) or an offered payload type echoed on
+            the rejected line (REJECTED).
+        codec: The negotiated H.264 codec (payload type + ``H264/90000`` + the
+            offered ``fmtp`` we echo) for the rtpmap; ``None`` when REJECTED.
     """
 
-    codec: Codec
     mid: str
-    active: bool
+    mode: VideoAnswerMode
+    proto: str
+    payload_type: int
+    codec: Codec | None = None
+
+    @classmethod
+    def sendonly(
+        cls, codec: Codec, mid: str, *, proto: str = _WEBRTC_PROFILE
+    ) -> VideoAnswer:
+        """A sourced answer: we send video (``a=sendonly``)."""
+        return cls(
+            mid=mid,
+            mode=VideoAnswerMode.SENDONLY,
+            proto=proto,
+            payload_type=codec.payload_type,
+            codec=codec,
+        )
+
+    @classmethod
+    def inactive(
+        cls, codec: Codec, mid: str, *, proto: str = _WEBRTC_PROFILE
+    ) -> VideoAnswer:
+        """A codec-accepted but source-less answer (``a=inactive``)."""
+        return cls(
+            mid=mid,
+            mode=VideoAnswerMode.INACTIVE,
+            proto=proto,
+            payload_type=codec.payload_type,
+            codec=codec,
+        )
+
+    @classmethod
+    def rejected(cls, mid: str, *, proto: str, payload_type: int) -> VideoAnswer:
+        """A rejected answer: ``m=video 0`` echoing an offered payload type."""
+        return cls(
+            mid=mid,
+            mode=VideoAnswerMode.REJECTED,
+            proto=proto,
+            payload_type=payload_type,
+            codec=None,
+        )
 
 
 @dataclass(slots=True)
@@ -915,11 +980,27 @@ def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec,
     return chosen
 
 
+def _fmtp_param(fmtp: str, key: str) -> str | None:
+    """Return the value of a ``;``-separated fmtp parameter, or ``None``.
+
+    SDP fmtp lines carry ``key=value`` parameters separated by ``;`` (RFC 6184
+    §8.1 for H.264). The key is matched case-insensitively after trimming
+    whitespace, and the trimmed value is returned. This is an exact-parameter
+    parse — an unanchored substring test mismatches (e.g. ``"packetization-mode=1"
+    in "packetization-mode=10"`` is wrongly true).
+    """
+    for entry in fmtp.split(";"):
+        name, sep, value = entry.strip().partition("=")
+        if sep and name.strip().lower() == key:
+            return value.strip()
+    return None
+
+
 def negotiate_video_h264(offer: VideoMedia) -> Codec | None:
     """Choose the H.264 codec to answer for a video offer (ADR-0044).
 
-    Selects an offered H.264 codec that declares ``packetization-mode=1`` in its
-    ``fmtp`` (FU-A capable — required to fragment large IDR frames). Returns
+    Selects an offered H.264 codec whose ``fmtp`` declares ``packetization-mode``
+    exactly ``1`` (FU-A capable — required to fragment large IDR frames). Returns
     ``None`` — declining video — when:
 
     * the offer carries no H.264 codec (e.g. a VP8-only offer); OR
@@ -927,7 +1008,11 @@ def negotiate_video_h264(offer: VideoMedia) -> Codec | None:
       ``packetization-mode``, whose RFC 6184 §8.1 default is mode 0). Our RFC 6184
       packetiser FU-A-fragments any large NAL, which violates the mode-0
       single-NAL-only contract, so we MUST NOT emit FU-A under mode 0 — we decline
-      video instead and the adapter answers ``a=inactive``.
+      video and the adapter rejects the m-line (RFC 3264 §6, port 0).
+
+    The fmtp is parsed into its ``;``-separated parameters (see :func:`_fmtp_param`)
+    and the value compared exactly to ``"1"`` — not matched as a substring, which
+    would wrongly accept ``packetization-mode=10`` / ``x-packetization-mode=1``.
 
     Args:
         offer: The peer's offered video media.
@@ -937,11 +1022,10 @@ def negotiate_video_h264(offer: VideoMedia) -> Codec | None:
         preserved), or ``None`` if none is offered.
     """
     for codec in offer.codecs:
-        if (
-            codec.encoding.lower() == _H264
-            and codec.fmtp is not None
-            and _PACKETIZATION_MODE_1 in codec.fmtp
-        ):
+        if codec.encoding.lower() != _H264 or codec.fmtp is None:
+            continue
+        mode = _fmtp_param(codec.fmtp, _PACKETIZATION_MODE_KEY)
+        if mode == _PACKETIZATION_MODE_FU_A:
             return codec
     return None
 
@@ -1065,12 +1149,19 @@ def _rtpmap_lines(codec: Codec) -> list[str]:
 
 
 def _build_video_section(video: VideoAnswer) -> list[str]:
-    """The BUNDLE'd ``m=video`` answer section lines (ADR-0044, RFC 6184/8843).
+    """The ``m=video`` answer section lines (ADR-0044, RFC 6184/8843/3264).
 
-    Shares the audio section's DTLS fingerprint + ICE + setup (BUNDLE, RFC 8843),
-    so this section carries NO fingerprint/ICE of its own — only the negotiated
-    H.264 codec, ``a=rtcp-mux``, the ``a=mid``, and the direction. ``a=sendonly``
-    when a source is configured (``active``); ``a=inactive`` otherwise.
+    Three shapes (see :class:`VideoAnswerMode`):
+
+    * ``REJECTED`` — ``m=video 0 <proto> <pt>`` + ``a=mid`` only. RFC 3264 §6:
+      port 0 declines the stream; the m-line (and its mid) is KEPT so the answer's
+      m-line count/order matches the offer (RFC 3264 §5.1). The rejected stream is
+      excluded from the BUNDLE group by :func:`_build_webrtc_body`
+      (RFC 8843 §7.3.3), so no fingerprint/ICE/rtpmap is needed here.
+    * ``SENDONLY`` / ``INACTIVE`` — a real (non-zero) placeholder port, the
+      negotiated H.264 ``a=rtpmap``, ``a=rtcp-mux``, ``a=mid``, and the direction;
+      DTLS fingerprint + ICE are shared with audio via BUNDLE (RFC 8843), so they
+      are not repeated here. The real media address is the shared ICE 5-tuple.
 
     We answer ``a=sendonly`` (never ``a=sendrecv``) even when sending: the plugin
     discards ALL inbound video, and ``a=sendrecv`` would solicit inbound video
@@ -1079,16 +1170,26 @@ def _build_video_section(video: VideoAnswer) -> list[str]:
     inbound video packet would bind it to the video SSRC and then silently drop
     all inbound audio — a silent inbound-audio outage. ``a=sendonly`` tells the
     peer not to send video at all, eliminating the race. ``a=inactive`` (no
-    source) is the RFC-correct "present but no media" answer that keeps the BUNDLE
-    group intact. The m-line keeps a real (non-zero) port so the group stays valid.
+    source) is the RFC-correct "present but no media" answer.
     """
-    # A real placeholder port (RFC 4566 disallows 0, which would *decline* the
-    # stream and break the BUNDLE group); the real address is the shared ICE pipe.
-    lines = [f"m=video 9 {_WEBRTC_PROFILE} {video.codec.payload_type}"]
-    lines.extend(_rtpmap_lines(video.codec))
+    if video.mode is VideoAnswerMode.REJECTED:
+        # RFC 3264 §6: reject with port 0, but keep the m-line + mid so the
+        # answer mirrors the offer's m-line count/order (RFC 3264 §5.1). No
+        # rtpmap/direction — there is no agreed codec. The offered transport
+        # profile is echoed (we never force UDP/TLS/RTP/SAVPF onto a profile the
+        # offer did not propose).
+        return [
+            f"m=video 0 {video.proto} {video.payload_type}",
+            f"a=mid:{video.mid}",
+        ]
+    lines = [f"m=video 9 {video.proto} {video.payload_type}"]
+    if video.codec is not None:
+        lines.extend(_rtpmap_lines(video.codec))
     lines.append("a=rtcp-mux")
     lines.append(f"a=mid:{video.mid}")
-    lines.append("a=sendonly" if video.active else "a=inactive")
+    lines.append(
+        "a=sendonly" if video.mode is VideoAnswerMode.SENDONLY else "a=inactive"
+    )
     return lines
 
 
@@ -1152,9 +1253,15 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
         "t=0 0",
     ]
     # BUNDLE group line (session level, RFC 8843) — only when answering video, so
-    # an audio-only answer stays byte-identical to before (no a=group).
+    # an audio-only answer stays byte-identical to before (no a=group). A REJECTED
+    # video (port 0) is excluded from the group (RFC 8843 §7.3.3): only the audio
+    # mid is bundled, though the rejected m-line is still emitted for m-line
+    # correspondence.
     if video is not None and audio_mid is not None:
-        lines.append(f"a=group:BUNDLE {audio_mid} {video.mid}")
+        if video.mode is VideoAnswerMode.REJECTED:
+            lines.append(f"a=group:BUNDLE {audio_mid}")
+        else:
+            lines.append(f"a=group:BUNDLE {audio_mid} {video.mid}")
     lines.append(f"m=audio {port} {_WEBRTC_PROFILE} {payloads}")
     for codec in codecs:
         lines.extend(_rtpmap_lines(codec))

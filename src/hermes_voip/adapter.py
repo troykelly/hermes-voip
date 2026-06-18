@@ -150,6 +150,7 @@ from hermes_voip.sdp import (
     AudioMedia,
     SessionDescription,
     VideoAnswer,
+    VideoAnswerMode,
     build_audio_answer,
     build_audio_offer,
     build_webrtc_answer,
@@ -2352,9 +2353,10 @@ class VoipAdapter(BasePlatformAdapter):
             # the negotiated codec (H.264 packetization-mode=1), build a BUNDLE'd
             # video answer. When a source is configured we answer a=sendonly (we
             # discard inbound video, so never a=sendrecv) and loop it
-            # post-handshake; without a source we answer a=inactive (RFC-correct,
-            # no outbound video).
-            video_answer, video_nals = _resolve_webrtc_video(offer, media_cfg)
+            # post-handshake; without a source we answer a=inactive; an offered
+            # video we cannot use is rejected with port 0 (RFC 3264 §6). The source
+            # file is read off the event loop (rule 22).
+            video_answer, video_nals = await _resolve_webrtc_video(offer, media_cfg)
             answer_sdp = build_webrtc_answer(
                 offer,
                 local_address=local_media.local_address,
@@ -2470,13 +2472,17 @@ class VoipAdapter(BasePlatformAdapter):
         # BUNDLE'd ICE pipe + a video-SSRC SRTP session derived from the same DTLS
         # handshake, looping the pre-packetised Annex-B source. Lifecycle is bound
         # to the call: cancelled + stopped in _teardown_call.
-        if video_answer is not None and video_answer.active and video_nals:
+        if (
+            video_answer is not None
+            and video_answer.mode is VideoAnswerMode.SENDONLY
+            and video_nals
+        ):
             self._start_webrtc_video_sender(
                 call_id=call_id,
                 session=session,
                 nals=video_nals,
                 fps=media_cfg.video_fps,
-                payload_type=video_answer.codec.payload_type,
+                payload_type=video_answer.payload_type,
             )
         return engine, local_media
 
@@ -4039,52 +4045,70 @@ def _telephone_event_payload_type(
     return None
 
 
-def _resolve_webrtc_video(
+async def _resolve_webrtc_video(
     offer: SessionDescription, media_cfg: MediaConfig
 ) -> tuple[VideoAnswer | None, list[bytes]]:
     """Resolve the WebRTC video answer + source NALs for an offer (ADR-0044).
 
-    Returns ``(None, [])`` when the offer has no ``m=video`` or offers no H.264
-    ``packetization-mode=1`` codec we can packetise — the call proceeds audio-only
-    (no video m-line). When the offer carries a usable H.264 ``m=video``:
+    Returns ``(None, [])`` ONLY when the offer has no ``m=video`` at all — the
+    answer then has no video m-line. When the offer DOES carry ``m=video``:
 
-    * a configured + readable ``HERMES_VOIP_VIDEO_SOURCE_PATH`` yields an
-      ``active`` :class:`VideoAnswer` (a=sendonly — we send video but discard all
-      inbound video) and the parsed Annex-B NAL units to loop;
-    * an unset/unreadable source yields an **inactive** answer (a=inactive — the
-      RFC-correct "present but no media" BUNDLE answer) and no NALs.
+    * no H.264 ``packetization-mode=1`` codec we can packetise (VP8-only,
+      mode-0-only) or a non-WebRTC transport profile ⇒ a **rejected**
+      :class:`VideoAnswer` (``m=video 0``, RFC 3264 §6) echoing an offered payload
+      type. The m-line is KEPT so the answer mirrors the offer's m-line count and
+      order (RFC 3264 §5.1 / RFC 8843), never dropped — a dropped m-line is a
+      malformed answer for strict peers;
+    * a configured + readable ``HERMES_VOIP_VIDEO_SOURCE_PATH`` ⇒ an ``a=sendonly``
+      answer (we send video but discard all inbound video) + the parsed Annex-B
+      NAL units to loop;
+    * an unset/unreadable/empty source ⇒ an ``a=inactive`` answer (present, no
+      media flow) and no NALs.
 
-    An unreadable configured source is logged and downgraded to inactive rather
-    than failing the call (the audio path must not be sacrificed for video).
+    The source file is read off the event loop (``asyncio.to_thread``) so a large
+    or slow read cannot stall concurrent calls' ICE/DTLS during INVITE handling
+    (rule 22). An unreadable configured source is logged and downgraded to
+    inactive rather than failing the call (the audio path must not be sacrificed
+    for video; rule 37: the error is surfaced, not swallowed).
     """
     video = offer.video
     if video is None:
         return None, []
-    chosen = negotiate_video_h264(video)
-    if chosen is None:
-        # No H.264 codec we can packetise (e.g. VP8-only). Decline video entirely;
-        # the call is audio-only (no m=video in the answer).
-        _log.info("WebRTC offer m=video has no H.264 codec we packetise; audio-only")
-        return None, []
     mid = video.mid or "1"
+    # Only an H.264 packetization-mode=1 codec on a WebRTC (DTLS-SRTP) video
+    # m-line is usable; anything else (VP8, mode-0, or a non-UDP/TLS/RTP/SAVPF
+    # profile) is declined without forcing our transport profile onto it.
+    chosen = negotiate_video_h264(video) if video.is_webrtc else None
+    if chosen is None:
+        # RFC 3264 §6: reject the offered m=video with port 0 (echoing an offered
+        # payload type) rather than dropping the m-line — the answer must keep the
+        # same m-line count/order as the offer (RFC 3264 §5.1 / RFC 8843 §7.3.3).
+        reject_pt = video.codecs[0].payload_type if video.codecs else 0
+        _log.info(
+            "WebRTC offer m=video has no codec we packetise (proto=%s); "
+            "rejecting with port 0",
+            video.protocol,
+        )
+        return (
+            VideoAnswer.rejected(mid=mid, proto=video.protocol, payload_type=reject_pt),
+            [],
+        )
     source = media_cfg.video_source_path
     if not source:
-        return VideoAnswer(codec=chosen, mid=mid, active=False), []
+        return VideoAnswer.inactive(chosen, mid), []
     try:
-        nals = read_annex_b_nals(Path(source))
+        nals = await asyncio.to_thread(read_annex_b_nals, Path(source))
     except OSError as exc:
-        # A configured-but-unreadable source must not fail the call: log and
-        # answer a=inactive (rule 37: the error is surfaced, not swallowed).
         _log.warning(
             "WebRTC video source %r unreadable (%s); answering a=inactive", source, exc
         )
-        return VideoAnswer(codec=chosen, mid=mid, active=False), []
+        return VideoAnswer.inactive(chosen, mid), []
     if not nals:
         _log.warning(
             "WebRTC video source %r has no NAL units; answering a=inactive", source
         )
-        return VideoAnswer(codec=chosen, mid=mid, active=False), []
-    return VideoAnswer(codec=chosen, mid=mid, active=True), nals
+        return VideoAnswer.inactive(chosen, mid), []
+    return VideoAnswer.sendonly(chosen, mid), nals
 
 
 def _opus_sip_available() -> bool:

@@ -249,7 +249,7 @@ def test_answer_video_sendonly_when_source_configured() -> None:
     assert chosen is not None
     text = _webrtc_answer(
         _OFFER_AUDIO_VIDEO,
-        video=VideoAnswer(codec=chosen, mid="1", active=True),
+        video=VideoAnswer.sendonly(chosen, "1"),
     )
     assert "m=video 9 UDP/TLS/RTP/SAVPF 99\r\n" in text
     assert "a=rtpmap:99 H264/90000\r\n" in text
@@ -276,7 +276,7 @@ def test_answer_video_inactive_when_no_source() -> None:
     assert chosen is not None
     text = _webrtc_answer(
         _OFFER_AUDIO_VIDEO,
-        video=VideoAnswer(codec=chosen, mid="1", active=False),
+        video=VideoAnswer.inactive(chosen, "1"),
     )
     video_block = text.split("m=video", 1)[1]
     assert "a=inactive" in video_block
@@ -292,7 +292,7 @@ def test_answer_video_shares_audio_fingerprint_and_ice() -> None:
     assert chosen is not None
     text = _webrtc_answer(
         _OFFER_AUDIO_VIDEO,
-        video=VideoAnswer(codec=chosen, mid="1", active=True),
+        video=VideoAnswer.sendonly(chosen, "1"),
     )
     # Exactly one fingerprint/ice-ufrag at the session/audio level shared via BUNDLE
     # — the video section does NOT repeat a different fingerprint.
@@ -330,10 +330,8 @@ def test_audio_only_offer_ignores_video_param() -> None:
         ice_ufrag=_OUR_UFRAG,
         ice_pwd=_OUR_PWD,
         ice_candidates=(),
-        video=VideoAnswer(
-            codec=Codec(payload_type=99, encoding="H264", clock_rate=90000),
-            mid="1",
-            active=True,
+        video=VideoAnswer.sendonly(
+            Codec(payload_type=99, encoding="H264", clock_rate=90000), "1"
         ),
     )
     assert "m=video" not in text
@@ -357,7 +355,7 @@ def test_build_webrtc_answer_rejects_video_setup_actpass() -> None:
             ice_ufrag=_OUR_UFRAG,
             ice_pwd=_OUR_PWD,
             ice_candidates=(),
-            video=VideoAnswer(codec=chosen, mid="1", active=True),
+            video=VideoAnswer.sendonly(chosen, "1"),
         )
 
 

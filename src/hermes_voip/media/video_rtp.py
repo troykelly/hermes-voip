@@ -57,6 +57,12 @@ _FU_HEADER_START = 0x80
 _FU_HEADER_END = 0x40
 # H.264 VCL NAL unit types (coded slices): 1..5 (RFC 6184 §1.3 / H.264 Table 7-1).
 _VCL_NAL_TYPES = frozenset(range(1, 6))
+# A VCL NAL needs at least a 1-byte NAL header + 1 RBSP byte for us to read its
+# slice header's leading first_mb_in_slice bit (H.264 §7.4.1.2.4).
+_NAL_MIN_SLICE_LEN = 2
+# first_mb_in_slice is an Exp-Golomb ue(v); value 0 is the single bit `1`, so the
+# first RBSP byte (after the NAL header) has its MSB set when first_mb_in_slice==0.
+_RBSP_LEADING_ONE_BIT = 0x80
 # STAP-A aggregation-unit size prefix is a 16-bit length (RFC 6184 §5.7.1).
 _STAP_A_SIZE_PREFIX = 2
 _U16_MAX = 0xFFFF
@@ -138,32 +144,65 @@ def _nal_type(nal: bytes) -> int:
     return nal[0] & _NAL_TYPE_MASK
 
 
-def group_access_units(nals: Sequence[bytes]) -> list[list[bytes]]:
-    """Group NAL units into access units (one coded picture each).
+def _starts_new_primary_picture(nal: bytes) -> bool:
+    """Whether a VCL NAL begins a new primary coded picture (H.264 §7.4.1.2.4).
 
-    A coded picture is a VCL NAL (types 1..5). Non-VCL NALs that *precede* a VCL
-    NAL (the parameter sets SPS/PPS, SEI, AUD) are attached to that following
-    coded picture, so an access unit is ``[<non-VCL...>, <VCL>]``. Trailing
-    non-VCL NALs with no following VCL are dropped (they carry no displayable
-    picture on their own).
+    The slice header's first field is ``first_mb_in_slice``, an Exp-Golomb
+    ``ue(v)``: the codeword for value 0 is the single bit ``1``, so the first
+    RBSP byte (immediately after the 1-byte NAL header) has its MSB set. The
+    *first* slice of a coded picture has ``first_mb_in_slice == 0``; later slices
+    of the SAME picture carry ``first_mb_in_slice > 0`` (MSB clear). A short or
+    malformed VCL NAL with no slice-header byte is treated as NOT a new picture,
+    so it stays in the current access unit rather than spuriously splitting it.
+    """
+    return len(nal) >= _NAL_MIN_SLICE_LEN and bool(nal[1] & _RBSP_LEADING_ONE_BIT)
+
+
+def group_access_units(nals: Sequence[bytes]) -> list[list[bytes]]:
+    """Group NAL units into access units — one *primary coded picture* each.
+
+    An access unit is one coded picture plus the non-VCL NALs (SPS/PPS, SEI, AUD)
+    that precede it. A coded picture may carry MORE THAN ONE VCL slice NAL (a
+    multi-slice picture); all slices of one picture share a single access unit, so
+    the packetiser gives them ONE RTP timestamp and ONE marker (RFC 6184 §5.1).
+
+    A new access unit begins at:
+
+    * a VCL NAL that starts a new primary coded picture
+      (:func:`_starts_new_primary_picture`, ``first_mb_in_slice == 0``) once the
+      current access unit already holds a coded picture; or
+    * a non-VCL NAL (AUD/SPS/PPS/SEI) arriving *after* a coded picture — the
+      delimiter and parameter sets belong to the FOLLOWING picture.
+
+    Trailing non-VCL NALs with no following coded picture are dropped (they carry
+    no displayable picture on their own).
 
     Args:
         nals: NAL units in decode order.
 
     Returns:
-        A list of access units, each a non-empty list of NAL units ending in the
-        coded-slice (VCL) NAL.
+        A list of access units, each a non-empty list of NAL units containing
+        exactly one primary coded picture (one or more VCL slice NALs).
     """
     units: list[list[bytes]] = []
     pending: list[bytes] = []
+    seen_vcl = False
     for nal in nals:
         if not nal:
             continue
-        pending.append(nal)
-        if _nal_type(nal) in _VCL_NAL_TYPES:
+        is_vcl = _nal_type(nal) in _VCL_NAL_TYPES
+        # Close the current access unit when, holding a coded picture already, we
+        # reach the next picture's first slice or a non-VCL NAL that belongs to it.
+        if seen_vcl and ((is_vcl and _starts_new_primary_picture(nal)) or not is_vcl):
             units.append(pending)
             pending = []
-    # `pending` left over (trailing non-VCL NALs) carries no coded picture; drop it.
+            seen_vcl = False
+        pending.append(nal)
+        if is_vcl:
+            seen_vcl = True
+    if seen_vcl:
+        units.append(pending)
+    # A trailing non-VCL run (no following coded picture) carries no picture; drop.
     return units
 
 
@@ -251,6 +290,53 @@ class H264Packetiser:
             offset += len(fragment)
         return payloads
 
+    def payloads_for_access_unit(self, nals: Sequence[bytes]) -> list[bytes]:
+        """The loop-invariant RTP payload bytes for one access unit.
+
+        Each NAL becomes a single-NAL payload (when it fits ``mtu_payload``) or a
+        run of FU-A fragment payloads (when it does not). These bytes depend ONLY
+        on the NAL bytes + the MTU budget — not on sequence number, timestamp, or
+        marker — so for a static source they can be computed ONCE and reused on
+        every loop iteration (ADR-0044 steady-state cost; rule 22). Empty NALs are
+        skipped.
+
+        Args:
+            nals: The NAL units of one access unit, in decode order.
+
+        Returns:
+            The RTP payloads, in send order (no RTP header applied yet).
+        """
+        payloads: list[bytes] = []
+        for nal in nals:
+            if not nal:
+                continue
+            payloads.extend(self._packetise_nal(nal))
+        return payloads
+
+    def wrap_payloads(
+        self, payloads: Sequence[bytes], *, timestamp: int
+    ) -> list[RtpPacket]:
+        """Wrap one access unit's precomputed payloads into RTP packets.
+
+        Assigns the next sequence number to each packet, the shared 90 kHz
+        ``timestamp``, and the RTP **marker bit** on the **last** packet only
+        (RFC 6184 §5.1: the marker signals the end of the coded picture). An empty
+        access unit yields no packets.
+
+        Args:
+            payloads: The RTP payloads of one access unit (see
+                :meth:`payloads_for_access_unit`).
+            timestamp: The 90 kHz RTP timestamp for this access unit.
+
+        Returns:
+            The RTP packets, in send order.
+        """
+        last = len(payloads) - 1
+        return [
+            self._packet(payload, timestamp=timestamp, marker=idx == last)
+            for idx, payload in enumerate(payloads)
+        ]
+
     def packetise_access_unit(
         self, nals: Sequence[bytes], *, timestamp: int
     ) -> list[RtpPacket]:
@@ -268,28 +354,20 @@ class H264Packetiser:
         Returns:
             The RTP packets, in send order.
         """
-        payloads: list[bytes] = []
-        for nal in nals:
-            if not nal:
-                continue
-            payloads.extend(self._packetise_nal(nal))
-        packets: list[RtpPacket] = []
-        last = len(payloads) - 1
-        for idx, payload in enumerate(payloads):
-            packets.append(
-                self._packet(payload, timestamp=timestamp, marker=idx == last)
-            )
-        return packets
+        return self.wrap_payloads(
+            self.payloads_for_access_unit(nals), timestamp=timestamp
+        )
 
     def aggregate_stap_a(
         self, nals: Sequence[bytes], *, timestamp: int, marker: bool = False
     ) -> RtpPacket:
         """Aggregate small NALs (e.g. SPS+PPS) into one STAP-A packet (§5.7.1).
 
-        The STAP-A header byte takes ``F``=0, ``NRI``=max of the aggregated NALs'
-        NRI, and type 24. Each aggregation unit is a 16-bit big-endian size
-        followed by the NAL bytes. The caller is responsible for keeping the total
-        within the MTU (parameter sets are tiny).
+        The STAP-A header byte takes ``F`` = the OR of the aggregated NALs' F bits
+        (RFC 6184 §5.7.1: set when any aggregated NAL had a forbidden_zero_bit),
+        ``NRI`` = the max of the aggregated NALs' NRI, and type 24. Each
+        aggregation unit is a 16-bit big-endian size followed by the NAL bytes.
+        The caller keeps the total within the MTU (parameter sets are tiny).
 
         Args:
             nals: The NAL units to aggregate (each must fit a 16-bit size).
@@ -307,7 +385,10 @@ class H264Packetiser:
             msg = "aggregate_stap_a requires at least one NAL"
             raise ValueError(msg)
         max_nri = max((nal[0] & _NAL_HEADER_NRI_MASK) for nal in nals)
-        stap_header = max_nri | _STAP_A_TYPE  # F=0
+        # RFC 6184 §5.7.1: the aggregation packet's F bit is the OR of the
+        # aggregated NALs' F bits; NRI is the maximum of their NRI values.
+        f_bit = max((nal[0] & _NAL_HEADER_F_MASK) for nal in nals)
+        stap_header = f_bit | max_nri | _STAP_A_TYPE
         body = bytearray([stap_header])
         for nal in nals:
             if len(nal) > _U16_MAX:
@@ -337,11 +418,14 @@ class _IceSend(Protocol):
 class RtpVideoSender:
     """Loop a pre-packetised H.264 source over the BUNDLE'd SRTP + ICE pipe.
 
-    The NALs are grouped into access units once at construction; each loop
-    iteration packetises every access unit (advancing the 90 kHz timestamp per
-    frame), SRTP-``protect``-s each RTP packet, and writes it to the ICE pipe —
-    the identical seam the audio engine uses (ADR-0044 §4: BUNDLE shares the ICE
-    5-tuple + the DTLS handshake, so no second gather/handshake).
+    The NALs are grouped into access units AND packetised into their (loop-
+    invariant) RTP payloads ONCE at construction; each loop iteration only wraps
+    those precomputed payloads in RTP packets (advancing the 90 kHz timestamp per
+    frame + a fresh sequence number), SRTP-``protect``-s each, and writes it to
+    the ICE pipe — the identical seam the audio engine uses (ADR-0044 §4: BUNDLE
+    shares the ICE 5-tuple + the DTLS handshake, so no second gather/handshake).
+    Re-fragmenting the static source every frame would be wasted work on a
+    forever loop (rule 22), so the FU-A/single-NAL split is done exactly once.
 
     The looping task is driven by :meth:`run` (paced at ``fps``); :meth:`stop`
     ends it. :meth:`send_loop_once` sends exactly one pass over the source (used
@@ -387,6 +471,14 @@ class RtpVideoSender:
             initial_sequence=initial_sequence,
             payload_type=payload_type,
         )
+        # Precompute each access unit's loop-invariant RTP payloads ONCE: the
+        # source is static, so its FU-A/single-NAL split never changes across
+        # loops. Each send only wraps these in RTP packets (seq/ts/marker), not
+        # re-fragment them every frame on the forever loop (rule 22).
+        self._frames: list[list[bytes]] = [
+            self._packetiser.payloads_for_access_unit(unit)
+            for unit in self._access_units
+        ]
         # Wall-clock 90 kHz timestamp accumulator (advances across loops).
         self._timestamp = 0
         self._stop = asyncio.Event()
@@ -394,13 +486,14 @@ class RtpVideoSender:
     async def send_loop_once(self) -> None:
         """Send one full pass over the source (every access unit once).
 
-        Each access unit's packets are SRTP-protected and written to the ICE
-        pipe; the 90 kHz timestamp advances by ``VIDEO_CLOCK_RATE // fps`` per
-        access unit. An empty source sends nothing.
+        Each access unit's precomputed payloads are wrapped in RTP packets,
+        SRTP-protected, and written to the ICE pipe; the 90 kHz timestamp advances
+        by ``VIDEO_CLOCK_RATE // fps`` per access unit. An empty source sends
+        nothing.
         """
-        for unit in self._access_units:
-            packets = self._packetiser.packetise_access_unit(
-                unit, timestamp=self._timestamp
+        for payloads in self._frames:
+            packets = self._packetiser.wrap_payloads(
+                payloads, timestamp=self._timestamp
             )
             for packet in packets:
                 await self._ice.send(self._srtp.protect(packet))
@@ -414,15 +507,15 @@ class RtpVideoSender:
         propagate (rule 37) — a send failure aborts the sender, it is not
         swallowed.
         """
-        if not self._access_units:
+        if not self._frames:
             return
         frame_interval = 1.0 / self._fps
         while not self._stop.is_set():
-            for unit in self._access_units:
+            for payloads in self._frames:
                 if self._stop.is_set():
                     return
-                packets = self._packetiser.packetise_access_unit(
-                    unit, timestamp=self._timestamp
+                packets = self._packetiser.wrap_payloads(
+                    payloads, timestamp=self._timestamp
                 )
                 for packet in packets:
                     await self._ice.send(self._srtp.protect(packet))

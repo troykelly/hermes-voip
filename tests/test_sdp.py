@@ -1312,6 +1312,96 @@ def test_build_webrtc_answer_rtcp_mux_present() -> None:
     assert "a=rtcp-mux" in text
 
 
+# --- trickle-ICE SDP primitives (ADR-0034) ---
+
+
+def _build_answer() -> str:
+    """Build a WebRTC answer from the canonical SAVPF offer (test helper)."""
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    return build_webrtc_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+
+
+def test_build_webrtc_answer_advertises_trickle_and_ice2() -> None:
+    """ADR-0034: the answer declares a=ice-options:trickle ice2 (RFC 8838 §4.1)."""
+    text = _build_answer()
+    assert "a=ice-options:trickle ice2" in text
+
+
+def test_build_webrtc_answer_emits_end_of_candidates() -> None:
+    """ADR-0034: a full-candidate answer ends with a=end-of-candidates (RFC 8838 §8.2).
+
+    We send our complete candidate set, then mark end-of-candidates — the
+    half-trickle degenerate case that interoperates with both classic and
+    trickling peers.
+    """
+    text = _build_answer()
+    assert "a=end-of-candidates" in text
+
+
+def test_build_webrtc_answer_end_of_candidates_after_candidates() -> None:
+    """end-of-candidates appears AFTER the a=candidate lines it terminates."""
+    text = _build_answer()
+    cand_idx = text.index("a=candidate:")
+    eoc_idx = text.index("a=end-of-candidates")
+    assert cand_idx < eoc_idx
+
+
+def test_parse_offer_ice_options_trickle() -> None:
+    """ADR-0034: a peer offer's a=ice-options trickle/ice2 is parsed + exposed."""
+    offer_with_trickle = _OFFER_SAVPF.replace(
+        "a=ice-options:ice2\r\n", "a=ice-options:trickle ice2\r\n"
+    )
+    sdp = SessionDescription.parse(offer_with_trickle)
+    assert sdp.audio is not None
+    assert "trickle" in sdp.audio.ice_options
+    assert "ice2" in sdp.audio.ice_options
+    assert sdp.audio.is_trickle is True
+
+
+def test_parse_offer_ice_options_non_trickle() -> None:
+    """A plain ice2-only offer is parsed but is_trickle is False."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.ice_options == ("ice2",)
+    assert sdp.audio.is_trickle is False
+
+
+def test_parse_offer_end_of_candidates_present() -> None:
+    """ADR-0034: a peer offer's a=end-of-candidates is parsed into a flag."""
+    offer_eoc = _OFFER_SAVPF.replace(
+        "a=rtcp-mux\r\n", "a=rtcp-mux\r\na=end-of-candidates\r\n"
+    )
+    sdp = SessionDescription.parse(offer_eoc)
+    assert sdp.audio is not None
+    assert sdp.audio.end_of_candidates is True
+
+
+def test_parse_offer_end_of_candidates_absent_defaults_false() -> None:
+    """No a=end-of-candidates => the flag defaults False."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.end_of_candidates is False
+
+
+def test_parse_sdes_offer_has_no_trickle_attrs() -> None:
+    """An SDES offer exposes no ice-options / end-of-candidates (defaults)."""
+    sdp = SessionDescription.parse(_OFFER_SAVP)
+    assert sdp.audio is not None
+    assert sdp.audio.ice_options == ()
+    assert sdp.audio.is_trickle is False
+    assert sdp.audio.end_of_candidates is False
+
+
 def test_build_webrtc_answer_no_sdes_crypto() -> None:
     """RFC 8827 §6.5 / ADR-0016: WebRTC answer MUST NOT carry a=crypto."""
     offer = SessionDescription.parse(_OFFER_SAVPF)

@@ -420,6 +420,10 @@ class AudioMedia:
         ice_pwd: ICE password (``a=ice-pwd``), or ``None`` if absent.
         ice_candidates: Parsed ICE candidate list (``a=candidate``), in offer order.
         rtcp_mux: ``True`` when ``a=rtcp-mux`` is present (RFC 5761).
+        ice_options: Parsed ``a=ice-options`` tokens (e.g. ``("trickle", "ice2")``),
+            empty when absent (ADR-0034, RFC 8839 §5.6).
+        end_of_candidates: ``True`` when the m-line carried ``a=end-of-candidates``
+            (RFC 8838 §8.2) — the candidate generation is complete.
 
     ``crypto`` and ``crypto_attrs`` are suppressed from ``repr``
     (``field(repr=False)``): both carry SDES inline master key||salt material,
@@ -440,11 +444,23 @@ class AudioMedia:
     ice_pwd: str | None = None
     ice_candidates: tuple[IceCandidate, ...] = field(default_factory=tuple)
     rtcp_mux: bool = False
+    ice_options: tuple[str, ...] = field(default_factory=tuple)
+    end_of_candidates: bool = False
 
     @property
     def is_srtp(self) -> bool:
         """True when the transport profile is SDES-secured (SAVP or SAVPF)."""
         return "SAVP" in self.protocol
+
+    @property
+    def is_trickle(self) -> bool:
+        """True when the peer advertised trickle ICE (``a=ice-options:trickle``).
+
+        RFC 8838 §4.1: a ``trickle`` ICE option signals the peer may send more
+        candidates incrementally after the initial offer/answer. Absent the
+        option (a classic non-trickle peer) this is ``False``.
+        """
+        return "trickle" in self.ice_options
 
     @property
     def is_webrtc(self) -> bool:
@@ -482,6 +498,9 @@ class _AudioAccumulator:
     ice_pwd: str | None = None
     ice_candidates: list[IceCandidate] = field(default_factory=list)
     rtcp_mux: bool = False
+    # Trickle-ICE SDP primitives (ADR-0034, RFC 8838/8839)
+    ice_options: tuple[str, ...] = ()
+    end_of_candidates: bool = False
 
     def set_media_line(self, value: str) -> None:
         """Apply an ``m=audio <port> <proto> <fmt...>`` line.
@@ -517,7 +536,9 @@ class _AudioAccumulator:
             msg = f"malformed a={value!r}"
             raise SdpError(msg) from exc
 
-    def _add_attribute(self, tag: str, rest: str, value: str) -> None:
+    def _add_attribute(  # noqa: PLR0912 -- a flat SDP attribute dispatch; each branch maps one a= tag to one field
+        self, tag: str, rest: str, value: str
+    ) -> None:
         if tag == "rtpmap":
             pt_str, _, enc_str = rest.partition(" ")
             encoding, _, after = enc_str.partition("/")
@@ -551,6 +572,13 @@ class _AudioAccumulator:
         elif tag == "candidate":
             with contextlib.suppress(SdpError):
                 self.ice_candidates.append(IceCandidate.parse(rest.strip()))
+        elif tag == "ice-options":
+            # RFC 8839 §5.6: space-separated option tokens (e.g. "trickle ice2").
+            self.ice_options = tuple(rest.split())
+        elif value == "end-of-candidates":
+            # RFC 8838 §8.2: a value-less attribute marking the end of the
+            # candidate generation (non-trickle / half-trickle).
+            self.end_of_candidates = True
         elif value == "rtcp-mux":
             self.rtcp_mux = True
 
@@ -600,6 +628,8 @@ class _AudioAccumulator:
             ice_pwd=self.ice_pwd,
             ice_candidates=tuple(self.ice_candidates),
             rtcp_mux=self.rtcp_mux,
+            ice_options=self.ice_options,
+            end_of_candidates=self.end_of_candidates,
         )
 
 
@@ -841,11 +871,17 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
     # DTLS-SRTP keying attributes (RFC 5763 §5, RFC 4572).
     lines.append(f"a=fingerprint:{fingerprint.render()}")
     lines.append(f"a=setup:{setup.render()}")
-    # ICE credentials and candidates (RFC 8839 §5.4, §5.1).
+    # ICE credentials, options, and candidates (RFC 8839 §5.4, §5.6, §5.1).
     lines.append(f"a=ice-ufrag:{ice_ufrag}")
     lines.append(f"a=ice-pwd:{ice_pwd}")
+    # Advertise trickle + ICE2 (RFC 8838 §4.1 / RFC 8445). Safe in a full-candidate
+    # answer: we list all candidates and then mark end-of-candidates, the
+    # half-trickle degenerate case that interoperates with classic + trickle peers.
+    lines.append("a=ice-options:trickle ice2")
     for cand in ice_candidates:
         lines.append(f"a=candidate:{cand.render()}")
+    # end-of-candidates (RFC 8838 §8.2): our candidate generation is complete.
+    lines.append("a=end-of-candidates")
     # rtcp-mux (RFC 5761): RTP + RTCP share the one ICE-selected 5-tuple.
     lines.append("a=rtcp-mux")
     lines.append(f"a=ptime:{ptime}")

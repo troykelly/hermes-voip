@@ -231,16 +231,22 @@ class _IceFactory(Protocol):
     """The ICE-factory callable :class:`WebRtcMediaSession` accepts (``ice_factory``).
 
     Matches the session's private ``_IceFactory`` protocol structurally (keyword-only
-    ``ice_controlling`` / ``stun_urls``), so a factory typed as this is accepted where
-    the session wants one — without importing the session's underscore-prefixed
-    Protocol. The returned :class:`_LinkedIce` satisfies the session's ``_IcePipe``
-    surface structurally.
+    ``ice_controlling`` / ``stun_urls`` plus the ADR-0034 TURN keywords, defaulted),
+    so a factory typed as this is accepted where the session wants one — without
+    importing the session's underscore-prefixed Protocol. The returned
+    :class:`_LinkedIce` satisfies the session's ``_IcePipe`` surface structurally.
     """
 
     def __call__(
-        self, *, ice_controlling: bool, stun_urls: tuple[str, ...]
+        self,
+        *,
+        ice_controlling: bool,
+        stun_urls: tuple[str, ...],
+        turn_urls: tuple[str, ...] = (),
+        turn_username: str | None = None,
+        turn_password: str | None = None,
     ) -> _LinkedIce:
-        """Build an ICE pipe for the given role and STUN servers."""
+        """Build an ICE pipe for the given role, STUN, and (optional) TURN."""
         ...
 
 
@@ -389,14 +395,20 @@ class FakeWebRtcGateway:
     def adapter_ice_factory(self) -> _IceFactory:
         """Return an ICE factory the adapter's ``WebRtcMediaSession`` uses (one-shot).
 
-        The factory ignores its ``ice_controlling`` / ``stun_urls`` arguments and
-        returns the adapter's pre-linked half of the in-memory ICE pipe. It is one-shot:
-        the adapter builds exactly one WebRtcMediaSession per inbound call, and this
-        harness drives exactly one call, so a second call would be a test-wiring bug.
+        The factory ignores its ``ice_controlling`` / ``stun_urls`` / TURN arguments
+        and returns the adapter's pre-linked half of the in-memory ICE pipe. It is
+        one-shot: the adapter builds exactly one WebRtcMediaSession per inbound call,
+        and this harness drives exactly one call, so a second call would be a
+        test-wiring bug.
         """
 
         def _factory(
-            *, ice_controlling: bool, stun_urls: tuple[str, ...]
+            *,
+            ice_controlling: bool,
+            stun_urls: tuple[str, ...],
+            turn_urls: tuple[str, ...] = (),
+            turn_username: str | None = None,
+            turn_password: str | None = None,
         ) -> _LinkedIce:
             if self._adapter_ice_handed_out:
                 msg = "adapter ICE pipe already handed out (one call per gateway)"
@@ -570,7 +582,12 @@ class FakeWebRtcGateway:
         """An ICE factory returning the peer's half of the linked pipe."""
 
         def _factory(
-            *, ice_controlling: bool, stun_urls: tuple[str, ...]
+            *,
+            ice_controlling: bool,
+            stun_urls: tuple[str, ...],
+            turn_urls: tuple[str, ...] = (),
+            turn_username: str | None = None,
+            turn_password: str | None = None,
         ) -> _LinkedIce:
             return self._peer_ice
 

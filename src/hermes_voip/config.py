@@ -298,9 +298,23 @@ _MAX_RTP_TIMEOUT_SECS = 300
 # WebRTC ICE STUN servers (ADR-0032/0016). A comma-separated list of ``stun:`` URLs
 # used to gather server-reflexive (srflx) ICE candidates for the WebRTC media path.
 # Empty (the default) ⇒ host-only ICE (works on a LAN / where the peer reaches our
-# host candidates directly). TURN relay is deferred (ADR-0016 §6). Has no effect on
-# the SIP-over-TLS path. Each member is trimmed; blank members are dropped.
+# host candidates directly). Has no effect on the SIP-over-TLS path. Each member is
+# trimmed; blank members are dropped.
 _ICE_STUN_URLS_KEY = "HERMES_VOIP_ICE_STUN_URLS"
+
+# WebRTC ICE TURN relay (ADR-0034). A comma-separated list of ``turn:``/``turns:``
+# URLs plus long-term credentials (RFC 8656). When set, a *relay* ICE candidate is
+# gathered so WebRTC works without a host / STUN-reflexive path (symmetric NAT,
+# restrictive firewalls). The plugin only CONSUMES an operator-provided TURN server;
+# it does not run one. Empty (the default) ⇒ no relay candidate. When URLs are set,
+# both username and password are REQUIRED (a credential-less TURN URL would silently
+# gather nothing — rejected loudly at load, rule 27). The password is a secret and is
+# repr-suppressed (never logged). Has no effect on the SIP-over-TLS path.
+_ICE_TURN_URLS_KEY = "HERMES_VOIP_ICE_TURN_URLS"
+_ICE_TURN_USERNAME_KEY = "HERMES_VOIP_ICE_TURN_USERNAME"
+# S105 noqa: this is the env-var NAME, not a password value — the secret is read from
+# this key at runtime, never hardcoded.
+_ICE_TURN_PASSWORD_KEY = "HERMES_VOIP_ICE_TURN_PASSWORD"  # noqa: S105
 
 # Prompt-injection guard (ADR-0009). Default is the in-process ONNX classifier;
 # the optional loopback sidecar is opt-in (and out of this parser's scope).
@@ -602,6 +616,15 @@ class MediaConfig:
     # gathering. Empty (the default) ⇒ host-only ICE. No effect on the SIP-over-TLS
     # path. Defaulted so existing direct constructions stay valid.
     ice_stun_urls: tuple[str, ...] = ()
+    # WebRTC ICE TURN relay (ADR-0034), as ``turn:``/``turns:`` URLs for relay
+    # candidate gathering. Empty (the default) ⇒ no relay candidate. When set, the
+    # username + password are required (validated at load). No effect on the
+    # SIP-over-TLS path. Defaulted so existing direct constructions stay valid.
+    ice_turn_urls: tuple[str, ...] = ()
+    ice_turn_username: str | None = None
+    # The TURN password is a secret — repr-suppressed so it never reaches a log line
+    # or traceback (same discipline as the cloud API keys above).
+    ice_turn_password: str | None = field(default=None, repr=False)
     # In-process acoustic echo cancellation (ADR-0033). On by default: the gateway
     # reflects the agent's TTS back, and the canceller subtracts the known outbound
     # reference from each inbound frame before the VAD/ASR see it, so the echo cannot
@@ -887,6 +910,8 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         if aec_enabled
         else _DEFAULT_BARGE_IN_MIN_SPEECH_MS
     )
+    # TURN relay (ADR-0034): parsed + validated together (URLs require credentials).
+    _ice_turn = _parse_ice_turn(env)
     return MediaConfig(
         stt_provider=_value_lower(env, _STT_PROVIDER_KEY) or _DEFAULT_STT_PROVIDER,
         stt_model_dir=_optional(env, _STT_MODEL_DIR_KEY),
@@ -951,6 +976,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             _DEFAULT_RTP_TIMEOUT_SECS,
         ),
         ice_stun_urls=_parse_ice_stun_urls(env),
+        ice_turn_urls=_ice_turn[0],
+        ice_turn_username=_ice_turn[1],
+        ice_turn_password=_ice_turn[2],
         aec_enabled=aec_enabled,
         aec_filter_ms=_parse_positive_int(
             env, _AEC_FILTER_MS_KEY, _DEFAULT_AEC_FILTER_MS
@@ -1282,6 +1310,34 @@ def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:
     if not raw:
         return ()
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _parse_ice_turn(
+    env: Mapping[str, str],
+) -> tuple[tuple[str, ...], str | None, str | None]:
+    """Parse the TURN relay config (ADR-0034): URLs + long-term credentials.
+
+    Returns ``(turn_urls, username, password)``. Each URL member is trimmed; blank
+    members are dropped (same shape as STUN). When ``turn_urls`` is non-empty, both
+    a username and a password are REQUIRED (RFC 8656 §9.2): a credential-less TURN
+    URL would gather no relay candidate, which rule 27 forbids — so a missing
+    credential is a loud :class:`ConfigError`, not a silent no-op.
+
+    Raises:
+        ConfigError: If TURN URLs are set but the username or password is missing.
+    """
+    raw = _value(env, _ICE_TURN_URLS_KEY)
+    urls = tuple(part.strip() for part in raw.split(",") if part.strip()) if raw else ()
+    username = _value(env, _ICE_TURN_USERNAME_KEY) or None
+    password = _value(env, _ICE_TURN_PASSWORD_KEY) or None
+    if urls and (username is None or password is None):
+        msg = (
+            f"{_ICE_TURN_URLS_KEY} is set but a TURN credential is missing: both "
+            f"{_ICE_TURN_USERNAME_KEY} and {_ICE_TURN_PASSWORD_KEY} are required "
+            "(RFC 8656 §9.2 long-term credentials)."
+        )
+        raise ConfigError(msg)
+    return urls, username, password
 
 
 def _parse_tone_secs(env: Mapping[str, str]) -> float:

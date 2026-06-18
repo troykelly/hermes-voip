@@ -396,8 +396,9 @@ Every one of these has a sensible default — set them only to tune the experien
 | `HERMES_VOIP_RTP_TIMEOUT_SECS`        | `20` (range 1–300) | End a call this many seconds after the audio goes silent (a safety watchdog so a silently-dropped call never hangs forever). |
 
 The full set of media knobs — VAD sensitivity, end-of-speech timing, keepalive interval,
-clean-stop fade, WebRTC STUN servers (`HERMES_VOIP_ICE_STUN_URLS`), DTMF receive settings — is
-documented in [`.env.example`](.env.example) and [`config.py`](src/hermes_voip/config.py).
+clean-stop fade, WebRTC STUN servers (`HERMES_VOIP_ICE_STUN_URLS`) and TURN relay
+(`HERMES_VOIP_ICE_TURN_URLS` + credentials), DTMF receive settings — is documented in
+[`.env.example`](.env.example) and [`config.py`](src/hermes_voip/config.py).
 
 ### Knowing who's calling (caller groups)
 

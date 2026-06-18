@@ -19,10 +19,12 @@ design). This runbook is the operational HOW.
 | Inbound WebRTC media (DTLS-SRTP + ICE + Opus) | **Wired** (ADR-0032) |
 | Opus 48 kHz on the wire; G.711 fallback | **Wired** |
 | ICE host candidates + STUN server-reflexive (srflx) | **Wired** |
+| **TURN** relay candidates (operator-provided credentials) | **Wired** (ADR-0034); see "The TURN knob" — full live relay needs a real TURN server |
+| ICE **consent freshness** (RFC 7675) — long calls behind NAT drop deterministically | **Wired** (ADR-0034; aioice-native, surfaced) |
+| **Trickle** ICE — SDP primitives (`a=ice-options:trickle`, `a=end-of-candidates`) + half-trickle answer | **Wired** (ADR-0034) |
 | **Outbound** WebRTC origination (our own offer) | **Deferred** — outbound runs over SIP-over-TLS |
 | SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Deferred** — registration/INVITE run over TLS |
-| **TURN** relay | **Deferred** (ADR-0016 §6); STUN srflx only |
-| **Trickle** ICE | **Deferred** — non-trickle MVP (all candidates in the answer) |
+| Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Deferred** (ADR-0034 §2) — gateways send a full candidate set in the initial SDP |
 | WebRTC **video** | **Deferred** (ADR-0018) |
 | **Live** validation against a real WebRTC client | **Pending** the operator's redeploy |
 
@@ -47,7 +49,7 @@ design). This runbook is the operational HOW.
    # -> libopus.so.0
    ```
 
-## The knob
+## The STUN knob
 
 | Item | Value |
 | --- | --- |
@@ -66,8 +68,89 @@ design). This runbook is the operational HOW.
   HERMES_VOIP_ICE_STUN_URLS=stun:stun.example.test:3478,stun:stun2.example.test:3478
   ```
 
-  A malformed URL fails loudly when the ICE agent is built (not silently at parse). TURN keys
-  are reserved (ADR-0016 §6) but unused.
+  A malformed URL fails loudly when the ICE agent is built (not silently at parse).
+
+## The TURN knob (relay candidates — ADR-0034)
+
+When neither a host nor a STUN-reflexive path is usable (symmetric NAT, restrictive
+firewalls), a **TURN relay** candidate is needed. The plugin **consumes** an
+operator-provided TURN server — **it does not run one** (a TURN server is external
+infrastructure: run `coturn`, or use a contracted relay; out of this plugin's scope, rules
+40/41).
+
+| Item | Value |
+| --- | --- |
+| Env vars | `HERMES_VOIP_ICE_TURN_URLS`, `HERMES_VOIP_ICE_TURN_USERNAME`, `HERMES_VOIP_ICE_TURN_PASSWORD` |
+| Type | URLs: comma-separated `turn:`/`turns:` list; username/password: strings |
+| Default | empty ⇒ **no relay candidate** |
+| Read by | `hermes_voip.config.load_media_config` → `MediaConfig.ice_turn_urls/_username/_password` |
+| Applied at | `WebRtcMediaSession(turn_urls=…, turn_username=…, turn_password=…)` → `IceConnection` → aioice's TURN client, per inbound WebRTC call |
+
+- **URL shape (RFC 7065):** `turn:<host>[:<port>][?transport=udp\|tcp]` (plain, default port
+  **3478**) or `turns:<host>[:<port>]` (TLS, default port **5349**). Only the **first** URL is
+  used (aioice accepts one TURN server). Example (values, no secret — the password lives in
+  `.env` / 1Password, never here):
+
+  ```
+  HERMES_VOIP_ICE_TURN_URLS=turn:turn.example.test:3478?transport=udp
+  HERMES_VOIP_ICE_TURN_USERNAME=relay-user
+  HERMES_VOIP_ICE_TURN_PASSWORD=<in .env / 1Password>
+  ```
+
+- **Credentials are REQUIRED when URLs are set** (RFC 8656 §9.2 long-term credentials). A
+  TURN URL with a missing username or password is a **loud `ConfigError` at load** (a
+  credential-less TURN URL would gather no relay candidate — never a silent no-op, rule 27).
+- **The password is a secret:** it is `repr`-suppressed on `MediaConfig` (never logged) and
+  the TURN URL parser does not echo the URL on error.
+- **Relay media is still end-to-end DTLS-SRTP:** the TURN server relays *ciphertext* — it is
+  not in the media-trust path.
+- **Live relay is an operator validation step.** Unit tests prove the URL parsing + the aioice
+  TURN-param wiring + the relay-candidate SDP round-trip; a **full live relay** (a real
+  allocation + media over the relay) requires a reachable TURN server you point the plugin at,
+  validated like the live-gateway path (runbook 0002).
+
+  Quick local TURN to validate against (operator machine; not part of CI):
+
+  ```
+  # A throwaway coturn with static long-term creds (replace the values):
+  docker run -d --name coturn-test --network host coturn/coturn \
+    -n --lt-cred-mech --realm=example.test --user=relay-user:RELAY_PASSWORD \
+    --no-tls --no-dtls
+  # then set the three env vars above (turn:127.0.0.1:3478) and place a WebRTC call.
+  ```
+
+## ICE consent freshness (RFC 7675 — long NAT'd calls don't silently drop)
+
+A long call behind a NAT whose mapping silently expires must be **torn down
+deterministically**, not left wedged (gap-analysis #6). `aioice` runs RFC 7675 consent
+freshness **internally**: after ICE connects it issues a periodic STUN consent check on the
+nominated pair (~every 5 s, randomised) and, after 6 consecutive failures, closes the ICE
+connection. The plugin **surfaces** that closure: the closed ICE pipe makes the engine's ICE
+reader's `recv()` raise, which the engine turns into a **transport-loss teardown** (the call
+ends, `media_timed_out`). This is **independent of media flow** — a held/quiet call is
+protected too (the media-inactivity timeout only fires when media *was* flowing and stopped).
+
+- **No knob, no new code:** consent freshness is aioice-native; ADR-0034 adds no timing of its
+  own (it keeps aioice's RFC-grounded interval/failure defaults) and only locks + surfaces the
+  behaviour. Verify it is armed:
+
+  ```
+  uv run pytest tests/test_media_ice.py -k "consent or recv_after_close or unblocks" \
+                tests/test_media_engine_ice.py -k "consent or transport_loss"
+  ```
+
+## Trickle ICE (SDP primitives — ADR-0034)
+
+The plugin **advertises trickle + ICE2** in its WebRTC answer (`a=ice-options:trickle ice2`),
+sends its full candidate set, then marks `a=end-of-candidates` (RFC 8838 §8.2 — the
+half-trickle degenerate case, interoperable with both classic and trickling peers). It
+**parses** a peer's `a=ice-options`/`a=end-of-candidates` (exposed as `AudioMedia.is_trickle`
+/ `AudioMedia.end_of_candidates`). On the receive side it **always** signals
+end-of-candidates to ICE after the offer's candidates: the **in-dialog transport** that would
+deliver a trickling peer's later candidates (SIP INFO with `application/trickle-ice-sdpfrag`,
+RFC 8840) is **deferred** (ADR-0034 §2), so withholding the end marker would hang ICE waiting
+for candidates that can never arrive. WebRTC SIP gateways send a complete candidate set in the
+initial SDP, so always ending candidates does not regress any working call.
 
 ## What happens on an inbound WebRTC call (the flow)
 
@@ -125,5 +208,8 @@ design). This runbook is the operational HOW.
   refuse WebRTC, do not point a WebRTC client at the extension (or omit the `webrtc` extra: a
   WebRTC offer then fails the call cleanly with a 488/ImportError, never dead audio).
 - **STUN:** unset `HERMES_VOIP_ICE_STUN_URLS` to fall back to host-only ICE.
+- **TURN:** unset `HERMES_VOIP_ICE_TURN_URLS` (and the username/password) to stop gathering a
+  relay candidate. Rotating the TURN credential = update `HERMES_VOIP_ICE_TURN_PASSWORD` (in
+  `.env` / 1Password) and the TURN server's user, then restart the plugin; nothing is cached.
 - This is a Python plugin (no provisioned infrastructure to tear down). STUN/TURN servers, if
   any, are external services the operator runs separately and are out of this plugin's scope.

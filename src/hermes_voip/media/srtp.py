@@ -40,6 +40,7 @@ import hashlib
 import hmac
 import importlib
 import struct
+import threading
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -228,17 +229,26 @@ class _CryptographyImpl:
 
 
 _CRYPTO: _CryptographyImpl | None = None
+_CRYPTO_LOCK = threading.Lock()
 
 
 def _get_crypto() -> _CryptographyImpl:
     """Return the singleton :class:`_CryptographyImpl`, constructing it on first call.
+
+    Thread-safe via double-checked locking: Hermes runs the agent generation on
+    an uncapped thread pool and forks background workers, so this getter can be
+    entered concurrently.  The unlocked fast path serves the common already-built
+    case; the lock plus re-check on the slow path makes the builder run at most
+    once even under a concurrent first-call stampede.
 
     Raises:
         ImportError: If the ``media`` extra (``cryptography``) is not installed.
     """
     global _CRYPTO  # noqa: PLW0603 — module-level singleton, intentional
     if _CRYPTO is None:
-        _CRYPTO = _CryptographyImpl()
+        with _CRYPTO_LOCK:
+            if _CRYPTO is None:
+                _CRYPTO = _CryptographyImpl()
     return _CRYPTO
 
 

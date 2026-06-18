@@ -253,6 +253,37 @@ trickles; that would be tasked into a signalling lane (it is a latency optimisat
   keyed (setup=…)`, `WebRTC media engine connected over ICE`, then `rtp tx/rx` lines. Two-way
   audio confirms the path.
 
+## Live validation status — real Asterisk/UCM gateway (2026-06-18, ADR-0042)
+
+First inbound WebRTC call from the live gateway (a Grandstream UCM whose WebRTC edge is an
+embedded Asterisk). What was **proven on the wire**, in order:
+
+1. **WSS REGISTER → `200 OK`** (expires ~299 s) on port `8090`, path `/ws`, subprotocol
+   `sip`, realm `voip002`, MD5 `qop=auth` — using the **VoIP-section `Password`** (the SIP
+   digest). `HERMES_SIP_WS_PASSWORD` is left **unset**; the item's top-level `password` is
+   the GDMS/WAVE portal login and `401`s here (see runbook 0002).
+2. **Inbound INVITE** classified to the `operator` group (needs `HERMES_VOIP_CALLER_ALLOW_FILE`
+   set, else the default group declines with `603`).
+3. **WebRTC SDP answer built** (`setup=passive`, Opus) + **`200 OK` sent** — the gateway's
+   offer puts DTLS/ICE at the **SDP session level** in a BUNDLE; the parser now inherits
+   them (ADR-0042 §1), so this no longer `488`s.
+4. **ICE connectivity check SUCCEEDED.**
+
+**Open item — media does not yet complete from the devcontainer (environment, not code).**
+The container is double-NAT'd (Docker on the operator's Mac, Mac on the office LAN): only a
+private IPv4 and a **ULA** IPv6, so a public-STUN srflx returns the office's hairpin-NAT IPv4
+the gateway cannot reach → the controlling gateway never nominates an ICE pair → DTLS never
+starts. The container **does** reach the gateway's **global IPv6** outbound (Docker NAT66),
+and the host shares the gateway's IPv6 `/48`. Per the operator's **IPv6-first, IPv4-fallback**
+directive the completion path is IPv6-first ICE (gather/prioritise IPv6; resolve STUN/TURN
+over IPv6 so the answer advertises a gateway-reachable address); TURN is the IPv4 fallback.
+Tracked as the next lane (a dedicated IPv6-first-ICE ADR).
+
+To reproduce the validation so far: run the gateway with `HERMES_SIP_TRANSPORT=wss`,
+`HERMES_SIP_PORT=8090`, `HERMES_SIP_WS_PATH=/ws`, the SIP `HERMES_SIP_*` creds, the model
+dirs, and `HERMES_VOIP_CALLER_ALLOW_FILE`; dial the extension from a WAVE client; watch the
+log for the four lines above.
+
 ## Security notes
 
 - No DTLS private key, certificate, or SRTP key material is ever logged, `repr`'d, or raised

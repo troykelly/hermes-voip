@@ -694,6 +694,39 @@ def test_media_ice_address_families_overridable() -> None:
     assert cfg.ice_use_ipv6 is True
 
 
+# --- WebRTC DTLS answerer role knob (ADR-0050) ---
+
+
+def test_media_webrtc_dtls_setup_default_auto() -> None:
+    """No knob => ``auto`` (the RFC-8842 active-answerer default, ADR-0050)."""
+    cfg = load_media_config({})
+    assert cfg.webrtc_dtls_setup == "auto"
+
+
+def test_media_webrtc_dtls_setup_forced_active() -> None:
+    """HERMES_VOIP_WEBRTC_DTLS_SETUP=active forces the active answerer role."""
+    cfg = load_media_config({"HERMES_VOIP_WEBRTC_DTLS_SETUP": "active"})
+    assert cfg.webrtc_dtls_setup == "active"
+
+
+def test_media_webrtc_dtls_setup_forced_passive() -> None:
+    """HERMES_VOIP_WEBRTC_DTLS_SETUP=passive forces the passive (server) role."""
+    cfg = load_media_config({"HERMES_VOIP_WEBRTC_DTLS_SETUP": "passive"})
+    assert cfg.webrtc_dtls_setup == "passive"
+
+
+def test_media_webrtc_dtls_setup_is_case_insensitive() -> None:
+    """The knob value is normalised (case-insensitive), e.g. ``PASSIVE``."""
+    cfg = load_media_config({"HERMES_VOIP_WEBRTC_DTLS_SETUP": "PASSIVE"})
+    assert cfg.webrtc_dtls_setup == "passive"
+
+
+def test_media_webrtc_dtls_setup_rejects_unknown() -> None:
+    """An unrecognised value is rejected loudly (rule 27 — no inert knob)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_WEBRTC_DTLS_SETUP": "actpass"})
+
+
 # --- TURN relay config (ADR-0034) ---
 
 

@@ -60,8 +60,10 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from email.message import Message as HTTPMessage
 from enum import Enum
 from pathlib import Path
+from typing import IO
 
 from hermes_voip.config import ConfigError
 from hermes_voip.dtmf import digit_to_event
@@ -183,6 +185,38 @@ class WebhookError(RuntimeError):
     Carries only the structural failure (HTTP status / failure class) — never the
     url / headers / body (which may embed a secret).
     """
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that REFUSES every 3xx instead of following it.
+
+    ``urllib.request.urlopen`` follows redirects by default. A webhook ``url`` is
+    validated as ``https://`` at load, but a redirect ``Location`` (e.g. a 302 to an
+    ``http://`` URL) would make urllib re-issue the request — Authorization header
+    and body included — to the redirect target IN CLEARTEXT, silently defeating the
+    https-only guarantee (ADR-0045). We refuse the redirect: the operator endpoint
+    must answer the configured https URL directly, never bounce it elsewhere.
+    """
+
+    def redirect_request(  # noqa: PLR0913 — base-class signature; all args required
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,  # noqa: ARG002 — base-class signature; reason text is fixed here
+        headers: HTTPMessage,
+        newurl: str,  # noqa: ARG002 — base-class signature; the target is never used
+    ) -> None:
+        # Returning a request would follow the redirect; raising refuses it. The
+        # error carries the status only — never the (secret-bearing) target URL.
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"refusing to follow redirect ({code})", headers, fp
+        )
+
+
+#: A shared opener that refuses redirects (see :class:`_NoRedirectHandler`). It is
+#: stateless and thread-safe to reuse across the worker-thread webhook calls.
+_WEBHOOK_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def load_multi_intercom_config(env: Mapping[str, str]) -> MultiIntercomConfig:
@@ -352,6 +386,15 @@ def _parse_webhook_opening(name: str, raw_opening: Mapping[str, object]) -> Open
         raise ConfigError(msg)
     headers = _parse_headers(name, raw_opening.get("headers"))
     body = _parse_body(name, raw_opening.get("body"))
+    if method == "GET" and body:
+        # A GET carries no body on the wire. Silently dropping a configured body
+        # would mask an operator misconfiguration, so reject it loud at load
+        # (rule 37) rather than discarding it at door-open time.
+        msg = (
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} uses method GET but has a "
+            "'body'; a GET sends no body — drop the body or use POST/PUT"
+        )
+        raise ConfigError(msg)
     timeout = _parse_timeout(name, raw_opening.get("timeout_s"))
     return Opening(
         name=name,
@@ -453,12 +496,14 @@ def _fire_webhook_blocking(opening: Opening) -> None:
         method=opening.method,
     )
     try:
-        with urllib.request.urlopen(  # noqa: S310 — see above; https enforced at load
-            request, timeout=opening.timeout_s
-        ) as response:
+        # Use the no-redirect opener: a 3xx (e.g. an https->http downgrade) is
+        # REFUSED, never followed (it would re-send the token/body in cleartext —
+        # ADR-0045). The url is operator-configured + https-validated at load.
+        with _WEBHOOK_OPENER.open(request, timeout=opening.timeout_s) as response:
             status = int(response.status)
     except urllib.error.HTTPError as exc:
-        # A non-2xx response: report the status only (no url, no headers, no body).
+        # A non-2xx response (including a refused redirect): report the status only
+        # (no url, no headers, no body).
         msg = f"webhook opening {opening.name!r} returned HTTP {exc.code}"
         raise WebhookError(msg) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:

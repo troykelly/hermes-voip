@@ -97,6 +97,46 @@ def test_transport_wss_defaults() -> None:
     assert cfg.transport == "wss"
     assert cfg.via_transport == "WSS"
     assert cfg.port == 443
+    # ADR-0035: the WebSocket upgrade path defaults to /ws when unset.
+    assert cfg.ws_path == "/ws"
+    # No separate WSS password unset ⇒ None (the digest falls back to the SIP pw).
+    assert cfg.ws_password is None
+
+
+def test_ws_path_override() -> None:
+    """ADR-0035: HERMES_SIP_WS_PATH overrides the default WebSocket upgrade path."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_SIP_TRANSPORT="wss",
+            HERMES_SIP_WS_PATH="/sip-ws",
+        )
+    )
+    assert cfg.ws_path == "/sip-ws"
+
+
+def test_ws_path_default_on_tls() -> None:
+    """ws_path is parsed even on tls (harmless default; only WSS reads it)."""
+    cfg = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="x")
+    )
+    assert cfg.ws_path == "/ws"
+
+
+def test_ws_password_parsed_and_repr_suppressed() -> None:
+    """ADR-0035: HERMES_SIP_WS_PASSWORD is read and NEVER appears in repr (a secret)."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="sip-pw",
+            HERMES_SIP_TRANSPORT="wss",
+            HERMES_SIP_WS_PASSWORD="wss-only-pw",
+        )
+    )
+    assert cfg.ws_password == "wss-only-pw"
+    # rule 34: the WSS password must never reach a log line — repr-suppressed.
+    assert "wss-only-pw" not in repr(cfg)
 
 
 def test_explicit_port_expires_and_user_agent() -> None:
@@ -162,6 +202,67 @@ def test_registration_config_builder() -> None:
     assert rc.user_agent == "hermes-voip/0"
     assert rc.contact == "<sip:1000@198.51.100.7:5061;transport=tls>"
     assert rc.local_sent_by == "198.51.100.7:5061"
+
+
+def test_registration_config_wss_password_override() -> None:
+    """ADR-0035: on wss with a WS password set, the digest uses the WS password."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="sip-pw",
+            HERMES_SIP_TRANSPORT="wss",
+            HERMES_SIP_WS_PASSWORD="wss-only-pw",
+        )
+    )
+    ext = cfg.extensions[0]
+    rc = cfg.registration_config(
+        ext,
+        contact="<sip:1000@aaa.invalid;transport=ws>",
+        local_sent_by="aaa.invalid",
+    )
+    assert rc.transport == "WSS"
+    # The WSS endpoint authenticates with the SEPARATE WSS credential, not the
+    # per-extension SIP password.
+    assert rc.password == "wss-only-pw"
+
+
+def test_registration_config_wss_password_falls_back_to_sip_password() -> None:
+    """ADR-0035: on wss with NO WS password, the digest falls back to the SIP pw."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="sip-pw",
+            HERMES_SIP_TRANSPORT="wss",
+        )
+    )
+    ext = cfg.extensions[0]
+    rc = cfg.registration_config(
+        ext,
+        contact="<sip:1000@aaa.invalid;transport=ws>",
+        local_sent_by="aaa.invalid",
+    )
+    assert rc.password == "sip-pw"
+
+
+def test_registration_config_ws_password_ignored_on_tls() -> None:
+    """A stray WS password does NOT override the digest on a tls transport."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="sip-pw",
+            HERMES_SIP_TRANSPORT="tls",
+            HERMES_SIP_WS_PASSWORD="wss-only-pw",
+        )
+    )
+    ext = cfg.extensions[0]
+    rc = cfg.registration_config(
+        ext,
+        contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+    )
+    assert rc.transport == "TLS"
+    # On TLS the WSS password is irrelevant — the SIP password is used.
+    assert rc.password == "sip-pw"
 
 
 # ---- rejection cases -------------------------------------------------------

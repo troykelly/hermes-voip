@@ -214,6 +214,41 @@ _PLAIN_OFFER = (
     "a=sendrecv\r\n"
 )
 
+# A WebRTC BUNDLE offer with audio + an H.264 m=video (ADR-0044). Fakes only.
+_WEBRTC_AV_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "a=group:BUNDLE 0 1\r\n"
+    "m=audio 50000 UDP/TLS/RTP/SAVPF 111 0\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=fingerprint:sha-256 "
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n"
+    "a=setup:actpass\r\n"
+    "a=ice-ufrag:peerUFRG\r\n"
+    "a=ice-pwd:peerPWDpeerPWDpeerPWDpeer\r\n"
+    "a=candidate:1 1 UDP 2130706431 127.0.0.1 50000 typ host\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+    "a=mid:0\r\n"
+    "m=video 50000 UDP/TLS/RTP/SAVPF 99\r\n"
+    "a=rtpmap:99 H264/90000\r\n"
+    "a=fmtp:99 profile-level-id=42e01f;packetization-mode=1\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+    "a=mid:1\r\n"
+)
+
+# A minimal H.264 Annex-B source: SPS + PPS + a small IDR (synthetic bytes).
+_FAKE_H264_ANNEX_B = (
+    b"\x00\x00\x00\x01\x67\x01\x02"  # SPS (type 7)
+    b"\x00\x00\x00\x01\x68\x03"  # PPS (type 8)
+    b"\x00\x00\x00\x01\x65" + b"\x00" * 40  # IDR (type 5)
+)
+
 
 def _make_invite(offer: str, call_id: str) -> str:
     content_length = len(offer.encode("utf-8"))
@@ -285,6 +320,9 @@ class _FakeWebRtcSession:
         self.handshake_args: dict[str, object] | None = None
         self.closed = False
         self.ice = MagicMock(name="ice_pipe")
+        # The video sender (ADR-0044) awaits ice.send(bytes); make it awaitable.
+        self.ice.send = AsyncMock(return_value=None)
+        self.video_ssrcs: list[int] = []
         _FakeWebRtcSession.last = self
 
     async def prepare(self) -> None:
@@ -326,6 +364,14 @@ class _FakeWebRtcSession:
     async def run_handshake(self, **kwargs: object) -> tuple[object, object]:
         self.handshake_args = kwargs
         return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
+
+    def derive_outbound_srtp_session(self, *, ssrc: int) -> object:
+        # Records the video SSRC and returns a fake SRTP whose protect() yields
+        # bytes the (fake) ICE pipe can send (ADR-0044).
+        self.video_ssrcs.append(ssrc)
+        srtp = MagicMock(name="video_srtp")
+        srtp.protect = MagicMock(return_value=b"SRTP-video-packet")
+        return srtp
 
     async def close(self) -> None:
         self.closed = True
@@ -402,6 +448,235 @@ async def test_webrtc_offer_yields_savpf_answer_with_opus_dtls_ice() -> None:
             assert kwargs["srtp_outbound"] is not None
     finally:
         in_call.set()
+        await asyncio.sleep(0)
+
+
+async def _build_adapter_with_media(
+    transport: _FakeTransport, media_cfg: object
+) -> object:
+    """A real VoipAdapter whose media config is ``media_cfg`` (ADR-0044 video)."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV))
+    manager = RegistrationManager(_gateway_config(), transport)
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config", return_value=_gateway_config()
+        ),
+        patch("hermes_voip.adapter.load_media_config", return_value=media_cfg),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_webrtc_av_offer_answers_sendonly_video_and_starts_sender(
+    tmp_path: object,
+) -> None:
+    """A configured video source yields a sendonly video answer + a live sender.
+
+    A WebRTC audio+video offer with a configured source is answered with a BUNDLE'd
+    sendonly ``m=video`` and starts the outbound H.264 sender over the ICE pipe.
+    We answer sendonly (never sendrecv): the plugin discards inbound video, and
+    sendrecv would solicit inbound video onto the BUNDLE 5-tuple and risk binding
+    the inbound audio SRTP session to the video SSRC (ADR-0044).
+    """
+    import pathlib  # noqa: PLC0415
+
+    assert isinstance(tmp_path, pathlib.Path)
+    source = tmp_path / "clip.h264"
+    source.write_bytes(_FAKE_H264_ANNEX_B)
+    media_cfg = load_media_config({"HERMES_VOIP_VIDEO_SOURCE_PATH": str(source)})
+
+    transport = _FakeTransport()
+    adapter = await _build_adapter_with_media(transport, media_cfg)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_AV_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+
+            ok = _sent_200_ok(transport)
+            # The answer carries a BUNDLE'd, sendonly m=video sharing audio's DTLS.
+            assert "m=video 9 UDP/TLS/RTP/SAVPF 99\r\n" in ok.body
+            assert "a=group:BUNDLE 0 1\r\n" in ok.body
+            video_block = ok.body.split("m=video", 1)[1]
+            assert "a=sendonly" in video_block
+            assert "a=sendrecv" not in video_block
+            assert "a=inactive" not in video_block
+            # The outbound video sender started: a distinct video SSRC was keyed
+            # and the sender is registered for this call.
+            session = _FakeWebRtcSession.last
+            assert session is not None
+            assert session.video_ssrcs, "no video SRTP session derived"
+            await _until(lambda: call_id in adapter._video_senders)  # type: ignore[attr-defined]
+            # The sender pushes SRTP-protected video bytes onto the ICE pipe.
+            await _until(lambda: session.ice.send.await_count > 0)
+    finally:
+        in_call.set()
+        # Tear the call down so the video sender task is stopped + cancelled.
+        await adapter.disconnect()  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+    # After teardown the per-call video sender registration is gone.
+    assert call_id not in adapter._video_senders  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_webrtc_video_ssrc_never_collides_with_audio(
+    tmp_path: object,
+) -> None:
+    """The random video SSRC never equals the fixed audio SSRC 0xCAFEBABE (ADR-0044).
+
+    A collision would let the inbound demux confuse audio and video streams on the
+    shared BUNDLE 5-tuple. The generator must skip the audio SSRC; here randint is
+    forced to return 0xCAFEBABE first, then a safe value — the keyed SSRC must be
+    the safe value, proving the collision is excluded.
+    """
+    import pathlib  # noqa: PLC0415
+
+    from hermes_voip.media.engine import _OUTBOUND_SSRC  # noqa: PLC0415
+
+    assert isinstance(tmp_path, pathlib.Path)
+    source = tmp_path / "clip.h264"
+    source.write_bytes(_FAKE_H264_ANNEX_B)
+    media_cfg = load_media_config({"HERMES_VOIP_VIDEO_SOURCE_PATH": str(source)})
+
+    transport = _FakeTransport()
+    adapter = await _build_adapter_with_media(transport, media_cfg)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_AV_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    _safe_ssrc = 0x0BADF00D
+    # First draw collides with the audio SSRC; the generator must reject it and
+    # redraw, landing on the safe value.
+    randint_returns = iter([_OUTBOUND_SSRC, _safe_ssrc])
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.random.randint",
+                side_effect=lambda *_a, **_k: next(randint_returns),
+            ),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            session = _FakeWebRtcSession.last
+            assert session is not None
+            await _until(lambda: bool(session.video_ssrcs))
+            assert _OUTBOUND_SSRC not in session.video_ssrcs
+            assert session.video_ssrcs == [_safe_ssrc]
+    finally:
+        in_call.set()
+        await adapter.disconnect()  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_webrtc_av_offer_no_source_answers_inactive_video(
+    tmp_path: object,
+) -> None:
+    """With no video source, a video offer is answered a=inactive (no sender).
+
+    RFC-correct BUNDLE decline (ADR-0044): the m=video line stays so the group is
+    intact, but a=inactive and no outbound video sender is started.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport)  # load_media_config({}) → no source
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_AV_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+
+            ok = _sent_200_ok(transport)
+            assert "m=video 9 UDP/TLS/RTP/SAVPF 99\r\n" in ok.body
+            video_block = ok.body.split("m=video", 1)[1]
+            assert "a=inactive" in video_block
+            assert "a=sendrecv" not in video_block
+            # No outbound sender: no video SSRC keyed, none registered.
+            session = _FakeWebRtcSession.last
+            assert session is not None
+            assert session.video_ssrcs == []
+            assert call_id not in adapter._video_senders  # type: ignore[attr-defined]
+    finally:
+        in_call.set()
+        await adapter.disconnect()  # type: ignore[attr-defined]
         await asyncio.sleep(0)
 
 
@@ -482,6 +757,92 @@ def test_webrtc_supported_encodings_never_drift_ahead_of_engine() -> None:
             pytest.fail(
                 f"WebRTC menu advertises {enc}/{rate} the engine cannot carry: {exc}"
             )
+
+
+# A WebRTC BUNDLE offer whose m=video offers ONLY VP8 (no H.264 we can packetise).
+_WEBRTC_VP8_ONLY_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "a=group:BUNDLE 0 1\r\n"
+    "m=audio 50000 UDP/TLS/RTP/SAVPF 111 0\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=fingerprint:sha-256 "
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n"
+    "a=setup:actpass\r\n"
+    "a=ice-ufrag:peerUFRG\r\n"
+    "a=ice-pwd:peerPWDpeerPWDpeerPWDpeer\r\n"
+    "a=candidate:1 1 UDP 2130706431 127.0.0.1 50000 typ host\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+    "a=mid:0\r\n"
+    "m=video 50000 UDP/TLS/RTP/SAVPF 96\r\n"
+    "a=rtpmap:96 VP8/90000\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+    "a=mid:1\r\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_resolve_webrtc_video_rejects_vp8_only_offer() -> None:
+    """An offered m=video we cannot packetise (VP8-only) is REJECTED, not dropped.
+
+    RFC 3264 §5.1 / RFC 8843: the answer must keep the same m-line count as the
+    offer, so an unsupported video stream is rejected with port 0 (ADR-0044), not
+    omitted (which produced a malformed answer for strict peers).
+    """
+    from hermes_voip.adapter import _resolve_webrtc_video  # noqa: PLC0415
+    from hermes_voip.sdp import VideoAnswerMode  # noqa: PLC0415
+
+    offer = SessionDescription.parse(_WEBRTC_VP8_ONLY_OFFER)
+    assert offer.video is not None
+    media_cfg = load_media_config({})
+    video_answer, nals = await _resolve_webrtc_video(offer, media_cfg)
+    assert video_answer is not None
+    assert video_answer.mode is VideoAnswerMode.REJECTED
+    assert nals == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_webrtc_video_reads_source_off_event_loop(
+    tmp_path: object,
+) -> None:
+    """The Annex-B source is read off the event loop (asyncio.to_thread, rule 22).
+
+    A blocking Path.read_bytes() on the loop during INVITE handling would stall
+    every concurrent call's ICE/DTLS for the read duration. The read must run in
+    a worker thread, so its thread id differs from the running event loop's.
+    """
+    import pathlib  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    from hermes_voip.adapter import _resolve_webrtc_video  # noqa: PLC0415
+    from hermes_voip.media.video_rtp import read_annex_b_nals  # noqa: PLC0415
+
+    assert isinstance(tmp_path, pathlib.Path)
+    source = tmp_path / "clip.h264"
+    source.write_bytes(_FAKE_H264_ANNEX_B)
+    media_cfg = load_media_config({"HERMES_VOIP_VIDEO_SOURCE_PATH": str(source)})
+    offer = SessionDescription.parse(_WEBRTC_AV_OFFER)
+
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+
+    def _spy(path: pathlib.Path) -> list[bytes]:
+        read_threads.append(threading.get_ident())
+        return read_annex_b_nals(path)
+
+    with patch("hermes_voip.adapter.read_annex_b_nals", _spy):
+        _video_answer, nals = await _resolve_webrtc_video(offer, media_cfg)
+    assert nals, "the source NALs were read"
+    assert read_threads, "the source file read helper was invoked"
+    assert read_threads[0] != loop_thread, (
+        "the source file must be read off the event loop"
+    )
 
 
 # A WebRTC profile offer MISSING the mandatory DTLS fingerprint + ICE credentials

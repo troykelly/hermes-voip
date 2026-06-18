@@ -477,6 +477,27 @@ class TestFingerprintBeforeKeying:
         with pytest.raises(RuntimeError, match="verify_peer_fingerprint"):
             server.derive_srtp_sessions()
 
+    def test_derive_outbound_srtp_session_requires_fingerprint_verification(
+        self,
+    ) -> None:
+        """derive_outbound_srtp_session enforces the RFC 5763 §5 keying guard.
+
+        ADR-0044's BUNDLE'd video SRTP session keys from the SAME DTLS export as
+        audio, so it MUST refuse to derive keys before the peer fingerprint is
+        verified — the identical MITM defence as derive_srtp_sessions. Without
+        this red test a future change could drop the guard and key the video
+        stream from un-verified (attacker) material with the suite still green.
+        """
+        client = DtlsEndpoint(role=DtlsRole.CLIENT)
+        server = DtlsEndpoint(role=DtlsRole.SERVER)
+        _pump_handshake(client, server)
+
+        # Neither endpoint has had verify_peer_fingerprint() called.
+        with pytest.raises(RuntimeError, match="verify_peer_fingerprint"):
+            client.derive_outbound_srtp_session(ssrc=0xDEAD)
+        with pytest.raises(RuntimeError, match="verify_peer_fingerprint"):
+            server.derive_outbound_srtp_session(ssrc=0xBEEF)
+
     def test_derive_srtp_sessions_succeeds_after_fingerprint_verification(
         self,
     ) -> None:

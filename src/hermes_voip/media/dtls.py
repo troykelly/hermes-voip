@@ -696,6 +696,47 @@ class DtlsEndpoint:
 
         return inbound, outbound
 
+    def derive_outbound_srtp_session(self, *, ssrc: int) -> SrtpSession:
+        """Derive an ADDITIONAL outbound SRTP session bound to ``ssrc`` (ADR-0044).
+
+        WebRTC BUNDLE multiplexes several RTP streams (audio + video) onto one
+        DTLS handshake but distinct SSRCs; an :class:`SrtpSession` is bound to a
+        single SSRC (one ROC + replay state). So the video stream needs its OWN
+        outbound session, keyed from the **same** RFC 5764 export as audio but
+        pre-bound to the video SSRC. The per-packet IV is ``salt ^ ssrc ^ index``
+        (RFC 3711 §4.1.1), so distinct SSRCs yield distinct keystreams safely.
+
+        Args:
+            ssrc: The 32-bit SSRC to bind the new outbound session to.
+
+        Returns:
+            A new outbound :class:`SrtpSession` pre-bound to ``ssrc``.
+
+        Raises:
+            RuntimeError: If called before the handshake completes / before
+                :meth:`verify_peer_fingerprint` (same precondition as
+                :meth:`derive_srtp_sessions`).
+        """
+        if not self._fingerprint_verified:
+            msg = (
+                "verify_peer_fingerprint() must be called before "
+                "derive_outbound_srtp_session() — RFC 5763 §5"
+            )
+            raise RuntimeError(msg)
+        material: bytes = self.export_srtp_keying_material()
+        suite: str = _PROFILE_TO_SUITE.get(
+            self._conn.get_selected_srtp_profile(), _SUITE_80
+        )
+        cwk: bytes = material[0:_SRTP_KEY_LEN]
+        swk: bytes = material[_SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN]
+        cws: bytes = material[2 * _SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN + _SRTP_SALT_LEN]
+        sws: bytes = material[2 * _SRTP_KEY_LEN + _SRTP_SALT_LEN : _EXPORT_LEN]
+        # Outbound uses the local write key: client_write for a CLIENT, else
+        # server_write (mirrors derive_srtp_sessions).
+        if self.role is DtlsRole.CLIENT:
+            return SrtpSession.from_raw_keys(cwk, cws, suite=suite, ssrc=ssrc)
+        return SrtpSession.from_raw_keys(swk, sws, suite=suite, ssrc=ssrc)
+
     def verify_peer_fingerprint(self, expected_fingerprint: str) -> None:
         """Verify the peer's certificate against the SDP ``a=fingerprint`` value.
 

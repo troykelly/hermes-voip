@@ -65,7 +65,7 @@ _DEFAULT_TRANSPORT = "tls"
 _DEFAULT_EXPIRES = 300
 _DEFAULT_USER_AGENT = "hermes-voip/0"
 
-# WebSocket signalling (SIP-over-WSS, RFC 7118 / ADR-0016 §6 / ADR-0037). Only
+# WebSocket signalling (SIP-over-WSS, RFC 7118 / ADR-0016 §6 / ADR-0038). Only
 # meaningful when HERMES_SIP_TRANSPORT=wss; harmlessly defaulted otherwise.
 _DEFAULT_WS_PATH = "/ws"
 
@@ -80,7 +80,7 @@ _USER_AGENT_KEY = "HERMES_SIP_USER_AGENT"
 _DEFAULT_EXTENSION_KEY = "HERMES_SIP_DEFAULT_EXTENSION"
 _WS_PATH_KEY = "HERMES_SIP_WS_PATH"
 # S105 noqa: this is the env-var NAME, not a password value — the SEPARATE WSS
-# digest credential is read from this key at runtime (ADR-0037 §3), never hardcoded.
+# digest credential is read from this key at runtime (ADR-0038 §3), never hardcoded.
 _WS_PASSWORD_KEY = "HERMES_SIP_WS_PASSWORD"  # noqa: S105
 
 _BARE_EXTENSION = "HERMES_SIP_EXTENSION"
@@ -393,7 +393,7 @@ class GatewayConfig:
         ws_path: The WebSocket upgrade path for the SIP-over-WSS transport
             (RFC 7118; default ``/ws``). Only read on the ``wss`` transport.
         ws_password: An optional digest-password override for the ``wss``
-            endpoint (ADR-0037). When set on a ``wss`` gateway it replaces the
+            endpoint (ADR-0038). When set on a ``wss`` gateway it replaces the
             per-extension SIP password in the digest; ``None`` (the default)
             falls back to the per-extension SIP password. A **secret** —
             repr-suppressed so it never reaches a log line.
@@ -461,7 +461,7 @@ class GatewayConfig:
         if ext not in self.extensions:
             msg = f"extension {ext.extension!r} is not configured on this gateway"
             raise ConfigError(msg)
-        # ADR-0037: a WebRTC/WSS gateway edge commonly authenticates against a
+        # ADR-0038: a WebRTC/WSS gateway edge commonly authenticates against a
         # SEPARATE credential than the SIP-TLS edge. On the wss transport, the
         # optional ws_password overrides the per-extension SIP password; unset
         # (or any tls transport) falls back to the per-extension SIP password.
@@ -1023,7 +1023,7 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
     expires = _parse_expires(env)
     user_agent = _value(env, _USER_AGENT_KEY) or _DEFAULT_USER_AGENT
     ws_path = _value(env, _WS_PATH_KEY) or _DEFAULT_WS_PATH
-    # The separate WSS digest credential (ADR-0037): read by name; the value lives
+    # The separate WSS digest credential (ADR-0038): read by name; the value lives
     # only in .env / 1Password. None ⇒ fall back to the per-extension SIP password.
     ws_password = _value(env, _WS_PASSWORD_KEY) or None
 

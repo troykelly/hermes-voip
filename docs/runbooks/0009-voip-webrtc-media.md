@@ -23,7 +23,7 @@ design). This runbook is the operational HOW.
 | ICE **consent freshness** (RFC 7675) — long calls behind NAT drop deterministically | **Wired** (ADR-0034; aioice-native, surfaced) |
 | **Trickle** ICE — SDP primitives (`a=ice-options:trickle`, `a=end-of-candidates`) + half-trickle answer | **Wired** (ADR-0034) |
 | **Outbound** WebRTC origination (our own offer) | **Deferred** — outbound runs over SIP-over-TLS |
-| SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Wired** (ADR-0037); see "SIP-over-WSS signalling" — full live validation needs the operator's WSS port + credential |
+| SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Wired** (ADR-0038); see "SIP-over-WSS signalling" — full live validation needs the operator's WSS port + credential |
 | Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |
 | **Live** validation against a real WebRTC client | **Pending** the operator's redeploy |
@@ -50,7 +50,7 @@ design). This runbook is the operational HOW.
    # -> libopus.so.0
    ```
 
-## SIP-over-WSS signalling (`HERMES_SIP_TRANSPORT=wss` — ADR-0037)
+## SIP-over-WSS signalling (`HERMES_SIP_TRANSPORT=wss` — ADR-0038)
 
 To register and receive calls over a gateway's **Secure-WebSocket** edge (the WebRTC
 signalling transport, RFC 7118) instead of SIP-over-TLS, select the WSS transport. The
@@ -233,7 +233,7 @@ trickles; that would be tasked into a signalling lane (it is a latency optimisat
   is_webrtc path) is exercised by `tests/test_adapter_webrtc.py` in the `hermes-contract` CI
   job (which installs hermes + webrtc + media + libopus).
 
-- **SIP-over-WSS signalling (ADR-0037, no live gateway):**
+- **SIP-over-WSS signalling (ADR-0038, no live gateway):**
 
   ```
   uv run pytest tests/test_adapter_wss_signalling.py \

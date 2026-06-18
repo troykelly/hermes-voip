@@ -109,7 +109,7 @@ class WssSipTransport:
                 ``/ws``). The runtime supplies this from ``HERMES_SIP_WS_PATH``
                 via :attr:`~hermes_voip.config.GatewayConfig.ws_path` when
                 ``HERMES_SIP_TRANSPORT=wss`` selects this transport in
-                ``adapter._establish()`` (ADR-0037; default ``/ws``).
+                ``adapter._establish()`` (ADR-0038; default ``/ws``).
             connect_address: An alternative IP or hostname to dial (e.g.
                 ``127.0.0.1`` in tests); the TLS SNI / hostname verification
                 still uses ``host``.

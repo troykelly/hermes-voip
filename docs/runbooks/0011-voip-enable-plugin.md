@@ -4,7 +4,7 @@
 why the obvious command needs a small directory install first. `hermes-voip` ships as a **pip /
 entry-point** plugin (entry-point group `hermes_agent.plugins`, declared in
 [`pyproject.toml`](../../pyproject.toml)) **and** carries a complete plugin manifest
-(`plugin.yaml`, ADR-0036). Two things gate it:
+(`plugin.yaml`, ADR-0037). Two things gate it:
 
 1. **Activation gate (always applies).** The Hermes runtime only loads an entry-point plugin
    when its name is in the `plugins.enabled` list of Hermes' `config.yaml`. This is the

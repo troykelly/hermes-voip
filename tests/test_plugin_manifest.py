@@ -15,7 +15,7 @@ cannot drift:
   PUBLIC-repo invariant).
 * The manifest ships BOTH as importable package data (``hermes_voip`` wheel) AND as
   the directory-install layout under ``packaging/`` with an ``__init__.py`` that
-  re-exports :func:`register` — the two canonical install models (ADR-0036).
+  re-exports :func:`register` — the two canonical install models (ADR-0037).
 
 The manifest schema (keys, ``requires_env`` rich format with ``secret:`` (NOT
 ``password:``), the ``kind`` values, and the fact that an ENTRY-POINT plugin never
@@ -320,7 +320,7 @@ def test_manifest_leaks_no_secret_values() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (e) Two install models (ADR-0036):
+# (e) Two install models (ADR-0037):
 #   1. directory-install: packaging/ dir has plugin.yaml + __init__.py(register)
 #   2. pip/entry-point: the manifest is importable package data of hermes_voip
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Directory-install entry point for the hermes-voip plugin (ADR-0036).
+"""Directory-install entry point for the hermes-voip plugin (ADR-0037).
 
 This is the ``register(ctx)`` the Hermes runtime calls when ``hermes-voip`` is
 installed as a **directory plugin** under ``~/.hermes/plugins/hermes-voip/`` (this

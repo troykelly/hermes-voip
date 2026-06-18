@@ -26,7 +26,7 @@ import json
 
 import pytest
 
-from hermes_voip.originate import OutboundCallNotAllowed
+from hermes_voip.originate import OutboundCallFailed, OutboundCallNotAllowed
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.voip_tools import (
     TRANSFER_ATTENDED_TOOL_NAME,
@@ -199,6 +199,62 @@ async def test_consult_rejects_unlisted_target(
     payload = json.loads(result)
     assert "error" in payload
     assert "9999" in payload["error"]
+
+
+class _RaisingConsultHost(_FakeHost):
+    """A fake host whose ``start_attended_consult`` raises a chosen exception.
+
+    Models the place_call failure paths that the consult leg inherits (ADR-0048): the
+    dial gate (slot busy / no registered ext / WSS) raises ``OutboundCallFailed`` and
+    the un-initialised transport raises ``RuntimeError`` — both escape the previous
+    handler (it caught only OutboundCallNotAllowed / PermissionError / KeyError).
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_consult_renders_outbound_call_failed_as_error_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consult whose dial fails (OutboundCallFailed) returns error JSON, never raises.
+
+    The dial path raises ``OutboundCallFailed`` for a busy slot / no registered
+    extension / the WSS transport; the always-JSON contract requires the handler to
+    catch it and render ``{"error": …}`` rather than let it escape.
+    """
+    host = _RaisingConsultHost(OutboundCallFailed(503, "no registered extension"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "consult", "target": "1000"})
+
+    payload = json.loads(result)
+    assert "error" in payload
+
+
+@pytest.mark.asyncio
+async def test_consult_renders_uninitialised_transport_as_error_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consult before the transport is up (RuntimeError) returns error JSON.
+
+    ``place_call`` raises ``RuntimeError`` when the transport/manager is not
+    initialised; the handler must render it as ``{"error": …}`` (never raise).
+    """
+    host = _RaisingConsultHost(RuntimeError("transport is not initialised"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "consult", "target": "1000"})
+
+    payload = json.loads(result)
+    assert "error" in payload
 
 
 # --- complete ---------------------------------------------------------------

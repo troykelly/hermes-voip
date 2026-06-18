@@ -108,6 +108,51 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 
+# The Hermes tool-handler contract is "a handler never raises; it returns a JSON
+# tool result, an ``{"error": ...}`` object on failure" — at the handler boundary
+# the model-facing JSON error IS the surfaced error. So every handler below ends
+# with an OUTERMOST ``except Exception`` that LOGS the unanticipated exception (with
+# full traceback context via ``_log.exception``) and returns an error-JSON string.
+# This reconciles with rule 37 (errors propagate, never silently swallowed): the
+# failure is surfaced twice — to the model as the contract's error result, and to
+# the operator's logs with full context — it is *translated* into the error channel,
+# not dropped. The specific-error returns inside each handler stay unchanged; the
+# guard only catches what they did not anticipate. ``noqa: BLE001`` carries this
+# justification at each site. The two SECRET-bearing tools (``send_dtmf`` /
+# ``open_entry``) use ``_tool_failure_redacted`` instead — same contract, but the
+# exception detail is never echoed (it could embed the secret digits / opening
+# secret).
+def _tool_failure(tool_name: str, exc: BaseException) -> str:
+    """Log ``exc`` and render the handler-boundary error-JSON for ``tool_name``."""
+    _log.exception("VoIP tool %r failed with an unanticipated error", tool_name)
+    return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+
+def _tool_failure_redacted(tool_name: str, exc: BaseException) -> str:
+    """Handler-boundary failure for the SECRET-bearing tools (send_dtmf/open_entry).
+
+    Identical contract to :func:`_tool_failure` EXCEPT the exception detail is never
+    surfaced — neither in the model-facing result nor in the log line. An
+    unanticipated ``exc`` from deep in the send path can embed the very DTMF digits
+    the caller asked to send (or the opening secret), which must never be echoed (the
+    handlers document "digits are NOT echoed in the result/log"). So the result is a
+    FIXED generic message and the log line carries ONLY the tool name and the
+    exception's TYPE name — never ``str(exc)`` and never ``exc_info`` (a traceback
+    renders the exception's repr, which would re-embed the digits). The failure is
+    still surfaced (rule 37): to the model as an error result, and to the operator's
+    logs as a typed failure line — just without the secret-bearing message text.
+    """
+    # Deliberately NOT ``_log.exception`` / ``exc_info=exc``: a rendered traceback or
+    # exception repr would re-embed the secret digits. The type name is safe and
+    # carries enough to triage without leaking the message.
+    _log.error(
+        "VoIP tool %r failed with an unanticipated %s (detail redacted)",
+        tool_name,
+        type(exc).__name__,
+    )
+    return json.dumps({"error": f"{tool_name} failed (internal error)"})
+
+
 class TransferOutcome(Enum):
     """The tri-state result of a DTMF-confirmed blind transfer (ADR-0010/0031).
 
@@ -687,16 +732,19 @@ async def hang_up_handler(
     end is fixed to the session's own call (the model cannot target another call).
     """
     _ = args  # the tool takes no parameters
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot end the call"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to end"})
-    ended = await adapter.hang_up_call(call_id)
-    if not ended:
-        return json.dumps({"error": "the call has already ended"})
-    return json.dumps({"result": "Call ended."})
+    try:
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps({"error": "no active VoIP adapter; cannot end the call"})
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session to end"})
+        ended = await adapter.hang_up_call(call_id)
+        if not ended:
+            return json.dumps({"error": "the call has already ended"})
+        return json.dumps({"result": "Call ended."})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(HANG_UP_TOOL_NAME, exc)
 
 
 async def hold_call_handler(
@@ -713,16 +761,19 @@ async def hold_call_handler(
     ELEVATED privilege clamp before this runs.
     """
     _ = args  # the tool takes no parameters
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot hold the call"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to hold"})
-    held = await adapter.hold_call(call_id)
-    if not held:
-        return json.dumps({"error": "the call is not active (unknown or ended)"})
-    return json.dumps({"result": "Caller placed on hold."})
+    try:
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps({"error": "no active VoIP adapter; cannot hold the call"})
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session to hold"})
+        held = await adapter.hold_call(call_id)
+        if not held:
+            return json.dumps({"error": "the call is not active (unknown or ended)"})
+        return json.dumps({"result": "Caller placed on hold."})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(HOLD_TOOL_NAME, exc)
 
 
 async def resume_call_handler(
@@ -737,16 +788,21 @@ async def resume_call_handler(
     enforced the ELEVATED privilege clamp.
     """
     _ = args  # the tool takes no parameters
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot resume the call"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to resume"})
-    resumed = await adapter.resume_call(call_id)
-    if not resumed:
-        return json.dumps({"error": "the call is not active (unknown or ended)"})
-    return json.dumps({"result": "Caller resumed."})
+    try:
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps(
+                {"error": "no active VoIP adapter; cannot resume the call"}
+            )
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session to resume"})
+        resumed = await adapter.resume_call(call_id)
+        if not resumed:
+            return json.dumps({"error": "the call is not active (unknown or ended)"})
+        return json.dumps({"result": "Caller resumed."})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(RESUME_TOOL_NAME, exc)
 
 
 async def list_registrations_handler(
@@ -762,12 +818,15 @@ async def list_registrations_handler(
     ...}`` when no adapter is in scope. ``args`` is ignored.
     """
     _ = args  # the tool takes no parameters
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps(
-            {"error": "no active VoIP adapter; cannot list registrations"}
-        )
-    return json.dumps({"result": adapter.list_registrations_text()})
+    try:
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps(
+                {"error": "no active VoIP adapter; cannot list registrations"}
+            )
+        return json.dumps({"result": adapter.list_registrations_text()})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(LIST_REGISTRATIONS_TOOL_NAME, exc)
 
 
 def _str_arg(args: Mapping[str, object] | None, key: str) -> str:
@@ -800,22 +859,27 @@ async def place_call_handler(
     non-degraded privilege clamp before this runs; the allowlist (enforced inside
     ``place_call_with_objective``) is the hard irreversibility gate.
     """
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot place a call"})
-    number = _str_arg(args, "number")
-    objective = _str_arg(args, "objective")
-    if not number:
-        return json.dumps({"error": "place_call requires a 'number' to dial"})
-    if not objective:
-        return json.dumps({"error": "place_call requires an 'objective' for the call"})
     try:
-        call_id = await adapter.place_call_with_objective(number, objective)
-    except OutboundCallNotAllowed as exc:
-        # The hard gate refused the target — surface a clear, non-fatal error; the
-        # number was NOT dialled. (The error message names the rejected target.)
-        return json.dumps({"error": str(exc)})
-    return json.dumps({"call_id": call_id})
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps({"error": "no active VoIP adapter; cannot place a call"})
+        number = _str_arg(args, "number")
+        objective = _str_arg(args, "objective")
+        if not number:
+            return json.dumps({"error": "place_call requires a 'number' to dial"})
+        if not objective:
+            return json.dumps(
+                {"error": "place_call requires an 'objective' for the call"}
+            )
+        try:
+            call_id = await adapter.place_call_with_objective(number, objective)
+        except OutboundCallNotAllowed as exc:
+            # The hard gate refused the target — surface a clear, non-fatal error; the
+            # number was NOT dialled. (The error message names the rejected target.)
+            return json.dumps({"error": str(exc)})
+        return json.dumps({"call_id": call_id})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(PLACE_CALL_TOOL_NAME, exc)
 
 
 async def report_call_result_handler(
@@ -831,19 +895,24 @@ async def report_call_result_handler(
     adapter/call is in scope or the call already ended. The call to report on is
     fixed to the session's own call — the model cannot target another call.
     """
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot record the result"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to report on"})
-    summary = _str_arg(args, "summary")
-    if not summary:
-        return json.dumps({"error": "report_call_result requires a 'summary'"})
-    recorded = adapter.record_call_result(call_id, summary)
-    if not recorded:
-        return json.dumps({"error": "the call is not active (unknown or ended)"})
-    return json.dumps({"result": "Outcome recorded."})
+    try:
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps(
+                {"error": "no active VoIP adapter; cannot record the result"}
+            )
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session to report on"})
+        summary = _str_arg(args, "summary")
+        if not summary:
+            return json.dumps({"error": "report_call_result requires a 'summary'"})
+        recorded = adapter.record_call_result(call_id, summary)
+        if not recorded:
+            return json.dumps({"error": "the call is not active (unknown or ended)"})
+        return json.dumps({"result": "Outcome recorded."})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(REPORT_RESULT_TOOL_NAME, exc)
 
 
 async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch (no adapter / no call / no digits / invalid-DTMF / not-negotiated / inactive / success); collapsing them would hide which failure the model sees
@@ -862,27 +931,33 @@ async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail
     call to send on is fixed to the session's own call — the model cannot target
     another call. The digits are NOT echoed in the result/log (they may be secret).
     """
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot send DTMF"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to send DTMF on"})
-    digits = _str_arg(args, "digits")
-    if not digits:
-        return json.dumps({"error": "send_dtmf requires a 'digits' string to send"})
     try:
-        sent = await adapter.send_dtmf_on_call(call_id, digits)
-    except ValueError as exc:
-        # A non-DTMF character — surface a clear, non-fatal error (nothing sent).
-        return json.dumps({"error": f"invalid DTMF digits: {exc}"})
-    except RuntimeError as exc:
-        # The call negotiated no telephone-event payload type, so DTMF cannot be
-        # sent. Report it (never a silent success); the engine sent nothing.
-        return json.dumps({"error": f"cannot send DTMF on this call: {exc}"})
-    if not sent:
-        return json.dumps({"error": "the call is not active (unknown or ended)"})
-    return json.dumps({"result": "Tones sent."})
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps({"error": "no active VoIP adapter; cannot send DTMF"})
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps(
+                {"error": "no active call in this session to send DTMF on"}
+            )
+        digits = _str_arg(args, "digits")
+        if not digits:
+            return json.dumps({"error": "send_dtmf requires a 'digits' string to send"})
+        try:
+            sent = await adapter.send_dtmf_on_call(call_id, digits)
+        except ValueError as exc:
+            # A non-DTMF character — surface a clear, non-fatal error (nothing sent).
+            return json.dumps({"error": f"invalid DTMF digits: {exc}"})
+        except RuntimeError as exc:
+            # The call negotiated no telephone-event payload type, so DTMF cannot be
+            # sent. Report it (never a silent success); the engine sent nothing.
+            return json.dumps({"error": f"cannot send DTMF on this call: {exc}"})
+        if not sent:
+            return json.dumps({"error": "the call is not active (unknown or ended)"})
+        return json.dumps({"result": "Tones sent."})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure_redacted)
+        # REDACTED guard: an unanticipated exc could embed the secret digits.
+        return _tool_failure_redacted(SEND_DTMF_TOOL_NAME, exc)
 
 
 async def open_entry_handler(
@@ -900,21 +975,28 @@ async def open_entry_handler(
     runs. ``args`` is ignored — opening the entry is a fixed action on this call.
     """
     _ = args  # the tool takes no parameters
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot open the entry"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session"})
     try:
-        opened = await adapter.open_entry(call_id)
-    except (RuntimeError, ValueError) as exc:
-        # The actuation failed (DTMF not negotiated, relay misconfigured, etc.).
-        # Report it clearly — the door was NOT opened (rule 37: surfaced, not hidden).
-        return json.dumps({"error": f"could not open the entry: {exc}"})
-    if not opened:
-        return json.dumps({"error": "the call is not active (unknown or ended)"})
-    return json.dumps({"result": "Entry opened."})
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps(
+                {"error": "no active VoIP adapter; cannot open the entry"}
+            )
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session"})
+        try:
+            opened = await adapter.open_entry(call_id)
+        except (RuntimeError, ValueError) as exc:
+            # The actuation failed (DTMF not negotiated, relay misconfigured, etc.).
+            # Report it clearly — the door was NOT opened (rule 37: surfaced, not
+            # hidden).
+            return json.dumps({"error": f"could not open the entry: {exc}"})
+        if not opened:
+            return json.dumps({"error": "the call is not active (unknown or ended)"})
+        return json.dumps({"result": "Entry opened."})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure_redacted)
+        # REDACTED guard: an unanticipated exc could embed the opening secret.
+        return _tool_failure_redacted(OPEN_ENTRY_TOOL_NAME, exc)
 
 
 async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch the model must be able to tell apart (no adapter / no call / no target / transfer-failed / transferred / not-confirmed / call-ended); collapsing them would hide which outcome occurred
@@ -943,37 +1025,47 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
     confirmation here is the irreversibility safeguard — the live, per-call analogue
     of ``place_call``'s static allowlist.
     """
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot transfer the call"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to transfer"})
-    target = _str_arg(args, "target")
-    if not target:
-        return json.dumps(
-            {"error": "transfer_blind requires a 'target' to transfer to"}
-        )
     try:
-        outcome = await adapter.transfer_blind_on_call(call_id, target)
-    except RuntimeError as exc:
-        # No confirmation channel (no telephone-event) OR the gateway rejected the
-        # REFER (CallError is a RuntimeError). Surface it clearly — nobody was
-        # transferred, and the failure is reported, never hidden (rule 37).
-        return json.dumps({"error": f"transfer failed: {exc}"})
-    if outcome is TransferOutcome.TRANSFERRED:
-        return json.dumps({"result": f"Transfer to {target} initiated."})
-    if outcome is TransferOutcome.UNCONFIRMED:
-        return json.dumps(
-            {"error": "the caller did not confirm the transfer; nobody was transferred"}
-        )
-    if outcome is TransferOutcome.BLOCKED:
-        # The REFER chokepoint's own guard re-check refused it (not operator-level /
-        # degraded — possibly a state change during the confirmation window). The
-        # privilege clamp is enforced at the chokepoint, not only at the gate.
-        return json.dumps({"error": "the transfer is not permitted on this call"})
-    # NO_CALL — the call is unknown or already ended.
-    return json.dumps({"error": "the call is not active (unknown or ended)"})
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps(
+                {"error": "no active VoIP adapter; cannot transfer the call"}
+            )
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session to transfer"})
+        target = _str_arg(args, "target")
+        if not target:
+            return json.dumps(
+                {"error": "transfer_blind requires a 'target' to transfer to"}
+            )
+        try:
+            outcome = await adapter.transfer_blind_on_call(call_id, target)
+        except RuntimeError as exc:
+            # No confirmation channel (no telephone-event) OR the gateway rejected the
+            # REFER (CallError is a RuntimeError). Surface it clearly — nobody was
+            # transferred, and the failure is reported, never hidden (rule 37).
+            return json.dumps({"error": f"transfer failed: {exc}"})
+        if outcome is TransferOutcome.TRANSFERRED:
+            return json.dumps({"result": f"Transfer to {target} initiated."})
+        if outcome is TransferOutcome.UNCONFIRMED:
+            return json.dumps(
+                {
+                    "error": (
+                        "the caller did not confirm the transfer; "
+                        "nobody was transferred"
+                    )
+                }
+            )
+        if outcome is TransferOutcome.BLOCKED:
+            # The REFER chokepoint's own guard re-check refused it (not operator-level /
+            # degraded — possibly a state change during the confirmation window). The
+            # privilege clamp is enforced at the chokepoint, not only at the gate.
+            return json.dumps({"error": "the transfer is not permitted on this call"})
+        # NO_CALL — the call is unknown or already ended.
+        return json.dumps({"error": "the call is not active (unknown or ended)"})
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(TRANSFER_BLIND_TOOL_NAME, exc)
 
 
 async def transfer_attended_handler(
@@ -1352,12 +1444,24 @@ def register_voip_tools(ctx: object) -> None:
                 spec.name,
             )
             continue
-        register_tool(
-            spec.name,
-            VOIP_TOOLSET,
-            spec.schema,
-            spec.handler,
-            is_async=True,
-            description=spec.description,
-            emoji=spec.emoji,
-        )
+        # Fail-soft per tool: a runtime that rejects ONE tool (e.g. a name collision
+        # with another plugin) must not abort the whole loop and silently drop the
+        # remaining tools. Log a warning naming the offending tool and continue —
+        # mirrors the getattr presence guards above (best-effort, resilient).
+        try:
+            register_tool(
+                spec.name,
+                VOIP_TOOLSET,
+                spec.schema,
+                spec.handler,
+                is_async=True,
+                description=spec.description,
+                emoji=spec.emoji,
+            )
+        except Exception:  # noqa: BLE001 — one bad tool must not abort the rest (fail-soft)
+            _log.warning(
+                "register(ctx): register_tool failed for VoIP tool %r — skipping it "
+                "(the other tools still register)",
+                spec.name,
+                exc_info=True,
+            )

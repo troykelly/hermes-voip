@@ -15,7 +15,7 @@ cannot drift:
   PUBLIC-repo invariant).
 * The manifest ships BOTH as importable package data (``hermes_voip`` wheel) AND as
   the directory-install layout under ``packaging/`` with an ``__init__.py`` that
-  re-exports :func:`register` — the two canonical install models (ADR-0034).
+  re-exports :func:`register` — the two canonical install models (ADR-0036).
 
 The manifest schema (keys, ``requires_env`` rich format with ``secret:`` (NOT
 ``password:``), the ``kind`` values, and the fact that an ENTRY-POINT plugin never
@@ -29,7 +29,6 @@ from __future__ import annotations
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
 
 import yaml
 
@@ -49,7 +48,10 @@ def _load_manifest(path: Path) -> dict[str, object]:
     text = path.read_text(encoding="utf-8")
     data = yaml.safe_load(text)
     assert isinstance(data, dict), f"{path} must parse to a YAML mapping"
-    return cast("dict[str, object]", data)
+    # ``data`` is now narrowed to ``dict`` by the assert; the values are ``object``
+    # under PyYAML's typed stubs, so this is the manifest mapping with no cast.
+    manifest: dict[str, object] = data
+    return manifest
 
 
 def _pyproject_version() -> str:
@@ -264,12 +266,15 @@ def test_optional_env_advertises_transport_and_provider_keys() -> None:
     """optional_env documents the non-gating knobs (port/transport + provider keys).
 
     These are NOT in requires_env (they have safe defaults / are provider-conditional,
-    so requiring them would wrongly disable the plugin), but the operator should see
-    them in the install prompt. The cloud provider keys are marked secret.
+    so requiring them would wrongly disable the plugin). They are documented in the
+    manifest's optional_env for completeness. NOTE (verified against hermes-agent
+    0.16.0): the install prompt reads ONLY requires_env, so the runtime does NOT
+    prompt for optional_env — the README + runbooks are where operators set these.
+    The cloud provider keys are marked secret.
     """
     manifest = _load_manifest(_PACKAGING_MANIFEST)
     optional = manifest.get("optional_env")
-    assert optional is not None, "optional_env should advertise the non-gating knobs"
+    assert isinstance(optional, list), "optional_env should be a YAML list"
     names = set(_env_entry_names(optional))
     for expected in (
         "HERMES_SIP_PORT",
@@ -315,7 +320,7 @@ def test_manifest_leaks_no_secret_values() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (e) Two install models (ADR-0034):
+# (e) Two install models (ADR-0036):
 #   1. directory-install: packaging/ dir has plugin.yaml + __init__.py(register)
 #   2. pip/entry-point: the manifest is importable package data of hermes_voip
 # ---------------------------------------------------------------------------

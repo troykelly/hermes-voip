@@ -41,12 +41,16 @@ def _pack(samples: Sequence[int]) -> bytes:
     return struct.pack(f"<{len(clamped)}h", *clamped)
 
 
-def _unpack(pcm16: bytes) -> tuple[int, ...]:
+def _unpack(pcm16: bytes | bytearray) -> tuple[int, ...]:
     return struct.unpack(f"<{len(pcm16) // 2}h", pcm16)
 
 
-def _rms(pcm16: bytes) -> float:
-    """Root-mean-square amplitude of a PCM16 buffer (0.0 for empty)."""
+def _rms(pcm16: bytes | bytearray) -> float:
+    """Root-mean-square amplitude of a PCM16 buffer (0.0 for empty).
+
+    Accepts ``bytearray`` too (a sliced ``residual`` accumulator) so call sites need
+    no per-call ``bytes()`` wrap.
+    """
     vals = _unpack(pcm16)
     if not vals:
         return 0.0

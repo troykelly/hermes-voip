@@ -239,9 +239,14 @@ async def test_engine_default_enables_aec() -> None:
     """
     engine, _rec = await _make_engine(aec_enabled=True)
     assert engine._aec_enabled is True
-    assert engine._aec is None  # not built until the first reference push
+    # Not built until the first reference push (lazy at the analysis rate); snapshot
+    # before so the assertion does not narrow the attribute to ``None`` across the
+    # ``send_audio`` mypy cannot see mutate it (which would flag the rest unreachable).
+    aec_before = engine._aec
+    assert aec_before is None
     await engine.send_audio(_sine_frame([100] * _SPF))
-    assert engine._aec is not None  # built on the first outbound frame
+    aec_after = engine._aec
+    assert aec_after is not None  # built on the first outbound frame
     await engine.stop()
 
 

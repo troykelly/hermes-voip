@@ -25,7 +25,12 @@ ADR-0005 SIP/RTP, ADR-0006/0007/0008/0009 the conversational providers, ADR-0013
     reproduced in this public runbook). Fields used: `Extension`
     (the extension number / SIP username), the **VoIP-section `Password`** (the SIP-TLS
     digest secret — *not* the top-level portal `password`), and the `website` URL (the SIP
-    host). It also holds a `Voicemail PIN` (unused here).
+    host). It also holds a `Voicemail PIN` (unused here). The item's **top-level
+    `password`** is the **GDMS/WAVE web-app portal login**, NOT a SIP credential: a live
+    RFC 7118 REGISTER returns `401` with it on both the SIP-TLS and the Secure-WebSocket
+    edges. The **WSS/WebRTC edge authenticates with the SAME VoIP-section `Password`** as
+    SIP-TLS (verified 2026-06-18, ADR-0042), so `HERMES_SIP_WS_PASSWORD` is left **unset**
+    for this gateway (the documented fallback reuses `HERMES_SIP_PASSWORD`).
   - **LLM backend:** `LLAP Hermes mbp018 Provider Key` (vault `Claude API Access`) — an
     OpenAI/OpenRouter-compatible LLM proxy (`credential` = bearer key, `hostname` = proxy
     host). The proxy serves OpenRouter-style `vendor/model` ids (e.g. `nousresearch/hermes-4-70b`).

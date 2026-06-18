@@ -1689,8 +1689,9 @@ async def test_inbound_savp_offer_answered_with_sdes_srtp() -> None:
             await asyncio.sleep(0)
 
     ok = _sent_200_ok(transport)
-    # The answer is a secured RTP/SAVP stream with exactly one a=crypto line.
-    assert "m=audio 20002 RTP/SAVP 0\r\n" in ok.body, (
+    # The answer is a secured RTP/SAVP stream (both offered codecs echoed) with
+    # exactly one a=crypto line.
+    assert "m=audio 20002 RTP/SAVP 0 8\r\n" in ok.body, (
         f"SDP answer is not RTP/SAVP (SDES); body:\n{ok.body}"
     )
     assert ok.body.count("a=crypto:") == 1, f"expected one a=crypto; body:\n{ok.body}"

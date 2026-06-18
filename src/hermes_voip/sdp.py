@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1607,6 +1608,34 @@ def build_webrtc_offer(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
         ice_ufrag=ice_ufrag,
         ice_pwd=ice_pwd,
         ice_candidates=ice_candidates,
+    )
+
+
+def generate_answer_crypto(accepted: CryptoAttribute) -> CryptoAttribute:
+    """Mint a fresh SDES answer ``a=crypto`` for an accepted offer crypto (RFC 4568).
+
+    Generates a cryptographically-random master key||salt of the length the
+    accepted suite requires and returns a :class:`CryptoAttribute` echoing the
+    accepted tag + suite with **our** key. Per RFC 4568 §6.1 each direction is
+    keyed by the *sender*: this is the key WE use to encrypt our **outbound** SRTP
+    (and advertise in the answer); the offerer's key (theirs) keys our inbound.
+
+    The returned attribute's key never reaches a log/`repr` (``key_params`` is
+    ``field(repr=False)``), and is generated with :mod:`secrets`, not ``random``.
+
+    Args:
+        accepted: The offered crypto we accepted (``audio.crypto_attrs[0]``),
+            already validated as a supported, well-formed suite.
+
+    Returns:
+        Our answer :class:`CryptoAttribute` (same tag + suite, our random key).
+    """
+    octets = _SRTP_KEY_SALT_OCTETS[accepted.suite]
+    key_b64 = base64.b64encode(secrets.token_bytes(octets)).decode("ascii")
+    return CryptoAttribute(
+        tag=accepted.tag,
+        suite=accepted.suite,
+        key_params=f"{_INLINE_PREFIX}{key_b64}",
     )
 
 

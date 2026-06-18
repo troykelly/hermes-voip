@@ -42,6 +42,12 @@ pairing cleared) or **cancel** (consult hung up, pairing cleared). The pairing l
 `VoipAdapter._attended_consults: dict[str, str]` (original Call-ID → consult Call-ID),
 keyed by the agent's own call (its `chat_id == Call-ID`), so the model can only act on the
 call whose turn is being processed — concurrency-safe across simultaneous calls.
+**One consultation per original call:** `start_attended_consult` refuses a second `consult`
+while one is already paired for the call (reserving the pairing slot with a sentinel
+**before** the dial `await`, rolled back if the dial fails), so the read→`await
+place_call`→write window cannot let a second action overwrite the pairing and orphan the
+first consult leg. A `RuntimeError` is raised (and rendered as a tool error); the operator
+must `complete` or `cancel` the first consultation before starting another.
 
 ### Security posture
 
@@ -70,10 +76,15 @@ additional hard gates, enforced **at the chokepoint** (defense in depth, mirrori
 `transfer_attended_handler` returns a JSON string on success AND every error and never
 raises (the house tool contract; accepts `**kwargs`). Outcomes map to distinct messages so
 the model can tell them apart: an unlisted target, a missing consult, a blocked privilege,
-a completed transfer. The host's `complete_attended_transfer` returns an
-`AttendedTransferOutcome` enum (`TRANSFERRED` / `NO_CONSULT` / `NO_CALL` / `BLOCKED`); a
-gateway REFER rejection propagates as `CallError` and is rendered as a clear tool error
-(rule 37 — never a silent no-op).
+a completed transfer. The `consult` path additionally renders the consult dial's failure
+modes as tool errors rather than letting them escape: `OutboundCallFailed` (a busy outbound
+slot / no registered extension / the WSS transport, inherited from `place_call`) and the
+`RuntimeError` paths (an un-initialised transport, or a second consultation refused while
+one is in flight) all map to `{"error": …}`. The host's `complete_attended_transfer`
+returns an `AttendedTransferOutcome` enum (`TRANSFERRED` / `NO_CONSULT` / `NO_CALL` /
+`BLOCKED`); a gateway REFER rejection propagates as `CallError` and is caught
+**specifically** (not as a bare `RuntimeError`, so an unrelated bug still propagates —
+rule 37) and rendered as a clear tool error.
 
 The tool is registered (`provides_tools` in `plugin.yaml`, guarded by the manifest
 drift-guard test) and owned by the `pre_tool_call` gate (`_voip_tool_names`).

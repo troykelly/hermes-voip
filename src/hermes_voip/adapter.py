@@ -241,6 +241,12 @@ _SIP_ERROR_FLOOR = 300  # responses at or above this are errors
 # = 2; with re-auth it is at most ~4. 32 is generous without being unbounded.
 _SINK_QUEUE_MAX = 32
 
+#: Reservation sentinel for ``_attended_consults`` (ADR-0048): placed in the pairing
+#: slot BEFORE the consult dial awaits, so a concurrent second ``consult`` for the same
+#: original call is refused. It is never a real SIP Call-ID (no session matches it), so
+#: complete/cancel during the dial window simply see "no live consult" and clear it.
+_CONSULT_PENDING = "\x00pending"
+
 
 def _make_tls_context(host: str) -> ssl.SSLContext:
     """Build a client TLS context that verifies the server certificate."""
@@ -2548,12 +2554,18 @@ class VoipAdapter(BasePlatformAdapter):
         untrusted outbound leg, the same threat model). On success it records the
         ``call_id -> consult_call_id`` pairing and returns the consult leg's Call-ID.
 
+        Only ONE consultation may be in flight per original call: a second ``consult``
+        while one is already paired is REFUSED (``RuntimeError``) rather than allowed to
+        overwrite the pairing and orphan the first leg (the read->await->write window).
+        Cancel or complete the first consultation before starting another.
+
         Raises (never a silent no-op — rule 37):
 
         * ``KeyError`` — the original call is unknown/ended (nothing to transfer).
         * ``PermissionError`` — the original call is not operator-level / is degraded.
         * :class:`~hermes_voip.originate.OutboundCallNotAllowed` — ``target`` is not on
           the outbound allowlist (no leg is dialled).
+        * ``RuntimeError`` — a consultation is already in flight for this call.
         * :class:`~hermes_voip.originate.OutboundCallFailed` / ``RuntimeError`` — as
           :meth:`place_call`.
         """
@@ -2561,6 +2573,15 @@ class VoipAdapter(BasePlatformAdapter):
         if session is None or session.ended:
             msg = f"attended transfer: original call {call_id!r} is unknown or ended"
             raise KeyError(msg)
+        # One consultation per original call. Refuse a second BEFORE the dial — the
+        # read->await place_call->write window would otherwise let a concurrent second
+        # action overwrite the pairing and orphan the first consult leg.
+        if call_id in self._attended_consults:
+            msg = (
+                f"attended transfer: a consultation is already in progress for call "
+                f"{call_id!r}; complete or cancel it before starting another"
+            )
+            raise RuntimeError(msg)
         # Defense in depth: re-run the operator-level + non-degraded clamp here, not
         # solely at the sync gate — an attended transfer dials a new untrusted leg, so
         # an unprivileged/degraded original call must never reach the dial.
@@ -2578,19 +2599,31 @@ class VoipAdapter(BasePlatformAdapter):
         # BEFORE dialling so an unlisted target is never called (raises NotAllowed).
         if not is_outbound_allowed(target, self._outbound_allow):
             raise OutboundCallNotAllowed(target)
+        # Reserve the pairing slot with a sentinel BEFORE the await so a concurrent
+        # second consult is refused (the membership check above) while this dial is in
+        # flight. On a dial failure the reservation is rolled back so a failed consult
+        # never permanently blocks a retry.
+        self._attended_consults[call_id] = _CONSULT_PENDING
         _log.info(
             "agent transfer_attended tool: dialling consultation %s for call %s",
             target,
             call_id,
         )
-        consult_call_id = await self.place_call(
-            target,
-            objective=(
-                "You are placing a consultation call on the operator's behalf to set "
-                "up an attended (warm) transfer. Briefly explain the caller you are "
-                "about to connect, then the operator will complete the transfer."
-            ),
-        )
+        try:
+            consult_call_id = await self.place_call(
+                target,
+                objective=(
+                    "You are placing a consultation call on the operator's behalf to "
+                    "set up an attended (warm) transfer. Briefly explain the caller "
+                    "you are about to connect, then the operator will complete the "
+                    "transfer."
+                ),
+            )
+        except BaseException:
+            # The dial did not establish — drop the reservation so the operator can
+            # retry (and complete/cancel see no stale pairing); then re-raise (rule 37).
+            self._attended_consults.pop(call_id, None)
+            raise
         self._attended_consults[call_id] = consult_call_id
         return consult_call_id
 

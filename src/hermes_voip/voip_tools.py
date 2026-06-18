@@ -59,7 +59,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from hermes_voip.originate import OutboundCallNotAllowed
+from hermes_voip.call import CallError
+from hermes_voip.originate import OutboundCallFailed, OutboundCallNotAllowed
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.tools import gate_voip_tool
 
@@ -568,6 +569,10 @@ class VoipToolHost(Protocol):
           the outbound allowlist (no leg is dialled).
         * ``PermissionError`` — the original call is not operator-level / is degraded.
         * ``KeyError`` — the original call is unknown.
+        * :class:`~hermes_voip.originate.OutboundCallFailed` — the consult dial reached
+          the gateway but did not establish (busy slot / no registered ext / WSS).
+        * ``RuntimeError`` — the transport/manager is not initialised, OR a second
+          consultation was requested while one is already in flight for this call.
         """
         ...
 
@@ -1033,6 +1038,14 @@ async def _attended_consult(adapter: VoipToolHost, call_id: str, target: str) ->
         return json.dumps({"error": "the transfer is not permitted on this call"})
     except KeyError:
         return json.dumps({"error": "the call is not active (unknown or ended)"})
+    except (OutboundCallFailed, RuntimeError) as exc:
+        # The consult dial did not establish: OutboundCallFailed for a busy outbound
+        # slot / no registered extension (503) or the WSS transport (501 — outbound
+        # origination is deferred there); RuntimeError for an un-initialised
+        # transport/manager OR a second consultation refused while one is already in
+        # flight for this call. All render as a clear, non-fatal JSON error — never an
+        # escaped exception (the always-JSON contract); no leg is left connected.
+        return json.dumps({"error": f"consultation call failed: {exc}"})
     return json.dumps({"consult_call_id": consult_call_id})
 
 
@@ -1040,9 +1053,10 @@ async def _attended_complete(adapter: VoipToolHost, call_id: str) -> str:
     """``transfer_attended action=complete``: send the REFER+Replaces (ADR-0048)."""
     try:
         outcome = await adapter.complete_attended_transfer(call_id)
-    except RuntimeError as exc:
-        # The gateway rejected the REFER (CallError is a RuntimeError). Surface it
-        # clearly — nobody was transferred, and the failure is reported (rule 37).
+    except CallError as exc:
+        # The gateway rejected the REFER (CallError, a RuntimeError subclass). Catch
+        # it SPECIFICALLY — an unrelated RuntimeError is a real bug and must propagate
+        # (rule 37), not be masked as a transfer failure. Nobody was transferred.
         return json.dumps({"error": f"transfer failed: {exc}"})
     if outcome is AttendedTransferOutcome.TRANSFERRED:
         return json.dumps({"result": "Caller connected to the consultation target."})
@@ -1293,8 +1307,10 @@ def register_voip_tools(ctx: object) -> None:
     Registers ``hang_up`` (SAFE) and the in-call control tools ``hold_call`` /
     ``resume_call`` / ``list_registrations`` (ELEVATED), each through
     ``ctx.register_tool`` and all behind the single ``pre_tool_call`` gate so the
-    privilege clamp governs every one. The IRREVERSIBLE transfer tools are NOT
-    registered (deferred — see the module docstring).
+    privilege clamp governs every one. The IRREVERSIBLE transfer tools —
+    ``transfer_blind`` (its spoof-resistant DTMF confirmation channel landed) and
+    ``transfer_attended`` (its agent-driven consult-leg origination landed, ADR-0048)
+    — ARE registered, both ELEVATED behind the same gate.
 
     **Fail-closed gating.** The ELEVATED tools' privilege clamp lives in the
     ``pre_tool_call`` hook, so they are registered ONLY when the hook is also

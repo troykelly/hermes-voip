@@ -1,4 +1,4 @@
-# Runbook: rich inbound-call context to the agent (ADR-0033)
+# Runbook: rich inbound-call context to the agent (ADR-0052)
 
 **What it is.** On every **inbound** call, the `hermes-voip` plugin extracts everything the
 SIP INVITE reveals — caller identity, the number that was dialled, the forward/divert chain
@@ -103,4 +103,4 @@ No resource is provisioned, so there is nothing to tear down. To change what the
 edit `render_call_context_block` (the text) or `extract_call_context` (the fields) in
 `src/hermes_voip/call_context.py`; to stop injecting it, remove the
 `_inject_call_context_first_turn` scheduling in `adapter._handle_inbound_invite`. Keep the
-untrusted/spoofable label and the defang on any caller-supplied field (ADR-0033).
+untrusted/spoofable label and the defang on any caller-supplied field (ADR-0052).

@@ -214,19 +214,46 @@ def test_provides_hooks_matches_registered_hooks_exactly() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _entry_name(entry: dict[str, object]) -> str:
+    """Return a normalised entry's ``name`` as a str (it is, by construction)."""
+    name = entry["name"]
+    assert isinstance(name, str)
+    return name
+
+
 def _env_entry_names(entries: object) -> list[str]:
     """Extract env-var names from a requires_env/optional_env list (str|dict form)."""
+    return [_entry_name(e) for e in _normalise_env(entries)]
+
+
+def _normalise_env(entries: object) -> list[dict[str, object]]:
+    """Normalise a requires_env/optional_env list to dicts with a string ``name``.
+
+    Accepts the two Hermes formats — a bare string or a rich mapping — and returns
+    a uniform ``[{"name": …, …}]`` list so callers can read name + metadata.
+    """
     assert isinstance(entries, list)
-    names: list[str] = []
+    out: list[dict[str, object]] = []
     for entry in entries:
         if isinstance(entry, str):
-            names.append(entry)
+            out.append({"name": entry})
         else:
             assert isinstance(entry, dict), "env entry must be a str or a dict"
             name = entry.get("name")
             assert isinstance(name, str), f"rich env entry needs a string name: {entry}"
-            names.append(name)
-    return names
+            out.append(entry)
+    return out
+
+
+def _requires_env_block() -> list[dict[str, object]]:
+    """The manifest's ``requires_env`` normalised to rich dicts."""
+    return _normalise_env(_load_manifest(_PACKAGING_MANIFEST).get("requires_env"))
+
+
+def _optional_env_block() -> list[dict[str, object]]:
+    """The manifest's ``optional_env`` normalised to rich dicts (``[]`` if absent)."""
+    optional = _load_manifest(_PACKAGING_MANIFEST).get("optional_env")
+    return _normalise_env(optional) if optional is not None else []
 
 
 def test_requires_env_lists_the_required_sip_vars() -> None:
@@ -301,22 +328,53 @@ def test_optional_env_advertises_transport_and_provider_keys() -> None:
 
 
 def test_manifest_leaks_no_secret_values() -> None:
-    """No secret VALUES anywhere in the manifest — only fakes in descriptions."""
+    """No secret VALUES anywhere in the manifest — only fakes in descriptions.
+
+    PUBLIC-repo invariant. This guard deliberately lists NO real identifier (writing
+    the operator's real host/extension here would itself be the leak it guards
+    against); instead it checks for the *shapes* of a leak — private-host suffixes,
+    RFC-1918 IP literals, and an env-var declared with an inline ``=value``. The
+    only digits the manifest may contain are the documented fake examples (ext
+    ``1000``, the TLS port ``5061``/``5060``) — asserted in
+    :func:`test_manifest_uses_only_fake_examples`.
+    """
     raw = _PACKAGING_MANIFEST.read_text(encoding="utf-8")
     lowered = raw.lower()
-    # Nothing that looks like a real internal host or the operator's real test
-    # extension may appear. (The env-var NAMES themselves are always fine.)
+    # Private-host suffixes / RFC-1918 IP prefixes that only a real deployment has.
     forbidden_markers = (
         ".internal",
         ".lan",
         ".corp",
-        "sip:1137",  # the operator's real test extension must never appear
-        "1137",
+        "192.168.",
+        "10.0.",
+        "172.16.",
     )
     for marker in forbidden_markers:
         assert marker not in lowered, (
             f"manifest appears to leak a real identifier: {marker!r}"
         )
+
+
+def test_manifest_uses_only_fake_examples() -> None:
+    """Env vars are declared as NAMES; no entry embeds an inline ``=value``.
+
+    A ``requires_env``/``optional_env`` entry is a name + metadata — never a
+    ``NAME=value`` assignment that could carry a real credential. The only example
+    host in any description is the documented fake ``pbx.example.test`` (if a host
+    appears at all). This is the positive complement to the shape-based leak guard
+    above, and it references no real identifier.
+    """
+    for entry in (*_requires_env_block(), *_optional_env_block()):
+        name = _entry_name(entry)
+        # The declared key is a bare env-var NAME, never ``NAME=value``.
+        assert "=" not in name, f"env entry {name!r} must be a name, not an assignment"
+        # Any host shown in a description must be the documented fake.
+        desc = entry.get("description", "")
+        assert isinstance(desc, str)
+        if "example" in desc.lower() or ".test" in desc.lower():
+            assert "pbx.example.test" in desc or "example.test" in desc, (
+                f"{name!r} description must use the fake host pbx.example.test"
+            )
 
 
 # ---------------------------------------------------------------------------

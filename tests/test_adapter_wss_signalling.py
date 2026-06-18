@@ -1,4 +1,4 @@
-"""VoipAdapter SIP-over-WSS signalling wiring (ADR-0037).
+"""VoipAdapter SIP-over-WSS signalling wiring (ADR-0038).
 
 ``adapter._establish()`` selects the signalling transport by
 ``gateway_cfg.transport``: ``tls`` builds ``SipOverTlsTransport`` (unchanged),
@@ -256,11 +256,11 @@ async def test_establish_selects_wss_transport_when_transport_wss() -> None:
     kwargs = wss_ctor.call_args.kwargs
     assert kwargs["host"] == "pbx.example.test"
     assert kwargs["port"] == 443
-    # The WS upgrade path is threaded from config (ADR-0037 §3).
+    # The WS upgrade path is threaded from config (ADR-0038 §3).
     assert kwargs["ws_path"] == "/ws"
     # wss:// is WebSocket-over-TLS — the same SSL context the TLS path verifies with.
     assert kwargs["ssl_context"] is not None
-    # The SAME inbound observer seams the TLS path uses (ADR-0037 §1) — wired so a
+    # The SAME inbound observer seams the TLS path uses (ADR-0038 §1) — wired so a
     # WSS-arriving INVITE reaches the identical inbound handling.
     assert kwargs["on_new_call"] == adapter._on_inbound_invite
     assert kwargs["on_unroutable"] == adapter._on_unroutable
@@ -305,7 +305,7 @@ async def test_establish_selects_tls_transport_when_transport_tls() -> None:
 
 @pytest.mark.asyncio
 async def test_place_call_rejected_on_wss_transport() -> None:
-    """Outbound over WSS is rejected loudly, never incoherent (ADR-0037 / 0032 §5).
+    """Outbound over WSS is rejected loudly, never incoherent (ADR-0038 / 0032 §5).
 
     place_call must raise (not put TLS-token SIP on the WebSocket) and send no INVITE.
     """
@@ -537,7 +537,7 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
             # WSS, copied from the inbound INVITE.
             assert "SIP/2.0/WSS" in (ok.header("Via") or "")
 
-            # ADR-0037 §2: the agent-facing call context reports the WSS transport
+            # ADR-0038 §2: the agent-facing call context reports the WSS transport
             # (derived from gateway via_transport, NOT the hardcoded "TLS").
             extract_spy.assert_called_once()
             assert extract_spy.call_args.kwargs["transport"] == "WSS"

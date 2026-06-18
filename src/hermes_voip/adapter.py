@@ -160,7 +160,7 @@ if TYPE_CHECKING:
 
 __all__ = ["VoipAdapter"]
 
-# The signalling transport is selected by HERMES_SIP_TRANSPORT (ADR-0037): both
+# The signalling transport is selected by HERMES_SIP_TRANSPORT (ADR-0038): both
 # classes satisfy the manager.SipTransport + call.CallSignaling Protocols (they
 # expose the identical method set — send / local_sent_by / contact_uri /
 # add_call / remove_call / bind_manager / connect / aclose), so every call site
@@ -491,7 +491,7 @@ class VoipAdapter(BasePlatformAdapter):
             msg = "_establish called before config was populated by connect()"
             raise RuntimeError(msg)
 
-        # ADR-0037: select the signalling transport by HERMES_SIP_TRANSPORT. Both
+        # ADR-0038: select the signalling transport by HERMES_SIP_TRANSPORT. Both
         # satisfy SipTransport + CallSignaling and are wired with the SAME inbound
         # observers, so an INVITE over WSS reaches _on_inbound_invite identically
         # to a TLS INVITE (and falls into the existing is_webrtc branch). wss:// is
@@ -802,7 +802,7 @@ class VoipAdapter(BasePlatformAdapter):
                 when no registered extension is available, or when the slot is busy.
             RuntimeError: When the transport or manager is not initialised.
         """
-        # ADR-0037 / ADR-0032 §5: outbound origination over WSS is DEFERRED. The
+        # ADR-0038 / ADR-0032 §5: outbound origination over WSS is DEFERRED. The
         # outbound UAC path offers SDES/G.711-G.722 and emits a TLS Via, so dialing
         # over the WSS signalling transport would put spec-incoherent SIP on the
         # WebSocket. Reject it LOUDLY here (a named boundary, never a silent
@@ -1340,7 +1340,7 @@ class VoipAdapter(BasePlatformAdapter):
         if gateway_cfg is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: gateway config not initialised"
             raise RuntimeError(msg)
-        # ADR-0037: the Via transport token for the inbound dialog + the
+        # ADR-0038: the Via transport token for the inbound dialog + the
         # agent-facing call context follows the configured transport (TLS | WSS),
         # not a hardcoded literal — a call received over WSS advertises WSS.
         via_transport = gateway_cfg.via_transport
@@ -1572,7 +1572,7 @@ class VoipAdapter(BasePlatformAdapter):
         # and FORGEABLE, so it is surfaced to the agent only as a labelled,
         # untrusted block (never used for authorization). `codec`, `audio`, and
         # `is_webrtc` are in scope here from the SDP-negotiation steps above; the
-        # signalling transport is the configured one (TLS | WSS, ADR-0037) — the
+        # signalling transport is the configured one (TLS | WSS, ADR-0038) — the
         # same token the dialog above carries.
         call_context = extract_call_context(
             invite,

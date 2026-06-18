@@ -69,7 +69,7 @@ class RegistrationConfig:
         username: The digest auth username.
         password: The digest auth password. A **secret** — repr-suppressed so it
             never reaches a log line (it carries the SIP or, on the WSS transport,
-            the ``HERMES_SIP_WS_PASSWORD`` credential; ADR-0037 / rule 34).
+            the ``HERMES_SIP_WS_PASSWORD`` credential; ADR-0038 / rule 34).
         contact: The Contact header value (``<sip:user@host:port;transport=...>``).
         local_sent_by: The Via ``sent-by`` (the transport's actual local
             host:port, or an ``.invalid`` host for WebSocket per RFC 7118).

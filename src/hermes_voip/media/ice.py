@@ -725,13 +725,22 @@ def _parse_turn_url(url: str) -> tuple[str, int, bool, str]:
         msg = "expected a turn: or turns: URL"
         raise ValueError(msg)
 
-    # Split off the optional ``?transport=...`` query (RFC 7065 s3.1).
+    # Reject userinfo in the URI: a "turn:user:pass@host" form would parse the
+    # credentials into the host token and could leak them into a DNS/connect error
+    # or a lower-layer log. TURN credentials come ONLY from the separate env vars
+    # (RFC 7065 §3.1 does not carry userinfo in a turn URI).
+    if "@" in remainder:
+        msg = "TURN URL must not contain userinfo (use the username/password env vars)"
+        raise ValueError(msg)
+
+    # Split off the optional ``?transport=...`` query (RFC 7065 §3.1).
     transport = "udp"
     if "?" in remainder:
-        remainder, _, query = remainder.partition("?")
-        key, _, value = query.partition("=")
+        remainder, _, _query = remainder.partition("?")
+        key, _, value = _query.partition("=")
         if key != "transport" or value not in {"udp", "tcp"}:
-            msg = f"unsupported TURN URL query {query!r} (want transport=udp|tcp)"
+            # Fixed message — never echo the query (it may carry deployment detail).
+            msg = "unsupported TURN URL query (want transport=udp|tcp)"
             raise ValueError(msg)
         transport = value
 

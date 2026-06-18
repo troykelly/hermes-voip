@@ -144,13 +144,13 @@ protected too (the media-inactivity timeout only fires when media *was* flowing 
 The plugin **advertises trickle + ICE2** in its WebRTC answer (`a=ice-options:trickle ice2`),
 sends its full candidate set, then marks `a=end-of-candidates` (RFC 8838 §8.2 — the
 half-trickle degenerate case, interoperable with both classic and trickling peers). It
-**parses** a peer's `a=ice-options`/`a=end-of-candidates` and, for a *trickling* peer
-(advertised `trickle` with **no** `a=end-of-candidates`), it does **not** prematurely signal
-end-of-candidates to ICE — leaving aioice's check loop open. The **in-dialog transport** that
-would deliver a trickling peer's later candidates (SIP INFO with
-`application/trickle-ice-sdpfrag`, RFC 8840) is **deferred** (ADR-0034 §2): WebRTC SIP
-gateways send a complete candidate set in the initial SDP, so this boundary does not regress
-any working call.
+**parses** a peer's `a=ice-options`/`a=end-of-candidates` (exposed as `AudioMedia.is_trickle`
+/ `AudioMedia.end_of_candidates`). On the receive side it **always** signals
+end-of-candidates to ICE after the offer's candidates: the **in-dialog transport** that would
+deliver a trickling peer's later candidates (SIP INFO with `application/trickle-ice-sdpfrag`,
+RFC 8840) is **deferred** (ADR-0034 §2), so withholding the end marker would hang ICE waiting
+for candidates that can never arrive. WebRTC SIP gateways send a complete candidate set in the
+initial SDP, so always ending candidates does not regress any working call.
 
 ## What happens on an inbound WebRTC call (the flow)
 

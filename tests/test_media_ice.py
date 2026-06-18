@@ -280,6 +280,24 @@ def test_parse_turn_url_rejects_non_turn_scheme() -> None:
         _parse_turn_url("stun:stun.example.test:3478")
 
 
+def test_parse_turn_url_rejects_userinfo() -> None:
+    """A turn: URL carrying userinfo is rejected (would leak embedded credentials).
+
+    'turn:user:pass@host' must NOT parse host as 'user:pass@host'; credentials come
+    only from the env vars. The error must not echo the credential material.
+    """
+    with pytest.raises(ValueError, match="userinfo") as excinfo:
+        _parse_turn_url("turn:relay-user:relay-secret@turn.example.test:3478")
+    assert "relay-secret" not in str(excinfo.value)
+
+
+def test_parse_turn_url_query_error_does_not_echo_query() -> None:
+    """A bad ?transport= query errors with a fixed message (no query echo)."""
+    with pytest.raises(ValueError, match="transport=udp") as excinfo:
+        _parse_turn_url("turn:turn.example.test:3478?transport=quic")
+    assert "quic" not in str(excinfo.value)
+
+
 class _SpyAioiceModule:
     """A fake ``aioice`` module that records the kwargs passed to ``Connection``.
 
@@ -353,7 +371,9 @@ async def test_connect_arms_consent_freshness_task() -> None:
     controlling, controlled = await _make_pair()
     try:
         # The wrapped aioice Connection's consent task must be a live asyncio.Task.
-        consent_task = controlled._conn._query_consent_task  # type: ignore[attr-defined]  # aioice internal; no public accessor
+        # aioice 0.10.2 has no public accessor for it; reach the internal attribute
+        # via getattr (returns Any — no type escape hatch, no private-attr typing).
+        consent_task = getattr(controlled._conn, "_query_consent_task", None)
         assert isinstance(consent_task, asyncio.Task)
         assert not consent_task.done()
     finally:

@@ -121,53 +121,58 @@ channel**:
 - **`a=end-of-candidates` (RFC 8838 §8.2).** `sdp.py` parses it into
   `AudioMedia.end_of_candidates: bool` and the answer builder emits it (we send our
   full candidate set in the answer, then mark the end — half-trickle). On the
-  receive side, the ICE driver now signals end-of-candidates to `aioice` **based on
-  the parsed marker**: a peer offer carrying `a=end-of-candidates` (or no trickle
-  option at all — a classic non-trickle peer) ⇒ end-of-candidates is signalled
-  immediately after the offered candidates (today's behaviour); a **trickling** peer
-  (offer has `ice-options:trickle` and **no** `end-of-candidates`) ⇒ we do **not**
-  prematurely signal end, leaving `aioice`'s check loop open for the candidates the
-  peer would trickle. `WebRtcMediaSession.run_handshake` gains a
-  `peer_end_of_candidates: bool = True` parameter carrying this decision (default
-  `True` preserves the non-trickle path verbatim).
+  **receive** side, `WebRtcMediaSession.run_handshake` **always** signals
+  end-of-candidates to `aioice` after the offer's candidates. The reason is the
+  residual boundary below: with **no transport to *receive* a trickled candidate**,
+  withholding the end marker for a trickling peer would leave `aioice`'s check loop
+  open waiting for candidates that can never arrive — an ICE hang. So the plugin
+  *advertises* trickle (it accepts trickle) but *acts on* the initial offer's
+  candidate set and ends candidates — the safe half-trickle behaviour that
+  interoperates with classic and trickling peers alike. (An earlier draft made
+  end-of-candidates conditional on the parsed trickle markers; the cross-vendor
+  review correctly flagged that as an ICE-hang risk given the missing receive
+  transport, so the conditional was removed — we always end.)
 - **The residual boundary, named (rule 6).** The *transport* that would deliver a
   trickling peer's later candidates — **in-dialog SIP INFO with
   `application/trickle-ice-sdpfrag` (RFC 8840)** — is **deferred**. The plugin has
   no INFO handler, and the in-dialog/INVITE adapter surface that would host one
   belongs to the SIP-signalling lanes (outbound-WSS #32, rich-payload #39), not this
-  media lane. So a trickling peer that *withholds* candidates until after the answer
-  is not yet fully served; in practice WebRTC SIP gateways send a complete candidate
-  set in the initial SDP (the same reason ADR-0016 chose a non-trickle MVP), so this
-  boundary does not regress any working call. This is a real, named follow-up
-  (a SIP-INFO trickle task), not a stub — mirroring how ADR-0032 deferred outbound
-  WebRTC to the signalling plane.
+  media lane. In practice WebRTC SIP gateways send a complete candidate set in the
+  initial SDP (the same reason ADR-0016 chose a non-trickle MVP), so always ending
+  candidates does not regress any working call. Wiring the SIP-INFO trickle transport
+  (and only then making end-of-candidates conditional) is a real, named follow-up —
+  mirroring how ADR-0032 deferred outbound WebRTC to the signalling plane.
 
-### 3. ICE consent freshness (surface aioice's built-in; do not duplicate)
+### 3. ICE consent freshness (aioice-native; verified + locked, NOT reimplemented)
 
-`aioice` runs RFC 7675 consent internally and `close()`s the connection on consent
-loss. The **defect** this lane fixes: `aioice`'s consent-driven `close()` does *not*
-enqueue the queue sentinel that a blocked `recv()` waits on, so a media reader
-already parked in `recv()` is **not woken** — the call can wedge instead of tearing
-down (the precise gap-analysis #6 failure). The fix is at our layer, not aioice's:
+`aioice` runs RFC 7675 consent freshness internally: `Connection.connect()` arms a
+`query_consent` task that issues a periodic STUN consent check on each nominated pair
+(`CONSENT_INTERVAL=5` s, randomised ×0.8–1.2) and, after `CONSENT_FAILURES=6`
+consecutive failures, calls `self.close()`. **The investigation found there is no
+recv-hang defect to fix** (an earlier draft of this ADR claimed one and proposed a
+"closed monitor" task — that claim was wrong and is withdrawn): `aioice`'s `close()`
+calls each STUN protocol's `transport.close()`, which fires `connection_lost`, which
+enqueues the `(None, …)` queue sentinel a blocked `recvfrom()` is waiting on, so a
+parked `recv()` **raises `ConnectionError` rather than hanging** (verified against a
+real aioice loopback pair). The engine's existing `_ice_recv_loop` **already**
+converts that `recv()` exception into a transport-loss teardown
+(`_media_timed_out=True; _stop_event.set()`).
 
-- **`IceConnection` runs one "closed monitor" task** (started in `connect()`, after
-  `aioice` has armed its consent task; cancelled in `close()`). It awaits
-  `aioice`'s `get_event()` until it observes `ConnectionClosed` (or `get_event()`
-  returns `None` because the connection is already closed) and then sets an internal
-  `asyncio.Event`. We own the *only* `get_event()` consumer, so aioice's
-  "one waiter at a time" constraint is satisfied.
-- **`IceConnection.recv()` races the underlying `recv()` against that closed-event.**
-  When consent is lost (or the connection otherwise closes), `recv()` raises
-  `ConnectionError("ICE connection closed — consent lost or peer gone")` instead of
-  hanging. The engine's existing `_ice_recv_loop` **already** converts a `recv()`
-  exception into a transport-loss teardown (`_media_timed_out=True; _stop_event.set()`).
-  Net: **consent loss → deterministic call teardown, independent of whether media is
-  flowing** (so a held/quiet call is still protected, which the media-inactivity
-  timeout alone does not guarantee).
-- **No timing/threshold of our own.** We keep `aioice`'s `CONSENT_INTERVAL`/
-  `CONSENT_FAILURES` (the RFC-grounded defaults) — we surface the outcome, we do not
-  second-guess the mechanism. `selected_pair` introspection and `local_candidates`
-  are unchanged.
+So this lane **adds no consent code** (rule 28 — no duplicate machinery, no second
+consent loop). It instead **verifies and locks** the existing end-to-end behaviour
+with tests:
+
+- the `aioice` `query_consent` task is live after `IceConnection.connect()` (proving
+  consent freshness is active on every WebRTC call with no code of ours);
+- a `recv()` blocked when the connection `close()`s raises `ConnectionError` (the
+  consent-loss wake path);
+- an ICE pipe that closes mid-call drives the engine to a transport-loss teardown
+  (`media_timed_out`) — **independent of media flow**, so a held/quiet NAT'd call is
+  torn down on consent loss even though the media-inactivity timeout alone would not
+  fire (gap-analysis #6).
+
+We keep `aioice`'s RFC-grounded `CONSENT_INTERVAL`/`CONSENT_FAILURES` defaults — there
+is no timing or threshold of our own to second-guess the mechanism.
 
 ## Consequences
 
@@ -178,15 +183,14 @@ down (the precise gap-analysis #6 failure). The fix is at our layer, not aioice'
   trickle/ice2 and correctly reads a trickling peer's SDP markers.
 - **Harder / committed to maintain:** the `_RawConnectionCtor` Protocol now mirrors
   five more `aioice.Connection` keyword params (a maintenance point if aioice's TURN
-  signature changes — pinned at `0.10.2`). The closed-monitor adds one small
-  background task per WebRTC call (bounded: it awaits a single event then exits;
-  cancelled on close). `MediaConfig` now carries a secret (`ice_turn_password`),
-  handled with the same `repr=False` discipline as the SDES keys.
+  signature changes — pinned at `0.10.2`). `MediaConfig` now carries a secret
+  (`ice_turn_password`), handled with the same `repr=False` discipline as the SDES
+  keys. No new background tasks or consent machinery (consent is aioice's).
 - **Efficiency (rule 22):** negligible. TURN gathering is one extra allocation
   round-trip at setup only (when configured). The consent task is aioice's, already
-  present; the closed-monitor is one idle `await get_event()` per call (no polling,
-  no per-packet cost). The steady-state SRTP/jitter/decode path is byte-for-byte
-  unchanged. Trickle primitives are sans-IO SDP string handling.
+  present — this lane adds no per-call task and no per-packet cost. The steady-state
+  SRTP/jitter/decode path is byte-for-byte unchanged. Trickle primitives are sans-IO
+  SDP string handling.
 - **Security:** the TURN password is a long-term credential; it is suppressed from
   `repr`, never logged, and `_parse_turn_url` errors do not echo userinfo. Relay
   media still rides DTLS-SRTP end-to-end (the TURN server relays ciphertext; it is
@@ -196,21 +200,23 @@ down (the precise gap-analysis #6 failure). The fix is at our layer, not aioice'
   new dependency, no `uv.lock` change. A TURN server, if used, is OSS (`coturn`) or
   operator-contracted infrastructure pointed at by config — gated by rules 40/41 in
   its runbook, never click-created.
-- **What is proven vs validated live:** TURN URL parsing, the aioice TURN-param
-  wiring, the trickle SDP round-trip + half-trickle answer, the end-of-candidates
-  decision, and the consent-loss→teardown surfacing are **unit-proven** (TDD
-  red→green, deterministic in-memory fakes). A **full live relay against a real TURN
-  server** and **consent expiry against a real NAT** remain **operator validation
-  steps** (runbook 0009), not asserted here (rule 23/26).
+- **What is proven vs validated live:** TURN URL parsing (incl. userinfo rejection),
+  the aioice TURN-param wiring, the trickle SDP round-trip + half-trickle answer +
+  always-end-of-candidates, the consent task being armed, and the
+  consent-close→recv-raise→engine-teardown chain are **unit-proven** (TDD red→green,
+  deterministic in-memory fakes + a real aioice loopback pair). A **full live relay
+  against a real TURN server** and **consent expiry against a real NAT** remain
+  **operator validation steps** (runbook 0009), not asserted here (rule 23/26).
 
 ## Alternatives considered
 
 | Alternative | Rejected because |
 | ----------- | ---------------- |
-| Reimplement RFC 7675 consent freshness in our layer | `aioice` already implements it (verified: `query_consent`, 5 s/6-failure → `close()`). Duplicating it would be redundant machinery (rule 28) and risk two consent loops fighting. We surface its outcome instead. |
+| Reimplement RFC 7675 consent freshness in our layer | `aioice` already implements it (verified: `query_consent`, 5 s/6-failure → `close()`), and its `close()` already wakes a blocked `recv()` so the engine tears the call down. Duplicating it would be redundant machinery (rule 28) and risk two consent loops fighting. We verify + lock the existing behaviour with tests instead. |
 | Run/operate a TURN server inside the plugin | A plugin is not a service (rule 40); running TURN is external infrastructure (rule 41). The plugin *consumes* operator-provided TURN credentials only. |
 | Ship "trickle ICE" as a full in-dialog incremental channel now | The transport is in-dialog SIP INFO (RFC 8840), which needs an INFO handler on the inbound/in-dialog adapter surface owned by other lanes (#32/#39). Building it here would either be a stub (rule 6) or contend on hot shared files (rule 32). We ship the SDP/ICE primitives + half-trickle and name the SIP-INFO transport as a real follow-up. |
 | Pass *all* TURN URLs to aioice | `aioice.Connection` accepts a single TURN server. We parse the first `turn:`/`turns:` URL (same single-server shape as STUN today); multiple TURN servers are a non-MVP extension. |
 | Detect consent loss via the media-inactivity timeout alone | The inactivity timeout only fires when media *was* flowing and stopped; it does not protect a held/quiet call whose NAT mapping expired. Consent freshness is the principled path-liveness check independent of media flow — surfacing it is the point of gap-analysis #6. |
 | Accept a credential-less `turn:` URL (gather nothing) | Silent no-op (no relay candidate) violates rule 27; RFC 8656 §9.2 requires long-term credentials. We raise `ConfigError` at load. |
-| Use `set_selected_pair` / poll `_nominated` to detect closure | Fragile (reaches into more aioice internals) and still would not wake a blocked `recv()`. Awaiting the public `ConnectionClosed` event is the supported, single-consumer-safe surface. |
+| Accept TURN URI userinfo (`turn:user:pass@host`) | A `turn:` URI carries no userinfo (RFC 7065 §3.1); parsing it would fold credentials into the host token and risk leaking them into a DNS/connect error. We reject `@` and take credentials only from the env vars. |
+| Withhold end-of-candidates for a trickling peer (conditional on the SDP markers) | With no in-dialog SIP-INFO transport to *receive* trickled candidates, leaving aioice's check loop open would hang ICE waiting for candidates that can never arrive (cross-vendor review BLOCKING finding). We always end candidates and defer the conditional until the SIP-INFO transport exists. |

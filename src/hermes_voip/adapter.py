@@ -1798,18 +1798,16 @@ class VoipAdapter(BasePlatformAdapter):
         # answered, the ICE session is closed, and _MediaNegotiationRejected is raised
         # so the inbound handler's finally tears the answered call down (no CallLoop on
         # dead media). The mandatory attributes were already validated pre-answer.
-        # Trickle decision (ADR-0034): a peer that advertised a=ice-options:trickle
-        # WITHOUT a=end-of-candidates has more candidates coming — don't signal
-        # end-of-candidates to ICE (leave its check loop open). A classic non-trickle
-        # peer, or one that sent end-of-candidates, is complete.
-        peer_end_of_candidates = not (audio.is_trickle and not audio.end_of_candidates)
+        # Trickle (ADR-0034): we advertise a=ice-options:trickle in the answer (we
+        # ACCEPT trickle), but we always act on the offer's candidate set + end
+        # candidates — there is no in-dialog SIP-INFO transport (RFC 8840) to receive
+        # trickled candidates, so withholding the end marker would hang ICE.
         try:
             srtp_inbound, srtp_outbound = await session.run_handshake(
                 peer_fingerprint=peer_fingerprint,
                 peer_ice_ufrag=audio.ice_ufrag,
                 peer_ice_pwd=audio.ice_pwd,
                 peer_candidates=audio.ice_candidates,
-                peer_end_of_candidates=peer_end_of_candidates,
             )
         except Exception:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
             # A DTLS/ICE failure (fingerprint mismatch, no connectivity, handshake

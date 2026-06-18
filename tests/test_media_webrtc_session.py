@@ -297,7 +297,7 @@ def test_session_threads_turn_params_to_factory() -> None:
 
 @pytest.mark.asyncio
 async def test_run_handshake_signals_end_of_candidates_by_default() -> None:
-    """Default peer_end_of_candidates=True signals end-of-candidates (non-trickle)."""
+    """run_handshake signals end-of-candidates to ICE (non-trickle peer)."""
     server_ice = _RecordingIce("svrU", "svrPwwwwwwwwwwwwww")
     client_ice = _RecordingIce("cliU", "cliPwwwwwwwwwwwwww")
     server_ice.peer, client_ice.peer = client_ice, server_ice
@@ -328,12 +328,14 @@ async def test_run_handshake_signals_end_of_candidates_by_default() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_handshake_withholds_end_of_candidates_for_trickling_peer() -> None:
-    """peer_end_of_candidates=False leaves the check loop open for a trickling peer.
+async def test_run_handshake_always_ends_candidates() -> None:
+    """run_handshake ALWAYS signals end-of-candidates (ADR-0034 — no trickle-receive).
 
-    A trickling peer (a=ice-options:trickle and NO a=end-of-candidates) has more
-    candidates coming; we must NOT prematurely tell aioice end-of-candidates, or
-    its connectivity-check loop would close before the trickled candidates arrive.
+    The plugin has no in-dialog SIP-INFO transport (RFC 8840) to receive a peer's
+    trickled candidates, so it must never withhold the end marker — that would hang
+    ICE waiting for candidates that can never arrive. It acts on the offer's
+    candidate set and ends candidates, even though it advertises trickle capability
+    in the SDP answer (RFC 8838 §4.1 half-trickle).
     """
     server_ice = _RecordingIce("svrU", "svrPwwwwwwwwwwwwww")
     client_ice = _RecordingIce("cliU", "cliPwwwwwwwwwwwwww")
@@ -351,15 +353,14 @@ async def test_run_handshake_withholds_end_of_candidates_for_trickling_peer() ->
             peer_fingerprint=client.fingerprint,
             peer_ice_ufrag=client.ice_ufrag,
             peer_ice_pwd=client.ice_pwd,
-            peer_end_of_candidates=False,  # trickling peer
         ),
         client.run_handshake(
             peer_fingerprint=server.fingerprint,
             peer_ice_ufrag=server.ice_ufrag,
             peer_ice_pwd=server.ice_pwd,
-            peer_end_of_candidates=False,
         ),
     )
-    # The server (which saw the trickling peer) must NOT have signalled end.
-    assert server_ice.end_of_candidates_signalled is False
+    # End-of-candidates is always signalled — there is no path to receive more.
+    assert server_ice.end_of_candidates_signalled is True
+    assert client_ice.end_of_candidates_signalled is True
     await asyncio.gather(server.close(), client.close())

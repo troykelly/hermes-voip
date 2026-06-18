@@ -299,7 +299,6 @@ class WebRtcMediaSession:
         peer_ice_ufrag: str,
         peer_ice_pwd: str,
         peer_candidates: Sequence[SdpIceCandidate] = (),
-        peer_end_of_candidates: bool = True,
     ) -> tuple[SrtpSession, SrtpSession]:
         """Run ICE connectivity + the DTLS handshake, returning the SRTP pair.
 
@@ -307,19 +306,21 @@ class WebRtcMediaSession:
         DTLS handshake over the ICE pipe, verifies the peer's certificate against
         ``peer_fingerprint`` (RFC 5763 §5), and derives the SRTP sessions.
 
+        End-of-candidates is **always** signalled to ICE after the offered
+        candidates (ADR-0034). The plugin has **no in-dialog SIP-INFO transport**
+        (RFC 8840) to *receive* candidates a peer would trickle later, so
+        withholding the end marker for a trickling peer would hang ICE waiting for
+        candidates that can never arrive. The answer still advertises
+        ``a=ice-options:trickle`` (we *accept* trickle), but the candidate set we
+        act on is the one in the initial offer — the safe half-trickle behaviour
+        that interoperates with classic and trickling peers alike (RFC 8838 §4.1).
+        Wiring the SIP-INFO trickle transport is the named follow-up (ADR-0034 §2).
+
         Args:
             peer_fingerprint: The peer's ``a=fingerprint`` from their offer.
             peer_ice_ufrag: The peer's ``a=ice-ufrag``.
             peer_ice_pwd: The peer's ``a=ice-pwd``.
             peer_candidates: The peer's ``a=candidate`` list from their offer.
-            peer_end_of_candidates: Whether the peer's candidate generation is
-                complete (ADR-0034).  ``True`` (default) for a classic non-trickle
-                peer or a peer that sent ``a=end-of-candidates`` — we signal
-                end-of-candidates to ICE.  ``False`` for a *trickling* peer
-                (``a=ice-options:trickle`` with no ``a=end-of-candidates``): we do
-                NOT signal end, leaving aioice's check loop open for the candidates
-                the peer would trickle (the in-dialog SIP-INFO transport that would
-                deliver them is a named follow-up, ADR-0034 §2).
 
         Returns:
             ``(inbound, outbound)`` SRTP sessions for the engine.
@@ -342,11 +343,9 @@ class WebRtcMediaSession:
         self._ice.set_remote_credentials(peer_ice_ufrag, peer_ice_pwd)
         for cand in peer_candidates:
             await self._ice.add_remote_candidate(IceCandidate.from_sdp(cand.render()))
-        # Signal end-of-candidates only when the peer's generation is complete.
-        # A trickling peer (peer_end_of_candidates=False) has more coming, so we
-        # leave aioice's check loop open (RFC 8838 §8.2 / ADR-0034).
-        if peer_end_of_candidates:
-            await self._ice.add_remote_candidate(None)  # end-of-candidates
+        # Always end candidates: with no trickle-receive transport, an open check
+        # loop would hang on candidates that cannot arrive (RFC 8838 §8.2).
+        await self._ice.add_remote_candidate(None)  # end-of-candidates
 
         # Run ICE connectivity checks (nominates a pair; raises on failure).
         await self._ice.connect()

@@ -112,11 +112,39 @@ _log = logging.getLogger(__name__)
 # the operator's logs with full context — it is *translated* into the error channel,
 # not dropped. The specific-error returns inside each handler stay unchanged; the
 # guard only catches what they did not anticipate. ``noqa: BLE001`` carries this
-# justification at each site.
+# justification at each site. The two SECRET-bearing tools (``send_dtmf`` /
+# ``open_entry``) use ``_tool_failure_redacted`` instead — same contract, but the
+# exception detail is never echoed (it could embed the secret digits / opening
+# secret).
 def _tool_failure(tool_name: str, exc: BaseException) -> str:
     """Log ``exc`` and render the handler-boundary error-JSON for ``tool_name``."""
     _log.exception("VoIP tool %r failed with an unanticipated error", tool_name)
     return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+
+def _tool_failure_redacted(tool_name: str, exc: BaseException) -> str:
+    """Handler-boundary failure for the SECRET-bearing tools (send_dtmf/open_entry).
+
+    Identical contract to :func:`_tool_failure` EXCEPT the exception detail is never
+    surfaced — neither in the model-facing result nor in the log line. An
+    unanticipated ``exc`` from deep in the send path can embed the very DTMF digits
+    the caller asked to send (or the opening secret), which must never be echoed (the
+    handlers document "digits are NOT echoed in the result/log"). So the result is a
+    FIXED generic message and the log line carries ONLY the tool name and the
+    exception's TYPE name — never ``str(exc)`` and never ``exc_info`` (a traceback
+    renders the exception's repr, which would re-embed the digits). The failure is
+    still surfaced (rule 37): to the model as an error result, and to the operator's
+    logs as a typed failure line — just without the secret-bearing message text.
+    """
+    # Deliberately NOT ``_log.exception`` / ``exc_info=exc``: a rendered traceback or
+    # exception repr would re-embed the secret digits. The type name is safe and
+    # carries enough to triage without leaking the message.
+    _log.error(
+        "VoIP tool %r failed with an unanticipated %s (detail redacted)",
+        tool_name,
+        type(exc).__name__,
+    )
+    return json.dumps({"error": f"{tool_name} failed (internal error)"})
 
 
 class TransferOutcome(Enum):
@@ -802,8 +830,9 @@ async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail
         if not sent:
             return json.dumps({"error": "the call is not active (unknown or ended)"})
         return json.dumps({"result": "Tones sent."})
-    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
-        return _tool_failure(SEND_DTMF_TOOL_NAME, exc)
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure_redacted)
+        # REDACTED guard: an unanticipated exc could embed the secret digits.
+        return _tool_failure_redacted(SEND_DTMF_TOOL_NAME, exc)
 
 
 async def open_entry_handler(
@@ -840,8 +869,9 @@ async def open_entry_handler(
         if not opened:
             return json.dumps({"error": "the call is not active (unknown or ended)"})
         return json.dumps({"result": "Entry opened."})
-    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
-        return _tool_failure(OPEN_ENTRY_TOOL_NAME, exc)
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure_redacted)
+        # REDACTED guard: an unanticipated exc could embed the opening secret.
+        return _tool_failure_redacted(OPEN_ENTRY_TOOL_NAME, exc)
 
 
 async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch the model must be able to tell apart (no adapter / no call / no target / transfer-failed / transferred / not-confirmed / call-ended); collapsing them would hide which outcome occurred

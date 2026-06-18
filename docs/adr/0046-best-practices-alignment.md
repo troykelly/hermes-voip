@@ -69,6 +69,18 @@ robustness liability:
    *translated* into the contract's error channel. A code comment records this
    rationale. `noqa: BLE001` (broad-except) carries that justification inline.
 
+   **Redacted variant for the two secret-bearing handlers.** `send_dtmf` and
+   `open_entry` carry secrets (the DTMF digits / the opening secret), which the
+   handlers already keep out of the success result and log. An unanticipated `exc`
+   from deep in the send path can embed those very digits in its message, so these
+   two use `_tool_failure_redacted` instead: it returns a FIXED generic message
+   (`"<tool> failed (internal error)"`) and logs ONLY the tool name and the
+   exception's TYPE name — never `str(exc)` and never `exc_info` (a rendered
+   traceback re-embeds the exception repr, hence the digits). The failure is still
+   surfaced (rule 37) — a typed error line to the operator and an error result to the
+   model — just without the secret-bearing message text. The other seven handlers
+   keep echoing `<exc>`.
+
 2. **Fail-soft per-tool registration.** The per-spec `register_tool()` call in
    `register_voip_tools`' loop is wrapped in `try/except Exception` that logs a
    warning naming the colliding/failing tool and `continue`s — so one bad tool can
@@ -92,7 +104,11 @@ robustness liability:
    behaviourally-identical stdlib fallback (kept correct and tested) when it does
    not. Each module exposes a `_reset_*_singleton()` for test isolation. Behaviour
    is identical on both paths (build-at-most-once under a concurrent first-call
-   stampede).
+   stampede). The `LazySingleton` wrapper performs BOTH the runtime-handle
+   resolution and the `self._value` read UNDER `self._lock` (double-checked on the
+   fast path), so the build-once guarantee holds on the runtime path too — a
+   stampede cannot resolve two runtime handles (each of which would run the value
+   factory once).
 
 5. **Documented `cron_deliver_env_var` omission.** A one-line comment at the primary
    `register_platform` records that `cron_deliver_env_var` is intentionally omitted

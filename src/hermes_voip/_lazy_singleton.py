@@ -69,12 +69,15 @@ class LazySingleton[T]:
         self._runtime: _RuntimeLazySingleton | None = None
         self._runtime_resolved = False
 
-    def _resolve_runtime(self) -> _RuntimeLazySingleton | None:
-        """Return the runtime lazy-singleton handle, or ``None`` to use the fallback.
+    def _resolve_runtime_locked(self) -> _RuntimeLazySingleton | None:
+        """Return the runtime lazy-singleton handle, or ``None`` for the fallback.
 
-        Guarded exactly like the adapter's ``from gateway...`` imports: the helper is
-        a Hermes-runtime module absent from the default test env, so ``ImportError``
-        selects the stdlib fallback (the path exercised by the test suite).
+        Caller MUST hold ``self._lock``. Guarded exactly like the adapter's ``from
+        gateway...`` imports: the helper is a Hermes-runtime module absent from the
+        default test env, so ``ImportError`` selects the stdlib fallback (the path
+        exercised by the test suite). Resolving under the lock is what makes the
+        runtime handle build-once: a concurrent first-call stampede cannot create two
+        handles (each of which would run the value factory once).
         """
         if self._runtime_resolved:
             return self._runtime
@@ -103,29 +106,40 @@ class LazySingleton[T]:
         return self._runtime
 
     def get(self) -> T:
-        """Return the singleton value, constructing it at most once."""
-        runtime = self._resolve_runtime()
-        if runtime is not None:
-            # Drives the runtime's build-once coordination; the side-effecting factory
-            # records the typed value into ``self._value`` (set on first build, and
-            # already set on subsequent cached calls).
-            runtime.get()
-            value = self._value
-            if value is None:  # pragma: no cover - the factory always sets it
-                value = self._factory()
-                self._value = value
+        """Return the singleton value, constructing it at most once.
+
+        The runtime-handle resolution, the runtime ``get()`` build-once drive, and the
+        read of the resulting ``self._value`` ALL happen under ``self._lock`` (double-
+        checked on the fast path), so a concurrent first-call stampede builds exactly
+        one runtime handle and one value. The lock is uncontended once built.
+        """
+        # Fast path: already built — no lock needed (value is set-once before publish).
+        value = self._value
+        if value is not None:
             return value
-        # Stdlib double-checked-lock fallback (identical build-once semantics).
-        if self._value is None:
-            with self._lock:
-                if self._value is None:
-                    self._value = self._factory()
-        return self._value
+        with self._lock:
+            # Re-check under the lock (another thread may have built it meanwhile).
+            value = self._value
+            if value is not None:
+                return value
+            runtime = self._resolve_runtime_locked()
+            if runtime is not None:
+                # Drives the runtime's build-once coordination; the side-effecting
+                # factory records the typed value into ``self._value``.
+                runtime.get()
+                built = self._value
+                if built is None:  # pragma: no cover - the factory always sets it
+                    built = self._factory()
+                    self._value = built
+                return built
+            # Stdlib fallback (identical build-once semantics, same lock).
+            self._value = self._factory()
+            return self._value
 
     def reset(self) -> None:
         """Drop the cached value so the next :meth:`get` rebuilds it (test seam)."""
         with self._lock:
             self._value = None
-        runtime = self._resolve_runtime()
-        if runtime is not None:
-            runtime.reset()
+            runtime = self._resolve_runtime_locked()
+            if runtime is not None:
+                runtime.reset()

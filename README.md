@@ -194,16 +194,23 @@ That's it. **Dial your extension from any phone** and your agent answers.
 
 ## Verify it's working
 
-**Is the plugin loaded?** Ask Hermes to show its plugins with debug output on:
+**Is the plugin listed?** Ask Hermes to show its plugins:
 
 ```bash
-HERMES_PLUGINS_DEBUG=1 hermes plugins list
+hermes plugins list
 ```
 
-`HERMES_PLUGINS_DEBUG=1` makes Hermes print what it discovers and loads as it starts up. If
-you installed the manifest directory from Step 3, `hermes-voip` also appears in the table with
-its description and version (and the in-session `/plugins` command shows it with its tool
-count — `9 tools, 1 hook`).
+If you installed the manifest directory from Step 3, `hermes-voip` appears in the table with
+its description and version. (This is a **filesystem listing** — it shows the plugin but does
+not load it. The in-session `/plugins` command, once the gateway is running, shows it loaded
+with its tool count — `9 tools, 1 hook`.)
+
+To see what Hermes actually **discovers and loads** at startup, set `HERMES_PLUGINS_DEBUG=1`
+when you start the gateway (not on `plugins list`):
+
+```bash
+HERMES_PLUGINS_DEBUG=1 hermes gateway run -vv
+```
 
 **Did it register on the gateway?** Start the gateway with verbose logging:
 

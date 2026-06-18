@@ -88,26 +88,34 @@ regardless, so the plugin loads.
 
 ## Verify
 
-All checks below run **read-only**; none of them touch a running gateway. To avoid disturbing a
-live `~/.hermes`, you can point `HERMES_HOME` at a throwaway dir first
-(`export HERMES_HOME=$(mktemp -d)` then copy the directory manifest into
-`$HERMES_HOME/plugins/hermes-voip/`).
-
-**The CLI sees it + enabling works (after the directory manifest is installed):**
+None of these checks touch a **running** gateway. One of them — `hermes plugins enable` —
+**does write** `plugins.enabled` to `config.yaml`, so to avoid mutating a live `~/.hermes`,
+point `HERMES_HOME` at a throwaway dir **first** and copy the directory manifest into it:
 
 ```bash
-hermes plugins list --plain | grep hermes-voip
+export HERMES_HOME=$(mktemp -d)
+mkdir -p "$HERMES_HOME/plugins/hermes-voip"
+cp packaging/hermes-plugins/hermes-voip/plugin.yaml "$HERMES_HOME/plugins/hermes-voip/"
+cp packaging/hermes-plugins/hermes-voip/__init__.py "$HERMES_HOME/plugins/hermes-voip/"
+```
+
+**The CLI sees it (read-only listing) + enabling works (this step writes config.yaml):**
+
+```bash
+hermes plugins list --plain | grep hermes-voip      # read-only
 # → not enabled  user  0.0.0  hermes-voip
-hermes plugins enable hermes-voip
+hermes plugins enable hermes-voip                    # WRITES plugins.enabled to config.yaml
 # → ✓ Plugin hermes-voip enabled. Takes effect on next session.
-hermes plugins list --plain | grep hermes-voip
+hermes plugins list --plain | grep hermes-voip       # read-only
 # → enabled      user  0.0.0  hermes-voip
 ```
 
-`hermes plugins list` reads the directory `plugin.yaml`, so the **version + description** come
-from the manifest. (`HERMES_PLUGINS_DEBUG=1 hermes plugins list` prints discovery/load detail at
-startup — useful when the plugin is unexpectedly absent. It is a Hermes runtime variable, not
-read by this plugin.)
+`hermes plugins list` is a **filesystem listing** — it reads the directory `plugin.yaml`
+(so the **version + description** come from the manifest) but does **not** load the plugin
+or run `register()`, and it does **not** consult `HERMES_PLUGINS_DEBUG`. To see actual
+discovery/load detail set `HERMES_PLUGINS_DEBUG=1` when you start the **gateway**
+(`hermes gateway run`) — that is the path that loads plugins. The load-bearing checks below
+are what actually prove the plugin loads + registers.
 
 **The plugin is recognised as enabled by the runtime** (the load-bearing check — independent of
 the CLI cosmetics). With the `webrtc`/all extras synced so the runtime is importable:

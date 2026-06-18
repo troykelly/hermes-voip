@@ -403,20 +403,58 @@ def test_directory_install_layout_has_init_reexporting_register() -> None:
 
 
 def test_manifest_is_importable_package_data() -> None:
-    """plugin.yaml ships inside the hermes_voip wheel (importlib.resources).
+    """plugin.yaml resolves as ``hermes_voip`` package data (importlib.resources).
 
     So a pip install can surface / extract the manifest, and the directory-install
-    copy can be sourced from the installed package rather than the repo.
+    copy can be sourced from the installed package rather than the repo. NOTE: in an
+    editable install this resolves to ``src/hermes_voip/plugin.yaml`` whether or not
+    the wheel-packaging is configured — so the *wheel* guard is the separate
+    :func:`test_pyproject_packages_the_manifest_into_the_wheel`.
     """
     from importlib.resources import files  # noqa: PLC0415
 
     resource = files("hermes_voip").joinpath("plugin.yaml")
-    assert resource.is_file(), (
-        "plugin.yaml must ship as hermes_voip package data (wheel force-include)"
-    )
+    assert resource.is_file(), "plugin.yaml must resolve as hermes_voip package data"
     data = yaml.safe_load(resource.read_text(encoding="utf-8"))
     assert isinstance(data, dict)
     assert data.get("name") == "hermes-voip"
+
+
+def test_pyproject_packages_the_manifest_into_the_wheel() -> None:
+    """The hatch wheel target must ship the manifest as package data.
+
+    Hatchling does NOT include non-``.py`` files under the package by default, so
+    ``plugin.yaml`` only lands in the built wheel because the wheel target declares
+    it (``artifacts``/``force-include``). This guard fails if that declaration is
+    dropped — which :func:`test_manifest_is_importable_package_data` would NOT catch
+    in an editable install (the source file resolves regardless). It asserts the
+    config, not a built wheel, so it stays fast and offline.
+    """
+    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    tool = data["tool"]
+    assert isinstance(tool, dict)
+    wheel = tool["hatch"]["build"]["targets"]["wheel"]
+    assert isinstance(wheel, dict)
+    declared = " ".join(
+        str(v)
+        for key in ("artifacts", "force-include")
+        for v in _as_list(wheel.get(key))
+    )
+    assert "src/hermes_voip/plugin.yaml" in declared or "plugin.yaml" in declared, (
+        "the hatch wheel target must include src/hermes_voip/plugin.yaml as package "
+        "data (via artifacts or force-include) — otherwise the wheel ships no manifest"
+    )
+
+
+def _as_list(value: object) -> list[object]:
+    """Coerce a hatch include value (list, or dict for force-include) to a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [*value.keys(), *value.values()]
+    return [value]
 
 
 def test_packaged_and_importable_manifests_are_identical() -> None:

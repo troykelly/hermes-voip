@@ -59,6 +59,12 @@ provides_hooks:
 # wrongly disable the plugin when it is absent. Rich format: name/description/url/
 # secret (verified against hermes-agent 0.16.0; the field is `secret`, not `password`).
 # NAMES + fake examples only.
+#
+# These are the SINGLE-registration credential names (the common case, == the runtime
+# gate hermes_voip.plugin._REQUIRED_ENV). A multi-registration deployment uses the
+# INDEXED form instead — HERMES_SIP_EXTENSION_<n> / HERMES_SIP_PASSWORD_<n> — which a
+# flat requires_env list cannot express as an "either/or"; the indexed variant is
+# documented in the README + runbook 0001 rather than gated here.
 requires_env:
   - name: HERMES_SIP_HOST
     description: "Your SIP/WebRTC gateway's hostname (e.g. pbx.example.test)."

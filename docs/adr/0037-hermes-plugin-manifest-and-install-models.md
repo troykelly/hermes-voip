@@ -95,8 +95,13 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
    present, the loader dedups by key (`manifest.key or manifest.name`, both `"hermes-voip"`)
    and the entry point wins, so the directory `__init__.py` is **not** re-imported — the
    platform registers **exactly once** (verified live: `voip` registered once, 9 tools, 1
-   hook). The directory `__init__.py` exists so the directory is a complete, self-contained
-   directory-install plugin (guide model (a)) even where someone uses only that model.
+   hook). The directory `__init__.py` does `from hermes_voip.plugin import register`, so it
+   is the canonical guide model (a) layout — but note the **`hermes_voip` package must still
+   be installed** (`pip install` / `uv sync`) for that import to resolve: this plugin's code
+   ships in the wheel, not in the directory, so the directory is the metadata + enable
+   affordance over the pip-installed package, **not** a package-less install. (There is no
+   code-bearing copy in the directory by design — that would be a second implementation that
+   could drift from the package; see the alternatives.)
 
 5. **Drift guard in CI.** `tests/test_plugin_manifest.py` asserts (a) the manifest parses
    and ships as package data, (b) `provides_tools`/`provides_hooks` **exactly** match the
@@ -135,6 +140,8 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
   live there; the directory-install copy is a separate path. The two-copy + identity-test
   approach keeps a single source of truth without breaking either install model.
 - **Drop the directory `__init__.py` (metadata-only stub, as in #109)** — rejected: the task
-  calls for a complete directory-install plugin per the guide; the entry point winning the
-  dedup means the `__init__.py` is harmless alongside pip and correct for a directory-only
-  install.
+  calls for the complete guide-model-(a) directory layout (`plugin.yaml` + `__init__.py`).
+  The `__init__.py` re-imports the installed package's `register` (it is not a package-less
+  install — the wheel must be present), and because the entry point wins the load dedup it is
+  harmless alongside pip (no double registration). A metadata-only stub would diverge from
+  the guide's stated directory shape for no benefit.

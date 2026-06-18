@@ -58,7 +58,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, Protocol
 
-from hermes_voip.dtmf import DtmfEvent, DtmfReceiver, event_payloads
+from hermes_voip.dtmf import (
+    DtmfEvent,
+    DtmfReceiver,
+    DtmfSendMode,
+    InbandDtmfDetector,
+    event_payloads,
+    inband_tone_pcm,
+)
 from hermes_voip.media.aec import EchoCanceller
 from hermes_voip.media.audio import (
     G711_SAMPLE_RATE,
@@ -633,6 +640,8 @@ class RtpMediaTransport:
         payload_type: int | None = None,
         telephone_event_payload_type: int | None = None,
         on_dtmf: Callable[[str], None] | None = None,
+        dtmf_send_mode: DtmfSendMode = DtmfSendMode.RFC4733,
+        inband_dtmf_rx_enabled: bool = False,
         ptime: int = _DEFAULT_PTIME_MS,
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
@@ -742,6 +751,16 @@ class RtpMediaTransport:
         # drops telephone-event packets so they never reach the audio decoder).
         self._on_dtmf: Callable[[str], None] | None = on_dtmf
         self._dtmf_receiver: DtmfReceiver = DtmfReceiver()
+        # The outbound DTMF backend send_dtmf uses (ADR-0034): RFC4733 emits the
+        # named-event train; INBAND synthesises dual-tone audio on the TX path; SIP_INFO
+        # is the CallSession's job (never reached here); UNAVAILABLE raises.
+        self._dtmf_send_mode: DtmfSendMode = dtmf_send_mode
+        # In-band DTMF RECEIVE (ADR-0034): when armed (a G.711 call with no
+        # telephone-event), the inbound generator runs a Goertzel detector on the
+        # AEC-cleaned decoded frame and fires on_dtmf. Off by default — zero cost on the
+        # common RFC 4733 path. Re-created in connect() for a clean per-call state.
+        self._inband_dtmf_rx_enabled: bool = inband_dtmf_rx_enabled
+        self._inband_detector: InbandDtmfDetector | None = None
         self._ptime = ptime
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
@@ -998,6 +1017,13 @@ class RtpMediaTransport:
         # recently-seen-timestamp window (a stale window could suppress a real first
         # press of the new call). The ``on_dtmf`` callback is preserved across calls.
         self._dtmf_receiver = DtmfReceiver()
+        # Fresh in-band detector (ADR-0034) so a reused engine starts with no held
+        # press; analysed at the engine's analysis rate (8 kHz G.711). None if unarmed.
+        self._inband_detector = (
+            InbandDtmfDetector(sample_rate=self._analysis_sample_rate)
+            if self._inband_dtmf_rx_enabled
+            else None
+        )
         self._stop_event = asyncio.Event()
         self._pending = None
         # Fresh TX lock so a reused engine never inherits a held lock (ADR-0031).
@@ -1308,6 +1334,14 @@ class RtpMediaTransport:
                 # analysis rate (the rate _decode delivers), so far-end and near-end
                 # align. Buffer-free (no added latency, rule 22).
                 frame = self._cancel_echo(frame)
+                # In-band DTMF receive (ADR-0034): run the Goertzel detector on the
+                # AEC-cleaned frame BEFORE the VAD/ASR see it, so the agent's own
+                # reflected tones (already removed by AEC) never false-trigger and a
+                # detected keypress goes to on_dtmf, not into the transcript. Armed only
+                # on a G.711 call that negotiated no telephone-event; a no-op otherwise.
+                # The audio frame still flows on unchanged — a tone the caller pressed
+                # is surfaced as a digit AND heard, like the gateway's own behaviour.
+                self._detect_inband_dtmf(frame)
                 yield frame
 
     def _maybe_latch(self, packet: RtpPacket, source: tuple[str, int]) -> None:
@@ -1751,12 +1785,19 @@ class RtpMediaTransport:
         gap_ms: int = _DEFAULT_DTMF_GAP_MS,
         volume: int = _DEFAULT_DTMF_VOLUME,
     ) -> None:
-        """Send ``digits`` as RFC 4733 telephone-event RTP on the active call.
+        """Send ``digits`` as DTMF on the active call, per the resolved send backend.
 
-        Wires the (separately-tested) :func:`hermes_voip.dtmf.event_payloads`
-        generator onto this engine's TX path (ADR-0010/0031). For EACH digit it
-        emits named-event packets at the NEGOTIATED telephone-event payload type,
-        with:
+        The backend is :attr:`_dtmf_send_mode` (ADR-0034): ``RFC4733`` emits the
+        named-event RTP train (described below); ``INBAND`` synthesises dual-tone PCM
+        and sends it on the audio TX path (a G.711 call with no telephone-event);
+        ``SIP_INFO`` is the :class:`~hermes_voip.call.CallSession`'s job, so the engine
+        never resolves to it; ``UNAVAILABLE`` raises. The whole burst runs under the
+        same TX mutex as :meth:`send_audio` regardless of backend.
+
+        RFC 4733 mode wires the (separately-tested)
+        :func:`hermes_voip.dtmf.event_payloads` generator onto this engine's TX path
+        (ADR-0010/0031). For EACH digit it emits named-event packets at the NEGOTIATED
+        telephone-event payload type, with:
 
         * the **marker bit set on the first packet** of the digit (RFC 4733 §2.5.1:
           the start of a new event), and clear on the rest;
@@ -1782,16 +1823,31 @@ class RtpMediaTransport:
             volume: Named-event power in -dBm0 (0-63; default 10).
 
         Raises:
-            RuntimeError: If the telephone-event payload type was not negotiated
-                (the call's offer had no ``telephone-event``) — DTMF is NOT sent
-                and the failure is explicit, never a silent no-op. Also if the
-                engine was never connected.
+            RuntimeError: In RFC 4733 mode, if the telephone-event payload type was not
+                negotiated (the call's offer had no ``telephone-event``) — DTMF is NOT
+                sent and the failure is explicit, never a silent no-op. Also if the send
+                backend resolved to ``UNAVAILABLE`` (no usable backend on this call), or
+                the engine was never connected.
             ValueError: If ``digits`` contains a non-DTMF character (propagated from
                 :func:`~hermes_voip.dtmf.digit_to_event`), or ``tone_ms`` is outside
                 the representable event-duration range.
         """
         if not digits:
             return
+        if self._dtmf_send_mode is DtmfSendMode.INBAND:
+            await self._send_inband_dtmf(digits, tone_ms=tone_ms, gap_ms=gap_ms)
+            return
+        if self._dtmf_send_mode is not DtmfSendMode.RFC4733:
+            # SIP_INFO is the CallSession's job (it never reaches the engine);
+            # UNAVAILABLE means no backend can run. Either way the engine must not
+            # silently drop — the caller (CallSession.send_dtmf) routes SIP_INFO away
+            # before here, so reaching this is a real misconfiguration.
+            msg = (
+                f"cannot send DTMF via the media engine in "
+                f"{self._dtmf_send_mode.value} mode — no usable in-band/RFC 4733 "
+                "backend for this call. DTMF is not sent (explicit failure)."
+            )
+            raise RuntimeError(msg)
         event_pt = self._telephone_event_payload_type
         if event_pt is None:
             msg = (
@@ -1876,6 +1932,52 @@ class RtpMediaTransport:
         if gap_ms > 0:
             await self._sleep(gap_ms / 1000.0)
 
+    async def _send_inband_dtmf(
+        self, digits: str, *, tone_ms: int, gap_ms: int
+    ) -> None:
+        """Send ``digits`` as in-band dual-tone audio (ADR-0034, G.711 last resort).
+
+        Each digit is synthesised at the engine's WIRE rate (8 kHz for G.711) by
+        :func:`hermes_voip.dtmf.inband_tone_pcm` and handed to :meth:`send_audio`, which
+        owns the encode + 20 ms framing + deadline pacing + SRTP + the TX mutex — so an
+        in-band digit is just audio on the wire and never interleaves with a concurrent
+        utterance. A silent inter-digit gap separates digits so a repeat is two tones.
+        ``inband_tone_pcm`` validates the digit (raising on a non-DTMF char), so an
+        invalid digit fails BEFORE any tone is sent (no partial burst).
+        """
+        rate = self._wire_sample_rate
+        # Synthesise every digit up front so a bad digit raises before any tone is sent.
+        tones = [
+            inband_tone_pcm(digit, sample_rate=rate, duration_ms=tone_ms)
+            for digit in digits
+        ]
+        gap = b"\x00\x00" * ((rate * gap_ms) // 1000) if gap_ms > 0 else b""
+        ts_ns = self._clock()
+        for index, tone in enumerate(tones):
+            await self.send_audio(
+                PcmFrame(samples=tone, sample_rate=rate, monotonic_ts_ns=ts_ns)
+            )
+            if gap and index < len(tones) - 1:
+                await self.send_audio(
+                    PcmFrame(samples=gap, sample_rate=rate, monotonic_ts_ns=ts_ns)
+                )
+
+    def _detect_inband_dtmf(self, frame: PcmFrame) -> None:
+        """Feed one AEC-cleaned inbound frame to the in-band detector (ADR-0034).
+
+        A no-op unless in-band RX is armed (a G.711 call with no telephone-event) and a
+        sink is set. A detected key-press fires :attr:`_on_dtmf` exactly once — the same
+        callback the RFC 4733 demux uses, so surfacing downstream is uniform. The frame
+        is NOT modified (the audio still flows on to the VAD/ASR). The detector consumes
+        analysis-rate PCM16, which is what ``_decode``/``_cancel_echo`` deliver here.
+        """
+        detector = self._inband_detector
+        if detector is None or self._on_dtmf is None:
+            return
+        digit = detector.feed(frame.samples)
+        if digit is not None:
+            self._on_dtmf(digit)
+
     def _handle_inbound_dtmf(self, packet: RtpPacket) -> None:
         """Decode one inbound telephone-event packet and surface a completed digit.
 
@@ -1936,6 +2038,33 @@ class RtpMediaTransport:
     @telephone_event_payload_type.setter
     def telephone_event_payload_type(self, value: int | None) -> None:
         self._telephone_event_payload_type = value
+
+    @property
+    def dtmf_send_mode(self) -> DtmfSendMode:
+        """The resolved outbound-DTMF backend :meth:`send_dtmf` uses (ADR-0034).
+
+        Settable after construction — the outbound path resolves it once the answer's
+        telephone-event PT / codec are known, mirroring
+        :attr:`telephone_event_payload_type`. The :class:`~hermes_voip.call.CallSession`
+        reads this to decide whether ``send_dtmf`` routes to SIP INFO (its own job) or
+        to this engine (RFC 4733 / in-band).
+        """
+        return self._dtmf_send_mode
+
+    @dtmf_send_mode.setter
+    def dtmf_send_mode(self, value: DtmfSendMode) -> None:
+        self._dtmf_send_mode = value
+
+    @property
+    def codec_encoding(self) -> str:
+        """The negotiated audio codec's encoding name (``PCMU`` / ``G722`` / ...).
+
+        The :class:`Codec` enum member name is the RTP encoding name, so this is what
+        :func:`hermes_voip.dtmf_config.is_g711_codec` needs to gate the in-band DTMF
+        backend (G.711 only). Reflects any post-connect codec re-set (the outbound path
+        upgrades a PCMU placeholder to the negotiated codec).
+        """
+        return self._codec.name
 
     @property
     def payload_type(self) -> int:

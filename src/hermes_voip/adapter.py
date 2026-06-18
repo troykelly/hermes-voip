@@ -87,7 +87,11 @@ from hermes_voip.config import (
 )
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
-from hermes_voip.dtmf_config import DtmfReceiveMode, resolve_dtmf_receive_mode
+from hermes_voip.dtmf_config import (
+    DtmfReceiveMode,
+    resolve_dtmf_receive_mode,
+    resolve_dtmf_send_mode,
+)
 from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.intercom import (
@@ -1049,6 +1053,23 @@ class VoipAdapter(BasePlatformAdapter):
             engine.telephone_event_payload_type = _telephone_event_payload_type(
                 agreed_codecs
             )
+            # Resolve + apply the DTMF send/receive backends now the codec + PT are
+            # known (ADR-0034): the engine adopts the send backend and arms the in-band
+            # detector on a G.711 call with no telephone-event. ``codec_encoding``
+            # reflects the codec adopted just above (no longer the PCMU placeholder).
+            engine.dtmf_send_mode = resolve_dtmf_send_mode(
+                media_cfg,
+                telephone_event_payload_type=engine.telephone_event_payload_type,
+                codec=engine.codec_encoding,
+            )
+            engine.inband_dtmf_rx_enabled = (
+                resolve_dtmf_receive_mode(
+                    media_cfg,
+                    telephone_event_payload_type=engine.telephone_event_payload_type,
+                    codec=engine.codec_encoding,
+                )
+                is DtmfReceiveMode.INBAND
+            )
 
             _log.info(
                 "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
@@ -1123,6 +1144,10 @@ class VoipAdapter(BasePlatformAdapter):
                 guard=guard_state,
                 local_media=local_media,
                 credentials=credentials_for_session,
+                # The resolved DTMF send backend (ADR-0034), read back from the engine
+                # so the backend is resolved in exactly one place (SIP-INFO send is the
+                # session's job; RFC 4733 / in-band delegate to the engine).
+                dtmf_send_mode=engine.dtmf_send_mode,
             )
             # Remove the temporary _QueueSink and install the real session sink.
             transport.remove_call(call_id, sink)
@@ -1472,6 +1497,10 @@ class VoipAdapter(BasePlatformAdapter):
             guard=guard_state,
             local_media=local_media,
             credentials=credentials,
+            # The resolved DTMF send backend (ADR-0034): in SIP-INFO mode the session
+            # emits in-dialog INFO itself; otherwise send_dtmf delegates to the engine.
+            # Read back from the engine so the backend is resolved in exactly one place.
+            dtmf_send_mode=engine.dtmf_send_mode,
         )
         if self._manager is not None:
             self._manager.add_call(session.dialog_id, session)
@@ -1588,6 +1617,21 @@ class VoipAdapter(BasePlatformAdapter):
         stops the engine, and raises :class:`_MediaNegotiationRejected`.
         """
         remote_address = _effective_address(audio, offer)
+        te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
+        # Resolve the per-call DTMF send/receive backends (ADR-0034) from config + the
+        # negotiated telephone-event PT + the negotiated audio codec. The engine acts on
+        # the send backend (RFC 4733 train / in-band tones; SIP INFO is the session's
+        # job) and arms the in-band Goertzel detector only when the receive backend is
+        # in-band (a G.711 call with no telephone-event).
+        dtmf_send_mode = resolve_dtmf_send_mode(
+            media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+        )
+        inband_rx = (
+            resolve_dtmf_receive_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+            )
+            is DtmfReceiveMode.INBAND
+        )
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — bind to all interfaces for RTP
             local_port=0,  # OS assigns a free port
@@ -1601,9 +1645,11 @@ class VoipAdapter(BasePlatformAdapter):
             # The negotiated RFC 4733 telephone-event PT for in-call DTMF (ADR-0031),
             # or None when the offer carried no telephone-event (send_dtmf then
             # raises rather than guessing a PT).
-            telephone_event_payload_type=_telephone_event_payload_type(
-                agreed_sdp_codecs
-            ),
+            telephone_event_payload_type=te_pt,
+            # The resolved DTMF send backend + whether to arm the in-band receive
+            # detector (ADR-0034).
+            dtmf_send_mode=dtmf_send_mode,
+            inband_dtmf_rx_enabled=inband_rx,
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
@@ -1983,28 +2029,40 @@ class VoipAdapter(BasePlatformAdapter):
         call_loop: CallLoop,
         media_cfg: MediaConfig,
     ) -> None:
-        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0010).
+        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0034).
 
         Resolves :func:`resolve_dtmf_receive_mode` from the call's ``dtmf_mode`` /
-        ``dtmf_inband_enabled`` and the engine's negotiated telephone-event PT, and:
+        ``dtmf_inband_enabled`` + the negotiated telephone-event PT + the negotiated
+        codec, then wires whichever backend resolved so the digit reaches the SAME
+        ``CallLoop.feed_dtmf`` router (uniform surfacing across all three mechanisms):
 
-        * ``RFC4733`` — wire the engine's ``on_dtmf`` demux to the loop's digit router
-          and bind a per-call :class:`~hermes_voip.dtmf_confirm.ArmedConfirmation` (so
-          an irreversible tool can obtain a spoof-resistant keypad confirmation — the
-          channel that unblocks ``transfer_blind``). The confirmation prompt is spoken
-          through the loop's TTS path;
+        * ``RFC4733`` — the engine's telephone-event demux fires ``engine.on_dtmf``;
+        * ``SIP_INFO`` — the :class:`~hermes_voip.call.CallSession`'s ``INFO`` handler
+          fires ``session.on_dtmf``;
+        * ``INBAND`` — the engine's Goertzel detector (already armed at construction for
+          a G.711 call) fires ``engine.on_dtmf``;
         * ``UNAVAILABLE`` — DTMF receive was wanted but cannot run (no telephone-event
-          negotiated); log a WARNING so the gap is operator-visible, and leave
-          ``on_dtmf`` unset (received nothing to route);
+          and the codec is not G.711, or in-band forbidden); log a WARNING so the gap is
+          operator-visible, wire nothing;
         * ``DISABLED`` — a clean no-DTMF call; nothing wired.
 
-        This is the load-bearing step that takes the config keys + the receiver out of
-        "parsed/built but unwired" into the live path (rule 6).
+        For EVERY active backend a per-call ``ArmedConfirmation``
+        (:mod:`hermes_voip.dtmf_confirm`) is bound, so an irreversible tool can obtain a
+        spoof-resistant keypad confirmation (the channel that unblocks the transfer
+        tool) regardless of which mechanism carries the digit. This is the
+        load-bearing step that takes the config keys + backends out of "parsed/built but
+        unwired" into the live path (rule 6).
         """
         mode = resolve_dtmf_receive_mode(
-            media_cfg, telephone_event_payload_type=engine.telephone_event_payload_type
+            media_cfg,
+            telephone_event_payload_type=engine.telephone_event_payload_type,
+            codec=engine.codec_encoding,
         )
-        if mode is DtmfReceiveMode.RFC4733:
+        if mode in (
+            DtmfReceiveMode.RFC4733,
+            DtmfReceiveMode.SIP_INFO,
+            DtmfReceiveMode.INBAND,
+        ):
 
             async def _speak_prompt(text: str) -> None:
                 async def _chunk() -> AsyncIterator[str]:
@@ -2014,20 +2072,29 @@ class VoipAdapter(BasePlatformAdapter):
 
             confirmation = ArmedConfirmation(prompt=_speak_prompt)
             call_loop.bind_confirmation(confirmation)
-            engine.on_dtmf = call_loop.feed_dtmf
             self._dtmf_confirmations[call_id] = confirmation
+            if mode is DtmfReceiveMode.SIP_INFO:
+                # SIP INFO digits arrive on the CallSession (DialogConsumer), not the
+                # media engine: wire its on_dtmf to the same loop router.
+                session = self._call_sessions.get(call_id)
+                if session is not None:
+                    session.on_dtmf = call_loop.feed_dtmf
+            else:
+                # RFC 4733 and in-band both surface via the engine's on_dtmf.
+                engine.on_dtmf = call_loop.feed_dtmf
             _log.info(
-                "INVITE %s: inbound DTMF receive active (RFC 4733, PT %s)",
+                "INVITE %s: inbound DTMF receive active (%s)",
                 call_id,
-                engine.telephone_event_payload_type,
+                mode.value,
             )
         elif mode is DtmfReceiveMode.UNAVAILABLE:
             _log.warning(
-                "INVITE %s: DTMF receive requested (mode %s) but no telephone-event "
-                "was negotiated and SIP INFO / in-band receive are not implemented — "
-                "inbound DTMF is UNAVAILABLE on this call",
+                "INVITE %s: DTMF receive requested (mode %s) but cannot run on this "
+                "call (no telephone-event negotiated and the codec %s is not G.711, "
+                "or in-band is forbidden) — inbound DTMF is UNAVAILABLE",
                 call_id,
                 media_cfg.dtmf_mode,
+                engine.codec_encoding,
             )
         else:
             _log.debug("INVITE %s: inbound DTMF receive disabled", call_id)

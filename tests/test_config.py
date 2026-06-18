@@ -719,9 +719,8 @@ def test_media_values_are_trimmed() -> None:
             "DEEPGRAM_API_KEY": "dg-x",  # deepgram (cloud) requires its key
             "HERMES_VOIP_TTS_VOICE": "  rachel  ",
             "HERMES_VOIP_VAD_THRESHOLD": "  0.3 ",
-            # A supported mode (rfc4733) with surrounding whitespace — trims to the
-            # bare token. (sip_info / inband are rejected at load, ADR-0010, so this
-            # asserts trimming on a value that survives validation.)
+            # A DTMF mode (rfc4733) with surrounding whitespace — trims to the bare
+            # token (all four modes load now, ADR-0034; this asserts the trim).
             "HERMES_SIP_DTMF_MODE": "  rfc4733  ",
         }
     )
@@ -951,18 +950,16 @@ def test_media_dtmf_inband_bool_accepts_common_spellings() -> None:
 
 
 def test_media_supported_dtmf_modes_accepted() -> None:
-    """RFC 4733 is the shipped receive path: only auto / rfc4733 load (ADR-0010).
+    """All four ADR-0010 DTMF modes now load and round-trip (ADR-0034).
 
-    Replaces the prior "all four modes accepted" test: accepting sip_info / inband
-    was the rule-27 drift (the config advertised receive backends the code lacked).
-    Those two now fail loud at load (asserted in test_dtmf_config.py); here we lock
-    that the two SUPPORTED modes still load and round-trip.
+    SIP INFO and in-band (send AND receive) are shipped, so ``sip_info`` / ``inband``
+    are no longer rejected at load (that rejection was the interim fail-loud state while
+    those backends were deferred). The per-call backend is resolved from the mode +
+    negotiation in ``hermes_voip.dtmf_config`` (matrix in test_dtmf_mode_resolution.py);
+    only an unknown mode is rejected (``test_media_unknown_dtmf_mode_rejected``).
     """
-    for mode in ("auto", "rfc4733"):
+    for mode in ("auto", "rfc4733", "sip_info", "inband"):
         assert load_media_config({"HERMES_SIP_DTMF_MODE": mode}).dtmf_mode == mode
-    for unsupported in ("sip_info", "inband"):
-        with pytest.raises(ConfigError):
-            load_media_config({"HERMES_SIP_DTMF_MODE": unsupported})
 
 
 def test_media_all_duplex_modes_accepted() -> None:

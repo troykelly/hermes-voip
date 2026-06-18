@@ -832,6 +832,16 @@ class VoipAdapter(BasePlatformAdapter):
             # RTP-inactivity watchdog (ADR-0026): an outbound call whose media
             # goes silent ends as MEDIA_TIMEOUT, not an indefinite hang.
             media_timeout_secs=media_cfg.media_timeout_secs,
+            # In-process acoustic echo cancellation (ADR-0033): subtract the known
+            # outbound TTS reference from each inbound frame before the VAD/ASR see
+            # it, so the gateway's reflected echo cannot false-trigger barge-in —
+            # which lets the barge-in threshold drop (responsive barge-in). On by
+            # default; the filter length/bulk-delay are ms (rate-independent), the
+            # engine converts them to taps at the live analysis rate.
+            aec_enabled=media_cfg.aec_enabled,
+            aec_filter_ms=media_cfg.aec_filter_ms,
+            aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+            aec_mu=media_cfg.aec_mu,
         )
         await engine.connect()
         local_rtp_host = _host_of(local_sent_by)
@@ -1569,6 +1579,16 @@ class VoipAdapter(BasePlatformAdapter):
             # the call as MEDIA_TIMEOUT instead of hanging the inbound generator
             # forever. Operator-configurable in [1, 300] s (default 20).
             media_timeout_secs=media_cfg.media_timeout_secs,
+            # In-process acoustic echo cancellation (ADR-0033): subtract the known
+            # outbound TTS reference from each inbound frame before the VAD/ASR see
+            # it, so the gateway's reflected echo cannot false-trigger barge-in —
+            # which lets the barge-in threshold drop (responsive barge-in). On by
+            # default; the filter length/bulk-delay are ms (rate-independent), the
+            # engine converts them to taps at the live analysis rate.
+            aec_enabled=media_cfg.aec_enabled,
+            aec_filter_ms=media_cfg.aec_filter_ms,
+            aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+            aec_mu=media_cfg.aec_mu,
         )
         await engine.connect()
 
@@ -1773,6 +1793,16 @@ class VoipAdapter(BasePlatformAdapter):
             # Carry media over the ICE datagram pipe instead of a bound UDP socket.
             ice_transport=session.ice,
             media_timeout_secs=media_cfg.media_timeout_secs,
+            # In-process acoustic echo cancellation (ADR-0033): subtract the known
+            # outbound TTS reference from each inbound frame before the VAD/ASR see
+            # it, so the gateway's reflected echo cannot false-trigger barge-in —
+            # which lets the barge-in threshold drop (responsive barge-in). On by
+            # default; the filter length/bulk-delay are ms (rate-independent), the
+            # engine converts them to taps at the live analysis rate.
+            aec_enabled=media_cfg.aec_enabled,
+            aec_filter_ms=media_cfg.aec_filter_ms,
+            aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+            aec_mu=media_cfg.aec_mu,
         )
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)

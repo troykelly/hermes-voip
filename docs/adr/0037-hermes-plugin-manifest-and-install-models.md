@@ -50,11 +50,17 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
    `kind: platform` grants applies **only to *bundled* platforms**; a *user-directory*
    platform plugin is still gated by `plugins.enabled` (so it still needs
    `hermes plugins enable`).
-3. **`requires_env` is a hard load gate _and_ an install prompt.** A missing `requires_env`
-   var disables the plugin; `hermes plugins install` prompts for the missing ones and saves
-   them to `.env`. The rich-entry fields the runtime reads are `name` / `description` /
-   `url` / **`secret`** (the guide's `password:` is doc drift — the install path reads
-   `secret`). `optional_env` is **not read by any 0.16.0 loader path** (no prompt, no gate).
+3. **`requires_env` is a hard load gate _and_ a prompt — read by two consumers.** A missing
+   `requires_env` var disables the plugin. Two code paths read the entries: (a)
+   `hermes plugins install`'s prompt (`_prompt_plugin_env_vars`) reads `name` / `description`
+   / `url` / **`secret`**; (b) the `hermes config` setup-wizard injector
+   (`_inject_platform_plugin_env_vars`) reads `requires_env` **and `optional_env`** with
+   fields `name` / `description` / `prompt` / `url` / **`password` OR `secret`** (plus a
+   `_KEY`/`_PASSWORD`/… suffix→secret heuristic) — **but it scans only *bundled* platform
+   plugins** (`repo/plugins/platforms/`), so it does not auto-prompt a pip/user-dir plugin
+   like ours today. We use `secret` (honoured by both; `password` alone is not read by the
+   install prompt) and add a `prompt` to every entry so the manifest is wizard-ready and
+   matches the canonical platform shape (`plugins/platforms/irc/`).
 4. **`provides_tools` is declarative only.** The in-session `/plugins` tool count is computed
    from the **actual `register(ctx)` result**, not from `provides_tools`; `hermes plugins
    list` has no tool-count column at all. Nothing in the runtime enforces that
@@ -145,3 +151,31 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
   install — the wheel must be present), and because the entry point wins the load dedup it is
   harmless alongside pip (no double registration). A metadata-only stub would diverge from
   the guide's stated directory shape for no benefit.
+
+## Addendum (2026-06-18): platform fields + the install-CLI reality
+
+A follow-up read of the guide + the operator surfaced two refinements, both verified against
+the installed hermes-agent 0.16.0 runtime:
+
+- **Platform-manifest fields.** A `kind: platform` manifest carries a top-level **`label`**
+  and a **`prompt`** on each `requires_env`/`optional_env` entry (the shape of the bundled
+  reference `plugins/platforms/irc/plugin.yaml`). The `hermes config` setup-wizard injector
+  consumes `label` + `prompt` + `password`/`secret`. We added `label` (matching the
+  `register_platform` label) and a `prompt` to every env entry; the field mapping is verified
+  against that injector's own logic. `register()`'s call already passes `env_enablement_fn`
+  and `is_connected` to `register_platform`, so env-only setups already surface in
+  `hermes gateway status` — no change needed there.
+
+- **`hermes plugins install owner/repo` is real, but not for us.** The 0.16.0 CLI **does**
+  support `hermes plugins install <Git URL | owner/repo>` (plus `update`/`remove`), contrary
+  to the guide prose. But it **`git clone`s** the repo into `~/.hermes/plugins/<name>/` and
+  reads the **clone-root** `plugin.yaml` — it never runs `pip`. `hermes-voip` is a src-layout
+  *package* (code under `src/hermes_voip/`), so a bare clone cannot import it, and with no
+  root `plugin.yaml` the installer names the plugin after the repo dir and skips the env
+  prompt (confirmed empirically with a `file://` install of this repo). Deliberately we do
+  **not** add a repo-root `plugin.yaml` to "enable" that path: it would produce a
+  named-and-enabled-but-unloadable plugin — a rule-27 trap. The honest canonical install is
+  **`pip install git+https://github.com/troykelly/hermes-voip`** (installs the importable
+  package; Hermes auto-discovers it via the entry point) followed by the directory-manifest
+  drop-in for the `hermes plugins list`/`enable` affordance. Documented in
+  [`README`](../../README.md) Step 1 and [runbook 0011](../runbooks/0011-voip-enable-plugin.md).

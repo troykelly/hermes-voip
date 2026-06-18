@@ -79,11 +79,26 @@ You need three things, then three steps.
 ### Step 1 — Install
 
 The plugin's core is tiny; everything heavy (the Hermes runtime, the speech engines, the
-phone/media libraries) is installed as **extras**. Install them all:
+phone/media libraries) is installed as **extras**. Pick whichever fits how you run Hermes:
 
 ```bash
+# Installing into an existing Hermes environment, straight from GitHub (no repo checkout):
+pip install "hermes-voip[ml,media,webrtc] @ git+https://github.com/troykelly/hermes-voip"
+
+# …or, working from a clone of this repo:
 uv sync --frozen --all-extras
 ```
+
+Installing the package is what makes it **loadable** — Hermes auto-discovers it through the
+plugin entry point it registers, so there is nothing else to wire up in code. (You still
+**enable** it and give it your gateway details in Steps 2–3.)
+
+> **Why `pip install`, not `hermes plugins install owner/repo`?** Hermes does have a
+> `hermes plugins install <owner/repo>` command, but it **git-clones** the repo into
+> `~/.hermes/plugins/` — it does **not** install the Python package. `hermes-voip` is a
+> packaged plugin (its code lives in an installable `hermes_voip` package), so a bare clone
+> can't import it. `pip install git+…` installs the package properly and Hermes discovers it
+> automatically — that's the supported path here.
 
 > **One system library for WebRTC/Opus calls.** If you'll take **WebRTC** calls, the Opus
 > audio codec needs the system **`libopus`** shared library at runtime — install it with your

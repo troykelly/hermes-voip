@@ -463,8 +463,14 @@ def test_w3_srtp_only_offer_path_sends_488() -> None:
         call_pos = src.find("answer_sdp = build_audio_answer(")
         assert call_pos != -1, "build_audio_answer call-site not found in adapter"
 
-        # Extract ~600 chars from the call through the except block.
-        excerpt = src[call_pos : call_pos + 600]
+        # Slice from the call through the end of its except block (the
+        # `raise _MediaNegotiationRejected`) rather than a fixed char window: the
+        # call site grows as keyword args are added (e.g. the ADR-0053 SDES
+        # `crypto=`), and a magic-number window would spuriously truncate the
+        # except block and lose the 488.
+        end_pos = src.find("raise _MediaNegotiationRejected", call_pos)
+        assert end_pos != -1, "build_audio_answer except block not found in adapter"
+        excerpt = src[call_pos:end_pos]
 
         # After the fix: the except block sends 488 not 500.
         assert "488" in excerpt, (

@@ -19,6 +19,8 @@ Also covers the WebRTC SDP attributes (ADR-0016, PR-B):
 import pytest
 
 from hermes_voip.sdp import (
+    _SRTP_KEY_SALT_OCTETS,
+    _SUPPORTED_CRYPTO_SUITES,
     AudioMedia,
     Codec,
     CryptoAttribute,
@@ -32,6 +34,7 @@ from hermes_voip.sdp import (
     build_audio_offer,
     build_webrtc_answer,
     build_webrtc_offer,
+    generate_answer_crypto,
     negotiate_audio,
 )
 
@@ -1824,3 +1827,77 @@ def test_build_webrtc_offer_round_trips_through_the_parser() -> None:
     assert parsed.audio.setup.value == "active"
     assert parsed.audio.ice_ufrag == _FAKE_ANSWER_UFRAG
     assert parsed.audio.codecs[0].encoding.lower() == "opus"
+
+
+# ---------------------------------------------------------------------------
+# generate_answer_crypto (ADR-0053 Stage 1) — invariants that close a blind
+# cross-vendor review's two MAJOR findings (codex reviewed diff-only; both
+# premises are unreachable, proven here so they cannot silently regress).
+# ---------------------------------------------------------------------------
+
+
+def test_every_supported_crypto_suite_has_a_key_salt_length() -> None:
+    """generate_answer_crypto looks up ``_SRTP_KEY_SALT_OCTETS[accepted.suite]``.
+
+    A ``CryptoAttribute`` can only hold a suite in ``_SUPPORTED_CRYPTO_SUITES``
+    (validated at construction), so every such suite MUST have a key||salt length
+    entry — otherwise an accepted offer crypto could raise a raw ``KeyError``.
+    This guards the two maps against drift (e.g. adding a suite to one only).
+    """
+    assert _SRTP_KEY_SALT_OCTETS.keys() >= _SUPPORTED_CRYPTO_SUITES
+
+
+def test_crypto_attribute_rejects_unsupported_suite() -> None:
+    """Unsupported suites cannot reach generate_answer_crypto.
+
+    A CryptoAttribute validates its suite at construction, so no unsupported-suite
+    attribute (and hence no KeyError lookup path) can ever exist.
+    """
+    with pytest.raises(SdpError, match="unsupported crypto suite"):
+        CryptoAttribute(
+            tag=1, suite="AES_CM_256_HMAC_SHA1_80", key_params=f"inline:{_FAKE_KEY}"
+        )
+
+
+def test_answer_selects_supported_crypto_when_unsupported_listed_first() -> None:
+    """An unsupported-first a=crypto offer is answered with the SUPPORTED suite.
+
+    RFC 4568 §6.1 directionality is by construction, not accident.
+    The unsupported line is excluded from ``crypto_attrs`` during parse, so
+    ``crypto_attrs[0]`` — used for the inbound key, the generated answer key, and
+    the echoed tag/suite — is the validated accepted crypto. The answer therefore
+    never carries the unsupported suite, and the answer key's suite matches.
+    """
+    offer_sdp = (
+        "v=0\r\n"
+        "o=- 1 1 IN IP4 192.0.2.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/SAVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:1 AES_CM_256_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\n"
+        f"a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{_FAKE_KEY}\r\n"
+        "a=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer_sdp)
+    assert sdp.audio is not None
+    # The unsupported AES_CM_256 line (tag 1) is filtered; the accepted is tag 2.
+    accepted = sdp.audio.crypto_attrs[0]
+    assert accepted.suite == "AES_CM_128_HMAC_SHA1_80"
+    assert accepted.tag == 2
+
+    answer = generate_answer_crypto(accepted)
+    assert answer.suite == "AES_CM_128_HMAC_SHA1_80"
+    assert answer.tag == 2
+
+    text = build_audio_answer(
+        sdp,
+        local_address="192.0.2.99",
+        port=40002,
+        supported=["PCMU"],
+        session_id=1,
+        crypto=answer,
+    )
+    assert "AES_CM_256" not in text
+    assert "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:" in text

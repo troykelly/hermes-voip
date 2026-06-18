@@ -148,6 +148,7 @@ from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
     AudioMedia,
+    CryptoAttribute,
     SessionDescription,
     VideoAnswer,
     VideoAnswerMode,
@@ -155,6 +156,7 @@ from hermes_voip.sdp import (
     build_audio_offer,
     build_webrtc_answer,
     build_webrtc_offer,
+    generate_answer_crypto,
     negotiate_audio,
     negotiate_video_h264,
 )
@@ -282,15 +284,14 @@ def _make_tls_context(host: str) -> ssl.SSLContext:
     return ctx
 
 
-def _srtp_from_audio(audio: AudioMedia, *, outbound: bool) -> SrtpSession | None:  # noqa: ARG001 — outbound direction reserved for future SRTP policy; SrtpSession selects key material from the crypto attribute
-    """Build an SrtpSession for a negotiated SRTP offer, or None for plain RTP.
+def _srtp_inbound_from_offer(audio: AudioMedia) -> SrtpSession | None:
+    """The inbound (RX/unprotect) SrtpSession keyed by the OFFERER's a=crypto.
 
-    ``outbound=True`` for the TX direction (protect), ``outbound=False`` for RX
-    (unprotect). Returns ``None`` when the offer is plain ``RTP/AVP``.
-
-    The SrtpSession is imported lazily (``media`` extra absent in the default
-    install; ``import hermes_voip.media.srtp`` still succeeds — the error
-    surfaces at SrtpSession construction time, rule 37).
+    RFC 4568 §6.1: each direction is keyed by its sender, so our inbound stream is
+    decrypted with the offerer's inline key (the key it encrypts with). Returns
+    ``None`` for a plain ``RTP/AVP`` offer. The SrtpSession is imported lazily
+    (``media`` extra absent in the default install; the error surfaces at
+    construction time, rule 37).
     """
     if not audio.is_srtp or not audio.crypto_attrs:
         return None
@@ -298,6 +299,21 @@ def _srtp_from_audio(audio: AudioMedia, *, outbound: bool) -> SrtpSession | None
 
     # The first validated, supported crypto attribute wins (offer order).
     return SrtpSession(audio.crypto_attrs[0])
+
+
+def _srtp_outbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | None:
+    """The outbound (TX/protect) SrtpSession keyed by OUR answer a=crypto.
+
+    RFC 4568 §6.1: our outbound stream is encrypted with our own key — the same
+    key advertised in the SDP answer's ``a=crypto`` (see
+    :func:`sdp.generate_answer_crypto`). Returns ``None`` for a plain-RTP answer.
+    Lazy SrtpSession import (rule 37, as above).
+    """
+    if crypto is None:
+        return None
+    from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+
+    return SrtpSession(crypto)
 
 
 class _QueueSink:
@@ -2175,6 +2191,16 @@ class VoipAdapter(BasePlatformAdapter):
             )
             is DtmfReceiveMode.INBAND
         )
+        # SDES SRTP (RFC 4568, ADR-0053 Stage 1): for an RTP/SAVP offer with a
+        # usable a=crypto, mint OUR OWN answer key — we encrypt our outbound with
+        # it (and advertise it in the answer), and decrypt our inbound with the
+        # offerer's key (RFC 4568 §6.1). None for a plain RTP/AVP offer (the answer
+        # then stays plain RTP/AVP).
+        answer_crypto = (
+            generate_answer_crypto(audio.crypto_attrs[0])
+            if audio.is_srtp and audio.crypto_attrs
+            else None
+        )
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — bind to all interfaces for RTP
             local_port=0,  # OS assigns a free port
@@ -2193,8 +2219,8 @@ class VoipAdapter(BasePlatformAdapter):
             # detector (ADR-0036).
             dtmf_send_mode=dtmf_send_mode,
             inband_dtmf_rx_enabled=inband_rx,
-            srtp_inbound=_srtp_from_audio(audio, outbound=False),
-            srtp_outbound=_srtp_from_audio(audio, outbound=True),
+            srtp_inbound=_srtp_inbound_from_offer(audio),
+            srtp_outbound=_srtp_outbound_from_answer(answer_crypto),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
             # to the peer's real RTP source, not blindly to the SDP address.
             symmetric=media_cfg.rtp_symmetric,
@@ -2229,6 +2255,9 @@ class VoipAdapter(BasePlatformAdapter):
                 # ADR-0049: Opus is in the SIP answer menu when libopus is loadable.
                 supported=list(_sip_supported_encodings()),
                 session_id=local_media.session_id,
+                # SDES SRTP answer (ADR-0053 Stage 1): our own key for an RTP/SAVP
+                # offer; None ⇒ a plain RTP/AVP answer (unchanged).
+                crypto=answer_crypto,
             )
         except Exception as exc:
             _log.warning("INVITE %s: cannot build SDP answer: %s", call_id, exc)

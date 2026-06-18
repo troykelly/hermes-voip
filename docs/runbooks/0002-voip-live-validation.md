@@ -445,6 +445,28 @@ and any native-`end_of_turn` STT (e.g. Deepgram Flux). The first withheld echo f
 If a gateway has its own echo cancellation and you want zero added barge-in latency, set
 `HERMES_VOIP_BARGE_IN_MODE=full`. To stop the agent ever being interrupted, set `off`.
 
+### 8d. Verify SRTP media (SDES) on a SIP-over-TLS call (ADR-0053 Stage 1)
+
+When the gateway offers secured media (`m=audio … RTP/SAVP …` + an `a=crypto` line),
+the plugin now answers SRTP instead of rejecting with 488 — it mints its **own**
+answer key (RFC 4568 §6.1: we encrypt outbound with our key, decrypt inbound with the
+offerer's). A plain `RTP/AVP` offer is still answered plain (opportunistic).
+
+```sh
+# In the gateway/extension config, enable SRTP (SDES) on the extension so its INVITE
+# offers RTP/SAVP + a=crypto, then place the test call and inspect the 200 OK SDP.
+# The adapter logs the answer; the 200 OK body must show RTP/SAVP + exactly one
+# a=crypto line whose inline key is OURS (not the offerer's).
+```
+
+- 200 OK SDP answer carries `m=audio <port> RTP/SAVP …` and one
+  `a=crypto:<tag> AES_CM_128_HMAC_SHA1_80 inline:<our-key>`. Confirm the inline key
+  differs from the one in the offer (each direction uses the sender's key).
+- The agreed-codec INFO log line is unchanged; audio is two-way as in step 8.
+- If the gateway only offers DTLS-SRTP (`UDP/TLS/RTP/SAVP` + `a=fingerprint`), that
+  is **ADR-0053 Stage 2** (not yet built) — such an offer is currently declined; use
+  SDES (`RTP/SAVP`) for this validation.
+
 ## 9. Teardown
 
 - Stop the validation process / gateway with `Ctrl-C` (the driver above calls

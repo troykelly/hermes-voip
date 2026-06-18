@@ -40,10 +40,10 @@ import hashlib
 import hmac
 import importlib
 import struct
-import threading
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from hermes_voip._lazy_singleton import LazySingleton
 from hermes_voip.rtp import RtpPacket
 from hermes_voip.sdp import CryptoAttribute
 
@@ -228,28 +228,31 @@ class _CryptographyImpl:
         return self._cipher(self._aes(key), self._ctr(iv))
 
 
-_CRYPTO: _CryptographyImpl | None = None
-_CRYPTO_LOCK = threading.Lock()
+# The cryptography backend is a build-once lazy singleton (ADR-0046): Hermes runs the
+# agent generation on an uncapped thread pool and forks background workers, so the
+# getter can be entered concurrently. :class:`LazySingleton` builds it at most once
+# via the documented ``plugins.plugin_utils.lazy_singleton`` helper when the runtime
+# provides it, with a behaviourally-identical stdlib double-checked-lock fallback in
+# the default (no-hermes) environment.
+_CRYPTO_SINGLETON: LazySingleton[_CryptographyImpl] = LazySingleton(_CryptographyImpl)
 
 
 def _get_crypto() -> _CryptographyImpl:
     """Return the singleton :class:`_CryptographyImpl`, constructing it on first call.
 
-    Thread-safe via double-checked locking: Hermes runs the agent generation on
-    an uncapped thread pool and forks background workers, so this getter can be
-    entered concurrently.  The unlocked fast path serves the common already-built
-    case; the lock plus re-check on the slow path makes the builder run at most
-    once even under a concurrent first-call stampede.
-
     Raises:
         ImportError: If the ``media`` extra (``cryptography``) is not installed.
     """
-    global _CRYPTO  # noqa: PLW0603 — module-level singleton, intentional
-    if _CRYPTO is None:
-        with _CRYPTO_LOCK:
-            if _CRYPTO is None:
-                _CRYPTO = _CryptographyImpl()
-    return _CRYPTO
+    return _CRYPTO_SINGLETON.get()
+
+
+def _reset_crypto_singleton() -> None:
+    """Drop the cached crypto backend so the next :func:`_get_crypto` rebuilds it.
+
+    Test-isolation seam (ADR-0046): a test that needs a fresh build (or that replaced
+    the backend) calls this so a later test sees a clean singleton.
+    """
+    _CRYPTO_SINGLETON.reset()
 
 
 # ---------------------------------------------------------------------------

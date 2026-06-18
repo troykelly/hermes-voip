@@ -1,6 +1,6 @@
 """Rich inbound-call context — extract every SIP-surfaceable fact + render it.
 
-ADR-0033.
+ADR-0052.
 
 A pure, sans-IO module. :func:`extract_call_context` reads an already-parsed inbound
 INVITE (:class:`hermes_voip.message.SipRequest`, which retains every header in received
@@ -9,7 +9,7 @@ and returns a frozen :class:`InboundCallContext`. :func:`render_call_context_blo
 produces a defanged, clearly-untrusted text block for injection to the agent at call
 start.
 
-SECURITY POSTURE (ADR-0033 / ADR-0020 / ADR-0021): **every** value here is caller- or
+SECURITY POSTURE (ADR-0052 / ADR-0020 / ADR-0021): **every** value here is caller- or
 network-supplied and therefore **forgeable** — `From`, `P-Asserted-Identity`,
 `Diversion`, `User-Agent`, all of it. Caller-ID is *not* an authorization boundary; the
 privilege clamp (ADR-0009/0021) is the only enforcement path. The rendered block is
@@ -296,7 +296,7 @@ def _history_info_sort_key(entry: HistoryInfoEntry) -> tuple[int, tuple[int, ...
 
 @dataclass(frozen=True, slots=True)
 class InboundCallContext:
-    """Everything the inbound INVITE + negotiated media reveal about a call (ADR-0033).
+    """Everything the inbound INVITE + negotiated media reveal about a call (ADR-0052).
 
     Every string field is caller- or network-supplied and therefore **forgeable** — the
     block is advisory only and is never an authorization input (ADR-0020/0021). Absent
@@ -566,7 +566,7 @@ _BLOCK_HEADER = (
 
 
 def render_call_context_block(context: InboundCallContext) -> str:
-    """Render the inbound-call context as a defanged, untrusted block (ADR-0033).
+    """Render the inbound-call context as a defanged, untrusted block (ADR-0052).
 
     The block opens with the fixed untrusted/spoofable-not-for-auth label, then lists
     the populated facts (absent fields are omitted). Every caller-supplied value is

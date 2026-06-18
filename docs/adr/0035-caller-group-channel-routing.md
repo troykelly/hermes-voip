@@ -71,7 +71,7 @@ agent under that channel's platform identity.** Concretely:
    `_deliver_turn` already does, defaulting to the receptionist channel) and constructs the
    `SessionSource` directly (the ADR-0029 technique). **All four own-session injections** —
    the spotlighted caller-transcript turn (`_deliver_turn`), the objective first-turn seed
-   (outbound), the rich call-context first-turn seed (ADR-0033), and the call-end Hermes
+   (outbound), the rich call-context first-turn seed (ADR-0052), and the call-end Hermes
    signal (ADR-0026) — go through `_call_source`, so an entire call's conversation (seed →
    turns → end-signal) lives in **one** channel session namespace. The ADR-0029 cross-session
    report path is untouched (it already targets the *originating* foreign session, not the

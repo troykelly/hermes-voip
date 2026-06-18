@@ -49,7 +49,9 @@ const resolved = path.resolve(cwd, target);
 const rel = path.relative(mainRoot, resolved);
 const insideRoot =
   rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-const insideLane = rel.startsWith(`.worktrees${path.sep}`);
+const insideLane =
+  rel.startsWith(`.worktrees${path.sep}`) ||
+  rel.startsWith(`.claude${path.sep}worktrees${path.sep}`);
 
 if (insideRoot && !insideLane) {
   console.error(

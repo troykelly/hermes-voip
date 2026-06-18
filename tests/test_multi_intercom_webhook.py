@@ -105,8 +105,11 @@ def server() -> Iterator[str]:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        host, port = httpd.server_address[0], httpd.server_address[1]
-        yield f"http://{host}:{port}"
+        # The server is bound to the 127.0.0.1 literal above; server_address[1] is
+        # the OS-assigned port. (server_address[0] is typed str | bytes, so use the
+        # known host literal rather than echoing it back through an f-string.)
+        port = int(httpd.server_address[1])
+        yield f"http://127.0.0.1:{port}"
     finally:
         httpd.shutdown()
         thread.join(timeout=5)

@@ -63,6 +63,11 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource
 
 from hermes_voip.call import CallSession
+from hermes_voip.call_context import (
+    InboundCallContext,
+    extract_call_context,
+    render_call_context_block,
+)
 from hermes_voip.call_end import CallEndReason, injection_text_for_reason
 from hermes_voip.caller_modes import (
     CallerGroup,
@@ -1482,6 +1487,21 @@ class VoipAdapter(BasePlatformAdapter):
         # --- Extract caller info from the inbound INVITE -------------------
         # `group` (classified at the top of this handler) drives the per-turn
         # persona preamble in _deliver_turn; persist it on the call info.
+        #
+        # ADR-0033: extract the RICH inbound-call context (caller identity,
+        # dialled target, redirection/diversion chain, calling device, media)
+        # from the same parsed INVITE — every value is caller-/network-supplied
+        # and FORGEABLE, so it is surfaced to the agent only as a labelled,
+        # untrusted block (never used for authorization). `codec`, `audio`, and
+        # `is_webrtc` are in scope here from the SDP-negotiation steps above; the
+        # signalling transport is SIP-over-TLS (the dialog's `transport="TLS"`).
+        call_context = extract_call_context(
+            invite,
+            negotiated_codec=codec.encoding,
+            is_srtp=audio.is_srtp,
+            is_webrtc=is_webrtc,
+            transport="TLS",
+        )
         self._call_info[call_id] = {
             "name": caller_number,
             "remote_uri": from_header,
@@ -1493,7 +1513,21 @@ class VoipAdapter(BasePlatformAdapter):
             # reaches here — it was rejected with 603 above). Kept so callers
             # reading the legacy "mode" key keep working.
             "mode": classification.mode,
+            # ADR-0033: the rich, structured inbound-call context (forgeable).
+            "context": call_context,
         }
+
+        # --- Seed the agent's first turn with the rich call context (ADR-0033) ---
+        # Inject the labelled, untrusted call-context block as the call's first system
+        # turn so the agent knows who called, what was dialled, and how the call reached
+        # it BEFORE the caller speaks. Awaited HERE, before _run_call_loop starts the
+        # media pump, so the context turn is delivered ahead of any caller transcript
+        # (the loop only begins consuming inbound audio after this returns) — making
+        # "first turn" deterministic, not a race with the first caller utterance. The
+        # injection is best-effort (it catches and logs its own failure internally), so
+        # awaiting it can never strand the call. Outbound calls carry the objective seed
+        # instead (no "context" key), so this is a no-op there.
+        await self._inject_call_context_first_turn(call_id)
 
         # --- Build + run CallLoop (leak-safe) ------------------------------
         # Everything from here on has already accepted the call (200 OK sent,
@@ -2443,6 +2477,50 @@ class VoipAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 — best-effort seed; never strand the call
             _log.warning(
                 "call %s: failed to inject objective first turn: %s", call_id, exc
+            )
+
+    async def _inject_call_context_first_turn(self, call_id: str) -> None:
+        """Seed an inbound call's FIRST turn with the rich call context (ADR-0033).
+
+        Injects one ``internal=True`` ``MessageEvent`` into the call's OWN session
+        (``chat_id`` == Call-ID) carrying the rendered :class:`InboundCallContext`
+        block — caller identity, the dialled number, the redirection/diversion chain,
+        the calling device, and the negotiated media — so the agent knows who is
+        calling, what was dialled, and how the call reached it before the caller
+        speaks. The block is rendered DEFANGED and labelled untrusted + spoofable; it
+        is presentation only and is NEVER an authorization input (caller ID is
+        forgeable — ADR-0020/0021).
+
+        No-op when no context was persisted (e.g. an outbound call, which carries the
+        objective seed instead, or a call set up before this field existed).
+        Best-effort like the other injections: a failure to inject is logged, not
+        raised, so it never strands the call (rule 37 — the error is acted upon).
+        """
+        info = self._call_info.get(call_id, {})
+        context = info.get("context")
+        if not isinstance(context, InboundCallContext):
+            return  # no rich context (e.g. an outbound call) — nothing to seed
+        caller = str(info.get("name", call_id))
+        text = render_call_context_block(context)
+        try:
+            source = self.build_source(
+                chat_id=call_id,
+                chat_name=caller,
+                chat_type="dm",
+                user_id=call_id,
+                user_name="system",
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.VOICE,
+                source=source,
+                media_urls=[],
+                internal=True,
+            )
+            await self.handle_message(event)
+        except Exception as exc:  # noqa: BLE001 — best-effort seed; never strand the call
+            _log.warning(
+                "call %s: failed to inject call-context first turn: %s", call_id, exc
             )
 
     async def _report_outbound_result(

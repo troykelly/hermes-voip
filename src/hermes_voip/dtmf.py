@@ -8,7 +8,7 @@ yields each pressed digit exactly once despite that triplicated end. RTP framing
 of these payloads is the transport's job (hermes_voip.rtp). DTMF is also the
 spoof-resistant confirmation channel for irreversible tools (ADR-0009).
 
-ADR-0035 adds the **in-band** backend — the last resort for a gateway that
+ADR-0036 adds the **in-band** backend — the last resort for a gateway that
 negotiates no telephone-event: :class:`InbandDtmfDetector` (Goertzel tone
 detection on decoded G.711 PCM, with the row/column + twist + second-harmonic +
 duration tests that reject speech and noise) and :func:`inband_tone_pcm` (dual-tone
@@ -212,7 +212,7 @@ class DtmfReceiver:
 
 
 # ---------------------------------------------------------------------------
-# In-band DTMF (ADR-0010 last resort / ADR-0035): Goertzel detect + tone gen
+# In-band DTMF (ADR-0010 last resort / ADR-0036): Goertzel detect + tone gen
 # ---------------------------------------------------------------------------
 
 # The eight DTMF tones (Hz). A keypad symbol is one low (row) + one high (column).
@@ -228,7 +228,7 @@ _DTMF_KEYPAD: tuple[tuple[str, ...], ...] = (
 
 _INBAND_MAX_AMPLITUDE = 0x3FFF  # per-tone amplitude (sum stays < int16 full-scale)
 
-# Detection thresholds (tuned on 8 kHz clean G.711; ADR-0035 re-measures live).
+# Detection thresholds (tuned on 8 kHz clean G.711; ADR-0036 re-measures live).
 # Goertzel power is N-normalised (x 2/N) so a pure full-amplitude tone scores ~the
 # frame's energy and a DTMF pair scores ~half each — same units as the frame energy,
 # so the fractions below are dimensionless and frame-length independent.
@@ -274,7 +274,7 @@ def inband_tone_pcm(
     duration_ms: int,
     amplitude: int = _INBAND_MAX_AMPLITUDE,
 ) -> bytes:
-    """Synthesise one key-press as in-band dual-tone PCM16-LE mono (ADR-0035).
+    """Synthesise one key-press as in-band dual-tone PCM16-LE mono (ADR-0036).
 
     The signal is the sum of the digit's row and column sine tones, each at
     ``amplitude`` (so the peak sum stays below int16 full-scale). Sent on the audio
@@ -335,7 +335,7 @@ def _clamp_int16(value: int) -> int:
 
 
 def _goertzel_power(samples: list[float], freq: int, sample_rate: int) -> float:
-    """Goertzel-filter power of ``samples`` at ``freq`` Hz (ADR-0035).
+    """Goertzel-filter power of ``samples`` at ``freq`` Hz (ADR-0036).
 
     A single-bin DFT magnitude-squared: O(len(samples)) with two multiplies per
     sample, far cheaper than a full FFT and exactly what tone detection needs.

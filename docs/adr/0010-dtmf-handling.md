@@ -150,7 +150,7 @@ Concrete shape:
   > LOUDLY (never a silent no-op). The `pre_tool_call` gate clamps privilege as a
   > fail-fast (an unprivileged/degraded caller is blocked before the confirm prompt is
   > ever spoken). The **SIP INFO** and **in-band** mechanisms (both send AND receive) are
-  > now ALSO SHIPPED — see **ADR-0035**, which supersedes the "deferred" status here:
+  > now ALSO SHIPPED — see **ADR-0036**, which supersedes the "deferred" status here:
   > `HERMES_SIP_DTMF_MODE` accepts all four ADR-0010 values, a single per-call resolver
   > (`hermes_voip.dtmf_config`) picks the send + receive backend, the SIP-INFO codec lives
   > in `hermes_voip.dtmf_sipinfo` (handled in-dialog by `CallSession`), and the in-band
@@ -189,7 +189,7 @@ Concrete shape:
   unreliable in-band last resort outright). Tests and examples use the obvious fakes
   (host `pbx.example.test`, extension `1000`).
 
-  > **As built (no inert key — rule 27; ADR-0035).** All three mechanisms are now
+  > **As built (no inert key — rule 27; ADR-0036).** All three mechanisms are now
   > implemented, so `HERMES_SIP_DTMF_MODE` accepts all four ADR-0010 values (`auto` |
   > `rfc4733` | `sip_info` | `inband`) and each drives a real backend (the interim
   > fail-loud rejection of `sip_info`/`inband` is gone). The resolvers

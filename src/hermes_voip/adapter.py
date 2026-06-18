@@ -1054,7 +1054,7 @@ class VoipAdapter(BasePlatformAdapter):
                 agreed_codecs
             )
             # Resolve + apply the DTMF send/receive backends now the codec + PT are
-            # known (ADR-0035): the engine adopts the send backend and arms the in-band
+            # known (ADR-0036): the engine adopts the send backend and arms the in-band
             # detector on a G.711 call with no telephone-event. ``codec_encoding``
             # reflects the codec adopted just above (no longer the PCMU placeholder).
             engine.dtmf_send_mode = resolve_dtmf_send_mode(
@@ -1144,7 +1144,7 @@ class VoipAdapter(BasePlatformAdapter):
                 guard=guard_state,
                 local_media=local_media,
                 credentials=credentials_for_session,
-                # The resolved DTMF send backend (ADR-0035), read back from the engine
+                # The resolved DTMF send backend (ADR-0036), read back from the engine
                 # so the backend is resolved in exactly one place (SIP-INFO send is the
                 # session's job; RFC 4733 / in-band delegate to the engine).
                 dtmf_send_mode=engine.dtmf_send_mode,
@@ -1497,7 +1497,7 @@ class VoipAdapter(BasePlatformAdapter):
             guard=guard_state,
             local_media=local_media,
             credentials=credentials,
-            # The resolved DTMF send backend (ADR-0035): in SIP-INFO mode the session
+            # The resolved DTMF send backend (ADR-0036): in SIP-INFO mode the session
             # emits in-dialog INFO itself; otherwise send_dtmf delegates to the engine.
             # Read back from the engine so the backend is resolved in exactly one place.
             dtmf_send_mode=engine.dtmf_send_mode,
@@ -1618,7 +1618,7 @@ class VoipAdapter(BasePlatformAdapter):
         """
         remote_address = _effective_address(audio, offer)
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
-        # Resolve the per-call DTMF send/receive backends (ADR-0035) from config + the
+        # Resolve the per-call DTMF send/receive backends (ADR-0036) from config + the
         # negotiated telephone-event PT + the negotiated audio codec. The engine acts on
         # the send backend (RFC 4733 train / in-band tones; SIP INFO is the session's
         # job) and arms the in-band Goertzel detector only when the receive backend is
@@ -1647,7 +1647,7 @@ class VoipAdapter(BasePlatformAdapter):
             # raises rather than guessing a PT).
             telephone_event_payload_type=te_pt,
             # The resolved DTMF send backend + whether to arm the in-band receive
-            # detector (ADR-0035).
+            # detector (ADR-0036).
             dtmf_send_mode=dtmf_send_mode,
             inband_dtmf_rx_enabled=inband_rx,
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
@@ -1865,7 +1865,7 @@ class VoipAdapter(BasePlatformAdapter):
             raise _MediaNegotiationRejected from None
 
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
-        # Resolve the DTMF send/receive backends for the WebRTC call too (ADR-0035) so a
+        # Resolve the DTMF send/receive backends for the WebRTC call too (ADR-0036) so a
         # forced sip_info routes SIP INFO via the CallSession (not the media engine) and
         # the receive wiring is correct. WebRTC is Opus, so in-band never applies (the
         # resolver returns UNAVAILABLE for a non-G.711 codec).
@@ -2052,7 +2052,7 @@ class VoipAdapter(BasePlatformAdapter):
         call_loop: CallLoop,
         media_cfg: MediaConfig,
     ) -> None:
-        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0035).
+        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0036).
 
         Resolves :func:`resolve_dtmf_receive_mode` from the call's ``dtmf_mode`` /
         ``dtmf_inband_enabled`` + the negotiated telephone-event PT + the negotiated

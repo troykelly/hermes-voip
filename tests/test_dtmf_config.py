@@ -2,11 +2,11 @@
 
 Before the DTMF-receive lane the keys ``HERMES_SIP_DTMF_MODE`` /
 ``HERMES_SIP_DTMF_INBAND_ENABLED`` / ``HERMES_SIP_DTMF_INTERDIGIT_MS`` were parsed into
-:class:`MediaConfig` but consumed NOWHERE (rule-27 drift). ADR-0035 ships the last two
+:class:`MediaConfig` but consumed NOWHERE (rule-27 drift). ADR-0036 ships the last two
 DTMF mechanisms, so all four ADR-0010 modes now load and drive a real backend:
 
 * ``auto`` and ``rfc4733`` prefer RFC 4733 when telephone-event is negotiated.
-* ``sip_info`` and ``inband`` are now IMPLEMENTED (ADR-0035) — they load and resolve to
+* ``sip_info`` and ``inband`` are now IMPLEMENTED (ADR-0036) — they load and resolve to
   their backend (in-band only on a G.711 call).
 * ``resolve_dtmf_receive_mode`` maps ``(dtmf_mode, dtmf_inband_enabled, PT, codec)``
   to a concrete :class:`DtmfReceiveMode`, so each key changes a real, observable
@@ -37,13 +37,13 @@ def test_rfc4733_mode_loads() -> None:
 
 
 def test_sip_info_mode_loads() -> None:
-    """sip_info is implemented (ADR-0035) — it now loads."""
+    """sip_info is implemented (ADR-0036) — it now loads."""
     cfg = load_media_config(_media_env(HERMES_SIP_DTMF_MODE="sip_info"))
     assert cfg.dtmf_mode == "sip_info"
 
 
 def test_inband_mode_loads() -> None:
-    """In-band is implemented (ADR-0035) — it now loads."""
+    """In-band is implemented (ADR-0036) — it now loads."""
     cfg = load_media_config(_media_env(HERMES_SIP_DTMF_MODE="inband"))
     assert cfg.dtmf_mode == "inband"
 
@@ -77,7 +77,7 @@ def test_resolve_auto_without_pt_is_disabled() -> None:
 
 
 def test_resolve_auto_without_pt_inband_enabled_g711_is_inband() -> None:
-    """Auto + NO PT + in-band ENABLED on a G.711 call => in-band receive (ADR-0035).
+    """Auto + NO PT + in-band ENABLED on a G.711 call => in-band receive (ADR-0036).
 
     The operator permits the in-band last resort (``dtmf_inband_enabled`` true, the
     default), no telephone-event was negotiated, and the codec is G.711 — so the

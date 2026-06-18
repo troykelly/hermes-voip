@@ -1,6 +1,6 @@
 """Engine-level in-band DTMF: send (tone generation) + receive (Goertzel).
 
-The RFC 4733 DTMF send/receive paths ship already; ADR-0035 adds the in-band
+The RFC 4733 DTMF send/receive paths ship already; ADR-0036 adds the in-band
 backend for a G.711 call that negotiated no telephone-event. On SEND, the engine
 synthesises dual-tone PCM and sends it on the normal audio TX path (encode + 20 ms
 framing + SRTP). On RECEIVE, the inbound generator runs Goertzel detection on the

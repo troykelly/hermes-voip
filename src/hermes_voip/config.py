@@ -325,7 +325,7 @@ _INJECTION_GUARDS = frozenset({"onnx", "sidecar"})
 
 # DTMF (ADR-0010/0034). Default `auto` negotiates RFC 4733 from the offer, else falls
 # to the in-band last resort on a G.711 call. All four ADR-0010 mechanisms are now
-# implemented (ADR-0035): RFC 4733 (telephone-event), SIP INFO (in-dialog), and in-band
+# implemented (ADR-0036): RFC 4733 (telephone-event), SIP INFO (in-dialog), and in-band
 # Goertzel — send AND receive. `dtmf_mode` selects per call; the per-call backend is
 # resolved (config + negotiation) in `hermes_voip.dtmf_config`, so every mode value
 # drives a real backend (no inert key — rule-27).
@@ -714,7 +714,7 @@ class MediaConfig:
             allowed = ", ".join(sorted(_DTMF_MODES))
             msg = f"dtmf_mode must be one of {{{allowed}}}, got {self.dtmf_mode!r}"
             raise ConfigError(msg)
-        # All four ADR-0010 modes are implemented (ADR-0035); the per-call backend is
+        # All four ADR-0010 modes are implemented (ADR-0036); the per-call backend is
         # resolved from the mode + negotiation in hermes_voip.dtmf_config, so no mode
         # value is inert (rule-27) and none is rejected beyond the vocabulary check.
         _require_enum("stt_provider", self.stt_provider, _STT_PROVIDERS)

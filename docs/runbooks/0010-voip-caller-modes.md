@@ -178,11 +178,12 @@ built-in pairing flow and let caller groups be the sole admission control.
 
 ## Caller-group channels (ADR-0035)
 
-**The "Telegram model": one Hermes, many channels.** Each caller group routes its calls to a
-distinct Hermes **channel** (a platform name) — a separate conversation with its own permitted
-tools. The agent **always** handles every call; the channel decides the *conversation + which
-tools are reachable*, never *whether* the call is taken. This is configured exactly like a chat
-platform: each channel is a first-class Hermes platform you can target with per-platform
+**VoIP channel routing: one Hermes, many VoIP channels.** Each caller group routes its calls to
+a distinct Hermes **channel** (a platform name) — a separate conversation with its own permitted
+tools (conceptually like a chat platform with multiple channels under one agent — an analogy
+only; there is no chat-platform integration). The agent **always** handles every call; the
+channel decides the *conversation + which tools are reachable*, never *whether* the call is
+taken. Each channel is a first-class Hermes platform you can target with per-platform
 `tools_config` / `agent.disabled_toolsets`.
 
 **Channels the plugin registers automatically** (no config needed): the four canonical operator
@@ -275,9 +276,9 @@ spotlighted personas, outbound callee identity.
 ADR-0021 Phase 1 (this runbook, PR #XX): N-group model, `privilege_level` int (0/2/3),
 `HERMES_VOIP_CALLER_GROUPS_FILE`, trusted/colleague level-2 tier, all ADR-0020 shims kept.
 
-ADR-0035 (caller-group channel routing): each group also names a `channel` (Hermes platform
+ADR-0035 (voip caller-group channel routing): each group also names a `channel` (Hermes platform
 name); a call's whole conversation (context seed → turns → end signal) is delivered under that
-channel so the operator gets one-Hermes-many-channels (the "Telegram model"). The four canonical
+channel so the operator gets one Hermes serving many VoIP channels. The four canonical
 channels (`voip-unknown` / `voip-known` / `voip-operator` / `voip-intercom`) register as
 first-class platforms; per-channel permitted tools = the `allowed_tools` sub-ceiling. Shared
 secrets/memory across channels is a documented, accepted limitation (option B — a separate

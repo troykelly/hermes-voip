@@ -35,7 +35,7 @@ class _FakeCtx:
         label: str,
         adapter_factory: Callable[[object], BasePlatformAdapterProtocol],
         check_fn: Callable[[], bool],
-        validate_config: Callable[[object], None] | None = None,
+        validate_config: Callable[[object], bool | None] | None = None,
         required_env: Sequence[str] | None = None,
         install_hint: str = "",
         **entry_kwargs: object,

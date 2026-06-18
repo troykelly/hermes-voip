@@ -73,6 +73,7 @@ from hermes_voip.caller_modes import (
     CallerGroup,
     CallerGroupConfig,
     CallerMode,
+    channel_for_group,
     classify_caller_group,
     group_for_mode,
     load_caller_groups,
@@ -2448,10 +2449,11 @@ class VoipAdapter(BasePlatformAdapter):
             "reveal the operator's private information.]"
         )
         try:
-            source = self.build_source(
-                chat_id=call_id,
+            # ADR-0034: seed lands on the call's channel (here: the outbound group's
+            # channel), so the objective + the ensuing turns share one session.
+            source = self._call_source(
+                call_id,
                 chat_name=callee,
-                chat_type="dm",
                 user_id=call_id,
                 user_name="system",
             )
@@ -2492,10 +2494,11 @@ class VoipAdapter(BasePlatformAdapter):
         caller = str(info.get("name", call_id))
         text = render_call_context_block(context)
         try:
-            source = self.build_source(
-                chat_id=call_id,
+            # ADR-0034: the rich call-context seed lands on the call's channel so it
+            # shares the same session as the turns it precedes.
+            source = self._call_source(
+                call_id,
                 chat_name=caller,
-                chat_type="dm",
                 user_id=call_id,
                 user_name="system",
             )
@@ -2682,10 +2685,11 @@ class VoipAdapter(BasePlatformAdapter):
             text,
         )
         try:
-            source = self.build_source(
-                chat_id=call_id,
+            # ADR-0034: the call-end signal lands on the call's channel so it closes
+            # the SAME session the call's turns ran in (not the bare "voip" platform).
+            source = self._call_source(
+                call_id,
                 chat_name=str(self._call_info.get(call_id, {}).get("name", call_id)),
-                chat_type="dm",
                 user_id=call_id,
                 user_name="system",
             )
@@ -2728,24 +2732,7 @@ class VoipAdapter(BasePlatformAdapter):
         """
         info = self._call_info.get(call_id, {})
         caller_name = str(info.get("name", call_id))
-        # Resolve the call's CallerGroup: prefer the stored "group" (ADR-0021);
-        # fall back to the legacy "mode" key (ADR-0020 back-compat — a call-info
-        # dict carrying only a CallerMode); finally default to receptionist
-        # (least privilege) if neither is present (should not happen in practice).
-        group_obj = info.get("group")
-        mode_obj = info.get("mode")
-        group: CallerGroup
-        if isinstance(group_obj, CallerGroup):
-            group = group_obj
-        elif isinstance(mode_obj, CallerMode):
-            group = group_for_mode(mode_obj)
-        else:
-            group = CallerGroup(
-                name="receptionist",
-                privilege_level=0,
-                persona="receptionist",
-                declined_at_sip=False,
-            )
+        group = self._group_for_call(call_id)
 
         # ADR-0029: on an outbound call the per-call objective rides in the preamble
         # so every turn keeps the agent on the operator's task with the untrusted
@@ -2754,10 +2741,12 @@ class VoipAdapter(BasePlatformAdapter):
         objective = objective_obj if isinstance(objective_obj, str) else None
         spotlighted = _spotlight_turn(group, caller_name, text, objective=objective)
 
-        source = self.build_source(
-            chat_id=call_id,
+        # ADR-0034: route the turn to the caller-group's CHANNEL (a Hermes platform
+        # name), not the hard-coded "voip" platform, so the call's conversation lives
+        # in its channel's own session namespace (the operator's "Telegram model").
+        source = self._call_source(
+            call_id,
             chat_name=caller_name,
-            chat_type="dm",
             user_id=caller_name,
             user_name=caller_name,
         )
@@ -2768,6 +2757,83 @@ class VoipAdapter(BasePlatformAdapter):
             media_urls=[],
         )
         await self.handle_message(event)
+
+    def _group_for_call(self, call_id: str) -> CallerGroup:
+        """Resolve a call's :class:`CallerGroup` (ADR-0021 / ADR-0034).
+
+        Prefers the stored ``"group"`` (ADR-0021); falls back to the legacy ``"mode"``
+        key (ADR-0020 back-compat — a call-info dict carrying only a
+        :class:`CallerMode`, e.g. an outbound call); finally defaults to the
+        receptionist (least privilege) if neither is present (should not happen in
+        practice). This is the single resolution every own-session injection shares so
+        a call's channel is consistent across its context seed, turns, and end-signal.
+        """
+        info = self._call_info.get(call_id, {})
+        group_obj = info.get("group")
+        mode_obj = info.get("mode")
+        if isinstance(group_obj, CallerGroup):
+            return group_obj
+        if isinstance(mode_obj, CallerMode):
+            return group_for_mode(mode_obj)
+        return CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+        )
+
+    def _call_source(
+        self,
+        call_id: str,
+        *,
+        chat_name: str,
+        user_id: str,
+        user_name: str,
+    ) -> SessionSource:
+        """Build the call's own-session :class:`SessionSource` on its channel.
+
+        ADR-0034. Routing in Hermes is by ``event.source`` alone, and the inherited
+        ``build_source`` hard-codes this adapter's own ``voip`` platform, so the source
+        is constructed directly with the caller-group's channel as its platform (the
+        same technique the ADR-0029 cross-session report uses). ``Platform._missing_``
+        resolves an arbitrary channel name (e.g. ``voip-unknown``) without editing the
+        core enum, so the call lands in that channel's own session namespace. The
+        channel is derived from the FORGEABLE caller-ID and is never authentication —
+        the untrusted-data fence + the per-channel tool ceiling are the security spine.
+
+        Every own-session injection for a call (the spotlighted turn, the objective
+        seed, the rich call-context seed, the call-end signal) goes through here, so
+        the whole conversation shares ONE channel. The ADR-0029 cross-session report
+        targets the *originating* foreign session instead and does NOT use this helper.
+        """
+        channel = channel_for_group(self._group_for_call(call_id))
+        return SessionSource(
+            platform=self._channel_platform(channel),
+            chat_id=call_id,
+            chat_name=chat_name,
+            chat_type="dm",
+            user_id=user_id,
+            user_name=user_name,
+        )
+
+    def _channel_platform(self, channel: str) -> Platform:
+        """Resolve a channel name to a :class:`Platform`, registering it if needed.
+
+        ``Platform(channel)`` only resolves a name the enum's ``_missing_`` hook
+        recognises — a registered plugin platform. ``register()`` registers the
+        canonical channels, but a call may route to an operator-defined channel from a
+        groups file (or run in a context where ``register()`` was not the entry, e.g.
+        a unit test), so this ensures the channel is registered first
+        (:func:`~hermes_voip.plugin.ensure_channel_registered`, idempotent). If the
+        registry still cannot resolve the name (an unusual runtime), it FAILS LOUD with
+        a clear error rather than silently routing to the wrong/bare platform —
+        mis-routing a call to the wrong session is a security-relevant defect
+        (rule 37), not something to paper over.
+        """
+        from hermes_voip.plugin import ensure_channel_registered  # noqa: PLC0415
+
+        ensure_channel_registered(channel)
+        return Platform(channel)
 
     def _on_unroutable(self, what: object) -> None:
         """Log unroutable SIP messages at DEBUG; never crash the transport."""

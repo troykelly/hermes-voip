@@ -8,6 +8,15 @@
   mode is unchanged. ADR-0020's security spine (forgeable caller-ID, the `privileged`
   clamp through ADR-0009's gate, the spotlighted persona, PII-safe list files) is retained
   verbatim and generalized — it is **not** re-litigated here.
+- **Extended by:** ADR-0034 (caller-group channel routing, 2026-06-18). The operator's
+  "Telegram model" correction — *trust tiers must not gate the plugin's voice
+  functionality; the agent always handles the call* — is realised there: each group
+  additionally names a **channel** (a Hermes platform name) and a call's conversation is
+  delivered under that channel, so per-caller-kind separation is **conversation + permitted
+  tools**, not a "can the agent take the call" gate. The `privilege_level` axis + the
+  `allowed_tools` sub-ceiling defined here are retained as the per-channel *permitted-tool*
+  mechanism (the gate is unchanged); ADR-0034 reframes them per channel and adds the channel
+  routing + registration. The operator-authorized **pairing** design below is not yet built.
 
 ## Context
 

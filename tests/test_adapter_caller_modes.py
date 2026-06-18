@@ -1775,9 +1775,9 @@ async def test_deliver_turn_routes_operator_to_operator_channel() -> None:
         await asyncio.sleep(0.02)
 
     assert sources
+    # Distinct from the unknown/receptionist channel: the operator gets its own
+    # session namespace (no shared conversation with untrusted callers).
     assert sources[0] == "voip-operator"
-    # The unknown channel and the operator channel are DISTINCT (no shared session).
-    assert sources[0] != "voip-unknown"
 
 
 @pytest.mark.asyncio
@@ -1829,7 +1829,7 @@ async def test_call_context_first_turn_routes_to_group_channel() -> None:
 @pytest.mark.asyncio
 async def test_call_end_signal_routes_to_group_channel() -> None:
     """The ADR-0026 call-end signal lands on the call's channel, not bare 'voip'."""
-    from hermes_voip.adapter import CallEndReason  # noqa: PLC0415
+    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
 
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)

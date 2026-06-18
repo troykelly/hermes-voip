@@ -96,6 +96,17 @@ _EXTRA_ENV_KEYS: frozenset[str] = frozenset({"DEEPGRAM_API_KEY", "ELEVENLABS_API
 # group CHANNEL platforms as routing aliases of this one.
 _PLATFORM_NAME = "voip"
 
+# The Hermes ``platform_hint`` injected into the agent's context for every VoIP
+# platform (primary + channel aliases). Telephony is a live, audio-only channel:
+# replies are read aloud by TTS, so markdown / code blocks / URLs / emoji are
+# actively harmful (spoken literally or dropped). The hint tells the model it is on
+# a phone call and to reply in short, spoken-friendly prose (ADR-0046).
+_PLATFORM_HINT = (
+    "You are speaking on a live phone call. Replies are read aloud, so keep them "
+    "short, conversational, and free of markdown, code blocks, URLs, or emoji. "
+    "Spell out anything that must be heard."
+)
+
 
 def channel_platform_names() -> tuple[str, ...]:
     """The caller-group CHANNEL platform names this plugin registers (ADR-0035).
@@ -308,6 +319,16 @@ def register(ctx: PluginContextProtocol) -> None:
         # HERMES_VOIP_* process env (secrets stay in env, never config.yaml).
         env_enablement_fn=_env_enablement,
         is_connected=_is_connected,
+        # Tell the model it is on a live, audio-only phone call (ADR-0046) so it
+        # replies in short spoken-friendly prose, not TTS-hostile markdown/URLs/emoji.
+        platform_hint=_PLATFORM_HINT,
+        emoji="☎️",  # ☎️ telephone — the platform's glyph in the runtime
+        # ``cron_deliver_env_var`` is INTENTIONALLY omitted: telephony has no
+        # persistent home channel (every call is an ephemeral session), so there is
+        # no channel for the runtime to deliver cron/kanban output to — and
+        # ``notice_filter.py`` suppresses the home-channel / cron "no home channel"
+        # notices that would otherwise be SPOKEN to a caller (ADR-0026 §notices,
+        # ADR-0046). Wiring cron delivery here would reintroduce that leak.
     )
 
     # ADR-0035: register each caller-group CHANNEL as a first-class platform aliasing
@@ -350,4 +371,8 @@ def _register_channel_platforms(ctx: PluginContextProtocol) -> None:
             install_hint=_INSTALL_HINT,
             env_enablement_fn=channel_env_enablement,
             is_connected=channel_is_never_independently_connected,
+            # Same live-phone-call hint as the primary platform (ADR-0046): a session
+            # routed to a channel alias is still a spoken call, so the model needs the
+            # same TTS-friendly guidance regardless of which channel it lands on.
+            platform_hint=_PLATFORM_HINT,
         )

@@ -13,11 +13,15 @@ that sleeps briefly inside construction, then hammering the getter from many
 threads at once.  After double-checked locking, the builder must run EXACTLY
 once and every caller must receive the SAME instance.
 
+The build-once-under-concurrency guarantee now lives in
+:class:`hermes_voip._lazy_singleton.LazySingleton` (ADR-0046), which backs both
+getters. Each test swaps the module's ``LazySingleton`` for one wrapping a counting
+stub factory, then resets it afterwards via the ``_reset_singletons`` fixture so the
+suite does not leak state into the rest of pytest (which may legitimately build the
+real singletons).
+
 No optional extra is required: the builders are stubbed out entirely, so the
-real ``cryptography`` / ``pyOpenSSL`` dependencies are never touched.  The
-module-level singleton globals are reset and restored around each test via the
-``_reset_singletons`` fixture so the suite does not leak state into the rest
-of pytest (which may legitimately build the real singletons).
+real ``cryptography`` / ``pyOpenSSL`` dependencies are never touched.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import pytest
 
 import hermes_voip.media.dtls as dtls_mod
 import hermes_voip.media.srtp as srtp_mod
+from hermes_voip._lazy_singleton import LazySingleton
 
 # Number of threads that race into the getter simultaneously.  Comfortably more
 # than the host core count so the scheduler genuinely interleaves them.
@@ -44,14 +49,14 @@ _BUILD_SLEEP_S = 0.05
 
 @pytest.fixture(autouse=True)
 def _reset_singletons() -> Iterator[None]:
-    """Reset both module singletons to ``None`` before and after each test."""
-    srtp_mod._CRYPTO = None
-    dtls_mod._OPENSSL = None
+    """Reset both media singletons before and after each test (ADR-0046)."""
+    srtp_mod._reset_crypto_singleton()
+    dtls_mod._reset_openssl_singleton()
     try:
         yield
     finally:
-        srtp_mod._CRYPTO = None
-        dtls_mod._OPENSSL = None
+        srtp_mod._reset_crypto_singleton()
+        dtls_mod._reset_openssl_singleton()
 
 
 class _Counter:
@@ -96,23 +101,23 @@ def test_get_crypto_builds_once_under_concurrency(
 
     def fake_impl() -> object:
         # Count the construction, then sleep so a second racing thread would
-        # also pass the ``is None`` check under the naive pattern.
+        # also pass the ``is None`` check under a naive (unlocked) pattern.
         counter.tick()
         time.sleep(_BUILD_SLEEP_S)
         return sentinel
 
-    # ``_get_crypto`` builds via ``_CryptographyImpl()`` — replace the name it
-    # resolves with our counting stub.
-    monkeypatch.setattr(srtp_mod, "_CryptographyImpl", fake_impl)
+    # ``_get_crypto`` builds via the module's LazySingleton — swap it for one
+    # wrapping the counting stub so the real cryptography backend is never touched.
+    monkeypatch.setattr(srtp_mod, "_CRYPTO_SINGLETON", LazySingleton(fake_impl))
 
     results = _hammer(srtp_mod._get_crypto)
 
     assert counter.count == 1, (
-        f"_CryptographyImpl built {counter.count} times under "
+        f"crypto backend built {counter.count} times under "
         f"{_N_THREADS} concurrent callers; expected exactly 1 (TOCTOU race)"
     )
     assert all(r is sentinel for r in results)
-    assert srtp_mod._CRYPTO is sentinel
+    assert srtp_mod._get_crypto() is sentinel
 
 
 def test_get_openssl_builds_once_under_concurrency(
@@ -130,15 +135,15 @@ def test_get_openssl_builds_once_under_concurrency(
         time.sleep(_BUILD_SLEEP_S)
         return sentinel
 
-    # ``_get_openssl`` builds via ``_PyOpenSSLImpl.load()`` — replace the
-    # classmethod the getter calls with our counting stub.
-    monkeypatch.setattr(dtls_mod._PyOpenSSLImpl, "load", staticmethod(fake_load))
+    # ``_get_openssl`` builds via the module's LazySingleton — swap it for one
+    # wrapping the counting stub so the real pyOpenSSL backend is never loaded.
+    monkeypatch.setattr(dtls_mod, "_OPENSSL_SINGLETON", LazySingleton(fake_load))
 
     results = _hammer(dtls_mod._get_openssl)
 
     assert counter.count == 1, (
-        f"_PyOpenSSLImpl.load ran {counter.count} times under "
+        f"pyOpenSSL backend loaded {counter.count} times under "
         f"{_N_THREADS} concurrent callers; expected exactly 1 (TOCTOU race)"
     )
     assert all(r is sentinel for r in results)
-    assert dtls_mod._OPENSSL is sentinel
+    assert dtls_mod._get_openssl() is sentinel

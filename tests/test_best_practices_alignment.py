@@ -22,7 +22,7 @@ through a fake ``VoipToolHost`` rigged to raise an unexpected exception.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 import pytest
 
@@ -106,9 +106,12 @@ def _set_chat(monkeypatch: pytest.MonkeyPatch, call_id: str | None) -> None:
     monkeypatch.setattr(vt, "_current_call_id", lambda: call_id)
 
 
+# A registered tool handler: takes the model's args mapping, returns the JSON result.
+_Handler = Callable[[Mapping[str, object]], Awaitable[str]]
+
 # Each entry: (handler, args) — args carry every required field so the handler
 # reaches the host call (where the synthetic exception is raised).
-_HANDLER_CASES: tuple[tuple[Callable[..., object], dict[str, object]], ...] = (
+_HANDLER_CASES: tuple[tuple[_Handler, dict[str, object]], ...] = (
     (hang_up_handler, {}),
     (hold_call_handler, {}),
     (resume_call_handler, {}),
@@ -124,7 +127,7 @@ _HANDLER_CASES: tuple[tuple[Callable[..., object], dict[str, object]], ...] = (
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("handler", "args"), _HANDLER_CASES)
 async def test_handler_returns_error_json_on_unanticipated_exception(
-    handler: Callable[..., object],
+    handler: _Handler,
     args: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -31,10 +31,12 @@ aioice = pytest.importorskip("aioice", reason="webrtc extra (aioice) not install
 # hermes_voip.media.ice lazy-imports aioice at construction time; the module
 # itself is always importable.  We import it AFTER the importorskip so that a
 # missing aioice shows as a skip, not a collection error.
+import hermes_voip.media.ice as ice_mod  # noqa: E402 — after importorskip guard
 from hermes_voip.media.ice import (  # noqa: E402 — after importorskip guard
     IceCandidate,
     IceConnection,
     IceSelectedPair,
+    _parse_turn_url,
 )
 
 # ---------------------------------------------------------------------------
@@ -225,3 +227,172 @@ async def test_gather_host_only_no_stun() -> None:
         assert non_host == []
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# TURN relay wiring (ADR-0034)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_turn_url_plain() -> None:
+    """A turn: URL parses to (host, port, ssl=False, transport=udp); default 3478."""
+    assert _parse_turn_url("turn:turn.example.test:3478") == (
+        "turn.example.test",
+        3478,
+        False,
+        "udp",
+    )
+
+
+def test_parse_turn_url_default_port() -> None:
+    """A turn: URL without a port defaults to 3478 (RFC 8656 §5)."""
+    assert _parse_turn_url("turn:turn.example.test") == (
+        "turn.example.test",
+        3478,
+        False,
+        "udp",
+    )
+
+
+def test_parse_turn_url_turns_tls_default_port() -> None:
+    """A turns: URL => ssl=True and the default TLS port 5349."""
+    assert _parse_turn_url("turns:turn.example.test") == (
+        "turn.example.test",
+        5349,
+        True,
+        "udp",
+    )
+
+
+def test_parse_turn_url_transport_query() -> None:
+    """A ?transport=tcp query selects the TCP transport."""
+    assert _parse_turn_url("turn:turn.example.test:3478?transport=tcp") == (
+        "turn.example.test",
+        3478,
+        False,
+        "tcp",
+    )
+
+
+def test_parse_turn_url_rejects_non_turn_scheme() -> None:
+    """A non-turn scheme is rejected loudly (ValueError)."""
+    with pytest.raises(ValueError, match="turn"):
+        _parse_turn_url("stun:stun.example.test:3478")
+
+
+class _SpyAioiceModule:
+    """A fake ``aioice`` module that records the kwargs passed to ``Connection``.
+
+    Injected via ``_get_aioice`` so the real aioice module is never patched and no
+    socket is opened. ``Connection`` returns a bare object — ``IceConnection.__init__``
+    only stores it; the test asserts on the captured kwargs.
+    """
+
+    def __init__(self) -> None:
+        self.captured: dict[str, object] = {}
+
+    def Connection(self, **kwargs: object) -> object:  # noqa: N802 — mirrors aioice.Connection
+        self.captured = dict(kwargs)
+        return object()
+
+
+def test_turn_params_passed_to_aioice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IceConnection threads TURN url+creds into aioice.Connection (ADR-0034).
+
+    The relay credentials must reach aioice's TURN client. A fake aioice module
+    captures the constructor kwargs without opening any socket.
+    """
+    spy = _SpyAioiceModule()
+    monkeypatch.setattr(ice_mod, "_get_aioice", lambda: spy)
+
+    IceConnection(
+        ice_controlling=False,
+        stun_urls=(),
+        turn_urls=("turn:turn.example.test:3478",),
+        turn_username="relay-user",
+        turn_password="relay-secret",
+    )
+
+    assert spy.captured["turn_server"] == ("turn.example.test", 3478)
+    assert spy.captured["turn_username"] == "relay-user"
+    assert spy.captured["turn_password"] == "relay-secret"
+    assert spy.captured["turn_ssl"] is False
+    assert spy.captured["turn_transport"] == "udp"
+
+
+def test_no_turn_when_urls_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no TURN URLs, aioice gets turn_server=None (no relay candidate)."""
+    spy = _SpyAioiceModule()
+    monkeypatch.setattr(ice_mod, "_get_aioice", lambda: spy)
+
+    IceConnection(ice_controlling=False, stun_urls=())
+    assert spy.captured["turn_server"] is None
+
+
+# ---------------------------------------------------------------------------
+# ICE consent freshness (RFC 7675) — aioice-native; ADR-0034 verifies + locks it.
+#
+# aioice already runs consent freshness internally: Connection.connect() arms a
+# query_consent task (5 s interval, 6-failure → close()). These tests LOCK that
+# behaviour and the consent-loss → teardown chain (close() wakes a blocked recv(),
+# which the engine turns into a transport-loss teardown). No new consent machinery
+# is added (rule 28): the gap was verified to NOT exist — aioice's close() already
+# enqueues the queue sentinel via the protocol's connection_lost, so a blocked
+# recv() raises rather than hanging (gap-analysis #6 is already covered).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_arms_consent_freshness_task() -> None:
+    """The RFC 7675 consent task is armed by aioice on connect() (verified).
+
+    Reaches into the wrapped aioice Connection to confirm the query_consent task
+    is live after connect — proving consent freshness is active on every WebRTC
+    call with no code of ours (the basis for ADR-0034's "do not duplicate").
+    """
+    controlling, controlled = await _make_pair()
+    try:
+        # The wrapped aioice Connection's consent task must be a live asyncio.Task.
+        consent_task = controlled._conn._query_consent_task  # type: ignore[attr-defined]  # aioice internal; no public accessor
+        assert isinstance(consent_task, asyncio.Task)
+        assert not consent_task.done()
+    finally:
+        await controlling.close()
+        await controlled.close()
+
+
+@pytest.mark.asyncio
+async def test_close_unblocks_blocked_recv() -> None:
+    """A recv() blocked when the connection closes raises (does not hang).
+
+    This is the consent-loss teardown path: aioice's query_consent calls close()
+    on consent loss, and close() must wake a recv() already parked on the queue so
+    the engine ends the call. Verified here against a real aioice loopback pair.
+    """
+    controlling, controlled = await _make_pair()
+    try:
+        # Park a recv() on the controlled side (no data will ever arrive).
+        recv_task = asyncio.ensure_future(controlled.recv())
+        await asyncio.sleep(0)  # let the recv task start awaiting
+
+        # Consent loss path: aioice closes the connection underneath the reader.
+        await controlled.close()
+
+        # The previously-blocked recv() must raise (sentinel woke it), not hang.
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(recv_task, timeout=5.0)
+    finally:
+        await controlling.close()
+        await controlled.close()
+
+
+@pytest.mark.asyncio
+async def test_recv_after_close_raises() -> None:
+    """A fresh recv() after the connection closed raises (not a silent hang)."""
+    controlling, controlled = await _make_pair()
+    await controlled.close()
+    try:
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(controlled.recv(), timeout=5.0)
+    finally:
+        await controlling.close()

@@ -149,7 +149,9 @@ from hermes_voip.tools import gate_voip_tool
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
 from hermes_voip.transport.ws_connection import WssSipTransport
 from hermes_voip.voip_tools import (
+    TRANSFER_ATTENDED_TOOL_NAME,
     TRANSFER_BLIND_TOOL_NAME,
+    AttendedTransferOutcome,
     TransferOutcome,
     active_voip_adapter,
     set_active_adapter,
@@ -397,6 +399,12 @@ class VoipAdapter(BasePlatformAdapter):
         # it before any INVITE; the env-trigger CALL_ON_CONNECT path bypasses it (it
         # is the operator's own explicit dial, like the gate-bypassing test trigger).
         self._outbound_allow: frozenset[str] = frozenset()
+        # _attended_consults (ADR-0048): the in-flight attended-transfer pairings,
+        # mapping an ORIGINAL call's Call-ID -> its CONSULTATION leg's Call-ID. Set by
+        # start_attended_consult, read by complete_attended_transfer (to find the
+        # consult Dialog the REFER+Replaces names) and cancel_attended_transfer (to
+        # hang up the consult leg), and cleared by both. One pairing per original call.
+        self._attended_consults: dict[str, str] = {}
         # _extra: the raw env config dict stored from connect() so _establish()
         # (called on reconnect too) can read CALL_ON_CONNECT without re-reading
         # self.config.extra each time.
@@ -2527,6 +2535,142 @@ class VoipAdapter(BasePlatformAdapter):
         )
         await session.transfer_blind(target, referred_by=referred_by)
         return TransferOutcome.TRANSFERRED
+
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        """Originate the CONSULTATION leg of an attended transfer (ADR-0048).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
+        ``transfer_attended`` tool's ``consult`` action calls. It re-enforces the
+        IRREVERSIBLE privilege clamp ITSELF (defense in depth, mirroring
+        :meth:`transfer_blind_on_call`) and dials ``target`` via the EXISTING outbound
+        origination path — so the consultation leg is gated by the SAME
+        ``HERMES_VOIP_OUTBOUND_ALLOW`` allowlist as ``place_call`` (the consult is a new
+        untrusted outbound leg, the same threat model). On success it records the
+        ``call_id -> consult_call_id`` pairing and returns the consult leg's Call-ID.
+
+        Raises (never a silent no-op — rule 37):
+
+        * ``KeyError`` — the original call is unknown/ended (nothing to transfer).
+        * ``PermissionError`` — the original call is not operator-level / is degraded.
+        * :class:`~hermes_voip.originate.OutboundCallNotAllowed` — ``target`` is not on
+          the outbound allowlist (no leg is dialled).
+        * :class:`~hermes_voip.originate.OutboundCallFailed` / ``RuntimeError`` — as
+          :meth:`place_call`.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            msg = f"attended transfer: original call {call_id!r} is unknown or ended"
+            raise KeyError(msg)
+        # Defense in depth: re-run the operator-level + non-degraded clamp here, not
+        # solely at the sync gate — an attended transfer dials a new untrusted leg, so
+        # an unprivileged/degraded original call must never reach the dial.
+        if not gate_voip_tool(
+            TRANSFER_ATTENDED_TOOL_NAME, session.guard, confirmed=True
+        ):
+            _log.warning(
+                "agent transfer_attended tool: call %s is not permitted to transfer "
+                "(privilege/degraded clamp); refusing the consultation",
+                call_id,
+            )
+            msg = "attended transfer is not permitted on this call"
+            raise PermissionError(msg)
+        # The outbound allowlist is the consult gate (same as place_call). Enforce it
+        # BEFORE dialling so an unlisted target is never called (raises NotAllowed).
+        if not is_outbound_allowed(target, self._outbound_allow):
+            raise OutboundCallNotAllowed(target)
+        _log.info(
+            "agent transfer_attended tool: dialling consultation %s for call %s",
+            target,
+            call_id,
+        )
+        consult_call_id = await self.place_call(
+            target,
+            objective=(
+                "You are placing a consultation call on the operator's behalf to set "
+                "up an attended (warm) transfer. Briefly explain the caller you are "
+                "about to connect, then the operator will complete the transfer."
+            ),
+        )
+        self._attended_consults[call_id] = consult_call_id
+        return consult_call_id
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        """COMPLETE an attended transfer: REFER+Replaces on the original (ADR-0048).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
+        ``transfer_attended`` tool's ``complete`` action calls. Looks up the paired
+        consultation leg, then sends the REFER on the ORIGINAL call naming the consult
+        leg's :class:`~hermes_voip.dialog.Dialog` (RFC 3891 ``Replaces``) via
+        :meth:`~hermes_voip.call.CallSession.transfer_attended`, so the gateway bridges
+        the caller to the target and releases our legs. The ``Referred-By`` AOR is the
+        original call's local URI (RFC 3892). Re-enforces the privilege clamp ITSELF
+        (defense in depth) and clears the pairing once the REFER is sent.
+
+        Returns an :class:`~hermes_voip.voip_tools.AttendedTransferOutcome`:
+
+        * ``TRANSFERRED`` — the REFER+Replaces fired.
+        * ``NO_CONSULT`` — no consultation leg is in flight for this call.
+        * ``NO_CALL`` — the original call (or the consult leg) is unknown / ended.
+        * ``BLOCKED`` — the original call's privilege clamp refused it.
+
+        Raises :class:`~hermes_voip.call.CallError` if the gateway rejects the REFER
+        (propagated from ``CallSession.transfer_attended``) — never a silent no-op.
+        """
+        consult_call_id = self._attended_consults.get(call_id)
+        if consult_call_id is None:
+            return AttendedTransferOutcome.NO_CONSULT
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return AttendedTransferOutcome.NO_CALL
+        consult = self._call_sessions.get(consult_call_id)
+        if consult is None or consult.ended:
+            # The consultation ended before we completed — there is nothing to bridge
+            # to. Clear the stale pairing and report it as no-call (no REFER).
+            self._attended_consults.pop(call_id, None)
+            return AttendedTransferOutcome.NO_CALL
+        # Defense in depth: re-run the privilege clamp before sending the REFER, so a
+        # session that lost privilege or went degraded during the consultation cannot
+        # complete the transfer (mirrors transfer_blind_on_call's post-await re-check).
+        if not gate_voip_tool(
+            TRANSFER_ATTENDED_TOOL_NAME, session.guard, confirmed=True
+        ):
+            _log.warning(
+                "agent transfer_attended tool: call %s lost transfer privilege; "
+                "REFER NOT sent",
+                call_id,
+            )
+            return AttendedTransferOutcome.BLOCKED
+        referred_by = session.dialog.local_uri
+        _log.info(
+            "agent transfer_attended tool: completing call %s -> consult %s (REFER)",
+            call_id,
+            consult_call_id,
+        )
+        await session.transfer_attended(consult.dialog, referred_by=referred_by)
+        self._attended_consults.pop(call_id, None)
+        return AttendedTransferOutcome.TRANSFERRED
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
+        """Abandon the consultation for ``call_id`` (ADR-0048); whether it acted.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
+        ``transfer_attended`` tool's ``cancel`` action calls. Hangs up the consultation
+        leg (BYE via :meth:`~hermes_voip.call.CallSession.hang_up`) and keeps the
+        original caller, clearing the pairing. Returns ``False`` (and does nothing) when
+        no consultation is in flight, so the tool reports a clear, non-fatal outcome.
+        """
+        consult_call_id = self._attended_consults.pop(call_id, None)
+        if consult_call_id is None:
+            return False
+        consult = self._call_sessions.get(consult_call_id)
+        if consult is not None and not consult.ended:
+            _log.info(
+                "agent transfer_attended tool: cancelling consultation %s for call %s",
+                consult_call_id,
+                call_id,
+            )
+            await consult.hang_up()
+        return True
 
     def list_registrations_text(self) -> str:
         """Return a human-readable registration snapshot (ADR-0011/0020; ELEVATED).

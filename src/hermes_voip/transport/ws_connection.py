@@ -328,43 +328,31 @@ class WssSipTransport:
         while True:
             frame = await ws.recv(decode=True)
             if isinstance(frame, str):
-                await self._dispatch(frame)
+                # RFC 7118 / RFC 5626 §4.4 CRLF keepalive: the gateway may send a
+                # bare double-CRLF ping ("\r\n\r\n"), a single-CRLF pong ("\r\n"),
+                # or a degenerate empty text frame. None is a SIP message — feeding
+                # one to SipRequest.parse would raise on the empty request-line and
+                # end the reader (dropping the registration, so inbound calls route
+                # to voicemail). Answer a double-CRLF ping with a single-CRLF pong
+                # on THIS live connection (a send failure propagates and ends the
+                # reader, surfacing as a connection loss — never swallowed); ignore
+                # the empty/pong cases. The TLS transport gets this for free via
+                # SipMessageFramer._skip_keepalive_crlf; the per-frame WSS path
+                # needs it explicitly.
+                if not frame.strip():
+                    if frame == _CRLF_KEEPALIVE_PING:
+                        async with self._send_lock:
+                            await ws.send(_CRLF_KEEPALIVE_PONG)
+                else:
+                    await self._dispatch(frame)
             # Binary frames (STUN/DTLS — later PRs) are silently dropped here;
             # the media plane owns those on the media socket, not the signalling WS.
 
     async def _dispatch(self, raw: str) -> None:
-        # RFC 7118 / RFC 5626 §4.4 CRLF keepalive: the gateway may send a bare
-        # double-CRLF ping ("\r\n\r\n"), a single-CRLF pong ("\r\n"), or a
-        # degenerate empty text frame over the WSS signalling channel. None of
-        # these is a SIP message — feeding them to SipRequest.parse raises on the
-        # empty request-line and kills the reader (dropping the registration, so
-        # inbound calls route to voicemail). Absorb any whitespace-only frame
-        # here; answer a double-CRLF ping with a single-CRLF pong so the gateway
-        # keeps the contact qualified. (The TLS transport gets this for free via
-        # SipMessageFramer._skip_keepalive_crlf; the per-frame WSS path needs it
-        # explicitly.)
-        if not raw.strip():
-            if raw == _CRLF_KEEPALIVE_PING:
-                await self._send_raw(_CRLF_KEEPALIVE_PONG)
-            return
         if raw.startswith(_RESPONSE_PREFIX):
             await self._dispatch_response(SipResponse.parse(raw))
         else:
             await self._dispatch_request(SipRequest.parse(raw))
-
-    async def _send_raw(self, frame: str) -> None:
-        """Send a raw WS text frame (a CRLF keepalive pong) bypassing SIP parsing.
-
-        ``send`` runs the frame through ``_register_if_invite`` (which parses it
-        as SIP); a CRLF pong is not SIP, so it goes out directly under the same
-        send lock. A no-op if the socket is already gone (a lost connection is
-        surfaced by the reader task, not here).
-        """
-        ws = self._ws
-        if ws is None:
-            return
-        async with self._send_lock:
-            await ws.send(frame)
 
     async def _dispatch_response(self, response: SipResponse) -> None:
         await self._auto_ack_non_2xx(response)

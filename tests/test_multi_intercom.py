@@ -216,6 +216,32 @@ def test_webhook_opening_rejects_bad_method(tmp_path: Path) -> None:
         load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
 
 
+def test_webhook_get_with_body_rejected_at_load(tmp_path: Path) -> None:
+    """A GET opening with a configured body fails LOUD at load (rule 37).
+
+    A GET carries no body on the wire; silently dropping a configured body would
+    mask an operator misconfiguration. The mismatch is rejected at load, not at
+    door-open time.
+    """
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "method": "GET",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "body": _FAKE_BODY,
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="GET"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
 def test_unknown_opening_type_rejected(tmp_path: Path) -> None:
     doc = {"intercoms": {"1000": {"openings": {"door": {"type": "banana"}}}}}
     path = _write(tmp_path, doc)

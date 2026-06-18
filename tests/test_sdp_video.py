@@ -359,3 +359,106 @@ def test_build_webrtc_answer_rejects_video_setup_actpass() -> None:
             ice_candidates=(),
             video=VideoAnswer(codec=chosen, mid="1", active=True),
         )
+
+
+# ---------------------------------------------------------------------------
+# negotiate_video_h264 — exact fmtp packetization-mode match (ADR-0044 §3)
+# ---------------------------------------------------------------------------
+
+# A video offer whose only H.264 codec carries packetization-mode=10 — a value
+# whose decimal prefix contains the literal "packetization-mode=1". A naive
+# substring test mis-accepts it as mode 1; an exact fmtp parse declines it.
+_OFFER_VIDEO_MODE_SUBSTRING = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP6 2001:db8::1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "a=group:BUNDLE 0 1\r\n"
+    f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+    f"a=ice-pwd:{_FAKE_PWD}\r\n"
+    f"a=fingerprint:SHA-256 {_FAKE_FINGERPRINT}\r\n"
+    "a=setup:actpass\r\n"
+    "m=audio 19710 UDP/TLS/RTP/SAVPF 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtcp-mux\r\n"
+    "a=mid:0\r\n"
+    "m=video 19710 UDP/TLS/RTP/SAVPF 99\r\n"
+    "a=rtpmap:99 H264/90000\r\n"
+    "a=fmtp:99 profile-level-id=42e01f;packetization-mode=10\r\n"
+    "a=rtcp-mux\r\n"
+    "a=mid:1\r\n"
+)
+
+# A video offer listing the mode-0 codec (PT 100) BEFORE the mode-1 codec (PT 99),
+# to prove selection is by packetization-mode, not by offer order (codecs[0]).
+_OFFER_VIDEO_MODE0_FIRST = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP6 2001:db8::1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "a=group:BUNDLE 0 1\r\n"
+    f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+    f"a=ice-pwd:{_FAKE_PWD}\r\n"
+    f"a=fingerprint:SHA-256 {_FAKE_FINGERPRINT}\r\n"
+    "a=setup:actpass\r\n"
+    "m=audio 19710 UDP/TLS/RTP/SAVPF 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtcp-mux\r\n"
+    "a=mid:0\r\n"
+    "m=video 19710 UDP/TLS/RTP/SAVPF 100 99\r\n"
+    "a=rtpmap:100 H264/90000\r\n"
+    "a=fmtp:100 profile-level-id=42e016;packetization-mode=0\r\n"
+    "a=rtpmap:99 H264/90000\r\n"
+    "a=fmtp:99 profile-level-id=42e01f;packetization-mode=1\r\n"
+    "a=rtcp-mux\r\n"
+    "a=mid:1\r\n"
+)
+
+
+def test_negotiate_video_rejects_packetization_mode_substring_false_match() -> None:
+    """packetization-mode=10 is NOT mode 1 — an exact fmtp parse declines it.
+
+    A naive ``"packetization-mode=1" in fmtp`` substring test wrongly accepts
+    ``packetization-mode=10`` (and ``x-packetization-mode=1``); RFC 6184 §8.1
+    fmtp parameters are ``;``-separated name=value pairs and the value must equal
+    "1" exactly (ADR-0044 §3).
+    """
+    sdp = SessionDescription.parse(_OFFER_VIDEO_MODE_SUBSTRING)
+    assert sdp.video is not None
+    assert negotiate_video_h264(sdp.video) is None
+
+
+def test_negotiate_video_skips_mode0_listed_first() -> None:
+    """Selection is by packetization-mode=1, not offer order (kills codecs[0]).
+
+    With the mode-0 codec listed first, a correct implementation skips it and
+    returns the mode-1 PT 99; a ``return codecs[0]`` would return the mode-0 PT.
+    """
+    sdp = SessionDescription.parse(_OFFER_VIDEO_MODE0_FIRST)
+    assert sdp.video is not None
+    chosen = negotiate_video_h264(sdp.video)
+    assert chosen is not None
+    assert chosen.payload_type == 99
+
+
+def test_build_answer_rejects_unsupported_video_with_port_zero() -> None:
+    """An offered m=video we cannot use is answered m=video 0 (RFC 3264 §6).
+
+    The m-line is NOT dropped (RFC 3264 §5.1 / RFC 8843 require the answer's
+    m-line count + order to match the offer); it is rejected with port 0 and
+    excluded from the BUNDLE group (RFC 8843 §7.3.3), echoing an offered payload
+    type. Dropping the line entirely produces a malformed answer for strict peers.
+    """
+    text = _webrtc_answer(
+        _OFFER_AUDIO_VIDEO,
+        video=VideoAnswer.rejected(mid="1", proto="UDP/TLS/RTP/SAVPF", payload_type=99),
+    )
+    assert "m=video 0 UDP/TLS/RTP/SAVPF 99\r\n" in text
+    assert text.count("m=video") == 1  # present, not dropped
+    assert "m=video 9" not in text
+    # Rejected video is excluded from the BUNDLE group; audio remains bundled.
+    assert "a=group:BUNDLE 0\r\n" in text
+    assert "a=group:BUNDLE 0 1" not in text
+    # m-line correspondence: the rejected video keeps its mid.
+    video_block = text.split("m=video", 1)[1]
+    assert "a=mid:1" in video_block

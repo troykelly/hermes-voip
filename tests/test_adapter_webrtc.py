@@ -759,6 +759,92 @@ def test_webrtc_supported_encodings_never_drift_ahead_of_engine() -> None:
             )
 
 
+# A WebRTC BUNDLE offer whose m=video offers ONLY VP8 (no H.264 we can packetise).
+_WEBRTC_VP8_ONLY_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "a=group:BUNDLE 0 1\r\n"
+    "m=audio 50000 UDP/TLS/RTP/SAVPF 111 0\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=fingerprint:sha-256 "
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n"
+    "a=setup:actpass\r\n"
+    "a=ice-ufrag:peerUFRG\r\n"
+    "a=ice-pwd:peerPWDpeerPWDpeerPWDpeer\r\n"
+    "a=candidate:1 1 UDP 2130706431 127.0.0.1 50000 typ host\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+    "a=mid:0\r\n"
+    "m=video 50000 UDP/TLS/RTP/SAVPF 96\r\n"
+    "a=rtpmap:96 VP8/90000\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+    "a=mid:1\r\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_resolve_webrtc_video_rejects_vp8_only_offer() -> None:
+    """An offered m=video we cannot packetise (VP8-only) is REJECTED, not dropped.
+
+    RFC 3264 §5.1 / RFC 8843: the answer must keep the same m-line count as the
+    offer, so an unsupported video stream is rejected with port 0 (ADR-0044), not
+    omitted (which produced a malformed answer for strict peers).
+    """
+    from hermes_voip.adapter import _resolve_webrtc_video  # noqa: PLC0415
+    from hermes_voip.sdp import VideoAnswerMode  # noqa: PLC0415
+
+    offer = SessionDescription.parse(_WEBRTC_VP8_ONLY_OFFER)
+    assert offer.video is not None
+    media_cfg = load_media_config({})
+    video_answer, nals = await _resolve_webrtc_video(offer, media_cfg)
+    assert video_answer is not None
+    assert video_answer.mode is VideoAnswerMode.REJECTED
+    assert nals == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_webrtc_video_reads_source_off_event_loop(
+    tmp_path: object,
+) -> None:
+    """The Annex-B source is read off the event loop (asyncio.to_thread, rule 22).
+
+    A blocking Path.read_bytes() on the loop during INVITE handling would stall
+    every concurrent call's ICE/DTLS for the read duration. The read must run in
+    a worker thread, so its thread id differs from the running event loop's.
+    """
+    import pathlib  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    from hermes_voip.adapter import _resolve_webrtc_video  # noqa: PLC0415
+    from hermes_voip.media.video_rtp import read_annex_b_nals  # noqa: PLC0415
+
+    assert isinstance(tmp_path, pathlib.Path)
+    source = tmp_path / "clip.h264"
+    source.write_bytes(_FAKE_H264_ANNEX_B)
+    media_cfg = load_media_config({"HERMES_VOIP_VIDEO_SOURCE_PATH": str(source)})
+    offer = SessionDescription.parse(_WEBRTC_AV_OFFER)
+
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+
+    def _spy(path: pathlib.Path) -> list[bytes]:
+        read_threads.append(threading.get_ident())
+        return read_annex_b_nals(path)
+
+    with patch("hermes_voip.adapter.read_annex_b_nals", _spy):
+        _video_answer, nals = await _resolve_webrtc_video(offer, media_cfg)
+    assert nals, "the source NALs were read"
+    assert read_threads, "the source file read helper was invoked"
+    assert read_threads[0] != loop_thread, (
+        "the source file must be read off the event loop"
+    )
+
+
 # A WebRTC profile offer MISSING the mandatory DTLS fingerprint + ICE credentials
 # (RFC 5763/8839). It must be REJECTED 488 BEFORE any 200 OK (ADR-0032 pre-answer
 # validation; codex review BLOCKING-1).

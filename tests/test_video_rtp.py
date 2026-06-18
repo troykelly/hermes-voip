@@ -46,6 +46,22 @@ def _nal(nal_type: int, *, nri: int = 3, body: bytes = b"") -> bytes:
     return bytes([header]) + body
 
 
+def _slice(
+    nal_type: int, *, first_mb_zero: bool, nri: int = 3, tail: bytes = b""
+) -> bytes:
+    """Build a synthetic VCL slice NAL with a controlled ``first_mb_in_slice``.
+
+    The slice header's first field is ``first_mb_in_slice``, an Exp-Golomb ue(v):
+    the codeword for value 0 is the single bit ``1`` (so the first RBSP byte has
+    its MSB set); any value > 0 begins with a ``0`` bit (MSB clear). A new primary
+    coded picture starts at a VCL NAL with ``first_mb_in_slice == 0`` (H.264
+    §7.4.1.2.4); subsequent slices of the SAME picture carry ``first_mb_in_slice
+    > 0``.
+    """
+    first_rbsp = 0x80 if first_mb_zero else 0x10
+    return _nal(nal_type, nri=nri, body=bytes([first_rbsp]) + tail)
+
+
 # ---------------------------------------------------------------------------
 # Annex-B NAL splitting
 # ---------------------------------------------------------------------------
@@ -254,8 +270,10 @@ def test_video_clock_rate_is_90khz() -> None:
 def test_group_access_units_attaches_param_sets_to_next_vcl() -> None:
     sps = _nal(_NAL_TYPE_SPS, body=b"\x01")
     pps = _nal(_NAL_TYPE_PPS, body=b"\x02")
-    idr = _nal(_NAL_TYPE_IDR, body=b"\x03")
-    p_slice = _nal(1, body=b"\x04")  # non-IDR coded slice (VCL type 1)
+    # IDR + a following P picture are two distinct access units (two frames); the
+    # P-slice begins a new primary coded picture (first_mb_in_slice == 0).
+    idr = _slice(_NAL_TYPE_IDR, first_mb_zero=True, tail=b"\x03")
+    p_slice = _slice(1, first_mb_zero=True, tail=b"\x04")
     units = group_access_units([sps, pps, idr, p_slice])
     # SPS+PPS group with the IDR; the P-slice is its own access unit.
     assert units == [[sps, pps, idr], [p_slice]]
@@ -324,8 +342,9 @@ async def test_video_sender_sends_one_loop_iteration() -> None:
 
 @pytest.mark.asyncio
 async def test_video_sender_advances_timestamp_between_frames() -> None:
-    idr = _nal(_NAL_TYPE_IDR, body=b"\x00" * 10)
-    p1 = _nal(1, body=b"\x01" * 10)
+    # Two distinct pictures (each first_mb_in_slice == 0): an IDR then a P frame.
+    idr = _slice(_NAL_TYPE_IDR, first_mb_zero=True, tail=b"\x00" * 10)
+    p1 = _slice(1, first_mb_zero=True, tail=b"\x01" * 10)
     srtp = _FakeSrtp()
     ice = _FakeIce()
     sender = RtpVideoSender(
@@ -360,3 +379,90 @@ def test_no_in_process_encoder_imported() -> None:
     banned = ("openh264", "pyopenh264", "vp8codec", "libvpx", "import av", "aiortc")
     for token in banned:
         assert token not in text, f"banned codec token in video_rtp.py: {token}"
+
+
+# ---------------------------------------------------------------------------
+# Access-unit grouping — multi-slice pictures (RFC 6184 §5.1 / H.264 §7.4.1.2.4)
+# ---------------------------------------------------------------------------
+
+
+def test_group_access_units_keeps_multi_slice_picture_as_one_au() -> None:
+    """Two slice NALs of ONE coded picture form ONE access unit (not two).
+
+    A new primary coded picture starts only at a VCL NAL with first_mb_in_slice
+    == 0; the second slice (first_mb_in_slice > 0) belongs to the SAME picture, so
+    both slices share one access unit — one RTP timestamp, one marker (RFC 6184
+    §5.1). The buggy per-VCL split assigned each slice its own timestamp + marker.
+    """
+    slice1 = _slice(1, first_mb_zero=True, tail=b"\xaa")
+    slice2 = _slice(1, first_mb_zero=False, tail=b"\xbb")
+    assert group_access_units([slice1, slice2]) == [[slice1, slice2]]
+
+
+def test_group_access_units_two_multi_slice_pictures() -> None:
+    """Two pictures, each two slices, group into two access units of two slices."""
+    s1a = _slice(_NAL_TYPE_IDR, first_mb_zero=True, tail=b"\x01")
+    s1b = _slice(_NAL_TYPE_IDR, first_mb_zero=False, tail=b"\x02")
+    s2a = _slice(1, first_mb_zero=True, tail=b"\x03")
+    s2b = _slice(1, first_mb_zero=False, tail=b"\x04")
+    assert group_access_units([s1a, s1b, s2a, s2b]) == [[s1a, s1b], [s2a, s2b]]
+
+
+def test_group_access_units_aud_delimits_multi_slice_pictures() -> None:
+    """An Access-Unit-Delimiter (type 9) before a picture starts a new AU.
+
+    Realistic encoder output: AUD + multi-slice picture, repeated. The AUD (a
+    non-VCL NAL arriving after a completed picture) opens the next access unit.
+    """
+    aud = _nal(9, body=b"\xf0")
+    p1a = _slice(_NAL_TYPE_IDR, first_mb_zero=True, tail=b"\x01")
+    p1b = _slice(_NAL_TYPE_IDR, first_mb_zero=False, tail=b"\x02")
+    p2a = _slice(1, first_mb_zero=True, tail=b"\x03")
+    p2b = _slice(1, first_mb_zero=False, tail=b"\x04")
+    assert group_access_units([aud, p1a, p1b, aud, p2a, p2b]) == [
+        [aud, p1a, p1b],
+        [aud, p2a, p2b],
+    ]
+
+
+def test_stap_a_f_bit_is_or_of_aggregated_f_bits() -> None:
+    """STAP-A header F bit = OR of the aggregated NALs' F bits (RFC 6184 §5.7.1).
+
+    The forbidden_zero_bit MUST be set if ANY aggregated NAL has F=1 (a NAL whose
+    transport detected a bit error). Hardcoding F=0 emits a non-conformant header.
+    """
+    packetiser = H264Packetiser(ssrc=1, initial_sequence=0)
+    nal_f1 = bytes([0x80 | (3 << 5) | _NAL_TYPE_SPS]) + b"\x01"  # F=1
+    nal_f0 = _nal(_NAL_TYPE_PPS, body=b"\x02")  # F=0
+    packet = packetiser.aggregate_stap_a([nal_f1, nal_f0], timestamp=0)
+    stap_header = packet.payload[0]
+    assert stap_header & 0x1F == _NAL_TYPE_STAP_A
+    assert stap_header & 0x80, "F bit must be set when an aggregated NAL has F=1"
+
+
+@pytest.mark.asyncio
+async def test_video_sender_marker_on_each_access_unit_boundary() -> None:
+    """The RTP marker is set on the last packet of EACH access unit, only there.
+
+    AU#0 is large enough to FU-A-fragment (multiple packets, intra-AU packets
+    unmarked); AU#1 is a single-NAL coded slice. Across one pass exactly two
+    markers fire — one per picture boundary (RFC 6184 §5.1).
+    """
+    big_idr = _slice(_NAL_TYPE_IDR, first_mb_zero=True, tail=b"\x00" * 200)
+    p_slice = _slice(1, first_mb_zero=True, tail=b"\x01" * 10)
+    srtp = _FakeSrtp()
+    ice = _FakeIce()
+    sender = RtpVideoSender(
+        nals=[big_idr, p_slice], srtp=srtp, ice=ice, ssrc=7, fps=10, mtu_payload=64
+    )
+    await sender.send_loop_once()
+    markers = [p.marker for p in srtp.protected]
+    assert markers.count(True) == 2, "exactly one marker per access unit"
+    # AU#0 fragmented into >1 packet, so there is at least one intra-AU unmarked
+    # packet before its boundary marker.
+    assert markers[0] is False
+    assert markers[-1] is True
+    # The two marked packets are the last of each AU; group the timestamps to
+    # confirm two access units with distinct timestamps.
+    marked_ts = {p.timestamp for p in srtp.protected if p.marker}
+    assert len(marked_ts) == 2

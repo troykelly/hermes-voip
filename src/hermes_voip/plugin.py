@@ -28,6 +28,12 @@ import os
 import ssl
 from typing import TYPE_CHECKING
 
+from hermes_voip.caller_modes import CallerMode as _CallerMode
+from hermes_voip.caller_modes import (
+    canonical_channel_groups,
+    channel_for_group,
+    group_for_mode,
+)
 from hermes_voip.config import load_gateway_config
 
 if TYPE_CHECKING:
@@ -36,7 +42,13 @@ if TYPE_CHECKING:
         PluginContextProtocol,
     )
 
-__all__ = ["register", "validate_voip_config"]
+__all__ = [
+    "channel_env_enablement",
+    "channel_is_never_independently_connected",
+    "channel_platform_names",
+    "register",
+    "validate_voip_config",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -79,6 +91,67 @@ _EXTRA_ENV_PREFIXES: tuple[str, ...] = ("HERMES_SIP_", "HERMES_VOIP_")
 # ``HERMES_VOIP_TTS_PROVIDER=elevenlabs``.  Neither carries one of the two
 # prefixes above, so they must be copied by exact name alongside the prefix match.
 _EXTRA_ENV_KEYS: frozenset[str] = frozenset({"DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY"})
+
+# The primary platform name (the one connecting adapter). ADR-0035 adds the caller-
+# group CHANNEL platforms as routing aliases of this one.
+_PLATFORM_NAME = "voip"
+
+
+def channel_platform_names() -> tuple[str, ...]:
+    """The caller-group CHANNEL platform names this plugin registers (ADR-0035).
+
+    The operator's four canonical channels (``voip-unknown`` / ``voip-known`` /
+    ``voip-operator`` / ``voip-intercom``) plus the channels the legacy ADR-0020 modes
+    and the outbound group resolve to (``voip-receptionist`` / ``voip-blocked`` /
+    ``voip-outbound``) — every channel an inbound or outbound call may route to under
+    the default/canonical groups. Registering these as platforms makes
+    ``gateway.config.Platform(<channel>)`` resolve (its ``_missing_`` hook only
+    accepts registered plugin platforms) and lets the operator target a channel with
+    per-platform ``tools_config`` / ``disabled_toolsets``. Custom channels named in a
+    groups file are registered on demand by
+    :func:`hermes_voip.adapter.ensure_channel_registered`.
+
+    Ordered + de-duplicated; the primary ``voip`` platform is NOT included (it is the
+    connecting adapter, registered separately).
+    """
+    names: list[str] = [channel_for_group(g) for g in canonical_channel_groups()]
+    # The legacy ADR-0020 default modes (ALLOW/GREY/OUTBOUND) and their channels.
+    for mode in (_CallerMode.ALLOW, _CallerMode.GREY, _CallerMode.OUTBOUND):
+        names.append(channel_for_group(group_for_mode(mode)))
+    # The blocked group is declined at SIP and never reaches a turn, but include its
+    # channel for completeness/audit symmetry (it costs one inert registry entry).
+    names.append("voip-blocked")
+    # De-duplicate, preserve first-seen order, drop the primary platform if present.
+    seen: dict[str, None] = {}
+    for name in names:
+        if name and name != _PLATFORM_NAME:
+            seen.setdefault(name, None)
+    return tuple(seen)
+
+
+def channel_is_never_independently_connected(_config: object) -> bool:
+    """A channel alias never connects on its own (the primary ``voip`` does).
+
+    Returning ``False`` keeps the gateway from enabling a second connecting platform
+    for a routing alias — the channels exist for session routing + per-platform tool
+    config, not their own SIP/RTP transport. (The alias is still *registered*, so
+    ``Platform(channel)`` resolves; registration, not enablement, is what ``_missing_``
+    checks.) The ``_config`` probe is part of the ``is_connected`` callback contract but
+    is unused — the answer is unconditionally "no".
+
+    Public (not ``_``-prefixed) so the adapter's ``ensure_channel_registered`` — which
+    builds the on-demand alias ``PlatformEntry`` in the hermes-importing module — can
+    reuse the exact same inert-enablement callback as :func:`register`.
+    """
+    return False
+
+
+def channel_env_enablement() -> dict[str, str]:
+    """A channel alias seeds no env of its own (it does not independently connect).
+
+    Public for the same reason as :func:`channel_is_never_independently_connected`.
+    """
+    return {}
 
 
 def validate_voip_config(config: object) -> bool:
@@ -237,6 +310,15 @@ def register(ctx: PluginContextProtocol) -> None:
         is_connected=_is_connected,
     )
 
+    # ADR-0035: register each caller-group CHANNEL as a first-class platform aliasing
+    # the one voip adapter (the operator's "Telegram model" — one Hermes, many
+    # channels). This makes the channel name resolve via Platform(<channel>) and lets
+    # the operator scope per-platform tools_config / disabled_toolsets to a channel.
+    # The aliases share the primary adapter_factory + check_fn (one telephony
+    # endpoint, many routing identities) and never connect independently
+    # (is_connected → False), so no second SIP/RTP transport is brought up.
+    _register_channel_platforms(ctx)
+
     # Register the agent-facing VoIP tools (the hang_up tool) + the pre_tool_call
     # gate (ADR-0026). Without this the agent has no way to end a call. Imported
     # lazily so a bare ``import hermes_voip.plugin`` stays light; the helper itself
@@ -245,3 +327,27 @@ def register(ctx: PluginContextProtocol) -> None:
     from hermes_voip.voip_tools import register_voip_tools  # noqa: PLC0415
 
     register_voip_tools(ctx)
+
+
+def _register_channel_platforms(ctx: PluginContextProtocol) -> None:
+    """Register each caller-group CHANNEL as a routing-alias platform (ADR-0035).
+
+    One ``register_platform`` call per channel in :func:`channel_platform_names`,
+    each reusing the primary ``voip`` adapter factory + ``check_fn`` so a channel is
+    a routing identity over the one adapter, not a second connecting platform. The
+    aliases declare ``is_connected`` → ``False`` and an empty env seed so the gateway
+    enables only the primary ``voip``; the aliases exist so ``Platform(<channel>)``
+    resolves and per-platform tool config can target a channel.
+    """
+    for channel in channel_platform_names():
+        ctx.register_platform(
+            channel,
+            f"VoIP channel: {channel}",
+            _adapter_factory,
+            _check_fn,
+            validate_config=validate_voip_config,
+            required_env=list(_REQUIRED_ENV),
+            install_hint=_INSTALL_HINT,
+            env_enablement_fn=channel_env_enablement,
+            is_connected=channel_is_never_independently_connected,
+        )

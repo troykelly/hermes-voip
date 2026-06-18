@@ -149,11 +149,15 @@ Concrete shape:
   > or a timeout transfers nobody, and a call that negotiated no telephone-event refuses
   > LOUDLY (never a silent no-op). The `pre_tool_call` gate clamps privilege as a
   > fail-fast (an unprivileged/degraded caller is blocked before the confirm prompt is
-  > ever spoken). The **SIP INFO** and **in-band** mechanisms (both send AND receive)
-  > remain DEFERRED — and are now rejected at config load rather than silently inert (see
-  > the Configuration bullet). **Attended transfer remains DEFERRED** (ADR-0031 §4: no
-  > agent-driven consult-leg Dialog origination), so `transfer_attended` stays
-  > not-registered.
+  > ever spoken). The **SIP INFO** and **in-band** mechanisms (both send AND receive) are
+  > now ALSO SHIPPED — see **ADR-0036**, which supersedes the "deferred" status here:
+  > `HERMES_SIP_DTMF_MODE` accepts all four ADR-0010 values, a single per-call resolver
+  > (`hermes_voip.dtmf_config`) picks the send + receive backend, the SIP-INFO codec lives
+  > in `hermes_voip.dtmf_sipinfo` (handled in-dialog by `CallSession`), and the in-band
+  > Goertzel detector + tone generator live in `hermes_voip.dtmf` (engine-wired, G.711
+  > only). All three mechanisms feed the same `CallLoop.feed_dtmf` router.
+  > **Attended transfer remains DEFERRED** (ADR-0031 §4: no agent-driven consult-leg
+  > Dialog origination), so `transfer_attended` stays not-registered.
 
 - **Surfacing inbound digits — no fake transcript.** Because Hermes has no DTMF
   `MessageType`, the call/turn controller (ADR-0003) consumes the `DtmfDigit` stream
@@ -185,19 +189,22 @@ Concrete shape:
   unreliable in-band last resort outright). Tests and examples use the obvious fakes
   (host `pbx.example.test`, extension `1000`).
 
-  > **As built (no inert key — rule 27).** Because only RFC 4733 is implemented (send
-  > AND receive), `HERMES_SIP_DTMF_MODE` accepts ONLY `auto` and `rfc4733`; `sip_info`
-  > and `inband` are **rejected at config load** with a loud `ConfigError` rather than
-  > parsed into a value that does nothing. Each surviving key drives a real outcome:
-  > `resolve_dtmf_receive_mode(config, telephone_event_payload_type)`
-  > (`hermes_voip.dtmf_config`) maps the mode + `HERMES_SIP_DTMF_INBAND_ENABLED` + the
-  > negotiated telephone-event PT to a `DtmfReceiveMode` (`RFC4733` /  `DISABLED` /
-  > `UNAVAILABLE`); the adapter wires the receiver on `RFC4733`, logs a WARNING on
-  > `UNAVAILABLE` (DTMF was wanted but the gateway negotiated no telephone-event), and
-  > stays silent on `DISABLED`. `HERMES_SIP_DTMF_INBAND_ENABLED` changes which of
-  > `DISABLED`/`UNAVAILABLE` a no-telephone-event call resolves to (it does NOT enable an
-  > in-band detector — that backend is unbuilt). `HERMES_SIP_DTMF_INTERDIGIT_MS` is the
-  > inbound menu-group delivery timeout (default 2000 ms when unset).
+  > **As built (no inert key — rule 27; ADR-0036).** All three mechanisms are now
+  > implemented, so `HERMES_SIP_DTMF_MODE` accepts all four ADR-0010 values (`auto` |
+  > `rfc4733` | `sip_info` | `inband`) and each drives a real backend (the interim
+  > fail-loud rejection of `sip_info`/`inband` is gone). The resolvers
+  > `resolve_dtmf_send_mode` / `resolve_dtmf_receive_mode(config, *,
+  > telephone_event_payload_type, codec)` (`hermes_voip.dtmf_config`) map the mode +
+  > `HERMES_SIP_DTMF_INBAND_ENABLED` + the negotiated PT + the negotiated codec to a
+  > concrete backend. `auto` prefers RFC 4733, else the in-band last resort on a G.711
+  > call; a forced `sip_info` always resolves (in-dialog signalling); a forced `inband`
+  > resolves on G.711 else `UNAVAILABLE`. The adapter wires the resolved receive backend
+  > (RFC 4733 / SIP INFO / in-band) to `CallLoop.feed_dtmf` and binds the
+  > armed-confirmation resolver for each; `UNAVAILABLE` logs a WARNING and `DISABLED`
+  > stays silent. `HERMES_SIP_DTMF_INBAND_ENABLED` now genuinely permits/forbids the
+  > in-band backend (it IS built). `HERMES_SIP_DTMF_INTERDIGIT_MS` is the inbound
+  > menu-group delivery timeout (default 2000 ms when unset). In-band is trusted ONLY on
+  > G.711 (a lossy/wideband codec distorts the dual-tone waveform).
 
 - **File paths.** `src/hermes_voip/dtmf/` holds `detector.py` (protocol + mode
   negotiation), `rfc4733.py` (event-payload codec + RTP state machine), `sip_info.py`,

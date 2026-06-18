@@ -456,6 +456,18 @@ start otherwise). A `blocked` group is hung up at ring time with a polite declin
 agent is ever involved. The complete schema, the security model, and how to keep the lists in
 1Password are in [the caller-groups runbook](docs/runbooks/0010-voip-caller-modes.md).
 
+**Separate conversations per caller (channels).** Each group also routes its calls to a Hermes
+**channel** — a separate conversation with its own permitted tools, just like having one
+assistant on several chat platforms. Out of the box you get `voip-unknown` (untrusted callers —
+the agent only talks, no sensitive tools), `voip-known` (a known contact — hold/resume),
+`voip-operator` (you — everything), and `voip-intercom` (a door/gate — only the "open" action).
+An unknown caller and you no longer share one conversation. Add `"channel": "voip-unknown"` (or
+any name) to a group to choose its channel, and `"allowed_tools": ["hold_call"]` to set exactly
+which tools that channel may use. One thing this does **not** do: it doesn't give each channel
+its own memory or secrets — it's still one agent, so the caller's number is never treated as a
+password. (See the runbook for the full picture, including how to fully isolate the untrusted
+channel by running it as a separate Hermes profile.)
+
 > If your Hermes gateway runs its own caller-pairing flow, set `GATEWAY_ALLOW_ALL_USERS=true`
 > in the **gateway** config so caller groups become the single front door. The runbook explains
 > why.

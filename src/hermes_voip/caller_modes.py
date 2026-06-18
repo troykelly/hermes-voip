@@ -64,6 +64,8 @@ __all__ = [
     "CallerModeConfig",
     "Normalization",
     "caller_mode_config_to_groups",
+    "canonical_channel_groups",
+    "channel_for_group",
     "classify_caller",
     "classify_caller_group",
     "group_for_mode",
@@ -171,6 +173,18 @@ class CallerGroup:
             one above ``privilege_level``. The intercom group uses this to expose
             ONLY its entry action (``open_entry`` / ``send_dtmf``), so even a
             spoofed caller-ID reaching the group cannot reach operator tools.
+            Under ADR-0035 this set is *also* the channel's per-channel permitted
+            tool set (the operator's "separate permissions").
+        channel: The Hermes channel (platform name) a call in this group is
+            delivered to (ADR-0035 — the "Telegram model": one Hermes, many
+            channels). EMPTY (the default) resolves to the canonical
+            ``voip-<name>`` via :func:`channel_for_group`; a non-empty value is
+            used verbatim. The channel is the routing identity an inbound call's
+            :class:`~gateway.session.SessionSource` carries, so each group lands in
+            its own session namespace with its own conversation + per-platform tool
+            config. The channel is derived from the FORGEABLE caller-ID and is never
+            authentication — the untrusted-data fence + the ``allowed_tools`` ceiling
+            are what make a spoofed identity safe, not the channel name.
     """
 
     name: str
@@ -178,6 +192,20 @@ class CallerGroup:
     persona: str
     declined_at_sip: bool
     allowed_tools: frozenset[str] = frozenset()
+    channel: str = ""
+
+
+def channel_for_group(group: CallerGroup) -> str:
+    """Resolve the Hermes channel (platform name) for a caller group (ADR-0035).
+
+    The single chokepoint for the channel default: an empty
+    :attr:`CallerGroup.channel` resolves to the canonical ``voip-<group-name>``; a
+    non-empty channel is returned verbatim (no ``voip-`` prefix forced, so an
+    operator can name a channel ``voip-unknown`` on the receptionist group). Routing
+    in Hermes is by ``event.source.platform`` alone, so this string is what places a
+    call in its channel's own session namespace.
+    """
+    return group.channel or f"voip-{group.name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,6 +649,75 @@ _DEFAULT_THREE_GROUPS: tuple[CallerGroup, ...] = (
     _RECEPTIONIST_GROUP,
     _BLOCKED_GROUP,
 )
+
+
+# ADR-0035: the operator's four canonical CHANNELS (the "Telegram model"). Each is a
+# distinct Hermes platform name with its own per-channel PERMITTED tool set (the
+# existing allowed_tools sub-ceiling reframed as "this channel's permissions"). The
+# agent ALWAYS handles the call (ADR-0021 correction); the channel decides the
+# conversation + which tools are reachable, NOT whether the call is taken. Caller-ID
+# is forgeable, so the unknown channel's no-sensitive-tools ceiling — not the channel
+# name — is what bounds a spoofed identity. Operator-overridable via a groups file.
+_CANONICAL_CHANNEL_GROUPS: tuple[CallerGroup, ...] = (
+    # Untrusted / unknown caller: the receptionist conversation, NO sensitive tool.
+    # privilege_level 0 already blocks every ELEVATED/IRREVERSIBLE tool through the
+    # gate; the empty allowed_tools keeps "no sub-ceiling" (level-only) so the agent
+    # still has the always-SAFE conversational tools (hang_up / report_call_result).
+    CallerGroup(
+        name="unknown",
+        privilege_level=0,
+        persona="receptionist",
+        declined_at_sip=False,
+        channel="voip-unknown",
+    ),
+    # Known contact: a limited conversation — hold/resume the call, but never
+    # place_call / transfer / open_entry. The explicit allowed_tools scopes the
+    # session to exactly hold/resume (stricter than level 2 alone, which would also
+    # expose send_dtmf / list_registrations).
+    CallerGroup(
+        name="known",
+        privilege_level=2,
+        persona="colleague",
+        declined_at_sip=False,
+        allowed_tools=frozenset({"hold_call", "resume_call"}),
+        channel="voip-known",
+    ),
+    # The operator (owner of the Hermes install): the full assistant — every tool,
+    # with IRREVERSIBLE actions still gated by ADR-0010 confirmation + a non-degraded
+    # session. No sub-ceiling. (open_entry stays intercom-only — it is grant-only.)
+    CallerGroup(
+        name="operator",
+        privilege_level=3,
+        persona="assistant",
+        declined_at_sip=False,
+        channel="voip-operator",
+    ),
+    # The door / gate intercom: scoped to ONLY the entry action. allowed_tools must
+    # list open_entry explicitly (it is a grant-only physical-access tool), so even a
+    # spoofed caller-ID reaching this channel can open the door but reach nothing else.
+    CallerGroup(
+        name="intercom",
+        privilege_level=2,
+        persona="intercom",
+        declined_at_sip=False,
+        allowed_tools=frozenset({"open_entry"}),
+        channel="voip-intercom",
+    ),
+)
+
+
+def canonical_channel_groups() -> tuple[CallerGroup, ...]:
+    """The operator's four canonical caller-group CHANNELS (ADR-0035).
+
+    ``voip-unknown`` (untrusted, no sensitive tool), ``voip-known`` (limited:
+    hold/resume), ``voip-operator`` (full assistant), ``voip-intercom`` (open_entry
+    only). Each is a distinct Hermes platform name carrying its own per-channel
+    permitted tool set (the ``allowed_tools`` sub-ceiling). These are the channels
+    :func:`hermes_voip.plugin.register` registers as first-class platforms and the
+    defaults an operator overrides with a groups file. Returned as an immutable tuple
+    (the groups themselves are frozen) so a caller cannot mutate the canonical set.
+    """
+    return _CANONICAL_CHANNEL_GROUPS
 
 
 def caller_mode_config_to_groups(cfg: CallerModeConfig) -> CallerGroupConfig:
@@ -1157,6 +1254,14 @@ def _parse_groups_document(  # noqa: PLR0912,PLR0915 — sequential validation o
                 "reaches a turn and must not have a persona"
             )
             raise ConfigError(msg)
+        # ADR-0035: optional per-group channel (a Hermes platform name). Absent ⇒
+        # empty (resolved to the canonical voip-<name> by channel_for_group). A
+        # non-string is a fail-loud ConfigError (rule 37 — a typo'd channel must not
+        # silently fall back and merge two groups into one session namespace).
+        channel = raw_g.get("channel", "")
+        if not isinstance(channel, str):
+            msg = f"{_GROUPS_FILE_KEY}: groups[{i}].channel must be a string"
+            raise ConfigError(msg)
         allowed_tools = _parse_allowed_tools(i, raw_g)
         groups.append(
             CallerGroup(
@@ -1165,6 +1270,7 @@ def _parse_groups_document(  # noqa: PLR0912,PLR0915 — sequential validation o
                 persona=persona,
                 declined_at_sip=declined_at_sip,
                 allowed_tools=allowed_tools,
+                channel=channel.strip(),
             )
         )
 

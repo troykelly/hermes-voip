@@ -96,7 +96,13 @@ packages = ["src/hermes_voip"]
 # Ship the plugin manifest as importable package data (ADR-0037) so the wheel is
 # self-describing: importlib.resources.files("hermes_voip")/"plugin.yaml" resolves it.
 # Non-.py files under the package dir are not included by hatchling unless declared.
-artifacts = ["src/hermes_voip/plugin.yaml"]
+artifacts = [
+  "src/hermes_voip/plugin.yaml",
+  # Bundled call-scenario skills (ADR-0047): skills/<name>/SKILL.md shipped as
+  # importable package data so register() can resolve each via
+  # importlib.resources.files("hermes_voip") / "skills" / <name> / "SKILL.md".
+  "src/hermes_voip/skills/**/SKILL.md",
+]
 
 # ---------------------------------------------------------------------------
 # Ruff — format + lint at high strictness (AGENTS.md rule 17). A strong curated

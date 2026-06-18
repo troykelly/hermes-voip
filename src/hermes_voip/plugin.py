@@ -328,6 +328,16 @@ def register(ctx: PluginContextProtocol) -> None:
 
     register_voip_tools(ctx)
 
+    # ADR-0047: register the bundled call-scenario skills (reception, take-message,
+    # intercom-open-for-delivery, make-reservation, enquire-price-availability). Each
+    # is a read-only, opt-in SKILL.md the agent loads on demand via skill_view; the
+    # persona preambles point the agent at the relevant ones. Imported lazily (keeps a
+    # bare import light) and guarded against a ctx without register_skill (older
+    # hermes-agent) inside the helper — the platform still registers either way.
+    from hermes_voip.skills import register_skills  # noqa: PLC0415
+
+    register_skills(ctx)
+
 
 def _register_channel_platforms(ctx: PluginContextProtocol) -> None:
     """Register each caller-group CHANNEL as a routing-alias platform (ADR-0035).

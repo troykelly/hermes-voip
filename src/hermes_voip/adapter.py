@@ -147,6 +147,7 @@ from hermes_voip.sdp import (
 )
 from hermes_voip.tools import gate_voip_tool
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
+from hermes_voip.transport.ws_connection import WssSipTransport
 from hermes_voip.voip_tools import (
     TRANSFER_BLIND_TOOL_NAME,
     TransferOutcome,
@@ -158,6 +159,13 @@ if TYPE_CHECKING:
     from hermes_voip.media.srtp import SrtpSession
 
 __all__ = ["VoipAdapter"]
+
+# The signalling transport is selected by HERMES_SIP_TRANSPORT (ADR-0037): both
+# classes satisfy the manager.SipTransport + call.CallSignaling Protocols (they
+# expose the identical method set — send / local_sent_by / contact_uri /
+# add_call / remove_call / bind_manager / connect / aclose), so every call site
+# below works against either member of this union with no escape hatch.
+SignalingTransport = SipOverTlsTransport | WssSipTransport
 
 _log = logging.getLogger(__name__)
 
@@ -338,7 +346,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._intercom_relay: IntercomRelayClient | None = None
         self._tls_ctx: ssl.SSLContext | None = None
         self._keepalive_interval: float = 30.0
-        self._transport: SipOverTlsTransport | None = None
+        self._transport: SignalingTransport | None = None
         self._manager: RegistrationManager | None = None
         self._connected = False
 
@@ -483,15 +491,33 @@ class VoipAdapter(BasePlatformAdapter):
             msg = "_establish called before config was populated by connect()"
             raise RuntimeError(msg)
 
-        transport = SipOverTlsTransport(
-            host=gateway_cfg.host,
-            port=gateway_cfg.port,
-            ssl_context=tls_ctx,
-            keepalive_interval=self._keepalive_interval,
-            on_new_call=self._on_inbound_invite,
-            on_unroutable=self._on_unroutable,
-            on_connection_lost=self._on_connection_lost,
-        )
+        # ADR-0037: select the signalling transport by HERMES_SIP_TRANSPORT. Both
+        # satisfy SipTransport + CallSignaling and are wired with the SAME inbound
+        # observers, so an INVITE over WSS reaches _on_inbound_invite identically
+        # to a TLS INVITE (and falls into the existing is_webrtc branch). wss:// is
+        # WebSocket-over-TLS, so the WSS transport verifies the gateway certificate
+        # with the SAME ssl context the TLS transport uses.
+        transport: SignalingTransport
+        if gateway_cfg.transport == "wss":
+            transport = WssSipTransport(
+                host=gateway_cfg.host,
+                port=gateway_cfg.port,
+                ws_path=gateway_cfg.ws_path,
+                ssl_context=tls_ctx,
+                on_new_call=self._on_inbound_invite,
+                on_unroutable=self._on_unroutable,
+                on_connection_lost=self._on_connection_lost,
+            )
+        else:
+            transport = SipOverTlsTransport(
+                host=gateway_cfg.host,
+                port=gateway_cfg.port,
+                ssl_context=tls_ctx,
+                keepalive_interval=self._keepalive_interval,
+                on_new_call=self._on_inbound_invite,
+                on_unroutable=self._on_unroutable,
+                on_connection_lost=self._on_connection_lost,
+            )
         self._transport = transport
 
         # Open the TLS connection FIRST: the transport learns its local socket
@@ -1297,6 +1323,14 @@ class VoipAdapter(BasePlatformAdapter):
         if transport is None:
             _log.warning("INVITE %s arrived after transport closed — ignored", call_id)
             return
+        gateway_cfg = self._gateway_cfg
+        if gateway_cfg is None:  # connect() populates this before any INVITE
+            msg = f"INVITE {call_id}: gateway config not initialised"
+            raise RuntimeError(msg)
+        # ADR-0037: the Via transport token for the inbound dialog + the
+        # agent-facing call context follows the configured transport (TLS | WSS),
+        # not a hardcoded literal — a call received over WSS advertises WSS.
+        via_transport = gateway_cfg.via_transport
 
         # --- Caller-group classification (ADR-0021) --------------------------
         # Classify the (forgeable) caller-ID FIRST, before any media work, so a
@@ -1420,7 +1454,7 @@ class VoipAdapter(BasePlatformAdapter):
             local_tag=local_tag,
             local_contact=local_contact,
             local_sent_by=transport.local_sent_by,
-            transport="TLS",
+            transport=via_transport,
         )
 
         # --- Open the media engine + answer (SDES or WebRTC path) -----------
@@ -1525,13 +1559,14 @@ class VoipAdapter(BasePlatformAdapter):
         # and FORGEABLE, so it is surfaced to the agent only as a labelled,
         # untrusted block (never used for authorization). `codec`, `audio`, and
         # `is_webrtc` are in scope here from the SDP-negotiation steps above; the
-        # signalling transport is SIP-over-TLS (the dialog's `transport="TLS"`).
+        # signalling transport is the configured one (TLS | WSS, ADR-0037) — the
+        # same token the dialog above carries.
         call_context = extract_call_context(
             invite,
             negotiated_codec=codec.encoding,
             is_srtp=audio.is_srtp,
             is_webrtc=is_webrtc,
-            transport="TLS",
+            transport=via_transport,
         )
         self._call_info[call_id] = {
             "name": caller_number,
@@ -1603,7 +1638,7 @@ class VoipAdapter(BasePlatformAdapter):
         agreed_sdp_codecs: tuple[SdpCodec, ...],
         engine_codec: Codec,
         codec: SdpCodec,
-        transport: SipOverTlsTransport,
+        transport: SignalingTransport,
         local_tag: str,
         local_contact: str,
         local_rtp_host: str,
@@ -1723,7 +1758,7 @@ class VoipAdapter(BasePlatformAdapter):
         agreed_sdp_codecs: tuple[SdpCodec, ...],
         engine_codec: Codec,
         codec: SdpCodec,
-        transport: SipOverTlsTransport,
+        transport: SignalingTransport,
         local_tag: str,
         local_contact: str,
         local_rtp_host: str,
@@ -1917,7 +1952,7 @@ class VoipAdapter(BasePlatformAdapter):
         self,
         *,
         invite: SipRequest,
-        transport: SipOverTlsTransport,
+        transport: SignalingTransport,
         local_tag: str,
         local_contact: str,
         answer_sdp: str,
@@ -2129,7 +2164,7 @@ class VoipAdapter(BasePlatformAdapter):
         *,
         call_id: str,
         engine: RtpMediaTransport,
-        transport: SipOverTlsTransport,
+        transport: SignalingTransport,
         dialog_id: tuple[str, str, str],
         session: CallSession | None = None,
         call_loop: CallLoop | None = None,

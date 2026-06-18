@@ -97,14 +97,14 @@ def test_transport_wss_defaults() -> None:
     assert cfg.transport == "wss"
     assert cfg.via_transport == "WSS"
     assert cfg.port == 443
-    # ADR-0035: the WebSocket upgrade path defaults to /ws when unset.
+    # ADR-0037: the WebSocket upgrade path defaults to /ws when unset.
     assert cfg.ws_path == "/ws"
     # No separate WSS password unset ⇒ None (the digest falls back to the SIP pw).
     assert cfg.ws_password is None
 
 
 def test_ws_path_override() -> None:
-    """ADR-0035: HERMES_SIP_WS_PATH overrides the default WebSocket upgrade path."""
+    """ADR-0037: HERMES_SIP_WS_PATH overrides the default WebSocket upgrade path."""
     cfg = load_gateway_config(
         _base(
             HERMES_SIP_EXTENSION="1000",
@@ -125,7 +125,7 @@ def test_ws_path_default_on_tls() -> None:
 
 
 def test_ws_password_parsed_and_repr_suppressed() -> None:
-    """ADR-0035: HERMES_SIP_WS_PASSWORD is read and NEVER appears in repr (a secret)."""
+    """ADR-0037: HERMES_SIP_WS_PASSWORD is read and NEVER appears in repr (a secret)."""
     cfg = load_gateway_config(
         _base(
             HERMES_SIP_EXTENSION="1000",
@@ -205,7 +205,7 @@ def test_registration_config_builder() -> None:
 
 
 def test_registration_config_wss_password_override() -> None:
-    """ADR-0035: on wss with a WS password set, the digest uses the WS password."""
+    """ADR-0037: on wss with a WS password set, the digest uses the WS password."""
     cfg = load_gateway_config(
         _base(
             HERMES_SIP_EXTENSION="1000",
@@ -227,7 +227,7 @@ def test_registration_config_wss_password_override() -> None:
 
 
 def test_registration_config_wss_password_falls_back_to_sip_password() -> None:
-    """ADR-0035: on wss with NO WS password, the digest falls back to the SIP pw."""
+    """ADR-0037: on wss with NO WS password, the digest falls back to the SIP pw."""
     cfg = load_gateway_config(
         _base(
             HERMES_SIP_EXTENSION="1000",

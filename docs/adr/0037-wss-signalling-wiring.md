@@ -1,4 +1,4 @@
-# ADR-0035: SIP-over-WSS signalling wiring (select the transport by config)
+# ADR-0037: SIP-over-WSS signalling wiring (select the transport by config)
 
 - **Date:** 2026-06-18
 - **Status:** Accepted (amends ADR-0016 §1/§6 and ADR-0032 §5)

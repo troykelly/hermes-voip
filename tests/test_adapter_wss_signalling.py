@@ -1,4 +1,4 @@
-"""VoipAdapter SIP-over-WSS signalling wiring (ADR-0035).
+"""VoipAdapter SIP-over-WSS signalling wiring (ADR-0037).
 
 ``adapter._establish()`` selects the signalling transport by
 ``gateway_cfg.transport``: ``tls`` builds ``SipOverTlsTransport`` (unchanged),
@@ -29,6 +29,7 @@ pytest.importorskip("gateway.platforms.base")
 pytest.importorskip("gateway.config")
 
 from gateway.config import PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_voip.config import ExtensionConfig, GatewayConfig, load_media_config
 from hermes_voip.manager import NewCall, RegistrationManager
@@ -38,6 +39,24 @@ from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
 from hermes_voip.sdp import Fingerprint, IceCandidate, SessionDescription, SetupRole
+
+
+@pytest.fixture(autouse=True)
+def _register_voip_platform() -> None:
+    """Register a throwaway "voip" entry so ``Platform("voip")`` resolves."""
+    if not platform_registry.is_registered("voip"):
+        platform_registry.register(
+            PlatformEntry(
+                name="voip",
+                label="VoIP",
+                adapter_factory=lambda cfg: MagicMock(),
+                check_fn=lambda: True,
+                validate_config=lambda cfg: True,
+                required_env=[],
+                install_hint="",
+                source="plugin",
+            )
+        )
 
 
 async def _until(
@@ -229,15 +248,15 @@ async def test_establish_selects_wss_transport_when_transport_wss() -> None:
     kwargs = wss_ctor.call_args.kwargs
     assert kwargs["host"] == "pbx.example.test"
     assert kwargs["port"] == 443
-    # The WS upgrade path is threaded from config (ADR-0035 §3).
+    # The WS upgrade path is threaded from config (ADR-0037 §3).
     assert kwargs["ws_path"] == "/ws"
     # wss:// is WebSocket-over-TLS — the same SSL context the TLS path verifies with.
     assert kwargs["ssl_context"] is not None
-    # The SAME inbound observer seams the TLS path uses (ADR-0035 §1) — wired so a
+    # The SAME inbound observer seams the TLS path uses (ADR-0037 §1) — wired so a
     # WSS-arriving INVITE reaches the identical inbound handling.
-    assert kwargs["on_new_call"] == adapter._on_inbound_invite  # type: ignore[attr-defined]
-    assert kwargs["on_unroutable"] == adapter._on_unroutable  # type: ignore[attr-defined]
-    assert kwargs["on_connection_lost"] == adapter._on_connection_lost  # type: ignore[attr-defined]
+    assert kwargs["on_new_call"] == adapter._on_inbound_invite
+    assert kwargs["on_unroutable"] == adapter._on_unroutable
+    assert kwargs["on_connection_lost"] == adapter._on_connection_lost
     # The manager was bound to the WSS transport (demux/routing).
     assert transport.bound_manager is manager
 
@@ -436,15 +455,15 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
         inbound_sample_rate=16_000,
     )
 
+    # Capture the transport kwarg the adapter passes to extract_call_context,
+    # delegating to the real implementation so the call context is still built.
+    from hermes_voip.call_context import extract_call_context  # noqa: PLC0415
+
     captured_context: dict[str, object] = {}
-    real_extract = None
-    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
 
-    real_extract = adapter_mod.extract_call_context
-
-    def _capture_extract(invite_arg: object, **kw: object) -> object:
+    def _capture_extract(invite_arg: SipRequest, **kw: object) -> object:
         captured_context.update(kw)
-        return real_extract(invite_arg, **kw)  # type: ignore[misc, arg-type]
+        return extract_call_context(invite_arg, **kw)  # type: ignore[arg-type]  # **kw is the adapter's exact kwargs
 
     try:
         with (
@@ -482,7 +501,7 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
             # WSS, copied from the inbound INVITE.
             assert "SIP/2.0/WSS" in (ok.header("Via") or "")
 
-            # ADR-0035 §2: the agent-facing call context reports the WSS transport
+            # ADR-0037 §2: the agent-facing call context reports the WSS transport
             # (derived from gateway via_transport, NOT the hardcoded "TLS").
             assert captured_context.get("transport") == "WSS"
     finally:

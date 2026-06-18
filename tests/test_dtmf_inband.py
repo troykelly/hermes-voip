@@ -141,6 +141,36 @@ def test_voiced_speech_sweep_is_not_a_digit() -> None:
     assert _feed_all(detector, bytes(out)) == []
 
 
+def test_harmonic_speech_landing_on_dtmf_pair_is_rejected() -> None:
+    """A voiced source whose harmonics land on a DTMF pair is rejected (review #1).
+
+    f0 = 189 Hz has a 4th harmonic near 770 (a low tone) and a 7th near 1323 (a high
+    tone); a bare two-bin test could read this as a keypress. The harmonic-corroboration
+    test rejects it because the voiced source ALSO carries energy at the second harmonic
+    of each tone and the difference frequency, which a real DTMF generator never emits.
+    """
+    detector = InbandDtmfDetector(sample_rate=_RATE)
+    out = bytearray()
+    for n in range(_FRAME * 30):
+        f0 = 189.0
+        v = sum(
+            amp * math.sin(2 * math.pi * h * f0 * n / _RATE)
+            for h, amp in (
+                (1, 0.6),
+                (2, 0.4),
+                (3, 0.3),
+                (4, 0.55),
+                (5, 0.25),
+                (6, 0.2),
+                (7, 0.5),
+                (8, 0.15),
+            )
+        )
+        s = int(0.3 * 32767.0 * v / 2.95)
+        out += struct.pack("<h", max(-32768, min(32767, s)))
+    assert _feed_all(detector, bytes(out)) == []
+
+
 def test_mismatched_twist_pair_is_rejected() -> None:
     # A row+column pair where one tone is far louder than the other (twist far
     # beyond the allowed bound) is not a valid keypress.

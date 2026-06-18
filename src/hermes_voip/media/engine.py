@@ -2056,6 +2056,32 @@ class RtpMediaTransport:
         self._dtmf_send_mode = value
 
     @property
+    def inband_dtmf_rx_enabled(self) -> bool:
+        """Whether the in-band Goertzel DTMF detector is armed on the inbound path.
+
+        Settable after construction — the outbound path resolves the receive backend
+        only after the 2xx answer, so it arms in-band here. Setting it (re)makes the
+        per-call detector at the current analysis rate (or clears it), so a value set
+        post-:meth:`connect` takes effect on the next inbound frame. Inbound DTMF still
+        only surfaces when :attr:`on_dtmf` is set.
+        """
+        return self._inband_dtmf_rx_enabled
+
+    @inband_dtmf_rx_enabled.setter
+    def inband_dtmf_rx_enabled(self, value: bool) -> None:
+        self._inband_dtmf_rx_enabled = value
+        # (Re)create or clear the detector now so a value set after connect() — the
+        # outbound path resolves the backend post-answer — actually takes effect:
+        # connect() built it from the ctor flag; this keeps the two in sync.
+        if value:
+            if self._inband_detector is None:
+                self._inband_detector = InbandDtmfDetector(
+                    sample_rate=self._analysis_sample_rate
+                )
+        else:
+            self._inband_detector = None
+
+    @property
     def codec_encoding(self) -> str:
         """The negotiated audio codec's encoding name (``PCMU`` / ``G722`` / ...).
 

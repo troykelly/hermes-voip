@@ -11,9 +11,12 @@ Fakes only (``pbx.example.test``, ext ``1000``/``2000``, ``198.51.100.x``).
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
+
 import pytest
 
-from hermes_voip.call import CallSession
+from hermes_voip.call import CallError, CallSession
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.dtmf import DtmfSendMode
@@ -111,6 +114,40 @@ def _last_request(signaling: _FakeSignaling, method: str) -> SipRequest:
     raise AssertionError(msg)
 
 
+def _ok_for(request: SipRequest) -> SipResponse:
+    """A 200 OK response for an in-dialog request (echoing its Call-ID/CSeq)."""
+    via = request.header("Via") or ""
+    cseq = request.header("CSeq") or ""
+    return SipResponse.parse(
+        f"SIP/2.0 200 OK\r\nVia: {via}\r\n"
+        f"From: {request.header('From')}\r\nTo: {request.header('To')};tag=theirs\r\n"
+        f"Call-ID: {request.header('Call-ID')}\r\nCSeq: {cseq}\r\n\r\n"
+    )
+
+
+async def _drive_acking_200(
+    session: CallSession, signaling: _FakeSignaling, coro: Awaitable[None]
+) -> None:
+    """Run ``coro`` (a send_dtmf* call) while feeding a 200 to each INFO it sends.
+
+    ``send_dtmf_info`` now awaits each INFO's final response, so the test must answer
+    them; poll the signaling log and ``on_response`` a 200 for every INFO not yet acked.
+    """
+    task = asyncio.ensure_future(coro)
+    acked = 0
+    while not task.done():
+        infos = [
+            SipRequest.parse(t)
+            for t in signaling.sent
+            if not t.startswith("SIP/2.0 ") and SipRequest.parse(t).method == "INFO"
+        ]
+        for info in infos[acked:]:
+            await session.on_response(_ok_for(info))
+            acked += 1
+        await asyncio.sleep(0)
+    await task
+
+
 # --- receive ----------------------------------------------------------------
 
 
@@ -161,7 +198,9 @@ async def test_inbound_dtmf_info_without_callback_does_not_crash() -> None:
 async def test_send_dtmf_info_emits_in_dialog_info_per_digit() -> None:
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media)
-    await session.send_dtmf_info("12", duration_ms=160)
+    await _drive_acking_200(
+        session, signaling, session.send_dtmf_info("12", duration_ms=160)
+    )
     infos = [
         SipRequest.parse(t)
         for t in signaling.sent
@@ -176,11 +215,39 @@ async def test_send_dtmf_info_emits_in_dialog_info_per_digit() -> None:
     assert media.dtmf == []  # SIP-INFO send never touched the media engine
 
 
+async def test_send_dtmf_info_raises_on_gateway_rejection() -> None:
+    """A >= 400 final response to an INFO surfaces as CallError (digit not accepted)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.ensure_future(session.send_dtmf_info("5"))
+    # Answer the INFO with a 415 (unsupported media) rather than a 200.
+    while not task.done():
+        infos = [
+            SipRequest.parse(t)
+            for t in signaling.sent
+            if not t.startswith("SIP/2.0 ") and SipRequest.parse(t).method == "INFO"
+        ]
+        if infos:
+            info = infos[-1]
+            await session.on_response(
+                SipResponse.parse(
+                    f"SIP/2.0 415 Unsupported Media Type\r\n"
+                    f"Via: {info.header('Via')}\r\n"
+                    f"From: {info.header('From')}\r\nTo: {info.header('To')};tag=x\r\n"
+                    f"Call-ID: {info.header('Call-ID')}\r\n"
+                    f"CSeq: {info.header('CSeq')}\r\n\r\n"
+                )
+            )
+        await asyncio.sleep(0)
+    with pytest.raises(CallError, match="415"):
+        await task
+
+
 async def test_send_dtmf_routes_to_sip_info_when_mode_is_sip_info() -> None:
     """send_dtmf in SIP-INFO send mode emits INFO, not RFC 4733 media tones."""
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media, dtmf_send_mode=DtmfSendMode.SIP_INFO)
-    await session.send_dtmf("9")
+    await _drive_acking_200(session, signaling, session.send_dtmf("9"))
     info = _last_request(signaling, "INFO")
     assert parse_dtmf_info(info.header("Content-Type") or "", info.body) == "9"
     assert media.dtmf == []

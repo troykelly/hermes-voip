@@ -241,9 +241,13 @@ _INBAND_MIN_FRAME_ENERGY = 5.0e5
 _INBAND_MIN_TONE_FRACTION = 0.33
 # ...and their COMBINED energy must be at least this fraction of the frame's energy.
 # This is the PRIMARY speech rejecter: a clean DTMF pair scores ~1.0 (all energy in
-# two bins), whereas voiced speech spreads energy across many bins and tops out far
-# below (measured ~0.10-0.17 on adversarial harmonic glides).
-_INBAND_MIN_COMBINED_FRACTION = 0.65
+# two bins), whereas voiced speech spreads energy across its full harmonic series and
+# tops out far below (measured ~0.04-0.17 on harmonic glides). Set HIGH (0.80) so a
+# voiced source whose two strongest harmonics happen to land near a DTMF pair is still
+# rejected by the energy it carries in its OTHER harmonics. (A signal that is spectrally
+# ONLY two pure DTMF tones is, by definition, indistinguishable from a real keypress —
+# the fundamental limit that makes in-band the LAST resort, ADR-0010/0034.)
+_INBAND_MIN_COMBINED_FRACTION = 0.80
 # Forward/reverse twist: the louder tone may exceed the quieter by at most this ratio
 # (~8 dB). A wildly mismatched "pair" is not a keypress.
 _INBAND_MAX_TWIST = 6.3
@@ -251,10 +255,13 @@ _INBAND_MAX_TWIST = 6.3
 # (rejects a single tone that merely happens to clear the fraction floor — its
 # group runner-up would be comparable for broadband noise).
 _INBAND_GROUP_DOMINANCE = 4.0
-# Second-harmonic rejecter: voiced speech has strong energy at 2x a low formant,
-# which can masquerade as a high tone. Reject when a low tone's second harmonic
-# rivals the high tone's energy.
-_INBAND_MAX_SECOND_HARMONIC_RATIO = 0.5
+# Harmonic-corroboration rejecter: a voiced source that lands two harmonics on a DTMF
+# pair ALSO carries energy at the OTHER harmonics it implies — most tellingly the second
+# harmonic of each detected tone (2x low, 2x high) and the difference frequency (the
+# would-be fundamental). A real DTMF generator emits ONLY the two tones, so those bins
+# are ~empty. Reject when their combined energy rivals the weaker detected tone by this
+# fraction. This catches the harmonic-speech case the bare second-harmonic test missed.
+_INBAND_MAX_HARMONIC_CORROBORATION = 0.25
 # Debounce: a digit must persist this many consecutive validated frames before it
 # emits (one 20 ms frame is enough to flag a glitch; ~2 frames = a real press).
 _INBAND_MIN_PRESS_FRAMES = 2
@@ -445,13 +452,20 @@ class InbandDtmfDetector:
         louder, quieter = (low_p, high_p) if low_p >= high_p else (high_p, low_p)
         if quieter <= 0.0 or louder / quieter > _INBAND_MAX_TWIST:
             return None
-        # Second-harmonic rejecter: voiced speech with a strong low formant lights 2x
-        # its frequency, which can fall in the high group. If the low tone's second
-        # harmonic rivals the high tone's energy, this is speech, not a keypress.
-        second = (
-            _goertzel_power(samples, 2 * _DTMF_LOW[low_idx], self._sample_rate) * norm
-        )
-        if high_p > 0.0 and second / high_p > _INBAND_MAX_SECOND_HARMONIC_RATIO:
+        # Harmonic-corroboration rejecter: a voiced source that lands two harmonics on a
+        # DTMF pair also carries energy at the second harmonic of EACH detected tone and
+        # at the difference frequency (its would-be fundamental). A real DTMF generator
+        # emits only the two tones, so those bins are ~empty. Reject when their combined
+        # energy rivals the weaker detected tone. Catches the harmonic-speech case the
+        # bare 2x-low test missed (cross-vendor review #1).
+        low_f = _DTMF_LOW[low_idx]
+        high_f = _DTMF_HIGH[high_idx]
+        corroboration = (
+            _goertzel_power(samples, 2 * low_f, self._sample_rate)
+            + _goertzel_power(samples, 2 * high_f, self._sample_rate)
+            + _goertzel_power(samples, high_f - low_f, self._sample_rate)
+        ) * norm
+        if corroboration / quieter > _INBAND_MAX_HARMONIC_CORROBORATION:
             return None
         return _DTMF_KEYPAD[low_idx][high_idx]
 

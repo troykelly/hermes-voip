@@ -1855,6 +1855,20 @@ class VoipAdapter(BasePlatformAdapter):
             await session.close()
             raise _MediaNegotiationRejected from None
 
+        te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
+        # Resolve the DTMF send/receive backends for the WebRTC call too (ADR-0034) so a
+        # forced sip_info routes SIP INFO via the CallSession (not the media engine) and
+        # the receive wiring is correct. WebRTC is Opus, so in-band never applies (the
+        # resolver returns UNAVAILABLE for a non-G.711 codec).
+        dtmf_send_mode = resolve_dtmf_send_mode(
+            media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+        )
+        inband_rx = (
+            resolve_dtmf_receive_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+            )
+            is DtmfReceiveMode.INBAND
+        )
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — unused on the ICE path (no socket bound)
             local_port=0,
@@ -1864,9 +1878,9 @@ class VoipAdapter(BasePlatformAdapter):
             remote_port=audio.port or 9,
             codec=engine_codec,
             payload_type=codec.payload_type,
-            telephone_event_payload_type=_telephone_event_payload_type(
-                agreed_sdp_codecs
-            ),
+            telephone_event_payload_type=te_pt,
+            dtmf_send_mode=dtmf_send_mode,
+            inband_dtmf_rx_enabled=inband_rx,
             # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
             srtp_inbound=srtp_inbound,
             srtp_outbound=srtp_outbound,

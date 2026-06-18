@@ -250,11 +250,13 @@ class CallSession:
         """Send ``digits`` as SIP INFO DTMF: one in-dialog ``INFO`` each (ADR-0034).
 
         Builds an ``application/dtmf-relay`` body for each digit and sends it as an
-        in-dialog ``INFO`` request (advancing the dialog CSeq — the ADR-0011 invariant).
-        Fire-and-forget per digit: the request goes out and the dialog state advances;
-        we do not block on the per-INFO 200 (the gateway may batch or delay them, and
-        an unacknowledged keypress must not stall the agent). Under the call lock so it
-        does not race a concurrent re-INVITE/REFER on the same dialog.
+        in-dialog ``INFO`` request (advancing the dialog CSeq — the ADR-0011 invariant),
+        awaiting the FINAL response for each before the next so a rejection is not
+        silently swallowed (cross-vendor review). A ``401``/``407`` challenge is met
+        once with credentials (like re-INVITE/REFER); any ``>= 400`` final response
+        raises :class:`CallError` (the digit was NOT accepted — never reported as sent).
+        Under the call lock so it does not race a concurrent re-INVITE/REFER on the same
+        dialog.
 
         Args:
             digits: The DTMF string to send (``0-9``, ``*``, ``#``, ``A``-``D``;
@@ -266,20 +268,51 @@ class CallSession:
                 :func:`~hermes_voip.dtmf_sipinfo.build_dtmf_relay_body`), or
                 ``duration_ms`` is not positive — raised BEFORE any INFO is sent so a
                 bad digit never emits a partial burst.
+            CallError: If the gateway rejects an ``INFO`` (a ``>= 400`` final response,
+                including after an auth retry) — the digit was not accepted.
         """
         if not digits:
             return
         bodies = [build_dtmf_relay_body(d, duration_ms=duration_ms) for d in digits]
         async with self._lock:
             for body in bodies:
-                request = build_in_dialog_request(
-                    self._dialog,
-                    "INFO",
-                    extra_headers=(("Content-Type", DTMF_RELAY_CONTENT_TYPE),),
-                    body=body,
-                )
-                self._dialog = request.dialog
-                await self._signaling.send(request.text)
+                await self._send_one_dtmf_info(body)
+
+    async def _send_one_dtmf_info(self, body: str) -> None:
+        """Send one DTMF ``INFO`` body, await its final response, raise on error.
+
+        Caller holds :attr:`_lock`. Mirrors :meth:`_refer`'s build → await → re-auth →
+        raise-on-error shape: a ``401``/``407`` is answered once with credentials, and
+        any ``>= 400`` final response is a :class:`CallError`.
+        """
+        request = build_in_dialog_request(
+            self._dialog,
+            "INFO",
+            extra_headers=(("Content-Type", DTMF_RELAY_CONTENT_TYPE),),
+            body=body,
+        )
+        self._dialog = request.dialog
+        response = await self._send_and_await_final(
+            request.text, self._dialog.local_cseq
+        )
+        if response.status_code in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
+            auth = self._authorization(response, "INFO")
+            retry = build_in_dialog_request(
+                self._dialog,
+                "INFO",
+                extra_headers=(
+                    ("Content-Type", DTMF_RELAY_CONTENT_TYPE),
+                    auth,
+                ),
+                body=body,
+            )
+            self._dialog = retry.dialog
+            response = await self._send_and_await_final(
+                retry.text, self._dialog.local_cseq
+            )
+        if response.status_code >= _FIRST_ERROR_STATUS:
+            msg = f"DTMF INFO rejected: {response.status_code} {response.reason}"
+            raise CallError(msg)
 
     async def hang_up(self) -> None:
         """End the call: send an in-dialog BYE, mark ended, stop media (ADR-0026).

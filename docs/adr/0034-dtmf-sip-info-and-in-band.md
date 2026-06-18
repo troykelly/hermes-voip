@@ -131,17 +131,24 @@ Concrete shape:
   surface with golden fixtures; the SIP-INFO codec is two body formats.
 - **In-band is best-effort by nature.** Detection reliability on a real lossy G.711 path is
   to be **re-measured live** (rules 23/26), not assumed from synthetic tones; the unit
-  tests prove tone-in/tone-out and speech rejection on clean PCM. In-band is the **last**
-  resort precisely because of this.
+  tests prove tone-in/tone-out and speech rejection (incl. a voiced-harmonic signal whose
+  two strongest harmonics land on a DTMF pair) on clean PCM. The detector rejects realistic
+  speech via the combined-energy fraction + harmonic-corroboration tests, but a signal that
+  is spectrally **only** two pure DTMF tones is, by definition, indistinguishable from a
+  real keypress — the fundamental limit that keeps in-band the **last** resort and keeps
+  the ADR-0009 confirmation preferring RFC 4733 / SIP INFO.
 - **Spoof resistance.** SIP INFO carries the digit out-of-band on its own signalling
   request (harder to forge than recognised speech); in-band is the weakest channel (a
   caller can play tones), so in-band remains the lowest-priority backend and the ADR-0009
   confirmation still prefers RFC 4733 / SIP INFO when available. The confirmation resolver
   binds on every backend so the human-in-the-loop gate keeps working when only in-band is
   available, with this known weaker property documented.
-- **Hot-path cost.** In-band RX adds bounded Goertzel math per inbound frame (eight tones x
-  frame samples) only when in-band RX is armed (a G.711 call with no telephone-event); it
-  is zero on the common RFC 4733 path. Runs after AEC, before VAD/ASR.
+- **Hot-path cost.** In-band RX adds bounded Goertzel math per inbound frame (ten single-
+  bin passes: 4 low + 4 high + 3 corroboration harmonics, over the frame samples) only
+  when in-band RX is armed (a G.711 call with no telephone-event); it is zero on the
+  common RFC 4733 path. **Measured ~0.024 ms per 20 ms frame at 8 kHz** (≈840x realtime
+  headroom; rule 22), so it is negligible against the 20 ms ptime. Runs after AEC, before
+  VAD/ASR.
 - **No new dependency, no infrastructure** (rule 40). Stdlib tone math + the already-pinned
   `audioop-lts`.
 

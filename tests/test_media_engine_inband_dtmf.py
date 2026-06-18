@@ -213,6 +213,54 @@ async def test_inband_receive_surfaces_digit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inband_rx_armed_after_connect_via_setter() -> None:
+    """Arming in-band RX AFTER connect() (the outbound path) takes effect (review #2).
+
+    connect() built the engine with the detector off (the ctor default); the outbound
+    path resolves the backend only after the answer and sets ``inband_dtmf_rx_enabled``
+    then. The setter must (re)create the detector so detection actually runs.
+    """
+    digits: list[str] = []
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        payload_type=_AUDIO_PT,
+        telephone_event_payload_type=None,
+        inband_dtmf_rx_enabled=False,  # off at construction, like the outbound engine
+        on_dtmf=digits.append,
+        jitter_depth=1,
+        symmetric=False,
+        aec_enabled=False,
+        clock=lambda: 0,
+    )
+    await engine.connect()
+    engine.inband_dtmf_rx_enabled = True  # the outbound path arms it post-answer
+
+    async def _drain() -> None:
+        async for _frame in engine.inbound_audio():
+            pass
+
+    task = asyncio.create_task(_drain())
+    await asyncio.sleep(0)
+    seq = 0
+    for dg in _tone_datagrams("3", n_frames=8, start_seq=seq):
+        engine._recv_queue.put_nowait((dg, _FAKE_SRC))
+        seq += 8
+    for dg in _silence_datagrams(n_frames=6, start_seq=seq):
+        engine._recv_queue.put_nowait((dg, _FAKE_SRC))
+    await asyncio.sleep(0.05)
+    assert digits == ["3"]
+
+    await engine.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_inband_receive_inert_when_not_armed() -> None:
     """Without in-band RX armed, a tone in the audio is just audio (no digit)."""
     digits: list[str] = []

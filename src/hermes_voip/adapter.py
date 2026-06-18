@@ -1700,9 +1700,14 @@ class VoipAdapter(BasePlatformAdapter):
             raise _MediaNegotiationRejected from exc
 
         # The offered a=setup decides our DTLS role; WebRtcMediaSession picks it.
+        # STUN gathers srflx candidates; TURN (ADR-0034) gathers a relay candidate
+        # when operator-provided credentials are configured (empty ⇒ host/STUN only).
         session = WebRtcMediaSession(
             offer_setup=audio.setup,
             stun_urls=media_cfg.ice_stun_urls,
+            turn_urls=media_cfg.ice_turn_urls,
+            turn_username=media_cfg.ice_turn_username,
+            turn_password=media_cfg.ice_turn_password,
         )
         try:
             await session.prepare()  # gather ICE; expose fingerprint/setup/creds
@@ -1759,12 +1764,18 @@ class VoipAdapter(BasePlatformAdapter):
         # answered, the ICE session is closed, and _MediaNegotiationRejected is raised
         # so the inbound handler's finally tears the answered call down (no CallLoop on
         # dead media). The mandatory attributes were already validated pre-answer.
+        # Trickle decision (ADR-0034): a peer that advertised a=ice-options:trickle
+        # WITHOUT a=end-of-candidates has more candidates coming — don't signal
+        # end-of-candidates to ICE (leave its check loop open). A classic non-trickle
+        # peer, or one that sent end-of-candidates, is complete.
+        peer_end_of_candidates = not (audio.is_trickle and not audio.end_of_candidates)
         try:
             srtp_inbound, srtp_outbound = await session.run_handshake(
                 peer_fingerprint=peer_fingerprint,
                 peer_ice_ufrag=audio.ice_ufrag,
                 peer_ice_pwd=audio.ice_pwd,
                 peer_candidates=audio.ice_candidates,
+                peer_end_of_candidates=peer_end_of_candidates,
             )
         except Exception:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
             # A DTLS/ICE failure (fingerprint mismatch, no connectivity, handshake

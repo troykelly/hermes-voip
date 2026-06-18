@@ -3,11 +3,18 @@
 This module implements the ICE connectivity layer for the WebRTC media path:
 
 * **Candidate gathering** -- host candidates always; server-reflexive (srflx)
-  via a configured STUN server when ``stun_urls`` is non-empty.  TURN is
-  deferred (ADR-0016 ss3, ss6 -- ``HERMES_VOIP_ICE_TURN_*`` are reserved but
-  unused until the TURN PR lands).
-* **Connectivity checks** -- full ICE, non-trickle MVP: all candidates are
-  exchanged in the initial offer/answer, then checks run (RFC 8838 s3).
+  via a configured STUN server when ``stun_urls`` is non-empty; **relay**
+  candidates via a configured TURN server when ``turn_urls`` + credentials are
+  supplied (ADR-0034).  The plugin only *consumes* operator-provided TURN
+  credentials (``HERMES_VOIP_ICE_TURN_*``); it does not run a TURN server.
+* **Connectivity checks** -- full ICE.  Non-trickle by default (all candidates
+  in the initial offer/answer, then checks run, RFC 8838 s3); aioice's check
+  loop also accepts incremental remote candidates (the trickle SDP primitives
+  live in ``sdp.py`` per ADR-0034).
+* **Consent freshness (RFC 7675)** -- aioice runs it internally: ``connect()``
+  arms a periodic STUN-consent task and ``close()``s the connection on consent
+  loss, which makes a blocked :meth:`recv` raise (the engine then tears the call
+  down).  This module adds no consent machinery of its own (ADR-0034).
 * **Socket handoff seam** -- after :meth:`IceConnection.connect` the
   :attr:`IceConnection.selected_pair` is populated and
   :meth:`IceConnection.send` / :meth:`IceConnection.recv` carry application
@@ -194,15 +201,20 @@ class _RawConnection(Protocol):
 class _RawConnectionCtor(Protocol):
     """The ``aioice.Connection`` constructor surface."""
 
-    def __call__(
+    def __call__(  # noqa: PLR0913 -- mirrors aioice.Connection's keyword surface
         self,
         *,
         ice_controlling: bool,
         stun_server: tuple[str, int] | None,
+        turn_server: tuple[str, int] | None,
+        turn_username: str | None,
+        turn_password: str | None,
+        turn_ssl: bool,
+        turn_transport: str,
         use_ipv4: bool,
         use_ipv6: bool,
     ) -> _RawConnection:
-        """Construct an ICE connection."""
+        """Construct an ICE connection (host/STUN/TURN per the given servers)."""
         ...
 
 
@@ -402,21 +414,34 @@ class IceConnection:
         ice_controlling: ``True`` if this agent is the controlling role (the
             SIP UAC / offerer is normally controlling -- RFC 8445 s6.1).
         stun_urls: Tuple of ``stun:`` URL strings.  Pass an empty tuple for
-            host-only ICE (no STUN server required).  TURN is deferred
-            (ADR-0016 s3) -- ``turn:`` URLs are not supported yet.
+            host-only ICE (no STUN server required).
+        turn_urls: Tuple of ``turn:`` / ``turns:`` URL strings for relay
+            candidates (ADR-0034).  Empty (default) ⇒ no relay candidate.  Only
+            the first URL is used (aioice accepts one TURN server).  When set,
+            ``turn_username`` and ``turn_password`` are required (RFC 8656 s9.2
+            long-term credentials).  The plugin consumes operator-provided TURN
+            credentials; it does not run a TURN server.
+        turn_username: TURN long-term username (required when ``turn_urls`` is set).
+        turn_password: TURN long-term password (required when ``turn_urls`` is set).
+            A secret -- never logged.
         use_ipv4: Gather IPv4 candidates (default ``True``).
         use_ipv6: Gather IPv6 candidates (default ``False`` -- most SIP
             gateways are IPv4-only; enable only if the gateway requires it).
 
     Raises:
         ImportError: At construction time if ``aioice`` is not installed.
+        ValueError: If ``turn_urls`` is set but a credential is missing, or a
+            ``turn:`` URL is malformed.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- independent keyword config (host/STUN/TURN/IP family)
         self,
         *,
         ice_controlling: bool,
         stun_urls: tuple[str, ...] = (),
+        turn_urls: tuple[str, ...] = (),
+        turn_username: str | None = None,
+        turn_password: str | None = None,
         use_ipv4: bool = True,
         use_ipv6: bool = False,
     ) -> None:
@@ -424,15 +449,36 @@ class IceConnection:
         aioice = _get_aioice()
 
         # Parse the first stun: URL (if any) into a (host, port) tuple.
-        # TURN: deferred -- turn: URLs are reserved (ADR-0016 s6) but unused.
         stun_server: tuple[str, int] | None = None
         for url in stun_urls:
             stun_server = _parse_stun_url(url)
             break  # aioice.Connection accepts a single STUN server
 
+        # Parse the first turn:/turns: URL (if any) into aioice's TURN params.
+        # The plugin only consumes operator-provided TURN credentials (ADR-0034).
+        turn_server: tuple[str, int] | None = None
+        turn_ssl = False
+        turn_transport = "udp"
+        for url in turn_urls:
+            host, port, turn_ssl, turn_transport = _parse_turn_url(url)
+            turn_server = (host, port)
+            if turn_username is None or turn_password is None:
+                # RFC 8656 s9.2: TURN requires long-term credentials. A
+                # credential-less TURN URL would silently gather no relay
+                # candidate -- fail loudly instead (rule 27). The URL is not
+                # echoed (it may carry userinfo).
+                msg = "a TURN server requires a username and password"
+                raise ValueError(msg)
+            break  # aioice.Connection accepts a single TURN server
+
         self._conn: _RawConnection = aioice.Connection(
             ice_controlling=ice_controlling,
             stun_server=stun_server,
+            turn_server=turn_server,
+            turn_username=turn_username if turn_server is not None else None,
+            turn_password=turn_password if turn_server is not None else None,
+            turn_ssl=turn_ssl,
+            turn_transport=turn_transport,
             use_ipv4=use_ipv4,
             use_ipv6=use_ipv6,
         )
@@ -638,3 +684,68 @@ def _parse_stun_url(url: str) -> tuple[str, int]:
         msg = f"invalid port in stun: URL {url!r}"
         raise ValueError(msg) from exc
     return host, port
+
+
+# Default TURN ports (RFC 8656 s5): 3478 for turn: (plain/UDP/TCP), 5349 for
+# turns: (TLS/DTLS).
+_TURN_DEFAULT_PORT = 3478
+_TURNS_DEFAULT_PORT = 5349
+
+
+def _parse_turn_url(url: str) -> tuple[str, int, bool, str]:
+    """Parse a ``turn:`` / ``turns:`` URL into aioice's TURN parameters (ADR-0034).
+
+    Supports the RFC 7065 TURN URI shape ``turn:<host>[:<port>][?transport=udp|tcp]``
+    (and ``turns:`` for TLS).  The plugin consumes operator-provided TURN servers;
+    the URI carries no credentials (those are passed separately).
+
+    Args:
+        url: A ``turn:`` or ``turns:`` URL, e.g.
+            ``"turn:turn.example.test:3478?transport=udp"``.
+
+    Returns:
+        A ``(host, port, ssl, transport)`` tuple: ``ssl`` is ``True`` for
+        ``turns:``; ``transport`` is ``"udp"`` (default) or ``"tcp"``.  Default
+        port is 3478 (``turn:``) or 5349 (``turns:``) when omitted (RFC 8656 s5).
+
+    Raises:
+        ValueError: If the URL scheme is not ``turn:``/``turns:``, the transport
+            is unknown, or the port is invalid.  The error never echoes the URL
+            (it may carry sensitive deployment detail).
+    """
+    if url.startswith("turns:"):
+        ssl = True
+        remainder = url[len("turns:") :]
+        default_port = _TURNS_DEFAULT_PORT
+    elif url.startswith("turn:"):
+        ssl = False
+        remainder = url[len("turn:") :]
+        default_port = _TURN_DEFAULT_PORT
+    else:
+        msg = "expected a turn: or turns: URL"
+        raise ValueError(msg)
+
+    # Split off the optional ``?transport=...`` query (RFC 7065 s3.1).
+    transport = "udp"
+    if "?" in remainder:
+        remainder, _, query = remainder.partition("?")
+        key, _, value = query.partition("=")
+        if key != "transport" or value not in {"udp", "tcp"}:
+            msg = f"unsupported TURN URL query {query!r} (want transport=udp|tcp)"
+            raise ValueError(msg)
+        transport = value
+
+    if ":" in remainder:
+        host, port_str = remainder.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError as exc:
+            msg = "invalid port in turn: URL"
+            raise ValueError(msg) from exc
+    else:
+        host, port = remainder, default_port
+
+    if not host:
+        msg = "turn: URL is missing a host"
+        raise ValueError(msg)
+    return host, port, ssl, transport

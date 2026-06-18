@@ -121,17 +121,30 @@ class _IceFactory(Protocol):
 
     A typed callable Protocol rather than ``Callable[..., _IcePipe]`` so the keyword
     signature is explicit and ``disallow_any_explicit`` stays satisfied (no ``...``).
+    The TURN keywords carry defaults so a factory that only handles host/STUN ICE
+    (a test fake) still satisfies the Protocol structurally.
     """
 
     def __call__(
-        self, *, ice_controlling: bool, stun_urls: tuple[str, ...]
+        self,
+        *,
+        ice_controlling: bool,
+        stun_urls: tuple[str, ...],
+        turn_urls: tuple[str, ...] = (),
+        turn_username: str | None = None,
+        turn_password: str | None = None,
     ) -> _IcePipe:
-        """Construct an ICE pipe for the given role and STUN servers."""
+        """Construct an ICE pipe for the given role, STUN, and (optional) TURN."""
         ...
 
 
 def _default_ice_factory(
-    *, ice_controlling: bool, stun_urls: tuple[str, ...]
+    *,
+    ice_controlling: bool,
+    stun_urls: tuple[str, ...],
+    turn_urls: tuple[str, ...] = (),
+    turn_username: str | None = None,
+    turn_password: str | None = None,
 ) -> _IcePipe:
     """Build the real :class:`~hermes_voip.media.ice.IceConnection`.
 
@@ -140,11 +153,21 @@ def _default_ice_factory(
             an inbound call is ICE-CONTROLLED (the offerer/UAC is controlling), so
             the adapter passes ``False`` here.
         stun_urls: ``stun:`` URLs for srflx candidates (empty ⇒ host-only).
+        turn_urls: ``turn:``/``turns:`` URLs for relay candidates (ADR-0034; empty
+            ⇒ no relay).
+        turn_username: TURN long-term username (required when ``turn_urls`` is set).
+        turn_password: TURN long-term password (required when ``turn_urls`` is set).
 
     Returns:
         A new :class:`IceConnection`.
     """
-    return IceConnection(ice_controlling=ice_controlling, stun_urls=stun_urls)
+    return IceConnection(
+        ice_controlling=ice_controlling,
+        stun_urls=stun_urls,
+        turn_urls=turn_urls,
+        turn_username=turn_username,
+        turn_password=turn_password,
+    )
 
 
 def answer_setup_for_offer(offer_setup: SetupRole | None) -> SetupRole:
@@ -177,16 +200,24 @@ class WebRtcMediaSession:
     Args:
         offer_setup: The offered ``a=setup`` role (``None`` ⇒ treated as actpass).
         stun_urls: ``stun:`` URLs for srflx ICE candidates (empty ⇒ host-only).
+        turn_urls: ``turn:``/``turns:`` URLs for relay ICE candidates (ADR-0034;
+            empty ⇒ no relay).  ``turn_username``/``turn_password`` are required
+            when set.
+        turn_username: TURN long-term username (required when ``turn_urls`` is set).
+        turn_password: TURN long-term password (required when ``turn_urls`` is set).
         ice_factory: Factory building the ICE pipe (defaults to the real
             :class:`IceConnection`; injected in tests).
         cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- independent keyword config (setup/STUN/TURN/factory/cipher)
         self,
         *,
         offer_setup: SetupRole | None,
         stun_urls: tuple[str, ...] = (),
+        turn_urls: tuple[str, ...] = (),
+        turn_username: str | None = None,
+        turn_password: str | None = None,
         ice_factory: _IceFactory = _default_ice_factory,
         cipher_list: bytes | None = None,
     ) -> None:
@@ -195,7 +226,13 @@ class WebRtcMediaSession:
         role = DtlsRole.CLIENT if self._setup.value == "active" else DtlsRole.SERVER
         self._dtls = DtlsEndpoint(role=role, cipher_list=cipher_list)
         # The SIP UAS (answering an inbound INVITE) is ICE-CONTROLLED.
-        self._ice: _IcePipe = ice_factory(ice_controlling=False, stun_urls=stun_urls)
+        self._ice: _IcePipe = ice_factory(
+            ice_controlling=False,
+            stun_urls=stun_urls,
+            turn_urls=turn_urls,
+            turn_username=turn_username,
+            turn_password=turn_password,
+        )
         self._prepared = False
 
     # ------------------------------------------------------------------
@@ -262,6 +299,7 @@ class WebRtcMediaSession:
         peer_ice_ufrag: str,
         peer_ice_pwd: str,
         peer_candidates: Sequence[SdpIceCandidate] = (),
+        peer_end_of_candidates: bool = True,
     ) -> tuple[SrtpSession, SrtpSession]:
         """Run ICE connectivity + the DTLS handshake, returning the SRTP pair.
 
@@ -273,7 +311,15 @@ class WebRtcMediaSession:
             peer_fingerprint: The peer's ``a=fingerprint`` from their offer.
             peer_ice_ufrag: The peer's ``a=ice-ufrag``.
             peer_ice_pwd: The peer's ``a=ice-pwd``.
-            peer_candidates: The peer's ``a=candidate`` list (non-trickle MVP).
+            peer_candidates: The peer's ``a=candidate`` list from their offer.
+            peer_end_of_candidates: Whether the peer's candidate generation is
+                complete (ADR-0034).  ``True`` (default) for a classic non-trickle
+                peer or a peer that sent ``a=end-of-candidates`` — we signal
+                end-of-candidates to ICE.  ``False`` for a *trickling* peer
+                (``a=ice-options:trickle`` with no ``a=end-of-candidates``): we do
+                NOT signal end, leaving aioice's check loop open for the candidates
+                the peer would trickle (the in-dialog SIP-INFO transport that would
+                deliver them is a named follow-up, ADR-0034 §2).
 
         Returns:
             ``(inbound, outbound)`` SRTP sessions for the engine.
@@ -289,14 +335,18 @@ class WebRtcMediaSession:
             msg = "WebRtcMediaSession.run_handshake() called before prepare()"
             raise RuntimeError(msg)
 
-        # Apply the peer's ICE credentials + candidates (non-trickle: all up front).
+        # Apply the peer's ICE credentials + the candidates they sent up front.
         # The peer's candidates come from the parsed offer as SDP candidates
         # (``address``/``typ``); reconcile each to the ICE layer's candidate
         # (``host``/``type``) via the canonical ``a=candidate`` string both agree on.
         self._ice.set_remote_credentials(peer_ice_ufrag, peer_ice_pwd)
         for cand in peer_candidates:
             await self._ice.add_remote_candidate(IceCandidate.from_sdp(cand.render()))
-        await self._ice.add_remote_candidate(None)  # end-of-candidates
+        # Signal end-of-candidates only when the peer's generation is complete.
+        # A trickling peer (peer_end_of_candidates=False) has more coming, so we
+        # leave aioice's check loop open (RFC 8838 §8.2 / ADR-0034).
+        if peer_end_of_candidates:
+            await self._ice.add_remote_candidate(None)  # end-of-candidates
 
         # Run ICE connectivity checks (nominates a pair; raises on failure).
         await self._ice.connect()

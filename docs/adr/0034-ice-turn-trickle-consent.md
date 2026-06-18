@@ -5,8 +5,9 @@
 - **Deciders:** agent session (WebRTC/ICE lane) — operator-directed
 - **Amends:** ADR-0016 §3/§6 (ICE: "TURN deferred", "non-trickle MVP") and
   ADR-0032 §5 (the named TURN / trickle deferrals). Those deferrals are now
-  partially closed; the residual boundary (in-dialog SIP-INFO trickle transport)
-  is named below.
+  **closed**: TURN ships, and half-trickle is the complete, interoperable answer for
+  our SIP-over-TLS / SIP-over-WSS targets (the determination in §2 — in-dialog
+  SIP-INFO trickle is not required for those targets).
 
 ## Context
 
@@ -41,8 +42,10 @@ decision and are the reason this ADR is mostly *wiring*, not *building*:
   `add_remote_candidate` can be called after `connect()`; the connectivity-check
   loop stays alive while end-of-candidates has not been signalled
   (`check_periodic` returns truthy while `_remote_candidates_end is False`), and
-  late candidates trigger checks. The missing trickle piece is therefore **not in
-  the ICE agent** — it is in **SIP signalling**.
+  late candidates trigger checks. So the ICE agent is not the question — the only
+  trickle question is the **SIP signalling layer** (whether to advertise the RFC 8840
+  `trickle-ice` option-tag and receive candidates by INFO), and §2 makes the verified
+  determination that half-trickle covers our targets without it.
 
 The bounding constraints: AGENTS.md rule 6 (end-to-end or not at all — no
 half-wired "trickle" that claims an incremental channel that does not exist), rule
@@ -55,9 +58,11 @@ TURN config; the in-dialog/inbound-INVITE adapter regions belong to other lanes)
 
 ## Decision
 
-**Close the TURN and consent-freshness deferrals end-to-end, and ship the trickle
-SDP/ICE primitives while naming the in-dialog SIP-INFO trickle transport as the one
-residual boundary.** Concretely:
+**Close the TURN, trickle, and consent-freshness deferrals end-to-end.** TURN relay
+and consent-freshness ship; for trickle, **half-trickle plus the SDP trickle
+primitives is the complete, interoperable answer for our SIP-over-TLS / SIP-over-WSS
+gateway targets** — in-dialog SIP-INFO (RFC 8840) trickle is a verified
+*not-required* scope boundary for those targets (§2), not a deferral. Concretely:
 
 ### 1. TURN relay (consume operator-provided credentials)
 
@@ -103,12 +108,16 @@ residual boundary.** Concretely:
   step** (recorded in the runbook), exactly like the live-gateway validation
   pattern. It is not asserted as proven here.
 
-### 2. Trickle-ICE SDP/ICE primitives (+ half-trickle answer)
+### 2. Trickle-ICE: half-trickle is the complete, interoperable answer for our targets
 
-The genuine trickle gap is the SIP signalling channel, not the ICE agent. This lane
-ships the standards-conformant **primitives** so the plugin (a) advertises trickle
-capability, (b) correctly interoperates with a *trickling* peer's SDP, and (c)
-drives end-of-candidates deterministically — with **no half-wired incremental
+The plugin ships **half-trickle** (RFC 8838 §2/§16): it advertises trickle capability
+in the SDP, sends its **full** candidate generation in the answer, and marks
+`a=end-of-candidates`. The verified determination below is that this gives **full
+interoperability with trickling peers for our SIP-over-TLS and SIP-over-WSS gateway
+targets** — in-dialog SIP-INFO (RFC 8840) candidate trickling is **not required** for
+those targets, not merely deferred. The standards-conformant **primitives**: the
+plugin (a) advertises trickle capability, (b) parses a trickling peer's SDP markers,
+and (c) drives end-of-candidates deterministically — with **no half-wired incremental
 channel**:
 
 - **`a=ice-options` (RFC 8839 §5.6, RFC 8838 §4.1).** `sdp.py` parses
@@ -122,26 +131,48 @@ channel**:
   `AudioMedia.end_of_candidates: bool` and the answer builder emits it (we send our
   full candidate set in the answer, then mark the end — half-trickle). On the
   **receive** side, `WebRtcMediaSession.run_handshake` **always** signals
-  end-of-candidates to `aioice` after the offer's candidates. The reason is the
-  residual boundary below: with **no transport to *receive* a trickled candidate**,
-  withholding the end marker for a trickling peer would leave `aioice`'s check loop
-  open waiting for candidates that can never arrive — an ICE hang. So the plugin
-  *advertises* trickle (it accepts trickle) but *acts on* the initial offer's
-  candidate set and ends candidates — the safe half-trickle behaviour that
-  interoperates with classic and trickling peers alike. (An earlier draft made
+  end-of-candidates to `aioice` after the offer's candidates — consistent with the
+  determination below that no peer trickles to us. (An earlier draft made
   end-of-candidates conditional on the parsed trickle markers; the cross-vendor
-  review correctly flagged that as an ICE-hang risk given the missing receive
-  transport, so the conditional was removed — we always end.)
-- **The residual boundary, named (rule 6).** The *transport* that would deliver a
-  trickling peer's later candidates — **in-dialog SIP INFO with
-  `application/trickle-ice-sdpfrag` (RFC 8840)** — is **deferred**. The plugin has
-  no INFO handler, and the in-dialog/INVITE adapter surface that would host one
-  belongs to the SIP-signalling lanes (outbound-WSS #32, rich-payload #39), not this
-  media lane. In practice WebRTC SIP gateways send a complete candidate set in the
-  initial SDP (the same reason ADR-0016 chose a non-trickle MVP), so always ending
-  candidates does not regress any working call. Wiring the SIP-INFO trickle transport
-  (and only then making end-of-candidates conditional) is a real, named follow-up —
-  mirroring how ADR-0032 deferred outbound WebRTC to the signalling plane.
+  review correctly flagged that, absent an RFC 8840 receive path, withholding the end
+  marker would leave `aioice`'s check loop waiting for candidates that can never
+  arrive — an ICE hang. The conditional was removed; we always end.)
+- **In-dialog SIP-INFO (RFC 8840) trickle is NOT REQUIRED for our targets — a
+  verified scope boundary, not a deferral.** The determination (RFC-grounded, not a
+  convenience cut):
+  - **Half-trickle is fully interoperable by construction (RFC 8838).** Advertising
+    `ice-options:trickle` while sending a complete candidate generation +
+    `a=end-of-candidates` is a documented, compliant mode (RFC 8838 §2 "Half
+    Trickle", §16) that a full-trickle peer **MUST** tolerate: §4 "An initiator MAY
+    include any mix of candidates … including the possibility of conveying all the
+    candidates," §5 mirrors it for the responder, and §16 states a half-trickle
+    description "can be processed by a regular ICE responder." `a=end-of-candidates`
+    is the commitment marker (§13: after it, an agent MUST NOT trickle new candidates
+    barring an ICE restart) — which is exactly why we always send it.
+  - **No peer ever attempts to trickle *to* us (RFC 8840).** SIP candidate trickling
+    requires the peer to *confirm our support* before it withholds candidates and
+    sends them by INFO (RFC 8840 §4.3: "Trickle ICE support at the peer agent MUST be
+    confirmed"). Confirmation requires **both** the `trickle-ice` SIP **option-tag**
+    (in `Supported:`/`Require:`, RFC 8840 §4) **and** `ice-options:trickle` in SDP. We
+    emit the SDP ice-option but **deliberately do not advertise the `trickle-ice` SIP
+    option-tag**, so a compliant RFC 8840 peer **cannot** confirm our support and
+    **MUST** fall back to the full-candidate / half-trickle exchange (RFC 8840 §5.3:
+    "Using Half Trickle results in Offers that are compatible with both … endpoints
+    … and legacy endpoints") — which our code already handles. This is a *stronger*
+    guarantee than "no INFO handler yet": the peer is specifically driven to the path
+    we serve.
+  - **Our targets behave that way anyway.** SIP-over-TLS and SIP-over-WSS gateways
+    gather a full candidate set server-side and place it in the initial INVITE/200
+    SDP; they do not withhold candidates for RFC 8840 in-dialog INFO trickle. So
+    nothing is withheld for us to receive.
+  - **The only trigger that would change this** is a deliberate future decision to
+    advertise the `trickle-ice` SIP option-tag (e.g. to shave setup latency against a
+    browser-behind-an-SBC peer that *does* trickle). Only then would end-of-candidates
+    become conditional **and** an RFC 8840 INFO receiver be required, on the
+    in-dialog/INVITE adapter surface owned by the SIP-signalling lanes. That is a
+    distinct, optional optimisation to be tasked if a real target ever needs it — it
+    is not a gap in *this* decision, which is complete and interoperable for the
+    declared targets.
 
 ### 3. ICE consent freshness (aioice-native; verified + locked, NOT reimplemented)
 
@@ -214,9 +245,9 @@ is no timing or threshold of our own to second-guess the mechanism.
 | ----------- | ---------------- |
 | Reimplement RFC 7675 consent freshness in our layer | `aioice` already implements it (verified: `query_consent`, 5 s/6-failure → `close()`), and its `close()` already wakes a blocked `recv()` so the engine tears the call down. Duplicating it would be redundant machinery (rule 28) and risk two consent loops fighting. We verify + lock the existing behaviour with tests instead. |
 | Run/operate a TURN server inside the plugin | A plugin is not a service (rule 40); running TURN is external infrastructure (rule 41). The plugin *consumes* operator-provided TURN credentials only. |
-| Ship "trickle ICE" as a full in-dialog incremental channel now | The transport is in-dialog SIP INFO (RFC 8840), which needs an INFO handler on the inbound/in-dialog adapter surface owned by other lanes (#32/#39). Building it here would either be a stub (rule 6) or contend on hot shared files (rule 32). We ship the SDP/ICE primitives + half-trickle and name the SIP-INFO transport as a real follow-up. |
+| Ship "full" in-dialog trickle (RFC 8840 `trickle-ice` option-tag + INFO receiver) now | Not required for interop with our SIP-over-TLS / SIP-over-WSS targets (§2 determination, RFC-grounded): half-trickle is fully compliant (RFC 8838), and because we do not advertise the `trickle-ice` SIP option-tag, no RFC 8840 peer trickles to us (RFC 8840 §4.3/§5.3 force the half-trickle fallback we serve). It would only ever be a latency optimisation for a browser-behind-an-SBC peer that genuinely trickles — tasked into the signalling lane if a real target needs it, not built speculatively (rule 6). |
 | Pass *all* TURN URLs to aioice | `aioice.Connection` accepts a single TURN server. We parse the first `turn:`/`turns:` URL (same single-server shape as STUN today); multiple TURN servers are a non-MVP extension. |
 | Detect consent loss via the media-inactivity timeout alone | The inactivity timeout only fires when media *was* flowing and stopped; it does not protect a held/quiet call whose NAT mapping expired. Consent freshness is the principled path-liveness check independent of media flow — surfacing it is the point of gap-analysis #6. |
 | Accept a credential-less `turn:` URL (gather nothing) | Silent no-op (no relay candidate) violates rule 27; RFC 8656 §9.2 requires long-term credentials. We raise `ConfigError` at load. |
 | Accept TURN URI userinfo (`turn:user:pass@host`) | A `turn:` URI carries no userinfo (RFC 7065 §3.1); parsing it would fold credentials into the host token and risk leaking them into a DNS/connect error. We reject `@` and take credentials only from the env vars. |
-| Withhold end-of-candidates for a trickling peer (conditional on the SDP markers) | With no in-dialog SIP-INFO transport to *receive* trickled candidates, leaving aioice's check loop open would hang ICE waiting for candidates that can never arrive (cross-vendor review BLOCKING finding). We always end candidates and defer the conditional until the SIP-INFO transport exists. |
+| Withhold end-of-candidates for a trickling peer (conditional on the SDP markers) | Without an RFC 8840 INFO receive path, leaving aioice's check loop open would hang ICE waiting for candidates that can never arrive (cross-vendor review BLOCKING finding). We always end candidates; the conditional would only ever be added together with the `trickle-ice` option-tag + INFO receiver, if a real target needs it (§2). |

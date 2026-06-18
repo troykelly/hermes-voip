@@ -114,31 +114,46 @@ URL (off the event loop). A non-2xx response or a network error raises
 just needs the gateway to negotiate `telephone-event`. Use it for IVR menus / keypad
 entry on outbound or trusted calls.
 
-### 4. Inbound DTMF receive (the caller presses keys) — ADR-0010
+### 4. Inbound DTMF receive (the caller presses keys) — ADR-0010/0034
 
-Inbound DTMF is decoded from RFC 4733 telephone-event RTP and surfaced by the call
-controller (`CallLoop`), not the engine: (1) while an irreversible tool has ARMED a
-confirmation, a digit resolves it directly (the spoof-resistant channel that gates
-transfer — ADR-0009); (2) otherwise a digit group (terminated by `#` or the inter-digit
-gap) is delivered to the agent as a tagged `[DTMF] 1234` turn. Digits never pass through
-STT / the LLM as a fake transcript. Wired for **every** call (inbound and outbound) whose
-gateway negotiated `telephone-event` — the adapter wires `engine.on_dtmf` to the loop and
-binds a per-call `ArmedConfirmation` in `_wire_dtmf_receive`.
+Inbound DTMF is decoded and surfaced by the call controller (`CallLoop`), not directly
+exposed: (1) while an irreversible tool has ARMED a confirmation, a digit resolves it
+directly (the spoof-resistant channel that gates transfer — ADR-0009); (2) otherwise a
+digit group (terminated by `#` or the inter-digit gap) is delivered to the agent as a
+tagged `[DTMF] 1234` turn. Digits never pass through STT / the LLM as a fake transcript.
+All **three** mechanisms feed the SAME `CallLoop.feed_dtmf` router, so surfacing is
+uniform; `_wire_dtmf_receive` resolves the per-call backend and binds a per-call
+`ArmedConfirmation` for every active one:
 
-No extra config is required for the default behaviour. The three env keys (all optional)
-now drive real behaviour (no inert key):
+- **RFC 4733** (`engine.on_dtmf`) — when the gateway negotiated `telephone-event`.
+- **SIP INFO** (`CallSession.on_dtmf`) — inbound `application/dtmf-relay` /
+  `application/dtmf` `INFO` requests (forced with `HERMES_SIP_DTMF_MODE=sip_info`).
+- **In-band Goertzel** (`engine.on_dtmf`) — tone detection on the decoded G.711 audio,
+  the last resort when no `telephone-event` was negotiated (G.711 only).
+
+No extra config is required for the default behaviour. The env keys (all optional) drive
+the backend selection (no inert key — every value picks a real backend):
 
 ```sh
-# Receive mechanism. ONLY auto / rfc4733 are implemented; sip_info / inband are REJECTED
-# at config load (a loud ConfigError) — never a key that silently does nothing.
-HERMES_SIP_DTMF_MODE=auto              # auto (default) | rfc4733
+# Backend selector (send AND receive). ALL FOUR are implemented (ADR-0036):
+#   auto     (default) negotiate RFC 4733, else in-band on a G.711 call
+#   rfc4733  force telephone-event (UNAVAILABLE if the peer offered none)
+#   sip_info force in-dialog INFO (always available)
+#   inband   force Goertzel/tone-gen (G.711 only; UNAVAILABLE on Opus/G.722)
+HERMES_SIP_DTMF_MODE=auto
 # Gap (ms) after which a buffered menu group with no '#' terminator is delivered.
 HERMES_SIP_DTMF_INTERDIGIT_MS=2000     # unset => built-in default (2000); must be > 0
-# Whether the (unbuilt) in-band last-resort detector is permitted. Default true. On a
-# call where the gateway negotiated no telephone-event this flag only changes whether the
-# missing-DTMF state is logged loud (true => UNAVAILABLE) or quiet (false => DISABLED).
+# Whether the in-band last resort is PERMITTED under `auto` when the peer offered no
+# telephone-event. Default true. false forbids it (an `auto` call then resolves to no
+# DTMF rather than the less spoof-resistant in-band backend). No effect when the mode is
+# forced to a specific backend.
 HERMES_SIP_DTMF_INBAND_ENABLED=true
 ```
+
+> **Spoof-resistance note.** In-band is the WEAKEST channel (a caller can play tones), so
+> it is the last resort and a deployment that relies on DTMF for the ADR-0009 confirmation
+> should prefer RFC 4733 / SIP INFO. The confirmation resolver still binds on the in-band
+> backend so the human-in-the-loop gate works when only in-band is available.
 
 ## Where the secret lives + rotation
 
@@ -172,22 +187,29 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
 - **Least-privilege.** From an intercom call, a request to "transfer me" / "list the
   extensions" must be refused — those tools are removed by the `allowed_tools`
   sub-ceiling. (Covered by `tests/test_voip_tools.py::test_open_entry_scoped_by_allowed_tools_blocks_other_tools`.)
-- **DTMF receive config (fail-loud check).** An unsupported mode fails at startup, not
-  at key-press time:
+- **DTMF mode loads (config check).** All four modes load now; only an unknown mode
+  fails at startup:
   ```sh
   uv run python -c "from hermes_voip.config import load_media_config as L; \
-    L({'HERMES_SIP_DTMF_MODE':'sip_info'})"
-  # -> ConfigError: dtmf_mode 'sip_info' is not supported for DTMF receive ...
-  uv run python -c "from hermes_voip.config import load_media_config as L; \
-    print(L({'HERMES_SIP_DTMF_MODE':'rfc4733'}).dtmf_mode)"   # -> rfc4733
+    print([L({'HERMES_SIP_DTMF_MODE':m}).dtmf_mode for m in ('auto','rfc4733','sip_info','inband')])"
+  # -> ['auto', 'rfc4733', 'sip_info', 'inband']
   ```
-- **DTMF receive live (pending operator redeploy + a real call).** On a call whose
-  gateway negotiated `telephone-event`, the answer log shows `inbound DTMF receive active
-  (RFC 4733, PT <n>)`; pressing keys logs `dtmf rx: digit '<d>'` (the digit is
-  operational, not a secret) and — for a menu group — `dtmf: delivering menu group
-  '[DTMF] 1234'`. If the gateway negotiated NO telephone-event the log shows a single
-  WARNING `inbound DTMF receive ... UNAVAILABLE` (with `HERMES_SIP_DTMF_INBAND_ENABLED`
-  true) rather than silence.
+- **Backend resolution (unit check).** The per-call backend follows the codec +
+  telephone-event negotiation (ADR-0036):
+  ```sh
+  uv run python -c "from hermes_voip.config import load_media_config as L; \
+    from hermes_voip.dtmf_config import resolve_dtmf_receive_mode as R; \
+    c=L({'HERMES_SIP_DTMF_MODE':'auto'}); \
+    print(R(c, telephone_event_payload_type=None, codec='PCMU'))"   # -> DtmfReceiveMode.INBAND
+  ```
+- **DTMF receive live (pending operator redeploy + a real call).** The answer log shows
+  `inbound DTMF receive active (<backend>)` (`rfc4733` / `sip_info` / `inband`); pressing
+  keys logs `dtmf rx: digit '<d>'` (the digit is operational, not a secret) and — for a
+  menu group — `dtmf: delivering menu group '[DTMF] 1234'`. If no backend can run (no
+  telephone-event AND a non-G.711 codec, or in-band forbidden) the log shows a single
+  WARNING `inbound DTMF receive ... UNAVAILABLE` rather than silence. **In-band detection
+  reliability on a real lossy G.711 path is to be re-measured live (ADR-0036, rules
+  23/26)** — the unit tests prove tone-in/tone-out + speech rejection on clean PCM.
 
 ## Roll back / disable
 
@@ -202,6 +224,6 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
 ## Related
 
 - ADR-0031 (this feature's WHY); ADR-0021 (caller groups + the `allowed_tools` clause);
-  ADR-0010 (DTMF; the RFC 4733 send AND receive paths + the armed-confirmation resolver
-  are now shipped — SIP INFO / in-band remain deferred); ADR-0009 (the tool gate).
+  ADR-0010 (DTMF) + ADR-0036 (the SIP INFO + in-band Goertzel mechanisms, send AND
+  receive — all three ADR-0010 mechanisms are now shipped); ADR-0009 (the tool gate).
 - `docs/runbooks/0010-voip-caller-modes.md` (the caller-groups file + JSON schema).

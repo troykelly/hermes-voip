@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 # ``mypy`` gate and type-checked in the hermes-contract CI job (which installs
 # the ``hermes`` extra) instead of via per-line escape hatches.
 from gateway.config import Platform, PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -73,6 +74,7 @@ from hermes_voip.caller_modes import (
     CallerGroup,
     CallerGroupConfig,
     CallerMode,
+    channel_for_group,
     classify_caller_group,
     group_for_mode,
     load_caller_groups,
@@ -87,7 +89,11 @@ from hermes_voip.config import (
 )
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
-from hermes_voip.dtmf_config import DtmfReceiveMode, resolve_dtmf_receive_mode
+from hermes_voip.dtmf_config import (
+    DtmfReceiveMode,
+    resolve_dtmf_receive_mode,
+    resolve_dtmf_send_mode,
+)
 from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.intercom import (
@@ -1049,6 +1055,23 @@ class VoipAdapter(BasePlatformAdapter):
             engine.telephone_event_payload_type = _telephone_event_payload_type(
                 agreed_codecs
             )
+            # Resolve + apply the DTMF send/receive backends now the codec + PT are
+            # known (ADR-0036): the engine adopts the send backend and arms the in-band
+            # detector on a G.711 call with no telephone-event. ``codec_encoding``
+            # reflects the codec adopted just above (no longer the PCMU placeholder).
+            engine.dtmf_send_mode = resolve_dtmf_send_mode(
+                media_cfg,
+                telephone_event_payload_type=engine.telephone_event_payload_type,
+                codec=engine.codec_encoding,
+            )
+            engine.inband_dtmf_rx_enabled = (
+                resolve_dtmf_receive_mode(
+                    media_cfg,
+                    telephone_event_payload_type=engine.telephone_event_payload_type,
+                    codec=engine.codec_encoding,
+                )
+                is DtmfReceiveMode.INBAND
+            )
 
             _log.info(
                 "outbound media negotiated: codec=%s/%d, sending RTP to %s:%d, "
@@ -1123,6 +1146,10 @@ class VoipAdapter(BasePlatformAdapter):
                 guard=guard_state,
                 local_media=local_media,
                 credentials=credentials_for_session,
+                # The resolved DTMF send backend (ADR-0036), read back from the engine
+                # so the backend is resolved in exactly one place (SIP-INFO send is the
+                # session's job; RFC 4733 / in-band delegate to the engine).
+                dtmf_send_mode=engine.dtmf_send_mode,
             )
             # Remove the temporary _QueueSink and install the real session sink.
             transport.remove_call(call_id, sink)
@@ -1472,6 +1499,10 @@ class VoipAdapter(BasePlatformAdapter):
             guard=guard_state,
             local_media=local_media,
             credentials=credentials,
+            # The resolved DTMF send backend (ADR-0036): in SIP-INFO mode the session
+            # emits in-dialog INFO itself; otherwise send_dtmf delegates to the engine.
+            # Read back from the engine so the backend is resolved in exactly one place.
+            dtmf_send_mode=engine.dtmf_send_mode,
         )
         if self._manager is not None:
             self._manager.add_call(session.dialog_id, session)
@@ -1588,6 +1619,21 @@ class VoipAdapter(BasePlatformAdapter):
         stops the engine, and raises :class:`_MediaNegotiationRejected`.
         """
         remote_address = _effective_address(audio, offer)
+        te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
+        # Resolve the per-call DTMF send/receive backends (ADR-0036) from config + the
+        # negotiated telephone-event PT + the negotiated audio codec. The engine acts on
+        # the send backend (RFC 4733 train / in-band tones; SIP INFO is the session's
+        # job) and arms the in-band Goertzel detector only when the receive backend is
+        # in-band (a G.711 call with no telephone-event).
+        dtmf_send_mode = resolve_dtmf_send_mode(
+            media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+        )
+        inband_rx = (
+            resolve_dtmf_receive_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+            )
+            is DtmfReceiveMode.INBAND
+        )
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — bind to all interfaces for RTP
             local_port=0,  # OS assigns a free port
@@ -1601,9 +1647,11 @@ class VoipAdapter(BasePlatformAdapter):
             # The negotiated RFC 4733 telephone-event PT for in-call DTMF (ADR-0031),
             # or None when the offer carried no telephone-event (send_dtmf then
             # raises rather than guessing a PT).
-            telephone_event_payload_type=_telephone_event_payload_type(
-                agreed_sdp_codecs
-            ),
+            telephone_event_payload_type=te_pt,
+            # The resolved DTMF send backend + whether to arm the in-band receive
+            # detector (ADR-0036).
+            dtmf_send_mode=dtmf_send_mode,
+            inband_dtmf_rx_enabled=inband_rx,
             srtp_inbound=_srtp_from_audio(audio, outbound=False),
             srtp_outbound=_srtp_from_audio(audio, outbound=True),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
@@ -1818,6 +1866,20 @@ class VoipAdapter(BasePlatformAdapter):
             await session.close()
             raise _MediaNegotiationRejected from None
 
+        te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
+        # Resolve the DTMF send/receive backends for the WebRTC call too (ADR-0036) so a
+        # forced sip_info routes SIP INFO via the CallSession (not the media engine) and
+        # the receive wiring is correct. WebRTC is Opus, so in-band never applies (the
+        # resolver returns UNAVAILABLE for a non-G.711 codec).
+        dtmf_send_mode = resolve_dtmf_send_mode(
+            media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+        )
+        inband_rx = (
+            resolve_dtmf_receive_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+            )
+            is DtmfReceiveMode.INBAND
+        )
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — unused on the ICE path (no socket bound)
             local_port=0,
@@ -1827,9 +1889,9 @@ class VoipAdapter(BasePlatformAdapter):
             remote_port=audio.port or 9,
             codec=engine_codec,
             payload_type=codec.payload_type,
-            telephone_event_payload_type=_telephone_event_payload_type(
-                agreed_sdp_codecs
-            ),
+            telephone_event_payload_type=te_pt,
+            dtmf_send_mode=dtmf_send_mode,
+            inband_dtmf_rx_enabled=inband_rx,
             # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
             srtp_inbound=srtp_inbound,
             srtp_outbound=srtp_outbound,
@@ -1992,28 +2054,40 @@ class VoipAdapter(BasePlatformAdapter):
         call_loop: CallLoop,
         media_cfg: MediaConfig,
     ) -> None:
-        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0010).
+        """Wire inbound DTMF receive for one call from config + negotiation (ADR-0036).
 
         Resolves :func:`resolve_dtmf_receive_mode` from the call's ``dtmf_mode`` /
-        ``dtmf_inband_enabled`` and the engine's negotiated telephone-event PT, and:
+        ``dtmf_inband_enabled`` + the negotiated telephone-event PT + the negotiated
+        codec, then wires whichever backend resolved so the digit reaches the SAME
+        ``CallLoop.feed_dtmf`` router (uniform surfacing across all three mechanisms):
 
-        * ``RFC4733`` — wire the engine's ``on_dtmf`` demux to the loop's digit router
-          and bind a per-call :class:`~hermes_voip.dtmf_confirm.ArmedConfirmation` (so
-          an irreversible tool can obtain a spoof-resistant keypad confirmation — the
-          channel that unblocks ``transfer_blind``). The confirmation prompt is spoken
-          through the loop's TTS path;
+        * ``RFC4733`` — the engine's telephone-event demux fires ``engine.on_dtmf``;
+        * ``SIP_INFO`` — the :class:`~hermes_voip.call.CallSession`'s ``INFO`` handler
+          fires ``session.on_dtmf``;
+        * ``INBAND`` — the engine's Goertzel detector (already armed at construction for
+          a G.711 call) fires ``engine.on_dtmf``;
         * ``UNAVAILABLE`` — DTMF receive was wanted but cannot run (no telephone-event
-          negotiated); log a WARNING so the gap is operator-visible, and leave
-          ``on_dtmf`` unset (received nothing to route);
+          and the codec is not G.711, or in-band forbidden); log a WARNING so the gap is
+          operator-visible, wire nothing;
         * ``DISABLED`` — a clean no-DTMF call; nothing wired.
 
-        This is the load-bearing step that takes the config keys + the receiver out of
-        "parsed/built but unwired" into the live path (rule 6).
+        For EVERY active backend a per-call ``ArmedConfirmation``
+        (:mod:`hermes_voip.dtmf_confirm`) is bound, so an irreversible tool can obtain a
+        spoof-resistant keypad confirmation (the channel that unblocks the transfer
+        tool) regardless of which mechanism carries the digit. This is the
+        load-bearing step that takes the config keys + backends out of "parsed/built but
+        unwired" into the live path (rule 6).
         """
         mode = resolve_dtmf_receive_mode(
-            media_cfg, telephone_event_payload_type=engine.telephone_event_payload_type
+            media_cfg,
+            telephone_event_payload_type=engine.telephone_event_payload_type,
+            codec=engine.codec_encoding,
         )
-        if mode is DtmfReceiveMode.RFC4733:
+        if mode in (
+            DtmfReceiveMode.RFC4733,
+            DtmfReceiveMode.SIP_INFO,
+            DtmfReceiveMode.INBAND,
+        ):
 
             async def _speak_prompt(text: str) -> None:
                 async def _chunk() -> AsyncIterator[str]:
@@ -2023,20 +2097,29 @@ class VoipAdapter(BasePlatformAdapter):
 
             confirmation = ArmedConfirmation(prompt=_speak_prompt)
             call_loop.bind_confirmation(confirmation)
-            engine.on_dtmf = call_loop.feed_dtmf
             self._dtmf_confirmations[call_id] = confirmation
+            if mode is DtmfReceiveMode.SIP_INFO:
+                # SIP INFO digits arrive on the CallSession (DialogConsumer), not the
+                # media engine: wire its on_dtmf to the same loop router.
+                session = self._call_sessions.get(call_id)
+                if session is not None:
+                    session.on_dtmf = call_loop.feed_dtmf
+            else:
+                # RFC 4733 and in-band both surface via the engine's on_dtmf.
+                engine.on_dtmf = call_loop.feed_dtmf
             _log.info(
-                "INVITE %s: inbound DTMF receive active (RFC 4733, PT %s)",
+                "INVITE %s: inbound DTMF receive active (%s)",
                 call_id,
-                engine.telephone_event_payload_type,
+                mode.value,
             )
         elif mode is DtmfReceiveMode.UNAVAILABLE:
             _log.warning(
-                "INVITE %s: DTMF receive requested (mode %s) but no telephone-event "
-                "was negotiated and SIP INFO / in-band receive are not implemented — "
-                "inbound DTMF is UNAVAILABLE on this call",
+                "INVITE %s: DTMF receive requested (mode %s) but cannot run on this "
+                "call (no telephone-event negotiated and the codec %s is not G.711, "
+                "or in-band is forbidden) — inbound DTMF is UNAVAILABLE",
                 call_id,
                 media_cfg.dtmf_mode,
+                engine.codec_encoding,
             )
         else:
             _log.debug("INVITE %s: inbound DTMF receive disabled", call_id)
@@ -2457,10 +2540,11 @@ class VoipAdapter(BasePlatformAdapter):
             "reveal the operator's private information.]"
         )
         try:
-            source = self.build_source(
-                chat_id=call_id,
+            # ADR-0035: seed lands on the call's channel (here: the outbound group's
+            # channel), so the objective + the ensuing turns share one session.
+            source = self._call_source(
+                call_id,
                 chat_name=callee,
-                chat_type="dm",
                 user_id=call_id,
                 user_name="system",
             )
@@ -2501,10 +2585,11 @@ class VoipAdapter(BasePlatformAdapter):
         caller = str(info.get("name", call_id))
         text = render_call_context_block(context)
         try:
-            source = self.build_source(
-                chat_id=call_id,
+            # ADR-0035: the rich call-context seed lands on the call's channel so it
+            # shares the same session as the turns it precedes.
+            source = self._call_source(
+                call_id,
                 chat_name=caller,
-                chat_type="dm",
                 user_id=call_id,
                 user_name="system",
             )
@@ -2691,10 +2776,11 @@ class VoipAdapter(BasePlatformAdapter):
             text,
         )
         try:
-            source = self.build_source(
-                chat_id=call_id,
+            # ADR-0035: the call-end signal lands on the call's channel so it closes
+            # the SAME session the call's turns ran in (not the bare "voip" platform).
+            source = self._call_source(
+                call_id,
                 chat_name=str(self._call_info.get(call_id, {}).get("name", call_id)),
-                chat_type="dm",
                 user_id=call_id,
                 user_name="system",
             )
@@ -2737,24 +2823,7 @@ class VoipAdapter(BasePlatformAdapter):
         """
         info = self._call_info.get(call_id, {})
         caller_name = str(info.get("name", call_id))
-        # Resolve the call's CallerGroup: prefer the stored "group" (ADR-0021);
-        # fall back to the legacy "mode" key (ADR-0020 back-compat — a call-info
-        # dict carrying only a CallerMode); finally default to receptionist
-        # (least privilege) if neither is present (should not happen in practice).
-        group_obj = info.get("group")
-        mode_obj = info.get("mode")
-        group: CallerGroup
-        if isinstance(group_obj, CallerGroup):
-            group = group_obj
-        elif isinstance(mode_obj, CallerMode):
-            group = group_for_mode(mode_obj)
-        else:
-            group = CallerGroup(
-                name="receptionist",
-                privilege_level=0,
-                persona="receptionist",
-                declined_at_sip=False,
-            )
+        group = self._group_for_call(call_id)
 
         # ADR-0029: on an outbound call the per-call objective rides in the preamble
         # so every turn keeps the agent on the operator's task with the untrusted
@@ -2763,10 +2832,12 @@ class VoipAdapter(BasePlatformAdapter):
         objective = objective_obj if isinstance(objective_obj, str) else None
         spotlighted = _spotlight_turn(group, caller_name, text, objective=objective)
 
-        source = self.build_source(
-            chat_id=call_id,
+        # ADR-0035: route the turn to the caller-group's CHANNEL (a Hermes platform
+        # name), not the hard-coded "voip" platform, so the call's conversation lives
+        # in its channel's own session namespace (the operator's "Telegram model").
+        source = self._call_source(
+            call_id,
             chat_name=caller_name,
-            chat_type="dm",
             user_id=caller_name,
             user_name=caller_name,
         )
@@ -2777,6 +2848,81 @@ class VoipAdapter(BasePlatformAdapter):
             media_urls=[],
         )
         await self.handle_message(event)
+
+    def _group_for_call(self, call_id: str) -> CallerGroup:
+        """Resolve a call's :class:`CallerGroup` (ADR-0021 / ADR-0035).
+
+        Prefers the stored ``"group"`` (ADR-0021); falls back to the legacy ``"mode"``
+        key (ADR-0020 back-compat — a call-info dict carrying only a
+        :class:`CallerMode`, e.g. an outbound call); finally defaults to the
+        receptionist (least privilege) if neither is present (should not happen in
+        practice). This is the single resolution every own-session injection shares so
+        a call's channel is consistent across its context seed, turns, and end-signal.
+        """
+        info = self._call_info.get(call_id, {})
+        group_obj = info.get("group")
+        mode_obj = info.get("mode")
+        if isinstance(group_obj, CallerGroup):
+            return group_obj
+        if isinstance(mode_obj, CallerMode):
+            return group_for_mode(mode_obj)
+        return CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+        )
+
+    def _call_source(
+        self,
+        call_id: str,
+        *,
+        chat_name: str,
+        user_id: str,
+        user_name: str,
+    ) -> SessionSource:
+        """Build the call's own-session :class:`SessionSource` on its channel.
+
+        ADR-0035. Routing in Hermes is by ``event.source`` alone, and the inherited
+        ``build_source`` hard-codes this adapter's own ``voip`` platform, so the source
+        is constructed directly with the caller-group's channel as its platform (the
+        same technique the ADR-0029 cross-session report uses). ``Platform._missing_``
+        resolves an arbitrary channel name (e.g. ``voip-unknown``) without editing the
+        core enum, so the call lands in that channel's own session namespace. The
+        channel is derived from the FORGEABLE caller-ID and is never authentication —
+        the untrusted-data fence + the per-channel tool ceiling are the security spine.
+
+        Every own-session injection for a call (the spotlighted turn, the objective
+        seed, the rich call-context seed, the call-end signal) goes through here, so
+        the whole conversation shares ONE channel. The ADR-0029 cross-session report
+        targets the *originating* foreign session instead and does NOT use this helper.
+        """
+        channel = channel_for_group(self._group_for_call(call_id))
+        return SessionSource(
+            platform=self._channel_platform(channel),
+            chat_id=call_id,
+            chat_name=chat_name,
+            chat_type="dm",
+            user_id=user_id,
+            user_name=user_name,
+        )
+
+    def _channel_platform(self, channel: str) -> Platform:
+        """Resolve a channel name to a :class:`Platform`, registering it if needed.
+
+        ``Platform(channel)`` only resolves a name the enum's ``_missing_`` hook
+        recognises — a registered plugin platform. ``register()`` registers the
+        canonical channels, but a call may route to an operator-defined channel from a
+        groups file (or run in a context where ``register()`` was not the entry, e.g.
+        a unit test), so this ensures the channel is registered first
+        (:func:`ensure_channel_registered`, idempotent). If the registry still cannot
+        resolve the name (an unusual runtime), it FAILS LOUD with a clear error rather
+        than silently routing to the wrong/bare platform — mis-routing a call to the
+        wrong session is a security-relevant defect (rule 37), not something to paper
+        over.
+        """
+        ensure_channel_registered(channel)
+        return Platform(channel)
 
     def _on_unroutable(self, what: object) -> None:
         """Log unroutable SIP messages at DEBUG; never crash the transport."""
@@ -3216,6 +3362,62 @@ def _parse_channel_target(channel: str | None) -> tuple[str, str] | None:
     if not platform or not chat_id:
         return None
     return (platform, chat_id)
+
+
+def ensure_channel_registered(channel: str) -> None:
+    """Register ``channel`` as a routing-alias platform if it is not already (ADR-0035).
+
+    ``gateway.config.Platform(channel)`` only resolves a name its ``_missing_`` hook
+    recognises — a bundled plugin platform or one present in the module-singleton
+    ``platform_registry`` (verified vs hermes-agent 0.16.0; it does NOT resolve
+    arbitrary names). A caller-group channel (canonical or operator-defined in a groups
+    file) must therefore be registered before :meth:`VoipAdapter._call_source` builds a
+    :class:`~gateway.session.SessionSource` on it, or routing raises ``ValueError``.
+
+    Registers an idempotent **alias** of the primary ``voip`` platform: the same adapter
+    factory + ``check_fn`` (there is one telephony endpoint; the channels are routing
+    identities over the one adapter, never a second SIP/RTP transport), but inert
+    enablement (``is_connected`` → ``False``, empty env seed) so the gateway never
+    brings the alias up as an independent connecting platform. No-op if the name is
+    already registered (the primary ``voip``, a prior call, or :func:`register`'s
+    own registration).
+
+    Lives here (not in the light :mod:`hermes_voip.plugin`) because it touches
+    ``gateway.platform_registry``: ``plugin.py`` stays hermes-import-free so it remains
+    in the default (no-``hermes``-extra) mypy gate, while this module already imports
+    the runtime and is type-checked in the hermes-contract job. The light enablement
+    callbacks + factory are imported from ``plugin`` lazily to avoid an import cycle.
+    """
+    if not channel or channel == _PLATFORM_NAME:
+        return
+    if platform_registry.is_registered(channel):
+        return
+    from hermes_voip.plugin import (  # noqa: PLC0415
+        _INSTALL_HINT,
+        _REQUIRED_ENV,
+        _adapter_factory,
+        _check_fn,
+        channel_env_enablement,
+        channel_is_never_independently_connected,
+        validate_voip_config,
+    )
+
+    platform_registry.register(
+        PlatformEntry(
+            name=channel,
+            label=f"VoIP channel: {channel}",
+            adapter_factory=_adapter_factory,
+            check_fn=_check_fn,
+            validate_config=validate_voip_config,
+            is_connected=channel_is_never_independently_connected,
+            required_env=list(_REQUIRED_ENV),
+            install_hint=_INSTALL_HINT,
+            env_enablement_fn=channel_env_enablement,
+            source="plugin",
+            plugin_name="hermes-voip",
+            pii_safe=True,
+        )
+    )
 
 
 def _spotlight_turn(

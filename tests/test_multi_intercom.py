@@ -224,7 +224,7 @@ def test_unknown_opening_type_rejected(tmp_path: Path) -> None:
 
 
 def test_intercom_with_no_openings_rejected(tmp_path: Path) -> None:
-    doc = {"intercoms": {"1000": {"openings": {}}}}
+    doc: dict[str, object] = {"intercoms": {"1000": {"openings": {}}}}
     path = _write(tmp_path, doc)
     with pytest.raises(ConfigError, match="opening"):
         load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))

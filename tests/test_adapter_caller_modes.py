@@ -1273,7 +1273,7 @@ async def test_named_opening_webhook_calls_the_webhook() -> None:
     async def _fake_fire(opening: Opening) -> None:
         fired.append(opening)
 
-    adapter._fire_webhook_opening = _fake_fire  # type: ignore[assignment, method-assign]  # test seam
+    adapter._fire_webhook_opening = _fake_fire  # type: ignore[method-assign]  # test seam
 
     opened = await adapter.open_entry(call_id, "gate")
 

@@ -59,6 +59,7 @@ class _FakeHost:
         already_ended: bool = False,
         guard: GuardSessionState | None = None,
         registrations: str = "1000: registered",
+        open_entry_raises: Exception | None = None,
     ) -> None:
         self.known = known
         self.already_ended = already_ended
@@ -72,6 +73,9 @@ class _FakeHost:
         self.results: list[tuple[str, str]] = []
         self.dtmf_sent: list[tuple[str, str]] = []
         self.entries_opened: list[str] = []
+        self.entry_names: list[str | None] = []
+        # When set, open_entry raises this (e.g. a name not in the intercom's set).
+        self.open_entry_raises = open_entry_raises
         self.transfers: list[tuple[str, str]] = []
         # When set, send_dtmf_on_call raises this instead of recording (e.g. the
         # telephone-event-not-negotiated RuntimeError).
@@ -121,9 +125,12 @@ class _FakeHost:
         self.dtmf_sent.append((call_id, digits))
         return self.known and not self.already_ended
 
-    async def open_entry(self, call_id: str) -> bool:
-        # ADR-0031 VoipToolHost member: actuate the intercom entry.
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
+        # ADR-0031/0045 VoipToolHost member: actuate the (optionally named) entry.
+        if self.open_entry_raises is not None:
+            raise self.open_entry_raises
         self.entries_opened.append(call_id)
+        self.entry_names.append(name)
         return self.known and not self.already_ended
 
     async def transfer_blind_on_call(
@@ -602,20 +609,25 @@ def test_send_dtmf_allowed_for_trusted(
 # --- open_entry: the intercom entry action ------------------------------------
 
 
-def test_open_entry_schema_takes_no_params() -> None:
+def test_open_entry_schema_has_optional_name_param() -> None:
     assert OPEN_ENTRY_TOOL_SCHEMA["name"] == OPEN_ENTRY_TOOL_NAME
     assert OPEN_ENTRY_TOOL_SCHEMA["description"]
     params = OPEN_ENTRY_TOOL_SCHEMA["parameters"]
     assert isinstance(params, dict)
-    # No parameters: opening the door is a fixed action, never a model-chosen target.
-    assert params.get("properties") == {}
+    # ADR-0045: an OPTIONAL 'name' selects which named opening to actuate; it is not
+    # required (a single-opening intercom may omit it). The call is still the session's
+    # own — only the opening name is model-chosen.
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    assert "name" in props
+    assert params.get("required") == []
 
 
 @pytest.mark.asyncio
 async def test_open_entry_handler_actuates_on_the_session_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_entry resolves the session's call and actuates the entry."""
+    """open_entry resolves the session's call and actuates the entry (no name)."""
     host = _FakeHost()
     set_active_adapter(host)
     _set_chat(monkeypatch, "call-door")
@@ -623,7 +635,38 @@ async def test_open_entry_handler_actuates_on_the_session_call(
     result = await open_entry_handler({})
 
     assert host.entries_opened == ["call-door"]
+    assert host.entry_names == [None]  # absent name => legacy/default opening
     assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_open_entry_handler_passes_the_named_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_entry forwards the chosen opening name to the adapter (ADR-0045)."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-gate")
+
+    result = await open_entry_handler({"name": "gate"})
+
+    assert host.entries_opened == ["call-gate"]
+    assert host.entry_names == ["gate"]
+    assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_open_entry_handler_reports_name_not_in_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name outside the calling intercom's set surfaces a clear error (ADR-0045)."""
+    host = _FakeHost(open_entry_raises=ValueError("opening 'garage' is not one of …"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-x")
+
+    result = await open_entry_handler({"name": "garage"})
+
+    assert "error" in json.loads(result)
 
 
 def test_open_entry_is_gated_blocked_for_receptionist(

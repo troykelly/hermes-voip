@@ -1566,7 +1566,7 @@ class VoipAdapter(BasePlatformAdapter):
         # `group` (classified at the top of this handler) drives the per-turn
         # persona preamble in _deliver_turn; persist it on the call info.
         #
-        # ADR-0033: extract the RICH inbound-call context (caller identity,
+        # ADR-0052: extract the RICH inbound-call context (caller identity,
         # dialled target, redirection/diversion chain, calling device, media)
         # from the same parsed INVITE — every value is caller-/network-supplied
         # and FORGEABLE, so it is surfaced to the agent only as a labelled,
@@ -1592,11 +1592,11 @@ class VoipAdapter(BasePlatformAdapter):
             # reaches here — it was rejected with 603 above). Kept so callers
             # reading the legacy "mode" key keep working.
             "mode": classification.mode,
-            # ADR-0033: the rich, structured inbound-call context (forgeable).
+            # ADR-0052: the rich, structured inbound-call context (forgeable).
             "context": call_context,
         }
 
-        # --- Seed the agent's first turn with the rich call context (ADR-0033) ---
+        # --- Seed the agent's first turn with the rich call context (ADR-0052) ---
         # Inject the labelled, untrusted call-context block as the call's first system
         # turn so the agent knows who called, what was dialled, and how the call reached
         # it BEFORE the caller speaks. Awaited HERE, before _run_call_loop starts the
@@ -2612,7 +2612,7 @@ class VoipAdapter(BasePlatformAdapter):
             )
 
     async def _inject_call_context_first_turn(self, call_id: str) -> None:
-        """Seed an inbound call's FIRST turn with the rich call context (ADR-0033).
+        """Seed an inbound call's FIRST turn with the rich call context (ADR-0052).
 
         Injects one ``internal=True`` ``MessageEvent`` into the call's OWN session
         (``chat_id`` == Call-ID) carrying the rendered :class:`InboundCallContext`

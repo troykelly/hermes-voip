@@ -230,19 +230,34 @@ class WebRtcMediaSession:
         use_ipv6: bool = True,
         ice_factory: _IceFactory = _default_ice_factory,
         cipher_list: bytes | None = None,
+        offerer: bool = False,
     ) -> None:
-        """Pick the DTLS role from the offer and build the DTLS + ICE objects.
+        """Pick the DTLS role + ICE role and build the DTLS + ICE objects.
 
         ``use_ipv4`` / ``use_ipv6`` select the ICE address families to gather
         (IPv6-first, ADR-0043): both default on, so the agent gathers IPv6 (which
         :attr:`ice_candidates` lists first) and IPv4 as the fallback family.
+
+        ``offerer`` (ADR-0049) selects the outbound-origination mode: the session is
+        the **ICE-CONTROLLING** peer (RFC 8445 §6.1) and offers a concrete
+        ``a=setup:active`` (we are the DTLS CLIENT — we send the ClientHello), so the
+        DTLS role and the fingerprint we advertise are fixed before the offer is sent
+        and need no post-answer switch. ``offer_setup`` is ignored in this mode.
+        Construct via :meth:`for_outbound_offer` rather than passing this directly.
+        The default (``offerer=False``) is the inbound ANSWERER: ICE-controlled, with
+        the DTLS role derived from the peer's ``offer_setup`` (RFC 5763 §5).
         """
-        self._setup = answer_setup_for_offer(offer_setup)
+        if offerer:
+            # Outbound origination: offer active (DTLS CLIENT), ICE-controlling.
+            self._setup = SetupRole("active")
+        else:
+            self._setup = answer_setup_for_offer(offer_setup)
         role = DtlsRole.CLIENT if self._setup.value == "active" else DtlsRole.SERVER
         self._dtls = DtlsEndpoint(role=role, cipher_list=cipher_list)
-        # The SIP UAS (answering an inbound INVITE) is ICE-CONTROLLED.
+        # The SIP UAS (answering an inbound INVITE) is ICE-CONTROLLED; the UAC
+        # originating an outbound call is ICE-CONTROLLING (ADR-0049).
         self._ice: _IcePipe = ice_factory(
-            ice_controlling=False,
+            ice_controlling=offerer,
             stun_urls=stun_urls,
             turn_urls=turn_urls,
             turn_username=turn_username,
@@ -251,6 +266,53 @@ class WebRtcMediaSession:
             use_ipv6=use_ipv6,
         )
         self._prepared = False
+
+    @classmethod
+    def for_outbound_offer(  # noqa: PLR0913 -- independent keyword config mirrors __init__
+        cls,
+        *,
+        stun_urls: tuple[str, ...] = (),
+        turn_urls: tuple[str, ...] = (),
+        turn_username: str | None = None,
+        turn_password: str | None = None,
+        use_ipv4: bool = True,
+        use_ipv6: bool = True,
+        ice_factory: _IceFactory = _default_ice_factory,
+        cipher_list: bytes | None = None,
+    ) -> WebRtcMediaSession:
+        """Construct the outbound-origination session (ADR-0049).
+
+        The returned session is the **offerer**: ICE-controlling and DTLS ``active``
+        (the CLIENT). Build it, call :meth:`prepare`, read :attr:`fingerprint` /
+        :attr:`setup` / :attr:`ice_ufrag` / :attr:`ice_pwd` / :attr:`ice_candidates`
+        into the WebRTC offer (:func:`hermes_voip.sdp.build_webrtc_offer`), send the
+        INVITE, then drive :meth:`run_handshake` with the peer's answer attributes.
+
+        Args:
+            stun_urls: ``stun:`` URLs for srflx ICE candidates (empty ⇒ host-only).
+            turn_urls: ``turn:``/``turns:`` URLs for relay candidates (ADR-0034).
+            turn_username: TURN long-term username (required when ``turn_urls`` set).
+            turn_password: TURN long-term password (required when ``turn_urls`` set).
+            use_ipv4: Gather IPv4 ICE candidates (the fallback family; ADR-0043).
+            use_ipv6: Gather IPv6 ICE candidates (the preferred family; ADR-0043).
+            ice_factory: Factory building the ICE pipe (injected in tests).
+            cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
+
+        Returns:
+            A new offerer :class:`WebRtcMediaSession`.
+        """
+        return cls(
+            offer_setup=None,
+            stun_urls=stun_urls,
+            turn_urls=turn_urls,
+            turn_username=turn_username,
+            turn_password=turn_password,
+            use_ipv4=use_ipv4,
+            use_ipv6=use_ipv6,
+            ice_factory=ice_factory,
+            cipher_list=cipher_list,
+            offerer=True,
+        )
 
     # ------------------------------------------------------------------
     # Phase A: prepare (gather + expose answer attributes)

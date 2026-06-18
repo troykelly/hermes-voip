@@ -123,6 +123,7 @@ from hermes_voip.message import (
     build_request,
     build_response,
     new_branch,
+    new_call_id,
     new_tag,
 )
 from hermes_voip.notice_filter import is_internal_system_notice
@@ -140,6 +141,7 @@ from hermes_voip.sdp import (
     build_audio_answer,
     build_audio_offer,
     build_webrtc_answer,
+    build_webrtc_offer,
     negotiate_audio,
 )
 from hermes_voip.sdp import (
@@ -197,6 +199,15 @@ _SUPPORTED_ENCODINGS = ("G722", "PCMU", "PCMA", "telephone-event")
 # Opus, pyOpenSSL/aioice for DTLS/ICE); a WebRTC offer to a host without it fails the
 # call loudly (ImportError) rather than answering dead — never a silent miss.
 _WEBRTC_SUPPORTED_ENCODINGS = ("opus", "PCMU", "PCMA", "telephone-event")
+
+# Opus on the SIP (SDES/TLS) path (ADR-0049). Opus is offered on the SIP menu ONLY
+# when libopus is actually loadable at runtime (``_opus_sip_available``), so a host
+# without the ``webrtc`` extra advertises exactly the G.722/G.711 floor menu and the
+# #84 advertise-without-carry invariant holds. PT 111 / opus/48000/2 with the
+# RFC 7587 fmtp; the engine carries Opus identically on the SIP and WebRTC paths.
+_OPUS_SIP_PAYLOAD_TYPE = 111
+_OPUS_RTP_CLOCK_RATE = 48000
+_OPUS_FMTP = "minptime=10;useinbandfec=1"
 
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
@@ -802,25 +813,23 @@ class VoipAdapter(BasePlatformAdapter):
                 when no registered extension is available, or when the slot is busy.
             RuntimeError: When the transport or manager is not initialised.
         """
-        # ADR-0038 / ADR-0032 §5: outbound origination over WSS is DEFERRED. The
-        # outbound UAC path offers SDES/G.711-G.722 and emits a TLS Via, so dialing
-        # over the WSS signalling transport would put spec-incoherent SIP on the
-        # WebSocket. Reject it LOUDLY here (a named boundary, never a silent
-        # incoherent send) rather than letting _handle_outbound_invite proceed.
+        # ADR-0049 (lifts ADR-0032 §5 / ADR-0038 §4): on a WSS gateway, outbound
+        # origination carries OUR OWN WebRTC offer (DTLS/ICE/Opus) over the
+        # WebSocket — never the SDES/TLS-Via INVITE the WSS transport cannot frame
+        # coherently. The transport is selected per dial: wss => WebRTC UAC,
+        # tls => the existing SDES UAC.
         gateway_cfg = self._gateway_cfg
-        if gateway_cfg is not None and gateway_cfg.transport == "wss":
-            raise OutboundCallFailed(
-                501,
-                "outbound calling is not supported on the WSS transport "
-                "(outbound WebRTC origination is deferred — ADR-0032 §5); "
-                "outbound runs only on HERMES_SIP_TRANSPORT=tls",
-            )
+        is_wss = gateway_cfg is not None and gateway_cfg.transport == "wss"
         if extension in self._outbound_extensions:
             raise OutboundCallFailed(
                 503, f"outbound call to {extension!r} already in progress"
             )
         self._outbound_extensions.add(extension)
         try:
+            if is_wss:
+                return await self._handle_outbound_webrtc_invite(
+                    extension, objective=objective, origin=origin
+                )
             return await self._handle_outbound_invite(
                 extension, objective=objective, origin=origin
             )
@@ -1023,7 +1032,11 @@ class VoipAdapter(BasePlatformAdapter):
                 raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
 
             try:
-                agreed_codecs = negotiate_audio(answer_audio, _SUPPORTED_ENCODINGS)
+                # ADR-0049: the SIP answer may negotiate Opus when we offered it
+                # (libopus available) — accept it here too, not only G.722/G.711.
+                agreed_codecs = negotiate_audio(
+                    answer_audio, _sip_supported_encodings()
+                )
             except ValueError as exc:
                 raise OutboundCallFailed(
                     488, f"no common codec in 2xx answer: {exc}"
@@ -1074,7 +1087,7 @@ class VoipAdapter(BasePlatformAdapter):
                 except UnsupportedCodecError as exc:
                     # Defense-in-depth (unreachable over the current menu, since
                     # negotiate_audio above already rejects an offer whose voice
-                    # codec is outside _SUPPORTED_ENCODINGS): if the advertised
+                    # codec is outside _sip_supported_encodings()): if the advertised
                     # menu ever drifts ahead of the engine table, FAIL the call
                     # loudly here rather than leave the engine on a placeholder
                     # codec and stream dead audio. OutboundCallFailed propagates to
@@ -1082,6 +1095,16 @@ class VoipAdapter(BasePlatformAdapter):
                     # inbound guard.
                     raise OutboundCallFailed(
                         488, f"2xx answer codec not carriable: {exc}"
+                    ) from exc
+                # ADR-0049: if the SIP answer negotiated Opus, preflight the runtime
+                # dependency so a host that somehow advertised Opus but lost libopus
+                # fails the call cleanly (488) rather than streaming dead audio. A
+                # no-op for G.722/G.711 (stdlib/pure-Python).
+                try:
+                    _preflight_codec_dependency(engine._codec)
+                except ImportError as exc:
+                    raise OutboundCallFailed(
+                        488, f"2xx answer codec dependency unavailable: {exc}"
                     ) from exc
                 # Also adopt the negotiated RTP payload type (the answer's PT may be
                 # a dynamic value for G.722, differing from the codec's static PT) so
@@ -1301,6 +1324,389 @@ class VoipAdapter(BasePlatformAdapter):
                     reason=CallEndReason.SIP_ERROR,
                 )
 
+    async def _handle_outbound_webrtc_invite(  # noqa: PLR0912,PLR0915 — UAC WebRTC flow: offer/challenge/2xx/handshake/ACK/loop, one sequence
+        self,
+        extension: str,
+        *,
+        objective: str | None = None,
+        origin: tuple[str, str] | None = None,
+    ) -> str:
+        """Drive the outbound WebRTC UAC flow over WSS (ADR-0049).
+
+        The outbound mirror of :meth:`_setup_webrtc_call` (inbound answerer): build
+        OUR DTLS/ICE/Opus offer as the ICE-controlling, DTLS-active offerer, send an
+        RFC-7118 INVITE over the WSS transport, handle a digest challenge + the 2xx,
+        run the ICE+DTLS handshake against the peer's answer attributes, then wire the
+        engine (over the ICE pipe) + CallSession + CallLoop. Lifts the ADR-0032 §5 /
+        ADR-0038 §4 outbound-WebRTC deferral.
+        """
+        transport = self._transport
+        manager = self._manager
+        if transport is None or manager is None:
+            msg = "place_call: not initialised — call connect() first"
+            raise RuntimeError(msg)
+        media_cfg = self._media_cfg
+        if media_cfg is None:
+            msg = "place_call: media config not initialised"
+            raise RuntimeError(msg)
+        gateway_cfg = self._gateway_cfg
+        if gateway_cfg is None:
+            msg = "place_call: gateway config not initialised"
+            raise RuntimeError(msg)
+
+        # A WebRTC call mandates DTLS-SRTP + a real codec (RFC 8827); Opus is the
+        # WebRTC audio codec. Reject BEFORE any INVITE if libopus is unavailable, so
+        # a host without the webrtc extra fails cleanly rather than dialling dead.
+        try:
+            _preflight_codec_dependency(Codec.OPUS)
+        except ImportError as exc:
+            raise OutboundCallFailed(
+                488,
+                "outbound WebRTC call needs the 'webrtc' extra + system libopus "
+                f"for Opus: {exc}",
+            ) from exc
+
+        # Source the call from a registered extension (any registered one).
+        source_state = None
+        for state in manager._by_extension.values():
+            if state.registered:
+                source_state = state
+                break
+        if source_state is None:
+            raise OutboundCallFailed(
+                503, "no registered extension available to originate call"
+            )
+        source_ext = source_state.extension
+
+        target_uri = f"sip:{extension}@{gateway_cfg.host}"
+        local_aor = f"sip:{source_ext.extension}@{gateway_cfg.host}"
+        local_contact = transport.contact_uri(source_ext.extension)
+        local_sent_by = transport.local_sent_by
+        local_rtp_host = _host_of(local_sent_by)
+        session_id = int(time.monotonic() * 1000) & 0xFFFF_FFFF
+
+        # --- Build OUR WebRTC offer (ICE-controlling, DTLS active) ----------
+        session = WebRtcMediaSession.for_outbound_offer(
+            stun_urls=media_cfg.ice_stun_urls,
+            turn_urls=media_cfg.ice_turn_urls,
+            turn_username=media_cfg.ice_turn_username,
+            turn_password=media_cfg.ice_turn_password,
+            use_ipv4=media_cfg.ice_use_ipv4,
+            use_ipv6=media_cfg.ice_use_ipv6,
+        )
+        sink: CallResponseSink = _QueueSink()
+        call_session: CallSession | None = None
+        session_established = False
+        call_id = new_call_id()
+        try:
+            await session.prepare()  # gather ICE; expose fingerprint/setup/creds
+            offer_body = build_webrtc_offer(
+                local_address=local_rtp_host,
+                port=9,  # advisory; ICE candidates carry the real address/port
+                codecs=(_opus_sdp_codec(),),
+                fingerprint=session.fingerprint,
+                setup=session.setup,
+                ice_ufrag=session.ice_ufrag,
+                ice_pwd=session.ice_pwd,
+                ice_candidates=session.ice_candidates,
+                session_id=session_id,
+            )
+
+            # --- Send INVITE (WSS Via, our WebRTC offer) -------------------
+            invite_text, call_id, from_tag = build_outbound_invite(
+                target_uri=target_uri,
+                local_aor=local_aor,
+                local_contact=local_contact,
+                local_sent_by=local_sent_by,
+                transport="WSS",
+                body=offer_body,
+                call_id=call_id,
+            )
+            transport.add_call(call_id, sink)
+            last_cseq = 1
+            await transport.send(invite_text)
+            _log.info(
+                "WebRTC INVITE sent over WSS: Call-ID %s -> %s", call_id, target_uri
+            )
+
+            assert isinstance(sink, _QueueSink)  # noqa: S101 — mypy narrowing aid
+            response = await sink.get()
+
+            if response.status_code in (_SIP_UNAUTHORIZED, _SIP_PROXY_AUTH):
+                is_proxy_auth = response.status_code == _SIP_PROXY_AUTH
+                auth_hdr_name = (
+                    "Proxy-Authenticate" if is_proxy_auth else "WWW-Authenticate"
+                )
+                auth_value = response.header(auth_hdr_name)
+                if auth_value is None:
+                    raise OutboundCallFailed(
+                        response.status_code, "challenge has no auth header"
+                    )
+                challenge = DigestChallenge.parse(auth_value)
+                credentials = DigestCredentials(
+                    username=source_ext.username,
+                    password=source_ext.password,
+                )
+                auth_resp_value = build_authorization(
+                    challenge, credentials, method="INVITE", uri=target_uri
+                )
+                auth_hdr_out = (
+                    "Proxy-Authorization" if is_proxy_auth else "Authorization"
+                )
+                last_cseq = 2
+                invite_text2, _, _ = build_outbound_invite(
+                    target_uri=target_uri,
+                    local_aor=local_aor,
+                    local_contact=local_contact,
+                    local_sent_by=local_sent_by,
+                    transport="WSS",
+                    body=offer_body,
+                    call_id=call_id,
+                    from_tag=from_tag,
+                    cseq=last_cseq,
+                    auth=(auth_hdr_out, auth_resp_value),
+                )
+                await transport.send(invite_text2)
+                _log.info("WebRTC INVITE re-sent with auth: Call-ID %s", call_id)
+                while True:
+                    response = await sink.get()
+                    if response.status_code < _SIP_FINAL_FLOOR:
+                        continue
+                    if _cseq_num(response) == last_cseq:
+                        break
+            elif response.status_code < _SIP_FINAL_FLOOR:
+                while True:
+                    response = await sink.get()
+                    if response.status_code >= _SIP_FINAL_FLOOR:
+                        break
+
+            if response.status_code >= _SIP_ERROR_FLOOR:
+                raise OutboundCallFailed(
+                    response.status_code, response.reason or "Call Failed"
+                )
+
+            # --- Parse the 2xx WebRTC answer -------------------------------
+            answer_body = response.body or ""
+            try:
+                answer_sdp = SessionDescription.parse(answer_body)
+            except Exception as exc:
+                raise OutboundCallFailed(
+                    500, f"2xx SDP answer unparseable: {exc}"
+                ) from exc
+            answer_audio = answer_sdp.audio
+            if answer_audio is None:
+                raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
+            if not answer_audio.is_webrtc:
+                raise OutboundCallFailed(
+                    488, "2xx answer is not a WebRTC (UDP/TLS/RTP/SAVPF) answer"
+                )
+            peer_fp = answer_audio.fingerprint
+            if (
+                peer_fp is None
+                or answer_audio.ice_ufrag is None
+                or answer_audio.ice_pwd is None
+            ):
+                raise OutboundCallFailed(
+                    488,
+                    "2xx WebRTC answer missing fingerprint / ICE credentials",
+                )
+            try:
+                agreed_codecs = negotiate_audio(
+                    answer_audio, _WEBRTC_SUPPORTED_ENCODINGS
+                )
+            except ValueError as exc:
+                raise OutboundCallFailed(
+                    488, f"no common codec in 2xx WebRTC answer: {exc}"
+                ) from exc
+            voice = _first_voice_codec(agreed_codecs)
+            if voice is None:
+                raise OutboundCallFailed(488, "2xx WebRTC answer has no voice codec")
+            try:
+                engine_codec = _to_engine_codec(voice)
+            except UnsupportedCodecError as exc:
+                raise OutboundCallFailed(
+                    488, f"2xx answer codec not carriable: {exc}"
+                ) from exc
+
+            # --- Run the ICE + DTLS handshake as the offerer ---------------
+            srtp_inbound, srtp_outbound = await session.run_handshake(
+                peer_fingerprint=peer_fp,
+                peer_ice_ufrag=answer_audio.ice_ufrag,
+                peer_ice_pwd=answer_audio.ice_pwd,
+                peer_candidates=answer_audio.ice_candidates,
+            )
+
+            # --- Build the UAC dialog + ACK the 2xx ------------------------
+            last_invite_headers = [
+                ("Via", f"SIP/2.0/WSS {local_sent_by};branch={new_branch()};rport"),
+                ("From", f"<{local_aor}>;tag={from_tag}"),
+                ("To", f"<{target_uri}>"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{last_cseq} INVITE"),
+                ("Contact", local_contact),
+            ]
+            parsed_invite = SipRequest.parse(
+                build_request("INVITE", target_uri, last_invite_headers, "")
+            )
+            dialog = Dialog.from_invite_2xx(parsed_invite, response)
+            ack_cseq_num = int(dialog.local_cseq)
+            ack_headers: list[tuple[str, str]] = [
+                ("Via", f"SIP/2.0/WSS {local_sent_by};branch={new_branch()};rport"),
+                ("Max-Forwards", "70"),
+            ]
+            ack_headers.extend(("Route", route) for route in dialog.route_set)
+            ack_headers += [
+                ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{ack_cseq_num} ACK"),
+                ("Contact", local_contact),
+            ]
+            await transport.send(
+                build_request("ACK", dialog.remote_target, ack_headers)
+            )
+            _log.info("WebRTC ACK sent: Call-ID %s", call_id)
+
+            # --- Build the media engine over the ICE pipe ------------------
+            te_pt = _telephone_event_payload_type(agreed_codecs)
+            dtmf_send_mode = resolve_dtmf_send_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=voice.encoding
+            )
+            inband_rx = (
+                resolve_dtmf_receive_mode(
+                    media_cfg,
+                    telephone_event_payload_type=te_pt,
+                    codec=voice.encoding,
+                )
+                is DtmfReceiveMode.INBAND
+            )
+            engine = RtpMediaTransport(
+                local_address="0.0.0.0",  # noqa: S104 — unused on the ICE path
+                local_port=0,
+                remote_address=_effective_address(answer_audio, answer_sdp)
+                or "0.0.0.0",  # noqa: S104
+                remote_port=answer_audio.port or 9,
+                codec=engine_codec,
+                payload_type=voice.payload_type,
+                telephone_event_payload_type=te_pt,
+                dtmf_send_mode=dtmf_send_mode,
+                inband_dtmf_rx_enabled=inband_rx,
+                srtp_inbound=srtp_inbound,
+                srtp_outbound=srtp_outbound,
+                ice_transport=session.ice,
+                media_timeout_secs=media_cfg.media_timeout_secs,
+                aec_enabled=media_cfg.aec_enabled,
+                aec_filter_ms=media_cfg.aec_filter_ms,
+                aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+                aec_mu=media_cfg.aec_mu,
+            )
+            await engine.connect()
+            _log.info("WebRTC outbound media engine connected over ICE: %s", call_id)
+
+            # --- Wire CallSession + CallLoop (outbound, untrusted callee) --
+            _outbound_group = CallerGroup(
+                name="outbound",
+                privilege_level=0,
+                persona="outbound",
+                declined_at_sip=False,
+            )
+            guard_state = GuardSessionState(
+                call_id,
+                privilege_level=_outbound_group.privilege_level,
+                allowed_tools=_outbound_group.allowed_tools,
+            )
+            credentials_for_session = DigestCredentials(
+                username=source_ext.username, password=source_ext.password
+            )
+            local_media = LocalMediaSession(
+                local_address=local_rtp_host,
+                port=9,
+                codecs=tuple(agreed_codecs),
+                session_id=session_id,
+            )
+            call_session = CallSession(
+                dialog=dialog,
+                signaling=transport,
+                media=engine,
+                guard=guard_state,
+                local_media=local_media,
+                credentials=credentials_for_session,
+                dtmf_send_mode=engine.dtmf_send_mode,
+            )
+            transport.remove_call(call_id, sink)
+            transport.add_call(call_id, call_session)
+            manager.add_call(call_session.dialog_id, call_session)
+            self._call_sessions[call_id] = call_session
+
+            call_info: dict[str, object] = {
+                "name": extension,
+                "remote_uri": target_uri,
+                "type": "dm",
+                "ended": False,
+                "group": _outbound_group,
+                "mode": CallerMode.OUTBOUND,
+            }
+            if objective is not None:
+                call_info["objective"] = objective
+            if origin is not None:
+                call_info["origin"] = origin
+            self._call_info[call_id] = call_info
+
+            _bg_engine = engine
+            _bg_transport = transport
+            _bg_session = call_session
+            _bg_call_id = call_id
+            _bg_guard_state = guard_state
+
+            async def _run_and_teardown() -> None:
+                _loop: CallLoop | None = None
+                _raised = True
+                try:
+                    _loop = await self._run_call_loop(
+                        call_id=_bg_call_id,
+                        engine=_bg_engine,
+                        guard_state=_bg_guard_state,
+                    )
+                    _raised = False
+                finally:
+                    _reason = self._classify_end_reason(
+                        _bg_call_id, _bg_engine, raised=_raised
+                    )
+                    await self._teardown_call(
+                        call_id=_bg_call_id,
+                        engine=_bg_engine,
+                        transport=_bg_transport,
+                        dialog_id=_bg_session.dialog_id,
+                        session=_bg_session,
+                        call_loop=_loop,
+                        reason=_reason,
+                    )
+
+            loop_task: asyncio.Task[None] = asyncio.create_task(_run_and_teardown())
+            self._call_tasks.setdefault(call_id, set()).add(loop_task)
+            loop_task.add_done_callback(lambda t: self._on_call_task_done(call_id, t))
+            if objective is not None:
+                first_turn_task: asyncio.Task[None] = asyncio.create_task(
+                    self._inject_objective_first_turn(call_id)
+                )
+                self._call_tasks.setdefault(call_id, set()).add(first_turn_task)
+                first_turn_task.add_done_callback(
+                    lambda t: self._on_call_task_done(call_id, t)
+                )
+            session_established = True
+            return call_id
+        finally:
+            if not session_established:
+                # Release the ICE session (aioice sockets) on any pre-session
+                # failure (errors propagate; this only frees resources, rule 37).
+                # No _teardown_call here: a pre-session failure built no CallLoop and
+                # added no manager dialog, so there is nothing to tear down — only the
+                # temporary response sink to remove.
+                await session.close()
+                transport_cur = self._transport
+                if transport_cur is not None:
+                    transport_cur.remove_call(call_id, sink)
+
     # -----------------------------------------------------------------------
     # Inbound call wiring
     # -----------------------------------------------------------------------
@@ -1413,7 +1819,11 @@ class VoipAdapter(BasePlatformAdapter):
         # (offer.audio.is_webrtc); the codec-capability and no-answer-on-failure
         # invariants below apply identically to both.
         is_webrtc = audio.is_webrtc
-        supported = _WEBRTC_SUPPORTED_ENCODINGS if is_webrtc else _SUPPORTED_ENCODINGS
+        # ADR-0049: the SDES/SIP answer menu offers Opus too when libopus is loadable
+        # (gated, so a host without it keeps the G.722/G.711 floor — no drift).
+        supported = (
+            _WEBRTC_SUPPORTED_ENCODINGS if is_webrtc else _sip_supported_encodings()
+        )
         try:
             agreed_sdp_codecs = negotiate_audio(audio, supported)
         except ValueError as exc:
@@ -1458,6 +1868,23 @@ class VoipAdapter(BasePlatformAdapter):
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
+
+        # ADR-0049: an Opus SIP (SDES) call must have a loadable libopus before we
+        # answer it, or it would be answered-but-dead. The WebRTC path runs this
+        # preflight inside _setup_webrtc_call; the SDES path does it here so an Opus
+        # SIP call is rejected cleanly (488) pre-answer. A no-op for G.722/G.711.
+        if not is_webrtc:
+            try:
+                _preflight_codec_dependency(engine_codec)
+            except ImportError as exc:
+                _log.error(
+                    "INVITE %s: REJECTED 488 — SIP codec dependency unavailable "
+                    "(install the 'webrtc' extra + system libopus): %s",
+                    call_id,
+                    exc,
+                )
+                await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+                return
 
         # --- Build the UAS dialog -------------------------------------------
         local_tag = new_tag()
@@ -1733,7 +2160,8 @@ class VoipAdapter(BasePlatformAdapter):
                 offer,
                 local_address=local_media.local_address,
                 port=local_media.port,
-                supported=list(_SUPPORTED_ENCODINGS),
+                # ADR-0049: Opus is in the SIP answer menu when libopus is loadable.
+                supported=list(_sip_supported_encodings()),
                 session_id=local_media.session_id,
             )
         except Exception as exc:
@@ -3178,15 +3606,70 @@ def _telephone_event_payload_type(
     return None
 
 
-def _outbound_offer_codecs() -> list[SdpCodec]:
-    """The codec list for an outbound INVITE offer, wideband-preferred (ADR-0022).
+def _opus_sip_available() -> bool:
+    """Return ``True`` when Opus can run for the SIP (SDES) path (ADR-0049).
 
-    G.722 (static payload type 9, 16 kHz wideband — rtpmap clock 8000 per RFC 3551)
-    FIRST so a wideband-capable peer picks it, then G.711 PCMU/PCMA (the universal
-    fallback), then telephone-event (DTMF). Matches ``_SUPPORTED_ENCODINGS`` order;
-    a peer that cannot do G.722 answers G.711 via RFC 3264 negotiation.
+    Opus is offered on the SIP menu ONLY when ``opuslib`` + the system ``libopus``
+    are loadable, so a host without the ``webrtc`` extra advertises exactly the
+    G.722/G.711 floor menu (no advertise-without-carry drift; #84). The check forces
+    the same import path a real Opus encode exercises and treats any failure as "not
+    available" — the error is acted upon (Opus is simply not offered), never silently
+    swallowed (rule 37): an unavailable codec is the expected, non-exceptional case
+    on a default install.
     """
-    return [
+    from hermes_voip.media.opus import ensure_opus_available  # noqa: PLC0415
+
+    try:
+        ensure_opus_available()
+    except ImportError:
+        return False
+    return True
+
+
+def _opus_sdp_codec() -> SdpCodec:
+    """The Opus SDP codec for the SIP menu (ADR-0049, RFC 7587).
+
+    ``opus/48000/2`` (two channels is the RFC 7587 rtpmap convention even for a mono
+    stream) at dynamic PT 111, with ``minptime=10;useinbandfec=1``. The engine
+    carries Opus identically on the SIP and WebRTC paths.
+    """
+    return SdpCodec(
+        payload_type=_OPUS_SIP_PAYLOAD_TYPE,
+        encoding="opus",
+        clock_rate=_OPUS_RTP_CLOCK_RATE,
+        channels=2,
+        fmtp=_OPUS_FMTP,
+    )
+
+
+def _sip_supported_encodings() -> tuple[str, ...]:
+    """The SIP (SDES/TLS) answer's supported encodings, Opus-gated (ADR-0049).
+
+    The G.722/G.711/telephone-event floor (``_SUPPORTED_ENCODINGS``), with ``opus``
+    prepended ONLY when libopus is loadable (:func:`_opus_sip_available`). So an
+    inbound SIP call negotiates Opus when both peers offer it and the host can carry
+    it; a host without libopus advertises exactly the prior menu.
+    """
+    if _opus_sip_available():
+        return ("opus", *_SUPPORTED_ENCODINGS)
+    return _SUPPORTED_ENCODINGS
+
+
+def _outbound_offer_codecs() -> list[SdpCodec]:
+    """The codec list for an outbound INVITE offer, wideband-preferred (ADR-0022/0049).
+
+    Opus (PT 111, 48 kHz) is prepended FIRST when libopus is loadable
+    (:func:`_opus_sip_available`, ADR-0049) so a SIP peer can negotiate it; then
+    G.722 (static payload type 9, 16 kHz wideband — rtpmap clock 8000 per RFC 3551)
+    so a wideband-capable peer picks it, then G.711 PCMU/PCMA (the universal
+    fallback), then telephone-event (DTMF). A host without libopus offers exactly the
+    G.722/G.711 floor; a peer that cannot do the offered wideband codec answers G.711
+    via RFC 3264 negotiation.
+    """
+    codecs: list[SdpCodec] = []
+    if _opus_sip_available():
+        codecs.append(_opus_sdp_codec())
+    codecs += [
         SdpCodec(payload_type=9, encoding="G722", clock_rate=8000),
         SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
         SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
@@ -3197,6 +3680,7 @@ def _outbound_offer_codecs() -> list[SdpCodec]:
             fmtp="0-16",
         ),
     ]
+    return codecs
 
 
 def _to_engine_codec(sdp_codec: SdpCodec) -> Codec:

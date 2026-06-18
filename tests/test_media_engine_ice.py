@@ -184,3 +184,34 @@ async def test_stop_closes_the_ice_pipe() -> None:
     await engine.connect()
     await engine.stop()
     assert pipe.closed is True
+
+
+@pytest.mark.asyncio
+async def test_ice_pipe_close_mid_call_tears_down_as_transport_loss() -> None:
+    """An ICE pipe that closes mid-call ends the call (consent-loss teardown).
+
+    This is the gap-analysis #6 chain end-to-end: aioice runs RFC 7675 consent and
+    close()s the ICE connection on consent loss; that close() makes a blocked
+    ``ice.recv()`` raise; the engine's ICE reader catches it and marks the call a
+    transport loss (``media_timed_out``) + sets the stop event so the call loop
+    exits. No media-inactivity timeout is needed — the teardown is driven by ICE
+    consent, independent of whether media was flowing.
+    """
+    pipe = _FakeIcePipe()
+    engine = _engine(pipe)
+    await engine.connect()
+    try:
+        # The reader is parked in ice.recv(). Simulate aioice's consent-driven
+        # close(): the pipe closes, so the parked recv() raises ConnectionError.
+        assert engine.media_timed_out is False
+        await pipe.close()
+
+        # The reader task must observe the close and flip the teardown state.
+        async def _await_teardown() -> None:
+            while not engine.media_timed_out:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_await_teardown(), timeout=2.0)
+        assert engine.media_timed_out is True
+    finally:
+        await engine.stop()

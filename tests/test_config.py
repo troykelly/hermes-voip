@@ -533,6 +533,93 @@ def test_media_ice_stun_urls_blank_members_dropped() -> None:
     assert cfg.ice_stun_urls == ()
 
 
+# --- TURN relay config (ADR-0034) ---
+
+
+def test_media_ice_turn_default_empty() -> None:
+    """No TURN config => no relay candidate (empty URLs, no creds) — ADR-0034."""
+    cfg = load_media_config({})
+    assert cfg.ice_turn_urls == ()
+    assert cfg.ice_turn_username is None
+    assert cfg.ice_turn_password is None
+
+
+def test_media_ice_turn_urls_parsed_with_credentials() -> None:
+    """HERMES_VOIP_ICE_TURN_URLS + username + password parse into MediaConfig."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_ICE_TURN_URLS": (
+                "turn:turn.example.test:3478, turns:turn.example.test:5349"
+            ),
+            "HERMES_VOIP_ICE_TURN_USERNAME": "relay-user",
+            "HERMES_VOIP_ICE_TURN_PASSWORD": "relay-secret",
+        }
+    )
+    assert cfg.ice_turn_urls == (
+        "turn:turn.example.test:3478",
+        "turns:turn.example.test:5349",
+    )
+    assert cfg.ice_turn_username == "relay-user"
+    assert cfg.ice_turn_password == "relay-secret"
+
+
+def test_media_ice_turn_blank_members_dropped() -> None:
+    """Blank entries between commas are dropped (same parser as STUN)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_ICE_TURN_URLS": "turn:turn.example.test:3478, ,",
+            "HERMES_VOIP_ICE_TURN_USERNAME": "u",
+            "HERMES_VOIP_ICE_TURN_PASSWORD": "p",
+        }
+    )
+    assert cfg.ice_turn_urls == ("turn:turn.example.test:3478",)
+
+
+def test_media_ice_turn_urls_without_username_is_config_error() -> None:
+    """TURN URLs set but no username => loud ConfigError (RFC 8656 needs creds)."""
+    with pytest.raises(ConfigError, match="TURN"):
+        load_media_config(
+            {
+                "HERMES_VOIP_ICE_TURN_URLS": "turn:turn.example.test:3478",
+                "HERMES_VOIP_ICE_TURN_PASSWORD": "p",
+            }
+        )
+
+
+def test_media_ice_turn_urls_without_password_is_config_error() -> None:
+    """TURN URLs set but no password => loud ConfigError (no silent no-op)."""
+    with pytest.raises(ConfigError, match="TURN"):
+        load_media_config(
+            {
+                "HERMES_VOIP_ICE_TURN_URLS": "turn:turn.example.test:3478",
+                "HERMES_VOIP_ICE_TURN_USERNAME": "u",
+            }
+        )
+
+
+def test_media_ice_turn_credentials_without_urls_ok() -> None:
+    """Creds present but no URLs is harmless (no relay gathered); not an error."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_ICE_TURN_USERNAME": "u",
+            "HERMES_VOIP_ICE_TURN_PASSWORD": "p",
+        }
+    )
+    assert cfg.ice_turn_urls == ()
+
+
+def test_media_ice_turn_password_suppressed_from_repr() -> None:
+    """The TURN password must never reach a log line / traceback (repr=False)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_ICE_TURN_URLS": "turn:turn.example.test:3478",
+            "HERMES_VOIP_ICE_TURN_USERNAME": "u",
+            "HERMES_VOIP_ICE_TURN_PASSWORD": "super-secret-value",
+        }
+    )
+    assert "super-secret-value" not in repr(cfg)
+
+
 def test_media_barge_in_fade_ms_zero_allowed() -> None:
     """A fade of 0 ms is valid (instant hard cut, no ramp)."""
     cfg = load_media_config({"HERMES_VOIP_BARGE_IN_FADE_MS": "0"})

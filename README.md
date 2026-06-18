@@ -30,6 +30,10 @@ client), so it works with the phone system you already have.
 - **Handles the keypad.** It can press buttons for you to get through an automated menu
   ("press 1 for bookings"), and it can screen a door/gate intercom and buzz an expected
   visitor in.
+- **Knows how to handle the common calls.** Bundled, on-demand playbooks for everyday
+  scenarios — screening an inbound caller, taking a message, a delivery at the door
+  intercom, making a booking, and asking about a price or availability — guide the agent
+  through each one. The relevant persona points the agent at the right playbook.
 - **Stays up.** Reconnects automatically if the line drops, and keeps the conversation alive
   through a brief blip.
 

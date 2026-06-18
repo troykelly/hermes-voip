@@ -475,13 +475,16 @@ async def _build_adapter_with_media(
 
 
 @pytest.mark.asyncio
-async def test_webrtc_av_offer_answers_sendrecv_video_and_starts_sender(
+async def test_webrtc_av_offer_answers_sendonly_video_and_starts_sender(
     tmp_path: object,
 ) -> None:
-    """A configured video source yields a sendrecv video answer + a live sender.
+    """A configured video source yields a sendonly video answer + a live sender.
 
     A WebRTC audio+video offer with a configured source is answered with a BUNDLE'd
-    sendrecv ``m=video`` and starts the outbound H.264 sender over the ICE pipe.
+    sendonly ``m=video`` and starts the outbound H.264 sender over the ICE pipe.
+    We answer sendonly (never sendrecv): the plugin discards inbound video, and
+    sendrecv would solicit inbound video onto the BUNDLE 5-tuple and risk binding
+    the inbound audio SRTP session to the video SSRC (ADR-0044).
     """
     import pathlib  # noqa: PLC0415
 
@@ -524,11 +527,12 @@ async def test_webrtc_av_offer_answers_sendrecv_video_and_starts_sender(
             await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
 
             ok = _sent_200_ok(transport)
-            # The answer carries a BUNDLE'd, sendrecv m=video sharing audio's DTLS.
+            # The answer carries a BUNDLE'd, sendonly m=video sharing audio's DTLS.
             assert "m=video 9 UDP/TLS/RTP/SAVPF 99\r\n" in ok.body
             assert "a=group:BUNDLE 0 1\r\n" in ok.body
             video_block = ok.body.split("m=video", 1)[1]
-            assert "a=sendrecv" in video_block
+            assert "a=sendonly" in video_block
+            assert "a=sendrecv" not in video_block
             assert "a=inactive" not in video_block
             # The outbound video sender started: a distinct video SSRC was keyed
             # and the sender is registered for this call.
@@ -545,6 +549,77 @@ async def test_webrtc_av_offer_answers_sendrecv_video_and_starts_sender(
         await asyncio.sleep(0)
     # After teardown the per-call video sender registration is gone.
     assert call_id not in adapter._video_senders  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_webrtc_video_ssrc_never_collides_with_audio(
+    tmp_path: object,
+) -> None:
+    """The random video SSRC never equals the fixed audio SSRC 0xCAFEBABE (ADR-0044).
+
+    A collision would let the inbound demux confuse audio and video streams on the
+    shared BUNDLE 5-tuple. The generator must skip the audio SSRC; here randint is
+    forced to return 0xCAFEBABE first, then a safe value — the keyed SSRC must be
+    the safe value, proving the collision is excluded.
+    """
+    import pathlib  # noqa: PLC0415
+
+    from hermes_voip.media.engine import _OUTBOUND_SSRC  # noqa: PLC0415
+
+    assert isinstance(tmp_path, pathlib.Path)
+    source = tmp_path / "clip.h264"
+    source.write_bytes(_FAKE_H264_ANNEX_B)
+    media_cfg = load_media_config({"HERMES_VOIP_VIDEO_SOURCE_PATH": str(source)})
+
+    transport = _FakeTransport()
+    adapter = await _build_adapter_with_media(transport, media_cfg)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_AV_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    _safe_ssrc = 0x0BADF00D
+    # First draw collides with the audio SSRC; the generator must reject it and
+    # redraw, landing on the safe value.
+    randint_returns = iter([_OUTBOUND_SSRC, _safe_ssrc])
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.random.randint",
+                side_effect=lambda *_a, **_k: next(randint_returns),
+            ),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            session = _FakeWebRtcSession.last
+            assert session is not None
+            await _until(lambda: bool(session.video_ssrcs))
+            assert _OUTBOUND_SSRC not in session.video_ssrcs
+            assert session.video_ssrcs == [_safe_ssrc]
+    finally:
+        in_call.set()
+        await adapter.disconnect()  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,11 @@ both. This lane:
   ``a=mid``, direction) — additive, leaving all audio parsing unchanged;
 * builds a full WebRTC answer that, when the offer has video, mirrors the
   BUNDLE group, emits an ``m=video`` answer sharing the SAME fingerprint / ICE /
-  setup as audio, and is ``a=sendrecv`` (when a source is configured) or
-  ``a=inactive`` (no source) — RFC-correct for a BUNDLE offer.
+  setup as audio, and is ``a=sendonly`` (when a source is configured) or
+  ``a=inactive`` (no source). We NEVER answer ``a=sendrecv``: the plugin discards
+  all inbound video, and soliciting inbound video onto the shared BUNDLE 5-tuple
+  would let an early inbound video packet bind the audio SRTP session to the
+  video SSRC and silently kill inbound audio (ADR-0044).
 
 The audio-only answer MUST be byte-identical to before (regression). Fakes only:
 RFC 5737/3849 documentation addresses, fake ICE/fingerprint tokens.
@@ -172,12 +175,74 @@ def test_negotiate_video_none_when_no_h264() -> None:
     assert negotiate_video_h264(sdp.video) is None
 
 
+def test_negotiate_video_none_when_only_packetization_mode_0() -> None:
+    """Decline H.264 when only packetization-mode=0 is offered (ADR-0044).
+
+    The RFC 6184 packetiser FU-A-fragments any large NAL, which violates the
+    mode-0 single-NAL-only contract. Rather than emit FU-A under mode 0, decline
+    video (return ``None``) so the adapter answers a=inactive.
+    """
+    offer = (
+        "v=0\r\n"
+        "o=- 1 1 IN IP6 2001:db8::1\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE 0 1\r\n"
+        f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+        f"a=ice-pwd:{_FAKE_PWD}\r\n"
+        f"a=fingerprint:SHA-256 {_FAKE_FINGERPRINT}\r\n"
+        "a=setup:actpass\r\n"
+        "m=audio 19710 UDP/TLS/RTP/SAVPF 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtcp-mux\r\n"
+        "a=mid:0\r\n"
+        "m=video 19710 UDP/TLS/RTP/SAVPF 100\r\n"
+        "a=rtpmap:100 H264/90000\r\n"
+        "a=fmtp:100 profile-level-id=42e016;packetization-mode=0\r\n"
+        "a=rtcp-mux\r\n"
+        "a=mid:1\r\n"
+    )
+    sdp = SessionDescription.parse(offer)
+    assert sdp.video is not None
+    assert negotiate_video_h264(sdp.video) is None
+
+
+def test_negotiate_video_none_when_h264_has_no_fmtp() -> None:
+    """An H.264 codec with no fmtp at all is mode-0 by default (RFC 6184 §8.1).
+
+    Absent ``packetization-mode``, the default is 0 (single-NAL only); we cannot
+    safely FU-A-fragment, so decline.
+    """
+    offer = (
+        "v=0\r\n"
+        "o=- 1 1 IN IP6 2001:db8::1\r\n"
+        "s=-\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE 0 1\r\n"
+        f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+        f"a=ice-pwd:{_FAKE_PWD}\r\n"
+        f"a=fingerprint:SHA-256 {_FAKE_FINGERPRINT}\r\n"
+        "a=setup:actpass\r\n"
+        "m=audio 19710 UDP/TLS/RTP/SAVPF 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtcp-mux\r\n"
+        "a=mid:0\r\n"
+        "m=video 19710 UDP/TLS/RTP/SAVPF 100\r\n"
+        "a=rtpmap:100 H264/90000\r\n"
+        "a=rtcp-mux\r\n"
+        "a=mid:1\r\n"
+    )
+    sdp = SessionDescription.parse(offer)
+    assert sdp.video is not None
+    assert negotiate_video_h264(sdp.video) is None
+
+
 # ---------------------------------------------------------------------------
 # Answer building
 # ---------------------------------------------------------------------------
 
 
-def test_answer_video_sendrecv_when_source_configured() -> None:
+def test_answer_video_sendonly_when_source_configured() -> None:
     sdp = SessionDescription.parse(_OFFER_AUDIO_VIDEO)
     assert sdp.video is not None
     chosen = negotiate_video_h264(sdp.video)
@@ -189,9 +254,12 @@ def test_answer_video_sendrecv_when_source_configured() -> None:
     assert "m=video 9 UDP/TLS/RTP/SAVPF 99\r\n" in text
     assert "a=rtpmap:99 H264/90000\r\n" in text
     assert "a=fmtp:99 profile-level-id=42e01f;packetization-mode=1\r\n" in text
-    # sendrecv because a source is configured (active=True).
+    # sendonly because a source is configured (active=True) but we discard inbound
+    # video — never sendrecv, which would solicit inbound video onto the shared
+    # BUNDLE 5-tuple and risk killing inbound audio SRTP binding (ADR-0044).
     video_block = text.split("m=video", 1)[1]
-    assert "a=sendrecv" in video_block
+    assert "a=sendonly" in video_block
+    assert "a=sendrecv" not in video_block
     assert "a=inactive" not in video_block
     # BUNDLE group + mids (RFC 8843).
     assert "a=group:BUNDLE 0 1\r\n" in text

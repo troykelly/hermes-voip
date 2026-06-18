@@ -44,6 +44,11 @@ from hermes_voip.voip_tools import (
 
 _BOOM = "unexpected host failure (synthetic)"
 
+#: The DTMF/opening tools whose guard MUST return a FIXED generic message and must
+#: NEVER echo the exception detail — an unanticipated ``exc`` can embed the secret
+#: DTMF digits / opening secret (voip_tools.py documents "digits are NOT echoed").
+_SECRET_DETAIL_HANDLER_NAMES = frozenset({"send_dtmf_handler", "open_entry_handler"})
+
 
 class _SyntheticHostError(Exception):
     """An UNANTICIPATED host error no handler branch expects (only the guard)."""
@@ -143,8 +148,15 @@ async def test_handler_returns_error_json_on_unanticipated_exception(
     assert isinstance(result, str)
     payload = json.loads(result)
     assert "error" in payload, f"{handler.__name__} did not return an error result"
-    # The synthetic failure detail is surfaced to the model (and logged).
-    assert _BOOM in payload["error"]
+    if handler.__name__ in _SECRET_DETAIL_HANDLER_NAMES:
+        # send_dtmf / open_entry MUST NOT echo the exception detail — an
+        # unanticipated exc could embed the secret digits / opening secret. The
+        # guard returns a FIXED generic message instead (asserted in detail by
+        # test_secret_handlers_never_echo_exception_detail).
+        assert _BOOM not in payload["error"]
+    else:
+        # The synthetic failure detail is surfaced to the model (and logged).
+        assert _BOOM in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -159,9 +171,77 @@ async def test_handler_guard_logs_the_exception(
     with caplog.at_level("ERROR", logger="hermes_voip.voip_tools"):
         await hang_up_handler({})
 
-    assert any(_BOOM in rec.getMessage() or rec.exc_info for rec in caplog.records), (
-        "the guard must log the unanticipated exception"
-    )
+    # The guard logs with full traceback context: the captured record's exc_info
+    # must carry the synthetic error TYPE (an unconditional ``or rec.exc_info`` would
+    # pass even if nothing about this failure was logged — exc_info is always set on
+    # _log.exception). Asserting the exception type proves THIS failure was logged.
+    assert any(
+        rec.exc_info is not None and rec.exc_info[0] is _SyntheticHostError
+        for rec in caplog.records
+    ), "the guard must log the unanticipated exception with its traceback context"
+
+
+# ---------------------------------------------------------------------------
+# (1b) The DTMF/opening tools' guard NEVER echoes the exception detail (it could
+#      embed the secret digits / opening secret). It returns a FIXED message and
+#      logs WITHOUT the exception text.
+# ---------------------------------------------------------------------------
+
+#: A recognisable secret-digit string an unanticipated exception might embed.
+_SECRET_DIGITS = "9182736450"
+
+
+class _DigitLeakingHost(_ExplodingHost):
+    """A host whose unanticipated error message embeds the secret DTMF digits.
+
+    Models the worst case: a bug deep in the send path raises an exception whose
+    ``str(exc)`` contains the very digits the caller asked to send (or the opening
+    secret). The guard for the DTMF/opening tools must NOT propagate that text into
+    the model-facing result OR the logs. Subclasses :class:`_ExplodingHost` so it
+    still satisfies the full ``VoipToolHost`` surface; only the two secret-bearing
+    methods are overridden to raise with the digits embedded.
+    """
+
+    async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
+        raise _SyntheticHostError(f"backend rejected sequence {_SECRET_DIGITS}")
+
+    async def open_entry(self, call_id: str) -> bool:
+        raise _SyntheticHostError(f"relay rejected secret {_SECRET_DIGITS}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        (send_dtmf_handler, {"digits": _SECRET_DIGITS}),
+        (open_entry_handler, {}),
+    ],
+)
+async def test_secret_handlers_never_echo_exception_detail(
+    handler: _Handler,
+    args: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """send_dtmf / open_entry return a FIXED message; digits never leak anywhere."""
+    set_active_adapter(_DigitLeakingHost())
+    _set_chat(monkeypatch, "call-xyz")
+
+    with caplog.at_level("ERROR", logger="hermes_voip.voip_tools"):
+        result = await handler(args)  # MUST NOT raise
+
+    payload = json.loads(result)
+    assert "error" in payload
+    # The secret digits must not appear in the model-facing result...
+    assert _SECRET_DIGITS not in result
+    # ...and the fixed generic message names the tool + "internal error", no exc text.
+    tool = handler.__name__.removesuffix("_handler")
+    assert payload["error"] == f"{tool} failed (internal error)"
+    # ...and the digits must not appear in any captured log line OR exc_info text.
+    for rec in caplog.records:
+        assert _SECRET_DIGITS not in rec.getMessage()
+        if rec.exc_info is not None and rec.exc_info[1] is not None:
+            assert _SECRET_DIGITS not in str(rec.exc_info[1])
 
 
 # ---------------------------------------------------------------------------

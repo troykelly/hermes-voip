@@ -26,9 +26,11 @@ real ``cryptography`` / ``pyOpenSSL`` dependencies are never touched.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from collections.abc import Iterator
+import types
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -147,3 +149,101 @@ def test_get_openssl_builds_once_under_concurrency(
     )
     assert all(r is sentinel for r in results)
     assert dtls_mod._get_openssl() is sentinel
+
+
+# ---------------------------------------------------------------------------
+# LazySingleton's RUNTIME-helper path is build-once under concurrency too.
+# ---------------------------------------------------------------------------
+
+
+class _CorrectRuntimeHandle:
+    """A faithful ``plugins.plugin_utils.lazy_singleton`` handle.
+
+    Builds its wrapped factory at most once, under its own lock — exactly what a
+    correct runtime helper guarantees. With a CORRECT runtime handle, the only way
+    the user factory runs more than once is if ``LazySingleton`` itself builds more
+    than one handle (its ``_resolve_runtime`` racing) — which is the bug under test.
+    """
+
+    def __init__(self, factory: Callable[[], object]) -> None:
+        self._factory = factory
+        self._lock = threading.Lock()
+        self._built = False
+        self._value: object = None
+
+    def get(self) -> object:
+        if not self._built:
+            with self._lock:
+                if not self._built:
+                    self._value = self._factory()
+                    self._built = True
+        return self._value
+
+    def reset(self) -> None:
+        with self._lock:
+            self._built = False
+            self._value = None
+
+
+@pytest.fixture
+def _fake_runtime_lazy_singleton() -> Iterator[None]:
+    """Install a fake ``plugins.plugin_utils`` exposing a correct ``lazy_singleton``.
+
+    LazySingleton's ``_resolve_runtime`` imports
+    ``plugins.plugin_utils.lazy_singleton``; absent in the default test env it falls
+    back to stdlib. Injecting a real module here drives the RUNTIME path instead.
+    """
+    handles: list[_CorrectRuntimeHandle] = []
+
+    def lazy_singleton(factory: Callable[[], object]) -> _CorrectRuntimeHandle:
+        # Sleep WHILE building the runtime handle to widen the window in which
+        # ``_runtime_resolved`` is True but ``_runtime`` is not yet assigned — the
+        # exact interleaving in which an unlocked ``_resolve_runtime`` lets a second
+        # thread fall through to the stdlib path and build the value a second time.
+        time.sleep(_BUILD_SLEEP_S)
+        handle = _CorrectRuntimeHandle(factory)
+        handles.append(handle)
+        return handle
+
+    pkg = types.ModuleType("plugins")
+    pkg.__path__ = []  # mark as a package so the submodule import resolves
+    sub = types.ModuleType("plugins.plugin_utils")
+    sub.lazy_singleton = lazy_singleton  # type: ignore[attr-defined]  # test stub attr
+    monkey_added = {"plugins": pkg, "plugins.plugin_utils": sub}
+    saved = {name: sys.modules.get(name) for name in monkey_added}
+    sys.modules.update(monkey_added)
+    try:
+        yield
+    finally:
+        for name, prior in saved.items():
+            if prior is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prior
+
+
+@pytest.mark.usefixtures("_fake_runtime_lazy_singleton")
+def test_lazy_singleton_runtime_path_builds_once_under_concurrency() -> None:
+    """LazySingleton over the RUNTIME helper builds the value once under a stampede.
+
+    A concurrent first-call stampede must not let ``_resolve_runtime`` build two
+    runtime handles (each of which would run the user factory once) — the value
+    factory must run EXACTLY once and every caller gets the same instance.
+    """
+    counter = _Counter()
+    sentinel = object()
+
+    def factory() -> object:
+        counter.tick()
+        time.sleep(_BUILD_SLEEP_S)
+        return sentinel
+
+    singleton: LazySingleton[object] = LazySingleton(factory)
+    results = _hammer(singleton.get)
+
+    assert counter.count == 1, (
+        f"runtime-path factory ran {counter.count} times under {_N_THREADS} "
+        f"concurrent callers; expected exactly 1 (resolve_runtime race)"
+    )
+    assert all(r is sentinel for r in results)
+    assert singleton.get() is sentinel

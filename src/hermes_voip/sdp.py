@@ -582,8 +582,23 @@ class _AudioAccumulator:
         elif value == "rtcp-mux":
             self.rtcp_mux = True
 
-    def build(self, session_connection: str | None) -> AudioMedia:
-        """Resolve the accumulated state into an immutable :class:`AudioMedia`."""
+    def build(
+        self,
+        session_connection: str | None,
+        session_defaults: _AudioAccumulator | None = None,
+    ) -> AudioMedia:
+        """Resolve the accumulated state into an immutable :class:`AudioMedia`.
+
+        ``session_defaults`` carries the SDP **session-level** DTLS/ICE
+        attributes (a separate accumulator fed the ``a=`` lines that appear
+        before the first ``m=`` line). A media section inherits any of
+        ``fingerprint`` / ``setup`` / ``ice_ufrag`` / ``ice_pwd`` /
+        ``ice_options`` it does not set itself, with the **media-level value
+        taking precedence** (RFC 8122 §5 fingerprint, RFC 8839 §4.2 ICE). This
+        is what lets a BUNDLE offer that hoists those credentials to the session
+        level (e.g. an Asterisk-based gateway) be recognised as a usable WebRTC
+        offer instead of being rejected as "missing fingerprint/ICE".
+        """
         codecs: list[Codec] = []
         for pt in self.fmt_order:
             if pt in self.rtpmaps:
@@ -613,6 +628,17 @@ class _AudioAccumulator:
             effective_conn = None
         else:
             effective_conn = self.connection or session_connection
+        # Inherit session-level DTLS/ICE credentials when this media section does
+        # not carry its own (media overrides session — RFC 8122 §5 / RFC 8839
+        # §4.2). ``ice_candidates`` / ``end_of_candidates`` are intentionally
+        # NOT inherited: candidates are per-media (for a BUNDLE offer they ride
+        # the first/tag m-line), so a media section's own candidate set stands.
+        defaults = session_defaults
+        fingerprint = self.fingerprint or (defaults.fingerprint if defaults else None)
+        setup = self.setup or (defaults.setup if defaults else None)
+        ice_ufrag = self.ice_ufrag or (defaults.ice_ufrag if defaults else None)
+        ice_pwd = self.ice_pwd or (defaults.ice_pwd if defaults else None)
+        ice_options = self.ice_options or (defaults.ice_options if defaults else ())
         return AudioMedia(
             port=self.port,
             protocol=self.protocol,
@@ -622,13 +648,13 @@ class _AudioAccumulator:
             direction=self.direction,
             connection_address=effective_conn,
             crypto_attrs=tuple(crypto_attrs),
-            fingerprint=self.fingerprint,
-            setup=self.setup,
-            ice_ufrag=self.ice_ufrag,
-            ice_pwd=self.ice_pwd,
+            fingerprint=fingerprint,
+            setup=setup,
+            ice_ufrag=ice_ufrag,
+            ice_pwd=ice_pwd,
             ice_candidates=tuple(self.ice_candidates),
             rtcp_mux=self.rtcp_mux,
-            ice_options=self.ice_options,
+            ice_options=ice_options,
             end_of_candidates=self.end_of_candidates,
         )
 
@@ -645,6 +671,11 @@ class SessionDescription:
         """Parse an SDP body, extracting the first audio media if present."""
         session_conn: str | None = None
         acc: _AudioAccumulator | None = None
+        # Collects the SESSION-level a= attributes (those before the first m=
+        # line). Only its DTLS/ICE fields are consumed by build(); reusing the
+        # accumulator keeps a single attribute-parsing code path (DRY) and an
+        # unrelated session-level a= line is parsed harmlessly and ignored.
+        session_acc = _AudioAccumulator()
         in_audio = False  # currently inside the (single) selected audio section
         seen_media = False  # any m= line has started; session-level c= is over
 
@@ -672,10 +703,16 @@ class SessionDescription:
                     session_conn = addr  # session-level c= precedes any media
                 elif in_audio and acc is not None:
                     acc.connection = addr  # media-level c= for the audio section
-            elif kind == "a" and in_audio and acc is not None:
-                acc.add_attribute(value)
+            elif kind == "a":
+                if in_audio and acc is not None:
+                    acc.add_attribute(value)
+                elif not seen_media:
+                    # Session-level a= (RFC 8122 §5 fingerprint, RFC 8839 §4.2
+                    # ICE): captured here and applied to the audio media as a
+                    # default in build() when the media block does not override.
+                    session_acc.add_attribute(value)
 
-        audio = acc.build(session_conn) if acc is not None else None
+        audio = acc.build(session_conn, session_acc) if acc is not None else None
         return cls(connection_address=session_conn, audio=audio)
 
 

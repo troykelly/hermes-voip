@@ -311,7 +311,7 @@ def register(ctx: PluginContextProtocol) -> None:
     )
 
     # ADR-0035: register each caller-group CHANNEL as a first-class platform aliasing
-    # the one voip adapter (the operator's "Telegram model" — one Hermes, many
+    # the one voip adapter (voip channel routing — one Hermes, many VoIP
     # channels). This makes the channel name resolve via Platform(<channel>) and lets
     # the operator scope per-platform tools_config / disabled_toolsets to a channel.
     # The aliases share the primary adapter_factory + check_fn (one telephony

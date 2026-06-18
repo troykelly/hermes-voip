@@ -176,7 +176,7 @@ class CallerGroup:
             Under ADR-0035 this set is *also* the channel's per-channel permitted
             tool set (the operator's "separate permissions").
         channel: The Hermes channel (platform name) a call in this group is
-            delivered to (ADR-0035 — the "Telegram model": one Hermes, many
+            delivered to (ADR-0035 — voip channel routing: one Hermes, many VoIP
             channels). EMPTY (the default) resolves to the canonical
             ``voip-<name>`` via :func:`channel_for_group`; a non-empty value is
             used verbatim. The channel is the routing identity an inbound call's
@@ -651,7 +651,7 @@ _DEFAULT_THREE_GROUPS: tuple[CallerGroup, ...] = (
 )
 
 
-# ADR-0035: the operator's four canonical CHANNELS (the "Telegram model"). Each is a
+# ADR-0035: the operator's four canonical VoIP CHANNELS (channel routing). Each is a
 # distinct Hermes platform name with its own per-channel PERMITTED tool set (the
 # existing allowed_tools sub-ceiling reframed as "this channel's permissions"). The
 # agent ALWAYS handles the call (ADR-0021 correction); the channel decides the

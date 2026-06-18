@@ -875,7 +875,7 @@ async def test_call_end_reports_result_into_origin_session() -> None:
 
     The end signal still goes to the call's own session (ADR-0026); ADDITIONALLY,
     when an origin was captured at trigger time, a second internal MessageEvent is
-    injected into that FOREIGN session (e.g. the Telegram chat that asked for the
+    injected into that FOREIGN session (e.g. the chat session that asked for the
     call) carrying the recorded result — so the originating agent tells the user.
     """
     from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
@@ -1653,7 +1653,7 @@ async def test_inbound_context_block_defangs_caller_fence_sentinel() -> None:
 # event.source alone, so the SessionSource the adapter builds for every own-session
 # injection (the spotlighted transcript turn, the objective seed, the rich
 # call-context seed, the call-end signal) must carry that channel as its platform.
-# This is the operator's "Telegram model": one Hermes, many channels.
+# This is voip channel routing: one Hermes, many VoIP channels.
 
 
 def _capture_sources() -> tuple[

@@ -2834,7 +2834,7 @@ class VoipAdapter(BasePlatformAdapter):
 
         # ADR-0035: route the turn to the caller-group's CHANNEL (a Hermes platform
         # name), not the hard-coded "voip" platform, so the call's conversation lives
-        # in its channel's own session namespace (the operator's "Telegram model").
+        # in its channel's own session namespace (voip channel routing).
         source = self._call_source(
             call_id,
             chat_name=caller_name,

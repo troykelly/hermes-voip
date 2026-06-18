@@ -1,7 +1,13 @@
 # ADR-0018: Video call support — outbound looping clip, inbound discard, dual-transport
 
 - **Date:** 2026-06-16
-- **Status:** Accepted
+- **Status:** Accepted — except the encoder/codec-library decision (§2, §4
+  "openh264 / `pyopenh264` / libvpx / `vp8codec`" + the `video` optional extra),
+  which is **Superseded by ADR-0044**: those Python bindings do not exist on PyPI
+  and the in-process system-library route corrupts the heap, so outbound video is
+  a pre-encoded H.264 Annex-B **file** (no in-process encoder). The rest of this
+  ADR (additive `m=video`, pre-encode-and-loop, inbound discard, graceful decline)
+  still holds.
 - **Deciders:** agent session (video-adr design), operator direction
 
 ## Context

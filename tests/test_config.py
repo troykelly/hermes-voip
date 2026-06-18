@@ -652,6 +652,31 @@ def test_media_ice_stun_urls_explicit_empty_disables() -> None:
     assert cfg.ice_stun_urls == ()
 
 
+def test_media_video_source_default_off() -> None:
+    """No video config => no outbound video source, default 10 fps (ADR-0044)."""
+    cfg = load_media_config({})
+    assert cfg.video_source_path is None
+    assert cfg.video_fps == 10
+
+
+def test_media_video_source_and_fps_parsed() -> None:
+    """HERMES_VOIP_VIDEO_SOURCE_PATH / _FPS are read into the media config."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_VIDEO_SOURCE_PATH": "/srv/clip.h264",
+            "HERMES_VOIP_VIDEO_FPS": "15",
+        }
+    )
+    assert cfg.video_source_path == "/srv/clip.h264"
+    assert cfg.video_fps == 15
+
+
+def test_media_video_fps_out_of_range_rejected() -> None:
+    """An out-of-range HERMES_VOIP_VIDEO_FPS is a ConfigError (1..60)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_VIDEO_FPS": "0"})
+
+
 def test_media_ice_stun_urls_parsed_comma_separated() -> None:
     """HERMES_VOIP_ICE_STUN_URLS is a comma-separated stun: URL list (trimmed)."""
     cfg = load_media_config(

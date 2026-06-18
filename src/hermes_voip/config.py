@@ -326,6 +326,20 @@ DEFAULT_ICE_STUN_URLS: tuple[str, ...] = (
 _ICE_USE_IPV4_KEY = "HERMES_VOIP_ICE_USE_IPV4"
 _ICE_USE_IPV6_KEY = "HERMES_VOIP_ICE_USE_IPV6"
 
+# WebRTC outbound video (ADR-0044). A pre-encoded H.264 Annex-B file the operator
+# supplies; the plugin packetises it (RFC 6184) and loops it over the BUNDLE'd
+# DTLS-SRTP video stream. UNSET ⇒ the WebRTC video answer is a=inactive (no
+# outbound video). There is NO in-process encoder (the named bindings do not exist
+# and the system-library route corrupts the heap — ADR-0044). The path is a local
+# file path, not a secret; it never appears in a tracked file. Has no effect on the
+# SIP-over-TLS path (WebRTC video only in this lane).
+_VIDEO_SOURCE_PATH_KEY = "HERMES_VOIP_VIDEO_SOURCE_PATH"
+# The source's frame rate; the 90 kHz RTP timestamp advances 90000//fps per frame.
+_VIDEO_FPS_KEY = "HERMES_VOIP_VIDEO_FPS"
+_DEFAULT_VIDEO_FPS = 10
+_MIN_VIDEO_FPS = 1
+_MAX_VIDEO_FPS = 60
+
 # WebRTC ICE TURN relay (ADR-0034). A comma-separated list of ``turn:``/``turns:``
 # URLs plus long-term credentials (RFC 8656). When set, a *relay* ICE candidate is
 # gathered so WebRTC works without a host / STUN-reflexive path (symmetric NAT,
@@ -678,6 +692,11 @@ class MediaConfig:
     # The TURN password is a secret — repr-suppressed so it never reaches a log line
     # or traceback (same discipline as the cloud API keys above).
     ice_turn_password: str | None = field(default=None, repr=False)
+    # WebRTC outbound video (ADR-0044): a pre-encoded H.264 Annex-B file path, or
+    # None ⇒ the WebRTC video answer is a=inactive (no outbound video). No effect on
+    # the SIP-over-TLS path. Defaulted so existing direct constructions stay valid.
+    video_source_path: str | None = None
+    video_fps: int = _DEFAULT_VIDEO_FPS
     # In-process acoustic echo cancellation (ADR-0033). On by default: the gateway
     # reflects the agent's TTS back, and the canceller subtracts the known outbound
     # reference from each inbound frame before the VAD/ASR see it, so the echo cannot
@@ -1024,6 +1043,10 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ice_turn_urls=_ice_turn[0],
         ice_turn_username=_ice_turn[1],
         ice_turn_password=_ice_turn[2],
+        video_source_path=_optional(env, _VIDEO_SOURCE_PATH_KEY),
+        video_fps=_parse_bounded_int(
+            env, _VIDEO_FPS_KEY, _MIN_VIDEO_FPS, _MAX_VIDEO_FPS, _DEFAULT_VIDEO_FPS
+        ),
         aec_enabled=aec_enabled,
         aec_filter_ms=_parse_positive_int(
             env, _AEC_FILTER_MS_KEY, _DEFAULT_AEC_FILTER_MS

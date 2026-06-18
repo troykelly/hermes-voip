@@ -390,6 +390,23 @@ class WebRtcMediaSession:
         _log.info("webrtc: DTLS-SRTP keyed (setup=%s)", self._setup.value)
         return inbound, outbound
 
+    def derive_outbound_srtp_session(self, *, ssrc: int) -> SrtpSession:
+        """Derive an additional outbound SRTP session for a BUNDLE'd SSRC (ADR-0044).
+
+        Used for the WebRTC video stream: it shares this call's DTLS handshake
+        (BUNDLE) but rides a distinct SSRC, so it needs its own outbound SRTP
+        session keyed from the same DTLS material. Must be called after
+        :meth:`run_handshake`; the fingerprint-verified precondition is enforced
+        by the underlying DTLS endpoint.
+
+        Args:
+            ssrc: The video stream's SSRC.
+
+        Returns:
+            A new outbound :class:`SrtpSession` bound to ``ssrc``.
+        """
+        return self._dtls.derive_outbound_srtp_session(ssrc=ssrc)
+
     async def _pump_dtls_handshake(self) -> None:
         """Exchange DTLS records over the ICE pipe until the handshake completes.
 

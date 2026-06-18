@@ -42,6 +42,7 @@ import random
 import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 # The real hermes-agent runtime surface. This module is imported ONLY lazily
@@ -116,6 +117,7 @@ from hermes_voip.media.vad import (
     load_silero_model,
     windows_for_ms,
 )
+from hermes_voip.media.video_rtp import RtpVideoSender, read_annex_b_nals
 from hermes_voip.media.webrtc_session import WebRtcMediaSession
 from hermes_voip.message import (
     SipRequest,
@@ -137,10 +139,12 @@ from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
     AudioMedia,
     SessionDescription,
+    VideoAnswer,
     build_audio_answer,
     build_audio_offer,
     build_webrtc_answer,
     negotiate_audio,
+    negotiate_video_h264,
 )
 from hermes_voip.sdp import (
     Codec as SdpCodec,
@@ -373,6 +377,11 @@ class VoipAdapter(BasePlatformAdapter):
         # (their engines never stopped). disconnect() cancels every task in every
         # set; _on_call_task_done discards just the one that finished.
         self._call_tasks: dict[str, set[asyncio.Task[None]]] = {}
+        # WebRTC outbound video senders (ADR-0044), keyed by call_id. Started after
+        # the DTLS handshake when a video source is configured + an H.264 video was
+        # negotiated; stopped + cancelled in _teardown_call alongside engine.stop().
+        self._video_sender_tasks: dict[str, asyncio.Task[None]] = {}
+        self._video_senders: dict[str, RtpVideoSender] = {}
         # Active call sessions mirrored here so they can be re-attached after
         # a reconnect: {call_id → CallSession}
         self._call_sessions: dict[str, CallSession] = {}
@@ -1852,6 +1861,11 @@ class VoipAdapter(BasePlatformAdapter):
                 codecs=agreed_sdp_codecs,
                 session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
             )
+            # Video (ADR-0044): if the offer carries m=video and we can packetise
+            # the negotiated codec (H.264), build a BUNDLE'd video answer. When a
+            # source is configured we answer a=sendrecv and loop it post-handshake;
+            # without a source we answer a=inactive (RFC-correct, no outbound video).
+            video_answer, video_nals = _resolve_webrtc_video(offer, media_cfg)
             answer_sdp = build_webrtc_answer(
                 offer,
                 local_address=local_media.local_address,
@@ -1863,6 +1877,7 @@ class VoipAdapter(BasePlatformAdapter):
                 ice_pwd=session.ice_pwd,
                 ice_candidates=session.ice_candidates,
                 session_id=local_media.session_id,
+                video=video_answer,
             )
         except Exception as exc:
             # Any ICE-gather / answer-build failure before the 200 OK is a clean
@@ -1961,7 +1976,60 @@ class VoipAdapter(BasePlatformAdapter):
         )
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
+        # Outbound video (ADR-0044): only when we answered a=sendrecv (a source is
+        # configured + an H.264 codec was negotiated). The sender rides the SAME
+        # BUNDLE'd ICE pipe + a video-SSRC SRTP session derived from the same DTLS
+        # handshake, looping the pre-packetised Annex-B source. Lifecycle is bound
+        # to the call: cancelled + stopped in _teardown_call.
+        if video_answer is not None and video_answer.active and video_nals:
+            self._start_webrtc_video_sender(
+                call_id=call_id,
+                session=session,
+                nals=video_nals,
+                fps=media_cfg.video_fps,
+                payload_type=video_answer.codec.payload_type,
+            )
         return engine, local_media
+
+    def _start_webrtc_video_sender(
+        self,
+        *,
+        call_id: str,
+        session: WebRtcMediaSession,
+        nals: list[bytes],
+        fps: int,
+        payload_type: int,
+    ) -> None:
+        """Start the looping outbound-video task for this WebRTC call (ADR-0044).
+
+        Derives a video-SSRC SRTP session from the call's completed DTLS handshake
+        (BUNDLE: same keys, distinct SSRC), constructs an :class:`RtpVideoSender`
+        over the shared ICE pipe, and runs its loop as a tracked task. The task and
+        sender are registered per call so :meth:`_teardown_call` stops + cancels
+        them; the task is added to ``_call_tasks`` so ``disconnect`` cancels it too.
+        """
+        video_ssrc = random.randint(0, (1 << 32) - 1)  # noqa: S311 — RTP SSRC, not cryptographic
+        video_srtp = session.derive_outbound_srtp_session(ssrc=video_ssrc)
+        sender = RtpVideoSender(
+            nals=nals,
+            srtp=video_srtp,
+            ice=session.ice,
+            ssrc=video_ssrc,
+            fps=fps,
+            payload_type=payload_type,
+        )
+        self._video_senders[call_id] = sender
+        task: asyncio.Task[None] = asyncio.create_task(sender.run())
+        self._video_sender_tasks[call_id] = task
+        self._call_tasks.setdefault(call_id, set()).add(task)
+        task.add_done_callback(lambda t: self._on_video_sender_done(call_id, t))
+        _log.info(
+            "INVITE %s: WebRTC outbound video started (ssrc=%d, %d NAL(s), %d fps)",
+            call_id,
+            video_ssrc,
+            len(nals),
+            fps,
+        )
 
     async def _send_answer_200(  # noqa: PLR0913 — the dialog-forming 200 OK needs all of these to build the response
         self,
@@ -2249,10 +2317,49 @@ class VoipAdapter(BasePlatformAdapter):
         # Identity-checked: only evict the transport response sink if it is still
         # OUR session (a newer same-Call-ID task may have overwritten it).
         transport.remove_call(call_id, session)
+        # Stop the outbound video sender (ADR-0044), if any: signal its loop to end,
+        # cancel + await its task, and drop the per-call registrations. Done before
+        # engine.stop() so no video packets race the engine teardown.
+        await self._stop_webrtc_video_sender(call_id)
         try:
             await engine.stop()
         except Exception as exc:  # noqa: BLE001 — log; never strand the call routes
             _log.warning("INVITE %s: error stopping media engine: %s", call_id, exc)
+
+    def _on_video_sender_done(self, call_id: str, task: asyncio.Task[None]) -> None:
+        """Log a video-sender task that ended on its own with an error (ADR-0044).
+
+        A clean return (source exhausted is impossible — ``run`` loops forever)
+        or a cancellation (teardown / disconnect) is normal and silent; an
+        unexpected exception (SRTP/ICE send failure) is logged so a broken video
+        leg is diagnosable. The audio call is unaffected — video is additive.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.error(
+                "INVITE %s: WebRTC outbound video sender failed: %s",
+                call_id,
+                exc,
+                exc_info=exc,
+            )
+
+    async def _stop_webrtc_video_sender(self, call_id: str) -> None:
+        """Stop + cancel this call's outbound video sender, if running (ADR-0044)."""
+        sender = self._video_senders.pop(call_id, None)
+        if sender is not None:
+            sender.stop()
+        task = self._video_sender_tasks.pop(call_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            tasks = self._call_tasks.get(call_id)
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks:
+                    self._call_tasks.pop(call_id, None)
 
     def _mark_agent_hangup(self, call_id: str) -> None:
         """Record that the agent's hang-up tool initiated this call's end (ADR-0026).
@@ -3176,6 +3283,54 @@ def _telephone_event_payload_type(
         if c.encoding.lower() == "telephone-event":
             return c.payload_type
     return None
+
+
+def _resolve_webrtc_video(
+    offer: SessionDescription, media_cfg: MediaConfig
+) -> tuple[VideoAnswer | None, list[bytes]]:
+    """Resolve the WebRTC video answer + source NALs for an offer (ADR-0044).
+
+    Returns ``(None, [])`` when the offer has no ``m=video`` or offers no H.264
+    codec we can packetise — the call proceeds audio-only (no video m-line). When
+    the offer carries an H.264 ``m=video``:
+
+    * a configured + readable ``HERMES_VOIP_VIDEO_SOURCE_PATH`` yields an
+      ``active`` :class:`VideoAnswer` (a=sendrecv) and the parsed Annex-B NAL
+      units to loop;
+    * an unset/unreadable source yields an **inactive** answer (a=inactive — the
+      RFC-correct "present but no media" BUNDLE answer) and no NALs.
+
+    An unreadable configured source is logged and downgraded to inactive rather
+    than failing the call (the audio path must not be sacrificed for video).
+    """
+    video = offer.video
+    if video is None:
+        return None, []
+    chosen = negotiate_video_h264(video)
+    if chosen is None:
+        # No H.264 codec we can packetise (e.g. VP8-only). Decline video entirely;
+        # the call is audio-only (no m=video in the answer).
+        _log.info("WebRTC offer m=video has no H.264 codec we packetise; audio-only")
+        return None, []
+    mid = video.mid or "1"
+    source = media_cfg.video_source_path
+    if not source:
+        return VideoAnswer(codec=chosen, mid=mid, active=False), []
+    try:
+        nals = read_annex_b_nals(Path(source))
+    except OSError as exc:
+        # A configured-but-unreadable source must not fail the call: log and
+        # answer a=inactive (rule 37: the error is surfaced, not swallowed).
+        _log.warning(
+            "WebRTC video source %r unreadable (%s); answering a=inactive", source, exc
+        )
+        return VideoAnswer(codec=chosen, mid=mid, active=False), []
+    if not nals:
+        _log.warning(
+            "WebRTC video source %r has no NAL units; answering a=inactive", source
+        )
+        return VideoAnswer(codec=chosen, mid=mid, active=False), []
+    return VideoAnswer(codec=chosen, mid=mid, active=True), nals
 
 
 def _outbound_offer_codecs() -> list[SdpCodec]:

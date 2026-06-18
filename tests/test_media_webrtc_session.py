@@ -211,6 +211,51 @@ async def test_two_sessions_complete_dtls_and_derive_matching_srtp() -> None:
 
 
 @pytest.mark.asyncio
+async def test_derive_video_srtp_session_shares_dtls_keys_bound_to_video_ssrc() -> None:
+    """ADR-0044: a second outbound SRTP session for the BUNDLE'd video SSRC.
+
+    Video rides the same DTLS handshake (BUNDLE) but on a distinct SSRC, and an
+    SrtpSession is bound to one SSRC — so the adapter derives a SECOND outbound
+    SRTP session, keyed from the same DTLS material, bound to the video SSRC. A
+    video packet it protects decrypts on the peer's inbound session.
+    """
+    server_ice, client_ice = _linked_ice(
+        ("svrU", "svrPwwwwwwwwwwwwww"), ("cliU", "cliPwwwwwwwwwwwwww")
+    )
+    server = WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"),
+        ice_factory=lambda **_kw: server_ice,
+    )
+    client = WebRtcMediaSession(
+        offer_setup=SetupRole("passive"),
+        ice_factory=lambda **_kw: client_ice,
+    )
+    await asyncio.gather(server.prepare(), client.prepare())
+    (_s_in, _s_out), (c_in, _c_out) = await asyncio.gather(
+        server.run_handshake(
+            peer_fingerprint=client.fingerprint,
+            peer_ice_ufrag=client.ice_ufrag,
+            peer_ice_pwd=client.ice_pwd,
+        ),
+        client.run_handshake(
+            peer_fingerprint=server.fingerprint,
+            peer_ice_ufrag=server.ice_ufrag,
+            peer_ice_pwd=server.ice_pwd,
+        ),
+    )
+    video_ssrc = 0xDEAD
+    video_out = server.derive_outbound_srtp_session(ssrc=video_ssrc)
+    assert isinstance(video_out, SrtpSession)
+    pkt = RtpPacket(
+        payload_type=96, sequence_number=1, timestamp=0, ssrc=video_ssrc, payload=b"NAL"
+    )
+    wire = video_out.protect(pkt)
+    # The client's inbound (same DTLS keys) decrypts the video packet.
+    assert c_in.unprotect(wire).payload == b"NAL"
+    await asyncio.gather(server.close(), client.close())
+
+
+@pytest.mark.asyncio
 async def test_run_handshake_rejects_fingerprint_mismatch() -> None:
     """A peer fingerprint that does not match the handshake cert raises (RFC 5763)."""
     server_ice, client_ice = _linked_ice(

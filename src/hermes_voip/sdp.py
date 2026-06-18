@@ -49,6 +49,12 @@ _OPUS = "opus"
 # G.711 payloads, emitted after Opus when Opus is offered (ADR-0005 codec order).
 _G711_ENCODINGS = frozenset({"PCMU", "PCMA"})
 _DEFAULT_CLOCK_RATE = 8000
+# Video RTP runs on a 90 kHz clock (RFC 3551 §4); ADR-0044.
+VIDEO_DEFAULT_CLOCK_RATE = 90000
+_H264 = "h264"
+# H.264 fmtp packetisation-mode (RFC 6184 §8.1): mode 1 (FU-A) is preferred over
+# mode 0 (single-NAL only) so large IDR frames can be fragmented.
+_PACKETIZATION_MODE_1 = "packetization-mode=1"
 _SECURE_PROFILE = "RTP/SAVP"
 _PLAIN_PROFILE = "RTP/AVP"
 # WebRTC DTLS-SRTP profile (ADR-0016, RFC 5764 / RFC 4585).
@@ -424,6 +430,8 @@ class AudioMedia:
             empty when absent (ADR-0034, RFC 8839 §5.6).
         end_of_candidates: ``True`` when the m-line carried ``a=end-of-candidates``
             (RFC 8838 §8.2) — the candidate generation is complete.
+        mid: The media identification (``a=mid``, RFC 5888) for BUNDLE grouping,
+            or ``None`` when absent (e.g. a non-BUNDLE SDES offer). ADR-0044.
 
     ``crypto`` and ``crypto_attrs`` are suppressed from ``repr``
     (``field(repr=False)``): both carry SDES inline master key||salt material,
@@ -446,6 +454,7 @@ class AudioMedia:
     rtcp_mux: bool = False
     ice_options: tuple[str, ...] = field(default_factory=tuple)
     end_of_candidates: bool = False
+    mid: str | None = None
 
     @property
     def is_srtp(self) -> bool:
@@ -470,6 +479,150 @@ class AudioMedia:
         ``a=crypto`` (RFC 8827 §6.5).
         """
         return self.protocol == _WEBRTC_PROFILE
+
+
+@dataclass(frozen=True, slots=True)
+class VideoMedia:
+    """A parsed ``m=video`` description (ADR-0044).
+
+    Video is additive: a WebRTC offer may carry an ``m=video`` section alongside
+    ``m=audio`` under a BUNDLE group. Only the fields the plugin needs to build a
+    BUNDLE video answer are kept; DTLS/ICE credentials are NOT duplicated here —
+    they are shared with audio via BUNDLE (the answer reuses the audio
+    fingerprint/ICE/setup).
+
+    Attributes:
+        port: The RTP port the peer declared for video (advisory under BUNDLE /
+            rtcp-mux; the real address is the ICE 5-tuple).
+        protocol: The transport profile (``UDP/TLS/RTP/SAVPF`` for WebRTC).
+        codecs: The offered video codecs in offer order, with their ``fmtp``
+            (e.g. ``profile-level-id``/``packetization-mode`` for H.264).
+        direction: ``sendrecv`` / ``sendonly`` / ``recvonly`` / ``inactive``.
+        mid: The ``a=mid`` media identification for BUNDLE, or ``None``.
+        rtcp_mux: ``True`` when the section carried ``a=rtcp-mux`` (RFC 5761).
+    """
+
+    port: int
+    protocol: str
+    codecs: tuple[Codec, ...]
+    direction: str
+    mid: str | None
+    rtcp_mux: bool
+
+    @property
+    def is_webrtc(self) -> bool:
+        """True when the transport profile is ``UDP/TLS/RTP/SAVPF`` (ADR-0016)."""
+        return self.protocol == _WEBRTC_PROFILE
+
+
+@dataclass(frozen=True, slots=True)
+class VideoAnswer:
+    """Our chosen ``m=video`` answer parameters (ADR-0044).
+
+    Built by the adapter from :func:`negotiate_video_h264` plus the configured
+    video source: ``active=True`` (a source is configured) answers ``a=sendrecv``;
+    ``active=False`` (no source) answers ``a=inactive`` — RFC-correct for a
+    BUNDLE offer that keeps the m-line so the group stays intact.
+
+    Attributes:
+        codec: The H.264 codec we accept (payload type + ``H264/90000`` + the
+            offered ``fmtp`` we echo).
+        mid: The video media identification to mirror (RFC 8843 BUNDLE).
+        active: Whether we send video (a source is configured).
+    """
+
+    codec: Codec
+    mid: str
+    active: bool
+
+
+@dataclass(slots=True)
+class _VideoAccumulator:
+    """Mutable scratch state for one ``m=video`` block while parsing (ADR-0044)."""
+
+    port: int = 0
+    protocol: str = ""
+    fmt_order: list[int] = field(default_factory=list)
+    rtpmaps: dict[int, tuple[str, int, int]] = field(default_factory=dict)
+    fmtps: dict[int, str] = field(default_factory=dict)
+    direction: str = "sendrecv"
+    rtcp_mux: bool = False
+    mid: str | None = None
+
+    def set_media_line(self, value: str) -> None:
+        """Apply an ``m=video <port> <proto> <fmt...>`` line.
+
+        Raises:
+            SdpError: If the line is truncated or carries a non-integer port or
+                payload type.
+        """
+        fields = value.split()
+        if len(fields) < _M_AUDIO_MIN_FIELDS:
+            msg = f"malformed m=video line: {value!r}"
+            raise SdpError(msg)
+        try:
+            self.port = int(fields[1])
+            self.fmt_order = [int(pt) for pt in fields[3:]]
+        except ValueError as exc:
+            msg = f"malformed m=video line: {value!r}"
+            raise SdpError(msg) from exc
+        self.protocol = fields[2]
+
+    def add_attribute(self, value: str) -> None:
+        """Fold one media-level ``a=`` attribute into the accumulator.
+
+        Raises:
+            SdpError: If an ``rtpmap``/``fmtp`` value is malformed.
+        """
+        tag, _, rest = value.partition(":")
+        try:
+            self._add_attribute(tag, rest, value)
+        except ValueError as exc:
+            if isinstance(exc, SdpError):
+                raise
+            msg = f"malformed a={value!r}"
+            raise SdpError(msg) from exc
+
+    def _add_attribute(self, tag: str, rest: str, value: str) -> None:
+        if tag == "rtpmap":
+            pt_str, _, enc_str = rest.partition(" ")
+            encoding, _, after = enc_str.partition("/")
+            rate_str, _, ch_str = after.partition("/")
+            rate = int(rate_str) if rate_str else VIDEO_DEFAULT_CLOCK_RATE
+            channels = int(ch_str) if ch_str else 1
+            self.rtpmaps[int(pt_str)] = (encoding, rate, channels)
+        elif tag == "fmtp":
+            pt_str, _, params = rest.partition(" ")
+            self.fmtps[int(pt_str)] = params.strip()
+        elif tag == "mid":
+            self.mid = rest.strip()
+        elif value in _DIRECTIONS:
+            self.direction = value
+        elif value == "rtcp-mux":
+            self.rtcp_mux = True
+
+    def build(self) -> VideoMedia:
+        """Resolve the accumulated state into an immutable :class:`VideoMedia`."""
+        codecs: list[Codec] = []
+        for pt in self.fmt_order:
+            if pt in self.rtpmaps:
+                encoding, rate, channels = self.rtpmaps[pt]
+            elif pt in _STATIC_PAYLOADS:
+                encoding, rate = _STATIC_PAYLOADS[pt]
+                channels = 1
+            else:
+                continue  # dynamic payload with no rtpmap is unusable
+            codecs.append(
+                Codec(pt, encoding, rate, channels=channels, fmtp=self.fmtps.get(pt))
+            )
+        return VideoMedia(
+            port=self.port,
+            protocol=self.protocol,
+            codecs=tuple(codecs),
+            direction=self.direction,
+            mid=self.mid,
+            rtcp_mux=self.rtcp_mux,
+        )
 
 
 @dataclass(slots=True)
@@ -501,6 +654,8 @@ class _AudioAccumulator:
     # Trickle-ICE SDP primitives (ADR-0034, RFC 8838/8839)
     ice_options: tuple[str, ...] = ()
     end_of_candidates: bool = False
+    # BUNDLE media identification (a=mid, RFC 5888 / 8843). ADR-0044.
+    mid: str | None = None
 
     def set_media_line(self, value: str) -> None:
         """Apply an ``m=audio <port> <proto> <fmt...>`` line.
@@ -575,6 +730,9 @@ class _AudioAccumulator:
         elif tag == "ice-options":
             # RFC 8839 §5.6: space-separated option tokens (e.g. "trickle ice2").
             self.ice_options = tuple(rest.split())
+        elif tag == "mid":
+            # RFC 5888 media identification (BUNDLE grouping, RFC 8843). ADR-0044.
+            self.mid = rest.strip()
         elif value == "end-of-candidates":
             # RFC 8838 §8.2: a value-less attribute marking the end of the
             # candidate generation (non-trickle / half-trickle).
@@ -656,27 +814,36 @@ class _AudioAccumulator:
             rtcp_mux=self.rtcp_mux,
             ice_options=ice_options,
             end_of_candidates=self.end_of_candidates,
+            mid=self.mid,
         )
 
 
 @dataclass(frozen=True, slots=True)
 class SessionDescription:
-    """A parsed SDP body, reduced to the audio media we care about."""
+    """A parsed SDP body, reduced to the audio (and optional video) media.
+
+    ``video`` is the first ``m=video`` section if the offer carries one (ADR-0044);
+    it is ``None`` for an audio-only offer. Parsing video is strictly additive —
+    the audio path is unchanged.
+    """
 
     connection_address: str | None
     audio: AudioMedia | None
+    video: VideoMedia | None = None
 
     @classmethod
-    def parse(cls, text: str) -> SessionDescription:
-        """Parse an SDP body, extracting the first audio media if present."""
+    def parse(cls, text: str) -> SessionDescription:  # noqa: PLR0912 - a flat SDP line dispatch (m=/c=/a= across audio + video sections)
+        """Parse an SDP body, extracting the first audio + first video media."""
         session_conn: str | None = None
         acc: _AudioAccumulator | None = None
+        vacc: _VideoAccumulator | None = None
         # Collects the SESSION-level a= attributes (those before the first m=
         # line). Only its DTLS/ICE fields are consumed by build(); reusing the
         # accumulator keeps a single attribute-parsing code path (DRY) and an
         # unrelated session-level a= line is parsed harmlessly and ignored.
         session_acc = _AudioAccumulator()
-        in_audio = False  # currently inside the (single) selected audio section
+        # The section the current a=/c= lines belong to: "audio", "video", or "".
+        section = ""
         seen_media = False  # any m= line has started; session-level c= is over
 
         for raw in text.replace(_CRLF, "\n").split("\n"):
@@ -686,14 +853,18 @@ class SessionDescription:
             kind, value = line[0], line[2:]
             if kind == "m":
                 seen_media = True
-                if acc is not None:
-                    in_audio = False  # first audio already captured; ignore the rest
-                elif value.startswith("audio"):
+                if value.startswith("audio") and acc is None:
                     acc = _AudioAccumulator()
                     acc.set_media_line(value)
-                    in_audio = True
+                    section = "audio"
+                elif value.startswith("video") and vacc is None:
+                    vacc = _VideoAccumulator()
+                    vacc.set_media_line(value)
+                    section = "video"
                 else:
-                    in_audio = False
+                    # A second audio/video, or an unsupported media type: ignore
+                    # its attributes (we keep only the first of each).
+                    section = ""
             elif kind == "c":
                 fields = value.split()
                 addr = (
@@ -701,11 +872,13 @@ class SessionDescription:
                 )
                 if not seen_media:
                     session_conn = addr  # session-level c= precedes any media
-                elif in_audio and acc is not None:
+                elif section == "audio" and acc is not None:
                     acc.connection = addr  # media-level c= for the audio section
             elif kind == "a":
-                if in_audio and acc is not None:
+                if section == "audio" and acc is not None:
                     acc.add_attribute(value)
+                elif section == "video" and vacc is not None:
+                    vacc.add_attribute(value)
                 elif not seen_media:
                     # Session-level a= (RFC 8122 §5 fingerprint, RFC 8839 §4.2
                     # ICE): captured here and applied to the audio media as a
@@ -713,7 +886,8 @@ class SessionDescription:
                     session_acc.add_attribute(value)
 
         audio = acc.build(session_conn, session_acc) if acc is not None else None
-        return cls(connection_address=session_conn, audio=audio)
+        video = vacc.build() if vacc is not None else None
+        return cls(connection_address=session_conn, audio=audio, video=video)
 
 
 def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec, ...]:
@@ -737,6 +911,31 @@ def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec,
         msg = f"no common audio codec (offered {[c.encoding for c in offer.codecs]})"
         raise ValueError(msg)
     return chosen
+
+
+def negotiate_video_h264(offer: VideoMedia) -> Codec | None:
+    """Choose the H.264 codec to answer for a video offer (ADR-0044).
+
+    Selects an offered H.264 codec, preferring one whose ``fmtp`` declares
+    ``packetization-mode=1`` (FU-A capable — required to fragment large IDR
+    frames) over a mode-0 (single-NAL-only) codec. Returns ``None`` when the
+    offer carries no H.264 codec (e.g. a VP8-only offer): the adapter then
+    declines video (no source on a codec we cannot packetise).
+
+    Args:
+        offer: The peer's offered video media.
+
+    Returns:
+        The chosen H.264 :class:`Codec` (with its offered ``fmtp`` preserved), or
+        ``None`` if no H.264 codec is offered.
+    """
+    h264 = [c for c in offer.codecs if c.encoding.lower() == _H264]
+    if not h264:
+        return None
+    for codec in h264:
+        if codec.fmtp is not None and _PACKETIZATION_MODE_1 in codec.fmtp:
+            return codec
+    return h264[0]
 
 
 def _order_opus_first(codecs: Sequence[Codec]) -> tuple[Codec, ...]:
@@ -846,6 +1045,37 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
     return _CRLF.join(lines) + _CRLF
 
 
+def _rtpmap_lines(codec: Codec) -> list[str]:
+    """The ``a=rtpmap`` (+ optional ``a=fmtp``) line(s) for one codec."""
+    rate = f"{codec.encoding}/{codec.clock_rate}"
+    if codec.channels != 1:
+        rate = f"{rate}/{codec.channels}"
+    lines = [f"a=rtpmap:{codec.payload_type} {rate}"]
+    if codec.fmtp is not None:
+        lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
+    return lines
+
+
+def _build_video_section(video: VideoAnswer) -> list[str]:
+    """The BUNDLE'd ``m=video`` answer section lines (ADR-0044, RFC 6184/8843).
+
+    Shares the audio section's DTLS fingerprint + ICE + setup (BUNDLE, RFC 8843),
+    so this section carries NO fingerprint/ICE of its own — only the negotiated
+    H.264 codec, ``a=rtcp-mux``, the ``a=mid``, and the direction. ``a=sendrecv``
+    when a source is configured (``active``); ``a=inactive`` otherwise — the
+    RFC-correct "present but no media" answer that keeps the BUNDLE group intact.
+    The m-line keeps a real (non-zero) port so the group stays valid.
+    """
+    # A real placeholder port (RFC 4566 disallows 0, which would *decline* the
+    # stream and break the BUNDLE group); the real address is the shared ICE pipe.
+    lines = [f"m=video 9 {_WEBRTC_PROFILE} {video.codec.payload_type}"]
+    lines.extend(_rtpmap_lines(video.codec))
+    lines.append("a=rtcp-mux")
+    lines.append(f"a=mid:{video.mid}")
+    lines.append("a=sendrecv" if video.active else "a=inactive")
+    return lines
+
+
 def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; all keyword-only
     *,
     local_address: str,
@@ -860,8 +1090,10 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
     ice_ufrag: str,
     ice_pwd: str,
     ice_candidates: Sequence[IceCandidate],
+    audio_mid: str | None = None,
+    video: VideoAnswer | None = None,
 ) -> str:
-    """Emit a WebRTC SDP body (``UDP/TLS/RTP/SAVPF``, ADR-0016).
+    """Emit a WebRTC SDP body (``UDP/TLS/RTP/SAVPF``, ADR-0016 + ADR-0044 video).
 
     Per RFC 5763 §5:
     - The ``c=`` session connection-address line is omitted (address is
@@ -872,6 +1104,12 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
 
     Includes ``a=fingerprint``, ``a=setup``, ``a=ice-ufrag``, ``a=ice-pwd``,
     one ``a=candidate`` per entry, and ``a=rtcp-mux``.
+
+    When ``video`` is supplied (ADR-0044), an ``a=group:BUNDLE`` line, an audio
+    ``a=mid``, and a BUNDLE'd ``m=video`` section sharing this fingerprint/ICE are
+    added (RFC 8843). When it is ``None`` the body is byte-identical to the
+    audio-only WebRTC answer (no group, no mid, no video) — the audio-only
+    regression invariant.
 
     ``local_address`` is used in the ``o=`` origin line only (RFC 4566 §5.2);
     it does not appear in a ``c=`` line (which is omitted per RFC 5763 §5).
@@ -896,15 +1134,14 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
         f"o=- {session_id} {sess_version} IN IP4 {local_address}",
         "s=-",
         "t=0 0",
-        f"m=audio {port} {_WEBRTC_PROFILE} {payloads}",
     ]
+    # BUNDLE group line (session level, RFC 8843) — only when answering video, so
+    # an audio-only answer stays byte-identical to before (no a=group).
+    if video is not None and audio_mid is not None:
+        lines.append(f"a=group:BUNDLE {audio_mid} {video.mid}")
+    lines.append(f"m=audio {port} {_WEBRTC_PROFILE} {payloads}")
     for codec in codecs:
-        rate = f"{codec.encoding}/{codec.clock_rate}"
-        if codec.channels != 1:
-            rate = f"{rate}/{codec.channels}"
-        lines.append(f"a=rtpmap:{codec.payload_type} {rate}")
-        if codec.fmtp is not None:
-            lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
+        lines.extend(_rtpmap_lines(codec))
     # DTLS-SRTP keying attributes (RFC 5763 §5, RFC 4572).
     lines.append(f"a=fingerprint:{fingerprint.render()}")
     lines.append(f"a=setup:{setup.render()}")
@@ -923,6 +1160,9 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
     lines.append("a=rtcp-mux")
     lines.append(f"a=ptime:{ptime}")
     lines.append(f"a={direction}")
+    if video is not None and audio_mid is not None:
+        lines.append(f"a=mid:{audio_mid}")
+        lines.extend(_build_video_section(video))
     return _CRLF.join(lines) + _CRLF
 
 
@@ -1073,6 +1313,7 @@ def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; a
     ptime: int = 20,
     session_id: int = 0,
     version: int | None = None,
+    video: VideoAnswer | None = None,
 ) -> str:
     """Build a WebRTC SDP answer to a ``UDP/TLS/RTP/SAVPF`` offer (ADR-0016).
 
@@ -1112,6 +1353,12 @@ def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; a
         ptime: Packetisation time in ms.
         session_id: SDP ``o=`` session id.
         version: SDP ``o=`` session version (defaults to ``session_id``).
+        video: When supplied AND the offer carries an ``m=video`` section
+            (ADR-0044), a BUNDLE'd ``m=video`` answer is appended sharing this
+            answer's fingerprint/ICE/setup (RFC 8843), plus the ``a=group:BUNDLE``
+            line and the audio ``a=mid``. When ``None`` — or when the offer has no
+            video — the answer is audio-only and byte-identical to before (no
+            group/mid/video).
 
     Returns:
         The SDP answer body terminated by CRLF, ready to attach to a 200 OK.
@@ -1142,6 +1389,12 @@ def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; a
     except ValueError as exc:
         raise SdpError(str(exc)) from exc
     sess_version = session_id if version is None else version
+    # Only answer video when the offer actually carried an m=video AND the caller
+    # supplied a VideoAnswer. A video param for an audio-only offer is ignored
+    # (no video is invented). The audio a=mid comes from the offer, defaulting to
+    # "0" if the offer omitted it (a BUNDLE offer always carries mids).
+    answer_video = video if offer.video is not None else None
+    audio_mid = audio.mid or "0"
     return _build_webrtc_body(
         local_address=local_address,
         port=port,
@@ -1155,6 +1408,8 @@ def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; a
         ice_ufrag=ice_ufrag,
         ice_pwd=ice_pwd,
         ice_candidates=ice_candidates,
+        audio_mid=audio_mid if answer_video is not None else None,
+        video=answer_video,
     )
 
 

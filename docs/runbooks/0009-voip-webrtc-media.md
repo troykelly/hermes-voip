@@ -305,6 +305,50 @@ To reproduce the validation so far: run the gateway with `HERMES_SIP_TRANSPORT=w
 dirs, and `HERMES_VOIP_CALLER_ALLOW_FILE`; dial the extension from a WAVE client; watch the
 log for the four lines above.
 
+## Outbound WebRTC video (ADR-0044)
+
+When a WebRTC offer carries an `m=video` line, the plugin answers it (BUNDLE, RFC 8843)
+instead of dropping the call. Outbound video is a **pre-encoded H.264 Annex-B file** — there
+is **no in-process encoder** (the Python encoder bindings do not exist and the system-library
+route corrupts the heap; ADR-0044). Inbound video is accepted in SDP but **discarded** (no
+decode).
+
+### Configure
+
+| Env var | Meaning | Default |
+| --- | --- | --- |
+| `HERMES_VOIP_VIDEO_SOURCE_PATH` | Path to a pre-encoded **H.264 Annex-B** elementary-stream file (e.g. `clip.h264`). Set ⇒ video answer is `a=sendrecv` and the file is packetised (RFC 6184) + looped over the BUNDLE'd video SRTP stream. **Unset ⇒ `a=inactive`** (the m-line is kept so BUNDLE stays intact, but no video is sent). | unset (inactive) |
+| `HERMES_VOIP_VIDEO_FPS` | The source's frame rate (1–60); the 90 kHz RTP timestamp advances `90000//fps` per frame. | `10` |
+
+Produce the source file **offline** with any tool (the plugin never encodes), e.g.:
+
+```sh
+# QCIF, H.264 constrained-baseline, Annex-B (-bsf:v h264_mp4toannexb if needed)
+ffmpeg -i input.mp4 -an -c:v libx264 -profile:v baseline -s 176x144 -r 10 \
+  -bsf:v h264_mp4toannexb -f h264 clip.h264
+```
+
+`HERMES_VOIP_VIDEO_SOURCE_PATH` is a **local file path, not a secret** — but, like all
+config, the value is read from the env var and never committed.
+
+### Verify
+
+- A WebRTC video offer is answered with `m=video <port> UDP/TLS/RTP/SAVPF <pt>` carrying
+  `a=group:BUNDLE`, `a=mid`, the negotiated `a=rtpmap:<pt> H264/90000`, and `a=sendrecv`
+  (source configured) or `a=inactive` (no source). Confirm in the 200 OK SDP.
+- With a source set, the log shows
+  `INVITE <id>: WebRTC outbound video started (ssrc=…, N NAL(s), F fps)`.
+- A configured-but-unreadable source is logged
+  (`WebRTC video source … unreadable …; answering a=inactive`) and the call proceeds
+  **audio-only** — video never sacrifices audio.
+
+### Rollback / disable
+
+- **Disable outbound video:** unset `HERMES_VOIP_VIDEO_SOURCE_PATH` and restart. The plugin
+  still answers any `m=video` with `a=inactive` (BUNDLE-correct), sending nothing.
+- A call with **no `m=video`** offer is byte-identical to the audio-only path — no video code
+  runs (regression-tested).
+
 ## Security notes
 
 - No DTLS private key, certificate, or SRTP key material is ever logged, `repr`'d, or raised

@@ -24,7 +24,7 @@ design). This runbook is the operational HOW.
 | **Trickle** ICE — SDP primitives (`a=ice-options:trickle`, `a=end-of-candidates`) + half-trickle answer | **Wired** (ADR-0034) |
 | **Outbound** WebRTC origination (our own offer) | **Deferred** — outbound runs over SIP-over-TLS |
 | SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Deferred** — registration/INVITE run over TLS |
-| Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Deferred** (ADR-0034 §2) — gateways send a full candidate set in the initial SDP |
+| Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |
 | **Live** validation against a real WebRTC client | **Pending** the operator's redeploy |
 
@@ -141,16 +141,22 @@ protected too (the media-inactivity timeout only fires when media *was* flowing 
 
 ## Trickle ICE (SDP primitives — ADR-0034)
 
-The plugin **advertises trickle + ICE2** in its WebRTC answer (`a=ice-options:trickle ice2`),
-sends its full candidate set, then marks `a=end-of-candidates` (RFC 8838 §8.2 — the
-half-trickle degenerate case, interoperable with both classic and trickling peers). It
-**parses** a peer's `a=ice-options`/`a=end-of-candidates` (exposed as `AudioMedia.is_trickle`
-/ `AudioMedia.end_of_candidates`). On the receive side it **always** signals
-end-of-candidates to ICE after the offer's candidates: the **in-dialog transport** that would
-deliver a trickling peer's later candidates (SIP INFO with `application/trickle-ice-sdpfrag`,
-RFC 8840) is **deferred** (ADR-0034 §2), so withholding the end marker would hang ICE waiting
-for candidates that can never arrive. WebRTC SIP gateways send a complete candidate set in the
-initial SDP, so always ending candidates does not regress any working call.
+The plugin runs **half-trickle** (RFC 8838 §2/§16): its WebRTC answer **advertises trickle +
+ICE2** (`a=ice-options:trickle ice2`), carries its **full** candidate set, then marks
+`a=end-of-candidates`. It **parses** a peer's `a=ice-options`/`a=end-of-candidates` (exposed
+as `AudioMedia.is_trickle` / `AudioMedia.end_of_candidates`) and **always** signals
+end-of-candidates to ICE after the offer's candidates.
+
+This is the **complete, interoperable** behaviour for our SIP-over-TLS / SIP-over-WSS targets —
+in-dialog SIP-INFO (RFC 8840) candidate trickling is **not required** (ADR-0034 §2), not
+deferred. Why: half-trickle is a compliant mode a full-trickle peer MUST accept (RFC 8838),
+and because the plugin **does not advertise the `trickle-ice` SIP option-tag**, a compliant
+RFC 8840 peer cannot confirm our support and MUST fall back to the full-candidate exchange we
+serve (RFC 8840 §4.3/§5.3). Our gateways gather a full candidate set and send it in the initial
+SDP anyway, so nothing is withheld for us to receive — and always ending candidates avoids the
+ICE hang that withholding the marker (with no INFO receiver) would cause. The only thing that
+would change this is a future decision to advertise `trickle-ice` for a peer that genuinely
+trickles; that would be tasked into a signalling lane (it is a latency optimisation, not a gap).
 
 ## What happens on an inbound WebRTC call (the flow)
 

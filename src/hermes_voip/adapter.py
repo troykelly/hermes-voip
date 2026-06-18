@@ -1838,6 +1838,8 @@ class VoipAdapter(BasePlatformAdapter):
             turn_urls=media_cfg.ice_turn_urls,
             turn_username=media_cfg.ice_turn_username,
             turn_password=media_cfg.ice_turn_password,
+            use_ipv4=media_cfg.ice_use_ipv4,
+            use_ipv6=media_cfg.ice_use_ipv6,
         )
         try:
             await session.prepare()  # gather ICE; expose fingerprint/setup/creds

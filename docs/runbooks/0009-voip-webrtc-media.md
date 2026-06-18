@@ -90,26 +90,47 @@ it flows into the same WebRTC media path above.
   Secure-WebSocket REGISTER for the test extension; the plugin now emits the correct RFC
   7118 REGISTER, so the remaining variable is the gateway-side endpoint + credential.
 
-## The STUN knob
+## The STUN knob (default revised — ADR-0043)
 
 | Item | Value |
 | --- | --- |
 | Env var | `HERMES_VOIP_ICE_STUN_URLS` |
 | Type | comma-separated list of `stun:` URLs |
-| Default | empty ⇒ **host-only** ICE |
+| Default (unset) | the public dual-stack list `DEFAULT_ICE_STUN_URLS` (Google + Cloudflare) |
+| Disable | set it **empty** (`HERMES_VOIP_ICE_STUN_URLS=`) ⇒ host-only ICE |
 | Read by | `hermes_voip.config.load_media_config` → `MediaConfig.ice_stun_urls` |
 | Applied at | `WebRtcMediaSession(stun_urls=…)` → the ICE agent, per inbound WebRTC call |
 
-- **Empty (default):** host-only ICE — works on a LAN, or wherever the WebRTC peer can reach
-  one of our host candidates directly. No external service required.
-- **Set:** each `stun:` URL gathers a server-reflexive (srflx) candidate, for a peer behind
-  NAT that cannot reach our host candidate. Example (a value, no secret):
+- **Unset (default):** the public STUN list gathers a server-reflexive (srflx) candidate —
+  including an **IPv6 srflx** on an IPv6-capable host — so a NAT'd deployment works out of
+  the box. These are free, no-auth, stateless reflexive-echo servers (not a paid/SaaS or
+  media-carrying dependency; TURN, which relays media, stays operator-provided — see below).
+- **Override:** set your own `stun:` URLs (a value, no secret):
 
   ```
   HERMES_VOIP_ICE_STUN_URLS=stun:stun.example.test:3478,stun:stun2.example.test:3478
   ```
 
-  A malformed URL fails loudly when the ICE agent is built (not silently at parse).
+- **Disable (host-only):** set it to empty — works on a LAN / where the peer reaches a host
+  candidate directly. A malformed URL fails loudly when the ICE agent is built.
+
+## IPv6-first ICE (ADR-0043)
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `HERMES_VOIP_ICE_USE_IPV6` | `true` | Gather IPv6 ICE candidates (the **preferred** family). |
+| `HERMES_VOIP_ICE_USE_IPV4` | `true` | Gather IPv4 ICE candidates (the **fallback** family). |
+
+Both default on: the agent gathers IPv6 **and** IPv4 candidates, and the SDP answer lists
+IPv6 candidates **first** (`WebRtcMediaSession.ice_candidates`). Set one to `false` for an
+IPv6-only or IPv4-only deployment. On a host with global IPv6 that shares the gateway's
+network, the IPv6 host candidate is directly reachable — no STUN needed.
+
+> **Live media needs real UDP to the gateway.** A devcontainer behind Docker NAT cannot
+> carry WebRTC media: UDP-over-IPv6 does not traverse Docker's NAT66, and UDP-over-IPv4
+> yields only a hairpin-NAT address. Run the live WebRTC media validation on a host with
+> working dual-stack UDP to the gateway (e.g. the same LAN/IPv6 `/48`). Signalling (WSS)
+> works from anywhere with TCP; only the media plane needs the real UDP path.
 
 ## The TURN knob (relay candidates — ADR-0034)
 

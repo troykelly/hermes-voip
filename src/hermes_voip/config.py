@@ -38,6 +38,7 @@ from hermes_voip.registration import RegistrationConfig
 
 __all__ = [
     "DEFAULT_GREETING",
+    "DEFAULT_ICE_STUN_URLS",
     "ConfigError",
     "ExtensionConfig",
     "GatewayConfig",
@@ -303,12 +304,27 @@ _DEFAULT_RTP_TIMEOUT_SECS = 20
 _MIN_RTP_TIMEOUT_SECS = 1
 _MAX_RTP_TIMEOUT_SECS = 300
 
-# WebRTC ICE STUN servers (ADR-0032/0016). A comma-separated list of ``stun:`` URLs
-# used to gather server-reflexive (srflx) ICE candidates for the WebRTC media path.
-# Empty (the default) ⇒ host-only ICE (works on a LAN / where the peer reaches our
-# host candidates directly). Has no effect on the SIP-over-TLS path. Each member is
-# trimmed; blank members are dropped.
+# WebRTC ICE STUN servers (ADR-0032/0016, default revised ADR-0043). A comma-separated
+# list of ``stun:`` URLs used to gather server-reflexive (srflx) ICE candidates for the
+# WebRTC media path. UNSET ⇒ the default public list below; an explicit EMPTY value ⇒
+# host-only ICE. Has no effect on the SIP-over-TLS path. Each member is trimmed; blank
+# members are dropped.
 _ICE_STUN_URLS_KEY = "HERMES_VOIP_ICE_STUN_URLS"
+# Default public STUN servers (operator-directed 2026-06-18, ADR-0043). Both are free,
+# no-auth, widely used, and dual-stack (they publish AAAA records), so a NAT'd
+# deployment gathers a server-reflexive candidate — including an IPv6 srflx on an
+# IPv6-capable host — out of the box. Overridable via HERMES_VOIP_ICE_STUN_URLS; an
+# explicit empty value disables STUN. Not a paid/SaaS dependency (rule 36): public
+# STUN is a stateless reflexive-address echo, used only until the operator sets theirs.
+DEFAULT_ICE_STUN_URLS: tuple[str, ...] = (
+    "stun:stun.l.google.com:19302",
+    "stun:stun.cloudflare.com:3478",
+)
+# IPv6-first ICE (ADR-0043): gather IPv6 candidates (and prefer them in the answer),
+# with IPv4 kept as the fallback family. Both default ON and are independently
+# overridable so an operator can run IPv6-only or IPv4-only.
+_ICE_USE_IPV4_KEY = "HERMES_VOIP_ICE_USE_IPV4"
+_ICE_USE_IPV6_KEY = "HERMES_VOIP_ICE_USE_IPV6"
 
 # WebRTC ICE TURN relay (ADR-0034). A comma-separated list of ``turn:``/``turns:``
 # URLs plus long-term credentials (RFC 8656). When set, a *relay* ICE candidate is
@@ -642,10 +658,17 @@ class MediaConfig:
     # reads naturally on every TTS model (no bracket tag). A blank override falls back
     # to the built-in default set; empty members are dropped (parser).
     comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES
-    # WebRTC ICE STUN servers (ADR-0032), as ``stun:`` URLs for srflx candidate
-    # gathering. Empty (the default) ⇒ host-only ICE. No effect on the SIP-over-TLS
-    # path. Defaulted so existing direct constructions stay valid.
+    # WebRTC ICE STUN servers (ADR-0032; default revised ADR-0043), as ``stun:`` URLs
+    # for srflx candidate gathering. Defaults to the public dual-stack list; an explicit
+    # empty env value ⇒ host-only ICE. No effect on the SIP-over-TLS path. The dataclass
+    # default stays empty so existing direct constructions are unchanged;
+    # load_media_config supplies DEFAULT_ICE_STUN_URLS when the env key is unset.
     ice_stun_urls: tuple[str, ...] = ()
+    # IPv6-first ICE address families (ADR-0043). Both default ON: gather IPv6
+    # (preferred in the answer) and IPv4 (fallback). Independently overridable for
+    # IPv6-only / IPv4-only deployments. No effect on the SIP-over-TLS path.
+    ice_use_ipv4: bool = True
+    ice_use_ipv6: bool = True
     # WebRTC ICE TURN relay (ADR-0034), as ``turn:``/``turns:`` URLs for relay
     # candidate gathering. Empty (the default) ⇒ no relay candidate. When set, the
     # username + password are required (validated at load). No effect on the
@@ -996,6 +1019,8 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             _DEFAULT_RTP_TIMEOUT_SECS,
         ),
         ice_stun_urls=_parse_ice_stun_urls(env),
+        ice_use_ipv4=_parse_bool(env, _ICE_USE_IPV4_KEY, default=True),
+        ice_use_ipv6=_parse_bool(env, _ICE_USE_IPV6_KEY, default=True),
         ice_turn_urls=_ice_turn[0],
         ice_turn_username=_ice_turn[1],
         ice_turn_password=_ice_turn[2],
@@ -1324,17 +1349,19 @@ def _parse_comfort_filler_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:
-    """Parse the comma-separated ``HERMES_VOIP_ICE_STUN_URLS`` list (ADR-0032).
+    """Parse ``HERMES_VOIP_ICE_STUN_URLS`` (ADR-0032; default revised ADR-0043).
 
-    Each member is trimmed; blank members (from a trailing/doubled comma or an
-    all-blank value) are dropped. An unset or all-blank value yields an empty tuple
-    (host-only ICE). No ``stun:`` scheme validation here — the ICE layer
-    (:func:`hermes_voip.media.ice._parse_stun_url`) validates each URL when it
-    builds the agent, so a bad URL fails loudly at use, not silently at parse.
+    Precedence: the key being **unset** yields :data:`DEFAULT_ICE_STUN_URLS` (the
+    public dual-stack list, so a NAT'd deployment gathers a srflx out of the box);
+    an **explicit** value (including an empty / all-blank string) is honoured
+    verbatim, so setting it empty disables STUN (host-only ICE). Members are
+    trimmed; blank members (trailing/doubled comma) are dropped. No ``stun:`` scheme
+    validation here — the ICE layer (:func:`hermes_voip.media.ice._parse_stun_url`)
+    validates each URL when it builds the agent, so a bad URL fails loudly at use.
     """
-    raw = _value(env, _ICE_STUN_URLS_KEY)
-    if not raw:
-        return ()
+    raw = env.get(_ICE_STUN_URLS_KEY)
+    if raw is None:
+        return DEFAULT_ICE_STUN_URLS  # unset -> public default
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 

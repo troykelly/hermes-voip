@@ -12,6 +12,7 @@ import pytest
 
 from hermes_voip.config import (
     DEFAULT_GREETING,
+    DEFAULT_ICE_STUN_URLS,
     ConfigError,
     ExtensionConfig,
     GatewayConfig,
@@ -633,9 +634,21 @@ def test_media_full_override() -> None:
     assert cfg.barge_in_fade_ms == 40
 
 
-def test_media_ice_stun_urls_default_empty() -> None:
-    """No STUN config => host-only ICE (empty tuple) — ADR-0032."""
+def test_media_ice_stun_urls_default_public() -> None:
+    """No STUN config => the default public IPv6-capable STUN list (ADR-0043).
+
+    Operator-directed (2026-06-18): a NAT'd deployment must gather a
+    server-reflexive candidate out of the box, so the default is a small list of
+    public dual-stack STUN servers (overridable; an explicit empty value disables).
+    """
     cfg = load_media_config({})
+    assert cfg.ice_stun_urls == DEFAULT_ICE_STUN_URLS
+    assert len(cfg.ice_stun_urls) >= 1
+
+
+def test_media_ice_stun_urls_explicit_empty_disables() -> None:
+    """An explicit empty HERMES_VOIP_ICE_STUN_URLS disables STUN (host-only ICE)."""
+    cfg = load_media_config({"HERMES_VOIP_ICE_STUN_URLS": ""})
     assert cfg.ice_stun_urls == ()
 
 
@@ -658,6 +671,27 @@ def test_media_ice_stun_urls_blank_members_dropped() -> None:
     """Blank entries between commas are dropped; an all-blank value => empty."""
     cfg = load_media_config({"HERMES_VOIP_ICE_STUN_URLS": " , ,"})
     assert cfg.ice_stun_urls == ()
+
+
+def test_media_ice_use_ipv6_default_true() -> None:
+    """IPv6-first (ADR-0043): IPv6 ICE gathering is ON by default."""
+    cfg = load_media_config({})
+    assert cfg.ice_use_ipv6 is True
+
+
+def test_media_ice_use_ipv4_default_true() -> None:
+    """IPv4 stays gathered as the fallback family by default (ADR-0043)."""
+    cfg = load_media_config({})
+    assert cfg.ice_use_ipv4 is True
+
+
+def test_media_ice_address_families_overridable() -> None:
+    """Either address family can be disabled via env (e.g. IPv6-only deployment)."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_ICE_USE_IPV4": "false", "HERMES_VOIP_ICE_USE_IPV6": "true"}
+    )
+    assert cfg.ice_use_ipv4 is False
+    assert cfg.ice_use_ipv6 is True
 
 
 # --- TURN relay config (ADR-0034) ---

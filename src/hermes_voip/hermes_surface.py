@@ -115,7 +115,10 @@ class PluginContextProtocol(Protocol):
         label: str,
         adapter_factory: Callable[[object], BasePlatformAdapterProtocol],
         check_fn: Callable[[], bool],
-        validate_config: Callable[[object], None] | None = None,
+        # The real registry treats a FALSEY return as a validation failure, so the
+        # plugin's validator (validate_voip_config) returns True on success — the
+        # return type must admit bool (not None-only).
+        validate_config: Callable[[object], bool | None] | None = None,
         required_env: Sequence[str] | None = None,
         install_hint: str = "",
         **entry_kwargs: object,

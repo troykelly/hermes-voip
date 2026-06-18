@@ -108,6 +108,65 @@ HERMES_VOIP_INTERCOM_RELAY_TIMEOUT_S=5     # request timeout seconds (> 0)
 URL (off the event loop). A non-2xx response or a network error raises
 `IntercomRelayError` and the tool reports a clear failure (the door was NOT opened).
 
+### 2b. Multiple intercoms with NAMED openings — `HERMES_VOIP_INTERCOM_CONFIG_FILE` (ADR-0045)
+
+For several door phones, or one panel that opens several entries (door + gate +
+garage), use the multi-intercom JSON document instead of (or alongside) the single
+env scheme above. Point `HERMES_VOIP_INTERCOM_CONFIG_FILE` at a JSON file —
+**kept OUTSIDE the tracked tree** (alongside `.env` / materialised from 1Password at
+deploy) — mapping each intercom's caller-ID to its named openings. `.gitignore`
+ignores the default names `.intercom-config.json` / `*.intercom-config.json` as a
+safety net, but a custom-named or differently-placed file is NOT auto-ignored — keep
+it out of the repo tree yourself:
+
+```json
+{
+  "intercoms": {
+    "1000": {
+      "openings": {
+        "door": {"type": "dtmf", "dtmf_code": "9"},
+        "gate": {"type": "webhook", "method": "POST",
+                 "url": "https://lock.example.test/gate",
+                 "headers": {"Authorization": "Bearer <from 1Password>"},
+                 "body": "open=true"}
+      }
+    },
+    "1001": {
+      "openings": {
+        "garage": {"type": "webhook", "method": "GET",
+                   "url": "https://lock.example.test/garage"}
+      }
+    }
+  }
+}
+```
+
+- Each opening is `{"type": "dtmf", "dtmf_code": …}` (sends the code on the live call;
+  validated as DTMF at load) OR `{"type": "webhook", "method": GET|POST|PUT, "url":
+  …https…, "headers": {…}, "body": "…", "timeout_s": 5}` (issues the HTTP request off
+  the event loop). `method` defaults to `POST`; `headers` / `body` / `timeout_s` are
+  optional.
+- The webhook **url must be https** (it may carry a token) and the `dtmf_code` must be
+  valid DTMF — a bad value fails LOUD at startup, never at door-open time. A `GET`
+  opening with a `body` is also rejected at load (a GET sends no body — drop it or use
+  `POST`/`PUT`).
+- The webhook send **refuses HTTP redirects** (any 3xx): a 302 `Location` to an
+  `http://` URL would re-send the token/body in cleartext, so the configured https URL
+  must answer directly — a redirect surfaces as a failed open (`WebhookError`).
+- **Scoping:** the agent is told only the calling intercom's opening NAMES (in the
+  ADR-0033 call-context block); `open_entry(name="door")` actuates that named opening,
+  scoped to ONLY the calling intercom's set. A name the intercom does not own, or a
+  non-intercom caller, is refused with a clear error. A single-opening intercom may
+  omit `name`.
+- **Secrets:** the `dtmf_code` / `url` / `headers` / `body` are repr-suppressed and
+  never logged; only the opening name + (for a webhook) the HTTP status are. The token
+  lives in 1Password and is materialised into the config file (kept outside the tracked
+  tree — see above) at deploy.
+- Still wire the `intercom` caller group (step 1) so the matched caller reaches the
+  intercom persona + the `open_entry` tool; the multi-intercom config decides WHICH
+  named openings that call can actuate. Unset the env var to disable multi-intercom and
+  fall back to the single-intercom path above (back-compat).
+
 ### 3. In-call DTMF send (no intercom needed)
 
 `send_dtmf(digits)` is registered for **every** privileged call. No extra config — it
@@ -174,9 +233,27 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
     print(L({'HERMES_VOIP_INTERCOM_OPEN_MODE':'dtmf','HERMES_VOIP_INTERCOM_DTMF':'9'}).open_mode)"
   # -> IntercomOpenMode.DTMF   (a typo'd code / non-https relay URL raises ConfigError)
   ```
+- **Multi-intercom config parses (ADR-0045 fail-loud check).** A bad document fails at
+  startup, not at door-open time:
+  ```sh
+  uv run python -c "import json, tempfile, os; \
+    from hermes_voip.multi_intercom import load_multi_intercom_config as L; \
+    p=tempfile.mktemp(suffix='.json'); \
+    open(p,'w').write(json.dumps({'intercoms':{'1000':{'openings':{'door':{'type':'dtmf','dtmf_code':'9'}}}}})); \
+    print(L({'HERMES_VOIP_INTERCOM_CONFIG_FILE':p}).match('1000').opening_names())"
+  # -> ('door',)   (an invalid code / non-https webhook / unknown type raises ConfigError)
+  ```
 - **Tools registered.** On plugin load the agent has `send_dtmf` and `open_entry` (gated).
   `register_voip_tools` installs the `pre_tool_call` gate first and skips an ELEVATED tool
   if the gate is absent (fail-closed), so a registered `open_entry` is always gated.
+- **Multi-intercom scoping (ADR-0045).** From a call matched to an intercom entry, the
+  agent sees only that intercom's opening NAMES; `open_entry(name="…")` opens only a name
+  in that set, and a name outside it (or a non-intercom caller) is refused with a clear
+  error. (Covered by `tests/test_adapter_caller_modes.py::test_opening_name_not_in_set_is_rejected`
+  + `::test_non_intercom_caller_with_name_cannot_open`; webhook config validation in
+  `tests/test_multi_intercom.py`; the real webhook SEND path — 2xx success, non-2xx /
+  network-error -> `WebhookError`, GET-sends-no-body, redirect-refused — in
+  `tests/test_multi_intercom_webhook.py` against a loopback `http.server`.)
 - **Live (pending operator redeploy + an intercom group config + a real door/relay).**
   Call the extension that maps to the intercom group; confirm the agent uses the intercom
   persona (screens the visitor) and that `open_entry` actuates ONLY for a legitimate
@@ -223,7 +300,9 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
 
 ## Related
 
-- ADR-0031 (this feature's WHY); ADR-0021 (caller groups + the `allowed_tools` clause);
+- ADR-0031 (this feature's WHY); ADR-0045 (multiple intercoms + per-opening
+  DTMF/WebHook + the scoping/security posture); ADR-0021 (caller groups + the
+  `allowed_tools` clause);
   ADR-0010 (DTMF) + ADR-0036 (the SIP INFO + in-band Goertzel mechanisms, send AND
   receive — all three ADR-0010 mechanisms are now shipped); ADR-0009 (the tool gate).
 - `docs/runbooks/0010-voip-caller-modes.md` (the caller-groups file + JSON schema).

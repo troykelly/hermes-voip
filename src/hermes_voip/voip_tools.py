@@ -395,17 +395,36 @@ SEND_DTMF_TOOL_SCHEMA: dict[str, object] = {
     },
 }
 
-#: ``open_entry`` schema. No parameters: opening the entry is a single fixed action
-#: on the current call, never a model-chosen target.
+#: ``open_entry`` schema. An OPTIONAL ``name`` selects WHICH named opening to actuate
+#: (ADR-0045): an intercom may have several (door / gate / garage). The call's context
+#: tells the agent which names are available; ``name`` must be one of them (the adapter
+#: rejects any other), and may be omitted for a legacy single-opening intercom. The
+#: call to open on is the session's own call — never model-chosen.
 OPEN_ENTRY_TOOL_SCHEMA: dict[str, object] = {
     "name": OPEN_ENTRY_TOOL_NAME,
     "description": (
-        "Open the entry (unlock the door / gate) for the visitor on this intercom "
-        "call. Use this ONLY for a legitimate, expected visitor after you have "
-        "confirmed who they are and that they are expected — opening the door is a "
-        "physical-access action. Takes no input."
+        "Open an entry (unlock the door / gate / garage) for the visitor on this "
+        "intercom call. Use this ONLY for a legitimate, expected visitor after you "
+        "have confirmed who they are and that they are expected — opening an entry is "
+        "a physical-access action. If this intercom has more than one named entry "
+        "(shown in the call context), pass 'name' to choose which one to open; with a "
+        "single entry you may omit it."
     ),
-    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "Which named entry to open (e.g. 'door', 'gate', 'garage') — must "
+                    "be one of the openings shown in this call's context. Omit for an "
+                    "intercom with a single entry."
+                ),
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
 }
 
 #: ``transfer_blind`` — IRREVERSIBLE (ADR-0010/0011/0031): hand the CURRENT caller to
@@ -568,12 +587,16 @@ class VoipToolHost(Protocol):
         """
         ...
 
-    async def open_entry(self, call_id: str) -> bool:
-        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031).
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
+        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031/0045).
 
-        Returns whether it acted (``False`` for an unknown/ended call). The
-        actuation path (in-call DTMF or an external relay) is the adapter's concern;
-        the tool only requests the entry on the current call.
+        ``name`` selects WHICH named opening to actuate on a multi-intercom call
+        (door / gate / garage), scoped to the calling intercom's set; ``None`` defaults
+        to the sole opening / the legacy single-intercom path. Returns whether it acted
+        (``False`` for an unknown/ended call). Raises :class:`ValueError` for a name
+        outside the calling intercom's set (the handler renders that as a clear error).
+        The actuation path (in-call DTMF or an external webhook/relay) is the adapter's
+        concern; the tool only requests the entry on the current call.
         """
         ...
 
@@ -967,14 +990,16 @@ async def open_entry_handler(
     """Tool handler: actuate the intercom entry on the current call (ELEVATED).
 
     Resolves the call from the Hermes session context and asks the live adapter to
-    open the entry (ADR-0031). Returns the JSON tool-result contract: ``{"result":
-    …}`` on success, ``{"error": …}`` when no adapter/call is in scope, the call has
-    ended, or the actuation could not be performed (e.g. DTMF not negotiated, or the
-    relay is not configured). The ``pre_tool_call`` gate has already enforced the
-    ELEVATED clamp and the intercom group's ``allowed_tools`` sub-ceiling before this
-    runs. ``args`` is ignored — opening the entry is a fixed action on this call.
+    open the entry (ADR-0031/0045). The OPTIONAL ``name`` arg selects WHICH named
+    opening to actuate on a multi-intercom call (door / gate / garage); it is scoped to
+    the calling intercom's set (the adapter rejects a name the intercom does not own).
+    Returns the JSON tool-result contract: ``{"result": …}`` on success, ``{"error":
+    …}`` when no adapter/call is in scope, the call has ended, the requested name is
+    not in this intercom's set, or the actuation could not be performed (e.g. DTMF not
+    negotiated, the relay/webhook is not configured). The ``pre_tool_call`` gate has
+    already enforced the ELEVATED clamp and the intercom group's ``allowed_tools``
+    sub-ceiling before this runs.
     """
-    _ = args  # the tool takes no parameters
     try:
         adapter = _ACTIVE_ADAPTER
         if adapter is None:
@@ -984,8 +1009,10 @@ async def open_entry_handler(
         call_id = _current_call_id()
         if call_id is None:
             return json.dumps({"error": "no active call in this session"})
+        # Absent/blank name => None (legacy single-opening / default-the-sole-opening).
+        name = _str_arg(args, "name") or None
         try:
-            opened = await adapter.open_entry(call_id)
+            opened = await adapter.open_entry(call_id, name)
         except (RuntimeError, ValueError) as exc:
             # The actuation failed (DTMF not negotiated, relay misconfigured, etc.).
             # Report it clearly — the door was NOT opened (rule 37: surfaced, not

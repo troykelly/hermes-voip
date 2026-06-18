@@ -90,7 +90,7 @@ class _ExplodingHost:
     async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
         raise _SyntheticHostError(_BOOM)
 
-    async def open_entry(self, call_id: str) -> bool:
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         raise _SyntheticHostError(_BOOM)
 
     async def transfer_blind_on_call(
@@ -218,7 +218,7 @@ class _DigitLeakingHost(_ExplodingHost):
     async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
         raise _SyntheticHostError(f"backend rejected sequence {_SECRET_DIGITS}")
 
-    async def open_entry(self, call_id: str) -> bool:
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         raise _SyntheticHostError(f"relay rejected secret {_SECRET_DIGITS}")
 
 

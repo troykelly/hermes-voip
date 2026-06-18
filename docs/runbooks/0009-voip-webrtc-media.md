@@ -18,11 +18,13 @@ design). This runbook is the operational HOW.
 | --- | --- |
 | Inbound WebRTC media (DTLS-SRTP + ICE + Opus) | **Wired** (ADR-0032) |
 | Opus 48 kHz on the wire; G.711 fallback | **Wired** |
+| **Opus on the SIP (SDES/TLS) path** — inbound + outbound SIP calls can negotiate Opus | **Wired** (ADR-0049); offered ONLY when `libopus` is loadable (else the G.722/G.711 floor) |
 | ICE host candidates + STUN server-reflexive (srflx) | **Wired** |
 | **TURN** relay candidates (operator-provided credentials) | **Wired** (ADR-0034); see "The TURN knob" — full live relay needs a real TURN server |
 | ICE **consent freshness** (RFC 7675) — long calls behind NAT drop deterministically | **Wired** (ADR-0034; aioice-native, surfaced) |
 | **Trickle** ICE — SDP primitives (`a=ice-options:trickle`, `a=end-of-candidates`) + half-trickle answer | **Wired** (ADR-0034) |
-| **Outbound** WebRTC origination (our own offer) | **Deferred** — outbound runs over SIP-over-TLS |
+| **Outbound** WebRTC origination (our own DTLS/ICE/Opus offer over WSS) | **Wired** (ADR-0049); on a `HERMES_SIP_TRANSPORT=wss` gateway `place_call` sends our WebRTC offer (ICE-controlling, DTLS `a=setup:active`). A `tls` gateway dials over SIP-over-TLS (SDES) as before |
+| Outbound WebRTC DTLS **active-answerer** (answering a gateway's `passive` offer) | **Deferred** (ADR-0050) — the outbound offerer always offers `active` |
 | SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Wired** (ADR-0038); see "SIP-over-WSS signalling" — full live validation needs the operator's WSS port + credential |
 | Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |
@@ -131,6 +133,40 @@ network, the IPv6 host candidate is directly reachable — no STUN needed.
 > yields only a hairpin-NAT address. Run the live WebRTC media validation on a host with
 > working dual-stack UDP to the gateway (e.g. the same LAN/IPv6 `/48`). Signalling (WSS)
 > works from anywhere with TCP; only the media plane needs the real UDP path.
+
+## The DTLS answerer-role knob (ADR-0050, RFC 8842)
+
+When the plugin answers an inbound WebRTC INVITE it picks its DTLS role from the offer's
+`a=setup` and carries that role in the answer. The DTLS **client** sends the `ClientHello`;
+the **server** waits for it. If both ends pick the server role the handshake deadlocks.
+
+| Item | Value |
+| --- | --- |
+| Env var | `HERMES_VOIP_WEBRTC_DTLS_SETUP` |
+| Type | one of `auto` / `active` / `passive` (case-insensitive) |
+| Default (unset) | `auto` — for an `a=setup:actpass` offer we answer **`active`** (the DTLS client) per RFC 8842 §5.3 |
+| `active` | explicit form of the default (active answerer for an actpass offer) |
+| `passive` | force the **server** role for an actpass offer (only for a gateway that insists on being the DTLS client) |
+| Read by | `hermes_voip.config.load_media_config` → `MediaConfig.webrtc_dtls_setup` |
+| Applied at | `WebRtcMediaSession(answer_setup=…)` → `answer_setup_for_offer(forced=…)`, per inbound WebRTC call |
+
+The knob applies **only** to an `a=setup:actpass` offer. A peer that pins itself `active`
+(DTLS client) is **always** answered `passive`, and a peer that pins itself `passive` is
+**always** answered `active` (RFC 5763 §5) — the knob cannot override a pinned role (that
+would create two clients or two servers and deadlock). An unknown value is rejected at
+config load.
+
+**Why the default flipped (ADR-0050).** A real Asterisk/UCM-class gateway offers
+`a=setup:actpass` but behaves as the DTLS **server**, expecting the answerer to be the
+client. The previous `actpass → passive` mapping left both ends as servers, so the DTLS
+handshake never started. RFC 8842 §5.3's active answerer (`auto`) is the standards-based
+fix. If a specific gateway ever insists on being the DTLS client, set
+`HERMES_VOIP_WEBRTC_DTLS_SETUP=passive`.
+
+```sh
+# Force the plugin to be the DTLS server for an actpass offer (rarely needed):
+HERMES_VOIP_WEBRTC_DTLS_SETUP=passive
+```
 
 ## The TURN knob (relay candidates — ADR-0034)
 

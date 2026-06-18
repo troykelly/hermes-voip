@@ -251,15 +251,6 @@ import hermes_voip
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
-
-```bash
-uv run python - <<'PY'
-import asyncio, os, logging
-logging.basicConfig(level=logging.INFO)
-import hermes_voip
-from gateway.config import PlatformConfig
-from gateway.platform_registry import PlatformEntry, platform_registry
-
 class _Ctx:
     def register_platform(self, name, label, fac, chk, validate_config=None,
                           required_env=None, install_hint="", **k):

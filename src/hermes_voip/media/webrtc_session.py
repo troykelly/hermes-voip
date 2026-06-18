@@ -4,8 +4,9 @@ Glues the already-tested WebRTC primitives into the two-phase flow the adapter
 needs to answer an inbound ``UDP/TLS/RTP/SAVPF`` offer:
 
 * :meth:`WebRtcMediaSession.prepare` — choose the DTLS role from the offer's
-  ``a=setup`` (RFC 5763 §5: an ``actpass``/``active`` offer makes us ``passive``;
-  a ``passive`` offer makes us ``active``), build the
+  ``a=setup`` (RFC 8842 §5.3, ADR-0050: an ``actpass`` offer makes us ``active`` by
+  default — the DTLS client sending the ClientHello; an ``active`` offer makes us
+  ``passive``; a ``passive`` offer makes us ``active``), build the
   :class:`~hermes_voip.media.dtls.DtlsEndpoint` and the
   :class:`~hermes_voip.media.ice.IceConnection`, gather ICE candidates, and expose
   the fingerprint / setup / ICE ufrag+pwd+candidates the SDP answer carries.
@@ -178,23 +179,43 @@ def _default_ice_factory(  # noqa: PLR0913 -- independent ICE config kwargs (rol
     )
 
 
-def answer_setup_for_offer(offer_setup: SetupRole | None) -> SetupRole:
-    """Choose our ``a=setup`` role as the answerer (RFC 5763 §5).
+def answer_setup_for_offer(
+    offer_setup: SetupRole | None, forced: str = "auto"
+) -> SetupRole:
+    """Choose our ``a=setup`` role as the answerer (RFC 8842 §5.3, ADR-0050).
 
-    The answerer MUST NOT be ``actpass``. An ``actpass`` or ``active`` offer makes
-    us ``passive`` (and thus the DTLS SERVER); a ``passive`` offer makes us
-    ``active`` (the DTLS CLIENT, sending the ClientHello). A missing ``a=setup`` is
-    treated as ``actpass`` (RFC 5763 §5 default), so we answer ``passive``.
+    The answerer MUST NOT be ``actpass``, so we always return ``active`` or
+    ``passive``. Two rules combine:
+
+    * **Pinned offer wins.** An ``active`` offer (the offerer pinned itself the DTLS
+      client) MUST be answered ``passive``; a ``passive`` offer (offerer pinned the
+      server) MUST be answered ``active`` (RFC 5763 §5). ``forced`` cannot override
+      these — doing so would create two clients or two servers and deadlock.
+    * **actpass offer ⇒ ``forced`` decides.** For an ``actpass`` offer (or a missing
+      ``a=setup``, which RFC 5763 §5 treats as ``actpass``) we are free to pick. The
+      ``auto`` default applies RFC 8842 §5.3: the answerer SHOULD be ``active`` (the
+      DTLS client, sending the ClientHello). Many gateways (e.g. Asterisk/UCM) offer
+      ``actpass`` yet behave as the DTLS server, so a ``passive`` answer deadlocks
+      (both servers wait). ``forced="passive"`` overrides this for a gateway that
+      insists on being the client; ``forced="active"`` is the explicit form of the
+      default.
 
     Args:
         offer_setup: The offered ``a=setup`` role, or ``None`` if absent.
+        forced: The operator's DTLS-role preference for an ``actpass`` offer —
+            ``"auto"`` (RFC 8842 active answerer), ``"active"``, or ``"passive"``.
 
     Returns:
         Our ``SetupRole`` for the answer (always ``active`` or ``passive``).
     """
     offered = offer_setup.value if offer_setup is not None else "actpass"
-    # passive offer → we initiate (active); actpass/active offer → we wait (passive).
-    return SetupRole("active") if offered == "passive" else SetupRole("passive")
+    # A pinned offer dictates the complementary role — forced cannot override it.
+    if offered == "active":
+        return SetupRole("passive")
+    if offered == "passive":
+        return SetupRole("active")
+    # actpass: forced decides. "auto"/"active" → active (RFC 8842); "passive" → server.
+    return SetupRole("passive") if forced == "passive" else SetupRole("active")
 
 
 class WebRtcMediaSession:
@@ -207,6 +228,10 @@ class WebRtcMediaSession:
 
     Args:
         offer_setup: The offered ``a=setup`` role (``None`` ⇒ treated as actpass).
+        answer_setup: Our DTLS-role preference for an ``actpass`` offer (ADR-0050):
+            ``"auto"`` (RFC 8842 active answerer — the default), ``"active"``, or
+            ``"passive"``. A pinned ``active``/``passive`` offer always overrides
+            this (see :func:`answer_setup_for_offer`).
         stun_urls: ``stun:`` URLs for srflx ICE candidates (empty ⇒ host-only).
         turn_urls: ``turn:``/``turns:`` URLs for relay ICE candidates (ADR-0034;
             empty ⇒ no relay).  ``turn_username``/``turn_password`` are required
@@ -222,6 +247,7 @@ class WebRtcMediaSession:
         self,
         *,
         offer_setup: SetupRole | None,
+        answer_setup: str = "auto",
         stun_urls: tuple[str, ...] = (),
         turn_urls: tuple[str, ...] = (),
         turn_username: str | None = None,
@@ -230,19 +256,36 @@ class WebRtcMediaSession:
         use_ipv6: bool = True,
         ice_factory: _IceFactory = _default_ice_factory,
         cipher_list: bytes | None = None,
+        offerer: bool = False,
     ) -> None:
-        """Pick the DTLS role from the offer and build the DTLS + ICE objects.
+        """Pick the DTLS role + ICE role and build the DTLS + ICE objects.
 
         ``use_ipv4`` / ``use_ipv6`` select the ICE address families to gather
         (IPv6-first, ADR-0043): both default on, so the agent gathers IPv6 (which
         :attr:`ice_candidates` lists first) and IPv4 as the fallback family.
+
+        ``offerer`` (ADR-0049) selects the outbound-origination mode: the session is
+        the **ICE-CONTROLLING** peer (RFC 8445 §6.1) and offers a concrete
+        ``a=setup:active`` (we are the DTLS CLIENT — we send the ClientHello), so the
+        DTLS role and the fingerprint we advertise are fixed before the offer is sent
+        and need no post-answer switch. ``offer_setup`` is ignored in this mode.
+        Construct via :meth:`for_outbound_offer` rather than passing this directly.
+        The default (``offerer=False``) is the inbound ANSWERER: ICE-controlled, with
+        the DTLS role derived from the peer's ``offer_setup`` (RFC 5763 §5).
         """
-        self._setup = answer_setup_for_offer(offer_setup)
+        if offerer:
+            # Outbound origination: offer active (DTLS CLIENT), ICE-controlling.
+            self._setup = SetupRole("active")
+        else:
+            # Inbound answerer: derive the DTLS role from the peer's offer, honouring
+            # the operator's HERMES_VOIP_WEBRTC_DTLS_SETUP override (ADR-0050).
+            self._setup = answer_setup_for_offer(offer_setup, answer_setup)
         role = DtlsRole.CLIENT if self._setup.value == "active" else DtlsRole.SERVER
         self._dtls = DtlsEndpoint(role=role, cipher_list=cipher_list)
-        # The SIP UAS (answering an inbound INVITE) is ICE-CONTROLLED.
+        # The SIP UAS (answering an inbound INVITE) is ICE-CONTROLLED; the UAC
+        # originating an outbound call is ICE-CONTROLLING (ADR-0049).
         self._ice: _IcePipe = ice_factory(
-            ice_controlling=False,
+            ice_controlling=offerer,
             stun_urls=stun_urls,
             turn_urls=turn_urls,
             turn_username=turn_username,
@@ -251,6 +294,53 @@ class WebRtcMediaSession:
             use_ipv6=use_ipv6,
         )
         self._prepared = False
+
+    @classmethod
+    def for_outbound_offer(  # noqa: PLR0913 -- independent keyword config mirrors __init__
+        cls,
+        *,
+        stun_urls: tuple[str, ...] = (),
+        turn_urls: tuple[str, ...] = (),
+        turn_username: str | None = None,
+        turn_password: str | None = None,
+        use_ipv4: bool = True,
+        use_ipv6: bool = True,
+        ice_factory: _IceFactory = _default_ice_factory,
+        cipher_list: bytes | None = None,
+    ) -> WebRtcMediaSession:
+        """Construct the outbound-origination session (ADR-0049).
+
+        The returned session is the **offerer**: ICE-controlling and DTLS ``active``
+        (the CLIENT). Build it, call :meth:`prepare`, read :attr:`fingerprint` /
+        :attr:`setup` / :attr:`ice_ufrag` / :attr:`ice_pwd` / :attr:`ice_candidates`
+        into the WebRTC offer (:func:`hermes_voip.sdp.build_webrtc_offer`), send the
+        INVITE, then drive :meth:`run_handshake` with the peer's answer attributes.
+
+        Args:
+            stun_urls: ``stun:`` URLs for srflx ICE candidates (empty ⇒ host-only).
+            turn_urls: ``turn:``/``turns:`` URLs for relay candidates (ADR-0034).
+            turn_username: TURN long-term username (required when ``turn_urls`` set).
+            turn_password: TURN long-term password (required when ``turn_urls`` set).
+            use_ipv4: Gather IPv4 ICE candidates (the fallback family; ADR-0043).
+            use_ipv6: Gather IPv6 ICE candidates (the preferred family; ADR-0043).
+            ice_factory: Factory building the ICE pipe (injected in tests).
+            cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
+
+        Returns:
+            A new offerer :class:`WebRtcMediaSession`.
+        """
+        return cls(
+            offer_setup=None,
+            stun_urls=stun_urls,
+            turn_urls=turn_urls,
+            turn_username=turn_username,
+            turn_password=turn_password,
+            use_ipv4=use_ipv4,
+            use_ipv6=use_ipv6,
+            ice_factory=ice_factory,
+            cipher_list=cipher_list,
+            offerer=True,
+        )
 
     # ------------------------------------------------------------------
     # Phase A: prepare (gather + expose answer attributes)

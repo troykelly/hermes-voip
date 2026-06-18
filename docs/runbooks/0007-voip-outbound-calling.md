@@ -96,6 +96,21 @@ but refuses every target — the safe default.
    receives `[Outbound call to '<number>' ended (…): <summary>]`. Dialling an **un-approved**
    number returns an error to the agent and sends no INVITE.
 
+## Transport: how the dial goes out (ADR-0049)
+
+`place_call` picks the outbound media/signalling shape from the gateway transport
+(`HERMES_SIP_TRANSPORT`), with no extra knob:
+
+- **`tls`** (SIP-over-TLS): the existing SDES UAC — an INVITE with a `TLS` Via and an
+  SDES/G.711-G.722 (+ Opus when `libopus` is loadable, ADR-0049) offer.
+- **`wss`** (SIP-over-Secure-WebSocket): a **WebRTC** UAC — an RFC-7118 INVITE with a `WSS`
+  Via carrying OUR DTLS/ICE/Opus offer (ICE-controlling, `a=setup:active` = DTLS client). It
+  needs the `webrtc` extra + system `libopus` (a WebRTC call mandates Opus); without them the
+  dial fails cleanly (`OutboundCallFailed(488)`) before any INVITE. This lifted the prior
+  `501 "outbound not supported on WSS"` reject.
+
+The allowlist + privilege gate above apply identically on both transports.
+
 ## Rotation / change
 
 To add or remove an approved target, edit `HERMES_VOIP_OUTBOUND_ALLOW` in the gitignored `.env`

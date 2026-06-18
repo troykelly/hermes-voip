@@ -96,7 +96,13 @@ packages = ["src/hermes_voip"]
 # Ship the plugin manifest as importable package data (ADR-0037) so the wheel is
 # self-describing: importlib.resources.files("hermes_voip")/"plugin.yaml" resolves it.
 # Non-.py files under the package dir are not included by hatchling unless declared.
-artifacts = ["src/hermes_voip/plugin.yaml"]
+artifacts = [
+  "src/hermes_voip/plugin.yaml",
+  # Bundled call-scenario skills (ADR-0047): skills/<name>/SKILL.md shipped as
+  # importable package data so register() can resolve each via
+  # importlib.resources.files("hermes_voip") / "skills" / <name> / "SKILL.md".
+  "src/hermes_voip/skills/**/SKILL.md",
+]
 
 # ---------------------------------------------------------------------------
 # Ruff — format + lint at high strictness (AGENTS.md rule 17). A strong curated
@@ -194,7 +200,7 @@ files = ["src", "tests"]
 # than launder it with ``# type: ignore[import-not-found]`` (rule 17), it joins the
 # hermes-contract type-check (which installs the extra and resolves the real
 # symbols via ``follow_untyped_imports``), same as ``adapter.py``.
-exclude = '(^|/)(src/hermes_voip/adapter\.py|src/hermes_voip/voip_tools\.py|tests/test_adapter\.py|tests/test_adapter_caller_modes\.py|tests/test_adapter_reconnect\.py|tests/test_adapter_webrtc\.py|tests/test_adapter_wss_signalling\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py|tests/e2e/test_inbound_webrtc_call\.py)$'
+exclude = '(^|/)(src/hermes_voip/adapter\.py|src/hermes_voip/voip_tools\.py|tests/test_adapter\.py|tests/test_adapter_caller_modes\.py|tests/test_adapter_reconnect\.py|tests/test_adapter_webrtc\.py|tests/test_adapter_wss_signalling\.py|tests/test_media_concurrency_hermes\.py|tests/test_adapter_attended_consult\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py|tests/e2e/test_inbound_webrtc_call\.py)$'
 
 # hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
 # (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``
@@ -232,6 +238,19 @@ ignore_missing_imports = true
 # override hides no runtime failure.
 [[tool.mypy.overrides]]
 module = ["opuslib.*"]
+ignore_missing_imports = true
+
+# ``plugins.plugin_utils`` is a Hermes-RUNTIME module (the documented
+# ``lazy_singleton`` helper) that is NOT vendored into the default (no-hermes) test
+# environment. ``_lazy_singleton.py`` imports it through a GUARDED try/except and
+# binds it to a narrow local Protocol (``_LazySingletonFactory``) — so NO ``Any``
+# crosses the boundary regardless of whether the module is present. ``ignore_missing_imports``
+# is used ONLY as the optional-runtime guard (so the guarded import resolves under
+# mypy when the runtime is absent), exactly like the ``websockets`` / ``opuslib``
+# overrides above: the runtime-present behaviour is the documented helper, the
+# runtime-absent behaviour is the tested stdlib fallback (ADR-0046).
+[[tool.mypy.overrides]]
+module = ["plugins.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

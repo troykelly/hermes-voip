@@ -340,6 +340,18 @@ _DEFAULT_VIDEO_FPS = 10
 _MIN_VIDEO_FPS = 1
 _MAX_VIDEO_FPS = 60
 
+# WebRTC DTLS answerer role (ADR-0050, RFC 8842 §5.3). For an ``a=setup:actpass``
+# offer the answerer is free to pick its DTLS role; ``auto`` (the default) makes us
+# ``active`` (the DTLS client, sending the ClientHello) per RFC 8842 — many gateways
+# offer ``actpass`` yet act as the DTLS server, so a ``passive`` answer deadlocks.
+# ``passive`` forces the server role for a gateway that insists on being the client;
+# ``active`` is the explicit form of the default. A pinned ``active``/``passive``
+# offer always overrides this knob (it cannot create two clients/servers). No effect
+# on the SIP-over-TLS path.
+_WEBRTC_DTLS_SETUP_KEY = "HERMES_VOIP_WEBRTC_DTLS_SETUP"
+_DEFAULT_WEBRTC_DTLS_SETUP = "auto"
+_WEBRTC_DTLS_SETUPS = frozenset({"auto", "active", "passive"})
+
 # WebRTC ICE TURN relay (ADR-0034). A comma-separated list of ``turn:``/``turns:``
 # URLs plus long-term credentials (RFC 8656). When set, a *relay* ICE candidate is
 # gathered so WebRTC works without a host / STUN-reflexive path (symmetric NAT,
@@ -683,6 +695,12 @@ class MediaConfig:
     # IPv6-only / IPv4-only deployments. No effect on the SIP-over-TLS path.
     ice_use_ipv4: bool = True
     ice_use_ipv6: bool = True
+    # WebRTC DTLS answerer role for an ``a=setup:actpass`` offer (ADR-0050, RFC 8842
+    # §5.3): ``auto`` (the default — answer ``active``, the DTLS client) / ``active`` /
+    # ``passive`` (force the server role). A pinned ``active``/``passive`` offer always
+    # overrides this. Defaulted so existing direct constructions stay valid; validated
+    # against the allowed set. No effect on the SIP-over-TLS path.
+    webrtc_dtls_setup: str = _DEFAULT_WEBRTC_DTLS_SETUP
     # WebRTC ICE TURN relay (ADR-0034), as ``turn:``/``turns:`` URLs for relay
     # candidate gathering. Empty (the default) ⇒ no relay candidate. When set, the
     # username + password are required (validated at load). No effect on the
@@ -786,6 +804,7 @@ class MediaConfig:
         _require_enum("stt_provider", self.stt_provider, _STT_PROVIDERS)
         _require_enum("tts_provider", self.tts_provider, _TTS_PROVIDERS)
         _require_enum("injection_guard", self.injection_guard, _INJECTION_GUARDS)
+        _require_enum("webrtc_dtls_setup", self.webrtc_dtls_setup, _WEBRTC_DTLS_SETUPS)
         if not math.isfinite(self.tone_secs) or self.tone_secs < 0:
             msg = (
                 "tone_secs must be a non-negative finite number, "
@@ -1040,6 +1059,8 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ice_stun_urls=_parse_ice_stun_urls(env),
         ice_use_ipv4=_parse_bool(env, _ICE_USE_IPV4_KEY, default=True),
         ice_use_ipv6=_parse_bool(env, _ICE_USE_IPV6_KEY, default=True),
+        webrtc_dtls_setup=_value_lower(env, _WEBRTC_DTLS_SETUP_KEY)
+        or _DEFAULT_WEBRTC_DTLS_SETUP,
         ice_turn_urls=_ice_turn[0],
         ice_turn_username=_ice_turn[1],
         ice_turn_password=_ice_turn[2],

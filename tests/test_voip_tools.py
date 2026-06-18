@@ -7,10 +7,9 @@ hermes-agent runtime). The plugin-registration side (``register(ctx)`` calling
 
 Beyond ``hang_up`` (ADR-0026) this also covers the in-call control tools exposed
 through the same mechanism (ADR-0011 §3): ``hold_call`` / ``resume_call`` and
-``list_registrations`` (all ``ELEVATED``). The IRREVERSIBLE transfer tools are
-NOT exposed (their spoof-resistant ADR-0010 DTMF confirmation channel is not
-wired into the live adapter, so an exposed transfer tool would be an always-blocked
-no-op — rule 6); the tests assert the gate would block them at level 0.
+``list_registrations`` (all ``ELEVATED``). The IRREVERSIBLE transfer tools
+(``transfer_blind`` — ADR-0010; ``transfer_attended`` — ADR-0048) are exposed and
+owned by the gate; the tests assert the gate blocks them for an unprivileged caller.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ from hermes_voip.voip_tools import (
     SEND_DTMF_TOOL_SCHEMA,
     TRANSFER_BLIND_TOOL_NAME,
     TRANSFER_BLIND_TOOL_SCHEMA,
+    AttendedTransferOutcome,
     TransferOutcome,
     active_voip_adapter,
     hang_up_handler,
@@ -59,6 +59,7 @@ class _FakeHost:
         already_ended: bool = False,
         guard: GuardSessionState | None = None,
         registrations: str = "1000: registered",
+        open_entry_raises: Exception | None = None,
     ) -> None:
         self.known = known
         self.already_ended = already_ended
@@ -72,6 +73,9 @@ class _FakeHost:
         self.results: list[tuple[str, str]] = []
         self.dtmf_sent: list[tuple[str, str]] = []
         self.entries_opened: list[str] = []
+        self.entry_names: list[str | None] = []
+        # When set, open_entry raises this (e.g. a name not in the intercom's set).
+        self.open_entry_raises = open_entry_raises
         self.transfers: list[tuple[str, str]] = []
         # When set, send_dtmf_on_call raises this instead of recording (e.g. the
         # telephone-event-not-negotiated RuntimeError).
@@ -121,9 +125,12 @@ class _FakeHost:
         self.dtmf_sent.append((call_id, digits))
         return self.known and not self.already_ended
 
-    async def open_entry(self, call_id: str) -> bool:
-        # ADR-0031 VoipToolHost member: actuate the intercom entry.
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
+        # ADR-0031/0045 VoipToolHost member: actuate the (optionally named) entry.
+        if self.open_entry_raises is not None:
+            raise self.open_entry_raises
         self.entries_opened.append(call_id)
+        self.entry_names.append(name)
         return self.known and not self.already_ended
 
     async def transfer_blind_on_call(
@@ -139,6 +146,17 @@ class _FakeHost:
         if self.transfer_outcome is TransferOutcome.TRANSFERRED:
             self.transfers.append((call_id, target))
         return self.transfer_outcome
+
+    # ADR-0048 VoipToolHost members (attended transfer): unused by this module's
+    # tests but present so set_active_adapter(host) type-checks against the protocol.
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        return ""
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        return AttendedTransferOutcome.TRANSFERRED
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -602,20 +620,25 @@ def test_send_dtmf_allowed_for_trusted(
 # --- open_entry: the intercom entry action ------------------------------------
 
 
-def test_open_entry_schema_takes_no_params() -> None:
+def test_open_entry_schema_has_optional_name_param() -> None:
     assert OPEN_ENTRY_TOOL_SCHEMA["name"] == OPEN_ENTRY_TOOL_NAME
     assert OPEN_ENTRY_TOOL_SCHEMA["description"]
     params = OPEN_ENTRY_TOOL_SCHEMA["parameters"]
     assert isinstance(params, dict)
-    # No parameters: opening the door is a fixed action, never a model-chosen target.
-    assert params.get("properties") == {}
+    # ADR-0045: an OPTIONAL 'name' selects which named opening to actuate; it is not
+    # required (a single-opening intercom may omit it). The call is still the session's
+    # own — only the opening name is model-chosen.
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    assert "name" in props
+    assert params.get("required") == []
 
 
 @pytest.mark.asyncio
 async def test_open_entry_handler_actuates_on_the_session_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_entry resolves the session's call and actuates the entry."""
+    """open_entry resolves the session's call and actuates the entry (no name)."""
     host = _FakeHost()
     set_active_adapter(host)
     _set_chat(monkeypatch, "call-door")
@@ -623,7 +646,38 @@ async def test_open_entry_handler_actuates_on_the_session_call(
     result = await open_entry_handler({})
 
     assert host.entries_opened == ["call-door"]
+    assert host.entry_names == [None]  # absent name => legacy/default opening
     assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_open_entry_handler_passes_the_named_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """open_entry forwards the chosen opening name to the adapter (ADR-0045)."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-gate")
+
+    result = await open_entry_handler({"name": "gate"})
+
+    assert host.entries_opened == ["call-gate"]
+    assert host.entry_names == ["gate"]
+    assert "result" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_open_entry_handler_reports_name_not_in_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name outside the calling intercom's set surfaces a clear error (ADR-0045)."""
+    host = _FakeHost(open_entry_raises=ValueError("opening 'garage' is not one of …"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-x")
+
+    result = await open_entry_handler({"name": "garage"})
+
+    assert "error" in json.loads(result)
 
 
 def test_open_entry_is_gated_blocked_for_receptionist(
@@ -948,18 +1002,19 @@ def test_gate_fails_safe_for_transfer_blind_when_call_unknown(
     assert verdict["action"] == "block"
 
 
-def test_transfer_attended_stays_deferred_not_registered() -> None:
-    """transfer_attended is NOT registered (deferred — no consult-leg origination).
+def test_both_transfer_tools_are_exposed_and_gated() -> None:
+    """Both transfer tools are exposed and owned by the gate (ADR-0010/0048).
 
-    Rule 6: it must not be a lying stub. The gate must not own it (it is not exposed),
-    and there is no schema/handler for it in the public API. transfer_blind IS exposed;
-    transfer_attended is not.
+    The agent-driven consult-leg origination landed (ADR-0019/0029), so the attended
+    transfer is no longer a deferred stub (rule 6 satisfied): it has a name, schema, and
+    handler in the public API, and the gate owns it (so its IRREVERSIBLE clamp applies).
     """
     import hermes_voip.voip_tools as vt  # noqa: PLC0415
 
-    # transfer_blind is exposed and owned by the gate...
+    # Both transfers are exposed and owned by the gate...
     assert TRANSFER_BLIND_TOOL_NAME in vt._voip_tool_names()
-    # ...transfer_attended is not registered at all (no name, schema, or handler).
-    assert "transfer_attended" not in vt._voip_tool_names()
-    assert not hasattr(vt, "TRANSFER_ATTENDED_TOOL_NAME")
-    assert not hasattr(vt, "transfer_attended_handler")
+    assert "transfer_attended" in vt._voip_tool_names()
+    # ...with a name, schema, and handler in the public API.
+    assert hasattr(vt, "TRANSFER_ATTENDED_TOOL_NAME")
+    assert hasattr(vt, "TRANSFER_ATTENDED_TOOL_SCHEMA")
+    assert hasattr(vt, "transfer_attended_handler")

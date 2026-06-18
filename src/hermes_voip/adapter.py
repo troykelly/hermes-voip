@@ -126,7 +126,16 @@ from hermes_voip.message import (
     build_request,
     build_response,
     new_branch,
+    new_call_id,
     new_tag,
+)
+from hermes_voip.multi_intercom import (
+    IntercomEntry,
+    MultiIntercomConfig,
+    Opening,
+    OpeningType,
+    fire_webhook_opening,
+    load_multi_intercom_config,
 )
 from hermes_voip.notice_filter import is_internal_system_notice
 from hermes_voip.originate import (
@@ -144,6 +153,7 @@ from hermes_voip.sdp import (
     build_audio_answer,
     build_audio_offer,
     build_webrtc_answer,
+    build_webrtc_offer,
     negotiate_audio,
     negotiate_video_h264,
 )
@@ -154,7 +164,9 @@ from hermes_voip.tools import gate_voip_tool
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
 from hermes_voip.transport.ws_connection import WssSipTransport
 from hermes_voip.voip_tools import (
+    TRANSFER_ATTENDED_TOOL_NAME,
     TRANSFER_BLIND_TOOL_NAME,
+    AttendedTransferOutcome,
     TransferOutcome,
     active_voip_adapter,
     set_active_adapter,
@@ -203,6 +215,15 @@ _SUPPORTED_ENCODINGS = ("G722", "PCMU", "PCMA", "telephone-event")
 # call loudly (ImportError) rather than answering dead — never a silent miss.
 _WEBRTC_SUPPORTED_ENCODINGS = ("opus", "PCMU", "PCMA", "telephone-event")
 
+# Opus on the SIP (SDES/TLS) path (ADR-0049). Opus is offered on the SIP menu ONLY
+# when libopus is actually loadable at runtime (``_opus_sip_available``), so a host
+# without the ``webrtc`` extra advertises exactly the G.722/G.711 floor menu and the
+# #84 advertise-without-carry invariant holds. PT 111 / opus/48000/2 with the
+# RFC 7587 fmtp; the engine carries Opus identically on the SIP and WebRTC paths.
+_OPUS_SIP_PAYLOAD_TYPE = 111
+_OPUS_RTP_CLOCK_RATE = 48000
+_OPUS_FMTP = "minptime=10;useinbandfec=1"
+
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
 
@@ -243,6 +264,12 @@ _SIP_ERROR_FLOOR = 300  # responses at or above this are errors
 # Maximum outstanding responses buffered in _QueueSink (N2). A 407 + final
 # = 2; with re-auth it is at most ~4. 32 is generous without being unbounded.
 _SINK_QUEUE_MAX = 32
+
+#: Reservation sentinel for ``_attended_consults`` (ADR-0048): placed in the pairing
+#: slot BEFORE the consult dial awaits, so a concurrent second ``consult`` for the same
+#: original call is refused. It is never a real SIP Call-ID (no session matches it), so
+#: complete/cancel during the dial window simply see "no live consult" and clear it.
+_CONSULT_PENDING = "\x00pending"
 
 
 def _make_tls_context(host: str) -> ssl.SSLContext:
@@ -349,6 +376,13 @@ class VoipAdapter(BasePlatformAdapter):
         # The relay client (RELAY mode only) is built once in connect().
         self._intercom_cfg: IntercomConfig | None = None
         self._intercom_relay: IntercomRelayClient | None = None
+        # Multi-intercom NAMED openings (ADR-0045): multiple intercom caller-IDs, each
+        # with a named opening set (door/gate/garage), each opening a DTMF code OR a
+        # webhook. EMPTY by default (the legacy single-intercom path above applies);
+        # populated from HERMES_VOIP_INTERCOM_CONFIG_FILE in connect(). A call whose
+        # caller-ID matches an entry stores it on _call_info[call_id]['intercom_entry']
+        # so open_entry(name) is scoped to ONLY that intercom's openings.
+        self._multi_intercom: MultiIntercomConfig = MultiIntercomConfig(entries=())
         self._tls_ctx: ssl.SSLContext | None = None
         self._keepalive_interval: float = 30.0
         self._transport: SignalingTransport | None = None
@@ -407,6 +441,12 @@ class VoipAdapter(BasePlatformAdapter):
         # it before any INVITE; the env-trigger CALL_ON_CONNECT path bypasses it (it
         # is the operator's own explicit dial, like the gate-bypassing test trigger).
         self._outbound_allow: frozenset[str] = frozenset()
+        # _attended_consults (ADR-0048): the in-flight attended-transfer pairings,
+        # mapping an ORIGINAL call's Call-ID -> its CONSULTATION leg's Call-ID. Set by
+        # start_attended_consult, read by complete_attended_transfer (to find the
+        # consult Dialog the REFER+Replaces names) and cancel_attended_transfer (to
+        # hang up the consult leg), and cleared by both. One pairing per original call.
+        self._attended_consults: dict[str, str] = {}
         # _extra: the raw env config dict stored from connect() so _establish()
         # (called on reconnect too) can read CALL_ON_CONNECT without re-reading
         # self.config.extra each time.
@@ -464,6 +504,11 @@ class VoipAdapter(BasePlatformAdapter):
             if intercom_cfg.open_mode is IntercomOpenMode.RELAY
             else None
         )
+        # Multi-intercom NAMED openings (ADR-0045): opt-in via
+        # HERMES_VOIP_INTERCOM_CONFIG_FILE; empty otherwise. Loaded once here so a
+        # malformed document (bad type / invalid DTMF code / non-https webhook URL)
+        # fails LOUD at startup, never at door-open time (rule 37).
+        self._multi_intercom = load_multi_intercom_config(extra)
         self._tls_ctx = _make_tls_context(gateway_cfg.host)
         self._keepalive_interval = float(
             extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
@@ -812,25 +857,23 @@ class VoipAdapter(BasePlatformAdapter):
                 when no registered extension is available, or when the slot is busy.
             RuntimeError: When the transport or manager is not initialised.
         """
-        # ADR-0038 / ADR-0032 §5: outbound origination over WSS is DEFERRED. The
-        # outbound UAC path offers SDES/G.711-G.722 and emits a TLS Via, so dialing
-        # over the WSS signalling transport would put spec-incoherent SIP on the
-        # WebSocket. Reject it LOUDLY here (a named boundary, never a silent
-        # incoherent send) rather than letting _handle_outbound_invite proceed.
+        # ADR-0049 (lifts ADR-0032 §5 / ADR-0038 §4): on a WSS gateway, outbound
+        # origination carries OUR OWN WebRTC offer (DTLS/ICE/Opus) over the
+        # WebSocket — never the SDES/TLS-Via INVITE the WSS transport cannot frame
+        # coherently. The transport is selected per dial: wss => WebRTC UAC,
+        # tls => the existing SDES UAC.
         gateway_cfg = self._gateway_cfg
-        if gateway_cfg is not None and gateway_cfg.transport == "wss":
-            raise OutboundCallFailed(
-                501,
-                "outbound calling is not supported on the WSS transport "
-                "(outbound WebRTC origination is deferred — ADR-0032 §5); "
-                "outbound runs only on HERMES_SIP_TRANSPORT=tls",
-            )
+        is_wss = gateway_cfg is not None and gateway_cfg.transport == "wss"
         if extension in self._outbound_extensions:
             raise OutboundCallFailed(
                 503, f"outbound call to {extension!r} already in progress"
             )
         self._outbound_extensions.add(extension)
         try:
+            if is_wss:
+                return await self._handle_outbound_webrtc_invite(
+                    extension, objective=objective, origin=origin
+                )
             return await self._handle_outbound_invite(
                 extension, objective=objective, origin=origin
             )
@@ -1033,7 +1076,11 @@ class VoipAdapter(BasePlatformAdapter):
                 raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
 
             try:
-                agreed_codecs = negotiate_audio(answer_audio, _SUPPORTED_ENCODINGS)
+                # ADR-0049: the SIP answer may negotiate Opus when we offered it
+                # (libopus available) — accept it here too, not only G.722/G.711.
+                agreed_codecs = negotiate_audio(
+                    answer_audio, _sip_supported_encodings()
+                )
             except ValueError as exc:
                 raise OutboundCallFailed(
                     488, f"no common codec in 2xx answer: {exc}"
@@ -1080,11 +1127,11 @@ class VoipAdapter(BasePlatformAdapter):
             negotiated_voice = _first_voice_codec(agreed_codecs)
             if negotiated_voice is not None:
                 try:
-                    engine._codec = _to_engine_codec(negotiated_voice)
+                    negotiated_engine_codec = _to_engine_codec(negotiated_voice)
                 except UnsupportedCodecError as exc:
                     # Defense-in-depth (unreachable over the current menu, since
                     # negotiate_audio above already rejects an offer whose voice
-                    # codec is outside _SUPPORTED_ENCODINGS): if the advertised
+                    # codec is outside _sip_supported_encodings()): if the advertised
                     # menu ever drifts ahead of the engine table, FAIL the call
                     # loudly here rather than leave the engine on a placeholder
                     # codec and stream dead audio. OutboundCallFailed propagates to
@@ -1092,6 +1139,20 @@ class VoipAdapter(BasePlatformAdapter):
                     # inbound guard.
                     raise OutboundCallFailed(
                         488, f"2xx answer codec not carriable: {exc}"
+                    ) from exc
+                # Adopt the negotiated engine codec (the outbound engine is built on
+                # a PCMU placeholder before the answer is known; reassign it here).
+                engine._codec = negotiated_engine_codec
+                # ADR-0049: if the SIP answer negotiated Opus, preflight the runtime
+                # dependency so a host that somehow advertised Opus but lost libopus
+                # fails the call cleanly (488) rather than streaming dead audio. A
+                # no-op for G.722/G.711 (stdlib/pure-Python). Preflight the
+                # locally-computed codec, not a re-read of the engine's private attr.
+                try:
+                    _preflight_codec_dependency(negotiated_engine_codec)
+                except ImportError as exc:
+                    raise OutboundCallFailed(
+                        488, f"2xx answer codec dependency unavailable: {exc}"
                     ) from exc
                 # Also adopt the negotiated RTP payload type (the answer's PT may be
                 # a dynamic value for G.722, differing from the codec's static PT) so
@@ -1311,6 +1372,396 @@ class VoipAdapter(BasePlatformAdapter):
                     reason=CallEndReason.SIP_ERROR,
                 )
 
+    async def _handle_outbound_webrtc_invite(  # noqa: PLR0912,PLR0915 — UAC WebRTC flow: offer/challenge/2xx/handshake/ACK/loop, one sequence
+        self,
+        extension: str,
+        *,
+        objective: str | None = None,
+        origin: tuple[str, str] | None = None,
+    ) -> str:
+        """Drive the outbound WebRTC UAC flow over WSS (ADR-0049).
+
+        The outbound mirror of :meth:`_setup_webrtc_call` (inbound answerer): build
+        OUR DTLS/ICE/Opus offer as the ICE-controlling, DTLS-active offerer, send an
+        RFC-7118 INVITE over the WSS transport, handle a digest challenge + the 2xx,
+        run the ICE+DTLS handshake against the peer's answer attributes, then wire the
+        engine (over the ICE pipe) + CallSession + CallLoop. Lifts the ADR-0032 §5 /
+        ADR-0038 §4 outbound-WebRTC deferral.
+        """
+        transport = self._transport
+        manager = self._manager
+        if transport is None or manager is None:
+            msg = "place_call: not initialised — call connect() first"
+            raise RuntimeError(msg)
+        media_cfg = self._media_cfg
+        if media_cfg is None:
+            msg = "place_call: media config not initialised"
+            raise RuntimeError(msg)
+        gateway_cfg = self._gateway_cfg
+        if gateway_cfg is None:
+            msg = "place_call: gateway config not initialised"
+            raise RuntimeError(msg)
+
+        # A WebRTC call mandates DTLS-SRTP + a real codec (RFC 8827); Opus is the
+        # WebRTC audio codec. Reject BEFORE any INVITE if libopus is unavailable, so
+        # a host without the webrtc extra fails cleanly rather than dialling dead.
+        try:
+            _preflight_codec_dependency(Codec.OPUS)
+        except ImportError as exc:
+            raise OutboundCallFailed(
+                488,
+                "outbound WebRTC call needs the 'webrtc' extra + system libopus "
+                f"for Opus: {exc}",
+            ) from exc
+
+        # Source the call from a registered extension (any registered one).
+        source_state = None
+        for state in manager._by_extension.values():
+            if state.registered:
+                source_state = state
+                break
+        if source_state is None:
+            raise OutboundCallFailed(
+                503, "no registered extension available to originate call"
+            )
+        source_ext = source_state.extension
+
+        target_uri = f"sip:{extension}@{gateway_cfg.host}"
+        local_aor = f"sip:{source_ext.extension}@{gateway_cfg.host}"
+        local_contact = transport.contact_uri(source_ext.extension)
+        local_sent_by = transport.local_sent_by
+        local_rtp_host = _host_of(local_sent_by)
+        session_id = int(time.monotonic() * 1000) & 0xFFFF_FFFF
+
+        # --- Build OUR WebRTC offer (ICE-controlling, DTLS active) ----------
+        session = WebRtcMediaSession.for_outbound_offer(
+            stun_urls=media_cfg.ice_stun_urls,
+            turn_urls=media_cfg.ice_turn_urls,
+            turn_username=media_cfg.ice_turn_username,
+            turn_password=media_cfg.ice_turn_password,
+            use_ipv4=media_cfg.ice_use_ipv4,
+            use_ipv6=media_cfg.ice_use_ipv6,
+        )
+        sink: CallResponseSink = _QueueSink()
+        call_session: CallSession | None = None
+        session_established = False
+        call_id = new_call_id()
+        # OUR offered codec menu (Opus + G.711 fallback + telephone-event); also
+        # used to BOUND the 2xx answer negotiation below (RFC 3264: the answer must
+        # be a subset of what we offered).
+        offered_codecs = _webrtc_offer_codecs()
+        offered_encodings = tuple(c.encoding for c in offered_codecs)
+        try:
+            await session.prepare()  # gather ICE; expose fingerprint/setup/creds
+            offer_body = build_webrtc_offer(
+                local_address=local_rtp_host,
+                port=9,  # advisory; ICE candidates carry the real address/port
+                codecs=offered_codecs,
+                fingerprint=session.fingerprint,
+                setup=session.setup,
+                ice_ufrag=session.ice_ufrag,
+                ice_pwd=session.ice_pwd,
+                ice_candidates=session.ice_candidates,
+                session_id=session_id,
+            )
+
+            # --- Send INVITE (WSS Via, our WebRTC offer) -------------------
+            invite_text, call_id, from_tag = build_outbound_invite(
+                target_uri=target_uri,
+                local_aor=local_aor,
+                local_contact=local_contact,
+                local_sent_by=local_sent_by,
+                transport="WSS",
+                body=offer_body,
+                call_id=call_id,
+            )
+            transport.add_call(call_id, sink)
+            last_cseq = 1
+            await transport.send(invite_text)
+            _log.info(
+                "WebRTC INVITE sent over WSS: Call-ID %s -> %s", call_id, target_uri
+            )
+
+            assert isinstance(sink, _QueueSink)  # noqa: S101 — mypy narrowing aid
+            response = await sink.get()
+
+            if response.status_code in (_SIP_UNAUTHORIZED, _SIP_PROXY_AUTH):
+                is_proxy_auth = response.status_code == _SIP_PROXY_AUTH
+                auth_hdr_name = (
+                    "Proxy-Authenticate" if is_proxy_auth else "WWW-Authenticate"
+                )
+                auth_value = response.header(auth_hdr_name)
+                if auth_value is None:
+                    raise OutboundCallFailed(
+                        response.status_code, "challenge has no auth header"
+                    )
+                challenge = DigestChallenge.parse(auth_value)
+                credentials = DigestCredentials(
+                    username=source_ext.username,
+                    password=source_ext.password,
+                )
+                auth_resp_value = build_authorization(
+                    challenge, credentials, method="INVITE", uri=target_uri
+                )
+                auth_hdr_out = (
+                    "Proxy-Authorization" if is_proxy_auth else "Authorization"
+                )
+                last_cseq = 2
+                invite_text2, _, _ = build_outbound_invite(
+                    target_uri=target_uri,
+                    local_aor=local_aor,
+                    local_contact=local_contact,
+                    local_sent_by=local_sent_by,
+                    transport="WSS",
+                    body=offer_body,
+                    call_id=call_id,
+                    from_tag=from_tag,
+                    cseq=last_cseq,
+                    auth=(auth_hdr_out, auth_resp_value),
+                )
+                await transport.send(invite_text2)
+                _log.info("WebRTC INVITE re-sent with auth: Call-ID %s", call_id)
+                while True:
+                    response = await sink.get()
+                    if response.status_code < _SIP_FINAL_FLOOR:
+                        continue
+                    if _cseq_num(response) == last_cseq:
+                        break
+            elif response.status_code < _SIP_FINAL_FLOOR:
+                while True:
+                    response = await sink.get()
+                    if response.status_code >= _SIP_FINAL_FLOOR:
+                        break
+
+            if response.status_code >= _SIP_ERROR_FLOOR:
+                raise OutboundCallFailed(
+                    response.status_code, response.reason or "Call Failed"
+                )
+
+            # --- Parse the 2xx WebRTC answer -------------------------------
+            answer_body = response.body or ""
+            try:
+                answer_sdp = SessionDescription.parse(answer_body)
+            except Exception as exc:
+                raise OutboundCallFailed(
+                    500, f"2xx SDP answer unparseable: {exc}"
+                ) from exc
+            answer_audio = answer_sdp.audio
+            if answer_audio is None:
+                raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
+            if not answer_audio.is_webrtc:
+                raise OutboundCallFailed(
+                    488, "2xx answer is not a WebRTC (UDP/TLS/RTP/SAVPF) answer"
+                )
+            peer_fp = answer_audio.fingerprint
+            if (
+                peer_fp is None
+                or answer_audio.ice_ufrag is None
+                or answer_audio.ice_pwd is None
+            ):
+                raise OutboundCallFailed(
+                    488,
+                    "2xx WebRTC answer missing fingerprint / ICE credentials",
+                )
+            # RFC 3264 §6: the answer MUST be bounded by what WE offered, not the
+            # full inbound menu. Bound negotiation to OUR offered encodings so a
+            # gateway echoing a codec we never offered is rejected, not silently
+            # accepted (e.g. an answer naming G.722, which we don't offer on WebRTC).
+            try:
+                agreed_codecs = negotiate_audio(answer_audio, offered_encodings)
+            except ValueError as exc:
+                raise OutboundCallFailed(
+                    488, f"no common codec in 2xx WebRTC answer: {exc}"
+                ) from exc
+            voice = _first_voice_codec(agreed_codecs)
+            if voice is None:
+                raise OutboundCallFailed(488, "2xx WebRTC answer has no voice codec")
+            try:
+                engine_codec = _to_engine_codec(voice)
+            except UnsupportedCodecError as exc:
+                raise OutboundCallFailed(
+                    488, f"2xx answer codec not carriable: {exc}"
+                ) from exc
+
+            # --- Run the ICE + DTLS handshake as the offerer ---------------
+            srtp_inbound, srtp_outbound = await session.run_handshake(
+                peer_fingerprint=peer_fp,
+                peer_ice_ufrag=answer_audio.ice_ufrag,
+                peer_ice_pwd=answer_audio.ice_pwd,
+                peer_candidates=answer_audio.ice_candidates,
+            )
+
+            # --- Build the UAC dialog + ACK the 2xx ------------------------
+            last_invite_headers = [
+                ("Via", f"SIP/2.0/WSS {local_sent_by};branch={new_branch()};rport"),
+                ("From", f"<{local_aor}>;tag={from_tag}"),
+                ("To", f"<{target_uri}>"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{last_cseq} INVITE"),
+                ("Contact", local_contact),
+            ]
+            parsed_invite = SipRequest.parse(
+                build_request("INVITE", target_uri, last_invite_headers, "")
+            )
+            dialog = Dialog.from_invite_2xx(parsed_invite, response)
+            ack_cseq_num = int(dialog.local_cseq)
+            ack_headers: list[tuple[str, str]] = [
+                ("Via", f"SIP/2.0/WSS {local_sent_by};branch={new_branch()};rport"),
+                ("Max-Forwards", "70"),
+            ]
+            ack_headers.extend(("Route", route) for route in dialog.route_set)
+            ack_headers += [
+                ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{ack_cseq_num} ACK"),
+                ("Contact", local_contact),
+            ]
+            await transport.send(
+                build_request("ACK", dialog.remote_target, ack_headers)
+            )
+            _log.info("WebRTC ACK sent: Call-ID %s", call_id)
+
+            # --- Build the media engine over the ICE pipe ------------------
+            te_pt = _telephone_event_payload_type(agreed_codecs)
+            dtmf_send_mode = resolve_dtmf_send_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=voice.encoding
+            )
+            inband_rx = (
+                resolve_dtmf_receive_mode(
+                    media_cfg,
+                    telephone_event_payload_type=te_pt,
+                    codec=voice.encoding,
+                )
+                is DtmfReceiveMode.INBAND
+            )
+            engine = RtpMediaTransport(
+                local_address="0.0.0.0",  # noqa: S104 — unused on the ICE path
+                local_port=0,
+                remote_address=_effective_address(answer_audio, answer_sdp)
+                or "0.0.0.0",  # noqa: S104
+                remote_port=answer_audio.port or 9,
+                codec=engine_codec,
+                payload_type=voice.payload_type,
+                telephone_event_payload_type=te_pt,
+                dtmf_send_mode=dtmf_send_mode,
+                inband_dtmf_rx_enabled=inband_rx,
+                srtp_inbound=srtp_inbound,
+                srtp_outbound=srtp_outbound,
+                ice_transport=session.ice,
+                media_timeout_secs=media_cfg.media_timeout_secs,
+                aec_enabled=media_cfg.aec_enabled,
+                aec_filter_ms=media_cfg.aec_filter_ms,
+                aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+                aec_mu=media_cfg.aec_mu,
+            )
+            await engine.connect()
+            _log.info("WebRTC outbound media engine connected over ICE: %s", call_id)
+
+            # --- Wire CallSession + CallLoop (outbound, untrusted callee) --
+            _outbound_group = CallerGroup(
+                name="outbound",
+                privilege_level=0,
+                persona="outbound",
+                declined_at_sip=False,
+            )
+            guard_state = GuardSessionState(
+                call_id,
+                privilege_level=_outbound_group.privilege_level,
+                allowed_tools=_outbound_group.allowed_tools,
+            )
+            credentials_for_session = DigestCredentials(
+                username=source_ext.username, password=source_ext.password
+            )
+            local_media = LocalMediaSession(
+                local_address=local_rtp_host,
+                port=9,
+                codecs=tuple(agreed_codecs),
+                session_id=session_id,
+            )
+            call_session = CallSession(
+                dialog=dialog,
+                signaling=transport,
+                media=engine,
+                guard=guard_state,
+                local_media=local_media,
+                credentials=credentials_for_session,
+                dtmf_send_mode=engine.dtmf_send_mode,
+            )
+            transport.remove_call(call_id, sink)
+            transport.add_call(call_id, call_session)
+            manager.add_call(call_session.dialog_id, call_session)
+            self._call_sessions[call_id] = call_session
+
+            call_info: dict[str, object] = {
+                "name": extension,
+                "remote_uri": target_uri,
+                "type": "dm",
+                "ended": False,
+                "group": _outbound_group,
+                "mode": CallerMode.OUTBOUND,
+            }
+            if objective is not None:
+                call_info["objective"] = objective
+            if origin is not None:
+                call_info["origin"] = origin
+            self._call_info[call_id] = call_info
+
+            _bg_engine = engine
+            _bg_transport = transport
+            _bg_session = call_session
+            _bg_call_id = call_id
+            _bg_guard_state = guard_state
+
+            async def _run_and_teardown() -> None:
+                _loop: CallLoop | None = None
+                _raised = True
+                try:
+                    _loop = await self._run_call_loop(
+                        call_id=_bg_call_id,
+                        engine=_bg_engine,
+                        guard_state=_bg_guard_state,
+                    )
+                    _raised = False
+                finally:
+                    _reason = self._classify_end_reason(
+                        _bg_call_id, _bg_engine, raised=_raised
+                    )
+                    await self._teardown_call(
+                        call_id=_bg_call_id,
+                        engine=_bg_engine,
+                        transport=_bg_transport,
+                        dialog_id=_bg_session.dialog_id,
+                        session=_bg_session,
+                        call_loop=_loop,
+                        reason=_reason,
+                    )
+
+            loop_task: asyncio.Task[None] = asyncio.create_task(_run_and_teardown())
+            self._call_tasks.setdefault(call_id, set()).add(loop_task)
+            loop_task.add_done_callback(lambda t: self._on_call_task_done(call_id, t))
+            if objective is not None:
+                first_turn_task: asyncio.Task[None] = asyncio.create_task(
+                    self._inject_objective_first_turn(call_id)
+                )
+                self._call_tasks.setdefault(call_id, set()).add(first_turn_task)
+                first_turn_task.add_done_callback(
+                    lambda t: self._on_call_task_done(call_id, t)
+                )
+            session_established = True
+            return call_id
+        finally:
+            if not session_established:
+                # Release the ICE session (aioice sockets) on any pre-session
+                # failure (errors propagate; this only frees resources, rule 37).
+                # No _teardown_call here: a pre-session failure built no CallLoop and
+                # added no manager dialog, so there is nothing to tear down — only the
+                # temporary response sink to remove.
+                await session.close()
+                transport_cur = self._transport
+                if transport_cur is not None:
+                    transport_cur.remove_call(call_id, sink)
+
     # -----------------------------------------------------------------------
     # Inbound call wiring
     # -----------------------------------------------------------------------
@@ -1423,7 +1874,11 @@ class VoipAdapter(BasePlatformAdapter):
         # (offer.audio.is_webrtc); the codec-capability and no-answer-on-failure
         # invariants below apply identically to both.
         is_webrtc = audio.is_webrtc
-        supported = _WEBRTC_SUPPORTED_ENCODINGS if is_webrtc else _SUPPORTED_ENCODINGS
+        # ADR-0049: the SDES/SIP answer menu offers Opus too when libopus is loadable
+        # (gated, so a host without it keeps the G.722/G.711 floor — no drift).
+        supported = (
+            _WEBRTC_SUPPORTED_ENCODINGS if is_webrtc else _sip_supported_encodings()
+        )
         try:
             agreed_sdp_codecs = negotiate_audio(audio, supported)
         except ValueError as exc:
@@ -1468,6 +1923,23 @@ class VoipAdapter(BasePlatformAdapter):
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
+
+        # ADR-0049: an Opus SIP (SDES) call must have a loadable libopus before we
+        # answer it, or it would be answered-but-dead. The WebRTC path runs this
+        # preflight inside _setup_webrtc_call; the SDES path does it here so an Opus
+        # SIP call is rejected cleanly (488) pre-answer. A no-op for G.722/G.711.
+        if not is_webrtc:
+            try:
+                _preflight_codec_dependency(engine_codec)
+            except ImportError as exc:
+                _log.error(
+                    "INVITE %s: REJECTED 488 — SIP codec dependency unavailable "
+                    "(install the 'webrtc' extra + system libopus): %s",
+                    call_id,
+                    exc,
+                )
+                await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+                return
 
         # --- Build the UAS dialog -------------------------------------------
         local_tag = new_tag()
@@ -1576,7 +2048,7 @@ class VoipAdapter(BasePlatformAdapter):
         # `group` (classified at the top of this handler) drives the per-turn
         # persona preamble in _deliver_turn; persist it on the call info.
         #
-        # ADR-0033: extract the RICH inbound-call context (caller identity,
+        # ADR-0052: extract the RICH inbound-call context (caller identity,
         # dialled target, redirection/diversion chain, calling device, media)
         # from the same parsed INVITE — every value is caller-/network-supplied
         # and FORGEABLE, so it is surfaced to the agent only as a labelled,
@@ -1591,6 +2063,11 @@ class VoipAdapter(BasePlatformAdapter):
             is_webrtc=is_webrtc,
             transport=via_transport,
         )
+        # ADR-0045: match the caller-ID against the multi-intercom config. A match
+        # binds this call to that intercom's NAMED opening set, scoping open_entry(name)
+        # to ONLY those openings. Caller-ID is forgeable (never auth) — the per-opening
+        # secret + the ELEVATED/allowed_tools gate are the protection, not the match.
+        intercom_entry = self._multi_intercom.match(caller_number)
         self._call_info[call_id] = {
             "name": caller_number,
             "remote_uri": from_header,
@@ -1602,11 +2079,16 @@ class VoipAdapter(BasePlatformAdapter):
             # reaches here — it was rejected with 603 above). Kept so callers
             # reading the legacy "mode" key keep working.
             "mode": classification.mode,
-            # ADR-0033: the rich, structured inbound-call context (forgeable).
+            # ADR-0052: the rich, structured inbound-call context (forgeable).
             "context": call_context,
         }
+        if intercom_entry is not None:
+            # ADR-0045: bind the matched intercom's NAMED opening set to this call so
+            # open_entry(name) is scoped to ONLY these openings (and surface the NAMES,
+            # never the secret codes/urls, to the agent below).
+            self._call_info[call_id]["intercom_entry"] = intercom_entry
 
-        # --- Seed the agent's first turn with the rich call context (ADR-0033) ---
+        # --- Seed the agent's first turn with the rich call context (ADR-0052) ---
         # Inject the labelled, untrusted call-context block as the call's first system
         # turn so the agent knows who called, what was dialled, and how the call reached
         # it BEFORE the caller speaks. Awaited HERE, before _run_call_loop starts the
@@ -1743,7 +2225,8 @@ class VoipAdapter(BasePlatformAdapter):
                 offer,
                 local_address=local_media.local_address,
                 port=local_media.port,
-                supported=list(_SUPPORTED_ENCODINGS),
+                # ADR-0049: Opus is in the SIP answer menu when libopus is loadable.
+                supported=list(_sip_supported_encodings()),
                 session_id=local_media.session_id,
             )
         except Exception as exc:
@@ -1839,11 +2322,14 @@ class VoipAdapter(BasePlatformAdapter):
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected from exc
 
-        # The offered a=setup decides our DTLS role; WebRtcMediaSession picks it.
+        # The offered a=setup + the HERMES_VOIP_WEBRTC_DTLS_SETUP knob decide our DTLS
+        # role; WebRtcMediaSession picks it (RFC 8842 active answerer by default for an
+        # actpass offer — ADR-0050).
         # STUN gathers srflx candidates; TURN (ADR-0034) gathers a relay candidate
         # when operator-provided credentials are configured (empty ⇒ host/STUN only).
         session = WebRtcMediaSession(
             offer_setup=audio.setup,
+            answer_setup=media_cfg.webrtc_dtls_setup,
             stun_urls=media_cfg.ice_stun_urls,
             turn_urls=media_cfg.ice_turn_urls,
             turn_username=media_cfg.ice_turn_username,
@@ -2483,16 +2969,40 @@ class VoipAdapter(BasePlatformAdapter):
         await session.send_dtmf(digits)
         return True
 
-    async def open_entry(self, call_id: str) -> bool:
-        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031).
+    def _intercom_entry_for_call(self, call_id: str) -> IntercomEntry | None:
+        """The multi-intercom entry bound to ``call_id`` at INVITE time, or None."""
+        entry = self._call_info.get(call_id, {}).get("intercom_entry")
+        return entry if isinstance(entry, IntercomEntry) else None
+
+    async def _fire_webhook_opening(self, opening: Opening) -> None:
+        """Actuate a WEBHOOK opening (ADR-0045) — a seam the tests can override.
+
+        Delegates to :func:`hermes_voip.multi_intercom.fire_webhook_opening` (the
+        blocking ``urllib`` request runs off the event loop). The url/headers/body are
+        never logged (they may carry secrets).
+        """
+        await fire_webhook_opening(opening)
+
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
+        """Actuate the intercom entry for ``call_id`` (open the door — ADR-0031/0045).
 
         The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the intercom
-        group's ``open_entry`` tool calls. Opens the entry via the configured
-        actuation path:
+        group's ``open_entry`` tool calls.
 
-        * **DTMF** — send the configured open code on the live call (via
-          :meth:`~hermes_voip.call.CallSession.send_dtmf`); or
-        * **RELAY** — call the external relay client.
+        **Multi-intercom (ADR-0045).** When this call's caller-ID matched a
+        multi-intercom entry at setup, ``name`` selects one of that intercom's NAMED
+        openings (door / gate / garage), scoped to ONLY that intercom's set:
+
+        * a ``name`` not in the calling intercom's set raises :class:`ValueError`
+          (the door is never opened by a name the intercom does not own);
+        * each opening actuates via its own DTMF code or its own webhook.
+
+        ``name`` defaults to the sole opening when the intercom has exactly one; an
+        ambiguous ``None`` with several openings raises (the agent must choose).
+
+        **Single-intercom (ADR-0031, back-compat).** When the call matched no
+        multi-intercom entry, ``name`` is ignored and the legacy single actuation path
+        (the ``HERMES_VOIP_INTERCOM_*`` env scheme) applies: DTMF open code or relay.
 
         Returns ``False`` (and does nothing) for an unknown/ended call so the tool
         reports a clear, non-fatal outcome. The ``pre_tool_call`` gate has already
@@ -2500,13 +3010,64 @@ class VoipAdapter(BasePlatformAdapter):
         sub-ceiling before this runs.
 
         Raises:
-            RuntimeError: when no actuation is configured (the default DISABLED
-                mode) — opening a door is never a silent no-op (rule 37); the tool
-                surfaces this as a clear error.
-            IntercomRelayError: when the relay call fails (RELAY mode) — the door
-                was NOT opened, and the failure is reported, never hidden.
-            ValueError: if the configured DTMF open code is invalid (DTMF mode).
+            ValueError: a ``name`` outside the calling intercom's set, or an ambiguous
+                ``None`` name on a multi-opening intercom, or an invalid DTMF code.
+            RuntimeError: when no actuation is configured for a non-multi caller (the
+                default DISABLED single-intercom mode) — opening a door is never a
+                silent no-op (rule 37).
+            IntercomRelayError / WebhookError: when the relay/webhook call fails — the
+                door was NOT opened, and the failure is reported, never hidden.
         """
+        entry = self._intercom_entry_for_call(call_id)
+        if entry is not None:
+            return await self._open_named_entry(call_id, entry, name)
+        return await self._open_legacy_entry(call_id)
+
+    async def _open_named_entry(
+        self, call_id: str, entry: IntercomEntry, name: str | None
+    ) -> bool:
+        """Open a NAMED opening, scoped to the calling intercom's set (ADR-0045)."""
+        resolved = self._resolve_opening_name(entry, name)
+        opening = entry.openings[resolved]
+        if opening.type is OpeningType.WEBHOOK:
+            # Require a live call so a stale tool call cannot open the entry; the
+            # webhook itself does not need the media leg.
+            session = self._call_sessions.get(call_id)
+            if session is None or session.ended:
+                return False
+            _log.info("intercom open_entry (webhook) %r for call %s", resolved, call_id)
+            await self._fire_webhook_opening(opening)
+            return True
+        # DTMF opening: send the opening's own open code on the live call (send_dtmf
+        # handles unknown/ended -> False and not-negotiated -> raise; logs only the
+        # digit count — the open code is sensitive).
+        _log.info("intercom open_entry (dtmf) %r for call %s", resolved, call_id)
+        return await self.send_dtmf_on_call(call_id, opening.dtmf_code)
+
+    @staticmethod
+    def _resolve_opening_name(entry: IntercomEntry, name: str | None) -> str:
+        """Resolve + validate the opening name against the intercom set (fail-loud)."""
+        names = entry.opening_names()
+        if name is None:
+            if len(names) == 1:
+                return names[0]
+            available = ", ".join(sorted(names))
+            msg = (
+                "this intercom has multiple openings; specify which one to open. "
+                f"Available openings: {available}"
+            )
+            raise ValueError(msg)
+        if name not in entry.openings:
+            available = ", ".join(sorted(names))
+            msg = (
+                f"opening {name!r} is not one of this intercom's openings. "
+                f"Available openings: {available}"
+            )
+            raise ValueError(msg)
+        return name
+
+    async def _open_legacy_entry(self, call_id: str) -> bool:
+        """The ADR-0031 single-intercom actuation path (back-compat)."""
         cfg = self._intercom_cfg
         if cfg is None or cfg.open_mode is IntercomOpenMode.DISABLED:
             msg = (
@@ -2644,6 +3205,169 @@ class VoipAdapter(BasePlatformAdapter):
         await session.transfer_blind(target, referred_by=referred_by)
         return TransferOutcome.TRANSFERRED
 
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        """Originate the CONSULTATION leg of an attended transfer (ADR-0048).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
+        ``transfer_attended`` tool's ``consult`` action calls. It re-enforces the
+        IRREVERSIBLE privilege clamp ITSELF (defense in depth, mirroring
+        :meth:`transfer_blind_on_call`) and dials ``target`` via the EXISTING outbound
+        origination path — so the consultation leg is gated by the SAME
+        ``HERMES_VOIP_OUTBOUND_ALLOW`` allowlist as ``place_call`` (the consult is a new
+        untrusted outbound leg, the same threat model). On success it records the
+        ``call_id -> consult_call_id`` pairing and returns the consult leg's Call-ID.
+
+        Only ONE consultation may be in flight per original call: a second ``consult``
+        while one is already paired is REFUSED (``RuntimeError``) rather than allowed to
+        overwrite the pairing and orphan the first leg (the read->await->write window).
+        Cancel or complete the first consultation before starting another.
+
+        Raises (never a silent no-op — rule 37):
+
+        * ``KeyError`` — the original call is unknown/ended (nothing to transfer).
+        * ``PermissionError`` — the original call is not operator-level / is degraded.
+        * :class:`~hermes_voip.originate.OutboundCallNotAllowed` — ``target`` is not on
+          the outbound allowlist (no leg is dialled).
+        * ``RuntimeError`` — a consultation is already in flight for this call.
+        * :class:`~hermes_voip.originate.OutboundCallFailed` / ``RuntimeError`` — as
+          :meth:`place_call`.
+        """
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            msg = f"attended transfer: original call {call_id!r} is unknown or ended"
+            raise KeyError(msg)
+        # One consultation per original call. Refuse a second BEFORE the dial — the
+        # read->await place_call->write window would otherwise let a concurrent second
+        # action overwrite the pairing and orphan the first consult leg.
+        if call_id in self._attended_consults:
+            msg = (
+                f"attended transfer: a consultation is already in progress for call "
+                f"{call_id!r}; complete or cancel it before starting another"
+            )
+            raise RuntimeError(msg)
+        # Defense in depth: re-run the operator-level + non-degraded clamp here, not
+        # solely at the sync gate — an attended transfer dials a new untrusted leg, so
+        # an unprivileged/degraded original call must never reach the dial.
+        if not gate_voip_tool(
+            TRANSFER_ATTENDED_TOOL_NAME, session.guard, confirmed=True
+        ):
+            _log.warning(
+                "agent transfer_attended tool: call %s is not permitted to transfer "
+                "(privilege/degraded clamp); refusing the consultation",
+                call_id,
+            )
+            msg = "attended transfer is not permitted on this call"
+            raise PermissionError(msg)
+        # The outbound allowlist is the consult gate (same as place_call). Enforce it
+        # BEFORE dialling so an unlisted target is never called (raises NotAllowed).
+        if not is_outbound_allowed(target, self._outbound_allow):
+            raise OutboundCallNotAllowed(target)
+        # Reserve the pairing slot with a sentinel BEFORE the await so a concurrent
+        # second consult is refused (the membership check above) while this dial is in
+        # flight. On a dial failure the reservation is rolled back so a failed consult
+        # never permanently blocks a retry.
+        self._attended_consults[call_id] = _CONSULT_PENDING
+        _log.info(
+            "agent transfer_attended tool: dialling consultation %s for call %s",
+            target,
+            call_id,
+        )
+        try:
+            consult_call_id = await self.place_call(
+                target,
+                objective=(
+                    "You are placing a consultation call on the operator's behalf to "
+                    "set up an attended (warm) transfer. Briefly explain the caller "
+                    "you are about to connect, then the operator will complete the "
+                    "transfer."
+                ),
+            )
+        except BaseException:
+            # The dial did not establish — drop the reservation so the operator can
+            # retry (and complete/cancel see no stale pairing); then re-raise (rule 37).
+            self._attended_consults.pop(call_id, None)
+            raise
+        self._attended_consults[call_id] = consult_call_id
+        return consult_call_id
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        """COMPLETE an attended transfer: REFER+Replaces on the original (ADR-0048).
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
+        ``transfer_attended`` tool's ``complete`` action calls. Looks up the paired
+        consultation leg, then sends the REFER on the ORIGINAL call naming the consult
+        leg's :class:`~hermes_voip.dialog.Dialog` (RFC 3891 ``Replaces``) via
+        :meth:`~hermes_voip.call.CallSession.transfer_attended`, so the gateway bridges
+        the caller to the target and releases our legs. The ``Referred-By`` AOR is the
+        original call's local URI (RFC 3892). Re-enforces the privilege clamp ITSELF
+        (defense in depth) and clears the pairing once the REFER is sent.
+
+        Returns an :class:`~hermes_voip.voip_tools.AttendedTransferOutcome`:
+
+        * ``TRANSFERRED`` — the REFER+Replaces fired.
+        * ``NO_CONSULT`` — no consultation leg is in flight for this call.
+        * ``NO_CALL`` — the original call (or the consult leg) is unknown / ended.
+        * ``BLOCKED`` — the original call's privilege clamp refused it.
+
+        Raises :class:`~hermes_voip.call.CallError` if the gateway rejects the REFER
+        (propagated from ``CallSession.transfer_attended``) — never a silent no-op.
+        """
+        consult_call_id = self._attended_consults.get(call_id)
+        if consult_call_id is None:
+            return AttendedTransferOutcome.NO_CONSULT
+        session = self._call_sessions.get(call_id)
+        if session is None or session.ended:
+            return AttendedTransferOutcome.NO_CALL
+        consult = self._call_sessions.get(consult_call_id)
+        if consult is None or consult.ended:
+            # The consultation ended before we completed — there is nothing to bridge
+            # to. Clear the stale pairing and report it as no-call (no REFER).
+            self._attended_consults.pop(call_id, None)
+            return AttendedTransferOutcome.NO_CALL
+        # Defense in depth: re-run the privilege clamp before sending the REFER, so a
+        # session that lost privilege or went degraded during the consultation cannot
+        # complete the transfer (mirrors transfer_blind_on_call's post-await re-check).
+        if not gate_voip_tool(
+            TRANSFER_ATTENDED_TOOL_NAME, session.guard, confirmed=True
+        ):
+            _log.warning(
+                "agent transfer_attended tool: call %s lost transfer privilege; "
+                "REFER NOT sent",
+                call_id,
+            )
+            return AttendedTransferOutcome.BLOCKED
+        referred_by = session.dialog.local_uri
+        _log.info(
+            "agent transfer_attended tool: completing call %s -> consult %s (REFER)",
+            call_id,
+            consult_call_id,
+        )
+        await session.transfer_attended(consult.dialog, referred_by=referred_by)
+        self._attended_consults.pop(call_id, None)
+        return AttendedTransferOutcome.TRANSFERRED
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
+        """Abandon the consultation for ``call_id`` (ADR-0048); whether it acted.
+
+        The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
+        ``transfer_attended`` tool's ``cancel`` action calls. Hangs up the consultation
+        leg (BYE via :meth:`~hermes_voip.call.CallSession.hang_up`) and keeps the
+        original caller, clearing the pairing. Returns ``False`` (and does nothing) when
+        no consultation is in flight, so the tool reports a clear, non-fatal outcome.
+        """
+        consult_call_id = self._attended_consults.pop(call_id, None)
+        if consult_call_id is None:
+            return False
+        consult = self._call_sessions.get(consult_call_id)
+        if consult is not None and not consult.ended:
+            _log.info(
+                "agent transfer_attended tool: cancelling consultation %s for call %s",
+                consult_call_id,
+                call_id,
+            )
+            await consult.hang_up()
+        return True
+
     def list_registrations_text(self) -> str:
         """Return a human-readable registration snapshot (ADR-0011/0020; ELEVATED).
 
@@ -2728,7 +3452,7 @@ class VoipAdapter(BasePlatformAdapter):
             )
 
     async def _inject_call_context_first_turn(self, call_id: str) -> None:
-        """Seed an inbound call's FIRST turn with the rich call context (ADR-0033).
+        """Seed an inbound call's FIRST turn with the rich call context (ADR-0052).
 
         Injects one ``internal=True`` ``MessageEvent`` into the call's OWN session
         (``chat_id`` == Call-ID) carrying the rendered :class:`InboundCallContext`
@@ -2750,6 +3474,27 @@ class VoipAdapter(BasePlatformAdapter):
             return  # no rich context (e.g. an outbound call) — nothing to seed
         caller = str(info.get("name", call_id))
         text = render_call_context_block(context)
+        # ADR-0045: when this call matched a multi-intercom entry, surface the
+        # available opening NAMES (never the secret codes/urls) so the agent knows
+        # which entry it can open via open_entry(name=...). This line is operator
+        # configuration (not caller-supplied), so it is TRUSTED — it is appended to the
+        # rendered block as a fixed system note, not defanged.
+        #
+        # THREAT-MODEL NOTE (ADR-0045 decision 4): WHICH name set is shown is selected
+        # by the matched intercom entry, and that match keys off a FORGEABLE caller-ID
+        # (ADR-0020/0021). A spoofer presenting an intercom's caller-ID can thus make
+        # this trusted note appear and learn the opening NAMES — but never the
+        # codes/urls/tokens (server-side, repr-suppressed) and never an actual opening:
+        # open_entry stays ELEVATED + grant-only, so a name grants nothing without the
+        # operator's prior authorization of that caller into the intercom group.
+        entry = self._intercom_entry_for_call(call_id)
+        if entry is not None:
+            names = ", ".join(sorted(entry.opening_names()))
+            text = (
+                f"{text}\n[System: this is an INTERCOM. You can open the following "
+                f"named entries with open_entry(name=...): {names}. Open one ONLY for "
+                "a legitimate, expected visitor.]"
+            )
         try:
             # ADR-0035: the rich call-context seed lands on the call's channel so it
             # shares the same session as the turns it precedes.
@@ -3342,15 +4087,97 @@ def _resolve_webrtc_video(
     return VideoAnswer(codec=chosen, mid=mid, active=True), nals
 
 
-def _outbound_offer_codecs() -> list[SdpCodec]:
-    """The codec list for an outbound INVITE offer, wideband-preferred (ADR-0022).
+def _opus_sip_available() -> bool:
+    """Return ``True`` when Opus can run for the SIP (SDES) path (ADR-0049).
 
-    G.722 (static payload type 9, 16 kHz wideband — rtpmap clock 8000 per RFC 3551)
-    FIRST so a wideband-capable peer picks it, then G.711 PCMU/PCMA (the universal
-    fallback), then telephone-event (DTMF). Matches ``_SUPPORTED_ENCODINGS`` order;
-    a peer that cannot do G.722 answers G.711 via RFC 3264 negotiation.
+    Opus is offered on the SIP menu ONLY when ``opuslib`` + the system ``libopus``
+    are loadable, so a host without the ``webrtc`` extra advertises exactly the
+    G.722/G.711 floor menu (no advertise-without-carry drift; #84). The check forces
+    the same import path a real Opus encode exercises and treats any failure as "not
+    available" — the error is acted upon (Opus is simply not offered), never silently
+    swallowed (rule 37): an unavailable codec is the expected, non-exceptional case
+    on a default install.
     """
-    return [
+    from hermes_voip.media.opus import ensure_opus_available  # noqa: PLC0415
+
+    try:
+        ensure_opus_available()
+    except ImportError:
+        return False
+    return True
+
+
+def _opus_sdp_codec() -> SdpCodec:
+    """The Opus SDP codec for the SIP menu (ADR-0049, RFC 7587).
+
+    ``opus/48000/2`` (two channels is the RFC 7587 rtpmap convention even for a mono
+    stream) at dynamic PT 111, with ``minptime=10;useinbandfec=1``. The engine
+    carries Opus identically on the SIP and WebRTC paths.
+    """
+    return SdpCodec(
+        payload_type=_OPUS_SIP_PAYLOAD_TYPE,
+        encoding="opus",
+        clock_rate=_OPUS_RTP_CLOCK_RATE,
+        channels=2,
+        fmtp=_OPUS_FMTP,
+    )
+
+
+def _webrtc_offer_codecs() -> tuple[SdpCodec, ...]:
+    """The codec menu for an OUTBOUND WebRTC offer (ADR-0049).
+
+    Mirrors the inbound WebRTC answer menu (``_WEBRTC_SUPPORTED_ENCODINGS`` =
+    ``opus, PCMU, PCMA, telephone-event``) so the outbound and inbound media planes
+    are symmetric: Opus first (the WebRTC audio codec, RFC 7587), then the G.711
+    fallbacks so a gateway that cannot do Opus can still answer PCMU/PCMA, then
+    ``telephone-event`` so RFC 4733 DTMF can negotiate. An Opus-only offer would make
+    ``te_pt`` structurally always ``None`` (DTMF impossible) and leave no fallback
+    for a non-Opus peer — both regressions vs the inbound path.
+
+    Opus is preflighted before this is called (the offerer only reaches here once
+    ``libopus`` is confirmed loadable), so Opus is always present here.
+    """
+    return (
+        _opus_sdp_codec(),
+        SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
+        SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
+        SdpCodec(
+            payload_type=101,
+            encoding="telephone-event",
+            clock_rate=8000,
+            fmtp="0-16",
+        ),
+    )
+
+
+def _sip_supported_encodings() -> tuple[str, ...]:
+    """The SIP (SDES/TLS) answer's supported encodings, Opus-gated (ADR-0049).
+
+    The G.722/G.711/telephone-event floor (``_SUPPORTED_ENCODINGS``), with ``opus``
+    prepended ONLY when libopus is loadable (:func:`_opus_sip_available`). So an
+    inbound SIP call negotiates Opus when both peers offer it and the host can carry
+    it; a host without libopus advertises exactly the prior menu.
+    """
+    if _opus_sip_available():
+        return ("opus", *_SUPPORTED_ENCODINGS)
+    return _SUPPORTED_ENCODINGS
+
+
+def _outbound_offer_codecs() -> list[SdpCodec]:
+    """The codec list for an outbound INVITE offer, wideband-preferred (ADR-0022/0049).
+
+    Opus (PT 111, 48 kHz) is prepended FIRST when libopus is loadable
+    (:func:`_opus_sip_available`, ADR-0049) so a SIP peer can negotiate it; then
+    G.722 (static payload type 9, 16 kHz wideband — rtpmap clock 8000 per RFC 3551)
+    so a wideband-capable peer picks it, then G.711 PCMU/PCMA (the universal
+    fallback), then telephone-event (DTMF). A host without libopus offers exactly the
+    G.722/G.711 floor; a peer that cannot do the offered wideband codec answers G.711
+    via RFC 3264 negotiation.
+    """
+    codecs: list[SdpCodec] = []
+    if _opus_sip_available():
+        codecs.append(_opus_sdp_codec())
+    codecs += [
         SdpCodec(payload_type=9, encoding="G722", clock_rate=8000),
         SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
         SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
@@ -3361,6 +4188,7 @@ def _outbound_offer_codecs() -> list[SdpCodec]:
             fmtp="0-16",
         ),
     ]
+    return codecs
 
 
 def _to_engine_codec(sdp_codec: SdpCodec) -> Codec:

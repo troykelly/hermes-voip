@@ -623,23 +623,23 @@ def test_register_registers_the_in_call_control_tools() -> None:
         assert tool in names, f"the {tool!r} tool was not registered"
 
 
-def test_register_exposes_transfer_blind_but_not_attended() -> None:
-    """``transfer_blind`` IS exposed (ADR-0010/0031); ``transfer_attended`` is not.
+def test_register_exposes_both_transfer_tools() -> None:
+    """``transfer_blind`` AND ``transfer_attended`` are both exposed (ADR-0010/0048).
 
     The spoof-resistant ADR-0010 DTMF confirmation channel landed (PR #104
-    ``ArmedConfirmation``), so ``transfer_blind`` is no longer an always-blocked
-    no-op: it is registered and the REFER fires only on a real keypad confirm. The
-    one transfer still deferred is ``transfer_attended`` — it needs a consultation
-    Dialog the agent cannot originate (ADR-0031 §4), so registering it would be a
-    lying stub (rule 6). It stays deferred-not-registered.
+    ``ArmedConfirmation``), so ``transfer_blind`` is registered and its REFER fires
+    only on a real keypad confirm. The agent-driven consult-leg origination landed
+    (ADR-0048), so ``transfer_attended`` is no longer deferred: it is registered and
+    drives the consult → REFER+Replaces (RFC 3891) flow. Neither is a lying stub
+    (rule 6); both are wired end-to-end.
     """
     from hermes_voip.plugin import register  # noqa: PLC0415
 
     ctx = _FakeCtx()
     register(ctx)
     names = {c["name"] for c in ctx.tool_calls}
-    assert "transfer_blind" in names, "transfer_blind should now be registered"
-    assert "transfer_attended" not in names, "transfer_attended must stay deferred"
+    assert "transfer_blind" in names, "transfer_blind should be registered"
+    assert "transfer_attended" in names, "transfer_attended should now be registered"
     # transfer_blind is async and ships a model-readable schema with a target param.
     blind = next(c for c in ctx.tool_calls if c["name"] == "transfer_blind")
     assert blind["is_async"] is True
@@ -650,6 +650,16 @@ def test_register_exposes_transfer_blind_but_not_attended() -> None:
     props = params.get("properties")
     assert isinstance(props, dict)
     assert "target" in props
+    # transfer_attended is async and ships a schema with an action discriminator.
+    attended = next(c for c in ctx.tool_calls if c["name"] == "transfer_attended")
+    assert attended["is_async"] is True
+    a_schema = attended["schema"]
+    assert isinstance(a_schema, dict)
+    a_params = a_schema.get("parameters")
+    assert isinstance(a_params, dict)
+    a_props = a_params.get("properties")
+    assert isinstance(a_props, dict)
+    assert "action" in a_props
 
 
 def test_registered_control_tools_are_async_with_schemas() -> None:

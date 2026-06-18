@@ -116,14 +116,94 @@ def _linked_ice(
     return a, b
 
 
-def test_answer_setup_for_offer_picks_passive_for_actpass() -> None:
-    """An offer of actpass/active makes us passive/active per RFC 5763 §5."""
-    # actpass offer → we are passive (and thus the DTLS server)
-    assert answer_setup_for_offer(SetupRole("actpass")).value == "passive"
-    # active offer → we are passive
+def test_answer_setup_for_offer_picks_active_for_actpass() -> None:
+    """The RFC 8842 default: an actpass offer makes us active (ADR-0050).
+
+    RFC 8842 §5.3: the answerer SHOULD be ``active`` (the DTLS client, sending the
+    ClientHello). A real Asterisk/UCM gateway offers ``actpass`` but behaves as the
+    DTLS server, so an answerer that picks ``passive`` deadlocks (both servers). The
+    ``auto`` default therefore answers ``active`` to an ``actpass`` offer. The forced
+    roles in the offer are still honoured: an ``active`` offer pins us ``passive``;
+    a ``passive`` offer pins us ``active`` (RFC 5763 §5).
+    """
+    # actpass offer → we are ACTIVE (the DTLS client) under the RFC-8842 default.
+    assert answer_setup_for_offer(SetupRole("actpass")).value == "active"
+    # active offer → we MUST be passive (the offerer pinned itself client).
     assert answer_setup_for_offer(SetupRole("active")).value == "passive"
-    # passive offer → we are active (the DTLS client)
+    # passive offer → we are active (the offerer pinned itself server).
     assert answer_setup_for_offer(SetupRole("passive")).value == "active"
+    # A missing a=setup is treated as actpass (RFC 5763 §5 default) → active.
+    assert answer_setup_for_offer(None).value == "active"
+
+
+def test_answer_setup_for_offer_forced_passive_only_affects_actpass() -> None:
+    """A forced ``passive`` answer role overrides an actpass offer, not a pinned one.
+
+    The operator knob ``HERMES_VOIP_WEBRTC_DTLS_SETUP=passive`` forces us to be the
+    DTLS server for an ``actpass`` offer (some gateways insist on being the client).
+    The forced-vs-offer compatibility rules still bind: a peer that pinned itself
+    ``active`` (DTLS client) MUST be answered ``passive`` regardless of the knob, and
+    a peer that pinned itself ``passive`` MUST be answered ``active`` regardless.
+    """
+    # actpass offer + forced passive → we are passive (the server).
+    assert answer_setup_for_offer(SetupRole("actpass"), forced="passive").value == (
+        "passive"
+    )
+    # active offer can ONLY be answered passive — the knob cannot create two clients.
+    assert answer_setup_for_offer(SetupRole("active"), forced="passive").value == (
+        "passive"
+    )
+    # passive offer can ONLY be answered active — the knob cannot create two servers.
+    assert answer_setup_for_offer(SetupRole("passive"), forced="passive").value == (
+        "active"
+    )
+
+
+def test_answer_setup_for_offer_forced_active_only_affects_actpass() -> None:
+    """A forced ``active`` answer role matches the RFC-8842 default for actpass.
+
+    ``forced="active"`` makes the actpass answer ``active`` (same as ``auto``), and
+    still cannot override a pinned offer: an ``active`` offer is answered ``passive``,
+    a ``passive`` offer is answered ``active``.
+    """
+    assert answer_setup_for_offer(SetupRole("actpass"), forced="active").value == (
+        "active"
+    )
+    assert answer_setup_for_offer(SetupRole("active"), forced="active").value == (
+        "passive"
+    )
+    assert answer_setup_for_offer(SetupRole("passive"), forced="active").value == (
+        "active"
+    )
+
+
+def test_answer_setup_for_offer_auto_is_the_default() -> None:
+    """``forced="auto"`` (the default) is the RFC-8842 mapping (active for actpass)."""
+    assert answer_setup_for_offer(SetupRole("actpass"), forced="auto").value == "active"
+    # Omitting forced entirely is the same as forced="auto".
+    assert answer_setup_for_offer(SetupRole("actpass")) == answer_setup_for_offer(
+        SetupRole("actpass"), forced="auto"
+    )
+
+
+def test_session_answer_setup_threads_to_role() -> None:
+    """``WebRtcMediaSession(answer_setup=...)`` selects the DTLS role for actpass.
+
+    ``passive`` makes us the DTLS server for an actpass offer; ``auto``/``active``
+    make us the client (the RFC-8842 default, ADR-0050).
+    """
+    forced_passive = WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"),
+        answer_setup="passive",
+        ice_factory=lambda **_kw: _FakeIce("u", "pwwwwwwwwwwwwwwwww"),
+    )
+    assert forced_passive.setup.value == "passive"
+
+    auto = WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"),
+        ice_factory=lambda **_kw: _FakeIce("u", "pwwwwwwwwwwwwwwwww"),
+    )
+    assert auto.setup.value == "active"
 
 
 @pytest.mark.asyncio
@@ -135,8 +215,8 @@ async def test_prepare_exposes_answer_attributes() -> None:
         ice_factory=lambda **_kw: ice,
     )
     await session.prepare()
-    # Our setup is passive (answerer to an actpass offer).
-    assert session.setup.value == "passive"
+    # Our setup is active (RFC 8842 answerer to an actpass offer; ADR-0050).
+    assert session.setup.value == "active"
     # The fingerprint is a sha-256 a=fingerprint value.
     assert isinstance(session.fingerprint, Fingerprint)
     assert session.fingerprint.algorithm == "sha-256"
@@ -159,15 +239,17 @@ async def test_two_sessions_complete_dtls_and_derive_matching_srtp() -> None:
         ("svrU", "svrPwwwwwwwwwwwwww"), ("cliU", "cliPwwwwwwwwwwwwww")
     )
 
-    # The answerer: we are passive (DTLS server) responding to an actpass offer.
+    # The answerer (DTLS server): an *active* offer pins us passive/server. This is
+    # the role the gateway holds; under the RFC-8842 default an actpass offer would
+    # make us the client, so to model the server side here we answer an active offer.
     server = WebRtcMediaSession(
-        offer_setup=SetupRole("actpass"),
+        offer_setup=SetupRole("active"),  # => this side is passive/server
         ice_factory=lambda **_kw: server_ice,
     )
-    # The "peer" (acts as the offerer's active/client side) — modelled with the same
-    # session class but role=active, so we can complete a real handshake in-process.
+    # The "peer" (the DTLS client) — an actpass offer makes us active under the
+    # RFC-8842 default (ADR-0050), so this side sends the ClientHello.
     client = WebRtcMediaSession(
-        offer_setup=SetupRole("passive"),  # => this side is active/client
+        offer_setup=SetupRole("actpass"),  # => this side is active/client (RFC 8842)
         ice_factory=lambda **_kw: client_ice,
     )
 
@@ -262,11 +344,11 @@ async def test_run_handshake_rejects_fingerprint_mismatch() -> None:
         ("svrU", "svrPwwwwwwwwwwwwww"), ("cliU", "cliPwwwwwwwwwwwwww")
     )
     server = WebRtcMediaSession(
-        offer_setup=SetupRole("actpass"),
+        offer_setup=SetupRole("active"),  # => passive/server (RFC 8842, ADR-0050)
         ice_factory=lambda **_kw: server_ice,
     )
     client = WebRtcMediaSession(
-        offer_setup=SetupRole("passive"),
+        offer_setup=SetupRole("actpass"),  # => active/client (RFC 8842, ADR-0050)
         ice_factory=lambda **_kw: client_ice,
     )
     await asyncio.gather(server.prepare(), client.prepare())
@@ -422,10 +504,12 @@ async def test_run_handshake_signals_end_of_candidates_by_default() -> None:
     server_ice.peer, client_ice.peer = client_ice, server_ice
 
     server = WebRtcMediaSession(
-        offer_setup=SetupRole("actpass"), ice_factory=lambda **_kw: server_ice
+        offer_setup=SetupRole("active"),  # => passive/server (RFC 8842, ADR-0050)
+        ice_factory=lambda **_kw: server_ice,
     )
     client = WebRtcMediaSession(
-        offer_setup=SetupRole("passive"), ice_factory=lambda **_kw: client_ice
+        offer_setup=SetupRole("actpass"),  # => active/client (RFC 8842, ADR-0050)
+        ice_factory=lambda **_kw: client_ice,
     )
     await asyncio.gather(server.prepare(), client.prepare())
     await asyncio.gather(
@@ -461,10 +545,12 @@ async def test_run_handshake_always_ends_candidates() -> None:
     server_ice.peer, client_ice.peer = client_ice, server_ice
 
     server = WebRtcMediaSession(
-        offer_setup=SetupRole("actpass"), ice_factory=lambda **_kw: server_ice
+        offer_setup=SetupRole("active"),  # => passive/server (RFC 8842, ADR-0050)
+        ice_factory=lambda **_kw: server_ice,
     )
     client = WebRtcMediaSession(
-        offer_setup=SetupRole("passive"), ice_factory=lambda **_kw: client_ice
+        offer_setup=SetupRole("actpass"),  # => active/client (RFC 8842, ADR-0050)
+        ice_factory=lambda **_kw: client_ice,
     )
     await asyncio.gather(server.prepare(), client.prepare())
     await asyncio.gather(
@@ -483,3 +569,70 @@ async def test_run_handshake_always_ends_candidates() -> None:
     assert server_ice.end_of_candidates_signalled is True
     assert client_ice.end_of_candidates_signalled is True
     await asyncio.gather(server.close(), client.close())
+
+
+# ---------------------------------------------------------------------------
+# Outbound offerer mode (ADR-0049): for_outbound_offer() constructs the session
+# as the ICE-CONTROLLING DTLS CLIENT (a=setup:active) so place_call can carry
+# OUR own WebRTC offer over WSS.
+# ---------------------------------------------------------------------------
+
+
+def test_for_outbound_offer_is_ice_controlling_and_active() -> None:
+    """The outbound offerer is ICE-CONTROLLING (RFC 8445) and DTLS active (client)."""
+    captured: dict[str, object] = {}
+
+    def _factory(**kw: object) -> _FakeIce:
+        captured.update(kw)
+        return _FakeIce("ourUfrag01", "ourPwd012345678901234567")
+
+    session = WebRtcMediaSession.for_outbound_offer(ice_factory=_factory)
+    # The offerer is ICE-controlling (we drive nomination on outbound).
+    assert captured["ice_controlling"] is True
+    # We offer a concrete active role => we are the DTLS CLIENT (send ClientHello).
+    assert session.setup.value == "active"
+
+
+@pytest.mark.asyncio
+async def test_outbound_offerer_and_answerer_complete_dtls() -> None:
+    """An outbound offerer (active/controlling) + an answerer key matching SRTP.
+
+    The offerer is built via for_outbound_offer() (a=setup:active, ICE-controlling);
+    the answerer answers an active offer as passive (DTLS server). The real DTLS
+    handshake completes over the linked fake ICE pipe and the SRTP pair cross-decrypts.
+    """
+    offerer_ice, answerer_ice = _linked_ice(
+        ("offU", "offPwwwwwwwwwwwwww"), ("ansU", "ansPwwwwwwwwwwwwww")
+    )
+    offerer = WebRtcMediaSession.for_outbound_offer(
+        ice_factory=lambda **_kw: offerer_ice
+    )
+    # The answerer sees our active offer => it answers passive (DTLS server).
+    answerer = WebRtcMediaSession(
+        offer_setup=SetupRole("active"),
+        ice_factory=lambda **_kw: answerer_ice,
+    )
+    await asyncio.gather(offerer.prepare(), answerer.prepare())
+    assert offerer.setup.value == "active"
+    assert answerer.setup.value == "passive"
+
+    (o_in, o_out), (a_in, a_out) = await asyncio.gather(
+        offerer.run_handshake(
+            peer_fingerprint=answerer.fingerprint,
+            peer_ice_ufrag=answerer.ice_ufrag,
+            peer_ice_pwd=answerer.ice_pwd,
+        ),
+        answerer.run_handshake(
+            peer_fingerprint=offerer.fingerprint,
+            peer_ice_ufrag=offerer.ice_ufrag,
+            peer_ice_pwd=offerer.ice_pwd,
+        ),
+    )
+    for s in (o_in, o_out, a_in, a_out):
+        assert isinstance(s, SrtpSession)
+
+    pkt = RtpPacket(
+        payload_type=111, sequence_number=7, timestamp=0, ssrc=0x33, payload=b"out"
+    )
+    assert a_in.unprotect(o_out.protect(pkt)).payload == b"out"
+    await asyncio.gather(offerer.close(), answerer.close())

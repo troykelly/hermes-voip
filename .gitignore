@@ -17,6 +17,15 @@
 # N-group config file (ADR-0021)
 .hermes-caller-groups.json
 *.hermes-caller-groups.json
+# Multi-intercom openings config file (ADR-0045): maps caller-IDs (PII) to named
+# openings whose dtmf_code / webhook url+headers+body may carry secrets (door
+# codes, bearer tokens). The real file lives alongside .env / in 1Password; these
+# are the default filenames an operator may drop at the repo root, ignored so a
+# stray copy cannot be staged by accident. NOTE: HERMES_VOIP_INTERCOM_CONFIG_FILE
+# may point ANYWHERE — only these default names are gitignored, so keep a
+# custom-named config file OUTSIDE the repo tree.
+.intercom-config.json
+*.intercom-config.json
 
 # Local memory MCP store — never commit
 .memory/

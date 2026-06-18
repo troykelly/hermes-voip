@@ -46,10 +46,11 @@ from hermes_voip.dtmf_confirm import ArmedConfirmation
 from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
+from hermes_voip.multi_intercom import IntercomEntry, Opening, OpeningType
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
-from hermes_voip.voip_tools import TransferOutcome
+from hermes_voip.voip_tools import AttendedTransferOutcome, TransferOutcome
 
 
 async def _noop_prompt(_text: str) -> None:
@@ -224,7 +225,7 @@ def _make_invite(
     ftag = new_tag()
     content_length = len(_FAKE_SDP_OFFER.encode("utf-8"))
     # Optional extra headers (e.g. Diversion / User-Agent) are inserted before the
-    # content headers so a redirection/device-rich INVITE can be built for ADR-0033
+    # content headers so a redirection/device-rich INVITE can be built for ADR-0052
     # call-context tests. Each is a fake; no real identifier appears.
     extra = "".join(f"{name}: {value}\r\n" for name, value in extra_headers)
     return (
@@ -1217,6 +1218,124 @@ async def test_open_entry_unknown_call_returns_false() -> None:
 
 
 # ===========================================================================
+# Multi-intercom NAMED openings, per-call scoping (ADR-0045, #38)
+# ===========================================================================
+
+
+def _intercom_entry() -> IntercomEntry:
+    """An intercom with a DTMF 'door' + a webhook 'gate' (fakes only)."""
+    return IntercomEntry(
+        caller_id="9999",
+        openings={
+            "door": Opening(name="door", type=OpeningType.DTMF, dtmf_code="9"),
+            "gate": Opening(
+                name="gate",
+                type=OpeningType.WEBHOOK,
+                method="POST",
+                url="https://relay.example.test/gate",
+                headers={},
+                body="",
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_opening_dtmf_sends_that_codes_dtmf() -> None:
+    """open_entry('door') on a matched multi-intercom sends that opening's DTMF."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {"intercom_entry": _intercom_entry()}
+
+    opened = await adapter.open_entry(call_id, "door")
+
+    assert opened is True
+    assert session.dtmf == ["9"]
+
+
+@pytest.mark.asyncio
+async def test_named_opening_webhook_calls_the_webhook() -> None:
+    """open_entry('gate') actuates the named webhook opening (no DTMF)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {"intercom_entry": _intercom_entry()}
+
+    fired: list[Opening] = []
+
+    async def _fake_fire(opening: Opening) -> None:
+        fired.append(opening)
+
+    adapter._fire_webhook_opening = _fake_fire  # type: ignore[method-assign]  # test seam
+
+    opened = await adapter.open_entry(call_id, "gate")
+
+    assert opened is True
+    assert [o.name for o in fired] == ["gate"]
+    assert session.dtmf == []  # webhook openings never send DTMF
+
+
+@pytest.mark.asyncio
+async def test_opening_name_not_in_set_is_rejected() -> None:
+    """A name not in the calling intercom's set is rejected (scoping, fail-loud)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {"intercom_entry": _intercom_entry()}
+
+    with pytest.raises(ValueError, match="garage"):
+        await adapter.open_entry(call_id, "garage")
+    assert session.dtmf == []  # nothing actuated
+
+
+@pytest.mark.asyncio
+async def test_non_intercom_caller_with_name_cannot_open() -> None:
+    """A non-intercom caller (no matched entry) cannot open a named entry."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    # DISABLED single-intercom config + NO matched multi-intercom entry.
+    adapter._intercom_cfg = IntercomConfig(open_mode=IntercomOpenMode.DISABLED)
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._call_info[call_id] = {}  # not an intercom caller
+
+    with pytest.raises((ValueError, RuntimeError)):
+        await adapter.open_entry(call_id, "door")
+    assert session.dtmf == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_open_entry_no_name_still_works() -> None:
+    """Back-compat: open_entry(call_id) with no name uses the legacy single path."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._intercom_cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.DTMF, dtmf_digits="9"
+    )
+    session = _FakeCallSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+
+    opened = await adapter.open_entry(call_id)
+
+    assert opened is True
+    assert session.dtmf == ["9"]
+
+
+# ===========================================================================
 # transfer_blind_on_call: DTMF-confirmed blind transfer (ADR-0010/0031)
 # ===========================================================================
 #
@@ -1442,14 +1561,14 @@ async def test_transfer_blind_on_call_toctou_degrade_during_confirm_blocks() -> 
     assert session.blind == []  # confirmed, but degraded-during-window → no REFER
 
 
-# --- rich inbound-call context surfaced to the agent (ADR-0033) --------------
+# --- rich inbound-call context surfaced to the agent (ADR-0052) --------------
 
 
 def _enter_inbound_call_patches(stack: contextlib.ExitStack) -> None:
     """Enter the media/CallLoop/VAD mocks that let the REAL inbound handler run.
 
     Mirrors test_inbound_grey_sets_privileged_false: the SDP negotiation, dialog,
-    call-info construction, and the ADR-0033 context extraction + injection all run
+    call-info construction, and the ADR-0052 context extraction + injection all run
     for real; only the media engine, CallSession, CallLoop, and VAD/endpointer are
     faked so no socket opens and the loop returns immediately. Each patch is entered
     on ``stack`` so the caller can add further patches (e.g. handle_message capture).
@@ -1487,7 +1606,7 @@ def _enter_inbound_call_patches(stack: contextlib.ExitStack) -> None:
 
 @pytest.mark.asyncio
 async def test_inbound_call_persists_rich_context_on_call_info() -> None:
-    """The adapter extracts + persists the rich InboundCallContext (ADR-0033).
+    """The adapter extracts + persists the rich InboundCallContext (ADR-0052).
 
     A forwarded INVITE from a door panel carries Diversion + User-Agent; after the
     real _handle_inbound_invite runs, _call_info[call_id]["context"] holds an
@@ -1594,7 +1713,7 @@ async def test_inbound_context_block_defangs_caller_fence_sentinel() -> None:
 
     A hostile, attacker-controlled header value (here a self-reported User-Agent)
     carrying the literal untrusted-data closing marker must not survive verbatim
-    into the injected context block (ADR-0009/0033).
+    into the injected context block (ADR-0009/0052).
     """
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
@@ -1782,7 +1901,7 @@ async def test_deliver_turn_routes_operator_to_operator_channel() -> None:
 
 @pytest.mark.asyncio
 async def test_call_context_first_turn_routes_to_group_channel() -> None:
-    """The ADR-0033 rich call-context seed lands on the call's channel, not 'voip'.
+    """The ADR-0052 rich call-context seed lands on the call's channel, not 'voip'.
 
     Every own-session injection for a call must share one channel so the whole
     conversation (context seed -> turns -> end signal) lives in one session.
@@ -1881,3 +2000,229 @@ async def test_objective_first_turn_routes_to_outbound_channel() -> None:
     assert sources
     # The outbound group has no explicit channel => canonical default voip-outbound.
     assert sources[0] == "voip-outbound"
+
+
+# ===========================================================================
+# Attended (consultative) transfer: start / complete / cancel (ADR-0048)
+# ===========================================================================
+#
+# The agent originates a CONSULTATION leg to the target (reusing the outbound
+# origination path, gated by the SAME outbound allowlist as place_call), converses
+# on it, then COMPLETES the transfer with a REFER+Replaces (RFC 3891) on the ORIGINAL
+# call so the caller is bridged to the target and our legs are released. cancel hangs
+# up the consult leg and keeps the original caller.
+
+
+class _FakeAttendedOriginalSession:
+    """The ORIGINAL call's session: records the attended REFER + Referred-By AOR."""
+
+    def __init__(
+        self,
+        *,
+        ended: bool = False,
+        local_uri: str = "sip:1000@pbx.example.test",
+        guard: GuardSessionState | None = None,
+    ) -> None:
+        self.ended = ended
+        self.dialog = SimpleNamespace(local_uri=local_uri)
+        self.guard = guard or GuardSessionState(call_id="c", privilege_level=3)
+        self.attended: list[tuple[object, str | None]] = []
+
+    async def transfer_attended(
+        self, consult: object, *, referred_by: str | None = None
+    ) -> None:
+        self.attended.append((consult, referred_by))
+
+
+class _FakeConsultSession:
+    """The CONSULT leg's session: exposes a dialog and records its hang_up."""
+
+    def __init__(self, *, ended: bool = False) -> None:
+        self.ended = ended
+        self.dialog = SimpleNamespace(call_id="consult-callid")
+        self.hung_up = 0
+
+    async def hang_up(self) -> None:
+        self.hung_up += 1
+        self.ended = True
+
+
+@pytest.mark.asyncio
+async def test_start_attended_consult_dials_allowlisted_target() -> None:
+    """start_attended_consult dials the target and records the consult pairing."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    adapter._outbound_allow = frozenset({"1000"})
+
+    dialled: list[str] = []
+
+    async def _fake_place_call(
+        extension: str, *, objective: str | None = None, origin: object = None
+    ) -> str:
+        dialled.append(extension)
+        return "consult-call-id"
+
+    adapter.place_call = _fake_place_call  # type: ignore[method-assign]  # test stub
+
+    consult_id = await adapter.start_attended_consult(call_id, "1000")
+
+    assert consult_id == "consult-call-id"
+    assert dialled == ["1000"]
+    assert adapter._attended_consults[call_id] == "consult-call-id"
+
+
+@pytest.mark.asyncio
+async def test_start_attended_consult_rejects_unlisted_target() -> None:
+    """An unlisted consult target is refused before any dial (not allowlisted)."""
+    from hermes_voip.originate import OutboundCallNotAllowed  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    adapter._outbound_allow = frozenset({"1000"})  # 9999 not listed
+
+    dialled: list[str] = []
+
+    async def _fake_place_call(
+        extension: str, *, objective: str | None = None, origin: object = None
+    ) -> str:
+        dialled.append(extension)
+        return "x"
+
+    adapter.place_call = _fake_place_call  # type: ignore[method-assign]  # test stub
+
+    with pytest.raises(OutboundCallNotAllowed):
+        await adapter.start_attended_consult(call_id, "9999")
+
+    assert dialled == []  # never dialled
+    assert call_id not in adapter._attended_consults
+
+
+@pytest.mark.asyncio
+async def test_start_attended_consult_blocks_non_operator() -> None:
+    """A level-2 (non-operator) original call cannot start an attended transfer."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession(
+        guard=GuardSessionState(call_id="c", privilege_level=2)
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    adapter._outbound_allow = frozenset({"1000"})
+
+    dialled: list[str] = []
+
+    async def _fake_place_call(
+        extension: str, *, objective: str | None = None, origin: object = None
+    ) -> str:
+        dialled.append(extension)
+        return "x"
+
+    adapter.place_call = _fake_place_call  # type: ignore[method-assign]  # test stub
+
+    with pytest.raises(PermissionError):
+        await adapter.start_attended_consult(call_id, "1000")
+
+    assert dialled == []
+
+
+@pytest.mark.asyncio
+async def test_complete_attended_transfer_sends_refer_replaces() -> None:
+    """Completing sends the REFER+Replaces naming the consult dialog + Referred-By."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession(local_uri="sip:1000@pbx.example.test")
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    consult = _FakeConsultSession()
+    adapter._call_sessions["consult-call-id"] = consult  # type: ignore[assignment]  # fake session
+    adapter._attended_consults[call_id] = "consult-call-id"
+
+    outcome = await adapter.complete_attended_transfer(call_id)
+
+    assert outcome is AttendedTransferOutcome.TRANSFERRED
+    assert len(original.attended) == 1
+    sent_consult, referred_by = original.attended[0]
+    assert sent_consult is consult.dialog  # the consult leg's Dialog drives Replaces
+    assert referred_by == "sip:1000@pbx.example.test"
+    # The pairing is cleared once the REFER is sent.
+    assert call_id not in adapter._attended_consults
+
+
+@pytest.mark.asyncio
+async def test_complete_attended_transfer_without_consult_returns_no_consult() -> None:
+    """Completing with no consultation in flight returns NO_CONSULT (no REFER)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+
+    outcome = await adapter.complete_attended_transfer(call_id)
+
+    assert outcome is AttendedTransferOutcome.NO_CONSULT
+    assert original.attended == []
+
+
+@pytest.mark.asyncio
+async def test_complete_attended_transfer_blocks_degraded_operator() -> None:
+    """A degraded operator original call cannot complete the transfer (no REFER)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession(
+        guard=GuardSessionState(call_id="c", privilege_level=3, degraded=True)
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    consult = _FakeConsultSession()
+    adapter._call_sessions["consult-call-id"] = consult  # type: ignore[assignment]  # fake session
+    adapter._attended_consults[call_id] = "consult-call-id"
+
+    outcome = await adapter.complete_attended_transfer(call_id)
+
+    assert outcome is AttendedTransferOutcome.BLOCKED
+    assert original.attended == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_attended_transfer_hangs_up_the_consult() -> None:
+    """Cancelling hangs up the consult leg and clears the pairing (original kept)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    consult = _FakeConsultSession()
+    adapter._call_sessions["consult-call-id"] = consult  # type: ignore[assignment]  # fake session
+    adapter._attended_consults[call_id] = "consult-call-id"
+
+    cancelled = await adapter.cancel_attended_transfer(call_id)
+
+    assert cancelled is True
+    assert consult.hung_up == 1
+    assert call_id not in adapter._attended_consults
+
+
+@pytest.mark.asyncio
+async def test_cancel_attended_transfer_without_consult_returns_false() -> None:
+    """Cancelling with no consultation in flight is a no-op returning False."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession()
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+
+    assert await adapter.cancel_attended_transfer(call_id) is False

@@ -1,4 +1,4 @@
-# ADR-0033: Rich inbound-call context surfaced to the agent
+# ADR-0052: Rich inbound-call context surfaced to the agent
 
 - **Date:** 2026-06-18
 - **Status:** Accepted

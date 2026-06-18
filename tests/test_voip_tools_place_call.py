@@ -29,6 +29,7 @@ from hermes_voip.voip_tools import (
     PLACE_CALL_TOOL_SCHEMA,
     REPORT_RESULT_TOOL_NAME,
     REPORT_RESULT_TOOL_SCHEMA,
+    AttendedTransferOutcome,
     TransferOutcome,
     place_call_handler,
     report_call_result_handler,
@@ -83,13 +84,22 @@ class _FakeHost:
     async def send_dtmf_on_call(self, call_id: str, digits: str) -> bool:
         return True
 
-    async def open_entry(self, call_id: str) -> bool:
+    async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         return True
 
     async def transfer_blind_on_call(
         self, call_id: str, target: str
     ) -> TransferOutcome:
         return TransferOutcome.TRANSFERRED
+
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        return ""
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        return AttendedTransferOutcome.TRANSFERRED
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
+        return True
 
 
 @pytest.fixture(autouse=True)

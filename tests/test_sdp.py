@@ -31,6 +31,7 @@ from hermes_voip.sdp import (
     build_audio_answer,
     build_audio_offer,
     build_webrtc_answer,
+    build_webrtc_offer,
     negotiate_audio,
 )
 
@@ -1738,3 +1739,88 @@ def test_sdes_path_unchanged_build_answer_savp() -> None:
     assert "a=crypto:" in text
     assert "fingerprint" not in text
     assert "UDP/TLS" not in text
+
+
+# ---------------------------------------------------------------------------
+# build_webrtc_offer (ADR-0049): the outbound WebRTC UAC offer body.
+# Mirrors build_webrtc_answer's SAVPF/DTLS/ICE shape but is offerer-driven:
+# our own codec menu (not the peer's), and a concrete a=setup we choose.
+# ---------------------------------------------------------------------------
+
+_OFFER_OPUS = Codec(payload_type=111, encoding="opus", clock_rate=48000, channels=2)
+_OFFER_OPUS_FMTP = Codec(
+    payload_type=111,
+    encoding="opus",
+    clock_rate=48000,
+    channels=2,
+    fmtp="minptime=10;useinbandfec=1",
+)
+
+
+def _build_offer(
+    setup: str = "active", *, codecs: tuple[Codec, ...] | None = None
+) -> str:
+    """Build a WebRTC offer with our fingerprint/setup/ICE (test helper)."""
+    return build_webrtc_offer(
+        local_address="192.0.2.20",
+        port=9,
+        codecs=codecs if codecs is not None else (_OFFER_OPUS_FMTP,),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT}"),
+        setup=SetupRole.parse(setup),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+    )
+
+
+def test_build_webrtc_offer_profile_is_savpf() -> None:
+    """The outbound WebRTC offer uses the UDP/TLS/RTP/SAVPF profile (RFC 8827)."""
+    assert "m=audio 9 UDP/TLS/RTP/SAVPF 111" in _build_offer()
+
+
+def test_build_webrtc_offer_carries_our_dtls_keying() -> None:
+    """The offer carries OUR fingerprint + a concrete a=setup (RFC 5763 §5)."""
+    text = _build_offer("active")
+    assert f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}" in text
+    assert "a=setup:active" in text
+
+
+def test_build_webrtc_offer_carries_ice_creds_and_candidates() -> None:
+    """The offer carries OUR ICE ufrag/pwd + candidates (RFC 8839)."""
+    text = _build_offer()
+    assert f"a=ice-ufrag:{_FAKE_ANSWER_UFRAG}" in text
+    assert f"a=ice-pwd:{_FAKE_ANSWER_PWD}" in text
+    assert "a=candidate:1 1 UDP 2130706431 192.0.2.20 42000 typ host" in text
+    assert "a=rtcp-mux" in text
+
+
+def test_build_webrtc_offer_advertises_opus() -> None:
+    """An Opus codec appears in the WebRTC offer's rtpmap (the WebRTC audio codec)."""
+    text = _build_offer()
+    assert "a=rtpmap:111 opus/48000/2" in text
+    assert "a=fmtp:111 minptime=10;useinbandfec=1" in text
+
+
+def test_build_webrtc_offer_no_sdes_crypto_or_connection() -> None:
+    """RFC 8827 §6.5 / RFC 5763 §5: no a=crypto and no c= on a WebRTC m-line."""
+    text = _build_offer()
+    assert "a=crypto" not in text
+    assert "\r\nc=" not in text
+
+
+def test_build_webrtc_offer_actpass_allowed() -> None:
+    """An offerer MAY offer actpass (RFC 5763 §5) — unlike an answerer."""
+    text = _build_offer("actpass")
+    assert "a=setup:actpass" in text
+
+
+def test_build_webrtc_offer_round_trips_through_the_parser() -> None:
+    """The offer parses back as a WebRTC offer the answerer can consume."""
+    parsed = SessionDescription.parse(_build_offer())
+    assert parsed.audio is not None
+    assert parsed.audio.is_webrtc
+    assert parsed.audio.fingerprint is not None
+    assert parsed.audio.setup is not None
+    assert parsed.audio.setup.value == "active"
+    assert parsed.audio.ice_ufrag == _FAKE_ANSWER_UFRAG
+    assert parsed.audio.codecs[0].encoding.lower() == "opus"

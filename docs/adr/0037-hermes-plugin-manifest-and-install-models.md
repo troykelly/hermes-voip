@@ -1,8 +1,10 @@
-# ADR-0036: Hermes plugin manifest (`plugin.yaml`) + the two install models
+# ADR-0037: Hermes plugin manifest (`plugin.yaml`) + the two install models
 
 - **Date:** 2026-06-18
 - **Status:** Accepted
 - **Deciders:** operator (`troy@…`) + agent session
+- **Note:** numbered 0037 because ADR-0036 was concurrently taken by the DTMF
+  lane (`0036-dtmf-sip-info-and-in-band.md`); both landed the same day.
 
 ## Context
 

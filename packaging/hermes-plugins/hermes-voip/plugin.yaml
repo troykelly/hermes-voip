@@ -1,4 +1,4 @@
-# hermes-voip — Hermes plugin manifest (ADR-0036).
+# hermes-voip — Hermes plugin manifest (ADR-0037).
 #
 # This is the CANONICAL plugin manifest. It is shipped two ways (both supported by
 # the Hermes plugin loader):
@@ -9,12 +9,14 @@
 #      from the installed package and the package is self-describing.
 #
 #   2. As a directory-install plugin under ~/.hermes/plugins/hermes-voip/ — this very
-#      directory (plugin.yaml + __init__.py). Hermes' `hermes plugins list` /
-#      `hermes plugins enable` / `/plugins` commands are FILESYSTEM-only (verified
-#      against hermes-agent 0.16.0: they never read importlib entry-point metadata),
-#      so a directory manifest is what surfaces the name/version/tool-count and lets
-#      `hermes plugins enable hermes-voip` succeed. The __init__.py re-exports the
-#      package's real register(), so the plugin still loads exactly once. See
+#      directory (plugin.yaml + __init__.py). Hermes' `hermes plugins list` and
+#      `hermes plugins enable` commands are FILESYSTEM-only (verified against
+#      hermes-agent 0.16.0: they never read importlib entry-point metadata), so a
+#      directory manifest is what surfaces the name + version in `hermes plugins list`
+#      and lets `hermes plugins enable hermes-voip` succeed. The __init__.py re-exports
+#      the package's real register(), so the plugin still loads exactly once (the entry
+#      point wins the load dedup). The in-session `/plugins` view's tool count comes
+#      from the live registration, not from provides_tools below. See
 #      docs/runbooks/0011-voip-enable-plugin.md.
 #
 # PUBLIC repo: this file carries env-var NAMES and fake examples only — never a real

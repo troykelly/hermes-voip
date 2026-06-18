@@ -28,6 +28,7 @@ import pytest
 
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.voip_tools import (
+    AttendedTransferOutcome,
     TransferOutcome,
     hang_up_handler,
     hold_call_handler,
@@ -95,6 +96,18 @@ class _ExplodingHost:
     async def transfer_blind_on_call(
         self, call_id: str, target: str
     ) -> TransferOutcome:
+        raise _SyntheticHostError(_BOOM)
+
+    # ADR-0048 VoipToolHost members (attended transfer): present so the host
+    # satisfies the VoipToolHost protocol for set_active_adapter; they raise the
+    # same synthetic error as every other method (the class's exploding contract).
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        raise _SyntheticHostError(_BOOM)
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        raise _SyntheticHostError(_BOOM)
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
         raise _SyntheticHostError(_BOOM)
 
 

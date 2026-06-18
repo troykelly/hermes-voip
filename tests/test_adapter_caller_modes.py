@@ -57,7 +57,7 @@ async def _noop_prompt(_text: str) -> None:
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 
     from hermes_voip.adapter import VoipAdapter
     from hermes_voip.providers.audio import PcmFrame
@@ -1642,3 +1642,242 @@ async def test_inbound_context_block_defangs_caller_fence_sentinel() -> None:
     # The raw triple-bracket runs from the caller must not appear in the block.
     assert ">>>" not in text
     assert "<<<" not in text
+
+
+# ===========================================================================
+# ADR-0034: caller-group -> Hermes channel (platform name) routing
+# ===========================================================================
+#
+# Each call is delivered to the agent under its caller-group's CHANNEL (a Hermes
+# platform name), not the hard-coded "voip" platform. Routing in Hermes is by
+# event.source alone, so the SessionSource the adapter builds for every own-session
+# injection (the spotlighted transcript turn, the objective seed, the rich
+# call-context seed, the call-end signal) must carry that channel as its platform.
+# This is the operator's "Telegram model": one Hermes, many channels.
+
+
+def _capture_sources() -> tuple[
+    list[object], Callable[[object], Coroutine[object, object, None]]
+]:
+    """A message handler that records each event's SessionSource platform value."""
+    sources: list[object] = []
+
+    async def _handler(event: object) -> None:
+        src = getattr(event, "source", None)
+        platform = getattr(src, "platform", None)
+        sources.append(getattr(platform, "value", platform))
+
+    return sources, _handler
+
+
+def _grouped_info(group: CallerGroup) -> dict[str, object]:
+    """An inbound _call_info dict carrying a specific CallerGroup."""
+    return {
+        "name": "9999",
+        "remote_uri": "sip:9999@pbx.example.test",
+        "type": "dm",
+        "ended": False,
+        "group": group,
+    }
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_routes_to_group_channel_platform() -> None:
+    """The spotlighted caller turn lands under the group's channel, not bare 'voip'.
+
+    A receptionist group with no explicit channel resolves to ``voip-receptionist``;
+    the emitted MessageEvent's SessionSource.platform must carry that name so Hermes
+    routes the turn into the receptionist channel's own session.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    sources, handler = _capture_sources()
+    adapter.set_message_handler(handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _grouped_info(
+        CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+        )
+    )
+
+    await adapter._deliver_turn(call_id, "hello?")
+    for _ in range(50):
+        if sources:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sources
+    assert sources[0] == "voip-receptionist"
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_routes_unknown_caller_to_unknown_channel() -> None:
+    """An unknown caller's group with channel='voip-unknown' routes there verbatim."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    sources, handler = _capture_sources()
+    adapter.set_message_handler(handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _grouped_info(
+        CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+            channel="voip-unknown",
+        )
+    )
+
+    await adapter._deliver_turn(call_id, "is this a real person?")
+    for _ in range(50):
+        if sources:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sources
+    assert sources[0] == "voip-unknown"
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_routes_operator_to_operator_channel() -> None:
+    """An operator-group call routes to its operator channel (distinct namespace)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    sources, handler = _capture_sources()
+    adapter.set_message_handler(handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _grouped_info(
+        CallerGroup(
+            name="operator",
+            privilege_level=3,
+            persona="assistant",
+            declined_at_sip=False,
+            channel="voip-operator",
+        )
+    )
+
+    await adapter._deliver_turn(call_id, "hold my next call")
+    for _ in range(50):
+        if sources:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sources
+    assert sources[0] == "voip-operator"
+    # The unknown channel and the operator channel are DISTINCT (no shared session).
+    assert sources[0] != "voip-unknown"
+
+
+@pytest.mark.asyncio
+async def test_call_context_first_turn_routes_to_group_channel() -> None:
+    """The ADR-0033 rich call-context seed lands on the call's channel, not 'voip'.
+
+    Every own-session injection for a call must share one channel so the whole
+    conversation (context seed -> turns -> end signal) lives in one session.
+    """
+    from hermes_voip.call_context import extract_call_context  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    sources, handler = _capture_sources()
+    adapter.set_message_handler(handler)
+
+    call_id = new_call_id()
+    info = _grouped_info(
+        CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+            channel="voip-unknown",
+        )
+    )
+    invite = SipRequest.parse(_make_invite(caller="9999", call_id=call_id))
+    info["context"] = extract_call_context(
+        invite,
+        negotiated_codec="PCMU",
+        is_srtp=True,
+        is_webrtc=False,
+        transport="tls",
+    )
+    adapter._call_info[call_id] = info
+
+    await adapter._inject_call_context_first_turn(call_id)
+    for _ in range(50):
+        if sources:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sources
+    assert sources[0] == "voip-unknown"
+
+
+@pytest.mark.asyncio
+async def test_call_end_signal_routes_to_group_channel() -> None:
+    """The ADR-0026 call-end signal lands on the call's channel, not bare 'voip'."""
+    from hermes_voip.adapter import CallEndReason  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    sources, handler = _capture_sources()
+    adapter.set_message_handler(handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _grouped_info(
+        CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+            channel="voip-unknown",
+        )
+    )
+
+    await adapter._signal_call_end(call_id, CallEndReason.REMOTE_BYE)
+    for _ in range(50):
+        if sources:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sources
+    assert sources[0] == "voip-unknown"
+
+
+@pytest.mark.asyncio
+async def test_objective_first_turn_routes_to_outbound_channel() -> None:
+    """The ADR-0029 objective seed (outbound) lands on the outbound group's channel."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+
+    sources, handler = _capture_sources()
+    adapter.set_message_handler(handler)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = _outbound_info(objective="confirm the booking")
+
+    await adapter._inject_objective_first_turn(call_id)
+    for _ in range(50):
+        if sources:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sources
+    # The outbound group has no explicit channel => canonical default voip-outbound.
+    assert sources[0] == "voip-outbound"

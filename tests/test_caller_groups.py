@@ -28,6 +28,7 @@ from hermes_voip.caller_modes import (
     CallerMode,
     CallerModeConfig,
     Normalization,
+    channel_for_group,
     classify_caller_group,
     load_caller_groups,
     load_caller_modes,
@@ -1128,3 +1129,227 @@ def test_caller_group_config_allows_specific_patterns_in_privileged_group() -> N
     assert classify_caller_group("+15555500001", cfg).group.privilege_level == 3
     assert classify_caller_group("+12125550001", cfg).group.privilege_level == 2
     assert classify_caller_group("+447700900001", cfg).group.privilege_level == 0
+
+
+# ===========================================================================
+# ADR-0034: caller-group -> Hermes channel (platform name) routing
+# ===========================================================================
+#
+# Each group names a CHANNEL (a Hermes platform name). An empty channel resolves
+# to the canonical default ``voip-<group-name>`` via channel_for_group; a non-empty
+# channel is used verbatim. The JSON groups document accepts an optional per-group
+# "channel" string. The channel is the routing identity an inbound call's
+# SessionSource carries (adapter-level tests live in test_adapter_caller_modes.py).
+
+
+def test_caller_group_has_channel_field_defaulting_empty() -> None:
+    """A CallerGroup constructed without a channel has an empty channel string.
+
+    Empty means "use the canonical default" (resolved by channel_for_group); the
+    field defaults to "" so every existing positional/keyword construction stays
+    valid.
+    """
+    g = _operator_group()
+    assert g.channel == ""
+
+
+def test_caller_group_accepts_explicit_channel() -> None:
+    g = CallerGroup(
+        name="operator",
+        privilege_level=3,
+        persona="assistant",
+        declined_at_sip=False,
+        channel="voip-operator",
+    )
+    assert g.channel == "voip-operator"
+
+
+def test_channel_for_group_defaults_to_voip_dash_name() -> None:
+    """An empty channel resolves to ``voip-<group-name>``."""
+    assert channel_for_group(_operator_group()) == "voip-operator"
+    assert channel_for_group(_receptionist_group()) == "voip-receptionist"
+    assert channel_for_group(_trusted_group()) == "voip-trusted"
+    assert channel_for_group(_blocked_group()) == "voip-blocked"
+
+
+def test_channel_for_group_uses_explicit_channel_verbatim() -> None:
+    """A non-empty channel is returned as-is (no voip- prefix forced)."""
+    g = CallerGroup(
+        name="receptionist",
+        privilege_level=0,
+        persona="receptionist",
+        declined_at_sip=False,
+        channel="voip-unknown",
+    )
+    assert channel_for_group(g) == "voip-unknown"
+
+
+def test_channel_is_distinct_per_group() -> None:
+    """Distinct groups resolve to distinct channels (separate session namespaces)."""
+    channels = {
+        channel_for_group(_operator_group()),
+        channel_for_group(_trusted_group()),
+        channel_for_group(_receptionist_group()),
+        channel_for_group(_blocked_group()),
+    }
+    assert len(channels) == 4
+
+
+def test_json_groups_document_parses_optional_channel(tmp_path: Path) -> None:
+    """The groups JSON accepts a per-group ``channel``; absent => empty (default)."""
+    doc = {
+        "groups": [
+            {
+                "name": "operator",
+                "privilege_level": 3,
+                "persona": "assistant",
+                "channel": "voip-operator",
+            },
+            {
+                "name": "receptionist",
+                "privilege_level": 0,
+                "persona": "receptionist",
+                # no "channel" => default
+            },
+        ],
+        "lists": {"operator": ["+15555550100"], "receptionist": []},
+        "default_group": "receptionist",
+        "match_order": ["operator", "receptionist"],
+    }
+    path = tmp_path / "groups.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    cfg = load_caller_groups({"HERMES_VOIP_CALLER_GROUPS_FILE": str(path)})
+    by_name = {g.name: g for g in cfg.groups}
+    assert by_name["operator"].channel == "voip-operator"
+    assert by_name["receptionist"].channel == ""
+    # And the default resolves to the canonical name.
+    assert channel_for_group(by_name["receptionist"]) == "voip-receptionist"
+
+
+def test_json_groups_document_rejects_non_string_channel(tmp_path: Path) -> None:
+    """A non-string ``channel`` is a fail-loud ConfigError (rule 37)."""
+    doc = {
+        "groups": [
+            {
+                "name": "receptionist",
+                "privilege_level": 0,
+                "persona": "receptionist",
+                "channel": 123,
+            },
+        ],
+        "lists": {"receptionist": []},
+        "default_group": "receptionist",
+        "match_order": ["receptionist"],
+    }
+    path = tmp_path / "groups.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_caller_groups({"HERMES_VOIP_CALLER_GROUPS_FILE": str(path)})
+
+
+# ===========================================================================
+# ADR-0034: per-channel PERMITTED TOOLS (the operator's "separate permissions")
+# ===========================================================================
+#
+# The per-channel permission is the existing CallerGroup.allowed_tools sub-ceiling
+# reframed as the channel's permitted tool set, enforced by the existing
+# gate_voip_tool. The plugin ships canonical default channel groups:
+#   voip-unknown  -> NO sensitive tool (no place_call / transfer / open_entry / hold)
+#   voip-known    -> limited (hold/resume; no place_call / transfer / open_entry)
+#   voip-operator -> all (no sub-ceiling)
+#   voip-intercom -> open_entry only
+# Caller-ID is NOT authentication: an unknown caller's channel must expose nothing
+# sensitive even though the channel name is derived from a forgeable identifier.
+
+_SENSITIVE_TOOLS = (
+    "place_call",
+    "transfer_blind",
+    "transfer_attended",
+    "open_entry",
+    "hold_call",
+    "resume_call",
+    "send_dtmf",
+    "list_registrations",
+)
+
+
+def _channel_group(name: str) -> CallerGroup:
+    """Fetch a canonical channel group by its channel name (e.g. 'voip-unknown')."""
+    from hermes_voip.caller_modes import canonical_channel_groups  # noqa: PLC0415
+
+    for g in canonical_channel_groups():
+        if channel_for_group(g) == name:
+            return g
+    msg = f"no canonical channel group resolves to {name!r}"
+    raise AssertionError(msg)
+
+
+def _guard_for(group: CallerGroup) -> GuardSessionState:
+    """A live guard state seeded from a channel group (level + allowed_tools)."""
+    return GuardSessionState(
+        call_id="c-1",
+        privilege_level=group.privilege_level,
+        allowed_tools=group.allowed_tools,
+    )
+
+
+def test_canonical_channel_groups_cover_the_four_operator_channels() -> None:
+    from hermes_voip.caller_modes import canonical_channel_groups  # noqa: PLC0415
+
+    channels = {channel_for_group(g) for g in canonical_channel_groups()}
+    assert {"voip-unknown", "voip-known", "voip-operator", "voip-intercom"} <= channels
+
+
+def test_unknown_channel_exposes_no_sensitive_tool() -> None:
+    """SECURITY: the untrusted voip-unknown channel reaches no sensitive tool.
+
+    Even with confirmed=True (a spoofed/forged confirmation) every sensitive tool is
+    denied — caller-ID routing to voip-unknown never grants a sensitive action.
+    """
+    state = _guard_for(_channel_group("voip-unknown"))
+    for tool in _SENSITIVE_TOOLS:
+        assert gate_voip_tool(tool, state, confirmed=True) is False, (
+            f"voip-unknown must NOT expose {tool!r}"
+        )
+    # The always-safe conversational tools still run (the agent handles the call).
+    assert gate_voip_tool("hang_up", state, confirmed=False) is True
+    assert gate_voip_tool("report_call_result", state, confirmed=False) is True
+
+
+def test_intercom_channel_exposes_only_open_entry() -> None:
+    """SECURITY: voip-intercom reaches open_entry and nothing else sensitive."""
+    state = _guard_for(_channel_group("voip-intercom"))
+    assert gate_voip_tool("open_entry", state, confirmed=False) is True
+    for tool in ("place_call", "transfer_blind", "hold_call", "list_registrations"):
+        assert gate_voip_tool(tool, state, confirmed=True) is False, (
+            f"voip-intercom must NOT expose {tool!r}"
+        )
+
+
+def test_known_channel_is_limited_no_place_call_or_transfer_or_open_entry() -> None:
+    """voip-known allows hold/resume but never place_call / transfer / open_entry."""
+    state = _guard_for(_channel_group("voip-known"))
+    assert gate_voip_tool("hold_call", state, confirmed=False) is True
+    assert gate_voip_tool("resume_call", state, confirmed=False) is True
+    for tool in ("place_call", "transfer_blind", "open_entry"):
+        assert gate_voip_tool(tool, state, confirmed=True) is False, (
+            f"voip-known must NOT expose {tool!r}"
+        )
+
+
+def test_operator_channel_exposes_the_full_tool_set() -> None:
+    """voip-operator reaches every tool (IRREVERSIBLE still needs confirmation).
+
+    open_entry stays grant-only (physical access) and is NOT exposed to the operator
+    channel — only the intercom channel grants it (ADR-0031). Everything else is
+    reachable: ELEVATED with no confirm, IRREVERSIBLE with confirm.
+    """
+    state = _guard_for(_channel_group("voip-operator"))
+    assert gate_voip_tool("hold_call", state, confirmed=False) is True
+    assert gate_voip_tool("list_registrations", state, confirmed=False) is True
+    assert gate_voip_tool("place_call", state, confirmed=True) is True
+    assert gate_voip_tool("transfer_blind", state, confirmed=True) is True
+    # IRREVERSIBLE still blocked without confirmation (ADR-0010 unchanged).
+    assert gate_voip_tool("place_call", state, confirmed=False) is False
+    # open_entry stays intercom-only even for the operator channel.
+    assert gate_voip_tool("open_entry", state, confirmed=True) is False

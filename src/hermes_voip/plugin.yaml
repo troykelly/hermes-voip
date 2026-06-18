@@ -47,6 +47,7 @@ provides_tools:
   - send_dtmf           # ELEVATED: send in-call DTMF tones (ADR-0031)
   - open_entry          # ELEVATED: actuate the intercom entry / open the door (ADR-0031)
   - transfer_blind      # IRREVERSIBLE: DTMF-confirmed blind transfer (ADR-0010/0031)
+  - transfer_attended   # IRREVERSIBLE: consultative transfer (REFER+Replaces, ADR-0048)
 
 # The lifecycle hook register() registers via ctx.register_hook — the per-call
 # privilege-clamp gate that governs every tool above.

@@ -7,10 +7,9 @@ hermes-agent runtime). The plugin-registration side (``register(ctx)`` calling
 
 Beyond ``hang_up`` (ADR-0026) this also covers the in-call control tools exposed
 through the same mechanism (ADR-0011 §3): ``hold_call`` / ``resume_call`` and
-``list_registrations`` (all ``ELEVATED``). The IRREVERSIBLE transfer tools are
-NOT exposed (their spoof-resistant ADR-0010 DTMF confirmation channel is not
-wired into the live adapter, so an exposed transfer tool would be an always-blocked
-no-op — rule 6); the tests assert the gate would block them at level 0.
+``list_registrations`` (all ``ELEVATED``). The IRREVERSIBLE transfer tools
+(``transfer_blind`` — ADR-0010; ``transfer_attended`` — ADR-0048) are exposed and
+owned by the gate; the tests assert the gate blocks them for an unprivileged caller.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ from hermes_voip.voip_tools import (
     SEND_DTMF_TOOL_SCHEMA,
     TRANSFER_BLIND_TOOL_NAME,
     TRANSFER_BLIND_TOOL_SCHEMA,
+    AttendedTransferOutcome,
     TransferOutcome,
     active_voip_adapter,
     hang_up_handler,
@@ -146,6 +146,17 @@ class _FakeHost:
         if self.transfer_outcome is TransferOutcome.TRANSFERRED:
             self.transfers.append((call_id, target))
         return self.transfer_outcome
+
+    # ADR-0048 VoipToolHost members (attended transfer): unused by this module's
+    # tests but present so set_active_adapter(host) type-checks against the protocol.
+    async def start_attended_consult(self, call_id: str, target: str) -> str:
+        return ""
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        return AttendedTransferOutcome.TRANSFERRED
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -991,18 +1002,19 @@ def test_gate_fails_safe_for_transfer_blind_when_call_unknown(
     assert verdict["action"] == "block"
 
 
-def test_transfer_attended_stays_deferred_not_registered() -> None:
-    """transfer_attended is NOT registered (deferred — no consult-leg origination).
+def test_both_transfer_tools_are_exposed_and_gated() -> None:
+    """Both transfer tools are exposed and owned by the gate (ADR-0010/0048).
 
-    Rule 6: it must not be a lying stub. The gate must not own it (it is not exposed),
-    and there is no schema/handler for it in the public API. transfer_blind IS exposed;
-    transfer_attended is not.
+    The agent-driven consult-leg origination landed (ADR-0019/0029), so the attended
+    transfer is no longer a deferred stub (rule 6 satisfied): it has a name, schema, and
+    handler in the public API, and the gate owns it (so its IRREVERSIBLE clamp applies).
     """
     import hermes_voip.voip_tools as vt  # noqa: PLC0415
 
-    # transfer_blind is exposed and owned by the gate...
+    # Both transfers are exposed and owned by the gate...
     assert TRANSFER_BLIND_TOOL_NAME in vt._voip_tool_names()
-    # ...transfer_attended is not registered at all (no name, schema, or handler).
-    assert "transfer_attended" not in vt._voip_tool_names()
-    assert not hasattr(vt, "TRANSFER_ATTENDED_TOOL_NAME")
-    assert not hasattr(vt, "transfer_attended_handler")
+    assert "transfer_attended" in vt._voip_tool_names()
+    # ...with a name, schema, and handler in the public API.
+    assert hasattr(vt, "TRANSFER_ATTENDED_TOOL_NAME")
+    assert hasattr(vt, "TRANSFER_ATTENDED_TOOL_SCHEMA")
+    assert hasattr(vt, "transfer_attended_handler")

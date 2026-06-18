@@ -38,7 +38,14 @@ that carries **our own** DTLS/ICE/Opus offer:
 - A new `build_webrtc_offer()` in `sdp.py` emits a `UDP/TLS/RTP/SAVPF` offer body
   (shared `_build_webrtc_body` with `build_webrtc_answer`) carrying our
   `a=fingerprint`, `a=setup`, `a=ice-ufrag`/`a=ice-pwd`/`a=candidate`,
-  `a=rtcp-mux`, and the Opus rtpmap (`opus/48000/2` + `minptime=10;useinbandfec=1`).
+  `a=rtcp-mux`, and our codec menu. The menu (`_webrtc_offer_codecs()`) mirrors the
+  inbound answer menu (`_WEBRTC_SUPPORTED_ENCODINGS` = opus, PCMU, PCMA,
+  telephone-event): the Opus rtpmap (`opus/48000/2` + `minptime=10;useinbandfec=1`)
+  first, then the G.711 fallbacks, then `telephone-event` — so RFC 4733 DTMF can
+  negotiate (an Opus-only offer makes the negotiated telephone-event PT structurally
+  `None`, i.e. DTMF impossible) and a non-Opus gateway can still answer G.711. The
+  2xx answer is bounded to exactly these offered encodings (RFC 3264 §6), so a
+  gateway echoing a codec we never offered is rejected, not silently accepted.
 - `WebRtcMediaSession.for_outbound_offer()` constructs the session as the
   **offerer**: `ice_controlling=True` (we are ICE-CONTROLLING on outbound, RFC
   8445 §6.1) and `a=setup:active` — we are the **DTLS CLIENT** that sends the
@@ -47,13 +54,13 @@ that carries **our own** DTLS/ICE/Opus offer:
   `a=fingerprint` we put in the offer — is fixed at construction, so the DTLS role
   must be known before the offer is sent. `active` is RFC 5763 §5 compliant for an
   offerer and needs no post-answer role switch (the answerer answers `passive`).
-  `run_handshake_as_offerer()` runs the same ICE-connect + DTLS-pump as the
+  The role-agnostic `run_handshake()` runs the same ICE-connect + DTLS-pump as the
   answerer path; being ICE-controlling and DTLS-client is the only difference.
 - The INVITE goes out over the `WssSipTransport` with a `WSS` Via and the
   transport's `.invalid` sent-by + `transport=ws` Contact (already produced by
   `build_outbound_invite(transport="WSS", …)` + `WssSipTransport`), so the SIP on
   the WebSocket is RFC 7118 coherent. The 200 OK SDP answer is parsed, the peer's
-  fingerprint/ICE creds/candidates feed `run_handshake_as_offerer`, and the engine
+  fingerprint/ICE creds/candidates feed `run_handshake()`, and the engine
   runs over the ICE pipe (the same `ice_transport` seam as inbound).
 - A `wss` gateway with no Opus runtime (`opuslib`/system `libopus`) is rejected
   cleanly **before** the INVITE (`OutboundCallFailed(488, …)` via the existing

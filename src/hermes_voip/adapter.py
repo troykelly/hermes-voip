@@ -1083,7 +1083,7 @@ class VoipAdapter(BasePlatformAdapter):
             negotiated_voice = _first_voice_codec(agreed_codecs)
             if negotiated_voice is not None:
                 try:
-                    engine._codec = _to_engine_codec(negotiated_voice)
+                    negotiated_engine_codec = _to_engine_codec(negotiated_voice)
                 except UnsupportedCodecError as exc:
                     # Defense-in-depth (unreachable over the current menu, since
                     # negotiate_audio above already rejects an offer whose voice
@@ -1096,12 +1096,16 @@ class VoipAdapter(BasePlatformAdapter):
                     raise OutboundCallFailed(
                         488, f"2xx answer codec not carriable: {exc}"
                     ) from exc
+                # Adopt the negotiated engine codec (the outbound engine is built on
+                # a PCMU placeholder before the answer is known; reassign it here).
+                engine._codec = negotiated_engine_codec
                 # ADR-0049: if the SIP answer negotiated Opus, preflight the runtime
                 # dependency so a host that somehow advertised Opus but lost libopus
                 # fails the call cleanly (488) rather than streaming dead audio. A
-                # no-op for G.722/G.711 (stdlib/pure-Python).
+                # no-op for G.722/G.711 (stdlib/pure-Python). Preflight the
+                # locally-computed codec, not a re-read of the engine's private attr.
                 try:
-                    _preflight_codec_dependency(engine._codec)
+                    _preflight_codec_dependency(negotiated_engine_codec)
                 except ImportError as exc:
                     raise OutboundCallFailed(
                         488, f"2xx answer codec dependency unavailable: {exc}"
@@ -1398,12 +1402,17 @@ class VoipAdapter(BasePlatformAdapter):
         call_session: CallSession | None = None
         session_established = False
         call_id = new_call_id()
+        # OUR offered codec menu (Opus + G.711 fallback + telephone-event); also
+        # used to BOUND the 2xx answer negotiation below (RFC 3264: the answer must
+        # be a subset of what we offered).
+        offered_codecs = _webrtc_offer_codecs()
+        offered_encodings = tuple(c.encoding for c in offered_codecs)
         try:
             await session.prepare()  # gather ICE; expose fingerprint/setup/creds
             offer_body = build_webrtc_offer(
                 local_address=local_rtp_host,
                 port=9,  # advisory; ICE candidates carry the real address/port
-                codecs=(_opus_sdp_codec(),),
+                codecs=offered_codecs,
                 fingerprint=session.fingerprint,
                 setup=session.setup,
                 ice_ufrag=session.ice_ufrag,
@@ -1510,10 +1519,12 @@ class VoipAdapter(BasePlatformAdapter):
                     488,
                     "2xx WebRTC answer missing fingerprint / ICE credentials",
                 )
+            # RFC 3264 §6: the answer MUST be bounded by what WE offered, not the
+            # full inbound menu. Bound negotiation to OUR offered encodings so a
+            # gateway echoing a codec we never offered is rejected, not silently
+            # accepted (e.g. an answer naming G.722, which we don't offer on WebRTC).
             try:
-                agreed_codecs = negotiate_audio(
-                    answer_audio, _WEBRTC_SUPPORTED_ENCODINGS
-                )
+                agreed_codecs = negotiate_audio(answer_audio, offered_encodings)
             except ValueError as exc:
                 raise OutboundCallFailed(
                     488, f"no common codec in 2xx WebRTC answer: {exc}"
@@ -3639,6 +3650,33 @@ def _opus_sdp_codec() -> SdpCodec:
         clock_rate=_OPUS_RTP_CLOCK_RATE,
         channels=2,
         fmtp=_OPUS_FMTP,
+    )
+
+
+def _webrtc_offer_codecs() -> tuple[SdpCodec, ...]:
+    """The codec menu for an OUTBOUND WebRTC offer (ADR-0049).
+
+    Mirrors the inbound WebRTC answer menu (``_WEBRTC_SUPPORTED_ENCODINGS`` =
+    ``opus, PCMU, PCMA, telephone-event``) so the outbound and inbound media planes
+    are symmetric: Opus first (the WebRTC audio codec, RFC 7587), then the G.711
+    fallbacks so a gateway that cannot do Opus can still answer PCMU/PCMA, then
+    ``telephone-event`` so RFC 4733 DTMF can negotiate. An Opus-only offer would make
+    ``te_pt`` structurally always ``None`` (DTMF impossible) and leave no fallback
+    for a non-Opus peer — both regressions vs the inbound path.
+
+    Opus is preflighted before this is called (the offerer only reaches here once
+    ``libopus`` is confirmed loadable), so Opus is always present here.
+    """
+    return (
+        _opus_sdp_codec(),
+        SdpCodec(payload_type=0, encoding="PCMU", clock_rate=8000),
+        SdpCodec(payload_type=8, encoding="PCMA", clock_rate=8000),
+        SdpCodec(
+            payload_type=101,
+            encoding="telephone-event",
+            clock_rate=8000,
+            fmtp="0-16",
+        ),
     )
 
 

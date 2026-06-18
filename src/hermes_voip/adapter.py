@@ -2744,6 +2744,14 @@ class VoipAdapter(BasePlatformAdapter):
         # which entry it can open via open_entry(name=...). This line is operator
         # configuration (not caller-supplied), so it is TRUSTED — it is appended to the
         # rendered block as a fixed system note, not defanged.
+        #
+        # THREAT-MODEL NOTE (ADR-0045 decision 4): WHICH name set is shown is selected
+        # by the matched intercom entry, and that match keys off a FORGEABLE caller-ID
+        # (ADR-0020/0021). A spoofer presenting an intercom's caller-ID can thus make
+        # this trusted note appear and learn the opening NAMES — but never the
+        # codes/urls/tokens (server-side, repr-suppressed) and never an actual opening:
+        # open_entry stays ELEVATED + grant-only, so a name grants nothing without the
+        # operator's prior authorization of that caller into the intercom group.
         entry = self._intercom_entry_for_call(call_id)
         if entry is not None:
             names = ", ".join(sorted(entry.opening_names()))

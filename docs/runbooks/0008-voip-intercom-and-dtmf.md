@@ -112,8 +112,12 @@ URL (off the event loop). A non-2xx response or a network error raises
 
 For several door phones, or one panel that opens several entries (door + gate +
 garage), use the multi-intercom JSON document instead of (or alongside) the single
-env scheme above. Point `HERMES_VOIP_INTERCOM_CONFIG_FILE` at a **gitignored** JSON
-file mapping each intercom's caller-ID to its named openings:
+env scheme above. Point `HERMES_VOIP_INTERCOM_CONFIG_FILE` at a JSON file —
+**kept OUTSIDE the tracked tree** (alongside `.env` / materialised from 1Password at
+deploy) — mapping each intercom's caller-ID to its named openings. `.gitignore`
+ignores the default names `.intercom-config.json` / `*.intercom-config.json` as a
+safety net, but a custom-named or differently-placed file is NOT auto-ignored — keep
+it out of the repo tree yourself:
 
 ```json
 {
@@ -143,7 +147,12 @@ file mapping each intercom's caller-ID to its named openings:
   the event loop). `method` defaults to `POST`; `headers` / `body` / `timeout_s` are
   optional.
 - The webhook **url must be https** (it may carry a token) and the `dtmf_code` must be
-  valid DTMF — a bad value fails LOUD at startup, never at door-open time.
+  valid DTMF — a bad value fails LOUD at startup, never at door-open time. A `GET`
+  opening with a `body` is also rejected at load (a GET sends no body — drop it or use
+  `POST`/`PUT`).
+- The webhook send **refuses HTTP redirects** (any 3xx): a 302 `Location` to an
+  `http://` URL would re-send the token/body in cleartext, so the configured https URL
+  must answer directly — a redirect surfaces as a failed open (`WebhookError`).
 - **Scoping:** the agent is told only the calling intercom's opening NAMES (in the
   ADR-0033 call-context block); `open_entry(name="door")` actuates that named opening,
   scoped to ONLY the calling intercom's set. A name the intercom does not own, or a
@@ -151,7 +160,8 @@ file mapping each intercom's caller-ID to its named openings:
   omit `name`.
 - **Secrets:** the `dtmf_code` / `url` / `headers` / `body` are repr-suppressed and
   never logged; only the opening name + (for a webhook) the HTTP status are. The token
-  lives in 1Password and is materialised into the gitignored config file at deploy.
+  lives in 1Password and is materialised into the config file (kept outside the tracked
+  tree — see above) at deploy.
 - Still wire the `intercom` caller group (step 1) so the matched caller reaches the
   intercom persona + the `open_entry` tool; the multi-intercom config decides WHICH
   named openings that call can actuate. Unset the env var to disable multi-intercom and
@@ -240,8 +250,10 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
   agent sees only that intercom's opening NAMES; `open_entry(name="…")` opens only a name
   in that set, and a name outside it (or a non-intercom caller) is refused with a clear
   error. (Covered by `tests/test_adapter_caller_modes.py::test_opening_name_not_in_set_is_rejected`
-  + `::test_non_intercom_caller_with_name_cannot_open`; webhook actuation in
-  `tests/test_multi_intercom.py`.)
+  + `::test_non_intercom_caller_with_name_cannot_open`; webhook config validation in
+  `tests/test_multi_intercom.py`; the real webhook SEND path — 2xx success, non-2xx /
+  network-error -> `WebhookError`, GET-sends-no-body, redirect-refused — in
+  `tests/test_multi_intercom_webhook.py` against a loopback `http.server`.)
 - **Live (pending operator redeploy + an intercom group config + a real door/relay).**
   Call the extension that maps to the intercom group; confirm the agent uses the intercom
   persona (screens the visitor) and that `open_entry` actuates ONLY for a legitimate

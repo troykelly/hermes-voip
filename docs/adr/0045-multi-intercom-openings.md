@@ -30,9 +30,10 @@ mandatory: the existing single-intercom path and its tests stay green.
 
 ## Decision
 
-1. **A JSON config document**, referenced by `HERMES_VOIP_INTERCOM_CONFIG_FILE` (a
-   gitignored path — the document holds caller-IDs and may hold secrets), maps each
-   intercom's caller-ID to its named openings:
+1. **A JSON config document**, referenced by `HERMES_VOIP_INTERCOM_CONFIG_FILE` (the
+   document holds caller-IDs and may hold secrets, so it MUST live outside the tracked
+   tree — alongside `.env` / in 1Password), maps each intercom's caller-ID to its named
+   openings:
 
    ```json
    {
@@ -80,6 +81,18 @@ mandatory: the existing single-intercom path and its tests stay green.
    note (operator config, not caller-supplied, so not defanged), telling the agent
    which entries it may open via `open_entry(name=...)`. The codes/urls/tokens are
    never surfaced.
+
+   **Threat-model note (the trusted note rides on a forgeable caller-ID).** WHICH
+   intercom's name set is shown is selected by `MultiIntercomConfig.match(caller_id)`,
+   and caller-ID is **forgeable** (ADR-0020/0021). A spoofer who presents an
+   intercom's caller-ID can therefore make the (trusted, non-defanged) opening-names
+   note appear, learning the opening NAMES (e.g. `door` / `gate`) — never the codes,
+   urls, or tokens, which stay server-side and repr-suppressed. This is acceptable
+   under the threat model because the names alone grant nothing: `open_entry` stays
+   **ELEVATED and grant-only** (decision 5), so the spoofed call can only open an entry
+   if the operator already authorized that caller-ID into the intercom group, and no
+   secret is ever revealed. The protection is the per-call scoping + the unchanged
+   privilege gate, not the trustworthiness of the caller-ID.
 
 5. **The `open_entry` tool gains an OPTIONAL `name`** (string). The gate is unchanged:
    `open_entry` stays ELEVATED and grant-only (reachable only via the intercom group's

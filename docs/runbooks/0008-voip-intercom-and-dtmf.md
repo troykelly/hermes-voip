@@ -135,7 +135,7 @@ No extra config is required for the default behaviour. The env keys (all optiona
 the backend selection (no inert key — every value picks a real backend):
 
 ```sh
-# Backend selector (send AND receive). ALL FOUR are implemented (ADR-0034):
+# Backend selector (send AND receive). ALL FOUR are implemented (ADR-0035):
 #   auto     (default) negotiate RFC 4733, else in-band on a G.711 call
 #   rfc4733  force telephone-event (UNAVAILABLE if the peer offered none)
 #   sip_info force in-dialog INFO (always available)
@@ -195,7 +195,7 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
   # -> ['auto', 'rfc4733', 'sip_info', 'inband']
   ```
 - **Backend resolution (unit check).** The per-call backend follows the codec +
-  telephone-event negotiation (ADR-0034):
+  telephone-event negotiation (ADR-0035):
   ```sh
   uv run python -c "from hermes_voip.config import load_media_config as L; \
     from hermes_voip.dtmf_config import resolve_dtmf_receive_mode as R; \
@@ -208,7 +208,7 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
   menu group — `dtmf: delivering menu group '[DTMF] 1234'`. If no backend can run (no
   telephone-event AND a non-G.711 codec, or in-band forbidden) the log shows a single
   WARNING `inbound DTMF receive ... UNAVAILABLE` rather than silence. **In-band detection
-  reliability on a real lossy G.711 path is to be re-measured live (ADR-0034, rules
+  reliability on a real lossy G.711 path is to be re-measured live (ADR-0035, rules
   23/26)** — the unit tests prove tone-in/tone-out + speech rejection on clean PCM.
 
 ## Roll back / disable
@@ -224,6 +224,6 @@ HERMES_SIP_DTMF_INBAND_ENABLED=true
 ## Related
 
 - ADR-0031 (this feature's WHY); ADR-0021 (caller groups + the `allowed_tools` clause);
-  ADR-0010 (DTMF) + ADR-0034 (the SIP INFO + in-band Goertzel mechanisms, send AND
+  ADR-0010 (DTMF) + ADR-0035 (the SIP INFO + in-band Goertzel mechanisms, send AND
   receive — all three ADR-0010 mechanisms are now shipped); ADR-0009 (the tool gate).
 - `docs/runbooks/0010-voip-caller-modes.md` (the caller-groups file + JSON schema).

@@ -720,7 +720,7 @@ def test_media_values_are_trimmed() -> None:
             "HERMES_VOIP_TTS_VOICE": "  rachel  ",
             "HERMES_VOIP_VAD_THRESHOLD": "  0.3 ",
             # A DTMF mode (rfc4733) with surrounding whitespace — trims to the bare
-            # token (all four modes load now, ADR-0034; this asserts the trim).
+            # token (all four modes load now, ADR-0035; this asserts the trim).
             "HERMES_SIP_DTMF_MODE": "  rfc4733  ",
         }
     )
@@ -950,7 +950,7 @@ def test_media_dtmf_inband_bool_accepts_common_spellings() -> None:
 
 
 def test_media_supported_dtmf_modes_accepted() -> None:
-    """All four ADR-0010 DTMF modes now load and round-trip (ADR-0034).
+    """All four ADR-0010 DTMF modes now load and round-trip (ADR-0035).
 
     SIP INFO and in-band (send AND receive) are shipped, so ``sip_info`` / ``inband``
     are no longer rejected at load (that rejection was the interim fail-loud state while

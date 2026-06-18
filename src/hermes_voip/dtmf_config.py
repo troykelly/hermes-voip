@@ -15,7 +15,7 @@ resort on a G.711 call (in-band is trusted ONLY on clean G.711 — ADR-0005). A 
 ``sip_info`` always resolves to SIP INFO (in-dialog signalling is always available); a
 forced ``inband`` resolves to in-band on G.711 else UNAVAILABLE; a forced ``rfc4733``
 needs a negotiated telephone-event or it is UNAVAILABLE. All four ADR-0010 modes are now
-implemented (ADR-0034), so the config no longer rejects any of them at load.
+implemented (ADR-0035), so the config no longer rejects any of them at load.
 """
 
 from __future__ import annotations

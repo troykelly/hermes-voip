@@ -751,11 +751,11 @@ class RtpMediaTransport:
         # drops telephone-event packets so they never reach the audio decoder).
         self._on_dtmf: Callable[[str], None] | None = on_dtmf
         self._dtmf_receiver: DtmfReceiver = DtmfReceiver()
-        # The outbound DTMF backend send_dtmf uses (ADR-0034): RFC4733 emits the
+        # The outbound DTMF backend send_dtmf uses (ADR-0035): RFC4733 emits the
         # named-event train; INBAND synthesises dual-tone audio on the TX path; SIP_INFO
         # is the CallSession's job (never reached here); UNAVAILABLE raises.
         self._dtmf_send_mode: DtmfSendMode = dtmf_send_mode
-        # In-band DTMF RECEIVE (ADR-0034): when armed (a G.711 call with no
+        # In-band DTMF RECEIVE (ADR-0035): when armed (a G.711 call with no
         # telephone-event), the inbound generator runs a Goertzel detector on the
         # AEC-cleaned decoded frame and fires on_dtmf. Off by default — zero cost on the
         # common RFC 4733 path. Re-created in connect() for a clean per-call state.
@@ -1017,7 +1017,7 @@ class RtpMediaTransport:
         # recently-seen-timestamp window (a stale window could suppress a real first
         # press of the new call). The ``on_dtmf`` callback is preserved across calls.
         self._dtmf_receiver = DtmfReceiver()
-        # Fresh in-band detector (ADR-0034) so a reused engine starts with no held
+        # Fresh in-band detector (ADR-0035) so a reused engine starts with no held
         # press; analysed at the engine's analysis rate (8 kHz G.711). None if unarmed.
         self._inband_detector = (
             InbandDtmfDetector(sample_rate=self._analysis_sample_rate)
@@ -1334,7 +1334,7 @@ class RtpMediaTransport:
                 # analysis rate (the rate _decode delivers), so far-end and near-end
                 # align. Buffer-free (no added latency, rule 22).
                 frame = self._cancel_echo(frame)
-                # In-band DTMF receive (ADR-0034): run the Goertzel detector on the
+                # In-band DTMF receive (ADR-0035): run the Goertzel detector on the
                 # AEC-cleaned frame BEFORE the VAD/ASR see it, so the agent's own
                 # reflected tones (already removed by AEC) never false-trigger and a
                 # detected keypress goes to on_dtmf, not into the transcript. Armed only
@@ -1787,7 +1787,7 @@ class RtpMediaTransport:
     ) -> None:
         """Send ``digits`` as DTMF on the active call, per the resolved send backend.
 
-        The backend is :attr:`_dtmf_send_mode` (ADR-0034): ``RFC4733`` emits the
+        The backend is :attr:`_dtmf_send_mode` (ADR-0035): ``RFC4733`` emits the
         named-event RTP train (described below); ``INBAND`` synthesises dual-tone PCM
         and sends it on the audio TX path (a G.711 call with no telephone-event);
         ``SIP_INFO`` is the :class:`~hermes_voip.call.CallSession`'s job, so the engine
@@ -1935,7 +1935,7 @@ class RtpMediaTransport:
     async def _send_inband_dtmf(
         self, digits: str, *, tone_ms: int, gap_ms: int
     ) -> None:
-        """Send ``digits`` as in-band dual-tone audio (ADR-0034, G.711 last resort).
+        """Send ``digits`` as in-band dual-tone audio (ADR-0035, G.711 last resort).
 
         Each digit is synthesised at the engine's WIRE rate (8 kHz for G.711) by
         :func:`hermes_voip.dtmf.inband_tone_pcm` and handed to :meth:`send_audio`, which
@@ -1963,7 +1963,7 @@ class RtpMediaTransport:
                 )
 
     def _detect_inband_dtmf(self, frame: PcmFrame) -> None:
-        """Feed one AEC-cleaned inbound frame to the in-band detector (ADR-0034).
+        """Feed one AEC-cleaned inbound frame to the in-band detector (ADR-0035).
 
         A no-op unless in-band RX is armed (a G.711 call with no telephone-event) and a
         sink is set. A detected key-press fires :attr:`_on_dtmf` exactly once — the same
@@ -2041,7 +2041,7 @@ class RtpMediaTransport:
 
     @property
     def dtmf_send_mode(self) -> DtmfSendMode:
-        """The resolved outbound-DTMF backend :meth:`send_dtmf` uses (ADR-0034).
+        """The resolved outbound-DTMF backend :meth:`send_dtmf` uses (ADR-0035).
 
         Settable after construction — the outbound path resolves it once the answer's
         telephone-event PT / codec are known, mirroring

@@ -1,4 +1,4 @@
-# ADR-0034: Ship the deferred DTMF mechanisms — SIP INFO and in-band (Goertzel), send + receive
+# ADR-0035: Ship the deferred DTMF mechanisms — SIP INFO and in-band (Goertzel), send + receive
 
 - **Date:** 2026-06-18
 - **Status:** Accepted

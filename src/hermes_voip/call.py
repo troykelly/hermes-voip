@@ -145,11 +145,11 @@ class CallSession:
         self._local_media = local_media
         self._credentials = credentials
         self._refer_handler = on_refer
-        # The resolved DTMF send backend (ADR-0034): in SIP_INFO mode :meth:`send_dtmf`
+        # The resolved DTMF send backend (ADR-0035): in SIP_INFO mode :meth:`send_dtmf`
         # emits in-dialog INFO requests; otherwise it delegates to the media engine
         # (RFC 4733 / in-band). Settable so the adapter can resolve it after answer.
         self._dtmf_send_mode = dtmf_send_mode
-        # Callback fired once per RECEIVED SIP-INFO DTMF digit (ADR-0034), or None to
+        # Callback fired once per RECEIVED SIP-INFO DTMF digit (ADR-0035), or None to
         # ignore inbound INFO DTMF. The adapter wires this to ``CallLoop.feed_dtmf`` —
         # the SAME router the engine's RFC 4733 / in-band ``on_dtmf`` feeds, so digit
         # surfacing is uniform across all three receive backends. Settable after
@@ -247,7 +247,7 @@ class CallSession:
         await self._media.send_dtmf(digits)
 
     async def send_dtmf_info(self, digits: str, *, duration_ms: int = 160) -> None:
-        """Send ``digits`` as SIP INFO DTMF: one in-dialog ``INFO`` each (ADR-0034).
+        """Send ``digits`` as SIP INFO DTMF: one in-dialog ``INFO`` each (ADR-0035).
 
         Builds an ``application/dtmf-relay`` body for each digit and sends it as an
         in-dialog ``INFO`` request (advancing the dialog CSeq — the ADR-0011 invariant),
@@ -472,7 +472,7 @@ class CallSession:
             await self._signaling.send(build_response(request, 501, "Not Implemented"))
 
     async def _on_info(self, request: SipRequest) -> None:
-        """Answer an inbound ``INFO`` (SIP INFO DTMF receive, ADR-0034).
+        """Answer an inbound ``INFO`` (SIP INFO DTMF receive, ADR-0035).
 
         Every in-dialog ``INFO`` is acknowledged ``200 OK`` (per RFC 6086 it must get a
         final response). When the body is a DTMF relay/simple body, the parsed digit is

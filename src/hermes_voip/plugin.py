@@ -43,8 +43,9 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "channel_env_enablement",
+    "channel_is_never_independently_connected",
     "channel_platform_names",
-    "ensure_channel_registered",
     "register",
     "validate_voip_config",
 ]
@@ -107,7 +108,8 @@ def channel_platform_names() -> tuple[str, ...]:
     ``gateway.config.Platform(<channel>)`` resolve (its ``_missing_`` hook only
     accepts registered plugin platforms) and lets the operator target a channel with
     per-platform ``tools_config`` / ``disabled_toolsets``. Custom channels named in a
-    groups file are registered on demand by :func:`ensure_channel_registered`.
+    groups file are registered on demand by
+    :func:`hermes_voip.adapter.ensure_channel_registered`.
 
     Ordered + de-duplicated; the primary ``voip`` platform is NOT included (it is the
     connecting adapter, registered separately).
@@ -127,56 +129,7 @@ def channel_platform_names() -> tuple[str, ...]:
     return tuple(seen)
 
 
-def ensure_channel_registered(channel: str) -> None:
-    """Register ``channel`` as a routing-alias platform if it is not already (ADR-0035).
-
-    ``gateway.config.Platform(channel)`` only resolves a name its ``_missing_`` hook
-    recognises — a bundled plugin platform or one present in the module-singleton
-    ``platform_registry``. A caller-group channel (canonical or operator-defined in a
-    groups file) must therefore be registered before the adapter builds a
-    :class:`~gateway.session.SessionSource` on it, or routing raises ``ValueError``.
-
-    This registers an idempotent **alias** of the primary ``voip`` platform: same
-    adapter factory + ``check_fn`` (there is one telephony endpoint; the channels are
-    routing identities over the one adapter, never a second SIP/RTP transport), but
-    inert enablement (``is_connected`` → ``False``, empty env seed) so the gateway
-    never tries to bring the alias up as an independent connecting platform. No-op if
-    the name is already registered (the primary ``voip``, a prior call, or a
-    ``register_platform`` registration).
-
-    Best-effort and lazy-imported: the hermes-agent registry is imported here, not at
-    module top, so the light ``import hermes_voip`` stays hermes-free. A registry that
-    does not expose ``is_registered``/``register`` (an older/!=0.16 runtime) is left
-    untouched — the adapter's :meth:`_call_source` still defends with a fallback.
-    """
-    if not channel or channel == _PLATFORM_NAME:
-        return
-    from gateway.platform_registry import (  # noqa: PLC0415
-        PlatformEntry,
-        platform_registry,
-    )
-
-    if platform_registry.is_registered(channel):
-        return
-    platform_registry.register(
-        PlatformEntry(
-            name=channel,
-            label=f"VoIP channel: {channel}",
-            adapter_factory=_adapter_factory,
-            check_fn=_check_fn,
-            validate_config=validate_voip_config,
-            is_connected=_channel_is_never_independently_connected,
-            required_env=list(_REQUIRED_ENV),
-            install_hint=_INSTALL_HINT,
-            env_enablement_fn=_channel_env_enablement,
-            source="plugin",
-            plugin_name="hermes-voip",
-            pii_safe=True,
-        )
-    )
-
-
-def _channel_is_never_independently_connected(_config: object) -> bool:
+def channel_is_never_independently_connected(_config: object) -> bool:
     """A channel alias never connects on its own (the primary ``voip`` does).
 
     Returning ``False`` keeps the gateway from enabling a second connecting platform
@@ -185,12 +138,19 @@ def _channel_is_never_independently_connected(_config: object) -> bool:
     ``Platform(channel)`` resolves; registration, not enablement, is what ``_missing_``
     checks.) The ``_config`` probe is part of the ``is_connected`` callback contract but
     is unused — the answer is unconditionally "no".
+
+    Public (not ``_``-prefixed) so the adapter's ``ensure_channel_registered`` — which
+    builds the on-demand alias ``PlatformEntry`` in the hermes-importing module — can
+    reuse the exact same inert-enablement callback as :func:`register`.
     """
     return False
 
 
-def _channel_env_enablement() -> dict[str, str]:
-    """A channel alias seeds no env of its own (it does not independently connect)."""
+def channel_env_enablement() -> dict[str, str]:
+    """A channel alias seeds no env of its own (it does not independently connect).
+
+    Public for the same reason as :func:`channel_is_never_independently_connected`.
+    """
     return {}
 
 
@@ -388,6 +348,6 @@ def _register_channel_platforms(ctx: PluginContextProtocol) -> None:
             validate_config=validate_voip_config,
             required_env=list(_REQUIRED_ENV),
             install_hint=_INSTALL_HINT,
-            env_enablement_fn=_channel_env_enablement,
-            is_connected=_channel_is_never_independently_connected,
+            env_enablement_fn=channel_env_enablement,
+            is_connected=channel_is_never_independently_connected,
         )

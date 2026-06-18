@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 # ``mypy`` gate and type-checked in the hermes-contract CI job (which installs
 # the ``hermes`` extra) instead of via per-line escape hatches.
 from gateway.config import Platform, PlatformConfig
+from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -2833,14 +2834,12 @@ class VoipAdapter(BasePlatformAdapter):
         canonical channels, but a call may route to an operator-defined channel from a
         groups file (or run in a context where ``register()`` was not the entry, e.g.
         a unit test), so this ensures the channel is registered first
-        (:func:`~hermes_voip.plugin.ensure_channel_registered`, idempotent). If the
-        registry still cannot resolve the name (an unusual runtime), it FAILS LOUD with
-        a clear error rather than silently routing to the wrong/bare platform —
-        mis-routing a call to the wrong session is a security-relevant defect
-        (rule 37), not something to paper over.
+        (:func:`ensure_channel_registered`, idempotent). If the registry still cannot
+        resolve the name (an unusual runtime), it FAILS LOUD with a clear error rather
+        than silently routing to the wrong/bare platform — mis-routing a call to the
+        wrong session is a security-relevant defect (rule 37), not something to paper
+        over.
         """
-        from hermes_voip.plugin import ensure_channel_registered  # noqa: PLC0415
-
         ensure_channel_registered(channel)
         return Platform(channel)
 
@@ -3282,6 +3281,62 @@ def _parse_channel_target(channel: str | None) -> tuple[str, str] | None:
     if not platform or not chat_id:
         return None
     return (platform, chat_id)
+
+
+def ensure_channel_registered(channel: str) -> None:
+    """Register ``channel`` as a routing-alias platform if it is not already (ADR-0035).
+
+    ``gateway.config.Platform(channel)`` only resolves a name its ``_missing_`` hook
+    recognises — a bundled plugin platform or one present in the module-singleton
+    ``platform_registry`` (verified vs hermes-agent 0.16.0; it does NOT resolve
+    arbitrary names). A caller-group channel (canonical or operator-defined in a groups
+    file) must therefore be registered before :meth:`VoipAdapter._call_source` builds a
+    :class:`~gateway.session.SessionSource` on it, or routing raises ``ValueError``.
+
+    Registers an idempotent **alias** of the primary ``voip`` platform: the same adapter
+    factory + ``check_fn`` (there is one telephony endpoint; the channels are routing
+    identities over the one adapter, never a second SIP/RTP transport), but inert
+    enablement (``is_connected`` → ``False``, empty env seed) so the gateway never
+    brings the alias up as an independent connecting platform. No-op if the name is
+    already registered (the primary ``voip``, a prior call, or :func:`register`'s
+    own registration).
+
+    Lives here (not in the light :mod:`hermes_voip.plugin`) because it touches
+    ``gateway.platform_registry``: ``plugin.py`` stays hermes-import-free so it remains
+    in the default (no-``hermes``-extra) mypy gate, while this module already imports
+    the runtime and is type-checked in the hermes-contract job. The light enablement
+    callbacks + factory are imported from ``plugin`` lazily to avoid an import cycle.
+    """
+    if not channel or channel == _PLATFORM_NAME:
+        return
+    if platform_registry.is_registered(channel):
+        return
+    from hermes_voip.plugin import (  # noqa: PLC0415
+        _INSTALL_HINT,
+        _REQUIRED_ENV,
+        _adapter_factory,
+        _check_fn,
+        channel_env_enablement,
+        channel_is_never_independently_connected,
+        validate_voip_config,
+    )
+
+    platform_registry.register(
+        PlatformEntry(
+            name=channel,
+            label=f"VoIP channel: {channel}",
+            adapter_factory=_adapter_factory,
+            check_fn=_check_fn,
+            validate_config=validate_voip_config,
+            is_connected=channel_is_never_independently_connected,
+            required_env=list(_REQUIRED_ENV),
+            install_hint=_INSTALL_HINT,
+            env_enablement_fn=channel_env_enablement,
+            source="plugin",
+            plugin_name="hermes-voip",
+            pii_safe=True,
+        )
+    )
 
 
 def _spotlight_turn(

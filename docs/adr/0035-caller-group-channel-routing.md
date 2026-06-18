@@ -1,8 +1,8 @@
-# ADR-0035: Caller-group channel routing — one Hermes, many channels (the "Telegram model")
+# ADR-0035: VoIP caller-group channel routing — one Hermes, many VoIP channels
 
 - **Date:** 2026-06-18
 - **Status:** Accepted
-- **Deciders:** operator (requirement, "Telegram model", 2026-06-18) + agent session (channel-routing design)
+- **Deciders:** operator (requirement, 2026-06-18) + agent session (channel-routing design)
 - **Extends:** ADR-0021 (caller groups) and ADR-0020 (caller modes). The N named caller
   groups are retained; what changes is how a group's identity reaches Hermes. Each group
   now also names a **channel** (a Hermes platform name), and an inbound call is delivered to
@@ -12,11 +12,13 @@
 
 ## Context
 
-The operator's model for this plugin is the same as a chat platform like Telegram:
-**ONE** Hermes agent serving **MULTIPLE** channels, where each channel is a separate
-conversation with its own permitted tools. Different kinds of caller should land in
-different channels — an unknown cold caller, a known contact, the operator themselves, and a
-door/gate intercom are four different conversations with the agent, not one. The agent
+The operator's model for this plugin is **voip caller-group channel routing**: our one
+VoIP plugin presents **MULTIPLE** VoIP channels to **ONE** Hermes agent, where each channel
+is a separate conversation with its own permitted tools (conceptually like a chat platform
+with multiple channels under a single agent — an analogy only; there is no chat-platform
+integration). Different kinds of caller should land in different channels — an unknown cold
+caller, a known contact, the operator themselves, and a door/gate intercom are four
+different conversations with the agent, not one. The agent
 **always** handles every call (ADR-0021's correction: trust tiers must never gate the
 plugin's core voice functionality); separation is per-channel **conversation + permitted
 tools**, decided by the caller group.
@@ -128,7 +130,7 @@ never the channel name itself.
 
 | Alternative | Rejected because |
 |---|---|
-| Keep one `voip` platform; encode the group only in the spotlight preamble (status quo) | Every caller shares one session/transcript and one per-platform tool config. The operator explicitly wants separate **conversations** per caller kind (the "Telegram model"); a preamble is not a separate conversation and cannot drive Hermes's per-platform `disabled_toolsets`. |
+| Keep one `voip` platform; encode the group only in the spotlight preamble (status quo) | Every caller shares one session/transcript and one per-platform tool config. The operator explicitly wants separate **conversations** per caller kind (voip channel routing); a preamble is not a separate conversation and cannot drive Hermes's per-platform `disabled_toolsets`. |
 | A separate Hermes **profile/gateway per group** (option B) for full secret isolation | The principled answer for *secret* isolation, but it is multiple processes, multiple registrations, and operator-managed process lifecycle. The operator asked for the one-Hermes-many-channels model now; option B is recorded as the deferred path when hard secret isolation is required. |
 | Re-introduce `privilege_level` tool-gating as the per-channel boundary | ADR-0021's operator correction forbids trust tiers gating the plugin's voice functionality. Channel routing decides the *conversation + permitted tools*; the agent always handles the call. (The `allowed_tools` sub-ceiling is retained as the permitted-tool mechanism, **not** as a "can the agent take the call" gate.) |
 | Use the caller's channel as an **authentication** boundary (trust `voip-operator` to mean "is the operator") | Caller-ID is forgeable (ADR-0020 §0). The channel is derived from a spoofable identifier; it selects a conversation + a tool ceiling, never proof of identity. `voip-unknown`'s **no-sensitive-tools** ceiling is what bounds a spoofed `voip-operator` claim — there is no path from caller-ID to a sensitive action without an operator-assigned list match **and** ADR-0010 confirmation. |

@@ -1,4 +1,4 @@
-"""Tests for the rich inbound-call context extractor + renderer (ADR-0033).
+"""Tests for the rich inbound-call context extractor + renderer (ADR-0052).
 
 Covers, against an already-parsed ``SipRequest`` INVITE:
 * Caller identity — From display name + user-part, P-Asserted-Identity (sip: AND

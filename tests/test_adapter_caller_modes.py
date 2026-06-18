@@ -225,7 +225,7 @@ def _make_invite(
     ftag = new_tag()
     content_length = len(_FAKE_SDP_OFFER.encode("utf-8"))
     # Optional extra headers (e.g. Diversion / User-Agent) are inserted before the
-    # content headers so a redirection/device-rich INVITE can be built for ADR-0033
+    # content headers so a redirection/device-rich INVITE can be built for ADR-0052
     # call-context tests. Each is a fake; no real identifier appears.
     extra = "".join(f"{name}: {value}\r\n" for name, value in extra_headers)
     return (
@@ -1561,14 +1561,14 @@ async def test_transfer_blind_on_call_toctou_degrade_during_confirm_blocks() -> 
     assert session.blind == []  # confirmed, but degraded-during-window → no REFER
 
 
-# --- rich inbound-call context surfaced to the agent (ADR-0033) --------------
+# --- rich inbound-call context surfaced to the agent (ADR-0052) --------------
 
 
 def _enter_inbound_call_patches(stack: contextlib.ExitStack) -> None:
     """Enter the media/CallLoop/VAD mocks that let the REAL inbound handler run.
 
     Mirrors test_inbound_grey_sets_privileged_false: the SDP negotiation, dialog,
-    call-info construction, and the ADR-0033 context extraction + injection all run
+    call-info construction, and the ADR-0052 context extraction + injection all run
     for real; only the media engine, CallSession, CallLoop, and VAD/endpointer are
     faked so no socket opens and the loop returns immediately. Each patch is entered
     on ``stack`` so the caller can add further patches (e.g. handle_message capture).
@@ -1606,7 +1606,7 @@ def _enter_inbound_call_patches(stack: contextlib.ExitStack) -> None:
 
 @pytest.mark.asyncio
 async def test_inbound_call_persists_rich_context_on_call_info() -> None:
-    """The adapter extracts + persists the rich InboundCallContext (ADR-0033).
+    """The adapter extracts + persists the rich InboundCallContext (ADR-0052).
 
     A forwarded INVITE from a door panel carries Diversion + User-Agent; after the
     real _handle_inbound_invite runs, _call_info[call_id]["context"] holds an
@@ -1713,7 +1713,7 @@ async def test_inbound_context_block_defangs_caller_fence_sentinel() -> None:
 
     A hostile, attacker-controlled header value (here a self-reported User-Agent)
     carrying the literal untrusted-data closing marker must not survive verbatim
-    into the injected context block (ADR-0009/0033).
+    into the injected context block (ADR-0009/0052).
     """
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
@@ -1901,7 +1901,7 @@ async def test_deliver_turn_routes_operator_to_operator_channel() -> None:
 
 @pytest.mark.asyncio
 async def test_call_context_first_turn_routes_to_group_channel() -> None:
-    """The ADR-0033 rich call-context seed lands on the call's channel, not 'voip'.
+    """The ADR-0052 rich call-context seed lands on the call's channel, not 'voip'.
 
     Every own-session injection for a call must share one channel so the whole
     conversation (context seed -> turns -> end signal) lives in one session.

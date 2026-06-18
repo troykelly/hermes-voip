@@ -3,7 +3,8 @@
 Test infrastructure, not production code (ADR-0032). The far-end WebRTC peer the real
 plugin talks to over loopback: a genuine TLS SIP server (reusing
 :mod:`tests.transport._loopback`) PLUS a real far-end
-:class:`~hermes_voip.media.webrtc_session.WebRtcMediaSession` (the DTLS *client* side)
+:class:`~hermes_voip.media.webrtc_session.WebRtcMediaSession` (the DTLS *server* side —
+the adapter is the active client per RFC 8842, ADR-0050)
 and an in-memory ICE pipe linking it to the adapter's session — so an entire inbound
 WebRTC call can be scripted and asserted at each seam: REGISTER, the SAVPF/Opus/DTLS
 INVITE, the real DTLS-SRTP handshake, ACK, SRTP-protected Opus media both ways, and BYE.
@@ -257,8 +258,8 @@ class WebRtcCall:
 
     Holds the far-end (UAC) dialog half (so the gateway can send the in-dialog ACK / BYE
     the plugin's 200 OK requires, echoing the plugin's To-tag) and the peer's
-    :class:`WebRtcMediaSession` (the DTLS client) whose handshake keys the SRTP the
-    media flows under.
+    :class:`WebRtcMediaSession` (the DTLS server; ADR-0050) whose handshake keys the
+    SRTP the media flows under.
     """
 
     def __init__(
@@ -459,11 +460,11 @@ class FakeWebRtcGateway:
     ) -> WebRtcCall:
         """Send a WebRTC INVITE, await the 200 OK, ACK, and run the DTLS handshake.
 
-        Builds the peer's far-end :class:`WebRtcMediaSession` (the DTLS *client*: an
-        ``actpass`` offer makes the adapter ``passive``/server, so this peer offers as
-        the active side by constructing its session with ``offer_setup=passive``),
-        gathers its ICE, and emits a ``UDP/TLS/RTP/SAVPF`` + Opus + ``a=fingerprint`` +
-        ICE offer.
+        Builds the peer's far-end :class:`WebRtcMediaSession` (the DTLS *server*: the
+        offer carries ``a=setup:actpass`` and RFC 8842 §5.3 makes the adapter the
+        ``active`` client, ADR-0050, so this peer is the server by constructing its
+        session with ``offer_setup=active``), gathers its ICE, and emits a
+        ``UDP/TLS/RTP/SAVPF`` + Opus + ``a=fingerprint`` + ICE offer.
 
         After the plugin's 200 OK arrives (recording the To-tag + SAVPF answer), it runs
         the peer's :meth:`WebRtcMediaSession.run_handshake` against the adapter's: the
@@ -484,13 +485,14 @@ class FakeWebRtcGateway:
         in-dialog). Keeping the ACK out of this method avoids a nondeterministic
         scheduler-settle and asserts only what is genuinely guaranteed.
         """
-        # The peer is the DTLS CLIENT. RFC 5763 §5: a `passive` offer makes the answerer
-        # `active`; conversely, to make the ADAPTER passive/server we offer `actpass` —
-        # but the peer ITSELF must be the active/client. WebRtcMediaSession derives its
-        # own role from `offer_setup`: offer_setup="passive" => this side is
-        # active/client.
+        # The peer is the DTLS SERVER (ADR-0050). The offer carries `a=setup:actpass`,
+        # and under RFC 8842 §5.3 the adapter answers `active` (the DTLS client). So
+        # this peer — modelling a real Asterisk/UCM gateway that offers actpass yet
+        # behaves as the DTLS server — must be passive/server. WebRtcMediaSession
+        # derives its own role from `offer_setup`: an `active` offer makes this side
+        # passive/server (the complement of the adapter's active answer).
         peer = WebRtcMediaSession(
-            offer_setup=SetupRole("passive"),
+            offer_setup=SetupRole("active"),
             ice_factory=self._peer_ice_factory(),
         )
         self._peer_session = peer
@@ -819,7 +821,8 @@ def _webrtc_offer(
 
     Mirrors a browser/WebRTC offer: Opus first (the WebRTC codec) then PCMU fallback,
     the peer's real DTLS ``a=fingerprint``, ``a=setup:actpass`` (so the adapter answers
-    ``passive``/server and the peer is the active/client), the peer's ICE ufrag/pwd +
+    ``active``/client per RFC 8842 §5.3 and the peer is the passive/server, ADR-0050),
+    the peer's ICE ufrag/pwd +
     loopback host candidate, and ``a=rtcp-mux``. Per RFC 5763 §5 there is no ``c=`` line
     and no ``a=crypto`` (the media address is conveyed by ICE; SDES is forbidden here).
     """

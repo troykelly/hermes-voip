@@ -96,7 +96,13 @@ packages = ["src/hermes_voip"]
 # Ship the plugin manifest as importable package data (ADR-0037) so the wheel is
 # self-describing: importlib.resources.files("hermes_voip")/"plugin.yaml" resolves it.
 # Non-.py files under the package dir are not included by hatchling unless declared.
-artifacts = ["src/hermes_voip/plugin.yaml"]
+artifacts = [
+  "src/hermes_voip/plugin.yaml",
+  # Bundled call-scenario skills (ADR-0047): skills/<name>/SKILL.md shipped as
+  # importable package data so register() can resolve each via
+  # importlib.resources.files("hermes_voip") / "skills" / <name> / "SKILL.md".
+  "src/hermes_voip/skills/**/SKILL.md",
+]
 
 # ---------------------------------------------------------------------------
 # Ruff — format + lint at high strictness (AGENTS.md rule 17). A strong curated
@@ -232,6 +238,19 @@ ignore_missing_imports = true
 # override hides no runtime failure.
 [[tool.mypy.overrides]]
 module = ["opuslib.*"]
+ignore_missing_imports = true
+
+# ``plugins.plugin_utils`` is a Hermes-RUNTIME module (the documented
+# ``lazy_singleton`` helper) that is NOT vendored into the default (no-hermes) test
+# environment. ``_lazy_singleton.py`` imports it through a GUARDED try/except and
+# binds it to a narrow local Protocol (``_LazySingletonFactory``) — so NO ``Any``
+# crosses the boundary regardless of whether the module is present. ``ignore_missing_imports``
+# is used ONLY as the optional-runtime guard (so the guarded import resolves under
+# mypy when the runtime is absent), exactly like the ``websockets`` / ``opuslib``
+# overrides above: the runtime-present behaviour is the documented helper, the
+# runtime-absent behaviour is the tested stdlib fallback (ADR-0046).
+[[tool.mypy.overrides]]
+module = ["plugins.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

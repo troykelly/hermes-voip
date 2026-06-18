@@ -13,7 +13,7 @@ re-authenticate. Keeping IO out makes the digest and state logic deterministic.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.message import (
@@ -67,7 +67,9 @@ class RegistrationConfig:
     Attributes:
         aor: The address-of-record (``sip:user@domain``).
         username: The digest auth username.
-        password: The digest auth password.
+        password: The digest auth password. A **secret** — repr-suppressed so it
+            never reaches a log line (it carries the SIP or, on the WSS transport,
+            the ``HERMES_SIP_WS_PASSWORD`` credential; ADR-0037 / rule 34).
         contact: The Contact header value (``<sip:user@host:port;transport=...>``).
         local_sent_by: The Via ``sent-by`` (the transport's actual local
             host:port, or an ``.invalid`` host for WebSocket per RFC 7118).
@@ -78,7 +80,7 @@ class RegistrationConfig:
 
     aor: str
     username: str
-    password: str
+    password: str = field(repr=False)
     contact: str
     local_sent_by: str
     transport: str = "TLS"

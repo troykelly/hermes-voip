@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,6 +40,9 @@ from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
 from hermes_voip.sdp import Fingerprint, IceCandidate, SessionDescription, SetupRole
+
+if TYPE_CHECKING:
+    from hermes_voip.adapter import VoipAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -145,6 +149,8 @@ class _FakeTTS:
         *,
         sample_rate: int | None = None,
     ) -> TtsStream:
+        # The fake yields no frames; it is structurally an async-iterable but not a
+        # nominal TtsStream — the test never touches TTS output (rule 20: justified).
         return _FakeTtsStream()  # type: ignore[return-value]
 
 
@@ -169,6 +175,8 @@ class _FakeGuard:
 
 
 def _fake_providers() -> Providers:
+    # Duck-typed provider fakes (the runtime Protocols are not nominally satisfied);
+    # the WSS-signalling path under test never exercises real ASR/TTS/guard (rule 20).
     return Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())  # type: ignore[arg-type]
 
 
@@ -295,6 +303,40 @@ async def test_establish_selects_tls_transport_when_transport_tls() -> None:
     assert "ws_path" not in tls_ctor.call_args.kwargs
 
 
+@pytest.mark.asyncio
+async def test_place_call_rejected_on_wss_transport() -> None:
+    """Outbound over WSS is rejected loudly, never incoherent (ADR-0037 / 0032 §5).
+
+    place_call must raise (not put TLS-token SIP on the WebSocket) and send no INVITE.
+    """
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+    from hermes_voip.originate import OutboundCallFailed  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway_config("wss"), transport)
+    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV_WSS))
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=_gateway_config("wss"),
+        ),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.WssSipTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+        transport.sent.clear()  # drop the REGISTER; we only assert about the INVITE
+        with pytest.raises(OutboundCallFailed):
+            await adapter.place_call("1001")
+    # No INVITE was put on the WSS wire (the reject is pre-transaction).
+    assert not any(m.startswith("INVITE") for m in transport.sent)
+
+
 # ---------------------------------------------------------------------------
 # 3 + 4: a SAVPF INVITE over a WSS gateway routes to the is_webrtc path and the
 # inbound dialog + answer advertise the WSS Via transport (not TLS).
@@ -405,7 +447,7 @@ class _FakeWebRtcSession:
         """No-op."""
 
 
-async def _build_wss_adapter(transport: _FakeTransport) -> object:
+async def _build_wss_adapter(transport: _FakeTransport) -> VoipAdapter:
     """A real VoipAdapter on a wss gateway wired to fakes + a real manager."""
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
@@ -455,15 +497,11 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
         inbound_sample_rate=16_000,
     )
 
-    # Capture the transport kwarg the adapter passes to extract_call_context,
-    # delegating to the real implementation so the call context is still built.
+    # Wrap the real extract_call_context so the call context is still built AND
+    # the kwargs (incl. the transport token) the adapter passed are recorded.
     from hermes_voip.call_context import extract_call_context  # noqa: PLC0415
 
-    captured_context: dict[str, object] = {}
-
-    def _capture_extract(invite_arg: SipRequest, **kw: object) -> object:
-        captured_context.update(kw)
-        return extract_call_context(invite_arg, **kw)  # type: ignore[arg-type]  # **kw is the adapter's exact kwargs
+    extract_spy = MagicMock(wraps=extract_call_context)
 
     try:
         with (
@@ -476,14 +514,12 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
             patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
-            patch(
-                "hermes_voip.adapter.extract_call_context", side_effect=_capture_extract
-            ),
+            patch("hermes_voip.adapter.extract_call_context", extract_spy),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             # The is_webrtc branch ran: the WebRTC session was built + handshook.
             session = _FakeWebRtcSession.last
@@ -503,7 +539,8 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
 
             # ADR-0037 §2: the agent-facing call context reports the WSS transport
             # (derived from gateway via_transport, NOT the hardcoded "TLS").
-            assert captured_context.get("transport") == "WSS"
+            extract_spy.assert_called_once()
+            assert extract_spy.call_args.kwargs["transport"] == "WSS"
     finally:
         in_call.set()
         await asyncio.sleep(0)

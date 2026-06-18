@@ -141,10 +141,11 @@ two registration sets) and is out of scope — named, not stubbed.
   REGISTER + inbound INVITE + BYE + keepalive over `WssSipTransport`, feeding the
   ADR-0032 WebRTC media path. This lane makes the whole WSS→WebRTC path reachable.
 - **Outbound WebRTC origination over WSS stays deferred** (ADR-0032 §5). The
-  outbound UAC path (`originate.py` + `_place_call`) still offers SDES/G.711-G.722
-  over TLS and keeps its `"TLS"` Via. Selecting WSS does not yet re-route the
-  agent's `place_call` over the WebSocket; that is a separate, named follow-up
-  (task #32). A real boundary, not a stub.
+  outbound UAC path (`originate.py` + `_place_call`) offers SDES/G.711-G.722 with a
+  `"TLS"` Via, which would be spec-incoherent SIP over a WebSocket. So on a `wss`
+  gateway `place_call` is **rejected loudly** (`OutboundCallFailed(501, …)`) before
+  any INVITE — never a silent incoherent send. Re-routing `place_call` over the
+  WebSocket is a separate, named follow-up (task #32). A real boundary, not a stub.
 - **Opus-on-SIP (SDES/TLS) stays deferred** (ADR-0032 alternatives): Opus is
   advertised only on the WebRTC path it was added for.
 - **Two simultaneous transports** (a TLS *and* a WSS registration in one process)

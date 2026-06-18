@@ -244,6 +244,32 @@ def test_registration_config_wss_password_falls_back_to_sip_password() -> None:
     assert rc.password == "sip-pw"
 
 
+def test_registration_config_password_repr_suppressed() -> None:
+    """ADR-0037: the digest password NEVER appears in a RegistrationConfig repr.
+
+    registration_config() copies the SIP/WSS secret into RegistrationConfig.password,
+    so that field must be repr-suppressed too or repr(rc) would leak it (rule 34).
+    """
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="sip-secret-pw",
+            HERMES_SIP_TRANSPORT="wss",
+            HERMES_SIP_WS_PASSWORD="wss-secret-pw",
+        )
+    )
+    rc = cfg.registration_config(
+        cfg.extensions[0],
+        contact="<sip:1000@aaa.invalid;transport=ws>",
+        local_sent_by="aaa.invalid",
+    )
+    # The WSS secret was selected for the digest...
+    assert rc.password == "wss-secret-pw"
+    # ...but neither it nor the SIP password may reach a log line via repr.
+    assert "wss-secret-pw" not in repr(rc)
+    assert "sip-secret-pw" not in repr(rc)
+
+
 def test_registration_config_ws_password_ignored_on_tls() -> None:
     """A stray WS password does NOT override the digest on a tls transport."""
     cfg = load_gateway_config(

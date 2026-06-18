@@ -802,6 +802,19 @@ class VoipAdapter(BasePlatformAdapter):
                 when no registered extension is available, or when the slot is busy.
             RuntimeError: When the transport or manager is not initialised.
         """
+        # ADR-0037 / ADR-0032 §5: outbound origination over WSS is DEFERRED. The
+        # outbound UAC path offers SDES/G.711-G.722 and emits a TLS Via, so dialing
+        # over the WSS signalling transport would put spec-incoherent SIP on the
+        # WebSocket. Reject it LOUDLY here (a named boundary, never a silent
+        # incoherent send) rather than letting _handle_outbound_invite proceed.
+        gateway_cfg = self._gateway_cfg
+        if gateway_cfg is not None and gateway_cfg.transport == "wss":
+            raise OutboundCallFailed(
+                501,
+                "outbound calling is not supported on the WSS transport "
+                "(outbound WebRTC origination is deferred — ADR-0032 §5); "
+                "outbound runs only on HERMES_SIP_TRANSPORT=tls",
+            )
         if extension in self._outbound_extensions:
             raise OutboundCallFailed(
                 503, f"outbound call to {extension!r} already in progress"

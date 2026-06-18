@@ -31,6 +31,7 @@ from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import (
     SipRequest,
+    SipResponse,
     build_request,
     new_branch,
     new_call_id,
@@ -662,3 +663,36 @@ async def test_instance_id_is_stable_across_contact_uri_calls() -> None:
     finally:
         await transport.aclose()
         await server.stop()
+
+
+async def test_remove_call_sink_identity_guard_matches_tls() -> None:
+    """remove_call(call_id, sink) mirrors the TLS transport's identity guard.
+
+    The adapter tears a call down with ``remove_call(call_id, that_call's_sink)``;
+    the WSS transport MUST accept the second arg (or a WSS call teardown raises
+    TypeError) AND only evict the entry when the sink still owns it — so an
+    overlapping INVITE sharing the Call-ID (a later add_call) is not evicted by
+    the earlier call's teardown (RFC 3261 fork/retransmit). Pure in-memory; no IO.
+    """
+
+    class _Sink:
+        async def on_response(self, response: SipResponse) -> None:
+            """Unused — the registry only stores the sink by identity here."""
+
+    transport = _make_transport(5061)
+    first: _Sink = _Sink()
+    second: _Sink = _Sink()
+
+    # A later call overwrites the same Call-ID; the earlier call's teardown
+    # (passing its OWN sink) must be a no-op, leaving the live later sink in place.
+    transport.add_call("call-1", first)
+    transport.add_call("call-1", second)
+    transport.remove_call("call-1", first)  # the 2-arg form must not raise
+    assert transport._calls.get("call-1") is second
+
+    # Passing the owning sink removes it; sink=None removes unconditionally.
+    transport.remove_call("call-1", second)
+    assert "call-1" not in transport._calls
+    transport.add_call("call-2", first)
+    transport.remove_call("call-2")
+    assert "call-2" not in transport._calls

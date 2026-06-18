@@ -599,3 +599,76 @@ async def test_place_call_over_wss_sends_webrtc_offer_invite() -> None:
     session = _FakeWebRtcSession.last
     assert session is not None
     assert session.built_for_outbound is True
+
+
+async def _capture_outbound_webrtc_offer() -> SessionDescription:
+    """Drive place_call over WSS and return the parsed outbound WebRTC SDP offer.
+
+    Shared setup for the offer-content assertions below: mirrors
+    ``test_place_call_over_wss_sends_webrtc_offer_invite`` but returns the parsed
+    offer so a test can assert on its codec menu.
+    """
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway_config("wss"), transport)
+    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV_WSS))
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=_gateway_config("wss"),
+        ),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.WssSipTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+        _mark_registered(manager)
+        transport.sent.clear()
+
+        with patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession):
+            call_task = asyncio.ensure_future(adapter.place_call("1001"))
+            try:
+                await _until(
+                    lambda: any(m.startswith("INVITE") for m in transport.sent)
+                )
+            finally:
+                call_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await call_task
+
+    invites = [m for m in transport.sent if m.startswith("INVITE")]
+    assert invites, "no INVITE was sent over the WSS transport"
+    offer = SessionDescription.parse(SipRequest.parse(invites[0]).body or "")
+    assert offer.audio is not None
+    return offer
+
+
+@pytest.mark.asyncio
+async def test_outbound_webrtc_offer_includes_dtmf_and_g711_fallback() -> None:
+    """The outbound WebRTC offer carries telephone-event + G.711, not Opus alone.
+
+    ADR-0049: the outbound offer must mirror the inbound answer menu
+    (``_WEBRTC_SUPPORTED_ENCODINGS`` = opus, PCMU, PCMA, telephone-event) so that:
+      * RFC 4733 DTMF (telephone-event) can negotiate — an Opus-only offer makes
+        ``te_pt`` structurally always ``None`` and DTMF impossible on the call; and
+      * a gateway that cannot do Opus can still answer G.711 (PCMU/PCMA).
+    An Opus-only offer is the bug this test guards against.
+    """
+    offer = await _capture_outbound_webrtc_offer()
+    assert offer.audio is not None
+    encodings = {c.encoding.lower() for c in offer.audio.codecs}
+    assert "opus" in encodings
+    assert "telephone-event" in encodings, (
+        "outbound WebRTC offer must offer telephone-event so RFC 4733 DTMF "
+        "can negotiate"
+    )
+    assert "pcmu" in encodings, "outbound WebRTC offer must offer G.711 PCMU fallback"
+    assert "pcma" in encodings, "outbound WebRTC offer must offer G.711 PCMA fallback"
+    # Opus is offered first (preference order); DTMF is offered, not the only entry.
+    assert offer.audio.codecs[0].encoding.lower() == "opus"

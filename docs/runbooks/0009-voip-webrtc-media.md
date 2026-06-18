@@ -18,11 +18,13 @@ design). This runbook is the operational HOW.
 | --- | --- |
 | Inbound WebRTC media (DTLS-SRTP + ICE + Opus) | **Wired** (ADR-0032) |
 | Opus 48 kHz on the wire; G.711 fallback | **Wired** |
+| **Opus on the SIP (SDES/TLS) path** — inbound + outbound SIP calls can negotiate Opus | **Wired** (ADR-0049); offered ONLY when `libopus` is loadable (else the G.722/G.711 floor) |
 | ICE host candidates + STUN server-reflexive (srflx) | **Wired** |
 | **TURN** relay candidates (operator-provided credentials) | **Wired** (ADR-0034); see "The TURN knob" — full live relay needs a real TURN server |
 | ICE **consent freshness** (RFC 7675) — long calls behind NAT drop deterministically | **Wired** (ADR-0034; aioice-native, surfaced) |
 | **Trickle** ICE — SDP primitives (`a=ice-options:trickle`, `a=end-of-candidates`) + half-trickle answer | **Wired** (ADR-0034) |
-| **Outbound** WebRTC origination (our own offer) | **Deferred** — outbound runs over SIP-over-TLS |
+| **Outbound** WebRTC origination (our own DTLS/ICE/Opus offer over WSS) | **Wired** (ADR-0049); on a `HERMES_SIP_TRANSPORT=wss` gateway `place_call` sends our WebRTC offer (ICE-controlling, DTLS `a=setup:active`). A `tls` gateway dials over SIP-over-TLS (SDES) as before |
+| Outbound WebRTC DTLS **active-answerer** (answering a gateway's `passive` offer) | **Deferred** (ADR-0050) — the outbound offerer always offers `active` |
 | SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Wired** (ADR-0038); see "SIP-over-WSS signalling" — full live validation needs the operator's WSS port + credential |
 | Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |

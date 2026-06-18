@@ -1158,6 +1158,80 @@ def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; a
     )
 
 
+def build_webrtc_offer(  # noqa: PLR0913 - WebRTC SDP fields are independent; all keyword-only
+    *,
+    local_address: str,
+    port: int,
+    codecs: Sequence[Codec],
+    fingerprint: Fingerprint,
+    setup: SetupRole,
+    ice_ufrag: str,
+    ice_pwd: str,
+    ice_candidates: Sequence[IceCandidate],
+    direction: str = "sendrecv",
+    ptime: int = 20,
+    session_id: int = 0,
+    version: int | None = None,
+) -> str:
+    """Build a WebRTC SDP *offer* (``UDP/TLS/RTP/SAVPF``, ADR-0049).
+
+    The outbound (UAC) counterpart to :func:`build_webrtc_answer`: it emits the
+    same ``UDP/TLS/RTP/SAVPF`` body (shared :func:`_build_webrtc_body`) carrying
+    our DTLS-SRTP keying (``a=fingerprint`` + ``a=setup``), ICE credentials and
+    candidates (``a=ice-ufrag`` / ``a=ice-pwd`` / ``a=candidate``), and
+    ``a=rtcp-mux`` — but with OUR codec menu (``codecs``, Opus-promoted per
+    ADR-0005) rather than a negotiated subset of a peer's offer, and a
+    caller-chosen ``direction``.
+
+    Unlike :func:`build_webrtc_answer`, ``setup`` MAY be ``actpass`` (RFC 5763 §5:
+    only the *answerer* MUST NOT offer ``actpass``). The outbound origination path
+    offers a concrete ``active`` (we are the DTLS CLIENT) so the
+    :class:`~hermes_voip.media.dtls.DtlsEndpoint` role — fixed at construction
+    along with the fingerprint we put here — needs no post-answer switch.
+
+    Per RFC 5763 §5 / RFC 8827 §6.5: NO ``a=crypto`` (SDES is forbidden on a WebRTC
+    m-line) and NO ``c=`` connection-address line (the address is conveyed by ICE).
+
+    Args:
+        local_address: Used in the ``o=`` origin line only (RFC 4566 §5.2); the
+            media address/port are conveyed by ``ice_candidates``.
+        port: The advisory port in the ``m=`` line.
+        codecs: Our offered codecs in preference order (Opus is promoted ahead of
+            G.711 per ADR-0005 when present).
+        fingerprint: Our DTLS certificate fingerprint.
+        setup: Our DTLS role (``active``, ``passive``, or ``actpass``).
+        ice_ufrag: Our ICE username fragment.
+        ice_pwd: Our ICE password.
+        ice_candidates: Our gathered ICE candidates (full set; half-trickle MVP).
+        direction: Media direction attribute (default ``sendrecv``).
+        ptime: Packetisation time in ms.
+        session_id: SDP ``o=`` session id.
+        version: SDP ``o=`` session version (defaults to ``session_id``).
+
+    Returns:
+        The SDP offer body terminated by CRLF, ready to attach to an INVITE.
+
+    Raises:
+        ValueError: If ``direction`` is invalid, ``codecs`` is empty, ``port`` is
+            out of range, or ``ptime`` is not positive.
+    """
+    sess_version = session_id if version is None else version
+    return _build_webrtc_body(
+        local_address=local_address,
+        port=port,
+        codecs=_order_opus_first(codecs),
+        direction=direction,
+        ptime=ptime,
+        session_id=session_id,
+        sess_version=sess_version,
+        fingerprint=fingerprint,
+        setup=setup,
+        ice_ufrag=ice_ufrag,
+        ice_pwd=ice_pwd,
+        ice_candidates=ice_candidates,
+    )
+
+
 def _negotiate_answer_crypto(
     audio: AudioMedia, our_crypto: CryptoAttribute | str | None
 ) -> CryptoAttribute:

@@ -93,6 +93,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_voip"]
+# Ship the plugin manifest as importable package data (ADR-0037) so the wheel is
+# self-describing: importlib.resources.files("hermes_voip")/"plugin.yaml" resolves it.
+# Non-.py files under the package dir are not included by hatchling unless declared.
+artifacts = ["src/hermes_voip/plugin.yaml"]
 
 # ---------------------------------------------------------------------------
 # Ruff — format + lint at high strictness (AGENTS.md rule 17). A strong curated
@@ -152,6 +156,11 @@ known-first-party = ["hermes_voip"]
   "S105", "S106", "S107", "PLR2004",
   "ARG001", "ARG002", "ARG005",  # fakes/lambdas mirror real signatures; matching unused params are intentional
 ]
+# The directory-install plugin layout (ADR-0037) lives in a HYPHENATED dir named after
+# the Hermes plugin (`hermes-voip/`), which Hermes loads by path — not an importable
+# Python module, so N999 (invalid module name) does not apply. It re-exports the real
+# register from the hermes_voip package.
+"packaging/hermes-plugins/hermes-voip/__init__.py" = ["N999"]
 
 # ---------------------------------------------------------------------------
 # mypy — strict, no escape hatches (AGENTS.md rule 17).
@@ -244,4 +253,7 @@ dev = [
     "pytest==9.1.0",
     "pytest-asyncio==1.4.0",
     "ruff==0.15.17",
+    # Type stubs for PyYAML (a transitive runtime dep) so the plugin-manifest test
+    # parses plugin.yaml under mypy --strict without an import-untyped escape hatch.
+    "types-pyyaml==6.0.12.20260518",
 ]

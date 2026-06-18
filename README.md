@@ -143,31 +143,36 @@ shows exactly which files go in each folder.)
 
 ### Step 3 — Turn it on and run
 
-Hermes only loads a plugin you've **enabled**. The easiest way is a one-time helper file that
-also makes the plugin show up in `hermes plugins list` — then the natural enable command works:
+Hermes only loads a plugin you've **enabled**. The easiest way is to install the plugin's
+manifest as a one-time directory plugin, which makes it show up in `hermes plugins list` — then
+the natural enable command works:
 
 ```bash
-# 1. Install the helper file so Hermes' CLI can see the plugin (one time):
+# 1. Install the plugin manifest so Hermes' CLI can see the plugin (one time):
 mkdir -p ~/.hermes/plugins/hermes-voip
 cp packaging/hermes-plugins/hermes-voip/plugin.yaml ~/.hermes/plugins/hermes-voip/plugin.yaml
+cp packaging/hermes-plugins/hermes-voip/__init__.py ~/.hermes/plugins/hermes-voip/__init__.py
 
 # 2. Enable it:
 hermes plugins enable hermes-voip
+# → ✓ Plugin hermes-voip enabled. Takes effect on next session.
 
 # 3. Start Hermes — the plugin registers your extension on the gateway automatically:
 hermes gateway run
 ```
 
-> **Why the helper file?** Hermes' `hermes plugins enable` / `hermes plugins list` commands
-> only look on disk, so a pip-installed plugin like this one is invisible to them out of the
-> box (the command would say *"Plugin 'hermes-voip' is not installed or bundled"*). The tiny
-> [`plugin.yaml`](packaging/hermes-plugins/hermes-voip/plugin.yaml) above is a description-only
-> stub that makes the CLI recognise the plugin — it carries no code, so the real plugin still
-> loads from its normal pip install. Full details + how to reverse it:
+> **Why install the manifest directory?** Hermes' `hermes plugins enable` / `hermes plugins
+> list` commands only look on disk, so a pip-installed plugin like this one is invisible to them
+> out of the box (the command would otherwise say *"Plugin 'hermes-voip' is not installed or
+> bundled"*). The [`plugin.yaml`](packaging/hermes-plugins/hermes-voip/plugin.yaml) above is the
+> plugin's full manifest (name, version, the tools it provides, the env vars it needs); the
+> [`__init__.py`](packaging/hermes-plugins/hermes-voip/__init__.py) just points back at the
+> installed package's code. With both present the plugin still loads **exactly once** (from its
+> pip install — no double registration). Full details + how to reverse it:
 > [the enable runbook](docs/runbooks/0011-voip-enable-plugin.md).
 
-**Prefer not to add the helper file?** You can enable the plugin by editing Hermes' config
-directly instead — open the file printed by `hermes config path` (usually
+**Prefer not to add the manifest directory?** You can enable the plugin by editing Hermes'
+config directly instead — open the file printed by `hermes config path` (usually
 `~/.hermes/config.yaml`) and add:
 
 ```yaml
@@ -176,10 +181,12 @@ plugins:
     - hermes-voip
 ```
 
-then run `hermes gateway run`. This is exactly what `hermes plugins enable` does once the
-helper file is in place. (Note: `hermes config set plugins.enabled '[...]'` does **not** work
-for this — it stores the value as text, not a list — so edit the YAML by hand if you go this
-route.)
+then run `hermes gateway run`. This sets the same `plugins.enabled` list `hermes plugins enable`
+writes once the manifest directory is in place. (Note: `hermes config set plugins.enabled
+'[...]'` does **not** work for this — it stores the value as text, not a list — so edit the YAML
+by hand if you go this route. Without the manifest directory, `hermes plugins list` won't show
+the plugin and `hermes plugins enable` won't find it, but the runtime still loads it from this
+list.)
 
 That's it. **Dial your extension from any phone** and your agent answers.
 
@@ -187,15 +194,23 @@ That's it. **Dial your extension from any phone** and your agent answers.
 
 ## Verify it's working
 
-**Is the plugin loaded?** Ask Hermes to show its plugins with debug output on:
+**Is the plugin listed?** Ask Hermes to show its plugins:
 
 ```bash
-HERMES_PLUGINS_DEBUG=1 hermes plugins list
+hermes plugins list
 ```
 
-`HERMES_PLUGINS_DEBUG=1` makes Hermes print what it discovers and loads as it starts up. If
-you installed the helper file from Step 3, `hermes-voip` also appears in the table with its
-description and version.
+If you installed the manifest directory from Step 3, `hermes-voip` appears in the table with
+its description and version. (This is a **filesystem listing** — it shows the plugin but does
+not load it. The in-session `/plugins` command, once the gateway is running, shows it loaded
+with its tool count — `9 tools, 1 hook`.)
+
+To see what Hermes actually **discovers and loads** at startup, set `HERMES_PLUGINS_DEBUG=1`
+when you start the gateway (not on `plugins list`):
+
+```bash
+HERMES_PLUGINS_DEBUG=1 hermes gateway run -vv
+```
 
 **Did it register on the gateway?** Start the gateway with verbose logging:
 
@@ -242,9 +257,10 @@ place a call — is in [the live-validation runbook](docs/runbooks/0002-voip-liv
 ## Troubleshooting
 
 **`hermes plugins enable hermes-voip` says "not installed or bundled".**
-This is expected for a pip-installed plugin until you add the helper `plugin.yaml` from
-[Step 3](#step-3--turn-it-on-and-run). Either add that file, or enable the plugin by editing
-`config.yaml` directly (also shown in Step 3). See
+This is expected for a pip-installed plugin until you install the manifest directory from
+[Step 3](#step-3--turn-it-on-and-run) (the `plugin.yaml` + `__init__.py` under
+`~/.hermes/plugins/hermes-voip/`). Either install that directory, or enable the plugin by
+editing `config.yaml` directly (also shown in Step 3). See
 [the enable runbook](docs/runbooks/0011-voip-enable-plugin.md).
 
 **The extension won't register on the gateway** (no inbound calls arrive).

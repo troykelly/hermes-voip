@@ -276,6 +276,9 @@ def test_primary_platform_omits_cron_deliver_env_var_and_sets_emoji() -> None:
 
 def test_srtp_get_crypto_is_a_singleton_with_reset() -> None:
     """_get_crypto returns the same instance until reset, then rebuilds."""
+    # _get_crypto builds _CryptographyImpl, which needs the optional `media` extra;
+    # the default (no-extra) gate would otherwise raise ImportError here.
+    pytest.importorskip("cryptography")
     from hermes_voip.media import srtp  # noqa: PLC0415
 
     srtp._reset_crypto_singleton()

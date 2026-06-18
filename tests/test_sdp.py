@@ -977,6 +977,74 @@ _OFFER_SAVPF = (
 )
 
 
+# A realistic WebRTC offer as sent by an Asterisk-based gateway (e.g. the
+# Grandstream UCM's embedded Asterisk WebRTC edge): a BUNDLE group with the
+# DTLS-SRTP + ICE credentials at the **session level** (before the first m=
+# line), shared across all bundled m-lines. RFC 8122 §5 (fingerprint) and RFC
+# 8839 §4.2 (ice-ufrag/ice-pwd) both permit session-level placement; a
+# session-level attribute applies to every media section that does not override
+# it. The audio m-line itself carries ONLY its candidates/codecs — no
+# fingerprint/ice of its own. A second `a=bundle-only` video m-line is included
+# so the fixture exercises the multi-m-line BUNDLE shape too. Fakes only.
+_OFFER_SAVPF_SESSION_LEVEL = (
+    "v=0\r\n"
+    "o=- 1217827275 1217827275 IN IP6 2001:db8::1\r\n"
+    "s=Asterisk\r\n"
+    "c=IN IP6 2001:db8::1\r\n"
+    "t=0 0\r\n"
+    "a=msid-semantic:WMS *\r\n"
+    "a=group:BUNDLE 0 1\r\n"
+    f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+    f"a=ice-pwd:{_FAKE_PWD}\r\n"
+    "a=ice-options:trickle\r\n"
+    # Gateways send the algorithm token upper-case (SHA-256); the parser
+    # lower-cases it (RFC 4572 §5) — the fixture keeps the on-the-wire form.
+    f"a=fingerprint:SHA-256 {_FAKE_FINGERPRINT}\r\n"
+    "a=setup:actpass\r\n"
+    "m=audio 19710 UDP/TLS/RTP/SAVPF 123 0 101\r\n"
+    "a=candidate:1 1 UDP 2130706431 2001:db8::1 19710 typ host\r\n"
+    "a=rtpmap:123 opus/48000/2\r\n"
+    "a=fmtp:123 useinbandfec=1;usedtx=1\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=fmtp:101 0-15\r\n"
+    "a=ptime:20\r\n"
+    "a=sendrecv\r\n"
+    "a=rtcp-mux\r\n"
+    "a=mid:0\r\n"
+    "m=video 9 UDP/TLS/RTP/SAVPF 99\r\n"
+    "a=bundle-only\r\n"
+    "a=rtpmap:99 H264/90000\r\n"
+    "a=inactive\r\n"
+    "a=rtcp-mux\r\n"
+    "a=mid:1\r\n"
+)
+
+
+# A WebRTC offer that carries ICE/DTLS at BOTH session and media level, with
+# DIFFERENT values, so the parser's precedence rule (media overrides session,
+# RFC 8839 §4.2) can be asserted unambiguously. Fakes only.
+_OFFER_SAVPF_MEDIA_OVERRIDES_SESSION = (
+    "v=0\r\n"
+    "o=- 3000 3000 IN IP4 192.0.2.20\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    f"a=ice-ufrag:{_FAKE_UFRAG}\r\n"
+    f"a=ice-pwd:{_FAKE_PWD}\r\n"
+    f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\n"
+    "a=setup:actpass\r\n"
+    "m=audio 49000 UDP/TLS/RTP/SAVPF 0 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    f"a=ice-ufrag:{_FAKE_ANSWER_UFRAG}\r\n"
+    f"a=ice-pwd:{_FAKE_ANSWER_PWD}\r\n"
+    f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT_ANSWER}\r\n"
+    "a=setup:active\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+
 # --- Fingerprint typed attribute ---
 
 
@@ -1174,6 +1242,58 @@ def test_parse_webrtc_offer_has_no_sdes_crypto() -> None:
     assert sdp.audio is not None
     assert sdp.audio.crypto == ()
     assert sdp.audio.crypto_attrs == ()
+
+
+def test_parse_webrtc_session_level_fingerprint() -> None:
+    """Session-level a=fingerprint applies to the bundled audio (RFC 8122 §5).
+
+    Regression: an Asterisk/UCM BUNDLE offer puts the DTLS fingerprint at the
+    session level; the parser must surface it on the audio media (it was being
+    dropped, producing a spurious 488 'missing fingerprint' on the live gateway).
+    """
+    sdp = SessionDescription.parse(_OFFER_SAVPF_SESSION_LEVEL)
+    assert sdp.audio is not None
+    assert sdp.audio.is_webrtc is True
+    assert sdp.audio.fingerprint is not None
+    assert sdp.audio.fingerprint.algorithm == "sha-256"
+    assert sdp.audio.fingerprint.value == _FAKE_FINGERPRINT
+
+
+def test_parse_webrtc_session_level_ice_credentials() -> None:
+    """Session-level a=ice-ufrag/a=ice-pwd apply to the audio (RFC 8839 §4.2)."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF_SESSION_LEVEL)
+    assert sdp.audio is not None
+    assert sdp.audio.ice_ufrag == _FAKE_UFRAG
+    assert sdp.audio.ice_pwd == _FAKE_PWD
+
+
+def test_parse_webrtc_session_level_setup_and_options() -> None:
+    """Session-level a=setup and a=ice-options apply to the audio media."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF_SESSION_LEVEL)
+    assert sdp.audio is not None
+    assert sdp.audio.setup is not None
+    assert sdp.audio.setup.value == "actpass"
+    assert "trickle" in sdp.audio.ice_options
+
+
+def test_parse_webrtc_session_level_keeps_media_candidates() -> None:
+    """Media-level candidates are still captured alongside session-level creds."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF_SESSION_LEVEL)
+    assert sdp.audio is not None
+    assert len(sdp.audio.ice_candidates) == 1
+    assert sdp.audio.ice_candidates[0].typ == "host"
+
+
+def test_parse_webrtc_media_level_overrides_session_level() -> None:
+    """A media-level attribute wins over a session-level one (RFC 8839 §4.2)."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF_MEDIA_OVERRIDES_SESSION)
+    assert sdp.audio is not None
+    assert sdp.audio.ice_ufrag == _FAKE_ANSWER_UFRAG
+    assert sdp.audio.ice_pwd == _FAKE_ANSWER_PWD
+    assert sdp.audio.fingerprint is not None
+    assert sdp.audio.fingerprint.value == _FAKE_FINGERPRINT_ANSWER
+    assert sdp.audio.setup is not None
+    assert sdp.audio.setup.value == "active"
 
 
 def test_parse_sdes_offer_has_no_webrtc_attrs() -> None:

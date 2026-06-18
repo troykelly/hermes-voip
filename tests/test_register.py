@@ -87,9 +87,9 @@ class _FakeCtx:
 
 
 def test_register_registers_the_primary_voip_platform_first() -> None:
-    """The primary ``voip`` platform is registered first (ADR-0034).
+    """The primary ``voip`` platform is registered first (ADR-0035).
 
-    ADR-0034 adds the per-caller-group CHANNEL platforms (voip-unknown / voip-known /
+    ADR-0035 adds the per-caller-group CHANNEL platforms (voip-unknown / voip-known /
     voip-operator / voip-intercom) as additional first-class registrations, so the
     plugin no longer registers exactly one platform. The PRIMARY ``voip`` platform
     (the one carrying the adapter factory + env-enablement + connection probe) is
@@ -112,7 +112,7 @@ def test_register_uses_name_voip() -> None:
 
 
 def test_register_registers_the_four_channel_platforms() -> None:
-    """ADR-0034: each caller-group channel is a first-class Hermes platform.
+    """ADR-0035: each caller-group channel is a first-class Hermes platform.
 
     Registering the channels as platforms is what lets the operator target a channel
     with per-platform tools_config / disabled_toolsets and makes the channel
@@ -568,7 +568,7 @@ def test_register_registers_a_pre_tool_call_gate() -> None:
 def test_register_still_registers_the_primary_platform() -> None:
     """Adding tool/hook + channel registration keeps the primary voip platform.
 
-    (ADR-0034 made the platform set the primary ``voip`` plus the channel aliases;
+    (ADR-0035 made the platform set the primary ``voip`` plus the channel aliases;
     this asserts the primary is still registered first and the tool/hook wiring did
     not displace it.)
     """
@@ -596,7 +596,7 @@ def test_register_is_resilient_to_a_ctx_without_register_tool() -> None:
 
     ctx = _PlatformOnlyCtx()
     register(ctx)  # must not raise even though register_tool/register_hook are absent
-    # The primary voip platform plus the ADR-0034 channel aliases all register; the
+    # The primary voip platform plus the ADR-0035 channel aliases all register; the
     # primary is first. (register_tool/register_hook absence only skips tool wiring.)
     assert ctx.calls[0] == "voip"
     for channel in ("voip-unknown", "voip-known", "voip-operator", "voip-intercom"):

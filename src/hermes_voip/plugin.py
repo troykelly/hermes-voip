@@ -91,13 +91,13 @@ _EXTRA_ENV_PREFIXES: tuple[str, ...] = ("HERMES_SIP_", "HERMES_VOIP_")
 # prefixes above, so they must be copied by exact name alongside the prefix match.
 _EXTRA_ENV_KEYS: frozenset[str] = frozenset({"DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY"})
 
-# The primary platform name (the one connecting adapter). ADR-0034 adds the caller-
+# The primary platform name (the one connecting adapter). ADR-0035 adds the caller-
 # group CHANNEL platforms as routing aliases of this one.
 _PLATFORM_NAME = "voip"
 
 
 def channel_platform_names() -> tuple[str, ...]:
-    """The caller-group CHANNEL platform names this plugin registers (ADR-0034).
+    """The caller-group CHANNEL platform names this plugin registers (ADR-0035).
 
     The operator's four canonical channels (``voip-unknown`` / ``voip-known`` /
     ``voip-operator`` / ``voip-intercom``) plus the channels the legacy ADR-0020 modes
@@ -128,7 +128,7 @@ def channel_platform_names() -> tuple[str, ...]:
 
 
 def ensure_channel_registered(channel: str) -> None:
-    """Register ``channel`` as a routing-alias platform if it is not already (ADR-0034).
+    """Register ``channel`` as a routing-alias platform if it is not already (ADR-0035).
 
     ``gateway.config.Platform(channel)`` only resolves a name its ``_missing_`` hook
     recognises — a bundled plugin platform or one present in the module-singleton
@@ -350,7 +350,7 @@ def register(ctx: PluginContextProtocol) -> None:
         is_connected=_is_connected,
     )
 
-    # ADR-0034: register each caller-group CHANNEL as a first-class platform aliasing
+    # ADR-0035: register each caller-group CHANNEL as a first-class platform aliasing
     # the one voip adapter (the operator's "Telegram model" — one Hermes, many
     # channels). This makes the channel name resolve via Platform(<channel>) and lets
     # the operator scope per-platform tools_config / disabled_toolsets to a channel.
@@ -370,7 +370,7 @@ def register(ctx: PluginContextProtocol) -> None:
 
 
 def _register_channel_platforms(ctx: PluginContextProtocol) -> None:
-    """Register each caller-group CHANNEL as a routing-alias platform (ADR-0034).
+    """Register each caller-group CHANNEL as a routing-alias platform (ADR-0035).
 
     One ``register_platform`` call per channel in :func:`channel_platform_names`,
     each reusing the primary ``voip`` adapter factory + ``check_fn`` so a channel is

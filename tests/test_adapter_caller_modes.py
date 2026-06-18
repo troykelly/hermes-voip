@@ -1645,7 +1645,7 @@ async def test_inbound_context_block_defangs_caller_fence_sentinel() -> None:
 
 
 # ===========================================================================
-# ADR-0034: caller-group -> Hermes channel (platform name) routing
+# ADR-0035: caller-group -> Hermes channel (platform name) routing
 # ===========================================================================
 #
 # Each call is delivered to the agent under its caller-group's CHANNEL (a Hermes

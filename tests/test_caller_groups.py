@@ -1132,7 +1132,7 @@ def test_caller_group_config_allows_specific_patterns_in_privileged_group() -> N
 
 
 # ===========================================================================
-# ADR-0034: caller-group -> Hermes channel (platform name) routing
+# ADR-0035: caller-group -> Hermes channel (platform name) routing
 # ===========================================================================
 #
 # Each group names a CHANNEL (a Hermes platform name). An empty channel resolves
@@ -1248,7 +1248,7 @@ def test_json_groups_document_rejects_non_string_channel(tmp_path: Path) -> None
 
 
 # ===========================================================================
-# ADR-0034: per-channel PERMITTED TOOLS (the operator's "separate permissions")
+# ADR-0035: per-channel PERMITTED TOOLS (the operator's "separate permissions")
 # ===========================================================================
 #
 # The per-channel permission is the existing CallerGroup.allowed_tools sub-ceiling

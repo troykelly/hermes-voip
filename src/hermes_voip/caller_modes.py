@@ -173,10 +173,10 @@ class CallerGroup:
             one above ``privilege_level``. The intercom group uses this to expose
             ONLY its entry action (``open_entry`` / ``send_dtmf``), so even a
             spoofed caller-ID reaching the group cannot reach operator tools.
-            Under ADR-0034 this set is *also* the channel's per-channel permitted
+            Under ADR-0035 this set is *also* the channel's per-channel permitted
             tool set (the operator's "separate permissions").
         channel: The Hermes channel (platform name) a call in this group is
-            delivered to (ADR-0034 — the "Telegram model": one Hermes, many
+            delivered to (ADR-0035 — the "Telegram model": one Hermes, many
             channels). EMPTY (the default) resolves to the canonical
             ``voip-<name>`` via :func:`channel_for_group`; a non-empty value is
             used verbatim. The channel is the routing identity an inbound call's
@@ -196,7 +196,7 @@ class CallerGroup:
 
 
 def channel_for_group(group: CallerGroup) -> str:
-    """Resolve the Hermes channel (platform name) for a caller group (ADR-0034).
+    """Resolve the Hermes channel (platform name) for a caller group (ADR-0035).
 
     The single chokepoint for the channel default: an empty
     :attr:`CallerGroup.channel` resolves to the canonical ``voip-<group-name>``; a
@@ -651,7 +651,7 @@ _DEFAULT_THREE_GROUPS: tuple[CallerGroup, ...] = (
 )
 
 
-# ADR-0034: the operator's four canonical CHANNELS (the "Telegram model"). Each is a
+# ADR-0035: the operator's four canonical CHANNELS (the "Telegram model"). Each is a
 # distinct Hermes platform name with its own per-channel PERMITTED tool set (the
 # existing allowed_tools sub-ceiling reframed as "this channel's permissions"). The
 # agent ALWAYS handles the call (ADR-0021 correction); the channel decides the
@@ -707,7 +707,7 @@ _CANONICAL_CHANNEL_GROUPS: tuple[CallerGroup, ...] = (
 
 
 def canonical_channel_groups() -> tuple[CallerGroup, ...]:
-    """The operator's four canonical caller-group CHANNELS (ADR-0034).
+    """The operator's four canonical caller-group CHANNELS (ADR-0035).
 
     ``voip-unknown`` (untrusted, no sensitive tool), ``voip-known`` (limited:
     hold/resume), ``voip-operator`` (full assistant), ``voip-intercom`` (open_entry
@@ -1254,7 +1254,7 @@ def _parse_groups_document(  # noqa: PLR0912,PLR0915 — sequential validation o
                 "reaches a turn and must not have a persona"
             )
             raise ConfigError(msg)
-        # ADR-0034: optional per-group channel (a Hermes platform name). Absent ⇒
+        # ADR-0035: optional per-group channel (a Hermes platform name). Absent ⇒
         # empty (resolved to the canonical voip-<name> by channel_for_group). A
         # non-string is a fail-loud ConfigError (rule 37 — a typo'd channel must not
         # silently fall back and merge two groups into one session namespace).

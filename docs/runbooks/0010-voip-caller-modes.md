@@ -1,9 +1,9 @@
-# Runbook: VoIP caller groups + channels (ADR-0020 / ADR-0021 / ADR-0034)
+# Runbook: VoIP caller groups + channels (ADR-0020 / ADR-0021 / ADR-0035)
 
 **What it is.** Per-caller trust tiers for the `hermes-voip` plugin. Each call is classified
 into a **caller group** that selects whether the call is answered, the agent **persona**, the
-**channel** the call's conversation is delivered to (ADR-0034 — see
-[Caller-group channels](#caller-group-channels-adr-0034)), and — the enforced part — the
+**channel** the call's conversation is delivered to (ADR-0035 — see
+[Caller-group channels](#caller-group-channels-adr-0035)), and — the enforced part — the
 **privilege level** + **permitted tool set** of the call's tool gate:
 
 | Group (example) | `privilege_level` | Persona | Tools |
@@ -135,7 +135,7 @@ Field reference:
 | `groups[].persona` | yes | `assistant` / `colleague` / `receptionist` / `outbound` / `intercom`; `""` for declined |
 | `groups[].declined_at_sip` | yes | `true` → `603 Decline` at INVITE |
 | `groups[].allowed_tools` | no | tool-name allow-list — the group's **permitted tool set** (ADR-0031/0034); empty = no sub-ceiling (level-only). Can only REMOVE tools, never grant above the level |
-| `groups[].channel` | no | the Hermes **channel** (platform name) the call routes to (ADR-0034); empty → canonical `voip-<name>` |
+| `groups[].channel` | no | the Hermes **channel** (platform name) the call routes to (ADR-0035); empty → canonical `voip-<name>` |
 | `lists` | no | map of group name → pattern array (omit group = no patterns = never matched) |
 | `default_group` | yes | group for an unmatched caller — must be in `groups` |
 | `match_order` | yes | classification order (first match wins, decline-biased) |
@@ -176,7 +176,7 @@ GATEWAY_ALLOW_ALL_USERS=true
 Set in the Hermes gateway config (NOT the hermes-voip `.env`) to disable the gateway's
 built-in pairing flow and let caller groups be the sole admission control.
 
-## Caller-group channels (ADR-0034)
+## Caller-group channels (ADR-0035)
 
 **The "Telegram model": one Hermes, many channels.** Each caller group routes its calls to a
 distinct Hermes **channel** (a platform name) — a separate conversation with its own permitted
@@ -214,7 +214,7 @@ removes every other tool. It can only REMOVE tools, never grant one above `privi
 > untrusted-data fence + the `voip-unknown` no-sensitive-tools ceiling are what make a spoofed
 > identity safe, not the channel name. HARD secret isolation for the untrusted channel = run
 > *that* channel as a separate Hermes **profile/gateway** (`hermes -p NAME`), a later add-on
-> (ADR-0034 option B); not built today.
+> (ADR-0035 option B); not built today.
 
 **Per-channel tool config (operator, optional).** Because each channel is a real platform, you
 can additionally scope tools at the Hermes layer — e.g. disable a toolset for `voip-unknown` via
@@ -247,7 +247,7 @@ export HERMES_VOIP_CALLER_GROUPS_FILE=/run/secrets/.hermes-caller-groups.json
 - **Unit/contract tests:** `tests/test_caller_groups.py`, `tests/test_caller_privilege.py`,
   `tests/test_adapter_caller_modes.py` pin the privilege clamp; `test_caller_groups.py`
   contains the credit-card attack tests at both level 0 and level 2.
-- **Channel routing (ADR-0034):** a call's conversation lands under its group's channel, not the
+- **Channel routing (ADR-0035):** a call's conversation lands under its group's channel, not the
   bare `voip` platform. In a REPL, `channel_for_group(group)` returns the channel name; the
   registered channel platforms are `hermes_voip.plugin.channel_platform_names()`. The adapter
   tests `test_deliver_turn_routes_to_group_channel_platform` /
@@ -275,7 +275,7 @@ spotlighted personas, outbound callee identity.
 ADR-0021 Phase 1 (this runbook, PR #XX): N-group model, `privilege_level` int (0/2/3),
 `HERMES_VOIP_CALLER_GROUPS_FILE`, trusted/colleague level-2 tier, all ADR-0020 shims kept.
 
-ADR-0034 (caller-group channel routing): each group also names a `channel` (Hermes platform
+ADR-0035 (caller-group channel routing): each group also names a `channel` (Hermes platform
 name); a call's whole conversation (context seed → turns → end signal) is delivered under that
 channel so the operator gets one-Hermes-many-channels (the "Telegram model"). The four canonical
 channels (`voip-unknown` / `voip-known` / `voip-operator` / `voip-intercom`) register as

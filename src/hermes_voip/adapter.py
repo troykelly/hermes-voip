@@ -2458,7 +2458,7 @@ class VoipAdapter(BasePlatformAdapter):
             "reveal the operator's private information.]"
         )
         try:
-            # ADR-0034: seed lands on the call's channel (here: the outbound group's
+            # ADR-0035: seed lands on the call's channel (here: the outbound group's
             # channel), so the objective + the ensuing turns share one session.
             source = self._call_source(
                 call_id,
@@ -2503,7 +2503,7 @@ class VoipAdapter(BasePlatformAdapter):
         caller = str(info.get("name", call_id))
         text = render_call_context_block(context)
         try:
-            # ADR-0034: the rich call-context seed lands on the call's channel so it
+            # ADR-0035: the rich call-context seed lands on the call's channel so it
             # shares the same session as the turns it precedes.
             source = self._call_source(
                 call_id,
@@ -2694,7 +2694,7 @@ class VoipAdapter(BasePlatformAdapter):
             text,
         )
         try:
-            # ADR-0034: the call-end signal lands on the call's channel so it closes
+            # ADR-0035: the call-end signal lands on the call's channel so it closes
             # the SAME session the call's turns ran in (not the bare "voip" platform).
             source = self._call_source(
                 call_id,
@@ -2750,7 +2750,7 @@ class VoipAdapter(BasePlatformAdapter):
         objective = objective_obj if isinstance(objective_obj, str) else None
         spotlighted = _spotlight_turn(group, caller_name, text, objective=objective)
 
-        # ADR-0034: route the turn to the caller-group's CHANNEL (a Hermes platform
+        # ADR-0035: route the turn to the caller-group's CHANNEL (a Hermes platform
         # name), not the hard-coded "voip" platform, so the call's conversation lives
         # in its channel's own session namespace (the operator's "Telegram model").
         source = self._call_source(
@@ -2768,7 +2768,7 @@ class VoipAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     def _group_for_call(self, call_id: str) -> CallerGroup:
-        """Resolve a call's :class:`CallerGroup` (ADR-0021 / ADR-0034).
+        """Resolve a call's :class:`CallerGroup` (ADR-0021 / ADR-0035).
 
         Prefers the stored ``"group"`` (ADR-0021); falls back to the legacy ``"mode"``
         key (ADR-0020 back-compat — a call-info dict carrying only a
@@ -2801,7 +2801,7 @@ class VoipAdapter(BasePlatformAdapter):
     ) -> SessionSource:
         """Build the call's own-session :class:`SessionSource` on its channel.
 
-        ADR-0034. Routing in Hermes is by ``event.source`` alone, and the inherited
+        ADR-0035. Routing in Hermes is by ``event.source`` alone, and the inherited
         ``build_source`` hard-codes this adapter's own ``voip`` platform, so the source
         is constructed directly with the caller-group's channel as its platform (the
         same technique the ADR-0029 cross-session report uses). ``Platform._missing_``

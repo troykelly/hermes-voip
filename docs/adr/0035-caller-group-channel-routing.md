@@ -1,4 +1,4 @@
-# ADR-0034: Caller-group channel routing — one Hermes, many channels (the "Telegram model")
+# ADR-0035: Caller-group channel routing — one Hermes, many channels (the "Telegram model")
 
 - **Date:** 2026-06-18
 - **Status:** Accepted

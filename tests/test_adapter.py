@@ -2039,14 +2039,51 @@ def test_supported_menu_leads_with_g722_then_g711() -> None:
 
 def test_outbound_offer_lists_g722_first() -> None:
     # The outbound INVITE offer must put G.722 (PT 9) ahead of the G.711 payloads
-    # so a wideband-capable peer picks it; G.711 stays as the fallback.
+    # so a wideband-capable peer picks it; G.711 stays as the fallback. (When Opus
+    # is available it is promoted ahead of G.722 by the offer builder; this test
+    # forces Opus UNavailable so the floor menu is asserted.)
+    from unittest.mock import patch  # noqa: PLC0415
+
     from hermes_voip.adapter import _outbound_offer_codecs  # noqa: PLC0415
 
-    codecs = _outbound_offer_codecs()
+    with patch("hermes_voip.adapter._opus_sip_available", return_value=False):
+        codecs = _outbound_offer_codecs()
     voice = [c for c in codecs if c.encoding.lower() != "telephone-event"]
     assert voice[0].encoding == "G722"
     assert voice[0].payload_type == 9
     assert {c.encoding for c in voice} >= {"G722", "PCMU", "PCMA"}
+    assert not any(c.encoding.lower() == "opus" for c in voice)
+
+
+def test_outbound_offer_includes_opus_when_available() -> None:
+    # ADR-0049: Opus on the SIP path — when libopus is available, the outbound SIP
+    # offer menu carries Opus (opus/48000) so a SIP call can negotiate it.
+    from unittest.mock import patch  # noqa: PLC0415
+
+    from hermes_voip.adapter import _outbound_offer_codecs  # noqa: PLC0415
+
+    with patch("hermes_voip.adapter._opus_sip_available", return_value=True):
+        codecs = _outbound_offer_codecs()
+    opus = [c for c in codecs if c.encoding.lower() == "opus"]
+    assert opus, "Opus must appear in the SIP offer menu when libopus is available"
+    assert opus[0].clock_rate == 48000
+
+
+def test_supported_menu_includes_opus_when_available() -> None:
+    # ADR-0049: the inbound SIP answer's supported list also offers Opus when
+    # libopus is available (so an inbound SIP call can negotiate Opus).
+    from unittest.mock import patch  # noqa: PLC0415
+
+    from hermes_voip.adapter import _sip_supported_encodings  # noqa: PLC0415
+
+    with patch("hermes_voip.adapter._opus_sip_available", return_value=True):
+        supported = _sip_supported_encodings()
+    assert any(e.lower() == "opus" for e in supported)
+
+    with patch("hermes_voip.adapter._opus_sip_available", return_value=False):
+        supported_floor = _sip_supported_encodings()
+    assert not any(e.lower() == "opus" for e in supported_floor)
+    assert "G722" in supported_floor
 
 
 _FAKE_SDP_OFFER_G722 = (

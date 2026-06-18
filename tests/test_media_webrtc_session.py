@@ -438,3 +438,70 @@ async def test_run_handshake_always_ends_candidates() -> None:
     assert server_ice.end_of_candidates_signalled is True
     assert client_ice.end_of_candidates_signalled is True
     await asyncio.gather(server.close(), client.close())
+
+
+# ---------------------------------------------------------------------------
+# Outbound offerer mode (ADR-0049): for_outbound_offer() constructs the session
+# as the ICE-CONTROLLING DTLS CLIENT (a=setup:active) so place_call can carry
+# OUR own WebRTC offer over WSS.
+# ---------------------------------------------------------------------------
+
+
+def test_for_outbound_offer_is_ice_controlling_and_active() -> None:
+    """The outbound offerer is ICE-CONTROLLING (RFC 8445) and DTLS active (client)."""
+    captured: dict[str, object] = {}
+
+    def _factory(**kw: object) -> _FakeIce:
+        captured.update(kw)
+        return _FakeIce("ourUfrag01", "ourPwd012345678901234567")
+
+    session = WebRtcMediaSession.for_outbound_offer(ice_factory=_factory)
+    # The offerer is ICE-controlling (we drive nomination on outbound).
+    assert captured["ice_controlling"] is True
+    # We offer a concrete active role => we are the DTLS CLIENT (send ClientHello).
+    assert session.setup.value == "active"
+
+
+@pytest.mark.asyncio
+async def test_outbound_offerer_and_answerer_complete_dtls() -> None:
+    """An outbound offerer (active/controlling) + an answerer key matching SRTP.
+
+    The offerer is built via for_outbound_offer() (a=setup:active, ICE-controlling);
+    the answerer answers an active offer as passive (DTLS server). The real DTLS
+    handshake completes over the linked fake ICE pipe and the SRTP pair cross-decrypts.
+    """
+    offerer_ice, answerer_ice = _linked_ice(
+        ("offU", "offPwwwwwwwwwwwwww"), ("ansU", "ansPwwwwwwwwwwwwww")
+    )
+    offerer = WebRtcMediaSession.for_outbound_offer(
+        ice_factory=lambda **_kw: offerer_ice
+    )
+    # The answerer sees our active offer => it answers passive (DTLS server).
+    answerer = WebRtcMediaSession(
+        offer_setup=SetupRole("active"),
+        ice_factory=lambda **_kw: answerer_ice,
+    )
+    await asyncio.gather(offerer.prepare(), answerer.prepare())
+    assert offerer.setup.value == "active"
+    assert answerer.setup.value == "passive"
+
+    (o_in, o_out), (a_in, a_out) = await asyncio.gather(
+        offerer.run_handshake(
+            peer_fingerprint=answerer.fingerprint,
+            peer_ice_ufrag=answerer.ice_ufrag,
+            peer_ice_pwd=answerer.ice_pwd,
+        ),
+        answerer.run_handshake(
+            peer_fingerprint=offerer.fingerprint,
+            peer_ice_ufrag=offerer.ice_ufrag,
+            peer_ice_pwd=offerer.ice_pwd,
+        ),
+    )
+    for s in (o_in, o_out, a_in, a_out):
+        assert isinstance(s, SrtpSession)
+
+    pkt = RtpPacket(
+        payload_type=111, sequence_number=7, timestamp=0, ssrc=0x33, payload=b"out"
+    )
+    assert a_in.unprotect(o_out.protect(pkt)).payload == b"out"
+    await asyncio.gather(offerer.close(), answerer.close())

@@ -303,40 +303,6 @@ async def test_establish_selects_tls_transport_when_transport_tls() -> None:
     assert "ws_path" not in tls_ctor.call_args.kwargs
 
 
-@pytest.mark.asyncio
-async def test_place_call_rejected_on_wss_transport() -> None:
-    """Outbound over WSS is rejected loudly, never incoherent (ADR-0038 / 0032 §5).
-
-    place_call must raise (not put TLS-token SIP on the WebSocket) and send no INVITE.
-    """
-    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
-    from hermes_voip.originate import OutboundCallFailed  # noqa: PLC0415
-
-    transport = _FakeTransport()
-    manager = RegistrationManager(_gateway_config("wss"), transport)
-    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV_WSS))
-    with (
-        patch(
-            "hermes_voip.adapter.load_gateway_config",
-            return_value=_gateway_config("wss"),
-        ),
-        patch(
-            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
-        ),
-        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
-        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
-        patch("hermes_voip.adapter.WssSipTransport", return_value=transport),
-        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
-    ):
-        adapter = VoipAdapter(config)
-        await adapter.connect()
-        transport.sent.clear()  # drop the REGISTER; we only assert about the INVITE
-        with pytest.raises(OutboundCallFailed):
-            await adapter.place_call("1001")
-    # No INVITE was put on the WSS wire (the reject is pre-transaction).
-    assert not any(m.startswith("INVITE") for m in transport.sent)
-
-
 # ---------------------------------------------------------------------------
 # 3 + 4: a SAVPF INVITE over a WSS gateway routes to the is_webrtc path and the
 # inbound dialog + answer advertise the WSS Via transport (not TLS).
@@ -394,22 +360,35 @@ class _FakeWebRtcSession:
     def __init__(
         self,
         *,
-        offer_setup: SetupRole | None,
+        offer_setup: SetupRole | None = None,
         stun_urls: tuple[str, ...] = (),
+        built_for_outbound: bool = False,
         **_kw: object,
     ) -> None:
         self.offer_setup = offer_setup
         self.prepared = False
         self.handshake_args: dict[str, object] | None = None
+        self.built_for_outbound = built_for_outbound
         self.ice = MagicMock(name="ice_pipe")
         _FakeWebRtcSession.last = self
+
+    @classmethod
+    def for_outbound_offer(cls, **_kw: object) -> _FakeWebRtcSession:
+        """Mirror WebRtcMediaSession.for_outbound_offer (ADR-0049): the offerer side."""
+        return cls(built_for_outbound=True)
+
+    @property
+    def setup_for_outbound(self) -> SetupRole:
+        return SetupRole("active")
 
     async def prepare(self) -> None:
         self.prepared = True
 
     @property
     def setup(self) -> SetupRole:
-        return SetupRole("passive")
+        # The outbound offerer offers active (DTLS client); the inbound answerer
+        # answers passive (DTLS server).
+        return SetupRole("active" if self.built_for_outbound else "passive")
 
     @property
     def fingerprint(self) -> Fingerprint:
@@ -544,3 +523,79 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
     finally:
         in_call.set()
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# 5: outbound WebRTC origination over WSS (ADR-0049 — lifts ADR-0032 §5 / 0038 §4).
+# place_call on a wss gateway sends OUR DTLS/ICE/Opus offer, not a 501 reject.
+# ---------------------------------------------------------------------------
+
+
+def _mark_registered(manager: RegistrationManager) -> None:
+    """Mark the gateway's first extension registered so place_call can source it."""
+    for state in manager._by_extension.values():
+        state.registered = True
+
+
+@pytest.mark.asyncio
+async def test_place_call_over_wss_sends_webrtc_offer_invite() -> None:
+    """Outbound over WSS now carries OUR WebRTC offer (ADR-0049 lifts the deferral).
+
+    place_call on a wss gateway no longer returns 501: it sends an RFC-7118 INVITE
+    (WSS Via) carrying a UDP/TLS/RTP/SAVPF offer with our DTLS fingerprint, a=setup,
+    ICE creds + candidates, and the Opus rtpmap — never a TLS-token SDES INVITE.
+    """
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway_config("wss"), transport)
+    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV_WSS))
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=_gateway_config("wss"),
+        ),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.WssSipTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+        _mark_registered(manager)
+        transport.sent.clear()  # drop the REGISTER; we only assert about the INVITE
+
+        with patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession):
+            call_task = asyncio.ensure_future(adapter.place_call("1001"))
+            try:
+                # place_call awaits the 2xx; assert only the INVITE on the wire.
+                await _until(
+                    lambda: any(m.startswith("INVITE") for m in transport.sent)
+                )
+            finally:
+                call_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await call_task
+
+    invites = [m for m in transport.sent if m.startswith("INVITE")]
+    assert invites, "no INVITE was sent over the WSS transport"
+    invite = SipRequest.parse(invites[0])
+    # The Via reflects the WSS transport (RFC 7118), never TLS.
+    assert "SIP/2.0/WSS" in (invite.header("Via") or "")
+    assert "SIP/2.0/TLS" not in (invite.header("Via") or "")
+    # The body is a WebRTC offer (our own DTLS/ICE/Opus offer).
+    offer = SessionDescription.parse(invite.body or "")
+    assert offer.audio is not None
+    assert offer.audio.is_webrtc
+    assert offer.audio.fingerprint is not None
+    assert offer.audio.setup is not None
+    assert offer.audio.setup.value == "active"
+    assert offer.audio.ice_ufrag is not None
+    assert any(c.encoding.lower() == "opus" for c in offer.audio.codecs)
+    # The outbound offerer is the ICE-controlling / DTLS-active side.
+    session = _FakeWebRtcSession.last
+    assert session is not None
+    assert session.built_for_outbound is True

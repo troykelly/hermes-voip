@@ -185,7 +185,7 @@ files = ["src", "tests"]
 # than launder it with ``# type: ignore[import-not-found]`` (rule 17), it joins the
 # hermes-contract type-check (which installs the extra and resolves the real
 # symbols via ``follow_untyped_imports``), same as ``adapter.py``.
-exclude = '(^|/)(src/hermes_voip/adapter\.py|src/hermes_voip/voip_tools\.py|tests/test_adapter\.py|tests/test_adapter_caller_modes\.py|tests/test_adapter_reconnect\.py|tests/test_adapter_webrtc\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py|tests/e2e/test_inbound_webrtc_call\.py)$'
+exclude = '(^|/)(src/hermes_voip/adapter\.py|src/hermes_voip/voip_tools\.py|tests/test_adapter\.py|tests/test_adapter_caller_modes\.py|tests/test_adapter_reconnect\.py|tests/test_adapter_webrtc\.py|tests/test_adapter_wss_signalling\.py|tests/test_media_concurrency_hermes\.py|tests/e2e/test_inbound_call\.py|tests/e2e/test_concurrent_inbound_calls\.py|tests/e2e/test_outbound_call\.py|tests/e2e/test_inbound_webrtc_call\.py)$'
 
 # hermes-agent ships no ``py.typed``. When the ``hermes`` extra IS installed
 # (the hermes-contract CI job type-checks ``adapter.py`` + ``test_adapter.py``

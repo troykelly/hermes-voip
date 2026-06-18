@@ -288,10 +288,20 @@ class EchoCanceller:
                     w[k] += step * xv
 
         # Advance the read cursor by this frame's near-end sample count (1:1 with the
-        # far-end), then trim FIFO samples that no future window can reach (older than
-        # the next frame's oldest window start), shifting the cursor by the trim count
-        # so absolute alignment is preserved. Bounds the FIFO across a long call.
-        self._read = read + n
+        # far-end) — but NEVER past the available far-end (``len(x)``). On a real call
+        # the inbound pump and the greeting run concurrently, so near-end (RTP /
+        # comfort noise) can arrive BEFORE the first outbound TTS; those samples have
+        # no echo (the agent has not spoken) and pass through, and the cursor must not
+        # run off the end of the (still-empty/short) FIFO — otherwise when the
+        # greeting's echo finally arrives the window would point PAST the FIFO and
+        # never cancel (cross-vendor review: a 200 ms inbound pre-roll left the echo
+        # uncancelled). Pinning the cursor at the FIFO end while the reference lags
+        # keeps the window on the newest available reference; the NLMS taps (spanning
+        # ``flen`` back) then find the true echo delay once both streams are live.
+        self._read = min(read + n, len(x))
+        # Trim FIFO samples no future window can reach (older than the next frame's
+        # oldest window start), shifting the cursor by the trim count so the alignment
+        # is preserved. Bounds the FIFO across a long call.
         trim = self._read - self._keep_behind
         if trim > 0:
             del x[:trim]

@@ -104,7 +104,12 @@ span the echo round-trip delay forward from the cursor. Anchoring the window on 
 sample instead — the naive choice — points it at *future* TTS uncorrelated with the current echo,
 which **diverges** the filter and **mis-fires the double-talk guard** (this was found and fixed in
 cross-vendor review by an engine-level test where TX leads RX by the jitter buffer + scheduling; a
-unit test with 1:1 interleave does not exercise it).
+unit test with 1:1 interleave does not exercise it). The cursor is also **clamped to the available
+far-end** (`min(read+n, len(x))`): the *other* live ordering is inbound arriving **before** the
+first outbound (the pump and greeting start concurrently, and TTS has synthesis latency) — those
+pre-roll near-end samples have no echo and pass through, and the cursor must not run off the end of
+the still-empty FIFO, or the greeting's later echo would land past the FIFO and never cancel (a
+second cross-vendor finding, reproduced with a 200 ms inbound pre-roll; pinned + regression-tested).
 
 **Convergence window (the residual risk, honestly stated).** A fresh per-call canceller starts with
 zeroed taps, so for the first few hundred ms of the greeting — before the filter has learned the

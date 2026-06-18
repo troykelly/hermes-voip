@@ -212,6 +212,47 @@ def test_cancels_delayed_broadband_echo_when_window_spans_the_delay() -> None:
     )
 
 
+def test_cancels_echo_when_inbound_starts_before_outbound() -> None:
+    """Near-end arriving BEFORE the first reference does not break later cancellation.
+
+    On a real call the inbound pump and the greeting playout start concurrently, so
+    near-end (RTP / comfort noise) can arrive before the first outbound TTS frame.
+    Those pre-roll samples have no echo (the agent has not spoken) and must pass
+    through — and crucially the read cursor must NOT run off the end of the (empty)
+    far-end FIFO, or when the greeting's echo finally arrives the window would point
+    past the FIFO and never cancel (cross-vendor review: a 200 ms inbound pre-roll
+    reproduced exactly this — the echo tail stayed at 100%).
+    """
+    rate = _G711_RATE
+    block = 160
+    pre_roll_frames = 12  # ~240 ms of inbound before any outbound
+    n = rate * 2
+    reference = _noise(n, amplitude=0.3, seed=21)
+    delay = (rate * 30) // 1000  # 30 ms echo delay
+    echo = _delayed_echo(reference, delay=delay, gain=0.6)
+
+    aec = EchoCanceller(sample_rate=rate, filter_len=512, bulk_delay=0, mu=0.5)
+    residual = bytearray()
+    # Phase 1: inbound silence arrives with NO reference pushed yet (the pre-roll).
+    silence = [0] * block
+    for _ in range(pre_roll_frames):
+        residual += aec.cancel(_pack(silence))
+    # Phase 2: now the outbound starts; push reference + cancel the delayed echo 1:1.
+    for off in range(0, n, block):
+        aec.push_reference(_pack(reference[off : off + block]), sample_rate=rate)
+        residual += aec.cancel(_pack(echo[off : off + block]))
+
+    echo_rms = _rms(_pack(echo))
+    # Measure the converged tail of the phase-2 residual (skip the pre-roll + ramp-up).
+    tail = residual[len(residual) - n :]  # the last ~2 s (phase-2 region)
+    tail_rms = _rms(tail[len(tail) // 2 :])
+    assert echo_rms > 200.0
+    assert tail_rms < echo_rms * 0.25, (
+        f"echo not cancelled after an inbound pre-roll: "
+        f"residual={tail_rms:.1f} echo={echo_rms:.1f}"
+    )
+
+
 def test_disabled_passthrough_does_not_cancel() -> None:
     """A divergence guard sanity check: with no reference pushed, near-end is intact.
 

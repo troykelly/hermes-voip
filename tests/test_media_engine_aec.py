@@ -106,8 +106,9 @@ async def _make_engine(*, aec_enabled: bool) -> tuple[RtpMediaTransport, _Record
         aec_mu=0.5,
     )
     await engine.connect()
-    engine._transport = _Recorder()  # silence the TX socket; recorder is fine
-    return engine, engine._transport  # type: ignore[return-value]
+    recorder = _Recorder()  # silence the TX socket; the recorder satisfies the sink
+    engine._transport = recorder
+    return engine, recorder
 
 
 @pytest.mark.asyncio

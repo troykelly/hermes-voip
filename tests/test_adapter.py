@@ -15,6 +15,7 @@ ML); credentials and hostnames are obvious fakes (``pbx.example.test`` / ext
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1605,6 +1606,98 @@ async def test_inbound_invite_sdp_answer_advertises_real_local_rtp_address() -> 
     )
     assert "127.0.0.1" not in ok.body, (
         f"SDP answer still advertises the 127.0.0.1 loopback placeholder:\n{ok.body}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADR-0053 Stage 1: an inbound RTP/SAVP (SDES) offer is answered with SRTP — our
+# OWN answer key in a=crypto — not rejected with 488. The fake SDES key is
+# computed at runtime (sequential bytes 0..29) so no high-entropy key literal
+# appears in this file (the gitleaks allowlist is path-scoped to test_sdp.py).
+# ---------------------------------------------------------------------------
+
+# The offerer's fake SDES master key||salt (30 octets for AES_CM_128_HMAC_SHA1_80),
+# built at runtime so it is not a source literal the secret-scanner would flag.
+_OFFER_SDES_KEY = base64.b64encode(bytes(range(30))).decode("ascii")
+_FAKE_SDP_OFFER_SAVP = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/SAVP 0 8\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_OFFER_SDES_KEY}\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite_savp(call_id: str) -> str:
+    content_length = len(_FAKE_SDP_OFFER_SAVP.encode("utf-8"))
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bK{new_tag()}\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:caller@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:caller@127.0.0.1:5061;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER_SAVP}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_savp_offer_answered_with_sdes_srtp() -> None:
+    """ADR-0053 Stage 1: an RTP/SAVP (SDES) offer is answered with SRTP, not 488.
+
+    The answer must be RTP/SAVP carrying an ``a=crypto`` with OUR OWN key (RFC 4568
+    §6.1 — each direction uses the sender's key), distinct from the offerer's key.
+    Today the adapter omits the answer key, so this offer is rejected with 488 and
+    no 200 OK is sent (the dormant-SDES wiring gap this stage closes).
+    """
+    transport = _FakeTransport(local_sent_by="172.23.0.2:55728")
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite_savp(call_id))
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                local_port=20002,
+                inbound_sample_rate=8_000,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    ok = _sent_200_ok(transport)
+    # The answer is a secured RTP/SAVP stream with exactly one a=crypto line.
+    assert "m=audio 20002 RTP/SAVP 0\r\n" in ok.body, (
+        f"SDP answer is not RTP/SAVP (SDES); body:\n{ok.body}"
+    )
+    assert ok.body.count("a=crypto:") == 1, f"expected one a=crypto; body:\n{ok.body}"
+    assert "AES_CM_128_HMAC_SHA1_80 inline:" in ok.body
+    # Our answer key must be OUR OWN, never an echo of the offerer's key.
+    assert f"inline:{_OFFER_SDES_KEY}" not in ok.body, (
+        "answer echoes the offerer's SDES key instead of generating our own"
     )
 
 

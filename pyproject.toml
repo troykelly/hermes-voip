@@ -240,6 +240,19 @@ ignore_missing_imports = true
 module = ["opuslib.*"]
 ignore_missing_imports = true
 
+# ``plugins.plugin_utils`` is a Hermes-RUNTIME module (the documented
+# ``lazy_singleton`` helper) that is NOT vendored into the default (no-hermes) test
+# environment. ``_lazy_singleton.py`` imports it through a GUARDED try/except and
+# binds it to a narrow local Protocol (``_LazySingletonFactory``) — so NO ``Any``
+# crosses the boundary regardless of whether the module is present. ``ignore_missing_imports``
+# is used ONLY as the optional-runtime guard (so the guarded import resolves under
+# mypy when the runtime is absent), exactly like the ``websockets`` / ``opuslib``
+# overrides above: the runtime-present behaviour is the documented helper, the
+# runtime-absent behaviour is the tested stdlib fallback (ADR-0046).
+[[tool.mypy.overrides]]
+module = ["plugins.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------

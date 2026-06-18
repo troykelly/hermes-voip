@@ -516,6 +516,91 @@ async def test_out_of_dialog_options_is_answered_200_ok() -> None:
         await server.stop()
 
 
+async def test_crlf_keepalive_ping_does_not_drop_connection() -> None:
+    """An RFC 5626 §4.4 / RFC 7118 CRLF keepalive frame must not crash the reader.
+
+    Regression: a real Asterisk/Grandstream-UCM WebRTC edge sends bare CRLF keepalive
+    frames over the WSS signalling channel. The reader fed each text frame straight to
+    ``SipRequest.parse``, which raised ``not a SIP request-line: ''`` on the empty
+    request-line, ending the reader task and dropping the registration — inbound calls
+    then went to voicemail. The keepalive frame must be absorbed; the connection (and
+    thus the registration) survives, proven by a following OPTIONS still being answered.
+    """
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = _make_transport(server.port)
+    gateway = _gateway()
+    manager = RegistrationManager(gateway, transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        # The gateway sends a double-CRLF keepalive PING, then a normal OPTIONS.
+        await server.push("\r\n\r\n")
+        await server.push(_inbound_options(to_user="1000"))
+        # If the keepalive crashed the reader, the OPTIONS 200 OK never arrives.
+        response_frame = await server.wait_for_received(
+            lambda f: f.startswith("SIP/2.0 200 "), timeout=3.0
+        )
+        assert "200 OK" in response_frame
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_crlf_keepalive_ping_is_answered_with_crlf_pong() -> None:
+    """A double-CRLF keepalive PING is answered with a single-CRLF PONG (RFC 5626)."""
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = _make_transport(server.port)
+    gateway = _gateway()
+    manager = RegistrationManager(gateway, transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push("\r\n\r\n")
+        pong = await server.wait_for_received(lambda f: f == "\r\n", timeout=3.0)
+        assert pong == "\r\n"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_empty_keepalive_frame_is_ignored() -> None:
+    """An empty text frame (degenerate keepalive) is dropped, not parsed as SIP."""
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = _make_transport(server.port)
+    gateway = _gateway()
+    manager = RegistrationManager(gateway, transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push("")  # empty frame must not crash the reader
+        await server.push(_inbound_options(to_user="1000"))
+        response_frame = await server.wait_for_received(
+            lambda f: f.startswith("SIP/2.0 200 "), timeout=3.0
+        )
+        assert "200 OK" in response_frame
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 async def test_in_dialog_request_routes_to_consumer() -> None:
     """An in-dialog BYE (WS frame) routes to the registered DialogConsumer."""
     handled: list[SipRequest] = []

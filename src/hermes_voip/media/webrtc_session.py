@@ -125,7 +125,7 @@ class _IceFactory(Protocol):
     (a test fake) still satisfies the Protocol structurally.
     """
 
-    def __call__(
+    def __call__(  # noqa: PLR0913 -- independent ICE config kwargs (role/STUN/TURN/IP-family)
         self,
         *,
         ice_controlling: bool,
@@ -133,18 +133,22 @@ class _IceFactory(Protocol):
         turn_urls: tuple[str, ...] = (),
         turn_username: str | None = None,
         turn_password: str | None = None,
+        use_ipv4: bool = True,
+        use_ipv6: bool = True,
     ) -> _IcePipe:
-        """Construct an ICE pipe for the given role, STUN, and (optional) TURN."""
+        """Construct an ICE pipe for the given role, STUN, TURN, and IP families."""
         ...
 
 
-def _default_ice_factory(
+def _default_ice_factory(  # noqa: PLR0913 -- independent ICE config kwargs (role/STUN/TURN/IP-family)
     *,
     ice_controlling: bool,
     stun_urls: tuple[str, ...],
     turn_urls: tuple[str, ...] = (),
     turn_username: str | None = None,
     turn_password: str | None = None,
+    use_ipv4: bool = True,
+    use_ipv6: bool = True,
 ) -> _IcePipe:
     """Build the real :class:`~hermes_voip.media.ice.IceConnection`.
 
@@ -157,6 +161,8 @@ def _default_ice_factory(
             ⇒ no relay).
         turn_username: TURN long-term username (required when ``turn_urls`` is set).
         turn_password: TURN long-term password (required when ``turn_urls`` is set).
+        use_ipv4: Gather IPv4 ICE candidates (the fallback family; ADR-0043).
+        use_ipv6: Gather IPv6 ICE candidates (the preferred family; ADR-0043).
 
     Returns:
         A new :class:`IceConnection`.
@@ -167,6 +173,8 @@ def _default_ice_factory(
         turn_urls=turn_urls,
         turn_username=turn_username,
         turn_password=turn_password,
+        use_ipv4=use_ipv4,
+        use_ipv6=use_ipv6,
     )
 
 
@@ -210,7 +218,7 @@ class WebRtcMediaSession:
         cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
     """
 
-    def __init__(  # noqa: PLR0913 -- independent keyword config (setup/STUN/TURN/factory/cipher)
+    def __init__(  # noqa: PLR0913 -- independent keyword config (setup/STUN/TURN/IP-family/factory/cipher)
         self,
         *,
         offer_setup: SetupRole | None,
@@ -218,10 +226,17 @@ class WebRtcMediaSession:
         turn_urls: tuple[str, ...] = (),
         turn_username: str | None = None,
         turn_password: str | None = None,
+        use_ipv4: bool = True,
+        use_ipv6: bool = True,
         ice_factory: _IceFactory = _default_ice_factory,
         cipher_list: bytes | None = None,
     ) -> None:
-        """Pick the DTLS role from the offer and build the DTLS + ICE objects."""
+        """Pick the DTLS role from the offer and build the DTLS + ICE objects.
+
+        ``use_ipv4`` / ``use_ipv6`` select the ICE address families to gather
+        (IPv6-first, ADR-0043): both default on, so the agent gathers IPv6 (which
+        :attr:`ice_candidates` lists first) and IPv4 as the fallback family.
+        """
         self._setup = answer_setup_for_offer(offer_setup)
         role = DtlsRole.CLIENT if self._setup.value == "active" else DtlsRole.SERVER
         self._dtls = DtlsEndpoint(role=role, cipher_list=cipher_list)
@@ -232,6 +247,8 @@ class WebRtcMediaSession:
             turn_urls=turn_urls,
             turn_username=turn_username,
             turn_password=turn_password,
+            use_ipv4=use_ipv4,
+            use_ipv6=use_ipv6,
         )
         self._prepared = False
 
@@ -278,10 +295,18 @@ class WebRtcMediaSession:
         :class:`hermes_voip.sdp.IceCandidate` (``address``/``typ`` + ``render()``)
         via the canonical SDP ``a=candidate`` string both agree on — the integration
         point the ICE module flags (its ``to_sdp`` ↔ sdp's ``parse``).
+
+        IPv6-first (ADR-0043): IPv6 candidates are listed before IPv4 ones (stable
+        within each family), so the answer advertises the IPv6 path first. ICE
+        nomination is still driven by RFC 8445 candidate *priority* on the
+        controlling peer; this ordering makes our family preference explicit and
+        deterministic in the SDP.
         """
-        return [
+        candidates = [
             SdpIceCandidate.parse(cand.to_sdp()) for cand in self._ice.local_candidates
         ]
+        # Stable partition: IPv6 (address contains a ':') first, then IPv4.
+        return sorted(candidates, key=lambda c: 0 if ":" in c.address else 1)
 
     @property
     def ice(self) -> _IcePipe:

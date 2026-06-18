@@ -237,7 +237,7 @@ class _IceFactory(Protocol):
     :class:`_LinkedIce` satisfies the session's ``_IcePipe`` surface structurally.
     """
 
-    def __call__(
+    def __call__(  # noqa: PLR0913 -- ICE factory config kwargs (role/STUN/TURN/IP-family)
         self,
         *,
         ice_controlling: bool,
@@ -245,6 +245,8 @@ class _IceFactory(Protocol):
         turn_urls: tuple[str, ...] = (),
         turn_username: str | None = None,
         turn_password: str | None = None,
+        use_ipv4: bool = True,
+        use_ipv6: bool = True,
     ) -> _LinkedIce:
         """Build an ICE pipe for the given role, STUN, and (optional) TURN."""
         ...
@@ -402,13 +404,15 @@ class FakeWebRtcGateway:
         test-wiring bug.
         """
 
-        def _factory(
+        def _factory(  # noqa: PLR0913 -- ICE factory config kwargs (role/STUN/TURN/IP-family)
             *,
             ice_controlling: bool,
             stun_urls: tuple[str, ...],
             turn_urls: tuple[str, ...] = (),
             turn_username: str | None = None,
             turn_password: str | None = None,
+            use_ipv4: bool = True,
+            use_ipv6: bool = True,
         ) -> _LinkedIce:
             if self._adapter_ice_handed_out:
                 msg = "adapter ICE pipe already handed out (one call per gateway)"
@@ -581,13 +585,15 @@ class FakeWebRtcGateway:
     def _peer_ice_factory(self) -> _IceFactory:
         """An ICE factory returning the peer's half of the linked pipe."""
 
-        def _factory(
+        def _factory(  # noqa: PLR0913 -- ICE factory config kwargs (role/STUN/TURN/IP-family)
             *,
             ice_controlling: bool,
             stun_urls: tuple[str, ...],
             turn_urls: tuple[str, ...] = (),
             turn_username: str | None = None,
             turn_password: str | None = None,
+            use_ipv4: bool = True,
+            use_ipv6: bool = True,
         ) -> _LinkedIce:
             return self._peer_ice
 

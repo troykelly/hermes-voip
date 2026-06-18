@@ -295,6 +295,80 @@ def test_session_threads_turn_params_to_factory() -> None:
     assert captured["turn_password"] == "relay-secret"
 
 
+def test_session_threads_ipv6_flags_to_factory() -> None:
+    """WebRtcMediaSession passes the IPv6/IPv4 family flags to ICE (ADR-0043)."""
+    captured: dict[str, object] = {}
+
+    def _factory(**kwargs: object) -> _FakeIce:
+        captured.update(kwargs)
+        return _FakeIce("u", "pwwwwwwwwwwwwwwwww")
+
+    WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"),
+        use_ipv4=False,
+        use_ipv6=True,
+        ice_factory=_factory,
+    )
+    assert captured["use_ipv4"] is False
+    assert captured["use_ipv6"] is True
+
+
+def test_session_defaults_are_ipv6_first_dual_stack() -> None:
+    """Default construction gathers both families (IPv6-first), ADR-0043."""
+    captured: dict[str, object] = {}
+
+    def _factory(**kwargs: object) -> _FakeIce:
+        captured.update(kwargs)
+        return _FakeIce("u", "pwwwwwwwwwwwwwwwww")
+
+    WebRtcMediaSession(offer_setup=SetupRole("actpass"), ice_factory=_factory)
+    assert captured["use_ipv6"] is True
+    assert captured["use_ipv4"] is True
+
+
+class _MixedFamilyIce(_FakeIce):
+    """A fake ICE that returns an IPv4 host candidate BEFORE an IPv6 one."""
+
+    @property
+    def local_candidates(self) -> list[IceCandidate]:
+        return [
+            IceCandidate(
+                foundation="candidate:1",
+                component=1,
+                transport="UDP",
+                priority=2130706000,
+                host="192.0.2.10",
+                port=50000,
+                type="host",
+                related_address=None,
+                related_port=None,
+            ),
+            IceCandidate(
+                foundation="candidate:2",
+                component=1,
+                transport="UDP",
+                priority=2130706431,
+                host="2001:db8::10",
+                port=50001,
+                type="host",
+                related_address=None,
+                related_port=None,
+            ),
+        ]
+
+
+def test_ice_candidates_are_ipv6_first() -> None:
+    """ice_candidates lists IPv6 before IPv4 regardless of gather order (ADR-0043)."""
+    ice = _MixedFamilyIce("u", "pwwwwwwwwwwwwwwwww")
+    session = WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"), ice_factory=lambda **_kw: ice
+    )
+    families = [(":" in c.address) for c in session.ice_candidates]
+    # All IPv6 (True) must come before any IPv4 (False).
+    assert families == sorted(families, reverse=True)
+    assert families[0] is True  # IPv6 first even though it was gathered second
+
+
 @pytest.mark.asyncio
 async def test_run_handshake_signals_end_of_candidates_by_default() -> None:
     """run_handshake signals end-of-candidates to ICE (non-trickle peer)."""

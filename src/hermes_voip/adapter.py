@@ -1780,9 +1780,14 @@ class VoipAdapter(BasePlatformAdapter):
             raise _MediaNegotiationRejected from exc
 
         # The offered a=setup decides our DTLS role; WebRtcMediaSession picks it.
+        # STUN gathers srflx candidates; TURN (ADR-0034) gathers a relay candidate
+        # when operator-provided credentials are configured (empty ⇒ host/STUN only).
         session = WebRtcMediaSession(
             offer_setup=audio.setup,
             stun_urls=media_cfg.ice_stun_urls,
+            turn_urls=media_cfg.ice_turn_urls,
+            turn_username=media_cfg.ice_turn_username,
+            turn_password=media_cfg.ice_turn_password,
         )
         try:
             await session.prepare()  # gather ICE; expose fingerprint/setup/creds
@@ -1839,6 +1844,10 @@ class VoipAdapter(BasePlatformAdapter):
         # answered, the ICE session is closed, and _MediaNegotiationRejected is raised
         # so the inbound handler's finally tears the answered call down (no CallLoop on
         # dead media). The mandatory attributes were already validated pre-answer.
+        # Trickle (ADR-0034): we advertise a=ice-options:trickle in the answer (we
+        # ACCEPT trickle), but we always act on the offer's candidate set + end
+        # candidates — there is no in-dialog SIP-INFO transport (RFC 8840) to receive
+        # trickled candidates, so withholding the end marker would hang ICE.
         try:
             srtp_inbound, srtp_outbound = await session.run_handshake(
                 peer_fingerprint=peer_fingerprint,

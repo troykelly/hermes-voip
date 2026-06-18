@@ -1,7 +1,7 @@
 # ADR-0032: WebRTC media wiring (ICE + DTLS-SRTP) and the Opus wire codec
 
 - **Date:** 2026-06-17
-- **Status:** Accepted
+- **Status:** Accepted (§5 TURN + trickle deferrals closed by ADR-0034)
 - **Deciders:** agent session (WebRTC lane) — operator-directed
 
 ## Context
@@ -130,10 +130,14 @@ before.
   follow-up. This is a real, named boundary, not a stub.
 - **Video stays deferred per ADR-0018** (the WebRTC answer is audio-only; an
   `m=video` line in the offer is declined). Forward-compat unaffected.
-- **TURN relay** stays deferred per ADR-0016 §6 (`HERMES_VOIP_ICE_TURN_*` reserved,
-  unused). Host + srflx candidates only.
-- **Trickle ICE** stays non-trickle MVP (all candidates in the answer; interoperates
-  with trickle peers per RFC 8838 §3).
+- **TURN relay** was deferred per ADR-0016 §6; **now wired in ADR-0034**
+  (`HERMES_VOIP_ICE_TURN_*` are consumed; aioice gathers a relay candidate). This lane
+  remained host + srflx only.
+- **Trickle ICE** was non-trickle MVP here; **ADR-0034 adds the trickle SDP/ICE
+  primitives** (`a=ice-options:trickle`, `a=end-of-candidates`, half-trickle answer +
+  end-of-candidates control). The in-dialog SIP-INFO trickle transport (RFC 8840)
+  remains a named follow-up. A full candidate set in the initial answer still
+  interoperates with trickle peers per RFC 8838.
 - **Live validation** against a real WebRTC client + the redeployed gateway is
   pending the operator's redeploy; this lane lands the wiring + the in-process
   (loopback ICE, in-memory DTLS pump, Opus round-trip) evidence.

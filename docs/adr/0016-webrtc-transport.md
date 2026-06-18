@@ -1,7 +1,7 @@
 # ADR-0016: WebRTC transport — SIP-over-WSS signalling + DTLS-SRTP media + ICE
 
 - **Date:** 2026-06-16
-- **Status:** Accepted
+- **Status:** Accepted (TURN + trickle-SDP-primitive deferrals closed by ADR-0034)
 - **Deciders:** agent session (transport architecture), operator direction
 
 ## Context
@@ -183,14 +183,18 @@ nominated UDP path to the DTLS+SRTP engine.
   the Initial Offer"). This is fully interoperable with trickle-capable gateways. Trickle
   / half-trickle is a later optimisation, not MVP.
 - **Candidate types, phased.** **MVP: host candidates always, server-reflexive (srflx)
-  via a configured STUN server.** **TURN (relay) is deferred** — it needs an allocation +
-  credentials + an operated/contracted TURN server (rule 40/41 infra), out of MVP scope;
-  added only if a real call needs it. STUN server config: `HERMES_VOIP_ICE_STUN_URLS`
+  via a configured STUN server.** TURN (relay) was deferred here — it needs
+  credentials + an operated/contracted TURN server (rule 40/41 infra); **now wired in
+  ADR-0034** (the plugin consumes operator-provided `HERMES_VOIP_ICE_TURN_*`
+  credentials and aioice gathers the relay candidate; the plugin does not run a TURN
+  server). STUN server config: `HERMES_VOIP_ICE_STUN_URLS`
   (e.g. `stun:stun.example.test:3478`); empty → host-only ICE.
 - **SDP attributes (RFC 8839).** Add `a=ice-ufrag`, `a=ice-pwd`, one `a=candidate` line
   per gathered candidate (`foundation component-id transport priority address port typ
-  host|srflx [raddr … rport …]`), `a=rtcp-mux`, and `a=ice-options:ice2`. (Trickle tag
-  and `a=end-of-candidates` are added with trickle later.)
+  host|srflx [raddr … rport …]`), `a=rtcp-mux`, and `a=ice-options:ice2`. (The trickle
+  `a=ice-options:trickle` tag and `a=end-of-candidates` SDP primitives + half-trickle
+  answer landed in **ADR-0034**; the in-dialog SIP-INFO trickle *transport*, RFC 8840,
+  remains a named follow-up there.)
 - **ICE subsumes comedia (ADR-0015).** ICE connectivity checks are STUN binding requests
   on the media path — the principled superset of "send to the source of received media":
   ICE additionally _selects_ the working pair by priority and keeps the NAT binding alive
@@ -258,9 +262,9 @@ into a small `WebrtcConfig`, defaulted so non-WSS installs ignore them):
 
 - `HERMES_SIP_WS_PATH` — WebSocket upgrade path (default `/ws`).
 - `HERMES_VOIP_ICE_STUN_URLS` — comma-separated `stun:` URLs; empty → host-only ICE.
-- `HERMES_VOIP_ICE_TURN_URLS` / `…_TURN_USERNAME` / `…_TURN_PASSWORD` — **reserved,
-  deferred** (TURN is post-MVP); parsed but unused until the TURN PR lands, so the schema
-  is stable.
+- `HERMES_VOIP_ICE_TURN_URLS` / `…_TURN_USERNAME` / `…_TURN_PASSWORD` — TURN relay
+  credentials, **wired in ADR-0034** (the plugin consumes them and aioice gathers a
+  relay candidate; the plugin does not run a TURN server). Empty → no relay candidate.
 
 Gateway endpoint: `wss://${HERMES_SIP_HOST}:${HERMES_SIP_PORT}${HERMES_SIP_WS_PATH}`
 (port default `443` for `wss`, already in `config.py`). All connection facts stay in the
@@ -270,10 +274,12 @@ gitignored `.env` / 1Password; tests use `pbx.example.test` / ext `1000` /
 **Honest MVP boundary.** Ships first: WSS signalling (REGISTER + inbound INVITE +
 BYE + the keepalive answers), DTLS-SRTP with `AES_CM_128_HMAC_SHA1_80/32`, full
 non-trickle ICE with host + STUN-srflx candidates, half-duplex media (ADR-0008 Phase 1,
-same as TLS). **Deferred (named, not silently dropped):** TURN/relay candidates, trickle
-& half-trickle ICE, SRTCP/`a=rtcp-mux` feedback messages beyond mux, multiple `m=`
-lines/BUNDLE, and any DTLS-SRTP suite outside the two AES-CM-128 suites. Each is a
-follow-up task, not part of "WebRTC works".
+same as TLS). **Deferred (named, not silently dropped):** ~~TURN/relay candidates~~
+(landed in **ADR-0034**), ~~trickle & half-trickle ICE SDP primitives~~ (landed in
+**ADR-0034**; the in-dialog SIP-INFO trickle transport per RFC 8840 is still a named
+follow-up), SRTCP/`a=rtcp-mux` feedback messages beyond mux, multiple `m=` lines/BUNDLE,
+and any DTLS-SRTP suite outside the two AES-CM-128 suites. Each is a follow-up task, not
+part of "WebRTC works".
 
 ### 7. Build plan — ordered, independently-testable PRs
 

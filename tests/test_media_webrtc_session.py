@@ -254,3 +254,113 @@ async def test_close_closes_the_ice_pipe() -> None:
     await session.prepare()
     await session.close()
     assert ice.closed is True
+
+
+# ---------------------------------------------------------------------------
+# TURN threading + trickle end-of-candidates control (ADR-0034)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingIce(_FakeIce):
+    """A fake ICE that records the end-of-candidates signal (None marker)."""
+
+    def __init__(self, ufrag: str, pwd: str) -> None:
+        super().__init__(ufrag, pwd)
+        self.end_of_candidates_signalled = False
+
+    async def add_remote_candidate(self, candidate: IceCandidate | None) -> None:
+        if candidate is None:
+            self.end_of_candidates_signalled = True
+        await super().add_remote_candidate(candidate)
+
+
+def test_session_threads_turn_params_to_factory() -> None:
+    """WebRtcMediaSession passes TURN url+creds to its ICE factory (ADR-0034)."""
+    captured: dict[str, object] = {}
+
+    def _factory(**kwargs: object) -> _FakeIce:
+        captured.update(kwargs)
+        return _FakeIce("u", "pwwwwwwwwwwwwwwwww")
+
+    WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"),
+        stun_urls=("stun:stun.example.test:3478",),
+        turn_urls=("turn:turn.example.test:3478",),
+        turn_username="relay-user",
+        turn_password="relay-secret",
+        ice_factory=_factory,
+    )
+    assert captured["turn_urls"] == ("turn:turn.example.test:3478",)
+    assert captured["turn_username"] == "relay-user"
+    assert captured["turn_password"] == "relay-secret"
+
+
+@pytest.mark.asyncio
+async def test_run_handshake_signals_end_of_candidates_by_default() -> None:
+    """run_handshake signals end-of-candidates to ICE (non-trickle peer)."""
+    server_ice = _RecordingIce("svrU", "svrPwwwwwwwwwwwwww")
+    client_ice = _RecordingIce("cliU", "cliPwwwwwwwwwwwwww")
+    server_ice.peer, client_ice.peer = client_ice, server_ice
+
+    server = WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"), ice_factory=lambda **_kw: server_ice
+    )
+    client = WebRtcMediaSession(
+        offer_setup=SetupRole("passive"), ice_factory=lambda **_kw: client_ice
+    )
+    await asyncio.gather(server.prepare(), client.prepare())
+    await asyncio.gather(
+        server.run_handshake(
+            peer_fingerprint=client.fingerprint,
+            peer_ice_ufrag=client.ice_ufrag,
+            peer_ice_pwd=client.ice_pwd,
+        ),
+        client.run_handshake(
+            peer_fingerprint=server.fingerprint,
+            peer_ice_ufrag=server.ice_ufrag,
+            peer_ice_pwd=server.ice_pwd,
+        ),
+    )
+    # Non-trickle: each side signalled end-of-candidates.
+    assert server_ice.end_of_candidates_signalled is True
+    assert client_ice.end_of_candidates_signalled is True
+    await asyncio.gather(server.close(), client.close())
+
+
+@pytest.mark.asyncio
+async def test_run_handshake_always_ends_candidates() -> None:
+    """run_handshake ALWAYS signals end-of-candidates (ADR-0034 — no trickle-receive).
+
+    The plugin has no in-dialog SIP-INFO transport (RFC 8840) to receive a peer's
+    trickled candidates, so it must never withhold the end marker — that would hang
+    ICE waiting for candidates that can never arrive. It acts on the offer's
+    candidate set and ends candidates, even though it advertises trickle capability
+    in the SDP answer (RFC 8838 §4.1 half-trickle).
+    """
+    server_ice = _RecordingIce("svrU", "svrPwwwwwwwwwwwwww")
+    client_ice = _RecordingIce("cliU", "cliPwwwwwwwwwwwwww")
+    server_ice.peer, client_ice.peer = client_ice, server_ice
+
+    server = WebRtcMediaSession(
+        offer_setup=SetupRole("actpass"), ice_factory=lambda **_kw: server_ice
+    )
+    client = WebRtcMediaSession(
+        offer_setup=SetupRole("passive"), ice_factory=lambda **_kw: client_ice
+    )
+    await asyncio.gather(server.prepare(), client.prepare())
+    await asyncio.gather(
+        server.run_handshake(
+            peer_fingerprint=client.fingerprint,
+            peer_ice_ufrag=client.ice_ufrag,
+            peer_ice_pwd=client.ice_pwd,
+        ),
+        client.run_handshake(
+            peer_fingerprint=server.fingerprint,
+            peer_ice_ufrag=server.ice_ufrag,
+            peer_ice_pwd=server.ice_pwd,
+        ),
+    )
+    # End-of-candidates is always signalled — there is no path to receive more.
+    assert server_ice.end_of_candidates_signalled is True
+    assert client_ice.end_of_candidates_signalled is True
+    await asyncio.gather(server.close(), client.close())

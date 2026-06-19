@@ -4823,23 +4823,30 @@ def _redact_sdp_body(body: str) -> str:
 # leaked — and replaces only the value. Matching is case-insensitive; over-masking a
 # benign ``token: …`` is the safe direction for a security log.
 _CREDENTIAL_SHAPE_PATTERNS = (
-    # Authorization / Proxy-Authorization, header- OR JSON-style. The key may be
-    # quoted (``"Authorization":``) and the value quoted (``"Basic X"``); group 1
-    # keeps the key + separator + any opening quote, group 2 is the value — masked up
-    # to a quote / comma / semicolon / brace / newline boundary (covers any scheme,
-    # not just bearer).
-    re.compile(r'(?i)("?\b(?:proxy-)?authorization\b"?\s*[:=]\s*"?)([^"\r\n,;}]+)'),
-    # A bare bearer token not behind an Authorization keyword. Bounded like above so a
-    # compact JSON tail (``Bearer X","api_key":"Y"``) is not swallowed whole — the
-    # following ``api_key`` is then masked by its own pattern.
-    re.compile(r'(?i)(\bbearer\s+)([^"\r\n,;}]+)'),
+    # Authorization / Proxy-Authorization, header- OR JSON-style. Group 1 keeps the
+    # key + separator + any opening quote of the value; group 2 captures that opening
+    # quote only when present. The value itself (uncaptured, dropped) is matched two
+    # ways via a conditional on group 2: a QUOTED value consumes escaped chars and
+    # runs to the unescaped closing quote (so ``"abc\"def"`` and values with spaces or
+    # commas are fully masked, never truncated at an inner quote); an UNQUOTED value
+    # stops at the first quote / comma / semicolon / brace / newline. Any auth scheme,
+    # not just bearer.
+    re.compile(
+        r'(?i)("?\b(?:proxy-)?authorization\b"?\s*[:=]\s*(")?)'
+        r'(?(2)(?:\\.|[^"\\\r\n])*|[^"\r\n,;}]+)'
+    ),
+    # A bare bearer token not behind an Authorization keyword. Bounded so a compact
+    # JSON tail (``Bearer X","api_key":"Y"``) is not swallowed whole — the following
+    # ``api_key`` is then masked by its own pattern.
+    re.compile(r'(?i)(\bbearer\s+)[^"\r\n,;}]+'),
     # key=value / ``"key":"value"`` credential pairs — api_key/token/secret/password…
     # (longest alternatives first so e.g. ``access_token`` matches that branch, not
-    # the bare ``token`` branch). The value stops at a quote / comma / semicolon /
-    # ampersand / brace / whitespace boundary.
+    # the bare ``token`` branch). Same quoted/unquoted conditional as Authorization;
+    # the unquoted value additionally stops at ``&`` (query string) and whitespace.
     re.compile(
         r'(?i)("?\b(?:api[-_]?key|apikey|x-api-key|access[-_]?token|token|secret'
-        r'|password|passwd|pwd)\b"?\s*[=:]\s*"?)([^"\r\n,;&}\s]+)'
+        r'|password|passwd|pwd)\b"?\s*[=:]\s*(")?)'
+        r'(?(2)(?:\\.|[^"\\\r\n])*|[^"\s,;&}]+)'
     ),
 )
 

@@ -29,7 +29,7 @@ design). This runbook is the operational HOW.
 | Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |
 | **Loss resilience** — adaptive jitter buffer, packet-loss concealment, Opus in-band FEC, ptime/maxptime negotiation | **Wired** (ADR-0056); see "Loss resilience" below |
-| **RTCP** sender/receiver reports (loss/jitter feedback on the wire) | **Deferred** — a separate later lane (the concealment path already tracks a per-call loss count it can read) |
+| **RTCP** sender/receiver reports (loss/jitter/RTT feedback on the wire) + rtcp-mux | **Capability wired, live wiring is the adapter's** (ADR-0061). The engine builds/parses SR/RR/SDES/BYE, computes loss/jitter/RTT on `RtpMediaTransport.call_quality`, and runs a periodic sender (`run_rtcp`); `sdp.negotiate_rtcp_mux` + `build_audio_offer/answer` handle rtcp-mux on the SDES path (WebRTC already muxes). The adapter must pick the RTCP socket/mux, call `engine.ingest_rtcp(...)` on inbound RTCP, and start `engine.run_rtcp(...)` — see ADR-0061 "Adapter activation". RTCP signals are catalogued in runbook 0014 |
 | **Live** validation against a real WebRTC client | **Pending** the operator's redeploy |
 
 ## Prerequisites

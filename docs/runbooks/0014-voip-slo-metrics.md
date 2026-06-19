@@ -21,9 +21,10 @@ or degradation. The **WHY** (design decisions on latency budgets, capacity, etc.
 | **Time to first audio** | < 2 s | s | **MEASURABLE** from logs | See [Time to first audio](#time-to-first-audio) |
 | **Per-turn latency (p50)** | < 1.0 s | s | **MEASURABLE** from logs (rough) | See [Per-turn latency](#per-turn-latency) |
 | **Per-turn latency (p99)** | < 3.0 s | s | **MEASURABLE** from logs (rough) | See [Per-turn latency](#per-turn-latency) |
-| **RTP packet loss** | < 1% | % | **NOT YET** — requires instrumentation | See [Packet loss & jitter](#packet-loss--jitter) |
-| **Media jitter** | < 100 ms | ms | **NOT YET** — requires instrumentation | See [Packet loss & jitter](#packet-loss--jitter) |
-| **One-way audio / no audio** | < 0.5% | % (per call) | **NOT YET** — requires instrumentation | See [Media quality](#media-quality) |
+| **RTP packet loss** | < 1% | % | **SOURCE EXISTS (RTCP)** — adapter emission TBD | See [Packet loss & jitter](#packet-loss--jitter) |
+| **Media jitter** | < 100 ms | ms | **SOURCE EXISTS (RTCP)** — adapter emission TBD | See [Packet loss & jitter](#packet-loss--jitter) |
+| **Round-trip time** | < 300 ms | ms | **SOURCE EXISTS (RTCP)** — adapter emission TBD | See [Packet loss & jitter](#packet-loss--jitter) |
+| **One-way audio / no audio** | < 0.5% | % (per call) | **INFERABLE (RTCP)** — adapter emission TBD | See [Media quality](#media-quality) |
 | **Concurrent call capacity** | 50 | calls | **MEASURABLE** from memory/load | See [Concurrent calls](#concurrent-calls) |
 | **Error spoken to caller** | < 5% | % (per turn) | **MEASURABLE** via manual spot checks | See [Error handling](#error-handling) |
 
@@ -189,30 +190,45 @@ grep "rtp tx: first packet" /path/to/hermes/log | head -3 | tail -1
 **Targets:**
 - **Packet loss:** < 1% (< 1 lost packet per 100).
 - **Jitter:** < 100 ms (< 100 ms variance in inter-packet arrival time).
+- **Round-trip time:** < 300 ms (RTCP-derived; see below).
 
-**How to observe today:**
+**In-process source (RTCP, ADR-0061).** The media engine now runs RTCP (RFC 3550 §6):
+it computes per-call reception statistics from the inbound RTP stream and parses the peer's
+RTCP reports. `RtpMediaTransport.call_quality` returns a `CallQuality` snapshot with:
 
-**NOT YET INSTRUMENTED.** The RTP media engine has no builtin stats emission. Observation requires
-external packet capture or gateway-side metrics.
+- `local_fraction_lost` / `local_cumulative_lost` / `local_jitter_ms` — what WE received
+  from the peer (our own measurement).
+- `remote_fraction_lost` / `remote_cumulative_lost` / `remote_jitter_ms` — what the PEER
+  reported it received from US (the far-end view of our outbound stream).
+- `rtt_seconds` — round-trip time from the peer report block's LSR/DLSR.
 
-**Workaround for test/validation:**
+**What is NOT done yet:** the engine BUILDS these numbers but does not push them to a
+metrics sink — that emission (and reading `call_quality` periodically) is the adapter lane's
+job (ADR-0061 "Adapter activation"). Until then, read them in a debugger / log them from the
+adapter; the values are correct the moment the adapter calls `engine.ingest_rtcp(...)` on
+inbound RTCP and starts `engine.run_rtcp(...)`.
+
+**Workaround for test/validation (independent of the above):**
 - Use external packet capture on the RTP port (5000 by default):
   ```bash
   # Capture 30 s of RTP and export to pcap:
   sudo tcpdump -i any -n "udp and port 5000" -c 1000 -w /tmp/rtp.pcap
   # Analyze with wireshark or a tool like tshark:
   tshark -r /tmp/rtp.pcap -Y "rtp" -T fields -e frame.time_epoch -e rtp.seq -e rtp.timestamp
+  # RTCP SR/RR (incl. the loss/jitter/RTT fields) — muxed on the RTP port when
+  # rtcp-mux was negotiated, else on RTP port + 1:
+  tshark -r /tmp/rtp.pcap -Y "rtcp" -V
   ```
 
 **Gateway-side metrics:**
 - The SIP gateway logs RTP statistics per call (lost packets, jitter).
 - After a call, check the gateway's call analytics for that call ID.
 
-**NOT YET INSTRUMENTED:**
-- `voip.rtp.packet_loss_pct` — gauge.
-- `voip.rtp.jitter_ms` — gauge.
-- `voip.rtp.packets_sent` — counter per call.
-- `voip.rtp.packets_received` — counter per call.
+**To emit (adapter lane — the source exists in `call_quality`):**
+- `voip.rtp.packet_loss_pct` — gauge (`local_fraction_lost` * 100).
+- `voip.rtp.jitter_ms` — gauge (`local_jitter_ms`).
+- `voip.rtp.rtt_ms` — gauge (`rtt_seconds` * 1000).
+- `voip.rtp.packets_sent` / `voip.rtp.packets_received` — counters per call.
 
 ---
 
@@ -245,8 +261,13 @@ grep "one-way" /path/to/hermes/log
 grep -i "garbled\|decode\|sync" /path/to/hermes/log
 ```
 
-**NOT YET INSTRUMENTED:**
-- `voip.calls.one_way_audio` — counter (inbound or outbound dead).
+**One-way audio is now inferable from RTCP (ADR-0061):** if `call_quality` shows we send
+packets but the peer's reports never arrive (no inbound RTCP / `rtt_seconds` stays `None`)
+the OUTBOUND leg may be dead; if we receive no RTP (`local_*` all `None`) while sending, the
+INBOUND leg may be dead. The adapter lane turns this into the counters below.
+
+**To emit (adapter lane — RTCP source exists):**
+- `voip.calls.one_way_audio` — counter (inbound or outbound dead, inferred from `call_quality`).
 - `voip.calls.no_audio` — counter (both directions silent).
 - `voip.calls.media_quality_issues` — counter.
 - `voip.calls.media_quality_score` — gauge, 0–100 (100 = perfect; based on metrics above).
@@ -351,14 +372,19 @@ See ADR backlog Task #26 and the `llm-502-spoken-error-finding-verified` memory 
 **Current state (as of 2026-06-19):**
 - ✅ **MEASURABLE from logs:** registration events, call setup (INVITE → 200 OK), time to first audio,
   per-turn latency (rough), concurrent calls (rough).
-- ❌ **NOT YET INSTRUMENTED:** call setup success rate (automated), packet loss / jitter, media
-  quality score, error-to-caller rate (automated).
+- 🟡 **SOURCE EXISTS, EMISSION TBD:** RTP packet loss / jitter / RTT and one-way-audio inference —
+  computed by the media engine via RTCP (ADR-0061) and exposed on `RtpMediaTransport.call_quality`;
+  the adapter lane wires `ingest_rtcp`/`run_rtcp` and pushes the numbers to a metrics sink.
+- ❌ **NOT YET INSTRUMENTED:** call setup success rate (automated), media quality score,
+  error-to-caller rate (automated).
 
 **Next code lane:** wire metric emission (likely via StatsD, Prometheus, or structured logging)
 so that:
 1. Each call emits its own metrics: setup latency, duration, call outcome, latency per turn.
 2. Registration state changes emit gauge updates.
-3. Media engine emits RTP stats: sent/received packets, loss, jitter.
+3. Media engine RTP stats are PUSHED: read `engine.call_quality` (loss/jitter/RTT already
+   computed via RTCP, ADR-0061) periodically and emit the gauges/counters above. The adapter
+   also calls `engine.ingest_rtcp(datagram)` on inbound RTCP and starts `engine.run_rtcp(...)`.
 4. Provider calls emit latency + success/failure flags.
 5. Errors are logged with structured fields, never spoken verbatim.
 

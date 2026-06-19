@@ -57,13 +57,21 @@ class _FakeUdpPipe:
         self.sent: list[bytes] = []
         self.peer_addr: tuple[str, int] | None = None
         self.latched = False
+        self.frozen = False
 
     @property
     def local_port(self) -> int:
         return 50000  # a fixed fake port (the SDP-answer port in the fake path)
 
+    @property
+    def inbound_maxsize(self) -> int:
+        return 512
+
     def set_peer(self, host: str, port: int) -> None:
         self.peer_addr = (host, port)
+
+    def freeze_peer(self) -> None:
+        self.frozen = True
 
     async def send(self, data: bytes) -> None:
         assert self.peer is not None
@@ -261,6 +269,8 @@ async def test_two_sessions_complete_dtls_and_derive_matching_srtp() -> None:
     recovered2 = a_inbound.unprotect(wire2)
     assert recovered2.payload == pkt2.payload
 
+    # The session freezes the comedia latch after a verified handshake (anti-poison).
+    assert a_pipe.frozen is True
     await answerer.close()
 
 
@@ -335,13 +345,13 @@ async def test_udp_pipe_round_trips_datagrams_over_real_sockets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_udp_pipe_latches_send_dest_to_first_inbound_source() -> None:
-    """The pipe latches its send destination to the first inbound source (comedia).
+async def test_udp_pipe_latches_send_dest_to_first_dtls_source() -> None:
+    """The pipe latches its send destination to the first DTLS-range inbound source.
 
     NAT case: the peer's real source port differs from the SDP-advertised one. The
     pipe is told to send to a BOGUS port (a black hole) initially, but once it
-    receives a datagram from the peer's real socket it latches onto that source, so
-    the reply reaches the peer. This is the no-ICE NAT-traversal mechanism.
+    receives a DTLS datagram from the peer's real socket it latches onto that source,
+    so the reply reaches the peer. This is the no-ICE NAT-traversal mechanism.
     """
     loop = asyncio.get_running_loop()
     a = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
@@ -352,7 +362,7 @@ async def test_udp_pipe_latches_send_dest_to_first_inbound_source() -> None:
         a.set_peer("127.0.0.1", 1)  # port 1: a black hole
         b.set_peer("127.0.0.1", a.local_port)
         # b reaches a (correct dest). a learns b's real source and latches.
-        await b.send(b"\x14from-b")
+        await b.send(b"\x14from-b")  # 0x14 = 20, a DTLS-range first byte
         got = await asyncio.wait_for(a.recv(), timeout=5.0)
         assert got == b"\x14from-b"
         assert a.latched is True
@@ -363,3 +373,105 @@ async def test_udp_pipe_latches_send_dest_to_first_inbound_source() -> None:
     finally:
         await a.close()
         await b.close()
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_does_not_latch_on_non_dtls_datagram() -> None:
+    """A non-DTLS datagram (e.g. a stray/spoofed RTP byte) must NOT latch the dest.
+
+    Anti-DoS: an off-path host racing a non-DTLS datagram to the port must not be
+    able to redirect the handshake destination. Only DTLS-range (20-63) datagrams
+    move the latch.
+    """
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    attacker = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    try:
+        pipe.set_peer("127.0.0.1", 5060)  # the "real" advertised peer
+        attacker.set_peer("127.0.0.1", pipe.local_port)
+        # The attacker sends a non-DTLS datagram (first byte 128 = SRTP/RTP range).
+        await attacker.send(b"\x80spoof")
+        got = await asyncio.wait_for(pipe.recv(), timeout=5.0)
+        assert got == b"\x80spoof"
+        # The latch must NOT have moved onto the attacker's source.
+        assert pipe.latched is False
+    finally:
+        await pipe.close()
+        await attacker.close()
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_relatches_until_frozen_then_freezes() -> None:
+    """The latch re-tracks DTLS sources during handshake, then freezes (anti-poison).
+
+    A stray early DTLS datagram from one source must not permanently poison the
+    destination: a later DTLS datagram from the real peer re-latches. After
+    :meth:`freeze_peer` (called once fingerprint verification succeeds) the
+    destination is fixed and further inbound datagrams cannot move it.
+    """
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    src1 = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    src2 = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    try:
+        src1.set_peer("127.0.0.1", pipe.local_port)
+        src2.set_peer("127.0.0.1", pipe.local_port)
+        # First DTLS datagram from src1 latches.
+        await src1.send(b"\x16one")  # 0x16 = 22, DTLS handshake record
+        assert await asyncio.wait_for(pipe.recv(), timeout=5.0) == b"\x16one"
+        await pipe.send(b"\x16r1")
+        assert await asyncio.wait_for(src1.recv(), timeout=5.0) == b"\x16r1"
+        # A later DTLS datagram from src2 re-latches (handshake not yet frozen).
+        await src2.send(b"\x16two")
+        assert await asyncio.wait_for(pipe.recv(), timeout=5.0) == b"\x16two"
+        await pipe.send(b"\x16r2")
+        assert await asyncio.wait_for(src2.recv(), timeout=5.0) == b"\x16r2"
+        # Freeze (post-verification): further inbound datagrams cannot move the dest.
+        pipe.freeze_peer()
+        await src1.send(b"\x16three")  # src1 tries to steal the latch back
+        assert await asyncio.wait_for(pipe.recv(), timeout=5.0) == b"\x16three"
+        await pipe.send(b"\x16r3")
+        # The reply still goes to src2 (the frozen dest), NOT back to src1.
+        assert await asyncio.wait_for(src2.recv(), timeout=5.0) == b"\x16r3"
+    finally:
+        await pipe.close()
+        await src1.close()
+        await src2.close()
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_recv_raises_after_close() -> None:
+    """recv() after close() raises a deterministic closed-pipe error (not a hang).
+
+    The engine's recv loop awaits ``pipe.recv()``; on teardown the pipe must wake a
+    pending receiver rather than leaving it blocked forever (rule 37).
+    """
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    await pipe.close()
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(pipe.recv(), timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_close_wakes_a_pending_recv() -> None:
+    """A recv() already awaiting when close() is called wakes with a closed error."""
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    recv_task = asyncio.create_task(pipe.recv())
+    await asyncio.sleep(0)  # let the recv start awaiting
+    await pipe.close()
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(recv_task, timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_inbound_queue_is_bounded() -> None:
+    """The inbound queue has a finite maxsize (flood-resistant), not unbounded."""
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    try:
+        # The queue must advertise a positive, finite maxsize (no unbounded growth).
+        assert pipe.inbound_maxsize > 0
+    finally:
+        await pipe.close()

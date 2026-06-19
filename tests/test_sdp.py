@@ -2248,17 +2248,44 @@ def test_negotiate_media_security_plain_for_avp_offer() -> None:
     assert negotiate_media_security(sdp.audio) is MediaSecurity.PLAIN
 
 
-def test_negotiate_media_security_savp_without_crypto_is_plain() -> None:
-    """An RTP/SAVP offer with no usable a=crypto cannot be SDES — falls to PLAIN.
+def test_negotiate_media_security_savp_without_crypto_is_unsupported() -> None:
+    """An RTP/SAVP offer with no usable a=crypto is UNSUPPORTED — NOT PLAIN.
 
-    The opportunistic ladder never *invents* a tier the offer cannot key: a SAVP
-    profile whose only crypto line is malformed has no usable key, so it cannot be
-    answered SDES; it degrades to PLAIN (the caller then answers in the clear, or a
-    strict policy may reject — that is the adapter's choice, not the ranker's).
+    Critical downgrade guard: a SAVP profile DEMANDED encrypted media. We cannot key
+    it (its only crypto line is malformed), but it must NOT degrade to PLAIN — that
+    would let the caller answer clear RTP to a peer that never offered clear RTP. The
+    ranker returns UNSUPPORTED, a distinct non-plain tier the caller must reject (or
+    re-offer), never silently answer in the clear.
     """
     sdp = SessionDescription.parse(_OFFER_SAVP_BAD_CRYPTO)
     assert sdp.audio is not None
-    assert negotiate_media_security(sdp.audio) is MediaSecurity.PLAIN
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.UNSUPPORTED
+
+
+def test_negotiate_media_security_dtls_profile_without_fingerprint_is_unsupported() -> (
+    None
+):
+    """A UDP/TLS/RTP/SAVP offer missing a=fingerprint is UNSUPPORTED — not PLAIN.
+
+    The profile demanded DTLS-SRTP but omitted the fingerprint (RFC 5763 §5), so we
+    cannot key it. It must not downgrade to clear RTP — UNSUPPORTED, so the caller
+    rejects rather than answering plaintext to an encrypted-media offer.
+    """
+    sdp = SessionDescription.parse(_OFFER_SIP_DTLS_NO_FP)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.UNSUPPORTED
+
+
+def test_negotiate_media_security_webrtc_savpf_is_not_plain() -> None:
+    """A WebRTC SAVPF offer is an encrypted profile — UNSUPPORTED here, never PLAIN.
+
+    negotiate_media_security covers the SIP (non-WebRTC) path; a SAVPF offer is not
+    answerable here (it needs the WebRTC/ICE path), and it must NOT be ranked PLAIN —
+    that would invite a plaintext answer to an encrypted-transport offer.
+    """
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.UNSUPPORTED
 
 
 def test_negotiate_media_security_dtls_outranks_sdes() -> None:

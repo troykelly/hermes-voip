@@ -4225,6 +4225,122 @@ async def test_goodbye_disabled_graceful_end_still_ends_cleanly() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_no_input_barge_in_during_reprompt_resets_and_does_not_end() -> None:
+    """A caller answering DURING a reprompt playout resets the cycle — must not end.
+
+    Regression (codex MAJOR): the activity flag was cleared at the TOP of each watchdog
+    iteration, so a barge-in that arrives WHILE a reprompt is being spoken (after that
+    window's dead-air decision, before the next iteration's top) was wiped before the
+    watchdog observed it. With ``no_input_max_reprompts=1`` the caller answers
+    mid-reprompt yet the next silent window would treat the reprompt as unanswered and
+    END the call — hanging up on a caller who just spoke. The fix consumes the flag only
+    when observed, so activity during reprompt playout persists to the next window.
+
+    To exercise the race deterministically the reprompt's first ``send_audio`` BLOCKS,
+    so the watchdog parks INSIDE ``_speak_phrase_best_effort`` (the reprompt is playing)
+    when the barge-in arrives — before the watchdog reaches the next iteration's top.
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _BlockingLiveSilenceTransport(_LiveSilenceTransport):
+        """Silent-but-live caller whose FIRST send_audio blocks on a gate.
+
+        Live so the pump observes ``_end_call`` and ``run()`` actually completes (the
+        clean discriminator: a graceful end ⇒ ``run_task`` done). The blocked first send
+        parks the reprompt mid-playout so a barge-in lands during it (the race window).
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_send_gate = asyncio.Event()
+
+        async def send_audio(self, frame: PcmFrame) -> None:
+            if not self.sent_audio:
+                await self.first_send_gate.wait()
+            self.sent_audio.append(frame)
+
+    # window#1 (→ reprompt, which parks on the blocked send) + window#2 (must see the
+    # mid-reprompt barge-in and reset, NOT end) + window#3 (no NEW activity → reprompt
+    # again, proving the cycle restarted rather than ending).
+    sleep = _SteppedSleep(steps=3)
+    transport = _BlockingLiveSilenceTransport()
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=1,
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # Window 1 elapses → the reprompt fires and parks INSIDE _play on the blocked send
+    # (so the watchdog is still inside _speak_phrase_best_effort — mid-playout).
+    sleep.step()
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], "the reprompt send should be blocked (parked)"
+    assert loop._no_input_task is not None
+    assert not loop._no_input_task.done()
+
+    # The caller ANSWERS during the reprompt (a barge-in mid-playout). This is caller
+    # life and must reset the cycle — not be lost when the reprompt finishes and the
+    # watchdog loops back to its (formerly flag-clearing) top.
+    await loop.barge_in()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # Release the blocked reprompt send so the playout completes and the watchdog
+    # returns from _speak_phrase_best_effort and parks on window #2's sleep.
+    transport.first_send_gate.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert transport.sent_audio == [reprompt_frame], "the reprompt did not complete"
+
+    # Window 2 elapses: the watchdog must observe the (still-set) mid-reprompt barge-in,
+    # reset the count, and NOT end the call. With the bug the flag was cleared at the
+    # iteration top, so the watchdog ends the call (sets _end_call) and the live pump
+    # winds run() up — ``run_task`` completes. The fix keeps run() alive.
+    sleep.step()
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if run_task.done():
+            break
+    assert not loop._end_call.is_set(), (
+        "the watchdog ended the call despite the caller answering during the reprompt "
+        "(mid-reprompt activity was lost)"
+    )
+    assert not run_task.done(), "run() ended after a mid-reprompt caller answer"
+
+    # Window 3 with no further activity: since the count reset, the watchdog reprompts
+    # again rather than ending — proof the cycle truly restarted.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(transport.sent_audio) >= 2:
+            break
+    assert len(transport.sent_audio) == 2, (
+        "the reprompt cycle did not restart after the caller answered; "
+        f"sent={len(transport.sent_audio)}"
+    )
+    assert not loop._end_call.is_set(), "the call ended even though the cycle had reset"
+
+    # Wind the call down for a clean teardown (the loop itself never ended).
+    loop._end_call.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+
 # ---------------------------------------------------------------------------
 # (i) Reply streaming — TTS sentence-by-sentence pipelining guard (ADR-0057)
 # ---------------------------------------------------------------------------
@@ -4316,14 +4432,21 @@ async def test_reply_streams_first_sentence_before_later_synthesised() -> None:
         if transport.sent_audio:
             break
 
-    # The first sentence's audio is already on the wire though the second sentence has
-    # NOT yet produced any audio — proof the loop streams per-sentence (pipelined).
+    # The load-bearing guard: the first sentence's AUDIO is on the wire while the
+    # SECOND sentence's audio is still gated (unsynthesised). If the loop had regressed
+    # to whole-reply synthesis (emit nothing until the entire reply is synthesised),
+    # ``sent_audio`` would be EMPTY here — both segments are gated, so nothing could be
+    # sent and ``speak()`` would be parked. Exactly one frame on the wire therefore
+    # proves per-sentence AUDIO pipelining: segment 1's audio flows before segment 2 is
+    # synthesised. (The segmenter MAY *open* segment 2's source ahead — pipelining the
+    # network round-trip — which is desirable; it is the AUDIO emission order that
+    # bounds first-audio latency, so the guard is on the sent audio, not open ordering.)
     assert len(transport.sent_audio) == 1, (
         "first-sentence audio did not reach the wire before the second was synthesised "
         f"(sent={len(transport.sent_audio)}, opened={opened!r})"
     )
-    assert opened[:1] == ["First sentence here."], (
-        f"the first segment was not the first sentence; opened={opened!r}"
+    assert opened[0] == "First sentence here.", (
+        f"the first segment synthesised was not the first sentence; opened={opened!r}"
     )
     assert not speak_task.done(), "speak() finished before the gated 2nd segment"
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
@@ -43,6 +44,7 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
+from hermes_voip.sdp import CryptoAttribute
 from hermes_voip.transport.connection import SipOverTlsTransport
 from tests.e2e._fake_gateway import (
     FakeRtpEndpoint,
@@ -1121,5 +1123,79 @@ async def test_outbound_sdes_plain_answer_fails_closed() -> None:
                 "was answered plain"
             )
             assert not adapter._call_loops
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_offer_key_is_never_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rule 34 (repo is PUBLIC): the outbound SDES master key never reaches a log.
+
+    Patches the offer-crypto generator to a KNOWN runtime-computed key, drives a full
+    secured outbound call, captures EVERY log record at DEBUG across the whole logger
+    tree, and asserts the inline base64 key||salt appears in no message (and no record
+    repr — the CryptoAttribute key_params is field(repr=False), so a logged object must
+    not expose it either). The key is built at runtime (base64 of bytes 1..30) so no
+    high-entropy literal sits in this file for gitleaks.
+    """
+    # A KNOWN per-call offer key (30 octets, distinct from the gateway's 0..29 answer
+    # key) computed at runtime — never a source literal (gitleaks path-scoping).
+    known_key_b64 = base64.b64encode(bytes(range(1, 31))).decode("ascii")
+    known_offer_crypto = CryptoAttribute(
+        tag=1,
+        suite="AES_CM_128_HMAC_SHA1_80",
+        key_params=f"inline:{known_key_b64}",
+    )
+
+    gateway = _SrtpAnsweringGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    extra = {"HERMES_VOIP_SIP_SDES_OFFER": "true"}
+    try:
+        async with _real_adapter(
+            gateway, providers=providers, extra_env=extra
+        ) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            # Capture the WHOLE logger tree at DEBUG (the key must not leak from ANY
+            # logger — adapter, sdp, media, transport), and pin the offer key to the
+            # known value so we know exactly what must be absent.
+            with (
+                caplog.at_level(logging.DEBUG),
+                patch(
+                    "hermes_voip.adapter._outbound_offer_crypto",
+                    return_value=known_offer_crypto,
+                ),
+            ):
+                place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+                await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+                await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+                await gateway.await_ack_from_plugin(timeout=5.0)
+                call_id = await asyncio.wait_for(place_task, timeout=5.0)
+                await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+
+            # Sanity: the engine really came up secured (so the key WAS in play and a
+            # leak was possible) — otherwise this test would pass vacuously.
+            session = adapter._call_sessions[call_id]
+            engine = session._media
+            assert isinstance(engine, RtpMediaTransport)
+            assert engine._srtp_out is not None
+            assert engine._srtp_in is not None
+
+            # The inline key||salt must appear in NO log record — neither in the
+            # formatted message nor in any record's repr/args.
+            for record in caplog.records:
+                assert known_key_b64 not in record.getMessage(), (
+                    f"SDES offer key leaked into a log message ({record.name} "
+                    f"{record.levelname}): {record.getMessage()!r}"
+                )
+                assert known_key_b64 not in repr(record.args), (
+                    f"SDES offer key leaked via log args ({record.name})"
+                )
     finally:
         await gateway.stop()

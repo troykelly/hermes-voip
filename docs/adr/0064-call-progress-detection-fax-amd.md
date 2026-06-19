@@ -119,10 +119,13 @@ sustained burst (default ≥ 0.2 s). Two paths produce the record cue:
   after the post-greeting silence has lasted the response gap. **This fallback is driven by
   the audio/sample clock in `on_audio_frame`, not by a VAD edge** — a machine that has
   stopped talking to record sends no further VAD ONSET/OFFSET, so waiting for an edge would
-  hang forever. An OFFSET stamps the silence start (on the sample clock) and an ONSET clears
-  it (resetting the timer if the machine resumes speaking before the gap elapses); each fed
-  audio frame then checks whether the gap has been reached. So the agent is never stuck
-  waiting for a beep — or an edge — that never comes.
+  hang forever. An OFFSET stamps the silence start **from the edge's own window time** (its
+  ordinal × the 32 ms window duration, the same call-elapsed timeline the sample clock uses)
+  and an ONSET clears it (resetting the timer if the machine resumes speaking before the gap
+  elapses); each fed audio frame then checks whether the gap has been reached. Stamping from
+  the edge's own time (not from "samples seen when `on_vad_event` was called") makes the
+  timer independent of how the caller interleaves `on_audio_frame` and `on_vad_event`. So the
+  agent is never stuck waiting for a beep — or an edge — that never comes.
 
 The detector only ever **emits the cue**. The hang-up-vs-speak decision belongs to the
 **Hermes agent**, which already has the call-control tools (ADR-0009/0010/0031) to hang up
@@ -201,5 +204,6 @@ independently unit-testable (raw PCM frames / raw segment durations) without the
 | Let the detector decide hang-up vs leave-message | Policy belongs to the Hermes agent, which already owns the call-control tools (ADR-0009/0010/0031). The detector emitting a `ReadyToLeaveMessage` cue and leaving the decision to the agent keeps the detector sans-IO and policy-free. |
 | Put the AMD timing on a wall clock | Non-deterministic and untestable; the VAD already stamps a monotonic 32 ms window ordinal (ADR-0008), so converting ordinals→seconds gives an exact, offline-testable timer with no clock drift (same discipline as `media.endpoint`). |
 | Fire the no-beep record-cue fallback from a VAD edge (the next ONSET closing the silence) | Dead in the common case: a machine that has stopped talking to record emits **no further VAD edge**, so the cue would never fire and the agent would wait forever. The fallback is driven by the audio/sample clock in `on_audio_frame` instead — an OFFSET stamps the silence start, an ONSET clears it, and each fed frame checks the gap. (Caught by codex review of PR #149.) |
+| Stamp the no-beep silence start from `samples_seen` at the moment `on_vad_event` is called | Couples the timer to caller interleaving: an OFFSET delivered before the matching audio has advanced the sample clock starts the timer early (can fire while greeting audio still feeds); after, late. Stamp from the **edge's own window time** instead (its ordinal × the window duration, the same call-elapsed timeline) so the fallback is interleaving-independent. (Caught by codex round-2 review of PR #149.) |
 | Compute `elapsed_s` / tone-run lengths from a frame **count** × frame duration | Wrong under variable or zero-length frames (real on the wire): the count drifts from true elapsed time the moment frame sizes vary. `elapsed_s` is the accumulated sample count ÷ rate, and each tone run accumulates **seconds** (per-frame duration), so both stay exact. (Caught by codex review of PR #149.) |
 | Feed an optional STT greeting-text length into AMD as machine corroboration | The facade has no transcript-input path, so the constructor would advertise a parameter the engine/adapter never supplies — aspirational (rule 27). Dropped for this lane; the `Final` thresholds leave a clean seam to add a real transcript input (with its own test) later. |

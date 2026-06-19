@@ -468,12 +468,13 @@ class CallProgressDetector:
         # AMD + record-cue state (used only when outbound).
         self._amd = _AnsweringMachineDetector()
         self._ready_emitted = False
-        # The audio-clock time (seconds) at which the current run of silence began
-        # (set on each VAD OFFSET, cleared on each ONSET), or None while speech is in
-        # progress / before any edge. The no-beep fallback fires once a machine has
-        # been classified and this silence has lasted the response gap — driven by
-        # on_audio_frame, NOT by a later ONSET (a recording machine sends no edge).
-        self._silence_since_audio_s: float | None = None
+        # The call-elapsed time (seconds) at which the current run of silence began,
+        # stamped from the VAD OFFSET edge's OWN window time (cleared on each ONSET),
+        # or None while speech is in progress / before any edge. The no-beep fallback
+        # fires once a machine has been classified and this silence has lasted the
+        # response gap — driven by on_audio_frame, NOT by a later ONSET (a recording
+        # machine sends no edge). Edge-time, so it is interleaving-independent.
+        self._silence_since_s: float | None = None
         # VAD segmentation: the window ordinal of the last edge and its kind.
         self._last_edge_index: int | None = None
         self._last_edge_was_onset = False
@@ -542,28 +543,33 @@ class CallProgressDetector:
                 return ReadyToLeaveMessage(elapsed_s=elapsed_s, beep_at_s=elapsed_s)
             # No beep — the tick-driven fallback: if the greeting has now been silent
             # for the response gap (the machine stopped to record and sends no further
-            # VAD edge), signal the record cue on the sample clock alone.
+            # VAD edge), signal the record cue on the sample clock alone. The silence
+            # start is the OFFSET edge's own time, so this gap is measured on the one
+            # call-elapsed timeline regardless of on_audio_frame/on_vad_event ordering.
             if (
-                self._silence_since_audio_s is not None
-                and elapsed_s - self._silence_since_audio_s >= _AMD_RESPONSE_GAP_S
+                self._silence_since_s is not None
+                and elapsed_s - self._silence_since_s >= _AMD_RESPONSE_GAP_S
             ):
                 self._ready_emitted = True
                 return ReadyToLeaveMessage(elapsed_s=elapsed_s, beep_at_s=None)
         return None
 
-    def on_vad_event(self, event: VadEvent) -> CallProgressEvent | None:
-        """Process one VAD onset/offset edge; return an event or ``None``.
+    def on_vad_event(self, event: VadEvent) -> AnsweringMachine | LikelyHuman | None:
+        """Process one VAD onset/offset edge; classify human vs machine.
 
         Segments the edge stream into speech/silence runs (ONSET→OFFSET = speech,
         OFFSET→next ONSET = silence), converts window ordinals to seconds, and feeds
-        the answering-machine state machine — which classifies human vs machine. On
-        an inbound call (``outbound`` False) this is inert.
+        the answering-machine state machine. On an inbound call (``outbound`` False)
+        this is inert. This method **never** emits :class:`ReadyToLeaveMessage` — the
+        record cue (beep or no-beep fallback) comes only from :meth:`on_audio_frame`.
 
-        The edge also marks the silence boundary the no-beep record-cue fallback
-        times against: an OFFSET starts a silence run (stamped on the audio/sample
-        clock), an ONSET ends it. The fallback itself fires from
-        :meth:`on_audio_frame` (the audio clock keeps ticking when the recording
-        machine sends no further VAD edge); this method never emits the cue.
+        The edge also marks the silence boundary the no-beep fallback times against:
+        an OFFSET starts a silence run, an ONSET ends it. The boundary is stamped
+        from the **edge's own window time** (its ordinal x the window duration), not
+        from the audio clock at call time — so the fallback is independent of how the
+        caller interleaves :meth:`on_audio_frame` and this method. Both clocks are
+        the one call-elapsed timeline (the VAD windows are derived from the same
+        audio), so :meth:`on_audio_frame` measures the gap against this stamp.
 
         Args:
             event: A VAD speech onset/offset edge (window-ordinal timestamped).
@@ -574,12 +580,14 @@ class CallProgressDetector:
         """
         if not self._outbound:
             return None
-        # Track the silence boundary on the AUDIO clock for the on_audio_frame
-        # fallback: OFFSET => silence begins now; ONSET => speech, silence ends.
+        # Stamp the silence boundary from the EDGE's own time so the fallback timer is
+        # interleaving-independent: OFFSET => silence begins at the edge; ONSET =>
+        # speech, silence ends. (Edge time, not samples_seen, which would key the
+        # timer to when this method happened relative to the audio clock.)
         if event.edge is SpeechEdge.OFFSET:
-            self._silence_since_audio_s = self._samples_seen / self._rate
+            self._silence_since_s = event.frame_index * self._vad_window_s
         else:
-            self._silence_since_audio_s = None
+            self._silence_since_s = None
         segment = self._close_segment(event)
         if segment is None:
             return None
@@ -621,6 +629,6 @@ class CallProgressDetector:
         self._samples_seen = 0
         self._amd.reset()
         self._ready_emitted = False
-        self._silence_since_audio_s = None
+        self._silence_since_s = None
         self._last_edge_index = None
         self._last_edge_was_onset = False

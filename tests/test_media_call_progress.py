@@ -125,6 +125,16 @@ def _windows_for(duration_ms: int, rate: int) -> int:
     return max(1, round(duration_ms / window_ms))
 
 
+def _w8(duration_ms: int) -> int:
+    """Window ordinals spanning ``duration_ms`` at 8 kHz (256-sample windows)."""
+    return _windows_for(duration_ms, _RATE_8K)
+
+
+def _w16(duration_ms: int) -> int:
+    """Window ordinals spanning ``duration_ms`` at 16 kHz (512-sample windows)."""
+    return _windows_for(duration_ms, _RATE_16K)
+
+
 def _onset(index: int) -> VadEvent:
     return VadEvent(edge=SpeechEdge.ONSET, frame_index=index, probability=0.9)
 
@@ -200,12 +210,11 @@ def test_short_2100hz_blip_is_not_ced() -> None:
 def test_beep_after_machine_greeting_emits_ready_to_leave_message() -> None:
     # Outbound: a long machine greeting (VAD), then a ~1000 Hz beep on audio.
     detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
-    w = lambda ms: _windows_for(ms, _RATE_8K)  # noqa: E731 — local ordinal helper
     # 4 s greeting => AnsweringMachine on the trailing-silence offset.
-    vad_events = _drive_vad(detector, [_onset(0), _offset(w(4000))])
+    vad_events = _drive_vad(detector, [_onset(0), _offset(_w8(4000))])
     assert any(isinstance(e, AnsweringMachine) for e in vad_events)
     # The beep arrives ~0.5 s into the trailing silence (audio frames continue).
-    beep_start = w(4000) + 16  # ~0.5 s of 32 ms windows ~= 16 frames of 20 ms
+    beep_start = _w8(4000) + 16  # ~0.5 s of 32 ms windows ~= 16 frames of 20 ms
     audio_events = _feed_tone(
         detector, 1000.0, rate=_RATE_8K, duration_ms=300, start_frame=beep_start
     )
@@ -218,11 +227,10 @@ def test_machine_greeting_with_no_beep_still_signals_ready_via_silence() -> None
     # Many machines emit no beep. After the machine greeting, a sufficient
     # trailing silence still yields ReadyToLeaveMessage(beep_at_s=None).
     detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
-    w = lambda ms: _windows_for(ms, _RATE_8K)  # noqa: E731 — local ordinal helper
-    offset_at = w(4000)
+    offset_at = _w8(4000)
     events = _drive_vad(
         detector,
-        [_onset(0), _offset(offset_at), _onset(offset_at + w(1500))],
+        [_onset(0), _offset(offset_at), _onset(offset_at + _w8(1500))],
     )
     machine = [e for e in events if isinstance(e, AnsweringMachine)]
     ready = [e for e in events if isinstance(e, ReadyToLeaveMessage)]
@@ -239,11 +247,10 @@ def test_machine_greeting_with_no_beep_still_signals_ready_via_silence() -> None
 def test_short_greeting_then_pause_is_likely_human() -> None:
     # "Hello?" (~0.8 s) then a pause awaiting a response => LikelyHuman.
     detector = CallProgressDetector(sample_rate=_RATE_16K, outbound=True)
-    w = lambda ms: _windows_for(ms, _RATE_16K)  # noqa: E731 — local ordinal helper
-    offset_at = w(800)
+    offset_at = _w16(800)
     events = _drive_vad(
         detector,
-        [_onset(0), _offset(offset_at), _onset(offset_at + w(1500))],
+        [_onset(0), _offset(offset_at), _onset(offset_at + _w16(1500))],
     )
     assert any(isinstance(e, LikelyHuman) for e in events)
     assert not any(isinstance(e, AnsweringMachine) for e in events)
@@ -252,8 +259,7 @@ def test_short_greeting_then_pause_is_likely_human() -> None:
 def test_long_continuous_greeting_is_answering_machine() -> None:
     # A long uninterrupted greeting (~5 s) => AnsweringMachine, not human.
     detector = CallProgressDetector(sample_rate=_RATE_16K, outbound=True)
-    w = lambda ms: _windows_for(ms, _RATE_16K)  # noqa: E731 — local ordinal helper
-    events = _drive_vad(detector, [_onset(0), _offset(w(5000))])
+    events = _drive_vad(detector, [_onset(0), _offset(_w16(5000))])
     assert any(isinstance(e, AnsweringMachine) for e in events)
     assert not any(isinstance(e, LikelyHuman) for e in events)
 
@@ -262,15 +268,14 @@ def test_human_hello_yes_cadence_is_not_a_machine() -> None:
     # NEGATIVE CONTROL: "Hello? ... yes?" — two short utterances with a pause
     # between must classify human, never a machine.
     detector = CallProgressDetector(sample_rate=_RATE_16K, outbound=True)
-    w = lambda ms: _windows_for(ms, _RATE_16K)  # noqa: E731 — local ordinal helper
-    o2 = w(700) + w(1200)  # after "Hello?" + a pause
+    o2 = _w16(700) + _w16(1200)  # after "Hello?" + a pause
     events = _drive_vad(
         detector,
         [
             _onset(0),
-            _offset(w(700)),  # "Hello?"
+            _offset(_w16(700)),  # "Hello?"
             _onset(o2),
-            _offset(o2 + w(500)),  # "yes?"
+            _offset(o2 + _w16(500)),  # "yes?"
         ],
     )
     assert not any(isinstance(e, AnsweringMachine) for e in events)
@@ -280,8 +285,7 @@ def test_human_hello_yes_cadence_is_not_a_machine() -> None:
 def test_amd_is_outbound_only_inbound_never_classifies() -> None:
     # On inbound the agent IS the answerer; AMD must not run.
     detector = CallProgressDetector(sample_rate=_RATE_16K, outbound=False)
-    w = lambda ms: _windows_for(ms, _RATE_16K)  # noqa: E731 — local ordinal helper
-    events = _drive_vad(detector, [_onset(0), _offset(w(5000))])
+    events = _drive_vad(detector, [_onset(0), _offset(_w16(5000))])
     assert not any(isinstance(e, AnsweringMachine) for e in events)
     assert not any(isinstance(e, LikelyHuman) for e in events)
 

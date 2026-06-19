@@ -746,3 +746,27 @@ def test_reception_stats_recovers_after_source_sequence_restart() -> None:
     assert block.extended_highest_seq == 40002
     # Cumulative loss is bounded (the restart is not counted as ~39000 lost).
     assert block.cumulative_lost < 100
+
+
+def test_stray_out_of_range_packet_does_not_poison_jitter() -> None:
+    """A far out-of-range (unvalidated) packet must not update jitter (RFC 3550 A.1).
+
+    A.1 update_seq() returns false for a far-sequence packet held as a possible
+    restart; the caller must NOT fold it into reception-dependent stats. Here a clean
+    isochronous run yields zero jitter; injecting ONE stray far-sequence packet (with
+    a wildly wrong RTP timestamp) between them must leave the jitter estimate exactly
+    where the clean stream put it — the stray packet's bogus transit is ignored.
+    """
+    clean = ReceptionStats(clock_rate=8000)
+    stray = ReceptionStats(clock_rate=8000)
+    seqs = list(range(100, 110))
+    for i, seq in enumerate(seqs):
+        clean.on_packet(seq=seq, rtp_timestamp=160 * i, arrival_ts=0.02 * i)
+        stray.on_packet(seq=seq, rtp_timestamp=160 * i, arrival_ts=0.02 * i)
+        if seq == 104:
+            # One stray far-sequence packet with a nonsense RTP timestamp/arrival:
+            # A.1 holds it (bad_seq), so it must not perturb jitter.
+            stray.on_packet(seq=40000, rtp_timestamp=999_999, arrival_ts=0.021)
+    clean_block = clean.report_block(source_ssrc=1, lsr=0, dlsr=0)
+    stray_block = stray.report_block(source_ssrc=1, lsr=0, dlsr=0)
+    assert stray_block.jitter == clean_block.jitter == 0

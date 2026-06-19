@@ -2164,3 +2164,64 @@ async def test_send_dtmf_does_not_interleave_with_concurrent_send_audio() -> Non
         f"DTMF packets were interleaved with audio: {dtmf_idx}"
     )
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# ptime negotiation (ADR-0056 item 5): the engine no longer assumes 20 ms — the
+# negotiated framing can be applied after construction via the ptime setter, and
+# every TX framing computation follows it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ptime_setter_changes_tx_framing() -> None:
+    """Setting engine.ptime reframes outbound RTP to the new packetisation time.
+
+    A 30 ms G.711 frame is 240 samples; the RTP timestamp must advance by 240 per
+    packet (not the 160 of the default 20 ms), proving the engine applies the
+    negotiated ptime rather than the hard-coded 20 ms.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    assert engine.ptime == 20  # default
+    engine.ptime = 30
+    assert engine.ptime == 30
+    await engine.connect()
+
+    samples_30ms = (G711_SAMPLE_RATE * 30) // 1000  # 240
+    frame = PcmFrame(
+        samples=b"\x00" * (2 * samples_30ms * 2),  # two whole 30 ms frames
+        sample_rate=G711_SAMPLE_RATE,
+        monotonic_ts_ns=0,
+    )
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(frame)
+    await engine.stop()
+
+    assert len(recorder.sent) == 2
+    pkt0 = RtpPacket.parse(recorder.sent[0][0])
+    pkt1 = RtpPacket.parse(recorder.sent[1][0])
+    assert len(pkt0.payload) == samples_30ms  # mu-law: 1 byte/sample, 240 bytes
+    ts_delta = (pkt1.timestamp - pkt0.timestamp) % (1 << 32)
+    assert ts_delta == samples_30ms  # timestamp advances by the 30 ms sample count
+
+
+def test_ptime_setter_rejects_non_positive() -> None:
+    """Reject a non-positive ptime (a positive count of milliseconds is required)."""
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+    )
+    with pytest.raises(ValueError, match="ptime"):
+        engine.ptime = 0
+    with pytest.raises(ValueError, match="ptime"):
+        engine.ptime = -5

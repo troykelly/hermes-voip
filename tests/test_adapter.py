@@ -2937,6 +2937,48 @@ async def test_send_provider_error_log_redacts_json_credential_shapes(
 
 
 @pytest.mark.asyncio
+async def test_send_provider_error_log_redacts_json_value_with_escaped_quote(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    r"""A JSON credential value containing an escaped quote is fully masked.
+
+    Codex review BLOCKING: a value like ``{"api_key":"HEAD\"TAIL"}`` must not leak
+    the post-escaped-quote tail — the redactor treats ``\"`` as an escaped char
+    INSIDE the quoted value, not as the closing quote (rule 34). Built at runtime.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    # Minimal speak()-only double for the typed call-loop slot (rule 20).
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    head = base64.b64encode(bytes(range(94, 109))).decode()
+    tail = base64.b64encode(bytes(range(109, 124))).decode()
+    # The api_key value is head + an ESCAPED quote + tail; the ``\"`` must not be read
+    # as the closing quote (which would leave ``tail`` visible in the log).
+    err = 'API call failed: HTTP 502; {"api_key": "' + head + '\\"' + tail + '"}'
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, err)
+
+    assert result.success
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "502" in blob
+    assert head not in blob
+    # The tail AFTER the escaped quote must not leak either.
+    assert tail not in blob
+
+
+@pytest.mark.asyncio
 async def test_send_genuine_reply_not_treated_as_provider_error() -> None:
     """A genuine reply mentioning an error/number is still spoken verbatim."""
     transport = _FakeTransport()

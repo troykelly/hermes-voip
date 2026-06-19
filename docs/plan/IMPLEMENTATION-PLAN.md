@@ -242,6 +242,10 @@ Phase 2 full-duplex barge-in + AEC (ADR-0008 Phase 2) is **explicitly deferred**
 the unverified `AIAgent.run_conversation` mid-generation cancellation + an AEC choice in a follow-up
 ADR) and is **out of scope** for this plan — do not build it now (rule 6).
 
+Durable call-events + recordings analytics export (AWS S3 Tables / Iceberg) is researched and designed
+in ADR-0060 (Proposed/Deferred) as a post-Wave-2 nice-to-have; it is OUT OF SCOPE for the P0–P3 phases
+here and is gated on operator cost approval + an ADR flip to Accepted + a runbook (rule 40).
+
 ---
 
 ## 5. Smallest next shippable step ("get back to shipping")

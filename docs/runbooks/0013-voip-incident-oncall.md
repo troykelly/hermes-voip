@@ -143,6 +143,22 @@ If the gateway is behind a NAT (private network), verify:
   not **signalling** NAT). This is a gateway/network configuration issue.
 - Confirm the gateway can route back to the plugin's SIP address (the registered Contact).
 
+### 4. Callers get a busy signal under load (admission cap — ADR-0059)
+
+```bash
+grep "REJECTED 486 Busy Here — at concurrent-call cap" /path/to/hermes/log | tail
+# Each line is a NEW inbound INVITE rejected because the line was already at the
+# HERMES_SIP_MAX_CALLS concurrent-call cap (default 8). This is BY DESIGN — the cap
+# protects the host from a per-call-pipeline (RTP+STT+TTS+AEC+VAD) resource
+# exhaustion under burst/flood.
+```
+
+- If this is expected load, raise `HERMES_SIP_MAX_CALLS` to the host's pipeline
+  budget (each call is one full media pipeline — size it to CPU/memory headroom) and
+  restart.
+- If it is a flood/abuse, the cap is doing its job; investigate the source at the
+  gateway. The line stays up for legitimate calls as slots free.
+
 ---
 
 ## Symptom: Call answers but no audio / one-way audio
@@ -494,10 +510,20 @@ change.
 
 ```bash
 ps aux | grep hermes | grep -v grep
-# If found:
+# If found, prefer a graceful stop FIRST so live calls drain cleanly (ADR-0059):
+kill -TERM <PID>
+# The adapter stops accepting new INVITEs (a racing INVITE gets 503), sends a BYE
+# to every live call, and waits up to HERMES_SIP_SHUTDOWN_DRAIN_SECS (default 5s)
+# for the drain before deregistering and closing. Expect a log line:
+#   "graceful shutdown: draining N live call(s) with BYE (timeout 5.0s)"
+# Only if it does not exit within the drain window + a few seconds:
 kill -9 <PID>
 # Wait 5 s.
 ```
+
+> **Graceful drain (ADR-0059).** A `SIGTERM`/`aclose()` no longer hard-drops live
+> callers — they get an in-dialog BYE. A `kill -9` skips the drain and IS a hard
+> drop, so use it only as the fallback.
 
 ### 2. Verify all env vars are set (SIP + LLM + models)
 

@@ -268,6 +268,10 @@ async def _build_adapter(
                 ),
                 default_extension=MagicMock(extension="1000"),
                 via_transport="TLS",
+                # ADR-0059 lifecycle knobs — real ints/floats so the admission cap
+                # comparison + drain timeout work, not TypeError on a MagicMock.
+                max_calls=8,
+                shutdown_drain_secs=5.0,
             ),
         ),
         patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
@@ -381,6 +385,10 @@ async def test_connect_fails_loud_on_empty_privileged_allow_file(
                 ),
                 default_extension=MagicMock(extension="1000"),
                 via_transport="TLS",
+                # ADR-0059 lifecycle knobs — real ints/floats so the admission cap
+                # comparison + drain timeout work, not TypeError on a MagicMock.
+                max_calls=8,
+                shutdown_drain_secs=5.0,
             ),
         ),
         patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),

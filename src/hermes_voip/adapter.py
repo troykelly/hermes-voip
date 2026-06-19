@@ -103,7 +103,7 @@ from hermes_voip.intercom import (
     IntercomRelayClient,
     load_intercom_config,
 )
-from hermes_voip.manager import NewCall, RegistrationManager
+from hermes_voip.manager import NewCall, RegistrationManager, Unroutable
 from hermes_voip.media.call_loop import BargeInMode, CallLoop
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import (
@@ -234,6 +234,18 @@ _PLATFORM_NAME = "voip"
 _RECONNECT_BACKOFF_INITIAL = 1.0  # first retry delay in seconds
 _RECONNECT_BACKOFF_CAP = 30.0  # maximum delay cap in seconds
 _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
+
+# Defensive fallback for the graceful-shutdown drain timeout (ADR-0059) used only if
+# ``_gateway_cfg`` is somehow unset when ``disconnect`` drains (should-never-happen —
+# connect() populates it first). The AUTHORITATIVE value is
+# ``GatewayConfig.shutdown_drain_secs`` (env ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``); this
+# mirrors its default so a None-config drain is still bounded, never unbounded.
+_DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+# After the drain timeout, cancelled BYE tasks get this brief, bounded grace to
+# finish cancelling — so cooperative BYEs are awaited and their errors observed
+# (not orphaned when the runtime keeps the loop alive after ``disconnect()``); a
+# BYE that ignores cancellation past it is abandoned so shutdown stays bounded.
+_DRAIN_CANCEL_GRACE_SECS = 1.0
 
 # HERMES_VOIP_CALL_ON_CONNECT: if set, the named extension is dialled once after
 # the first successful registration — useful for an AFK test or a scheduled call.
@@ -443,6 +455,17 @@ class VoipAdapter(BasePlatformAdapter):
         # open for follow-up) rather than REMOTE_BYE. Set by ``_mark_agent_hangup``;
         # read by ``_classify_end_reason``; discarded in ``_teardown_call``.
         self._agent_hangups: set[str] = set()
+
+        # Admission control (ADR-0059): the Call-IDs of calls that have RESERVED a
+        # concurrency slot. A slot is reserved in ``_handle_inbound_invite`` the
+        # moment the call passes the cheap reject-early guards and is about to open
+        # its media engine + pipeline, and released in ``_teardown_call`` (or on a
+        # pre-session media-setup failure). ``len(self._admitted_calls)`` is the live
+        # active-call count the cap (``GatewayConfig.max_calls``) is compared against;
+        # a new INVITE at capacity is rejected 486 Busy Here before any media is
+        # built. A set, so an overlapping retransmitted/forked same-Call-ID INVITE
+        # does not double-count and a release is idempotent.
+        self._admitted_calls: set[str] = set()
 
         # Outbound call state (ADR-0019).
         # _call_on_connect_fired: True once the CALL_ON_CONNECT trigger has fired
@@ -655,9 +678,22 @@ class VoipAdapter(BasePlatformAdapter):
         return result
 
     async def disconnect(self) -> None:
-        """Cancel all call loops, close the manager and transport; idempotent."""
+        """Gracefully drain live calls, then close the manager and transport.
+
+        Idempotent. Graceful-shutdown order (ADR-0059): (1) stop accepting new
+        INVITEs (``_connected = False`` makes :meth:`_handle_inbound_invite` decline
+        any INVITE that arrives during shutdown); (2) BYE every live call and wait up
+        to ``shutdown_drain_secs`` for the drain, so a restart no longer hard-drops
+        connected callers into a dangling dialog; (3) cancel any remaining per-call
+        tasks; (4) deregister the extensions (``manager.aclose`` sends Expires:0) and
+        close the transport. A call whose BYE hangs cannot block shutdown past the
+        bounded timeout (its task is cancelled in step 3 regardless).
+        """
         if not self._connected:
             return
+        # Stop accepting new INVITEs FIRST: an INVITE that races in during the drain
+        # is declined by _handle_inbound_invite's _connected guard rather than
+        # answered onto a transport we are about to close.
         self._connected = False
 
         # We are no longer the live adapter for the agent VoIP tools (ADR-0026):
@@ -677,8 +713,15 @@ class VoipAdapter(BasePlatformAdapter):
             with contextlib.suppress(asyncio.CancelledError):
                 await supervisor
 
+        # Graceful drain (ADR-0059): BYE every live call within a bounded timeout
+        # BEFORE cancelling its task, so connected callers get a clean in-dialog BYE
+        # rather than a hard media drop. Bounded so a hung BYE cannot stall shutdown.
+        await self._drain_active_calls()
+
         # Cancel and drain EVERY per-call task across all Call-ID sets (a Call-ID
         # may have multiple overlapping tasks from retransmitted/forked INVITEs).
+        # After the BYE-drain above this is the backstop: any task whose BYE hung (or
+        # that had no session yet) is cancelled here so shutdown always completes.
         tasks = [task for task_set in self._call_tasks.values() for task in task_set]
         for task in tasks:
             task.cancel()
@@ -688,6 +731,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_loops.clear()
         self._dtmf_confirmations.clear()
         self._call_sessions.clear()
+        self._admitted_calls.clear()
 
         manager = self._manager
         if manager is not None:
@@ -698,6 +742,79 @@ class VoipAdapter(BasePlatformAdapter):
         if transport is not None:
             await transport.aclose()
             self._transport = None
+
+    async def _drain_active_calls(self) -> None:
+        """BYE every live call within the bounded shutdown-drain timeout (ADR-0059).
+
+        Sends an in-dialog BYE (via the idempotent :meth:`CallSession.hang_up`) to
+        every currently-registered :class:`CallSession` concurrently, and waits up to
+        :attr:`GatewayConfig.shutdown_drain_secs` for them all to complete. A call
+        already ended (``session.ended``) is skipped (its dialog is gone). A
+        per-session BYE error is collected and logged, so one failed BYE never aborts
+        the drain of the others.
+
+        STRICTLY bounded: each BYE runs as its own task and the wait is
+        :func:`asyncio.wait` with the timeout. On timeout the still-pending BYE tasks
+        are ``cancel()``-ed and then awaited within a short secondary grace
+        (:data:`_DRAIN_CANCEL_GRACE_SECS`) so a cooperative BYE finishes cleanly and
+        its error is observed rather than orphaned — important when the runtime keeps
+        the event loop alive after :meth:`disconnect`. A BYE that ignores cancellation
+        past that grace is abandoned (shutdown stays bounded) and surfaced at WARNING
+        (rule 37 — never silently swallowed).
+        """
+        # Snapshot: teardown mutates _call_sessions, so iterate a copy.
+        sessions = [s for s in self._call_sessions.values() if not s.ended]
+        if not sessions:
+            return
+        drain_timeout = (
+            self._gateway_cfg.shutdown_drain_secs
+            if self._gateway_cfg is not None
+            else _DEFAULT_SHUTDOWN_DRAIN_SECS
+        )
+        _log.info(
+            "graceful shutdown: draining %d live call(s) with BYE (timeout %.1fs)",
+            len(sessions),
+            drain_timeout,
+        )
+        bye_tasks: list[asyncio.Task[None]] = [
+            asyncio.create_task(session.hang_up()) for session in sessions
+        ]
+        # asyncio.wait does NOT propagate task exceptions (unlike gather) and returns
+        # on first-of: all done OR timeout — the timeout is a hard wall here.
+        done, pending = await asyncio.wait(bye_tasks, timeout=drain_timeout)
+        if pending:
+            _log.warning(
+                "graceful shutdown: %d BYE(s) did not complete within %.1fs — "
+                "cancelling and proceeding with teardown",
+                len(pending),
+                drain_timeout,
+            )
+            for task in pending:
+                task.cancel()
+            # Await the cancellations within a short bounded grace so cooperative
+            # BYEs finish and their exceptions are observed (not orphaned when the
+            # runtime keeps the loop alive after disconnect()); a BYE that ignores
+            # cancellation past the grace is abandoned so shutdown stays bounded.
+            settled, unresponsive = await asyncio.wait(
+                pending, timeout=_DRAIN_CANCEL_GRACE_SECS
+            )
+            for task in settled:
+                if not task.cancelled() and task.exception() is not None:
+                    _log.warning(
+                        "graceful shutdown: error sending BYE to a call: %s",
+                        task.exception(),
+                    )
+            if unresponsive:
+                _log.warning(
+                    "graceful shutdown: %d BYE(s) ignored cancellation; abandoning",
+                    len(unresponsive),
+                )
+        for task in done:
+            # A completed BYE that raised: surface it (never swallowed, rule 37). Not
+            # cancelled (it is in ``done``), so .exception() is safe.
+            exc = task.exception()
+            if exc is not None:
+                _log.warning("graceful shutdown: error sending BYE to a call: %s", exc)
 
     async def send(
         self,
@@ -1829,10 +1946,37 @@ class VoipAdapter(BasePlatformAdapter):
         if transport is None:
             _log.warning("INVITE %s arrived after transport closed — ignored", call_id)
             return
+        # Graceful shutdown (ADR-0059): once disconnect() has begun (``_connected``
+        # cleared) we no longer accept NEW calls — an INVITE that races in during the
+        # drain is declined 503 Service Unavailable rather than answered onto a
+        # transport that is about to close. (In-dialog requests for ALREADY-live calls
+        # are routed by the manager, not here, so they are unaffected.)
+        if not self._connected:
+            _log.info("INVITE %s arrived during shutdown — 503 (draining)", call_id)
+            await transport.send(build_response(invite, 503, "Service Unavailable"))
+            return
         gateway_cfg = self._gateway_cfg
         if gateway_cfg is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: gateway config not initialised"
             raise RuntimeError(msg)
+        # Admission control fast-path (ADR-0059): if we are already at the concurrent
+        # -call cap, reject this NEW INVITE with 486 Busy Here immediately — before the
+        # classification + SDP work — so a burst/flood does the least work. This read
+        # is advisory (the authoritative atomic reserve is at the media boundary
+        # below); a retransmit of an ALREADY-admitted call (its Call-ID already holds a
+        # slot) is never rejected here. 486 is the RFC 3261 §21.4.24 "the callee is
+        # busy" code a gateway maps to a busy/queue treatment.
+        if (
+            call_id not in self._admitted_calls
+            and len(self._admitted_calls) >= gateway_cfg.max_calls
+        ):
+            _log.warning(
+                "INVITE %s: REJECTED 486 Busy Here — at concurrent-call cap (%d)",
+                call_id,
+                gateway_cfg.max_calls,
+            )
+            await transport.send(build_response(invite, 486, "Busy Here"))
+            return
         # ADR-0038: the Via transport token for the inbound dialog + the
         # agent-facing call context follows the configured transport (TLS | WSS),
         # not a hardcoded literal — a call received over WSS advertises WSS.
@@ -1996,6 +2140,25 @@ class VoipAdapter(BasePlatformAdapter):
         # reaching it from a public gateway needs symmetric-RTP latching, an
         # outbound greeting first, or — on WebRTC — ICE.)
         local_rtp_host = _host_of(transport.local_sent_by)
+        # Admission control authoritative reserve (ADR-0059): claim the concurrency
+        # slot RIGHT BEFORE the per-call media engine + pipeline are built — the
+        # boundary where the protected resources (an RTP socket, the STT/TTS/AEC/VAD
+        # pipeline) are actually allocated. ``_admit_inbound`` re-checks the cap and
+        # reserves atomically (no ``await`` between the check and the ``add`` on the
+        # single-threaded loop), closing the race where two INVITEs both passed the
+        # advisory fast-path above while the last slot was free. ``add`` is idempotent
+        # for an overlapping same-Call-ID retransmit. The slot is released in
+        # ``_teardown_call`` (the post-session path) or on the pre-session media-setup
+        # failures handled in the ``except`` blocks below — never leaked.
+        if not self._admit_inbound(call_id, gateway_cfg.max_calls):
+            _log.warning(
+                "INVITE %s: REJECTED 486 Busy Here — at concurrent-call cap (%d) "
+                "after classification",
+                call_id,
+                gateway_cfg.max_calls,
+            )
+            await transport.send(build_response(invite, 486, "Busy Here"))
+            return
         try:
             if is_webrtc:
                 engine, local_media = await self._setup_webrtc_call(
@@ -2029,8 +2192,16 @@ class VoipAdapter(BasePlatformAdapter):
                 )
         except _MediaNegotiationRejected:
             # The 488 was already sent and any partial media torn down inside the
-            # setup helper. Nothing more to do — the call was never answered.
+            # setup helper. The call was never answered, so no session/_teardown_call
+            # will run — release the admission slot here so capacity does not leak.
+            self._release_admission(call_id)
             return
+        except BaseException:
+            # An UNEXPECTED media-setup failure (e.g. engine.connect() raised) before
+            # a CallSession exists: no _teardown_call covers this path, so release the
+            # reserved slot, then let the error propagate (rule 37 — never swallowed).
+            self._release_admission(call_id)
+            raise
         # On return the engine is connected and the 200 OK has been sent; execution
         # continues to the shared dialog-registration + CallLoop tail below.
 
@@ -2853,6 +3024,36 @@ class VoipAdapter(BasePlatformAdapter):
             # single chokepoint.
             if not already_ended:
                 await self._signal_call_end(call_id, reason)
+            # BYE on a FAILURE end (ADR-0059): when the conversational pipeline died
+            # mid-call (PIPELINE_FAILURE / MEDIA_TIMEOUT / SIP_ERROR / CONNECTION_LOST
+            # / REGISTRATION_LOST — every reason.was_failure), the SIP dialog is still
+            # UP on the gateway with the caller in dead air. Close it cleanly with an
+            # in-dialog BYE via the idempotent CallSession.hang_up (which sends BYE +
+            # stops media) so the call is never a zombie. Gated on ``session.ended``:
+            # a NORMAL end (the caller already BYE'd, or the agent's hang_up tool
+            # already did) has its dialog closed — sending a second BYE on a dead
+            # dialog is wrong, so we skip it. Best-effort: a BYE-send failure is logged
+            # and never strands the engine-stop / route cleanup below (rule 37 — the
+            # error is surfaced, not swallowed, and the rest of teardown still runs).
+            if reason.was_failure and session is not None and not session.ended:
+                _log.info(
+                    "INVITE %s: failure end (%s) with a live dialog — "
+                    "sending BYE to close it",
+                    call_id,
+                    reason.name,
+                )
+                try:
+                    await session.hang_up()
+                except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
+                    _log.warning(
+                        "INVITE %s: error sending BYE on failure teardown: %s",
+                        call_id,
+                        exc,
+                    )
+            # Release the admission concurrency slot (ADR-0059) when WE own the call —
+            # gated on ``is_current`` so a superseded same-Call-ID task's teardown
+            # never frees the live call's slot. Idempotent.
+            self._release_admission(call_id)
         if call_loop is None or self._call_loops.get(call_id) is call_loop:
             self._call_loops.pop(call_id, None)
             # The per-call DTMF confirmation resolver dies with the loop (ADR-0010).
@@ -2912,6 +3113,35 @@ class VoipAdapter(BasePlatformAdapter):
                 tasks.discard(task)
                 if not tasks:
                     self._call_tasks.pop(call_id, None)
+
+    def _admit_inbound(self, call_id: str, max_calls: int) -> bool:
+        """Atomically reserve a concurrency slot for ``call_id`` (ADR-0059).
+
+        Returns ``True`` and reserves a slot when admission is permitted, ``False``
+        (reserving nothing) when the concurrent-call cap is already reached. A
+        retransmitted/forked INVITE for an ALREADY-admitted Call-ID is always
+        admitted (it holds its slot already; the ``add`` is idempotent), so an
+        overlapping same-Call-ID INVITE never double-counts or is spuriously rejected.
+
+        Atomic by construction: there is no ``await`` between the capacity check and
+        the ``add`` on the single-threaded event loop, so two concurrent inbound
+        handlers cannot both pass the check for the last free slot.
+        """
+        if call_id in self._admitted_calls:
+            return True
+        if len(self._admitted_calls) >= max_calls:
+            return False
+        self._admitted_calls.add(call_id)
+        return True
+
+    def _release_admission(self, call_id: str) -> None:
+        """Release ``call_id``'s reserved concurrency slot, if any (ADR-0059).
+
+        Idempotent (``discard``): called from :meth:`_teardown_call` for the normal
+        path and from the pre-session media-setup failure paths in
+        :meth:`_handle_inbound_invite`; a double release is a harmless no-op.
+        """
+        self._admitted_calls.discard(call_id)
 
     def _mark_agent_hangup(self, call_id: str) -> None:
         """Record that the agent's hang-up tool initiated this call's end (ADR-0026).
@@ -3893,8 +4123,16 @@ class VoipAdapter(BasePlatformAdapter):
         return Platform(channel)
 
     def _on_unroutable(self, what: object) -> None:
-        """Log unroutable SIP messages at DEBUG; never crash the transport."""
-        _log.debug("unroutable SIP message: %s", what)
+        """Log unroutable SIP messages at DEBUG, redacted; never crash the transport.
+
+        The raw object (an :class:`~hermes_voip.manager.Unroutable` request or a
+        :class:`~hermes_voip.message.SipResponse`) carries secrets — the
+        ``Authorization`` / ``Proxy-Authorization`` digest **response** and any SDP
+        ``a=crypto`` **inline SRTP key material**. This repo is PUBLIC and logs may be
+        captured in CI, so :func:`_redact_sip_for_log` masks those before logging
+        (rule 34) while keeping the diagnostic shape (method/status + header NAMES).
+        """
+        _log.debug("unroutable SIP message: %s", _redact_sip_for_log(what))
 
     def _on_connection_lost(self, exc: BaseException | None) -> None:
         """Signal the reconnect supervisor that the TLS connection is gone."""
@@ -4378,6 +4616,96 @@ def _redact_number(number: str) -> str:
     if len(number) <= tail:
         return "*" * len(number)
     return "*" * (len(number) - tail) + number[-tail:]
+
+
+# Header names whose VALUES carry the digest authentication response — a credential
+# derived from the SIP password (rule 34: must never reach a log line). Compared
+# case-insensitively. ``Authorization``/``Proxy-Authorization`` are what a UAC sends;
+# ``Authentication-Info`` echoes a server-computed digest. The matching
+# ``*-Authenticate`` CHALLENGE headers carry only a nonce/realm (not a secret) but
+# are masked too, for safety.
+_SENSITIVE_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "authentication-info",
+    }
+)
+_REDACTED = "<redacted>"
+
+
+def _redact_header_value(name: str, value: str) -> str:
+    """Mask a header value that carries credential material; pass others through."""
+    if name.lower() in _SENSITIVE_HEADER_NAMES:
+        return _REDACTED
+    return value
+
+
+def _redact_sdp_body(body: str) -> str:
+    """Mask SRTP key material in an SDP body, keeping the line structure.
+
+    RFC 4568 ``a=crypto`` lines carry an ``inline:`` SRTP master key + salt — live
+    key material that must never be logged (rule 34). Each ``a=crypto`` line's value
+    is replaced wholesale (the suite name is not worth the risk of a partial leak);
+    every other SDP line is preserved so the log still shows the media shape. A body
+    with no ``a=crypto`` is returned unchanged. The match is case-INSENSITIVE: SDP
+    attribute names are lowercase by RFC 4566, but a non-conformant peer's ``A=CRYPTO``
+    must not slip an unredacted key through the fast-path guard.
+    """
+    if "a=crypto" not in body.lower():
+        return body
+    out: list[str] = []
+    for line in body.splitlines():
+        if line.lower().startswith("a=crypto"):
+            out.append("a=crypto:" + _REDACTED)
+        else:
+            out.append(line)
+    # Preserve the trailing newline style loosely: SDP is CRLF on the wire but this
+    # is a log string, so a plain join is fine (it is never re-parsed).
+    return "\n".join(out)
+
+
+def _redact_sip_for_log(what: object) -> str:
+    """Render an unroutable SIP message for logging with all secrets masked (rule 34).
+
+    Accepts an :class:`~hermes_voip.manager.Unroutable` (an unroutable request +
+    reason) or a :class:`~hermes_voip.message.SipResponse` (the two types the
+    transport hands to ``on_unroutable``). Produces a compact, diagnostic string —
+    the method/request-URI or status/reason, every header with its NAME kept but the
+    ``Authorization``/``Proxy-Authorization``/``a=crypto`` SECRETS masked — so a SIP
+    routing problem stays debuggable without leaking the digest response or SRTP keys.
+
+    Anything else (an unexpected type) falls back to ``type(what).__name__`` rather
+    than ``str(what)``: never risk an unredacted ``repr`` of an unknown object that
+    might embed a credential.
+    """
+    if isinstance(what, Unroutable):
+        request = what.request
+        headers = " ".join(
+            f"{name}={_redact_header_value(name, value)}"
+            for name, value in request.headers
+        )
+        body = _redact_sdp_body(request.body)
+        body_note = f" body={body!r}" if body else ""
+        return (
+            f"unroutable request {request.method} {request.request_uri} "
+            f"(reason={what.reason!r}) [{headers}]{body_note}"
+        )
+    if isinstance(what, SipResponse):
+        headers = " ".join(
+            f"{name}={_redact_header_value(name, value)}"
+            for name, value in what.headers
+        )
+        body = _redact_sdp_body(what.body)
+        body_note = f" body={body!r}" if body else ""
+        return (
+            f"unroutable response {what.status_code} {what.reason!r} "
+            f"[{headers}]{body_note}"
+        )
+    # Unknown type: never str()/repr() it (could embed a secret) — name only.
+    return f"<{type(what).__name__}>"
 
 
 # Spotlighting delimiters for the untrusted remote-party transcript (ADR-0009).

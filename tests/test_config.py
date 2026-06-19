@@ -155,6 +155,132 @@ def test_explicit_port_expires_and_user_agent() -> None:
     assert cfg.user_agent == "hermes-voip/test"
 
 
+# ---- provisioning-alias host/port keys (launch-blocker fix) ----------------
+#
+# The 1Password-provisioned .env emits HERMES_SIP_SERVER_HOST / HERMES_SIP_TLS_PORT,
+# but the canonical keys are HERMES_SIP_HOST / HERMES_SIP_PORT. Accept the provisioner
+# names as fallbacks so a first live launch from the sanctioned secret registers; the
+# canonical names win when both are set (runbook 0001).
+
+
+def test_server_host_alias_loads_when_canonical_host_unset() -> None:
+    """A config with ONLY HERMES_SIP_SERVER_HOST (no HERMES_SIP_HOST) loads the host.
+
+    This is the exact .env the 1Password provisioner writes — it must register, not
+    fail with 'HERMES_SIP_HOST is required'.
+    """
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_SERVER_HOST": "pbx.example.test",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.host == "pbx.example.test"
+
+
+def test_tls_port_alias_loads_when_canonical_port_unset() -> None:
+    """A config with ONLY HERMES_SIP_TLS_PORT (no HERMES_SIP_PORT) loads the port."""
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_SERVER_HOST": "pbx.example.test",
+            "HERMES_SIP_TLS_PORT": "5061",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.port == 5061
+
+
+def test_provisioner_env_shape_loads_host_and_port() -> None:
+    """The full provisioner shape (SERVER_HOST + TLS_PORT, no canonical keys) loads."""
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_SERVER_HOST": "pbx.example.test",
+            "HERMES_SIP_TLS_PORT": "5061",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.host == "pbx.example.test"
+    assert cfg.port == 5061
+
+
+def test_canonical_host_wins_over_server_host_alias() -> None:
+    """When both names are set, the canonical HERMES_SIP_HOST takes precedence."""
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_HOST": "canonical.example.test",
+            "HERMES_SIP_SERVER_HOST": "alias.example.test",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.host == "canonical.example.test"
+
+
+def test_canonical_port_wins_over_tls_port_alias() -> None:
+    """When both names are set, the canonical HERMES_SIP_PORT takes precedence."""
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_HOST": "pbx.example.test",
+            "HERMES_SIP_PORT": "5070",
+            "HERMES_SIP_TLS_PORT": "5061",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.port == 5070
+
+
+def test_blank_canonical_host_falls_back_to_server_host_alias() -> None:
+    """A present-but-blank HERMES_SIP_HOST falls back to the alias (not 'required')."""
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_HOST": "   ",
+            "HERMES_SIP_SERVER_HOST": "alias.example.test",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.host == "alias.example.test"
+
+
+def test_blank_canonical_port_falls_back_to_tls_port_alias() -> None:
+    """A present-but-blank HERMES_SIP_PORT falls back to the TLS-port alias."""
+    cfg = load_gateway_config(
+        {
+            "HERMES_SIP_HOST": "pbx.example.test",
+            "HERMES_SIP_PORT": "  ",
+            "HERMES_SIP_TLS_PORT": "5061",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "secret",
+        }
+    )
+    assert cfg.port == 5061
+
+
+def test_neither_host_name_set_rejected() -> None:
+    """Neither HERMES_SIP_HOST nor HERMES_SIP_SERVER_HOST set => a clear ConfigError."""
+    with pytest.raises(ConfigError, match="HERMES_SIP_HOST"):
+        load_gateway_config(
+            {"HERMES_SIP_EXTENSION": "1000", "HERMES_SIP_PASSWORD": "secret"}
+        )
+
+
+def test_tls_port_alias_out_of_range_rejected() -> None:
+    """A malformed value via the TLS-port alias is validated like the canonical key."""
+    with pytest.raises(ConfigError):
+        load_gateway_config(
+            {
+                "HERMES_SIP_SERVER_HOST": "pbx.example.test",
+                "HERMES_SIP_TLS_PORT": "70000",
+                "HERMES_SIP_EXTENSION": "1000",
+                "HERMES_SIP_PASSWORD": "secret",
+            }
+        )
+
+
 def test_default_extension_explicit() -> None:
     cfg = load_gateway_config(
         _base(
@@ -1341,6 +1467,34 @@ def test_media_cloud_keys_absent_from_repr() -> None:
     # the value is still accessible by reference for the runtime to use
     assert cfg.elevenlabs_api_key == "el-super-secret"
     assert cfg.deepgram_api_key == "dg-super-secret"
+
+
+def test_extension_config_password_absent_from_repr() -> None:
+    """Rule 34: the SIP digest password must NEVER reach a log line via repr.
+
+    ``ExtensionConfig.password`` is a secret (the SIP-TLS digest credential), so it is
+    repr-suppressed like every sibling secret — a traceback or config-dump that renders
+    an ExtensionConfig must not print the plaintext password.
+    """
+    ext = ExtensionConfig(
+        index=0, extension="1000", username="1000", password="super-secret-pw"
+    )
+    assert "super-secret-pw" not in repr(ext)
+    # the value is still accessible by reference for the digest to use
+    assert ext.password == "super-secret-pw"
+
+
+def test_gateway_config_password_absent_from_repr() -> None:
+    """Rule 34: repr(GatewayConfig) renders its extensions tuple — no password leaks.
+
+    GatewayConfig's repr includes ``extensions``, so an un-suppressed per-extension
+    password would surface here in any traceback/config-dump. The whole config repr
+    must be free of the plaintext digest secret.
+    """
+    cfg = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="super-secret-pw")
+    )
+    assert "super-secret-pw" not in repr(cfg)
 
 
 # ---- rejection cases -------------------------------------------------------

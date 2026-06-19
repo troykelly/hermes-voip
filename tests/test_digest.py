@@ -528,3 +528,35 @@ def test_rejects_genuinely_unsupported_algorithm() -> None:
                 uri="sip:pbx.example.test",
                 cnonce="c",
             )
+
+
+# ---------------------------------------------------------------------------
+# -sess cnonce in Authorization header (RFC 2617 §3.2.2 compliance)
+# ---------------------------------------------------------------------------
+
+
+def test_md5_sess_no_qop_emits_cnonce_in_header() -> None:
+    """RFC 2617 §3.2.2: cnonce MUST appear in the Authorization header for -sess.
+
+    Even when the challenge does not offer qop, the -sess HA1 bakes in the
+    cnonce, so the server needs it to reproduce HA1.  The Authorization header
+    must therefore carry a cnonce= param.
+    """
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="sip_nonce_42",
+        algorithm="MD5-sess",
+        qop=(),  # no qop
+    )
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="1000", password="s3cr3t"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="sip_cnonce_42",
+    )
+    # cnonce must be present so the server can recompute HA1-sess
+    assert _param(header, "cnonce") == "sip_cnonce_42"
+    # nc and qop must NOT be present (no qop offered)
+    assert _param(header, "nc") is None
+    assert _param(header, "qop") is None

@@ -328,6 +328,10 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
         params.append(
             ("response", _hash_hex(algo_lower, f"{ha1}:{challenge.nonce}:{ha2}"), True)
         )
+        # RFC 2617 §3.2.2: for -sess, the cnonce binds the session key and MUST
+        # appear in the Authorization header even when qop is not present.
+        if is_sess and client_nonce:
+            params.append(("cnonce", client_nonce, True))
 
     if challenge.opaque is not None:
         params.append(("opaque", challenge.opaque, True))

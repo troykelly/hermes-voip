@@ -241,6 +241,11 @@ _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
 # ``GatewayConfig.shutdown_drain_secs`` (env ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``); this
 # mirrors its default so a None-config drain is still bounded, never unbounded.
 _DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+# After the drain timeout, cancelled BYE tasks get this brief, bounded grace to
+# finish cancelling — so cooperative BYEs are awaited and their errors observed
+# (not orphaned when the runtime keeps the loop alive after ``disconnect()``); a
+# BYE that ignores cancellation past it is abandoned so shutdown stays bounded.
+_DRAIN_CANCEL_GRACE_SECS = 1.0
 
 # HERMES_VOIP_CALL_ON_CONNECT: if set, the named extension is dialled once after
 # the first successful registration — useful for an AFK test or a scheduled call.
@@ -750,12 +755,12 @@ class VoipAdapter(BasePlatformAdapter):
 
         STRICTLY bounded: each BYE runs as its own task and the wait is
         :func:`asyncio.wait` with the timeout. On timeout the still-pending BYE tasks
-        are ``cancel()``-ed but NOT awaited here — a BYE that resists cancellation
-        cannot stall shutdown (``asyncio.wait_for`` would have awaited the
-        cancellation; we deliberately do not). The caller (:meth:`disconnect`) then
-        cancels the call tasks and closes the transport, so shutdown always completes
-        within the budget (rule 37 — the timeout is surfaced at WARNING, not
-        swallowed). The orphaned BYE tasks die with the event loop at process exit.
+        are ``cancel()``-ed and then awaited within a short secondary grace
+        (:data:`_DRAIN_CANCEL_GRACE_SECS`) so a cooperative BYE finishes cleanly and
+        its error is observed rather than orphaned — important when the runtime keeps
+        the event loop alive after :meth:`disconnect`. A BYE that ignores cancellation
+        past that grace is abandoned (shutdown stays bounded) and surfaced at WARNING
+        (rule 37 — never silently swallowed).
         """
         # Snapshot: teardown mutates _call_sessions, so iterate a copy.
         sessions = [s for s in self._call_sessions.values() if not s.ended]
@@ -785,10 +790,25 @@ class VoipAdapter(BasePlatformAdapter):
                 drain_timeout,
             )
             for task in pending:
-                # Cancel but do NOT await: a cancellation-resistant hang_up must not
-                # re-introduce an unbounded wait. The task is orphaned; it dies with
-                # the loop. (disconnect() also cancels the owning call task next.)
                 task.cancel()
+            # Await the cancellations within a short bounded grace so cooperative
+            # BYEs finish and their exceptions are observed (not orphaned when the
+            # runtime keeps the loop alive after disconnect()); a BYE that ignores
+            # cancellation past the grace is abandoned so shutdown stays bounded.
+            settled, unresponsive = await asyncio.wait(
+                pending, timeout=_DRAIN_CANCEL_GRACE_SECS
+            )
+            for task in settled:
+                if not task.cancelled() and task.exception() is not None:
+                    _log.warning(
+                        "graceful shutdown: error sending BYE to a call: %s",
+                        task.exception(),
+                    )
+            if unresponsive:
+                _log.warning(
+                    "graceful shutdown: %d BYE(s) ignored cancellation; abandoning",
+                    len(unresponsive),
+                )
         for task in done:
             # A completed BYE that raised: surface it (never swallowed, rule 37). Not
             # cancelled (it is in ``done``), so .exception() is safe.

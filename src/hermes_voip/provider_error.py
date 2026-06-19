@@ -36,18 +36,32 @@ import re
 # NOT match (a genuine reply uses those innocently).
 
 # HTTP error STATUS codes (5xx server errors + 429 rate-limit) — only in an error
-# context, never a bare number. Three ways a real raw error frames a status, none of
-# which a genuine conversational reply about a third party's outage produces. One, an
-# http or status token sits next to the code, as in HTTP 502 or status code 500. Two,
-# the status leads the message the way a raw error does (502 Bad Gateway) — whereas a
-# reply ABOUT someone else's outage carries the number mid-sentence (a caller whose
-# website is returning 503), not leading. Three, an explicit error-N framing, as in
-# error 502. A genuine reply — reference 502, room 500, 503 people, a caller naming a
-# 503 Service Unavailable page — matches none of these.
+# context, never a bare number. A real raw error frames a status one of two ways,
+# neither of which a genuine conversational reply produces. (1) An http/status/error
+# keyword sits next to the code, tolerating an "HTTP/1.1 " version prefix and a
+# "status code" / "status=" / "error code:" framing — HTTP 502, HTTP/1.1 502, status
+# code 500, status: 429, error code: 502. (2) A raw status LINE leads the message:
+# the code immediately followed by its canonical reason phrase — 502 Bad Gateway,
+# 429 Too Many Requests. A genuine reply matches neither: one that merely mentions a
+# code mid-sentence (a caller naming a 503 Service Unavailable page), that LEADS with
+# a code which is NOT a reason phrase ("503 people are waiting", "429 confirmed
+# guests"), or that names a bare reference number (reference 502, room 500).
 _HTTP_STATUS = r"(?:5\d{2}|429)"
+# Canonical HTTP reason phrases for the 5xx/429 codes — what distinguishes a raw
+# status line ("502 Bad Gateway") from a reply that merely LEADS with the number.
+_HTTP_REASON = (
+    r"(?:internal\s+server\s+error|not\s+implemented|bad\s+gateway"
+    r"|service\s+unavailable|gateway\s+time-?out|http\s+version\s+not\s+supported"
+    r"|variant\s+also\s+negotiates|insufficient\s+storage|loop\s+detected"
+    r"|not\s+extended|network\s+authentication\s+required|too\s+many\s+requests)"
+)
 _HTTP_ERROR_RE = re.compile(
-    rf"\b(?:http|status(?:\s+code)?|error)\b[\s:]*{_HTTP_STATUS}\b"
-    rf"|^\s*{_HTTP_STATUS}\b",
+    # 1. an http/status/error keyword next to the code (digit-free separators so the
+    #    status digits are never eaten by the gap matcher).
+    rf"\b(?:https?(?:/\d(?:\.\d)?)?|status(?:\s+code)?|error(?:\s+code)?)\b"
+    rf"[\s:=]*{_HTTP_STATUS}\b"
+    # 2. a raw status line leading the message: code + its canonical reason phrase.
+    rf"|^\s*{_HTTP_STATUS}\s+{_HTTP_REASON}\b",
     re.IGNORECASE,
 )
 

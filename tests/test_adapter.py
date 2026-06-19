@@ -2865,6 +2865,8 @@ async def test_send_provider_error_log_redacts_credential_shapes(
             async for _chunk in text:
                 pass
 
+    # Minimal speak()-only double for the typed call-loop slot (rule 20: a full
+    # CallLoop is unnecessary for this log-redaction assertion).
     adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
 
     secret_token = base64.b64encode(bytes(range(33, 63))).decode()

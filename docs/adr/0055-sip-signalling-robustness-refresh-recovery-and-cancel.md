@@ -1,4 +1,4 @@
-# ADR-0054: SIP signalling robustness — registration-refresh recovery and inbound CANCEL
+# ADR-0055: SIP signalling robustness — registration-refresh recovery and inbound CANCEL
 
 - Status: Accepted
 - Date: 2026-06-19

@@ -2572,6 +2572,10 @@ class VoipAdapter(BasePlatformAdapter):
         if rtcp_plan is not None:
             await engine.start_rtcp(
                 mux=rtcp_plan.mux,
+                # Engine-side RFC 5761 §4 last-line guard (codex review): the full
+                # answered RTP payload set (agreed_sdp_codecs already includes
+                # telephone-event) — the engine refuses mux if any PT is in 64-95.
+                rtp_payload_types=tuple(c.payload_type for c in agreed_sdp_codecs),
                 remote_rtcp_addr=None if rtcp_plan.mux else rtcp_plan.remote_rtcp_addr,
             )
             _log.info(

@@ -183,6 +183,12 @@ _DEFAULT_CNAME: Final[str] = "hermes-voip"
 # real call reports about every 5 s regardless — the default below only matters for
 # the (unused here) many-party case. Bytes/s.
 _DEFAULT_RTCP_BANDWIDTH: Final[float] = 500.0
+# RFC 5761 §4: RTP payload types 64-95 alias the RTCP packet-type byte (an RTP M+PT
+# of 200-204 is indistinguishable from SR/RR/SDES/BYE/APP) on a muxed stream, so
+# RTP/RTCP cannot be demultiplexed. start_rtcp refuses mux activation for such a PT
+# (the adapter also refuses it before activation — defense in depth).
+_RTCP_MUX_CONFLICT_PT_MIN: Final[int] = 64
+_RTCP_MUX_CONFLICT_PT_MAX: Final[int] = 95
 # Seed average compound-RTCP packet size (bytes incl. UDP/IP, RFC 3550 §6.2) before
 # the first report is sent; refined toward the real sizes as reports are emitted.
 _INITIAL_AVG_RTCP_SIZE: Final[float] = 96.0
@@ -1183,6 +1189,12 @@ class RtpMediaTransport:
         # ---- RTCP control channel (RFC 3550 §6, ADR-0061) ----
         self._cname = cname
         self._rtcp_send: Callable[[bytes], None] | None = rtcp_send
+        # The constructor-injected RTCP sink (None on a muxed prod call; a test sink
+        # or the separate-port adapter sink otherwise). The non-muxed start_rtcp path
+        # overwrites self._rtcp_send with a sibling-socket lambda; stop()/connect()
+        # restore it to THIS value so a reused engine never sends RTCP through a
+        # closed previous socket (codex review: RTCP-send lifecycle).
+        self._injected_rtcp_send: Callable[[bytes], None] | None = rtcp_send
         self._ntp_clock: Callable[[], float] = (
             ntp_clock if ntp_clock is not None else time.time
         )
@@ -1358,6 +1370,9 @@ class RtpMediaTransport:
         self._rtcp_mux_active = False
         self._rtcp_transport = None
         self._rtcp_reader = None
+        # Restore the constructor sink: drop any sibling-socket lambda a previous
+        # non-muxed call installed, so this call never sends RTCP via a closed socket.
+        self._rtcp_send = self._injected_rtcp_send
         self._rtcp_local_port = None
 
         if self._ice is not None:
@@ -2379,6 +2394,7 @@ class RtpMediaTransport:
         self,
         *,
         mux: bool,
+        rtp_payload_types: tuple[int, ...] = (),
         remote_rtcp_addr: tuple[str, int] | None = None,
         send_bye_on_stop: bool = True,
     ) -> None:
@@ -2412,6 +2428,9 @@ class RtpMediaTransport:
         Args:
             mux: ``True`` to multiplex RTCP onto the RTP transport (RFC 5761), ``False``
                 to use a separate RTCP socket on RTP-port+1.
+            rtp_payload_types: The negotiated/answered RTP payload types. When ``mux``
+                is ``True`` and any lies in the RFC 5761 §4 conflict range (64-95),
+                RTCP is left dormant (the muxed RTP/RTCP demux would be ambiguous).
             remote_rtcp_addr: The peer's RTCP ``(host, port)`` — REQUIRED when
                 ``mux=False`` (where to send our RTCP). Ignored when muxed (RTCP
                 follows the RTP destination / comedia latch).
@@ -2432,6 +2451,20 @@ class RtpMediaTransport:
                 "DORMANT (no SRTCP transform; cleartext RTCP on an encrypted call "
                 "would violate the profile and leak SSRC/CNAME). The future SRTCP "
                 "lane flips this guard."
+            )
+            return
+        # RFC 5761 §4 defense-in-depth: an RTP payload type in 64-95 aliases the RTCP
+        # packet-type byte on a muxed stream, so the RTP/RTCP demux is ambiguous. The
+        # adapter already refuses mux (sibling port) for such a PT; this is the engine's
+        # last-line guard for any other caller — refuse mux, leave RTCP dormant.
+        if mux and any(
+            _RTCP_MUX_CONFLICT_PT_MIN <= pt <= _RTCP_MUX_CONFLICT_PT_MAX
+            for pt in rtp_payload_types
+        ):
+            _log.warning(
+                "start_rtcp(mux=True) with an RFC 5761 §4 conflict-range RTP payload "
+                "type (64-95) — RTCP left DORMANT (muxed RTP/RTCP demux would be "
+                "ambiguous); a separate RTCP port is required for these payload types."
             )
             return
         if not mux:
@@ -3224,6 +3257,11 @@ class RtpMediaTransport:
         if rtcp_transport is not None:
             rtcp_transport.close()
         self._rtcp_local_port = None
+        # Restore the constructor sink AFTER the closing BYE has gone out (above) and
+        # the sibling socket is closed: a non-muxed call installed a lambda bound to
+        # that now-closed socket, so drop it to the injected value (None on a muxed
+        # prod call) — a reused engine never sends RTCP via the dead socket.
+        self._rtcp_send = self._injected_rtcp_send
         # Set the stop flag so the inbound generator wakes and exits cleanly.
         # Unlike a queued sentinel, this is independent of recv-queue capacity:
         # a full queue cannot drop the signal and strand the consumer.

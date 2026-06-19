@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
 import random
 import re
@@ -67,7 +68,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource
 
-from hermes_voip.call import CallSession
+from hermes_voip.call import CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
     extract_call_context,
@@ -91,7 +92,7 @@ from hermes_voip.config import (
     load_gateway_config,
     load_media_config,
 )
-from hermes_voip.dialog import Dialog
+from hermes_voip.dialog import Dialog, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.dtmf_config import (
     DtmfReceiveMode,
@@ -116,6 +117,7 @@ from hermes_voip.media.engine import (
     UnsupportedCodecError,
     codec_for_encoding,
 )
+from hermes_voip.media.sip_dtls_session import SipDtlsMediaSession
 from hermes_voip.media.vad import (
     VoiceActivityDetector,
     load_silero_model,
@@ -153,15 +155,18 @@ from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
     AudioMedia,
     CryptoAttribute,
+    MediaSecurity,
     SessionDescription,
     VideoAnswer,
     VideoAnswerMode,
     build_audio_answer,
     build_audio_offer,
+    build_sip_dtls_answer,
     build_webrtc_answer,
     build_webrtc_offer,
     generate_answer_crypto,
     negotiate_audio,
+    negotiate_media_security,
     negotiate_ptime,
     negotiate_rtcp_mux,
     negotiate_video_h264,
@@ -205,6 +210,172 @@ class _MediaNegotiationRejected(Exception):  # noqa: N818 — control-flow signa
     that keeps the 488-and-teardown logic inside the per-path helper (rule 6: the
     call is fully un-answered, never half-set-up).
     """
+
+
+class _AnsweredCallPeerEnded(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Internal signal: the peer BYE'd a DTLS/WebRTC call DURING media setup (ADR-0065).
+
+    Raised by :meth:`VoipAdapter._setup_sip_dtls_call` / ``_setup_webrtc_call`` when the
+    answer-time dialog guard saw a peer ``BYE`` (already answered ``200``) by the time
+    the handshake + engine succeeded. The setup helper has already stopped media and
+    deregistered the guard, so the inbound handler must NOT build a ``CallLoop`` on the
+    peer-ended dialog — a clean ``return`` channel (no BYE from us; the peer ended it).
+    Distinct from :class:`_MediaNegotiationRejected` (a media FAILURE) — here media
+    SUCCEEDED but the dialog is already gone.
+    """
+
+
+# Bounded wait (seconds) for the peer's ACK to confirm an answered dialog before the
+# post-200 abort sends its fallback BYE (ADR-0065). Mirrors RFC 3261 Timer H
+# (64*T1 = 32 s): a peer that received our 2xx but never ACKs is non-conformant, so we
+# close the dialog anyway after this bound rather than wait forever. Media is released
+# IMMEDIATELY on the failure; only the BYE waits.
+_ANSWERED_ABORT_ACK_TIMEOUT_S = 32.0
+
+# Bounded settle (seconds) after an ACK confirms the dialog, during which a closely-
+# trailing peer BYE still wins (ADR-0065). The transport drives ONE sequential read
+# loop, so a BYE the peer sends right after its ACK is a separate, not-yet-read frame
+# when the ACK wakes the abort's wait — a snapshot there returns ACK_CONFIRMED and the
+# abort BYEs, colliding with the peer's just-arriving BYE (glare). This brief grace lets
+# the trailing BYE supersede the ACK so we send no BYE of our own. A BYE after the grace
+# is independent teardown the SIP layer absorbs (both-sides BYE, RFC 3261 §15). The
+# grace need only cover the read-loop scheduling gap, so it stays short. Only the (rare)
+# abort path pays it, and only when the peer ACKs without then BYEing.
+_ACK_BYE_SETTLE_S = 0.5
+
+
+class _DialogOutcome(enum.Enum):
+    """Terminal state of an answered dialog seen by :class:`_AnsweredDialogGuard`.
+
+    An explicit outcome (rather than a mutable flag read at one moment) is what makes
+    the post-200 teardown race-free (ADR-0065): the success path and the abort both act
+    on the outcome, so a peer BYE that arrives mid-wait cannot produce a double-BYE and
+    a peer BYE during a successful handshake cannot start a CallLoop.
+    """
+
+    ACK_CONFIRMED = enum.auto()  # the peer ACKed our 2xx — the dialog is confirmed
+    PEER_BYE = enum.auto()  # the peer BYE'd (we answered 200) — the dialog is ended
+    TIMEOUT = enum.auto()  # neither arrived within the bound (non-conformant peer)
+
+
+class _AnsweredDialogGuard:
+    """Routes an answered dialog's in-dialog requests during the media-handshake window.
+
+    The DTLS-SRTP / WebRTC inbound paths send the ``200 OK`` **before** running their
+    media handshake (RFC 5763 §4), and the real :class:`~hermes_voip.call.CallSession`
+    is only built + registered **after** the handshake. Without a route in between, the
+    peer's ``2xx``-ACK (and a racing ``BYE``) is unroutable and dropped — so the dialog
+    is never observed as **confirmed** (RFC 3261 §12), which blocks an §15.1.1-correct
+    BYE on a post-200 failure.
+
+    This lightweight guard is registered at **answer-time** (right after the 200 OK,
+    before the handshake) via the same ``manager.add_call`` / ``transport.add_call``
+    routing the real session uses. It is **signalling only** — it carries no media and
+    starts no RTP path (the engine is still built only after fingerprint verification,
+    RFC 5763 §5). On success the real :class:`CallSession` **overwrites** it on the same
+    keys (a seamless upgrade); on a post-200 failure
+    :meth:`VoipAdapter._abort_answered_call` consults it to BYE the dialog only once
+    confirmed.
+
+    Implements :class:`~hermes_voip.manager.DialogConsumer` (``handle_request``) and
+    :class:`~hermes_voip.transport.connection.CallResponseSink` (``on_response``).
+    """
+
+    def __init__(
+        self, *, dialog: Dialog, transport: CallSignaling, call_id: str
+    ) -> None:
+        """Bind the guard to the answered ``dialog`` on ``transport``.
+
+        ``transport`` is typed as the narrow :class:`~hermes_voip.call.CallSignaling`
+        seam — the guard only ever ``send``s SIP responses (200/491) — not the full
+        :data:`SignalingTransport` union; both concrete transports satisfy it.
+        """
+        self._dialog = dialog
+        self._transport = transport
+        self._call_id = call_id
+        self._confirmed = asyncio.Event()
+        self._peer_bye = asyncio.Event()
+
+    @property
+    def peer_ended(self) -> bool:
+        """Whether the peer has ALREADY ended the dialog with a BYE (instantaneous).
+
+        Read by the success path right before it would start the CallLoop: if the peer
+        BYE'd during the handshake, the call must end cleanly with no CallLoop. There is
+        no ``await`` between this check and the real CallSession ``add_call`` overwrite,
+        so the check + registration are atomic relative to inbound routing on the
+        single-threaded loop (a later BYE then routes to the real CallSession).
+        """
+        return self._peer_bye.is_set()
+
+    async def handle_request(self, request: SipRequest) -> None:
+        """Consume one in-dialog request during the handshake window.
+
+        An ``ACK`` confirms the dialog (RFC 3261 §13.2.2.4). A peer ``BYE`` is answered
+        ``200 OK``, marks the dialog peer-ended, and also confirms (the dialog is now
+        established-then-terminated; the abort must not send its own BYE). An in-window
+        re-``INVITE`` is rejected ``491 Request Pending`` (media is not up yet, so we
+        cannot service a re-offer). Anything else is acknowledged where a final response
+        is required and otherwise benignly absorbed — never crashing the window.
+        """
+        method = request.method
+        if method == "ACK":
+            self._confirmed.set()
+        elif method == "BYE":
+            # Mark peer-ended + confirmed BEFORE the 200-send await, so the flag is
+            # observable the instant this handler runs (no await/yield can interleave
+            # between dispatch and the mark) — the abort's settle-grace and the
+            # success-path peer_ended check both rely on this.
+            self._peer_bye.set()
+            self._confirmed.set()
+            await self._transport.send(build_response(request, 200, "OK"))
+        elif method == "INVITE":
+            await self._transport.send(build_response(request, 491, "Request Pending"))
+        elif method in ("INFO", "NOTIFY", "OPTIONS"):
+            await self._transport.send(build_response(request, 200, "OK"))
+        # Any other in-dialog method in this brief window is ignored (no media yet).
+
+    async def on_response(self, response: SipResponse) -> None:
+        """Absorb a stray response (the guard sends no request that awaits one).
+
+        The abort's BYE is fire-and-forget (it does not block on a final response, the
+        same rationale as :meth:`CallSession.hang_up`), so nothing correlates here.
+        """
+
+    async def wait_outcome(self, *, timeout: float) -> _DialogOutcome:
+        """Wait up to ``timeout`` s and return the dialog's terminal outcome.
+
+        Returns :attr:`_DialogOutcome.PEER_BYE` if the peer BYE'd (whether before the
+        wait, during it, or closely trailing an ACK), :attr:`ACK_CONFIRMED` if the peer
+        only ACKed, or :attr:`TIMEOUT` if neither arrived within the bound. The caller
+        sends our BYE only on ``ACK_CONFIRMED`` / ``TIMEOUT`` — never on ``PEER_BYE``
+        (the peer already ended the dialog).
+
+        Two waits close the double-BYE window. First, a bounded wait for the dialog to
+        confirm (ACK or BYE). If that resolves via a BYE, ``PEER_BYE`` wins outright.
+        If it resolves via an ACK, a second bounded wait (``_ACK_BYE_SETTLE_S``) lets a
+        closely-trailing BYE supersede it: the transport drives ONE sequential read
+        loop, so a BYE the peer sends right after its ACK is a separate, not-yet-read
+        frame when the ACK wakes this method — without the settle a snapshot here would
+        return ``ACK_CONFIRMED`` and the abort would BYE into the peer's arriving BYE
+        (glare). A BYE after the settle is independent teardown the SIP layer absorbs.
+        """
+        if not self._confirmed.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._confirmed.wait(), timeout=timeout)
+        if self._peer_bye.is_set():
+            return _DialogOutcome.PEER_BYE
+        if not self._confirmed.is_set():
+            return _DialogOutcome.TIMEOUT
+        # Confirmed by ACK. Grace-wait for a BYE the peer may have sent right behind the
+        # ACK (still an unread frame on the single read loop) so it suppresses our BYE.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._peer_bye.wait(), timeout=_ACK_BYE_SETTLE_S)
+        return (
+            _DialogOutcome.PEER_BYE
+            if self._peer_bye.is_set()
+            else _DialogOutcome.ACK_CONFIRMED
+        )
 
 
 # Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):
@@ -2150,12 +2321,29 @@ class VoipAdapter(BasePlatformAdapter):
             ",".join(c.encoding for c in audio.codecs),
         )
 
-        # WebRTC (UDP/TLS/RTP/SAVPF) offers negotiate against the Opus-first menu and
-        # take the DTLS-SRTP / ICE answer path (ADR-0032); everything else uses the
-        # SDES / plain-RTP G.711-G.722 menu. The detection is the profile token
-        # (offer.audio.is_webrtc); the codec-capability and no-answer-on-failure
-        # invariants below apply identically to both.
+        media_cfg = self._media_cfg
+        if media_cfg is None:  # connect() populates this before any INVITE
+            msg = f"INVITE {call_id}: media config not initialised"
+            raise RuntimeError(msg)
+
+        # Pick the media path. Three branches:
+        #   * WebRTC (UDP/TLS/RTP/SAVPF) → the ICE + DTLS-SRTP answer path (ADR-0032),
+        #     negotiated against the Opus-first menu.
+        #   * SIP DTLS-SRTP (UDP/TLS/RTP/SAVP + a=fingerprint) → the no-ICE DTLS-SRTP
+        #     answer path (ADR-0053 Stage 2), the operator's "real certs" preferred
+        #     tier, gated on HERMES_VOIP_SIP_DTLS_SRTP — when off, the offer falls
+        #     through to the SDES/plain handler (rollback switch, no behaviour change).
+        #   * everything else (RTP/SAVP SDES, plain RTP/AVP) → the SDES / plain-RTP
+        #     G.711-G.722 menu.
+        # The DTLS-SRTP and SDES tiers share the SIP codec menu (G.711/G.722/Opus);
+        # only WebRTC uses the Opus-first menu. The codec-capability and
+        # no-answer-on-failure invariants below apply identically to all three.
         is_webrtc = audio.is_webrtc
+        is_sip_dtls = (
+            not is_webrtc
+            and media_cfg.sip_dtls_srtp
+            and negotiate_media_security(audio) is MediaSecurity.DTLS
+        )
         # ADR-0049: the SDES/SIP answer menu offers Opus too when libopus is loadable
         # (gated, so a host without it keeps the G.722/G.711 floor — no drift).
         supported = (
@@ -2207,10 +2395,11 @@ class VoipAdapter(BasePlatformAdapter):
             return
 
         # ADR-0049: an Opus SIP (SDES) call must have a loadable libopus before we
-        # answer it, or it would be answered-but-dead. The WebRTC path runs this
-        # preflight inside _setup_webrtc_call; the SDES path does it here so an Opus
-        # SIP call is rejected cleanly (488) pre-answer. A no-op for G.722/G.711.
-        if not is_webrtc:
+        # answer it, or it would be answered-but-dead. The WebRTC and SIP DTLS-SRTP
+        # paths run this preflight inside their own setup helper (before the 200 OK);
+        # the SDES/plain path does it here so an Opus SIP call is rejected cleanly
+        # (488) pre-answer. A no-op for G.722/G.711.
+        if not is_webrtc and not is_sip_dtls:
             try:
                 _preflight_codec_dependency(engine_codec)
             except ImportError as exc:
@@ -2234,11 +2423,8 @@ class VoipAdapter(BasePlatformAdapter):
             transport=via_transport,
         )
 
-        # --- Open the media engine + answer (SDES or WebRTC path) -----------
-        media_cfg = self._media_cfg
-        if media_cfg is None:  # connect() populates this before any INVITE
-            msg = f"INVITE {call_id}: media config not initialised"
-            raise RuntimeError(msg)
+        # --- Open the media engine + answer (DTLS-SRTP, SDES, or WebRTC path) ---
+        # ``media_cfg`` was resolved above (the media-path decision needed it).
         # Advertise the runtime's REAL local interface for RTP — the same host as
         # the SIP Contact (the transport's local socket address). The 127.0.0.1
         # loopback placeholder makes the gateway send RTP to its own loopback, so
@@ -2275,6 +2461,23 @@ class VoipAdapter(BasePlatformAdapter):
                     engine_codec=engine_codec,
                     codec=codec,
                     transport=transport,
+                    dialog=dialog,
+                    local_tag=local_tag,
+                    local_contact=local_contact,
+                    local_rtp_host=local_rtp_host,
+                    media_cfg=media_cfg,
+                    call_id=call_id,
+                )
+            elif is_sip_dtls:
+                engine, local_media = await self._setup_sip_dtls_call(
+                    invite=invite,
+                    offer=offer,
+                    audio=audio,
+                    agreed_sdp_codecs=agreed_sdp_codecs,
+                    engine_codec=engine_codec,
+                    codec=codec,
+                    transport=transport,
+                    dialog=dialog,
                     local_tag=local_tag,
                     local_contact=local_contact,
                     local_rtp_host=local_rtp_host,
@@ -2300,6 +2503,16 @@ class VoipAdapter(BasePlatformAdapter):
             # The 488 was already sent and any partial media torn down inside the
             # setup helper. The call was never answered, so no session/_teardown_call
             # will run — release the admission slot here so capacity does not leak.
+            self._release_admission(call_id)
+            return
+        except _AnsweredCallPeerEnded:
+            # ADR-0065: the peer BYE'd during media setup (the answer-time guard
+            # answered it 200 OK). The setup helper already stopped media + deregistered
+            # the guard, so the dialog is closed — do NOT build a CallLoop. Release the
+            # admission slot (no CallSession/_teardown_call covers this clean end).
+            _log.info(
+                "INVITE %s: peer ended the call during setup — no CallLoop", call_id
+            )
             self._release_admission(call_id)
             return
         except BaseException:
@@ -2642,6 +2855,7 @@ class VoipAdapter(BasePlatformAdapter):
         engine_codec: Codec,
         codec: SdpCodec,
         transport: SignalingTransport,
+        dialog: Dialog,
         local_tag: str,
         local_contact: str,
         local_rtp_host: str,
@@ -2772,12 +2986,27 @@ class VoipAdapter(BasePlatformAdapter):
             call_id=call_id,
         )
 
+        # Register the answered dialog's in-dialog route AT ANSWER-TIME — before the
+        # ICE/DTLS handshake (ADR-0065). The peer's 2xx-ACK (and any racing BYE) can
+        # arrive during the (potentially slow) handshake; without a route here it would
+        # be unroutable and the dialog never observed as confirmed (RFC 3261 §12),
+        # blocking an §15.1.1-correct BYE on a post-200 failure. Signalling only — no
+        # media flows (the engine is built only after fingerprint verification below,
+        # RFC 5763 §5). The real CallSession overwrites it on success (the call tail).
+        guard = _AnsweredDialogGuard(
+            dialog=dialog, transport=transport, call_id=call_id
+        )
+        if self._manager is not None:
+            self._manager.add_call(dialog.dialog_id, guard)
+        transport.add_call(call_id, guard)
+
         # Run ICE connectivity + the DTLS-SRTP handshake (over the ICE pipe), then
         # derive the SRTP sessions. A failure here is AFTER the 200 OK (the handshake
         # needs the peer to have our answer), so this is NOT a 488 reject: the call was
-        # answered, the ICE session is closed, and _MediaNegotiationRejected is raised
-        # so the inbound handler's finally tears the answered call down (no CallLoop on
-        # dead media). The mandatory attributes were already validated pre-answer.
+        # answered. Close media now + BYE the dialog once confirmed (the guard tracks
+        # the ACK; RFC 3261 §15.1.1), then re-raise the reject signal so the inbound
+        # handler builds no CallLoop on dead media. The mandatory attributes were
+        # validated pre-answer.
         # Trickle (ADR-0034): we advertise a=ice-options:trickle in the answer (we
         # ACCEPT trickle), but we always act on the offer's candidate set + end
         # candidates — there is no in-dialog SIP-INFO transport (RFC 8840) to receive
@@ -2791,11 +3020,18 @@ class VoipAdapter(BasePlatformAdapter):
             )
         except Exception:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
             # A DTLS/ICE failure (fingerprint mismatch, no connectivity, handshake
-            # timeout). The call was answered (200 OK sent) but cannot be keyed —
-            # close ICE and abort setup. Re-raised as the internal reject signal so
-            # the inbound handler stops without building a CallLoop on dead media.
+            # timeout). The call was answered (200 OK sent) but cannot be keyed — close
+            # media + ACK-aware BYE the dialog, then re-raise the reject signal so the
+            # inbound handler stops without building a CallLoop on dead media.
             _log.exception("INVITE %s: WebRTC ICE/DTLS handshake failed", call_id)
-            await session.close()
+            await self._abort_answered_call(
+                dialog=dialog,
+                transport=transport,
+                session=session,
+                engine=None,
+                guard=guard,
+                call_id=call_id,
+            )
             raise _MediaNegotiationRejected from None
 
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
@@ -2850,6 +3086,18 @@ class VoipAdapter(BasePlatformAdapter):
         engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
+        # If the peer BYE'd during the ICE/DTLS handshake (the guard answered it 200),
+        # end cleanly here — do NOT start a video sender or return media the inbound
+        # handler would build a CallLoop on a dead dialog (ADR-0065). Raises
+        # _AnsweredCallPeerEnded after cleanup; checked BEFORE the video sender starts.
+        await self._abort_if_peer_ended_during_setup(
+            dialog=dialog,
+            transport=transport,
+            session=session,
+            engine=engine,
+            guard=guard,
+            call_id=call_id,
+        )
         # Outbound video (ADR-0044): only when we answered a=sendonly (a source is
         # configured + an H.264 codec was negotiated). The sender rides the SAME
         # BUNDLE'd ICE pipe + a video-SSRC SRTP session derived from the same DTLS
@@ -2868,6 +3116,456 @@ class VoipAdapter(BasePlatformAdapter):
                 payload_type=video_answer.payload_type,
             )
         return engine, local_media
+
+    async def _setup_sip_dtls_call(  # noqa: PLR0913 — the inbound handler's locals threaded through
+        self,
+        *,
+        invite: SipRequest,
+        offer: SessionDescription,
+        audio: AudioMedia,
+        agreed_sdp_codecs: tuple[SdpCodec, ...],
+        engine_codec: Codec,
+        codec: SdpCodec,
+        transport: SignalingTransport,
+        dialog: Dialog,
+        local_tag: str,
+        local_contact: str,
+        local_rtp_host: str,
+        media_cfg: MediaConfig,
+        call_id: str,
+    ) -> tuple[RtpMediaTransport, LocalMediaSession]:
+        """Run the SIP DTLS-SRTP media setup: bind → answer/200 OK → DTLS → engine.
+
+        The no-ICE DTLS-SRTP path (ADR-0053 Stage 2, RFC 5763/5764). A SIP-over-TLS
+        call has the peer's RTP address in the SDP, so the DTLS handshake rides a
+        plain UDP socket (no ICE). Like the WebRTC path the handshake needs the peer
+        to hold our answer first, so the order is:
+
+        1. Preflight the negotiated codec dependency (the ``webrtc``/``media`` extra +
+           system ``libopus`` for Opus) BEFORE any answer — a missing dep is a CLEAN
+           488 (never answered-but-dead). The mandatory ``a=fingerprint`` was already
+           validated by :meth:`AudioMedia.is_sip_dtls` (the routing predicate).
+        2. Bind the UDP datagram pipe (:meth:`SipDtlsMediaSession.prepare`); its bound
+           port is what the answer advertises in ``c=``/``m=audio`` (unlike WebRTC the
+           ``c=``/port is real — the media address is in the SDP, not ICE-borne). Build
+           the ``UDP/TLS/RTP/SAVP`` answer carrying our ``a=fingerprint``/``a=setup``
+           and send the 200 OK (RFC 5763 §4 — the peer needs our fingerprint+role to
+           start its DTLS half).
+        3. Run the DTLS handshake over the pipe (the session sets the initial peer to
+           the offer's ``c=``/port and re-latches via comedia), verify the peer
+           fingerprint (RFC 5763 §5), derive the SRTP pair, construct the engine over
+           the pipe.
+
+        A failure in step 1/2 is a clean pre-answer reject (488 + ``close`` +
+        :class:`_MediaNegotiationRejected`). A handshake failure in step 3 is AFTER the
+        200 OK (the handshake needs the peer to have our answer): the call WAS answered
+        ``UDP/TLS/RTP/SAVP``, so it is **not** a 488 and — crucially — there is **no
+        plaintext fallback** (RFC 5763 §5; that would defeat the security the peer
+        asked for). The session is closed and ``_MediaNegotiationRejected`` is raised so
+        the inbound handler tears the answered call down (no CallLoop on dead, unkeyed
+        media).
+
+        Returns the connected engine (carrying SRTP over the datagram pipe) + the
+        :class:`LocalMediaSession`.
+        """
+        # --- Pre-answer validation: a missing codec dependency is a CLEAN 488. The
+        # peer fingerprint is guaranteed present by is_sip_dtls (the routing
+        # predicate); re-narrow it for the type checker and as belt-and-suspenders.
+        peer_fingerprint = audio.fingerprint
+        if peer_fingerprint is None:  # pragma: no cover — is_sip_dtls guarantees it
+            _log.error(
+                "INVITE %s: REJECTED 488 — SIP DTLS-SRTP offer missing a=fingerprint",
+                call_id,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected
+        try:
+            # Preflight the negotiated engine codec's runtime dependency (Opus forces
+            # the opuslib + system-libopus import) so a host missing it is a clean 488
+            # here, not an answered-but-dead call. A no-op for G.722/G.711.
+            _preflight_codec_dependency(engine_codec)
+        except ImportError as exc:
+            _log.error(
+                "INVITE %s: REJECTED 488 — SIP DTLS-SRTP codec dependency unavailable "
+                "(install the 'webrtc' extra + system libopus): %s",
+                call_id,
+                exc,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected from exc
+
+        remote_address = _effective_address(audio, offer)
+        # The offered a=setup + the HERMES_VOIP_SIP_DTLS_SETUP knob decide our DTLS
+        # role; SipDtlsMediaSession picks it (RFC 8842 active answerer by default for an
+        # actpass offer — ADR-0053 §2, mirroring the WebRTC ADR-0050 rationale).
+        session = SipDtlsMediaSession(
+            offer_setup=audio.setup,
+            answer_setup=media_cfg.sip_dtls_setup,
+        )
+        try:
+            # Bind the UDP datagram pipe; its bound port is what the answer advertises.
+            await session.prepare(local_address=local_rtp_host, local_port=0)
+            local_media = LocalMediaSession(
+                local_address=local_rtp_host,
+                # The DTLS handshake socket's real bound port — the SIP path keeps a
+                # real c=/port (no ICE). NOT engine.local_port: the engine binds no
+                # socket on the pipe path; the pipe owns the UDP endpoint.
+                port=session.local_port,
+                codecs=agreed_sdp_codecs,
+                session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
+            )
+            answer_sdp = build_sip_dtls_answer(
+                offer,
+                local_address=local_media.local_address,
+                port=local_media.port,
+                # ADR-0049: Opus is in the SIP answer menu when libopus is loadable.
+                supported=list(_sip_supported_encodings()),
+                fingerprint=session.fingerprint,
+                setup=session.setup,
+                ptime=_negotiated_ptime(audio, engine_codec),
+                session_id=local_media.session_id,
+            )
+        except Exception as exc:
+            # Any bind / answer-build failure before the 200 OK is a clean pre-answer
+            # reject (488). Close the session FIRST — before the 488 transmit, which
+            # may itself raise on a dead transport — so the bound UDP socket is never
+            # leaked (the close must not be stranded behind a failing send). Then send
+            # the 488 and re-raise the internal reject signal (never swallowed, rule
+            # 37). The call was NOT answered, so this is a 488, not a BYE.
+            _log.warning(
+                "INVITE %s: cannot build SIP DTLS-SRTP answer: %s", call_id, exc
+            )
+            await session.close()
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected from exc
+
+        # Log only NON-identifying state (rule 34: no host/IP on the live media path —
+        # the local RTP address is the runtime's interface). Port + setup + codecs are
+        # safe (the port is the same level the RTCP-active log emits).
+        _log.info(
+            "INVITE %s: SIP DTLS-SRTP answer built — setup=%s, local RTP port %d, "
+            "codecs %s",
+            call_id,
+            session.setup.value,
+            local_media.port,
+            ",".join(c.encoding for c in agreed_sdp_codecs),
+        )
+        # Send the 200 OK BEFORE the handshake: the peer needs our answer (fingerprint
+        # + setup) to start its DTLS half (RFC 5763 §4).
+        await self._send_answer_200(
+            invite=invite,
+            transport=transport,
+            local_tag=local_tag,
+            local_contact=local_contact,
+            answer_sdp=answer_sdp,
+            call_id=call_id,
+        )
+
+        # Register the answered dialog's in-dialog route AT ANSWER-TIME — before the
+        # handshake (ADR-0065). The peer's 2xx-ACK (and any racing BYE) can arrive
+        # during the handshake; without a route here it would be unroutable and the
+        # dialog never observed as confirmed (RFC 3261 §12), blocking an §15.1.1-correct
+        # BYE on a post-200 failure. The guard is SIGNALLING ONLY — no media flows (the
+        # engine is built only after fingerprint verification below, RFC 5763 §5). On
+        # success the real CallSession overwrites it on the same keys (the call tail).
+        guard = _AnsweredDialogGuard(
+            dialog=dialog, transport=transport, call_id=call_id
+        )
+        if self._manager is not None:
+            self._manager.add_call(dialog.dialog_id, guard)
+        transport.add_call(call_id, guard)
+
+        # Run the DTLS handshake over the UDP pipe, then derive the SRTP sessions. A
+        # failure here is AFTER the 200 OK (the handshake needs the peer to have our
+        # answer), so this is NOT a 488: the call was answered UDP/TLS/RTP/SAVP. A
+        # fingerprint mismatch / timeout ENDS THE CALL — there is NO plaintext fallback
+        # (RFC 5763 §5). The peer's RTP address comes from the offer's c=/m=audio; the
+        # pipe re-latches onto the peer's real source via comedia during the handshake.
+        try:
+            srtp_inbound, srtp_outbound = await session.run_handshake(
+                peer_fingerprint=peer_fingerprint,
+                peer_address=remote_address,
+                peer_port=audio.port,
+            )
+        except Exception:  # noqa: BLE001 — any DTLS failure aborts the call (caught + re-raised as reject)
+            # A fingerprint mismatch / timeout AFTER the 200 OK: the peer holds an
+            # ANSWERED UDP/TLS/RTP/SAVP call, so this is NOT a 488 and there is NO
+            # plaintext fallback (RFC 5763 §5). Close media now + BYE the dialog once
+            # confirmed (the guard tracks the ACK; §15.1.1), then re-raise the reject
+            # signal so the inbound handler builds no CallLoop on dead media.
+            _log.exception("INVITE %s: SIP DTLS-SRTP handshake failed", call_id)
+            await self._abort_answered_call(
+                dialog=dialog,
+                transport=transport,
+                session=session,
+                engine=None,
+                guard=guard,
+                call_id=call_id,
+            )
+            raise _MediaNegotiationRejected from None
+
+        te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
+        # Resolve the DTMF send/receive backends (ADR-0036) so a forced sip_info routes
+        # SIP INFO via the CallSession (not the media engine) and the receive wiring is
+        # correct; in-band applies only to a G.711 call with no telephone-event.
+        dtmf_send_mode = resolve_dtmf_send_mode(
+            media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+        )
+        inband_rx = (
+            resolve_dtmf_receive_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+            )
+            is DtmfReceiveMode.INBAND
+        )
+        # Build + connect the engine. This is also AFTER the 200 OK, so a failure here
+        # (ctor or connect()) is the same half-open-dialog situation as a handshake
+        # failure: BYE the dialog, stop the engine if it was constructed (release its
+        # SRTP state / any task), close the DTLS session (release the UDP socket), and
+        # re-raise the reject signal. ``engine`` stays None until the ctor returns, so
+        # the cleanup knows whether an engine exists to stop.
+        engine: RtpMediaTransport | None = None
+        try:
+            engine = RtpMediaTransport(
+                local_address="0.0.0.0",  # noqa: S104 — unused on the pipe path (the pipe owns the socket)
+                local_port=0,
+                # The pipe's comedia latch is the destination; these are the
+                # SDP-advertised peer the pipe was initialised with, kept for
+                # parity/diagnostics (the engine's ice_transport seam does not re-send).
+                remote_address=remote_address or "0.0.0.0",  # noqa: S104
+                remote_port=audio.port or 9,
+                codec=engine_codec,
+                payload_type=codec.payload_type,
+                telephone_event_payload_type=te_pt,
+                dtmf_send_mode=dtmf_send_mode,
+                inband_dtmf_rx_enabled=inband_rx,
+                # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
+                srtp_inbound=srtp_inbound,
+                srtp_outbound=srtp_outbound,
+                # Carry media over the session's UDP datagram pipe instead of a bound
+                # socket — the same engine seam the WebRTC path uses for its ICE pipe.
+                ice_transport=session.pipe,
+                media_timeout_secs=media_cfg.media_timeout_secs,
+                # In-process acoustic echo cancellation (ADR-0033): subtract the known
+                # outbound TTS reference from each inbound frame before the VAD/ASR see.
+                aec_enabled=media_cfg.aec_enabled,
+                aec_filter_ms=media_cfg.aec_filter_ms,
+                aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+                aec_mu=media_cfg.aec_mu,
+                # Adaptive jitter buffer (ADR-0056/0063): grow the reorder tolerance
+                # under loss up to the configured ceiling, shrink back when clean.
+                jitter_adapt=True,
+                jitter_max_depth=media_cfg.jitter_max_depth,
+            )
+            # ptime negotiation (ADR-0056/0063): codec-aware (Opus pinned to 20 ms). Set
+            # before connect() so the first outbound packet is framed correctly.
+            engine.ptime = _negotiated_ptime(audio, engine_codec)
+            await engine.connect()
+        except Exception:  # noqa: BLE001 — any engine setup failure aborts the answered call (caught + re-raised as reject)
+            _log.exception(
+                "INVITE %s: SIP DTLS-SRTP engine setup failed after the 200 OK",
+                call_id,
+            )
+            await self._abort_answered_call(
+                dialog=dialog,
+                transport=transport,
+                session=session,
+                engine=engine,
+                guard=guard,
+                call_id=call_id,
+            )
+            raise _MediaNegotiationRejected from None
+        # RTCP (ADR-0061) is NOT activated on the secured DTLS-SRTP path: the engine
+        # has no SRTCP (RFC 3711 §3.4) transform, so cleartext RTCP on a secured
+        # 5-tuple would violate the profile and leak SSRC/CNAME/timing — same as the
+        # SDES/WebRTC secured paths (a named follow-up adds SRTCP).
+        _log.info("INVITE %s: SIP DTLS-SRTP media engine connected over UDP", call_id)
+        # If the peer BYE'd during the handshake (the guard answered it 200 OK), end
+        # cleanly here — do NOT return media the inbound handler would build a CallLoop
+        # on a dead dialog (ADR-0065). Raises _AnsweredCallPeerEnded after cleanup.
+        await self._abort_if_peer_ended_during_setup(
+            dialog=dialog,
+            transport=transport,
+            session=session,
+            engine=engine,
+            guard=guard,
+            call_id=call_id,
+        )
+        return engine, local_media
+
+    async def _abort_answered_call(  # noqa: PLR0913 — the answered-call teardown needs the dialog + transport + media session + engine + guard + call_id; all keyword-only
+        self,
+        *,
+        dialog: Dialog,
+        transport: SignalingTransport,
+        session: SipDtlsMediaSession | WebRtcMediaSession,
+        engine: RtpMediaTransport | None,
+        guard: _AnsweredDialogGuard,
+        call_id: str,
+    ) -> None:
+        """Abort a DTLS-SRTP / WebRTC call that failed AFTER the 200 OK (ADR-0065).
+
+        Reached when the media handshake or the engine setup fails once the 200 OK has
+        gone out, so the peer holds an answered call (the dialog is established,
+        RFC 3261 §12). An established dialog is ended with an in-dialog **BYE**
+        (RFC 3261 §15.1) — but §15.1.1 forbids BYE before the dialog is **confirmed**
+        (the peer's ACK), and a fingerprint mismatch can be detected before that ACK.
+
+        Two phases, so the call task + admission slot are freed immediately:
+
+        1. **Synchronous (here):** release media NOW — stop the engine (if it was
+           constructed) and close the session (release the UDP socket / ICE), then spawn
+           the bounded ACK-wait + BYE as a TRACKED background task and return. The
+           inbound handler then re-raises the reject signal and frees its admission slot
+           at once (a flood of failing handshakes cannot exhaust admission).
+        2. **Background (:meth:`_finish_answered_abort`):** wait (bounded, ≈Timer H) for
+           the guard's terminal outcome and BYE the dialog only on ``ACK_CONFIRMED`` /
+           ``TIMEOUT`` (never ``PEER_BYE`` — the peer already ended it), then deregister
+           the guard. The task is tracked in ``_call_tasks`` so ``disconnect`` cancels +
+           awaits it within the bounded shutdown (no orphaned task, rule 37).
+
+        Media release is best-effort and independently guarded — a failing resource must
+        not strand the others (logged, never swallowed). No ``CallSession`` exists yet,
+        so the BYE is sent directly on the ``dialog`` (``_teardown_call`` is the
+        post-registration chokepoint, unreachable here).
+        """
+        if engine is not None:
+            try:
+                await engine.stop()
+            except Exception as exc:  # noqa: BLE001 — best-effort; never strand the rest
+                _log.warning(
+                    "INVITE %s: error stopping engine on answered-call abort: %s",
+                    call_id,
+                    exc,
+                )
+        try:
+            await session.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
+            _log.warning(
+                "INVITE %s: error closing media session on abort: %s", call_id, exc
+            )
+        # Spawn the bounded ACK-wait + BYE in the background so the inbound handler (and
+        # its admission slot) is freed NOW. Tracked in _call_tasks so disconnect cancels
+        # + awaits it (bounded, like the ADR-0059 drain).
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._finish_answered_abort(
+                dialog=dialog, transport=transport, guard=guard, call_id=call_id
+            )
+        )
+        self._call_tasks.setdefault(call_id, set()).add(task)
+        task.add_done_callback(
+            lambda t: self._call_tasks.get(call_id, set()).discard(t)
+        )
+
+    async def _finish_answered_abort(
+        self,
+        *,
+        dialog: Dialog,
+        transport: SignalingTransport,
+        guard: _AnsweredDialogGuard,
+        call_id: str,
+    ) -> None:
+        """Background tail of :meth:`_abort_answered_call`: ACK-aware BYE + deregister.
+
+        Waits (bounded) for the guard's terminal outcome (ADR-0065) and acts on it:
+
+        * ``PEER_BYE`` — the peer already ended the dialog (its BYE was answered 200);
+          send NO BYE of our own (avoids the double-BYE when the peer BYEs during the
+          wait).
+        * ``ACK_CONFIRMED`` — the dialog is confirmed; send the in-dialog BYE
+          (RFC 3261 §15.1.1) — the same request :meth:`CallSession.hang_up` builds.
+        * ``TIMEOUT`` — no ACK within the bound (non-conformant peer); send a fallback
+          BYE anyway so the dialog cannot linger forever.
+
+        Always deregisters the answer-time guard. Best-effort: a BYE-send failure is
+        logged, never raised. Tolerates cancellation (``disconnect``): the ``finally``
+        deregisters even when the wait is cancelled (rule 37 — never swallowed).
+        """
+        try:
+            outcome = await guard.wait_outcome(timeout=_ANSWERED_ABORT_ACK_TIMEOUT_S)
+            if outcome is _DialogOutcome.PEER_BYE:
+                _log.info(
+                    "INVITE %s: answered-call abort — peer already BYE'd; no BYE sent",
+                    call_id,
+                )
+            else:
+                if outcome is _DialogOutcome.TIMEOUT:
+                    _log.warning(
+                        "INVITE %s: no ACK within %.0fs — sending fallback BYE to "
+                        "close the unconfirmed dialog",
+                        call_id,
+                        _ANSWERED_ABORT_ACK_TIMEOUT_S,
+                    )
+                bye = build_in_dialog_request(dialog, "BYE")
+                await transport.send(bye.text)
+                _log.info(
+                    "INVITE %s: BYE sent to close the answered dialog (%s)",
+                    call_id,
+                    "confirmed"
+                    if outcome is _DialogOutcome.ACK_CONFIRMED
+                    else "fallback",
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort; the dialog times out if the BYE cannot be sent
+            _log.warning(
+                "INVITE %s: error sending BYE on answered-call abort: %s", call_id, exc
+            )
+        finally:
+            # Deregister the answer-time guard — the call never reached the real
+            # CallSession registration (which would have overwritten it on success).
+            if self._manager is not None:
+                self._manager.remove_call(dialog.dialog_id)
+            transport.remove_call(call_id)
+
+    async def _abort_if_peer_ended_during_setup(  # noqa: PLR0913 — the peer-ended check needs the dialog + transport + media session + engine + guard + call_id; all keyword-only
+        self,
+        *,
+        dialog: Dialog,
+        transport: SignalingTransport,
+        session: SipDtlsMediaSession | WebRtcMediaSession,
+        engine: RtpMediaTransport,
+        guard: _AnsweredDialogGuard,
+        call_id: str,
+    ) -> None:
+        """End the call cleanly if the peer BYE'd during media setup (ADR-0065).
+
+        Called by the setup helpers right before their success return — after the
+        handshake + engine are up but BEFORE the inbound handler builds the CallLoop.
+        If the answer-time guard observed a peer ``BYE`` (already answered ``200 OK``),
+        the dialog is gone: stop the (just-connected) engine, close the media session,
+        deregister the guard, and raise :class:`_AnsweredCallPeerEnded` so the inbound
+        handler returns without a CallLoop — no BYE from us (the peer ended it).
+
+        There is no ``await`` between this check returning normally and the caller's
+        success return + the inbound handler's ``add_call`` overwrite, so the check +
+        registration are atomic relative to inbound routing on the single-threaded loop
+        (a peer BYE after this point routes to the real CallSession). A no-op when the
+        peer has not BYE'd.
+        """
+        if not guard.peer_ended:
+            return
+        _log.info(
+            "INVITE %s: peer BYE'd during media setup — ending without a CallLoop",
+            call_id,
+        )
+        try:
+            await engine.stop()
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
+            _log.warning(
+                "INVITE %s: error stopping engine on peer-ended setup: %s",
+                call_id,
+                exc,
+            )
+        try:
+            await session.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
+            _log.warning(
+                "INVITE %s: error closing media session on peer-ended setup: %s",
+                call_id,
+                exc,
+            )
+        if self._manager is not None:
+            self._manager.remove_call(dialog.dialog_id)
+        transport.remove_call(call_id)
+        raise _AnsweredCallPeerEnded
 
     def _start_webrtc_video_sender(
         self,

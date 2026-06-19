@@ -38,8 +38,9 @@ jobs:
         with:
           version: "0.11.21"
           enable-cache: true
-      # The WebRTC inbound-branch adapter test (tests/test_adapter_webrtc.py) needs
-      # the REAL hermes runtime AND the webrtc media stack (pyOpenSSL/aioice for
+      # The WebRTC inbound-branch adapter test (tests/test_adapter_webrtc.py) and the
+      # SIP DTLS-SRTP inbound-branch test (tests/test_adapter_sip_dtls.py, ADR-0053 §6)
+      # need the REAL hermes runtime AND the webrtc media stack (pyOpenSSL/aioice for
       # DTLS/ICE, opuslib + the system libopus for the Opus codec — ADR-0032), so this
       # job installs all three extras and libopus. Without them the test would skip in
       # BOTH the hermes-contract job (no webrtc extra) and the webrtc job (no hermes
@@ -53,10 +54,10 @@ jobs:
       # supervisor tests, the media-concurrency adapter isolation test, and the
       # WebRTC inbound-branch test all drive the real VoipAdapter, so they are
       # checked + run here too.
-      - run: uv run mypy src/hermes_voip/adapter.py src/hermes_voip/voip_tools.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_rtcp.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py tests/e2e/test_inbound_webrtc_call.py
+      - run: uv run mypy src/hermes_voip/adapter.py src/hermes_voip/voip_tools.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_rtcp.py tests/test_adapter_sip_dtls.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py tests/e2e/test_inbound_webrtc_call.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
-        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_rtcp.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e -rs
+        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_rtcp.py tests/test_adapter_sip_dtls.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e -rs
 
   # Runs the conversational-provider tests with the optional `ml` extra installed
   # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack

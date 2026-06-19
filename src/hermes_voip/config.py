@@ -428,6 +428,27 @@ _WEBRTC_DTLS_SETUP_KEY = "HERMES_VOIP_WEBRTC_DTLS_SETUP"
 _DEFAULT_WEBRTC_DTLS_SETUP = "auto"
 _WEBRTC_DTLS_SETUPS = frozenset({"auto", "active", "passive"})
 
+# SIP DTLS-SRTP activation (ADR-0053 Stage 2). When True (the default), an inbound
+# SIP-over-TLS call whose audio offers ``UDP/TLS/RTP/SAVP`` with an ``a=fingerprint``
+# is answered with cert-keyed DTLS-SRTP media (the operator's "real certs" preferred
+# tier). Setting it false is the ROLLBACK SWITCH (not a downgrade path): a SIP-DTLS
+# offer then falls through to the SDES/plain handler unchanged. No effect on the
+# WebRTC (SAVPF/ICE) or plain/SDES paths.
+_SIP_DTLS_SRTP_KEY = "HERMES_VOIP_SIP_DTLS_SRTP"
+_DEFAULT_SIP_DTLS_SRTP = True
+
+# SIP DTLS-SRTP answerer role (ADR-0053 §2, RFC 8842 §5.3 / RFC 5763 §5). For an
+# ``a=setup:actpass`` offer the answerer picks its DTLS role; ``auto`` (the default)
+# makes us ``active`` (the DTLS client, sending the ClientHello) — many gateways offer
+# ``actpass`` yet act as the DTLS server, so a ``passive`` answer deadlocks. ``passive``
+# forces the server role; ``active`` is the explicit form of the default. A pinned
+# ``active``/``passive`` offer always overrides this knob. This MIRRORS
+# ``HERMES_VOIP_WEBRTC_DTLS_SETUP`` but is INDEPENDENT — the two transports may need
+# different defaults against different gateways. No effect on the WebRTC path.
+_SIP_DTLS_SETUP_KEY = "HERMES_VOIP_SIP_DTLS_SETUP"
+_DEFAULT_SIP_DTLS_SETUP = "auto"
+_SIP_DTLS_SETUPS = frozenset({"auto", "active", "passive"})
+
 # WebRTC ICE TURN relay (ADR-0034). A comma-separated list of ``turn:``/``turns:``
 # URLs plus long-term credentials (RFC 8656). When set, a *relay* ICE candidate is
 # gathered so WebRTC works without a host / STUN-reflexive path (symmetric NAT,
@@ -821,6 +842,19 @@ class MediaConfig:
     # overrides this. Defaulted so existing direct constructions stay valid; validated
     # against the allowed set. No effect on the SIP-over-TLS path.
     webrtc_dtls_setup: str = _DEFAULT_WEBRTC_DTLS_SETUP
+    # SIP DTLS-SRTP activation (ADR-0053 Stage 2): when True (the default) an inbound
+    # ``UDP/TLS/RTP/SAVP``+fingerprint offer is answered with cert-keyed DTLS-SRTP
+    # media; false is the rollback switch (the offer falls through to SDES/plain). No
+    # effect on the WebRTC/plain/SDES paths. Defaulted so existing direct constructions
+    # stay valid.
+    sip_dtls_srtp: bool = _DEFAULT_SIP_DTLS_SRTP
+    # SIP DTLS-SRTP answerer role for an ``a=setup:actpass`` offer (ADR-0053 §2, RFC
+    # 8842 §5.3): ``auto`` (the default — answer ``active``, the DTLS client) /
+    # ``active`` / ``passive`` (force the server role). A pinned ``active``/``passive``
+    # offer always overrides this. Mirrors ``webrtc_dtls_setup`` but is independent.
+    # Defaulted so existing direct constructions stay valid; validated against the
+    # allowed set. No effect on the WebRTC path.
+    sip_dtls_setup: str = _DEFAULT_SIP_DTLS_SETUP
     # WebRTC ICE TURN relay (ADR-0034), as ``turn:``/``turns:`` URLs for relay
     # candidate gathering. Empty (the default) ⇒ no relay candidate. When set, the
     # username + password are required (validated at load). No effect on the
@@ -942,6 +976,7 @@ class MediaConfig:
         _require_enum("tts_provider", self.tts_provider, _TTS_PROVIDERS)
         _require_enum("injection_guard", self.injection_guard, _INJECTION_GUARDS)
         _require_enum("webrtc_dtls_setup", self.webrtc_dtls_setup, _WEBRTC_DTLS_SETUPS)
+        _require_enum("sip_dtls_setup", self.sip_dtls_setup, _SIP_DTLS_SETUPS)
         if not math.isfinite(self.tone_secs) or self.tone_secs < 0:
             msg = (
                 "tone_secs must be a non-negative finite number, "
@@ -1217,6 +1252,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ice_use_ipv6=_parse_bool(env, _ICE_USE_IPV6_KEY, default=True),
         webrtc_dtls_setup=_value_lower(env, _WEBRTC_DTLS_SETUP_KEY)
         or _DEFAULT_WEBRTC_DTLS_SETUP,
+        sip_dtls_srtp=_parse_bool(env, _SIP_DTLS_SRTP_KEY, _DEFAULT_SIP_DTLS_SRTP),
+        sip_dtls_setup=_value_lower(env, _SIP_DTLS_SETUP_KEY)
+        or _DEFAULT_SIP_DTLS_SETUP,
         ice_turn_urls=_ice_turn[0],
         ice_turn_username=_ice_turn[1],
         ice_turn_password=_ice_turn[2],

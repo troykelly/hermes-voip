@@ -269,8 +269,15 @@ def _make_invite(offer: str, call_id: str) -> str:
     )
 
 
-async def _build_adapter(transport: _FakeTransport) -> object:
-    """A real VoipAdapter wired to fakes + a real RegistrationManager."""
+async def _build_adapter_with_manager(
+    transport: _FakeTransport,
+) -> tuple[object, RegistrationManager]:
+    """A real VoipAdapter + the real RegistrationManager it routes through.
+
+    The manager is returned so a test can route an in-dialog ACK/BYE through it (the
+    same path ``SipOverTlsTransport._dispatch_request`` uses) to the answer-time dialog
+    guard registered during the WebRTC handshake window (ADR-0065).
+    """
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV))
@@ -289,6 +296,12 @@ async def _build_adapter(transport: _FakeTransport) -> object:
     ):
         adapter = VoipAdapter(config)
         await adapter.connect()
+    return adapter, manager
+
+
+async def _build_adapter(transport: _FakeTransport) -> object:
+    """A real VoipAdapter wired to fakes + a real RegistrationManager."""
+    adapter, _manager = await _build_adapter_with_manager(transport)
     return adapter
 
 
@@ -296,6 +309,45 @@ def _sent_200_ok(transport: _FakeTransport) -> SipResponse:
     oks = [SipResponse.parse(m) for m in transport.sent if m.startswith("SIP/2.0 200")]
     assert oks, "the adapter did not send a 200 OK answer"
     return oks[-1]
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake_webrtc_session() -> None:
+    """Reset the WebRTC fake's class-level handshake controls between tests."""
+    _FakeWebRtcSession.last = None
+    _FakeWebRtcSession.gate = None
+    _FakeWebRtcSession.in_handshake = None
+    _FakeWebRtcSession.fail_handshake = False
+
+
+def _in_dialog_request(method: str, ok: SipResponse, *, call_id: str) -> SipRequest:
+    """A gateway in-dialog ACK/BYE echoing the dialog To/From from our 200 OK."""
+    to_value = ok.header("To") or ""
+    from_value = ok.header("From") or ""
+    cseq = 1 if method == "ACK" else 2
+    raw = (
+        f"{method} sip:1000@127.0.0.1:5061 SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.7:5061;branch=z9hG4bKdlg\r\n"
+        "Max-Forwards: 70\r\n"
+        f"From: {from_value}\r\n"
+        f"To: {to_value}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq} {method}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    return SipRequest.parse(raw)
+
+
+async def _deliver_in_dialog(
+    manager: RegistrationManager, request: SipRequest
+) -> object:
+    """Route an in-dialog request through the real manager to its consumer."""
+    from hermes_voip.manager import InDialog  # noqa: PLC0415
+
+    routing = manager.route_request(request)
+    if isinstance(routing, InDialog):
+        await routing.consumer.handle_request(routing.request)
+    return routing
 
 
 class _FakeWebRtcSession:
@@ -306,6 +358,13 @@ class _FakeWebRtcSession:
     """
 
     last: _FakeWebRtcSession | None = None
+    # Optional handshake controls for the post-200 dialog-window tests (ADR-0065),
+    # mirroring the SIP-DTLS fake: ``gate`` holds run_handshake open so a test can
+    # deliver an in-dialog ACK/BYE mid-handshake; ``in_handshake`` fires once entered;
+    # ``fail_handshake`` makes it raise (the post-200 failure path).
+    gate: asyncio.Event | None = None
+    in_handshake: asyncio.Event | None = None
+    fail_handshake: bool = False
 
     def __init__(
         self,
@@ -363,6 +422,13 @@ class _FakeWebRtcSession:
 
     async def run_handshake(self, **kwargs: object) -> tuple[object, object]:
         self.handshake_args = kwargs
+        if _FakeWebRtcSession.in_handshake is not None:
+            _FakeWebRtcSession.in_handshake.set()
+        if _FakeWebRtcSession.gate is not None:
+            await _FakeWebRtcSession.gate.wait()
+        if _FakeWebRtcSession.fail_handshake:
+            msg = "WebRTC ICE/DTLS handshake failed"
+            raise ValueError(msg)
         return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
 
     def derive_outbound_srtp_session(self, *, ssrc: int) -> object:
@@ -933,3 +999,199 @@ async def test_webrtc_missing_opus_dependency_is_rejected_before_answer() -> Non
     # The codec dependency is preflighted BEFORE the WebRtcMediaSession is built.
     webrtc_ctor.assert_not_called()
     assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+
+
+# --- ADR-0065: answer-time dialog registration + ACK-aware abort (WebRTC) ---
+
+
+@pytest.mark.asyncio
+async def test_webrtc_ack_during_handshake_then_success_guard_replaced() -> None:
+    """ACK during a SUCCEEDING WebRTC handshake ⇒ live call, guard upgraded (ADR-0065).
+
+    The answer-time dialog guard routes the 2xx-ACK during the ICE/DTLS handshake; the
+    handshake succeeds, the real CallSession replaces the guard on the same dialog_id,
+    and the call runs — no BYE. A second ACK after registration routes to the real
+    CallSession (proving the guard was upgraded, not still registered).
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_OFFER, call_id))
+
+    _FakeWebRtcSession.gate = asyncio.Event()
+    _FakeWebRtcSession.in_handshake = asyncio.Event()
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            assert _FakeWebRtcSession.in_handshake is not None
+            await _FakeWebRtcSession.in_handshake.wait()
+            ok = _sent_200_ok(transport)
+            # The ACK during the handshake routes to the guard (not Unroutable).
+            from hermes_voip.manager import InDialog  # noqa: PLC0415
+
+            routing = await _deliver_in_dialog(
+                manager, _in_dialog_request("ACK", ok, call_id=call_id)
+            )
+            assert isinstance(routing, InDialog)
+            assert _FakeWebRtcSession.gate is not None
+            _FakeWebRtcSession.gate.set()
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            assert not any(m.startswith("BYE ") for m in transport.sent)
+            # The guard was UPGRADED: a later ACK routes to the real CallSession.
+            session = manager.route_request(
+                _in_dialog_request("ACK", ok, call_id=call_id)
+            )
+            assert isinstance(session, InDialog)
+            from hermes_voip.adapter import _AnsweredDialogGuard  # noqa: PLC0415
+
+            assert not isinstance(session.consumer, _AnsweredDialogGuard), (
+                "the answer-time guard must be replaced by the real CallSession"
+            )
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_webrtc_peer_bye_during_successful_handshake_no_callloop() -> None:
+    """A peer BYE during a SUCCESSFUL WebRTC handshake ⇒ no CallLoop (ADR-0065).
+
+    The WebRTC equivalent of the DTLS BLOCKING: the peer hangs up mid-handshake (the
+    guard answers 200 + records peer-ended), the handshake then SUCCEEDS, and the
+    success path must NOT start a CallLoop on the peer-terminated dialog. Media is
+    stopped, no live CallLoop, no BYE from us.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_OFFER, call_id))
+
+    _FakeWebRtcSession.gate = asyncio.Event()
+    _FakeWebRtcSession.in_handshake = asyncio.Event()
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            assert _FakeWebRtcSession.in_handshake is not None
+            await _FakeWebRtcSession.in_handshake.wait()
+            ok = _sent_200_ok(transport)
+            await _deliver_in_dialog(
+                manager, _in_dialog_request("BYE", ok, call_id=call_id)
+            )
+            assert _FakeWebRtcSession.gate is not None
+            _FakeWebRtcSession.gate.set()
+            session = _FakeWebRtcSession.last
+            assert session is not None
+            await _until(lambda: fake_engine.stop.await_count > 0)
+            await asyncio.sleep(0.05)
+            assert call_id not in adapter._call_loops, (  # type: ignore[attr-defined]
+                "must NOT start a CallLoop on a dialog the peer already BYE'd"
+            )
+            assert not any(m.startswith("BYE ") for m in transport.sent), (
+                "no redundant BYE — the peer already terminated the dialog"
+            )
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_webrtc_handshake_failure_byes_after_ack() -> None:
+    """A WebRTC post-200 handshake failure BYEs the confirmed dialog (ADR-0065).
+
+    The 200 OK is sent before the ICE/DTLS handshake; the ACK confirms the dialog (via
+    the answer-time guard), the handshake then fails, and the answered dialog is closed
+    with exactly one in-dialog BYE — no plaintext fallback, no CallLoop.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_OFFER, call_id))
+
+    _FakeWebRtcSession.fail_handshake = True
+    _FakeWebRtcSession.gate = asyncio.Event()
+    _FakeWebRtcSession.in_handshake = asyncio.Event()
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    with (
+        patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            NewCall(registration=_ext_config(), invite=invite)
+        )
+        assert _FakeWebRtcSession.in_handshake is not None
+        await _FakeWebRtcSession.in_handshake.wait()
+        ok = _sent_200_ok(transport)
+        await _deliver_in_dialog(
+            manager, _in_dialog_request("ACK", ok, call_id=call_id)
+        )
+        assert _FakeWebRtcSession.gate is not None
+        _FakeWebRtcSession.gate.set()
+        session = _FakeWebRtcSession.last
+        assert session is not None
+        await _until(lambda: session.closed)
+        await _until(lambda: any(m.startswith("BYE ") for m in transport.sent))
+        await asyncio.sleep(0.01)
+
+    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+    answers = [m for m in transport.sent if m.startswith("SIP/2.0 200")]
+    # Exactly the one DTLS-SRTP 200 OK answer (no second plaintext answer).
+    assert any("UDP/TLS/RTP/SAVPF" in m for m in answers)
+    byes = [m for m in transport.sent if m.startswith("BYE ")]
+    assert len(byes) == 1, "a confirmed-dialog WebRTC handshake failure sends one BYE"

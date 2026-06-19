@@ -885,6 +885,63 @@ def test_media_webrtc_dtls_setup_rejects_unknown() -> None:
         load_media_config({"HERMES_VOIP_WEBRTC_DTLS_SETUP": "actpass"})
 
 
+# --- SIP DTLS-SRTP activation knobs (ADR-0053 Stage 2 §6) ---
+
+
+def test_media_sip_dtls_srtp_default_on() -> None:
+    """No knob => DTLS-SRTP answering is ON (the opportunistic preferred tier)."""
+    cfg = load_media_config({})
+    assert cfg.sip_dtls_srtp is True
+
+
+def test_media_sip_dtls_srtp_disabled() -> None:
+    """HERMES_VOIP_SIP_DTLS_SRTP=false is the rollback switch (off)."""
+    cfg = load_media_config({"HERMES_VOIP_SIP_DTLS_SRTP": "false"})
+    assert cfg.sip_dtls_srtp is False
+
+
+def test_media_sip_dtls_setup_default_auto() -> None:
+    """No knob => ``auto`` (the RFC-8842 active-answerer default, mirroring WebRTC)."""
+    cfg = load_media_config({})
+    assert cfg.sip_dtls_setup == "auto"
+
+
+def test_media_sip_dtls_setup_forced_active() -> None:
+    """HERMES_VOIP_SIP_DTLS_SETUP=active forces the active (DTLS client) role."""
+    cfg = load_media_config({"HERMES_VOIP_SIP_DTLS_SETUP": "active"})
+    assert cfg.sip_dtls_setup == "active"
+
+
+def test_media_sip_dtls_setup_forced_passive() -> None:
+    """HERMES_VOIP_SIP_DTLS_SETUP=passive forces the passive (DTLS server) role."""
+    cfg = load_media_config({"HERMES_VOIP_SIP_DTLS_SETUP": "passive"})
+    assert cfg.sip_dtls_setup == "passive"
+
+
+def test_media_sip_dtls_setup_is_case_insensitive() -> None:
+    """The knob value is normalised (case-insensitive), e.g. ``PASSIVE``."""
+    cfg = load_media_config({"HERMES_VOIP_SIP_DTLS_SETUP": "PASSIVE"})
+    assert cfg.sip_dtls_setup == "passive"
+
+
+def test_media_sip_dtls_setup_rejects_unknown() -> None:
+    """An unrecognised value is rejected loudly (rule 27 — no inert knob)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_SIP_DTLS_SETUP": "actpass"})
+
+
+def test_media_sip_dtls_setup_independent_of_webrtc() -> None:
+    """The SIP-DTLS role knob is independent of the WebRTC one (separate gateways)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_SIP_DTLS_SETUP": "passive",
+            "HERMES_VOIP_WEBRTC_DTLS_SETUP": "active",
+        }
+    )
+    assert cfg.sip_dtls_setup == "passive"
+    assert cfg.webrtc_dtls_setup == "active"
+
+
 # --- TURN relay config (ADR-0034) ---
 
 

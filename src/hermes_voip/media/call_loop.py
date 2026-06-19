@@ -1286,20 +1286,22 @@ class CallLoop:
         """Return a RANDOM filler phrase, never the immediately-previous one (ADR-0054).
 
         Random (not round-robin) so a multi-fire / multi-gap call does not sound
-        mechanically cyclic; the one guarantee is no back-to-back repeat. With a
-        single-phrase set the no-repeat rule has no alternative, so that phrase is
-        returned (no starvation). Uses the injected :attr:`_comfort_rng` (a seeded
-        ``random.Random`` in tests) — for variety only, never security.
+        mechanically cyclic; the one guarantee is no back-to-back repeat. Selection is a
+        *direct* choice from the distinct phrases other than the last one (not rejection
+        sampling), so it terminates even when the set has duplicates and no other
+        distinct value (e.g. ``("A", "A")``): then there is no alternative and the only
+        phrase is returned (no starvation, no spin). A single-phrase set is the same
+        case. Uses the injected :attr:`_comfort_rng` (a seeded ``random.Random`` in
+        tests) — for variety only, never security.
         """
         phrases = self._comfort_filler_phrases
-        if len(phrases) == 1:
-            phrase = phrases[0]
-        else:
-            # Draw uniformly, re-drawing while it equals the last phrase. With >= 2
-            # distinct candidates this terminates almost surely in O(1) expected draws.
-            phrase = self._comfort_rng.choice(phrases)
-            while phrase == self._last_comfort_phrase:
-                phrase = self._comfort_rng.choice(phrases)
+        # Distinct candidates other than the immediately-previous phrase, order-kept
+        # (a seeded RNG draw stays deterministic). Empty only when every phrase equals
+        # the last (incl. a single-phrase set) — then the no-repeat rule has no choice.
+        alternatives = tuple(
+            dict.fromkeys(p for p in phrases if p != self._last_comfort_phrase)
+        )
+        phrase = self._comfort_rng.choice(alternatives) if alternatives else phrases[0]
         self._last_comfort_phrase = phrase
         return phrase
 
@@ -1326,12 +1328,17 @@ class CallLoop:
         supersedes the filler stream there; the next iteration's audio check (or the
         ``speak`` cancel) then stops the loop.
 
+        Best-effort (rule 37): a filler synthesis/send failure is caught, logged, and
+        the loop CONTINUES to the next interval — a transient TTS hiccup neither stops
+        the periodic fill nor (being a fire-and-forget task) the call. A
+        ``CancelledError`` is the normal stop and is never caught.
+
         A barge-in / reply-commit / teardown cancels this task (raising
         ``CancelledError`` here — at the sleep or mid-playout), which propagates to end
         it cleanly; it is never swallowed (rule 37). The task keeps its
         ``_comfort_filler_task`` handle for its whole life (including playout) so
         :meth:`run`'s teardown can cancel it even mid-stream (no leak); the
-        done-callback clears the handle on completion.
+        done-callback clears the handle on completion (and logs any unexpected escape).
         """
         await self._sleep(self._comfort_filler_delay_s)
         while True:
@@ -1353,7 +1360,22 @@ class CallLoop:
                 # echo-gate-arming, flushable). A real reply arriving mid-filler
                 # supersedes this stream via _speak_text's stream-supersede; the next
                 # iteration's audio check (or the speak() cancel) stops the loop.
-                await self._speak_text(_single_chunk(), on_first_frame=None)
+                #
+                # Best-effort (rule 37): a filler synthesis/send failure is LOGGED and
+                # the loop CONTINUES — a transient TTS hiccup must not end periodic
+                # fill for the rest of the gap, nor (a fire-and-forget task) the call.
+                # A CancelledError is the normal stop (reply/barge-in/teardown) and MUST
+                # propagate to end the loop — it is never caught here.
+                try:
+                    await self._speak_text(_single_chunk(), on_first_frame=None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — best-effort filler; logged, never fatal (rule 37)
+                    _log.warning(
+                        "comfort filler: synthesis/send failed (call continues), "
+                        "will retry next interval",
+                        exc_info=True,
+                    )
             # Wait the repeat interval, then re-check. Cancelled here (the common stop)
             # when the reply commits or a barge-in/teardown fires — CancelledError ends
             # the loop cleanly without another fire.

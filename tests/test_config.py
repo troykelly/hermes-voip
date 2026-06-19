@@ -1894,3 +1894,61 @@ def test_shutdown_drain_secs_rejects_non_positive_or_malformed(bad: str) -> None
                 HERMES_SIP_SHUTDOWN_DRAIN_SECS=bad,
             )
         )
+
+
+# ---- adaptive jitter buffer ceiling (ADR-0063) -----------------------------
+
+
+def test_jitter_max_depth_default() -> None:
+    """The adaptive-jitter ceiling defaults to a sane value (ADR-0063).
+
+    The adapter constructs the media engine's :class:`JitterBuffer` with
+    ``adapt=True`` and this value as the ceiling, so a default install gets the
+    launch-promoted adaptive reorder tolerance without any env tuning.
+    """
+    cfg = load_media_config({})
+    assert cfg.jitter_max_depth == 10
+
+
+def test_jitter_max_depth_override() -> None:
+    """HERMES_VOIP_JITTER_MAX_DEPTH sets the adaptive-jitter ceiling."""
+    cfg = load_media_config({"HERMES_VOIP_JITTER_MAX_DEPTH": "16"})
+    assert cfg.jitter_max_depth == 16
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "abc"])
+def test_jitter_max_depth_rejects_non_positive_or_malformed(bad: str) -> None:
+    """A non-positive / malformed adaptive-jitter ceiling is rejected at load."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_JITTER_MAX_DEPTH": bad})
+
+
+def test_jitter_max_depth_must_be_positive_on_direct_construction() -> None:
+    """A directly-constructed MediaConfig validates the ceiling itself."""
+    with pytest.raises(ConfigError, match="jitter_max_depth"):
+        MediaConfig(
+            stt_provider="sherpa-onnx",
+            stt_model_dir=None,
+            tts_provider="sherpa-kokoro",
+            tts_model=None,
+            tts_voice=None,
+            elevenlabs_api_key=None,
+            deepgram_api_key=None,
+            cartesia_api_key=None,
+            vad_threshold=0.5,
+            endpoint_silence_ms=500,
+            duplex_mode="half",
+            greeting="",
+            rtp_symmetric=True,
+            barge_in_mode="gated",
+            barge_in_min_speech_ms=200,
+            barge_in_tail_ms=250,
+            barge_in_fade_ms=30,
+            injection_guard="onnx",
+            injection_guard_model_dir=None,
+            dtmf_mode="auto",
+            dtmf_interdigit_ms=None,
+            dtmf_inband_enabled=True,
+            tone_secs=0.0,
+            jitter_max_depth=0,
+        )

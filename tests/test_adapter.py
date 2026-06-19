@@ -2619,3 +2619,214 @@ async def test_inbound_invite_g722_dynamic_pt_opens_engine_with_that_pt() -> Non
         f"engine not opened with the negotiated dynamic PT 109; "
         f"got {captured.get('payload_type')!r} (sending static 9 is the bug)"
     )
+
+
+# ===========================================================================
+# ptime negotiation + adaptive jitter ACTIVATION (ADR-0063, completes ADR-0056)
+# ===========================================================================
+#
+# PR #142 built negotiate_ptime() + the engine ptime setter + the adaptive
+# JitterBuffer, but they were DORMANT (the adapter never called them). These
+# tests prove the adapter now activates both on the inbound answer path.
+
+# A G.722 offer that explicitly requests a 40 ms packetisation time (a value in
+# our supported framing set, != the 20 ms default) so the test proves the
+# NEGOTIATED ptime reaches the engine, not the hard-coded 20.
+_FAKE_SDP_OFFER_G722_PTIME40 = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 9 0\r\n"
+    "a=rtpmap:9 G722/8000\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=ptime:40\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite_g722_ptime40(call_id: str) -> str:
+    content_length = len(_FAKE_SDP_OFFER_G722_PTIME40.encode("utf-8"))
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKpt40\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:5061;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER_G722_PTIME40}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_activates_negotiated_ptime_and_adaptive_jitter() -> None:
+    """Inbound answer: the negotiated ptime + adaptive jitter reach the engine.
+
+    The offer requests ``a=ptime:40``; the adapter must set ``engine.ptime`` to
+    the negotiated 40 (not the 20 ms default) AND construct the engine with
+    ``jitter_adapt=True`` + the configured ``jitter_max_depth`` ceiling — the
+    activation that makes ADR-0056's launch-promoted features live.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+    # Default media config → jitter_max_depth == 10.
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite_g722_ptime40(call_id=call_id))
+
+    captured: dict[str, object] = {}
+    engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=20010,
+    )
+
+    def _capture_engine(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
+        return engine
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", side_effect=_capture_engine),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    # Adaptive jitter activated at construction with the configured ceiling.
+    assert captured.get("jitter_adapt") is True, (
+        f"engine not opened with adaptive jitter; got "
+        f"jitter_adapt={captured.get('jitter_adapt')!r} (the dormant ADR-0056 path)"
+    )
+    assert captured.get("jitter_max_depth") == 10, (
+        f"engine not opened with the configured jitter ceiling; "
+        f"got jitter_max_depth={captured.get('jitter_max_depth')!r}"
+    )
+    # The NEGOTIATED ptime (40) was applied to the engine, not the 20 ms default.
+    assert engine.ptime == 40, (
+        f"engine.ptime was not set to the negotiated 40 ms; got {engine.ptime!r} "
+        f"(the adapter is still leaving the engine on its hard-coded default)"
+    )
+
+
+# ===========================================================================
+# Provider/LLM error sanitisation spoken to the caller (ADR-0063, LAUNCH #4)
+# ===========================================================================
+#
+# An unrecoverable backend error (a raw 502 / provider message / stack trace)
+# arrives at send() as the "reply" text; today it is read aloud verbatim — an
+# info leak + unprofessional. The adapter must speak a short safe line instead
+# and log the real error (redacted), never raising toward the caller.
+
+# A realistic provider error string the Hermes gateway can hand to send() as the
+# turn text on an unrecoverable LLM failure (HTTP status + provider error class).
+_PROVIDER_ERROR_REPLY = (
+    "API call failed: HTTP 502 Bad Gateway (overloaded_error: Overloaded)"
+)
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_speaks_safe_line_not_raw_error() -> None:
+    """A provider-error reply is replaced with a short safe spoken line.
+
+    The raw error text must never reach the TTS sink; the safe apology is spoken
+    instead, and the call still reports a successful send (no retry storm).
+    """
+    from hermes_voip.provider_error import safe_error_reply  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})  # language defaults to "en"
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    # The safe line was spoken …
+    assert spoken == [safe_error_reply("en")]
+    # … and the raw provider error reached the TTS sink NOWHERE.
+    joined = " ".join(spoken)
+    assert "502" not in joined
+    assert "overloaded_error" not in joined
+    assert "API call failed" not in joined
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_logs_real_error_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real provider error is logged at WARNING (so it is not lost)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # Some WARNING record references the backend error (so an operator sees it).
+    assert any(
+        "502" in r.getMessage() or "provider" in r.getMessage().lower()
+        for r in warnings
+    ), (
+        f"no WARNING logged the real provider error; "
+        f"records={[r.getMessage() for r in warnings]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_genuine_reply_not_treated_as_provider_error() -> None:
+    """A genuine reply mentioning an error/number is still spoken verbatim."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    reply = "Your reference number is 502 and there was no error with the booking."
+    result = await adapter.send(call_id, reply)
+    assert result.success
+    assert reply in spoken

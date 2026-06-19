@@ -16,6 +16,8 @@ Also covers the WebRTC SDP attributes (ADR-0016, PR-B):
 - SDES/AVP path is fully unregressed (no cross-contamination).
 """
 
+import base64
+
 import pytest
 
 from hermes_voip.sdp import (
@@ -1901,3 +1903,38 @@ def test_answer_selects_supported_crypto_when_unsupported_listed_first() -> None
     )
     assert "AES_CM_256" not in text
     assert "a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:" in text
+
+
+def test_generate_answer_crypto_key_is_exactly_the_suite_length() -> None:
+    """The minted answer key||salt decodes to exactly the suite's octet count.
+
+    Security invariant (RFC 4568 §6.2): AES_CM_128_HMAC_SHA1_{80,32} need a
+    16-octet master key + 14-octet master salt = 30 octets. A short key would
+    leave salt/key bytes zero — a catastrophically weak SRTP context. This pins
+    the generated length so a mutation of ``secrets.token_bytes(octets)`` to a
+    wrong-length (or constant-length) value is caught, not silently accepted.
+    """
+    accepted = CryptoAttribute(
+        tag=4, suite="AES_CM_128_HMAC_SHA1_80", key_params=f"inline:{_FAKE_KEY}"
+    )
+    answer = generate_answer_crypto(accepted)
+    key_b64 = answer.key_params[len("inline:") :]
+    decoded = base64.b64decode(key_b64, validate=True)
+    assert len(decoded) == _SRTP_KEY_SALT_OCTETS[accepted.suite]
+    assert len(decoded) == 30  # the literal RFC 4568 §6.2 key||salt length
+
+
+def test_generate_answer_crypto_is_random_per_call() -> None:
+    """Two calls mint DIFFERENT keys — the master key is per-call random.
+
+    Security invariant: a static/reused master key would let an attacker who
+    recovers one call's key decrypt every call (and breaks the SRTP keystream
+    uniqueness assumption). This catches a mutation of ``secrets.token_bytes`` to
+    a deterministic value (e.g. ``bytes(octets)``), which every other test passes.
+    """
+    accepted = CryptoAttribute(
+        tag=1, suite="AES_CM_128_HMAC_SHA1_80", key_params=f"inline:{_FAKE_KEY}"
+    )
+    first = generate_answer_crypto(accepted)
+    second = generate_answer_crypto(accepted)
+    assert first.key_params != second.key_params

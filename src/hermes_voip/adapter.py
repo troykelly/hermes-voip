@@ -2669,13 +2669,16 @@ class VoipAdapter(BasePlatformAdapter):
             # this many ms when a barge-in flushes the queued audio, so the cut is
             # click-free instead of an abrupt pop.
             barge_in_fade_ms=media_cfg.barge_in_fade_ms,
-            # Dead-air comfort filler (ADR-0030): when enabled, emit one short natural
-            # filler on a turn gap that exceeds the delay before the agent's reply
-            # audio starts, so the caller does not think the line dropped. Off by
-            # default (today's behaviour exactly); flushable + model-tag-aware because
-            # it routes through the same speak()/TTS path as a reply.
+            # Dead-air comfort filler (ADR-0030, extended ADR-0054): emit a short
+            # natural filler on a turn gap that exceeds the delay before the agent's
+            # reply audio starts, then a fresh RANDOM phrase every repeat interval on a
+            # sustained gap, so a long wait never leaves a long silence. ON by default;
+            # flushable + model-tag-aware because it routes through the same speak()/TTS
+            # path as a reply. The phrase set is already language-selected by the config
+            # parser (HERMES_VOIP_LANGUAGE); CallLoop's own random source needs no seam.
             comfort_filler=media_cfg.comfort_filler,
             comfort_filler_delay_ms=media_cfg.comfort_filler_delay_ms,
+            comfort_filler_repeat_ms=media_cfg.comfort_filler_repeat_ms,
             comfort_filler_phrases=media_cfg.comfort_filler_phrases,
             # Inbound DTMF menu-group aggregation timeout (ADR-0010): a buffered group
             # with no ``#`` terminator is delivered after this gap. None => the loop's

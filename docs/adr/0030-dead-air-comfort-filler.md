@@ -1,7 +1,14 @@
 # ADR-0030: Dead-air comfort filler — one short, flushable, model-aware filler on the turn gap
 
 - **Date:** 2026-06-17
-- **Status:** Accepted
+- **Status:** Accepted — **extended by ADR-0054** (random phrasing, periodic fill for long
+  waits, multi-language phrase sets, default-on). The seams, safety invariants, and the
+  config keys below all still hold; ADR-0054 changes *selection* (round-robin → random,
+  no-immediate-repeat), makes the single fire a *periodic* one that re-fires every repeat
+  interval on a sustained gap (closing the "known one-shot limitation" recorded here),
+  keys the default phrase set by `HERMES_VOIP_LANGUAGE`, and flips the master switch to on
+  by default. Where this record says "OFF by default" / "at most once per gap" /
+  "round-robin", read ADR-0054 for the current behaviour.
 - **Deciders:** agent session (VoIP voice-UX, operator media-UX report)
 - **Builds on:** ADR-0023 (echo-robust barge-in), ADR-0028 (barge-in clean stop + flush), ADR-0027 (model-conditional audio tags), ADR-0007 (streaming TTS), ADR-0003 (cascaded media / call loop)
 

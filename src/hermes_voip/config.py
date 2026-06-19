@@ -245,34 +245,67 @@ _MAX_AEC_MU = 2.0
 # explicit value always wins. AEC off → the 600 ms default (ADR-0023) is restored.
 _DEFAULT_BARGE_IN_MIN_SPEECH_MS_AEC = 200
 
-# Dead-air comfort filler (ADR-0030). On a slow turn there is a gap of pure silence
-# between the caller finishing and the agent's first audio (LLM think time + TTS
-# first-audio latency). On a phone call that reads as a dropped line. When enabled,
-# the call loop emits ONE short, natural human filler ("Hmm,", "Let me see,") on the
-# gap if it lasts longer than the delay, then keeps waiting for the real reply — at
-# most once per gap, cancelled the instant the reply audio or a barge-in arrives.
-# OFF by default: the master switch off is exactly today's behaviour (no filler task
-# is created). The filler routes through the normal speak()/TTS path so it is
-# flushable (ADR-0028) and model-conditional-tag-aware (ADR-0027).
+# Dead-air comfort filler (ADR-0030, extended ADR-0054). On a slow turn there is a gap
+# of pure silence between the caller finishing and the agent's first audio (LLM think
+# time + TTS first-audio latency). On a phone call that reads as a dropped line. When
+# enabled, the call loop emits a short, natural human filler ("One moment please.",
+# "Bear with me.") on the gap once it exceeds the delay, then RE-EMITS a fresh random
+# phrase every repeat interval until the reply audio starts, so a long wait does not
+# leave a long silence — cancelled the instant the reply audio or a barge-in arrives.
+# ON by default (ADR-0054); set HERMES_VOIP_TTS_COMFORT_FILLER=false for exactly the
+# pre-filler behaviour (no filler task created). The filler routes through the normal
+# speak()/TTS path so it is flushable (ADR-0028) and model-conditional-tag-aware
+# (ADR-0027).
 _COMFORT_FILLER_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER"
 _COMFORT_FILLER_DELAY_MS_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS"
+_COMFORT_FILLER_REPEAT_MS_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER_REPEAT_MS"
 _COMFORT_FILLER_PHRASES_KEY = "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES"
-_DEFAULT_COMFORT_FILLER = False
+# ON by default (ADR-0054): the operator wants a slow turn to never leave the caller
+# in silence. The off path is still exactly the pre-filler behaviour (no filler task
+# created) for an operator who sets HERMES_VOIP_TTS_COMFORT_FILLER=false.
+_DEFAULT_COMFORT_FILLER = True
 # 900 ms ≈ long enough that a brisk reply (a few hundred ms) never triggers the
 # filler, short enough that a genuinely slow turn does not leave the caller in
 # silence wondering whether the line dropped.
 _DEFAULT_COMFORT_FILLER_DELAY_MS = 900
-# The phrase set is `|`-separated; one phrase is chosen per gap (round-robin per
-# call). These defaults read naturally on EVERY TTS model (no bracket tag), so the
-# default never depends on v3 tag rendering. An operator running v3 may set a phrase
-# that includes a tag (e.g. "[hesitates] hmm") — it renders on v3 and strips cleanly
-# elsewhere via the per-segment strip (ADR-0027).
+# The PERIODIC repeat interval (ADR-0054): on a sustained dead-air gap a fresh filler
+# fires every this-many ms until the reply audio starts, so a single ~1 s phrase does
+# not leave a 10 s LLM wait mostly silent. Defaults to the dead-air delay (one cadence
+# to reason about); overridable independently. Must be > 0.
+_DEFAULT_COMFORT_FILLER_REPEAT_MS = _DEFAULT_COMFORT_FILLER_DELAY_MS
 _COMFORT_FILLER_PHRASE_SEP = "|"
-_DEFAULT_COMFORT_FILLER_PHRASES: tuple[str, ...] = (
-    "Hmm,",
-    "Let me see,",
-    "One moment,",
-)
+# The active conversation language (ADR-0054), selecting the built-in comfort-filler
+# phrase set. English only for now; the structure (a dict keyed by language code) makes
+# adding a language later a data-only change. Validated against the known set.
+_LANGUAGE_KEY = "HERMES_VOIP_LANGUAGE"
+_DEFAULT_LANGUAGE = "en"
+# Built-in comfort-filler phrase sets, keyed by language code. Each phrase reads
+# naturally on EVERY TTS model (no bracket tag), so the default never depends on v3
+# tag rendering. An operator running v3 may override with a phrase that includes a tag
+# (e.g. "[hesitates] hmm") — it renders on v3 and strips cleanly elsewhere via the
+# per-segment strip (ADR-0027). The English set is intentionally varied (random,
+# no-immediate-repeat selection wears better with more choices). To add a language,
+# add an entry here — nothing else changes.
+_COMFORT_FILLER_PHRASES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
+    "en": (
+        "Just a moment.",
+        "One moment please.",
+        "Bear with me.",
+        "Let me check that for you.",
+        "Just a second.",
+        "Almost there.",
+        "Hold on a moment.",
+        "Let me look into that.",
+        "Give me just a second.",
+        "One moment.",
+    ),
+}
+# The English set is the back-compatible default for a directly-constructed
+# MediaConfig / CallLoop (no env, no language argument).
+_DEFAULT_COMFORT_FILLER_PHRASES: tuple[str, ...] = _COMFORT_FILLER_PHRASES_BY_LANGUAGE[
+    _DEFAULT_LANGUAGE
+]
+_SUPPORTED_LANGUAGES: frozenset[str] = frozenset(_COMFORT_FILLER_PHRASES_BY_LANGUAGE)
 
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
@@ -669,20 +702,29 @@ class MediaConfig:
     # hanging the call forever. Defaulted (20) so existing direct constructions stay
     # valid; the parser validates the operator override's bounds.
     media_timeout_secs: int = _DEFAULT_RTP_TIMEOUT_SECS
-    # Dead-air comfort filler (ADR-0030). OFF by default: a slow turn otherwise
-    # leaves the caller in silence (LLM think time + TTS first-audio latency), which
-    # on a phone call reads as a dropped line. When on, the call loop emits ONE short
-    # natural filler ("Hmm,") on the gap after ``comfort_filler_delay_ms`` if no reply
-    # audio has started, then keeps waiting — at most once per gap, cancelled the
-    # instant the reply or a barge-in arrives. Defaulted so existing direct
-    # constructions stay valid; off = today's behaviour exactly.
+    # Active conversation language (ADR-0054), selecting the built-in comfort-filler
+    # phrase set. English only for now; validated against the known set. Defaulted so
+    # existing direct constructions stay valid.
+    language: str = _DEFAULT_LANGUAGE
+    # Dead-air comfort filler (ADR-0030, extended ADR-0054). ON by default (the
+    # operator wants a slow turn to never leave the caller in silence). When on, the
+    # call loop emits a short natural filler ("One moment please.") on the gap after
+    # ``comfort_filler_delay_ms`` if no reply audio has started, then RE-EMITS a fresh
+    # random phrase every ``comfort_filler_repeat_ms`` until the reply starts —
+    # cancelled the instant the reply or a barge-in arrives. Defaulted so existing
+    # direct constructions stay valid; off = the pre-filler behaviour exactly.
     comfort_filler: bool = _DEFAULT_COMFORT_FILLER
-    # Dead-air threshold (ms): how long the gap must last before one filler fires.
-    # Must be strictly positive (validated). Inert while ``comfort_filler`` is off.
+    # Dead-air threshold (ms): how long the gap must last before the first filler
+    # fires. Must be strictly positive (validated). Inert while ``comfort_filler`` off.
     comfort_filler_delay_ms: int = _DEFAULT_COMFORT_FILLER_DELAY_MS
-    # The filler phrase set; one is chosen per gap (round-robin per call). Each phrase
-    # reads naturally on every TTS model (no bracket tag). A blank override falls back
-    # to the built-in default set; empty members are dropped (parser).
+    # Periodic repeat interval (ms): on a sustained gap a fresh filler fires this often
+    # after the first, until the reply audio starts. Strictly positive (validated);
+    # defaults to the dead-air delay. Inert while ``comfort_filler`` is off.
+    comfort_filler_repeat_ms: int = _DEFAULT_COMFORT_FILLER_REPEAT_MS
+    # The filler phrase set; one is chosen at RANDOM per fire, never repeating the
+    # immediately-previous phrase (ADR-0054). Each phrase reads naturally on every TTS
+    # model (no bracket tag). Defaults to the selected language's built-in set; a blank
+    # override falls back to it; empty members are dropped (parser).
     comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES
     # WebRTC ICE STUN servers (ADR-0032; default revised ADR-0043), as ``stun:`` URLs
     # for srflx candidate gathering. Defaults to the public dual-stack list; an explicit
@@ -860,19 +902,30 @@ class MediaConfig:
             raise ConfigError(msg)
 
     def _validate_comfort_filler(self) -> None:
-        """Validate the dead-air comfort-filler invariants (ADR-0030).
+        """Validate the dead-air comfort-filler invariants (ADR-0030, ADR-0054).
 
-        The delay must be strictly positive (a non-positive dead-air threshold is
-        meaningless); the phrase set must be non-empty and contain no blank phrase
-        (a filler with nothing to say is a silent no-op). These hold regardless of
-        the master switch so a direct :class:`MediaConfig` construction is also
-        self-validating.
+        The delay and the periodic repeat interval must be strictly positive (a
+        non-positive dead-air / repeat interval is meaningless); the language must be
+        one we have a phrase set for; the phrase set must be non-empty and contain no
+        blank phrase (a filler with nothing to say is a silent no-op). These hold
+        regardless of the master switch so a direct :class:`MediaConfig` construction
+        is also self-validating.
         """
         if self.comfort_filler_delay_ms <= 0:
             msg = (
                 f"comfort_filler_delay_ms must be positive, "
                 f"got {self.comfort_filler_delay_ms}"
             )
+            raise ConfigError(msg)
+        if self.comfort_filler_repeat_ms <= 0:
+            msg = (
+                f"comfort_filler_repeat_ms must be positive, "
+                f"got {self.comfort_filler_repeat_ms}"
+            )
+            raise ConfigError(msg)
+        if self.language not in _SUPPORTED_LANGUAGES:
+            allowed = ", ".join(sorted(_SUPPORTED_LANGUAGES))
+            msg = f"language must be one of {{{allowed}}}, got {self.language!r}"
             raise ConfigError(msg)
         if not self.comfort_filler_phrases:
             msg = "comfort_filler_phrases must not be empty"
@@ -993,6 +1046,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
     )
     # TURN relay (ADR-0034): parsed + validated together (URLs require credentials).
     _ice_turn = _parse_ice_turn(env)
+    # Active language (ADR-0054), parsed before the comfort-filler phrases so a blank
+    # phrase override can fall back to THIS language's built-in set.
+    language = _parse_language(env)
     return MediaConfig(
         stt_provider=_value_lower(env, _STT_PROVIDER_KEY) or _DEFAULT_STT_PROVIDER,
         stt_model_dir=_optional(env, _STT_MODEL_DIR_KEY),
@@ -1023,11 +1079,15 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         barge_in_fade_ms=_parse_non_negative_int(
             env, _BARGE_IN_FADE_MS_KEY, _DEFAULT_BARGE_IN_FADE_MS
         ),
+        language=language,
         comfort_filler=_parse_bool(env, _COMFORT_FILLER_KEY, _DEFAULT_COMFORT_FILLER),
         comfort_filler_delay_ms=_parse_positive_int(
             env, _COMFORT_FILLER_DELAY_MS_KEY, _DEFAULT_COMFORT_FILLER_DELAY_MS
         ),
-        comfort_filler_phrases=_parse_comfort_filler_phrases(env),
+        comfort_filler_repeat_ms=_parse_positive_int(
+            env, _COMFORT_FILLER_REPEAT_MS_KEY, _DEFAULT_COMFORT_FILLER_REPEAT_MS
+        ),
+        comfort_filler_phrases=_parse_comfort_filler_phrases(env, language),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,
         injection_guard_model_dir=_optional(env, _INJECTION_GUARD_MODEL_DIR_KEY),
@@ -1375,21 +1435,41 @@ def _parse_greeting(env: Mapping[str, str]) -> str:
     return raw.strip()  # present (incl. empty/whitespace) → verbatim, trimmed
 
 
-def _parse_comfort_filler_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
-    """Parse the `|`-separated comfort-filler phrase set (ADR-0030).
+def _parse_language(env: Mapping[str, str]) -> str:
+    """Parse and validate the active conversation language (ADR-0054).
+
+    Lower-cased; defaults to :data:`_DEFAULT_LANGUAGE` when unset. An unknown code
+    (one we have no phrase set for) is rejected fail-fast rather than silently
+    falling back, so a typo'd language is caught at startup.
+    """
+    token = _value_lower(env, _LANGUAGE_KEY) or _DEFAULT_LANGUAGE
+    if token not in _SUPPORTED_LANGUAGES:
+        allowed = ", ".join(sorted(_SUPPORTED_LANGUAGES))
+        msg = f"{_LANGUAGE_KEY} must be one of {{{allowed}}}, got {token!r}"
+        raise ConfigError(msg)
+    return token
+
+
+def _parse_comfort_filler_phrases(
+    env: Mapping[str, str], language: str
+) -> tuple[str, ...]:
+    """Parse the `|`-separated comfort-filler phrase set (ADR-0030, ADR-0054).
 
     Each member is trimmed; empty members (e.g. from a trailing or doubled ``|``)
-    are dropped. An unset or all-blank value falls back to the built-in default set
-    (:data:`_DEFAULT_COMFORT_FILLER_PHRASES`) so a misconfigured-empty override never
-    yields a filler with no phrase to speak. The result is always non-empty.
+    are dropped. An unset or all-blank value falls back to the selected *language*'s
+    built-in set (:data:`_COMFORT_FILLER_PHRASES_BY_LANGUAGE`) so a misconfigured-empty
+    override never yields a filler with no phrase to speak. An explicit set always
+    wins (it overrides the language default). The result is always non-empty.
+    ``language`` is pre-validated by :func:`_parse_language`.
     """
+    default = _COMFORT_FILLER_PHRASES_BY_LANGUAGE[language]
     raw = _value(env, _COMFORT_FILLER_PHRASES_KEY)
     if not raw:
-        return _DEFAULT_COMFORT_FILLER_PHRASES
+        return default
     phrases = tuple(
         part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
     )
-    return phrases or _DEFAULT_COMFORT_FILLER_PHRASES
+    return phrases or default
 
 
 def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:

@@ -613,13 +613,15 @@ async def test_sip_dtls_disabled_falls_through_to_sdes_plain() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sip_dtls_handshake_failure_ends_call_no_plaintext() -> None:
-    """A DTLS handshake failure ends the call and NEVER answers plaintext (§4).
+async def test_sip_dtls_handshake_failure_byes_dialog_no_plaintext() -> None:
+    """A DTLS handshake failure ends the dialog with a BYE; NEVER answers plaintext.
 
-    The 200 OK is the DTLS answer (it precedes the handshake), so the call IS
-    answered SAVP; when the handshake then fails the call is torn down (no CallLoop
-    on dead media) — and crucially no SECOND, plaintext answer is ever sent (no
-    plaintext fallback, RFC 5763 §5 / rule 37). The session is closed.
+    The 200 OK is the DTLS answer (it precedes the handshake), so the peer holds an
+    ANSWERED UDP/TLS/RTP/SAVP call. When the handshake then fails the dialog is
+    HALF-OPEN on the gateway — it MUST be definitively closed with an in-dialog BYE
+    (not left to the peer's timer). And crucially no SECOND, plaintext answer is ever
+    sent (no plaintext fallback, RFC 5763 §5 / rule 37), and no CallLoop is built on
+    the dead media. The session is closed.
     """
     transport = _FakeTransport()
     adapter = await _build_adapter(transport, load_media_config({}))
@@ -643,6 +645,8 @@ async def test_sip_dtls_handshake_failure_ends_call_no_plaintext() -> None:
         session = _FakeSipDtlsSession.last
         assert session is not None
         await _until(lambda: session.closed)
+        # The half-open answered dialog is closed with a BYE.
+        await _until(lambda: any(m.startswith("BYE ") for m in transport.sent))
         await asyncio.sleep(0.01)
 
     # No CallLoop was built on the dead (unkeyed) media.
@@ -657,6 +661,110 @@ async def test_sip_dtls_handshake_failure_ends_call_no_plaintext() -> None:
         if m.startswith("SIP/2.0 200") and "RTP/AVP" in m and "SAVP" not in m
     ]
     assert plaintext_answers == [], "a handshake failure must NOT answer plaintext"
+    # A BYE definitively closed the answered dialog (not a 4xx — the call was
+    # answered, so RFC 3261 §15 requires a BYE to terminate the established dialog).
+    byes = [m for m in transport.sent if m.startswith("BYE ")]
+    assert byes, "a post-200 handshake failure must BYE the half-open dialog"
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_engine_failure_after_handshake_byes_and_cleans_up() -> None:
+    """An engine construct/connect failure AFTER the handshake BYEs + cleans up.
+
+    The handshake succeeded (SRTP keyed) but ``RtpMediaTransport.connect`` then
+    raises. The 200 OK was already sent, so the dialog is HALF-OPEN: it must be
+    closed with a BYE, the media engine stopped (no leaked SRTP state), and the DTLS
+    session/pipe closed (no leaked UDP socket) — and no CallLoop built.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, load_media_config({}))
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    # The handshake succeeds; engine.connect() raises (a post-200, post-handshake
+    # failure) — the engine was constructed, so it must be stopped.
+    engine = MagicMock(
+        connect=AsyncMock(side_effect=RuntimeError("engine connect failed")),
+        stop=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=_SESSION_PORT,
+        inbound_sample_rate=8_000,
+    )
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            NewCall(registration=_ext_config(), invite=invite)
+        )
+        await _until(lambda: _FakeSipDtlsSession.last is not None)
+        session = _FakeSipDtlsSession.last
+        assert session is not None
+        # The engine was stopped and the session closed (no leaked socket/SRTP).
+        await _until(lambda: engine.stop.await_count > 0)
+        await _until(lambda: session.closed)
+        await _until(lambda: any(m.startswith("BYE ") for m in transport.sent))
+        await asyncio.sleep(0.01)
+
+    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+    assert engine.stop.await_count == 1, "the constructed engine must be stopped"
+    assert session.closed, "the DTLS session/pipe must be closed (no leaked socket)"
+    byes = [m for m in transport.sent if m.startswith("BYE ")]
+    assert byes, "a post-200 engine failure must BYE the half-open dialog"
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_bind_failure_closes_session_even_if_488_send_raises() -> None:
+    """A pre-answer bind failure closes the session even if the 488 transmit RAISES.
+
+    The codex finding: session.close() must not be stranded behind a failing
+    transport.send(488). Here prepare() fails (a bind error) AND the 488 send itself
+    raises — the session must still be closed (no leaked UDP socket), proving the
+    close runs in a finally / before the send, not after it.
+    """
+
+    class _Failing488Transport(_FakeTransport):
+        async def send(self, message: str) -> None:
+            await super().send(message)
+            if message.startswith("SIP/2.0 488"):
+                msg = "network down sending 488"
+                raise ConnectionError(msg)
+
+    transport = _Failing488Transport()
+    adapter = await _build_adapter(transport, load_media_config({}))
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    class _BindFailSession(_FakeSipDtlsSession):
+        async def prepare(self, *, local_address: str, local_port: int = 0) -> None:
+            self.prepared = False
+            msg = "UDP bind failed"
+            raise OSError(msg)
+
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _BindFailSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=_fake_engine()),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            NewCall(registration=_ext_config(), invite=invite)
+        )
+        await _until(lambda: _FakeSipDtlsSession.last is not None)
+        session = _FakeSipDtlsSession.last
+        assert session is not None
+        # The session is closed despite the 488 transmit raising (no leaked socket).
+        await _until(lambda: session.closed)
+        await asyncio.sleep(0.01)
+
+    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+    assert session.closed, (
+        "a pre-answer bind failure must close the session even if the 488 send raises"
+    )
 
 
 @pytest.mark.asyncio

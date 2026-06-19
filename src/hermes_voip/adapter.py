@@ -91,7 +91,7 @@ from hermes_voip.config import (
     load_gateway_config,
     load_media_config,
 )
-from hermes_voip.dialog import Dialog
+from hermes_voip.dialog import Dialog, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.dtmf_config import (
     DtmfReceiveMode,
@@ -2309,6 +2309,7 @@ class VoipAdapter(BasePlatformAdapter):
                     engine_codec=engine_codec,
                     codec=codec,
                     transport=transport,
+                    dialog=dialog,
                     local_tag=local_tag,
                     local_contact=local_contact,
                     local_rtp_host=local_rtp_host,
@@ -2913,6 +2914,7 @@ class VoipAdapter(BasePlatformAdapter):
         engine_codec: Codec,
         codec: SdpCodec,
         transport: SignalingTransport,
+        dialog: Dialog,
         local_tag: str,
         local_contact: str,
         local_rtp_host: str,
@@ -3012,21 +3014,26 @@ class VoipAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             # Any bind / answer-build failure before the 200 OK is a clean pre-answer
-            # reject (488); the session is closed and the internal reject signal is
-            # re-raised — this except never swallows (rule 37).
+            # reject (488). Close the session FIRST — before the 488 transmit, which
+            # may itself raise on a dead transport — so the bound UDP socket is never
+            # leaked (the close must not be stranded behind a failing send). Then send
+            # the 488 and re-raise the internal reject signal (never swallowed, rule
+            # 37). The call was NOT answered, so this is a 488, not a BYE.
             _log.warning(
                 "INVITE %s: cannot build SIP DTLS-SRTP answer: %s", call_id, exc
             )
-            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             await session.close()
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected from exc
 
+        # Log only NON-identifying state (rule 34: no host/IP on the live media path —
+        # the local RTP address is the runtime's interface). Port + setup + codecs are
+        # safe (the port is the same level the RTCP-active log emits).
         _log.info(
-            "INVITE %s: SIP DTLS-SRTP answer built — setup=%s, local RTP %s:%d, "
+            "INVITE %s: SIP DTLS-SRTP answer built — setup=%s, local RTP port %d, "
             "codecs %s",
             call_id,
             session.setup.value,
-            local_media.local_address,
             local_media.port,
             ",".join(c.encoding for c in agreed_sdp_codecs),
         )
@@ -3056,8 +3063,20 @@ class VoipAdapter(BasePlatformAdapter):
                 peer_port=audio.port,
             )
         except Exception:  # noqa: BLE001 — any DTLS failure aborts the call (caught + re-raised as reject)
+            # A fingerprint mismatch / timeout AFTER the 200 OK: the peer holds an
+            # ANSWERED UDP/TLS/RTP/SAVP call, so this is NOT a 488 and there is NO
+            # plaintext fallback (RFC 5763 §5). The dialog is HALF-OPEN — definitively
+            # close it with an in-dialog BYE (RFC 3261 §15) so it is never a zombie,
+            # close the DTLS session (release the UDP socket), and re-raise the reject
+            # signal so the inbound handler builds no CallLoop on dead media.
             _log.exception("INVITE %s: SIP DTLS-SRTP handshake failed", call_id)
-            await session.close()
+            await self._abort_answered_sip_dtls(
+                dialog=dialog,
+                transport=transport,
+                session=session,
+                engine=None,
+                call_id=call_id,
+            )
             raise _MediaNegotiationRejected from None
 
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
@@ -3073,47 +3092,121 @@ class VoipAdapter(BasePlatformAdapter):
             )
             is DtmfReceiveMode.INBAND
         )
-        engine = RtpMediaTransport(
-            local_address="0.0.0.0",  # noqa: S104 — unused on the pipe path (the pipe owns the socket)
-            local_port=0,
-            # The pipe's comedia latch is the destination; these are the SDP-advertised
-            # peer the pipe was initialised with, kept for parity/diagnostics (the
-            # engine's ice_transport seam does not re-send to them).
-            remote_address=remote_address or "0.0.0.0",  # noqa: S104
-            remote_port=audio.port or 9,
-            codec=engine_codec,
-            payload_type=codec.payload_type,
-            telephone_event_payload_type=te_pt,
-            dtmf_send_mode=dtmf_send_mode,
-            inband_dtmf_rx_enabled=inband_rx,
-            # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
-            srtp_inbound=srtp_inbound,
-            srtp_outbound=srtp_outbound,
-            # Carry media over the session's UDP datagram pipe instead of a bound
-            # socket — the same engine seam the WebRTC path uses for its ICE pipe.
-            ice_transport=session.pipe,
-            media_timeout_secs=media_cfg.media_timeout_secs,
-            # In-process acoustic echo cancellation (ADR-0033): subtract the known
-            # outbound TTS reference from each inbound frame before the VAD/ASR see it.
-            aec_enabled=media_cfg.aec_enabled,
-            aec_filter_ms=media_cfg.aec_filter_ms,
-            aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
-            aec_mu=media_cfg.aec_mu,
-            # Adaptive jitter buffer (ADR-0056/0063): grow the reorder tolerance under
-            # loss up to the configured ceiling, shrink back when the link is clean.
-            jitter_adapt=True,
-            jitter_max_depth=media_cfg.jitter_max_depth,
-        )
-        # ptime negotiation (ADR-0056/0063): codec-aware (Opus pinned to 20 ms). Set
-        # before connect() so the first outbound packet is framed correctly.
-        engine.ptime = _negotiated_ptime(audio, engine_codec)
-        await engine.connect()
+        # Build + connect the engine. This is also AFTER the 200 OK, so a failure here
+        # (ctor or connect()) is the same half-open-dialog situation as a handshake
+        # failure: BYE the dialog, stop the engine if it was constructed (release its
+        # SRTP state / any task), close the DTLS session (release the UDP socket), and
+        # re-raise the reject signal. ``engine`` stays None until the ctor returns, so
+        # the cleanup knows whether an engine exists to stop.
+        engine: RtpMediaTransport | None = None
+        try:
+            engine = RtpMediaTransport(
+                local_address="0.0.0.0",  # noqa: S104 — unused on the pipe path (the pipe owns the socket)
+                local_port=0,
+                # The pipe's comedia latch is the destination; these are the
+                # SDP-advertised peer the pipe was initialised with, kept for
+                # parity/diagnostics (the engine's ice_transport seam does not re-send).
+                remote_address=remote_address or "0.0.0.0",  # noqa: S104
+                remote_port=audio.port or 9,
+                codec=engine_codec,
+                payload_type=codec.payload_type,
+                telephone_event_payload_type=te_pt,
+                dtmf_send_mode=dtmf_send_mode,
+                inband_dtmf_rx_enabled=inband_rx,
+                # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
+                srtp_inbound=srtp_inbound,
+                srtp_outbound=srtp_outbound,
+                # Carry media over the session's UDP datagram pipe instead of a bound
+                # socket — the same engine seam the WebRTC path uses for its ICE pipe.
+                ice_transport=session.pipe,
+                media_timeout_secs=media_cfg.media_timeout_secs,
+                # In-process acoustic echo cancellation (ADR-0033): subtract the known
+                # outbound TTS reference from each inbound frame before the VAD/ASR see.
+                aec_enabled=media_cfg.aec_enabled,
+                aec_filter_ms=media_cfg.aec_filter_ms,
+                aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+                aec_mu=media_cfg.aec_mu,
+                # Adaptive jitter buffer (ADR-0056/0063): grow the reorder tolerance
+                # under loss up to the configured ceiling, shrink back when clean.
+                jitter_adapt=True,
+                jitter_max_depth=media_cfg.jitter_max_depth,
+            )
+            # ptime negotiation (ADR-0056/0063): codec-aware (Opus pinned to 20 ms). Set
+            # before connect() so the first outbound packet is framed correctly.
+            engine.ptime = _negotiated_ptime(audio, engine_codec)
+            await engine.connect()
+        except Exception:  # noqa: BLE001 — any engine setup failure aborts the answered call (caught + re-raised as reject)
+            _log.exception(
+                "INVITE %s: SIP DTLS-SRTP engine setup failed after the 200 OK",
+                call_id,
+            )
+            await self._abort_answered_sip_dtls(
+                dialog=dialog,
+                transport=transport,
+                session=session,
+                engine=engine,
+                call_id=call_id,
+            )
+            raise _MediaNegotiationRejected from None
         # RTCP (ADR-0061) is NOT activated on the secured DTLS-SRTP path: the engine
         # has no SRTCP (RFC 3711 §3.4) transform, so cleartext RTCP on a secured
         # 5-tuple would violate the profile and leak SSRC/CNAME/timing — same as the
         # SDES/WebRTC secured paths (a named follow-up adds SRTCP).
         _log.info("INVITE %s: SIP DTLS-SRTP media engine connected over UDP", call_id)
         return engine, local_media
+
+    async def _abort_answered_sip_dtls(
+        self,
+        *,
+        dialog: Dialog,
+        transport: SignalingTransport,
+        session: SipDtlsMediaSession,
+        engine: RtpMediaTransport | None,
+        call_id: str,
+    ) -> None:
+        """Definitively end a SIP DTLS-SRTP call that failed AFTER the 200 OK.
+
+        Reached when the DTLS handshake or the engine setup fails once the
+        ``UDP/TLS/RTP/SAVP`` 200 OK has already gone out, so the peer holds an answered
+        call (the SIP dialog is established, RFC 3261 §12). Unlike the pre-answer reject
+        (a 488), an established dialog MUST be torn down with an in-dialog **BYE**
+        (RFC 3261 §15.1) — a 4xx would be ignored. No ``CallSession`` exists yet (it is
+        built only after this helper's caller returns), so the BYE is sent directly on
+        the ``dialog`` — the same wire request :meth:`CallSession.hang_up` builds
+        (``build_in_dialog_request(dialog, "BYE")``); ``_teardown_call`` is the
+        post-registration chokepoint and is not reachable here.
+
+        Order: stop the engine (if it was constructed — release its SRTP state and any
+        background task) and close the DTLS session (release the UDP socket) FIRST, so
+        the media resources are freed even if the BYE transmit raises; then send the
+        BYE. Each step is best-effort and independently guarded — one failing resource
+        must not strand the others (rule 37: the error is logged, never swallowed
+        silently, and never a plaintext fallback).
+        """
+        if engine is not None:
+            try:
+                await engine.stop()
+            except Exception as exc:  # noqa: BLE001 — best-effort; never strand the rest
+                _log.warning(
+                    "INVITE %s: error stopping engine on DTLS abort: %s", call_id, exc
+                )
+        try:
+            await session.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand the BYE
+            _log.warning(
+                "INVITE %s: error closing DTLS session on abort: %s", call_id, exc
+            )
+        # Close the half-open dialog with an in-dialog BYE (the same request
+        # CallSession.hang_up sends). Best-effort: a BYE-send failure is logged, not
+        # raised — the call is already being aborted.
+        try:
+            bye = build_in_dialog_request(dialog, "BYE")
+            await transport.send(bye.text)
+            _log.info(
+                "INVITE %s: BYE sent to close the half-open DTLS-SRTP dialog", call_id
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; the dialog will time out if the BYE cannot be sent
+            _log.warning("INVITE %s: error sending BYE on DTLS abort: %s", call_id, exc)
 
     def _start_webrtc_video_sender(
         self,

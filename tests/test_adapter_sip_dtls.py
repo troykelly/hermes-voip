@@ -26,9 +26,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from hermes_voip.adapter import VoipAdapter
 
 pytest.importorskip("gateway.platforms.base")
 pytest.importorskip("gateway.config")
@@ -40,10 +44,11 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_voip.config import ExtensionConfig, GatewayConfig, load_media_config
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
+from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
-from hermes_voip.providers.guard import GuardResult, GuardVerdict
-from hermes_voip.providers.tts import TtsStream
+from hermes_voip.providers.guard import GuardResult, GuardVerdict, InjectionGuard
+from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.sdp import Fingerprint, SessionDescription, SetupRole
 
 
@@ -112,20 +117,28 @@ class _FakeTransport:
         self._calls.pop(call_id, None)
 
 
-class _FakeTtsStream:
-    def __aiter__(self) -> AsyncIterator[PcmFrame]:
-        return self._gen()
+class _FakeTtsStream(TtsStream):
+    """An empty, lifecycle-complete TtsStream (yields nothing). Typed, no ignores."""
 
-    async def _gen(self) -> AsyncIterator[PcmFrame]:
-        empty: list[PcmFrame] = []
-        for frame in empty:
-            yield frame
+    def __aiter__(self) -> _FakeTtsStream:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        raise StopAsyncIteration
+
+    async def flush(self) -> None:
+        """No-op: nothing buffered."""
 
     async def cancel(self) -> None:
         """No-op."""
 
+    async def aclose(self) -> None:
+        """No-op: idempotent teardown."""
 
-class _FakeTTS:
+
+class _FakeTTS(StreamingTTS):
+    """A StreamingTTS that returns the empty stream (typed, Protocol-conformant)."""
+
     def synthesize(
         self,
         text: AsyncIterator[str],
@@ -133,19 +146,35 @@ class _FakeTTS:
         *,
         sample_rate: int | None = None,
     ) -> TtsStream:
-        return _FakeTtsStream()  # type: ignore[return-value]
+        return _FakeTtsStream()
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
 
 
-class _FakeASR:
-    async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+class _FakeASR(StreamingASR):
+    """A StreamingASR that drains audio and yields no transcripts (typed)."""
+
+    async def _drain(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
         async for _ in audio:
             pass
-        empty: list[object] = []
-        for chunk in empty:
-            yield chunk
+        # An async generator that yields nothing: the for-loop never iterates.
+        empty: tuple[Transcript, ...] = ()
+        for transcript in empty:
+            yield transcript
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        return self._drain(audio)
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
 
 
-class _FakeGuard:
+class _FakeGuard(InjectionGuard):
+    """An InjectionGuard that always allows (typed, Protocol-conformant)."""
+
     async def screen(self, text: str, *, call_id: str) -> GuardResult:
         return GuardResult(
             verdict=GuardVerdict.ALLOW,
@@ -157,7 +186,7 @@ class _FakeGuard:
 
 
 def _fake_providers() -> Providers:
-    return Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())  # type: ignore[arg-type]
+    return Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
 
 
 _FAKE_ENV = {
@@ -285,7 +314,7 @@ def _make_invite(offer: str, call_id: str) -> str:
     )
 
 
-async def _build_adapter(transport: _FakeTransport, media_cfg: object) -> object:
+async def _build_adapter(transport: _FakeTransport, media_cfg: object) -> VoipAdapter:
     """A real VoipAdapter wired to fakes + a real RegistrationManager + media_cfg."""
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
@@ -429,10 +458,10 @@ async def test_sip_dtls_offer_yields_savp_answer_with_fingerprint_and_pipe() -> 
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             ok = _sent_200_ok(transport)
             answer = SessionDescription.parse(ok.body)
@@ -510,10 +539,10 @@ async def test_sip_dtls_200_ok_sent_before_handshake() -> None:
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
             assert ok_seen_at_handshake == [True], (
                 "200 OK must be sent BEFORE the DTLS handshake (RFC 5763 §4)"
             )
@@ -536,19 +565,10 @@ async def test_sip_dtls_setup_knob_flows_to_session() -> None:
     async def _blocking_run() -> None:
         await in_call.wait()
 
-    captured: dict[str, object] = {}
-
-    def _capture(**kwargs: object) -> _FakeSipDtlsSession:
-        captured.update(kwargs)
-        return _FakeSipDtlsSession(
-            offer_setup=kwargs["offer_setup"],  # type: ignore[arg-type]
-            answer_setup=str(kwargs.get("answer_setup", "auto")),
-        )
-
     engine = _fake_engine()
     try:
         with (
-            patch("hermes_voip.adapter.SipDtlsMediaSession", _capture),
+            patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
             patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
             patch(
                 "hermes_voip.adapter.CallLoop",
@@ -558,15 +578,17 @@ async def test_sip_dtls_setup_knob_flows_to_session() -> None:
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
-            # The offered a=setup (actpass) and the knob both reached the session.
-            assert captured["answer_setup"] == "passive"
-            offered = captured["offer_setup"]
-            assert isinstance(offered, SetupRole)
-            assert offered.value == "actpass"
+            await _until(lambda: call_id in adapter._call_loops)
+            # The offered a=setup (actpass) and the knob both reached the session
+            # (the fake records its construction kwargs on ``last``).
+            session = _FakeSipDtlsSession.last
+            assert session is not None
+            assert session.answer_setup == "passive"
+            assert session.offer_setup is not None
+            assert session.offer_setup.value == "actpass"
     finally:
         in_call.set()
         await asyncio.sleep(0)
@@ -599,9 +621,7 @@ async def test_sip_dtls_disabled_falls_through_to_sdes_plain() -> None:
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
-        adapter._on_inbound_invite(  # type: ignore[attr-defined]
-            NewCall(registration=_ext_config(), invite=invite)
-        )
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         # The fall-through SDES/plain path rejects an unkeyable SAVP offer with 488;
         # await that terminal response deterministically.
         await _until(lambda: bool(transport.sent))
@@ -637,9 +657,7 @@ async def test_sip_dtls_handshake_failure_byes_dialog_no_plaintext() -> None:
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
-        adapter._on_inbound_invite(  # type: ignore[attr-defined]
-            NewCall(registration=_ext_config(), invite=invite)
-        )
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         # The handshake failure tears the call down: no live CallLoop is registered.
         await _until(lambda: _FakeSipDtlsSession.last is not None)
         session = _FakeSipDtlsSession.last
@@ -650,7 +668,7 @@ async def test_sip_dtls_handshake_failure_byes_dialog_no_plaintext() -> None:
         await asyncio.sleep(0.01)
 
     # No CallLoop was built on the dead (unkeyed) media.
-    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+    assert call_id not in adapter._call_loops
     # The ONLY answer sent was the single DTLS-SRTP 200 OK; there is no second,
     # plaintext answer. Count the answers (RTP/AVP body) — there must be none.
     answers = [m for m in transport.sent if m.startswith("SIP/2.0 200")]
@@ -697,9 +715,7 @@ async def test_sip_dtls_engine_failure_after_handshake_byes_and_cleans_up() -> N
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
-        adapter._on_inbound_invite(  # type: ignore[attr-defined]
-            NewCall(registration=_ext_config(), invite=invite)
-        )
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         await _until(lambda: _FakeSipDtlsSession.last is not None)
         session = _FakeSipDtlsSession.last
         assert session is not None
@@ -709,7 +725,7 @@ async def test_sip_dtls_engine_failure_after_handshake_byes_and_cleans_up() -> N
         await _until(lambda: any(m.startswith("BYE ") for m in transport.sent))
         await asyncio.sleep(0.01)
 
-    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+    assert call_id not in adapter._call_loops
     assert engine.stop.await_count == 1, "the constructed engine must be stopped"
     assert session.closed, "the DTLS session/pipe must be closed (no leaked socket)"
     byes = [m for m in transport.sent if m.startswith("BYE ")]
@@ -751,9 +767,7 @@ async def test_sip_dtls_bind_failure_closes_session_even_if_488_send_raises() ->
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
-        adapter._on_inbound_invite(  # type: ignore[attr-defined]
-            NewCall(registration=_ext_config(), invite=invite)
-        )
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         await _until(lambda: _FakeSipDtlsSession.last is not None)
         session = _FakeSipDtlsSession.last
         assert session is not None
@@ -761,7 +775,7 @@ async def test_sip_dtls_bind_failure_closes_session_even_if_488_send_raises() ->
         await _until(lambda: session.closed)
         await asyncio.sleep(0.01)
 
-    assert call_id not in adapter._call_loops  # type: ignore[attr-defined]
+    assert call_id not in adapter._call_loops
     assert session.closed, (
         "a pre-answer bind failure must close the session even if the 488 send raises"
     )
@@ -801,10 +815,10 @@ async def test_plain_offer_never_touches_sip_dtls_branch() -> None:
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             ok = _sent_200_ok(transport)
             answer = SessionDescription.parse(ok.body)
@@ -834,9 +848,7 @@ async def test_webrtc_offer_never_touches_sip_dtls_branch() -> None:
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
-        adapter._on_inbound_invite(  # type: ignore[attr-defined]
-            NewCall(registration=_ext_config(), invite=invite)
-        )
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         # The WebRTC branch is taken (its ctor is reached); the SIP-DTLS one is not.
         await _until(lambda: webrtc_ctor.called)
         await asyncio.sleep(0)
@@ -877,10 +889,10 @@ async def test_sdes_offer_never_touches_sip_dtls_branch() -> None:
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             ok = _sent_200_ok(transport)
             answer = SessionDescription.parse(ok.body)

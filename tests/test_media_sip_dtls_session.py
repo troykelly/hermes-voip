@@ -507,7 +507,7 @@ async def test_udp_pipe_close_delivers_wake_sentinel_when_inbound_full() -> None
 
 
 @pytest.mark.asyncio
-async def test_udp_pipe_recv_raises_runtime_error_on_internal_non_datagram() -> None:
+async def test_udp_pipe_recv_raises_type_error_on_internal_non_datagram() -> None:
     """recv() raises a real error (not a strippable assert) on a corrupt queue item.
 
     The inbound queue only ever holds datagrams or the close sentinel. A non-bytes,

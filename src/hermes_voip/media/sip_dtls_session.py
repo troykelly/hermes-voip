@@ -284,6 +284,10 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
     async def recv(self) -> bytes:
         """Await the next inbound datagram (data only; source latched internally).
 
+        Single logical consumer by design: the DTLS handshake pump drains it, then
+        the media engine — never two ``recv`` callers at once. ``close`` therefore
+        enqueues exactly one wake sentinel.
+
         Raises:
             ConnectionError: If the pipe is (or becomes) closed — so a receiver
                 awaiting on a torn-down pipe wakes deterministically instead of

@@ -604,7 +604,11 @@ async def test_refresh_with_no_response_times_out_and_reregisters() -> None:
 async def test_refresh_response_cancels_the_timeout() -> None:
     # The Timer-F/B response timeout must NOT fire when the refresh DOES get a
     # timely 200 OK — otherwise every healthy refresh would spuriously flap the
-    # registration down. A 200 to the refresh keeps the extension up with no error.
+    # registration down. With refresh_fraction=0.0 a fresh refresh fires the
+    # instant the previous one is answered, so this models a healthy registrar
+    # that ALWAYS answers promptly: every REGISTER it emits in the window gets an
+    # immediate 200 OK. The Timer-F/B deadline must therefore never fire — no
+    # error, still registered — proving a timely response disarms it.
     errors: list[tuple[str, BaseException]] = []
     transport = _FakeTransport()
     manager = RegistrationManager(
@@ -619,15 +623,20 @@ async def test_refresh_response_cancels_the_timeout() -> None:
     first_register = transport.sent[0]
     call_id = SipRequest.parse(first_register).header("Call-ID")
     await manager.on_response(_ok_for(first_register))
-    await asyncio.sleep(0.01)  # let the refresh fire (but not time out yet)
-    refresh = next(
-        m
-        for m in transport.sent[1:]
-        if SipRequest.parse(m).header("Call-ID") == call_id
-    )
-    await manager.on_response(_ok_for(refresh))  # timely refresh OK
-    # Wait well past the timeout window: no flap, no error, still registered.
-    await asyncio.sleep(0.15)
+    seen = 1  # index 0 is the initial REGISTER, answered on the line above
+    # Promptly answer every refresh for a window several Timer-F/B periods long —
+    # a healthy, always-answering registrar. Walk the send log by index so a
+    # REGISTER appended while we answer the previous one is not skipped.
+    deadline = asyncio.get_running_loop().time() + 0.3
+    while asyncio.get_running_loop().time() < deadline:
+        while seen < len(transport.sent):
+            message = transport.sent[seen]
+            seen += 1
+            parsed = SipRequest.parse(message)
+            if parsed.method == "REGISTER" and parsed.header("Call-ID") == call_id:
+                await manager.on_response(_ok_for(message))
+        await asyncio.sleep(0.01)
+    assert seen >= 2, "the refresh cascade must have fired (sanity)"
     assert not errors, "a refresh that got a 200 OK must not also time out"
     up = next(s for s in manager.snapshot() if s.extension == "1000")
     assert up.registered is True

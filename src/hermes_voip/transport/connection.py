@@ -42,29 +42,54 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
+    Cancel,
     InDialog,
     NewCall,
     RegistrationManager,
     Unroutable,
 )
-from hermes_voip.message import SipRequest, SipResponse, new_tag
+from hermes_voip.message import SipRequest, SipResponse, build_response, new_tag
 from hermes_voip.transport.framing import SipMessageFramer
 from hermes_voip.transport.transaction import (
     InviteClientTransaction,
+    InviteServerTransaction,
     TransactionState,
 )
 
 __all__ = ["CallResponseSink", "SipOverTlsTransport"]
 
+_log = logging.getLogger(__name__)
+
 _RESPONSE_PREFIX = "SIP/2.0 "
 # A To/From header parameter carrying a dialog tag (after the name-addr's '>').
 _TO_TAG_PARAM = re.compile(r";\s*tag=", re.IGNORECASE)
+# The Via ``branch`` parameter (RFC 3261 §8.1.1.7) that identifies a transaction.
+_VIA_BRANCH = re.compile(r";\s*branch=([^;,\s]+)", re.IGNORECASE)
+_FINAL_STATUS = 200  # status >= 200 is a final response (terminates the txn)
+_FIRST_FAILURE = 300  # status >= 300 is a non-2xx final
+
+
+@dataclass(slots=True)
+class _PendingInvite:
+    """An inbound INVITE server transaction awaiting a final response.
+
+    Tracked from the moment the INVITE is handed to ``on_new_call`` until we send
+    its final response (or a CANCEL terminates it), so a CANCEL can be matched to
+    it by Via branch (RFC 3261 §9.2) and a 200 OK racing a CANCEL is suppressed.
+    """
+
+    invite: SipRequest
+    call_id: str
+    txn: InviteServerTransaction
+    cancelled: bool = False
 
 
 @runtime_checkable
@@ -89,6 +114,7 @@ class SipOverTlsTransport:
         connect_address: str | None = None,
         keepalive_interval: float = 30.0,
         on_new_call: Callable[[NewCall], None] | None = None,
+        on_cancel: Callable[[str], None] | None = None,
         on_unroutable: Callable[[Unroutable | SipResponse], None] | None = None,
         on_connection_lost: Callable[[BaseException | None], None] | None = None,
     ) -> None:
@@ -110,6 +136,9 @@ class SipOverTlsTransport:
                 Default 30 s matches the common NAT binding lifetime.
             on_new_call: Invoked with each out-of-dialog INVITE the manager maps
                 to a registration; the consumer builds the ``CallSession``.
+            on_cancel: Invoked with the Call-ID of a pending INVITE the peer has
+                CANCELled (RFC 3261 §9.2), so the consumer aborts that call's
+                half-built setup (the transport has already 487'd the INVITE).
             on_unroutable: Invoked with an unroutable request or a response that
                 matches no registration or active call (observed, not swallowed).
             on_connection_lost: Invoked when the reader task ends, with the
@@ -122,6 +151,7 @@ class SipOverTlsTransport:
         self._connect_address = connect_address if connect_address is not None else host
         self._keepalive_interval = keepalive_interval
         self._on_new_call = on_new_call
+        self._on_cancel = on_cancel
         self._on_unroutable = on_unroutable
         self._on_connection_lost = on_connection_lost
         self._reader: asyncio.StreamReader | None = None
@@ -132,6 +162,9 @@ class SipOverTlsTransport:
         self._manager: RegistrationManager | None = None
         self._calls: dict[str, CallResponseSink] = {}
         self._client_txns: dict[tuple[str, int], InviteClientTransaction] = {}
+        # Inbound INVITE server transactions awaiting a final response, keyed by
+        # Via branch (RFC 3261 §9.2 CANCEL matching).
+        self._pending_invites: dict[str, _PendingInvite] = {}
         self._send_lock = asyncio.Lock()
 
     # --- lifecycle ----------------------------------------------------------
@@ -228,7 +261,13 @@ class SipOverTlsTransport:
         return f"<sip:{extension}@{self.local_sent_by};transport=tls>"
 
     async def send(self, message: str) -> None:
-        """Send one SIP message; track an outbound INVITE's client transaction.
+        """Send one SIP message; track transactions and honour CANCEL (§9.2).
+
+        An outbound INVITE we originate is tracked as a client transaction. An
+        outbound INVITE *response* updates the matching inbound server
+        transaction: a final clears its pending entry, and a 200 OK for an INVITE
+        the peer has already CANCELled is **suppressed** (the caller is gone, so
+        answering would strand a ghost call — RFC 3261 §9.2 / §15).
 
         Raises:
             RuntimeError: if called before :meth:`connect`.
@@ -236,20 +275,69 @@ class SipOverTlsTransport:
         if self._writer is None:
             msg = "cannot send before connect()"
             raise RuntimeError(msg)
-        self._register_if_invite(message)
+        if message.startswith(_RESPONSE_PREFIX):
+            if self._suppress_or_track_response(message):
+                return  # a 200 OK to a CANCELled INVITE — dropped, never sent
+        else:
+            self._register_if_invite(message)
         async with self._send_lock:
             self._writer.write(message.encode("utf-8"))
             await self._writer.drain()
 
     def _register_if_invite(self, message: str) -> None:
-        if message.startswith(_RESPONSE_PREFIX):
-            return  # a response we are sending, not a request
         request = SipRequest.parse(message)
         if request.method != "INVITE":
             return
         key = _txn_key(request.header("Call-ID"), request.header("CSeq"))
         if key is not None:
             self._client_txns[key] = InviteClientTransaction(message)
+
+    def _suppress_or_track_response(self, message: str) -> bool:
+        """Handle an outbound INVITE response vs a pending CANCEL; return suppress.
+
+        For a final response to an inbound INVITE we track (matched by Via branch,
+        CSeq method ``INVITE``): a 200 OK for a transaction the peer CANCELled is
+        suppressed (returns ``True``); otherwise the final is recorded on the
+        server transaction and a non-CANCELled transaction's pending entry is
+        cleared (it is complete). Responses to other methods (e.g. the 200 OK to
+        the CANCEL itself, whose CSeq method is ``CANCEL``) are left untouched.
+        """
+        response = SipResponse.parse(message)
+        match = self._pending_for_response(response)
+        if match is None:
+            return False
+        branch, pending = match
+        status = response.status_code
+        if status < _FINAL_STATUS:
+            return False  # a provisional (1xx) keeps the transaction pending
+        if pending.cancelled and status < _FIRST_FAILURE:
+            # A 200 OK racing the CANCEL: the call is dead — drop it. The entry is
+            # KEPT (cleared in remove_call on teardown) so a retransmitted 2xx is
+            # also suppressed.
+            _log.warning(
+                "INVITE %s: suppressing a 200 OK for a CANCELled call",
+                pending.call_id,
+            )
+            return True
+        # A final response completes the server transaction. A CANCELled entry is
+        # KEPT (its 487 may be followed by a late 2xx to suppress); a normal
+        # answer/reject clears it.
+        pending.txn.on_final_sent(status)
+        if not pending.cancelled:
+            del self._pending_invites[branch]
+        return False
+
+    def _pending_for_response(
+        self, response: SipResponse
+    ) -> tuple[str, _PendingInvite] | None:
+        """The (branch, pending INVITE) an outbound INVITE response answers, if any."""
+        if _method_of(response.header("CSeq")) != "INVITE":
+            return None
+        branch = _via_branch(response.header("Via"))
+        if branch is None:
+            return None
+        pending = self._pending_invites.get(branch)
+        return (branch, pending) if pending is not None else None
 
     # --- call registry (response routing) -----------------------------------
 
@@ -258,7 +346,7 @@ class SipOverTlsTransport:
         self._calls[call_id] = sink
 
     def remove_call(self, call_id: str, sink: CallResponseSink | None = None) -> None:
-        """Forget a call; drop any tracked client transactions for it.
+        """Forget a call; drop any tracked client/server transactions for it.
 
         When ``sink`` is given the registration is only removed if it is still
         that exact sink. Overlapping INVITEs can share a Call-ID (retransmission
@@ -267,12 +355,20 @@ class SipOverTlsTransport:
         earlier call's own sink and the identity check makes the removal a no-op
         when it no longer owns the entry. With ``sink=None`` the removal is
         unconditional (used where there is provably one call per Call-ID).
+
+        Any retained pending-INVITE server transaction for this Call-ID (a
+        CANCELled call kept to keep suppressing a late 2xx) is also cleared here —
+        the call is definitively gone once its teardown runs.
         """
         if sink is not None and self._calls.get(call_id) is not sink:
             return
         self._calls.pop(call_id, None)
         for key in [k for k in self._client_txns if k[0] == call_id]:
             del self._client_txns[key]
+        for branch in [
+            b for b, p in self._pending_invites.items() if p.call_id == call_id
+        ]:
+            del self._pending_invites[branch]
 
     def bind_manager(self, manager: RegistrationManager) -> None:
         """Bind the registration manager the transport demuxes through."""
@@ -346,6 +442,7 @@ class SipOverTlsTransport:
         routing = manager.route_request(request)
         if isinstance(routing, NewCall):
             if self._on_new_call is not None:
+                self._track_pending_invite(routing.invite)
                 self._on_new_call(routing)
             else:
                 self._report_unroutable(
@@ -353,10 +450,63 @@ class SipOverTlsTransport:
                 )
         elif isinstance(routing, InDialog):
             await routing.consumer.handle_request(routing.request)
+        elif isinstance(routing, Cancel):
+            await self._handle_cancel(routing.request)
         elif await self._answer_keepalive(request):
             return
         else:
             self._report_unroutable(routing)
+
+    def _track_pending_invite(self, invite: SipRequest) -> None:
+        """Record an inbound INVITE server transaction for CANCEL matching.
+
+        Keyed by the top Via branch (the CANCEL shares it, RFC 3261 §9.1). A
+        malformed INVITE missing the branch or Call-ID is still dispatched; it
+        just cannot be matched by a later CANCEL.
+        """
+        branch = _via_branch(invite.header("Via"))
+        call_id = invite.header("Call-ID")
+        if branch is None or call_id is None:
+            return
+        self._pending_invites[branch] = _PendingInvite(
+            invite=invite,
+            call_id=call_id,
+            txn=InviteServerTransaction(),
+        )
+
+    async def _handle_cancel(self, cancel: SipRequest) -> None:
+        """Answer an inbound CANCEL and terminate the matching INVITE (RFC 3261 §9.2).
+
+        A CANCEL shares the INVITE's top Via branch. When it matches a pending
+        INVITE: the CANCEL is answered ``200 OK``, the INVITE is replied ``487
+        Request Terminated``, the pending entry is marked cancelled (so a 200 OK
+        racing in from the answer task is suppressed in :meth:`send`), and the
+        ``on_cancel`` hook fires so the consumer tears down the half-built call.
+        A CANCEL matching no transaction is answered ``481 Call/Transaction Does
+        Not Exist`` — never a 200 OK that would imply something was cancelled.
+        """
+        branch = _via_branch(cancel.header("Via"))
+        pending = self._pending_invites.get(branch) if branch is not None else None
+        if pending is None:
+            await self.send(
+                build_response(cancel, 481, "Call/Transaction Does Not Exist")
+            )
+            return
+        pending.cancelled = True
+        # 200 OK to the CANCEL itself (its own transaction).
+        await self.send(build_response(cancel, 200, "OK", to_tag=new_tag()))
+        # 487 the INVITE: a dialog-forming final, so it carries our To-tag. This
+        # final terminates the INVITE server transaction and clears the pending
+        # entry (handled in send() on the outbound final response).
+        await self.send(
+            build_response(pending.invite, 487, "Request Terminated", to_tag=new_tag())
+        )
+        _log.info(
+            "INVITE %s CANCELled by peer — 487 Request Terminated, aborting setup",
+            pending.call_id,
+        )
+        if self._on_cancel is not None:
+            self._on_cancel(pending.call_id)
 
     async def _answer_keepalive(self, request: SipRequest) -> bool:
         """Answer an out-of-dialog ``OPTIONS``/``NOTIFY`` 200 OK; report success.
@@ -430,6 +580,16 @@ def _method_of(cseq: str | None) -> str | None:
         return None
     parts = cseq.split()
     return parts[1] if len(parts) >= 2 else None  # noqa: PLR2004 — CSeq is "<num> <method>"
+
+
+def _via_branch(via: str | None) -> str | None:
+    """The top Via's ``branch`` token (the transaction id, RFC 3261 §8.1.1.7)."""
+    if via is None:
+        return None
+    # ``headers_all('Via')`` may join multiple Vias with a comma; the transaction
+    # is identified by the TOP Via, so match the first ``branch=`` occurrence.
+    match = _VIA_BRANCH.search(via)
+    return match.group(1) if match is not None else None
 
 
 def _txn_key(call_id: str | None, cseq: str | None) -> tuple[str, int] | None:

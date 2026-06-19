@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -42,17 +43,53 @@ from hermes_voip.registration import (
 _log = logging.getLogger(__name__)
 
 __all__ = [
+    "Cancel",
     "DialogConsumer",
     "InDialog",
     "NewCall",
+    "RegistrationError",
     "RegistrationManager",
+    "RegistrationRejectedError",
     "RegistrationStatus",
+    "RegistrationTimeoutError",
     "RequestRouting",
     "SipTransport",
     "Unroutable",
 ]
 
+
+class RegistrationError(Exception):
+    """Base class for a recoverable registration-keep-alive failure."""
+
+
+class RegistrationRejectedError(RegistrationError):
+    """A refresh REGISTER was rejected with a final 4xx/5xx/6xx status."""
+
+    def __init__(self, status: int, reason: str) -> None:
+        """Carry the rejecting status/reason (no SIP host/extension/secret)."""
+        super().__init__(f"registration refresh rejected: {status} {reason}")
+        self.status = status
+        self.reason = reason
+
+
+class RegistrationTimeoutError(RegistrationError):
+    """A refresh REGISTER got no response within the Timer-F/B deadline."""
+
+    def __init__(self) -> None:
+        """A response-deadline timeout (the registrar never answered)."""
+        super().__init__("registration refresh timed out with no response")
+
+
 _DEFAULT_REFRESH_FRACTION = 0.5
+# RFC 3261 Timer-F/B analogue: how long to wait for a response to a REGISTER
+# before treating it as failed. Over reliable TLS there are no retransmissions,
+# so this is a single overall response deadline (the §17.1.1.2 32 s default).
+_DEFAULT_REFRESH_TIMEOUT = 32.0
+# Registration-recovery backoff (mirrors the transport reconnect supervisor):
+# exponential from this initial delay, capped, with ±20% decorrelation jitter.
+_DEFAULT_RETRY_BACKOFF = 1.0
+_RETRY_BACKOFF_CAP = 30.0
+_RETRY_JITTER = 0.2
 _TAG_PARAM = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
 
@@ -111,6 +148,19 @@ class InDialog:
 
 
 @dataclass(frozen=True, slots=True)
+class Cancel:
+    """An out-of-dialog CANCEL targeting a pending INVITE server transaction.
+
+    RFC 3261 §9.2: a CANCEL abandons an in-progress INVITE. It is neither a new
+    call nor an in-dialog request — the transport matches it to the pending
+    INVITE by its top Via branch and answers the CANCEL ``200 OK`` while the
+    INVITE is replied ``487 Request Terminated``.
+    """
+
+    request: SipRequest
+
+
+@dataclass(frozen=True, slots=True)
 class Unroutable:
     """A request that matches no registration or active dialog."""
 
@@ -118,40 +168,63 @@ class Unroutable:
     reason: str
 
 
-type RequestRouting = NewCall | InDialog | Unroutable
+type RequestRouting = NewCall | InDialog | Cancel | Unroutable
 
 
 @dataclass(slots=True)
 class _FlowState:
-    """One extension's flow plus its live registration status."""
+    """One extension's flow plus its live registration status.
+
+    ``established`` is sticky once the extension first registers: it stays True
+    across a refresh failure and its recovery so the recovery loop (re-REGISTER
+    with backoff) keeps running until the registrar comes back — distinct from a
+    cold-start REGISTER failure, which is left to ``connect()``/the transport
+    supervisor. ``deregistering`` suppresses recovery for a deliberate
+    de-registration (a Failed there is an expected end, not an outage).
+    """
 
     extension: ExtensionConfig
     flow: RegistrationFlow
     registered: bool = False
+    established: bool = False
+    deregistering: bool = False
     expires: int | None = None
     refresh_task: asyncio.Task[None] | None = field(default=None)
+    response_timeout_task: asyncio.Task[None] | None = field(default=None)
+    recovery_task: asyncio.Task[None] | None = field(default=None)
+    recovery_attempt: int = 0
     last_error: BaseException | None = None
 
 
 class RegistrationManager:
     """Owns N registration flows over one transport and demuxes inbound SIP."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — gateway + transport plus three keyword-only refresh/recovery tuning knobs and one observer callback; all defaulted and keyword-only
         self,
         gateway: GatewayConfig,
         transport: SipTransport,
         *,
         refresh_fraction: float = _DEFAULT_REFRESH_FRACTION,
+        refresh_timeout: float = _DEFAULT_REFRESH_TIMEOUT,
+        retry_backoff: float = _DEFAULT_RETRY_BACKOFF,
         on_registration_error: Callable[[str, BaseException], None] | None = None,
     ) -> None:
         """Build one flow per configured extension (no IO until :meth:`start`).
 
         ``on_registration_error`` is invoked (extension, error) when a background
         refresh fails, so a flapping registration is observed, never swallowed.
+
+        ``refresh_timeout`` is the per-REGISTER response deadline (RFC 3261 Timer
+        F/B analogue): a refresh that gets no response within it is treated as
+        failed rather than left ``registered`` forever. ``retry_backoff`` is the
+        initial recovery delay for a re-REGISTER after a failed refresh
+        (exponential, capped at 30 s, with ±20% jitter).
         """
         self._gateway = gateway
         self._transport = transport
         self._refresh_fraction = refresh_fraction
+        self._refresh_timeout = refresh_timeout
+        self._retry_backoff = retry_backoff
         self._on_error = on_registration_error
         self._flows: dict[str, _FlowState] = {}
         self._by_extension: dict[str, _FlowState] = {}
@@ -209,27 +282,38 @@ class RegistrationManager:
         return self.is_up
 
     async def aclose(self) -> None:
-        """Cancel every refresh task; the transport is closed by its owner.
+        """Cancel every background task; the transport is closed by its owner.
 
-        Each task's done callback (:meth:`_on_refresh_done`) has already observed
-        any real failure; the ``gather`` here only drains the resulting
-        cancellations.
+        Each task's done callback has already observed any real failure; the
+        ``gather`` here only drains the resulting cancellations. The refresh, the
+        Timer-F/B response-timeout, and the recovery re-REGISTER tasks are all
+        cancelled so none fires after shutdown.
         """
         tasks = [
-            state.refresh_task
+            task
             for state in self._flows.values()
-            if state.refresh_task is not None
+            for task in (
+                state.refresh_task,
+                state.response_timeout_task,
+                state.recovery_task,
+            )
+            if task is not None
         ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for state in self._flows.values():
             state.refresh_task = None
+            state.response_timeout_task = None
+            state.recovery_task = None
 
     # --- inbound responses --------------------------------------------------
 
     async def on_response(self, response: SipResponse) -> None:
         """Route a REGISTER response to its flow and act on the outcome.
+
+        A response for a flow disarms that flow's in-flight response timeout
+        (RFC 3261 Timer F/B) — the registrar answered, so the deadline is moot.
 
         Raises:
             KeyError: if no flow owns the response's Call-ID (the transport must
@@ -241,15 +325,21 @@ class RegistrationManager:
             msg = f"no registration flow for Call-ID {call_id!r}"
             raise KeyError(msg)
         state = self._flows[call_id]
+        # The registrar responded: cancel the Timer-F/B deadline for this REGISTER.
+        self._cancel_response_timeout(state)
         outcome = state.flow.handle(response)
         # Challenged (401/407) and Retry (423 Interval Too Brief) both carry a
-        # ready-to-send follow-up request; the rest update registration state.
+        # ready-to-send follow-up REGISTER; the rest update registration state.
         if isinstance(outcome, Challenged | Retry):
-            await self._transport.send(outcome.request)
+            # The follow-up is itself a REGISTER awaiting a response — re-arm the
+            # response deadline so a dropped re-auth/retry also recovers.
+            await self._send_register(state, outcome.request)
         elif isinstance(outcome, Registered):
             was_registered = state.registered
             state.registered = True
+            state.established = True
             state.expires = outcome.expires
+            state.recovery_attempt = 0  # a success clears the backoff ramp
             self._up.set()
             self._schedule_refresh(state, outcome.expires)
             # Operator-facing "gateway login is up" signal (the runbooks point at
@@ -264,11 +354,16 @@ class RegistrationManager:
             else:
                 _log.info("SIP registration established (expires %ss)", outcome.expires)
         elif isinstance(outcome, Failed):
-            state.registered = False
+            self._on_registration_failed(
+                state,
+                RegistrationRejectedError(outcome.status, outcome.reason),
+            )
         else:
             # Exhaustive over RegistrationOutcome: a future member fails mypy here
             # (and raises at runtime), never silently dropped (rule 37).
             assert_never(outcome)
+
+    # --- refresh + recovery (RFC 3261 §10 keep-alive) -----------------------
 
     def _schedule_refresh(self, state: _FlowState, expires: int) -> None:
         if state.refresh_task is not None:
@@ -280,17 +375,106 @@ class RegistrationManager:
 
     async def _refresh_after(self, state: _FlowState, delay: float) -> None:
         await asyncio.sleep(delay)
-        await self._transport.send(state.flow.start())
+        await self._send_register(state, state.flow.start())
+
+    async def _send_register(self, state: _FlowState, request: str) -> None:
+        """Send a REGISTER and arm its RFC 3261 Timer-F/B response deadline.
+
+        The deadline fires only if no response for this flow arrives within
+        ``refresh_timeout`` (:meth:`on_response` cancels it on any response), so a
+        refresh that the registrar simply never answers is treated as a failure
+        and recovered, never left ``registered`` forever.
+        """
+        await self._transport.send(request)
+        self._arm_response_timeout(state)
+
+    def _arm_response_timeout(self, state: _FlowState) -> None:
+        self._cancel_response_timeout(state)
+        if self._refresh_timeout <= 0:
+            return  # disabled (e.g. tests that drive responses synchronously)
+        task = asyncio.create_task(self._response_timeout_after(state))
+        state.response_timeout_task = task
+        task.add_done_callback(lambda done: self._on_background_task_done(state, done))
+
+    def _cancel_response_timeout(self, state: _FlowState) -> None:
+        task = state.response_timeout_task
+        state.response_timeout_task = None
+        if task is not None:
+            task.cancel()
+
+    async def _response_timeout_after(self, state: _FlowState) -> None:
+        await asyncio.sleep(self._refresh_timeout)
+        # No response cleared us in time: the binding may already be gone at the
+        # registrar. Treat it as a failure and recover, rather than trusting a
+        # 'registered' flag that no longer reflects reality (Timer F/B).
+        state.response_timeout_task = None
+        self._on_registration_failed(state, RegistrationTimeoutError())
+
+    def _on_registration_failed(self, state: _FlowState, error: BaseException) -> None:
+        """Mark a flow down on a failed REGISTER, report it, and recover.
+
+        Recovery (a bounded-backoff re-REGISTER) runs only for an extension that
+        was actually established — a refresh/keep-alive outage. A cold-start
+        REGISTER that never succeeded, or a deliberate de-registration, is NOT
+        retried here (those are ``connect()``'s / a clean teardown's concern).
+        """
+        state.registered = False
+        state.last_error = error
+        if self._on_error is not None:
+            self._on_error(state.extension.extension, error)
+        if state.established and not state.deregistering:
+            self._schedule_recovery(state)
+
+    def _schedule_recovery(self, state: _FlowState) -> None:
+        """Schedule a re-REGISTER after exponential-with-jitter backoff."""
+        if state.recovery_task is not None:
+            state.recovery_task.cancel()
+        delay = min(
+            _RETRY_BACKOFF_CAP,
+            self._retry_backoff * (2**state.recovery_attempt),
+        )
+        # ±20% decorrelation jitter so N extensions failing together don't
+        # re-REGISTER in lockstep (a thundering herd at the registrar).
+        jitter = 1.0 + random.uniform(-_RETRY_JITTER, _RETRY_JITTER)  # noqa: S311 — decorrelation jitter, not cryptographic
+        state.recovery_attempt += 1
+        task = asyncio.create_task(self._recover_after(state, max(0.0, delay * jitter)))
+        state.recovery_task = task
+        task.add_done_callback(lambda done: self._on_background_task_done(state, done))
+
+    async def _recover_after(self, state: _FlowState, delay: float) -> None:
+        await asyncio.sleep(delay)
+        state.recovery_task = None
+        # A fresh REGISTER transaction; its response drives on_response back to
+        # Registered (recovered) or another Failed/timeout (backoff again).
+        await self._send_register(state, state.flow.start())
 
     def _on_refresh_done(self, state: _FlowState, task: asyncio.Task[None]) -> None:
         """Observe a finished refresh task; surface any failure (never swallow).
 
         A cancelled task (shutdown) is expected. Any other exception means the
-        refresh could not be sent, so the registration can no longer be kept
-        alive: mark it down, record the error, and report it.
+        refresh REGISTER could not even be sent (the transport write failed), so
+        the registration can no longer be kept alive: fail it (which reports and,
+        for an established extension, schedules recovery).
         """
         if state.refresh_task is task:
             state.refresh_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        self._on_registration_failed(state, error)
+
+    def _on_background_task_done(
+        self, state: _FlowState, task: asyncio.Task[None]
+    ) -> None:
+        """Surface an unexpected crash in a timeout/recovery task (never swallow).
+
+        These tasks own their failure handling internally; reaching here with a
+        non-cancelled exception means an unforeseen bug (e.g. a transport send
+        raised during recovery), which is reported rather than lost as an
+        un-retrieved task exception (rule 37).
+        """
         if task.cancelled():
             return
         error = task.exception()
@@ -314,10 +498,18 @@ class RegistrationManager:
         self._calls.pop(dialog_id, None)
 
     def route_request(self, request: SipRequest) -> RequestRouting:
-        """Demux an inbound request to a registration, a call, or nowhere."""
+        """Demux an inbound request to a registration, a call, a CANCEL, or nowhere.
+
+        A CANCEL (RFC 3261 §9.2) targets a pending INVITE *transaction* and is
+        matched by Via branch at the transport, not by dialog — so it is
+        classified :class:`Cancel` here (no To-tag: it predates the dialog) and
+        the transport resolves the matching INVITE and emits the 200/487.
+        """
         to_tag = _tag(request.header("To"))
         if to_tag is not None:
             return self._route_in_dialog(request, to_tag)
+        if request.method == "CANCEL":
+            return Cancel(request)
         if request.method != "INVITE":
             return Unroutable(request, f"out-of-dialog {request.method}")
         return self._route_new_invite(request)

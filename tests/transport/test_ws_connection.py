@@ -489,6 +489,56 @@ async def test_inbound_invite_routes_to_new_call() -> None:
         await server.stop()
 
 
+async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
+    """Over WSS a CANCEL surfaces via on_unroutable (TLS-only handling, follow-up).
+
+    The shared :class:`~hermes_voip.manager.RegistrationManager` now classifies a
+    CANCEL as :class:`~hermes_voip.manager.Cancel`; the WSS transport does not yet
+    implement the §9.2 200/487 server-transaction handling (that lives on the TLS
+    transport), so a CANCEL falls through to the unroutable observer exactly as it
+    did before — this pins that behaviour so the typed routing change is covered.
+    """
+    from hermes_voip.manager import Unroutable  # noqa: PLC0415
+
+    unroutable: list[object] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_unroutable=unroutable.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        cancel = (
+            "CANCEL sip:1000@pbx.example.test SIP/2.0\r\n"
+            "Via: SIP/2.0/WSS gw.pbx.example.test;branch=z9hG4bKinv1;rport\r\n"
+            "Max-Forwards: 70\r\n"
+            "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+            "To: <sip:1000@pbx.example.test>\r\n"
+            "Call-ID: ws-cancel-1\r\n"
+            "CSeq: 1 CANCEL\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        await server.push(cancel)
+        await _until(lambda: len(unroutable) == 1, timeout=3.0)
+        reported = unroutable[0]
+        assert isinstance(reported, Unroutable)
+        assert reported.request.method == "CANCEL"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 async def test_out_of_dialog_options_is_answered_200_ok() -> None:
     """An out-of-dialog OPTIONS ping is answered 200 OK (keepalive, RFC 3261 §11)."""
 

@@ -606,6 +606,32 @@ class _HoldOpenTransport(_FakeTransport):
         return _gen()
 
 
+class _LiveSilenceTransport(_FakeTransport):
+    """Transport modelling a silent-but-LIVE caller: continuous inbound silence frames.
+
+    A real silent caller's line still carries RTP (silence/comfort-noise packets), so
+    the inbound generator yields silence frames continuously (yielding control between
+    each) rather than ending or parking. This is exactly the condition the watchdog
+    handles, and it lets the call loop's graceful self-end (ADR-0057) be exercised: the
+    pump keeps iterating, so it observes the watchdog's ``_end_call`` request within one
+    frame and winds the call up — no ``close_inbound()`` needed (the loop ends ITSELF).
+    The generator stops when the consumer (the pump) breaks and ``aclose()``s it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__([_silence_frame(0)])
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            # Bounded high so a watchdog bug cannot wedge the suite forever, but well
+            # past any test's stepping before the graceful end fires.
+            for index in range(100_000):
+                yield _silence_frame(index)
+                await asyncio.sleep(0)  # cooperative: let the watchdog/pump interleave
+
+        return _gen()
+
+
 def _seeded_rng(seed: int) -> random.Random:
     # The comfort-filler RNG is for phrase variety only, never security (ADR-0054).
     return random.Random(seed)  # noqa: S311 — non-cryptographic; variety, not security
@@ -624,7 +650,13 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
     rng: random.Random | None = None,
     deliver_turn: Callable[[str], Awaitable[None]] | None = None,
 ) -> CallLoop:
-    """Build a CallLoop with the comfort filler wired to an injected sleep seam."""
+    """Build a CallLoop with the comfort filler wired to an injected sleep seam.
+
+    The no-input watchdog (ADR-0057, default-on) is turned OFF here so the ONLY consumer
+    of the injected ``sleep`` seam is the comfort filler — otherwise the watchdog's own
+    silence-window sleeps would interleave with the filler's on the shared seam and
+    corrupt these filler-isolating timing assertions. The watchdog has its own tests.
+    """
     return CallLoop(
         transport=transport,
         asr=asr,
@@ -640,6 +672,7 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
         comfort_filler_delay_ms=comfort_filler_delay_ms,
         comfort_filler_repeat_ms=comfort_filler_repeat_ms,
         comfort_filler_phrases=comfort_filler_phrases,
+        no_input_reprompt=False,  # isolate the filler's sleep seam (ADR-0057 off here)
         rng=rng if rng is not None else _seeded_rng(0),
         sleep=sleep,
     )
@@ -3966,7 +3999,9 @@ async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     )
     # reprompt#1 window + reprompt#2 window + the end window = 3 windows after arm.
     sleep = _SteppedSleep(steps=3)
-    transport = _HoldOpenTransport([_silence_frame(0)])
+    # A silent-but-LIVE caller: continuous inbound RTP, so the pump observes the loop's
+    # graceful self-end (no close_inbound() — the loop ends ITSELF).
+    transport = _LiveSilenceTransport()
     tts = _CapturingTTS([reprompt_frame])
     loop = _no_input_loop(
         transport,
@@ -4074,7 +4109,7 @@ async def test_goodbye_spoken_before_graceful_end() -> None:
             return stream
 
     sleep = _SteppedSleep(steps=2)  # reprompt#1 window + the end window
-    transport = _HoldOpenTransport([_silence_frame(0)])
+    transport = _LiveSilenceTransport()  # silent-but-live caller (continuous RTP)
     tts = _RepromptThenGoodbyeTTS([])
     loop = _no_input_loop(
         transport,
@@ -4158,7 +4193,7 @@ async def test_goodbye_disabled_graceful_end_still_ends_cleanly() -> None:
         samples=b"\x21\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
     sleep = _SteppedSleep(steps=2)  # reprompt#1 window + the end window
-    transport = _HoldOpenTransport([_silence_frame(0)])
+    transport = _LiveSilenceTransport()  # silent-but-live caller (continuous RTP)
     tts = _CapturingTTS([reprompt_frame])
     loop = _no_input_loop(
         transport,

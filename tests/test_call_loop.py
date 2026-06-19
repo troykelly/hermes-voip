@@ -4368,6 +4368,94 @@ async def test_no_input_barge_in_during_reprompt_resets_and_does_not_end() -> No
     await asyncio.wait_for(run_task, timeout=5.0)
 
 
+@pytest.mark.asyncio
+async def test_no_input_barge_in_during_goodbye_aborts_the_end() -> None:
+    """A caller answering DURING the goodbye aborts the graceful end — media is live.
+
+    Regression (codex follow-up MAJOR): the goodbye is spoken on a live media path
+    BEFORE ``run()`` returns, so a caller can still barge in during it. If they do, the
+    call must NOT end — the caller is engaging — and the reprompt cycle must resume. The
+    end is committed (``_end_call`` set) only if no caller activity arrived while the
+    goodbye played. ``max_reprompts=0`` ⇒ the first silent window goes straight to the
+    goodbye; the goodbye's send BLOCKS so the barge-in lands mid-goodbye.
+    """
+    goodbye_frame = PcmFrame(
+        samples=b"\x40\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _BlockingLiveSilenceTransport(_LiveSilenceTransport):
+        """Silent-but-live caller whose first send_audio (the goodbye) blocks."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_send_gate = asyncio.Event()
+
+        async def send_audio(self, frame: PcmFrame) -> None:
+            if not self.sent_audio:
+                await self.first_send_gate.wait()
+            self.sent_audio.append(frame)
+
+    sleep = _SteppedSleep(
+        steps=2
+    )  # window#1 → goodbye; window#2 → reprompt (cycle resumed)
+    transport = _BlockingLiveSilenceTransport()
+    tts = _CapturingTTS([goodbye_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=0,  # straight to goodbye on the first silent window
+        no_input_reprompt_phrases=("Are you still there?",),
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # Window 1 elapses with the budget already spent (0) → the goodbye starts and parks
+    # on the blocked send (so the caller can barge in mid-goodbye).
+    sleep.step()
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert tts.synthesised == ["Goodbye."], "the goodbye should be synthesising"
+    assert transport.sent_audio == [], "the goodbye send should be blocked (parked)"
+    assert not loop._end_call.is_set(), "the end committed before the goodbye flushed"
+
+    # The caller ANSWERS during the goodbye. The end must abort (media is still live).
+    await loop.barge_in()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.first_send_gate.set()  # let the goodbye finish flushing
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert not loop._end_call.is_set(), (
+        "the call ended despite the caller answering during the goodbye"
+    )
+    assert not run_task.done(), "run() ended despite a mid-goodbye caller answer"
+
+    # The cycle resumed: with max_reprompts=0 the next silent window goes to the goodbye
+    # AGAIN (a second goodbye synthesised) rather than the call having ended.
+    sleep.step()
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if len(tts.synthesised) >= 2:
+            break
+    assert tts.synthesised == ["Goodbye.", "Goodbye."], (
+        f"the cycle did not resume after the mid-goodbye answer; {tts.synthesised!r}"
+    )
+
+    loop._end_call.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+
 # ---------------------------------------------------------------------------
 # (i) Reply streaming — TTS sentence-by-sentence pipelining guard (ADR-0057)
 # ---------------------------------------------------------------------------

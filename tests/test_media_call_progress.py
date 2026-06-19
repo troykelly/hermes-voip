@@ -208,34 +208,73 @@ def test_short_2100hz_blip_is_not_ced() -> None:
 
 
 def test_beep_after_machine_greeting_emits_ready_to_leave_message() -> None:
-    # Outbound: a long machine greeting (VAD), then a ~1000 Hz beep on audio.
+    # Outbound, a realistic timeline: 4 s of greeting audio (with the VAD ONSET at
+    # its start and OFFSET at its end), then ~0.5 s of post-greeting silence audio,
+    # then a ~1000 Hz beep. The cue must fire on the BEEP (with beep_at_s set),
+    # before the silence-fallback would. Audio + VAD are interleaved on one clock.
     detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
-    # 4 s greeting => AnsweringMachine on the trailing-silence offset.
-    vad_events = _drive_vad(detector, [_onset(0), _offset(_w8(4000))])
-    assert any(isinstance(e, AnsweringMachine) for e in vad_events)
-    # The beep arrives ~0.5 s into the trailing silence (audio frames continue).
-    beep_start = _w8(4000) + 16  # ~0.5 s of 32 ms windows ~= 16 frames of 20 ms
-    audio_events = _feed_tone(
-        detector, 1000.0, rate=_RATE_8K, duration_ms=300, start_frame=beep_start
+    events: list[CallProgressEvent] = []
+    assert detector.on_vad_event(_onset(0)) is None
+    events += _feed_tone(detector, 300.0, rate=_RATE_8K, duration_ms=4000)
+    machine = detector.on_vad_event(_offset(_windows_for(4000, _RATE_8K)))
+    assert isinstance(machine, AnsweringMachine)
+    # 0.4 s of silence (below the 1.0 s fallback gap) then the beep.
+    events += _feed_silence(detector, rate=_RATE_8K, duration_ms=400, start_frame=200)
+    events += _feed_tone(
+        detector, 1000.0, rate=_RATE_8K, duration_ms=300, start_frame=220
     )
-    assert any(isinstance(e, ReadyToLeaveMessage) for e in audio_events)
-    cue = next(e for e in audio_events if isinstance(e, ReadyToLeaveMessage))
-    assert cue.beep_at_s is not None
-
-
-def test_machine_greeting_with_no_beep_still_signals_ready_via_silence() -> None:
-    # Many machines emit no beep. After the machine greeting, a sufficient
-    # trailing silence still yields ReadyToLeaveMessage(beep_at_s=None).
-    detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
-    offset_at = _w8(4000)
-    events = _drive_vad(
-        detector,
-        [_onset(0), _offset(offset_at), _onset(offset_at + _w8(1500))],
-    )
-    machine = [e for e in events if isinstance(e, AnsweringMachine)]
     ready = [e for e in events if isinstance(e, ReadyToLeaveMessage)]
-    assert machine
-    assert ready
+    assert len(ready) == 1
+    assert ready[0].beep_at_s is not None
+
+
+def test_machine_greeting_ends_then_silence_signals_ready_without_a_later_onset() -> (
+    None
+):
+    # The PRODUCTION no-beep voicemail path: the machine greeting ends (VAD OFFSET),
+    # the line goes silent, and NO further VAD edge ever arrives (the machine is now
+    # recording, not speaking). The silence-fallback must fire on the AUDIO/sample
+    # clock alone, emitting ReadyToLeaveMessage(beep_at_s=None) — never waiting for a
+    # later ONSET that production will not send.
+    detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
+    events: list[CallProgressEvent] = []
+    assert detector.on_vad_event(_onset(0)) is None
+    events += _feed_tone(detector, 300.0, rate=_RATE_8K, duration_ms=4000)
+    machine = detector.on_vad_event(_offset(_windows_for(4000, _RATE_8K)))
+    assert isinstance(machine, AnsweringMachine)
+    # Now ONLY silent audio frames, no further VAD edge. The fallback fires once the
+    # post-greeting silence reaches the response gap (1.0 s).
+    events += _feed_silence(detector, rate=_RATE_8K, duration_ms=2000, start_frame=200)
+    ready = [e for e in events if isinstance(e, ReadyToLeaveMessage)]
+    assert len(ready) == 1
+    assert ready[0].beep_at_s is None
+
+
+def test_machine_resuming_speech_resets_the_no_beep_silence_fallback() -> None:
+    # A two-part greeting ("Hi, you've reached … <pause> … leave a message"): the
+    # fallback must NOT fire during the interior pause if the machine resumes
+    # talking before the response gap elapses — only after the FINAL trailing
+    # silence. The interior pause is shorter than the gap.
+    detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
+    events: list[CallProgressEvent] = []
+    assert detector.on_vad_event(_onset(0)) is None
+    events += _feed_tone(detector, 300.0, rate=_RATE_8K, duration_ms=4000)
+    machine = detector.on_vad_event(_offset(_windows_for(4000, _RATE_8K)))
+    assert isinstance(machine, AnsweringMachine)
+    # A 0.6 s interior pause (below the 1.0 s gap), then the machine speaks again.
+    events += _feed_silence(detector, rate=_RATE_8K, duration_ms=600, start_frame=200)
+    resume_at = 200 + 30
+    assert detector.on_vad_event(_onset(_windows_for(4600, _RATE_8K))) is None
+    events += _feed_tone(
+        detector, 300.0, rate=_RATE_8K, duration_ms=1000, start_frame=resume_at
+    )
+    # No cue yet — the interior pause was too short and speech resumed.
+    assert not any(isinstance(e, ReadyToLeaveMessage) for e in events)
+    # The machine finishes; the final silence reaches the gap and fires the cue.
+    assert detector.on_vad_event(_offset(_windows_for(5600, _RATE_8K))) is None
+    events += _feed_silence(detector, rate=_RATE_8K, duration_ms=1500, start_frame=280)
+    ready = [e for e in events if isinstance(e, ReadyToLeaveMessage)]
+    assert len(ready) == 1
     assert ready[0].beep_at_s is None
 
 
@@ -331,6 +370,50 @@ def test_speech_band_tone_is_not_misread_as_fax() -> None:
     detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
     events = _feed_tone(detector, 1000.0, rate=_RATE_8K, duration_ms=1500)
     assert not any(e.kind in {"fax_cng", "fax_ced"} for e in events)
+
+
+# ===========================================================================
+# Sample-clock correctness (elapsed_s from accumulated samples, not frame count)
+# ===========================================================================
+
+
+def test_elapsed_s_tracks_accumulated_samples_not_frame_count() -> None:
+    # elapsed_s must be (samples seen so far / rate), so variable-length frames and
+    # a zero-length frame compute the exact wall position — NOT (frame count x the
+    # latest frame duration), which diverges the moment frame sizes vary.
+    detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
+    # A leading zero-length frame (a real possibility on the wire) advances no time.
+    assert (
+        detector.on_audio_frame(
+            PcmFrame(samples=b"", sample_rate=_RATE_8K, monotonic_ts_ns=0)
+        )
+        is None
+    )
+    # Feed sustained CED at 2100 Hz in 30 ms frames (240 samples) until it fires.
+    n = (_RATE_8K * 30) // 1000
+    scale = 0.5 * 32767.0
+    ced: FaxCed | None = None
+    samples_before_emit = 0
+    for i in range(60):
+        buf = bytearray()
+        for k in range(n):
+            v = int(scale * math.sin(2 * math.pi * 2100.0 * k / _RATE_8K))
+            buf += struct.pack("<h", max(-32768, min(32767, v)))
+        ev = detector.on_audio_frame(
+            PcmFrame(
+                samples=bytes(buf),
+                sample_rate=_RATE_8K,
+                monotonic_ts_ns=i * 30 * 1_000_000,
+            )
+        )
+        if isinstance(ev, FaxCed):
+            ced = ev
+            samples_before_emit = (i + 1) * n
+            break
+    assert ced is not None
+    # The reported elapsed equals the true accumulated-sample time (the zero-length
+    # frame contributed nothing), to within one float epsilon.
+    assert ced.elapsed_s == pytest.approx(samples_before_emit / _RATE_8K)
 
 
 # ===========================================================================

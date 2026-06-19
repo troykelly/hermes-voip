@@ -224,9 +224,11 @@ async def test_hold_on_srtp_call_reoffers_savp_and_rekeys() -> None:
 
     Regression for the ADR-0053 Stage 1 partial-ship — a hold/resume re-INVITE
     on a secured call MUST NOT downgrade media to cleartext RTP/AVP. The session
-    must (a) emit a secured re-offer and (b) re-key the engine's OUTBOUND SRTP
-    with the fresh per-offer key, then re-key INBOUND from the 200's answer
-    crypto (RFC 4568 §6.1 directionality).
+    must (a) emit a secured re-offer carrying a fresh per-offer key and (b) on
+    acceptance COMMIT the re-key to the engine: outbound with our offered key,
+    inbound from the 200's answer crypto (RFC 4568 §6.1 directionality). The
+    commit happens only after the peer accepts (a rejected re-offer must not touch
+    the live key — see test_rejected_srtp_reoffer_does_not_rekey_outbound).
     """
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = CallSession(
@@ -244,16 +246,17 @@ async def test_hold_on_srtp_call_reoffers_savp_and_rekeys() -> None:
     assert "m=audio 40000 RTP/SAVP 0" in reinvite.body
     assert "RTP/AVP" not in reinvite.body  # the secured stream is never downgraded
     assert "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:" in reinvite.body
-    # The outbound SRTP is re-keyed with the offer's fresh key BEFORE the answer.
-    assert media.rekeys, "engine outbound SRTP was not re-keyed for the re-offer"
-    _first_inbound, first_outbound = media.rekeys[0]
-    assert first_outbound is not None  # fresh outbound key supplied to the engine
+    # Not yet committed: the outbound key is only re-keyed once the peer accepts.
+    assert media.rekeys == []
     await session.on_response(SipResponse.parse(_srtp_answer_to(reinvite, "recvonly")))
     await task
     assert session.on_hold is True
-    # The 200's answer crypto re-keys the INBOUND direction (so resumed/held media
-    # still decrypts) — at least one rekey carried a non-None inbound key.
-    assert any(inbound is not None for inbound, _ in media.rekeys)
+    # On acceptance BOTH directions are committed in one atomic re-key: outbound
+    # with our offered key, inbound from the peer's answer crypto.
+    assert len(media.rekeys) == 1
+    inbound, outbound = media.rekeys[0]
+    assert inbound is not None  # peer's answer key → our inbound decrypt
+    assert outbound is not None  # our offered key → our outbound encrypt
 
 
 async def test_inbound_reinvite_on_srtp_call_answers_savp_and_rekeys() -> None:

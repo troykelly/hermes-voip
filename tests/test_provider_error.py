@@ -28,6 +28,11 @@ _ERROR_TEXTS: tuple[str, ...] = (
     "502 Bad Gateway",
     "An internal error occurred (rate_limit_error). Please try again later.",
     "upstream connect error or disconnect/reset before headers",
+    # Rate-limit (HTTP 429) — a common provider error that must not be spoken
+    # (codex review MAJOR: was undetected unless it also carried a token/phrase).
+    "HTTP 429 Too Many Requests",
+    "Error: 429 Too Many Requests",
+    "openai.RateLimitError: 429",
 )
 
 
@@ -51,6 +56,12 @@ _GENUINE_REPLIES: tuple[str, ...] = (
     "Please hold for just a moment.",
     "",
     "   ",
+    # Genuine technical-SUPPORT speech mentioning error phrases as content, not as
+    # the agent's own failure (codex review MAJOR: bare reason phrases over-matched).
+    "Your website is currently returning 503 Service Unavailable to visitors.",
+    "It sounds like your server is showing an internal server error to customers.",
+    "The page says bad gateway when I open it, so let's check your hosting.",
+    "There are 500 people on the waitlist and 429 of them have confirmed.",
 )
 
 

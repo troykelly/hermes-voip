@@ -2722,6 +2722,41 @@ async def test_inbound_invite_activates_negotiated_ptime_and_adaptive_jitter() -
     )
 
 
+def test_negotiated_ptime_is_codec_aware_opus_pinned_to_20() -> None:
+    """Codec-aware ptime negotiation pins Opus to 20 ms (ADR-0063).
+
+    Codex review BLOCKING: the engine's Opus encoder frames EXACTLY one 20 ms packet
+    (960 samples @ 48 kHz) and raises on any other size, so negotiating a non-20 ms
+    ptime for an Opus call would crash send_audio. G.711/G.722 encode per-sample and
+    DO support the other framings. The negotiator must therefore honour a 40 ms offer
+    for G.722 but pin Opus to 20 ms regardless.
+    """
+    from hermes_voip.adapter import _negotiated_ptime  # noqa: PLC0415
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+    from hermes_voip.sdp import AudioMedia  # noqa: PLC0415
+    from hermes_voip.sdp import Codec as SdpCodecForTest  # noqa: PLC0415
+
+    def _audio_with_ptime(ms: int) -> AudioMedia:
+        return AudioMedia(
+            port=20000,
+            protocol="RTP/AVP",
+            codecs=(SdpCodecForTest(payload_type=0, encoding="PCMU", clock_rate=8000),),
+            crypto=(),
+            ptime=ms,
+            direction="sendrecv",
+            connection_address="127.0.0.1",
+            maxptime=None,
+        )
+
+    # G.722 (per-sample encode) honours a carriable 40 ms request …
+    assert _negotiated_ptime(_audio_with_ptime(40), EngineCodec.G722) == 40
+    # … but Opus is pinned to 20 ms even when the peer asks for 40 (engine can only
+    # frame 960-sample/20 ms Opus packets).
+    assert _negotiated_ptime(_audio_with_ptime(40), EngineCodec.OPUS) == 20
+    # G.711 honours 40 too.
+    assert _negotiated_ptime(_audio_with_ptime(40), EngineCodec.PCMU) == 40
+
+
 # ===========================================================================
 # Provider/LLM error sanitisation spoken to the caller (ADR-0063, LAUNCH #4)
 # ===========================================================================
@@ -2806,6 +2841,47 @@ async def test_send_provider_error_logs_real_error_at_warning(
         f"no WARNING logged the real provider error; "
         f"records={[r.getMessage() for r in warnings]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_log_redacts_credential_shapes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The WARNING log masks credential-SHAPED tokens, not just exact secrets.
+
+    Codex review MINOR: a leaked error could carry a bearer token / api_key= /
+    password= value that is NOT the plugin's own configured secret; the WARNING log
+    must still not leak it. Built at runtime (never a literal — gitleaks all-refs).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    secret_token = base64.b64encode(bytes(range(33, 63))).decode()
+    err = (
+        f"API call failed: HTTP 502; Authorization: Bearer {secret_token}; "
+        f"api_key={secret_token}"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, err)
+
+    assert result.success
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    # The diagnostic status survives …
+    assert "502" in blob
+    # … but the credential-shaped value does not.
+    assert secret_token not in blob
 
 
 @pytest.mark.asyncio

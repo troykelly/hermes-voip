@@ -1923,6 +1923,25 @@ def test_jitter_max_depth_rejects_non_positive_or_malformed(bad: str) -> None:
         load_media_config({"HERMES_VOIP_JITTER_MAX_DEPTH": bad})
 
 
+def test_jitter_max_depth_below_engine_floor_rejected() -> None:
+    """A ceiling below the engine's fixed jitter floor (2) is rejected (ADR-0063).
+
+    Codex review BLOCKING: the adapter builds the media engine with the default
+    jitter_depth=2 floor and adapt=True; a ceiling of 1 would make
+    JitterBuffer(adapt=True, max_depth=1, target_depth=2) raise at engine
+    construction (max_depth must be >= target_depth). A "documented-valid" positive
+    value must not crash the call — reject it loudly at config load instead.
+    """
+    with pytest.raises(ConfigError, match="jitter_max_depth"):
+        load_media_config({"HERMES_VOIP_JITTER_MAX_DEPTH": "1"})
+
+
+def test_jitter_max_depth_at_floor_is_accepted() -> None:
+    """A ceiling equal to the floor (2) is the minimum valid value."""
+    cfg = load_media_config({"HERMES_VOIP_JITTER_MAX_DEPTH": "2"})
+    assert cfg.jitter_max_depth == 2
+
+
 def test_jitter_max_depth_must_be_positive_on_direct_construction() -> None:
     """A directly-constructed MediaConfig validates the ceiling itself."""
     with pytest.raises(ConfigError, match="jitter_max_depth"):

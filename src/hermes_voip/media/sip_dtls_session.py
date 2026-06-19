@@ -26,10 +26,12 @@ sessions become the engine's ``srtp_inbound``/``srtp_outbound`` — no engine ch
 
 **Comedia (no ICE).** A DTLS-SRTP SIP call may sit behind NAT, so the peer's real
 source ``(host, port)`` can differ from the SDP-advertised ``c=``/port. The pipe
-sends to the advertised peer initially but **latches** its send destination onto the
-source of the first inbound datagram (the symmetric-RTP / comedia latch), which
-arrives during the DTLS handshake — so SRTP media reaches the correct 5-tuple. The
-latch is one-shot (first-source-wins) to avoid mid-call source-spoofing redirection.
+sends to the advertised peer initially but **re-latches** its send destination onto
+the source of each inbound **DTLS** datagram while the handshake is in progress — so
+SRTP media reaches the correct 5-tuple even behind NAT, while a stray/spoofed or
+non-DTLS datagram cannot poison the destination. Once the peer certificate is
+verified the latch is **frozen** for the rest of the call. See
+:class:`_UdpDatagramPipe`.
 
 **Security invariants.** No key/cert material is logged or raised in exception text
 (inherited from :mod:`hermes_voip.media.dtls`). The peer fingerprint is verified
@@ -70,6 +72,14 @@ _MAX_HANDSHAKE_ROUNDS = 200
 # Per-recv timeout (seconds) inside the handshake pump. A handshake that stalls this
 # long on any single inbound datagram is treated as failed.
 _HANDSHAKE_RECV_TIMEOUT_S = 10.0
+# Bounded inbound datagram queue (datagrams). A flooding peer cannot grow memory
+# without limit; excess datagrams are dropped (the DTLS handshake retransmits, and
+# the engine's jitter buffer tolerates RTP loss). Mirrors the engine's queue cap.
+_INBOUND_QUEUE_MAXSIZE = 512
+
+# Sentinel enqueued by close() to wake a receiver blocked on an empty inbound queue
+# (so recv() raises a deterministic ConnectionError instead of hanging — rule 37).
+_CLOSE_SENTINEL: object = object()
 
 
 class _DatagramPipe(Protocol):
@@ -78,7 +88,8 @@ class _DatagramPipe(Protocol):
     A superset of the engine's ``ice_transport`` seam
     (:class:`hermes_voip.media.engine._IceDatagramPipe` — async ``send`` / ``recv``
     / ``close``): the session additionally reads :attr:`local_port` (for the SDP
-    answer) and calls :meth:`set_peer` (the initial send destination). The
+    answer) and :attr:`inbound_maxsize`, and calls :meth:`set_peer` (the initial send
+    destination) and :meth:`freeze_peer` (fix the latch after verification). The
     send/recv/close subset is exactly the engine seam, so the same pipe object is
     handed to the engine as ``ice_transport`` after the handshake. Declared as a
     Protocol so tests can inject an in-memory linked pipe pair without real sockets;
@@ -90,8 +101,17 @@ class _DatagramPipe(Protocol):
         """The bound local UDP port (for the SDP ``m=audio <port>`` answer)."""
         ...
 
+    @property
+    def inbound_maxsize(self) -> int:
+        """The bounded inbound-queue capacity (datagrams; finite, > 0)."""
+        ...
+
     def set_peer(self, host: str, port: int) -> None:
         """Set the initial send destination (the SDP-advertised peer ``c=``/port)."""
+        ...
+
+    def freeze_peer(self) -> None:
+        """Freeze the send destination (called after the peer cert is verified)."""
         ...
 
     async def send(self, data: bytes) -> None:
@@ -123,20 +143,37 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
     """A plain-UDP datagram pipe satisfying the engine's ``ice_transport`` seam.
 
     Owns one ``asyncio`` UDP endpoint (a ``DatagramTransport`` + this
-    ``DatagramProtocol``). Inbound datagrams are queued (data only) and yielded by
-    :meth:`recv`; :meth:`send` writes to the peer ``(host, port)``. The send
-    destination is the SDP-advertised peer until the **first** inbound datagram
-    arrives, after which it latches onto that datagram's real source (the comedia /
-    symmetric-RTP latch — the no-ICE NAT-traversal mechanism). The latch is one-shot.
+    ``DatagramProtocol``). Inbound datagrams are queued (data only, bounded) and
+    yielded by :meth:`recv`; :meth:`send` writes to the peer ``(host, port)``.
+
+    **Comedia latch (no ICE), hardened against poisoning.** The send destination
+    starts at the SDP-advertised peer (:meth:`set_peer`). It **re-latches** onto the
+    source of each inbound **DTLS** datagram (first byte 20-63, RFC 7983) while the
+    handshake is in progress — so a stray/spoofed early datagram cannot permanently
+    poison the destination (a later, genuine DTLS record from the real peer wins),
+    and a **non-DTLS** datagram (e.g. an off-path RTP/STUN byte) never moves the
+    latch at all. Once the peer certificate is verified the session calls
+    :meth:`freeze_peer`, fixing the destination so post-handshake SRTP cannot be
+    redirected. This gives no-ICE NAT traversal without the trivial off-path
+    redirection / DoS a first-datagram-wins latch would allow.
+
+    **Bounded queue.** The inbound queue has a finite capacity
+    (:data:`_INBOUND_QUEUE_MAXSIZE`); a flooding peer cannot grow memory without
+    limit. Excess datagrams are dropped (DTLS retransmits; the jitter buffer
+    tolerates RTP loss).
 
     Construct via :meth:`bind` (an async classmethod that creates the endpoint).
     """
 
     def __init__(self) -> None:
-        self._inbound: asyncio.Queue[bytes] = asyncio.Queue()
+        self._inbound: asyncio.Queue[bytes | object] = asyncio.Queue(
+            maxsize=_INBOUND_QUEUE_MAXSIZE
+        )
         self._transport: asyncio.DatagramTransport | None = None
         self._peer: tuple[str, int] | None = None
         self._latched = False
+        self._frozen = False
+        self._closed = False
         self._local_port = 0
 
     @classmethod
@@ -164,13 +201,31 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
         return self._local_port
 
     @property
+    def inbound_maxsize(self) -> int:
+        """The bounded inbound-queue capacity (datagrams)."""
+        return _INBOUND_QUEUE_MAXSIZE
+
+    @property
     def latched(self) -> bool:
-        """Whether the send destination has latched onto a received source."""
+        """Whether the send destination has latched onto a received DTLS source."""
         return self._latched
+
+    @property
+    def frozen(self) -> bool:
+        """Whether the send destination is frozen (post-verification)."""
+        return self._frozen
 
     def set_peer(self, host: str, port: int) -> None:
         """Set the initial send destination (the SDP-advertised peer ``c=``/port)."""
         self._peer = (host, port)
+
+    def freeze_peer(self) -> None:
+        """Fix the send destination (after the peer cert is verified); idempotent.
+
+        After this no inbound datagram can move the latch — the verified 5-tuple is
+        the destination for the rest of the call.
+        """
+        self._frozen = True
 
     # asyncio.DatagramProtocol -------------------------------------------------
 
@@ -180,13 +235,24 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
             self._transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        """Queue an inbound datagram and latch the send destination once (comedia)."""
-        if not self._latched:
-            # First-source-wins: latch outbound onto the peer's real media source.
+        """Queue an inbound datagram; (re-)latch only on a DTLS record until frozen.
+
+        A DTLS-range first byte (20-63, RFC 7983) while not yet frozen moves the send
+        destination onto this source (re-latchable during the handshake). A non-DTLS
+        datagram never moves the latch (anti-poison/anti-DoS). The data is queued
+        regardless (the handshake pump / engine apply their own first-byte demux).
+        """
+        if (
+            data
+            and not self._frozen
+            and _RFC7983_DTLS_MIN <= data[0] <= _RFC7983_DTLS_MAX
+        ):
             self._peer = (addr[0], int(addr[1]))
             self._latched = True
-        with contextlib.suppress(asyncio.QueueFull):
+        try:
             self._inbound.put_nowait(bytes(data))
+        except asyncio.QueueFull:
+            _log.debug("sip-dtls inbound queue full — datagram dropped from %s", addr)
 
     def error_received(self, exc: Exception) -> None:
         """Log a transient ICMP/socket error (the handshake pump's timeout covers it).
@@ -216,13 +282,35 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
         self._transport.sendto(bytes(data), self._peer)
 
     async def recv(self) -> bytes:
-        """Await the next inbound datagram (data only; source latched internally)."""
-        return await self._inbound.get()
+        """Await the next inbound datagram (data only; source latched internally).
+
+        Raises:
+            ConnectionError: If the pipe is (or becomes) closed — so a receiver
+                awaiting on a torn-down pipe wakes deterministically instead of
+                hanging forever (rule 37).
+        """
+        if self._closed:
+            msg = "_UdpDatagramPipe.recv() on a closed pipe"
+            raise ConnectionError(msg)
+        item = await self._inbound.get()
+        if item is _CLOSE_SENTINEL:
+            msg = "_UdpDatagramPipe closed while receiving"
+            raise ConnectionError(msg)
+        # The sentinel is the only non-bytes item ever enqueued; narrow for the type
+        # checker (every datagram path enqueues bytes).
+        assert isinstance(item, bytes)  # noqa: S101 - type narrowing, not a runtime check
+        return item
 
     async def close(self) -> None:
-        """Close the UDP endpoint (idempotent)."""
+        """Close the UDP endpoint and wake any pending :meth:`recv` (idempotent)."""
+        if self._closed:
+            return
+        self._closed = True
         if self._transport is not None and not self._transport.is_closing():
             self._transport.close()
+        # Wake a receiver blocked on an empty queue with the close sentinel.
+        with contextlib.suppress(asyncio.QueueFull):
+            self._inbound.put_nowait(_CLOSE_SENTINEL)
 
 
 async def _default_pipe_factory(
@@ -366,6 +454,9 @@ class SipDtlsMediaSession:
         self._dtls.verify_peer_fingerprint(
             f"{peer_fingerprint.algorithm} {peer_fingerprint.value}"
         )
+        # The peer is now cryptographically verified: freeze the comedia latch so the
+        # established 5-tuple is fixed for the rest of the call (no SRTP redirection).
+        self._pipe.freeze_peer()
 
         inbound, outbound = self._dtls.derive_srtp_sessions()
         _log.info("sip-dtls: DTLS-SRTP keyed (setup=%s)", self._setup.value)

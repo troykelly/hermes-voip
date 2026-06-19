@@ -167,15 +167,20 @@ explicitly-named adapter wave wires it onto the live INVITE/answer path.
   existing SDES/plain handler (no behaviour change).
 
 **Comedia on the plain-UDP DTLS path (implementation decision).** Unlike WebRTC
-(where ICE establishes the 5-tuple) and like the existing SDES/plain SIP path, a
-DTLS-SRTP SIP call may sit behind NAT, so the peer's real source `(host, port)` can
-differ from the SDP `c=`/port. `_UdpDatagramPipe` therefore sends to the
-SDP-advertised peer initially but **latches** its send destination to the source
-address of the first inbound datagram it receives (the comedia / symmetric-RTP
-latch, mirroring the engine's `symmetric` behaviour) — the latch happens during the
-DTLS handshake (the ClientHello/HelloVerify exchange reveals the real source), so
-SRTP media flows to the correct 5-tuple without ICE. The latch is one-shot
-(first-source-wins) to avoid mid-call source-spoofing redirection.
+(where ICE + STUN consent establishes the 5-tuple) and like the existing SDES/plain
+SIP path, a DTLS-SRTP SIP call may sit behind NAT, so the peer's real source
+`(host, port)` can differ from the SDP `c=`/port. `_UdpDatagramPipe` therefore sends
+to the SDP-advertised peer initially but **re-latches** its send destination onto the
+source of each inbound **DTLS** datagram (first byte 20–63, RFC 7983) *while the
+handshake is in progress*, and **freezes** the destination once the peer certificate
+is verified. This is hardened against the off-path-poisoning / DoS a naive
+first-datagram-wins latch would allow (a cross-vendor review finding): a non-DTLS
+stray/spoofed datagram never moves the latch, a genuine later ClientHello from the
+real peer can correct a mis-latch during the handshake, and after verification the
+established 5-tuple is fixed so post-handshake SRTP cannot be redirected. The
+fingerprint check (RFC 5763 §5) still means a mis-latch can never compromise keys —
+the freeze additionally removes the redirection/DoS exposure. The inbound datagram
+queue is bounded (a flooding peer cannot grow memory without limit).
 
 ## Scope / deferred (rule 6, rule 28)
 

@@ -121,17 +121,26 @@ class MediaSecurity(Enum):
       (cert-keyed DTLS-SRTP; the SRTP master key is never in the SDP).
     * :attr:`SDES` — the offer is ``RTP/SAVP`` with a usable ``a=crypto`` (the
       master key rides inline in the TLS-protected SDP, RFC 4568).
-    * :attr:`PLAIN` — the offer is plain ``RTP/AVP`` (or a ``RTP/SAVP`` offer that
-      carried no usable crypto, which cannot be keyed as SDES).
+    * :attr:`PLAIN` — the offer is plain ``RTP/AVP``: the peer asked for clear
+      media, so a clear answer is not a downgrade.
+    * :attr:`UNSUPPORTED` — the offer is an **encrypted** profile we cannot key:
+      a secured (``SAVP``/``SAVPF``) profile with no usable ``a=crypto``, or a
+      ``UDP/TLS/RTP/SAVP`` offer missing its ``a=fingerprint``, or a WebRTC
+      ``SAVPF`` offer (which needs the ICE path, not this one). This is **distinct
+      from PLAIN**: the peer demanded encryption, so the caller MUST reject (or
+      re-offer) — it must **never** answer clear RTP, which would be a silent
+      downgrade of an encrypted-media offer.
 
     The ranker picks the tier; whether a :attr:`PLAIN` outcome is *answered* in the
-    clear or rejected is the caller's policy (the default is opportunistic — answer
-    plain — per the operator's choice), not this function's.
+    clear is the caller's policy (the default is opportunistic — answer plain — per
+    the operator's choice). An :attr:`UNSUPPORTED` outcome is never answerable in the
+    clear (it is an encrypted offer we cannot satisfy).
     """
 
     DTLS = "dtls"
     SDES = "sdes"
     PLAIN = "plain"
+    UNSUPPORTED = "unsupported"
 
 
 def _validate_crypto(tag: int, suite: str, key_params: str) -> None:
@@ -1140,18 +1149,24 @@ def negotiate_media_security(offer: AudioMedia) -> MediaSecurity:
       Checked first so a (non-conformant) offer that carries both a fingerprint and
       ``a=crypto`` is still answered DTLS — DTLS is strictly stronger (the master
       key never appears in the SDP) and we never downgrade it to SDES.
-    * :attr:`MediaSecurity.SDES` when the offer is ``RTP/SAVP`` (or any ``SAVP``
-      profile) carrying a usable ``a=crypto`` (``crypto_attrs`` is the parse-filtered
-      supported-only subset, so a non-empty tuple means a keyable SDES offer).
-    * :attr:`MediaSecurity.PLAIN` otherwise — a plain ``RTP/AVP`` offer, or a
-      ``RTP/SAVP`` offer whose crypto was malformed/unsupported (no usable key, so it
-      cannot be answered SDES).
+    * :attr:`MediaSecurity.SDES` when the offer is ``RTP/SAVP`` carrying a usable
+      ``a=crypto`` (``crypto_attrs`` is the parse-filtered supported-only subset, so
+      a non-empty tuple means a keyable SDES offer).
+    * :attr:`MediaSecurity.UNSUPPORTED` when the offer is an **encrypted** profile we
+      cannot key — any ``SAVP``/``SAVPF`` profile that is neither answerable DTLS nor
+      keyable SDES (a SIP-DTLS profile missing its fingerprint, a ``RTP/SAVP`` offer
+      whose crypto was malformed/unsupported, or a WebRTC ``SAVPF`` offer that needs
+      the ICE path). The peer demanded encryption: the caller MUST NOT answer clear
+      RTP (that is a silent downgrade) — it rejects or re-offers.
+    * :attr:`MediaSecurity.PLAIN` only when the offer is a plain ``RTP/AVP`` profile
+      (the peer asked for clear media).
 
     This decides the tier only; the caller keys + builds the matching answer
     (:func:`build_sip_dtls_answer`, :func:`build_audio_answer` with ``crypto=``, or
     plain :func:`build_audio_answer`). Whether a :attr:`MediaSecurity.PLAIN` result
-    is answered in the clear or rejected is the caller's policy (default
-    opportunistic — answer plain).
+    is answered in the clear is the caller's policy (default opportunistic — answer
+    plain); an :attr:`MediaSecurity.UNSUPPORTED` result is **never** answered in the
+    clear.
 
     Args:
         offer: The peer's parsed audio offer.
@@ -1161,8 +1176,13 @@ def negotiate_media_security(offer: AudioMedia) -> MediaSecurity:
     """
     if offer.is_sip_dtls:
         return MediaSecurity.DTLS
-    if offer.is_srtp and offer.crypto_attrs:
+    if offer.is_srtp and offer.crypto_attrs and not offer.is_webrtc:
         return MediaSecurity.SDES
+    if offer.is_srtp:
+        # An encrypted profile (SAVP/SAVPF) we cannot key: missing fingerprint, no
+        # usable a=crypto, or WebRTC (needs the ICE path). NOT a plaintext fallback —
+        # the peer demanded encryption, so the caller must reject, never answer clear.
+        return MediaSecurity.UNSUPPORTED
     return MediaSecurity.PLAIN
 
 

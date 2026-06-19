@@ -39,6 +39,7 @@ from hermes_voip.sdp import (
     generate_answer_crypto,
     negotiate_audio,
     negotiate_ptime,
+    negotiate_rtcp_mux,
 )
 
 # Obvious fake SRTP master key||salt (RFC 4568 inline:). Never a real key.
@@ -2000,3 +2001,127 @@ def test_generate_answer_crypto_is_random_per_call() -> None:
     first = generate_answer_crypto(accepted)
     second = generate_answer_crypto(accepted)
     assert first.key_params != second.key_params
+
+
+# --- RTCP-mux negotiation (RFC 5761) on the SDES/plain-RTP audio path ---
+
+
+def _avp_offer_with(*, rtcp_mux: bool) -> str:
+    """An RTP/AVP audio offer, optionally carrying ``a=rtcp-mux`` (RFC 5761)."""
+    lines = [
+        "v=0",
+        "o=- 9000 9000 IN IP4 192.0.2.1",
+        "s=-",
+        "c=IN IP4 192.0.2.1",
+        "t=0 0",
+        "m=audio 40000 RTP/AVP 0 101",
+        "a=rtpmap:0 PCMU/8000",
+        "a=rtpmap:101 telephone-event/8000",
+    ]
+    if rtcp_mux:
+        lines.append("a=rtcp-mux")
+    lines.append("a=sendrecv")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def test_parse_audio_offer_detects_rtcp_mux() -> None:
+    """An RTP/AVP (non-WebRTC) audio offer's ``a=rtcp-mux`` is parsed (RFC 5761)."""
+    offer = SessionDescription.parse(_avp_offer_with(rtcp_mux=True))
+    assert offer.audio is not None
+    assert offer.audio.rtcp_mux is True
+
+
+def test_parse_audio_offer_without_rtcp_mux() -> None:
+    """No ``a=rtcp-mux`` in the offer parses to ``rtcp_mux=False`` (default)."""
+    offer = SessionDescription.parse(_avp_offer_with(rtcp_mux=False))
+    assert offer.audio is not None
+    assert offer.audio.rtcp_mux is False
+
+
+def test_negotiate_rtcp_mux_true_when_offered() -> None:
+    """RFC 5761 §5.1.1: we agree to mux iff the offer requested it."""
+    offer = SessionDescription.parse(_avp_offer_with(rtcp_mux=True))
+    assert offer.audio is not None
+    assert negotiate_rtcp_mux(offer.audio) is True
+
+
+def test_negotiate_rtcp_mux_false_when_not_offered() -> None:
+    """An offer without ``a=rtcp-mux`` MUST NOT be muxed (RFC 5761 §5.1.1)."""
+    offer = SessionDescription.parse(_avp_offer_with(rtcp_mux=False))
+    assert offer.audio is not None
+    assert negotiate_rtcp_mux(offer.audio) is False
+
+
+def test_build_audio_answer_emits_rtcp_mux_when_offered() -> None:
+    """The SDES answer carries ``a=rtcp-mux`` when the offer requested it."""
+    offer = SessionDescription.parse(_avp_offer_with(rtcp_mux=True))
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+    )
+    assert "a=rtcp-mux\r\n" in text
+    # And the emitted answer re-parses with the flag set (round-trip).
+    parsed = SessionDescription.parse(text)
+    assert parsed.audio is not None
+    assert parsed.audio.rtcp_mux is True
+
+
+def test_build_audio_answer_omits_rtcp_mux_when_not_offered() -> None:
+    """The SDES answer MUST NOT mux when the offer did not (RFC 5761 §5.1.1)."""
+    offer = SessionDescription.parse(_avp_offer_with(rtcp_mux=False))
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+    )
+    assert "a=rtcp-mux" not in text
+
+
+def test_build_audio_offer_includes_rtcp_mux_by_default() -> None:
+    """We OFFER rtcp-mux by default (RFC 5761 §5.1.1 — the offerer may request it)."""
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=(Codec.PCMU,),
+    )
+    assert "a=rtcp-mux\r\n" in text
+    parsed = SessionDescription.parse(text)
+    assert parsed.audio is not None
+    assert parsed.audio.rtcp_mux is True
+
+
+def test_build_audio_offer_can_suppress_rtcp_mux() -> None:
+    """``rtcp_mux=False`` builds an offer with no ``a=rtcp-mux`` line."""
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=(Codec.PCMU,),
+        rtcp_mux=False,
+    )
+    assert "a=rtcp-mux" not in text
+
+
+def test_audio_answer_rtcp_mux_round_trips_with_crypto() -> None:
+    """rtcp-mux and SDES crypto coexist in the answer (RFC 5761 + RFC 4568)."""
+    secure_mux_offer = (
+        "v=0\r\no=- 9 9 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/SAVP 0 101\r\n"
+        "a=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n"
+        f"a=crypto:1 {_FAKE_CRYPTO}\r\na=rtcp-mux\r\na=sendrecv\r\n"
+    )
+    offer = SessionDescription.parse(secure_mux_offer)
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        crypto=_FAKE_ANSWER_CRYPTO,
+    )
+    parsed = SessionDescription.parse(text)
+    assert parsed.audio is not None
+    assert parsed.audio.rtcp_mux is True
+    assert parsed.audio.protocol == "RTP/SAVP"
+    assert text.count("a=crypto:") == 1

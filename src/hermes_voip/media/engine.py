@@ -2458,8 +2458,13 @@ class RtpMediaTransport:
         # RTCP rides the sibling socket and the RTP socket stays pure RTP.
         self._rtcp_active = True
         self._rtcp_mux_active = mux
+        # RTCP cadence is WALL-TIME (RFC 3550 §6.2). Pin the loop to asyncio.sleep —
+        # it must NOT inherit ``self._sleep``, the outbound-pacing seam callers (e.g.
+        # the e2e harness) legitimately stub to a no-op for instant RTP pacing. With a
+        # no-op there the §6.2 interval never elapses, the loop spins, and it starves
+        # the media TX (a real e2e hang).
         self._rtcp_task = asyncio.create_task(
-            self.run_rtcp(send_bye_on_stop=send_bye_on_stop)
+            self.run_rtcp(sleep=asyncio.sleep, send_bye_on_stop=send_bye_on_stop)
         )
 
     @property

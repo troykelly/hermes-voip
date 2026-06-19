@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -237,7 +238,14 @@ _OPUS_FMTP = "minptime=10;useinbandfec=1"
 # lower-rate options a gateway may request to save bandwidth. negotiate_ptime() picks
 # the peer's a=ptime when it is in this set and within its a=maxptime, else 20 ms.
 _DEFAULT_PTIME_MS = 20
+# Framings the G.711/G.722 engine can carry (per-sample encode → any frame size).
 _SUPPORTED_PTIMES_MS: tuple[int, ...] = (10, 20, 30, 40)
+# Opus is FIXED at 20 ms in this engine: media/opus.OpusEncoder frames exactly one
+# 960-sample/20 ms packet and rejects any other size (it has no multi-frame
+# packetiser), so the Opus/WebRTC path can only ever negotiate 20 ms. negotiate_ptime
+# with a single supported value returns 20 unless maxptime pathologically excludes it
+# (then still 20 via the default) — never a size the Opus encoder would reject.
+_OPUS_SUPPORTED_PTIMES_MS: tuple[int, ...] = (20,)
 
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
@@ -957,6 +965,10 @@ class VoipAdapter(BasePlatformAdapter):
         # partially exposed.
         for secret in sorted(secrets, key=len, reverse=True):
             redacted = redacted.replace(secret, _REDACTED)
+        # Beyond the plugin's own configured secrets, mask any credential-SHAPED
+        # value the backend may have embedded in its error (a bearer token, an
+        # ``api_key=`` echoed back) — those are not in ``secrets`` but must not leak.
+        redacted = _redact_credential_shapes(redacted)
         limit = 500
         if len(redacted) > limit:
             redacted = redacted[:limit] + "…(truncated)"
@@ -1384,6 +1396,12 @@ class VoipAdapter(BasePlatformAdapter):
                 # a dynamic value for G.722, differing from the codec's static PT) so
                 # outbound packets and the comedia latch use the wire PT, not 9/0/8.
                 engine.payload_type = negotiated_voice.payload_type
+                # ptime negotiation (ADR-0056 activated by ADR-0063): the 2xx answer
+                # carries the agreed a=ptime/a=maxptime; honour it (else 20 ms) so the
+                # outbound stream is framed at the negotiated packetisation time —
+                # codec-aware (Opus pinned to 20 ms). Set here, alongside the other
+                # negotiated engine values, where the negotiated codec is in scope.
+                engine.ptime = _negotiated_ptime(answer_audio, negotiated_engine_codec)
 
             # Adopt the negotiated telephone-event PT for in-call DTMF (ADR-0031), or
             # None when the answer carried none (send_dtmf then raises). The outbound
@@ -1391,11 +1409,6 @@ class VoipAdapter(BasePlatformAdapter):
             engine.telephone_event_payload_type = _telephone_event_payload_type(
                 agreed_codecs
             )
-            # ptime negotiation (ADR-0056 activated by ADR-0063): the 2xx answer
-            # carries the agreed a=ptime/a=maxptime; honour it (else 20 ms) so the
-            # outbound stream is framed at the negotiated packetisation time. Set
-            # here (post-answer) like the other negotiated engine values above.
-            engine.ptime = _negotiated_ptime(answer_audio)
             # Resolve + apply the DTMF send/receive backends now the codec + PT are
             # known (ADR-0036): the engine adopts the send backend and arms the in-band
             # detector on a G.711 call with no telephone-event. ``codec_encoding``
@@ -1891,8 +1904,9 @@ class VoipAdapter(BasePlatformAdapter):
                 jitter_max_depth=media_cfg.jitter_max_depth,
             )
             # ptime negotiation (ADR-0056/0063): this engine is built AFTER the 2xx
-            # answer, so honour the answer's a=ptime/a=maxptime now (else 20 ms).
-            engine.ptime = _negotiated_ptime(answer_audio)
+            # answer, so honour the answer's a=ptime/a=maxptime now (codec-aware —
+            # Opus is pinned to 20 ms, the only framing the Opus encoder accepts).
+            engine.ptime = _negotiated_ptime(answer_audio, engine_codec)
             await engine.connect()
             _log.info("WebRTC outbound media engine connected over ICE: %s", call_id)
 
@@ -2521,9 +2535,10 @@ class VoipAdapter(BasePlatformAdapter):
             jitter_max_depth=media_cfg.jitter_max_depth,
         )
         # ptime negotiation (ADR-0056 activated by ADR-0063): honour the peer's
-        # requested framing (a=ptime/a=maxptime) when carriable, else 20 ms. Set
-        # before connect() so the very first outbound packet is framed correctly.
-        engine.ptime = _negotiated_ptime(audio)
+        # requested framing (a=ptime/a=maxptime) when carriable, else 20 ms —
+        # codec-aware (Opus pinned to 20 ms). Set before connect() so the very first
+        # outbound packet is framed correctly.
+        engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
 
         local_media = LocalMediaSession(
@@ -2787,9 +2802,9 @@ class VoipAdapter(BasePlatformAdapter):
             jitter_adapt=True,
             jitter_max_depth=media_cfg.jitter_max_depth,
         )
-        # ptime negotiation (ADR-0056/0063): honour the offer's a=ptime/a=maxptime
-        # (Opus on WebRTC) when carriable, else 20 ms. Set before connect().
-        engine.ptime = _negotiated_ptime(audio)
+        # ptime negotiation (ADR-0056/0063): codec-aware — WebRTC is Opus, which the
+        # engine frames only at 20 ms, so this pins 20 ms regardless of the offer.
+        engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
         # Outbound video (ADR-0044): only when we answered a=sendonly (a source is
@@ -4687,18 +4702,28 @@ def _effective_address(audio: AudioMedia, offer: SessionDescription) -> str:
     return addr if addr else "127.0.0.1"
 
 
-def _negotiated_ptime(audio: AudioMedia) -> int:
-    """The packetisation time (ms) to frame at for this audio media (ADR-0056/0063).
+def _negotiated_ptime(audio: AudioMedia, codec: Codec) -> int:
+    """The packetisation time (ms) to frame at for this media + codec (ADR-0056/0063).
 
-    Honours the peer's ``a=ptime``/``a=maxptime`` against the engine's supported
-    framings, falling back to the 20 ms RFC 3551 default. Applied to the engine via
-    its ``ptime`` setter after the SDP is negotiated, so the wire actually carries
+    Honours the peer's ``a=ptime``/``a=maxptime`` against the framings the engine can
+    carry FOR THIS CODEC, falling back to the 20 ms RFC 3551 default. Applied to the
+    engine via its ``ptime`` setter after the SDP is negotiated, so the wire carries
     the agreed framing rather than always 20 ms.
+
+    The supported set is **codec-specific** (the engine's real capability): G.711 and
+    G.722 encode per wire sample, so any of :data:`_SUPPORTED_PTIMES_MS` works; **Opus
+    is fixed at 20 ms** — the engine's :class:`~hermes_voip.media.opus.OpusEncoder`
+    frames exactly one 960-sample/20 ms packet and rejects any other size, so a non-20
+    ms ptime would crash ``send_audio``. Opus is therefore pinned to 20 ms regardless
+    of the offer (ptime is a preference, never a mandate — RFC 4566 §6).
     """
+    supported = (
+        _OPUS_SUPPORTED_PTIMES_MS if codec is Codec.OPUS else _SUPPORTED_PTIMES_MS
+    )
     return negotiate_ptime(
         audio.ptime,
         audio.maxptime,
-        supported=_SUPPORTED_PTIMES_MS,
+        supported=supported,
         default=_DEFAULT_PTIME_MS,
     )
 
@@ -4787,6 +4812,46 @@ def _redact_sdp_body(body: str) -> str:
     # Preserve the trailing newline style loosely: SDP is CRLF on the wire but this
     # is a log string, so a plain join is fine (it is never re-parsed).
     return "\n".join(out)
+
+
+# Credential-SHAPED substrings a backend error reply may embed that are NOT one of
+# the plugin's own configured secrets — a bearer token, an ``api_key=…`` /
+# ``access_token=…`` / ``password=…`` pair minted by the cloud provider and echoed
+# back in an error. ``_redact_credential_shapes`` masks these in the provider-error
+# WARNING log (rule 34: the repo is PUBLIC and operator logs may be shared). Each
+# pattern keeps the keyword + separator — so the log still shows the SHAPE of what
+# leaked — and replaces only the value. Matching is case-insensitive; over-masking a
+# benign ``token: …`` is the safe direction for a security log.
+_CREDENTIAL_SHAPE_PATTERNS = (
+    # Authorization / Proxy-Authorization header: mask the scheme + credential value.
+    re.compile(r"(?i)(\b(?:proxy-)?authorization\b\s*[:=]\s*)\S+(?:\s+\S+)?"),
+    # A bare bearer token not preceded by an Authorization keyword.
+    re.compile(r"(?i)(\bbearer\s+)\S+"),
+    # key=value / key: value credential pairs (longest alternatives first so e.g.
+    # ``access_token`` matches that branch, not the bare ``token`` branch).
+    re.compile(
+        r"(?i)(\b(?:api[-_]?key|apikey|x-api-key|access[-_]?token|token|secret|"
+        r"password|passwd|pwd)\b\s*[=:]\s*)\S+"
+    ),
+)
+
+
+def _redact_credential_shapes(text: str) -> str:
+    """Mask credential-SHAPED substrings (bearer / ``api_key=`` / ``password=``).
+
+    Complements :meth:`CallReplyAdapter._redact_secrets_for_log`, which masks the
+    plugin's *own* configured secret values verbatim. A backend error reply can also
+    embed a credential the plugin does NOT hold (a bearer token minted by the cloud
+    provider, an ``api_key=`` echoed back); this masks those by SHAPE so the WARNING
+    log never leaks one (rule 34). Each match keeps the keyword + separator and
+    replaces only the value with ``<redacted>``; non-credential detail (HTTP status,
+    provider class) is preserved — that is what keeps the log useful. Pure string
+    transform; the original ``text`` is never mutated.
+    """
+    redacted = text
+    for pattern in _CREDENTIAL_SHAPE_PATTERNS:
+        redacted = pattern.sub(r"\g<1>" + _REDACTED, redacted)
+    return redacted
 
 
 def _redact_sip_for_log(what: object) -> str:

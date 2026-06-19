@@ -364,6 +364,12 @@ _MAX_RTP_TIMEOUT_SECS = 300
 # bare install gets adaptive jitter without tuning.
 _JITTER_MAX_DEPTH_KEY = "HERMES_VOIP_JITTER_MAX_DEPTH"
 _DEFAULT_JITTER_MAX_DEPTH = 10
+# The adaptive ceiling is also the buffer's FLOOR's upper companion: the engine
+# builds the adaptive JitterBuffer with its fixed jitter_depth (2) as the floor, and
+# rtp.JitterBuffer requires max_depth >= target_depth (floor). A ceiling below the
+# floor would raise at engine construction (crashing the call), so the minimum valid
+# ceiling is the floor itself — validated here, not deferred to a runtime crash.
+_MIN_JITTER_MAX_DEPTH = 2
 
 # WebRTC ICE STUN servers (ADR-0032/0016, default revised ADR-0043). A comma-separated
 # list of ``stun:`` URLs used to gather server-reflexive (srflx) ICE candidates for the
@@ -714,8 +720,10 @@ class MediaConfig:
             per call). Each phrase reads naturally on every TTS model; non-empty.
         jitter_max_depth: The adaptive jitter-buffer ceiling (ADR-0056/0063) — the
             maximum reorder tolerance in packets the RX :class:`JitterBuffer` grows
-            to under loss before shrinking back toward its fixed floor. Positive;
-            ``HERMES_VOIP_JITTER_MAX_DEPTH`` (default 10 ≈ 200 ms at 20 ms ptime).
+            to under loss before shrinking back toward its fixed floor. Must be
+            ``>= 2`` (the buffer's floor; a lower ceiling would fail engine
+            construction). ``HERMES_VOIP_JITTER_MAX_DEPTH`` (default 10 ≈ 200 ms at
+            20 ms ptime).
     """
 
     stt_provider: str
@@ -903,8 +911,12 @@ class MediaConfig:
                 f"got {self.media_timeout_secs}"
             )
             raise ConfigError(msg)
-        if self.jitter_max_depth <= 0:
-            msg = f"jitter_max_depth must be positive, got {self.jitter_max_depth}"
+        if self.jitter_max_depth < _MIN_JITTER_MAX_DEPTH:
+            msg = (
+                f"jitter_max_depth must be >= {_MIN_JITTER_MAX_DEPTH} (the adaptive "
+                f"jitter buffer's floor — a lower ceiling would fail engine "
+                f"construction), got {self.jitter_max_depth}"
+            )
             raise ConfigError(msg)
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))

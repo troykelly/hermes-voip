@@ -35,14 +35,19 @@ import re
 # Python traceback header. A bare number or the lone word "error" deliberately does
 # NOT match (a genuine reply uses those innocently).
 
-# HTTP 5xx server errors, only when paired with the canonical reason phrase or an
-# explicit "status"/"HTTP" context — so "HTTP 502", "status code 500", "503 Service
-# Unavailable" match, but "reference 502" / "room 500" do not.
-_HTTP_5XX_RE = re.compile(
-    r"\b(?:http|status(?:\s+code)?)\b[^\n]{0,20}?\b5\d{2}\b"
-    r"|\b5\d{2}\s+(?:bad\s+gateway|service\s+unavailable"
-    r"|internal\s+server\s+error|gateway\s+time-?out)\b"
-    r"|\b(?:bad\s+gateway|service\s+unavailable|internal\s+server\s+error)\b",
+# HTTP error STATUS codes (5xx server errors + 429 rate-limit) — only in an error
+# context, never a bare number. Three ways a real raw error frames a status, none of
+# which a genuine conversational reply about a third party's outage produces. One, an
+# http or status token sits next to the code, as in HTTP 502 or status code 500. Two,
+# the status leads the message the way a raw error does (502 Bad Gateway) — whereas a
+# reply ABOUT someone else's outage carries the number mid-sentence (a caller whose
+# website is returning 503), not leading. Three, an explicit error-N framing, as in
+# error 502. A genuine reply — reference 502, room 500, 503 people, a caller naming a
+# 503 Service Unavailable page — matches none of these.
+_HTTP_STATUS = r"(?:5\d{2}|429)"
+_HTTP_ERROR_RE = re.compile(
+    rf"\b(?:http|status(?:\s+code)?|error)\b[\s:]*{_HTTP_STATUS}\b"
+    rf"|^\s*{_HTTP_STATUS}\b",
     re.IGNORECASE,
 )
 
@@ -88,7 +93,7 @@ def is_provider_error(content: str) -> bool:
         _TRACEBACK_RE.search(content)
         or _FAILURE_PHRASE_RE.search(content)
         or _PROVIDER_TOKEN_RE.search(content)
-        or _HTTP_5XX_RE.search(content)
+        or _HTTP_ERROR_RE.search(content)
     )
 
 

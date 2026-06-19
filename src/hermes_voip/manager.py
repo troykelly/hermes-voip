@@ -468,22 +468,28 @@ class RegistrationManager:
     def _on_background_task_done(
         self, state: _FlowState, task: asyncio.Task[None]
     ) -> None:
-        """Surface an unexpected crash in a timeout/recovery task (never swallow).
+        """Surface a crash in a timeout/recovery task and keep recovery alive.
 
-        These tasks own their failure handling internally; reaching here with a
-        non-cancelled exception means an unforeseen bug (e.g. a transport send
-        raised during recovery), which is reported rather than lost as an
-        un-retrieved task exception (rule 37).
+        A cancelled task (shutdown) is expected. Any other exception means the
+        task could not complete — most often a transport ``send`` raising inside
+        :meth:`_recover_after` (the registrar/socket is still down). Routing it
+        through :meth:`_on_registration_failed` reports it AND reschedules the
+        next bounded-backoff attempt for an established flow, so a send failure
+        mid-recovery does not dead-end the registration (codex finding); it is
+        never lost as an un-retrieved task exception (rule 37).
         """
+        # Drop the finished task's handle so the reschedule below does not try to
+        # cancel an already-completed task.
+        if state.recovery_task is task:
+            state.recovery_task = None
+        if state.response_timeout_task is task:
+            state.response_timeout_task = None
         if task.cancelled():
             return
         error = task.exception()
         if error is None:
             return
-        state.registered = False
-        state.last_error = error
-        if self._on_error is not None:
-            self._on_error(state.extension.extension, error)
+        self._on_registration_failed(state, error)
 
     # --- inbound requests (demux) -------------------------------------------
 

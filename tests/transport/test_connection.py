@@ -370,6 +370,56 @@ async def test_cancel_for_unknown_invite_is_481() -> None:
         await server.stop()
 
 
+async def test_retransmitted_cancel_is_absorbed_no_second_487_or_abort() -> None:
+    # A retransmitted CANCEL (same branch+Call-ID) must be absorbed: the 200 OK to
+    # the CANCEL is re-sent, but the INVITE is NOT 487'd a second time and the
+    # abort hook fires only once (idempotent RFC 3261 §9.2 — codex finding).
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKretx"
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await server.push(
+            _inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1)
+        cancel = _cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(cancel)
+        await _until(lambda: cancelled == [call_id])
+        await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        # The peer retransmits the CANCEL.
+        await server.push(cancel)
+        await asyncio.sleep(0.1)
+        # Exactly one 487 (the retransmit was absorbed) and one abort.
+        terminated = [raw for raw in server.received if raw.startswith("SIP/2.0 487")]
+        assert len(terminated) == 1, "a retransmitted CANCEL must not re-487 the INVITE"
+        assert cancelled == [call_id], "the abort hook must fire only once"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 # --------------------------------------------------------------------------
 # Non-2xx final to an INVITE we sent is ACKed by this layer
 # --------------------------------------------------------------------------

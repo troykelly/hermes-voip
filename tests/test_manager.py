@@ -558,6 +558,103 @@ async def test_failed_refresh_recovers_back_to_registered() -> None:
     await manager.aclose()
 
 
+def _single_gateway() -> GatewayConfig:
+    return load_gateway_config(
+        {
+            "HERMES_SIP_HOST": "pbx.example.test",
+            "HERMES_SIP_EXTENSION": "1000",
+            "HERMES_SIP_PASSWORD": "p1",
+        }
+    )
+
+
+async def test_is_up_false_after_sole_extensions_refresh_fails() -> None:
+    # is_up must reflect live registration state: when the only extension's
+    # refresh is rejected, the manager is no longer up (codex review — guards a
+    # future refactor that might back is_up by the one-shot connect() event).
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _single_gateway(),
+        transport,
+        refresh_fraction=0.0,
+        retry_backoff=10.0,  # keep the recovery from re-registering during the assert
+    )
+    await manager.start()
+    first = transport.sent[0]
+    call_id = SipRequest.parse(first).header("Call-ID")
+    await manager.on_response(_ok_for(first))
+    up_after_register = manager.is_up
+    assert up_after_register is True
+    await asyncio.sleep(0.02)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    await manager.on_response(_failed_for(refresh, status=403, reason="Forbidden"))
+    up_after_failure = manager.is_up
+    assert up_after_failure is False, "the manager is down once its sole binding fails"
+    await manager.aclose()
+
+
+class _SendFailsOnceTransport(_FakeTransport):
+    """A transport whose ``send`` raises on the nth message, then works again.
+
+    Used to prove a recovery re-REGISTER whose *send* fails still schedules
+    another bounded-backoff attempt (it must not dead-end — codex review).
+    """
+
+    def __init__(self, *, fail_on_index: int) -> None:
+        super().__init__()
+        self._fail_on_index = fail_on_index
+        self.attempts = 0
+
+    async def send(self, message: str) -> None:
+        self.attempts += 1
+        if self.attempts == self._fail_on_index:
+            msg = "transient transport send failure"
+            raise RuntimeError(msg)
+        self.sent.append(message)
+
+
+async def test_recovery_send_failure_reschedules_another_attempt() -> None:
+    # A recovery re-REGISTER whose transport.send() raises must not dead-end: the
+    # manager must schedule a further bounded-backoff attempt (codex finding). The
+    # 3rd send (initial=1, refresh=2, first recovery=3) fails; a later send proves
+    # recovery continued.
+    errors: list[tuple[str, BaseException]] = []
+    transport = _SendFailsOnceTransport(fail_on_index=3)
+    manager = RegistrationManager(
+        _single_gateway(),
+        transport,
+        refresh_fraction=0.0,
+        retry_backoff=0.0,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()  # send #1 (initial REGISTER)
+    first = transport.sent[0]
+    call_id = SipRequest.parse(first).header("Call-ID")
+    await manager.on_response(_ok_for(first))
+    await asyncio.sleep(0.02)  # send #2 = the refresh
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    sent_before = transport.attempts
+    # Reject the refresh -> recovery scheduled. Its send (#3) raises; recovery must
+    # reschedule and the next attempt (#4) succeeds in reaching the wire.
+    await manager.on_response(_failed_for(refresh, status=500, reason="Server Error"))
+    await asyncio.sleep(0.2)
+    assert transport.attempts > sent_before + 1, (
+        "a recovery send failure must trigger a further re-REGISTER attempt, "
+        "not dead-end the registration"
+    )
+    # The error reporting fired for both the rejection and the failed send.
+    assert len(errors) >= 2
+    await manager.aclose()
+
+
 # ---- recovery: a refresh that gets NO response (item 2, Timer-F/B) ----------
 
 

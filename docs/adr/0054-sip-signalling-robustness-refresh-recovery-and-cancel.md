@@ -124,3 +124,24 @@ lifetime.
 - WSS inbound CANCEL handling (the server-transaction tracking is TLS-only).
 - Registration recovery for a *cold-start* REGISTER that never succeeded (owned
   by `connect()` / the reconnect supervisor).
+
+## Cross-vendor review hardening
+
+A fresh-context adversarial review (rule 21, a different vendor) surfaced and
+these were fixed before merge:
+
+- **Late-200 suppression made atomic with the wire write.** The CANCELled-INVITE
+  suppression re-check now runs *under* the transport send-lock, so a 200 OK that
+  passed the cancelled check before the lock cannot still write after
+  `_handle_cancel` marks the INVITE cancelled.
+- **Recovery send-failure no longer dead-ends.** A recovery re-REGISTER whose
+  `transport.send` raises is routed back through the failure path, scheduling the
+  next bounded-backoff attempt for an established flow (it previously stopped).
+- **CANCEL retransmissions are absorbed.** A repeated CANCEL re-sends only the
+  `200 OK`; it does not re-`487` the INVITE or re-fire `on_cancel`.
+- **CANCEL matching hardened** with a defensive Call-ID check (not branch alone)
+  and the **`487` reuses a stable per-transaction To-tag** (§8.2.6.2).
+- Confirmed non-issues: `is_up` reads live registration flags (not the one-shot
+  `connect()` event), so it correctly flips to `False` on total failure; no
+  provisional `18x` is sent on the inbound path before the final, so the
+  CANCEL-driven `487` is the first response and its tag needs no prior match.

@@ -83,12 +83,15 @@ class _PendingInvite:
 
     Tracked from the moment the INVITE is handed to ``on_new_call`` until we send
     its final response (or a CANCEL terminates it), so a CANCEL can be matched to
-    it by Via branch (RFC 3261 §9.2) and a 200 OK racing a CANCEL is suppressed.
+    it (RFC 3261 §9.2) and a 200 OK racing a CANCEL is suppressed. ``local_tag``
+    is the To-tag for any response *we* generate for this transaction (the
+    CANCEL-driven 487), stable so a retransmitted 487 reuses it (§8.2.6.2).
     """
 
     invite: SipRequest
     call_id: str
     txn: InviteServerTransaction
+    local_tag: str
     cancelled: bool = False
 
 
@@ -275,12 +278,16 @@ class SipOverTlsTransport:
         if self._writer is None:
             msg = "cannot send before connect()"
             raise RuntimeError(msg)
-        if message.startswith(_RESPONSE_PREFIX):
-            if self._suppress_or_track_response(message):
-                return  # a 200 OK to a CANCELled INVITE — dropped, never sent
-        else:
+        is_response = message.startswith(_RESPONSE_PREFIX)
+        if not is_response:
             self._register_if_invite(message)
+        # The CANCEL-suppression decision and the wire write happen under the same
+        # lock so a 200 OK racing an inbound CANCEL cannot pass the cancelled check
+        # and then write after _handle_cancel marks the INVITE cancelled: the
+        # re-check below sees the flag set under this lock (codex finding).
         async with self._send_lock:
+            if is_response and self._suppress_or_track_response(message):
+                return  # a 200 OK to a CANCELled INVITE — dropped, never sent
             self._writer.write(message.encode("utf-8"))
             await self._writer.drain()
 
@@ -472,34 +479,42 @@ class SipOverTlsTransport:
             invite=invite,
             call_id=call_id,
             txn=InviteServerTransaction(),
+            local_tag=new_tag(),
         )
 
     async def _handle_cancel(self, cancel: SipRequest) -> None:
         """Answer an inbound CANCEL and terminate the matching INVITE (RFC 3261 §9.2).
 
-        A CANCEL shares the INVITE's top Via branch. When it matches a pending
-        INVITE: the CANCEL is answered ``200 OK``, the INVITE is replied ``487
-        Request Terminated``, the pending entry is marked cancelled (so a 200 OK
-        racing in from the answer task is suppressed in :meth:`send`), and the
-        ``on_cancel`` hook fires so the consumer tears down the half-built call.
-        A CANCEL matching no transaction is answered ``481 Call/Transaction Does
-        Not Exist`` — never a 200 OK that would imply something was cancelled.
+        A CANCEL shares the INVITE's top Via branch and (defensively) its Call-ID.
+        When it matches a pending INVITE: the CANCEL is answered ``200 OK``, the
+        INVITE is replied ``487 Request Terminated``, the entry is marked cancelled
+        (so a 200 OK racing the answer task is suppressed in :meth:`send`), and the
+        ``on_cancel`` hook fires once so the consumer tears down the half-built
+        call. A **retransmitted** CANCEL (the entry is already cancelled) is
+        absorbed — only the ``200 OK`` to the CANCEL is re-sent, with no second
+        487 or ``on_cancel`` (idempotent §9.2 handling). A CANCEL matching no
+        transaction is answered ``481 Call/Transaction Does Not Exist``.
         """
-        branch = _via_branch(cancel.header("Via"))
-        pending = self._pending_invites.get(branch) if branch is not None else None
+        pending = self._match_cancel(cancel)
         if pending is None:
             await self.send(
                 build_response(cancel, 481, "Call/Transaction Does Not Exist")
             )
             return
+        already_cancelled = pending.cancelled
         pending.cancelled = True
-        # 200 OK to the CANCEL itself (its own transaction).
+        # 200 OK to the CANCEL itself (its own transaction). Always re-sent, so a
+        # retransmitted CANCEL is absorbed.
         await self.send(build_response(cancel, 200, "OK", to_tag=new_tag()))
-        # 487 the INVITE: a dialog-forming final, so it carries our To-tag. This
-        # final terminates the INVITE server transaction and clears the pending
-        # entry (handled in send() on the outbound final response).
+        if already_cancelled:
+            return  # the 487 + abort already happened on the first CANCEL
+        # 487 the INVITE: a dialog-forming final carrying our stable local tag.
+        # This records the final on the server transaction; the cancelled entry is
+        # retained (cleared in remove_call) so a late 2xx stays suppressed.
         await self.send(
-            build_response(pending.invite, 487, "Request Terminated", to_tag=new_tag())
+            build_response(
+                pending.invite, 487, "Request Terminated", to_tag=pending.local_tag
+            )
         )
         _log.info(
             "INVITE %s CANCELled by peer — 487 Request Terminated, aborting setup",
@@ -507,6 +522,23 @@ class SipOverTlsTransport:
         )
         if self._on_cancel is not None:
             self._on_cancel(pending.call_id)
+
+    def _match_cancel(self, cancel: SipRequest) -> _PendingInvite | None:
+        """The pending INVITE a CANCEL targets (top Via branch + Call-ID), if any.
+
+        RFC 3261 §9.2/§17.2.3: the branch identifies the transaction; the Call-ID
+        is checked too as a cheap defence so a stray CANCEL that happens to reuse a
+        branch cannot terminate the wrong INVITE.
+        """
+        branch = _via_branch(cancel.header("Via"))
+        if branch is None:
+            return None
+        pending = self._pending_invites.get(branch)
+        if pending is None:
+            return None
+        if cancel.header("Call-ID") != pending.invite.header("Call-ID"):
+            return None
+        return pending
 
     async def _answer_keepalive(self, request: SipRequest) -> bool:
         """Answer an out-of-dialog ``OPTIONS``/``NOTIFY`` 200 OK; report success.

@@ -147,6 +147,7 @@ from hermes_voip.originate import (
     OutboundCallFailed,
     OutboundCallNotAllowed,
     build_outbound_invite,
+    build_srtp_crypto_attrs,
 )
 from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowlist
 from hermes_voip.provider_error import is_provider_error, safe_error_reply
@@ -514,6 +515,53 @@ def _srtp_outbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | 
     key advertised in the SDP answer's ``a=crypto`` (see
     :func:`sdp.generate_answer_crypto`). Returns ``None`` for a plain-RTP answer.
     Lazy SrtpSession import (rule 37, as above).
+    """
+    if crypto is None:
+        return None
+    from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+
+    return SrtpSession(crypto)
+
+
+def _outbound_offer_crypto() -> CryptoAttribute:
+    """Mint the SDES ``a=crypto`` for an outbound SRTP offer (ADR-0066, RFC 4568).
+
+    Returns a fresh ``AES_CM_128_HMAC_SHA1_80`` :class:`CryptoAttribute` (tag 1, the
+    preferred supported suite) with a cryptographically-random per-call master
+    key‖salt. As the OFFERER this key encrypts our **outbound** stream (RFC 4568 §6.1
+    sender-keying) and is advertised in the INVITE's ``a=crypto``; our inbound is keyed
+    from the peer's answer key. We offer one strong suite (not the 32-bit fallback that
+    :func:`originate.build_srtp_crypto_attrs` also mints) because
+    :func:`sdp.build_audio_offer` renders exactly one ``a=crypto`` — matching the
+    inbound answer's single-suite behaviour. The key never reaches a log/``repr``
+    (``CryptoAttribute.key_params`` is ``field(repr=False)``).
+    """
+    # build_srtp_crypto_attrs returns (80-bit, 32-bit); offer the 80-bit suite only.
+    offer_80bit, _offer_32bit = build_srtp_crypto_attrs()
+    return offer_80bit
+
+
+def _srtp_outbound_from_offer(crypto: CryptoAttribute | None) -> SrtpSession | None:
+    """The outbound (TX/protect) SrtpSession keyed by OUR **offer** a=crypto (ADR-0066).
+
+    The offerer mirror of :func:`_srtp_outbound_from_answer`: as the UAC we encrypt our
+    outbound stream with the key we advertised in the INVITE's ``a=crypto`` (RFC 4568
+    §6.1 — each direction is keyed by its sender). ``None`` ⇒ a plain RTP/AVP offer.
+    Lazy SrtpSession import (rule 37).
+    """
+    if crypto is None:
+        return None
+    from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+
+    return SrtpSession(crypto)
+
+
+def _srtp_inbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | None:
+    """The inbound (RX/unprotect) SrtpSession keyed by the PEER's answer a=crypto.
+
+    The offerer mirror of :func:`_srtp_inbound_from_offer`: as the UAC we decrypt the
+    callee's media with the key the callee advertised in its 2xx ``a=crypto`` (RFC 4568
+    §6.1). ``None`` ⇒ a plain RTP/AVP answer. Lazy SrtpSession import (rule 37).
     """
     if crypto is None:
         return None
@@ -1347,14 +1395,24 @@ class VoipAdapter(BasePlatformAdapter):
         local_sent_by = transport.local_sent_by
 
         # --- Build the SDP offer -------------------------------------------
+        # Outbound SDES-SRTP offering (ADR-0066): when enabled, mint a fresh per-call
+        # SDES key and offer RTP/SAVP + a=crypto. The OFFER key encrypts our outbound
+        # stream (RFC 4568 §6.1 sender-keying) and is advertised in the INVITE; our
+        # inbound is keyed from the peer's 2xx answer key (below). None ⇒ plain RTP/AVP
+        # offer (today's default), so srtp_outbound stays None and the engine is
+        # cleartext exactly as before.
+        offer_crypto = _outbound_offer_crypto() if media_cfg.sip_sdes_offer else None
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — bind all interfaces for RTP
             local_port=0,
             remote_address="127.0.0.1",  # placeholder; updated from 2xx SDP answer
             remote_port=9,  # discard port placeholder
             codec=Codec.PCMU,
+            # Inbound (RX/decrypt) SRTP is keyed from the peer's ANSWER a=crypto, which
+            # is not known until the 2xx is parsed below — assigned there (ADR-0066).
             srtp_inbound=None,
-            srtp_outbound=None,
+            # Outbound (TX/encrypt) SRTP is keyed from OUR offer a=crypto (None=plain).
+            srtp_outbound=_srtp_outbound_from_offer(offer_crypto),
             symmetric=media_cfg.rtp_symmetric,
             # RTP-inactivity watchdog (ADR-0026): an outbound call whose media
             # goes silent ends as MEDIA_TIMEOUT, not an indefinite hang.
@@ -1383,6 +1441,9 @@ class VoipAdapter(BasePlatformAdapter):
             port=engine.local_port,
             codecs=_outbound_offer_codecs(),
             session_id=session_id,
+            # SDES-SRTP offer (ADR-0066): when set, the profile becomes RTP/SAVP and the
+            # a=crypto carries our offer key; None ⇒ plain RTP/AVP (unchanged default).
+            crypto=offer_crypto,
         )
 
         # --- Register a _QueueSink so we can await responses ---------------
@@ -1504,6 +1565,27 @@ class VoipAdapter(BasePlatformAdapter):
             if answer_audio is None:
                 raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
 
+            # SDES-SRTP answer handling (ADR-0066). When we offered RTP/SAVP, the 2xx
+            # MUST answer RTP/SAVP with a usable a=crypto: that key decrypts the
+            # callee's inbound media (RFC 4568 §6.1 — keyed by its sender). A plain
+            # RTP/AVP answer (or an SAVP answer with no usable a=crypto) is a DOWNGRADE
+            # of a call we asked to protect — FAIL CLOSED (raise before ACK, mirroring
+            # the codec-mismatch 488 below) rather than silently streaming plaintext. No
+            # check when we offered plain (offer_crypto is None): the plain answer is
+            # expected and answer_inbound_crypto stays None (cleartext, unchanged).
+            answer_inbound_crypto: CryptoAttribute | None = None
+            if offer_crypto is not None:
+                if not answer_audio.is_srtp or not answer_audio.crypto_attrs:
+                    # The transport auto-ACKs only non-2xx; raising here leaves the 2xx
+                    # un-ACKed (absorbed by retransmission/the proxy), the same shape as
+                    # the codec-mismatch 488 path — no plaintext engine is ever started.
+                    raise OutboundCallFailed(
+                        488,
+                        "2xx answered plain RTP (or SAVP without a usable a=crypto) to "
+                        "an SRTP offer — refusing to downgrade to cleartext",
+                    )
+                answer_inbound_crypto = answer_audio.crypto_attrs[0]
+
             try:
                 # ADR-0049: the SIP answer may negotiate Opus when we offered it
                 # (libopus available) — accept it here too, not only G.722/G.711.
@@ -1545,6 +1627,15 @@ class VoipAdapter(BasePlatformAdapter):
             engine._remote_address = remote_address
             engine._remote_port = answer_audio.port
             engine._outbound_addr = (remote_address, answer_audio.port)
+
+            # Key the inbound (RX/decrypt) SRTP from the callee's ANSWER a=crypto
+            # (ADR-0066, RFC 4568 §6.1). The engine was built before the answer was
+            # known (srtp_inbound=None); set it here, alongside the other negotiated
+            # engine values. None ⇒ a plain RTP/AVP call (offer_crypto was None), so the
+            # engine stays cleartext. The fail-closed guard above guarantees that when
+            # we OFFERED SAVP this is non-None (a plain answer already raised), so a
+            # secured outbound call is never left with a half-keyed engine.
+            engine._srtp_in = _srtp_inbound_from_answer(answer_inbound_crypto)
 
             # Update the engine codec from the negotiated answer (the engine was
             # constructed with Codec.PCMU as a placeholder before the answer was
@@ -1683,6 +1774,11 @@ class VoipAdapter(BasePlatformAdapter):
                 port=engine.local_port,
                 codecs=tuple(agreed_codecs),
                 session_id=session_id,
+                # SDES continuity (ADR-0066, mirrors the inbound ADR-0053 path): carry
+                # our offer crypto so an in-dialog re-offer (hold/resume/re-INVITE)
+                # stays RTP/SAVP + a=crypto and never downgrades to cleartext. None ⇒ a
+                # plain RTP/AVP call (offer_crypto was None).
+                crypto=offer_crypto,
             )
             session = CallSession(
                 dialog=dialog,

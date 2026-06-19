@@ -437,6 +437,17 @@ _WEBRTC_DTLS_SETUPS = frozenset({"auto", "active", "passive"})
 _SIP_DTLS_SRTP_KEY = "HERMES_VOIP_SIP_DTLS_SRTP"
 _DEFAULT_SIP_DTLS_SRTP = True
 
+# Outbound SDES-SRTP offering (ADR-0066). When True, an agent-originated outbound
+# SIP-over-TLS INVITE offers ``RTP/SAVP`` with a fresh per-call ``a=crypto``
+# (SDES, RFC 4568) instead of plain ``RTP/AVP``; a 2xx that answers plain RTP/AVP
+# then FAILS the call (fail-closed — never a silent plaintext downgrade of a call we
+# asked to protect). Default OFF: it is opt-in because the fail-closed policy turns a
+# non-SRTP terminating leg into a failed call, so flipping it on is the operator's
+# explicit choice once the terminating side is known SRTP-capable. No effect on the
+# inbound answer path or the WebRTC outbound path (which already offers DTLS-SRTP).
+_SIP_SDES_OFFER_KEY = "HERMES_VOIP_SIP_SDES_OFFER"
+_DEFAULT_SIP_SDES_OFFER = False
+
 # SIP DTLS-SRTP answerer role (ADR-0053 §2, RFC 8842 §5.3 / RFC 5763 §5). For an
 # ``a=setup:actpass`` offer the answerer picks its DTLS role; ``auto`` (the default)
 # makes us ``active`` (the DTLS client, sending the ClientHello) — many gateways offer
@@ -855,6 +866,14 @@ class MediaConfig:
     # Defaulted so existing direct constructions stay valid; validated against the
     # allowed set. No effect on the WebRTC path.
     sip_dtls_setup: str = _DEFAULT_SIP_DTLS_SETUP
+    # Outbound SDES-SRTP offering (ADR-0066): when True an agent-originated outbound
+    # SIP-over-TLS INVITE offers ``RTP/SAVP`` + a fresh per-call ``a=crypto`` instead
+    # of plain ``RTP/AVP``, and a 2xx that answers plain RTP/AVP fails the call
+    # (fail-closed). Default OFF (opt-in) so existing outbound deployments keep
+    # offering cleartext until the operator enables it. No effect on the inbound
+    # answer path or the WebRTC outbound path. Defaulted so existing direct
+    # constructions stay valid.
+    sip_sdes_offer: bool = _DEFAULT_SIP_SDES_OFFER
     # WebRTC ICE TURN relay (ADR-0034), as ``turn:``/``turns:`` URLs for relay
     # candidate gathering. Empty (the default) ⇒ no relay candidate. When set, the
     # username + password are required (validated at load). No effect on the
@@ -1255,6 +1274,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         sip_dtls_srtp=_parse_bool(env, _SIP_DTLS_SRTP_KEY, _DEFAULT_SIP_DTLS_SRTP),
         sip_dtls_setup=_value_lower(env, _SIP_DTLS_SETUP_KEY)
         or _DEFAULT_SIP_DTLS_SETUP,
+        sip_sdes_offer=_parse_bool(env, _SIP_SDES_OFFER_KEY, _DEFAULT_SIP_SDES_OFFER),
         ice_turn_urls=_ice_turn[0],
         ice_turn_username=_ice_turn[1],
         ice_turn_password=_ice_turn[2],

@@ -41,13 +41,13 @@ _DTLS_MAX = 63
 
 
 class _FakeUdpPipe:
-    """An in-memory bidirectional datagram pipe (the ``_UdpDatagramPipe`` surface).
+    """An in-memory bidirectional datagram pipe (the ``_DatagramPipe`` surface).
 
-    Implements exactly what ``SipDtlsMediaSession`` drives on its pipe — async
-    ``send``/``recv``/``close`` plus the ``latched`` property the comedia test
-    asserts. ``send`` enqueues onto the peer's inbound queue; ``recv`` awaits this
-    pipe's inbound queue. No real socket — a real ``DtlsEndpoint`` handshake
-    completes in-process over the linked pair.
+    Implements exactly what ``SipDtlsMediaSession`` drives on its pipe —
+    ``local_port`` / ``set_peer`` plus async ``send``/``recv``/``close``, and the
+    ``latched`` property the comedia test asserts. ``send`` enqueues onto the peer's
+    inbound queue; ``recv`` awaits this pipe's inbound queue. No real socket — a real
+    ``DtlsEndpoint`` handshake completes in-process over the linked pair.
     """
 
     def __init__(self) -> None:
@@ -55,6 +55,15 @@ class _FakeUdpPipe:
         self.peer: _FakeUdpPipe | None = None
         self.closed = False
         self.sent: list[bytes] = []
+        self.peer_addr: tuple[str, int] | None = None
+        self.latched = False
+
+    @property
+    def local_port(self) -> int:
+        return 50000  # a fixed fake port (the SDP-answer port in the fake path)
+
+    def set_peer(self, host: str, port: int) -> None:
+        self.peer_addr = (host, port)
 
     async def send(self, data: bytes) -> None:
         assert self.peer is not None
@@ -74,16 +83,20 @@ def _linked_pipes() -> tuple[_FakeUdpPipe, _FakeUdpPipe]:
     return a, b
 
 
-def _pipe_factory(
-    pipe: _FakeUdpPipe,
-) -> object:
-    """Return a one-shot factory yielding ``pipe`` (the session's pipe seam)."""
+class _OneShotFactory:
+    """A ``_PipeFactory``-shaped callable yielding a fixed pipe (the session seam)."""
 
-    async def factory(*, local_address: str, local_port: int) -> _FakeUdpPipe:
+    def __init__(self, pipe: _FakeUdpPipe) -> None:
+        self._pipe = pipe
+
+    async def __call__(self, *, local_address: str, local_port: int) -> _FakeUdpPipe:
         _ = (local_address, local_port)  # the fake pipe ignores bind params
-        return pipe
+        return self._pipe
 
-    return factory
+
+def _pipe_factory(pipe: _FakeUdpPipe) -> _OneShotFactory:
+    """Return a one-shot factory yielding ``pipe`` (the session's pipe seam)."""
+    return _OneShotFactory(pipe)
 
 
 async def _pump_dtls(endpoint: DtlsEndpoint, pipe: _FakeUdpPipe) -> None:

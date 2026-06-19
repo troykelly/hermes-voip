@@ -64,6 +64,10 @@ _SECURE_PROFILE = "RTP/SAVP"
 _PLAIN_PROFILE = "RTP/AVP"
 # WebRTC DTLS-SRTP profile (ADR-0016, RFC 5764 / RFC 4585).
 _WEBRTC_PROFILE = "UDP/TLS/RTP/SAVPF"
+# SIP (non-WebRTC) DTLS-SRTP profile (ADR-0053 Stage 2, RFC 5764 §8). Distinct from
+# the WebRTC profile: it has no AVPF feedback (the trailing ``F``, RFC 5124) and no
+# ICE. Used on the SIP-over-TLS media path where the peer RTP address is in the SDP.
+_SIP_DTLS_PROFILE = "UDP/TLS/RTP/SAVP"
 # RFC 4568 SDES. We negotiate the two AES_CM_128 SRTP crypto-suites: with an
 # 80-bit and a 32-bit HMAC-SHA1 auth tag. Both use a 128-bit (16-octet) master
 # key and 112-bit (14-octet) master salt — they differ only in the SRTP/SRTCP
@@ -105,6 +109,29 @@ _SETUP_ROLES = frozenset({"actpass", "active", "passive"})
 
 class SdpError(ValueError):
     """Raised when an SDP body is malformed (inbound network data)."""
+
+
+class MediaSecurity(Enum):
+    """The media-security tier chosen for an answer (ADR-0053, opportunistic).
+
+    The opportunistic ladder ranks strongest first and never answers a *weaker*
+    profile than the offer (RFC 5763/5764 DTLS-SRTP > RFC 4568 SDES > plain RTP):
+
+    * :attr:`DTLS` — the offer is ``UDP/TLS/RTP/SAVP`` with an ``a=fingerprint``
+      (cert-keyed DTLS-SRTP; the SRTP master key is never in the SDP).
+    * :attr:`SDES` — the offer is ``RTP/SAVP`` with a usable ``a=crypto`` (the
+      master key rides inline in the TLS-protected SDP, RFC 4568).
+    * :attr:`PLAIN` — the offer is plain ``RTP/AVP`` (or a ``RTP/SAVP`` offer that
+      carried no usable crypto, which cannot be keyed as SDES).
+
+    The ranker picks the tier; whether a :attr:`PLAIN` outcome is *answered* in the
+    clear or rejected is the caller's policy (the default is opportunistic — answer
+    plain — per the operator's choice), not this function's.
+    """
+
+    DTLS = "dtls"
+    SDES = "sdes"
+    PLAIN = "plain"
 
 
 def _validate_crypto(tag: int, suite: str, key_params: str) -> None:
@@ -489,6 +516,19 @@ class AudioMedia:
         ``a=crypto`` (RFC 8827 §6.5).
         """
         return self.protocol == _WEBRTC_PROFILE
+
+    @property
+    def is_sip_dtls(self) -> bool:
+        """True for a non-WebRTC DTLS-SRTP offer (``UDP/TLS/RTP/SAVP``, ADR-0053).
+
+        The SIP DTLS-SRTP profile is ``UDP/TLS/RTP/SAVP`` (no AVPF ``F``, no ICE)
+        **and** an ``a=fingerprint`` MUST be present — RFC 5763 §5 binds the DTLS
+        certificate by its fingerprint, so a ``UDP/TLS/RTP/SAVP`` m-line without one
+        is not a usable DTLS-SRTP offer. ``is_srtp`` is also true (``SAVP`` in the
+        profile) and ``is_webrtc`` is false (no AVPF), so the existing audio path
+        keeps owning it without engaging any ICE/BUNDLE machinery.
+        """
+        return self.protocol == _SIP_DTLS_PROFILE and self.fingerprint is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1089,6 +1129,43 @@ def negotiate_rtcp_mux(offer: AudioMedia) -> bool:
     return offer.rtcp_mux
 
 
+def negotiate_media_security(offer: AudioMedia) -> MediaSecurity:
+    """Rank the strongest media-security tier the offer can be answered with.
+
+    The opportunistic ladder (ADR-0053), strongest first, never answering a
+    *weaker* profile than the offer:
+
+    * :attr:`MediaSecurity.DTLS` when the offer is SIP DTLS-SRTP
+      (``UDP/TLS/RTP/SAVP`` + ``a=fingerprint``; :meth:`AudioMedia.is_sip_dtls`).
+      Checked first so a (non-conformant) offer that carries both a fingerprint and
+      ``a=crypto`` is still answered DTLS — DTLS is strictly stronger (the master
+      key never appears in the SDP) and we never downgrade it to SDES.
+    * :attr:`MediaSecurity.SDES` when the offer is ``RTP/SAVP`` (or any ``SAVP``
+      profile) carrying a usable ``a=crypto`` (``crypto_attrs`` is the parse-filtered
+      supported-only subset, so a non-empty tuple means a keyable SDES offer).
+    * :attr:`MediaSecurity.PLAIN` otherwise — a plain ``RTP/AVP`` offer, or a
+      ``RTP/SAVP`` offer whose crypto was malformed/unsupported (no usable key, so it
+      cannot be answered SDES).
+
+    This decides the tier only; the caller keys + builds the matching answer
+    (:func:`build_sip_dtls_answer`, :func:`build_audio_answer` with ``crypto=``, or
+    plain :func:`build_audio_answer`). Whether a :attr:`MediaSecurity.PLAIN` result
+    is answered in the clear or rejected is the caller's policy (default
+    opportunistic — answer plain).
+
+    Args:
+        offer: The peer's parsed audio offer.
+
+    Returns:
+        The chosen :class:`MediaSecurity` tier.
+    """
+    if offer.is_sip_dtls:
+        return MediaSecurity.DTLS
+    if offer.is_srtp and offer.crypto_attrs:
+        return MediaSecurity.SDES
+    return MediaSecurity.PLAIN
+
+
 def _fmtp_param(fmtp: str, key: str) -> str | None:
     """Return the value of a ``;``-separated fmtp parameter, or ``None``.
 
@@ -1544,6 +1621,153 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
         session_id=session_id,
         sess_version=sess_version,
         crypto=answer_crypto,
+        rtcp_mux=rtcp_mux,
+    )
+
+
+def _build_sip_dtls_body(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
+    *,
+    local_address: str,
+    port: int,
+    codecs: Sequence[Codec],
+    direction: str,
+    ptime: int,
+    session_id: int,
+    sess_version: int,
+    fingerprint: Fingerprint,
+    setup: SetupRole,
+    rtcp_mux: bool,
+) -> str:
+    """Emit a SIP DTLS-SRTP answer body (``UDP/TLS/RTP/SAVP``, ADR-0053 Stage 2).
+
+    Like the SDES/plain body it KEEPS the ``c=`` connection-address line and the
+    real media ``port`` (the peer's RTP address is in the SDP — there is no ICE),
+    and it adds the DTLS-SRTP keying attributes ``a=fingerprint`` + ``a=setup``
+    (RFC 5763 §5, RFC 4572). It carries **no** ``a=crypto`` (the SRTP key is derived
+    from the DTLS handshake, not inline) and **no** ICE attributes. ``a=rtcp-mux``
+    is emitted iff ``rtcp_mux`` (mirrored from the offer, RFC 5761).
+
+    This is a separate code path from :func:`_build_audio_body` so the SDES/plain
+    output stays byte-identical (regression invariant); for WebRTC use
+    :func:`_build_webrtc_body`.
+    """
+    if direction not in _DIRECTIONS:
+        msg = f"invalid SDP direction: {direction!r}"
+        raise ValueError(msg)
+    if not codecs:
+        msg = "an SDP audio body needs at least one codec"
+        raise ValueError(msg)
+    if not 1 <= port <= _MAX_PORT:
+        msg = f"RTP port out of range 1..{_MAX_PORT}: {port}"
+        raise ValueError(msg)
+    if ptime <= 0:
+        msg = f"ptime must be positive, got {ptime}"
+        raise ValueError(msg)
+    payloads = " ".join(str(c.payload_type) for c in codecs)
+    lines = [
+        "v=0",
+        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
+        "s=-",
+        f"c=IN IP4 {local_address}",
+        "t=0 0",
+        f"m=audio {port} {_SIP_DTLS_PROFILE} {payloads}",
+    ]
+    for codec in codecs:
+        lines.extend(_rtpmap_lines(codec))
+    # DTLS-SRTP keying (RFC 5763 §5, RFC 4572). No a=crypto: the SRTP master key is
+    # derived from the DTLS handshake, never carried inline in the SDP.
+    lines.append(f"a=fingerprint:{fingerprint.render()}")
+    lines.append(f"a=setup:{setup.render()}")
+    if rtcp_mux:
+        lines.append("a=rtcp-mux")
+    lines.append(f"a=ptime:{ptime}")
+    lines.append(f"a={direction}")
+    return _CRLF.join(lines) + _CRLF
+
+
+def build_sip_dtls_answer(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
+    offer: SessionDescription,
+    *,
+    local_address: str,
+    port: int,
+    supported: Sequence[str],
+    fingerprint: Fingerprint,
+    setup: SetupRole,
+    ptime: int = 20,
+    session_id: int = 0,
+    version: int | None = None,
+) -> str:
+    """Build a SIP DTLS-SRTP answer to a ``UDP/TLS/RTP/SAVP`` offer (ADR-0053 Stage 2).
+
+    Produces a ``UDP/TLS/RTP/SAVP`` answer carrying our DTLS keying attributes
+    (``a=fingerprint``, ``a=setup``) and (mirroring the offer, RFC 5761)
+    ``a=rtcp-mux``. **Unlike** :func:`build_webrtc_answer`, this KEEPS the ``c=``
+    connection address and the real media port — a SIP-over-TLS call has the peer's
+    RTP address in the SDP, so there is no ICE. It carries no ``a=crypto`` (the SRTP
+    key is DTLS-derived) and no ICE attributes.
+
+    For an SDES (``RTP/SAVP``) or plain (``RTP/AVP``) offer use
+    :func:`build_audio_answer`; for a WebRTC (``UDP/TLS/RTP/SAVPF``) offer use
+    :func:`build_webrtc_answer`. Codec negotiation (via :func:`negotiate_audio`)
+    follows the offer's preference order, and the direction mirrors the offer
+    (RFC 3264 §6.1).
+
+    Args:
+        offer: The parsed peer offer; its audio MUST be SIP DTLS-SRTP
+            (:meth:`AudioMedia.is_sip_dtls`).
+        local_address: The address we receive RTP on (IPv4 literal); emitted in
+            both ``o=`` and ``c=``.
+        port: The RTP port we receive on (the DTLS handshake socket's port).
+        supported: Encoding names we can handle (case-insensitive).
+        fingerprint: Our DTLS certificate fingerprint.
+        setup: Our DTLS role (``active`` or ``passive``; never ``actpass``).
+        ptime: Packetisation time in ms.
+        session_id: SDP ``o=`` session id for the answer.
+        version: SDP ``o=`` session version (defaults to ``session_id``).
+
+    Returns:
+        The SDP answer body terminated by CRLF, ready to attach to a 200 OK.
+
+    Raises:
+        SdpError: If the offer has no audio media, the offer is not SIP DTLS-SRTP
+            (``UDP/TLS/RTP/SAVP`` + ``a=fingerprint``), no common voice codec is
+            shared, or ``setup`` is ``actpass`` (forbidden for an answerer,
+            RFC 5763 §5).
+    """
+    audio = offer.audio
+    if audio is None:
+        msg = "cannot answer an offer with no audio media"
+        raise SdpError(msg)
+    if not audio.is_sip_dtls:
+        msg = (
+            "build_sip_dtls_answer requires a SIP DTLS-SRTP "
+            "(UDP/TLS/RTP/SAVP + a=fingerprint) offer; "
+            f"got profile {audio.protocol!r}"
+        )
+        raise SdpError(msg)
+    if setup.value == "actpass":
+        msg = (
+            "build_sip_dtls_answer: setup=actpass is forbidden for an answerer "
+            "(RFC 5763 §5); use active or passive"
+        )
+        raise SdpError(msg)
+    try:
+        chosen = negotiate_audio(audio, supported)
+    except ValueError as exc:
+        raise SdpError(str(exc)) from exc
+    # RFC 5761 §5.1.1: mirror the offer — answer rtcp-mux iff the peer offered it.
+    rtcp_mux = negotiate_rtcp_mux(audio)
+    sess_version = session_id if version is None else version
+    return _build_sip_dtls_body(
+        local_address=local_address,
+        port=port,
+        codecs=chosen,
+        direction=_ANSWER_DIRECTION[audio.direction],
+        ptime=ptime,
+        session_id=session_id,
+        sess_version=sess_version,
+        fingerprint=fingerprint,
+        setup=setup,
         rtcp_mux=rtcp_mux,
     )
 

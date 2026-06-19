@@ -262,6 +262,32 @@ addopts = "-q"
 testpaths = ["tests"]
 asyncio_mode = "strict"  # async tests carry an explicit @pytest.mark.asyncio
 
+# ---------------------------------------------------------------------------
+# uv resolver overrides (AGENTS.md rule 35 — supply-chain hygiene).
+#
+# hermes-agent==0.16.0 hard-pins `PyJWT[crypto]==2.12.1` in its Requires-Dist,
+# which blocks uv from resolving pyjwt>=2.13.0 through ordinary constraint
+# solving.  The HIGH severity CVE (public-key JWK accepted as HMAC secret →
+# forged HS256 tokens; PYSEC-2026-175..179, fix: pyjwt 2.13.0) can be patched
+# HERE via a uv resolver override, which replaces the hermes-agent pin at the
+# resolution layer without changing hermes-agent itself.  The override was
+# fully verified before commit (see ADR-0062):
+#
+#   • `uv lock` resolves cleanly with pyjwt==2.13.0 in the lock.
+#   • `uv sync --frozen --extra hermes --extra ml --extra media` installs without error.
+#   • hermes-contract gate (mypy + full pytest) passes green.
+#   • `pip-audit` reports no advisories — the 5 PYSEC-2026-175..179 suppression
+#     lines in supply-chain.yml are removed in the same commit.
+#   • Import smoke: `import jwt; import gateway.config; import gateway.platforms.base`
+#     all succeed with pyjwt 2.13.0 installed.
+#
+# REVERT THIS SECTION the moment hermes-agent ships a version that allows
+# pyjwt>=2.13.0 natively — at that point the override is no longer needed and
+# `uv lock` will pick up the new constraint automatically.  See ADR-0062 and
+# docs/runbooks/0003-supply-chain-audit.md.
+[tool.uv]
+override-dependencies = ["pyjwt[crypto]>=2.13.0"]
+
 [dependency-groups]
 # Exact pins (AGENTS.md rule 33: no floating ranges); uv.lock is the full
 # transitive lock and CI installs with `uv sync --frozen`.

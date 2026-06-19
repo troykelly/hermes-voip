@@ -13,12 +13,7 @@ ADR-0024. This runbook is the HOW.
 
 ```yaml
 - run: uv sync --frozen --all-extras        # install hermes+ml+media+webrtc too
-- run: uv run pip-audit \                    # audit the FULL installed surface
-    --ignore-vuln PYSEC-2026-175 \           # pyjwt 2.12.1 advisories,
-    --ignore-vuln PYSEC-2026-176 \           # fixed in 2.13.0 but BLOCKED upstream
-    --ignore-vuln PYSEC-2026-177 \           # (hermes-agent==0.16.0 hard-pins
-    --ignore-vuln PYSEC-2026-178 \           #  PyJWT[crypto]==2.12.1). Per-ID so
-    --ignore-vuln PYSEC-2026-179             #  any OTHER advisory still fails red.
+- run: uv run pip-audit                     # audit the FULL installed surface, no suppression
 # licence gate (unchanged): scoped to PRODUCTION deps via `uv export --no-dev`
 ```
 
@@ -29,28 +24,36 @@ licence gate is unaffected — it reads the lock via `uv export --frozen --no-de
 which ignores extras, so it stays scoped to production deps (today: just
 `audioop-lts`).
 
-## The pyjwt suppression — why, and when it goes away
+## pyjwt history — fully resolved (ADR-0062)
 
-`pyjwt 2.12.1` (transitive via the `hermes` extra) carries 5 advisories
-(PYSEC-2026-175 … -179), fixed in 2.13.0. We **cannot** bump it:
-`hermes-agent==0.16.0` hard-pins `PyJWT[crypto]==2.12.1`, and forcing
-`pyjwt>=2.13.0` makes `uv lock` unsatisfiable. The fix is upstream
-(hermes-agent must relax the pin). Until then the 5 IDs are ignored **by ID** so
-the gate stays green-but-actionable.
+`pyjwt 2.12.1` (transitive via the `hermes` extra) carried 5 advisories
+(PYSEC-2026-175 … -179; HIGH + medium/low; fix: 2.13.0). Previously blocked
+because `hermes-agent==0.16.0` hard-pinned `PyJWT[crypto]==2.12.1` and
+`uv lock` reported "unsatisfiable" when forced to ≥2.13.0.
 
-**Drop the ignores when hermes-agent relaxes the pin.** On every hermes-agent
-bump, re-check:
+**Resolved 2026-06-19** via a uv resolver override in `pyproject.toml`
+(`[tool.uv] override-dependencies = ["pyjwt[crypto]>=2.13.0"]`), which
+supersedes the hermes-agent pin at the resolution layer. `uv lock` now resolves
+cleanly to pyjwt 2.13.0; `pip-audit` reports no advisories. The five
+`--ignore-vuln` lines that previously suppressed these CVEs have been removed
+from `supply-chain.yml`. See ADR-0062 for the full rationale and verification
+evidence.
+
+**Revert path.** If a future hermes-agent version is incompatible with
+pyjwt 2.13.x (i.e. `uv lock` fails "unsatisfiable" after a hermes-agent bump),
+the override may need to be widened or removed. If hermes-agent itself ships a
+native allow for pyjwt≥2.13.0, the override section in `pyproject.toml` becomes
+a no-op but does no harm; it may be removed for cleanliness.
+
+Re-check after any hermes-agent bump:
 
 ```bash
-# from a worktree (NOT the root checkout). Does the new hermes-agent still pin ==2.12.1?
+# from a worktree (NOT the root checkout).
+uv lock                                     # must resolve without error
 uv sync --frozen --all-extras
-uv run python -c "import importlib.metadata as m; print([r for r in (m.requires('hermes-agent') or []) if 'jwt' in r.lower()])"
+uv run pip-audit                            # must exit 0 with no vulnerabilities
+uv run python -c "import jwt; print(jwt.__version__)"   # must print >=2.13.0
 ```
-
-If that no longer prints `==2.12.1`, add `"pyjwt>=2.13.0"` to the `hermes` extra
-in `pyproject.toml`, run `uv lock`, confirm the lock moves pyjwt to ≥2.13.0, and
-**delete the five `--ignore-vuln` lines** from the workflow + the suppression note
-in ADR-0024.
 
 ## Verify (locally, before relying on CI — rule 15)
 
@@ -59,20 +62,8 @@ separate command (exit code shown):
 
 ```bash
 uv sync --frozen --all-extras                      # mirror the CI audit env
-uv run pip-audit \
-  --ignore-vuln PYSEC-2026-175 --ignore-vuln PYSEC-2026-176 \
-  --ignore-vuln PYSEC-2026-177 --ignore-vuln PYSEC-2026-178 \
-  --ignore-vuln PYSEC-2026-179
-# expect: "No known vulnerabilities found, 8 ignored"  +  exit 0
-```
-
-Prove the ignore is **scoped** (not a blanket mute) — omit one ID and it must fail:
-
-```bash
-uv run pip-audit \
-  --ignore-vuln PYSEC-2026-175 --ignore-vuln PYSEC-2026-176 \
-  --ignore-vuln PYSEC-2026-177 --ignore-vuln PYSEC-2026-178
-# expect: "Found ... known vulnerabilities"  +  exit 1
+uv run pip-audit
+# expect: "No known vulnerabilities found"  +  exit 0
 ```
 
 Licence gate (must stay scoped to production deps):
@@ -95,9 +86,12 @@ that is expected, not a failure.
 1. Read the `pip-audit` output: package, advisory ID, fix version.
 2. If a fix version exists and resolves: bump the pin in `pyproject.toml`,
    `uv lock`, re-run the **Verify** block, open a PR.
-3. If blocked upstream (like pyjwt): confirm with `uv lock` that the bump is
-   unsatisfiable, file/locate the upstream issue, and add a **per-ID**
-   `--ignore-vuln` with an inline justification + an entry in ADR-0024's
-   suppression note — never a blanket package ignore.
-4. Never widen the licence allowlist to copyleft to make the licence gate pass
+3. If a resolver override is needed (package hard-pinned by a transitive dep):
+   add `"pkg>=fix-version"` to `[tool.uv] override-dependencies` in
+   `pyproject.toml`, run `uv lock`, verify the lock picks the patched version,
+   run `uv run pip-audit`, write an ADR documenting the decision.
+4. If truly blocked (e.g. override causes import failure or test breakage):
+   confirm with test evidence, add a **per-ID** `--ignore-vuln` with an inline
+   justification + an ADR entry — never a blanket package ignore.
+5. Never widen the licence allowlist to copyleft to make the licence gate pass
    (rule 35); never disable the job.

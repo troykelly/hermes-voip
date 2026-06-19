@@ -31,23 +31,13 @@ jobs:
       # Advisory gate (AGENTS.md rule 35). The editable local project is not on
       # PyPI and is skipped (not a failure).
       #
-      # The five PYSEC-2026-175..179 advisories are KNOWN and BLOCKED UPSTREAM:
-      # they affect pyjwt 2.12.1 (fix: 2.13.0), but hermes-agent==0.16.0 hard-pins
-      # `PyJWT[crypto]==2.12.1` (verified: its PyPI Requires-Dist and `uv lock`,
-      # which fails "unsatisfiable" if we force pyjwt>=2.13.0). We cannot bump
-      # pyjwt without an incompatible resolution, so they are suppressed by ID
-      # here (rule 20 — justified, reviewable) to keep this gate ACTIONABLE: any
-      # OTHER advisory — including a sixth pyjwt one or a new vuln in any extra —
-      # still fails CI red. Remove these ignores the moment hermes-agent relaxes
-      # its pin (tracked: ADR-0024 + the hermes-agent upstream issue). See
-      # docs/runbooks/0003-supply-chain-audit.md.
-      - run: >-
-          uv run pip-audit
-          --ignore-vuln PYSEC-2026-175
-          --ignore-vuln PYSEC-2026-176
-          --ignore-vuln PYSEC-2026-177
-          --ignore-vuln PYSEC-2026-178
-          --ignore-vuln PYSEC-2026-179
+      # PYSEC-2026-175..179 (pyjwt 2.12.1, HIGH + medium/low, fix: 2.13.0) are
+      # RESOLVED: a [tool.uv] override-dependencies in pyproject.toml forces
+      # pyjwt[crypto]>=2.13.0 at the uv resolver level, superseding the
+      # hermes-agent==0.16.0 hard-pin. Fully verified: uv lock resolves cleanly,
+      # uv sync installs pyjwt 2.13.0, hermes-contract gate passes, pip-audit
+      # reports no advisories. See ADR-0062 and docs/runbooks/0003-supply-chain-audit.md.
+      - run: uv run pip-audit
       # Licence gate (AGENTS.md rule 35), scoped to PRODUCTION deps — the licences
       # we actually ship carry the distribution obligations; dev-tooling licences
       # do not. Empty today (no runtime deps), so it passes and begins gating the

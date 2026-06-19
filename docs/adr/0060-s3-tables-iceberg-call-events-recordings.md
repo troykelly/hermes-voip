@@ -3,7 +3,7 @@
 **Status:** Proposed — Deferred (nice-to-have; requires operator approval per AGENTS rule 40)
 **Date:** 2026-06-19
 **Scope:** observability / data export (future)
-**Relates to:** ADR-0010 (signalling/DTMF), ADR-0036 (DTMF mechanisms), ADR-0053 (SRTP media), ADR-0055 (signalling robustness), and runbook `docs/runbooks/0014-voip-slo-metrics.md` (SLO signal catalogue); follow-on to the proposed call-event **sink Protocol** (ADR-0059, in-flight).
+**Relates to:** ADR-0010 (signalling/DTMF), ADR-0036 (DTMF mechanisms), ADR-0053 (SRTP media), ADR-0055 (signalling robustness), and runbook `docs/runbooks/0014-voip-slo-metrics.md` (SLO signal catalogue). The call-event **sink interface** this design relies on is proposed within this ADR (see §2); it would be specified in its own ADR if adopted.
 
 ---
 
@@ -50,8 +50,8 @@ Iceberg tables in a `hermes_voip` namespace:
 Integration shape (the load-bearing part for rule-40 compliance):
 
 - **Core stays dependency-free and cloud-agnostic.** The core package defines a generic, vendor-neutral
-  **call-event sink interface** (an async `Protocol`; see ADR-0059) through which the adapter routes
-  lifecycle events off the hot path. Core contains **no `boto3`, no AWS SDK, no Iceberg/PyIceberg
+  **call-event sink interface** (an async `Protocol`, proposed here — see §2; to be specified in its
+  own ADR if adopted) through which the adapter routes lifecycle events off the hot path. Core contains **no `boto3`, no AWS SDK, no Iceberg/PyIceberg
   import** — none of it. The sink registry is **empty / no-op by default** (default **OFF**).
 - **The S3-Tables writer is an OPTIONAL extra**, not a core dependency. It lives behind an opt-in
   dependency group (e.g. `optional-aws-sinks` in `pyproject.toml`) and is enabled only by explicit

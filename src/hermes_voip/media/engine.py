@@ -2169,6 +2169,27 @@ class RtpMediaTransport:
         self._payload_type = value
 
     @property
+    def ptime(self) -> int:
+        """The RTP packetisation time in ms (the negotiated framing; ADR-0056).
+
+        Every TX framing computation reads this (samples per packet, the RTP
+        timestamp increment, the pacing interval), so the engine frames at the
+        NEGOTIATED ptime rather than a hard-coded 20 ms. Defaults to
+        :data:`_DEFAULT_PTIME_MS`; set it (e.g. from
+        :func:`hermes_voip.sdp.negotiate_ptime` on the offer) after construction
+        to apply the agreed framing — mirroring the post-construction
+        :attr:`payload_type` / :attr:`telephone_event_payload_type` setters.
+        """
+        return self._ptime
+
+    @ptime.setter
+    def ptime(self, value: int) -> None:
+        if value <= 0:
+            msg = f"ptime must be a positive number of milliseconds, got {value}"
+            raise ValueError(msg)
+        self._ptime = value
+
+    @property
     def _descriptor(self) -> _CodecDescriptor:
         """Rate descriptor for the CURRENT codec.
 

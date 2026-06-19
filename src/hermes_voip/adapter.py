@@ -68,7 +68,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource
 
-from hermes_voip.call import CallSession
+from hermes_voip.call import CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
     extract_call_context,
@@ -232,6 +232,17 @@ class _AnsweredCallPeerEnded(Exception):  # noqa: N818 — control-flow signal, 
 # IMMEDIATELY on the failure; only the BYE waits.
 _ANSWERED_ABORT_ACK_TIMEOUT_S = 32.0
 
+# Bounded settle (seconds) after an ACK confirms the dialog, during which a closely-
+# trailing peer BYE still wins (ADR-0065). The transport drives ONE sequential read
+# loop, so a BYE the peer sends right after its ACK is a separate, not-yet-read frame
+# when the ACK wakes the abort's wait — a snapshot there returns ACK_CONFIRMED and the
+# abort BYEs, colliding with the peer's just-arriving BYE (glare). This brief grace lets
+# the trailing BYE supersede the ACK so we send no BYE of our own. A BYE after the grace
+# is independent teardown the SIP layer absorbs (both-sides BYE, RFC 3261 §15). The
+# grace need only cover the read-loop scheduling gap, so it stays short. Only the (rare)
+# abort path pays it, and only when the peer ACKs without then BYEing.
+_ACK_BYE_SETTLE_S = 0.5
+
 
 class _DialogOutcome(enum.Enum):
     """Terminal state of an answered dialog seen by :class:`_AnsweredDialogGuard`.
@@ -271,14 +282,19 @@ class _AnsweredDialogGuard:
     """
 
     def __init__(
-        self, *, dialog: Dialog, transport: SignalingTransport, call_id: str
+        self, *, dialog: Dialog, transport: CallSignaling, call_id: str
     ) -> None:
-        """Bind the guard to the answered ``dialog`` on ``transport``."""
+        """Bind the guard to the answered ``dialog`` on ``transport``.
+
+        ``transport`` is typed as the narrow :class:`~hermes_voip.call.CallSignaling`
+        seam — the guard only ever ``send``s SIP responses (200/491) — not the full
+        :data:`SignalingTransport` union; both concrete transports satisfy it.
+        """
         self._dialog = dialog
         self._transport = transport
         self._call_id = call_id
         self._confirmed = asyncio.Event()
-        self._peer_bye = False
+        self._peer_bye = asyncio.Event()
 
     @property
     def peer_ended(self) -> bool:
@@ -290,7 +306,7 @@ class _AnsweredDialogGuard:
         so the check + registration are atomic relative to inbound routing on the
         single-threaded loop (a later BYE then routes to the real CallSession).
         """
-        return self._peer_bye
+        return self._peer_bye.is_set()
 
     async def handle_request(self, request: SipRequest) -> None:
         """Consume one in-dialog request during the handshake window.
@@ -306,9 +322,13 @@ class _AnsweredDialogGuard:
         if method == "ACK":
             self._confirmed.set()
         elif method == "BYE":
-            await self._transport.send(build_response(request, 200, "OK"))
-            self._peer_bye = True
+            # Mark peer-ended + confirmed BEFORE the 200-send await, so the flag is
+            # observable the instant this handler runs (no await/yield can interleave
+            # between dispatch and the mark) — the abort's settle-grace and the
+            # success-path peer_ended check both rely on this.
+            self._peer_bye.set()
             self._confirmed.set()
+            await self._transport.send(build_response(request, 200, "OK"))
         elif method == "INVITE":
             await self._transport.send(build_response(request, 491, "Request Pending"))
         elif method in ("INFO", "NOTIFY", "OPTIONS"):
@@ -325,21 +345,37 @@ class _AnsweredDialogGuard:
     async def wait_outcome(self, *, timeout: float) -> _DialogOutcome:
         """Wait up to ``timeout`` s and return the dialog's terminal outcome.
 
-        Returns :attr:`_DialogOutcome.PEER_BYE` if the peer BYE'd (whether before or
-        during the wait — checked AFTER the wake so a BYE racing the ACK wins, closing
-        the double-BYE window), :attr:`ACK_CONFIRMED` if the peer only ACKed, or
-        :attr:`TIMEOUT` if neither arrived within the bound. The caller sends our BYE
-        only on ``ACK_CONFIRMED`` / ``TIMEOUT`` — never on ``PEER_BYE`` (the peer
-        already ended the dialog).
+        Returns :attr:`_DialogOutcome.PEER_BYE` if the peer BYE'd (whether before the
+        wait, during it, or closely trailing an ACK), :attr:`ACK_CONFIRMED` if the peer
+        only ACKed, or :attr:`TIMEOUT` if neither arrived within the bound. The caller
+        sends our BYE only on ``ACK_CONFIRMED`` / ``TIMEOUT`` — never on ``PEER_BYE``
+        (the peer already ended the dialog).
+
+        Two waits close the double-BYE window. First, a bounded wait for the dialog to
+        confirm (ACK or BYE). If that resolves via a BYE, ``PEER_BYE`` wins outright.
+        If it resolves via an ACK, a second bounded wait (``_ACK_BYE_SETTLE_S``) lets a
+        closely-trailing BYE supersede it: the transport drives ONE sequential read
+        loop, so a BYE the peer sends right after its ACK is a separate, not-yet-read
+        frame when the ACK wakes this method — without the settle a snapshot here would
+        return ``ACK_CONFIRMED`` and the abort would BYE into the peer's arriving BYE
+        (glare). A BYE after the settle is independent teardown the SIP layer absorbs.
         """
         if not self._confirmed.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._confirmed.wait(), timeout=timeout)
-        if self._peer_bye:
+        if self._peer_bye.is_set():
             return _DialogOutcome.PEER_BYE
-        if self._confirmed.is_set():
-            return _DialogOutcome.ACK_CONFIRMED
-        return _DialogOutcome.TIMEOUT
+        if not self._confirmed.is_set():
+            return _DialogOutcome.TIMEOUT
+        # Confirmed by ACK. Grace-wait for a BYE the peer may have sent right behind the
+        # ACK (still an unread frame on the single read loop) so it suppresses our BYE.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._peer_bye.wait(), timeout=_ACK_BYE_SETTLE_S)
+        return (
+            _DialogOutcome.PEER_BYE
+            if self._peer_bye.is_set()
+            else _DialogOutcome.ACK_CONFIRMED
+        )
 
 
 # Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):

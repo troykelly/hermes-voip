@@ -55,10 +55,19 @@ Concretely (`src/hermes_voip/adapter.py`):
   **enum** — `ACK_CONFIRMED | PEER_BYE | TIMEOUT` — not a mutable flag read at one
   moment. `peer_ended` is an instantaneous property (the success-path check);
   `await wait_outcome(timeout)` blocks until the ACK/BYE arrives (or the bound elapses)
-  and returns the outcome, with **`PEER_BYE` winning over `ACK_CONFIRMED`** (re-checked
-  after the wake) so a peer BYE racing the ACK closes the double-BYE window. Making the
-  outcome explicit collapses the two concurrency edges (peer-BYE-during-success and
-  double-BYE) into one race-free decision used by both the success path and the abort.
+  and returns the outcome, with **`PEER_BYE` winning over `ACK_CONFIRMED`** so a peer
+  BYE racing the ACK closes the double-BYE window. Winning requires two waits, because
+  the transport drives **one sequential read loop**: a BYE the peer sends right behind
+  its ACK is a separate, not-yet-read frame when the ACK wakes the waiter, so a single
+  post-wake re-check would still return `ACK_CONFIRMED` and the abort would BYE into the
+  peer's arriving BYE (glare). So after an ACK confirms, `wait_outcome` waits a short
+  bounded **settle** (`_ACK_BYE_SETTLE_S`, 0.5 s) for a trailing BYE to supersede it;
+  a BYE after the settle is independent teardown the SIP layer absorbs (both-sides BYE,
+  RFC 3261 §15). `handle_request` sets the peer-BYE flag *before* its 200-send `await`,
+  so the flag is observable the instant the BYE frame is dispatched. Making the outcome
+  explicit collapses the concurrency edges (peer-BYE-during-success, double-BYE on a
+  BYE during the wait, and double-BYE on a BYE trailing the ACK) into one race-free
+  decision used by both the success path and the abort.
 - **Registration at answer-time:** right after `_send_answer_200`, the setup helper
   registers the guard via `manager.add_call(dialog_id, guard)` +
   `transport.add_call(call_id, guard)`. The `2xx`-ACK now routes to the guard (no longer

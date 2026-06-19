@@ -296,9 +296,12 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
         if item is _CLOSE_SENTINEL:
             msg = "_UdpDatagramPipe closed while receiving"
             raise ConnectionError(msg)
-        # The sentinel is the only non-bytes item ever enqueued; narrow for the type
-        # checker (every datagram path enqueues bytes).
-        assert isinstance(item, bytes)  # noqa: S101 - type narrowing, not a runtime check
+        # The sentinel is the only non-bytes item ever enqueued. Guard the invariant
+        # with an explicit raise — not an `assert`, which `python -O` strips — and to
+        # narrow `bytes | object` to `bytes` for the type checker (rules 17, 37).
+        if not isinstance(item, bytes):
+            msg = "_UdpDatagramPipe inbound queue yielded a non-datagram item"
+            raise TypeError(msg)
         return item
 
     async def close(self) -> None:
@@ -308,8 +311,16 @@ class _UdpDatagramPipe(asyncio.DatagramProtocol):
         self._closed = True
         if self._transport is not None and not self._transport.is_closing():
             self._transport.close()
-        # Wake a receiver blocked on an empty queue with the close sentinel.
-        with contextlib.suppress(asyncio.QueueFull):
+        # Wake a receiver blocked on an empty queue with the close sentinel. Under a
+        # flood the bounded queue can be full; discard one queued datagram so the
+        # wake signal always lands (rule 37 — a silently dropped sentinel could
+        # strand a receiver that later blocks on the drained queue). close() runs
+        # synchronously, so no datagram can be enqueued between the steps.
+        try:
+            self._inbound.put_nowait(_CLOSE_SENTINEL)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._inbound.get_nowait()
             self._inbound.put_nowait(_CLOSE_SENTINEL)
 
 

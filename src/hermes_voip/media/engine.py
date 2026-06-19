@@ -2394,7 +2394,7 @@ class RtpMediaTransport:
         self,
         *,
         mux: bool,
-        rtp_payload_types: tuple[int, ...] = (),
+        rtp_payload_types: tuple[int, ...],
         remote_rtcp_addr: tuple[str, int] | None = None,
         send_bye_on_stop: bool = True,
     ) -> None:

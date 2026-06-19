@@ -399,7 +399,7 @@ async def test_start_rtcp_does_not_inherit_a_no_op_pacing_sleep() -> None:
     # Send one frame so build_rtcp_report() yields an SR; without prior media it
     # returns None and the loop emits nothing, hiding the spin (a false GREEN).
     await engine.send_audio(_g711_frame(1))
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         # 200 instant event-loop turns: a wall-clock loop is still parked on its first
         # multi-second §6.2 interval (no real time has passed), so the sink stays empty.
@@ -431,13 +431,14 @@ async def test_start_rtcp_refuses_mux_for_an_rfc5761_conflict_payload_type() -> 
     await engine.start_rtcp(mux=True, rtp_payload_types=(72,))  # 72 ∈ 64-95
     assert engine._rtcp_active is False
     assert engine._rtcp_task is None
-    # Positive control: PCMU(0)/PCMA(8)/dynamic(96) are all outside 64-95 ⇒ activates.
-    await engine.start_rtcp(mux=True, rtp_payload_types=(0, 8, 96))
+    # Positive control (a fresh engine — PCMU(0)/PCMA(8)/dynamic(96) are outside 64-95).
+    ok_engine = _make_engine()
+    await ok_engine.start_rtcp(mux=True, rtp_payload_types=(0, 8, 96))
     try:
-        assert engine._rtcp_active is True
-        assert engine._rtcp_task is not None
+        assert ok_engine._rtcp_active is True
+        assert ok_engine._rtcp_task is not None
     finally:
-        await engine.stop()
+        await ok_engine.stop()
 
 
 @pytest.mark.asyncio
@@ -617,7 +618,7 @@ async def test_start_rtcp_muxed_registers_loop_task_and_rides_rtp_transport() ->
     engine = _make_engine()
     await engine.connect()
     engine._transport = _CaptureTransport()  # deterministic, no real socket
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         assert engine._rtcp_task is not None
         # Muxed: no separate RTCP sink is installed (RTCP rides _transport).
@@ -638,7 +639,9 @@ async def test_start_rtcp_non_muxed_opens_sibling_socket_on_rtp_port_plus_one() 
     engine = _make_engine()
     await engine.connect()
     rtp_port = engine.local_port
-    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    await engine.start_rtcp(
+        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
+    )
     try:
         assert engine._rtcp_task is not None
         # A separate sink was installed (NOT muxed over the RTP transport).
@@ -661,7 +664,7 @@ async def test_inbound_muxed_rtcp_datagram_reaches_ingest_not_audio() -> None:
     engine = _make_engine()
     await engine.connect()
     engine._transport = _CaptureTransport()
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         remote = ("127.0.0.1", 5004)
         # One real audio packet and one muxed RTCP packet, interleaved.
@@ -717,7 +720,7 @@ async def test_inbound_malformed_muxed_rtcp_is_dropped_not_fatal() -> None:
     engine = _make_engine()
     await engine.connect()
     engine._transport = _CaptureTransport()
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         remote = ("127.0.0.1", 5004)
         # A datagram whose 2nd byte is an RTCP PT (200) but is truncated garbage.
@@ -740,7 +743,9 @@ async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
     """
     engine = _make_engine()
     await engine.connect()
-    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    await engine.start_rtcp(
+        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
+    )
     try:
         rtcp_port = engine._rtcp_local_port
         assert rtcp_port is not None
@@ -839,7 +844,9 @@ async def test_non_muxed_active_call_does_not_demux_rtcp_typed_rtp_off_rtp_socke
     """
     engine = _make_engine()
     await engine.connect()
-    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    await engine.start_rtcp(
+        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
+    )
     try:
         remote = ("127.0.0.1", 5004)
         # A genuine peer RR (2nd byte 201) delivered on the RTP socket. On a non-muxed
@@ -870,7 +877,7 @@ async def test_start_rtcp_refuses_secured_engine_srtp_inbound() -> None:
     engine = _make_engine()
     engine._srtp_in = _IdentitySrtp()  # mark inbound as secured
     await engine.connect()
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         assert engine._rtcp_task is None  # no loop started
         assert engine._rtcp_active is False  # demux not engaged
@@ -885,7 +892,7 @@ async def test_start_rtcp_refuses_secured_engine_srtp_outbound() -> None:
     engine = _make_engine()
     engine._srtp_out = _IdentitySrtp()  # mark outbound as secured
     await engine.connect()
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         assert engine._rtcp_task is None
         assert engine._rtcp_active is False
@@ -915,7 +922,7 @@ async def test_start_rtcp_refuses_secured_engine_ice_dtls() -> None:
     )
     engine._srtp_in = _IdentitySrtp()
     engine._srtp_out = _IdentitySrtp()
-    await engine.start_rtcp(mux=True)
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
     try:
         assert engine._rtcp_task is None
         assert engine._rtcp_active is False
@@ -941,7 +948,9 @@ async def test_start_rtcp_non_muxed_socket_failure_degrades_call_stays_up() -> N
     blocker.bind((engine._local_address, rtp_port + 1))
     try:
         # Must NOT raise — the call degrades to RTCP-off.
-        await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+        await engine.start_rtcp(
+            mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
+        )
         assert engine._rtcp_active is False  # RTCP left inactive
         assert engine._rtcp_task is None  # loop never started
         assert engine._rtcp_transport is None  # no partial socket retained
@@ -967,7 +976,9 @@ async def test_stop_awaits_and_clears_non_muxed_rtcp_reader() -> None:
     """
     engine = _make_engine()
     await engine.connect()
-    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    await engine.start_rtcp(
+        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
+    )
     reader = engine._rtcp_reader
     assert reader is not None
     assert not reader.done()

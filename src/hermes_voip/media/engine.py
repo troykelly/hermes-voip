@@ -101,10 +101,13 @@ from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
 from hermes_voip.media.srtp import SrtpError
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 from hermes_voip.rtcp import (
+    RTCP_PT_APP,
+    RTCP_PT_SR,
     Bye,
     ReceiverReport,
     ReceptionStats,
     ReportBlock,
+    RtcpError,
     SdesChunk,
     SenderReport,
     SourceDescription,
@@ -180,6 +183,12 @@ _DEFAULT_CNAME: Final[str] = "hermes-voip"
 # real call reports about every 5 s regardless — the default below only matters for
 # the (unused here) many-party case. Bytes/s.
 _DEFAULT_RTCP_BANDWIDTH: Final[float] = 500.0
+# RFC 5761 §4: RTP payload types 64-95 alias the RTCP packet-type byte (an RTP M+PT
+# of 200-204 is indistinguishable from SR/RR/SDES/BYE/APP) on a muxed stream, so
+# RTP/RTCP cannot be demultiplexed. start_rtcp refuses mux activation for such a PT
+# (the adapter also refuses it before activation — defense in depth).
+_RTCP_MUX_CONFLICT_PT_MIN: Final[int] = 64
+_RTCP_MUX_CONFLICT_PT_MAX: Final[int] = 95
 # Seed average compound-RTCP packet size (bytes incl. UDP/IP, RFC 3550 §6.2) before
 # the first report is sent; refined toward the real sizes as reports are emitted.
 _INITIAL_AVG_RTCP_SIZE: Final[float] = 96.0
@@ -558,6 +567,11 @@ class _IceDatagramPipe(Protocol):
 _RFC7983_SRTP_FIRST_BYTE_MIN: Final[int] = 128
 _RFC7983_SRTP_FIRST_BYTE_MAX: Final[int] = 191
 
+# The RFC 5761 §4 RTP-vs-RTCP discriminator on a muxed stream is the SECOND byte
+# (the RTP M+PT byte aliases the RTCP packet-type byte), so a datagram must be at
+# least 2 bytes to demux. ADR-0061 adapter activation.
+_RTCP_DEMUX_MIN_LEN: Final[int] = 2
+
 
 class _DatagramSink(Protocol):
     """The synchronous datagram-send surface the engine's TX path uses.
@@ -707,6 +721,27 @@ class _UdpReceiver(asyncio.DatagramProtocol):
         if exc is not None:
             _log.warning("UDP connection lost — ending call: %s", exc)
             self._on_lost(exc)
+
+
+class _RtcpReceiver(asyncio.DatagramProtocol):
+    """DatagramProtocol for the SEPARATE RTCP socket (non-muxed path, RFC 3550 §11).
+
+    Used only when RTCP is not multiplexed with RTP (the offer carried no
+    ``a=rtcp-mux``): the engine binds a sibling UDP socket on RTP-port+1 and this
+    protocol enqueues each inbound RTCP datagram for the engine's RTCP reader loop
+    to feed into :meth:`~RtpMediaTransport.ingest_rtcp`. A full queue drops the
+    datagram (RTCP is periodic; a dropped report is harmless). The source address is
+    not retained — RTCP carries the sender SSRC, and we send to the negotiated RTCP
+    address, not a comedia-latched one.
+    """
+
+    def __init__(self, queue: asyncio.Queue[bytes]) -> None:
+        self._queue = queue
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:  # noqa: ARG002 — RTCP is keyed by SSRC, not source address
+        """Enqueue an inbound RTCP datagram (non-blocking; drop on overflow)."""
+        with contextlib.suppress(asyncio.QueueFull):
+            self._queue.put_nowait(data)
 
 
 # ---------------------------------------------------------------------------
@@ -1154,6 +1189,12 @@ class RtpMediaTransport:
         # ---- RTCP control channel (RFC 3550 §6, ADR-0061) ----
         self._cname = cname
         self._rtcp_send: Callable[[bytes], None] | None = rtcp_send
+        # The constructor-injected RTCP sink (None on a muxed prod call; a test sink
+        # or the separate-port adapter sink otherwise). The non-muxed start_rtcp path
+        # overwrites self._rtcp_send with a sibling-socket lambda; stop()/connect()
+        # restore it to THIS value so a reused engine never sends RTCP through a
+        # closed previous socket (codex review: RTCP-send lifecycle).
+        self._injected_rtcp_send: Callable[[bytes], None] | None = rtcp_send
         self._ntp_clock: Callable[[], float] = (
             ntp_clock if ntp_clock is not None else time.time
         )
@@ -1182,9 +1223,31 @@ class RtpMediaTransport:
         # The running average compound-RTCP size (RFC 3550 §6.2/§6.3.3) for the
         # interval calculation; seeded, then smoothed toward real sizes as we send.
         self._avg_rtcp_size: float = _INITIAL_AVG_RTCP_SIZE
-        # The background RTCP loop task (set by the adapter via run_rtcp; cancelled in
+        # The background RTCP loop task (set by :meth:`start_rtcp`; cancelled in
         # stop()). None on the TLS/UDP and ICE paths until the adapter starts it.
         self._rtcp_task: asyncio.Task[None] | None = None
+        # RTCP activation state (ADR-0061 adapter activation, set by start_rtcp,
+        # reset in connect()). ``_rtcp_active`` is True once the adapter activated RTCP
+        # for this call on EITHER path (muxed or non-muxed) — it gates the general RTCP
+        # machinery (the closing BYE, teardown quality logging). ``_rtcp_mux_active`` is
+        # a SEPARATE flag, True ONLY when RTCP is multiplexed onto the RTP transport
+        # (mux=True, RFC 5761); it — not ``_rtcp_active`` — gates the inbound muxed-RTCP
+        # demux in _inbound_gen, because on a NON-muxed call RTCP arrives on the sibling
+        # socket only and the RTP socket carries PURE RTP (codex review #1: gating the
+        # demux on ``_rtcp_active`` wrongly fired it on non-muxed calls, where an RTP
+        # packet whose 2nd byte aliases an RTCP PT would be mis-routed to ingest_rtcp).
+        # Both OFF until the adapter activates RTCP, so an engine on which RTCP was
+        # never started behaves byte-for-byte as before (an RTCP-typed datagram on the
+        # RTP socket is then just an unhandled payload type and is dropped). On the
+        # NON-muxed path start_rtcp binds a sibling RTCP DatagramTransport on RTP-port+1
+        # (RFC 3550 §11) and a reader that pumps it into ingest_rtcp;
+        # ``_rtcp_transport``/``_rtcp_reader``/``_rtcp_local_port`` hold it for stop()
+        # to tear down. All None on the muxed path (RTCP rides the RTP transport).
+        self._rtcp_active: bool = False
+        self._rtcp_mux_active: bool = False
+        self._rtcp_transport: asyncio.DatagramTransport | None = None
+        self._rtcp_reader: asyncio.Task[None] | None = None
+        self._rtcp_local_port: int | None = None
 
     # ------------------------------------------------------------------
     # MediaTransport Protocol
@@ -1300,6 +1363,17 @@ class RtpMediaTransport:
         self._rtt_seconds = None
         self._avg_rtcp_size = _INITIAL_AVG_RTCP_SIZE
         self._rtcp_task = None
+        # A reused engine starts a fresh call with RTCP dormant: the adapter must
+        # re-activate it (start_rtcp) per the new call's negotiated mux. The sibling
+        # RTCP socket (non-muxed path) was torn down in the previous stop().
+        self._rtcp_active = False
+        self._rtcp_mux_active = False
+        self._rtcp_transport = None
+        self._rtcp_reader = None
+        # Restore the constructor sink: drop any sibling-socket lambda a previous
+        # non-muxed call installed, so this call never sends RTCP via a closed socket.
+        self._rtcp_send = self._injected_rtcp_send
+        self._rtcp_local_port = None
 
         if self._ice is not None:
             # WebRTC path (ADR-0032): no socket. Wrap the ICE pipe in the synchronous
@@ -1440,6 +1514,32 @@ class RtpMediaTransport:
             if item is None:
                 return
             data, source = item
+
+            # Inbound RTCP demux (RFC 5761 §4, ADR-0061 adapter activation): on a
+            # MUXED stream RTP and RTCP share the 5-tuple, and the discriminator is
+            # the second byte — RTP's M+PT byte aliases the RTCP packet-type byte, so
+            # 200..204 (SR/RR/SDES/BYE/APP) is RTCP. Feed such a datagram to
+            # ingest_rtcp and consume it (it is control, never audio). Engaged ONLY
+            # when RTCP is MULTIPLEXED (``_rtcp_mux_active`` — NOT ``_rtcp_active``,
+            # which is also set on the non-muxed path where RTCP rides a SEPARATE
+            # socket and the RTP socket carries pure RTP; codex review #1) AND the
+            # stream is cleartext (``_srtp_in is None`` belt-and-suspenders: the engine
+            # has no SRTCP (RFC 3711 §3.4) transform, and start_rtcp already refuses a
+            # secured engine, so a secured session never multiplexes RTCP here). On the
+            # non-muxed path inbound RTCP arrives on the sibling socket
+            # (_rtcp_recv_loop), not this queue. The mux activation also guarantees no
+            # negotiated RTP payload type lies in 64-95 (the adapter refuses rtcp-mux
+            # for those per RFC 5761 §4), so a 200..204 second byte here is RTCP, never
+            # an aliased RTP M+PT. A malformed datagram is dropped, not fatal (mirrors
+            # the malformed-RTP drop below; per the ingest_rtcp contract).
+            if (
+                self._rtcp_mux_active
+                and self._srtp_in is None
+                and len(data) >= _RTCP_DEMUX_MIN_LEN
+                and RTCP_PT_SR <= data[1] <= RTCP_PT_APP
+            ):
+                self._ingest_rtcp_datagram(data)
+                continue
 
             rtp_pkt: RtpPacket
 
@@ -2290,6 +2390,201 @@ class RtpMediaTransport:
         # aligned, so concatenation stays a valid compound).
         return report + bye.pack()
 
+    async def start_rtcp(
+        self,
+        *,
+        mux: bool,
+        rtp_payload_types: tuple[int, ...],
+        remote_rtcp_addr: tuple[str, int] | None = None,
+        send_bye_on_stop: bool = True,
+    ) -> None:
+        """Activate RTCP for this call (ADR-0061 adapter activation, RFC 3550 §6).
+
+        The live activation point the adapter calls AFTER :meth:`connect` (the engine
+        never auto-starts RTCP — choosing the socket/mux needs the negotiated SDP the
+        adapter holds). It:
+
+        1. Chooses the RTCP transport from the negotiated mux. ``mux=True`` (RFC 5761)
+           leaves the outbound RTCP riding the RTP transport and engages the inbound
+           muxed-RTCP demux in :meth:`_inbound_gen`. ``mux=False`` binds a sibling UDP
+           socket on RTP-port+1 (RFC 3550 §11), routes our outbound RTCP to
+           ``remote_rtcp_addr`` through it, and starts a reader pumping that socket
+           into :meth:`ingest_rtcp` (the RTP queue never sees this RTCP).
+        2. Starts the periodic :meth:`run_rtcp` loop, registering the task on the
+           engine so :meth:`stop` cancels + awaits it (and flushes the closing BYE).
+
+        Idempotent-safe: a second call while RTCP is already active is a no-op.
+
+        FAIL-CLOSED on a secured transport (codex review #3): if this engine carries
+        SRTP (``_srtp_in``/``_srtp_out`` set) or an ICE/DTLS pipe (``_ice``), RTCP is
+        NOT started — it is a no-op + WARNING. The engine emits and parses CLEARTEXT
+        RTCP only; it has NO SRTCP (RFC 3711 §3.4) transform, so starting RTCP on a
+        secured 5-tuple would send cleartext RTCP on an otherwise-encrypted call,
+        violating the negotiated profile and leaking our SSRC/CNAME/timing. The
+        adapter also gates on the answered profile, but this engine-level guard is the
+        last line of defence. *** This guard is the seam a future SRTCP lane flips to
+        ENABLE secured RTCP (wrap the RTCP datagrams in an SRTCP transform first). ***
+
+        Args:
+            mux: ``True`` to multiplex RTCP onto the RTP transport (RFC 5761), ``False``
+                to use a separate RTCP socket on RTP-port+1.
+            rtp_payload_types: The negotiated/answered RTP payload types. When ``mux``
+                is ``True`` and any lies in the RFC 5761 §4 conflict range (64-95),
+                RTCP is left dormant (the muxed RTP/RTCP demux would be ambiguous).
+            remote_rtcp_addr: The peer's RTCP ``(host, port)`` — REQUIRED when
+                ``mux=False`` (where to send our RTCP). Ignored when muxed (RTCP
+                follows the RTP destination / comedia latch).
+            send_bye_on_stop: Flush a closing RTCP BYE when the loop stops (default
+                ``True`` — tells the peer our SSRC is leaving, RFC 3550 §6.6).
+
+        Raises:
+            ValueError: When ``mux=False`` but ``remote_rtcp_addr`` is ``None`` (the
+                separate-port path has no destination), or when called before
+                :meth:`connect` on the non-muxed UDP path (no local port yet).
+        """
+        if self._rtcp_active:
+            return
+        if self._is_secured:
+            # Cleartext RTCP must never ride a secured 5-tuple (no SRTCP yet). No-op.
+            _log.warning(
+                "start_rtcp called on a secured engine (SRTP/ICE) — RTCP left "
+                "DORMANT (no SRTCP transform; cleartext RTCP on an encrypted call "
+                "would violate the profile and leak SSRC/CNAME). The future SRTCP "
+                "lane flips this guard."
+            )
+            return
+        # RFC 5761 §4 defense-in-depth: an RTP payload type in 64-95 aliases the RTCP
+        # packet-type byte on a muxed stream, so the RTP/RTCP demux is ambiguous. The
+        # adapter already refuses mux (sibling port) for such a PT; this is the engine's
+        # last-line guard for any other caller — refuse mux, leave RTCP dormant.
+        if mux and any(
+            _RTCP_MUX_CONFLICT_PT_MIN <= pt <= _RTCP_MUX_CONFLICT_PT_MAX
+            for pt in rtp_payload_types
+        ):
+            _log.warning(
+                "start_rtcp(mux=True) with an RFC 5761 §4 conflict-range RTP payload "
+                "type (64-95) — RTCP left DORMANT (muxed RTP/RTCP demux would be "
+                "ambiguous); a separate RTCP port is required for these payload types."
+            )
+            return
+        if not mux:
+            if remote_rtcp_addr is None:
+                msg = "start_rtcp(mux=False) requires remote_rtcp_addr"
+                raise ValueError(msg)
+            # A sibling-socket failure (RTP-port+1 unavailable) must DEGRADE the call
+            # to RTCP-off, never crash it (codex review #5): the adapter awaits this
+            # during call setup, so an unhandled OSError here would reject the CALL.
+            # _open_rtcp_socket closes any partial socket before raising, so on failure
+            # we simply log and leave RTCP inactive — media continues.
+            try:
+                await self._open_rtcp_socket(remote_rtcp_addr)
+            except OSError as exc:
+                _log.warning(
+                    "RTCP sibling socket (RTP-port+1) unavailable — RTCP left off, "
+                    "media continues: %s",
+                    exc,
+                )
+                return
+        # Engage RTCP only AFTER any non-muxed socket is open, so the flags and the I/O
+        # path are set up together. ``_rtcp_mux_active`` gates the inbound RTP-socket
+        # demux and is set ONLY for the muxed path (RFC 5761); on the non-muxed path
+        # RTCP rides the sibling socket and the RTP socket stays pure RTP.
+        self._rtcp_active = True
+        self._rtcp_mux_active = mux
+        # RTCP cadence is WALL-TIME (RFC 3550 §6.2). Pin the loop to asyncio.sleep —
+        # it must NOT inherit ``self._sleep``, the outbound-pacing seam callers (e.g.
+        # the e2e harness) legitimately stub to a no-op for instant RTP pacing. With a
+        # no-op there the §6.2 interval never elapses, the loop spins, and it starves
+        # the media TX (a real e2e hang).
+        self._rtcp_task = asyncio.create_task(
+            self.run_rtcp(sleep=asyncio.sleep, send_bye_on_stop=send_bye_on_stop)
+        )
+
+    @property
+    def _is_secured(self) -> bool:
+        """True when this engine's media is encrypted (SRTP/SDES or ICE/DTLS-SRTP).
+
+        RTCP activation is fail-closed on this (codex review #3): the engine has no
+        SRTCP (RFC 3711 §3.4) transform, so a secured session must never send/receive
+        cleartext RTCP. ``_srtp_in``/``_srtp_out`` cover SDES + DTLS-derived SRTP;
+        ``_ice`` covers the WebRTC ICE/DTLS path (which is always secured).
+        """
+        return (
+            self._srtp_in is not None
+            or self._srtp_out is not None
+            or self._ice is not None
+        )
+
+    async def _open_rtcp_socket(self, remote_rtcp_addr: tuple[str, int]) -> None:
+        """Bind the sibling RTCP socket on RTP-port+1 and start its reader (non-mux).
+
+        RFC 3550 §11: when RTCP is not multiplexed it uses the port one above the RTP
+        port. Binds a non-blocking UDP socket on ``(local_address, local_port + 1)``,
+        installs an :meth:`ingest_rtcp` sink that targets ``remote_rtcp_addr`` through
+        it, and starts a reader task pumping inbound datagrams into
+        :meth:`ingest_rtcp`. The socket + reader are torn down in :meth:`stop`.
+
+        Raises:
+            OSError: When the sibling port (RTP-port+1) cannot be bound (e.g. already
+                in use). A partial socket is CLOSED before the error propagates so no
+                file descriptor leaks; :meth:`start_rtcp` catches this and degrades the
+                call to RTCP-off (codex review #5).
+            ValueError: When called before :meth:`connect` (no local RTP port yet).
+        """
+        if self._local_port == 0:
+            msg = "start_rtcp(mux=False) must be called after connect()"
+            raise ValueError(msg)
+        loop = asyncio.get_running_loop()
+        rtcp_port = self._local_port + 1
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setblocking(False)
+            sock.bind((self._local_address, rtcp_port))
+            queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
+            protocol = _RtcpReceiver(queue)
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: protocol, sock=sock
+            )
+        except OSError:
+            # Close the partial socket before propagating so no FD leaks (the asyncio
+            # endpoint may not have taken ownership yet). start_rtcp degrades the call.
+            sock.close()
+            raise
+        assert isinstance(transport, asyncio.DatagramTransport)  # noqa: S101 — UDP socket ⇒ DatagramTransport
+        self._rtcp_transport = transport
+        self._rtcp_local_port = sock.getsockname()[1]
+        # Route outbound RTCP through this socket to the peer's RTCP address.
+        self._rtcp_send = lambda d: transport.sendto(d, remote_rtcp_addr)
+        self._rtcp_reader = loop.create_task(self._rtcp_recv_loop(queue))
+
+    async def _rtcp_recv_loop(self, queue: asyncio.Queue[bytes]) -> None:
+        """Pump the sibling RTCP socket's datagrams into ingest_rtcp (non-mux path).
+
+        Each inbound datagram on the separate RTCP port is fed to
+        :meth:`_ingest_rtcp_datagram` (which drops a malformed one rather than ending
+        the call). Cancellation propagates (rule 37); the loop is cancelled in
+        :meth:`stop`.
+        """
+        while True:
+            data = await queue.get()
+            self._ingest_rtcp_datagram(data)
+
+    def _ingest_rtcp_datagram(self, data: bytes) -> None:
+        """Feed one inbound RTCP datagram to :meth:`ingest_rtcp`, dropping a bad one.
+
+        :meth:`ingest_rtcp` raises :class:`RtcpError` on a structurally broken
+        datagram and leaves to the caller whether that ends the call (its contract).
+        A single malformed inbound RTCP datagram is an environmental event, not a
+        programming error — so it is logged at DEBUG and dropped, exactly as a
+        malformed inbound RTP datagram is (the call stays up). Not swallowed silently
+        (rule 37): it is logged, and only an :class:`RtcpError` is caught — any other
+        exception propagates.
+        """
+        try:
+            self.ingest_rtcp(data)
+        except RtcpError as exc:
+            _log.debug("inbound RTCP datagram malformed — dropped: %s", exc)
+
     @property
     def call_quality(self) -> CallQuality:
         """A snapshot of the call's media quality from RTCP (ADR-0061).
@@ -2939,6 +3234,34 @@ class RtpMediaTransport:
             rtcp_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await rtcp_task
+        # Non-muxed RTCP (RFC 3550 §11, ADR-0061): tear down the sibling-socket reader
+        # and the RTCP socket. ORDER (codex review #6):
+        #   1. cancel AND AWAIT the reader — mirroring the run_rtcp task above — so it
+        #      cannot outlive the call (a reader left merely cancelled, never awaited,
+        #      races teardown and risks send-after-close / "task was destroyed but it
+        #      is pending"). It is parked on its internal queue (NOT the socket), so the
+        #      await completes promptly; CancelledError is expected and suppressed (the
+        #      loop re-raises it, rule 37). ``None`` on the muxed path.
+        #   2. THEN close the RTCP socket — AFTER both the run_rtcp task (whose finally
+        #      emits the closing BYE through ``_rtcp_send`` over this very socket) and
+        #      the reader have finished, so the BYE has already gone out (closing the
+        #      socket first would drop it) and the reader is no longer touching it.
+        self._rtcp_active = False
+        self._rtcp_mux_active = False
+        rtcp_reader, self._rtcp_reader = self._rtcp_reader, None
+        if rtcp_reader is not None:
+            rtcp_reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await rtcp_reader
+        rtcp_transport, self._rtcp_transport = self._rtcp_transport, None
+        if rtcp_transport is not None:
+            rtcp_transport.close()
+        self._rtcp_local_port = None
+        # Restore the constructor sink AFTER the closing BYE has gone out (above) and
+        # the sibling socket is closed: a non-muxed call installed a lambda bound to
+        # that now-closed socket, so drop it to the injected value (None on a muxed
+        # prod call) — a reused engine never sends RTCP via the dead socket.
+        self._rtcp_send = self._injected_rtcp_send
         # Set the stop flag so the inbound generator wakes and exits cleanly.
         # Unlike a queued sentinel, this is independent of recv-queue capacity:
         # a full queue cannot drop the signal and strand the consumer.

@@ -632,6 +632,11 @@ async def test_inbound_invite_registers_call_loop() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -688,6 +693,11 @@ async def test_inbound_invite_threads_greeting_into_call_loop() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -1320,6 +1330,11 @@ async def test_each_call_gets_distinct_guard_state() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -1377,6 +1392,8 @@ async def test_inbound_invite_failure_after_200ok_releases_resources() -> None:
     engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
         local_port=20002,
         inbound_sample_rate=8_000,
     )
@@ -1691,6 +1708,8 @@ async def test_inbound_invite_ack_and_bye_route_in_dialog() -> None:
                 return_value=MagicMock(
                     connect=AsyncMock(return_value=True),
                     stop=AsyncMock(return_value=None),
+                    start_rtcp=AsyncMock(return_value=None),
+                    _rtcp_active=False,
                     local_port=20002,
                     inbound_sample_rate=8_000,
                 ),
@@ -1757,6 +1776,11 @@ async def test_inbound_invite_200ok_carries_dialog_to_tag() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -1814,6 +1838,11 @@ async def test_inbound_invite_sdp_answer_advertises_real_local_rtp_address() -> 
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -1904,6 +1933,11 @@ async def test_inbound_savp_offer_answered_with_sdes_srtp() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -1970,6 +2004,9 @@ async def test_inbound_handler_exception_is_logged_with_traceback(
             return_value=MagicMock(
                 connect=AsyncMock(side_effect=boom),
                 stop=AsyncMock(return_value=None),
+                # connect() raises, so start_rtcp is never reached; _rtcp_active is
+                # inert so the teardown quality log is skipped (ADR-0061).
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -2190,6 +2227,11 @@ async def test_inbound_invite_no_common_codec_rejects_488_no_200ok(
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -2254,6 +2296,11 @@ async def test_inbound_invite_pcmu_pcma_offer_still_answers_200ok() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                # RTCP activation (ADR-0061): the inbound plain-RTP path now starts
+                # RTCP after connect(); the fake engine models the awaitable method +
+                # the inert _rtcp_active flag so teardown's quality log is skipped.
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),
@@ -2464,6 +2511,8 @@ async def test_inbound_invite_g722_offer_answers_200_with_g722() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20004,
             ),
         ),
@@ -2512,6 +2561,8 @@ async def test_inbound_invite_g722_engine_opened_with_g722_codec() -> None:
         return MagicMock(
             connect=AsyncMock(return_value=True),
             stop=AsyncMock(return_value=None),
+            start_rtcp=AsyncMock(return_value=None),
+            _rtcp_active=False,
             local_port=20006,
         )
 
@@ -2593,6 +2644,8 @@ async def test_inbound_invite_g722_dynamic_pt_opens_engine_with_that_pt() -> Non
         return MagicMock(
             connect=AsyncMock(return_value=True),
             stop=AsyncMock(return_value=None),
+            start_rtcp=AsyncMock(return_value=None),
+            _rtcp_active=False,
             local_port=20008,
         )
 
@@ -2685,6 +2738,8 @@ async def test_inbound_invite_activates_negotiated_ptime_and_adaptive_jitter() -
     engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
         local_port=20010,
     )
 

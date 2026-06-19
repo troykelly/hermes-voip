@@ -443,6 +443,8 @@ async def test_inbound_grey_sets_privileged_false() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8000,
             ),
@@ -509,6 +511,8 @@ async def test_inbound_allow_sets_privileged_true() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8000,
             ),
@@ -598,6 +602,8 @@ async def test_inbound_intercom_group_threads_allowed_tools_into_guard_state() -
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8000,
             ),
@@ -1587,6 +1593,8 @@ def _enter_inbound_call_patches(stack: contextlib.ExitStack) -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8000,
             ),

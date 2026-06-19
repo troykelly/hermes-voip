@@ -21,10 +21,10 @@ or degradation. The **WHY** (design decisions on latency budgets, capacity, etc.
 | **Time to first audio** | < 2 s | s | **MEASURABLE** from logs | See [Time to first audio](#time-to-first-audio) |
 | **Per-turn latency (p50)** | < 1.0 s | s | **MEASURABLE** from logs (rough) | See [Per-turn latency](#per-turn-latency) |
 | **Per-turn latency (p99)** | < 3.0 s | s | **MEASURABLE** from logs (rough) | See [Per-turn latency](#per-turn-latency) |
-| **RTP packet loss** | < 1% | % | **SOURCE EXISTS (RTCP)** — adapter emission TBD | See [Packet loss & jitter](#packet-loss--jitter) |
-| **Media jitter** | < 100 ms | ms | **SOURCE EXISTS (RTCP)** — adapter emission TBD | See [Packet loss & jitter](#packet-loss--jitter) |
-| **Round-trip time** | < 300 ms | ms | **SOURCE EXISTS (RTCP)** — adapter emission TBD | See [Packet loss & jitter](#packet-loss--jitter) |
-| **One-way audio / no audio** | < 0.5% | % (per call) | **INFERABLE (RTCP)** — adapter emission TBD | See [Media quality](#media-quality) |
+| **RTP packet loss** | < 1% | % | **RTCP ACTIVE (plain RTP)** — teardown log; metrics sink TBD | See [Packet loss & jitter](#packet-loss--jitter) |
+| **Media jitter** | < 100 ms | ms | **RTCP ACTIVE (plain RTP)** — teardown log; metrics sink TBD | See [Packet loss & jitter](#packet-loss--jitter) |
+| **Round-trip time** | < 300 ms | ms | **RTCP ACTIVE (plain RTP)** — teardown log; metrics sink TBD | See [Packet loss & jitter](#packet-loss--jitter) |
+| **One-way audio / no audio** | < 0.5% | % (per call) | **INFERABLE (RTCP, plain RTP)** — metrics sink TBD | See [Media quality](#media-quality) |
 | **Concurrent call capacity** | 50 | calls | **MEASURABLE** from memory/load | See [Concurrent calls](#concurrent-calls) |
 | **Error spoken to caller** | < 5% | % (per turn) | **MEASURABLE** via manual spot checks | See [Error handling](#error-handling) |
 
@@ -202,11 +202,22 @@ RTCP reports. `RtpMediaTransport.call_quality` returns a `CallQuality` snapshot 
   reported it received from US (the far-end view of our outbound stream).
 - `rtt_seconds` — round-trip time from the peer report block's LSR/DLSR.
 
-**What is NOT done yet:** the engine BUILDS these numbers but does not push them to a
-metrics sink — that emission (and reading `call_quality` periodically) is the adapter lane's
-job (ADR-0061 "Adapter activation"). Until then, read them in a debugger / log them from the
-adapter; the values are correct the moment the adapter calls `engine.ingest_rtcp(...)` on
-inbound RTCP and starts `engine.run_rtcp(...)`.
+**Adapter activation (live, ADR-0061).** The adapter activates RTCP for each inbound call
+on the **cleartext plain-RTP path**: after `connect()` it calls
+`engine.start_rtcp(mux=…, remote_rtcp_addr=…)`, which starts the periodic SR/RR sender,
+demuxes inbound RTCP (RFC 5761 §4 on the muxed port, or a sibling socket on RTP-port+1 when
+not muxed — RFC 3550 §11), and flushes a closing BYE on stop. At call teardown the adapter
+logs the final `call_quality` snapshot (an INFO line: local/remote loss, jitter, RTT). RTCP
+is on by default; the operator kill-switch is `HERMES_VOIP_RTCP_ENABLED=false`.
+
+**Secured paths (SDES / WebRTC) do NOT run RTCP yet.** The engine emits/parses CLEARTEXT
+RTCP only and has no SRTCP (RFC 3711 §3.4) transform, so RTCP on an RTP/SAVP or SAVPF
+5-tuple would violate the secured profile and leak the SSRC/CNAME/timing in cleartext.
+RTCP therefore stays dormant on encrypted calls until the SRTCP capability lands — tracked
+as the SRTCP follow-up. NOTE: the live test gateway uses SDES-SRTP, so RTCP is dormant there.
+
+**Still TODO:** the teardown snapshot is logged, not yet pushed to a metrics sink (the
+`voip.rtp.*` gauges below); wiring a metrics emitter is the remaining observability step.
 
 **Workaround for test/validation (independent of the above):**
 - Use external packet capture on the RTP port (5000 by default):

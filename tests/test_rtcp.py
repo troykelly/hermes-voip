@@ -675,3 +675,74 @@ def test_rtcp_interval_receiver_uses_receiver_fraction() -> None:
     )  # n=98, bw=7500 → ~13.07 s
     assert as_sender != as_receiver
     assert as_receiver > as_sender
+
+
+# ---------------------------------------------------------------------------
+# Parser strictness: padding (RFC 3550 §6.4.1 P bit) + exact RC/length
+# (codex review, ADR-0061)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_strips_rtcp_padding() -> None:
+    """A P-bit RTCP packet's trailing pad octets are removed, not parsed as body.
+
+    RFC 3550 §6.4.1: when the padding bit is set, the last octet is the pad count
+    (including itself) and those octets are NOT part of the packet's fields. Here an
+    empty RR (8 bytes) is padded with 4 octets (last = 4); parsing must recover the
+    same RR, not choke on or mis-read the 4 pad bytes.
+    """
+    rr = ReceiverReport(ssrc=0x01020304, report_blocks=())
+    base = rr.pack()  # 8 bytes, length word = 1
+    # Append 4 pad bytes (0,0,0,4), set P bit, bump the length word from 1 to 3.
+    padded = bytearray(base + b"\x00\x00\x00\x04")
+    padded[0] |= 0x20  # set the padding bit
+    # length in words minus one: (12 bytes / 4) - 1 = 2.
+    padded[2:4] = struct.pack("!H", 2)
+    parsed = parse_compound(bytes(padded))
+    assert parsed == [rr]
+
+
+def test_parse_rejects_trailing_garbage_after_report_blocks() -> None:
+    """A packet whose length covers MORE than its RC report blocks is malformed.
+
+    RFC 3550: the length field is authoritative and RC fixes the block count. A
+    declared length covering bytes beyond (RC report blocks + sender/SSRC), with no
+    padding bit to account for them, is a structurally broken packet — reject it
+    rather than silently ignore the extra bytes.
+    """
+    rr = ReceiverReport(ssrc=1, report_blocks=())  # RC=0, body = 4-byte SSRC
+    base = bytearray(rr.pack())
+    # Append 4 non-padding bytes and bump the length, WITHOUT setting the P bit.
+    broken = base + b"\xde\xad\xbe\xef"
+    broken[2:4] = struct.pack("!H", (len(broken) // 4) - 1)
+    with pytest.raises(RtcpError):
+        parse_compound(bytes(broken))
+
+
+# ---------------------------------------------------------------------------
+# ReceptionStats source-restart handling (RFC 3550 Appendix A.1, codex review)
+# ---------------------------------------------------------------------------
+
+
+def test_reception_stats_recovers_after_source_sequence_restart() -> None:
+    """A same-SSRC sender restart to a far sequence is recovered (RFC 3550 A.1).
+
+    After a clean run, the source restarts at a wildly different random sequence
+    (a re-INVITE/codec reset on the same SSRC). Appendix A.1 confirms a restart
+    once two packets arrive in sequence from the new base, then re-bases — so the
+    extended highest sequence and loss track the NEW stream rather than declaring
+    ~65000 packets lost forever.
+    """
+    stats = ReceptionStats(clock_rate=8000)
+    for i, seq in enumerate((1000, 1001, 1002)):
+        stats.on_packet(seq=seq, rtp_timestamp=160 * i, arrival_ts=0.02 * i)
+    # Restart far away (a big jump, treated as a possible restart, not loss).
+    stats.on_packet(seq=40000, rtp_timestamp=0, arrival_ts=1.0)
+    stats.on_packet(seq=40001, rtp_timestamp=160, arrival_ts=1.02)  # confirms restart
+    stats.on_packet(seq=40002, rtp_timestamp=320, arrival_ts=1.04)
+    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
+    # The highest sequence now tracks the NEW stream, not the stale 1002 nor a vast
+    # cycle count — restart re-based the baseline.
+    assert block.extended_highest_seq == 40002
+    # Cumulative loss is bounded (the restart is not counted as ~39000 lost).
+    assert block.cumulative_lost < 100

@@ -390,9 +390,12 @@ async def test_rtcp_loop_sends_bye_on_stop_when_muxed() -> None:
     await asyncio.wait_for(
         engine.run_rtcp(sleep=rtcp_sleep, send_bye_on_stop=True), timeout=1.0
     )
-    # The last datagram is a compound whose final packet is a BYE for our SSRC.
+    # The last datagram is a COMPOUND that leads with SR/RR (RFC 3550 §6.1 — a BYE
+    # is never sent standalone) and whose final packet is a BYE for our SSRC.
     last = parse_compound(sink.sent[-1])
-    assert any(isinstance(p, Bye) and OUTBOUND_AUDIO_SSRC in p.ssrcs for p in last)
+    assert isinstance(last[0], (SenderReport, ReceiverReport))
+    assert isinstance(last[-1], Bye)
+    assert OUTBOUND_AUDIO_SSRC in last[-1].ssrcs
 
 
 def test_rtcp_interval_is_at_least_five_seconds() -> None:
@@ -435,6 +438,37 @@ async def test_inbound_rtp_feeds_reception_stats() -> None:
     assert isinstance(rr, ReceiverReport)
     assert rr.report_blocks[0].ssrc == _PEER_SSRC
     assert rr.report_blocks[0].extended_highest_seq == 202
+
+
+# ---------------------------------------------------------------------------
+# stop() awaits the registered RTCP loop task (codex review, ADR-0061)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_awaits_and_cancels_registered_rtcp_task() -> None:
+    """stop() cancels AND awaits a registered run_rtcp task so it never dangles.
+
+    The adapter registers the loop task on the engine; stop() must cancel it and
+    await it to completion (so the BYE flush in run_rtcp's finally runs and no
+    'task was destroyed but it is pending' warning is left). After stop() the task
+    is done and the engine no longer holds it.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    started = asyncio.Event()
+
+    async def _never(_secs: float) -> None:
+        started.set()
+        await asyncio.Event().wait()  # block forever until cancelled
+
+    task = asyncio.create_task(engine.run_rtcp(sleep=_never))
+    engine._rtcp_task = task
+    await asyncio.wait_for(started.wait(), timeout=1.0)  # loop is parked in sleep
+
+    await engine.stop()
+    assert task.done()
+    assert engine._rtcp_task is None
 
 
 class _CaptureTransport:

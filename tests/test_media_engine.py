@@ -236,12 +236,15 @@ async def test_inbound_plain_rtp_yields_pcm_frames() -> None:
 
 @pytest.mark.asyncio
 async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
-    """A dropped packet causes a Lost signal; the stream continues in order.
+    """A dropped packet is CONCEALED (ADR-0056): the stream stays continuous.
 
     Scenario: seq 0 arrives (anchor), seq 1 is dropped, seqs 2/3/4 arrive.
     With jitter_depth=3, after 3 packets accumulate behind the gap (seqs 2, 3,
-    4), the buffer signals Lost(1) and then yields 2, 3, 4 in order.  The
-    engine skips Lost and yields PCM frames for the received packets.
+    4), the buffer signals Lost(1). The engine fills that hole with a concealment
+    frame instead of skipping it, so the frames produced are: seq 0, a
+    concealment frame for seq 1, then seqs 2, 3, 4 — FIVE frames, all at the
+    G.711 rate. (Before ADR-0056 the Lost was skipped and only four frames came
+    out, leaving an audible gap.)
 
     We inject directly into the engine's internal queue to avoid any timing
     uncertainty from real UDP sends; access to ``_recv_queue`` is a white-box
@@ -265,7 +268,7 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
     async def _collect() -> None:
         async for frame in engine.inbound_audio():
             frames.append(frame)
-            if len(frames) == 4:
+            if len(frames) == 5:
                 done.set()
                 break
 
@@ -274,7 +277,7 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
 
     # seq 0 arrives, then seq 1 is MISSING, then seqs 2, 3, 4 arrive.
     # After seq 4 is pushed (3 packets behind the gap at seq 1), the buffer
-    # declares Lost(1) and yields 2, 3, 4 in sequence order.
+    # declares Lost(1); the engine conceals it, then yields 2, 3, 4 in order.
     engine._recv_queue.put_nowait(
         (_make_rtp(0, 0 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
     )
@@ -291,10 +294,12 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
     await asyncio.wait_for(done.wait(), timeout=2.0)
     await asyncio.wait_for(task, timeout=2.0)
 
-    # Frames produced: seq 0, then (after concealment of Lost(1)) seqs 2, 3, 4.
-    assert len(frames) == 4
+    # Frames produced: seq 0, a concealment frame for Lost(1), then seqs 2, 3, 4.
+    assert len(frames) == 5  # the hole is filled, not skipped
     for frame in frames:
         assert frame.sample_rate == G711_SAMPLE_RATE
+        # Each concealment/real frame is a full 20 ms G.711 frame.
+        assert len(frame.samples) == _SAMPLES_PER_FRAME * 2
 
     await engine.stop()
 

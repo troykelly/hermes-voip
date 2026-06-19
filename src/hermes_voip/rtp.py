@@ -319,3 +319,17 @@ class JitterBuffer:
                 self._clean_run = 0  # a declared loss breaks the clean run
             return Lost(expected)
         return None
+
+    def peek_next(self) -> RtpPacket | None:
+        """Return the buffered packet at the current anchor WITHOUT consuming it.
+
+        Read-only: it never advances the anchor, declares loss, or mutates the
+        buffer. Used by the media engine immediately after :meth:`pop` returns a
+        :class:`Lost` to see whether the lost frame's *successor* (which carries
+        its Opus in-band FEC copy) has already arrived, so it can recover the
+        frame via FEC instead of plain concealment. Returns ``None`` when the
+        successor is not (yet) buffered.
+        """
+        if self._next is None:
+            return None
+        return self._packets.get(self._next)

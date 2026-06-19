@@ -58,6 +58,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
+import audioop  # audioop-lts (rule 38) — used for PLC attenuation of a held frame
+
 from hermes_voip.dtmf import (
     DtmfEvent,
     DtmfReceiver,
@@ -97,7 +99,7 @@ from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
 # — means an import failure propagates at module load (rule 37) instead of
 # being silently swallowed as a per-packet drop.
 from hermes_voip.media.srtp import SrtpError
-from hermes_voip.providers.audio import PcmFrame
+from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket
 
 if TYPE_CHECKING:
@@ -114,6 +116,17 @@ _log = logging.getLogger(__name__)
 
 # Default ptime in milliseconds (one packet per 20 ms = 50 pps).
 _DEFAULT_PTIME_MS = 20
+
+# Packet-loss concealment (ADR-0056). For G.711/G.722 (no in-codec PLC) a lost
+# frame is concealed by repeating the last good decoded frame, attenuated by this
+# factor PER consecutive lost frame, and forced to silence after a short run so a
+# sustained outage fades out instead of droning a held tone. Opus uses its own
+# in-band FEC / native PLC instead and ignores these.
+_PLC_ATTENUATION_PER_FRAME: Final[float] = 0.5  # ~ -6 dB per held frame
+# After this many consecutive losses the repeat is dropped to silence (a long gap
+# is better represented as quiet than as a decaying buzz). 5 frames = 100 ms at
+# the standard 20 ms ptime.
+_PLC_MAX_REPEAT_FRAMES: Final[int] = 5
 
 # RFC 4733 DTMF defaults (ADR-0010/0031). A 100 ms tone with a 70 ms inter-digit
 # gap is comfortably within the ITU-T Q.24 minimums (>= 40 ms tone, >= 40 ms gap)
@@ -412,6 +425,14 @@ class _OpusDecode(Protocol):
 
     def decode(self, packet: bytes) -> bytes:
         """Decode one Opus packet to a 20 ms 48 kHz PCM16 frame."""
+        ...
+
+    def decode_fec(self, next_packet: bytes) -> bytes:
+        """Recover a lost frame from the next packet's in-band FEC (ADR-0056)."""
+        ...
+
+    def decode_plc(self) -> bytes:
+        """Conceal one lost frame with no packet (Opus PLC; ADR-0056)."""
         ...
 
 
@@ -898,6 +919,18 @@ class RtpMediaTransport:
         self._opus_encoder: _OpusEncode | None = None
         self._opus_decoder: _OpusDecode | None = None
 
+        # Packet-loss concealment state (ADR-0056). On a JitterBuffer ``Lost`` the
+        # engine fills the hole with a concealment frame instead of leaving a gap,
+        # so the VAD/endpointer/STT see a continuous stream. For G.711/G.722 it
+        # repeats the last good decoded ANALYSIS-rate frame attenuated; ``None``
+        # until the first real frame, and reset in connect(). ``_consecutive_lost``
+        # counts the run of losses since the last real frame so the repeat fades
+        # (and so the Opus decoder-state bookkeeping below is correct). Opus carries
+        # its own concealment (FEC/PLC) and does not use ``_last_good_samples``, but
+        # shares ``_consecutive_lost``. A future RTCP lane can read this loss count.
+        self._last_good_samples: bytes | None = None
+        self._consecutive_lost: int = 0
+
         # In-process acoustic echo canceller (ADR-0033). The gateway reflects our
         # outbound TTS back on the inbound leg; the canceller subtracts the KNOWN
         # outbound reference from each decoded inbound frame BEFORE the VAD/ASR see
@@ -1055,6 +1088,10 @@ class RtpMediaTransport:
         # (re)created by _encode/_decode on first use of an Opus call.
         self._opus_encoder = None
         self._opus_decoder = None
+        # Reset packet-loss concealment state (ADR-0056): a reused engine must not
+        # conceal the start of a new call with the previous call's last frame.
+        self._last_good_samples = None
+        self._consecutive_lost = 0
         # Reset the echo canceller too (ADR-0033): a reused engine must start with a
         # zeroed adaptive filter + empty reference history (a stale echo path would
         # mis-cancel the start of the new call). Like the G.722/Opus codecs it is
@@ -1200,8 +1237,13 @@ class RtpMediaTransport:
         buffer, and decodes each ordered packet to a
         :class:`~hermes_voip.providers.audio.PcmFrame`.  Tampered or
         unauthenticated packets are silently dropped.
-        :class:`~hermes_voip.rtp.Lost` signals are silently skipped (no PLC
-        yet — that is out of scope for this unit).
+
+        A :class:`~hermes_voip.rtp.Lost` signal is CONCEALED rather than skipped
+        (ADR-0056): the engine yields a concealment frame in the hole so the
+        VAD/endpointer/STT see a continuous stream (Opus uses its in-band FEC /
+        native PLC; G.711/G.722 repeat the last good frame, attenuated). The
+        concealment frame flows through the same AEC + in-band-DTMF path as a real
+        frame.
 
         Returns:
             An :class:`~collections.abc.AsyncIterator` of decoded
@@ -1209,7 +1251,7 @@ class RtpMediaTransport:
         """
         return self._inbound_gen()
 
-    async def _inbound_gen(self) -> AsyncIterator[PcmFrame]:  # noqa: PLR0912 — the inbound RX path is a single linear demux (SRTP/parse → self-loopback drop → DTMF divert → latch → jitter → decode); each stage is a guard-and-continue that belongs in one place, not fragmented across helpers
+    async def _inbound_gen(self) -> AsyncIterator[PcmFrame]:  # noqa: PLR0912, PLR0915 — the inbound RX path is a single linear demux (SRTP/parse → self-loopback drop → DTMF divert → latch → jitter → decode-or-conceal); each stage is a guard-and-continue that belongs in one place, not fragmented across helpers (the decode/conceal/AEC/DTMF work IS already factored into helpers)
         """Internal async generator implementing inbound_audio.
 
         Terminates when :meth:`stop` sets the stop flag (even if the recv queue
@@ -1328,18 +1370,30 @@ class RtpMediaTransport:
                 output = self._jitter.pop()
                 if output is None:
                     break
-                if isinstance(output, Lost):
-                    _log.debug("JitterBuffer: lost packet seq=%d", output.sequence)
-                    continue
-                # Decode G.711 payload to PcmFrame.
                 ts_ns = self._clock()
-                frame = self._decode(output.payload, ts_ns)
+                if isinstance(output, Lost):
+                    # Packet-loss concealment (ADR-0056): fill the hole with a
+                    # concealment frame instead of skipping it, so the VAD/STT see a
+                    # continuous stream. For Opus this recovers the frame from the
+                    # NEXT packet's in-band FEC when that successor is already
+                    # buffered (peeked, not consumed), else uses Opus PLC; for
+                    # G.711/G.722 it repeats the last good frame, attenuated.
+                    _log.debug("JitterBuffer: lost packet seq=%d", output.sequence)
+                    frame = self._conceal_frame(ts_ns)
+                else:
+                    # Decode the wire payload to an analysis-rate PcmFrame and
+                    # remember it as the basis for concealing a future loss.
+                    frame = self._decode(output.payload, ts_ns)
+                    self._last_good_samples = frame.samples
+                    self._consecutive_lost = 0
                 # Acoustic echo cancellation (ADR-0033): subtract the KNOWN outbound
                 # TTS reference (tapped in the TX path) from this inbound frame
                 # BEFORE the VAD/ASR see it, so the gateway's reflected echo cannot
                 # false-trigger barge-in. A no-op when AEC is disabled. Runs at the
                 # analysis rate (the rate _decode delivers), so far-end and near-end
-                # align. Buffer-free (no added latency, rule 22).
+                # align. Buffer-free (no added latency, rule 22). A concealment frame
+                # is the genuine signal estimate for the lost slot, so it is run
+                # through AEC identically — the TX reference still advances in step.
                 frame = self._cancel_echo(frame)
                 # In-band DTMF receive (ADR-0036): run the Goertzel detector on the
                 # AEC-cleaned frame BEFORE the VAD/ASR see it, so the agent's own
@@ -2591,6 +2645,91 @@ class RtpMediaTransport:
         if self._rx_resampler is None:
             self._rx_resampler = Resampler(decoded_rate, analysis_rate)
         return self._rx_resampler.resample(pcm)
+
+    def _conceal_frame(self, ts_ns: int) -> PcmFrame:
+        """Build one concealment frame for a lost packet (ADR-0056, items 2+3).
+
+        Returns an analysis-rate :class:`~hermes_voip.providers.audio.PcmFrame` —
+        never an empty/absent slot — so the inbound stream the VAD/endpointer/STT
+        consume stays continuous across loss. Per codec:
+
+        * **Opus** — codec concealment that keeps the decoder's predictor coherent
+          (so wideband degrades LESS than G.711, not more). When the lost frame's
+          SUCCESSOR is already buffered (peeked, not consumed), its packet carries
+          an in-band FEC copy of the lost frame: :meth:`OpusDecoder.decode_fec`
+          reconstructs it exactly. Otherwise :meth:`OpusDecoder.decode_plc`
+          extrapolates from decoder state. Either advances the decoder so the
+          successor then decodes normally.
+        * **G.711 / G.722** — there is no in-codec concealment, so repeat the last
+          good decoded analysis-rate frame, attenuated by
+          :data:`_PLC_ATTENUATION_PER_FRAME` per consecutive lost frame, dropping
+          to silence after :data:`_PLC_MAX_REPEAT_FRAMES` (a long outage fades out
+          rather than droning). Identical for both codecs, so G.722 loss handling
+          is no worse than G.711's.
+
+        ``_consecutive_lost`` is incremented here (a run of losses) and reset by
+        the next real decode; a future RTCP lane can read it as a loss count.
+        """
+        run = self._consecutive_lost
+        self._consecutive_lost = run + 1
+        if self._codec is Codec.OPUS:
+            samples = self._conceal_opus()
+            # Track the recovered/concealed estimate as the basis for a subsequent
+            # G.711-style repeat should this become a non-Opus run (defensive; the
+            # codec does not change mid-call, so this only keeps state coherent).
+            self._last_good_samples = samples
+            return PcmFrame(
+                samples=samples,
+                sample_rate=self._analysis_sample_rate,
+                monotonic_ts_ns=ts_ns,
+            )
+        # G.711 / G.722: attenuated repeat of the last good frame, or silence.
+        return PcmFrame(
+            samples=self._conceal_repeat(run),
+            sample_rate=self._analysis_sample_rate,
+            monotonic_ts_ns=ts_ns,
+        )
+
+    def _conceal_opus(self) -> bytes:
+        """Recover/conceal one lost Opus frame at the analysis rate (ADR-0056).
+
+        Uses the next buffered packet's in-band FEC when available, else native
+        Opus PLC; both keep the decoder predictor coherent. The decoder is created
+        lazily (as in :meth:`_decode`) so a connect-as-PCMU-then-Opus call works
+        and the default no-webrtc path never imports opuslib.
+        """
+        if self._opus_decoder is None:
+            self._opus_decoder = _new_opus_decoder()
+        successor = self._jitter.peek_next()
+        if successor is not None and successor.payload_type == self._payload_type:
+            decoded = self._opus_decoder.decode_fec(successor.payload)
+        else:
+            decoded = self._opus_decoder.decode_plc()
+        return self._downsample_to_analysis(decoded, OPUS_SAMPLE_RATE)
+
+    def _conceal_repeat(self, run: int) -> bytes:
+        """An attenuated repeat of the last good frame, or silence (G.711/G.722).
+
+        ``run`` is the number of losses BEFORE this one (0 for the first loss after
+        a good frame), so the attenuation is ``_PLC_ATTENUATION_PER_FRAME ** run``
+        — a full-energy repeat first, decaying each further consecutive loss, and
+        silence once the run reaches :data:`_PLC_MAX_REPEAT_FRAMES` or before any
+        real frame has arrived.
+        """
+        last = self._last_good_samples
+        if last is None or run >= _PLC_MAX_REPEAT_FRAMES:
+            return self._analysis_silence()
+        factor = _PLC_ATTENUATION_PER_FRAME**run
+        if factor >= 1.0:
+            return last
+        # audioop.mul scales every PCM16 sample by ``factor`` (saturating), giving
+        # a quieter copy of the held frame without per-sample Python arithmetic.
+        return audioop.mul(last, PCM16_BYTES_PER_SAMPLE, factor)
+
+    def _analysis_silence(self) -> bytes:
+        """One ptime of PCM16 silence at the analysis rate (concealment fallback)."""
+        samples_per_frame = (self._analysis_sample_rate * self._ptime) // 1000
+        return b"\x00" * (samples_per_frame * PCM16_BYTES_PER_SAMPLE)
 
     def _encode(self, frame: PcmFrame) -> bytes:
         """Encode a wire-rate PcmFrame to an RTP payload for the codec.

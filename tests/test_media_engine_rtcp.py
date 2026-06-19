@@ -126,9 +126,9 @@ async def test_builds_sender_report_after_sending_media() -> None:
     media sent, and the compound includes an SDES CNAME (RFC 3550 §6.1).
     """
     clock = _FakeClock()
-    engine = _make_engine(pace_clock=clock)
-    engine._sleep = clock.sleep  # type: ignore[assignment]  # deterministic pacing
-    engine._transport = _CaptureTransport()  # type: ignore[assignment]  # _DatagramSink seam
+    engine = _make_engine(pace_clock=clock.monotonic)
+    engine._sleep = clock.sleep
+    engine._transport = _CaptureTransport()
     # Send two 20 ms frames so the sender counters advance.
     await engine.send_audio(_g711_frame(2))
 
@@ -230,9 +230,9 @@ def test_ingest_peer_receiver_report_yields_round_trip_time() -> None:
     """
     ntp_t = {"now": 1_700_000_000.0}
     clock = _FakeClock()
-    engine = _make_engine(ntp_clock=lambda: ntp_t["now"], pace_clock=clock)
-    engine._sleep = clock.sleep  # type: ignore[assignment]
-    engine._transport = _CaptureTransport()  # type: ignore[assignment]
+    engine = _make_engine(ntp_clock=lambda: ntp_t["now"], pace_clock=clock.monotonic)
+    engine._sleep = clock.sleep
+    engine._transport = _CaptureTransport()
     # Drive a send so an SR can be built, then build it (records our last SR NTP).
     # The peer's RR: it received our SR sent at ntp_t["now"], held it 0.05 s, then
     # replied. We ingest it 0.4 s later → RTT ≈ 0.4 - 0.05 = 0.35 s.
@@ -318,10 +318,10 @@ async def test_rtcp_loop_sends_periodically_then_stops() -> None:
     """
     clock = _FakeClock()
     sink = _RtcpSink()
-    engine = _make_engine(rtcp_send=sink, pace_clock=clock)
-    engine._transport = _CaptureTransport()  # type: ignore[assignment]
+    engine = _make_engine(rtcp_send=sink, pace_clock=clock.monotonic)
+    engine._transport = _CaptureTransport()
     # Send media so each tick builds an SR.
-    engine._sleep = clock.sleep  # type: ignore[assignment]
+    engine._sleep = clock.sleep
     await engine.send_audio(_g711_frame(1))
 
     async def rtcp_sleep(secs: float) -> None:
@@ -348,16 +348,19 @@ async def test_rtcp_loop_muxes_over_transport_when_no_sink_given() -> None:
     separate-port sink.
     """
     clock = _FakeClock()
-    engine = _make_engine(pace_clock=clock)
-    engine._sleep = clock.sleep  # type: ignore[assignment]
+    engine = _make_engine(pace_clock=clock.monotonic)
+    engine._sleep = clock.sleep
     capture = _CaptureTransport()
-    engine._transport = capture  # type: ignore[assignment]
+    engine._transport = capture
     await engine.send_audio(_g711_frame(1))
     n_rtp = len(capture.sent)
 
     async def rtcp_sleep(secs: float) -> None:
+        # First sleep returns → loop sends one report; stop only once a report
+        # has actually gone out (so exactly one RTCP datagram is emitted).
         clock.t += secs
-        engine._stop_event.set()
+        if len(capture.sent) > n_rtp:
+            engine._stop_event.set()
 
     await asyncio.wait_for(engine.run_rtcp(sleep=rtcp_sleep), timeout=1.0)
     # One more datagram (the RTCP compound) was sent over the RTP transport.
@@ -375,9 +378,9 @@ async def test_rtcp_loop_sends_bye_on_stop_when_muxed() -> None:
     """
     clock = _FakeClock()
     sink = _RtcpSink()
-    engine = _make_engine(rtcp_send=sink, pace_clock=clock)
-    engine._transport = _CaptureTransport()  # type: ignore[assignment]
-    engine._sleep = clock.sleep  # type: ignore[assignment]
+    engine = _make_engine(rtcp_send=sink, pace_clock=clock.monotonic)
+    engine._transport = _CaptureTransport()
+    engine._sleep = clock.sleep
     await engine.send_audio(_g711_frame(1))
 
     async def rtcp_sleep(secs: float) -> None:
@@ -414,7 +417,7 @@ async def test_inbound_rtp_feeds_reception_stats() -> None:
     not only reachable via the white-box helper.
     """
     engine = _make_engine()
-    engine._transport = _CaptureTransport()  # type: ignore[assignment]
+    engine._transport = _CaptureTransport()
     # Push three inbound RTP datagrams directly onto the recv queue.
     remote = ("127.0.0.1", 5004)
     for i in range(3):

@@ -100,12 +100,28 @@ from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
 # being silently swallowed as a per-packet drop.
 from hermes_voip.media.srtp import SrtpError
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
+from hermes_voip.rtcp import (
+    Bye,
+    ReceiverReport,
+    ReceptionStats,
+    ReportBlock,
+    SdesChunk,
+    SenderReport,
+    SourceDescription,
+    build_compound,
+    compact_ntp_now,
+    compute_rtcp_interval,
+    parse_compound,
+    rtt_from_report_block,
+    to_ntp,
+)
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket
 
 if TYPE_CHECKING:
     from hermes_voip.sdp import CryptoAttribute
 
 __all__ = [
+    "CallQuality",
     "Codec",
     "RtpMediaTransport",
     "UnsupportedCodecError",
@@ -150,6 +166,71 @@ _OUTBOUND_SSRC: int = 0xCAFEBABE
 # (ADR-0044) can EXCLUDE it when randomising the BUNDLE'd video SSRC — a
 # collision would confuse the shared-5-tuple demux of audio vs video.
 OUTBOUND_AUDIO_SSRC: int = _OUTBOUND_SSRC
+
+# Default SDES CNAME for the outbound RTCP source (RFC 3550 §6.5.1). The CNAME
+# stably identifies our stream across an SSRC change; the adapter overrides it with
+# a per-call value. It is NOT PII (no host/extension): a fixed, public-repo-safe
+# label is the safe default (the live value comes from the adapter).
+_DEFAULT_CNAME: Final[str] = "hermes-voip"
+
+# RTCP transmission-interval inputs (RFC 3550 §6.2). The session "RTCP bandwidth"
+# is ~5% of the media bandwidth; for a single bidirectional voice call (~80 kbit/s
+# with G.711 + headers) that 5% is ~500 bytes/s. With the 2-party session this
+# yields a sub-second arithmetic value that the §6.2 5 s floor then dominates, so a
+# real call reports about every 5 s regardless — the default below only matters for
+# the (unused here) many-party case. Bytes/s.
+_DEFAULT_RTCP_BANDWIDTH: Final[float] = 500.0
+# Seed average compound-RTCP packet size (bytes incl. UDP/IP, RFC 3550 §6.2) before
+# the first report is sent; refined toward the real sizes as reports are emitted.
+_INITIAL_AVG_RTCP_SIZE: Final[float] = 96.0
+# RFC 3550 §6.3.3: the average RTCP size is smoothed with a 1/16 gain.
+_AVG_RTCP_SIZE_GAIN: Final[float] = 1.0 / 16.0
+
+_MS_PER_S: Final[float] = 1000.0
+_RTCP_FRACTION_SCALE: Final[float] = 256.0  # fraction-lost 8-bit fixed point
+
+
+@dataclass(frozen=True, slots=True)
+class CallQuality:
+    """Per-call media-quality snapshot derived from RTCP (RFC 3550 §6.4, ADR-0061).
+
+    Two views of one call:
+
+    * ``local_*`` — what WE received from the peer, computed by our own
+      :class:`~hermes_voip.rtcp.ReceptionStats` from the inbound RTP stream (this is
+      what our outbound report blocks carry).
+    * ``remote_*`` — what the PEER reported it received from US, parsed from inbound
+      RTCP report blocks about our SSRC. ``None`` until a peer report arrives.
+
+    ``rtt_seconds`` is the round-trip time from the most recent peer report block's
+    LSR/DLSR (``None`` until one arrives that acknowledges an SR of ours). These are
+    the loss/jitter/RTT numbers the SLO catalogue (runbook 0014) and ADR-0056's
+    concealment count consume.
+
+    Attributes:
+        local_fraction_lost: Loss fraction (0..1) WE observed on the inbound stream
+            over the last report interval, or ``None`` if no RTP received yet.
+        local_cumulative_lost: Total inbound packets lost this call (may be negative
+            with duplicates), or ``None`` if no RTP received yet.
+        local_jitter_ms: Our interarrival jitter estimate in milliseconds, or
+            ``None`` if no RTP received yet.
+        remote_fraction_lost: Loss fraction (0..1) the PEER reported on our outbound
+            stream, or ``None`` if no peer report received.
+        remote_cumulative_lost: Total outbound packets the peer reported lost, or
+            ``None`` if no peer report received.
+        remote_jitter_ms: The peer's jitter estimate on our stream in milliseconds,
+            or ``None`` if no peer report received.
+        rtt_seconds: Round-trip time in seconds, or ``None`` if not yet measurable.
+    """
+
+    local_fraction_lost: float | None
+    local_cumulative_lost: int | None
+    local_jitter_ms: float | None
+    remote_fraction_lost: float | None
+    remote_cumulative_lost: int | None
+    remote_jitter_ms: float | None
+    rtt_seconds: float | None
+
 
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512
@@ -689,6 +770,10 @@ class RtpMediaTransport:
         aec_filter_ms: int = _AEC_DEFAULT_FILTER_MS,
         aec_bulk_delay_ms: int = 0,
         aec_mu: float = 0.30,
+        cname: str = _DEFAULT_CNAME,
+        rtcp_send: Callable[[bytes], None] | None = None,
+        ntp_clock: Callable[[], float] | None = None,
+        rtcp_bandwidth: float = _DEFAULT_RTCP_BANDWIDTH,
     ) -> None:
         """Construct the engine; no socket is opened until :meth:`connect`.
 
@@ -756,6 +841,23 @@ class RtpMediaTransport:
                 deterministic (RFC 3550 §5.1 default: random uint16).
             initial_ts:  Override the random initial RTP timestamp.
                 Pass a fixed value in tests (RFC 3550 §5.1 default: random uint32).
+            cname: The RTCP SDES canonical name for our outbound source (RFC 3550
+                §6.5.1, ADR-0061). The adapter passes a per-call value; the default
+                is a fixed, public-repo-safe label (NOT PII).
+            rtcp_send: A sink for outbound RTCP datagrams (ADR-0061). ``None`` (the
+                default) MULTIPLEXES RTCP onto the RTP transport (RFC 5761 rtcp-mux),
+                so :meth:`run_rtcp` sends compound RTCP via ``_transport.sendto``.
+                The adapter injects a separate-port sink when the negotiated SDP did
+                NOT agree rtcp-mux. The engine builds + sends RTCP through this seam;
+                CHOOSING the seam per the negotiated mux is the adapter's job.
+            ntp_clock: Wallclock time source in Unix SECONDS for the SR NTP
+                timestamp and the LSR/DLSR base (RFC 3550 §6.4.1). Defaults to
+                :func:`time.time`; inject a fake for deterministic RTCP tests.
+                Distinct from ``clock`` (monotonic ns) and ``pace_clock`` (monotonic
+                s) — RTT/SR maths needs a wallclock-derived NTP value.
+            rtcp_bandwidth: The session RTCP bandwidth in bytes/s (~5% of the media
+                bandwidth) feeding the §6.2 transmission interval. The 5 s floor
+                dominates for a 2-party call, so this rarely changes the cadence.
         """
         self._local_address = local_address
         self._local_port = local_port
@@ -1027,11 +1129,46 @@ class RtpMediaTransport:
         # engine starts with a fresh, unheld lock.
         self._tx_lock: asyncio.Lock = asyncio.Lock()
 
+        # ---- RTCP control channel (RFC 3550 §6, ADR-0061) ----
+        self._cname = cname
+        self._rtcp_send: Callable[[bytes], None] | None = rtcp_send
+        self._ntp_clock: Callable[[], float] = (
+            ntp_clock if ntp_clock is not None else time.time
+        )
+        self._rtcp_bandwidth = rtcp_bandwidth
+        # Sender bookkeeping for our SR (RFC 3550 §6.4.1): RTP data packets and
+        # payload octets we have sent this call. Incremented per outbound media frame
+        # in _transmit_frame; reset in connect()/stop().
+        self._rtcp_packets_sent: int = 0
+        self._rtcp_octets_sent: int = 0
+        # Per-source inbound reception statistics, keyed by the SENDER's SSRC. One
+        # ReceptionStats per remote source feeds the report blocks of our SR/RR. Reset
+        # in connect().
+        self._reception: dict[int, ReceptionStats] = {}
+        # For our report blocks' LSR/DLSR (RFC 3550 §6.4.1): per peer-SSRC, the compact
+        # (middle-32) NTP of the last SR we received from it, and the wallclock (Unix
+        # s) at which we received it (so DLSR = now - that, in 1/65536 s units).
+        self._last_sr_from: dict[int, tuple[int, float]] = {}
+        # The compact NTP of the last SR WE sent, so a peer RR echoing it (lsr) lets us
+        # compute RTT. None until we have sent an SR.
+        self._last_sr_sent_compact: int | None = None
+        # The far-end view of OUR stream, parsed from the most recent inbound report
+        # block about our SSRC (fraction lost, cumulative lost, jitter-in-clock-units),
+        # plus the last computed RTT in seconds. None until a peer report arrives.
+        self._remote_report: ReportBlock | None = None
+        self._rtt_seconds: float | None = None
+        # The running average compound-RTCP size (RFC 3550 §6.2/§6.3.3) for the
+        # interval calculation; seeded, then smoothed toward real sizes as we send.
+        self._avg_rtcp_size: float = _INITIAL_AVG_RTCP_SIZE
+        # The background RTCP loop task (set by the adapter via run_rtcp; cancelled in
+        # stop()). None on the TLS/UDP and ICE paths until the adapter starts it.
+        self._rtcp_task: asyncio.Task[None] | None = None
+
     # ------------------------------------------------------------------
     # MediaTransport Protocol
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self) -> bool:  # noqa: PLR0915 — a flat per-call state-reset sequence (now incl. the RTCP channel), not branching logic; splitting it would scatter the reset across helpers
         """Open the media transport (a UDP socket, or the ICE pipe on the WebRTC path).
 
         On the SIP-over-TLS path this binds a non-blocking UDP socket to
@@ -1126,6 +1263,17 @@ class RtpMediaTransport:
         self._self_ssrc_logged = False
         self._tx_amplitude_chunk_count = 0
         self._tx_amplitude_period_peak = 0
+        # Reset RTCP state (ADR-0061) so a reused engine starts a fresh control
+        # channel: no carried sender counts, reception stats, peer reports, or RTT.
+        self._rtcp_packets_sent = 0
+        self._rtcp_octets_sent = 0
+        self._reception = {}
+        self._last_sr_from = {}
+        self._last_sr_sent_compact = None
+        self._remote_report = None
+        self._rtt_seconds = None
+        self._avg_rtcp_size = _INITIAL_AVG_RTCP_SIZE
+        self._rtcp_task = None
 
         if self._ice is not None:
             # WebRTC path (ADR-0032): no socket. Wrap the ICE pipe in the synchronous
@@ -1363,6 +1511,20 @@ class RtpMediaTransport:
                     source[1],
                     len(data),
                 )
+
+            # RTCP reception statistics (RFC 3550 §6.4.1, ADR-0061): record this
+            # genuine inbound audio packet against its source's stats so our SR/RR
+            # report blocks carry the right loss/jitter/EHSN. Done here — after the
+            # PT filter, before the jitter buffer — so DTMF/comfort-noise/stray PTs
+            # are excluded and the count matches the audio actually received. The
+            # arrival time is the monotonic clock in SECONDS (the jitter transit
+            # maths needs a wall/loop time, not the ns presentation stamp's units).
+            self._note_rtp_received(
+                seq=rtp_pkt.sequence_number,
+                rtp_timestamp=rtp_pkt.timestamp,
+                arrival_ts=self._clock() / 1e9,
+                ssrc=rtp_pkt.ssrc,
+            )
 
             # Feed the jitter buffer.
             self._jitter.push(rtp_pkt)
@@ -1826,6 +1988,12 @@ class RtpMediaTransport:
             self._tx_amplitude_period_peak = 0
 
         transport.sendto(wire, self._outbound_addr)
+        # RTCP sender bookkeeping (RFC 3550 §6.4.1, ADR-0061): one more RTP data
+        # packet and ``len(payload)`` more PAYLOAD octets (the SR octet count excludes
+        # RTP/SRTP headers). Counted only for a frame actually on the wire, in send
+        # order, mirroring the AEC tap below.
+        self._rtcp_packets_sent += 1
+        self._rtcp_octets_sent = (self._rtcp_octets_sent + len(payload)) & 0xFFFFFFFF
         # Tap this outbound frame as the AEC reference (ADR-0033): it is the signal
         # the gateway will reflect back, so the canceller subtracts it from the
         # matching inbound frames. Pushed AFTER sendto so the reference is recorded
@@ -1839,6 +2007,301 @@ class RtpMediaTransport:
         # frame, but that governs whether the caller keeps draining (it re-checks
         # _transport) — it does not un-send this frame, so report True.
         return True
+
+    # ------------------------------------------------------------------
+    # RTCP control channel (RFC 3550 §6, RFC 5761, ADR-0061)
+    # ------------------------------------------------------------------
+
+    def _note_rtp_received(
+        self, *, seq: int, rtp_timestamp: int, arrival_ts: float, ssrc: int
+    ) -> None:
+        """Record one inbound RTP packet against its source's RTCP statistics.
+
+        Looks up (or creates) the :class:`~hermes_voip.rtcp.ReceptionStats` for
+        ``ssrc`` and feeds it the packet so our SR/RR report blocks carry the right
+        loss, jitter, and extended-highest-sequence numbers (RFC 3550 Appendix
+        A.1/A.3/A.8). The clock rate is the codec's RTP clock (the source uses the
+        same negotiated codec as us). Called from :meth:`_inbound_gen` for every
+        genuine audio packet (after the PT filter, before the jitter buffer).
+        """
+        stats = self._reception.get(ssrc)
+        if stats is None:
+            stats = ReceptionStats(clock_rate=self._rtp_clock_rate)
+            self._reception[ssrc] = stats
+        stats.on_packet(seq=seq, rtp_timestamp=rtp_timestamp, arrival_ts=arrival_ts)
+
+    def _report_blocks(self) -> tuple[ReportBlock, ...]:
+        """Build a reception report block for each source we receive from (§6.4.1).
+
+        Each block carries the LSR/DLSR for that source: the compact NTP of the last
+        SR we received from it and the delay (1/65536 s units) since we received it
+        (0/0 when we have had no SR from it yet). Snapshotting a block also rolls the
+        source's loss interval forward (so the next block covers only new packets).
+        """
+        now_unix = self._ntp_clock()
+        blocks: list[ReportBlock] = []
+        for src_ssrc, stats in self._reception.items():
+            lsr, dlsr = self._lsr_dlsr_for(src_ssrc, now_unix)
+            blocks.append(stats.report_block(source_ssrc=src_ssrc, lsr=lsr, dlsr=dlsr))
+        return tuple(blocks)
+
+    def _lsr_dlsr_for(self, src_ssrc: int, now_unix: float) -> tuple[int, int]:
+        """The (LSR, DLSR) fields for a report block about ``src_ssrc`` (§6.4.1).
+
+        LSR is the compact (middle-32) NTP of the last SR we received from the
+        source; DLSR is the delay since we received it, in 1/65536 s units. Both are
+        0 when we have received no SR from that source.
+        """
+        record = self._last_sr_from.get(src_ssrc)
+        if record is None:
+            return 0, 0
+        lsr, received_at = record
+        delay_s = max(0.0, now_unix - received_at)
+        dlsr = int(delay_s * (1 << 16)) & 0xFFFFFFFF
+        return lsr, dlsr
+
+    def _sdes(self) -> SourceDescription:
+        """Our SDES packet carrying the outbound SSRC's CNAME (RFC 3550 §6.5)."""
+        return SourceDescription(
+            chunks=(SdesChunk(ssrc=_OUTBOUND_SSRC, cname=self._cname),)
+        )
+
+    def build_rtcp_report(self) -> bytes | None:
+        """Build the periodic compound RTCP report, or ``None`` if nothing to report.
+
+        Returns a compound (RFC 3550 §6.1): a **Sender Report** when we have sent
+        media this call (it carries our NTP/RTP timestamp pair, sender packet/octet
+        counts, and a report block per received source), otherwise a **Receiver
+        Report** when we have received media (report blocks only). Both are followed
+        by an SDES CNAME. Returns ``None`` only when we have neither sent nor
+        received any media yet (there is nothing meaningful to report).
+
+        This builds the bytes; :meth:`run_rtcp` schedules and sends them. Pure and
+        synchronous, so it is directly unit-testable.
+        """
+        blocks = self._report_blocks()
+        if self._rtcp_packets_sent > 0:
+            ntp = to_ntp(self._ntp_clock())
+            self._last_sr_sent_compact = compact_ntp_now(self._ntp_clock())
+            sr = SenderReport(
+                ssrc=_OUTBOUND_SSRC,
+                ntp_timestamp=ntp,
+                rtp_timestamp=self._ts,
+                packet_count=self._rtcp_packets_sent,
+                octet_count=self._rtcp_octets_sent,
+                report_blocks=blocks,
+            )
+            return build_compound((sr, self._sdes()))
+        if blocks:
+            rr = ReceiverReport(ssrc=_OUTBOUND_SSRC, report_blocks=blocks)
+            return build_compound((rr, self._sdes()))
+        return None
+
+    def _record_outbound_sr_ntp(self, compact_ntp: int) -> None:
+        """Record the compact NTP of an SR we sent, for later RTT computation.
+
+        Exposed for the adapter/tests to arm RTT when an SR is sent outside the
+        normal :meth:`build_rtcp_report` path; the report builder also sets it.
+        """
+        self._last_sr_sent_compact = compact_ntp
+
+    def ingest_rtcp(self, data: bytes) -> None:
+        """Parse one inbound RTCP datagram and update per-call quality (§6.4.1).
+
+        Handles a compound packet (RFC 3550 §6.1):
+
+        * a peer **SR** records the compact NTP of its send time and our receive
+          time, so our next report block about that source carries the right
+          LSR/DLSR (we acknowledge their SR back to them).
+        * a peer **SR/RR** report block ABOUT OUR SSRC gives the far-end view of our
+          stream (fraction lost, cumulative lost, jitter) and — via its LSR/DLSR —
+          the round-trip time (:meth:`call_quality`).
+        * a **BYE** is accepted (the peer is leaving); SDES is ignored.
+
+        A structurally broken datagram raises :class:`~hermes_voip.rtcp.RtcpError`
+        (rule 37 — the error is not swallowed); the caller (adapter) decides whether
+        a single bad RTCP datagram ends the call or is logged and dropped.
+        """
+        now_unix = self._ntp_clock()
+        for packet in parse_compound(data):
+            if isinstance(packet, SenderReport):
+                # Acknowledge the peer's SR: remember its compact (middle-32) NTP +
+                # our receive time so our next RR/SR block reports LSR/DLSR for this
+                # source (RFC 3550 §6.4.1).
+                self._last_sr_from[packet.ssrc] = (
+                    (packet.ntp_timestamp >> 16) & 0xFFFFFFFF,
+                    now_unix,
+                )
+                self._absorb_remote_blocks(packet.report_blocks, now_unix)
+            elif isinstance(packet, ReceiverReport):
+                self._absorb_remote_blocks(packet.report_blocks, now_unix)
+            elif isinstance(packet, Bye):
+                _log.debug(
+                    "rtcp rx: BYE for ssrc(s) %s", [hex(s) for s in packet.ssrcs]
+                )
+            # SourceDescription: no per-call state to update (CNAME is informational).
+
+    def _absorb_remote_blocks(
+        self, blocks: tuple[ReportBlock, ...], now_unix: float
+    ) -> None:
+        """Update the far-end view + RTT from report blocks about our SSRC (§6.4.1)."""
+        for block in blocks:
+            if block.ssrc != _OUTBOUND_SSRC:
+                continue  # a block about some other source; not our stream
+            self._remote_report = block
+            rtt = rtt_from_report_block(
+                now_compact_ntp=compact_ntp_now(now_unix),
+                lsr=block.lsr,
+                dlsr=block.dlsr,
+            )
+            if rtt is not None:
+                self._rtt_seconds = rtt
+
+    def rtcp_interval(
+        self, *, randomize: bool = True, rng: random.Random | None = None
+    ) -> float:
+        """The RTCP transmission interval in seconds (RFC 3550 §6.2, ADR-0061).
+
+        A 2-party voice call (members=2; senders=1 receive-only or 2 both-ways) with
+        the small per-call RTCP bandwidth floors at the §6.2 5 s minimum, so a real
+        call reports about every 5 s. ``randomize`` applies the §6.3.1 jitter;
+        ``rng`` is injectable for deterministic tests.
+        """
+        senders = 1 if self._rtcp_packets_sent > 0 else 0
+        senders += len(
+            self._reception
+        )  # each remote source we receive from is a sender
+        members = 2  # this engine + the one remote peer (point-to-point telephony)
+        return compute_rtcp_interval(
+            members=members,
+            senders=max(1, senders),
+            rtcp_bw=self._rtcp_bandwidth,
+            we_sent=self._rtcp_packets_sent > 0,
+            avg_rtcp_size=self._avg_rtcp_size,
+            randomize=randomize,
+            rng=rng,
+        )
+
+    def _emit_rtcp(self, datagram: bytes) -> None:
+        """Send one RTCP datagram via the injected sink, or muxed over the RTP path.
+
+        With an ``rtcp_send`` sink injected (the separate-RTCP-port case the adapter
+        wires) the datagram goes there; otherwise it is multiplexed onto the RTP
+        transport (RFC 5761 rtcp-mux) via ``_transport.sendto``. A closed/absent
+        transport drops the datagram silently (the call is ending). Also smooths the
+        average RTCP size (§6.3.3) for the next interval calculation.
+        """
+        self._avg_rtcp_size += (
+            len(datagram) - self._avg_rtcp_size
+        ) * _AVG_RTCP_SIZE_GAIN
+        if self._rtcp_send is not None:
+            self._rtcp_send(datagram)
+            return
+        transport = self._transport
+        if transport is not None:
+            transport.sendto(datagram, self._outbound_addr)
+
+    async def run_rtcp(
+        self,
+        *,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        send_bye_on_stop: bool = False,
+        rng: random.Random | None = None,
+    ) -> None:
+        """Run the periodic RTCP sender until the call stops (RFC 3550 §6.2, ADR-0061).
+
+        Each cycle sleeps one (randomised) §6.2 interval then sends the compound
+        report from :meth:`build_rtcp_report` via :meth:`_emit_rtcp`. The loop exits
+        when the engine's stop event is set (:meth:`stop`); on exit it optionally
+        flushes a final BYE (RFC 3550 §6.6) so the peer stops reporting on us
+        promptly. Cancellation propagates (rule 37).
+
+        The adapter starts this with ``asyncio.create_task`` AFTER the call's media
+        is up — it is the live activation point (the engine never auto-starts it, so
+        the SDES/UDP and ICE paths choose the RTCP socket/mux at the adapter).
+        ``sleep`` is injectable for deterministic tests (defaults to the engine's
+        outbound ``sleep``).
+
+        Args:
+            sleep: Async one-shot delay; defaults to the engine's injected ``sleep``.
+            send_bye_on_stop: Flush an RTCP BYE for our SSRC when the loop stops.
+            rng: Random source for the §6.3.1 interval jitter (injectable in tests).
+        """
+        delay = sleep if sleep is not None else self._sleep
+        # The loop's only exit paths are the stop event (clean) and a CancelledError
+        # from stop()'s task cancel; both run the finally, which flushes the BYE.
+        # CancelledError is not caught here, so it propagates (rule 37) after the BYE.
+        try:
+            while not self._stop_event.is_set():
+                await delay(self.rtcp_interval(rng=rng))
+                if self._stop_event.is_set():
+                    break
+                report = self.build_rtcp_report()
+                if report is not None:
+                    self._emit_rtcp(report)
+        finally:
+            if send_bye_on_stop and self._rtcp_packets_sent > 0:
+                self._emit_rtcp(build_compound((self._bye(),)))
+
+    def _bye(self) -> Bye:
+        """An RTCP BYE for our outbound SSRC (RFC 3550 §6.6)."""
+        return Bye(ssrcs=(_OUTBOUND_SSRC,), reason=None)
+
+    @property
+    def call_quality(self) -> CallQuality:
+        """A snapshot of the call's media quality from RTCP (ADR-0061).
+
+        Combines OUR inbound reception view (loss/jitter we measured, from the
+        per-source :class:`~hermes_voip.rtcp.ReceptionStats`) with the PEER's
+        reported view of our outbound stream and the round-trip time. ``None`` fields
+        mean "not yet measurable" (no RTP received, or no peer report yet). These are
+        the SLO numbers (runbook 0014: packet loss, jitter, RTT).
+        """
+        local = self._local_quality_snapshot()
+        remote = self._remote_report
+        remote_fraction = (
+            remote.fraction_lost / _RTCP_FRACTION_SCALE if remote is not None else None
+        )
+        remote_jitter_ms = (
+            remote.jitter / self._rtp_clock_rate * _MS_PER_S
+            if remote is not None
+            else None
+        )
+        return CallQuality(
+            local_fraction_lost=local[0],
+            local_cumulative_lost=local[1],
+            local_jitter_ms=local[2],
+            remote_fraction_lost=remote_fraction,
+            remote_cumulative_lost=remote.cumulative_lost if remote else None,
+            remote_jitter_ms=remote_jitter_ms,
+            rtt_seconds=self._rtt_seconds,
+        )
+
+    def _local_quality_snapshot(
+        self,
+    ) -> tuple[float | None, int | None, float | None]:
+        """Our inbound (fraction_lost, cumulative_lost, jitter_ms) across all sources.
+
+        A READ-ONLY view that does NOT roll the loss interval forward (unlike
+        :meth:`_report_blocks`): it sums cumulative loss and takes the worst jitter
+        across sources, so polling ``call_quality`` never disturbs the report
+        cadence. ``(None, None, None)`` until any RTP is received.
+        """
+        if not self._reception:
+            return None, None, None
+        total_cumulative = 0
+        worst_jitter_units = 0.0
+        total_expected = 0
+        total_lost = 0
+        for stats in self._reception.values():
+            snap = stats.snapshot()
+            total_cumulative += snap.cumulative_lost
+            worst_jitter_units = max(worst_jitter_units, snap.jitter)
+            total_expected += snap.expected
+            total_lost += max(0, snap.cumulative_lost)
+        fraction = (total_lost / total_expected) if total_expected > 0 else 0.0
+        jitter_ms = worst_jitter_units / self._rtp_clock_rate * _MS_PER_S
+        return fraction, total_cumulative, jitter_ms
 
     async def send_dtmf(
         self,
@@ -2419,6 +2882,14 @@ class RtpMediaTransport:
             ice_reader.cancel()
         if self._ice is not None:
             await self._ice.close()
+        # RTCP loop (ADR-0061): if the adapter started run_rtcp and registered its
+        # task here, cancel it so it does not outlive the call. The loop also watches
+        # the stop event set below, but a registered task is cancelled for promptness;
+        # its CancelledError propagates inside run_rtcp (rule 37). None when the
+        # adapter ran the loop without registering it (it then exits on the event).
+        rtcp_task, self._rtcp_task = self._rtcp_task, None
+        if rtcp_task is not None:
+            rtcp_task.cancel()
         # Set the stop flag so the inbound generator wakes and exits cleanly.
         # Unlike a queued sentinel, this is independent of recv-queue capacity:
         # a full queue cannot drop the signal and strand the consumer.

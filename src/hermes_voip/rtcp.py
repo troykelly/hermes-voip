@@ -719,6 +719,23 @@ def parse_compound(data: bytes) -> list[RtcpPacket]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class ReceptionSnapshot:
+    """A read-only view of a source's reception statistics (no interval roll).
+
+    Unlike :meth:`ReceptionStats.report_block`, taking a snapshot does NOT advance
+    the loss-interval baseline, so a quality poll never disturbs the RTCP report
+    cadence. ``cumulative_lost`` and ``expected`` are session totals; ``jitter`` is
+    the current smoothed estimate in source clock units.
+    """
+
+    expected: int
+    received: int
+    cumulative_lost: int
+    jitter: float
+    extended_highest_seq: int
+
+
 @dataclass(slots=True)
 class ReceptionStats:
     """Per-source reception statistics for building RR/SR report blocks.
@@ -802,8 +819,26 @@ class ReceptionStats:
 
     def _expected(self) -> int:
         """Total packets expected so far (A.3): extended highest - base + 1."""
+        if not self._started:
+            return 0
         extended_max = self._cycles + self._max_seq
         return extended_max - self._base_seq + 1
+
+    def snapshot(self) -> ReceptionSnapshot:
+        """A read-only statistics view that does NOT roll the loss interval forward.
+
+        Use this to poll quality (e.g. the engine's ``call_quality``) without
+        disturbing the per-interval fraction-lost computed by :meth:`report_block`.
+        """
+        expected = self._expected()
+        cumulative = max(_S24_MIN, min(_S24_MAX, expected - self._received))
+        return ReceptionSnapshot(
+            expected=expected,
+            received=self._received,
+            cumulative_lost=cumulative,
+            jitter=self._jitter,
+            extended_highest_seq=(self._cycles + self._max_seq) & _U32,
+        )
 
     def report_block(self, *, source_ssrc: int, lsr: int, dlsr: int) -> ReportBlock:
         """Snapshot the current statistics into a report block (RFC 3550 §6.4.1).

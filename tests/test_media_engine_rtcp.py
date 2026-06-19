@@ -418,6 +418,49 @@ async def test_start_rtcp_does_not_inherit_a_no_op_pacing_sleep() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_rtcp_refuses_mux_for_an_rfc5761_conflict_payload_type() -> None:
+    """start_rtcp(mux=True) leaves RTCP dormant when an RTP PT is in 64-95 (RFC 5761).
+
+    Engine-side last-line guard (codex review): a payload type in 64-95 aliases the
+    RTCP packet-type byte on a muxed stream, so the RTP/RTCP demux would be ambiguous.
+    The adapter already refuses mux for such PTs; the engine refuses too — it must NOT
+    start the loop (``_rtcp_active`` stays False, no task). A PT outside the range
+    activates normally (positive control).
+    """
+    engine = _make_engine()  # unsecured ⇒ start_rtcp would otherwise activate
+    await engine.start_rtcp(mux=True, rtp_payload_types=(72,))  # 72 ∈ 64-95
+    assert engine._rtcp_active is False
+    assert engine._rtcp_task is None
+    # Positive control: PCMU(0)/PCMA(8)/dynamic(96) are all outside 64-95 ⇒ activates.
+    await engine.start_rtcp(mux=True, rtp_payload_types=(0, 8, 96))
+    try:
+        assert engine._rtcp_active is True
+        assert engine._rtcp_task is not None
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_restores_constructor_rtcp_send_dropping_a_socket_lambda() -> None:
+    """stop() restores the constructor RTCP sink, dropping a non-mux socket lambda.
+
+    Lifecycle (codex review): the non-muxed start_rtcp installs an ``_rtcp_send``
+    lambda bound to the sibling socket; stop() (and connect()) must restore the
+    constructor value so a REUSED engine never sends RTCP through the previous,
+    now-closed socket.
+    """
+    engine = _make_engine()  # constructor rtcp_send is None (the muxed prod default)
+
+    def _doomed_socket_sink(_datagram: bytes) -> None:
+        # Stands in for the non-mux sibling-socket lambda start_rtcp installs.
+        return None
+
+    engine._rtcp_send = _doomed_socket_sink
+    await engine.stop()
+    assert engine._rtcp_send is None
+
+
+@pytest.mark.asyncio
 async def test_rtcp_loop_sends_bye_on_stop_when_muxed() -> None:
     """Stopping the loop after media flushes a final RTCP BYE (RFC 3550 §6.6).
 

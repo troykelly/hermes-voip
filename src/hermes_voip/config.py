@@ -75,6 +75,13 @@ _MAX_PORT = 65535
 
 _HOST_KEY = "HERMES_SIP_HOST"
 _PORT_KEY = "HERMES_SIP_PORT"
+# Provisioning aliases (launch-blocker fix; runbook 0001). The 1Password-provisioned
+# .env emits HERMES_SIP_SERVER_HOST / HERMES_SIP_TLS_PORT, but the canonical keys this
+# parser reads are HERMES_SIP_HOST / HERMES_SIP_PORT. Accept the provisioner names as
+# FALLBACKS so a first live launch from the sanctioned secret registers instead of
+# failing "HERMES_SIP_HOST is required"; the canonical key wins when both are set.
+_SERVER_HOST_KEY = "HERMES_SIP_SERVER_HOST"
+_TLS_PORT_KEY = "HERMES_SIP_TLS_PORT"
 _TRANSPORT_KEY = "HERMES_SIP_TRANSPORT"
 _EXPIRES_KEY = "HERMES_SIP_EXPIRES"
 _USER_AGENT_KEY = "HERMES_SIP_USER_AGENT"
@@ -444,13 +451,19 @@ class ExtensionConfig:
         index: The scheme index (``0`` for the back-compatible single form).
         extension: The extension number / SIP user-part (e.g. ``1000``).
         username: The digest auth username (defaults to ``extension``).
-        password: The digest auth password.
+        password: The digest auth password. A **secret** — repr-suppressed so it
+            never reaches a log line or traceback (rule 34), the same discipline as
+            :attr:`GatewayConfig.ws_password` and the cloud API keys. The value stays
+            accessible by attribute for the digest computation.
     """
 
     index: int
     extension: str
     username: str
-    password: str
+    # The SIP digest password is a secret: repr-suppressed so a traceback or
+    # config-dump rendering this extension (e.g. via GatewayConfig's extensions
+    # tuple) never prints the plaintext credential (rule 34).
+    password: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1146,7 +1159,7 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
         ConfigError: if a required value is missing, a value is malformed, the
             single and indexed schemes are mixed, or extension numbers collide.
     """
-    host = _require(env, _HOST_KEY)
+    host = _require_host(env)
     transport = _parse_transport(env)
     port = _parse_port(env, transport)
     expires = _parse_expires(env)
@@ -1189,6 +1202,32 @@ def _require(env: Mapping[str, str], key: str) -> str:
     return value
 
 
+def _value_aliased(env: Mapping[str, str], key: str, alias: str) -> str:
+    """Return the trimmed value for ``key``, falling back to ``alias``.
+
+    The canonical ``key`` takes precedence: its non-blank value wins even when
+    ``alias`` is also set. A present-but-blank canonical value is treated as unset
+    and falls through to ``alias`` (so a stray empty canonical key in the .env does
+    not mask a populated provisioner alias). Returns ``""`` when neither is set.
+    """
+    return _value(env, key) or _value(env, alias)
+
+
+def _require_host(env: Mapping[str, str]) -> str:
+    """Resolve the gateway host from the canonical key or its provisioning alias.
+
+    ``HERMES_SIP_HOST`` is canonical; ``HERMES_SIP_SERVER_HOST`` (the name the
+    1Password provisioner emits) is the fallback so a first live launch from the
+    sanctioned secret registers (runbook 0001). The error names BOTH keys so the
+    operator knows either is accepted.
+    """
+    host = _value_aliased(env, _HOST_KEY, _SERVER_HOST_KEY)
+    if not host:
+        msg = f"{_HOST_KEY} (or {_SERVER_HOST_KEY}) is required"
+        raise ConfigError(msg)
+    return host
+
+
 def _parse_transport(env: Mapping[str, str]) -> str:
     token = _value(env, _TRANSPORT_KEY).lower() or _DEFAULT_TRANSPORT
     if token not in _VIA_TRANSPORT:
@@ -1199,10 +1238,19 @@ def _parse_transport(env: Mapping[str, str]) -> str:
 
 
 def _parse_port(env: Mapping[str, str], transport: str) -> int:
-    raw = _value(env, _PORT_KEY) or _DEFAULT_PORT[transport]
-    port = _parse_int(raw, _PORT_KEY)
+    # Canonical HERMES_SIP_PORT wins; HERMES_SIP_TLS_PORT (the provisioner alias) is
+    # the fallback (launch-blocker fix; runbook 0001). The error names the key the
+    # value actually came from so a malformed alias points the operator at the right
+    # variable; unset on both falls back to the transport default.
+    if canonical := _value(env, _PORT_KEY):
+        source_key, raw = _PORT_KEY, canonical
+    elif alias := _value(env, _TLS_PORT_KEY):
+        source_key, raw = _TLS_PORT_KEY, alias
+    else:
+        source_key, raw = _PORT_KEY, _DEFAULT_PORT[transport]
+    port = _parse_int(raw, source_key)
     if not _MIN_PORT <= port <= _MAX_PORT:
-        msg = f"{_PORT_KEY} must be in [{_MIN_PORT}, {_MAX_PORT}], got {port}"
+        msg = f"{source_key} must be in [{_MIN_PORT}, {_MAX_PORT}], got {port}"
         raise ConfigError(msg)
     return port
 

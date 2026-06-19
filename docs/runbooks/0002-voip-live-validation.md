@@ -551,6 +551,36 @@ Note: this is about Hermes *reply-text* streaming. The plugin still sentence-str
 **audio** itself (first audio in ~one short sentence); that is internal to the plugin and is
 not affected by this setting.
 
+### 8g. Verify outbound SDES-SRTP offering on `place_call` (ADR-0066)
+
+By default an agent-originated outbound call (`place_call`) offers **plain `RTP/AVP`**
+(the live-validated default). Setting `HERMES_VOIP_SIP_SDES_OFFER=1` makes the outbound
+INVITE offer **`RTP/SAVP` + a fresh per-call `a=crypto`** (SDES, RFC 4568) instead. This
+is **opt-in** because the policy is **fail-closed**: if the callee answers plain
+`RTP/AVP` to our secured offer, the call FAILS (it is never silently downgraded to
+cleartext).
+
+```sh
+# Enable the opt-in outbound SDES offer, then trigger an outbound call (the agent
+# place_call tool, or HERMES_VOIP_CALL_ON_CONNECT=<ext> for a one-shot test dial).
+export HERMES_VOIP_SIP_SDES_OFFER=1
+# Inspect the INVITE the plugin sends and the 2xx answer it receives.
+```
+
+- The outbound **INVITE** SDP offer shows `m=audio <port> RTP/SAVP …` and exactly one
+  `a=crypto:<tag> AES_CM_128_HMAC_SHA1_80 inline:<our-key>`. The same `a=crypto` is
+  re-sent on the 407 re-auth INVITE (the offer body is reused).
+- When the callee answers **`RTP/SAVP` + a usable `a=crypto`**: the call connects with
+  two-way SRTP — we encrypt outbound with our offer key and decrypt inbound with the
+  callee's answer key (RFC 4568 §6.1). Audio is two-way as in step 8.
+- When the callee answers **plain `RTP/AVP`** (a downgrade of our secured offer): the
+  call FAILS with `OutboundCallFailed(488, …)` and **no media flows** — the adapter logs
+  the 488 and tears down; it never streams plaintext. This is the fail-closed posture
+  (the offerer that asked for encryption must not accept a plaintext answer).
+- Rollback switch: unset `HERMES_VOIP_SIP_SDES_OFFER` (or `=0`) to return to the plain
+  `RTP/AVP` outbound offer without a code change. No effect on the inbound answer path or
+  the WebRTC outbound path (which already offers DTLS-SRTP).
+
 ## 9. Teardown
 
 - Stop the validation process / gateway with `Ctrl-C` (the driver above calls

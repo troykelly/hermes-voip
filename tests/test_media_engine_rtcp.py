@@ -38,6 +38,7 @@ from hermes_voip.rtcp import (
     parse_compound,
     to_ntp,
 )
+from hermes_voip.rtp import RtpPacket
 
 _G711_RATE = 8000
 _PTIME_MS = 20
@@ -670,3 +671,209 @@ async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
         assert engine.call_quality.remote_cumulative_lost == 11
     finally:
         await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# Codex review fixes (ADR-0061 adapter activation, fresh-context review)
+# ---------------------------------------------------------------------------
+
+
+def _identity_srtp() -> object:
+    """A minimal SRTP stand-in: protect/unprotect are byte-for-byte identity.
+
+    Satisfies the engine's ``_SrtpProtect`` (``protect(RtpPacket) -> bytes``) and
+    ``_SrtpUnprotect`` (``unprotect(bytes) -> RtpPacket``) Protocols enough to mark
+    the engine as *secured* for these tests, without pulling in the real
+    cryptography backend. Only the presence of ``_srtp_in``/``_srtp_out`` matters
+    here, not the transform.
+    """
+
+    class _IdentitySrtp:
+        def protect(self, packet: object) -> bytes:
+            assert isinstance(packet, RtpPacket)
+            return packet.pack()
+
+        def unprotect(self, data: bytes) -> RtpPacket:
+            return RtpPacket.parse(data)
+
+    return _IdentitySrtp()
+
+
+class _FakeIcePipe:
+    """A minimal ``_IceDatagramPipe`` stand-in (WebRTC marker for these tests).
+
+    Marks the engine as carrying an ICE/DTLS transport without a real ICE stack.
+    ``recv`` parks forever (no inbound) and ``send`` records, so the engine treats
+    it as the secured WebRTC media path; only ``_ice is not None`` matters here.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    async def recv(self) -> bytes:
+        await asyncio.Event().wait()  # park: no inbound for these tests
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def send(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        """No-op."""
+
+
+def test_rtcp_active_does_not_engage_demux_on_non_muxed_call() -> None:
+    """BLOCKING #1: a non-muxed active call must NOT demux RTCP off the RTP socket.
+
+    RFC 3550 §11: with mux=False, RTCP arrives on the SIBLING socket only — the RTP
+    socket carries pure RTP. The inbound RTP-socket demux is gated on a SEPARATE
+    ``_rtcp_mux_active`` flag (true only when mux=True), not on ``_rtcp_active``
+    (true for BOTH muxed and non-muxed). Without the separate flag the demux fires on
+    a non-muxed call and would mis-route an RTP packet whose 2nd byte aliases an RTCP
+    PT. This is a pure-state assertion on the flag the demux reads.
+    """
+    engine = _make_engine()
+    # Simulate start_rtcp(mux=False) having set RTCP active on the non-muxed path.
+    engine._rtcp_active = True
+    # The inbound RTP-socket demux must read a mux-specific flag, false here.
+    assert engine._rtcp_mux_active is False
+
+
+@pytest.mark.asyncio
+async def test_non_muxed_active_call_does_not_demux_rtcp_typed_rtp_off_rtp_socket() -> (
+    None
+):
+    """BLOCKING #1 (behavioural): a non-muxed active call yields RTP, never ingests it.
+
+    On the non-muxed path the engine binds a sibling RTCP socket; the RTP socket must
+    stay pure RTP. A datagram arriving on the RTP recv queue whose 2nd byte happens to
+    sit in the RTCP PT range (an RTP packet with a high PT + marker) must be processed
+    as RTP, NOT swallowed by the muxed demux into ingest_rtcp.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    try:
+        remote = ("127.0.0.1", 5004)
+        # A genuine peer RR (2nd byte 201) delivered on the RTP socket. On a non-muxed
+        # call this must NOT be demuxed to ingest_rtcp (RTCP comes via the sibling
+        # socket). It is an unknown PT for the audio path, so it is simply dropped —
+        # the key assertion is that it is NOT ingested as RTCP.
+        engine._recv_queue.put_nowait((_peer_rr_about_us(cumulative_lost=42), remote))
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=700, ts=0), remote))
+        gen = engine.inbound_audio()
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert frame.sample_rate == _G711_RATE
+        # The RR on the RTP socket was NOT absorbed by the muxed demux.
+        assert engine.call_quality.remote_cumulative_lost is None
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_refuses_secured_engine_srtp_inbound() -> None:
+    """MAJOR #3: start_rtcp is a no-op on a secured engine (SRTP inbound set).
+
+    The engine emits/parses CLEARTEXT RTCP only — it has no SRTCP (RFC 3711 §3.4)
+    transform. start_rtcp must REFUSE a secured transport rather than emit cleartext
+    RTCP on an encrypted 5-tuple (leaking SSRC/CNAME/timing). The loop is never
+    started and the inbound demux is never engaged. This is the seam a future SRTCP
+    lane flips to ENABLE.
+    """
+    engine = _make_engine()
+    engine._srtp_in = _identity_srtp()  # mark inbound as secured
+    await engine.connect()
+    await engine.start_rtcp(mux=True)
+    try:
+        assert engine._rtcp_task is None  # no loop started
+        assert engine._rtcp_active is False  # demux not engaged
+        assert engine._rtcp_mux_active is False
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_refuses_secured_engine_srtp_outbound() -> None:
+    """MAJOR #3: start_rtcp is a no-op on a secured engine (SRTP outbound set)."""
+    engine = _make_engine()
+    engine._srtp_out = _identity_srtp()  # mark outbound as secured
+    await engine.connect()
+    await engine.start_rtcp(mux=True)
+    try:
+        assert engine._rtcp_task is None
+        assert engine._rtcp_active is False
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_refuses_secured_engine_ice_dtls() -> None:
+    """MAJOR #3: start_rtcp is a no-op on the secured WebRTC (ICE/DTLS) path.
+
+    A WebRTC engine carries an ``ice_transport`` (and DTLS-derived SRTP). Cleartext
+    RTCP must never be sent over it; start_rtcp refuses and the loop never starts.
+    Constructed with the ICE pipe so the engine takes its ICE branch.
+    """
+    ice = _FakeIcePipe()
+    engine = _make_engine(ice_transport=ice)
+    engine._srtp_in = _identity_srtp()
+    engine._srtp_out = _identity_srtp()
+    await engine.start_rtcp(mux=True)
+    try:
+        assert engine._rtcp_task is None
+        assert engine._rtcp_active is False
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_non_muxed_socket_failure_degrades_call_stays_up() -> None:
+    """MAJOR #5: a non-mux RTCP socket-open failure leaves the call up, RTCP off.
+
+    The sibling RTCP socket (RTP-port+1) may be unavailable (port in use). That must
+    NOT crash/reject the CALL: start_rtcp catches the OSError, closes any partial
+    socket, leaves RTCP inactive, and returns so media continues. We genuinely OCCUPY
+    RTP-port+1 with another bound UDP socket so the engine's real bind raises OSError.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    rtp_port = engine.local_port
+    # Occupy RTP-port+1 so the engine's sibling-RTCP bind fails for real (no mock).
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    blocker.bind((engine._local_address, rtp_port + 1))
+    try:
+        # Must NOT raise — the call degrades to RTCP-off.
+        await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+        assert engine._rtcp_active is False  # RTCP left inactive
+        assert engine._rtcp_task is None  # loop never started
+        assert engine._rtcp_transport is None  # no partial socket retained
+        assert engine._rtcp_local_port is None
+        # The media path is still alive: the engine still yields inbound audio.
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=900, ts=0), ("127.0.0.1", 1)))
+        gen = engine.inbound_audio()
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert frame.sample_rate == _G711_RATE
+    finally:
+        blocker.close()
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_awaits_and_clears_non_muxed_rtcp_reader() -> None:
+    """MAJOR #6: stop() cancels AND awaits the RTCP reader, then clears it.
+
+    The sibling-socket reader task must be cancelled AND awaited (mirroring the
+    run_rtcp task teardown) so it cannot outlive the call (teardown race /
+    send-after-close, "task was destroyed but it is pending"). After stop() the
+    reader handle is cleared and the awaited task is truly done.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    reader = engine._rtcp_reader
+    assert reader is not None
+    assert not reader.done()
+    await engine.stop()
+    # The reader was awaited to completion and the handle cleared.
+    assert engine._rtcp_reader is None
+    assert reader.done()

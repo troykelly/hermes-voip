@@ -23,8 +23,9 @@ bound — proving the wire wiring, not just the planner.
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Callable
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -49,7 +50,13 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
-from hermes_voip.sdp import AudioMedia, SessionDescription
+from hermes_voip.sdp import (
+    AudioMedia,
+    Fingerprint,
+    IceCandidate,
+    SessionDescription,
+    SetupRole,
+)
 
 # ---------------------------------------------------------------------------
 # Pure-helper unit tests: the activation planner + the opaque CNAME
@@ -113,7 +120,8 @@ def test_plan_rtcp_activation_plain_non_muxed_uses_rtp_port_plus_one() -> None:
     plan = _plan_rtcp_activation(
         _audio_of(_PLAIN_OFFER_NO_MUX),
         remote_address="203.0.113.7",
-        secured=False,
+        answer_profile="RTP/AVP",
+        payload_types=(0, 8),
         rtcp_enabled=True,
     )
     assert plan is not None
@@ -127,7 +135,8 @@ def test_plan_rtcp_activation_plain_muxed_uses_rtp_port() -> None:
     plan = _plan_rtcp_activation(
         _audio_of(_PLAIN_OFFER_WITH_MUX),
         remote_address="203.0.113.7",
-        secured=False,
+        answer_profile="RTP/AVP",
+        payload_types=(0, 8),
         rtcp_enabled=True,
     )
     assert plan is not None
@@ -135,31 +144,104 @@ def test_plan_rtcp_activation_plain_muxed_uses_rtp_port() -> None:
     assert plan.remote_rtcp_addr == ("203.0.113.7", 20000)
 
 
-def test_plan_rtcp_activation_secured_is_suppressed() -> None:
-    """A secured (SDES/SAVP) session does NOT activate RTCP (no SRTCP transform).
-
-    The engine emits/parses cleartext RTCP only; activating on a secured 5-tuple
-    would violate RFC 3711 §3.4 and leak the CNAME/timing in cleartext, so the
-    planner returns None — the named, bounded scope of this activation lane.
-    """
-    plan = _plan_rtcp_activation(
-        _audio_of(_PLAIN_OFFER_WITH_MUX),
-        remote_address="203.0.113.7",
-        secured=True,
-        rtcp_enabled=True,
-    )
-    assert plan is None
-
-
 def test_plan_rtcp_activation_kill_switch_suppresses() -> None:
     """The operator kill-switch (rtcp_enabled=False) suppresses all activation."""
     plan = _plan_rtcp_activation(
         _audio_of(_PLAIN_OFFER_NO_MUX),
         remote_address="203.0.113.7",
-        secured=False,
+        answer_profile="RTP/AVP",
+        payload_types=(0, 8),
         rtcp_enabled=False,
     )
     assert plan is None
+
+
+# ---------------------------------------------------------------------------
+# Codex review #4: activation gated on the ANSWERED PROFILE, fail-closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "answer_profile",
+    [
+        "RTP/SAVP",  # SDES-SRTP (RFC 4568)
+        "RTP/SAVPF",  # SDES-SRTP with AVPF feedback
+        "UDP/TLS/RTP/SAVP",  # SIP DTLS-SRTP (ADR-0053 Stage 2)
+        "UDP/TLS/RTP/SAVPF",  # WebRTC DTLS-SRTP (ADR-0016)
+    ],
+)
+def test_plan_rtcp_activation_non_avp_profile_is_suppressed(
+    answer_profile: str,
+) -> None:
+    """MAJOR #4: only an exact ``RTP/AVP`` answer activates RTCP (fail-closed).
+
+    The engine has no SRTCP (RFC 3711 §3.4) transform, so RTCP is activated ONLY on
+    the cleartext plain-RTP profile. Gating on the ANSWERED profile (not "no crypto
+    present") is fail-closed: any secured profile — SDES SAVP/SAVPF, SIP DTLS, WebRTC
+    SAVPF — leaves RTCP dormant. Cleartext RTCP on a secured 5-tuple would violate
+    the profile and leak SSRC/CNAME/timing.
+    """
+    plan = _plan_rtcp_activation(
+        _audio_of(_PLAIN_OFFER_WITH_MUX),
+        remote_address="203.0.113.7",
+        answer_profile=answer_profile,
+        payload_types=(0, 8),
+        rtcp_enabled=True,
+    )
+    assert plan is None
+
+
+def test_plan_rtcp_activation_plain_avp_profile_activates() -> None:
+    """The exact plain ``RTP/AVP`` answer profile DOES activate RTCP (the positive)."""
+    plan = _plan_rtcp_activation(
+        _audio_of(_PLAIN_OFFER_NO_MUX),
+        remote_address="203.0.113.7",
+        answer_profile="RTP/AVP",
+        payload_types=(0, 8),
+        rtcp_enabled=True,
+    )
+    assert plan is not None
+
+
+# ---------------------------------------------------------------------------
+# Codex review #2: rtcp-mux forbidden when an RTP payload type is in 64-95
+# (RFC 5761 §4 — those PTs alias the RTCP packet-type range on a muxed stream)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_rtcp_activation_mux_refused_for_conflict_range_pt() -> None:
+    """MAJOR #2: an agreed RTP PT in 64-95 forbids rtcp-mux (RFC 5761 §4).
+
+    Byte 2 of an RTP packet is ``(marker<<7 | PT)``; an RTP PT in 64-95 with the
+    marker bit set becomes 192-223, which overlaps the RTCP packet-type range
+    (200-204) on a muxed stream — an unresolvable RTP-vs-RTCP ambiguity. RFC 5761 §4
+    forbids those PTs under rtcp-mux. The planner must NOT mux such a call: it falls
+    back to a non-muxed plan (RTCP on RTP-port+1) so the demux ambiguity never arises.
+    """
+    plan = _plan_rtcp_activation(
+        _audio_of(_PLAIN_OFFER_WITH_MUX),  # the offer requested a=rtcp-mux
+        remote_address="203.0.113.7",
+        answer_profile="RTP/AVP",
+        payload_types=(0, 72),  # 72 ∈ [64, 95] — forbidden under mux
+        rtcp_enabled=True,
+    )
+    assert plan is not None
+    # The mux request is REFUSED — RTCP falls back to the sibling port (RFC 3550 §11).
+    assert plan.mux is False
+    assert plan.remote_rtcp_addr == ("203.0.113.7", 20001)
+
+
+def test_plan_rtcp_activation_mux_kept_for_normal_payload_types() -> None:
+    """The plugin's own codecs (0/8/9/96-127) are outside 64-95: mux still honoured."""
+    plan = _plan_rtcp_activation(
+        _audio_of(_PLAIN_OFFER_WITH_MUX),
+        remote_address="203.0.113.7",
+        answer_profile="RTP/AVP",
+        payload_types=(0, 8, 9, 96, 101),  # all outside [64, 95]
+        rtcp_enabled=True,
+    )
+    assert plan is not None
+    assert plan.mux is True  # mux honoured — no conflict-range PT
 
 
 def test_media_config_rtcp_enabled_defaults_true() -> None:
@@ -421,4 +503,239 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
     finally:
         in_call.set()
         await adapter.disconnect()  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Codex review #8: secured-path negative controls through the REAL adapter paths
+#
+# The pure-helper tests prove the planner returns None for a secured profile; these
+# drive the REAL inbound INVITE → setup path with an SDES (RTP/SAVP) and a WebRTC
+# (SAVPF) offer and assert RTCP is NEVER activated on the live media (no cleartext
+# RTCP on a secured 5-tuple). The SDES path reaches a REAL engine; the WebRTC path
+# uses a fake engine whose start_rtcp is asserted never-called.
+# ---------------------------------------------------------------------------
+
+
+# A 30-byte SDES master key||salt, generated at runtime (never a literal secret in a
+# tracked file — rule 34). Valid base64 for an AES_CM_128_HMAC_SHA1_80 inline key.
+_SDES_INLINE_KEY = base64.b64encode(bytes(range(30))).decode("ascii")
+
+_SDES_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/SAVP 0 8\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_SDES_INLINE_KEY}\r\n"
+    "a=sendrecv\r\n"
+)
+
+_WEBRTC_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 50000 UDP/TLS/RTP/SAVPF 111 0\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=fmtp:111 minptime=10;useinbandfec=1\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=fingerprint:sha-256 "
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n"
+    "a=setup:actpass\r\n"
+    "a=ice-ufrag:peerUFRG\r\n"
+    "a=ice-pwd:peerPWDpeerPWDpeerPWDpeer\r\n"
+    "a=candidate:1 1 UDP 2130706431 127.0.0.1 50000 typ host\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_inbound_sdes_savp_call_never_activates_rtcp_on_live_engine() -> None:
+    """MAJOR #8 (SDES): a real RTP/SAVP INVITE leaves RTCP DORMANT on the live engine.
+
+    Through ``_on_inbound_invite`` with the REAL ``RtpMediaTransport``: the answer is
+    SDES (a=crypto present, RTP/SAVP), and the live engine must have RTCP inactive —
+    no loop task, no muxed demux engaged, no sibling socket. Cleartext RTCP on a
+    secured 5-tuple is forbidden until SRTCP lands.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SDES_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+
+            # The 200 OK is an SDES answer (a=crypto present) — the secured path.
+            oks = [
+                SipResponse.parse(m)
+                for m in transport.sent
+                if m.startswith("SIP/2.0 200")
+            ]
+            assert oks
+            assert "a=crypto" in oks[-1].body
+
+            # The LIVE engine must have RTCP DORMANT (no SRTCP transform).
+            session = adapter._call_sessions[call_id]  # type: ignore[attr-defined]
+            engine = session._media  # white-box: the concrete RtpMediaTransport
+            assert engine._rtcp_task is None  # no run_rtcp loop
+            assert engine._rtcp_active is False  # muxed demux NOT engaged
+            assert engine._rtcp_mux_active is False
+            assert engine._rtcp_local_port is None  # no sibling socket
+    finally:
+        in_call.set()
+        await adapter.disconnect()  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+
+
+class _FakeWebRtcSession:
+    """A fake WebRtcMediaSession: skips real ICE/DTLS, returns canned SRTP sessions.
+
+    Mirrors the fake in test_adapter_webrtc.py so a WebRTC INVITE reaches the engine
+    construction without a real ICE/DTLS stack.
+    """
+
+    last: _FakeWebRtcSession | None = None
+
+    def __init__(
+        self,
+        *,
+        offer_setup: SetupRole | None,
+        stun_urls: tuple[str, ...] = (),
+        **_kw: object,
+    ) -> None:
+        self.offer_setup = offer_setup
+        self.stun_urls = stun_urls
+        self.prepared = False
+        self.handshake_args: dict[str, object] | None = None
+        self.closed = False
+        self.ice = MagicMock(name="ice_pipe")
+        self.ice.send = AsyncMock(return_value=None)
+        _FakeWebRtcSession.last = self
+
+    async def prepare(self) -> None:
+        self.prepared = True
+
+    @property
+    def setup(self) -> SetupRole:
+        return SetupRole("passive")
+
+    @property
+    def fingerprint(self) -> Fingerprint:
+        return Fingerprint(algorithm="sha-256", value=":".join(["AB"] * 32))
+
+    @property
+    def ice_ufrag(self) -> str:
+        return "ourUFRAGxx"
+
+    @property
+    def ice_pwd(self) -> str:
+        return "ourPWDourPWDourPWDourPWD"
+
+    @property
+    def ice_candidates(self) -> list[IceCandidate]:
+        return [
+            IceCandidate(
+                foundation="candidate:1",
+                component=1,
+                transport="UDP",
+                priority=2130706431,
+                address="127.0.0.1",
+                port=51000,
+                typ="host",
+                raddr=None,
+                rport=None,
+            )
+        ]
+
+    async def run_handshake(self, **kwargs: object) -> tuple[object, object]:
+        self.handshake_args = kwargs
+        return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_inbound_webrtc_savpf_call_never_calls_start_rtcp() -> None:
+    """MAJOR #8 (WebRTC): a real SAVPF INVITE never calls start_rtcp on the engine.
+
+    Through ``_on_inbound_invite`` with the WebRTC (DTLS-SRTP) path: the engine is a
+    fake whose ``start_rtcp`` is an AsyncMock. The secured WebRTC profile must leave
+    RTCP dormant — ``start_rtcp`` is asserted NEVER called (no cleartext RTCP over the
+    encrypted ICE/DTLS 5-tuple).
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_WEBRTC_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+
+    try:
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+
+            # The answer is a WebRTC (DTLS) answer: fingerprint present, no a=crypto.
+            oks = [
+                SipResponse.parse(m)
+                for m in transport.sent
+                if m.startswith("SIP/2.0 200")
+            ]
+            assert oks
+            assert "a=fingerprint" in oks[-1].body
+            assert "a=crypto" not in oks[-1].body
+
+            # The secured WebRTC path NEVER activates RTCP.
+            fake_engine.start_rtcp.assert_not_called()
+    finally:
+        in_call.set()
         await asyncio.sleep(0)

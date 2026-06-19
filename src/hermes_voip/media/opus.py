@@ -74,6 +74,17 @@ _CHANNELS: Final[int] = 1
 #: ``opuslib`` application mode for low-latency speech (= ``OPUS_APPLICATION_VOIP``).
 _APPLICATION_VOIP: Final[int] = 2048
 
+#: Default expected packet-loss percentage the encoder is biased for (ADR-0056).
+#: Opus scales its in-band FEC strength with this hint; 10% is a reasonable
+#: open-internet default — enough redundancy to recover typical single-frame
+#: losses without a large bitrate cost. A future control path can raise it from
+#: measured loss via the ``expected_packet_loss_pct`` constructor argument.
+_DEFAULT_EXPECTED_PACKET_LOSS_PCT: Final[int] = 10
+
+#: Inclusive bounds for a packet-loss percentage hint.
+_MIN_LOSS_PCT: Final[int] = 0
+_MAX_LOSS_PCT: Final[int] = 100
+
 
 # ---------------------------------------------------------------------------
 # Narrow Protocol surface over the optional ``opuslib`` extra.
@@ -87,8 +98,24 @@ _APPLICATION_VOIP: Final[int] = 2048
 # ---------------------------------------------------------------------------
 
 
+# The libopus encoder/decoder handles are opaque ctypes pointer structures
+# (``opuslib.api.encoder.LP_Encoder`` / ``LP_Decoder``); this module only passes
+# them back into the ``opuslib.api`` CTL/decode functions, never inspecting them,
+# so an opaque ``object`` is the right type — it carries no Any.
+type _OpusHandle = object
+
+
 class _RawEncoder(Protocol):
-    """The ``opuslib.Encoder`` surface this module uses."""
+    """The ``opuslib.Encoder`` surface this module uses.
+
+    Includes ``encoder_state`` (the ctypes handle) and the read-back getters,
+    which work — only opuslib's CTL *setters* are broken (they omit the value
+    argument), so FEC/loss are enabled via the low-level CTL on ``encoder_state``.
+    """
+
+    encoder_state: _OpusHandle
+    inband_fec: int
+    packet_loss_perc: int
 
     def encode(self, pcm_data: bytes, frame_size: int) -> bytes:
         """Encode one frame of interleaved PCM16 to an Opus packet."""
@@ -96,11 +123,69 @@ class _RawEncoder(Protocol):
 
 
 class _RawDecoder(Protocol):
-    """The ``opuslib.Decoder`` surface this module uses."""
+    """The ``opuslib.Decoder`` surface this module uses.
 
-    def decode(self, opus_data: bytes, frame_size: int) -> bytes:
-        """Decode one Opus packet to interleaved PCM16."""
+    ``decoder_state`` (the ctypes handle) is used for the low-level NULL-packet
+    PLC path, since opuslib's high-level ``decode(None, …)`` crashes on
+    ``len(None)``.
+    """
+
+    decoder_state: _OpusHandle
+
+    def decode(
+        self, opus_data: bytes, frame_size: int, decode_fec: bool = ...
+    ) -> bytes:
+        """Decode one Opus packet to interleaved PCM16 (optionally in FEC mode)."""
         ...
+
+
+class _CtlRequest(Protocol):
+    """An ``opuslib.api.ctl`` request function (e.g. ``set_inband_fec``)."""
+
+    def __call__(self, func: object, obj: _OpusHandle, value: int) -> int:
+        """Apply the CTL ``request`` with ``value`` to the codec ``obj``."""
+        ...
+
+
+class _CtlModule(Protocol):
+    """The ``opuslib.api.ctl`` surface: the CTL request callables this module sets."""
+
+    set_inband_fec: _CtlRequest
+    set_packet_loss_perc: _CtlRequest
+
+
+class _EncoderApi(Protocol):
+    """The ``opuslib.api.encoder`` surface: the low-level CTL entry point."""
+
+    def encoder_ctl(
+        self, encoder_state: _OpusHandle, request: _CtlRequest, value: int = ...
+    ) -> int:
+        """Invoke a CTL ``request`` on ``encoder_state`` (passing ``value``)."""
+        ...
+
+
+class _DecoderApi(Protocol):
+    """The ``opuslib.api.decoder`` surface: the low-level decode (NULL-packet PLC)."""
+
+    def decode(  # noqa: PLR0913 — this mirrors opuslib.api.decoder.decode's real 6-parameter signature (decoder_state, opus_data, length, frame_size, decode_fec, channels); the Protocol must match it exactly to type the call site
+        self,
+        decoder_state: _OpusHandle,
+        opus_data: bytes | None,
+        length: int,
+        frame_size: int,
+        decode_fec: bool,
+        channels: int = ...,
+    ) -> bytes:
+        """Decode (or, with ``opus_data=None``, conceal) one frame to PCM16."""
+        ...
+
+
+class _OpusApiModule(Protocol):
+    """The ``opuslib.api`` surface used for the low-level CTL/PLC paths."""
+
+    encoder: _EncoderApi
+    decoder: _DecoderApi
+    ctl: _CtlModule
 
 
 class _EncoderCtor(Protocol):
@@ -124,6 +209,7 @@ class _OpuslibModule(Protocol):
 
     Encoder: _EncoderCtor
     Decoder: _DecoderCtor
+    api: _OpusApiModule
 
 
 def _get_opuslib() -> _OpuslibModule:
@@ -196,17 +282,64 @@ class OpusEncoder:
     Construct one per outbound stream; :meth:`encode` takes exactly one 20 ms
     48 kHz PCM16 frame (960 samples / 1920 bytes) and returns the Opus packet.
 
+    **In-band FEC (ADR-0056).** The encoder enables Opus in-band forward error
+    correction and an *expected packet-loss percentage* at construction, so each
+    packet can carry a low-bitrate redundant copy of the previous frame — the
+    loss-resilience the WebRTC SDP advertises (``useinbandfec=1``) and the reason
+    Opus is chosen on the open internet. opuslib 3.0.1's ``inband_fec`` /
+    ``packet_loss_perc`` *property setters are broken* (the lambda omits the CTL
+    value argument and raises ``TypeError``), so these are set via the low-level
+    ``opuslib.api.encoder.encoder_ctl(state, request, value)`` CTL; the getters,
+    which work, read the applied state back (see :attr:`inband_fec_enabled` /
+    :attr:`expected_packet_loss_pct`).
+
     Raises:
         ImportError: At construction if the ``webrtc`` extra (``opuslib``) or the
             system ``libopus`` is absent.
+        ValueError: If ``expected_packet_loss_pct`` is outside ``0..100``.
     """
 
-    def __init__(self) -> None:
-        """Build the underlying ``opuslib`` encoder in VOIP mode at 48 kHz mono."""
+    def __init__(
+        self, *, expected_packet_loss_pct: int = _DEFAULT_EXPECTED_PACKET_LOSS_PCT
+    ) -> None:
+        """Build the ``opuslib`` encoder in VOIP mode at 48 kHz mono with FEC on.
+
+        Args:
+            expected_packet_loss_pct: The loss percentage (0..100) Opus biases its
+                in-band FEC strength for. Higher = more redundancy (and bitrate);
+                the default (:data:`_DEFAULT_EXPECTED_PACKET_LOSS_PCT`) suits the
+                open internet.
+        """
+        if not _MIN_LOSS_PCT <= expected_packet_loss_pct <= _MAX_LOSS_PCT:
+            msg = (
+                "expected_packet_loss_pct must be a percentage in "
+                f"{_MIN_LOSS_PCT}..{_MAX_LOSS_PCT}, got {expected_packet_loss_pct}"
+            )
+            raise ValueError(msg)
         opuslib = _get_opuslib()
+        self._api = opuslib.api
         self._enc: _RawEncoder = opuslib.Encoder(
             OPUS_SAMPLE_RATE, _CHANNELS, _APPLICATION_VOIP
         )
+        # Enable in-band FEC and set the expected loss via the low-level CTL (the
+        # high-level property setters are broken — see the class docstring). A
+        # non-OK CTL raises opuslib.OpusError, which propagates (rule 37) rather
+        # than silently leaving FEC off.
+        ctl = opuslib.api.ctl
+        self._api.encoder.encoder_ctl(self._enc.encoder_state, ctl.set_inband_fec, 1)
+        self._api.encoder.encoder_ctl(
+            self._enc.encoder_state, ctl.set_packet_loss_perc, expected_packet_loss_pct
+        )
+
+    @property
+    def inband_fec_enabled(self) -> bool:
+        """Whether in-band FEC is on (read back from libopus via the working getter)."""
+        return self._enc.inband_fec != 0
+
+    @property
+    def expected_packet_loss_pct(self) -> int:
+        """The expected packet-loss percentage the encoder is biased for."""
+        return self._enc.packet_loss_perc
 
     def encode(self, pcm16: bytes) -> bytes:
         """Encode one 20 ms 48 kHz PCM16 frame to an Opus packet.
@@ -215,7 +348,8 @@ class OpusEncoder:
             pcm16: Exactly one frame of PCM16-LE mono at 48 kHz (960 samples).
 
         Returns:
-            The Opus-encoded packet bytes.
+            The Opus-encoded packet bytes (carrying in-band FEC redundancy when
+            the encoder judges it worthwhile for the configured expected loss).
 
         Raises:
             ValueError: If ``pcm16`` is not exactly one 20 ms 48 kHz frame.
@@ -230,6 +364,16 @@ class OpusDecoder:
     Construct one per inbound stream; :meth:`decode` takes one Opus packet and
     returns one 20 ms 48 kHz PCM16 frame (960 samples / 1920 bytes).
 
+    **Loss recovery (ADR-0056).** Two concealment paths keep the decoder's
+    internal predictor coherent across a lost frame (so wideband does not degrade
+    worse than G.711):
+
+    * :meth:`decode_fec` reconstructs the *previous* (lost) frame from the FEC
+      copy carried inside the *next* received packet — exact recovery when the
+      sender enabled in-band FEC and the successor packet has arrived.
+    * :meth:`decode_plc` extrapolates a concealment frame from decoder state with
+      no packet at all (a lone loss with no successor available yet).
+
     Raises:
         ImportError: At construction if the ``webrtc`` extra (``opuslib``) or the
             system ``libopus`` is absent.
@@ -238,6 +382,7 @@ class OpusDecoder:
     def __init__(self) -> None:
         """Build the underlying ``opuslib`` decoder at 48 kHz mono."""
         opuslib = _get_opuslib()
+        self._api = opuslib.api
         self._dec: _RawDecoder = opuslib.Decoder(OPUS_SAMPLE_RATE, _CHANNELS)
 
     def decode(self, packet: bytes) -> bytes:
@@ -251,3 +396,41 @@ class OpusDecoder:
             One 20 ms 48 kHz PCM16-LE mono frame (960 samples / 1920 bytes).
         """
         return self._dec.decode(packet, OPUS_FRAME_SAMPLES)
+
+    def decode_fec(self, next_packet: bytes) -> bytes:
+        """Recover a lost frame from the in-band FEC in the NEXT received packet.
+
+        When frame N is lost but packet N+1 has arrived, Opus can reconstruct
+        frame N from the redundant low-bitrate copy the encoder embedded in packet
+        N+1 (``decode_fec=True``). The decoder's predictor state is advanced for
+        frame N exactly as a normal decode would — the caller then decodes packet
+        N+1 normally on its next :meth:`decode`.
+
+        Args:
+            next_packet: The packet for frame N+1 (the successor of the lost one).
+
+        Returns:
+            The reconstructed lost frame as one 20 ms 48 kHz PCM16-LE mono frame.
+        """
+        return self._dec.decode(next_packet, OPUS_FRAME_SAMPLES, decode_fec=True)
+
+    def decode_plc(self) -> bytes:
+        """Conceal one lost frame with no packet (Opus packet-loss concealment).
+
+        Opus extrapolates the missing frame from its decoder state. The opuslib
+        *high-level* ``Decoder.decode(None, …)`` crashes on ``len(None)``, so this
+        calls the low-level ``opuslib.api.decoder.decode(state, None, 0,
+        frame_size, False, channels)`` — i.e. ``opus_decode(dec, NULL, 0, pcm,
+        frame_size, 0)``, the documented NULL-packet PLC path.
+
+        Returns:
+            A concealment frame as one 20 ms 48 kHz PCM16-LE mono frame.
+        """
+        return self._api.decoder.decode(
+            self._dec.decoder_state,
+            None,
+            0,
+            OPUS_FRAME_SAMPLES,
+            False,
+            channels=_CHANNELS,
+        )

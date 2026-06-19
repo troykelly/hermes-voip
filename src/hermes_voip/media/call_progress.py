@@ -14,15 +14,17 @@ edge stream and **returns typed events**:
   speech spreads energy across a harmonic series and never sustains one pure bin, so
   it is rejected.
 * **Answering machines (outbound only).** A sans-IO state machine fed the
-  speech/silence **segment durations** the VAD stream produces (plus an optional STT
-  greeting-text length): a short greeting then a pause awaiting a response ≈ a human;
-  long continuous speech ≈ a machine. Once a machine is classified, the record cue —
-  a ~1000 Hz **beep**, or the greeting-ended (long-speech→silence) signal when no
-  beep comes — emits :class:`ReadyToLeaveMessage`. **AMD is heuristic** (~85-95 %
-  even commercially); the thresholds below are tunable :data:`Final` constants and
-  this module makes no claim of exactness. The hang-up-vs-speak decision belongs to
-  the Hermes agent (its call-control tools, ADR-0009/0010/0031) — this detector only
-  emits the cue.
+  speech/silence **segment durations** the VAD stream produces: a short greeting then
+  a pause awaiting a response ≈ a human; long continuous speech ≈ a machine. Once a
+  machine is classified, the record cue — a ~1000 Hz **beep**, or the greeting-ended
+  (silence held for the response gap) signal when no beep comes — emits
+  :class:`ReadyToLeaveMessage`. The no-beep fallback fires from
+  :meth:`CallProgressDetector.on_audio_frame` on the audio/sample clock, because a
+  machine that has stopped talking to record sends no further VAD edge to wait on.
+  **AMD is heuristic** (~85-95 % even commercially); the thresholds below are tunable
+  :data:`Final` constants and this module makes no claim of exactness. The
+  hang-up-vs-speak decision belongs to the Hermes agent (its call-control tools,
+  ADR-0009/0010/0031) — this detector only emits the cue.
 
 On an *inbound* call the agent **is** the answerer, so AMD is gated behind the
 ``outbound`` flag; fax detection runs in both directions. The detector is
@@ -204,29 +206,30 @@ def _tone_present(
 
 
 class _ToneRun:
-    """Tracks the running length (in frames) of one continuously-present tone.
+    """Tracks the running duration (in seconds) of one continuously-present tone.
 
-    A frame either has the tone present or not; consecutive present-frames extend
-    the run, an absent frame resets it. The frame duration (seconds) lets a caller
-    test the run's length in time, rate-independently.
+    A frame either has the tone present or not; a present frame extends the run by
+    that frame's own duration, an absent frame resets it to zero. Accumulating
+    seconds (not a frame count) keeps the run length exact under variable frame
+    sizes — the same correctness the sample clock gives ``elapsed_s``.
     """
 
     def __init__(self) -> None:
-        self._frames = 0
+        self._seconds = 0.0
 
-    @property
-    def frames(self) -> int:
-        """Consecutive present-frames in the current run."""
-        return self._frames
+    def update(self, *, present: bool, frame_s: float) -> float:
+        """Advance by one frame; return the new run duration in seconds.
 
-    def update(self, present: bool) -> int:
-        """Advance with this frame's presence; return the new run length (frames)."""
-        self._frames = self._frames + 1 if present else 0
-        return self._frames
+        Args:
+            present: Whether the tone is present in this frame.
+            frame_s: This frame's duration in seconds.
+        """
+        self._seconds = self._seconds + frame_s if present else 0.0
+        return self._seconds
 
     def reset(self) -> None:
         """Clear the run (used on detector reset)."""
-        self._frames = 0
+        self._seconds = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -273,10 +276,6 @@ _AMD_HUMAN_SPEECH_S: Final[float] = 2.0
 #: ended. Below this, a gap is treated as an in-greeting pause, not a turn boundary.
 _AMD_RESPONSE_GAP_S: Final[float] = 1.0
 
-#: An STT greeting transcript at least this long (characters) corroborates a machine
-#: when supplied. Optional — it raises confidence but never overrides the durations.
-_AMD_MACHINE_TEXT_CHARS: Final[int] = 80
-
 
 class _AmdState(Enum):
     """The answering-machine state machine's phase."""
@@ -307,16 +306,19 @@ class _Segment:
 class _AnsweringMachineDetector:
     """Classifies human vs machine from VAD speech/silence segments (sans-IO).
 
-    Fed one :class:`_Segment` at a time via :meth:`on_segment`. The verdict fires at
-    the first silence that follows the opening speech:
+    Fed one :class:`_Segment` at a time via :meth:`on_segment`. A long enough opening
+    speech run fires :class:`AnsweringMachine` as soon as it crosses the machine
+    threshold; otherwise the verdict fires at the first silence that follows the
+    opening speech:
 
     * the opening speech run (accumulated across in-greeting pauses shorter than the
       response gap) exceeded the machine threshold → :class:`AnsweringMachine`;
     * the opening speech was short and the trailing silence reached the response gap
       → :class:`LikelyHuman`.
 
-    After a machine verdict, the first detected beep or a post-greeting silence that
-    reaches the response gap yields the record cue (driven by the owning facade).
+    This classifier only decides human vs machine. The record cue
+    (:class:`ReadyToLeaveMessage`) is the owning :class:`CallProgressDetector`'s job —
+    via a detected beep or the audio-clock no-beep fallback — not this state machine's.
     """
 
     def __init__(
@@ -338,16 +340,11 @@ class _AnsweringMachineDetector:
         """Whether the classifier has fired an :class:`AnsweringMachine` verdict."""
         return self._decided_machine
 
-    def on_segment(
-        self, segment: _Segment, *, greeting_text_len: int = 0
-    ) -> AnsweringMachine | LikelyHuman | None:
+    def on_segment(self, segment: _Segment) -> AnsweringMachine | LikelyHuman | None:
         """Feed one VAD segment; return a verdict on the segment that decides it.
 
         Args:
-            segment: The speech/silence segment that just completed (or, for the
-                final open silence, the silence accumulated so far).
-            greeting_text_len: Optional length of the STT greeting transcript so
-                far (characters); corroborates a machine, never overrides duration.
+            segment: The speech/silence segment that just completed.
 
         Returns:
             An :class:`AnsweringMachine` or :class:`LikelyHuman` on the deciding
@@ -357,7 +354,7 @@ class _AnsweringMachineDetector:
             return None
         if segment.is_speech:
             return self._on_speech(segment)
-        return self._on_silence(segment, greeting_text_len)
+        return self._on_silence(segment)
 
     def _on_speech(self, segment: _Segment) -> AnsweringMachine | None:
         """A speech run: accumulate the greeting; a long-enough run is a machine."""
@@ -377,9 +374,7 @@ class _AnsweringMachineDetector:
             )
         return None
 
-    def _on_silence(
-        self, segment: _Segment, greeting_text_len: int
-    ) -> AnsweringMachine | LikelyHuman | None:
+    def _on_silence(self, segment: _Segment) -> AnsweringMachine | LikelyHuman | None:
         """A silence run after speech: a short greeting + a real pause is a human."""
         if self._state is not _AmdState.GREETING:
             # Leading silence before any speech — nothing to classify yet.
@@ -388,25 +383,17 @@ class _AnsweringMachineDetector:
             # An in-greeting pause, not a turn boundary; keep accumulating speech.
             return None
         end_s = segment.start_s + segment.duration_s
-        if (
-            self._greeting_speech_s > self._human_speech_s
-            or greeting_text_len >= _AMD_MACHINE_TEXT_CHARS
-        ):
+        if self._greeting_speech_s > self._human_speech_s:
             # Spoke for a while (between the human and machine speech thresholds) and
-            # then went quiet, or a long transcript — treat as a machine greeting.
+            # then went quiet — treat as a machine greeting.
             self._state = _AmdState.DECIDED
             self._decided_machine = True
-            corroborated = (
-                " (corroborated by transcript length)"
-                if greeting_text_len >= _AMD_MACHINE_TEXT_CHARS
-                else ""
-            )
             return AnsweringMachine(
                 elapsed_s=end_s,
                 beep_at_s=None,
                 why=(
                     f"greeting {self._greeting_speech_s:.1f}s then "
-                    f"{segment.duration_s:.1f}s silence{corroborated}"
+                    f"{segment.duration_s:.1f}s silence"
                 ),
             )
         self._state = _AmdState.DECIDED
@@ -473,10 +460,20 @@ class CallProgressDetector:
         self._beep_run = _ToneRun()
         self._cng_emitted = False
         self._ced_emitted = False
-        self._frames_seen = 0
+        # The audio/sample clock: total samples fed to on_audio_frame. elapsed_s is
+        # derived from this (samples / rate), so variable/zero-length frames keep an
+        # exact wall position. This is the single clock the tick-driven no-beep
+        # fallback measures post-greeting silence against.
+        self._samples_seen = 0
         # AMD + record-cue state (used only when outbound).
         self._amd = _AnsweringMachineDetector()
         self._ready_emitted = False
+        # The audio-clock time (seconds) at which the current run of silence began
+        # (set on each VAD OFFSET, cleared on each ONSET), or None while speech is in
+        # progress / before any edge. The no-beep fallback fires once a machine has
+        # been classified and this silence has lasted the response gap — driven by
+        # on_audio_frame, NOT by a later ONSET (a recording machine sends no edge).
+        self._silence_since_audio_s: float | None = None
         # VAD segmentation: the window ordinal of the last edge and its kind.
         self._last_edge_index: int | None = None
         self._last_edge_was_onset = False
@@ -484,17 +481,18 @@ class CallProgressDetector:
     def on_audio_frame(self, frame: PcmFrame) -> CallProgressEvent | None:
         """Process one decoded PCM16-LE mono frame; return an event or ``None``.
 
-        Runs the CNG/CED fax-tone detectors (both directions) and, once a machine
-        has been classified, the record-beep detector. Frame timing comes from the
-        running frame count times the frame's sample duration, so ``elapsed_s`` is
-        exact and independent of any wall clock.
+        Runs the CNG/CED fax-tone detectors (both directions); once a machine has
+        been classified, the record-beep detector AND the tick-driven no-beep
+        fallback. ``elapsed_s`` is the running sample count divided by the rate, so
+        it stays exact under variable or zero-length frames with no wall clock.
 
         Args:
             frame: PCM16-LE mono audio at this detector's ``sample_rate``.
 
         Returns:
             A :class:`FaxCng`, :class:`FaxCed`, or :class:`ReadyToLeaveMessage`
-            (beep path) on the frame that completes a detection, else ``None``.
+            (beep path, or the no-beep silence fallback) on the frame that completes
+            a detection, else ``None``.
 
         Raises:
             ValueError: If the frame's rate differs from the detector's, or its
@@ -510,11 +508,13 @@ class CallProgressDetector:
             )
             raise ValueError(msg)
         n = frame.sample_count
-        self._frames_seen += 1
+        self._samples_seen += n
+        elapsed_s = self._samples_seen / self._rate
         if n == 0:
+            # A zero-length frame advances no time and carries no tone; nothing to do
+            # (the clock is unchanged, so the silence-fallback timer is unaffected).
             return None
         frame_s = n / self._rate
-        elapsed_s = self._frames_seen * frame_s
 
         samples = [float(v) for v in struct.unpack(f"<{n}h", frame.samples)]
         total_energy = sum(s * s for s in samples)
@@ -522,24 +522,33 @@ class CallProgressDetector:
         cng_present = _tone_present(samples, total_energy, _CNG_HZ, self._rate)
         ced_present = _tone_present(samples, total_energy, _CED_HZ, self._rate)
 
-        cng_frames = self._cng_run.update(cng_present)
-        ced_frames = self._ced_run.update(ced_present)
+        cng_s = self._cng_run.update(present=cng_present, frame_s=frame_s)
+        ced_s = self._ced_run.update(present=ced_present, frame_s=frame_s)
 
-        if not self._cng_emitted and cng_frames * frame_s >= _CNG_MIN_ON_S:
+        if not self._cng_emitted and cng_s >= _CNG_MIN_ON_S:
             self._cng_emitted = True
             return FaxCng(elapsed_s=elapsed_s)
-        if not self._ced_emitted and ced_frames * frame_s >= _CED_MIN_ON_S:
+        if not self._ced_emitted and ced_s >= _CED_MIN_ON_S:
             self._ced_emitted = True
             return FaxCed(elapsed_s=elapsed_s)
 
-        # The record beep only matters once a machine greeting has been classified,
+        # The record cue only matters once a machine greeting has been classified,
         # and only on an outbound call.
         if self._outbound and self._amd.decided_machine and not self._ready_emitted:
             beep_present = _tone_present(samples, total_energy, _BEEP_HZ, self._rate)
-            beep_frames = self._beep_run.update(beep_present)
-            if beep_frames * frame_s >= _BEEP_MIN_ON_S:
+            beep_s = self._beep_run.update(present=beep_present, frame_s=frame_s)
+            if beep_s >= _BEEP_MIN_ON_S:
                 self._ready_emitted = True
                 return ReadyToLeaveMessage(elapsed_s=elapsed_s, beep_at_s=elapsed_s)
+            # No beep — the tick-driven fallback: if the greeting has now been silent
+            # for the response gap (the machine stopped to record and sends no further
+            # VAD edge), signal the record cue on the sample clock alone.
+            if (
+                self._silence_since_audio_s is not None
+                and elapsed_s - self._silence_since_audio_s >= _AMD_RESPONSE_GAP_S
+            ):
+                self._ready_emitted = True
+                return ReadyToLeaveMessage(elapsed_s=elapsed_s, beep_at_s=None)
         return None
 
     def on_vad_event(self, event: VadEvent) -> CallProgressEvent | None:
@@ -547,41 +556,34 @@ class CallProgressDetector:
 
         Segments the edge stream into speech/silence runs (ONSET→OFFSET = speech,
         OFFSET→next ONSET = silence), converts window ordinals to seconds, and feeds
-        the answering-machine state machine. On an inbound call (``outbound`` False)
-        this is inert. Once a machine has been classified, an ONSET after a
-        sufficient post-greeting silence yields the record cue via the silence path
-        (no beep heard).
+        the answering-machine state machine — which classifies human vs machine. On
+        an inbound call (``outbound`` False) this is inert.
+
+        The edge also marks the silence boundary the no-beep record-cue fallback
+        times against: an OFFSET starts a silence run (stamped on the audio/sample
+        clock), an ONSET ends it. The fallback itself fires from
+        :meth:`on_audio_frame` (the audio clock keeps ticking when the recording
+        machine sends no further VAD edge); this method never emits the cue.
 
         Args:
             event: A VAD speech onset/offset edge (window-ordinal timestamped).
 
         Returns:
-            An :class:`AnsweringMachine`, :class:`LikelyHuman`, or
-            :class:`ReadyToLeaveMessage` (silence path) on the deciding edge, else
-            ``None``.
+            An :class:`AnsweringMachine` or :class:`LikelyHuman` on the deciding
+            edge, else ``None``.
         """
         if not self._outbound:
             return None
+        # Track the silence boundary on the AUDIO clock for the on_audio_frame
+        # fallback: OFFSET => silence begins now; ONSET => speech, silence ends.
+        if event.edge is SpeechEdge.OFFSET:
+            self._silence_since_audio_s = self._samples_seen / self._rate
+        else:
+            self._silence_since_audio_s = None
         segment = self._close_segment(event)
         if segment is None:
             return None
-        verdict = self._amd.on_segment(segment)
-        if verdict is not None:
-            return verdict
-        # No new verdict — but if a machine was already decided and this completed
-        # SILENCE segment ran long enough, the greeting has ended with no beep:
-        # signal the record cue via the silence path.
-        if (
-            not segment.is_speech
-            and self._amd.decided_machine
-            and not self._ready_emitted
-            and segment.duration_s >= _AMD_RESPONSE_GAP_S
-        ):
-            self._ready_emitted = True
-            return ReadyToLeaveMessage(
-                elapsed_s=segment.start_s + segment.duration_s, beep_at_s=None
-            )
-        return None
+        return self._amd.on_segment(segment)
 
     def _close_segment(self, event: VadEvent) -> _Segment | None:
         """Close the speech/silence run the previous edge opened, if any.
@@ -616,8 +618,9 @@ class CallProgressDetector:
         self._beep_run.reset()
         self._cng_emitted = False
         self._ced_emitted = False
-        self._frames_seen = 0
+        self._samples_seen = 0
         self._amd.reset()
         self._ready_emitted = False
+        self._silence_since_audio_s = None
         self._last_edge_index = None
         self._last_edge_was_onset = False

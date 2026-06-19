@@ -74,8 +74,8 @@ frequencies (1100, 2100 Hz) are public ITU-T T.30 constants.
 
 ### 2. Answering-machine detection (AMD) — a sans-IO state machine over VAD segments
 
-Fed the **speech/silence segment durations** (seconds) the VAD stream produces, plus an
-optional STT greeting-text length. The heuristic (the long-understood industry approach):
+Fed the **speech/silence segment durations** (seconds) the VAD stream produces. The
+heuristic (the long-understood industry approach):
 
 - **Human** ≈ a *short* greeting ("Hello?", < ~2 s of speech) followed by a *pause*
   awaiting a response (a trailing silence ≥ a response-gap threshold). Classified
@@ -83,14 +83,18 @@ optional STT greeting-text length. The heuristic (the long-understood industry a
 - **Machine** ≈ a *long* greeting — continuous speech beyond a machine threshold
   (default 3.5 s) — and/or a detected beep. Classified `AnsweringMachine`.
 
-The classification fires at the **first** silence that follows the opening speech: if the
-speech run up to that point already exceeded the machine threshold it is a machine;
-otherwise, if the opening speech was short and the trailing silence reaches the response
-gap, it is a human. Internal pauses inside a machine greeting ("Hi, you've reached … *beat*
-… please leave a message") are handled by accumulating speech across short gaps (a gap
-shorter than the response gap does **not** end the greeting). The optional STT text length,
-when supplied, raises confidence (a long transcript corroborates a machine) but never
-overrides the durations.
+A long enough opening speech run fires `AnsweringMachine` the moment it crosses the machine
+threshold; otherwise the verdict fires at the **first** silence that follows the opening
+speech — if the opening speech was short and the trailing silence reaches the response gap
+it is a human, and if it spoke for a while (between the human and machine thresholds) then
+went quiet it is a machine. Internal pauses inside a machine greeting ("Hi, you've reached
+… *beat* … please leave a message") are handled by accumulating speech across short gaps (a
+gap shorter than the response gap does **not** end the greeting).
+
+The classifier is fed **only the VAD segment durations** — no STT transcript participates.
+(An STT-corroboration input was considered and rejected for this lane: the facade has no
+transcript-input path yet, and claiming STT-corroborated AMD that the code does not wire
+would be aspirational, rule 27. The `Final` thresholds leave a clean seam to add it later.)
 
 **Applicability:** AMD is **outbound-only**. On an *inbound* call the agent **is** the
 answerer — there is no greeting to classify — so the facade gates AMD behind a per-call
@@ -111,10 +115,14 @@ sustained burst (default ≥ 0.2 s). Two paths produce the record cue:
 - **Beep heard:** once `AnsweringMachine` has been classified, a detected beep emits
   `ReadyToLeaveMessage(beep_at_s=<t>)`.
 - **Fallback (no beep):** many machines emit no beep or one outside the band. Once
-  `AnsweringMachine` is classified, the **greeting-ended** signal — the long-speech→silence
-  transition the VAD already gives — emits `ReadyToLeaveMessage(beep_at_s=None)` after the
-  trailing silence reaches the response gap, so the agent is never stuck waiting for a beep
-  that never comes.
+  `AnsweringMachine` is classified, the fallback emits `ReadyToLeaveMessage(beep_at_s=None)`
+  after the post-greeting silence has lasted the response gap. **This fallback is driven by
+  the audio/sample clock in `on_audio_frame`, not by a VAD edge** — a machine that has
+  stopped talking to record sends no further VAD ONSET/OFFSET, so waiting for an edge would
+  hang forever. An OFFSET stamps the silence start (on the sample clock) and an ONSET clears
+  it (resetting the timer if the machine resumes speaking before the gap elapses); each fed
+  audio frame then checks whether the gap has been reached. So the agent is never stuck
+  waiting for a beep — or an edge — that never comes.
 
 The detector only ever **emits the cue**. The hang-up-vs-speak decision belongs to the
 **Hermes agent**, which already has the call-control tools (ADR-0009/0010/0031) to hang up
@@ -124,8 +132,9 @@ holds no policy.
 ### Event model — a typed discriminated union
 
 Frozen, slotted dataclasses, each tagged with a `Literal` `kind`, unioned as
-`CallProgressEvent`. Each carries `elapsed_s` (seconds since detector start, on the frame
-clock):
+`CallProgressEvent`. Each carries `elapsed_s` (seconds since detector start, computed as the
+accumulated audio sample count divided by the sample rate — exact under variable or
+zero-length frames):
 
 - `FaxCng(kind="fax_cng", elapsed_s)`
 - `FaxCed(kind="fax_ced", elapsed_s)`
@@ -140,17 +149,20 @@ short human-readable rationale for logging/observability, not control flow.
 
 ```python
 class CallProgressDetector:
-    def __init__(self, *, sample_rate: int, outbound: bool, ...thresholds) -> None: ...
+    def __init__(self, *, sample_rate: int, outbound: bool) -> None: ...
     def on_audio_frame(self, frame: PcmFrame) -> CallProgressEvent | None: ...
     def on_vad_event(self, event: VadEvent) -> CallProgressEvent | None: ...
     def reset(self) -> None: ...
 ```
 
-`on_audio_frame` runs the three Goertzel tone detectors (CNG/CED/beep) and converts the
-frame's sample count to elapsed time at `sample_rate`. `on_vad_event` segments the VAD edge
-stream (ONSET→OFFSET = a speech segment; OFFSET→next ONSET = a silence segment), converts
-window ordinals to seconds with the silero 32 ms window duration, and drives the AMD state
-machine. Both are O(n) in the frame length and allocation-light, matching the per-frame CPU
+The thresholds are module-level `Final` constants (not constructor arguments) so tuning is
+a single reviewable edit. `on_audio_frame` advances the sample clock, runs the three
+Goertzel tone detectors (CNG/CED/beep), and fires the no-beep record-cue fallback once the
+post-greeting silence reaches the response gap. `on_vad_event` segments the VAD edge stream
+(ONSET→OFFSET = a speech segment; OFFSET→next ONSET = a silence segment), converts window
+ordinals to seconds with the silero 32 ms window duration, drives the AMD state machine, and
+stamps/clears the silence boundary the fallback times against. Both are O(n) in the frame
+length and allocation-light, matching the per-frame CPU
 budget (rule 22). The inner `_FaxToneDetector` and `_AnsweringMachineDetector` are
 independently unit-testable (raw PCM frames / raw segment durations) without the facade.
 
@@ -188,3 +200,6 @@ independently unit-testable (raw PCM frames / raw segment durations) without the
 | Run AMD on inbound calls too | On an inbound call the agent **is** the answerer; there is no far-end greeting to classify, so inbound AMD would only mis-classify the caller's first utterance. AMD is gated outbound-only; fax detection stays bidirectional. |
 | Let the detector decide hang-up vs leave-message | Policy belongs to the Hermes agent, which already owns the call-control tools (ADR-0009/0010/0031). The detector emitting a `ReadyToLeaveMessage` cue and leaving the decision to the agent keeps the detector sans-IO and policy-free. |
 | Put the AMD timing on a wall clock | Non-deterministic and untestable; the VAD already stamps a monotonic 32 ms window ordinal (ADR-0008), so converting ordinals→seconds gives an exact, offline-testable timer with no clock drift (same discipline as `media.endpoint`). |
+| Fire the no-beep record-cue fallback from a VAD edge (the next ONSET closing the silence) | Dead in the common case: a machine that has stopped talking to record emits **no further VAD edge**, so the cue would never fire and the agent would wait forever. The fallback is driven by the audio/sample clock in `on_audio_frame` instead — an OFFSET stamps the silence start, an ONSET clears it, and each fed frame checks the gap. (Caught by codex review of PR #149.) |
+| Compute `elapsed_s` / tone-run lengths from a frame **count** × frame duration | Wrong under variable or zero-length frames (real on the wire): the count drifts from true elapsed time the moment frame sizes vary. `elapsed_s` is the accumulated sample count ÷ rate, and each tone run accumulates **seconds** (per-frame duration), so both stay exact. (Caught by codex review of PR #149.) |
+| Feed an optional STT greeting-text length into AMD as machine corroboration | The facade has no transcript-input path, so the constructor would advertise a parameter the engine/adapter never supplies — aspirational (rule 27). Dropped for this lane; the `Final` thresholds leave a clean seam to add a real transcript input (with its own test) later. |

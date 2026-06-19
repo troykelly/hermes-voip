@@ -1102,6 +1102,172 @@ async def test_sip_dtls_ack_during_handshake_then_success_normal_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sip_dtls_peer_bye_during_successful_handshake_no_callloop() -> None:
+    """A peer BYE during a SUCCESSFUL handshake ⇒ no CallLoop starts (codex r3).
+
+    The peer hangs up mid-handshake (the guard answers 200 + records peer-ended), but
+    the handshake then SUCCEEDS. The success path must NOT start a CallLoop on a dialog
+    the peer already terminated — it stops media and ends cleanly. No BYE from us (the
+    peer already BYE'd), no live CallLoop.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    # Handshake SUCCEEDS, but gated so the peer BYE lands mid-handshake.
+    _FakeSipDtlsSession.gate = asyncio.Event()
+    _FakeSipDtlsSession.in_handshake = asyncio.Event()
+    engine = _fake_engine()
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            assert _FakeSipDtlsSession.in_handshake is not None
+            await _FakeSipDtlsSession.in_handshake.wait()
+            ok = _sent_200_ok(transport)
+            # The caller hangs up mid-handshake (guard answers 200, marks peer-ended).
+            await _deliver_in_dialog(
+                manager, _in_dialog_request("BYE", ok, call_id=call_id)
+            )
+            # Let the handshake SUCCEED.
+            assert _FakeSipDtlsSession.gate is not None
+            _FakeSipDtlsSession.gate.set()
+            session = _FakeSipDtlsSession.last
+            assert session is not None
+            # Media is torn down and the call ends — NO CallLoop on a peer-ended dialog.
+            await _until(lambda: engine.stop.await_count > 0)
+            await asyncio.sleep(0.05)
+            assert call_id not in adapter._call_loops, (
+                "must NOT start a CallLoop on a dialog the peer already BYE'd"
+            )
+            # We never send our OWN BYE (the peer's BYE was answered 200 by the guard).
+            assert not any(m.startswith("BYE ") for m in transport.sent), (
+                "no redundant BYE — the peer already terminated the dialog"
+            )
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_peer_bye_during_abort_wait_no_double_bye() -> None:
+    """A peer BYE arriving DURING the abort's ACK-wait ⇒ no double BYE (codex r3).
+
+    The handshake fails with NO prior ACK, so the abort begins its bounded ACK-wait.
+    The peer THEN sends a BYE (the guard answers 200, outcome = PEER_BYE). The abort
+    must wake and send NO BYE of its own — exactly one BYE response (ours, the 200), no
+    BYE request from us.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    _FakeSipDtlsSession.fail_handshake = True
+    engine = _fake_engine()
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        # A long timeout so the wait is still in progress when we inject the BYE.
+        patch("hermes_voip.adapter._ANSWERED_ABORT_ACK_TIMEOUT_S", 30.0),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        # Media is released synchronously; the abort is now waiting for the ACK.
+        await _until(lambda: _FakeSipDtlsSession.last is not None)
+        session = _FakeSipDtlsSession.last
+        assert session is not None
+        await _until(lambda: session.closed)
+        ok = _sent_200_ok(transport)
+        # No BYE yet — the dialog is unconfirmed and the abort is waiting.
+        assert not any(m.startswith("BYE ") for m in transport.sent)
+        # The peer now hangs up DURING the wait: the guard answers 200 + outcome
+        # becomes PEER_BYE, so the abort must NOT send its own BYE.
+        await _deliver_in_dialog(
+            manager, _in_dialog_request("BYE", ok, call_id=call_id)
+        )
+        await asyncio.sleep(0.05)
+
+    assert call_id not in adapter._call_loops
+    # The guard answered the peer BYE with a 200; we sent NO BYE request of our own.
+    assert any(m.startswith("SIP/2.0 200") and "BYE" in m for m in transport.sent)
+    assert not any(m.startswith("BYE ") for m in transport.sent), (
+        "a peer BYE during the abort wait must not produce a second (our) BYE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_abort_is_non_blocking_frees_admission_slot() -> None:
+    """The post-200 abort does NOT hold the handler/admission slot during the wait.
+
+    The handshake fails with no ACK; the abort's bounded ACK-wait runs in a TRACKED
+    BACKGROUND task. The inbound handler returns and the admission slot is freed
+    promptly (well within the long ACK timeout), and the background task is registered
+    so shutdown can cancel it. The fallback BYE still fires later from that task.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, load_media_config({}))
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    _FakeSipDtlsSession.fail_handshake = True
+    engine = _fake_engine()
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        # A long ACK timeout: if the abort blocked the handler, the admission slot
+        # would still be held for ~30s. It must be freed long before that.
+        patch("hermes_voip.adapter._ANSWERED_ABORT_ACK_TIMEOUT_S", 30.0),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: _FakeSipDtlsSession.last is not None)
+        session = _FakeSipDtlsSession.last
+        assert session is not None
+        await _until(lambda: session.closed)
+        # The admission slot is freed promptly — the abort wait does NOT block the
+        # handler (it runs in the background). 1.0s ≪ the 30s ACK timeout.
+        await _until(
+            lambda: call_id not in adapter._admitted_calls,  # type: ignore[attr-defined]
+            timeout=1.0,
+        )
+        # A tracked background teardown task exists (so shutdown can cancel/await it).
+        assert call_id in adapter._call_tasks  # type: ignore[attr-defined]
+        assert adapter._call_tasks[call_id]  # type: ignore[attr-defined]
+        # Tear down via disconnect (cancels the bg task within the bounded shutdown).
+        await adapter.disconnect()
+        await asyncio.sleep(0)
+
+    assert call_id not in adapter._call_loops
+
+
+@pytest.mark.asyncio
 async def test_plain_offer_never_touches_sip_dtls_branch() -> None:
     """A plain RTP/AVP offer never builds a SIP-DTLS session (no regression)."""
     transport = _FakeTransport()

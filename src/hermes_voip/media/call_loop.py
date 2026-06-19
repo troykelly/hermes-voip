@@ -142,6 +142,45 @@ _DEFAULT_COMFORT_FILLER_DELAY_MS: Final[int] = 900
 #: dead-air delay (one cadence). The adapter passes ``comfort_filler_repeat_ms``.
 _DEFAULT_COMFORT_FILLER_REPEAT_MS: Final[int] = _DEFAULT_COMFORT_FILLER_DELAY_MS
 
+#: Default caller-silence reprompt master switch (ADR-0057): ON. A live-but-silent
+#: caller (RTP flowing, no end-of-turn) otherwise sits in dead air indefinitely (the
+#: engine's RTP watchdog only fires on DEAD media, not silent-but-flowing media). The
+#: adapter passes the operator's config; this is the bare-construction default.
+_DEFAULT_NO_INPUT_REPROMPT: Final[bool] = True
+
+#: Default silence window (ms) of no caller end-of-turn before a reprompt fires
+#: (ADR-0057). 10 s is long enough not to nag a thinking caller, short enough that a
+#: dropped/abandoned line is noticed promptly.
+_DEFAULT_NO_INPUT_TIMEOUT_MS: Final[int] = 10_000
+
+#: Default number of unanswered reprompts before the loop ends the call gracefully
+#: (ADR-0057). After this many silent windows each followed by an unanswered reprompt,
+#: the caller is treated as gone and the call is wound up (goodbye, then a clean end).
+_DEFAULT_NO_INPUT_MAX_REPROMPTS: Final[int] = 2
+
+#: Default reprompt phrase set (ADR-0057), used when a CallLoop is built without an
+#: explicit set. Each phrase reads naturally on every TTS model (no bracket tag), and is
+#: chosen at RANDOM per fire (no immediate repeat) so repeated reprompts on one call do
+#: not sound mechanical. Multi-language-ready: the adapter/config selects a language set
+#: the same way the comfort-filler phrases are selected (ADR-0054).
+_DEFAULT_NO_INPUT_REPROMPT_PHRASES: Final[tuple[str, ...]] = (
+    "Are you still there?",
+    "Hello, are you still there?",
+    "Sorry, I can't hear anything. Are you still there?",
+)
+
+#: Default spoken-goodbye master switch (ADR-0057): ON. On a loop-initiated graceful end
+#: (the no-input reprompt limit is exhausted) a short closing line is spoken and flushed
+#: BEFORE the loop returns (so it still has a live media path), instead of dropping
+#: silently to BYE. NOT spoken on a caller-hangup / inbound-EOS / error end: there is no
+#: media path once the caller is gone or the pipeline has failed.
+_DEFAULT_GOODBYE: Final[bool] = True
+
+#: Default goodbye phrase (ADR-0057). Reads naturally on every TTS model; multi-language
+#: selection follows the comfort-filler phrase mechanism (the adapter/config passes the
+#: language-appropriate line).
+_DEFAULT_GOODBYE_PHRASE: Final[str] = "Goodbye."
+
 #: Default inter-digit gap (ms) after which a buffered DTMF group is delivered as a
 #: menu turn when no ``#`` terminator arrives (ADR-0010). Used when the adapter passes
 #: ``dtmf_interdigit_ms=None`` (the config key was unset). 2 s is comfortably longer
@@ -542,19 +581,45 @@ class CallLoop:
         comfort_filler_phrases: The filler phrase set; one is chosen at RANDOM per fire,
             never repeating the immediately-previous phrase. Each phrase reads naturally
             on every TTS model. Must be non-empty (defaults to the built-in set).
-        rng: The random source for filler phrase selection (ADR-0054). Defaults to a
-            fresh :class:`random.Random`; tests inject a seeded one for determinism. It
-            is for variety only, never security.
+        no_input_reprompt: Caller-silence reprompt master switch (ADR-0057), ``True`` by
+            default. When ``True``, a live-but-silent caller (RTP flowing but no
+            end-of-turn) is reprompted ("Are you still there?") after
+            ``no_input_timeout_ms`` of silence, and after ``no_input_max_reprompts``
+            unanswered reprompts the loop ends the call gracefully (a spoken goodbye if
+            ``goodbye``, then a CLEAN :meth:`run` return — never a raise). Off = no
+            watchdog task is created (the prior behaviour). The window resets the
+            instant the caller speaks (a delivered turn) or barges in.
+        no_input_timeout_ms: Silence window (ms) of no caller end-of-turn before a
+            reprompt fires (ADR-0057). Must be positive (the adapter passes the
+            validated config value).
+        no_input_max_reprompts: Unanswered reprompts before the loop ends the call
+            gracefully (ADR-0057). Must be ``>= 0``; ``0`` ends on the first silent
+            window with no reprompt at all (straight to goodbye + end).
+        no_input_reprompt_phrases: The reprompt phrase set; one is chosen at RANDOM per
+            fire, never repeating the immediately-previous phrase. Each phrase reads
+            naturally on every TTS model. Must be non-empty (defaults to the built-in
+            set). Multi-language-ready like the comfort-filler phrases (ADR-0054).
+        goodbye: Spoken-goodbye master switch (ADR-0057), ``True`` by default. When
+            ``True``, the loop-initiated graceful end (no-input limit exhausted) speaks
+            ``goodbye_phrase`` and flushes it BEFORE :meth:`run` returns, so it has a
+            live media path. NOT spoken on a caller-hangup / inbound-EOS / error end (no
+            media path there). Off = the graceful end still happens, just silently.
+        goodbye_phrase: The closing line spoken on a loop-initiated graceful end. Reads
+            naturally on every TTS model; multi-language selection follows the
+            comfort-filler phrase mechanism.
+        rng: The random source for filler AND reprompt phrase selection (ADR-0054/0057).
+            Defaults to a fresh :class:`random.Random`; tests inject a seeded one for
+            determinism. It is for variety only, never security.
         dtmf_interdigit_ms: Inter-digit gap (ms) after which a buffered DTMF menu
             group is delivered when no ``#`` terminator arrives (ADR-0010 §surfacing).
             ``None`` (the config key unset) uses the built-in default (2000 ms). The
             adapter passes ``MediaConfig.dtmf_interdigit_ms``. Only used for inbound
             DTMF the controller surfaces as a menu turn — a digit consumed by an armed
             confirmation never starts this timer.
-        sleep: The async sleep seam the comfort-filler delay + periodic repeats AND
-            the DTMF inter-digit timer await. Defaults to :func:`asyncio.sleep`; tests
-            inject a controllable sleep for determinism (the loop has no other
-            wall-clock dependency).
+        sleep: The async sleep seam the comfort-filler delay + periodic repeats, the
+            no-input silence window (ADR-0057), AND the DTMF inter-digit timer await.
+            Defaults to :func:`asyncio.sleep`; tests inject a controllable sleep for
+            determinism (the loop has no other wall-clock dependency).
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
@@ -580,6 +645,12 @@ class CallLoop:
         comfort_filler_delay_ms: int = _DEFAULT_COMFORT_FILLER_DELAY_MS,
         comfort_filler_repeat_ms: int = _DEFAULT_COMFORT_FILLER_REPEAT_MS,
         comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES,
+        no_input_reprompt: bool = _DEFAULT_NO_INPUT_REPROMPT,
+        no_input_timeout_ms: int = _DEFAULT_NO_INPUT_TIMEOUT_MS,
+        no_input_max_reprompts: int = _DEFAULT_NO_INPUT_MAX_REPROMPTS,
+        no_input_reprompt_phrases: tuple[str, ...] = _DEFAULT_NO_INPUT_REPROMPT_PHRASES,
+        goodbye: bool = _DEFAULT_GOODBYE,
+        goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE,
         rng: random.Random | None = None,
         dtmf_interdigit_ms: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -649,6 +720,38 @@ class CallLoop:
         # immediate repeat (ADR-0054). ``None`` until the first fire. Touched only from
         # the loop.
         self._last_comfort_phrase: str | None = None
+
+        # Caller-silence reprompt / no-input handling (ADR-0057).
+        self._no_input_reprompt = no_input_reprompt
+        # Silence window (seconds) of no caller end-of-turn before a reprompt. Stored in
+        # seconds for the asyncio sleep seam; the config value is validated positive.
+        self._no_input_timeout_s = no_input_timeout_ms / 1000.0
+        self._no_input_max_reprompts = no_input_max_reprompts
+        self._no_input_reprompt_phrases = no_input_reprompt_phrases
+        # The reprompt phrase chosen on the previous fire, so the random selector can
+        # avoid an immediate repeat. ``None`` until the first fire. Loop-only.
+        self._last_reprompt_phrase: str | None = None
+        # Spoken goodbye on the loop-initiated graceful end (ADR-0057).
+        self._goodbye = goodbye
+        self._goodbye_phrase = goodbye_phrase
+        # The single in-flight no-input watchdog task, or None when off / not yet armed.
+        # ``run`` arms it at loop start (when enabled) and cancels+joins it at teardown
+        # so it never leaks. The done-callback nulls it on completion.
+        self._no_input_task: asyncio.Task[None] | None = None
+        # Set TRUE whenever the caller shows life within the current silence window: a
+        # delivered turn (:meth:`_screen_and_deliver`) or a barge-in (:meth:`barge_in`).
+        # The watchdog clears it at the start of each window and re-checks it after the
+        # window elapses, so any caller activity during the window resets the reprompt
+        # cycle. Touched only from the event loop (no lock needed).
+        self._caller_active_in_window = False
+        # Set by the watchdog when it decides to end the call (no-input limit spent),
+        # observed by the pump to break out of its inbound loop and emit the end marker,
+        # so a loop-initiated graceful end terminates ``run`` CLEANLY (markers
+        # flow down the chain, no task raises), which the adapter classifies as a normal
+        # end. On a real silent-but-live call inbound RTP keeps flowing, so the pump
+        # observes this within ~one frame; if inbound were truly dead the engine's RTP
+        # watchdog ends the call instead (ADR-0026), so this never relies on dead media.
+        self._end_call = asyncio.Event()
 
         # Inbound DTMF surfacing (ADR-0010). The engine fires :meth:`feed_dtmf` for
         # each received digit; the controller routes it (NOT the engine): while a
@@ -914,6 +1017,19 @@ class CallLoop:
             # so the operator sees the gate engage once without flooding the log.
             echo_drop_logged = False
             async for frame in self._transport.inbound_audio():
+                # Loop-initiated graceful end (ADR-0057): the no-input watchdog has
+                # decided the caller is gone and already spoken the goodbye. Stop
+                # consuming inbound audio and fall through to the end-of-stream marker
+                # below, so the chain drains and ``run`` returns CLEANLY (a normal end),
+                # exactly as if the inbound stream had ended. Checked here (top of the
+                # per-frame body) so it is observed within ~one inbound frame on a live
+                # call; dead media is handled by the engine's RTP watchdog, not here.
+                if self._end_call.is_set():
+                    _log.info(
+                        "pump: graceful end (no-input) after %d frames",
+                        frames_received,
+                    )
+                    break
                 # Collect this frame's VAD edges. They drive the barge-in gate
                 # unconditionally (it must see echo to keep its run state correct),
                 # but the ENDPOINTER must only see edges from audio that actually
@@ -1109,6 +1225,13 @@ class CallLoop:
         else:
             greeting_stream = None
 
+        # Arm the caller-silence / no-input watchdog (ADR-0057) for the whole call, as a
+        # tracked task OUTSIDE the TaskGroup: it is best-effort (a reprompt/goodbye
+        # synthesis failure must never kill the call — rule 37) and may end the call
+        # itself, so it must not be a TaskGroup child whose raise would cancel the
+        # pipeline. No-op when disabled. Cancelled + joined in the finally (no leak).
+        self._schedule_no_input_watchdog()
+
         try:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(_pump())
@@ -1117,6 +1240,15 @@ class CallLoop:
                 if greeting_stream is not None:
                     tg.create_task(self._play_greeting(greeting_stream))
         finally:
+            # The no-input watchdog (ADR-0057) is a tracked task outside the TaskGroup
+            # (armed at loop start). Cancel + JOIN it on every exit path so it never
+            # outlives the call — incl. one parked mid-reprompt/goodbye playout. Same
+            # best-effort join as the filler: its result is handled by its own
+            # done-callback (rule 37) and must not mask the loop's teardown/exception.
+            watchdog = self._no_input_task
+            self._cancel_no_input_watchdog()
+            if watchdog is not None:
+                await asyncio.wait({watchdog})
             # The comfort filler runs as a tracked task OUTSIDE the TaskGroup (it is
             # armed per delivered turn, not at loop start). On every exit path —
             # normal end, error, or cancellation — cancel it AND JOIN it so it fully
@@ -1381,6 +1513,196 @@ class CallLoop:
             # the loop cleanly without another fire.
             await self._sleep(self._comfort_filler_repeat_s)
 
+    def _schedule_no_input_watchdog(self) -> None:
+        """Arm the caller-silence / no-input watchdog for this call (ADR-0057).
+
+        Called once from :meth:`run` at loop start, only when the feature is enabled.
+        Launches :meth:`_no_input_gap` as a tracked task so it runs concurrently with
+        the pipeline (it never blocks audio). No-op when the watchdog is disabled. The
+        done-callback (:meth:`_on_no_input_done`) retrieves the task's result so a
+        failure is logged (rule 37) and never surfaces as an unretrieved-task warning.
+        """
+        if not self._no_input_reprompt:
+            return
+        task = asyncio.create_task(self._no_input_gap())
+        task.add_done_callback(self._on_no_input_done)
+        self._no_input_task = task
+
+    def _on_no_input_done(self, task: asyncio.Task[None]) -> None:
+        """Retrieve a finished watchdog's result; log a real failure, ignore cancel.
+
+        Clears ``_no_input_task`` when this is the current handle. The watchdog is
+        best-effort: a reprompt/goodbye synthesis or send failure is logged at warning
+        and deliberately does NOT propagate (a failed reprompt must not kill an
+        otherwise working call); a cancellation (the teardown stop) is expected. A
+        logged, intentional degradation — not a swallowed error (rule 37).
+        """
+        if self._no_input_task is task:
+            self._no_input_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.warning("no-input watchdog failed (call continues): %r", exc)
+
+    def _cancel_no_input_watchdog(self) -> None:
+        """Cancel and forget the no-input watchdog task, if any (idempotent).
+
+        Called from :meth:`run`'s teardown so the watchdog never outlives the call, even
+        one parked mid-reprompt/goodbye playout. Cancelling raises ``CancelledError``
+        inside :meth:`_no_input_gap` (at its sleep or mid-playout), which propagates to
+        end it cleanly; the cancel is ignored by the done-callback.
+        """
+        task = self._no_input_task
+        if task is not None:
+            self._no_input_task = None
+            task.cancel()
+
+    def _next_reprompt_phrase(self) -> str:
+        """Return a RANDOM reprompt phrase, never the immediately-previous one.
+
+        Same selection discipline as the comfort filler (:meth:`_next_comfort_phrase`,
+        ADR-0057): random for variety, with the one guarantee of no back-to-back repeat,
+        and a direct choice among the distinct alternatives so it terminates even for a
+        single-phrase or all-duplicate set. Uses the shared injected ``_comfort_rng``
+        (seeded in tests).
+        """
+        phrases = self._no_input_reprompt_phrases
+        alternatives = tuple(
+            dict.fromkeys(p for p in phrases if p != self._last_reprompt_phrase)
+        )
+        phrase = self._comfort_rng.choice(alternatives) if alternatives else phrases[0]
+        self._last_reprompt_phrase = phrase
+        return phrase
+
+    async def _no_input_gap(self) -> None:
+        """Reprompt a silent caller; end gracefully after N unanswered reprompts.
+
+        The whole-call watchdog for a live-but-silent caller (ADR-0057). Each iteration:
+
+        1. clears the per-window activity flag and awaits one silence window on the
+           injected sleep seam;
+        2. if the caller showed life during the window (a delivered turn or a barge-in
+           set ``_caller_active_in_window``), RESETS the reprompt count and re-arms — a
+           caller who is talking is plainly still there;
+        3. else, if the agent's TTS is on the wire right now (``_tts_audio_active``), it
+           is not dead air (a reply / greeting / prior reprompt is still playing), so it
+           SKIPS this window and re-checks after the next (never speaks over the agent);
+        4. else, on genuine dead air: if the reprompt budget is not yet spent, speak ONE
+           reprompt (best-effort) and continue; once the budget is spent, end the call
+           gracefully — speak the goodbye (if enabled) and signal the pump to wind up.
+
+        The reprompt and goodbye route through :meth:`_speak_text`, so they are
+        sanitised, model-tag-aware (ADR-0027), echo-gate-arming and flushable
+        (ADR-0023/0028) like any agent audio — a barge-in cancels a playing reprompt
+        exactly like a reply.
+
+        Best-effort (rule 37): a reprompt synthesis/send failure is caught, logged, and
+        the loop CONTINUES (a transient TTS hiccup neither stops the watchdog nor the
+        call); a ``CancelledError`` (teardown) is the normal stop and is never caught.
+        """
+        reprompts_sent = 0
+        while True:
+            await self._sleep(self._no_input_timeout_s)
+            # Consume the activity flag at exactly ONE point (here, after the window),
+            # never at the loop top (codex review): caller life that arrives AFTER this
+            # check — e.g. a barge-in WHILE a reprompt is playing, or during a skipped
+            # agent-audio window — would be wiped by a top-of-loop clear before the next
+            # window's check sees it, hanging up on a caller who just answered. Clearing
+            # only on consume makes such activity persist to the next window's check.
+            # Read-then-clear with no await between them: single-loop asyncio, so no
+            # activity can interleave and be lost across these two lines.
+            if self._caller_active_in_window:
+                # The caller spoke / barged in within the window (or during the previous
+                # reprompt/skip): reset the reprompt cycle and re-arm.
+                self._caller_active_in_window = False
+                reprompts_sent = 0
+                continue
+            if self._tts_audio_active:
+                # Agent audio on the wire right now: not dead air; do not speak over it.
+                # Re-check next window (it may have cleared by then). This does NOT use
+                # the reprompt budget — no reprompt was actually heard.
+                continue
+            if reprompts_sent < self._no_input_max_reprompts:
+                reprompts_sent += 1
+                phrase = self._next_reprompt_phrase()
+                _log.info(
+                    "no-input: reprompt %d/%d on caller silence: %r",
+                    reprompts_sent,
+                    self._no_input_max_reprompts,
+                    phrase,
+                )
+                await self._speak_phrase_best_effort(phrase, what="reprompt")
+                continue
+            # The reprompt budget is spent and the caller is still silent: wind up the
+            # call gracefully (a spoken goodbye if enabled), then stop — UNLESS the
+            # caller barges in during the goodbye (it plays on a live media path), in
+            # which case the end aborts and the cycle resumes (the caller is back).
+            _log.info(
+                "no-input: caller silent after %d reprompt(s); ending the call",
+                reprompts_sent,
+            )
+            if await self._end_call_gracefully():
+                return
+            reprompts_sent = 0
+
+    async def _speak_phrase_best_effort(self, phrase: str, *, what: str) -> None:
+        """Speak one short ``phrase`` through the normal TTS path; best-effort.
+
+        Used for a no-input reprompt and the goodbye. Routes through :meth:`_speak_text`
+        (sanitised, model-tag-aware, echo-gate-arming, flushable) — NOT :meth:`speak`,
+        so it does not cancel the no-input watchdog task calling it (mirroring how the
+        comfort filler calls ``_speak_text`` directly). A synthesis/send failure is
+        logged and swallowed so a working call survives a TTS hiccup (rule 37); a
+        ``CancelledError`` (the teardown / barge-in stop) propagates to end it cleanly.
+        """
+
+        async def _single_chunk() -> AsyncIterator[str]:
+            yield phrase
+
+        try:
+            await self._speak_text(_single_chunk(), on_first_frame=None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort spoken UX; logged, never fatal (rule 37)
+            _log.warning(
+                "no-input: %s synthesis/send failed (call continues): %r",
+                what,
+                phrase,
+                exc_info=True,
+            )
+
+    async def _end_call_gracefully(self) -> bool:
+        """Speak the goodbye (if on), then commit the end unless the caller answered.
+
+        The loop-initiated graceful end (ADR-0057). The goodbye is spoken and fully
+        flushed to ``send_audio`` (``_speak_text`` returns only once the stream is
+        drained) BEFORE :attr:`_end_call` is set, so the closing line reaches the wire
+        while the media path is still live — the adapter stops the engine only after
+        :meth:`run` returns. Setting :attr:`_end_call` makes the pump break out of its
+        inbound loop and emit the end-of-stream marker, so ``run`` returns CLEANLY (a
+        normal end, not a ``/stop``). The goodbye is best-effort: a failure is logged
+        and does not strand the call (a missing goodbye must never block the end).
+
+        Because the goodbye plays on a LIVE media path, the caller can still barge in
+        during it (codex review). If they do — ``_caller_active_in_window`` is set by
+        :meth:`barge_in` — the caller is engaging, so the end is ABORTED: we do NOT set
+        :attr:`_end_call`, we consume the flag, and return ``False`` so the watchdog
+        resumes the reprompt cycle. Read-then-clear with no await between, so the check
+        cannot miss a concurrent set. Returns ``True`` when the end is committed.
+        """
+        if self._goodbye and self._goodbye_phrase:
+            _log.info("no-input: speaking goodbye before end: %r", self._goodbye_phrase)
+            await self._speak_phrase_best_effort(self._goodbye_phrase, what="goodbye")
+        # The goodbye played on a live media path: if the caller spoke during it, abort
+        # the end and let the watchdog resume (the caller is back). Consume the flag.
+        if self._caller_active_in_window:
+            self._caller_active_in_window = False
+            _log.info("no-input: caller answered during the goodbye; aborting the end")
+            return False
+        self._end_call.set()
+        return True
+
     async def _play(
         self,
         stream: TtsStream,
@@ -1537,7 +1859,16 @@ class CallLoop:
         during the turn gap means the caller is taking the floor, so a filler that
         has not yet fired must not fire. A filler already PLAYING is the active
         stream, so it is cancelled + flushed by the steps below like any agent audio.
+
+        Also marks caller activity for the no-input watchdog (ADR-0057): a barge-in is
+        the caller speaking, so it resets the silence window — a pending reprompt stands
+        down and the reprompt count clears on the watchdog's next wake. This runs even
+        when no TTS stream is active (the flush below is the only stream-gated step),
+        because a caller onset during silence is still proof of life.
         """
+        # The caller is interrupting / speaking: reset the no-input silence window so a
+        # pending reprompt stands down and the reprompt cycle restarts (ADR-0057).
+        self._caller_active_in_window = True
         # The caller is interrupting: a pending (not-yet-fired) filler must not fire.
         self._cancel_comfort_filler()
         stream = self._active_tts_stream
@@ -1554,7 +1885,16 @@ class CallLoop:
         On a non-REFUSE verdict the dead-air comfort filler is armed (ADR-0030) and
         then the turn is handed to the agent. A REFUSE never reaches the agent, so no
         gap and no filler.
+
+        A delivered turn is also caller activity for the no-input watchdog (ADR-0057):
+        the caller finished a turn, so the silence window resets (a pending reprompt
+        stands down and the count clears on the watchdog's next wake). Marked even on a
+        REFUSE — the caller DID speak; the guard merely declined to forward it — so a
+        prompt-injection attempt does not look like an absent caller.
         """
+        # The caller finished a turn (heard, even if the guard refuses to forward it):
+        # reset the no-input silence window (ADR-0057).
+        self._caller_active_in_window = True
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
         if result.verdict is not GuardVerdict.REFUSE:

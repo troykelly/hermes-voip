@@ -606,6 +606,32 @@ class _HoldOpenTransport(_FakeTransport):
         return _gen()
 
 
+class _LiveSilenceTransport(_FakeTransport):
+    """Transport modelling a silent-but-LIVE caller: continuous inbound silence frames.
+
+    A real silent caller's line still carries RTP (silence/comfort-noise packets), so
+    the inbound generator yields silence frames continuously (yielding control between
+    each) rather than ending or parking. This is exactly the condition the watchdog
+    handles, and it lets the call loop's graceful self-end (ADR-0057) be exercised: the
+    pump keeps iterating, so it observes the watchdog's ``_end_call`` request within one
+    frame and winds the call up — no ``close_inbound()`` needed (the loop ends ITSELF).
+    The generator stops when the consumer (the pump) breaks and ``aclose()``s it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__([_silence_frame(0)])
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            # Bounded high so a watchdog bug cannot wedge the suite forever, but well
+            # past any test's stepping before the graceful end fires.
+            for index in range(100_000):
+                yield _silence_frame(index)
+                await asyncio.sleep(0)  # cooperative: let the watchdog/pump interleave
+
+        return _gen()
+
+
 def _seeded_rng(seed: int) -> random.Random:
     # The comfort-filler RNG is for phrase variety only, never security (ADR-0054).
     return random.Random(seed)  # noqa: S311 — non-cryptographic; variety, not security
@@ -624,7 +650,13 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
     rng: random.Random | None = None,
     deliver_turn: Callable[[str], Awaitable[None]] | None = None,
 ) -> CallLoop:
-    """Build a CallLoop with the comfort filler wired to an injected sleep seam."""
+    """Build a CallLoop with the comfort filler wired to an injected sleep seam.
+
+    The no-input watchdog (ADR-0057, default-on) is turned OFF here so the ONLY consumer
+    of the injected ``sleep`` seam is the comfort filler — otherwise the watchdog's own
+    silence-window sleeps would interleave with the filler's on the shared seam and
+    corrupt these filler-isolating timing assertions. The watchdog has its own tests.
+    """
     return CallLoop(
         transport=transport,
         asr=asr,
@@ -640,6 +672,7 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
         comfort_filler_delay_ms=comfort_filler_delay_ms,
         comfort_filler_repeat_ms=comfort_filler_repeat_ms,
         comfort_filler_phrases=comfort_filler_phrases,
+        no_input_reprompt=False,  # isolate the filler's sleep seam (ADR-0057 off here)
         rng=rng if rng is not None else _seeded_rng(0),
         sleep=sleep,
     )
@@ -3704,3 +3737,835 @@ async def test_run_does_not_require_reset_hook_on_plain_tts() -> None:
     )
     # Must complete cleanly even though the TTS has no reset hook.
     await loop.run()
+
+
+# ---------------------------------------------------------------------------
+# (h) Caller-silence reprompt / no-input handling + spoken goodbye (ADR-0057)
+# ---------------------------------------------------------------------------
+#
+# A live-but-silent caller (RTP flowing — silence frames — but no end-of-turn) gets
+# no handling today: the agent waits in dead air and the RTP watchdog only fires on
+# DEAD media. The no-input watchdog speaks a reprompt after a silence window, and ends
+# the call gracefully after N unanswered reprompts; on that loop-initiated graceful
+# end it speaks a short goodbye BEFORE run() returns (so it has a live media path),
+# then ends run() CLEANLY (so the adapter classifies a normal end, not a /stop). Both
+# features use the injected sleep seam and reuse the speak()/_speak_text path, so a
+# reprompt/goodbye is flushable + echo-gate-arming and a barge-in stands it down.
+
+
+class _CapturingTtsStream(_FakeTtsStream):
+    """A TtsStream that drains (and records) the text iterator before emitting frames.
+
+    A real provider consumes the text it is handed; the bare ``_FakeTtsStream`` ignores
+    it. This subclass drains the iterator on first iteration and appends each chunk to a
+    shared sink, so a test can assert the exact phrase the watchdog/goodbye synthesised.
+    """
+
+    def __init__(
+        self, frames: list[PcmFrame], text: AsyncIterator[str], sink: list[str]
+    ) -> None:
+        super().__init__(frames)
+        self._text = text
+        self._sink = sink
+
+    async def _iter(self) -> AsyncIterator[PcmFrame]:
+        async for chunk in self._text:
+            self._sink.append(chunk)
+        for frame in self._frames:
+            if self._cancelled:
+                return
+            yield frame
+
+
+class _CapturingTTS(_FakeTTS):
+    """StreamingTTS fake recording each synthesised text chunk into ``synthesised``."""
+
+    def __init__(self, frames: list[PcmFrame]) -> None:
+        super().__init__(frames)
+        self.synthesised: list[str] = []
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        self.last_sample_rate = sample_rate
+        stream = _CapturingTtsStream(self._frames, text, self.synthesised)
+        self.last_stream = stream
+        return stream
+
+
+def _no_input_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __init__ plus the no-input knobs
+    transport: _FakeTransport,
+    asr: StreamingASR,
+    tts: StreamingTTS,
+    *,
+    sleep: Callable[[float], Awaitable[None]],
+    deliver_turn: Callable[[str], Awaitable[None]] | None = None,
+    vad: VoiceActivityDetector | None = None,
+    no_input_reprompt: bool = True,
+    no_input_timeout_ms: int = 10_000,
+    no_input_max_reprompts: int = 2,
+    no_input_reprompt_phrases: tuple[str, ...] = ("Are you still there?",),
+    goodbye: bool = True,
+    goodbye_phrase: str = "Goodbye.",
+) -> CallLoop:
+    """Build a CallLoop with the no-input watchdog wired to an injected sleep seam.
+
+    The comfort filler is OFF here so the ONLY consumer of the injected ``sleep`` seam
+    is the no-input watchdog — making the stepped/gated sleep assertions unambiguous.
+    """
+    return CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad or _make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=deliver_turn or _noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        comfort_filler=False,
+        no_input_reprompt=no_input_reprompt,
+        no_input_timeout_ms=no_input_timeout_ms,
+        no_input_max_reprompts=no_input_max_reprompts,
+        no_input_reprompt_phrases=no_input_reprompt_phrases,
+        goodbye=goodbye,
+        goodbye_phrase=goodbye_phrase,
+        sleep=sleep,
+    )
+
+
+class _DrainingSilentASR:
+    """ASR fake that DRAINS its audio input forever and yields NO transcript.
+
+    Models a recogniser hearing pure silence: it never produces a turn, but it keeps
+    consuming ``audio`` so the pump's bounded ``audio_q`` never fills (a non-draining
+    ``_FakeASR([])`` would wedge the pump on a continuous-frame transport once the queue
+    fills). Pair with :class:`_LiveSilenceTransport` for a silent-but-live caller whose
+    call runs for many frames before a loop-initiated graceful end.
+    """
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:  # drain so the pump never blocks on a full queue
+                pass
+            # Yield nothing: the typed empty tuple makes ``_gen`` an async generator
+            # (satisfying AsyncIterator[Transcript]) without ever emitting a turn.
+            empty: tuple[Transcript, ...] = ()
+            for transcript in empty:
+                yield transcript
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_no_input_reprompt_fires_after_silence_window() -> None:
+    """A live-but-silent caller gets a spoken reprompt after the silence window.
+
+    RTP keeps flowing (silence frames hold the call open) but no end-of-turn ever
+    arrives, so nothing is delivered to the agent. After the no-input window elapses
+    with no caller activity, the watchdog speaks one reprompt phrase through the normal
+    TTS/send path (so it is flushable + echo-gate-arming like any agent audio).
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=1)  # only the first silence window elapses
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),  # the caller never finishes a turn (pure silence)
+        tts,
+        sleep=sleep,
+        no_input_reprompt_phrases=("Are you still there?",),
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    # Let the watchdog arm and park on the injected silence-window sleep.
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the no-input watchdog did not arm a silence-window wait"
+    assert transport.sent_audio == [], "no reprompt should fire before the window"
+
+    # The silence window elapses with no caller input: the reprompt must be spoken.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert transport.sent_audio == [reprompt_frame], (
+        "the no-input watchdog did not speak a reprompt after the silence window"
+    )
+    assert tts.synthesised == ["Are you still there?"], (
+        f"the reprompt phrase was not synthesised verbatim; got {tts.synthesised!r}"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_no_input_reprompt_resets_when_caller_speaks() -> None:
+    """A delivered caller turn resets the no-input watchdog — no reprompt fires.
+
+    The caller speaks (an end-of-turn is delivered) DURING the silence window. When the
+    window elapses, the watchdog must observe the activity and re-arm rather than
+    reprompt — a caller who is talking is plainly still there.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=2)  # two windows; activity in the first resets it
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([reprompt_frame])
+    # The caller DOES finish a turn (end-of-turn True), so deliver_turn fires.
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([("hello, I am here", True, True)]),
+        tts,
+        sleep=sleep,
+        deliver_turn=capture,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if delivered and sleep.calls:
+            break
+    assert delivered == ["hello, I am here"], "the caller turn was not delivered"
+    assert sleep.calls, "the watchdog did not arm"
+
+    # First window elapses; a turn WAS delivered during it, so the watchdog resets
+    # (re-arms) instead of reprompting.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "a reprompt fired even though the caller had spoken (timer did not reset)"
+    )
+    # It re-armed for another window (white-box: the watchdog is still alive).
+    assert not run_task.done(), "the watchdog ended the call after caller activity"
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_no_input_reprompt_stands_down_on_barge_in() -> None:
+    """A barge-in (caller speaking) stands down a pending no-input reprompt.
+
+    Barge-in means the caller has taken the floor, so the watchdog must reset — a
+    reprompt that fired now would talk over the responding caller. After a barge-in
+    during the window, the elapsed window must NOT reprompt.
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=1)
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the watchdog did not arm"
+
+    # The caller starts speaking (barge-in) during the silence window.
+    await loop.barge_in()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # The window elapses, but the barge-in reset the watchdog: no reprompt.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "a reprompt fired after a barge-in (the watchdog did not stand down)"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
+    """After N unanswered reprompts the watchdog ends the call gracefully (run returns).
+
+    With ``no_input_max_reprompts=2`` the watchdog speaks two reprompts on two silent
+    windows; on the third silent window (the limit is exhausted) it ends the call — and
+    the test NEVER closes the inbound transport, proving the loop ended ITSELF. run()
+    must return CLEANLY (no exception), so the adapter classifies a normal end.
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    # reprompt#1 window + reprompt#2 window + the end window = 3 windows after arm.
+    sleep = _SteppedSleep(steps=3)
+    # A silent-but-LIVE caller: continuous inbound RTP, so the pump observes the loop's
+    # graceful self-end (no close_inbound() — the loop ends ITSELF).
+    transport = _LiveSilenceTransport()
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=2,
+        no_input_reprompt_phrases=("Are you still there?",),
+        goodbye=False,  # isolate the end behaviour; goodbye has its own tests
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # Two silent windows → two reprompts.
+    for expected in (1, 2):
+        sleep.step()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(transport.sent_audio) >= expected:
+                break
+        assert len(transport.sent_audio) == expected, (
+            f"expected {expected} reprompt(s); got {len(transport.sent_audio)}"
+        )
+    assert not run_task.done(), "the call ended before the reprompt limit was reached"
+
+    # Third silent window: the limit (2) is exhausted — the watchdog ends the call.
+    sleep.step()
+    # The loop must end on its OWN — the test does NOT close the inbound transport.
+    await asyncio.wait_for(run_task, timeout=5.0)
+    assert run_task.exception() is None, (
+        "a no-input graceful end must return cleanly (not raise)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_input_off_emits_nothing_and_does_not_self_end() -> None:
+    """With the watchdog OFF nothing is reprompted and the call never ends itself.
+
+    The off path must be exactly the prior behaviour: no watchdog task, no use of the
+    sleep seam for reprompts, no reprompt audio, and the loop ends only when the inbound
+    stream does (the test closes it).
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([_silence_frame(0)])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        sleep=sleep,
+        no_input_reprompt=False,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert sleep.calls == [], "the watchdog scheduled a wait though it is OFF"
+    assert transport.sent_audio == [], "a reprompt fired though the watchdog is OFF"
+    assert not run_task.done(), "the loop self-ended though the watchdog is OFF"
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_goodbye_spoken_before_graceful_end() -> None:
+    """On a loop-initiated graceful end the goodbye is spoken + flushed pre-BYE.
+
+    When the no-input reprompt limit is exhausted the loop ends the call ITSELF; on
+    that path it must speak a short goodbye through the normal TTS/send path and let
+    its audio flush BEFORE run() returns (so the goodbye has a live media path — the
+    adapter stops the engine only after run() returns). The goodbye is the LAST audio.
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x21\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    goodbye_frame = PcmFrame(
+        samples=b"\x40\x00" * 256, sample_rate=16_000, monotonic_ts_ns=2
+    )
+
+    class _RepromptThenGoodbyeTTS(_CapturingTTS):
+        """Reprompt synth yields the reprompt frame; goodbye synth the goodbye frame."""
+
+        def __init__(self, frames: list[PcmFrame]) -> None:
+            super().__init__(frames)
+            self._n = 0
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            # First synth call is the single reprompt; the second is the goodbye.
+            self._n += 1
+            frames = [reprompt_frame] if self._n == 1 else [goodbye_frame]
+            stream = _CapturingTtsStream(frames, text, self.synthesised)
+            self.last_stream = stream
+            return stream
+
+    sleep = _SteppedSleep(steps=2)  # reprompt#1 window + the end window
+    transport = _LiveSilenceTransport()  # silent-but-live caller (continuous RTP)
+    tts = _RepromptThenGoodbyeTTS([])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=1,
+        no_input_reprompt_phrases=("Are you still there?",),
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # One silent window → one reprompt.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert transport.sent_audio == [reprompt_frame], "the single reprompt did not fire"
+
+    # Next silent window: limit exhausted → goodbye spoken, then graceful end.
+    sleep.step()
+    await asyncio.wait_for(run_task, timeout=5.0)
+    assert run_task.exception() is None, "the graceful end must return cleanly"
+
+    # The goodbye audio reached the wire AFTER the reprompt, BEFORE run() returned.
+    assert transport.sent_audio == [reprompt_frame, goodbye_frame], (
+        f"the goodbye was not flushed before the end; sent={transport.sent_audio!r}"
+    )
+    assert tts.synthesised == ["Are you still there?", "Goodbye."], (
+        f"the goodbye phrase was not synthesised verbatim; got {tts.synthesised!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_goodbye_not_spoken_on_caller_hangup_eos() -> None:
+    """A caller-hangup / inbound-EOS end speaks NO goodbye (no live media path).
+
+    When the inbound stream simply ends (caller BYE / EOS) the media path is gone — a
+    goodbye would play to nothing. The goodbye fires ONLY on a loop-initiated graceful
+    end, never on the externally-driven inbound-stream end. Here the call ends because
+    the transport's inbound iterator is exhausted; no goodbye must be synthesised.
+    """
+    sleep = (
+        _GatedSleep()
+    )  # never released: no silence window elapses in this short call
+    # A plain transport whose inbound iterator ends immediately (caller-hangup/EOS).
+    transport = _FakeTransport([_silence_frame(0)])
+    tts = _CapturingTTS([_silence_frame(0)])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        sleep=sleep,
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    assert transport.sent_audio == [], "audio was emitted on a plain inbound-EOS end"
+    assert tts.synthesised == [], (
+        f"a goodbye was spoken on a caller-hangup/EOS end; got {tts.synthesised!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_goodbye_disabled_graceful_end_still_ends_cleanly() -> None:
+    """With the goodbye OFF a no-input graceful end still ends cleanly — no goodbye.
+
+    Disabling the goodbye must not break the graceful end: after the reprompt limit the
+    loop still ends itself (run() returns), it simply speaks no closing line.
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x21\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=2)  # reprompt#1 window + the end window
+    transport = _LiveSilenceTransport()  # silent-but-live caller (continuous RTP)
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=1,
+        goodbye=False,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    sleep.step()  # one reprompt
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert transport.sent_audio == [reprompt_frame]
+
+    sleep.step()  # limit exhausted → graceful end, no goodbye
+    await asyncio.wait_for(run_task, timeout=5.0)
+    assert run_task.exception() is None
+    # No goodbye frame was appended after the reprompt.
+    assert transport.sent_audio == [reprompt_frame], (
+        f"audio appeared after the reprompt (goodbye off); got {transport.sent_audio!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_input_barge_in_during_reprompt_resets_and_does_not_end() -> None:
+    """A caller answering DURING a reprompt playout resets the cycle — must not end.
+
+    Regression (codex MAJOR): the activity flag was cleared at the TOP of each watchdog
+    iteration, so a barge-in that arrives WHILE a reprompt is being spoken (after that
+    window's dead-air decision, before the next iteration's top) was wiped before the
+    watchdog observed it. With ``no_input_max_reprompts=1`` the caller answers
+    mid-reprompt yet the next silent window would treat the reprompt as unanswered and
+    END the call — hanging up on a caller who just spoke. The fix consumes the flag only
+    when observed, so activity during reprompt playout persists to the next window.
+
+    To exercise the race deterministically the reprompt's first ``send_audio`` BLOCKS,
+    so the watchdog parks INSIDE ``_speak_phrase_best_effort`` (the reprompt is playing)
+    when the barge-in arrives — before the watchdog reaches the next iteration's top.
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _BlockingLiveSilenceTransport(_LiveSilenceTransport):
+        """Silent-but-live caller whose FIRST send_audio blocks on a gate.
+
+        Live so the pump observes ``_end_call`` and ``run()`` actually completes (the
+        clean discriminator: a graceful end ⇒ ``run_task`` done). The blocked first send
+        parks the reprompt mid-playout so a barge-in lands during it (the race window).
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_send_gate = asyncio.Event()
+
+        async def send_audio(self, frame: PcmFrame) -> None:
+            if not self.sent_audio:
+                await self.first_send_gate.wait()
+            self.sent_audio.append(frame)
+
+    # window#1 (→ reprompt, which parks on the blocked send) + window#2 (must see the
+    # mid-reprompt barge-in and reset, NOT end) + window#3 (no NEW activity → reprompt
+    # again, proving the cycle restarted rather than ending).
+    sleep = _SteppedSleep(steps=3)
+    transport = _BlockingLiveSilenceTransport()
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=1,
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # Window 1 elapses → the reprompt fires and parks INSIDE _play on the blocked send
+    # (so the watchdog is still inside _speak_phrase_best_effort — mid-playout).
+    sleep.step()
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], "the reprompt send should be blocked (parked)"
+    assert loop._no_input_task is not None
+    assert not loop._no_input_task.done()
+
+    # The caller ANSWERS during the reprompt (a barge-in mid-playout). This is caller
+    # life and must reset the cycle — not be lost when the reprompt finishes and the
+    # watchdog loops back to its (formerly flag-clearing) top.
+    await loop.barge_in()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # Release the blocked reprompt send so the playout completes and the watchdog
+    # returns from _speak_phrase_best_effort and parks on window #2's sleep.
+    transport.first_send_gate.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert transport.sent_audio == [reprompt_frame], "the reprompt did not complete"
+
+    # Window 2 elapses: the watchdog must observe the (still-set) mid-reprompt barge-in,
+    # reset the count, and NOT end the call. With the bug the flag was cleared at the
+    # iteration top, so the watchdog ends the call (sets _end_call) and the live pump
+    # winds run() up — ``run_task`` completes. The fix keeps run() alive.
+    sleep.step()
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if run_task.done():
+            break
+    assert not loop._end_call.is_set(), (
+        "the watchdog ended the call despite the caller answering during the reprompt "
+        "(mid-reprompt activity was lost)"
+    )
+    assert not run_task.done(), "run() ended after a mid-reprompt caller answer"
+
+    # Window 3 with no further activity: since the count reset, the watchdog reprompts
+    # again rather than ending — proof the cycle truly restarted.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(transport.sent_audio) >= 2:
+            break
+    assert len(transport.sent_audio) == 2, (
+        "the reprompt cycle did not restart after the caller answered; "
+        f"sent={len(transport.sent_audio)}"
+    )
+    assert not loop._end_call.is_set(), "the call ended even though the cycle had reset"
+
+    # Wind the call down for a clean teardown (the loop itself never ended).
+    loop._end_call.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_no_input_barge_in_during_goodbye_aborts_the_end() -> None:
+    """A caller answering DURING the goodbye aborts the graceful end — media is live.
+
+    Regression (codex follow-up MAJOR): the goodbye is spoken on a live media path
+    BEFORE ``run()`` returns, so a caller can still barge in during it. If they do, the
+    call must NOT end — the caller is engaging — and the reprompt cycle must resume. The
+    end is committed (``_end_call`` set) only if no caller activity arrived while the
+    goodbye played. ``max_reprompts=0`` ⇒ the first silent window goes straight to the
+    goodbye; the goodbye's send BLOCKS so the barge-in lands mid-goodbye.
+    """
+    goodbye_frame = PcmFrame(
+        samples=b"\x40\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _BlockingLiveSilenceTransport(_LiveSilenceTransport):
+        """Silent-but-live caller whose first send_audio (the goodbye) blocks."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_send_gate = asyncio.Event()
+
+        async def send_audio(self, frame: PcmFrame) -> None:
+            if not self.sent_audio:
+                await self.first_send_gate.wait()
+            self.sent_audio.append(frame)
+
+    sleep = _SteppedSleep(
+        steps=2
+    )  # window#1 → goodbye; window#2 → reprompt (cycle resumed)
+    transport = _BlockingLiveSilenceTransport()
+    tts = _CapturingTTS([goodbye_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=0,  # straight to goodbye on the first silent window
+        no_input_reprompt_phrases=("Are you still there?",),
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # Window 1 elapses with the budget already spent (0) → the goodbye starts and parks
+    # on the blocked send (so the caller can barge in mid-goodbye).
+    sleep.step()
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert tts.synthesised == ["Goodbye."], "the goodbye should be synthesising"
+    assert transport.sent_audio == [], "the goodbye send should be blocked (parked)"
+    assert not loop._end_call.is_set(), "the end committed before the goodbye flushed"
+
+    # The caller ANSWERS during the goodbye. The end must abort (media is still live).
+    await loop.barge_in()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.first_send_gate.set()  # let the goodbye finish flushing
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    assert not loop._end_call.is_set(), (
+        "the call ended despite the caller answering during the goodbye"
+    )
+    assert not run_task.done(), "run() ended despite a mid-goodbye caller answer"
+
+    # The cycle resumed: with max_reprompts=0 the next silent window goes to the goodbye
+    # AGAIN (a second goodbye synthesised) rather than the call having ended.
+    sleep.step()
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if len(tts.synthesised) >= 2:
+            break
+    assert tts.synthesised == ["Goodbye.", "Goodbye."], (
+        f"the cycle did not resume after the mid-goodbye answer; {tts.synthesised!r}"
+    )
+
+    loop._end_call.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# (i) Reply streaming — TTS sentence-by-sentence pipelining guard (ADR-0057)
+# ---------------------------------------------------------------------------
+#
+# The Hermes 0.16.0 runtime delivers the agent reply to the plugin as ONE complete
+# string (verified — there is no per-sentence text callback wired through the gateway
+# platform path), so plugin-side incremental delivery FROM THE RUNTIME is impossible.
+# The best available mitigation already lives in the TTS layer: a single multi-sentence
+# chunk is split into sentences (SentenceAggregator) and each segment's audio is emitted
+# before the next is synthesised (PcmFrameStream). This regression guard pins that the
+# CALL LOOP preserves that pipeline end-to-end: first-sentence audio reaches the wire
+# before the later sentence is even opened, so a future call-loop change cannot silently
+# regress first-audio latency back to whole-reply synthesis. (No new production code is
+# needed for the streaming feature; this is the verification artefact for ADR-0057.)
+
+
+@pytest.mark.asyncio
+async def test_reply_streams_first_sentence_before_later_synthesised() -> None:
+    """speak() emits the first sentence's audio before the second sentence is opened.
+
+    Drives a *real* ``PcmFrameStream`` (the production segmenter + per-segment pipeline)
+    from a single multi-sentence reply chunk — exactly how the adapter hands the whole
+    reply string to ``speak()``. The per-segment source records when each segment is
+    OPENED and gates the SECOND segment's first byte behind an event the test controls.
+    The assertion: the first segment's frame reaches ``send_audio`` while the second
+    segment's source has not yet produced audio — i.e. the call loop streams the reply
+    sentence-by-sentence rather than awaiting the whole synthesis (ADR-0057 §3).
+    """
+    opened: list[str] = []
+    second_segment_gate = asyncio.Event()
+
+    class _PipelinedTTS:
+        """Real ``PcmFrameStream`` whose 2nd segment's audio is gated by the test."""
+
+        @property
+        def output_sample_rate(self) -> int:
+            return 16_000
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            _ = voice, sample_rate
+            stop = threading.Event()
+
+            def _open_segment(sentence: str) -> SegmentSource:
+                opened.append(sentence)
+                is_second = len(opened) >= 2
+
+                async def _chunks() -> AsyncIterator[bytes]:
+                    if is_second:
+                        # The 2nd segment must not produce audio until released, so the
+                        # test can prove the 1st segment's frame went out first.
+                        await second_segment_gate.wait()
+                    if stop.is_set():
+                        return
+                    yield bytes(320)  # 160 samples @ 16 kHz PCM16 = one frame
+
+                return SegmentSource(chunks=_chunks())
+
+            return PcmFrameStream(
+                text=text,
+                open_segment=_open_segment,
+                sample_rate=16_000,
+                stop=stop,
+            )
+
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _PipelinedTTS(),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    async def _reply() -> AsyncIterator[str]:
+        # The WHOLE reply as one chunk — the way the adapter delivers it.
+        yield "First sentence here. Second sentence follows."
+
+    speak_task = asyncio.create_task(loop.speak(_reply()))
+    # Pump the loop: the first segment is synthesised and its frame sent, then the
+    # pipeline blocks opening/emitting the SECOND segment on the gate.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+
+    # The load-bearing guard: the first sentence's AUDIO is on the wire while the
+    # SECOND sentence's audio is still gated (unsynthesised). If the loop had regressed
+    # to whole-reply synthesis (emit nothing until the entire reply is synthesised),
+    # ``sent_audio`` would be EMPTY here — both segments are gated, so nothing could be
+    # sent and ``speak()`` would be parked. Exactly one frame on the wire therefore
+    # proves per-sentence AUDIO pipelining: segment 1's audio flows before segment 2 is
+    # synthesised. (The segmenter MAY *open* segment 2's source ahead — pipelining the
+    # network round-trip — which is desirable; it is the AUDIO emission order that
+    # bounds first-audio latency, so the guard is on the sent audio, not open ordering.)
+    assert len(transport.sent_audio) == 1, (
+        "first-sentence audio did not reach the wire before the second was synthesised "
+        f"(sent={len(transport.sent_audio)}, opened={opened!r})"
+    )
+    assert opened[0] == "First sentence here.", (
+        f"the first segment synthesised was not the first sentence; opened={opened!r}"
+    )
+    assert not speak_task.done(), "speak() finished before the gated 2nd segment"
+
+    # Release the second segment; speak() drains it and completes.
+    second_segment_gate.set()
+    await asyncio.wait_for(speak_task, timeout=5.0)
+    assert len(transport.sent_audio) == 2, "the second sentence's audio was not sent"

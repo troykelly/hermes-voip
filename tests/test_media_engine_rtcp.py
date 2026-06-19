@@ -15,6 +15,7 @@ these tests exercise the capability through the injectable seams.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 import struct
 
@@ -370,6 +371,50 @@ async def test_rtcp_loop_muxes_over_transport_when_no_sink_given() -> None:
     rtcp_datagram = capture.sent[-1][0]
     packets = parse_compound(rtcp_datagram)
     assert isinstance(packets[0], SenderReport)
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_does_not_inherit_a_no_op_pacing_sleep() -> None:
+    """start_rtcp runs the RTCP loop on the real wall clock, not the pacing stub.
+
+    Regression (rule 25): start_rtcp started run_rtcp WITHOUT a sleep arg, so the
+    loop inherited ``engine._sleep`` — which callers (e.g. the e2e fake gateway)
+    legitimately stub to a no-op for instant outbound RTP pacing. The §6.2 interval
+    then never elapsed, the loop SPUN, and it starved the call's audio TX (a real
+    e2e hang). start_rtcp must pin ``sleep=asyncio.sleep``. Here ``_sleep`` is a
+    no-op that only yields (no wall time): a real-clock loop stays parked on its
+    multi-second first interval and emits NOTHING in sub-ms test time, while a loop
+    that inherited the stub floods the sink.
+    """
+    sink = _RtcpSink()
+    engine = _make_engine(rtcp_send=sink)  # unsecured ⇒ start_rtcp activates RTCP
+    engine._transport = _CaptureTransport()
+
+    async def _no_op_pacing_sleep(_secs: float) -> None:
+        # Models the e2e's instant outbound-pacing sleep: returns at once (no wall
+        # time) but yields, so a spinning RTCP loop floods rather than hangs the test.
+        await asyncio.sleep(0)
+
+    engine._sleep = _no_op_pacing_sleep
+    # Send one frame so build_rtcp_report() yields an SR; without prior media it
+    # returns None and the loop emits nothing, hiding the spin (a false GREEN).
+    await engine.send_audio(_g711_frame(1))
+    await engine.start_rtcp(mux=True)
+    try:
+        # 200 instant event-loop turns: a wall-clock loop is still parked on its first
+        # multi-second §6.2 interval (no real time has passed), so the sink stays empty.
+        for _ in range(200):
+            await asyncio.sleep(0)
+        assert sink.sent == [], (
+            "start_rtcp inherited the no-op pacing sleep and spun: "
+            f"{len(sink.sent)} RTCP datagrams emitted in sub-millisecond test time"
+        )
+    finally:
+        task = engine._rtcp_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 @pytest.mark.asyncio

@@ -472,6 +472,10 @@ async def test_savpf_invite_over_wss_routes_to_webrtc_and_advertises_wss_via() -
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # RTCP activation (ADR-0061): the inbound plain-RTP path starts RTCP after
+        # connect(); the fake models the awaitable method + inert _rtcp_active flag.
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
     )

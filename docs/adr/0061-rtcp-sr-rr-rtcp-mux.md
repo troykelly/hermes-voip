@@ -111,6 +111,35 @@ lane) must, for each `RtpMediaTransport` it constructs:
 This mirrors ADR-0056's ptime boundary (`engine.ptime = negotiate_ptime(...)` is likewise
 the adapter's call), so both land in the same launch push.
 
+### Adapter activation as built (refinement, 2026-06-19)
+
+The activation lane shipped the above with two refinements to what is written above:
+
+1. **The engine owns the RTCP socket via `start_rtcp`, not the adapter.** Because the engine
+   already owns the RTP socket, its OS-assigned port, the inbound reader, and `stop()`
+   teardown, the live wiring is a single `await engine.start_rtcp(mux=…, remote_rtcp_addr=…)`
+   the adapter calls after `connect()`. `start_rtcp` sets the inbound muxed-demux flag,
+   registers the `run_rtcp` task on the engine (so `stop()` cancels + awaits it and flushes
+   the BYE), and — on the non-muxed path — binds the sibling RTCP socket on RTP-port+1 and
+   starts a reader that pumps it into `ingest_rtcp`. The muxed inbound demux (RFC 5761 §4
+   second byte 200–204) lives in the engine's `_inbound_gen` (the only place raw datagrams
+   are read), gated on the activation flag so a non-activated engine is byte-for-byte
+   unchanged. `engine.call_quality` is logged at adapter teardown (runbook 0014).
+
+2. **RTCP is activated ONLY on the cleartext plain-RTP path; secured paths are NOT.**
+   Step 4 above assumed an "SRTP unprotect" of RTCP — i.e. **SRTCP** (RFC 3711 §3.4). The
+   media engine and `media/srtp.py` implement **SRTP only**: `_emit_rtcp`/`ingest_rtcp`
+   handle CLEARTEXT RTCP, and `SrtpSession` has no `protect_rtcp`/`unprotect_rtcp`. Sending
+   cleartext RTCP on an RTP/SAVP (SDES) or SAVPF (WebRTC/DTLS) 5-tuple would violate the
+   secured profile **and** leak our SSRC/CNAME/timing in cleartext on an otherwise-encrypted
+   call — worse than no RTCP. So the adapter's `_plan_rtcp_activation` returns `None` for a
+   secured session, and `_setup_sdes_call` activates RTCP only when the answer is plain
+   RTP/AVP (`answer_crypto is None`); the WebRTC path never activates it. Activating RTCP on
+   secured calls requires an SRTCP transform — a separate, named capability follow-up
+   (SRTCP, RFC 3711 §3.4). Until it lands, RTCP is dormant on encrypted calls (which
+   includes the SDES-SRTP live test gateway). The operator kill-switch is
+   `HERMES_VOIP_RTCP_ENABLED` (default on).
+
 ## Consequences
 
 - The SLO catalogue's packet-loss / jitter / RTT / packets-sent-received signals now have a

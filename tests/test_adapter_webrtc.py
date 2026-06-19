@@ -396,6 +396,9 @@ async def test_webrtc_offer_yields_savpf_answer_with_opus_dtls_ice() -> None:
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
+        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
     )
@@ -506,6 +509,9 @@ async def test_webrtc_av_offer_answers_sendonly_video_and_starts_sender(
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
+        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
     )
@@ -584,6 +590,9 @@ async def test_webrtc_video_ssrc_never_collides_with_audio(
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
+        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
     )
@@ -644,6 +653,9 @@ async def test_webrtc_av_offer_no_source_answers_inactive_video(
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
+        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
     )
@@ -702,6 +714,10 @@ async def test_plain_offer_still_uses_sdes_path_no_webrtc() -> None:
                 return_value=MagicMock(
                     connect=AsyncMock(return_value=True),
                     stop=AsyncMock(return_value=None),
+                    # RTCP activation (ADR-0061): the plain-RTP path starts RTCP after
+                    # connect(); the fake models the awaitable method + inert flag.
+                    start_rtcp=AsyncMock(return_value=None),
+                    _rtcp_active=False,
                     local_port=20002,
                     inbound_sample_rate=8_000,
                 ),

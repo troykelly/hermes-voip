@@ -49,14 +49,14 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
-from hermes_voip.sdp import SessionDescription
+from hermes_voip.sdp import AudioMedia, SessionDescription
 
 # ---------------------------------------------------------------------------
 # Pure-helper unit tests: the activation planner + the opaque CNAME
 # ---------------------------------------------------------------------------
 
 
-def _audio_of(offer_text: str) -> object:
+def _audio_of(offer_text: str) -> AudioMedia:
     """Parse an SDP offer and return its (first) audio media section."""
     offer = SessionDescription.parse(offer_text)
     assert offer.audio is not None
@@ -232,15 +232,31 @@ def _ext_config() -> ExtensionConfig:
 
 
 class _FakeTransport:
-    """Records sent messages; satisfies the SignalingTransport surface used here."""
+    """Fake SipTransport + CallSignaling capturing sent messages."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, local_sent_by: str = "127.0.0.1:5061") -> None:
+        self._local_sent_by = local_sent_by
         self.sent: list[str] = []
         self._calls: dict[str, object] = {}
-        self.local_sent_by = "127.0.0.1:5061"
+
+    @property
+    def local_sent_by(self) -> str:
+        return self._local_sent_by
+
+    def contact_uri(self, extension: str) -> str:
+        return f"<sip:{extension}@{self._local_sent_by};transport=tls>"
 
     async def send(self, message: str) -> None:
         self.sent.append(message)
+
+    async def connect(self) -> None:
+        """No-op."""
+
+    async def aclose(self) -> None:
+        """No-op."""
+
+    def bind_manager(self, manager: object) -> None:
+        """No-op."""
 
     def add_call(self, call_id: str, sink: object) -> None:
         self._calls[call_id] = sink
@@ -248,31 +264,49 @@ class _FakeTransport:
     def remove_call(self, call_id: str, sink: object | None = None) -> None:
         self._calls.pop(call_id, None)
 
-    def contact_uri(self, extension: str) -> str:
-        return f"<sip:{extension}@127.0.0.1:5061;transport=tls>"
 
+class _FakeTtsStream:
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self._gen()
 
-class _FakeASR:
-    async def stream(self, frames: AsyncIterator[PcmFrame]) -> AsyncIterator[str]:
-        async for _ in frames:
-            return
-        return
-        yield ""  # pragma: no cover — makes this an async generator
+    async def _gen(self) -> AsyncIterator[PcmFrame]:
+        empty: list[PcmFrame] = []
+        for frame in empty:
+            yield frame
+
+    async def cancel(self) -> None:
+        """No-op."""
 
 
 class _FakeTTS:
-    def synthesize(self, text: str, *, sample_rate: int) -> TtsStream:
-        async def _gen() -> AsyncIterator[PcmFrame]:
-            yield PcmFrame(
-                samples=b"\x00\x00", sample_rate=sample_rate, monotonic_ts_ns=0
-            )
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        return _FakeTtsStream()  # type: ignore[return-value]
 
-        return TtsStream(_gen())
+
+class _FakeASR:
+    async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+        async for _ in audio:
+            pass
+        empty: list[object] = []
+        for chunk in empty:
+            yield chunk
 
 
 class _FakeGuard:
-    async def check(self, text: str, **_kw: object) -> GuardResult:
-        return GuardResult(verdict=GuardVerdict.ALLOW, reason="ok")
+    async def screen(self, text: str, *, call_id: str) -> GuardResult:
+        return GuardResult(
+            verdict=GuardVerdict.ALLOW,
+            score=0.0,
+            degraded=False,
+            normalized_text=text,
+            reasons=(),
+        )
 
 
 def _fake_providers() -> Providers:
@@ -379,7 +413,7 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
 
             # Reach the LIVE engine and assert RTCP was activated on it.
             session = adapter._call_sessions[call_id]  # type: ignore[attr-defined]
-            engine = session.media
+            engine = session._media  # white-box: the concrete RtpMediaTransport
             assert engine._rtcp_task is not None  # the run_rtcp loop is live
             assert engine._rtcp_active is True  # inbound muxed-demux engaged
             assert engine._rtcp_send is not None  # non-muxed: separate sink installed

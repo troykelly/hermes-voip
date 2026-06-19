@@ -254,7 +254,13 @@ class _FakeSession:
 
 
 def _fake_engine() -> MagicMock:
-    return MagicMock(stop=AsyncMock(return_value=None), media_timed_out=False)
+    return MagicMock(
+        stop=AsyncMock(return_value=None),
+        media_timed_out=False,
+        # RTCP (ADR-0061): inert so the teardown call-quality log is skipped for a
+        # fake engine that never activated RTCP.
+        _rtcp_active=False,
+    )
 
 
 # ===========================================================================
@@ -499,6 +505,8 @@ async def test_inbound_invite_under_capacity_is_admitted() -> None:
             return_value=MagicMock(
                 connect=AsyncMock(return_value=True),
                 stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
                 local_port=20002,
                 inbound_sample_rate=8_000,
             ),

@@ -40,11 +40,13 @@ import contextlib
 import logging
 import random
 import re
+import secrets
 import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 # The real hermes-agent runtime surface. This module is imported ONLY lazily
 # (inside ``hermes_voip.plugin._adapter_factory``), so a bare ``import
@@ -161,6 +163,7 @@ from hermes_voip.sdp import (
     generate_answer_crypto,
     negotiate_audio,
     negotiate_ptime,
+    negotiate_rtcp_mux,
     negotiate_video_h264,
 )
 from hermes_voip.sdp import (
@@ -2533,6 +2536,11 @@ class VoipAdapter(BasePlatformAdapter):
             # resilience only when the link needs it.
             jitter_adapt=True,
             jitter_max_depth=media_cfg.jitter_max_depth,
+            # RTCP SDES CNAME (RFC 3550 §6.5.1, ADR-0061): a fresh opaque per-call
+            # token (never the SIP host/extension — rule 34). Held by the engine even
+            # if RTCP is not activated (e.g. a secured call); only used on the wire
+            # once start_rtcp runs below.
+            cname=_mint_rtcp_cname(),
         )
         # ptime negotiation (ADR-0056 activated by ADR-0063): honour the peer's
         # requested framing (a=ptime/a=maxptime) when carriable, else 20 ms —
@@ -2540,6 +2548,30 @@ class VoipAdapter(BasePlatformAdapter):
         # outbound packet is framed correctly.
         engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
+        # RTCP activation (RFC 3550 §6 / RFC 5761, ADR-0061): turn the dormant RTCP
+        # control channel live for this call — but ONLY on the cleartext plain-RTP
+        # path (``answer_crypto is None``). A secured SDES/SAVP call is NOT activated:
+        # the engine emits/parses cleartext RTCP and has no SRTCP (RFC 3711 §3.4)
+        # transform, so cleartext RTCP on a secured 5-tuple would violate the profile
+        # and leak our SSRC/CNAME/timing in cleartext (a named follow-up). Done AFTER
+        # connect() so the OS-assigned RTP port (hence the non-muxed RTCP port+1) is
+        # known. The plan mirrors the offer's rtcp-mux (RFC 5761 §5.1.1).
+        rtcp_plan = _plan_rtcp_activation(
+            audio,
+            remote_address=remote_address,
+            secured=answer_crypto is not None,
+            rtcp_enabled=media_cfg.rtcp_enabled,
+        )
+        if rtcp_plan is not None:
+            await engine.start_rtcp(
+                mux=rtcp_plan.mux,
+                remote_rtcp_addr=None if rtcp_plan.mux else rtcp_plan.remote_rtcp_addr,
+            )
+            _log.info(
+                "INVITE %s: RTCP active (%s)",
+                call_id,
+                "rtcp-mux" if rtcp_plan.mux else f"port {engine.local_port + 1}",
+            )
 
         local_media = LocalMediaSession(
             local_address=local_rtp_host,
@@ -3195,6 +3227,24 @@ class VoipAdapter(BasePlatformAdapter):
         # cancel + await its task, and drop the per-call registrations. Done before
         # engine.stop() so no video packets race the engine teardown.
         await self._stop_webrtc_video_sender(call_id)
+        # RTCP call-quality SLO snapshot (RFC 3550 §6.4, ADR-0061, runbook 0014): when
+        # RTCP was active for this call, emit the final loss/jitter/RTT view (ours +
+        # the peer's report about us) before stopping the engine. The CallQuality
+        # carries only numeric quality metrics — no caller identity — so it is safe to
+        # log on a PUBLIC repo (rule 34). The read never raises (a pure snapshot);
+        # gated on _rtcp_active so a non-RTCP (secured / disabled) call logs nothing.
+        if engine._rtcp_active:
+            q = engine.call_quality
+            _log.info(
+                "INVITE %s: RTCP call quality — local loss=%s jitter_ms=%s; "
+                "remote loss=%s jitter_ms=%s; rtt_s=%s",
+                call_id,
+                q.local_fraction_lost,
+                q.local_jitter_ms,
+                q.remote_fraction_lost,
+                q.remote_jitter_ms,
+                q.rtt_seconds,
+            )
         try:
             await engine.stop()
         except Exception as exc:  # noqa: BLE001 — log; never strand the call routes
@@ -4726,6 +4776,83 @@ def _negotiated_ptime(audio: AudioMedia, codec: Codec) -> int:
         supported=supported,
         default=_DEFAULT_PTIME_MS,
     )
+
+
+# RTCP SDES CNAME token length in bytes (RFC 3550 §6.5.1, ADR-0061). 8 bytes →
+# 16 hex chars: ample collision resistance for a per-call identifier while staying
+# short on the wire. An OPAQUE token, never PII (the repo is PUBLIC; the CNAME is
+# sent on the wire, so it must carry no host/extension/number — rule 34).
+_RTCP_CNAME_TOKEN_BYTES: Final[int] = 8
+
+
+def _mint_rtcp_cname() -> str:
+    """Mint a fresh, opaque per-call RTCP SDES CNAME (RFC 3550 §6.5.1, ADR-0061).
+
+    The CNAME stably names our RTP source for the duration of the call and is sent
+    on the wire in every SDES. RFC 3550 suggests a ``user@host`` form, but that is
+    identifying — on a PUBLIC repo / shared operator logs the CNAME must leak no SIP
+    host, extension, or caller number (rule 34). So we use a random opaque token,
+    unlinkable across calls. Returns a hex string (a valid SDES CNAME).
+    """
+    return secrets.token_hex(_RTCP_CNAME_TOKEN_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class _RtcpActivation:
+    """The adapter's RTCP-activation plan for one call (ADR-0061 step 1).
+
+    Attributes:
+        mux: ``True`` to multiplex RTCP onto the RTP transport (RFC 5761 — the offer
+            requested ``a=rtcp-mux``); ``False`` to use a separate RTCP socket on
+            RTP-port+1 (RFC 3550 §11).
+        remote_rtcp_addr: Where to send our RTCP — the peer's RTP address when muxed,
+            or RTP-port+1 when not (RFC 3550 §11; there is no ``a=rtcp:`` override
+            parsed, so the default sibling port is used).
+    """
+
+    mux: bool
+    remote_rtcp_addr: tuple[str, int]
+
+
+def _plan_rtcp_activation(
+    offer_audio: AudioMedia,
+    *,
+    remote_address: str,
+    secured: bool,
+    rtcp_enabled: bool,
+) -> _RtcpActivation | None:
+    """Decide whether/how to activate RTCP for an inbound call (ADR-0061 step 1).
+
+    Returns the activation plan, or ``None`` when RTCP must NOT be activated:
+
+    * ``rtcp_enabled`` is the operator kill-switch (``HERMES_VOIP_RTCP_ENABLED``).
+    * ``secured`` (an SDES/SAVP or DTLS/SAVPF session) is NOT activated: the media
+      engine emits and parses CLEARTEXT RTCP only — it has no SRTCP (RFC 3711 §3.4)
+      transform — so multiplexing/sending cleartext RTCP on a secured 5-tuple would
+      be a protocol violation AND leak our SSRC/CNAME/timing in cleartext on an
+      otherwise-encrypted call. Secured-path RTCP (SRTCP) is a separate, named
+      capability follow-up (the bounded scope of this activation lane).
+
+    On the cleartext plain-RTP path the RTCP transport mirrors the offer's mux
+    (RFC 5761 §5.1.1 via :func:`~hermes_voip.sdp.negotiate_rtcp_mux`): muxed RTCP
+    rides the RTP port; otherwise RTCP is on RTP-port+1 (RFC 3550 §11).
+
+    Args:
+        offer_audio: The inbound offer's audio media (its port + ``rtcp_mux`` flag).
+        remote_address: The peer's effective RTP address (post c=/comedia resolution).
+        secured: Whether the negotiated media is encrypted (SDES/SAVP or DTLS/SAVPF).
+        rtcp_enabled: The operator kill-switch (``MediaConfig.rtcp_enabled``).
+
+    Returns:
+        An :class:`_RtcpActivation` plan, or ``None`` to leave RTCP dormant.
+    """
+    if not rtcp_enabled or secured:
+        return None
+    mux = negotiate_rtcp_mux(offer_audio)
+    # RFC 3550 §11: non-muxed RTCP uses the port one above the RTP port. No
+    # ``a=rtcp:`` override is parsed, so the sibling port is the default.
+    rtcp_port = offer_audio.port if mux else offer_audio.port + 1
+    return _RtcpActivation(mux=mux, remote_rtcp_addr=(remote_address, rtcp_port))
 
 
 def _host_of(sent_by: str) -> str:

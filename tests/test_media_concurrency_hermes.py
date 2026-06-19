@@ -205,6 +205,10 @@ async def test_adapter_concurrent_same_call_id_teardown_isolation() -> None:  # 
         engine = MagicMock()
         engine.connect = AsyncMock(return_value=True)
         engine.stop = AsyncMock(side_effect=lambda: stopped_engine_ids.add(id(engine)))
+        # RTCP activation (ADR-0061): the inbound plain-RTP path starts RTCP after
+        # connect(); model the awaitable method + the inert _rtcp_active flag.
+        engine.start_rtcp = AsyncMock(return_value=None)
+        engine._rtcp_active = False
         engine.local_port = 20000 + len(created_engines) * 2
         engine.inbound_sample_rate = G711_SAMPLE_RATE
         created_engines.append(engine)
@@ -511,6 +515,10 @@ async def test_concurrent_same_call_id_all_tasks_tracked_and_cancelled() -> None
         engine = MagicMock()
         engine.connect = AsyncMock(return_value=True)
         engine.stop = AsyncMock(side_effect=lambda: stopped_engine_ids.add(id(engine)))
+        # RTCP activation (ADR-0061): the inbound plain-RTP path starts RTCP after
+        # connect(); model the awaitable method + the inert _rtcp_active flag.
+        engine.start_rtcp = AsyncMock(return_value=None)
+        engine._rtcp_active = False
         engine.local_port = 20000 + len(created_engines) * 2
         engine.inbound_sample_rate = G711_SAMPLE_RATE
         created_engines.append(engine)

@@ -343,6 +343,15 @@ _DEFAULT_BARGE_IN_TAIL_MS = 250
 _RTP_SYMMETRIC_KEY = "HERMES_VOIP_RTP_SYMMETRIC"
 _DEFAULT_RTP_SYMMETRIC = True
 
+# RTCP (RFC 3550 §6 / RFC 5761) — the control channel that reports loss/jitter/RTT
+# and names our source (SDES CNAME). Activated by the adapter on the CLEARTEXT
+# plain-RTP path (ADR-0061); a secured SDES/SAVP session is not activated (the engine
+# has no SRTCP transform — RFC 3711 §3.4). On by default (a gateway may gate on RTCP
+# presence and an absent RTCP can be read as a dead media path); set false as an
+# operator kill-switch to suppress all RTCP send/receive.
+_RTCP_ENABLED_KEY = "HERMES_VOIP_RTCP_ENABLED"
+_DEFAULT_RTCP_ENABLED = True
+
 # RTP-inactivity watchdog (ADR-0026). A silent media/network drop otherwise hangs
 # the call forever (the inbound generator blocks on the recv queue with nothing
 # ever setting the stop event). When no inbound RTP arrives within this window the
@@ -849,6 +858,10 @@ class MediaConfig:
     # be positive (validated). Defaulted (10 ≈ 200 ms at 20 ms ptime) so existing
     # direct constructions stay valid and a bare install gets adaptive jitter.
     jitter_max_depth: int = _DEFAULT_JITTER_MAX_DEPTH
+    # RTCP (RFC 3550 §6, ADR-0061): when True (the default) the adapter activates the
+    # RTCP SR/RR/SDES/BYE control channel on the cleartext plain-RTP path (a secured
+    # session is not activated — no SRTCP transform). The operator kill-switch.
+    rtcp_enabled: bool = _DEFAULT_RTCP_ENABLED
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -1149,6 +1162,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ),
         greeting=_parse_greeting(env),
         rtp_symmetric=_parse_bool(env, _RTP_SYMMETRIC_KEY, _DEFAULT_RTP_SYMMETRIC),
+        rtcp_enabled=_parse_bool(env, _RTCP_ENABLED_KEY, _DEFAULT_RTCP_ENABLED),
         barge_in_mode=_parse_enum(
             env, _BARGE_IN_MODE_KEY, _BARGE_IN_MODES, _DEFAULT_BARGE_IN_MODE
         ),

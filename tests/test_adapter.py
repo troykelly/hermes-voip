@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -900,13 +901,23 @@ async def test_teardown_signals_exactly_once_even_if_called_twice() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_is_suppressed_after_the_call_has_ended() -> None:
-    """Post-hangup TTS is suppressed: send() to an ended call does not speak.
+async def test_send_after_the_call_has_ended_is_a_clean_no_op(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Post-hangup TTS is a CLEAN no-op: dropped, reported success, logged quietly.
 
     Once the chokepoint has signalled call-end (info["ended"]=True), a late agent
-    reply (e.g. the replayed-note turn the agent answers) must NOT be synthesised
-    to the now-disconnected caller — there is no media path. send() returns a
-    non-success result and never touches the (stopped) call loop.
+    reply (e.g. the replayed-note turn the agent answers) has NO media path — it
+    must NOT be synthesised to the now-disconnected caller and must NOT touch the
+    (stopped) call loop. The drop is EXPECTED, so send() returns a *successful*
+    result (the gateway's ``_send_with_retry`` returns immediately on success and
+    never logs a delivery failure / retries / plain-text fallback) and the drop is
+    recorded at DEBUG/INFO only — never WARNING/ERROR.
+
+    This is the bug fix for the live noise (2026-06-19): the prior contract
+    returned ``success=False`` for this expected case, which drove the gateway to
+    emit ``WARNING [Voip] Send failed … trying plain-text fallback`` and then
+    ``ERROR [Voip] Fallback send also failed`` for a harmless late reply.
     """
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
@@ -923,10 +934,56 @@ async def test_send_is_suppressed_after_the_call_has_ended() -> None:
     adapter._call_loops[call_id] = MagicMock(speak=_speak)
     adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": True}
 
-    result = await adapter.send(call_id, "a late reply")
+    with caplog.at_level(logging.DEBUG, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, "a late reply")
 
     assert spoke is False, "an ended call must not synthesise TTS to the caller"
+    # Expected late reply → clean success so the gateway drops it quietly.
+    assert getattr(result, "success", False) is True
+    # And NOT a noisy failure: no WARNING/ERROR record for the expected drop.
+    noisy = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.adapter" and r.levelno >= logging.WARNING
+    ]
+    assert noisy == [], f"post-hangup drop must be quiet, got: {noisy!r}"
+
+
+@pytest.mark.asyncio
+async def test_send_mid_call_speak_failure_still_surfaces(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A GENUINE mid-call send failure still surfaces (rule 37 — not swallowed).
+
+    Only the *expected* post-hangup case is downgraded to a clean no-op. If the
+    call is LIVE (not flagged ended) and ``CallLoop.speak`` raises — a real
+    TTS/transport fault while the caller is still connected — ``send()`` must
+    return a FAILURE result and log a WARNING, exactly as before. The ended-call
+    fix must not blanket-swallow real errors.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    call_id = new_call_id()
+
+    async def _boom(_chunks: object) -> None:
+        raise RuntimeError("rtp write failed mid-call")
+
+    # Call is LIVE (ended is False); speak() raises a genuine fault.
+    adapter._call_loops[call_id] = MagicMock(speak=_boom)
+    adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": False}
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, "a live reply")
+
     assert getattr(result, "success", True) is False
+    assert "rtp write failed mid-call" in (getattr(result, "error", "") or "")
+    warned = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.adapter" and r.levelno >= logging.WARNING
+    ]
+    assert warned, "a genuine mid-call send failure must still be logged loudly"
 
 
 @pytest.mark.asyncio

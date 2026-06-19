@@ -31,6 +31,7 @@ pytest.importorskip("OpenSSL", reason="webrtc extra (pyOpenSSL) not installed")
 
 from hermes_voip.media.dtls import DtlsEndpoint, DtlsRole
 from hermes_voip.media.sip_dtls_session import (
+    _CLOSE_SENTINEL,
     SipDtlsMediaSession,
     _UdpDatagramPipe,
 )
@@ -473,5 +474,52 @@ async def test_udp_pipe_inbound_queue_is_bounded() -> None:
     try:
         # The queue must advertise a positive, finite maxsize (no unbounded growth).
         assert pipe.inbound_maxsize > 0
+    finally:
+        await pipe.close()
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_close_delivers_wake_sentinel_when_inbound_full() -> None:
+    """close() delivers its wake sentinel even when the inbound queue is saturated.
+
+    close()'s documented job is to wake a receiver blocked on :meth:`recv`. A
+    flooding peer can fill the bounded inbound queue; if the sentinel enqueue is
+    silently dropped under that back-pressure, a consumer that later drains the
+    backlog and blocks on the now-empty queue never learns the pipe closed and hangs
+    (rule 37). The wake signal must survive saturation — close() makes room for it
+    rather than dropping it.
+    """
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    try:
+        # Saturate the bounded inbound queue (simulate a flood at close time).
+        for _ in range(pipe.inbound_maxsize):
+            pipe._inbound.put_nowait(b"\x16flood")
+        assert pipe._inbound.full()
+        await pipe.close()
+        # The close sentinel must still be present once the backlog drains.
+        drained: list[object] = []
+        while not pipe._inbound.empty():
+            drained.append(pipe._inbound.get_nowait())
+        assert _CLOSE_SENTINEL in drained
+    finally:
+        await pipe.close()
+
+
+@pytest.mark.asyncio
+async def test_udp_pipe_recv_raises_runtime_error_on_internal_non_datagram() -> None:
+    """recv() raises a real error (not a strippable assert) on a corrupt queue item.
+
+    The inbound queue only ever holds datagrams or the close sentinel. A non-bytes,
+    non-sentinel item is an internal type-invariant violation; recv() must fail at
+    runtime even under ``python -O`` (where ``assert`` is a no-op), so the guard is
+    an explicit ``raise TypeError``, not an assertion (rules 17 and 37).
+    """
+    loop = asyncio.get_running_loop()
+    pipe = await _UdpDatagramPipe.bind(loop, "127.0.0.1", 0)
+    try:
+        pipe._inbound.put_nowait(12345)  # neither bytes nor the close sentinel
+        with pytest.raises(TypeError):
+            await pipe.recv()
     finally:
         await pipe.close()

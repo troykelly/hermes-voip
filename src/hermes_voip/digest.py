@@ -253,14 +253,17 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
     """Build an ``Authorization`` / ``Proxy-Authorization`` header value.
 
     Implements RFC 7616 ``qop=auth`` for SHA-256 / SHA-256-sess and RFC 2617
-    ``qop=auth`` for MD5 / MD5-sess.  Falls back to the RFC 2069 construction
-    (``response = H(HA1:nonce:HA2)``) when the challenge does not offer qop.
-    ``HA1`` bakes in the realm, so the challenge realm must match the realm
-    the server validates against.
+    ``qop=auth`` for MD5 / MD5-sess.  ``HA1`` bakes in the realm, so the
+    challenge realm must match the realm the server validates against.
 
     The ``-sess`` variants (MD5-sess, SHA-256-sess) bind the session key to the
-    nonce and cnonce: ``HA1 = H(H(user:realm:pass):nonce:cnonce)``.  This
-    requires a cnonce even for no-qop challenges; one is generated automatically.
+    nonce and cnonce: ``HA1 = H(H(user:realm:pass):nonce:cnonce)``.
+
+    The RFC 2069 legacy no-qop construction (``response = H(HA1:nonce:HA2)``) is
+    used only for plain ``MD5`` when the challenge omits ``qop`` (ancient-server
+    back-compat).  SHA-256, SHA-256-sess, and MD5-sess have no legacy form (RFC
+    7616 §3.4.1, RFC 8760 §2.6) and -sess cannot send the cnonce its HA1 needs
+    without qop (RFC 2617 §3.2.2); a no-qop challenge for any of these raises.
 
     Args:
         challenge: The parsed server challenge.
@@ -275,8 +278,8 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
 
     Raises:
         ValueError: If the challenge algorithm is unsupported, if it offers
-            ``qop`` but not ``auth``, or if any rendered auth-param value
-            contains a control character.
+            ``qop`` but not ``auth``, if a non-MD5 algorithm omits ``qop``, or
+            if any rendered auth-param value contains a control character.
     """
     algo_lower = challenge.algorithm.lower()
     if algo_lower not in _SUPPORTED_ALGORITHMS:
@@ -286,12 +289,24 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
         msg = f"challenge offers qop without 'auth': {challenge.qop!r}"
         raise ValueError(msg)
 
-    # Resolve a cnonce early: -sess variants always need one (even without qop).
-    is_sess = algo_lower.endswith("-sess")
     use_auth_qop = "auth" in challenge.qop
-    needs_cnonce = use_auth_qop or is_sess
+    # The RFC 2069 legacy no-qop construction (response = H(HA1:nonce:HA2)) is
+    # valid ONLY for plain MD5. RFC 7616 §3.4.1 / RFC 8760 §2.6 define no legacy
+    # form for SHA-256(/-sess), and RFC 2617 §3.2.2 forbids sending the cnonce a
+    # -sess HA1 requires when the server offered no qop. So any algorithm other
+    # than plain MD5 MUST be answered with qop=auth — reject if it was omitted,
+    # rather than mis-signing with a construction the server cannot verify.
+    if not use_auth_qop and algo_lower != "md5":
+        msg = (
+            f"algorithm {challenge.algorithm!r} requires a qop=auth challenge; "
+            "the no-qop (RFC 2069 legacy) form is only valid for plain MD5"
+        )
+        raise ValueError(msg)
+
+    # A cnonce is needed only on the qop=auth path (the only path reachable for
+    # -sess after the guard above). The legacy MD5 no-qop path uses none.
     client_nonce = (
-        cnonce if cnonce is not None else (secrets.token_hex(8) if needs_cnonce else "")
+        (cnonce if cnonce is not None else secrets.token_hex(8)) if use_auth_qop else ""
     )
 
     ha1 = _compute_ha1(
@@ -325,13 +340,10 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
             ("response", response, True),
         ]
     else:
+        # Plain MD5 only (guarded above): RFC 2069 legacy form, no qop/nc/cnonce.
         params.append(
             ("response", _hash_hex(algo_lower, f"{ha1}:{challenge.nonce}:{ha2}"), True)
         )
-        # RFC 2617 §3.2.2: for -sess, the cnonce binds the session key and MUST
-        # appear in the Authorization header even when qop is not present.
-        if is_sess and client_nonce:
-            params.append(("cnonce", client_nonce, True))
 
     if challenge.opaque is not None:
         params.append(("opaque", challenge.opaque, True))

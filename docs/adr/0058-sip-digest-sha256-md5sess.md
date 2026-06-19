@@ -35,6 +35,14 @@ algorithm from a list of challenges (RFC 8760 §3 order):
 **Unsupported algorithms** (SHA-512, unknown tokens) still raise `ValueError` rather
 than silently mis-signing — rule 37.
 
+**No-qop legacy is MD5-only.** The RFC 2069 legacy construction
+(`response = H(HA1:nonce:HA2)`, no nc/cnonce) is applied only for plain `MD5` when the
+challenge omits `qop` (ancient-server back-compat). `SHA-256`/`SHA-256-sess` have no
+legacy form (RFC 7616 §3.4.1, RFC 8760 §2.6), and `-sess` cannot send the cnonce its
+HA1 requires without `qop` (RFC 2617 §3.2.2 — "cnonce MUST NOT be specified if the
+server did not send a qop directive"). A no-qop challenge for any non-MD5 algorithm
+therefore raises `ValueError` rather than mis-signing with an unverifiable response.
+
 **Parser** — `DigestChallenge.parse` already accepted any token for the `algorithm`
 field; the regex was tightened from `\w+` to `\w[\w-]*` to handle hyphenated tokens
 (`SHA-256`, `MD5-sess`) as single captures. Case-insensitive matching throughout;

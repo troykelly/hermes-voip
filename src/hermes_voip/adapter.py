@@ -722,25 +722,30 @@ class VoipAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=chat_id)
 
-        # Post-hangup TTS suppression (ADR-0026): once the call has ended (the
-        # chokepoint set info["ended"]=True and stopped the media engine), there is
-        # NO media path to the caller. A late agent reply — notably the turn the
-        # agent produces in response to the replayed disconnected-note of a NORMAL
-        # end — must NOT be synthesised to the now-disconnected caller. Dropping it
-        # is reported as a FAILED send (not a silent success): the call really is
-        # gone, so the runtime learns the reply was not delivered rather than
-        # believing the caller heard it. Follow-up work happens off the voice path
-        # (background task / outbound callback / another channel), never here.
+        # Post-hangup TTS suppression (ADR-0026, amended 2026-06-19): once the call
+        # has ended (the chokepoint set info["ended"]=True and stopped the media
+        # engine), there is NO media path to the caller. A late agent reply —
+        # notably the turn the agent produces in response to the replayed
+        # disconnected-note of a NORMAL end — must NOT be synthesised to the
+        # now-disconnected caller. This is an EXPECTED, harmless drop, so it is a
+        # CLEAN no-op: report SUCCESS (like the system-notice drop above) and log
+        # at DEBUG only. Returning a FAILED result here was wrong — the gateway's
+        # ``_send_with_retry`` interprets a non-network, non-timeout failure as a
+        # *formatting* failure and emits "Send failed … trying plain-text
+        # fallback" (WARNING) then re-sends, hitting this same dead call again and
+        # logging "Fallback send also failed" (ERROR): noise + an apparent failure
+        # for a reply that was correctly dropped by design. Follow-up work happens
+        # off the voice path (background task / outbound callback / another
+        # channel), never here. A GENUINE mid-call send fault is a different branch
+        # below (loop.speak raising) and STILL surfaces as a failure (rule 37).
         info = self._call_info.get(chat_id)
         if info is not None and info.get("ended", False):
             _log.debug(
-                "suppressing send to ended call %s (no media path): %.80r",
+                "dropping late reply to ended call %s (no media path): %.80r",
                 chat_id,
                 content,
             )
-            return SendResult(
-                success=False, error=f"call {chat_id!r} has ended; no media path"
-            )
+            return SendResult(success=True, message_id=chat_id)
 
         loop = self._call_loops.get(chat_id)
         if loop is None:

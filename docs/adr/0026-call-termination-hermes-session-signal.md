@@ -106,10 +106,37 @@ than leaving it dangling or replaying an ambiguous content note.
   `HERMES_VOIP_RTP_TIMEOUT_SECS` validates/caps to `[1, 300]`. (The engine accepts `0` as
   "disabled", but the operator knob does **not** expose disabling the safety watchdog.)
 - **Registration loss → failure → stop** (`REGISTRATION_LOST`).
-- **Post-hangup TTS is suppressed.** Once a call is flagged ended, `send()` to it returns a
-  **failed** send (no media path) and never synthesises — notably the turn the agent produces
-  in reply to the replayed note is not spoken to the disconnected caller. (`send()` to an
-  ended call already failed; this enforces it as a deliberate, logged drop.)
+- **Post-hangup TTS is suppressed as a CLEAN no-op** (amended 2026-06-19 — see the amendment
+  below). Once a call is flagged ended, `send()` to it drops the text and never synthesises —
+  notably the turn the agent produces in reply to the replayed note is not spoken to the
+  disconnected caller.
+
+### Amendment (2026-06-19): post-hangup `send()` returns SUCCESS, not failure
+
+The original decision had `send()` to an ended call return a **failed** `SendResult`
+(`success=False`, `error="call '<id>' has ended; no media path"`), on the reasoning that the
+runtime should "learn the reply was not delivered." Live operation showed that reasoning was
+wrong in practice: the runtime does nothing useful with a post-hangup failure except generate
+noise and a doomed retry.
+
+The gateway delivers every agent reply through `BasePlatformAdapter._send_with_retry`
+(`gateway/platforms/base.py`). On `success=True` it returns immediately. On `success=False` it
+classifies the `error`: only network/timeout strings retry; **anything else is treated as a
+*formatting* failure** → it logs `WARNING [Voip] Send failed: … — trying plain-text fallback`,
+re-sends a plain-text-prefixed copy (which hits the same dead call and fails identically), then
+logs `ERROR [Voip] Fallback send also failed`. So every expected late reply after a hangup —
+the runtime sometimes emits 1–2, e.g. the turn the agent produces in reply to the replayed
+disconnected-note — surfaced as a WARNING + ERROR and an apparent delivery failure, for a reply
+the plugin **correctly** dropped by design.
+
+**Decision:** the post-hangup drop is now a **clean no-op** — `send()` returns
+`SendResult(success=True)` (exactly like the home-channel/system-notice drop already does) and
+logs the drop at **DEBUG** only. The reply is harmlessly discarded; the gateway stays quiet.
+This does **not** weaken error handling: a **genuine mid-call** send fault is a *different*
+branch (`CallLoop.speak` raising on a call that is **not** flagged ended) and still returns a
+**failure** + a `WARNING` (rule 37). Only the expected "call already ended" case is downgraded.
+There is still no media path and no spoken late reply — the only change is that the deliberate
+drop is reported truthfully as handled rather than as a delivery failure.
 
 ### Reason rides as TEXT; follow-up has no media path
 

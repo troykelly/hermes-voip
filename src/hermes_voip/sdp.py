@@ -1071,6 +1071,24 @@ def negotiate_ptime(
     return default
 
 
+def negotiate_rtcp_mux(offer: AudioMedia) -> bool:
+    """Decide whether to multiplex RTP and RTCP on one port (RFC 5761 §5.1.1).
+
+    On the SDES / plain-RTP path the answerer may agree to ``rtcp-mux`` ONLY when
+    the offer requested it: an offer without ``a=rtcp-mux`` expects RTP and RTCP on
+    separate ports (RTCP on port+1, RFC 3550 §11), so answering with mux would
+    point our RTCP at a port the peer is not listening on. We always *prefer* mux
+    (it is the modern default and the only mode WebRTC uses), and
+    :func:`build_audio_offer` therefore offers it; but as the *answerer* we mirror
+    the offer.
+
+    Returns:
+        ``True`` to multiplex RTCP onto the RTP port (the offer carried
+        ``a=rtcp-mux``), ``False`` to keep RTCP on its own port (it did not).
+    """
+    return offer.rtcp_mux
+
+
 def _fmtp_param(fmtp: str, key: str) -> str | None:
     """Return the value of a ``;``-separated fmtp parameter, or ``None``.
 
@@ -1180,6 +1198,7 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
     session_id: int,
     sess_version: int,
     crypto: CryptoAttribute | None,
+    rtcp_mux: bool,
 ) -> str:
     """Emit the SDP body shared by offer and answer (SDES or plain RTP paths).
 
@@ -1189,6 +1208,9 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
     ``ptime`` happens here so both callers enforce the same invariants; the
     crypto attribute is already validated by construction. The SRTP master
     key/salt is the caller's; this function never generates key material.
+
+    When ``rtcp_mux`` is set an ``a=rtcp-mux`` line is emitted (RFC 5761): RTP and
+    RTCP then share the one media port, so no separate RTCP port is needed.
 
     For the WebRTC / DTLS-SRTP path, use :func:`_build_webrtc_body` instead.
     """
@@ -1223,6 +1245,9 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
             lines.append(f"a=fmtp:{codec.payload_type} {codec.fmtp}")
     if crypto is not None:
         lines.append(f"a=crypto:{crypto.render()}")
+    # rtcp-mux (RFC 5761): RTP + RTCP share the one media port when negotiated.
+    if rtcp_mux:
+        lines.append("a=rtcp-mux")
     lines.append(f"a=ptime:{ptime}")
     lines.append(f"a={direction}")
     return _CRLF.join(lines) + _CRLF
@@ -1390,6 +1415,7 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
     session_id: int = 0,
     version: int | None = None,
     crypto: CryptoAttribute | str | None = None,
+    rtcp_mux: bool = True,
 ) -> str:
     """Build an SDP audio offer/answer body (RTP/AVP, or RTP/SAVP with crypto).
 
@@ -1405,6 +1431,9 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
             order is preserved.
         direction: Media direction attribute.
         ptime: Packetisation time in ms.
+        rtcp_mux: Offer ``a=rtcp-mux`` (RFC 5761), advertising that we can carry
+            RTCP on the RTP port. Defaults to ``True`` (the modern default); set
+            ``False`` to omit it for a peer that needs separate RTP/RTCP ports.
         session_id: SDP ``o=`` session id (constant for the life of a dialog).
         version: SDP ``o=`` session version. A re-offer keeps ``session_id``
             constant and increments ``version`` (RFC 4566 §5.2, ADR-0011
@@ -1435,6 +1464,7 @@ def build_audio_offer(  # noqa: PLR0913 - SDP fields are independent; all keywor
         session_id=session_id,
         sess_version=sess_version,
         crypto=_coerce_crypto(crypto),
+        rtcp_mux=rtcp_mux,
     )
 
 
@@ -1463,7 +1493,9 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
     accepted offer's **tag and suite** (RFC 4568: the answerer identifies its
     choice by the offer's tag) but carries **our own** key material from
     ``crypto``. The answer's payload ordering follows the offer, not
-    ``supported`` — the answerer honours the offerer's preference.
+    ``supported`` — the answerer honours the offerer's preference. It also mirrors
+    the offer's ``a=rtcp-mux`` (RFC 5761 §5.1.1, via :func:`negotiate_rtcp_mux`):
+    the answer carries it iff the offer requested it.
 
     Args:
         offer: The parsed peer offer to answer; must carry audio media.
@@ -1500,6 +1532,8 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
         # codec" message (covers the telephone-event-only rejection).
         raise SdpError(str(exc)) from exc
     answer_crypto = _negotiate_answer_crypto(audio, crypto) if audio.is_srtp else None
+    # RFC 5761 §5.1.1: mirror the offer — answer rtcp-mux iff the peer offered it.
+    rtcp_mux = negotiate_rtcp_mux(audio)
     sess_version = session_id if version is None else version
     return _build_audio_body(
         local_address=local_address,
@@ -1510,6 +1544,7 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
         session_id=session_id,
         sess_version=sess_version,
         crypto=answer_crypto,
+        rtcp_mux=rtcp_mux,
     )
 
 

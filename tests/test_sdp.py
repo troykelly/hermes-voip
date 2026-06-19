@@ -1770,14 +1770,18 @@ def test_build_webrtc_answer_multiple_candidates() -> None:
 
 
 def test_sdes_path_unchanged_build_offer_avp() -> None:
-    """The existing plain AVP offer builder is unaffected by WebRTC additions."""
+    """The plain AVP offer builder carries no DTLS/ICE WebRTC attributes.
+
+    rtcp-mux is now a deliberate SDES-path offer attribute (RFC 5761, ADR-0061) —
+    offered by default — so it is NOT in this "no WebRTC leakage" exclusion list;
+    its presence is asserted by ``test_build_audio_offer_includes_rtcp_mux_by_default``.
+    """
     codecs = (Codec(0, "PCMU", 8000),)
     text = build_audio_offer(local_address="192.0.2.10", port=41000, codecs=codecs)
     assert "RTP/AVP" in text
     assert "fingerprint" not in text
     assert "ice-ufrag" not in text
     assert "a=setup" not in text
-    assert "rtcp-mux" not in text
 
 
 def test_sdes_path_unchanged_build_offer_savp() -> None:
@@ -2085,7 +2089,7 @@ def test_build_audio_offer_includes_rtcp_mux_by_default() -> None:
     text = build_audio_offer(
         local_address="192.0.2.10",
         port=41000,
-        codecs=(Codec.PCMU,),
+        codecs=(Codec(0, "PCMU", 8000),),
     )
     assert "a=rtcp-mux\r\n" in text
     parsed = SessionDescription.parse(text)
@@ -2098,7 +2102,7 @@ def test_build_audio_offer_can_suppress_rtcp_mux() -> None:
     text = build_audio_offer(
         local_address="192.0.2.10",
         port=41000,
-        codecs=(Codec.PCMU,),
+        codecs=(Codec(0, "PCMU", 8000),),
         rtcp_mux=False,
     )
     assert "a=rtcp-mux" not in text

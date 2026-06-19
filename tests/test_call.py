@@ -381,6 +381,54 @@ async def test_srtp_reoffer_with_plain_answer_raises_and_keeps_media() -> None:
     assert all(inbound is None for inbound, _ in media.rekeys)
 
 
+async def test_srtp_reoffer_answer_with_wrong_tag_raises() -> None:
+    """An SRTP answer that echoes the WRONG crypto tag is rejected (RFC 4568 §6.1).
+
+    Robustness (codex round-2): the answerer MUST echo the offered tag (it
+    identifies which offered crypto it accepted). An answer carrying a different
+    tag/suite is non-compliant — committing it would key outbound to a tag the
+    peer never selected. We offered tag 7; the peer answers tag 9 → CallError,
+    and the engine outbound is never re-keyed.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),  # offers crypto tag 7
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    # Build a secured answer whose a=crypto echoes a DIFFERENT tag (9, not 7).
+    key = base64.b64encode(bytes(range(30))).decode("ascii")
+    wrong = (
+        "v=0\r\n"
+        "o=- 2 2 IN IP4 198.51.100.99\r\n"
+        "s=-\r\n"
+        "c=IN IP4 198.51.100.99\r\n"
+        "t=0 0\r\n"
+        "m=audio 41000 RTP/SAVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:9 AES_CM_128_HMAC_SHA1_80 inline:{key}\r\n"
+        "a=recvonly\r\n"
+    )
+    answer = build_response(
+        reinvite,
+        200,
+        "OK",
+        extra_headers=(("Content-Type", "application/sdp"),),
+        body=wrong,
+    )
+    await session.on_response(SipResponse.parse(answer))
+    with pytest.raises(CallError):
+        await task
+    assert media.rekeys == []  # never committed a mismatched key
+
+
 async def test_rejected_srtp_reoffer_does_not_rekey_outbound() -> None:
     """A rejected SRTP re-INVITE must NOT leave outbound on an unaccepted key.
 

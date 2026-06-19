@@ -250,6 +250,35 @@ def test_machine_greeting_ends_then_silence_signals_ready_without_a_later_onset(
     assert ready[0].beep_at_s is None
 
 
+@pytest.mark.parametrize("audio_ms_at_offset", [3500, 4000, 4500])
+def test_no_beep_fallback_is_independent_of_offset_delivery_order(
+    audio_ms_at_offset: int,
+) -> None:
+    # The OFFSET's silence boundary is the VAD EDGE'S OWN time (window ordinal), not
+    # "samples seen when on_vad_event happened" — so the no-beep cue fires at the same
+    # elapsed time whether the OFFSET is delivered slightly BEFORE the matching audio
+    # has caught up (3500 ms fed), exactly at it (4000 ms), or slightly AFTER (4500
+    # ms). The greeting OFFSET edge is at window 4000 ms regardless; the cue must fire
+    # at edge_time + response_gap = 5.0 s.
+    detector = CallProgressDetector(sample_rate=_RATE_8K, outbound=True)
+    assert detector.on_vad_event(_onset(0)) is None
+    # Feed greeting audio up to the (possibly skewed) point the OFFSET is delivered.
+    fed = _feed_tone(detector, 300.0, rate=_RATE_8K, duration_ms=audio_ms_at_offset)
+    assert not any(isinstance(e, ReadyToLeaveMessage) for e in fed)
+    # The OFFSET edge is always stamped at the true greeting end (window = 4000 ms).
+    machine = detector.on_vad_event(_offset(_windows_for(4000, _RATE_8K)))
+    assert isinstance(machine, AnsweringMachine)
+    # Continue silent audio from where the audio clock currently is, well past 5 s.
+    start = audio_ms_at_offset // _FRAME_MS
+    events = _feed_silence(detector, rate=_RATE_8K, duration_ms=3000, start_frame=start)
+    ready = [e for e in events if isinstance(e, ReadyToLeaveMessage)]
+    assert len(ready) == 1
+    assert ready[0].beep_at_s is None
+    # Fires at edge_time (4.0 s) + response_gap (1.0 s) = 5.0 s, within one frame —
+    # NOT keyed to when on_vad_event was called relative to the audio clock.
+    assert ready[0].elapsed_s == pytest.approx(5.0, abs=_FRAME_MS / 1000)
+
+
 def test_machine_resuming_speech_resets_the_no_beep_silence_fallback() -> None:
     # A two-part greeting ("Hi, you've reached … <pause> … leave a message"): the
     # fallback must NOT fire during the interior pause if the machine resumes

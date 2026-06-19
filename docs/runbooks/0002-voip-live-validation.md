@@ -480,17 +480,16 @@ offerer's). A plain `RTP/AVP` offer is still answered plain (opportunistic).
   would surface as silence/garble. The re-offer key is fresh per offer (its inline
   key differs from the prior offer's), echoing the same tag + suite.
 - If the gateway only offers DTLS-SRTP (`UDP/TLS/RTP/SAVP` + `a=fingerprint`), that
-  is **ADR-0053 Stage 2**. The **media capability is built** (`sdp.build_sip_dtls_answer`
-  + `sdp.negotiate_media_security` + `media/sip_dtls_session.SipDtlsMediaSession` over a
-  plain-UDP `_UdpDatagramPipe`, reusing `media/dtls.DtlsEndpoint`), but the **adapter
-  wiring is a separate, named activation wave** (a `_setup_sip_dtls_call` path gated on
-  `HERMES_VOIP_SIP_DTLS_SRTP`). Until that wave lands, an inbound DTLS-SRTP offer still
-  falls through to the SDES/plain handler — so for now use SDES (`RTP/SAVP`) for this
-  validation. See §8e once Stage 2 is activated.
+  is **ADR-0053 Stage 2**, now **fully wired**: `adapter._setup_sip_dtls_call` (gated on
+  `HERMES_VOIP_SIP_DTLS_SRTP`, default on) answers DTLS-SRTP using
+  `sdp.build_sip_dtls_answer` + `media/sip_dtls_session.SipDtlsMediaSession` over a
+  plain-UDP `_UdpDatagramPipe` (reusing `media/dtls.DtlsEndpoint`). See **§8e** for the
+  DTLS-SRTP verify steps. (SDES `RTP/SAVP` remains the middle tier; plain `RTP/AVP` the
+  floor — the opportunistic ladder is `sdp.negotiate_media_security`.)
 
 ### 8e. Verify DTLS-SRTP media on a SIP-over-TLS call (ADR-0053 Stage 2)
 
-Applies **after the adapter-activation wave** wires `SipDtlsMediaSession` (see §8d).
+The adapter-activation wave is wired (`adapter._setup_sip_dtls_call`; see §8d).
 When the gateway/extension offers DTLS-SRTP (`m=audio … UDP/TLS/RTP/SAVP …` with an
 `a=fingerprint` and an `a=setup`), the plugin answers DTLS-SRTP: it advertises **our**
 `a=fingerprint`/`a=setup` (default `active` — the DTLS client — for an `actpass` offer;

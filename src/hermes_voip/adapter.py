@@ -116,6 +116,7 @@ from hermes_voip.media.engine import (
     UnsupportedCodecError,
     codec_for_encoding,
 )
+from hermes_voip.media.sip_dtls_session import SipDtlsMediaSession
 from hermes_voip.media.vad import (
     VoiceActivityDetector,
     load_silero_model,
@@ -153,15 +154,18 @@ from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
     AudioMedia,
     CryptoAttribute,
+    MediaSecurity,
     SessionDescription,
     VideoAnswer,
     VideoAnswerMode,
     build_audio_answer,
     build_audio_offer,
+    build_sip_dtls_answer,
     build_webrtc_answer,
     build_webrtc_offer,
     generate_answer_crypto,
     negotiate_audio,
+    negotiate_media_security,
     negotiate_ptime,
     negotiate_rtcp_mux,
     negotiate_video_h264,
@@ -2150,12 +2154,29 @@ class VoipAdapter(BasePlatformAdapter):
             ",".join(c.encoding for c in audio.codecs),
         )
 
-        # WebRTC (UDP/TLS/RTP/SAVPF) offers negotiate against the Opus-first menu and
-        # take the DTLS-SRTP / ICE answer path (ADR-0032); everything else uses the
-        # SDES / plain-RTP G.711-G.722 menu. The detection is the profile token
-        # (offer.audio.is_webrtc); the codec-capability and no-answer-on-failure
-        # invariants below apply identically to both.
+        media_cfg = self._media_cfg
+        if media_cfg is None:  # connect() populates this before any INVITE
+            msg = f"INVITE {call_id}: media config not initialised"
+            raise RuntimeError(msg)
+
+        # Pick the media path. Three branches:
+        #   * WebRTC (UDP/TLS/RTP/SAVPF) → the ICE + DTLS-SRTP answer path (ADR-0032),
+        #     negotiated against the Opus-first menu.
+        #   * SIP DTLS-SRTP (UDP/TLS/RTP/SAVP + a=fingerprint) → the no-ICE DTLS-SRTP
+        #     answer path (ADR-0053 Stage 2), the operator's "real certs" preferred
+        #     tier, gated on HERMES_VOIP_SIP_DTLS_SRTP — when off, the offer falls
+        #     through to the SDES/plain handler (rollback switch, no behaviour change).
+        #   * everything else (RTP/SAVP SDES, plain RTP/AVP) → the SDES / plain-RTP
+        #     G.711-G.722 menu.
+        # The DTLS-SRTP and SDES tiers share the SIP codec menu (G.711/G.722/Opus);
+        # only WebRTC uses the Opus-first menu. The codec-capability and
+        # no-answer-on-failure invariants below apply identically to all three.
         is_webrtc = audio.is_webrtc
+        is_sip_dtls = (
+            not is_webrtc
+            and media_cfg.sip_dtls_srtp
+            and negotiate_media_security(audio) is MediaSecurity.DTLS
+        )
         # ADR-0049: the SDES/SIP answer menu offers Opus too when libopus is loadable
         # (gated, so a host without it keeps the G.722/G.711 floor — no drift).
         supported = (
@@ -2207,10 +2228,11 @@ class VoipAdapter(BasePlatformAdapter):
             return
 
         # ADR-0049: an Opus SIP (SDES) call must have a loadable libopus before we
-        # answer it, or it would be answered-but-dead. The WebRTC path runs this
-        # preflight inside _setup_webrtc_call; the SDES path does it here so an Opus
-        # SIP call is rejected cleanly (488) pre-answer. A no-op for G.722/G.711.
-        if not is_webrtc:
+        # answer it, or it would be answered-but-dead. The WebRTC and SIP DTLS-SRTP
+        # paths run this preflight inside their own setup helper (before the 200 OK);
+        # the SDES/plain path does it here so an Opus SIP call is rejected cleanly
+        # (488) pre-answer. A no-op for G.722/G.711.
+        if not is_webrtc and not is_sip_dtls:
             try:
                 _preflight_codec_dependency(engine_codec)
             except ImportError as exc:
@@ -2234,11 +2256,8 @@ class VoipAdapter(BasePlatformAdapter):
             transport=via_transport,
         )
 
-        # --- Open the media engine + answer (SDES or WebRTC path) -----------
-        media_cfg = self._media_cfg
-        if media_cfg is None:  # connect() populates this before any INVITE
-            msg = f"INVITE {call_id}: media config not initialised"
-            raise RuntimeError(msg)
+        # --- Open the media engine + answer (DTLS-SRTP, SDES, or WebRTC path) ---
+        # ``media_cfg`` was resolved above (the media-path decision needed it).
         # Advertise the runtime's REAL local interface for RTP — the same host as
         # the SIP Contact (the transport's local socket address). The 127.0.0.1
         # loopback placeholder makes the gateway send RTP to its own loopback, so
@@ -2268,6 +2287,21 @@ class VoipAdapter(BasePlatformAdapter):
         try:
             if is_webrtc:
                 engine, local_media = await self._setup_webrtc_call(
+                    invite=invite,
+                    offer=offer,
+                    audio=audio,
+                    agreed_sdp_codecs=agreed_sdp_codecs,
+                    engine_codec=engine_codec,
+                    codec=codec,
+                    transport=transport,
+                    local_tag=local_tag,
+                    local_contact=local_contact,
+                    local_rtp_host=local_rtp_host,
+                    media_cfg=media_cfg,
+                    call_id=call_id,
+                )
+            elif is_sip_dtls:
+                engine, local_media = await self._setup_sip_dtls_call(
                     invite=invite,
                     offer=offer,
                     audio=audio,
@@ -2867,6 +2901,218 @@ class VoipAdapter(BasePlatformAdapter):
                 fps=media_cfg.video_fps,
                 payload_type=video_answer.payload_type,
             )
+        return engine, local_media
+
+    async def _setup_sip_dtls_call(  # noqa: PLR0913 — the inbound handler's locals threaded through
+        self,
+        *,
+        invite: SipRequest,
+        offer: SessionDescription,
+        audio: AudioMedia,
+        agreed_sdp_codecs: tuple[SdpCodec, ...],
+        engine_codec: Codec,
+        codec: SdpCodec,
+        transport: SignalingTransport,
+        local_tag: str,
+        local_contact: str,
+        local_rtp_host: str,
+        media_cfg: MediaConfig,
+        call_id: str,
+    ) -> tuple[RtpMediaTransport, LocalMediaSession]:
+        """Run the SIP DTLS-SRTP media setup: bind → answer/200 OK → DTLS → engine.
+
+        The no-ICE DTLS-SRTP path (ADR-0053 Stage 2, RFC 5763/5764). A SIP-over-TLS
+        call has the peer's RTP address in the SDP, so the DTLS handshake rides a
+        plain UDP socket (no ICE). Like the WebRTC path the handshake needs the peer
+        to hold our answer first, so the order is:
+
+        1. Preflight the negotiated codec dependency (the ``webrtc``/``media`` extra +
+           system ``libopus`` for Opus) BEFORE any answer — a missing dep is a CLEAN
+           488 (never answered-but-dead). The mandatory ``a=fingerprint`` was already
+           validated by :meth:`AudioMedia.is_sip_dtls` (the routing predicate).
+        2. Bind the UDP datagram pipe (:meth:`SipDtlsMediaSession.prepare`); its bound
+           port is what the answer advertises in ``c=``/``m=audio`` (unlike WebRTC the
+           ``c=``/port is real — the media address is in the SDP, not ICE-borne). Build
+           the ``UDP/TLS/RTP/SAVP`` answer carrying our ``a=fingerprint``/``a=setup``
+           and send the 200 OK (RFC 5763 §4 — the peer needs our fingerprint+role to
+           start its DTLS half).
+        3. Run the DTLS handshake over the pipe (the session sets the initial peer to
+           the offer's ``c=``/port and re-latches via comedia), verify the peer
+           fingerprint (RFC 5763 §5), derive the SRTP pair, construct the engine over
+           the pipe.
+
+        A failure in step 1/2 is a clean pre-answer reject (488 + ``close`` +
+        :class:`_MediaNegotiationRejected`). A handshake failure in step 3 is AFTER the
+        200 OK (the handshake needs the peer to have our answer): the call WAS answered
+        ``UDP/TLS/RTP/SAVP``, so it is **not** a 488 and — crucially — there is **no
+        plaintext fallback** (RFC 5763 §5; that would defeat the security the peer
+        asked for). The session is closed and ``_MediaNegotiationRejected`` is raised so
+        the inbound handler tears the answered call down (no CallLoop on dead, unkeyed
+        media).
+
+        Returns the connected engine (carrying SRTP over the datagram pipe) + the
+        :class:`LocalMediaSession`.
+        """
+        # --- Pre-answer validation: a missing codec dependency is a CLEAN 488. The
+        # peer fingerprint is guaranteed present by is_sip_dtls (the routing
+        # predicate); re-narrow it for the type checker and as belt-and-suspenders.
+        peer_fingerprint = audio.fingerprint
+        if peer_fingerprint is None:  # pragma: no cover — is_sip_dtls guarantees it
+            _log.error(
+                "INVITE %s: REJECTED 488 — SIP DTLS-SRTP offer missing a=fingerprint",
+                call_id,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected
+        try:
+            # Preflight the negotiated engine codec's runtime dependency (Opus forces
+            # the opuslib + system-libopus import) so a host missing it is a clean 488
+            # here, not an answered-but-dead call. A no-op for G.722/G.711.
+            _preflight_codec_dependency(engine_codec)
+        except ImportError as exc:
+            _log.error(
+                "INVITE %s: REJECTED 488 — SIP DTLS-SRTP codec dependency unavailable "
+                "(install the 'webrtc' extra + system libopus): %s",
+                call_id,
+                exc,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            raise _MediaNegotiationRejected from exc
+
+        remote_address = _effective_address(audio, offer)
+        # The offered a=setup + the HERMES_VOIP_SIP_DTLS_SETUP knob decide our DTLS
+        # role; SipDtlsMediaSession picks it (RFC 8842 active answerer by default for an
+        # actpass offer — ADR-0053 §2, mirroring the WebRTC ADR-0050 rationale).
+        session = SipDtlsMediaSession(
+            offer_setup=audio.setup,
+            answer_setup=media_cfg.sip_dtls_setup,
+        )
+        try:
+            # Bind the UDP datagram pipe; its bound port is what the answer advertises.
+            await session.prepare(local_address=local_rtp_host, local_port=0)
+            local_media = LocalMediaSession(
+                local_address=local_rtp_host,
+                # The DTLS handshake socket's real bound port — the SIP path keeps a
+                # real c=/port (no ICE). NOT engine.local_port: the engine binds no
+                # socket on the pipe path; the pipe owns the UDP endpoint.
+                port=session.local_port,
+                codecs=agreed_sdp_codecs,
+                session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
+            )
+            answer_sdp = build_sip_dtls_answer(
+                offer,
+                local_address=local_media.local_address,
+                port=local_media.port,
+                # ADR-0049: Opus is in the SIP answer menu when libopus is loadable.
+                supported=list(_sip_supported_encodings()),
+                fingerprint=session.fingerprint,
+                setup=session.setup,
+                ptime=_negotiated_ptime(audio, engine_codec),
+                session_id=local_media.session_id,
+            )
+        except Exception as exc:
+            # Any bind / answer-build failure before the 200 OK is a clean pre-answer
+            # reject (488); the session is closed and the internal reject signal is
+            # re-raised — this except never swallows (rule 37).
+            _log.warning(
+                "INVITE %s: cannot build SIP DTLS-SRTP answer: %s", call_id, exc
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            await session.close()
+            raise _MediaNegotiationRejected from exc
+
+        _log.info(
+            "INVITE %s: SIP DTLS-SRTP answer built — setup=%s, local RTP %s:%d, "
+            "codecs %s",
+            call_id,
+            session.setup.value,
+            local_media.local_address,
+            local_media.port,
+            ",".join(c.encoding for c in agreed_sdp_codecs),
+        )
+        # Send the 200 OK BEFORE the handshake: the peer needs our answer (fingerprint
+        # + setup) to start its DTLS half (RFC 5763 §4).
+        await self._send_answer_200(
+            invite=invite,
+            transport=transport,
+            local_tag=local_tag,
+            local_contact=local_contact,
+            answer_sdp=answer_sdp,
+            call_id=call_id,
+        )
+
+        # Run the DTLS handshake over the UDP pipe, then derive the SRTP sessions. A
+        # failure here is AFTER the 200 OK (the handshake needs the peer to have our
+        # answer), so this is NOT a 488: the call was answered UDP/TLS/RTP/SAVP. A
+        # fingerprint mismatch / timeout ENDS THE CALL — there is NO plaintext fallback
+        # (RFC 5763 §5). The session is closed and _MediaNegotiationRejected is raised
+        # so the inbound handler tears the answered call down (no CallLoop on dead
+        # media). The peer's RTP address comes from the offer's c=/m=audio; the pipe
+        # re-latches onto the peer's real source via comedia during the handshake.
+        try:
+            srtp_inbound, srtp_outbound = await session.run_handshake(
+                peer_fingerprint=peer_fingerprint,
+                peer_address=remote_address,
+                peer_port=audio.port,
+            )
+        except Exception:  # noqa: BLE001 — any DTLS failure aborts the call (caught + re-raised as reject)
+            _log.exception("INVITE %s: SIP DTLS-SRTP handshake failed", call_id)
+            await session.close()
+            raise _MediaNegotiationRejected from None
+
+        te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
+        # Resolve the DTMF send/receive backends (ADR-0036) so a forced sip_info routes
+        # SIP INFO via the CallSession (not the media engine) and the receive wiring is
+        # correct; in-band applies only to a G.711 call with no telephone-event.
+        dtmf_send_mode = resolve_dtmf_send_mode(
+            media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+        )
+        inband_rx = (
+            resolve_dtmf_receive_mode(
+                media_cfg, telephone_event_payload_type=te_pt, codec=codec.encoding
+            )
+            is DtmfReceiveMode.INBAND
+        )
+        engine = RtpMediaTransport(
+            local_address="0.0.0.0",  # noqa: S104 — unused on the pipe path (the pipe owns the socket)
+            local_port=0,
+            # The pipe's comedia latch is the destination; these are the SDP-advertised
+            # peer the pipe was initialised with, kept for parity/diagnostics (the
+            # engine's ice_transport seam does not re-send to them).
+            remote_address=remote_address or "0.0.0.0",  # noqa: S104
+            remote_port=audio.port or 9,
+            codec=engine_codec,
+            payload_type=codec.payload_type,
+            telephone_event_payload_type=te_pt,
+            dtmf_send_mode=dtmf_send_mode,
+            inband_dtmf_rx_enabled=inband_rx,
+            # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
+            srtp_inbound=srtp_inbound,
+            srtp_outbound=srtp_outbound,
+            # Carry media over the session's UDP datagram pipe instead of a bound
+            # socket — the same engine seam the WebRTC path uses for its ICE pipe.
+            ice_transport=session.pipe,
+            media_timeout_secs=media_cfg.media_timeout_secs,
+            # In-process acoustic echo cancellation (ADR-0033): subtract the known
+            # outbound TTS reference from each inbound frame before the VAD/ASR see it.
+            aec_enabled=media_cfg.aec_enabled,
+            aec_filter_ms=media_cfg.aec_filter_ms,
+            aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
+            aec_mu=media_cfg.aec_mu,
+            # Adaptive jitter buffer (ADR-0056/0063): grow the reorder tolerance under
+            # loss up to the configured ceiling, shrink back when the link is clean.
+            jitter_adapt=True,
+            jitter_max_depth=media_cfg.jitter_max_depth,
+        )
+        # ptime negotiation (ADR-0056/0063): codec-aware (Opus pinned to 20 ms). Set
+        # before connect() so the first outbound packet is framed correctly.
+        engine.ptime = _negotiated_ptime(audio, engine_codec)
+        await engine.connect()
+        # RTCP (ADR-0061) is NOT activated on the secured DTLS-SRTP path: the engine
+        # has no SRTCP (RFC 3711 §3.4) transform, so cleartext RTCP on a secured
+        # 5-tuple would violate the profile and leak SSRC/CNAME/timing — same as the
+        # SDES/WebRTC secured paths (a named follow-up adds SRTCP).
+        _log.info("INVITE %s: SIP DTLS-SRTP media engine connected over UDP", call_id)
         return engine, local_media
 
     def _start_webrtc_video_sender(

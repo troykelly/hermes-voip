@@ -1,9 +1,11 @@
 # ADR-0053: Opportunistic SRTP on the SIP-over-TLS media path — wire SDES (RFC 4568), add DTLS-SRTP (RFC 5763/5764, no ICE)
 
-- **Date:** 2026-06-18 (Stage 2 built 2026-06-19)
+- **Date:** 2026-06-18 (Stage 2 built 2026-06-19; Stage 2 adapter activation wired
+  2026-06-19)
 - **Status:** Accepted — **Stage 1 SDES merged + live-validated (PR #132); Stage 2
-  DTLS-SRTP capability built (this lane)**, pending its adapter-activation wave (see
-  "Stage 2 build status" below)
+  DTLS-SRTP capability built AND wired onto the live inbound INVITE path** (the
+  adapter-activation wave; see "Stage 2 build status" below). Pending live validation
+  against a gateway configured to offer `UDP/TLS/RTP/SAVP` (runbook 0002 §8e).
 - **Deciders:** operator direction ("require SRTP with real certs for our SIP over
   TLS"; clarified 2026-06-18 to mean cert-keyed **DTLS-SRTP** media, enforced
   **opportunistically**) — agent session (SIP DTLS-SRTP lane)
@@ -126,12 +128,13 @@ SIP-over-TLS *now*, validated against the test gateway switched to TLS); **Stage
 adds DTLS-SRTP** as the preferred, cert-keyed tier ("real certs"). Stage 1 ships
 first so SRTP is testable immediately.
 
-### 6. Stage 2 build status (capability vs. activation — built 2026-06-19)
+### 6. Stage 2 build status (capability + activation — both shipped 2026-06-19)
 
-Stage 2 follows the same **build-in-engine / activate-in-adapter** split that
+Stage 2 followed the same **build-in-engine / activate-in-adapter** split that
 shipped the engine-side of ADR-0061 (RTCP) and the #142 media work: the lane that
-builds the media capability does **not** touch the adapter, and a subsequent,
-explicitly-named adapter wave wires it onto the live INVITE/answer path.
+built the media capability did **not** touch the adapter, and a subsequent,
+explicitly-named adapter wave wired it onto the live INVITE/answer path. Both have
+landed — the capability (the first lane) and its adapter activation (this wave).
 
 - **Built in this lane (capability, no adapter wiring):**
   - `sdp.py` — `_SIP_DTLS_PROFILE = "UDP/TLS/RTP/SAVP"`, `AudioMedia.is_sip_dtls`
@@ -153,18 +156,23 @@ explicitly-named adapter wave wires it onto the live INVITE/answer path.
     SRTP over it with **no engine change**.
   - `media/srtp.py` already consumes DTLS-derived keys (`SrtpSession.from_raw_keys`,
     via `DtlsEndpoint.derive_srtp_sessions`) — unchanged.
-- **The adapter-activation wave (separate, named — NOT built here, rule 6):** a
-  `_setup_sip_dtls_call` path in `adapter.py` that, for an inbound `is_sip_dtls`
-  offer (gated on `HERMES_VOIP_SIP_DTLS_SRTP`), constructs the session with the
-  offered `a=setup` + the `HERMES_VOIP_SIP_DTLS_SETUP` knob, sends the
-  `build_sip_dtls_answer` 200 OK advertising the session socket's port **first**,
-  then runs the handshake and builds `RtpMediaTransport(ice_transport=<the
-  session's pipe>, srtp_inbound=…, srtp_outbound=…)` — exactly mirroring
-  `_setup_webrtc_call` (which hands `ice_transport=session.ice`). The two config
-  knobs `HERMES_VOIP_SIP_DTLS_SRTP` / `HERMES_VOIP_SIP_DTLS_SETUP` (`config.py`
-  `MediaConfig`, mirroring `webrtc_dtls_setup`) are added in that wave. Until then
-  the capability is dormant: an `is_sip_dtls` offer still falls through to the
-  existing SDES/plain handler (no behaviour change).
+- **The adapter-activation wave (wired here):** `adapter._setup_sip_dtls_call`,
+  for an inbound `is_sip_dtls` offer (routed by `negotiate_media_security` → `dtls`
+  and gated on `HERMES_VOIP_SIP_DTLS_SRTP`), constructs `SipDtlsMediaSession` with
+  the offered `a=setup` + the `HERMES_VOIP_SIP_DTLS_SETUP` knob, preflights the codec
+  dependency, `prepare()`s the UDP pipe, sends the `build_sip_dtls_answer` 200 OK
+  advertising the bound session port **first** (RFC 5763 §4), then runs the handshake
+  and builds `RtpMediaTransport(ice_transport=session.pipe, srtp_inbound=…,
+  srtp_outbound=…)` — exactly mirroring `_setup_webrtc_call` (which hands
+  `ice_transport=session.ice`). A handshake failure (timeout / fingerprint mismatch)
+  closes the session and raises the internal media-reject signal so the answered call
+  is torn down — there is **no plaintext fallback** (RFC 5763 §5). RTCP is **not**
+  activated (the secured path has no SRTCP transform — RFC 3711 §3.4 — a named
+  follow-up). The two config knobs `HERMES_VOIP_SIP_DTLS_SRTP` (bool, default on,
+  the rollback switch) / `HERMES_VOIP_SIP_DTLS_SETUP` (`auto`|`active`|`passive`,
+  default `auto`→active) live in `config.py` `MediaConfig`, mirroring
+  `webrtc_dtls_setup` but independent. With the switch **off**, an `is_sip_dtls`
+  offer falls through to the existing SDES/plain handler (no behaviour change).
 
 **Comedia on the plain-UDP DTLS path (implementation decision).** Unlike WebRTC
 (where ICE + STUN consent establishes the 5-tuple) and like the existing SDES/plain

@@ -521,8 +521,10 @@ class CallSession:
 
         Raises:
             CallError: If we offered SRTP but the answer is not ``RTP/SAVP`` with a
-                usable ``a=crypto`` (a downgrade or a non-compliant answer) — the media
-                change is rejected, never silently accepted on a mismatched key.
+                usable ``a=crypto`` (a downgrade), or the answer's crypto does not
+                echo the offered ``tag``/``suite`` (RFC 4568 §6.1: the answer's tag
+                identifies the accepted offered crypto). The media change is rejected,
+                never silently accepted on a key the peer never selected.
         """
         if offer_crypto is None:
             return
@@ -530,9 +532,17 @@ class CallSession:
         if audio is None or not audio.is_srtp or not audio.crypto_attrs:
             msg = "secured re-INVITE answered without a usable a=crypto (downgrade)"
             raise CallError(msg)
-        await self._media.rekey_srtp(
-            inbound=audio.crypto_attrs[0], outbound=offer_crypto
-        )
+        peer_answer = audio.crypto_attrs[0]
+        if (
+            peer_answer.tag != offer_crypto.tag
+            or peer_answer.suite != offer_crypto.suite
+        ):
+            # RFC 4568 §6.1: a compliant answer echoes the offered tag (and the suite
+            # it selected). A mismatch is a non-compliant/forged answer — committing it
+            # would key outbound to a tag the peer never accepted.
+            msg = "secured re-INVITE answer crypto does not match the offered tag/suite"
+            raise CallError(msg)
+        await self._media.rekey_srtp(inbound=peer_answer, outbound=offer_crypto)
         self._adopt_local_crypto(offer_crypto)
 
     async def _refer(

@@ -509,7 +509,11 @@ keys SRTP from the handshake (no `a=crypto` — the master key is never in the S
   `a=crypto` and **no** ICE attributes.
 - The adapter logs `sip-dtls: DTLS-SRTP keyed (setup=…)` once the handshake completes;
   audio is two-way as in step 8. A fingerprint mismatch or handshake timeout ends the
-  call (it does **not** fall back to plaintext).
+  call (it does **not** fall back to plaintext): media is released immediately and the
+  answered dialog is closed with an in-dialog **BYE** — sent only once the dialog is
+  confirmed by the peer's ACK (RFC 3261 §15.1.1; a bounded ≈32 s fallback BYE covers a
+  peer that never ACKs). The log shows `BYE sent to close the answered dialog
+  (confirmed|fallback)`. See ADR-0065.
 - NAT note: there is no ICE; the media pipe latches its send destination onto the
   peer's real source on the first inbound datagram (the comedia latch), so two-way
   media works even when the offered `c=`/port is behind NAT.

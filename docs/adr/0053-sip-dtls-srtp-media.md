@@ -164,11 +164,14 @@ landed — the capability (the first lane) and its adapter activation (this wave
   advertising the bound session port **first** (RFC 5763 §4), then runs the handshake
   and builds `RtpMediaTransport(ice_transport=session.pipe, srtp_inbound=…,
   srtp_outbound=…)` — exactly mirroring `_setup_webrtc_call` (which hands
-  `ice_transport=session.ice`). A handshake failure (timeout / fingerprint mismatch)
-  closes the session and raises the internal media-reject signal so the answered call
-  is torn down — there is **no plaintext fallback** (RFC 5763 §5). RTCP is **not**
-  activated (the secured path has no SRTCP transform — RFC 3711 §3.4 — a named
-  follow-up). The two config knobs `HERMES_VOIP_SIP_DTLS_SRTP` (bool, default on,
+  `ice_transport=session.ice`). The answered dialog's in-dialog route is registered at
+  answer-time (before the handshake) so the peer's ACK confirms it and a post-200
+  failure can be torn down RFC-correctly (**ADR-0065**): a handshake failure (timeout /
+  fingerprint mismatch) releases media immediately and ends the **confirmed** dialog
+  with an in-dialog BYE (RFC 3261 §15.1.1 — never a pre-ACK BYE), then raises the
+  internal media-reject signal so no CallLoop runs on dead media — and there is **no
+  plaintext fallback** (RFC 5763 §5). RTCP is **not** activated (the secured path has no
+  SRTCP transform — RFC 3711 §3.4 — a named follow-up). The two config knobs `HERMES_VOIP_SIP_DTLS_SRTP` (bool, default on,
   the rollback switch) / `HERMES_VOIP_SIP_DTLS_SETUP` (`auto`|`active`|`passive`,
   default `auto`→active) live in `config.py` `MediaConfig`, mirroring
   `webrtc_dtls_setup` but independent. With the switch **off**, an `is_sip_dtls`

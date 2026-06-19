@@ -211,6 +211,97 @@ class _MediaNegotiationRejected(Exception):  # noqa: N818 — control-flow signa
     """
 
 
+# Bounded wait (seconds) for the peer's ACK to confirm an answered dialog before the
+# post-200 abort sends its fallback BYE (ADR-0065). Mirrors RFC 3261 Timer H
+# (64*T1 = 32 s): a peer that received our 2xx but never ACKs is non-conformant, so we
+# close the dialog anyway after this bound rather than wait forever. Media is released
+# IMMEDIATELY on the failure; only the BYE waits.
+_ANSWERED_ABORT_ACK_TIMEOUT_S = 32.0
+
+
+class _AnsweredDialogGuard:
+    """Routes an answered dialog's in-dialog requests during the media-handshake window.
+
+    The DTLS-SRTP / WebRTC inbound paths send the ``200 OK`` **before** running their
+    media handshake (RFC 5763 §4), and the real :class:`~hermes_voip.call.CallSession`
+    is only built + registered **after** the handshake. Without a route in between, the
+    peer's ``2xx``-ACK (and a racing ``BYE``) is unroutable and dropped — so the dialog
+    is never observed as **confirmed** (RFC 3261 §12), which blocks an §15.1.1-correct
+    BYE on a post-200 failure.
+
+    This lightweight guard is registered at **answer-time** (right after the 200 OK,
+    before the handshake) via the same ``manager.add_call`` / ``transport.add_call``
+    routing the real session uses. It is **signalling only** — it carries no media and
+    starts no RTP path (the engine is still built only after fingerprint verification,
+    RFC 5763 §5). On success the real :class:`CallSession` **overwrites** it on the same
+    keys (a seamless upgrade); on a post-200 failure
+    :meth:`VoipAdapter._abort_answered_call` consults it to BYE the dialog only once
+    confirmed.
+
+    Implements :class:`~hermes_voip.manager.DialogConsumer` (``handle_request``) and
+    :class:`~hermes_voip.transport.connection.CallResponseSink` (``on_response``).
+    """
+
+    def __init__(
+        self, *, dialog: Dialog, transport: SignalingTransport, call_id: str
+    ) -> None:
+        """Bind the guard to the answered ``dialog`` on ``transport``."""
+        self._dialog = dialog
+        self._transport = transport
+        self._call_id = call_id
+        self._confirmed = asyncio.Event()
+        self._peer_bye = False
+
+    @property
+    def peer_bye(self) -> bool:
+        """Whether the peer ended the dialog with a BYE during the window."""
+        return self._peer_bye
+
+    async def handle_request(self, request: SipRequest) -> None:
+        """Consume one in-dialog request during the handshake window.
+
+        An ``ACK`` confirms the dialog (RFC 3261 §13.2.2.4). A peer ``BYE`` is answered
+        ``200 OK``, marks the dialog peer-ended, and also confirms (the dialog is now
+        established-then-terminated; the abort must not send its own BYE). An in-window
+        re-``INVITE`` is rejected ``491 Request Pending`` (media is not up yet, so we
+        cannot service a re-offer). Anything else is acknowledged where a final response
+        is required and otherwise benignly absorbed — never crashing the window.
+        """
+        method = request.method
+        if method == "ACK":
+            self._confirmed.set()
+        elif method == "BYE":
+            await self._transport.send(build_response(request, 200, "OK"))
+            self._peer_bye = True
+            self._confirmed.set()
+        elif method == "INVITE":
+            await self._transport.send(build_response(request, 491, "Request Pending"))
+        elif method in ("INFO", "NOTIFY", "OPTIONS"):
+            await self._transport.send(build_response(request, 200, "OK"))
+        # Any other in-dialog method in this brief window is ignored (no media yet).
+
+    async def on_response(self, response: SipResponse) -> None:
+        """Absorb a stray response (the guard sends no request that awaits one).
+
+        The abort's BYE is fire-and-forget (it does not block on a final response, the
+        same rationale as :meth:`CallSession.hang_up`), so nothing correlates here.
+        """
+
+    async def wait_confirmed(self, *, timeout: float) -> bool:
+        """Wait up to ``timeout`` s for the dialog to be confirmed (ACK or peer BYE).
+
+        Returns ``True`` if confirmed within the bound, ``False`` on timeout (the
+        caller then sends a fallback BYE so the dialog cannot linger).
+        """
+        if self._confirmed.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._confirmed.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+
 # Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):
 # G.722 (16 kHz wideband) FIRST, then G.711 PCMU/PCMA (the universal fallback),
 # then telephone-event (DTMF). Every voice entry maps to a runnable engine codec
@@ -2294,6 +2385,7 @@ class VoipAdapter(BasePlatformAdapter):
                     engine_codec=engine_codec,
                     codec=codec,
                     transport=transport,
+                    dialog=dialog,
                     local_tag=local_tag,
                     local_contact=local_contact,
                     local_rtp_host=local_rtp_host,
@@ -2677,6 +2769,7 @@ class VoipAdapter(BasePlatformAdapter):
         engine_codec: Codec,
         codec: SdpCodec,
         transport: SignalingTransport,
+        dialog: Dialog,
         local_tag: str,
         local_contact: str,
         local_rtp_host: str,
@@ -2807,12 +2900,27 @@ class VoipAdapter(BasePlatformAdapter):
             call_id=call_id,
         )
 
+        # Register the answered dialog's in-dialog route AT ANSWER-TIME — before the
+        # ICE/DTLS handshake (ADR-0065). The peer's 2xx-ACK (and any racing BYE) can
+        # arrive during the (potentially slow) handshake; without a route here it would
+        # be unroutable and the dialog never observed as confirmed (RFC 3261 §12),
+        # blocking an §15.1.1-correct BYE on a post-200 failure. Signalling only — no
+        # media flows (the engine is built only after fingerprint verification below,
+        # RFC 5763 §5). The real CallSession overwrites it on success (the call tail).
+        guard = _AnsweredDialogGuard(
+            dialog=dialog, transport=transport, call_id=call_id
+        )
+        if self._manager is not None:
+            self._manager.add_call(dialog.dialog_id, guard)
+        transport.add_call(call_id, guard)
+
         # Run ICE connectivity + the DTLS-SRTP handshake (over the ICE pipe), then
         # derive the SRTP sessions. A failure here is AFTER the 200 OK (the handshake
         # needs the peer to have our answer), so this is NOT a 488 reject: the call was
-        # answered, the ICE session is closed, and _MediaNegotiationRejected is raised
-        # so the inbound handler's finally tears the answered call down (no CallLoop on
-        # dead media). The mandatory attributes were already validated pre-answer.
+        # answered. Close media now + BYE the dialog once confirmed (the guard tracks
+        # the ACK; RFC 3261 §15.1.1), then re-raise the reject signal so the inbound
+        # handler builds no CallLoop on dead media. The mandatory attributes were
+        # validated pre-answer.
         # Trickle (ADR-0034): we advertise a=ice-options:trickle in the answer (we
         # ACCEPT trickle), but we always act on the offer's candidate set + end
         # candidates — there is no in-dialog SIP-INFO transport (RFC 8840) to receive
@@ -2826,11 +2934,18 @@ class VoipAdapter(BasePlatformAdapter):
             )
         except Exception:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
             # A DTLS/ICE failure (fingerprint mismatch, no connectivity, handshake
-            # timeout). The call was answered (200 OK sent) but cannot be keyed —
-            # close ICE and abort setup. Re-raised as the internal reject signal so
-            # the inbound handler stops without building a CallLoop on dead media.
+            # timeout). The call was answered (200 OK sent) but cannot be keyed — close
+            # media + ACK-aware BYE the dialog, then re-raise the reject signal so the
+            # inbound handler stops without building a CallLoop on dead media.
             _log.exception("INVITE %s: WebRTC ICE/DTLS handshake failed", call_id)
-            await session.close()
+            await self._abort_answered_call(
+                dialog=dialog,
+                transport=transport,
+                session=session,
+                engine=None,
+                guard=guard,
+                call_id=call_id,
+            )
             raise _MediaNegotiationRejected from None
 
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
@@ -3048,14 +3163,26 @@ class VoipAdapter(BasePlatformAdapter):
             call_id=call_id,
         )
 
+        # Register the answered dialog's in-dialog route AT ANSWER-TIME — before the
+        # handshake (ADR-0065). The peer's 2xx-ACK (and any racing BYE) can arrive
+        # during the handshake; without a route here it would be unroutable and the
+        # dialog never observed as confirmed (RFC 3261 §12), blocking an §15.1.1-correct
+        # BYE on a post-200 failure. The guard is SIGNALLING ONLY — no media flows (the
+        # engine is built only after fingerprint verification below, RFC 5763 §5). On
+        # success the real CallSession overwrites it on the same keys (the call tail).
+        guard = _AnsweredDialogGuard(
+            dialog=dialog, transport=transport, call_id=call_id
+        )
+        if self._manager is not None:
+            self._manager.add_call(dialog.dialog_id, guard)
+        transport.add_call(call_id, guard)
+
         # Run the DTLS handshake over the UDP pipe, then derive the SRTP sessions. A
         # failure here is AFTER the 200 OK (the handshake needs the peer to have our
         # answer), so this is NOT a 488: the call was answered UDP/TLS/RTP/SAVP. A
         # fingerprint mismatch / timeout ENDS THE CALL — there is NO plaintext fallback
-        # (RFC 5763 §5). The session is closed and _MediaNegotiationRejected is raised
-        # so the inbound handler tears the answered call down (no CallLoop on dead
-        # media). The peer's RTP address comes from the offer's c=/m=audio; the pipe
-        # re-latches onto the peer's real source via comedia during the handshake.
+        # (RFC 5763 §5). The peer's RTP address comes from the offer's c=/m=audio; the
+        # pipe re-latches onto the peer's real source via comedia during the handshake.
         try:
             srtp_inbound, srtp_outbound = await session.run_handshake(
                 peer_fingerprint=peer_fingerprint,
@@ -3065,16 +3192,16 @@ class VoipAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 — any DTLS failure aborts the call (caught + re-raised as reject)
             # A fingerprint mismatch / timeout AFTER the 200 OK: the peer holds an
             # ANSWERED UDP/TLS/RTP/SAVP call, so this is NOT a 488 and there is NO
-            # plaintext fallback (RFC 5763 §5). The dialog is HALF-OPEN — definitively
-            # close it with an in-dialog BYE (RFC 3261 §15) so it is never a zombie,
-            # close the DTLS session (release the UDP socket), and re-raise the reject
+            # plaintext fallback (RFC 5763 §5). Close media now + BYE the dialog once
+            # confirmed (the guard tracks the ACK; §15.1.1), then re-raise the reject
             # signal so the inbound handler builds no CallLoop on dead media.
             _log.exception("INVITE %s: SIP DTLS-SRTP handshake failed", call_id)
-            await self._abort_answered_sip_dtls(
+            await self._abort_answered_call(
                 dialog=dialog,
                 transport=transport,
                 session=session,
                 engine=None,
+                guard=guard,
                 call_id=call_id,
             )
             raise _MediaNegotiationRejected from None
@@ -3140,11 +3267,12 @@ class VoipAdapter(BasePlatformAdapter):
                 "INVITE %s: SIP DTLS-SRTP engine setup failed after the 200 OK",
                 call_id,
             )
-            await self._abort_answered_sip_dtls(
+            await self._abort_answered_call(
                 dialog=dialog,
                 transport=transport,
                 session=session,
                 engine=engine,
+                guard=guard,
                 call_id=call_id,
             )
             raise _MediaNegotiationRejected from None
@@ -3155,58 +3283,98 @@ class VoipAdapter(BasePlatformAdapter):
         _log.info("INVITE %s: SIP DTLS-SRTP media engine connected over UDP", call_id)
         return engine, local_media
 
-    async def _abort_answered_sip_dtls(
+    async def _abort_answered_call(  # noqa: PLR0913 — the answered-call teardown needs the dialog + transport + media session + engine + guard + call_id; all keyword-only
         self,
         *,
         dialog: Dialog,
         transport: SignalingTransport,
-        session: SipDtlsMediaSession,
+        session: SipDtlsMediaSession | WebRtcMediaSession,
         engine: RtpMediaTransport | None,
+        guard: _AnsweredDialogGuard,
         call_id: str,
     ) -> None:
-        """Definitively end a SIP DTLS-SRTP call that failed AFTER the 200 OK.
+        """Definitively end a DTLS-SRTP / WebRTC call that failed AFTER the 200 OK.
 
-        Reached when the DTLS handshake or the engine setup fails once the
-        ``UDP/TLS/RTP/SAVP`` 200 OK has already gone out, so the peer holds an answered
-        call (the SIP dialog is established, RFC 3261 §12). Unlike the pre-answer reject
-        (a 488), an established dialog MUST be torn down with an in-dialog **BYE**
-        (RFC 3261 §15.1) — a 4xx would be ignored. No ``CallSession`` exists yet (it is
-        built only after this helper's caller returns), so the BYE is sent directly on
-        the ``dialog`` — the same wire request :meth:`CallSession.hang_up` builds
-        (``build_in_dialog_request(dialog, "BYE")``); ``_teardown_call`` is the
-        post-registration chokepoint and is not reachable here.
+        Reached when the media handshake or the engine setup fails once the 200 OK has
+        gone out, so the peer holds an answered call (the SIP dialog is established,
+        RFC 3261 §12). Unlike the pre-answer reject (a 488), an established dialog is
+        ended with an in-dialog **BYE** (RFC 3261 §15.1) — but §15.1.1 forbids sending
+        BYE before the dialog is **confirmed** (the peer's ACK for our 2xx), and a DTLS
+        fingerprint mismatch can be detected before that ACK. So (ADR-0065):
 
-        Order: stop the engine (if it was constructed — release its SRTP state and any
-        background task) and close the DTLS session (release the UDP socket) FIRST, so
-        the media resources are freed even if the BYE transmit raises; then send the
-        BYE. Each step is best-effort and independently guarded — one failing resource
-        must not strand the others (rule 37: the error is logged, never swallowed
-        silently, and never a plaintext fallback).
+        1. Release media IMMEDIATELY — stop the engine (if it was constructed) and
+           close the session (release the UDP socket / ICE). Nothing is held in the
+           ACK wait.
+        2. If the peer already sent a BYE in the window, the dialog is closed — only
+           deregister; do not send a redundant BYE.
+        3. Otherwise wait (bounded, ≈Timer H) for the guard to observe the ACK, then
+           send the in-dialog BYE (the same request :meth:`CallSession.hang_up` builds).
+           A timeout still sends a fallback BYE so a non-conformant peer cannot leave
+           the dialog open forever.
+        4. Deregister the guard (the call never reaches the real CallSession
+           registration).
+
+        Each step is best-effort and independently guarded — one failing resource must
+        not strand the others (rule 37: logged, never swallowed, never a plaintext
+        fallback). No ``CallSession`` exists yet, so the BYE is sent directly on the
+        ``dialog`` (``_teardown_call`` is the post-registration chokepoint, unreachable
+        here).
         """
         if engine is not None:
             try:
                 await engine.stop()
             except Exception as exc:  # noqa: BLE001 — best-effort; never strand the rest
                 _log.warning(
-                    "INVITE %s: error stopping engine on DTLS abort: %s", call_id, exc
+                    "INVITE %s: error stopping engine on answered-call abort: %s",
+                    call_id,
+                    exc,
                 )
         try:
             await session.close()
         except Exception as exc:  # noqa: BLE001 — best-effort; never strand the BYE
             _log.warning(
-                "INVITE %s: error closing DTLS session on abort: %s", call_id, exc
+                "INVITE %s: error closing media session on abort: %s", call_id, exc
             )
-        # Close the half-open dialog with an in-dialog BYE (the same request
-        # CallSession.hang_up sends). Best-effort: a BYE-send failure is logged, not
-        # raised — the call is already being aborted.
         try:
-            bye = build_in_dialog_request(dialog, "BYE")
-            await transport.send(bye.text)
-            _log.info(
-                "INVITE %s: BYE sent to close the half-open DTLS-SRTP dialog", call_id
-            )
+            if guard.peer_bye:
+                # The peer already terminated the dialog (its BYE was answered 200 OK by
+                # the guard) — sending our own BYE would be a redundant request on a
+                # dead dialog. Just deregister.
+                _log.info(
+                    "INVITE %s: answered-call abort — peer already BYE'd; no BYE sent",
+                    call_id,
+                )
+            else:
+                # Wait (bounded) for the dialog to be confirmed before BYEing it
+                # (RFC 3261 §15.1.1). A timeout still BYEs (fallback) so the dialog
+                # cannot linger; media is already released, so the wait holds nothing.
+                confirmed = await guard.wait_confirmed(
+                    timeout=_ANSWERED_ABORT_ACK_TIMEOUT_S
+                )
+                if not confirmed:
+                    _log.warning(
+                        "INVITE %s: no ACK within %.0fs — sending fallback BYE to "
+                        "close the unconfirmed dialog",
+                        call_id,
+                        _ANSWERED_ABORT_ACK_TIMEOUT_S,
+                    )
+                bye = build_in_dialog_request(dialog, "BYE")
+                await transport.send(bye.text)
+                _log.info(
+                    "INVITE %s: BYE sent to close the answered dialog (%s)",
+                    call_id,
+                    "confirmed" if confirmed else "fallback",
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort; the dialog will time out if the BYE cannot be sent
-            _log.warning("INVITE %s: error sending BYE on DTLS abort: %s", call_id, exc)
+            _log.warning(
+                "INVITE %s: error sending BYE on answered-call abort: %s", call_id, exc
+            )
+        finally:
+            # Deregister the answer-time guard — the call never reached the real
+            # CallSession registration (which would have overwritten it on success).
+            if self._manager is not None:
+                self._manager.remove_call(dialog.dialog_id)
+            transport.remove_call(call_id)
 
     def _start_webrtc_video_sender(
         self,

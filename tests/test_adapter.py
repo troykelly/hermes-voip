@@ -987,6 +987,60 @@ async def test_send_mid_call_speak_failure_still_surfaces(
 
 
 @pytest.mark.asyncio
+async def test_send_after_real_teardown_is_quiet_not_unknown_call_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End-to-end: a late send after the REAL teardown chokepoint is a clean no-op.
+
+    Locks the teardown ORDERING invariant the clean-no-op fix depends on: the
+    chokepoint sets ``_call_info[id]["ended"]=True`` (and KEEPS the ``_call_info``
+    entry) while popping ``_call_loops``. So a reply that arrives after the real
+    ``_teardown_call`` hits the ``ended`` branch (clean success, DEBUG) — NOT the
+    ``unknown call_id`` failure branch, which would re-introduce the gateway's
+    WARNING/ERROR fallback noise. If a future teardown ever dropped the
+    ``_call_info`` entry, this test fails (it would become an unknown-call_id
+    failure), catching the regression at its source.
+    """
+    adapter, _captured = await _captured_handler_adapter()
+    call_id = new_call_id()
+
+    spoke = False
+
+    async def _speak(_chunks: object) -> None:
+        nonlocal spoke
+        spoke = True
+
+    # Register a live call exactly as the inbound path would, then tear it down
+    # through the real chokepoint (a NORMAL remote-BYE end).
+    adapter._call_loops[call_id] = MagicMock(speak=_speak)
+    adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": False}
+
+    await _teardown(adapter, call_id, CallEndReason.REMOTE_BYE)
+
+    # The loop is gone but the call_info entry survives, flagged ended.
+    assert call_id not in adapter._call_loops
+    assert adapter._call_info.get(call_id, {}).get("ended") is True
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, "a late reply after teardown")
+
+    assert spoke is False, "no media path after teardown — must not synthesise"
+    assert getattr(result, "success", False) is True, (
+        "a late send after real teardown must be a clean success, not a failure"
+    )
+    error = getattr(result, "error", None)
+    assert error is None or "unknown call_id" not in error, (
+        "must hit the ended branch, never the unknown-call_id failure branch"
+    )
+    noisy = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.adapter" and r.levelno >= logging.WARNING
+    ]
+    assert noisy == [], f"post-teardown drop must be quiet, got: {noisy!r}"
+
+
+@pytest.mark.asyncio
 async def test_run_call_loop_clean_return_then_media_timeout_classifies_timeout() -> (
     None
 ):

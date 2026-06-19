@@ -652,7 +652,14 @@ class RtpMediaTransport:
                          Must satisfy :class:`_SrtpProtect`.
                          ``None`` → plain RTP/AVP.
         jitter_depth:    ``target_depth`` parameter for
-                         :class:`~hermes_voip.rtp.JitterBuffer`.
+                         :class:`~hermes_voip.rtp.JitterBuffer` (the fixed depth, or
+                         the FLOOR when ``jitter_adapt`` is on).
+        jitter_adapt:    Enable the JitterBuffer's adaptive reorder tolerance
+                         (ADR-0056). ``False`` (the default) keeps a fixed depth —
+                         byte-for-byte the legacy behaviour.
+        jitter_max_depth: The CEILING for the adaptive depth (only meaningful with
+                         ``jitter_adapt=True``); ``None`` uses the JitterBuffer's own
+                         default ceiling. Must be ``>= jitter_depth``.
         clock:           Callable returning the current monotonic time in ns.
                          Defaults to :func:`time.monotonic_ns`.  Inject in tests.
         sleep:           Async callable for outbound pacing (default
@@ -676,6 +683,8 @@ class RtpMediaTransport:
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
         jitter_depth: int = 2,
+        jitter_adapt: bool = False,
+        jitter_max_depth: int | None = None,
         symmetric: bool = True,
         media_timeout_secs: float = 0.0,
         clock: Callable[[], int] | None = None,
@@ -795,6 +804,12 @@ class RtpMediaTransport:
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
         self._jitter_depth = jitter_depth
+        # Adaptive jitter (ADR-0056): when ``jitter_adapt`` the RX JitterBuffer's
+        # reorder tolerance grows under loss/reorder up to ``jitter_max_depth`` and
+        # shrinks back toward ``jitter_depth`` (the floor). ``False`` (the default)
+        # keeps a fixed-depth buffer — byte-for-byte the legacy behaviour.
+        self._jitter_adapt = jitter_adapt
+        self._jitter_max_depth = jitter_max_depth
         # The ICE datagram pipe (WebRTC path, ADR-0032), or None for the TLS/UDP
         # path. When set, connect() routes I/O over it instead of binding a socket;
         # the comedia latch is force-disabled (the ICE pair is the destination).
@@ -886,7 +901,11 @@ class RtpMediaTransport:
         self._recv_queue: asyncio.Queue[_Datagram] = asyncio.Queue(
             maxsize=_QUEUE_MAXSIZE
         )
-        self._jitter: JitterBuffer = JitterBuffer(target_depth=jitter_depth)
+        self._jitter: JitterBuffer = JitterBuffer(
+            target_depth=jitter_depth,
+            adapt=jitter_adapt,
+            max_depth=jitter_max_depth,
+        )
 
         # Outbound rate reconciliation (ADR-0017/0022): a TTS provider emits frames
         # at its own output rate (e.g. sherpa-Kokoro at 24 kHz), but the wire rate
@@ -1054,7 +1073,11 @@ class RtpMediaTransport:
             self._local_port = sock.getsockname()[1]
 
         self._recv_queue = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
-        self._jitter = JitterBuffer(target_depth=self._jitter_depth)
+        self._jitter = JitterBuffer(
+            target_depth=self._jitter_depth,
+            adapt=self._jitter_adapt,
+            max_depth=self._jitter_max_depth,
+        )
         # Fresh inbound DTMF decoder so a reused engine starts with an empty
         # recently-seen-timestamp window (a stale window could suppress a real first
         # press of the new call). The ``on_dtmf`` callback is preserved across calls.

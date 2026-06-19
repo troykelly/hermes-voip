@@ -144,6 +144,7 @@ from hermes_voip.originate import (
     build_outbound_invite,
 )
 from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowlist
+from hermes_voip.provider_error import is_provider_error, safe_error_reply
 from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
@@ -158,6 +159,7 @@ from hermes_voip.sdp import (
     build_webrtc_offer,
     generate_answer_crypto,
     negotiate_audio,
+    negotiate_ptime,
     negotiate_video_h264,
 )
 from hermes_voip.sdp import (
@@ -226,6 +228,16 @@ _WEBRTC_SUPPORTED_ENCODINGS = ("opus", "PCMU", "PCMA", "telephone-event")
 _OPUS_SIP_PAYLOAD_TYPE = 111
 _OPUS_RTP_CLOCK_RATE = 48000
 _OPUS_FMTP = "minptime=10;useinbandfec=1"
+
+# ptime negotiation (ADR-0056 activated by ADR-0063). The engine frames every codec
+# at a single packetisation time read live from ``engine.ptime`` (samples/packet,
+# the RTP timestamp increment, the pacer interval all derive from it), so it can
+# carry any of these common telephony framings. 20 ms is RFC 3551's default; 10 ms
+# matches Opus's ``minptime=10`` floor we advertise; 30/40 ms are the typical
+# lower-rate options a gateway may request to save bandwidth. negotiate_ptime() picks
+# the peer's a=ptime when it is in this set and within its a=maxptime, else 20 ms.
+_DEFAULT_PTIME_MS = 20
+_SUPPORTED_PTIMES_MS: tuple[int, ...] = (10, 20, 30, 40)
 
 # The platform name this adapter registers under.
 _PLATFORM_NAME = "voip"
@@ -878,7 +890,26 @@ class VoipAdapter(BasePlatformAdapter):
         if loop is None:
             return SendResult(success=False, error=f"unknown call_id {chat_id!r}")
 
+        # Provider/runtime error sanitisation (ADR-0063, LAUNCH #4): an unrecoverable
+        # backend failure can arrive here AS the reply text — a raw HTTP 502, a
+        # provider error class, or a stack trace. Reading that aloud to the caller is
+        # unprofessional and leaks backend detail (the gateway's own sanitiser only
+        # fires for platform=="telegram", so voip gets raw text). Speak a SHORT safe
+        # apology instead, language-aware, and log the REAL error at WARNING with the
+        # adapter's known secrets redacted (rule 34). The error is NOT raised toward
+        # the caller — it is already surfaced in the log (rule 37). A genuine reply
+        # that merely mentions a number/"error" is not matched (is_provider_error is
+        # conservative), so the agent is never wrongly silenced.
         text = content
+        if is_provider_error(content):
+            language = self._media_cfg.language if self._media_cfg is not None else "en"
+            text = safe_error_reply(language)
+            _log.warning(
+                "provider/runtime error reply for %s replaced with safe spoken "
+                "line (caller did not hear the raw error); real error: %s",
+                chat_id,
+                self._redact_secrets_for_log(content),
+            )
 
         async def _single_chunk() -> AsyncIterator[str]:
             yield text
@@ -889,6 +920,47 @@ class VoipAdapter(BasePlatformAdapter):
             _log.warning("speak() failed for %s: %s", chat_id, exc)
             return SendResult(success=False, error=str(exc))
         return SendResult(success=True, message_id=chat_id)
+
+    def _redact_secrets_for_log(self, text: str) -> str:
+        """Mask the adapter's known secret values in ``text`` before logging (rule 34).
+
+        A provider/runtime error reply (logged at WARNING by :meth:`send`) is
+        backend-authored text that *could* embed a credential the plugin holds — a
+        SIP digest password, the WSS password, a cloud-provider API key, or the TURN
+        password. This replaces any verbatim occurrence of those live secret values
+        with ``<redacted>`` so the diagnostic log never leaks one (the repo is
+        PUBLIC and operator logs may be shared). Truncates to a bounded length so a
+        pathological multi-kilobyte trace cannot flood the log. Non-secret error
+        detail (HTTP status, provider class) is preserved — that is what makes the
+        log useful. Pure string masking; the original ``text`` is never mutated.
+        """
+        candidates: list[object] = []
+        gateway_cfg = self._gateway_cfg
+        if gateway_cfg is not None:
+            candidates.extend(ext.password for ext in gateway_cfg.extensions)
+            candidates.append(gateway_cfg.ws_password)
+        media_cfg = self._media_cfg
+        if media_cfg is not None:
+            candidates.extend(
+                (
+                    media_cfg.elevenlabs_api_key,
+                    media_cfg.deepgram_api_key,
+                    media_cfg.cartesia_api_key,
+                    media_cfg.ice_turn_password,
+                )
+            )
+        # Only non-empty STRING values are real secrets to mask (a None or any
+        # non-str config value is skipped — never passed to str.replace).
+        secrets = [c for c in candidates if isinstance(c, str) and c]
+        redacted = text
+        # Mask longest-first so a secret that is a substring of another is not left
+        # partially exposed.
+        for secret in sorted(secrets, key=len, reverse=True):
+            redacted = redacted.replace(secret, _REDACTED)
+        limit = 500
+        if len(redacted) > limit:
+            redacted = redacted[:limit] + "…(truncated)"
+        return redacted
 
     async def get_chat_info(self, chat_id: str) -> dict[str, object]:
         """Return chat metadata for a live or ended call.
@@ -1094,6 +1166,11 @@ class VoipAdapter(BasePlatformAdapter):
             aec_filter_ms=media_cfg.aec_filter_ms,
             aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
             aec_mu=media_cfg.aec_mu,
+            # Adaptive jitter buffer (ADR-0056/0063): the outbound call's RX buffer
+            # adapts too. ptime is negotiated + applied AFTER the 2xx answer is
+            # parsed (the answer carries the agreed a=ptime), below.
+            jitter_adapt=True,
+            jitter_max_depth=media_cfg.jitter_max_depth,
         )
         await engine.connect()
         local_rtp_host = _host_of(local_sent_by)
@@ -1314,6 +1391,11 @@ class VoipAdapter(BasePlatformAdapter):
             engine.telephone_event_payload_type = _telephone_event_payload_type(
                 agreed_codecs
             )
+            # ptime negotiation (ADR-0056 activated by ADR-0063): the 2xx answer
+            # carries the agreed a=ptime/a=maxptime; honour it (else 20 ms) so the
+            # outbound stream is framed at the negotiated packetisation time. Set
+            # here (post-answer) like the other negotiated engine values above.
+            engine.ptime = _negotiated_ptime(answer_audio)
             # Resolve + apply the DTMF send/receive backends now the codec + PT are
             # known (ADR-0036): the engine adopts the send backend and arms the in-band
             # detector on a G.711 call with no telephone-event. ``codec_encoding``
@@ -1803,7 +1885,14 @@ class VoipAdapter(BasePlatformAdapter):
                 aec_filter_ms=media_cfg.aec_filter_ms,
                 aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
                 aec_mu=media_cfg.aec_mu,
+                # Adaptive jitter buffer (ADR-0056/0063): the outbound WebRTC RX
+                # buffer adapts too, capped at the configured ceiling.
+                jitter_adapt=True,
+                jitter_max_depth=media_cfg.jitter_max_depth,
             )
+            # ptime negotiation (ADR-0056/0063): this engine is built AFTER the 2xx
+            # answer, so honour the answer's a=ptime/a=maxptime now (else 20 ms).
+            engine.ptime = _negotiated_ptime(answer_audio)
             await engine.connect()
             _log.info("WebRTC outbound media engine connected over ICE: %s", call_id)
 
@@ -2424,7 +2513,17 @@ class VoipAdapter(BasePlatformAdapter):
             aec_filter_ms=media_cfg.aec_filter_ms,
             aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
             aec_mu=media_cfg.aec_mu,
+            # Adaptive jitter buffer (ADR-0056 activated by ADR-0063): the RX buffer
+            # grows its reorder tolerance under loss up to the configured ceiling and
+            # shrinks back when the link is clean — trading a little latency for loss
+            # resilience only when the link needs it.
+            jitter_adapt=True,
+            jitter_max_depth=media_cfg.jitter_max_depth,
         )
+        # ptime negotiation (ADR-0056 activated by ADR-0063): honour the peer's
+        # requested framing (a=ptime/a=maxptime) when carriable, else 20 ms. Set
+        # before connect() so the very first outbound packet is framed correctly.
+        engine.ptime = _negotiated_ptime(audio)
         await engine.connect()
 
         local_media = LocalMediaSession(
@@ -2683,7 +2782,14 @@ class VoipAdapter(BasePlatformAdapter):
             aec_filter_ms=media_cfg.aec_filter_ms,
             aec_bulk_delay_ms=media_cfg.aec_bulk_delay_ms,
             aec_mu=media_cfg.aec_mu,
+            # Adaptive jitter buffer (ADR-0056/0063): same as the SIP path — grows
+            # the reorder tolerance under loss up to the configured ceiling.
+            jitter_adapt=True,
+            jitter_max_depth=media_cfg.jitter_max_depth,
         )
+        # ptime negotiation (ADR-0056/0063): honour the offer's a=ptime/a=maxptime
+        # (Opus on WebRTC) when carriable, else 20 ms. Set before connect().
+        engine.ptime = _negotiated_ptime(audio)
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
         # Outbound video (ADR-0044): only when we answered a=sendonly (a source is
@@ -4579,6 +4685,22 @@ def _effective_address(audio: AudioMedia, offer: SessionDescription) -> str:
     """The remote RTP address: media-level c=, then session-level c=, else loopback."""
     addr = audio.connection_address or offer.connection_address
     return addr if addr else "127.0.0.1"
+
+
+def _negotiated_ptime(audio: AudioMedia) -> int:
+    """The packetisation time (ms) to frame at for this audio media (ADR-0056/0063).
+
+    Honours the peer's ``a=ptime``/``a=maxptime`` against the engine's supported
+    framings, falling back to the 20 ms RFC 3551 default. Applied to the engine via
+    its ``ptime`` setter after the SDP is negotiated, so the wire actually carries
+    the agreed framing rather than always 20 ms.
+    """
+    return negotiate_ptime(
+        audio.ptime,
+        audio.maxptime,
+        supported=_SUPPORTED_PTIMES_MS,
+        default=_DEFAULT_PTIME_MS,
+    )
 
 
 def _host_of(sent_by: str) -> str:

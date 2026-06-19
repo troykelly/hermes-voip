@@ -2885,6 +2885,56 @@ async def test_send_provider_error_log_redacts_credential_shapes(
 
 
 @pytest.mark.asyncio
+async def test_send_provider_error_log_redacts_json_credential_shapes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The WARNING log masks JSON-quoted credential shapes, not just header style.
+
+    Codex review BLOCKING: a backend error can embed a JSON body — e.g.
+    ``{"Authorization":"Bearer X","api_key":"X"}`` — where a closing quote sits
+    between the key and the ``:`` separator, so a header-only regex misses it and
+    the secret leaks (rule 34: the repo is PUBLIC). Built at runtime (never a
+    literal — gitleaks all-refs).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    # Minimal speak()-only double for the typed call-loop slot (rule 20: a full
+    # CallLoop is unnecessary for this log-redaction assertion).
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    secret_token = base64.b64encode(bytes(range(64, 94))).decode()
+    # A JSON body with a non-bearer Authorization scheme + an api_key field: a closing
+    # quote sits between each key and its ``:``, so a header-only regex misses both.
+    # (No "Bearer " here — otherwise a greedy bearer-token match would mask the rest
+    # of the compact JSON by accident and hide the real leak.)
+    err = (
+        "API call failed: HTTP 502; "
+        '{"Authorization": "Basic ' + secret_token + '", '
+        '"api_key": "' + secret_token + '"}'
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, err)
+
+    assert result.success
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    # The diagnostic status survives …
+    assert "502" in blob
+    # … but the JSON-embedded credential does not.
+    assert secret_token not in blob
+
+
+@pytest.mark.asyncio
 async def test_send_genuine_reply_not_treated_as_provider_error() -> None:
     """A genuine reply mentioning an error/number is still spoken verbatim."""
     transport = _FakeTransport()

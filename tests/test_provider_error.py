@@ -33,6 +33,10 @@ _ERROR_TEXTS: tuple[str, ...] = (
     "HTTP 429 Too Many Requests",
     "Error: 429 Too Many Requests",
     "openai.RateLimitError: 429",
+    # codex round-2 MAJOR: a raw status LINE with the HTTP version prefix, and the
+    # "Error code: NNN" framing common to SDK exceptions, were slipping through.
+    "HTTP/1.1 502 Bad Gateway",
+    "Error code: 502",
 )
 
 
@@ -62,6 +66,10 @@ _GENUINE_REPLIES: tuple[str, ...] = (
     "It sounds like your server is showing an internal server error to customers.",
     "The page says bad gateway when I open it, so let's check your hosting.",
     "There are 500 people on the waitlist and 429 of them have confirmed.",
+    # codex round-2 MAJOR: a genuine reply LEADING with a status number (no reason
+    # phrase) must not be classified as an error by the start-of-message branch.
+    "503 people are waiting in the queue right now.",
+    "429 confirmed guests will attend the gala on Saturday.",
 )
 
 

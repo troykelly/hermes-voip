@@ -1,10 +1,13 @@
-"""Tests for hermes_voip.digest — RFC 2617 HTTP/SIP digest authentication.
+"""Tests for hermes_voip.digest — RFC 2617/7616/8760 SIP digest authentication.
 
-The load-bearing case is the canonical worked example from RFC 2617 section 3.5,
-used as a known-answer vector: with the published inputs the computed ``response``
-must equal the published digest ``6629fae49393a05397450978507c4ef1``. The rest
-cover SIP-shaped usage and the RFC 2069 (no-``qop``) fallback. Fakes only — no real
-gateway host or credentials (the repo is public; AGENTS.md invariant).
+The load-bearing cases are known-answer vectors from published RFCs:
+
+- RFC 2617 §3.5 MD5 (``6629fae49393a05397450978507c4ef1``)
+- RFC 7616 §3.9.1 SHA-256
+  (``753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1``)
+- MD5-sess, SHA-256-sess: independently-computed vectors (rule 19; pinned per test)
+
+Fakes only — no real gateway host or credentials (the repo is public; AGENTS.md).
 """
 
 import hashlib
@@ -12,7 +15,12 @@ import re
 
 import pytest
 
-from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
+from hermes_voip.digest import (
+    DigestChallenge,
+    DigestCredentials,
+    build_authorization,
+    pick_best_challenge,
+)
 
 
 def _param(header: str, name: str) -> str | None:
@@ -125,9 +133,10 @@ def test_rejects_qop_present_without_auth() -> None:
         )
 
 
-def test_rejects_unsupported_algorithm() -> None:
+def test_rejects_sha512_unsupported_algorithm() -> None:
+    # SHA-512 is not a mandated SIP digest algorithm; reject rather than mis-sign.
     challenge = DigestChallenge.parse(
-        'Digest realm="pbx.example.test", nonce="n", algorithm=MD5-sess, qop="auth"'
+        'Digest realm="pbx.example.test", nonce="n", algorithm=SHA-512, qop="auth"'
     )
     with pytest.raises(ValueError, match="algorithm"):
         build_authorization(
@@ -246,3 +255,376 @@ def test_username_with_quote_is_escaped_on_the_wire_and_hashed_raw() -> None:
     expected = md5_hex(f"{ha1}:{nonce}:00000001:c:auth:{ha2}")
     assert r'username="jo\"hn"' in header
     assert f'response="{expected}"' in header
+
+
+# ---------------------------------------------------------------------------
+# SHA-256 (RFC 7616 / RFC 8760) — known-answer vectors
+# ---------------------------------------------------------------------------
+
+
+def test_rfc7616_section_3_9_1_sha256_known_answer() -> None:
+    """RFC 7616 §3.9.1 worked example — SHA-256 qop=auth.
+
+    Published inputs and expected response (hex) taken verbatim from the RFC.
+    Any implementation that produces a different digest fails this test, which
+    catches wrong hash function, wrong HA1/HA2 construction, or wrong ordering.
+    """
+    # Inputs from RFC 7616 §3.9.1
+    challenge = DigestChallenge.parse(
+        'Digest realm="http-auth@example.org", '
+        'qop="auth, auth-int", '
+        "algorithm=SHA-256, "
+        'nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", '
+        'opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"'
+    )
+    assert challenge.algorithm == "SHA-256"
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="Mufasa", password="Circle of Life"),
+        method="GET",
+        uri="/dir/index.html",
+        cnonce="f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+        nc=1,
+    )
+    # Expected from RFC 7616 §3.9.1
+    assert (
+        _param(header, "response")
+        == "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1"
+    )
+    assert _param(header, "algorithm") == "SHA-256"
+    assert _param(header, "qop") == "auth"
+
+
+def test_sha256_sip_register_known_answer() -> None:
+    """SHA-256 SIP REGISTER — independently computed KAT vector.
+
+    HA1 = SHA-256("1000:pbx.example.test:s3cr3t") = 76d8fb619…
+    HA2 = SHA-256("REGISTER:sip:pbx.example.test") = acc841bfe…
+    response = SHA-256(HA1:sip_nonce_42:00000001:sip_cnonce_42:auth:HA2)
+             = 266fff235961b5de438936f840df947e16342a5854d9da67de3d19b4072a9844
+    """
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="sip_nonce_42", '
+        'algorithm=SHA-256, qop="auth"'
+    )
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="1000", password="s3cr3t"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="sip_cnonce_42",
+        nc=1,
+    )
+    assert (
+        _param(header, "response")
+        == "266fff235961b5de438936f840df947e16342a5854d9da67de3d19b4072a9844"
+    )
+    assert _param(header, "algorithm") == "SHA-256"
+
+
+def test_parse_accepts_sha256_algorithm_token() -> None:
+    """Parser must accept ``SHA-256`` (and ``sha-256``) as the algorithm field."""
+    ch = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", algorithm=SHA-256, qop="auth"'
+    )
+    assert ch.algorithm == "SHA-256"
+
+    ch_lower = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", algorithm=sha-256, qop="auth"'
+    )
+    assert ch_lower.algorithm == "sha-256"
+
+
+def test_parse_accepts_sha256_in_quoted_form() -> None:
+    ch = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", algorithm="SHA-256", qop="auth"'
+    )
+    assert ch.algorithm == "SHA-256"
+
+
+# ---------------------------------------------------------------------------
+# MD5-sess — known-answer vectors
+# ---------------------------------------------------------------------------
+
+
+def test_md5_sess_sip_register_known_answer() -> None:
+    """MD5-sess HA1 = MD5(MD5(user:realm:pass):nonce:cnonce).
+
+    All inputs and the pinned response are independently derived; the test is
+    deterministic for any fixed (username, realm, password, nonce, cnonce).
+
+    HA1-base = MD5("1000:pbx.example.test:s3cr3t") = fd244f9ae6a9c052fbd9301be3490375
+    HA1-sess = MD5(HA1-base:sip_nonce_42:sip_cnonce_42)
+             = 15602ab3deffb069805d5775e5e5626f
+    HA2      = MD5("REGISTER:sip:pbx.example.test") = c585fdc849a05928f3ed76cc3270bbc8
+    response = MD5(HA1-sess:sip_nonce_42:00000001:sip_cnonce_42:auth:HA2)
+             = 5755195a21c2ac0abb4cba6554ac7efe
+    """
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="sip_nonce_42", '
+        'algorithm=MD5-sess, qop="auth"'
+    )
+    assert challenge.algorithm == "MD5-sess"
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="1000", password="s3cr3t"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="sip_cnonce_42",
+        nc=1,
+    )
+    assert _param(header, "response") == "5755195a21c2ac0abb4cba6554ac7efe"
+    assert _param(header, "algorithm") == "MD5-sess"
+    assert _param(header, "cnonce") == "sip_cnonce_42"
+
+
+def test_md5_sess_rfc7616_inputs() -> None:
+    """MD5-sess with the RFC 7616 §3.9.1 username/realm/password/nonce/cnonce.
+
+    Using the same inputs as the SHA-256 RFC example to cross-check that the
+    -sess construction differs from plain MD5 and from SHA-256.
+
+    HA1-base = MD5("Mufasa:http-auth@example.org:Circle of Life")
+             = 3d78807defe7de2157e2b0b6573a855f
+    HA1-sess = MD5(HA1-base:7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v:
+                   f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ)
+             = 2b3d906f52651c3136e1502b3d6f38ee
+    HA2      = MD5("GET:/dir/index.html") = 39aff3a2bab6126f332b942af96d3366
+    response = MD5(HA1-sess:7ypf/…:00000001:f2/…:auth:HA2)
+             = e783283f46242139c486a698fec7211d
+    """
+    nonce = "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v"
+    cnonce = "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ"
+    challenge = DigestChallenge(
+        realm="http-auth@example.org",
+        nonce=nonce,
+        algorithm="MD5-sess",
+        qop=("auth",),
+    )
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="Mufasa", password="Circle of Life"),
+        method="GET",
+        uri="/dir/index.html",
+        cnonce=cnonce,
+        nc=1,
+    )
+    assert _param(header, "response") == "e783283f46242139c486a698fec7211d"
+
+
+# ---------------------------------------------------------------------------
+# SHA-256-sess — known-answer vectors
+# ---------------------------------------------------------------------------
+
+
+def test_sha256_sess_known_answer() -> None:
+    """SHA-256-sess: HA1 = SHA-256(SHA-256(user:realm:pass):nonce:cnonce).
+
+    HA1-base = SHA-256("Mufasa:http-auth@example.org:Circle of Life")
+             = 7987c64c30e25f1b74be53f966b49b90f2808aa92faf9a00262392d7b4794232
+    HA1-sess = SHA-256(HA1-base:7ypf/…:f2/…)
+             = bca21f4c7d7e8bf70d96361085370c7d219947abc1b8cd628f710917b89bed5b
+    HA2      = SHA-256("GET:/dir/index.html")
+             = 9a3fdae9a622fe8de177c24fa9c070f2b181ec85e15dcbdc32e10c82ad450b04
+    response = SHA-256(HA1-sess:nonce:00000001:cnonce:auth:HA2)
+             = 2fd51b3a77ad75bad6afad6003e818d767133c46d9e2749e7f5232ae1ea3efd7
+    """
+    nonce = "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v"
+    cnonce = "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ"
+    challenge = DigestChallenge(
+        realm="http-auth@example.org",
+        nonce=nonce,
+        algorithm="SHA-256-sess",
+        qop=("auth",),
+    )
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="Mufasa", password="Circle of Life"),
+        method="GET",
+        uri="/dir/index.html",
+        cnonce=cnonce,
+        nc=1,
+    )
+    assert (
+        _param(header, "response")
+        == "2fd51b3a77ad75bad6afad6003e818d767133c46d9e2749e7f5232ae1ea3efd7"
+    )
+    assert _param(header, "algorithm") == "SHA-256-sess"
+
+
+# ---------------------------------------------------------------------------
+# Algorithm preference selection (RFC 8760 §3 preference order)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_picks_strongest_algorithm_from_multiple_challenges() -> None:
+    """pick_best_challenge selects SHA-256 over MD5 (RFC 8760 §3 preference)."""
+    sha256_challenge = DigestChallenge(
+        realm="pbx.example.test", nonce="n1", algorithm="SHA-256", qop=("auth",)
+    )
+    md5_challenge = DigestChallenge(
+        realm="pbx.example.test", nonce="n2", algorithm="MD5", qop=("auth",)
+    )
+    # SHA-256 wins regardless of order
+    assert pick_best_challenge([md5_challenge, sha256_challenge]) is sha256_challenge
+    assert pick_best_challenge([sha256_challenge, md5_challenge]) is sha256_challenge
+
+
+def test_pick_best_challenge_sha256_sess_over_sha256() -> None:
+    """SHA-256-sess is preferred over plain SHA-256 (offers session binding)."""
+    sha256 = DigestChallenge(
+        realm="pbx.example.test", nonce="n1", algorithm="SHA-256", qop=("auth",)
+    )
+    sha256_sess = DigestChallenge(
+        realm="pbx.example.test", nonce="n1", algorithm="SHA-256-sess", qop=("auth",)
+    )
+    assert pick_best_challenge([sha256, sha256_sess]) is sha256_sess
+
+
+def test_pick_best_challenge_falls_back_to_single_md5() -> None:
+    """A single MD5 challenge is selected when it is the only option."""
+    md5 = DigestChallenge(
+        realm="pbx.example.test", nonce="n", algorithm="MD5", qop=("auth",)
+    )
+    assert pick_best_challenge([md5]) is md5
+
+
+def test_pick_best_challenge_rejects_empty_list() -> None:
+    """pick_best_challenge raises ValueError on an empty list."""
+    with pytest.raises(ValueError, match="empty"):
+        pick_best_challenge([])
+
+
+def test_pick_best_challenge_md5_sess_over_md5() -> None:
+    """MD5-sess is preferred over plain MD5 (adds session binding)."""
+    md5 = DigestChallenge(
+        realm="pbx.example.test", nonce="n", algorithm="MD5", qop=("auth",)
+    )
+    md5_sess = DigestChallenge(
+        realm="pbx.example.test", nonce="n", algorithm="MD5-sess", qop=("auth",)
+    )
+    assert pick_best_challenge([md5, md5_sess]) is md5_sess
+
+
+# ---------------------------------------------------------------------------
+# Regression: unsupported algorithms still raise
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_genuinely_unsupported_algorithm() -> None:
+    """SHA-512 and unknown tokens must raise, not silently mis-sign."""
+    for algo in ("SHA-512", "SHA-1", "unknown-algo"):
+        challenge = DigestChallenge(
+            realm="pbx.example.test",
+            nonce="n",
+            algorithm=algo,
+            qop=("auth",),
+        )
+        with pytest.raises(ValueError, match="unsupported"):
+            build_authorization(
+                challenge,
+                DigestCredentials(username="1000", password="s3cr3t"),
+                method="REGISTER",
+                uri="sip:pbx.example.test",
+                cnonce="c",
+            )
+
+
+# ---------------------------------------------------------------------------
+# no-qop legacy (RFC 2069) is MD5-only; -sess and SHA-256 require qop
+# ---------------------------------------------------------------------------
+#
+# Rule-19 note: this section REPLACES the earlier
+# test_md5_sess_no_qop_emits_cnonce_in_header, which asserted a spec violation.
+# RFC 2617 §3.2.2 states "cnonce ... MUST NOT be specified if the server did
+# not send a qop directive" — so a -sess challenge WITHOUT qop is internally
+# inconsistent (it needs a cnonce to build HA1 but is forbidden from sending
+# one). RFC 7616 §3.4.1 / RFC 8760 §2.6 define NO RFC 2069 legacy form for
+# SHA-256(/-sess). The correct behaviour for all of these is to RAISE; the
+# legacy no-qop form is valid ONLY for plain MD5 (ancient-server back-compat).
+
+
+def test_md5_sess_without_qop_raises() -> None:
+    # RFC 2617 §3.2.2: -sess needs a cnonce for HA1 but MUST NOT send one
+    # without qop — the combination is unanswerable, so raise.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="sip_nonce_42",
+        algorithm="MD5-sess",
+        qop=(),  # no qop offered
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="sip_cnonce_42",
+        )
+
+
+def test_sha256_without_qop_raises() -> None:
+    # RFC 7616 §3.4.1 / RFC 8760 §2.6 define no RFC 2069 legacy form for
+    # SHA-256; a challenge that omits qop cannot be answered — raise.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="sip_nonce_42",
+        algorithm="SHA-256",
+        qop=(),
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="sip_cnonce_42",
+        )
+
+
+def test_sha256_sess_without_qop_raises() -> None:
+    # SHA-256-sess inherits both constraints: no legacy form AND the §3.2.2
+    # cnonce-without-qop prohibition. Raise.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="sip_nonce_42",
+        algorithm="SHA-256-sess",
+        qop=(),
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="sip_cnonce_42",
+        )
+
+
+def test_plain_md5_no_qop_still_uses_legacy_rfc2069() -> None:
+    # Regression guard: plain MD5 with no qop MUST keep the RFC 2069 legacy
+    # form response = MD5(HA1:nonce:HA2), with no qop/nc/cnonce in the header.
+    # This is the only algorithm for which the no-qop legacy path is valid.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="abc123",
+        algorithm="MD5",
+        qop=(),
+    )
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="1000", password="s3cr3t"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+    )
+
+    def md5_hex(value: str) -> str:
+        return hashlib.md5(value.encode("utf-8")).hexdigest()  # noqa: S324 - test KAT
+
+    ha1 = md5_hex("1000:pbx.example.test:s3cr3t")
+    ha2 = md5_hex("REGISTER:sip:pbx.example.test")
+    expected = md5_hex(f"{ha1}:abc123:{ha2}")
+    assert _param(header, "response") == expected
+    assert _param(header, "qop") is None
+    assert _param(header, "nc") is None
+    assert _param(header, "cnonce") is None

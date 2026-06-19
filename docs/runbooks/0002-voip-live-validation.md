@@ -480,8 +480,40 @@ offerer's). A plain `RTP/AVP` offer is still answered plain (opportunistic).
   would surface as silence/garble. The re-offer key is fresh per offer (its inline
   key differs from the prior offer's), echoing the same tag + suite.
 - If the gateway only offers DTLS-SRTP (`UDP/TLS/RTP/SAVP` + `a=fingerprint`), that
-  is **ADR-0053 Stage 2** (not yet built) — such an offer is currently declined; use
-  SDES (`RTP/SAVP`) for this validation.
+  is **ADR-0053 Stage 2**. The **media capability is built** (`sdp.build_sip_dtls_answer`
+  + `sdp.negotiate_media_security` + `media/sip_dtls_session.SipDtlsMediaSession` over a
+  plain-UDP `_UdpDatagramPipe`, reusing `media/dtls.DtlsEndpoint`), but the **adapter
+  wiring is a separate, named activation wave** (a `_setup_sip_dtls_call` path gated on
+  `HERMES_VOIP_SIP_DTLS_SRTP`). Until that wave lands, an inbound DTLS-SRTP offer still
+  falls through to the SDES/plain handler — so for now use SDES (`RTP/SAVP`) for this
+  validation. See §8e once Stage 2 is activated.
+
+### 8e. Verify DTLS-SRTP media on a SIP-over-TLS call (ADR-0053 Stage 2)
+
+Applies **after the adapter-activation wave** wires `SipDtlsMediaSession` (see §8d).
+When the gateway/extension offers DTLS-SRTP (`m=audio … UDP/TLS/RTP/SAVP …` with an
+`a=fingerprint` and an `a=setup`), the plugin answers DTLS-SRTP: it advertises **our**
+`a=fingerprint`/`a=setup` (default `active` — the DTLS client — for an `actpass` offer;
+`HERMES_VOIP_SIP_DTLS_SETUP` ∈ `{auto,active,passive}` overrides for an `actpass` offer
+only), sends the 200 OK first, then runs the DTLS handshake over the RTP UDP socket and
+keys SRTP from the handshake (no `a=crypto` — the master key is never in the SDP).
+
+```sh
+# Enable DTLS-SRTP on the extension/profile so its INVITE offers UDP/TLS/RTP/SAVP +
+# a=fingerprint + a=setup, then place the test call and inspect the 200 OK SDP.
+# Rollback switch: HERMES_VOIP_SIP_DTLS_SRTP=0 makes a DTLS offer fall through to
+# SDES/plain (no DTLS answer) without a code change.
+```
+
+- 200 OK SDP carries `m=audio <port> UDP/TLS/RTP/SAVP …`, an `a=fingerprint:sha-256 …`
+  (ours), an `a=setup:active|passive`, `a=rtcp-mux`, the real `c=`/port — and **no**
+  `a=crypto` and **no** ICE attributes.
+- The adapter logs `sip-dtls: DTLS-SRTP keyed (setup=…)` once the handshake completes;
+  audio is two-way as in step 8. A fingerprint mismatch or handshake timeout ends the
+  call (it does **not** fall back to plaintext).
+- NAT note: there is no ICE; the media pipe latches its send destination onto the
+  peer's real source on the first inbound datagram (the comedia latch), so two-way
+  media works even when the offered `c=`/port is behind NAT.
 
 ## 9. Teardown
 

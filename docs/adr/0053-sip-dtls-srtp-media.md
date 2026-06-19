@@ -1,7 +1,9 @@
 # ADR-0053: Opportunistic SRTP on the SIP-over-TLS media path — wire SDES (RFC 4568), add DTLS-SRTP (RFC 5763/5764, no ICE)
 
-- **Date:** 2026-06-18
-- **Status:** Accepted
+- **Date:** 2026-06-18 (Stage 2 built 2026-06-19)
+- **Status:** Accepted — **Stage 1 SDES merged + live-validated (PR #132); Stage 2
+  DTLS-SRTP capability built (this lane)**, pending its adapter-activation wave (see
+  "Stage 2 build status" below)
 - **Deciders:** operator direction ("require SRTP with real certs for our SIP over
   TLS"; clarified 2026-06-18 to mean cert-keyed **DTLS-SRTP** media, enforced
   **opportunistically**) — agent session (SIP DTLS-SRTP lane)
@@ -123,6 +125,62 @@ each is end-to-end, not a parked half): **Stage 1 wires SDES** (SRTP working ove
 SIP-over-TLS *now*, validated against the test gateway switched to TLS); **Stage 2
 adds DTLS-SRTP** as the preferred, cert-keyed tier ("real certs"). Stage 1 ships
 first so SRTP is testable immediately.
+
+### 6. Stage 2 build status (capability vs. activation — built 2026-06-19)
+
+Stage 2 follows the same **build-in-engine / activate-in-adapter** split that
+shipped the engine-side of ADR-0061 (RTCP) and the #142 media work: the lane that
+builds the media capability does **not** touch the adapter, and a subsequent,
+explicitly-named adapter wave wires it onto the live INVITE/answer path.
+
+- **Built in this lane (capability, no adapter wiring):**
+  - `sdp.py` — `_SIP_DTLS_PROFILE = "UDP/TLS/RTP/SAVP"`, `AudioMedia.is_sip_dtls`
+    (SAVP profile **and** an `a=fingerprint` present, media- or session-level),
+    `build_sip_dtls_answer(...)` (the `UDP/TLS/RTP/SAVP` answer carrying
+    `a=fingerprint`/`a=setup`/`a=rtcp-mux`, keeping `c=`/port, no `a=crypto`/ICE),
+    and an opportunistic `negotiate_media_security(offer)` ranking function that
+    returns the chosen tier (`dtls` > `sdes` > `plain`). The `dtls=` keyword on
+    `build_audio_answer` (ADR §1) is realised as the standalone
+    `build_sip_dtls_answer` so the plain/SDES `build_audio_answer` output stays
+    **byte-identical** (regression invariant) and the DTLS shape is a separate,
+    independently-tested code path rather than a branch inside the SDES builder.
+  - `media/sip_dtls_session.py` — `SipDtlsMediaSession`: owns a bound `asyncio`
+    UDP datagram pipe (`_UdpDatagramPipe`), reuses `DtlsEndpoint` + the WebRTC
+    `answer_setup_for_offer` role logic verbatim, drives the same RFC-7983 DTLS
+    handshake pump, verifies the peer fingerprint, and derives
+    `(srtp_inbound, srtp_outbound)`. The pipe satisfies the engine's existing
+    `ice_transport` seam (async `send`/`recv`/`close`) — so the engine carries
+    SRTP over it with **no engine change**.
+  - `media/srtp.py` already consumes DTLS-derived keys (`SrtpSession.from_raw_keys`,
+    via `DtlsEndpoint.derive_srtp_sessions`) — unchanged.
+- **The adapter-activation wave (separate, named — NOT built here, rule 6):** a
+  `_setup_sip_dtls_call` path in `adapter.py` that, for an inbound `is_sip_dtls`
+  offer (gated on `HERMES_VOIP_SIP_DTLS_SRTP`), constructs the session with the
+  offered `a=setup` + the `HERMES_VOIP_SIP_DTLS_SETUP` knob, sends the
+  `build_sip_dtls_answer` 200 OK advertising the session socket's port **first**,
+  then runs the handshake and builds `RtpMediaTransport(ice_transport=<the
+  session's pipe>, srtp_inbound=…, srtp_outbound=…)` — exactly mirroring
+  `_setup_webrtc_call` (which hands `ice_transport=session.ice`). The two config
+  knobs `HERMES_VOIP_SIP_DTLS_SRTP` / `HERMES_VOIP_SIP_DTLS_SETUP` (`config.py`
+  `MediaConfig`, mirroring `webrtc_dtls_setup`) are added in that wave. Until then
+  the capability is dormant: an `is_sip_dtls` offer still falls through to the
+  existing SDES/plain handler (no behaviour change).
+
+**Comedia on the plain-UDP DTLS path (implementation decision).** Unlike WebRTC
+(where ICE + STUN consent establishes the 5-tuple) and like the existing SDES/plain
+SIP path, a DTLS-SRTP SIP call may sit behind NAT, so the peer's real source
+`(host, port)` can differ from the SDP `c=`/port. `_UdpDatagramPipe` therefore sends
+to the SDP-advertised peer initially but **re-latches** its send destination onto the
+source of each inbound **DTLS** datagram (first byte 20–63, RFC 7983) *while the
+handshake is in progress*, and **freezes** the destination once the peer certificate
+is verified. This is hardened against the off-path-poisoning / DoS a naive
+first-datagram-wins latch would allow (a cross-vendor review finding): a non-DTLS
+stray/spoofed datagram never moves the latch, a genuine later ClientHello from the
+real peer can correct a mis-latch during the handshake, and after verification the
+established 5-tuple is fixed so post-handshake SRTP cannot be redirected. The
+fingerprint check (RFC 5763 §5) still means a mis-latch can never compromise keys —
+the freeze additionally removes the redirection/DoS exposure. The inbound datagram
+queue is bounded (a flooding peer cannot grow memory without limit).
 
 ## Scope / deferred (rule 6, rule 28)
 

@@ -21,6 +21,7 @@ import base64
 import pytest
 
 from hermes_voip.sdp import (
+    _SIP_DTLS_PROFILE,
     _SRTP_KEY_SALT_OCTETS,
     _SUPPORTED_CRYPTO_SUITES,
     AudioMedia,
@@ -28,16 +29,19 @@ from hermes_voip.sdp import (
     CryptoAttribute,
     Fingerprint,
     IceCandidate,
+    MediaSecurity,
     SdpError,
     SessionDescription,
     SetupRole,
     _AudioAccumulator,
     build_audio_answer,
     build_audio_offer,
+    build_sip_dtls_answer,
     build_webrtc_answer,
     build_webrtc_offer,
     generate_answer_crypto,
     negotiate_audio,
+    negotiate_media_security,
     negotiate_ptime,
     negotiate_rtcp_mux,
 )
@@ -2129,3 +2133,371 @@ def test_audio_answer_rtcp_mux_round_trips_with_crypto() -> None:
     assert parsed.audio.rtcp_mux is True
     assert parsed.audio.protocol == "RTP/SAVP"
     assert text.count("a=crypto:") == 1
+
+
+# ===========================================================================
+# SIP DTLS-SRTP (UDP/TLS/RTP/SAVP, no ICE) — ADR-0053 Stage 2
+#
+# A non-WebRTC DTLS-SRTP offer: UDP/TLS/RTP/SAVP + a=fingerprint + a=setup +
+# a=rtcp-mux, but UNLIKE WebRTC it KEEPS its c=/port and carries NO ICE and NO
+# a=crypto. The fingerprint is bound by the (real-CA-verified) signalling TLS.
+# ===========================================================================
+
+_OFFER_SIP_DTLS = (
+    "v=0\r\n"
+    "o=- 3000 3000 IN IP4 192.0.2.30\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.30\r\n"
+    "t=0 0\r\n"
+    "m=audio 41000 UDP/TLS/RTP/SAVP 0 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\n"
+    "a=setup:actpass\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+# A UDP/TLS/RTP/SAVP m-line that is missing the a=fingerprint: it MUST NOT be
+# treated as a usable DTLS-SRTP offer (RFC 5763 §5 requires the fingerprint).
+_OFFER_SIP_DTLS_NO_FP = (
+    "v=0\r\n"
+    "o=- 3000 3000 IN IP4 192.0.2.30\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.30\r\n"
+    "t=0 0\r\n"
+    "m=audio 41000 UDP/TLS/RTP/SAVP 0 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=setup:actpass\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+# --- AudioMedia.is_sip_dtls detection ---
+
+
+def test_sip_dtls_profile_constant() -> None:
+    """The SIP DTLS-SRTP profile is UDP/TLS/RTP/SAVP (RFC 5764 §8), no AVPF F."""
+    assert _SIP_DTLS_PROFILE == "UDP/TLS/RTP/SAVP"
+
+
+def test_parse_sip_dtls_offer_is_sip_dtls() -> None:
+    """A UDP/TLS/RTP/SAVP m-line with a=fingerprint is recognised as SIP-DTLS."""
+    sdp = SessionDescription.parse(_OFFER_SIP_DTLS)
+    assert sdp.audio is not None
+    assert sdp.audio.is_sip_dtls is True
+    # It is SRTP-secured but NOT WebRTC (no SAVPF feedback profile, no ICE).
+    assert sdp.audio.is_srtp is True
+    assert sdp.audio.is_webrtc is False
+
+
+def test_parse_sip_dtls_offer_keeps_connection_address() -> None:
+    """Unlike WebRTC, a SIP-DTLS m-line keeps its c= connection address."""
+    sdp = SessionDescription.parse(_OFFER_SIP_DTLS)
+    assert sdp.audio is not None
+    assert sdp.audio.connection_address == "192.0.2.30"
+
+
+def test_sip_dtls_requires_fingerprint() -> None:
+    """UDP/TLS/RTP/SAVP without a=fingerprint is NOT a usable DTLS-SRTP offer."""
+    sdp = SessionDescription.parse(_OFFER_SIP_DTLS_NO_FP)
+    assert sdp.audio is not None
+    assert sdp.audio.fingerprint is None
+    assert sdp.audio.is_sip_dtls is False
+
+
+def test_webrtc_offer_is_not_sip_dtls() -> None:
+    """A WebRTC SAVPF offer is is_webrtc, never is_sip_dtls (distinct profiles)."""
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert sdp.audio.is_webrtc is True
+    assert sdp.audio.is_sip_dtls is False
+
+
+def test_sdes_offer_is_not_sip_dtls() -> None:
+    """An SDES RTP/SAVP offer is is_srtp but never is_sip_dtls (no fingerprint)."""
+    sdp = SessionDescription.parse(_OFFER_SAVP)
+    assert sdp.audio is not None
+    assert sdp.audio.is_srtp is True
+    assert sdp.audio.is_sip_dtls is False
+
+
+# --- negotiate_media_security: opportunistic DTLS > SDES > plain ranking ---
+
+
+def test_negotiate_media_security_dtls_for_sip_dtls_offer() -> None:
+    """A UDP/TLS/RTP/SAVP+fingerprint offer ranks as DTLS (the strongest tier)."""
+    sdp = SessionDescription.parse(_OFFER_SIP_DTLS)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.DTLS
+
+
+def test_negotiate_media_security_sdes_for_savp_offer() -> None:
+    """An RTP/SAVP offer with a usable a=crypto ranks as SDES (the middle tier)."""
+    sdp = SessionDescription.parse(_OFFER_SAVP)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.SDES
+
+
+def test_negotiate_media_security_plain_for_avp_offer() -> None:
+    """A plain RTP/AVP offer ranks as PLAIN (the fallback tier)."""
+    sdp = SessionDescription.parse(_OFFER_AVP)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.PLAIN
+
+
+def test_negotiate_media_security_savp_without_crypto_is_unsupported() -> None:
+    """An RTP/SAVP offer with no usable a=crypto is UNSUPPORTED — NOT PLAIN.
+
+    Critical downgrade guard: a SAVP profile DEMANDED encrypted media. We cannot key
+    it (its only crypto line is malformed), but it must NOT degrade to PLAIN — that
+    would let the caller answer clear RTP to a peer that never offered clear RTP. The
+    ranker returns UNSUPPORTED, a distinct non-plain tier the caller must reject (or
+    re-offer), never silently answer in the clear.
+    """
+    sdp = SessionDescription.parse(_OFFER_SAVP_BAD_CRYPTO)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.UNSUPPORTED
+
+
+def test_negotiate_media_security_dtls_profile_without_fingerprint_is_unsupported() -> (
+    None
+):
+    """A UDP/TLS/RTP/SAVP offer missing a=fingerprint is UNSUPPORTED — not PLAIN.
+
+    The profile demanded DTLS-SRTP but omitted the fingerprint (RFC 5763 §5), so we
+    cannot key it. It must not downgrade to clear RTP — UNSUPPORTED, so the caller
+    rejects rather than answering plaintext to an encrypted-media offer.
+    """
+    sdp = SessionDescription.parse(_OFFER_SIP_DTLS_NO_FP)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.UNSUPPORTED
+
+
+def test_negotiate_media_security_webrtc_savpf_is_not_plain() -> None:
+    """A WebRTC SAVPF offer is an encrypted profile — UNSUPPORTED here, never PLAIN.
+
+    negotiate_media_security covers the SIP (non-WebRTC) path; a SAVPF offer is not
+    answerable here (it needs the WebRTC/ICE path), and it must NOT be ranked PLAIN —
+    that would invite a plaintext answer to an encrypted-transport offer.
+    """
+    sdp = SessionDescription.parse(_OFFER_SAVPF)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.UNSUPPORTED
+
+
+def test_negotiate_media_security_dtls_outranks_sdes() -> None:
+    """A UDP/TLS/RTP/SAVP offer that ALSO carried a=crypto still ranks DTLS first.
+
+    Defensive: a non-conformant peer might attach SDES crypto to a DTLS profile.
+    DTLS is strictly stronger (key never in SDP), so the ranker prefers it — we
+    never downgrade to SDES when DTLS is on offer.
+    """
+    offer_both = (
+        "v=0\r\n"
+        "o=- 3000 3000 IN IP4 192.0.2.30\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.30\r\n"
+        "t=0 0\r\n"
+        "m=audio 41000 UDP/TLS/RTP/SAVP 0 101\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:101 telephone-event/8000\r\n"
+        f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\n"
+        "a=setup:actpass\r\n"
+        f"a=crypto:1 {_FAKE_CRYPTO}\r\n"
+        "a=rtcp-mux\r\n"
+        "a=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer_both)
+    assert sdp.audio is not None
+    assert negotiate_media_security(sdp.audio) is MediaSecurity.DTLS
+
+
+# --- build_sip_dtls_answer ---
+
+
+def test_build_sip_dtls_answer_profile() -> None:
+    """The answer uses the UDP/TLS/RTP/SAVP profile (no AVPF F)."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "m=audio 43000 UDP/TLS/RTP/SAVP " in text
+
+
+def test_build_sip_dtls_answer_fingerprint_present() -> None:
+    """The answer advertises OUR DTLS certificate fingerprint."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT_ANSWER}" in text
+
+
+def test_build_sip_dtls_answer_setup_present() -> None:
+    """The answer carries our negotiated DTLS role (active/passive)."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "a=setup:active" in text
+
+
+def test_build_sip_dtls_answer_keeps_connection_line() -> None:
+    """UNLIKE WebRTC, the SIP-DTLS answer KEEPS its c= line (real media address)."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "c=IN IP4 192.0.2.40" in text
+
+
+def test_build_sip_dtls_answer_rtcp_mux_mirrors_offer() -> None:
+    """rtcp-mux is mirrored from the offer (RFC 5761 §5.1.1)."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "a=rtcp-mux" in text
+
+
+def test_build_sip_dtls_answer_no_sdes_crypto() -> None:
+    """A DTLS-SRTP answer MUST NOT carry a=crypto (the key is derived, not inline)."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "a=crypto" not in text
+
+
+def test_build_sip_dtls_answer_no_ice() -> None:
+    """A SIP-DTLS answer carries NO ICE attributes (no ICE on this path)."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "a=ice-ufrag" not in text
+    assert "a=ice-pwd" not in text
+    assert "a=candidate" not in text
+
+
+def test_build_sip_dtls_answer_round_trip_parse() -> None:
+    """The built answer parses back as a UDP/TLS/RTP/SAVP DTLS-SRTP description."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    parsed = SessionDescription.parse(text)
+    assert parsed.audio is not None
+    assert parsed.audio.protocol == "UDP/TLS/RTP/SAVP"
+    assert parsed.audio.is_sip_dtls is True
+    assert parsed.audio.fingerprint is not None
+    assert parsed.audio.fingerprint.value == _FAKE_FINGERPRINT_ANSWER
+    assert parsed.audio.setup is not None
+    assert parsed.audio.setup.value == "active"
+    assert parsed.audio.connection_address == "192.0.2.40"
+
+
+def test_build_sip_dtls_answer_mirrors_direction() -> None:
+    """The answer mirrors the offered direction (sendonly -> recvonly, RFC 3264)."""
+    sendonly = _OFFER_SIP_DTLS.replace("a=sendrecv", "a=sendonly")
+    offer = SessionDescription.parse(sendonly)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address="192.0.2.40",
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert "a=recvonly" in text
+
+
+def test_build_sip_dtls_answer_rejects_actpass_setup() -> None:
+    """RFC 5763 §5: the answerer MUST NOT answer actpass — only active/passive."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    with pytest.raises(SdpError, match="actpass"):
+        build_sip_dtls_answer(
+            offer,
+            local_address="192.0.2.40",
+            port=43000,
+            supported=("PCMU", "telephone-event"),
+            fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+            setup=SetupRole.parse("actpass"),
+        )
+
+
+def test_build_sip_dtls_answer_rejects_non_dtls_offer() -> None:
+    """build_sip_dtls_answer requires a UDP/TLS/RTP/SAVP+fingerprint offer."""
+    offer = SessionDescription.parse(_OFFER_SAVP)  # SDES, not DTLS
+    with pytest.raises(SdpError, match="UDP/TLS/RTP/SAVP"):
+        build_sip_dtls_answer(
+            offer,
+            local_address="192.0.2.40",
+            port=43000,
+            supported=("PCMU", "telephone-event"),
+            fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+            setup=SetupRole.parse("active"),
+        )
+
+
+def test_build_sip_dtls_answer_does_not_regress_sdes() -> None:
+    """build_audio_answer (SDES/plain) is unchanged: a SAVP offer still answers SDES.
+
+    Cross-contamination guard — the new DTLS path is a SEPARATE builder; the SDES
+    answer remains byte-for-byte the SDES shape (RTP/SAVP + a=crypto, no fingerprint).
+    """
+    offer = SessionDescription.parse(_OFFER_SAVP)
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        crypto=_FAKE_ANSWER_CRYPTO,
+    )
+    assert "RTP/SAVP" in text
+    assert "UDP/TLS/RTP/SAVP" not in text
+    assert "a=crypto:" in text
+    assert "a=fingerprint" not in text

@@ -38,6 +38,7 @@ from hermes_voip.sdp import (
     build_webrtc_offer,
     generate_answer_crypto,
     negotiate_audio,
+    negotiate_ptime,
 )
 
 # Obvious fake SRTP master key||salt (RFC 4568 inline:). Never a real key.
@@ -103,6 +104,67 @@ def test_parse_audio_media_line() -> None:
     assert sdp.audio.connection_address == "192.0.2.1"
     assert sdp.audio.ptime == 20
     assert sdp.audio.direction == "sendrecv"
+
+
+def test_parse_audio_maxptime_absent_is_none() -> None:
+    """An offer without a=maxptime parses maxptime as None (ADR-0056 item 5)."""
+    sdp = SessionDescription.parse(_OFFER_AVP)
+    assert sdp.audio is not None
+    assert sdp.audio.maxptime is None
+
+
+def test_parse_audio_maxptime_when_present() -> None:
+    """a=maxptime is parsed into AudioMedia.maxptime (ADR-0056 item 5)."""
+    offer = _OFFER_AVP + "a=maxptime:40\r\n"
+    sdp = SessionDescription.parse(offer)
+    assert sdp.audio is not None
+    assert sdp.audio.ptime == 20
+    assert sdp.audio.maxptime == 40
+
+
+def test_negotiate_ptime_honours_supported_offer_ptime() -> None:
+    """The offer's ptime is used when the engine supports it (ADR-0056 item 5)."""
+    assert negotiate_ptime(30, None, supported=(20, 30, 40), default=20) == 30
+
+
+def test_negotiate_ptime_falls_back_to_default_for_unsupported() -> None:
+    """An offered ptime the engine cannot frame falls back to the default."""
+    # 25 ms is not a frame size the engine supports → default 20.
+    assert negotiate_ptime(25, None, supported=(20, 30, 40), default=20) == 20
+
+
+def test_negotiate_ptime_defaults_when_offer_omits_ptime() -> None:
+    """No a=ptime in the offer → the default framing (RFC 3551's 20 ms)."""
+    assert negotiate_ptime(None, None, supported=(20, 30, 40), default=20) == 20
+
+
+def test_negotiate_ptime_respects_maxptime_ceiling() -> None:
+    """An offered ptime above a=maxptime is not used (it would overrun the ceiling)."""
+    # Offer asks 40 but caps at 30: 40 > 30, so fall back (default 20, ≤ 30 → ok).
+    assert negotiate_ptime(40, 30, supported=(20, 30, 40), default=20) == 20
+
+
+def test_negotiate_ptime_clamps_default_above_maxptime() -> None:
+    """If even the default exceeds maxptime, pick the largest supported ≤ maxptime."""
+    # maxptime 10 < default 20; the only supported value within the cap is 10.
+    assert negotiate_ptime(None, 10, supported=(10, 20, 30), default=20) == 10
+
+
+def test_negotiate_ptime_rejects_misconfiguration() -> None:
+    """A misconfigured engine (bad supported/default) is a loud error, not a bad ptime.
+
+    The docstring promises it never returns an unsupported/non-positive value, so a
+    default the engine cannot frame — or an empty/non-positive supported set — must
+    raise rather than silently emit an invalid ptime on the wire.
+    """
+    with pytest.raises(ValueError, match=r"non-empty|supported"):
+        negotiate_ptime(20, None, supported=(), default=20)
+    with pytest.raises(ValueError, match="positive"):
+        negotiate_ptime(20, None, supported=(0, 20), default=20)
+    with pytest.raises(ValueError, match="positive"):
+        negotiate_ptime(None, None, supported=(20, 30), default=0)
+    with pytest.raises(ValueError, match=r"supported|default"):
+        negotiate_ptime(None, None, supported=(20, 30), default=25)
 
 
 def test_parse_codecs_with_rtpmap_and_fmtp() -> None:

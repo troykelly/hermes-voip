@@ -419,7 +419,7 @@ class AudioMedia:
             lenient: a malformed or unsupported crypto line stays in ``crypto``
             but is excluded here, so this carries only usable offered keys.
             Always empty on WebRTC m-lines.
-        ptime: Packetisation time in ms, if declared.
+        ptime: Packetisation time in ms, if declared (``a=ptime``).
         direction: ``sendrecv`` / ``sendonly`` / ``recvonly`` / ``inactive``.
         connection_address: The effective connection address for this media.
             ``None`` on a WebRTC m-line (address is conveyed by ICE candidates).
@@ -437,6 +437,10 @@ class AudioMedia:
             (RFC 8838 §8.2) — the candidate generation is complete.
         mid: The media identification (``a=mid``, RFC 5888) for BUNDLE grouping,
             or ``None`` when absent (e.g. a non-BUNDLE SDES offer). ADR-0044.
+        maxptime: The maximum packetisation time in ms the peer will accept
+            (``a=maxptime``, RFC 4566 §6), or ``None`` when absent. An upper bound
+            on the framing the answer may choose; :func:`negotiate_ptime` honours
+            it (ADR-0056).
 
     ``crypto`` and ``crypto_attrs`` are suppressed from ``repr``
     (``field(repr=False)``): both carry SDES inline master key||salt material,
@@ -460,6 +464,7 @@ class AudioMedia:
     ice_options: tuple[str, ...] = field(default_factory=tuple)
     end_of_candidates: bool = False
     mid: str | None = None
+    maxptime: int | None = None
 
     @property
     def is_srtp(self) -> bool:
@@ -710,6 +715,7 @@ class _AudioAccumulator:
     fmtps: dict[int, str] = field(default_factory=dict)
     crypto: list[str] = field(default_factory=list, repr=False)
     ptime: int | None = None
+    maxptime: int | None = None
     direction: str = "sendrecv"
     connection: str | None = None
     # WebRTC / DTLS-SRTP + ICE attributes (ADR-0016)
@@ -776,6 +782,10 @@ class _AudioAccumulator:
             self.crypto.append(rest.strip())
         elif tag == "ptime":
             self.ptime = int(rest.strip())
+        elif tag == "maxptime":
+            # RFC 4566 §6: the maximum packetisation time the peer accepts (ms),
+            # an upper bound negotiate_ptime honours (ADR-0056).
+            self.maxptime = int(rest.strip())
         elif value in _DIRECTIONS:
             self.direction = value
         # WebRTC attributes (ADR-0016, RFC 5763/8839).  Malformed lines are
@@ -883,6 +893,7 @@ class _AudioAccumulator:
             ice_options=ice_options,
             end_of_candidates=self.end_of_candidates,
             mid=self.mid,
+            maxptime=self.maxptime,
         )
 
 
@@ -979,6 +990,85 @@ def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec,
         msg = f"no common audio codec (offered {[c.encoding for c in offer.codecs]})"
         raise ValueError(msg)
     return chosen
+
+
+def negotiate_ptime(
+    offer_ptime: int | None,
+    offer_maxptime: int | None,
+    *,
+    supported: Sequence[int],
+    default: int,
+) -> int:
+    """Choose the RTP packetisation time (ms) to frame and answer with (ADR-0056).
+
+    The engine no longer assumes 20 ms: it honours the peer's requested framing
+    when it can carry it. The peer expresses framing via ``a=ptime`` (its
+    preferred packet duration) and optionally ``a=maxptime`` (the largest it will
+    accept) — RFC 4566 §6 / RFC 3551. ptime is a *preference*, not a mandate, so
+    an unsupported request falls back rather than failing the call.
+
+    Selection:
+
+    * Use ``offer_ptime`` when it is one the engine ``supported`` frame sizes AND
+      within ``offer_maxptime`` (if given).
+    * Otherwise use ``default`` — but if even ``default`` exceeds
+      ``offer_maxptime``, fall to the LARGEST ``supported`` value that fits the
+      cap (a peer that caps below 20 ms gets the biggest framing it allows).
+    * If nothing fits the cap (a pathological maxptime below every supported
+      value), return ``default`` unchanged — the engine still emits valid RTP and
+      the peer can reject; we never return an unsupported or non-positive value.
+
+    Args:
+        offer_ptime: The peer's ``a=ptime`` in ms, or ``None`` if absent.
+        offer_maxptime: The peer's ``a=maxptime`` in ms, or ``None`` if absent.
+        supported: The frame sizes (ms) the engine can carry, e.g. ``(20, 30, 40)``.
+            Must be non-empty and all positive.
+        default: The framing to use when the offer's is unusable (RFC 3551's 20 ms).
+            Must be positive and one of ``supported`` — the engine's own default
+            must be carriable, so a misconfiguration is a loud error, not a silent
+            invalid ptime on the wire.
+
+    Returns:
+        The agreed packetisation time in ms.
+
+    Raises:
+        ValueError: If ``supported`` is empty or has a non-positive value, or
+            ``default`` is non-positive or not in ``supported`` (a programming
+            error: the engine cannot frame at its own default).
+    """
+    supported_set = set(supported)
+    if not supported_set:
+        msg = "supported ptimes must be a non-empty set of frame sizes"
+        raise ValueError(msg)
+    if any(p <= 0 for p in supported_set):
+        msg = f"supported ptimes must all be positive, got {sorted(supported_set)}"
+        raise ValueError(msg)
+    if default <= 0:
+        msg = f"default ptime must be positive, got {default}"
+        raise ValueError(msg)
+    if default not in supported_set:
+        msg = (
+            f"default ptime {default} must be one of the supported frame sizes "
+            f"{sorted(supported_set)} (the engine must be able to frame at its default)"
+        )
+        raise ValueError(msg)
+
+    def _within_cap(value: int) -> bool:
+        return offer_maxptime is None or value <= offer_maxptime
+
+    if (
+        offer_ptime is not None
+        and offer_ptime in supported_set
+        and _within_cap(offer_ptime)
+    ):
+        return offer_ptime
+    if _within_cap(default):
+        return default
+    # The default overruns the cap: pick the largest supported value that fits.
+    fitting = [p for p in supported_set if _within_cap(p)]
+    if fitting:
+        return max(fitting)
+    return default
 
 
 def _fmtp_param(fmtp: str, key: str) -> str | None:

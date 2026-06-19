@@ -229,3 +229,112 @@ def test_jitter_anchors_at_minimum_of_a_reordered_start_cluster() -> None:
     for seq in (13, 11, 14, 10, 12):  # heavily reordered opening cluster
         jb.push(_pkt(seq))
     assert [_packet(jb.pop()).sequence_number for _ in range(5)] == [10, 11, 12, 13, 14]
+
+
+# ---------------------------------------------------------------------------
+# Adaptive jitter depth (ADR-0056, item 1). The buffer adapts its reorder
+# tolerance to the observed reordering/late-drop of the push/pop stream — no
+# wall clock, so every case is deterministic.
+# ---------------------------------------------------------------------------
+
+
+def test_adaptive_disabled_by_default_keeps_fixed_depth() -> None:
+    # The default (non-adaptive) buffer never moves its depth: byte-for-byte the
+    # legacy behaviour. current_depth stays at the constructed target_depth no
+    # matter what the stream does.
+    jb = JitterBuffer(target_depth=2)
+    assert jb.current_depth == 2
+    for seq in (10, 12, 13, 14, 15):  # a gap that would grow an adaptive buffer
+        jb.push(_pkt(seq))
+    for _ in range(5):
+        jb.pop()
+    assert jb.current_depth == 2  # unchanged: adaptation is opt-in
+
+
+def test_adaptive_grows_depth_on_late_drop() -> None:
+    # A packet that arrives AFTER its slot was already emitted as Lost (a late
+    # drop) means the buffer declared loss too eagerly: grow the reorder
+    # tolerance so the next such reorder is absorbed instead of dropped.
+    jb = JitterBuffer(target_depth=2, max_depth=8, adapt=True)
+    assert jb.current_depth == 2
+    # Open a gap at 11 and pile up 12,13 so 11 is declared Lost at depth 2.
+    for seq in (10, 12, 13):
+        jb.push(_pkt(seq))
+    assert _packet(jb.pop()).sequence_number == 10
+    assert isinstance(jb.pop(), Lost)  # 11 declared lost
+    # 11 now arrives late — proof we were too eager. Depth must have grown.
+    jb.push(_pkt(11))
+    assert jb.current_depth == 3
+
+
+def test_adaptive_grows_depth_on_wide_reorder() -> None:
+    # An in-window packet arriving with a reorder span >= the current depth means
+    # the link reorders further than we tolerate; grow toward that span.
+    jb = JitterBuffer(target_depth=2, max_depth=8, adapt=True)
+    jb.push(_pkt(10))
+    assert _packet(jb.pop()).sequence_number == 10  # anchor now at 11, emitted
+    # 14 arrives (anchor 11), then 11 arrives 3 behind the highest expected — a
+    # reorder span of 3 >= depth 2 -> grow.
+    jb.push(_pkt(14))
+    jb.push(_pkt(11))
+    assert jb.current_depth >= 3
+
+
+def test_adaptive_depth_never_exceeds_max() -> None:
+    # Repeated late drops must not run the depth past max_depth.
+    jb = JitterBuffer(target_depth=2, max_depth=4, adapt=True)
+    seq = 100
+    for _ in range(20):
+        # Each round: emit one, declare the next lost, then deliver it late.
+        jb.push(_pkt(seq))
+        jb.push(_pkt(seq + 2))
+        jb.push(_pkt(seq + 3))
+        jb.push(_pkt(seq + 4))
+        jb.push(_pkt(seq + 5))
+        for _ in range(10):
+            if jb.pop() is None:
+                break
+        jb.push(_pkt(seq + 1))  # late drop
+        seq += 6
+    assert jb.current_depth <= 4
+
+
+def test_adaptive_shrinks_depth_after_clean_run() -> None:
+    # After the depth has grown, a long clean in-order run (no loss, no late
+    # drop) must shrink it back toward the floor so a calmed link stops paying
+    # the latency. Floor is target_depth and is never breached.
+    jb = JitterBuffer(target_depth=2, max_depth=8, adapt=True)
+    # Grow once via a late drop.
+    for seq in (10, 12, 13):
+        jb.push(_pkt(seq))
+    assert _packet(jb.pop()).sequence_number == 10
+    assert isinstance(jb.pop(), Lost)  # 11
+    jb.push(_pkt(11))  # late -> depth 3
+    assert jb.current_depth == 3
+    # Drain the already-buffered 12, 13 (anchor is now at 12) so the clean run
+    # starts from a clean slate.
+    assert _packet(jb.pop()).sequence_number == 12
+    assert _packet(jb.pop()).sequence_number == 13
+    # Now feed a long clean in-order run; depth must come back down to 2.
+    seq = 14
+    for _ in range(200):
+        jb.push(_pkt(seq))
+        out = jb.pop()
+        assert _packet(out).sequence_number == seq
+        seq += 1
+    assert jb.current_depth == 2  # shrank to the floor, never below
+
+
+def test_adaptive_floor_is_target_depth() -> None:
+    # A perfectly clean stream on an adaptive buffer never shrinks below the
+    # constructed floor (a 1-packet depth would lose all reorder tolerance).
+    jb = JitterBuffer(target_depth=3, max_depth=8, adapt=True)
+    for seq in range(500):
+        jb.push(_pkt(seq))
+        jb.pop()
+    assert jb.current_depth == 3
+
+
+def test_adaptive_constructor_validates_max_depth() -> None:
+    with pytest.raises(ValueError, match="max_depth"):
+        JitterBuffer(target_depth=4, max_depth=2, adapt=True)  # max < floor

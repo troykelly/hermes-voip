@@ -129,3 +129,84 @@ def test_encoder_and_decoder_are_independent_per_instance() -> None:
 def test_ensure_opus_available_succeeds_when_libopus_present() -> None:
     """ensure_opus_available() is a no-op (no raise) when opuslib + libopus load."""
     ensure_opus_available()  # must not raise in this (webrtc-extra) environment
+
+
+# ---------------------------------------------------------------------------
+# In-band FEC + PLC (ADR-0056 item 4). opuslib 3.0.1's property setters for
+# inband_fec / packet_loss_perc are broken (they omit the CTL value), so the
+# encoder must enable them via the low-level CTL. We assert the GETTERS (which
+# work) reflect the enabled state, and that the decoder can recover a lost frame
+# from the next packet's FEC and conceal via PLC.
+# ---------------------------------------------------------------------------
+
+
+def test_encoder_enables_inband_fec_and_expected_loss() -> None:
+    """OpusEncoder turns on in-band FEC and a non-zero expected packet-loss pct."""
+    enc = OpusEncoder()
+    # The getter is authoritative (it reads the CTL back from libopus).
+    assert enc.inband_fec_enabled is True
+    assert enc.expected_packet_loss_pct > 0
+
+
+def test_encoder_expected_loss_is_configurable() -> None:
+    """The expected packet-loss percentage is a constructor knob (FEC strength)."""
+    enc = OpusEncoder(expected_packet_loss_pct=25)
+    assert enc.expected_packet_loss_pct == 25
+    assert enc.inband_fec_enabled is True
+
+
+def test_encoder_rejects_out_of_range_expected_loss() -> None:
+    """Expected packet loss must be a percentage in 0..100."""
+    with pytest.raises(ValueError, match=r"0.*100|percent|loss"):
+        OpusEncoder(expected_packet_loss_pct=101)
+    with pytest.raises(ValueError, match=r"0.*100|percent|loss"):
+        OpusEncoder(expected_packet_loss_pct=-1)
+
+
+def test_decode_fec_recovers_a_lost_frame_from_the_next_packet() -> None:
+    """decode_fec(next_packet) reconstructs the *previous* lost frame as real audio.
+
+    With FEC on, packet N carries a low-bitrate copy of frame N-1. After priming
+    the decoder, decoding packet N+1 in FEC mode yields the lost frame N with
+    energy (not silence) — the loss-resilience Opus is chosen for.
+    """
+    enc = OpusEncoder(expected_packet_loss_pct=30)
+    dec = OpusDecoder()
+    # A frequency-varying stream so consecutive frames genuinely differ.
+    packets = [
+        enc.encode(_sine_pcm16(OPUS_FRAME_SAMPLES, freq_hz=300.0 + 25.0 * i))
+        for i in range(6)
+    ]
+    # Prime the decoder with frames 0..3 (normal decode).
+    for i in range(4):
+        dec.decode(packets[i])
+    # Frame 4 is "lost"; recover it from packet 5's embedded FEC.
+    recovered = dec.decode_fec(packets[5])
+    assert len(recovered) == OPUS_FRAME_SAMPLES * _BYTES_PER_SAMPLE
+    vals = struct.unpack(f"<{OPUS_FRAME_SAMPLES}h", recovered)
+    rms = math.sqrt(sum(v * v for v in vals) / OPUS_FRAME_SAMPLES)
+    assert rms > 0.0  # real concealment audio, not a zero-filled hole
+
+
+def test_decode_plc_conceals_without_a_packet() -> None:
+    """decode_plc() extrapolates a concealment frame from decoder state (no packet).
+
+    The opuslib high-level wrapper crashes on decode(None, …); decode_plc routes
+    through the low-level NULL-packet path so a lone loss (no successor available
+    for FEC) still yields a full, non-empty frame.
+    """
+    enc = OpusEncoder()
+    dec = OpusDecoder()
+    for i in range(4):
+        frame = _sine_pcm16(OPUS_FRAME_SAMPLES, freq_hz=300.0 + 25.0 * i)
+        dec.decode(enc.encode(frame))
+    concealed = dec.decode_plc()
+    assert len(concealed) == OPUS_FRAME_SAMPLES * _BYTES_PER_SAMPLE
+
+
+def test_normal_encode_decode_still_works_with_fec_on() -> None:
+    """Enabling FEC does not break the ordinary encode→decode contract."""
+    enc = OpusEncoder()
+    dec = OpusDecoder()
+    out = dec.decode(enc.encode(_sine_pcm16(OPUS_FRAME_SAMPLES)))
+    assert len(out) == OPUS_FRAME_SAMPLES * _BYTES_PER_SAMPLE

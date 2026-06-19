@@ -29,8 +29,50 @@ _PROXY_AUTH_REQUIRED = 407
 _INTERVAL_TOO_BRIEF = 423
 _OK = 200
 _EXPIRES_PARAM = re.compile(r";\s*expires\s*=\s*(\d+)", re.IGNORECASE)
+# The addr-spec inside a Contact name-addr's angle brackets (``<sip:...>``).
+_ANGLE_ADDR = re.compile(r"<([^>]*)>")
 # The SIP schemes an AOR may carry; sips is ADR-0005's SIP-over-TLS scheme.
 _AOR_SCHEMES = frozenset({"sip", "sips"})
+
+
+def _split_contacts(header_value: str) -> list[str]:
+    """Split a Contact header into its individual bindings (RFC 3261 §10.3).
+
+    A REGISTER 200 OK may carry several bindings either as repeated ``Contact``
+    headers or comma-separated within one header value. Commas inside a
+    name-addr's ``<...>`` or a quoted display-name are NOT separators, so the
+    split tracks angle-bracket and double-quote depth and only breaks on a
+    top-level comma.
+    """
+    bindings: list[str] = []
+    current: list[str] = []
+    in_angle = False
+    in_quote = False
+    for char in header_value:
+        if char == '"' and not in_angle:
+            in_quote = not in_quote
+        elif char == "<" and not in_quote:
+            in_angle = True
+        elif char == ">" and not in_quote:
+            in_angle = False
+        elif char == "," and not in_angle and not in_quote:
+            bindings.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        bindings.append(tail)
+    return [b.strip() for b in bindings if b.strip()]
+
+
+def _binding_uri(binding: str) -> str:
+    """The bare addr-spec of one Contact binding (inside ``<...>`` if present)."""
+    match = _ANGLE_ADDR.search(binding)
+    if match is not None:
+        return match.group(1).strip()
+    # A bare URI form (no angle brackets): everything before the first ';' param.
+    return binding.split(";", 1)[0].strip()
 
 
 def _split_aor(aor: str) -> tuple[str, str]:
@@ -159,6 +201,9 @@ class RegistrationFlow:
         """Initialise the flow with a stable Call-ID and From-tag."""
         self._cfg = config
         self._registrar = _registrar_uri(config.aor)
+        # Our own binding's bare addr-spec, used to pick OUR Contact (and its
+        # expires) out of a multi-binding 200 OK echo (RFC 3261 §10.3).
+        self._contact_uri = _binding_uri(config.contact)
         self._call_id = new_call_id()
         self._from_tag = new_tag()
         self._cseq = 0
@@ -277,9 +322,26 @@ class RegistrationFlow:
             raise RuntimeError(msg)
 
     def _granted_expires(self, response: SipResponse) -> int:
-        contact = response.header("Contact")
-        if contact is not None:
-            match = _EXPIRES_PARAM.search(contact)
+        """The granted lifetime for OUR binding (RFC 3261 §10.3).
+
+        A 200 OK to REGISTER echoes EVERY binding the registrar holds for the
+        AOR, each with its own ``expires`` — so the refresh window must be read
+        from OUR Contact, not whichever binding comes first (another device's
+        lifetime would arm the wrong timer and let our binding lapse). All
+        ``Contact`` headers are flattened into individual bindings; the one
+        whose addr-spec matches our Contact URI supplies the value. Failing an
+        exact match, the first binding's ``expires`` is the fallback, then the
+        ``Expires`` header, then our requested lifetime.
+        """
+        bindings = [
+            binding
+            for header in response.headers_all("Contact")
+            for binding in _split_contacts(header)
+        ]
+        ours = next((b for b in bindings if _binding_uri(b) == self._contact_uri), None)
+        chosen = ours if ours is not None else (bindings[0] if bindings else None)
+        if chosen is not None:
+            match = _EXPIRES_PARAM.search(chosen)
             if match is not None:
                 return int(match.group(1))
         expires = response.header("Expires")

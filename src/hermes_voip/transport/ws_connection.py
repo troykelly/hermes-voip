@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
+    Cancel,
     InDialog,
     NewCall,
     RegistrationManager,
@@ -401,6 +402,11 @@ class WssSipTransport:
                 )
         elif isinstance(routing, InDialog):
             await routing.consumer.handle_request(routing.request)
+        elif isinstance(routing, Cancel):
+            # CANCEL handling (RFC 3261 §9.2) is implemented on the TLS transport
+            # only; over WSS a CANCEL falls through to the unroutable path as
+            # before (a follow-up will port the server-transaction tracking here).
+            self._report_unroutable(Unroutable(request, "out-of-dialog CANCEL"))
         elif await self._answer_keepalive(request):
             return
         else:

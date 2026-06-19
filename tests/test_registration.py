@@ -132,6 +132,48 @@ def test_granted_expiry_param_is_case_insensitive() -> None:
     assert outcome.expires == 90
 
 
+def test_granted_expiry_selects_our_contact_in_multi_binding_200() -> None:
+    # RFC 3261 §10.3: a 200 OK to REGISTER echoes EVERY binding the registrar
+    # holds for the AOR — other devices' Contacts too, each with its OWN expires.
+    # The refresh timer must be armed from OUR binding's lifetime, not whichever
+    # Contact comes first; arming off another device's (here much longer) expiry
+    # would skip our own refresh and let our binding silently lapse.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    # Two other-device Contacts (one as a leading header, one comma-joined inside
+    # our own Contact line) bracket ours — our binding is the config's contact URI
+    # (host 198.51.100.7:5061), whose expires=120 is the value to arm from.
+    multi = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"CSeq: {_cseq_num(started)} REGISTER\r\n"
+        "Contact: <sip:1000@198.51.100.9:5061;transport=tls>;expires=600\r\n"
+        "Contact: <sip:1000@198.51.100.7:5061;transport=tls>;expires=120, "
+        "<sip:1000@198.51.100.8:5062;transport=tls>;expires=900\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(multi)
+    assert isinstance(outcome, Registered)
+    assert outcome.expires == 120  # OUR binding, not 600/900 from other devices
+
+
+def test_granted_expiry_falls_back_to_first_contact_when_ours_absent() -> None:
+    # Defensive: if the registrar's echo omits our exact Contact URI (a rewritten
+    # or normalised binding), fall back to the first Contact's expires so a refresh
+    # is still armed rather than the flow crashing — a slightly-off refresh beats
+    # none. A real registrar echoes our Contact verbatim; this is belt-and-braces.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    other = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"CSeq: {_cseq_num(started)} REGISTER\r\n"
+        "Contact: <sip:1000@198.51.100.99:5061;transport=tls>;expires=222\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(other)
+    assert isinstance(outcome, Registered)
+    assert outcome.expires == 222
+
+
 def test_403_yields_failed() -> None:
     flow = RegistrationFlow(_CONFIG)
     flow.start()

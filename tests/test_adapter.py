@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
@@ -1450,6 +1451,121 @@ async def test_connect_brings_transport_up_before_building_manager() -> None:
     # connect() returns the manager's degraded-up boolean (no real 200 OK here,
     # so it is False after the wait_for timeout — but it MUST NOT raise).
     assert up is False
+
+
+# ---------------------------------------------------------------------------
+# Regression (item 4): the production adapter MUST wire on_registration_error
+# into the RegistrationManager. Without it, the manager's registration-recovery
+# reporting (a rejected/timed-out refresh) has nowhere to surface — the failure
+# is silently lost. The hook must log on the adapter logger and must NOT leak any
+# HERMES_SIP_* value (rule 34: extension number / host / password are sensitive).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_wires_on_registration_error_into_the_manager(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_establish`` passes a non-None ``on_registration_error`` that logs."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _ConnectOrderTransport()
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+
+    captured: dict[str, object] = {}
+    real_manager_cls = RegistrationManager
+
+    def _capture_manager(*args: object, **kwargs: object) -> RegistrationManager:
+        captured.update(kwargs)
+        # Build the real manager so connect() proceeds normally.
+        gateway = args[0]
+        transport_arg = args[1]
+        assert isinstance(gateway, GatewayConfig)
+        return real_manager_cls(gateway, transport_arg, **kwargs)  # type: ignore[arg-type]  # test shim forwards the captured kwargs to the real ctor
+
+    with (
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", side_effect=_capture_manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+
+    hook = captured.get("on_registration_error")
+    assert hook is not None, (
+        "the adapter must pass on_registration_error so registration-failure "
+        "recovery can be surfaced (item 4)"
+    )
+    assert callable(hook)
+    # Invoking the hook logs the failure on the adapter logger (observed, not
+    # swallowed) and never leaks the extension number or any secret.
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        hook("1000", RuntimeError("registrar rejected refresh: 503"))
+    records = [r for r in caplog.records if r.name == "hermes_voip.adapter"]
+    assert records, "on_registration_error must log on the adapter logger"
+    message = " ".join(r.getMessage() for r in records)
+    # rule 34: the extension number is PII — it must not appear verbatim in the log.
+    assert "1000" not in message, "registration-error log must not leak the extension"
+
+
+# ---------------------------------------------------------------------------
+# Regression (item 3, CANCEL teardown): the production adapter must wire
+# on_cancel into the transport, and the handler must abort the half-built call
+# (cancel its setup task) so a CANCELled INVITE leaks no media/CallLoop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_wires_on_cancel_and_it_aborts_the_call_task() -> None:
+    """``_establish`` passes on_cancel; invoking it cancels the call's setup task."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _ConnectOrderTransport()
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+
+    captured: dict[str, object] = {}
+
+    def _capture_transport(*_args: object, **kwargs: object) -> _ConnectOrderTransport:
+        captured.update(kwargs)
+        return transport
+
+    with (
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.SipOverTlsTransport", side_effect=_capture_transport
+        ),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=_FakeManager()),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+
+    on_cancel = captured.get("on_cancel")
+    assert on_cancel is not None, (
+        "the adapter must pass on_cancel so a CANCELled INVITE's setup is aborted"
+    )
+    assert callable(on_cancel)
+
+    # A long-running fake setup task tracked under a Call-ID; on_cancel must cancel
+    # it (the half-built media/CallLoop is torn down on the task's cancellation).
+    call_id = "cancel-me-call"
+
+    async def _never() -> None:
+        await asyncio.Event().wait()  # blocks until cancelled
+
+    task: asyncio.Task[None] = asyncio.ensure_future(_never())
+    adapter._call_tasks.setdefault(call_id, set()).add(task)
+    await asyncio.sleep(0)  # let the task start
+
+    on_cancel(call_id)
+    await asyncio.sleep(0)  # let the cancellation propagate
+    assert task.cancelled() or task.cancelling() > 0, (
+        "on_cancel must cancel the call's in-flight setup task"
+    )
+    # Drain the cancellation so the test leaves no pending task.
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 # ---------------------------------------------------------------------------

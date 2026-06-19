@@ -26,6 +26,7 @@ from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import (
     SipRequest,
     build_request,
+    build_response,
     new_branch,
     new_call_id,
     new_tag,
@@ -186,6 +187,237 @@ def _inbound_invite(*, to_user: str) -> str:
         "Content-Type: application/sdp\r\n"
         "Content-Length: 0\r\n\r\n"
     )
+
+
+# --------------------------------------------------------------------------
+# Inbound CANCEL aborts the pending INVITE (RFC 3261 §9.2)
+# --------------------------------------------------------------------------
+
+
+def _inbound_invite_with(*, to_user: str, call_id: str, branch: str) -> str:
+    return (
+        f"INVITE sip:{to_user}@127.0.0.1:5061;transport=tls SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 203.0.113.5:5061;branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+        f"To: <sip:{to_user}@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Contact: <sip:caller@203.0.113.5:5061;transport=tls>\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _cancel_for(*, to_user: str, call_id: str, branch: str) -> str:
+    # §9.1: same Request-URI/Call-ID/From/To and top Via branch as the INVITE,
+    # CSeq number unchanged but method CANCEL.
+    return (
+        f"CANCEL sip:{to_user}@127.0.0.1:5061;transport=tls SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 203.0.113.5:5061;branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+        f"To: <sip:{to_user}@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 CANCEL\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_inbound_cancel_487s_invite_and_200s_cancel_and_aborts() -> None:
+    # A caller who abandons setup sends CANCEL (RFC 3261 §9.2). The transport must
+    # answer the CANCEL 200 OK, the pending INVITE 487 Request Terminated, and fire
+    # the on_cancel hook (Call-ID) so the adapter tears down the half-built call.
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKcancelme"
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await server.push(
+            _inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1)
+        # The caller now abandons: a CANCEL for the same transaction.
+        await server.push(_cancel_for(to_user="1000", call_id=call_id, branch=branch))
+        # The transport answers the CANCEL 200 OK ...
+        ok = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw,
+            timeout=3.0,
+        )
+        assert "CSeq: 1 CANCEL" in ok
+        # ... and the pending INVITE 487 Request Terminated.
+        terminated = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        assert "CSeq: 1 INVITE" in terminated
+        # ... and the abort hook fired with this call's Call-ID.
+        await _until(lambda: cancelled == [call_id])
+        assert cancelled == [call_id]
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_cancel_suppresses_a_late_200_ok_for_the_dead_invite() -> None:
+    # The core defect: even after CANCEL, the plugin could still 200-OK the dead
+    # INVITE (the answer task may already be in flight). Once an INVITE has been
+    # CANCELled, the transport MUST drop a late 200 OK for that INVITE — the caller
+    # is gone, so answering it would strand a ghost call.
+    new_calls: list[NewCall] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKlate200"
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=lambda _cid: None,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        invite = _inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(invite)
+        await _until(lambda: len(new_calls) == 1)
+        await server.push(_cancel_for(to_user="1000", call_id=call_id, branch=branch))
+        await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        # The adapter's answer task, unaware of the race, now tries to 200 OK the
+        # INVITE. The transport must SUPPRESS it (the call is dead).
+        late_200 = build_response(
+            SipRequest.parse(invite),
+            200,
+            "OK",
+            to_tag=new_tag(),
+            extra_headers=(("Contact", "<sip:1000@127.0.0.1:5061;transport=tls>"),),
+        )
+        await transport.send(late_200)
+        await asyncio.sleep(0.1)
+        # No 200 OK to the INVITE reached the wire (only the 487 did).
+        invite_2xx = [
+            raw
+            for raw in server.received
+            if raw.startswith("SIP/2.0 200") and "CSeq: 1 INVITE" in raw
+        ]
+        assert invite_2xx == [], "a 200 OK for a CANCELled INVITE must be suppressed"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_cancel_for_unknown_invite_is_481() -> None:
+    # RFC 3261 §9.2: a CANCEL that matches no existing INVITE server transaction is
+    # answered 481 Call/Transaction Does Not Exist — never a 200 OK that would imply
+    # a transaction was cancelled.
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=lambda _nc: None,
+        on_cancel=lambda _cid: None,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await server.push(
+            _cancel_for(to_user="1000", call_id="never-seen", branch="z9hG4bKghost")
+        )
+        resp = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 481"), timeout=3.0
+        )
+        assert "CSeq: 1 CANCEL" in resp
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_retransmitted_cancel_is_absorbed_no_second_487_or_abort() -> None:
+    # A retransmitted CANCEL (same branch+Call-ID) must be absorbed: the 200 OK to
+    # the CANCEL is re-sent, but the INVITE is NOT 487'd a second time and the
+    # abort hook fires only once (idempotent RFC 3261 §9.2 — codex finding).
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKretx"
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await server.push(
+            _inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1)
+        cancel = _cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(cancel)
+        await _until(lambda: cancelled == [call_id])
+        await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        # The peer retransmits the CANCEL.
+        await server.push(cancel)
+        await asyncio.sleep(0.1)
+        # Exactly one 487 (the retransmit was absorbed) and one abort.
+        terminated = [raw for raw in server.received if raw.startswith("SIP/2.0 487")]
+        assert len(terminated) == 1, "a retransmitted CANCEL must not re-487 the INVITE"
+        assert cancelled == [call_id], "the abort hook must fire only once"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
 
 
 # --------------------------------------------------------------------------

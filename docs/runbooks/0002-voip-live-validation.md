@@ -297,6 +297,15 @@ auth challenge/response (`401` → `200 OK`) all work. The process then waits fo
   `403` = forbidden / wrong realm; `404` = unknown AOR; `423` = interval too brief, handled
   automatically). The code + reason phrase is the debugging key.
 
+**Once registered, a refresh failure self-heals (ADR-0055).** A periodic refresh `REGISTER`
+that the registrar rejects (`4xx/5xx/6xx`) or never answers no longer silently de-registers
+the extension. The adapter logs a WARNING on `hermes_voip.adapter`
+(`SIP registration error on extension *NN: … — recovering`, the extension redacted to its
+last two digits) and the manager re-`REGISTER`s with bounded exponential backoff (1 s → 30 s,
+±20% jitter) until the registrar accepts again. Watch for that WARNING to spot a flapping
+registrar; a single line that is not followed by recovery (a new `SIP registration
+established` at INFO) means the registrar is persistently rejecting — check credentials/realm.
+
 ## 8. The test call — two-way audio
 
 1. From any phone able to reach the gateway, **dial the registered extension** (the value of

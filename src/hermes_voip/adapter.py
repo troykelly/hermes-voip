@@ -587,6 +587,12 @@ class VoipAdapter(BasePlatformAdapter):
                 ssl_context=tls_ctx,
                 keepalive_interval=self._keepalive_interval,
                 on_new_call=self._on_inbound_invite,
+                # RFC 3261 §9.2: a CANCEL aborts a pending INVITE's setup. The TLS
+                # transport answers the 200/487 itself; this hook tears down the
+                # half-built call. (The WSS transport does not yet route CANCEL —
+                # tracked as a follow-up; over WSS a CANCEL still falls through to
+                # on_unroutable as before.)
+                on_cancel=self._on_cancel,
                 on_unroutable=self._on_unroutable,
                 on_connection_lost=self._on_connection_lost,
             )
@@ -609,6 +615,10 @@ class VoipAdapter(BasePlatformAdapter):
         manager = RegistrationManager(
             gateway_cfg,
             transport,
+            # Surface refresh-keepalive failures (rejected / timed-out / unsendable
+            # REGISTER refresh) so the manager's bounded-backoff recovery is
+            # observable instead of silently swallowed (rule 37).
+            on_registration_error=self._on_registration_error,
         )
         self._manager = manager
         transport.bind_manager(manager)
@@ -3895,6 +3905,40 @@ class VoipAdapter(BasePlatformAdapter):
         else:
             _log.warning("SIP-over-TLS connection closed cleanly — will reconnect")
         self._lost_event.set()
+
+    def _on_cancel(self, call_id: str) -> None:
+        """Abort a CANCELled inbound INVITE's half-built call (RFC 3261 §9.2).
+
+        The transport has already answered the CANCEL ``200 OK`` and the INVITE
+        ``487 Request Terminated`` (and will suppress any 200 OK the setup task
+        races out), so all that remains is to tear down the in-flight setup:
+        cancelling the call's tracked task(s) unwinds whatever media/CallLoop it
+        had built. Mirrors the per-Call-ID cancellation ``disconnect`` performs.
+        """
+        tasks = self._call_tasks.get(call_id)
+        if not tasks:
+            return
+        _log.info("INVITE %s: aborting setup after CANCEL", call_id)
+        for task in tasks:
+            task.cancel()
+
+    def _on_registration_error(self, extension: str, exc: BaseException) -> None:
+        """Surface a per-extension registration-keep-alive failure (never swallow).
+
+        The :class:`RegistrationManager` calls this when a periodic REGISTER
+        refresh is rejected (4xx/5xx/6xx), times out with no response, or cannot
+        be sent — the manager then recovers it with a bounded-backoff re-REGISTER.
+        Logging it at WARNING makes a flapping extension observable (without it the
+        recovery, items 1/2, would have nowhere to report). rule 34: the extension
+        number is sensitive, so only a short redacted tail reaches the log — never
+        the full number, the SIP host, or any credential (the error message is the
+        manager's own, which carries only a status/reason, never secrets).
+        """
+        _log.warning(
+            "SIP registration error on extension *%s: %s — recovering",
+            _redact_number(extension),
+            exc,
+        )
 
     # -----------------------------------------------------------------------
     # Reconnect supervisor

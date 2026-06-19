@@ -1006,6 +1006,105 @@ async def test_comfort_filler_single_phrase_set_does_not_deadlock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_comfort_filler_duplicate_phrases_do_not_spin() -> None:
+    """A multi-entry set with NO distinct alternative must not loop forever.
+
+    Regression (codex finding): with phrases like ("A", "A") the no-immediate-repeat
+    rule has no *distinct* alternative, so a naive ``while choice() == last`` would spin
+    forever once ``last == "A"``. The selector must fall back to the (only distinct)
+    phrase instead of hanging. Runs many draws within a hard timeout so a spin fails
+    loudly rather than wedging the suite.
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("A", "A", "A"),
+        rng=_seeded_rng(3),
+    )
+
+    async def _draw_many() -> list[str]:
+        return [loop._next_comfort_phrase() for _ in range(50)]
+
+    # If the selector spins, this await never returns and the timeout fails the test.
+    draws = await asyncio.wait_for(_draw_many(), timeout=2.0)
+    assert draws == ["A"] * 50
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_synthesis_error_is_logged_and_loop_continues() -> None:
+    """A filler synthesis failure is best-effort: logged, non-fatal, the loop continues.
+
+    Regression (codex finding): the periodic loop must survive a transient filler
+    failure — it logs the error (rule 37: never silently swallowed) and keeps filling on
+    the next interval, rather than the loop dying on one hiccup or the call failing.
+    The first synthesize() raises; the second succeeds, and its audio reaches the wire.
+    """
+    good_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _FlakyTTS(_FakeTTS):
+        """First synthesize() raises; subsequent ones return a normal stream."""
+
+        def __init__(self, frames: list[PcmFrame]) -> None:
+            super().__init__(frames)
+            self._calls = 0
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self._calls += 1
+            if self._calls == 1:
+                raise RuntimeError("synth boom")
+            return super().synthesize(text, voice, sample_rate=sample_rate)
+
+    sleep = _SteppedSleep(steps=2)  # first fire (fails) + second fire (succeeds)
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FlakyTTS([good_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # First iteration: synthesize() raises — must be caught, logged, NOT fatal.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not run_task.done(), "a filler synthesis error wrongly ended the call"
+    assert transport.sent_audio == [], "no audio should have reached the wire yet"
+
+    # Second iteration: a fresh filler succeeds — the loop survived the failure.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert transport.sent_audio == [good_frame], (
+        "the periodic loop did not continue after a transient filler failure"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
 async def test_comfort_filler_off_by_default_emits_nothing() -> None:
     """With the filler OFF (the default), no filler audio and no sleep is scheduled.
 

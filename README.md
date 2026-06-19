@@ -417,9 +417,11 @@ Every one of these has a sensible default — set them only to tune the experien
 | Variable                              | Default            | What it does                                                                 |
 | ------------------------------------- | ------------------ | --------------------------------------------------------------------------- |
 | `HERMES_VOIP_GREETING`                | a friendly line    | What the agent says the instant it answers. Set empty to stay silent on answer. |
-| `HERMES_VOIP_TTS_COMFORT_FILLER`      | `false`            | On a slow reply, play one short natural filler ("Hmm,") so the line doesn't sound dropped. |
-| `HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS` | `900`          | How long a silent gap must last before that filler plays.                    |
-| `HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES` | built-in set    | The filler phrases, `\|`-separated (e.g. `Hmm,\|Let me see,\|One moment,`).    |
+| `HERMES_VOIP_LANGUAGE`                | `en`               | Conversation language; picks the built-in comfort-filler phrase set (English only for now). |
+| `HERMES_VOIP_TTS_COMFORT_FILLER`      | `true`             | On a slow reply, play short natural fillers ("One moment please.") so the line doesn't sound dropped. Set `false` to disable. |
+| `HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS` | `900`          | How long a silent gap must last before the first filler plays.               |
+| `HERMES_VOIP_TTS_COMFORT_FILLER_REPEAT_MS` | `900`         | On a long wait, how often a fresh filler plays after the first (so a 10-second wait isn't mostly silence). |
+| `HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES` | built-in set    | Override the filler phrases, `\|`-separated (one chosen at random per fill, e.g. `One moment please.\|Bear with me.`). |
 | `HERMES_VOIP_BARGE_IN_MODE`           | `gated`            | How the caller interrupts the agent: `gated` (echo-safe), `full` (instant), `off`. |
 | `HERMES_VOIP_RTP_SYMMETRIC`           | `true`             | Auto-latch onto the caller's real audio address (NAT-friendly). Leave on unless your gateway needs the SDP address honoured strictly. |
 | `HERMES_VOIP_RTP_TIMEOUT_SECS`        | `20` (range 1–300) | End a call this many seconds after the audio goes silent (a safety watchdog so a silently-dropped call never hangs forever). |

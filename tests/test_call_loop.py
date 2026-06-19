@@ -18,6 +18,8 @@ All fakes are synchronous; no real timing, threads, or network involved.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import random
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from typing import Final
@@ -550,6 +552,32 @@ class _GatedSleep:
         await self._gate.wait()
 
 
+class _SteppedSleep:
+    """A ``sleep`` seam that releases successive waits one :meth:`step` at a time.
+
+    Unlike :class:`_GatedSleep` (one shared gate that frees every wait at once), this
+    lets a test advance the periodic comfort-filler (ADR-0054) wait-by-wait and count
+    exactly how many fillers fire. Each ``await stepped(delay)`` records the delay then
+    blocks until a :meth:`step` releases it (a permit issued before the wait is honoured
+    immediately). A wait with no pending ``step`` stays blocked, so a runaway loop is
+    caught (it never silently spins). ``steps`` is the number of releases the test
+    intends to issue — recorded only for readability; the actual releasing is via
+    :meth:`step`.
+    """
+
+    def __init__(self, *, steps: int) -> None:
+        self.calls: list[float] = []
+        self.steps = steps
+        self._sem = asyncio.Semaphore(0)
+
+    def step(self) -> None:
+        self._sem.release()
+
+    async def __call__(self, delay: float) -> None:
+        self.calls.append(delay)
+        await self._sem.acquire()
+
+
 class _HoldOpenTransport(_FakeTransport):
     """Transport that delivers preset inbound frames then holds the stream open.
 
@@ -578,6 +606,11 @@ class _HoldOpenTransport(_FakeTransport):
         return _gen()
 
 
+def _seeded_rng(seed: int) -> random.Random:
+    # The comfort-filler RNG is for phrase variety only, never security (ADR-0054).
+    return random.Random(seed)  # noqa: S311 — non-cryptographic; variety, not security
+
+
 def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __init__ plus the filler knobs
     transport: _FakeTransport,
     asr: StreamingASR,
@@ -586,7 +619,9 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
     sleep: Callable[[float], Awaitable[None]],
     comfort_filler: bool = True,
     comfort_filler_delay_ms: int = 900,
+    comfort_filler_repeat_ms: int = 900,
     comfort_filler_phrases: tuple[str, ...] = ("Hmm,",),
+    rng: random.Random | None = None,
     deliver_turn: Callable[[str], Awaitable[None]] | None = None,
 ) -> CallLoop:
     """Build a CallLoop with the comfort filler wired to an injected sleep seam."""
@@ -603,17 +638,21 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
         call_id=_CALL_ID,
         comfort_filler=comfort_filler,
         comfort_filler_delay_ms=comfort_filler_delay_ms,
+        comfort_filler_repeat_ms=comfort_filler_repeat_ms,
         comfort_filler_phrases=comfort_filler_phrases,
+        rng=rng if rng is not None else _seeded_rng(0),
         sleep=sleep,
     )
 
 
 @pytest.mark.asyncio
 async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
-    """When the gap exceeds the delay and no reply has started, one filler plays.
+    """When the gap exceeds the delay and no reply has started, a filler plays.
 
-    The injected sleep is released (the delay 'elapses') while no agent reply has
-    begun, so the filler synthesises exactly one phrase and sends its frames.
+    The injected delay 'elapses' (one stepped wait) while no agent reply has begun, so
+    the filler synthesises one phrase and sends its frames. ADR-0054: the loop would
+    re-fire on the NEXT repeat interval, so the seam releases only the initial delay
+    (the periodic re-fire is covered by its own test); this isolates the first fire.
     """
     delivered: list[str] = []
 
@@ -623,7 +662,7 @@ async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
     filler_frame = PcmFrame(
         samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # only the initial dead-air delay elapses
     transport = _HoldOpenTransport([_silence_frame(0)])
     tts = _FakeTTS([filler_frame, filler_frame])
     loop = _comfort_loop(
@@ -645,7 +684,7 @@ async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
     assert delivered == ["hello there"]
 
     # The delay elapses with no reply: the filler must synthesise + send.
-    sleep.release()
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
         if transport.sent_audio:
@@ -708,7 +747,7 @@ async def test_comfort_filler_uses_configured_phrase_text() -> None:
     filler_frame = PcmFrame(
         samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # only the first fire (periodic re-fire: own test)
     transport = _HoldOpenTransport([_silence_frame(0)])
     tts = _CapturingTTS([filler_frame])
     loop = _comfort_loop(
@@ -724,7 +763,7 @@ async def test_comfort_filler_uses_configured_phrase_text() -> None:
         await asyncio.sleep(0)
         if sleep.calls:
             break
-    sleep.release()
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
         if transport.sent_audio:
@@ -793,23 +832,78 @@ async def test_comfort_filler_does_not_fire_when_reply_starts_first() -> None:
 
 
 @pytest.mark.asyncio
-async def test_comfort_filler_fires_at_most_once_per_gap() -> None:
-    """Only ONE filler is emitted per turn gap — never a 'hmm hmm hmm' loop.
+async def test_comfort_filler_fires_periodically_on_sustained_gap() -> None:
+    """On a SUSTAINED dead-air gap the filler re-fires every repeat interval (ADR-0054).
 
-    Even after the delay elapses and the filler plays, the gap does not re-arm
-    while still waiting: the filler task fires once and returns.
+    A single ~1 s phrase does not fill a 10 s LLM wait, so once the delay elapses with
+    no reply the filler emits one phrase, then keeps re-emitting a fresh phrase every
+    ``comfort_filler_repeat_ms`` until the reply audio starts (or a barge-in/teardown
+    cancels it). This replaces the old one-shot ("at most once per gap") behaviour; the
+    change is recorded in ADR-0054.
     """
     filler_frame = PcmFrame(
         samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
-    sleep = _GatedSleep()
+    # One frame per synthesis, so #sent frames == #fillers fired.
+    sleep = _SteppedSleep(steps=3)  # the initial delay + two repeat intervals
     transport = _HoldOpenTransport([_silence_frame(0)])
-    # Provide many frames so a re-fire would visibly send more than one phrase's
-    # worth; one fire sends exactly the two frames of a single synthesis.
-    tts = _FakeTTS([filler_frame, filler_frame])
+    tts = _FakeTTS([filler_frame])
     loop = _comfort_loop(
         transport,
         _FakeASR([("slow question", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_delay_ms=900,
+        comfort_filler_repeat_ms=900,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    # Let all three gated waits elapse (delay + 2 repeats), pumping between each.
+    for _ in range(3):
+        sleep.step()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(transport.sent_audio) >= 3:
+                break
+
+    assert len(transport.sent_audio) == 3, (
+        "the filler did not re-fire periodically on a sustained gap; "
+        f"sent={len(transport.sent_audio)} frames, sleeps={sleep.calls!r}"
+    )
+    # The loop awaited the initial delay then a repeat interval after EACH fire (all
+    # 0.9 s here): delay + 3 repeats recorded — the 4th repeat wait is the one the loop
+    # is now parked on, blocked (no further step), proving it did not free-run.
+    assert sleep.calls == [0.9, 0.9, 0.9, 0.9], (
+        f"unexpected periodic wait schedule: {sleep.calls!r}"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_periodic_skips_iterations_while_audio_active() -> None:
+    """Each periodic iteration re-checks dead air; no fire while audio is active.
+
+    ADR-0054 preserves the ADR-0030 guard PER ITERATION, not just the first one. After
+    one filler fires, agent audio becomes active on the wire (a reply that has not yet
+    cancelled the task, or a still-playing prior stream); the NEXT repeat-interval check
+    must see ``_tts_audio_active`` and skip — no filler over live audio. When the audio
+    later clears, a later iteration fires again (the loop is alive until cancelled).
+    """
+    filler_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=3)
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([filler_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow", True, True)]),
         tts,
         sleep=sleep,
     )
@@ -819,16 +913,191 @@ async def test_comfort_filler_fires_at_most_once_per_gap() -> None:
         await asyncio.sleep(0)
         if sleep.calls:
             break
-    sleep.release()
-    # Pump the loop generously; a looping filler would keep scheduling sleeps.
-    for _ in range(40):
+    # First iteration: dead air → one filler fires.
+    sleep.step()
+    for _ in range(20):
         await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert len(transport.sent_audio) == 1, "first periodic filler did not fire"
 
-    assert transport.sent_audio == [filler_frame, filler_frame], (
-        "the comfort filler fired more than once for a single gap"
+    # Simulate agent audio now on the wire (e.g. a reply mid-flight). The next iteration
+    # must SKIP rather than speak over it.
+    loop._tts_audio_active = True
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(transport.sent_audio) == 1, (
+        "a filler fired while agent audio was active (per-iteration guard failed)"
     )
-    assert len(sleep.calls) == 1, (
-        f"the filler re-scheduled its delay (looped); sleeps={sleep.calls!r}"
+
+    # The audio clears; the still-alive loop fires again on the following iteration.
+    loop._tts_audio_active = False
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(transport.sent_audio) >= 2:
+            break
+    assert len(transport.sent_audio) == 2, (
+        "the periodic loop did not resume firing after the audio cleared"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_selects_phrases_randomly_no_immediate_repeat() -> None:
+    """Phrase selection is RANDOM and never repeats the immediately-previous phrase.
+
+    ADR-0054 replaces the deterministic round-robin with random selection (so a
+    multi-gap / periodic call does not sound mechanically cyclic), with the one
+    guarantee that no phrase is spoken twice in a row. This drives
+    ``_next_comfort_phrase`` directly over many draws with a seeded RNG: every
+    adjacent pair differs, and — given enough draws — it is not a fixed rotation.
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    phrases = ("A", "B", "C", "D")
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=phrases,
+        rng=_seeded_rng(1234),
+    )
+
+    draws = [loop._next_comfort_phrase() for _ in range(200)]
+    assert set(draws) <= set(phrases)
+    assert set(draws) == set(phrases), "not all phrases were ever chosen (not random)"
+    # No phrase is ever immediately repeated.
+    assert all(a != b for a, b in itertools.pairwise(draws)), (
+        "a filler phrase repeated immediately (must avoid back-to-back repeats)"
+    )
+    # Not a fixed round-robin: a deterministic rotation would make
+    # draws[i + period] == draws[i] for all i; assert it is not perfectly periodic.
+    period = len(phrases)
+    assert any(draws[i] != draws[i + period] for i in range(len(draws) - period)), (
+        "selection looks like a fixed rotation, not random"
+    )
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_single_phrase_set_does_not_deadlock() -> None:
+    """A one-phrase set must still work (no-immediate-repeat cannot starve it).
+
+    With only one phrase the 'avoid an immediate repeat' rule has no alternative, so
+    the selector must return it rather than loop forever seeking a different phrase.
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("only one,",),
+        rng=_seeded_rng(7),
+    )
+    assert [loop._next_comfort_phrase() for _ in range(5)] == ["only one,"] * 5
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_duplicate_phrases_do_not_spin() -> None:
+    """A multi-entry set with NO distinct alternative must not loop forever.
+
+    Regression (codex finding): with phrases like ("A", "A") the no-immediate-repeat
+    rule has no *distinct* alternative, so a naive ``while choice() == last`` would spin
+    forever once ``last == "A"``. The selector must fall back to the (only distinct)
+    phrase instead of hanging. Runs many draws within a hard timeout so a spin fails
+    loudly rather than wedging the suite.
+    """
+    sleep = _GatedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FakeTTS([_silence_frame(0)])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("hi", True, True)]),
+        tts,
+        sleep=sleep,
+        comfort_filler_phrases=("A", "A", "A"),
+        rng=_seeded_rng(3),
+    )
+
+    async def _draw_many() -> list[str]:
+        return [loop._next_comfort_phrase() for _ in range(50)]
+
+    # If the selector spins, this await never returns and the timeout fails the test.
+    draws = await asyncio.wait_for(_draw_many(), timeout=2.0)
+    assert draws == ["A"] * 50
+
+
+@pytest.mark.asyncio
+async def test_comfort_filler_synthesis_error_is_logged_and_loop_continues() -> None:
+    """A filler synthesis failure is best-effort: logged, non-fatal, the loop continues.
+
+    Regression (codex finding): the periodic loop must survive a transient filler
+    failure — it logs the error (rule 37: never silently swallowed) and keeps filling on
+    the next interval, rather than the loop dying on one hiccup or the call failing.
+    The first synthesize() raises; the second succeeds, and its audio reaches the wire.
+    """
+    good_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+
+    class _FlakyTTS(_FakeTTS):
+        """First synthesize() raises; subsequent ones return a normal stream."""
+
+        def __init__(self, frames: list[PcmFrame]) -> None:
+            super().__init__(frames)
+            self._calls = 0
+
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self._calls += 1
+            if self._calls == 1:
+                raise RuntimeError("synth boom")
+            return super().synthesize(text, voice, sample_rate=sample_rate)
+
+    sleep = _SteppedSleep(steps=2)  # first fire (fails) + second fire (succeeds)
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _FlakyTTS([good_frame])
+    loop = _comfort_loop(
+        transport,
+        _FakeASR([("slow", True, True)]),
+        tts,
+        sleep=sleep,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+
+    # First iteration: synthesize() raises — must be caught, logged, NOT fatal.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not run_task.done(), "a filler synthesis error wrongly ended the call"
+    assert transport.sent_audio == [], "no audio should have reached the wire yet"
+
+    # Second iteration: a fresh filler succeeds — the loop survived the failure.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if transport.sent_audio:
+            break
+    assert transport.sent_audio == [good_frame], (
+        "the periodic loop did not continue after a transient filler failure"
     )
 
     transport.close_inbound()
@@ -1031,7 +1300,7 @@ async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None
                 await self.first_send_gate.wait()
             self.sent_audio.append(frame)
 
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # one fire, which parks on the blocked send_audio
     transport = _BlockingHoldOpenTransport([_silence_frame(0)])
     tts = _FakeTTS([filler_frame, filler_frame])
     loop = _comfort_loop(
@@ -1046,8 +1315,9 @@ async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None
         await asyncio.sleep(0)
         if sleep.calls:
             break
-    # Release the delay; the filler fires and parks inside _play on the send gate.
-    sleep.release()
+    # Elapse the delay; the filler fires and parks inside _play on the send gate. The
+    # periodic loop never reaches its repeat wait (the first send blocks).
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
     # White-box assertion: the filler task handle is kept for the task's whole life
@@ -1121,7 +1391,7 @@ async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None
             self.last_stream = stream
             return stream
 
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # one delay elapses while the greeting is active
     transport = _HoldOpenTransport([_silence_frame(0)])
     tts = _GreetingTTS([greet_frame], [filler_frame])
     loop = CallLoop(
@@ -1151,8 +1421,10 @@ async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None
     assert sleep.calls, "filler did not schedule"
     assert transport.sent_audio == [greet_frame], "greeting audio should be active"
 
-    # The delay elapses while the greeting audio is STILL active → no filler.
-    sleep.release()
+    # The delay elapses while the greeting audio is STILL active → no filler. The
+    # periodic loop's per-iteration guard skips this iteration (audio active) and parks
+    # on the repeat wait (no further step), so no filler is ever emitted here.
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
     assert transport.sent_audio == [greet_frame], (

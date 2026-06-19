@@ -567,12 +567,19 @@ def test_media_defaults_when_env_empty() -> None:
     assert cfg.aec_filter_ms == 64
     assert cfg.aec_bulk_delay_ms == 0
     assert cfg.aec_mu == pytest.approx(0.30)
-    # dead-air comfort filler (ADR-0030): OFF by default — today's behaviour
-    # exactly; the delay and phrases carry the documented defaults but are inert
-    # while the master switch is off.
-    assert cfg.comfort_filler is False
+    # dead-air comfort filler (ADR-0030, extended ADR-0054): ON by default now —
+    # the operator wants a slow turn to never leave the caller in silence. The delay
+    # is the dead-air threshold AND the periodic repeat interval; the phrases default
+    # to the selected language's built-in set (English here, the default language).
+    assert cfg.comfort_filler is True
     assert cfg.comfort_filler_delay_ms == 900
-    assert cfg.comfort_filler_phrases == ("Hmm,", "Let me see,", "One moment,")
+    assert cfg.comfort_filler_repeat_ms == 900
+    assert cfg.language == "en"
+    # The English default set is richer than the original three (random, no-immediate
+    # -repeat selection wears better with more variety); these members must be present.
+    assert "One moment please." in cfg.comfort_filler_phrases
+    assert "Just a moment." in cfg.comfort_filler_phrases
+    assert all(p.strip() for p in cfg.comfort_filler_phrases)
     # injection guard
     assert cfg.injection_guard == "onnx"
     assert cfg.injection_guard_model_dir is None
@@ -865,23 +872,60 @@ def test_media_comfort_filler_on_and_overrides() -> None:
     assert cfg.comfort_filler_phrases == ("uh,", "let me check,", "hold on,")
 
 
-def test_media_comfort_filler_default_off_with_default_delay_and_phrases() -> None:
-    """Unset → OFF, with the documented default delay and built-in phrase set."""
+def test_media_comfort_filler_default_on_with_default_delay_and_phrases() -> None:
+    """Unset → ON (ADR-0054), with the default delay/repeat and English phrase set."""
     cfg = load_media_config({})
-    assert cfg.comfort_filler is False
+    assert cfg.comfort_filler is True
     assert cfg.comfort_filler_delay_ms == 900
-    assert cfg.comfort_filler_phrases == ("Hmm,", "Let me see,", "One moment,")
+    assert cfg.comfort_filler_repeat_ms == 900
+    assert cfg.language == "en"
+    assert "One moment please." in cfg.comfort_filler_phrases
 
 
-def test_media_comfort_filler_blank_phrases_fall_back_to_default() -> None:
-    """A blank phrase override collapses to the built-in default set, not empty."""
+def test_media_comfort_filler_can_be_disabled() -> None:
+    """The operator can still turn the filler OFF explicitly (per ADR-0054)."""
+    cfg = load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER": "false"})
+    assert cfg.comfort_filler is False
+
+
+def test_media_comfort_filler_repeat_ms_override_and_validation() -> None:
+    """The periodic repeat interval is overridable and must be positive (ADR-0054)."""
+    cfg = load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER_REPEAT_MS": "1500"})
+    assert cfg.comfort_filler_repeat_ms == 1500
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TTS_COMFORT_FILLER_REPEAT_MS": "0"})
+
+
+def test_media_language_selects_phrase_set_and_is_validated() -> None:
+    """HERMES_VOIP_LANGUAGE selects the phrase set; an unknown code fails (ADR-0054)."""
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "EN"})  # case-insensitive
+    assert cfg.language == "en"
+    assert "One moment please." in cfg.comfort_filler_phrases
+    with pytest.raises(ConfigError, match="HERMES_VOIP_LANGUAGE"):
+        load_media_config({"HERMES_VOIP_LANGUAGE": "zz"})
+
+
+def test_media_comfort_filler_explicit_phrases_override_language_default() -> None:
+    """An explicit phrase set wins over the language's built-in default (ADR-0054)."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_LANGUAGE": "en",
+            "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES": "uh,|hold on,",
+        }
+    )
+    assert cfg.comfort_filler_phrases == ("uh,", "hold on,")
+
+
+def test_media_comfort_filler_blank_phrases_fall_back_to_language_default() -> None:
+    """A blank phrase override collapses to the language's built-in set, not empty."""
     cfg = load_media_config(
         {
             "HERMES_VOIP_TTS_COMFORT_FILLER": "on",
             "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES": "   ",
         }
     )
-    assert cfg.comfort_filler_phrases == ("Hmm,", "Let me see,", "One moment,")
+    assert "One moment please." in cfg.comfort_filler_phrases
+    assert all(p.strip() for p in cfg.comfort_filler_phrases)
 
 
 def test_media_comfort_filler_phrases_trims_and_drops_empty_members() -> None:

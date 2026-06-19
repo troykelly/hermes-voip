@@ -1635,13 +1635,16 @@ class CallLoop:
                 await self._speak_phrase_best_effort(phrase, what="reprompt")
                 continue
             # The reprompt budget is spent and the caller is still silent: wind up the
-            # call gracefully (a spoken goodbye if enabled), then stop.
+            # call gracefully (a spoken goodbye if enabled), then stop — UNLESS the
+            # caller barges in during the goodbye (it plays on a live media path), in
+            # which case the end aborts and the cycle resumes (the caller is back).
             _log.info(
                 "no-input: caller silent after %d reprompt(s); ending the call",
                 reprompts_sent,
             )
-            await self._end_call_gracefully()
-            return
+            if await self._end_call_gracefully():
+                return
+            reprompts_sent = 0
 
     async def _speak_phrase_best_effort(self, phrase: str, *, what: str) -> None:
         """Speak one short ``phrase`` through the normal TTS path; best-effort.
@@ -1669,8 +1672,8 @@ class CallLoop:
                 exc_info=True,
             )
 
-    async def _end_call_gracefully(self) -> None:
-        """Speak the goodbye (if enabled), flush it, then signal the pump to wind up.
+    async def _end_call_gracefully(self) -> bool:
+        """Speak the goodbye (if on), then commit the end unless the caller answered.
 
         The loop-initiated graceful end (ADR-0057). The goodbye is spoken and fully
         flushed to ``send_audio`` (``_speak_text`` returns only once the stream is
@@ -1679,12 +1682,26 @@ class CallLoop:
         :meth:`run` returns. Setting :attr:`_end_call` makes the pump break out of its
         inbound loop and emit the end-of-stream marker, so ``run`` returns CLEANLY (a
         normal end, not a ``/stop``). The goodbye is best-effort: a failure is logged
-        and the call still ends cleanly (a missing goodbye must never strand the call).
+        and does not strand the call (a missing goodbye must never block the end).
+
+        Because the goodbye plays on a LIVE media path, the caller can still barge in
+        during it (codex review). If they do — ``_caller_active_in_window`` is set by
+        :meth:`barge_in` — the caller is engaging, so the end is ABORTED: we do NOT set
+        :attr:`_end_call`, we consume the flag, and return ``False`` so the watchdog
+        resumes the reprompt cycle. Read-then-clear with no await between, so the check
+        cannot miss a concurrent set. Returns ``True`` when the end is committed.
         """
         if self._goodbye and self._goodbye_phrase:
             _log.info("no-input: speaking goodbye before end: %r", self._goodbye_phrase)
             await self._speak_phrase_best_effort(self._goodbye_phrase, what="goodbye")
+        # The goodbye played on a live media path: if the caller spoke during it, abort
+        # the end and let the watchdog resume (the caller is back). Consume the flag.
+        if self._caller_active_in_window:
+            self._caller_active_in_window = False
+            _log.info("no-input: caller answered during the goodbye; aborting the end")
+            return False
         self._end_call.set()
+        return True
 
     async def _play(
         self,

@@ -78,12 +78,20 @@ and the loop continues (rule 37); `CancelledError` (teardown) is the normal stop
 ### 2. Spoken goodbye before BYE, on a loop-initiated graceful end only
 
 `_end_call_gracefully` speaks `goodbye_phrase` via `_speak_text` and lets it **fully flush**
-(`_speak_text` returns only once the stream is drained) **before** setting a new
-`asyncio.Event` `_end_call`. The pump checks `_end_call.is_set()` at the top of its inbound
-`async for` and `break`s to its existing end-of-stream-marker emission, so the chain drains
-and `run()` returns **cleanly** — a normal `REMOTE_BYE` end, never a raise. The goodbye is
-therefore the last audio on the wire while the media path is still live (the adapter stops the
-engine only after `run()` returns).
+(`_speak_text` returns only once the stream is drained), then sets a new `asyncio.Event`
+`_end_call` **unless** the caller barged in during the goodbye. The pump checks
+`_end_call.is_set()` at the top of its inbound `async for` and `break`s to its existing
+end-of-stream-marker emission, so the chain drains and `run()` returns **cleanly** — a normal
+`REMOTE_BYE` end, never a raise. The goodbye is therefore the last audio on the wire while the
+media path is still live (the adapter stops the engine only after `run()` returns).
+
+Because the goodbye plays on a **live** media path, a late-engaging caller can still barge in
+during it. `_end_call_gracefully` re-checks `_caller_active_in_window` after the goodbye
+(read-then-clear, no `await` between, so a concurrent set is not missed): if the caller spoke,
+the end is **aborted** (`_end_call` is NOT set), the flag is consumed, and the watchdog
+resets the reprompt cycle and resumes. Setting `_end_call` is the **point of no return** — a
+barge-in in the ~1-frame window between `_end_call.set()` and the pump observing it is too late
+(teardown is in motion); that residual window is accepted, not papered over.
 
 The goodbye fires **only** on this loop-initiated end (the no-input limit). A caller-hangup /
 inbound-EOS / error end is driven from *outside* the loop (the transport closes / the pipeline

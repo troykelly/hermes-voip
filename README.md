@@ -329,11 +329,13 @@ What is built and working today:
   and a backup voice that takes over if a cloud voice fails mid-call so the caller never hears
   dead silence.
 
-> **On the roadmap (not yet — don't rely on these):** **outbound** WebRTC calls (your agent
-> placing a WebRTC call) run over SIP-over-TLS today; WebRTC **video** is deferred. (SIP
-> signalling over **Secure-WebSocket** for *inbound* WebRTC is now wired — set
-> `HERMES_SIP_TRANSPORT=wss`; full live validation needs your gateway's WSS port +
-> credential.) The current state of each is tracked in [`docs/adr/`](docs/adr/).
+> **Now shipped (was roadmap):** **outbound** WebRTC origination (your agent placing a
+> WebRTC/Opus call over Secure-WebSocket) is wired (ADR-0049), and **WebRTC video** —
+> a pre-encoded outbound video stream, inbound discarded — ships too (ADR-0044). SIP
+> signalling over **Secure-WebSocket** for *inbound* WebRTC is wired as well (set
+> `HERMES_SIP_TRANSPORT=wss`). These paths still want **full live validation** against your
+> own gateway (its WSS port + credential, a real WebRTC client); the current state of each is
+> tracked in [`docs/adr/`](docs/adr/).
 
 ---
 
@@ -440,12 +442,14 @@ You sort callers into named groups, each with a privilege level:
   greet, help, take a message. It cannot be talked into anything more, even if the caller
   insists.
 - **Trusted (level 2)** — adds everyday call controls (like hold/resume).
-- **Operator (level 3)** — your own tier; adds the powerful, irreversible actions (today:
-  placing an outbound call). Even here it's not a free pass: outbound calling only runs on a
-  healthy session and is hard-gated by the `HERMES_VOIP_OUTBOUND_ALLOW` allow-list you control —
-  being in the operator tier is the *ceiling*, not the trigger. (Call **transfer** is not
-  available yet; it's waiting on a spoof-resistant confirmation channel — see the roadmap note
-  above.)
+- **Operator (level 3)** — your own tier; adds the powerful, irreversible actions: placing an
+  outbound call, and transferring a call (**blind** and **attended**). Even here it's not a free
+  pass: outbound calling only runs on a healthy session and is hard-gated by the
+  `HERMES_VOIP_OUTBOUND_ALLOW` allow-list you control — being in the operator tier is the
+  *ceiling*, not the trigger. A **blind transfer** fires only when the person on the call presses
+  the live keypad confirm digit (a spoof-resistant DTMF channel — a wrong digit or a timeout
+  transfers nobody); an **attended** transfer's consult leg is gated by the same outbound
+  allow-list.
 
 Because phone numbers are personal data, the lists live in **gitignored files** that you point
 at by **path** — you never put numbers in the committed config. Point one variable at a single

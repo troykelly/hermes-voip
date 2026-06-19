@@ -1,7 +1,9 @@
 # ADR-0010: DTMF: RFC 4733 telephone-event primary, SIP INFO fallback, in-band last resort
 
 - **Date:** 2026-06-14
-- **Status:** Accepted
+- **Status:** Accepted (amended by ADR-0036 — ships the SIP INFO + in-band Goertzel
+  mechanisms, send + receive, that this record deferred; `HERMES_SIP_DTMF_MODE` accepts
+  all four values)
 - **Deciders:** agent session (VoIP architecture, post-research)
 
 ## Context
@@ -156,8 +158,11 @@ Concrete shape:
   > in `hermes_voip.dtmf_sipinfo` (handled in-dialog by `CallSession`), and the in-band
   > Goertzel detector + tone generator live in `hermes_voip.dtmf` (engine-wired, G.711
   > only). All three mechanisms feed the same `CallLoop.feed_dtmf` router.
-  > **Attended transfer remains DEFERRED** (ADR-0031 §4: no agent-driven consult-leg
-  > Dialog origination), so `transfer_attended` stays not-registered.
+  > **Attended transfer is now SHIPPED too** (ADR-0048, which lifts ADR-0031 §4's
+  > "no agent-driven consult-leg Dialog origination" deferral): `transfer_attended` is a
+  > registered IRREVERSIBLE agent tool driving a consult → complete/cancel state machine
+  > (the consult leg is a new outbound leg, gated by the same `HERMES_VOIP_OUTBOUND_ALLOW`
+  > allowlist as `place_call`).
 
 - **Surfacing inbound digits — no fake transcript.** Because Hermes has no DTMF
   `MessageType`, the call/turn controller (ADR-0003) consumes the `DtmfDigit` stream

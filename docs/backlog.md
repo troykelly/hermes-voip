@@ -144,20 +144,21 @@ defect or a load-bearing test gap; it is **not** a claim that the foundation is 
 
 ## src/hermes_voip/sdp.py
 
-- [ ] **[high] api** — `build_audio_offer` cannot produce an SRTP/SAVP answer — no protocol/crypto
-  support. Hard-codes `m=audio … RTP/AVP` (line 289), emits no `a=crypto`. ADR-0005 makes SDES-SRTP a
-  *preferred* profile and the parser already round-trips `a=crypto` into `AudioMedia.crypto`, so the
-  plugin can parse an SAVP offer yet cannot build the SAVP/SDES answer. Add keyword-only
-  `protocol`/`crypto` params; validate protocol; emit `m=` proto + `a=crypto` lines; build→parse
-  round-trip test asserting `is_srtp` and `crypto` survive.
+- [x] **[high] api** — `build_audio_offer` / `build_audio_answer` can now produce an SRTP/SAVP
+  answer (RESOLVED, ADR-0053 Stage 1). Both take keyword-only `crypto` and emit `m=audio … RTP/SAVP`
+  + an `a=crypto` line; `build_audio_answer` (`sdp.py`) mints our own answer key via
+  `generate_answer_crypto` / `_negotiate_answer_crypto` and is wired into `adapter.py` for an
+  `RTP/SAVP` offer (a plain `RTP/AVP` offer is still answered plain). Round-trip + adapter tests
+  cover `is_srtp` / `crypto` survival.
 - [ ] **[medium] correctness** — Opus / preference-ordered offer is unreachable through the builder.
   `negotiate_audio` selects in *offer* order (lines 220-240) with no notion of *our* preference, so a
   gateway offering PCMU-then-Opus keeps PCMU first, violating ADR-0005's "prefer Opus when offered".
   Order the result by the caller's `supported` order, or add `prefer: Sequence[str]`; document which wins
   (RFC 3264 lets the answerer reorder).
-- [ ] **[medium] api** — No companion `build_audio_answer` (parse offer → negotiate → build answer with
-  reciprocal direction + echoed/keyed crypto). Each future caller re-derives RFC 3264 reciprocity by
-  hand — where interop bugs live. Add `build_audio_answer(offer, *, local_address, port, chosen, …)`.
+- [x] **[medium] api** — Companion `build_audio_answer` now exists (RESOLVED, ADR-0053 Stage 1):
+  `build_audio_answer` in `sdp.py` parses the offer → negotiates → builds the answer with reciprocal
+  direction + keyed crypto, so callers no longer re-derive RFC 3264 reciprocity by hand. Wired in
+  `adapter.py`.
 - [ ] **[medium] robustness** — Parser accepts negative/zero ports and negative ptime silently.
   Verified: `m=audio -5 RTP/AVP 0` → port `-5`; `a=ptime:-3` → ptime `-3`. The *builder* validates these
   but the *parser* (hostile inbound data) does not. Validate port range and `ptime>0` on parse → `SdpError`;

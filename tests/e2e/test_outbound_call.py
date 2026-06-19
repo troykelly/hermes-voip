@@ -20,6 +20,7 @@ These tests fail until adapter.py + originate.py are implemented.
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
@@ -885,5 +886,240 @@ async def test_call_on_connect_trigger() -> None:
                 await gateway._server.push(bye)
                 await _until(lambda: call_id not in adapter._call_sessions, timeout=5.0)
 
+    finally:
+        await gateway.stop()
+
+
+# ---------------------------------------------------------------------------
+# ADR-0066: outbound SDES-SRTP offering on place_call.
+#
+# Today the outbound INVITE offers PLAIN RTP/AVP (srtp_*=None + build_audio_offer
+# with no crypto=), while the inbound answer path negotiates SDES — an asymmetry.
+# These RED tests assert the opt-in offer (HERMES_VOIP_SIP_SDES_OFFER) makes the
+# outbound INVITE offer RTP/SAVP + a=crypto, that a secured answer brings the engine
+# up secured (RFC 4568 §6.1 sender-keying), and that a PLAIN answer to our SAVP offer
+# FAILS the call (fail-closed — never a silent plaintext downgrade).
+#
+# The fake SDES key the gateway answers with is computed at runtime (sequential bytes
+# 0..29 → base64) so no high-entropy key literal appears in this file (the gitleaks
+# allowlist is path-scoped to tests/test_sdp.py).
+# ---------------------------------------------------------------------------
+
+_GATEWAY_ANSWER_SDES_KEY = base64.b64encode(bytes(range(30))).decode("ascii")
+
+
+def _crypto_line_of(invite: SipRequest) -> str | None:
+    """Return the single ``a=crypto:`` line body of an INVITE SDP offer, or None."""
+    for line in (invite.body or "").splitlines():
+        if line.startswith("a=crypto:"):
+            return line[len("a=crypto:") :]
+    return None
+
+
+class _SrtpAnsweringGateway(OutboundGateway):
+    """Gateway that answers the plugin's INVITE with an SDES ``RTP/SAVP`` SDP.
+
+    Echoes the offered crypto's tag/suite but with the gateway's OWN key (RFC 4568
+    §6.1 — each side keys with its own key). The plugin must encrypt outbound with
+    its own offer key and decrypt inbound with THIS answer key.
+    """
+
+    def _sdp_answer(self) -> str:
+        rtp_port = self.rtp.port
+        return (
+            "v=0\r\n"
+            "o=- 8000 8000 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 127.0.0.1\r\n"
+            "t=0 0\r\n"
+            f"m=audio {rtp_port} RTP/SAVP 0 8 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=fmtp:101 0-16\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}\r\n"
+            "a=ptime:20\r\n"
+            "a=sendrecv\r\n"
+        )
+
+
+async def test_outbound_offer_is_plain_rtp_avp_by_default() -> None:
+    """Default (flag unset): the outbound INVITE offers PLAIN RTP/AVP, no a=crypto.
+
+    Regression guard for the safe default — turning SDES offering ON is opt-in
+    (ADR-0066), so an unconfigured deployment keeps offering cleartext exactly as
+    today (the live-validated default). This already passes on main; it locks the
+    default so the GREEN change cannot silently flip it.
+    """
+    gateway = OutboundGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            first_invite = await gateway.await_invite_from_plugin(timeout=5.0)
+            assert "m=audio" in (first_invite.body or "")
+            assert "RTP/AVP" in (first_invite.body or ""), (
+                f"default offer is not plain RTP/AVP; body:\n{first_invite.body}"
+            )
+            assert "RTP/SAVP" not in (first_invite.body or ""), (
+                f"default offer wrongly advertises SAVP; body:\n{first_invite.body}"
+            )
+            assert _crypto_line_of(first_invite) is None, (
+                f"default offer wrongly carries a=crypto; body:\n{first_invite.body}"
+            )
+
+            # Drain the flow so the adapter tears down cleanly.
+            await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth INVITE
+            await gateway.await_ack_from_plugin(timeout=5.0)
+            call_id = await asyncio.wait_for(place_task, timeout=5.0)
+            await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_offer_advertises_savp_and_crypto() -> None:
+    """Flag ON: the outbound INVITE offers RTP/SAVP with exactly one a=crypto.
+
+    RED on main (the offer is always plain RTP/AVP — build_audio_offer is called with
+    no crypto=). After ADR-0066 the opt-in flag makes the INVITE offer SDES-SRTP with
+    a fresh per-call AES_CM_128_HMAC_SHA1_80 key.
+    """
+    gateway = _SrtpAnsweringGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    extra = {"HERMES_VOIP_SIP_SDES_OFFER": "true"}
+    try:
+        async with _real_adapter(
+            gateway, providers=providers, extra_env=extra
+        ) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            first_invite = await gateway.await_invite_from_plugin(timeout=5.0)
+            body = first_invite.body or ""
+            assert "m=audio" in body, f"offer has no audio m-line; body:\n{body}"
+            assert "RTP/SAVP" in body, (
+                f"opt-in outbound offer is not RTP/SAVP; body:\n{body}"
+            )
+            assert body.count("a=crypto:") == 1, (
+                f"expected exactly one a=crypto in the offer; body:\n{body}"
+            )
+            crypto = _crypto_line_of(first_invite)
+            assert crypto is not None
+            assert "AES_CM_128_HMAC_SHA1_80 inline:" in crypto, (
+                f"offer crypto is not the preferred suite; line: {crypto}"
+            )
+            # Our offer key must be OUR OWN, never the gateway's answer key.
+            assert _GATEWAY_ANSWER_SDES_KEY not in crypto, (
+                "outbound offer leaked the gateway's answer key into our offer"
+            )
+
+            # The re-auth re-send MUST carry the SAME offer body (same a=crypto), so
+            # the key we keyed the engine with matches what the gateway sees.
+            second_invite = await gateway.await_invite_from_plugin(timeout=5.0)
+            assert _crypto_line_of(second_invite) == crypto, (
+                "re-auth INVITE offered a different a=crypto than the first INVITE"
+            )
+
+            await gateway.await_ack_from_plugin(timeout=5.0)
+            call_id = await asyncio.wait_for(place_task, timeout=5.0)
+            await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_secured_answer_brings_engine_up_secured() -> None:
+    """Flag ON + SRTP answer: the engine comes up SECURED in BOTH directions.
+
+    RFC 4568 §6.1: we encrypt outbound with our offer key and decrypt inbound with the
+    gateway's answer key, so both _srtp_out and _srtp_in are set. RED on main (no
+    a=crypto offered, the 2xx a=crypto is ignored, the engine stays cleartext).
+    """
+    gateway = _SrtpAnsweringGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    extra = {"HERMES_VOIP_SIP_SDES_OFFER": "true"}
+    try:
+        async with _real_adapter(
+            gateway, providers=providers, extra_env=extra
+        ) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+            await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+            await gateway.await_ack_from_plugin(timeout=5.0)
+            call_id = await asyncio.wait_for(place_task, timeout=5.0)
+
+            await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+            session = adapter._call_sessions[call_id]
+            engine = session._media
+            assert isinstance(engine, RtpMediaTransport)
+            # SECURED both ways: outbound encrypt + inbound decrypt SRTP sessions.
+            assert engine._srtp_out is not None, (
+                "outbound SRTP not keyed — the call streams cleartext despite the "
+                "SAVP offer/answer"
+            )
+            assert engine._srtp_in is not None, (
+                "inbound SRTP not keyed — we cannot decrypt the gateway's media"
+            )
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_plain_answer_fails_closed() -> None:
+    """Flag ON + the peer answers PLAIN RTP/AVP to our SAVP offer → the call FAILS.
+
+    Fail-closed (ADR-0066): accepting a cleartext answer to an encrypted offer would
+    silently stream plaintext for a call we asked to protect — a bid-down. The call
+    must raise OutboundCallFailed and leave NO secured/cleartext call running. RED on
+    main (the answer's profile/crypto is ignored, so a plain answer is accepted and the
+    engine streams cleartext).
+    """
+    # The base OutboundGateway answers plain RTP/AVP; with the flag on we OFFERED SAVP,
+    # so this plain answer is the downgrade case.
+    gateway = OutboundGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    extra = {"HERMES_VOIP_SIP_SDES_OFFER": "true"}
+    try:
+        async with _real_adapter(
+            gateway, providers=providers, extra_env=extra
+        ) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            with pytest.raises(OutboundCallFailed) as exc_info:
+                await adapter.place_call(_TARGET_EXT)
+
+            # 488 Not Acceptable Here — we cannot accept a plaintext answer to a
+            # secured offer (mirrors the codec-mismatch 488 in the same handler).
+            assert exc_info.value.status == 488
+
+            # No call may be running — neither secured nor (worse) cleartext.
+            await asyncio.sleep(0.05)
+            assert not adapter._call_sessions, (
+                "a downgraded (plaintext) call was left running after the SAVP offer "
+                "was answered plain"
+            )
+            assert not adapter._call_loops
     finally:
         await gateway.stop()

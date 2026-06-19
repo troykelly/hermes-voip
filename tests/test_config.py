@@ -912,6 +912,26 @@ def test_media_sip_dtls_setup_forced_active() -> None:
     assert cfg.sip_dtls_setup == "active"
 
 
+# --- Outbound SDES-SRTP offering knob (ADR-0066) ---
+
+
+def test_media_sip_sdes_offer_default_off() -> None:
+    """No knob => the outbound INVITE offers PLAIN RTP/AVP (opt-in, ADR-0066).
+
+    Default-off preserves today's live-validated cleartext outbound offer; turning
+    SDES offering on is the operator's explicit opt-in (the fail-closed policy would
+    otherwise fail any non-SRTP terminating leg).
+    """
+    cfg = load_media_config({})
+    assert cfg.sip_sdes_offer is False
+
+
+def test_media_sip_sdes_offer_enabled() -> None:
+    """HERMES_VOIP_SIP_SDES_OFFER=true makes the outbound INVITE offer RTP/SAVP."""
+    cfg = load_media_config({"HERMES_VOIP_SIP_SDES_OFFER": "true"})
+    assert cfg.sip_sdes_offer is True
+
+
 def test_media_sip_dtls_setup_forced_passive() -> None:
     """HERMES_VOIP_SIP_DTLS_SETUP=passive forces the passive (DTLS server) role."""
     cfg = load_media_config({"HERMES_VOIP_SIP_DTLS_SETUP": "passive"})

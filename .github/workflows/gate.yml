@@ -53,10 +53,10 @@ jobs:
       # supervisor tests, the media-concurrency adapter isolation test, and the
       # WebRTC inbound-branch test all drive the real VoipAdapter, so they are
       # checked + run here too.
-      - run: uv run mypy src/hermes_voip/adapter.py src/hermes_voip/voip_tools.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py tests/e2e/test_inbound_webrtc_call.py
+      - run: uv run mypy src/hermes_voip/adapter.py src/hermes_voip/voip_tools.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_rtcp.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e/test_inbound_call.py tests/e2e/test_concurrent_inbound_calls.py tests/e2e/test_outbound_call.py tests/e2e/test_inbound_webrtc_call.py
       - env:
           HERMES_CONTRACT_REQUIRED: "1" # missing/drifted surface -> hard failure, never a silent skip
-        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e -rs
+        run: uv run pytest tests/test_hermes_contract.py tests/test_adapter.py tests/test_adapter_caller_modes.py tests/test_adapter_reconnect.py tests/test_adapter_rtcp.py tests/test_adapter_webrtc.py tests/test_adapter_wss_signalling.py tests/test_media_concurrency_hermes.py tests/test_adapter_attended_consult.py tests/test_adapter_production_safety.py tests/e2e -rs
 
   # Runs the conversational-provider tests with the optional `ml` extra installed
   # (onnxruntime + sherpa-onnx + numpy). Separate job so the heavy native ML stack

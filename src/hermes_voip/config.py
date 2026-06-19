@@ -91,6 +91,17 @@ _WS_PATH_KEY = "HERMES_SIP_WS_PATH"
 # digest credential is read from this key at runtime (ADR-0038 §3), never hardcoded.
 _WS_PASSWORD_KEY = "HERMES_SIP_WS_PASSWORD"  # noqa: S105
 
+# Admission-control + graceful-shutdown drain (ADR-0059). Both are gateway-level
+# SIP-lifecycle knobs, parsed from the HERMES_SIP_* scheme. ``MAX_CALLS`` caps the
+# number of concurrent active calls (a new inbound INVITE at capacity is rejected
+# 486 Busy Here before any per-call media/pipeline is built — protecting a 24/7
+# line from a burst/flood OOM). ``SHUTDOWN_DRAIN_SECS`` bounds how long ``disconnect``
+# waits for in-flight calls to BYE-drain before forcing teardown on shutdown.
+_MAX_CALLS_KEY = "HERMES_SIP_MAX_CALLS"
+_DEFAULT_MAX_CALLS = 8
+_SHUTDOWN_DRAIN_SECS_KEY = "HERMES_SIP_SHUTDOWN_DRAIN_SECS"
+_DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+
 _BARE_EXTENSION = "HERMES_SIP_EXTENSION"
 _BARE_PASSWORD = "HERMES_SIP_PASSWORD"  # noqa: S105 — env var name, not a secret
 _BARE_USERNAME = "HERMES_SIP_USERNAME"
@@ -485,6 +496,16 @@ class GatewayConfig:
             per-extension SIP password in the digest; ``None`` (the default)
             falls back to the per-extension SIP password. A **secret** —
             repr-suppressed so it never reaches a log line.
+        max_calls: The maximum number of concurrent active calls (ADR-0059). A new
+            inbound INVITE arriving while at this cap is rejected ``486 Busy Here``
+            BEFORE any per-call media engine / STT-TTS pipeline is built, so a
+            burst/flood cannot exhaust CPU/memory on a 24/7 line. Strictly positive
+            (default 8). ``HERMES_SIP_MAX_CALLS``.
+        shutdown_drain_secs: The bounded graceful-shutdown drain timeout in seconds
+            (ADR-0059). On ``disconnect`` (aclose / SIGTERM path) the adapter sends a
+            BYE to every live call and waits up to this long for the drain before
+            forcing teardown, so a restart no longer hard-drops live callers. Strictly
+            positive and finite (default 5.0). ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``.
     """
 
     host: str
@@ -496,6 +517,8 @@ class GatewayConfig:
     default_index: int
     ws_path: str = _DEFAULT_WS_PATH
     ws_password: str | None = field(default=None, repr=False)
+    max_calls: int = _DEFAULT_MAX_CALLS
+    shutdown_drain_secs: float = _DEFAULT_SHUTDOWN_DRAIN_SECS
 
     def __post_init__(self) -> None:
         """Enforce the invariants the type promises, not just the parser.
@@ -518,6 +541,17 @@ class GatewayConfig:
             raise ConfigError(msg)
         if self.default_index not in indices:
             msg = f"default_index {self.default_index} is not a configured index"
+            raise ConfigError(msg)
+        # ADR-0059 lifecycle knobs validate here too (the dataclass is public, so a
+        # direct construction is self-validating, not only the env parser).
+        if self.max_calls <= 0:
+            msg = f"max_calls must be positive, got {self.max_calls}"
+            raise ConfigError(msg)
+        if not math.isfinite(self.shutdown_drain_secs) or self.shutdown_drain_secs <= 0:
+            msg = (
+                "shutdown_drain_secs must be a positive finite number, "
+                f"got {self.shutdown_drain_secs!r}"
+            )
             raise ConfigError(msg)
 
     @property
@@ -1182,6 +1216,11 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
         default_index=default_index,
         ws_path=ws_path,
         ws_password=ws_password,
+        # ADR-0059 lifecycle knobs (admission cap + shutdown drain).
+        max_calls=_parse_positive_int(env, _MAX_CALLS_KEY, _DEFAULT_MAX_CALLS),
+        shutdown_drain_secs=_parse_positive_float(
+            env, _SHUTDOWN_DRAIN_SECS_KEY, _DEFAULT_SHUTDOWN_DRAIN_SECS
+        ),
     )
 
 
@@ -1271,6 +1310,30 @@ def _parse_int(raw: str, key: str) -> int:
         msg = f"{key} must be a non-negative integer, got {raw!r}"
         raise ConfigError(msg)
     return int(raw)
+
+
+def _parse_positive_float(env: Mapping[str, str], key: str, default: float) -> float:
+    """Parse ``key`` as a strictly-positive finite float, defaulting when unset.
+
+    Rejects non-numeric, NaN/inf, and non-positive values fail-fast (rule 37) — a
+    zero/negative drain timeout would defeat the graceful drain it configures, and
+    NaN slips past a naive ``> 0`` test, so finiteness is checked explicitly.
+
+    Raises:
+        ConfigError: If the value is non-numeric, NaN/inf, or ``<= 0``.
+    """
+    raw = _value(env, key)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        msg = f"{key} must be a positive number, got {raw!r}"
+        raise ConfigError(msg) from exc
+    if not math.isfinite(value) or value <= 0:
+        msg = f"{key} must be a positive finite number, got {raw!r}"
+        raise ConfigError(msg)
+    return value
 
 
 # --- media / feature field parsing ------------------------------------------

@@ -363,6 +363,11 @@ async def _build_adapter(
                 ),
                 default_extension=MagicMock(extension="1000"),
                 via_transport="TLS",
+                # ADR-0059 lifecycle knobs — real ints/floats (not MagicMocks) so the
+                # admission cap comparison + drain timeout work, not a MagicMock
+                # TypeError.
+                max_calls=8,
+                shutdown_drain_secs=5.0,
             ),
         ),
         patch(

@@ -1825,3 +1825,72 @@ def test_media_tts_tuning_validates_on_direct_construction() -> None:
             tone_secs=0.0,
             tts_stability=1.5,
         )
+
+
+# ---- admission cap + shutdown drain (ADR-0059) -----------------------------
+
+
+def test_max_calls_default() -> None:
+    """The concurrent-call cap defaults to a sane positive value when unset."""
+    cfg = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="x")
+    )
+    assert cfg.max_calls == 8
+
+
+def test_max_calls_override() -> None:
+    """HERMES_SIP_MAX_CALLS sets the concurrent-call cap."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_SIP_MAX_CALLS="3",
+        )
+    )
+    assert cfg.max_calls == 3
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "1.5"])
+def test_max_calls_rejects_non_positive_or_malformed(bad: str) -> None:
+    """A non-positive / malformed cap is rejected fail-fast (rule 37)."""
+    with pytest.raises(ConfigError):
+        load_gateway_config(
+            _base(
+                HERMES_SIP_EXTENSION="1000",
+                HERMES_SIP_PASSWORD="x",
+                HERMES_SIP_MAX_CALLS=bad,
+            )
+        )
+
+
+def test_shutdown_drain_secs_default() -> None:
+    """The shutdown-drain timeout defaults to a sane positive value when unset."""
+    cfg = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="x")
+    )
+    assert cfg.shutdown_drain_secs == 5.0
+
+
+def test_shutdown_drain_secs_override() -> None:
+    """HERMES_SIP_SHUTDOWN_DRAIN_SECS sets the bounded drain timeout (seconds)."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_SIP_SHUTDOWN_DRAIN_SECS="12.5",
+        )
+    )
+    assert cfg.shutdown_drain_secs == 12.5
+
+
+@pytest.mark.parametrize("bad", ["0", "-2", "abc", "nan", "inf"])
+def test_shutdown_drain_secs_rejects_non_positive_or_malformed(bad: str) -> None:
+    """A non-positive / non-finite / malformed drain timeout is rejected."""
+    with pytest.raises(ConfigError):
+        load_gateway_config(
+            _base(
+                HERMES_SIP_EXTENSION="1000",
+                HERMES_SIP_PASSWORD="x",
+                HERMES_SIP_SHUTDOWN_DRAIN_SECS=bad,
+            )
+        )

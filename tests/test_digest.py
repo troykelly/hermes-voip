@@ -531,32 +531,100 @@ def test_rejects_genuinely_unsupported_algorithm() -> None:
 
 
 # ---------------------------------------------------------------------------
-# -sess cnonce in Authorization header (RFC 2617 §3.2.2 compliance)
+# no-qop legacy (RFC 2069) is MD5-only; -sess and SHA-256 require qop
 # ---------------------------------------------------------------------------
+#
+# Rule-19 note: this section REPLACES the earlier
+# test_md5_sess_no_qop_emits_cnonce_in_header, which asserted a spec violation.
+# RFC 2617 §3.2.2 states "cnonce ... MUST NOT be specified if the server did
+# not send a qop directive" — so a -sess challenge WITHOUT qop is internally
+# inconsistent (it needs a cnonce to build HA1 but is forbidden from sending
+# one). RFC 7616 §3.4.1 / RFC 8760 §2.6 define NO RFC 2069 legacy form for
+# SHA-256(/-sess). The correct behaviour for all of these is to RAISE; the
+# legacy no-qop form is valid ONLY for plain MD5 (ancient-server back-compat).
 
 
-def test_md5_sess_no_qop_emits_cnonce_in_header() -> None:
-    """RFC 2617 §3.2.2: cnonce MUST appear in the Authorization header for -sess.
-
-    Even when the challenge does not offer qop, the -sess HA1 bakes in the
-    cnonce, so the server needs it to reproduce HA1.  The Authorization header
-    must therefore carry a cnonce= param.
-    """
+def test_md5_sess_without_qop_raises() -> None:
+    # RFC 2617 §3.2.2: -sess needs a cnonce for HA1 but MUST NOT send one
+    # without qop — the combination is unanswerable, so raise.
     challenge = DigestChallenge(
         realm="pbx.example.test",
         nonce="sip_nonce_42",
         algorithm="MD5-sess",
-        qop=(),  # no qop
+        qop=(),  # no qop offered
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="sip_cnonce_42",
+        )
+
+
+def test_sha256_without_qop_raises() -> None:
+    # RFC 7616 §3.4.1 / RFC 8760 §2.6 define no RFC 2069 legacy form for
+    # SHA-256; a challenge that omits qop cannot be answered — raise.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="sip_nonce_42",
+        algorithm="SHA-256",
+        qop=(),
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="sip_cnonce_42",
+        )
+
+
+def test_sha256_sess_without_qop_raises() -> None:
+    # SHA-256-sess inherits both constraints: no legacy form AND the §3.2.2
+    # cnonce-without-qop prohibition. Raise.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="sip_nonce_42",
+        algorithm="SHA-256-sess",
+        qop=(),
+    )
+    with pytest.raises(ValueError, match="qop"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="sip_cnonce_42",
+        )
+
+
+def test_plain_md5_no_qop_still_uses_legacy_rfc2069() -> None:
+    # Regression guard: plain MD5 with no qop MUST keep the RFC 2069 legacy
+    # form response = MD5(HA1:nonce:HA2), with no qop/nc/cnonce in the header.
+    # This is the only algorithm for which the no-qop legacy path is valid.
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="abc123",
+        algorithm="MD5",
+        qop=(),
     )
     header = build_authorization(
         challenge,
         DigestCredentials(username="1000", password="s3cr3t"),
         method="REGISTER",
         uri="sip:pbx.example.test",
-        cnonce="sip_cnonce_42",
     )
-    # cnonce must be present so the server can recompute HA1-sess
-    assert _param(header, "cnonce") == "sip_cnonce_42"
-    # nc and qop must NOT be present (no qop offered)
-    assert _param(header, "nc") is None
+
+    def md5_hex(value: str) -> str:
+        return hashlib.md5(value.encode("utf-8")).hexdigest()  # noqa: S324 - test KAT
+
+    ha1 = md5_hex("1000:pbx.example.test:s3cr3t")
+    ha2 = md5_hex("REGISTER:sip:pbx.example.test")
+    expected = md5_hex(f"{ha1}:abc123:{ha2}")
+    assert _param(header, "response") == expected
     assert _param(header, "qop") is None
+    assert _param(header, "nc") is None
+    assert _param(header, "cnonce") is None

@@ -28,6 +28,17 @@ _MAX_SEQ = 0xFFFF
 _U32 = 0xFFFFFFFF
 _DEFAULT_MAX_AHEAD = 256
 
+# Adaptive jitter depth (ADR-0056). The ceiling used when adaptation is enabled
+# but no explicit ``max_depth`` is given: 10 packets = 200 ms at the standard
+# 20 ms ptime — generous reorder tolerance without an unbounded latency tax.
+_DEFAULT_MAX_DEPTH = 10
+# Consecutive clean pops (a real in-order packet, no loss and no late drop)
+# before the adaptive depth shrinks one step back toward the floor. A run, not a
+# single pop, so a calm patch between bursts does not thrash the depth down and
+# straight back up; one full window's worth of clean packets is a reasonable
+# "the link has settled" signal.
+_SHRINK_AFTER = 50
+
 
 @dataclass(frozen=True, slots=True)
 class RtpPacket:
@@ -149,21 +160,46 @@ class JitterBuffer:
     """Reorders inbound RTP and signals loss for concealment.
 
     ``pop`` returns the next in-order packet when available, a :class:`Lost`
-    marker once ``target_depth`` later packets have piled up behind a gap (so
-    the caller conceals and moves on), or ``None`` on underflow (wait for more).
+    marker once the current reorder tolerance (the *depth*) of later packets has
+    piled up behind a gap (so the caller conceals and moves on), or ``None`` on
+    underflow (wait for more).
+
+    The depth is fixed at ``target_depth`` by default. With ``adapt=True`` it
+    becomes *adaptive* (ADR-0056): the depth is the live reorder tolerance and
+    moves between ``target_depth`` (floor) and ``max_depth`` (ceiling) in
+    response to the observed stream — it GROWS when the buffer is shown to have
+    declared loss too eagerly (a packet arrives after its slot was already
+    emitted as :class:`Lost`, a *late drop*, or an in-window packet arrives
+    reordered by a span ≥ the current depth) and SHRINKS one step toward the
+    floor after a sustained clean run, so a jittery link stops underrunning and a
+    calm link stops paying needless latency. Adaptation is driven ONLY by the
+    push/pop sequence stream (no wall clock), so it is fully deterministic.
     """
 
     def __init__(
-        self, target_depth: int = 2, max_ahead: int = _DEFAULT_MAX_AHEAD
+        self,
+        target_depth: int = 2,
+        max_ahead: int = _DEFAULT_MAX_AHEAD,
+        *,
+        max_depth: int | None = None,
+        adapt: bool = False,
     ) -> None:
         """Create the buffer.
 
         Args:
             target_depth: Declare loss once this many later packets have piled
-                up behind a gap.
+                up behind a gap. When ``adapt`` is on this is the FLOOR (minimum)
+                reorder tolerance the adaptive depth never drops below.
             max_ahead: Playout window — packets more than this many sequence
                 numbers ahead of the next expected one are dropped, bounding
                 storage even under a permanent gap or a source resync.
+            max_depth: The CEILING for the adaptive depth (only meaningful with
+                ``adapt=True``). ``None`` (the default) uses
+                :data:`_DEFAULT_MAX_DEPTH` (10 packets ≈ 200 ms at 20 ms ptime).
+                Must be ≥ ``target_depth``.
+            adapt: Enable adaptive reorder tolerance. ``False`` (the default)
+                keeps the depth fixed at ``target_depth`` — byte-for-byte the
+                legacy behaviour, so existing call sites are unaffected.
         """
         if target_depth < 1:
             msg = f"target_depth must be >= 1, got {target_depth}"
@@ -171,11 +207,42 @@ class JitterBuffer:
         if max_ahead < 1:
             msg = f"max_ahead must be >= 1, got {max_ahead}"
             raise ValueError(msg)
+        ceiling = _DEFAULT_MAX_DEPTH if max_depth is None else max_depth
+        if adapt and ceiling < target_depth:
+            msg = (
+                f"max_depth must be >= target_depth (floor), "
+                f"got max_depth={ceiling} < target_depth={target_depth}"
+            )
+            raise ValueError(msg)
+        self._adapt = adapt
+        self._floor = target_depth
+        self._ceiling = ceiling
         self._depth = target_depth
         self._max_ahead = max_ahead
         self._packets: dict[int, RtpPacket] = {}
         self._next: int | None = None
         self._emitted = False
+        # Highest sequence (RFC 1982 order) ever pushed — the reference for a
+        # reorder-span measurement. ``None`` until the first push. Adaptive only.
+        self._highest: int | None = None
+        # Consecutive clean pops (real in-order packet, no loss/late-drop) since
+        # the last grow or shrink. Drives the shrink-toward-floor decision.
+        self._clean_run = 0
+
+    @property
+    def current_depth(self) -> int:
+        """The live reorder tolerance (in packets).
+
+        Equals ``target_depth`` for a non-adaptive buffer; for an adaptive one
+        it moves within ``[target_depth, max_depth]`` as the link is observed.
+        """
+        return self._depth
+
+    def _grow(self) -> None:
+        """Widen the reorder tolerance by one, bounded by the ceiling (adaptive)."""
+        if self._depth < self._ceiling:
+            self._depth += 1
+        self._clean_run = 0
 
     def push(self, packet: RtpPacket) -> None:
         """Add a packet; duplicate, late, and too-far-ahead packets are dropped.
@@ -187,23 +254,51 @@ class JitterBuffer:
         the most reordering-prone. The playout window is measured against this
         tentative anchor throughout, keeping storage bounded. Once a packet has
         been emitted the anchor only advances, and late arrivals are dropped.
+
+        When ``adapt`` is on, a *late drop* (a packet arriving after its slot was
+        emitted as :class:`Lost`) and a *wide reorder* (an in-window packet
+        arriving a span ≥ the current depth behind the highest pushed) each grow
+        the reorder tolerance — both are evidence the buffer was too eager.
         """
         seq = packet.sequence_number
         if self._next is not None:
             if _seq_before(seq, self._next):
                 if self._emitted:
-                    return  # too late: this sequence has already been emitted
+                    # Too late: this sequence has already been emitted. Under
+                    # adaptation, an arrival within the window proves we declared
+                    # loss too eagerly — grow so the next such reorder survives.
+                    if self._adapt and (self._next - seq) % _SEQ_MOD <= self._max_ahead:
+                        self._grow()
+                    return
                 if (self._next - seq) % _SEQ_MOD > self._max_ahead:
                     return  # too far behind to be a start reorder; bound the window
                 self._next = seq  # pre-playout reorder within window: revise anchor
             elif (seq - self._next) % _SEQ_MOD > self._max_ahead:
                 return  # outside the playout window: keep storage bounded
+            elif (
+                self._adapt
+                and self._highest is not None
+                and _seq_before(seq, self._highest)
+                and (self._highest - seq) % _SEQ_MOD >= self._depth
+            ):
+                # A wide reorder: this in-window packet arrived a span >= the
+                # current depth behind the highest we have seen, i.e. the link
+                # reorders further than we currently tolerate. Grow toward it.
+                self._grow()
         else:
             self._next = seq  # tentative anchor at the first arrival
+        if self._highest is None or _seq_before(self._highest, seq):
+            self._highest = seq
         self._packets.setdefault(seq, packet)  # first arrival wins; ignore duplicates
 
     def pop(self) -> JitterOutput | None:
-        """Return the next packet, a :class:`Lost` marker, or ``None`` (underflow)."""
+        """Return the next packet, a :class:`Lost` marker, or ``None`` (underflow).
+
+        Under adaptation a sustained run of clean in-order pops (``_SHRINK_AFTER``
+        with no loss and no intervening late drop/wide reorder) shrinks the depth
+        one step toward the floor, so a settled link sheds the latency it took on
+        during a jittery patch.
+        """
         if self._next is None:
             return None
         expected = self._next
@@ -211,9 +306,16 @@ class JitterBuffer:
         if packet is not None:
             self._emitted = True
             self._next = _seq_next(expected)
+            if self._adapt:
+                self._clean_run += 1
+                if self._clean_run >= _SHRINK_AFTER and self._depth > self._floor:
+                    self._depth -= 1
+                    self._clean_run = 0
             return packet
         if len(self._packets) >= self._depth:
             self._emitted = True
             self._next = _seq_next(expected)
+            if self._adapt:
+                self._clean_run = 0  # a declared loss breaks the clean run
             return Lost(expected)
         return None

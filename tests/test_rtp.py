@@ -307,10 +307,14 @@ def test_adaptive_shrinks_depth_after_clean_run() -> None:
     # Grow once via a late drop.
     for seq in (10, 12, 13):
         jb.push(_pkt(seq))
-    jb.pop()  # 10
-    jb.pop()  # Lost 11
+    assert _packet(jb.pop()).sequence_number == 10
+    assert isinstance(jb.pop(), Lost)  # 11
     jb.push(_pkt(11))  # late -> depth 3
     assert jb.current_depth == 3
+    # Drain the already-buffered 12, 13 (anchor is now at 12) so the clean run
+    # starts from a clean slate.
+    assert _packet(jb.pop()).sequence_number == 12
+    assert _packet(jb.pop()).sequence_number == 13
     # Now feed a long clean in-order run; depth must come back down to 2.
     seq = 14
     for _ in range(200):

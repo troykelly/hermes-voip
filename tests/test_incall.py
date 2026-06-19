@@ -10,6 +10,8 @@ Fakes only (``pbx.example.test``, ext ``1000``/``2000``, ``198.51.100.x``).
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from hermes_voip.dialog import Dialog
@@ -28,7 +30,12 @@ from hermes_voip.incall import (
     handle_reinvite_response,
 )
 from hermes_voip.message import SipRequest, SipResponse
-from hermes_voip.sdp import Codec, build_audio_offer
+from hermes_voip.sdp import (
+    Codec,
+    CryptoAttribute,
+    build_audio_offer,
+    generate_answer_crypto,
+)
 
 _PCMU = Codec(payload_type=0, encoding="PCMU", clock_rate=8000)
 _MEDIA = LocalMediaSession(
@@ -124,6 +131,78 @@ def test_session_id_constant_version_monotonic_across_reoffers() -> None:
     assert "o=- 88888 2 " in SipRequest.parse(second.text).body
     assert second.dialog.sdp_version == 2
     assert second.dialog.local_cseq == 3
+
+
+# ---- SDES SRTP continuity on re-offer (ADR-0053 §In-dialog re-offer keying) -
+
+
+def _srtp_crypto() -> CryptoAttribute:
+    """A supported SDES a=crypto with a runtime-computed fake key (no literal).
+
+    The key is computed (not a literal) so the path-scoped gitleaks allowlist —
+    which covers only ``tests/test_sdp.py`` — does not need to cover this file.
+    """
+    key = base64.b64encode(bytes(range(30))).decode("ascii")
+    return CryptoAttribute(
+        tag=7, suite="AES_CM_128_HMAC_SHA1_80", key_params=f"inline:{key}"
+    )
+
+
+def test_hold_reinvite_on_srtp_call_stays_savp_with_crypto() -> None:
+    """A hold re-INVITE on an SRTP call MUST stay RTP/SAVP + a=crypto (no downgrade).
+
+    Regression for the ADR-0053 Stage 1 partial-ship: ``build_hold_reinvite``
+    must carry the SDES security context into the re-offer. Without ``crypto``
+    threaded through, ``build_audio_offer`` emits plain RTP/AVP and the
+    ``a=crypto`` vanishes mid-call — cleartext audio (RFC 4568 §6 continuity
+    violation). Here the call's :class:`LocalMediaSession` carries an SDES
+    crypto context and a fresh per-offer key is supplied.
+    """
+    media = LocalMediaSession(
+        local_address="198.51.100.7",
+        port=40000,
+        codecs=(_PCMU,),
+        session_id=88888,
+        crypto=_srtp_crypto(),
+    )
+    result = build_hold_reinvite(
+        _dialog(), media, "sendonly", crypto=generate_answer_crypto(_srtp_crypto())
+    )
+    body = SipRequest.parse(result.text).body
+    assert "m=audio 40000 RTP/SAVP 0" in body
+    assert "RTP/AVP" not in body  # never downgrade the secured stream
+    assert "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:" in body
+
+
+def test_resume_reinvite_on_srtp_call_stays_savp_with_crypto() -> None:
+    """A resume (sendrecv) re-INVITE on an SRTP call also stays RTP/SAVP."""
+    media = LocalMediaSession(
+        local_address="198.51.100.7",
+        port=40000,
+        codecs=(_PCMU,),
+        session_id=88888,
+        crypto=_srtp_crypto(),
+    )
+    result = build_hold_reinvite(
+        _dialog(), media, "sendrecv", crypto=generate_answer_crypto(_srtp_crypto())
+    )
+    body = SipRequest.parse(result.text).body
+    assert "RTP/SAVP" in body
+    assert "RTP/AVP" not in body
+    assert "a=sendrecv" in body
+
+
+def test_hold_reinvite_on_plain_call_stays_plain() -> None:
+    """A plain (non-SRTP) call's re-offer stays RTP/AVP — no crypto appears.
+
+    The crypto context is ``None`` (the default), so the regression fix must not
+    accidentally secure a plain call.
+    """
+    result = build_hold_reinvite(_dialog(), _MEDIA, "sendonly")
+    body = SipRequest.parse(result.text).body
+    assert "RTP/AVP" in body
+    assert "RTP/SAVP" not in body
+    assert "a=crypto" not in body
 
 
 # ---- handle_reinvite_response ----------------------------------------------

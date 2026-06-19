@@ -1087,6 +1087,65 @@ async def test_srtp_round_trip_recovers_audio() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rekey_srtp_swaps_outbound_and_inbound_sessions() -> None:
+    """rekey_srtp installs fresh SRTP sessions mid-call (ADR-0053 re-offer keying).
+
+    A hold/resume/re-INVITE on a secured call re-keys both directions (RFC 4568
+    §6.1). The engine must (a) accept a new outbound CryptoAttribute and protect
+    its TX with THAT key, and (b) accept a new inbound CryptoAttribute and
+    decrypt with it — proving the private SRTP sessions were actually swapped.
+    """
+    pytest.importorskip("cryptography")
+
+    from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+    from hermes_voip.sdp import CryptoAttribute  # noqa: PLC0415
+
+    # Two DISTINCT keys: the engine starts plain (no SRTP), then is re-keyed.
+    new_key_b64 = base64.b64encode(b"\x11" * 16 + b"\x22" * 14).decode()
+    new_crypto = CryptoAttribute(
+        tag=3,
+        suite="AES_CM_128_HMAC_SHA1_80",
+        key_params=f"inline:{new_key_b64}",
+    )
+
+    cap_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cap_sock.bind(("127.0.0.1", 0))
+    cap_sock.setblocking(False)
+    remote_port = cap_sock.getsockname()[1]
+
+    async def _fake_sleep(secs: float) -> None:
+        pass
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=remote_port,
+        codec=Codec.PCMU,
+        sleep=_fake_sleep,
+    )
+    await engine.connect()
+
+    # Re-key both directions to the new SDES context.
+    await engine.rekey_srtp(inbound=new_crypto, outbound=new_crypto)
+
+    await engine.send_audio(_silence_frame())
+    await asyncio.sleep(0.01)
+    try:
+        enc_data, _ = cap_sock.recvfrom(4096)
+    except BlockingIOError:
+        pytest.fail("no SRTP datagram received after rekey")
+    cap_sock.close()
+    await engine.stop()
+
+    # The datagram is NOT plain RTP (a plain parse of an SRTP packet keeps the
+    # auth tag in the payload, so it would not equal the silence frame), and it
+    # DOES decrypt under the NEW inbound key — both prove the swap took effect.
+    decrypted = SrtpSession(new_crypto).unprotect(enc_data)
+    assert decrypted.payload == _ulaw_silence()
+
+
+@pytest.mark.asyncio
 async def test_srtp_tampered_packet_is_dropped() -> None:
     """A tampered SRTP packet must raise SrtpError (auth failure)."""
     pytest.importorskip("cryptography")

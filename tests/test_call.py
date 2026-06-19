@@ -12,6 +12,7 @@ Fakes only (``pbx.example.test``, ext ``1000``/``2000``, ``198.51.100.x``).
 from __future__ import annotations
 
 import asyncio
+import base64
 
 import pytest
 
@@ -22,7 +23,14 @@ from hermes_voip.incall import LocalMediaSession
 from hermes_voip.message import SipRequest, SipResponse, build_response
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.refer import ReferRequest
-from hermes_voip.sdp import Codec, build_audio_offer
+from hermes_voip.sdp import (
+    Codec,
+    CryptoAttribute,
+    SessionDescription,
+    build_audio_answer,
+    build_audio_offer,
+    generate_answer_crypto,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -46,12 +54,23 @@ class _FakeMedia:
         self.holds: list[bool] = []
         self.stopped = False
         self.dtmf: list[str] = []
+        # Records each SRTP re-key (ADR-0053 in-dialog re-offer keying): one
+        # (inbound, outbound) tuple of the CryptoAttribute (or None) per call.
+        self.rekeys: list[tuple[CryptoAttribute | None, CryptoAttribute | None]] = []
 
     async def set_hold(self, on_hold: bool) -> None:
         self.holds.append(on_hold)
 
     async def send_dtmf(self, digits: str) -> None:
         self.dtmf.append(digits)
+
+    async def rekey_srtp(
+        self,
+        *,
+        inbound: CryptoAttribute | None,
+        outbound: CryptoAttribute | None,
+    ) -> None:
+        self.rekeys.append((inbound, outbound))
 
     async def stop(self) -> None:
         self.stopped = True
@@ -144,6 +163,331 @@ async def test_unhold_resumes_and_ungates_media() -> None:
     await task
     assert session.on_hold is False
     assert media.holds == [False]
+
+
+# ---- SDES SRTP continuity across re-offer (ADR-0053 in-dialog re-offer keying) ----
+
+
+def _srtp_crypto(tag: int = 7) -> CryptoAttribute:
+    """A supported SDES a=crypto with a runtime-computed fake key (no literal).
+
+    The key is computed (never a literal) so the path-scoped gitleaks allowlist
+    (which covers only ``tests/test_sdp.py``) need not extend to this file.
+    """
+    key = base64.b64encode(bytes(range(30))).decode("ascii")
+    return CryptoAttribute(
+        tag=tag, suite="AES_CM_128_HMAC_SHA1_80", key_params=f"inline:{key}"
+    )
+
+
+def _srtp_media() -> LocalMediaSession:
+    return LocalMediaSession(
+        local_address="198.51.100.7",
+        port=40000,
+        codecs=(_PCMU,),
+        session_id=55555,
+        crypto=_srtp_crypto(),
+    )
+
+
+def _srtp_answer_to(request: SipRequest, direction: str) -> str:
+    """A 200-OK SRTP answer (RTP/SAVP + a=crypto echoing the offered tag/suite)."""
+    offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=41000,
+        codecs=(_PCMU,),
+        direction="sendrecv",
+        session_id=2,
+        crypto=_srtp_crypto(),
+    )
+    answer_sdp = build_audio_answer(
+        SessionDescription.parse(offer),
+        local_address="198.51.100.99",
+        port=41000,
+        supported=["PCMU"],
+        session_id=2,
+        crypto=generate_answer_crypto(_srtp_crypto()),
+    )
+    # Mirror the requested direction so the classifier/assert reads cleanly.
+    answer_sdp = answer_sdp.replace("a=sendrecv", f"a={direction}")
+    return build_response(
+        request,
+        200,
+        "OK",
+        extra_headers=(("Content-Type", "application/sdp"),),
+        body=answer_sdp,
+    )
+
+
+async def test_hold_on_srtp_call_reoffers_savp_and_rekeys() -> None:
+    """Hold on an SRTP call: the re-INVITE stays RTP/SAVP + a=crypto, never plain.
+
+    Regression for the ADR-0053 Stage 1 partial-ship — a hold/resume re-INVITE
+    on a secured call MUST NOT downgrade media to cleartext RTP/AVP. The session
+    must (a) emit a secured re-offer carrying a fresh per-offer key and (b) on
+    acceptance COMMIT the re-key to the engine: outbound with our offered key,
+    inbound from the 200's answer crypto (RFC 4568 §6.1 directionality). The
+    commit happens only after the peer accepts (a rejected re-offer must not touch
+    the live key — see test_rejected_srtp_reoffer_does_not_rekey_outbound).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    assert "m=audio 40000 RTP/SAVP 0" in reinvite.body
+    assert "RTP/AVP" not in reinvite.body  # the secured stream is never downgraded
+    assert "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:" in reinvite.body
+    # Not yet committed: the outbound key is only re-keyed once the peer accepts.
+    assert media.rekeys == []
+    await session.on_response(SipResponse.parse(_srtp_answer_to(reinvite, "recvonly")))
+    await task
+    assert session.on_hold is True
+    # On acceptance BOTH directions are committed in one atomic re-key: outbound
+    # with our offered key, inbound from the peer's answer crypto.
+    assert len(media.rekeys) == 1
+    inbound, outbound = media.rekeys[0]
+    assert inbound is not None  # peer's answer key → our inbound decrypt
+    assert outbound is not None  # our offered key → our outbound encrypt
+
+
+async def test_inbound_reinvite_on_srtp_call_answers_savp_and_rekeys() -> None:
+    """A peer re-INVITE (offer) on an SRTP call is answered RTP/SAVP + a=crypto.
+
+    The ANSWER side of the same bug: when the peer re-offers SRTP, our 200 OK
+    answer must stay secured and the engine must be re-keyed (inbound from the
+    peer's offer key, outbound from our fresh answer key) — never a silent
+    downgrade to RTP/AVP.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendonly",
+        session_id=7,
+        crypto=_srtp_crypto(),
+    )
+    await session.handle_request(_inbound("INVITE", body=offer))
+    response = SipResponse.parse(signaling.sent[-1])
+    assert response.status_code == 200
+    assert "RTP/SAVP" in response.body
+    assert "RTP/AVP" not in response.body
+    assert "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:" in response.body
+    assert "a=recvonly" in response.body
+    # Engine re-keyed both directions: inbound from the peer's offer, outbound
+    # from our fresh answer key.
+    assert media.rekeys, "engine SRTP was not re-keyed on the inbound re-offer"
+    inbound, outbound = media.rekeys[-1]
+    assert inbound is not None
+    assert outbound is not None
+
+
+async def test_inbound_reinvite_on_plain_call_stays_plain_no_rekey() -> None:
+    """A plain call's inbound re-INVITE answer stays RTP/AVP and never re-keys."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)  # _MEDIA has no crypto
+    offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendonly",
+        session_id=7,
+    )
+    await session.handle_request(_inbound("INVITE", body=offer))
+    response = SipResponse.parse(signaling.sent[-1])
+    assert "RTP/AVP" in response.body
+    assert "RTP/SAVP" not in response.body
+    assert "a=crypto" not in response.body
+    assert media.rekeys == []  # a plain call never re-keys SRTP
+
+
+async def test_inbound_plain_reinvite_on_srtp_call_is_rejected_488() -> None:
+    """A peer that re-offers PLAIN RTP/AVP on a secured call is rejected 488.
+
+    Downgrade resistance (codex finding): an established SRTP call must NEVER
+    answer a plain (no-``a=crypto``) re-offer with a plain 200 OK — that would
+    drop the media to cleartext mid-call. We reject with 488 Not Acceptable Here
+    and leave the secured media untouched (no re-key, no hold state change).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    plain_offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendrecv",
+        session_id=7,
+    )
+    await session.handle_request(_inbound("INVITE", body=plain_offer))
+    response = SipResponse.parse(signaling.sent[-1])
+    assert response.status_code == 488
+    assert media.rekeys == []  # the secured context is never disturbed
+    assert media.holds == []
+
+
+async def test_srtp_reoffer_with_plain_answer_raises_and_keeps_media() -> None:
+    """If our SRTP re-offer gets a PLAIN answer, the re-INVITE fails loudly.
+
+    Downgrade resistance (codex finding): when WE offered SRTP, a 200 OK that is
+    not RTP/SAVP + a=crypto is a failed/non-compliant negotiation — never treated
+    as a confirmed media change. We raise CallError and do NOT key inbound to a
+    bogus/absent key.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    # The peer answers PLAIN RTP/AVP (a downgrade) to our SRTP offer.
+    plain_answer = _answer_to(reinvite, "recvonly")
+    await session.on_response(SipResponse.parse(plain_answer))
+    with pytest.raises(CallError):
+        await task
+    # Inbound was never keyed from a plain answer (no inbound re-key recorded).
+    assert all(inbound is None for inbound, _ in media.rekeys)
+
+
+async def test_srtp_reoffer_answer_with_wrong_tag_raises() -> None:
+    """An SRTP answer that echoes the WRONG crypto tag is rejected (RFC 4568 §6.1).
+
+    Robustness (codex round-2): the answerer MUST echo the offered tag (it
+    identifies which offered crypto it accepted). An answer carrying a different
+    tag/suite is non-compliant — committing it would key outbound to a tag the
+    peer never selected. We offered tag 7; the peer answers tag 9 → CallError,
+    and the engine outbound is never re-keyed.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),  # offers crypto tag 7
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    # Build a secured answer whose a=crypto echoes a DIFFERENT tag (9, not 7).
+    key = base64.b64encode(bytes(range(30))).decode("ascii")
+    wrong = (
+        "v=0\r\n"
+        "o=- 2 2 IN IP4 198.51.100.99\r\n"
+        "s=-\r\n"
+        "c=IN IP4 198.51.100.99\r\n"
+        "t=0 0\r\n"
+        "m=audio 41000 RTP/SAVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:9 AES_CM_128_HMAC_SHA1_80 inline:{key}\r\n"
+        "a=recvonly\r\n"
+    )
+    answer = build_response(
+        reinvite,
+        200,
+        "OK",
+        extra_headers=(("Content-Type", "application/sdp"),),
+        body=wrong,
+    )
+    await session.on_response(SipResponse.parse(answer))
+    with pytest.raises(CallError):
+        await task
+    assert media.rekeys == []  # never committed a mismatched key
+
+
+async def test_rejected_srtp_reoffer_does_not_rekey_outbound() -> None:
+    """A rejected SRTP re-INVITE must NOT leave outbound on an unaccepted key.
+
+    Rollback/commit-timing (codex finding): the fresh outbound key is committed
+    to the engine only AFTER the peer accepts the re-offer (HoldConfirmed). A
+    491/timeout/4xx re-INVITE leaves the established outbound SRTP untouched, so
+    media is never encrypted with a key the peer never agreed to.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    assert "RTP/SAVP" in reinvite.body  # the re-offer is still secured on the wire
+    await session.on_response(
+        SipResponse.parse(build_response(reinvite, 491, "Request Pending"))
+    )
+    with pytest.raises(CallError, match="glare"):
+        await task
+    # Rejected: the engine outbound SRTP was never re-keyed.
+    assert media.rekeys == []
+
+
+async def test_offerless_reinvite_on_srtp_reuses_current_key_no_rekey() -> None:
+    """An offerless re-INVITE on an SRTP call re-advertises the CURRENT key.
+
+    Continuity without ACK-answer plumbing (codex finding): for an offerless
+    re-INVITE we offer in the 200 OK. We re-advertise the call's ESTABLISHED
+    outbound key (not a fresh one) and do NOT re-key — so there is no dependency
+    on parsing the peer's answer in the ACK, and inbound/outbound both stay on
+    their agreed keys. The answer still carries RTP/SAVP + a=crypto (no downgrade).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    # An offerless re-INVITE (no SDP body) → we offer in the 200 OK.
+    await session.handle_request(_inbound("INVITE", body=""))
+    response = SipResponse.parse(signaling.sent[-1])
+    assert response.status_code == 200
+    assert "RTP/SAVP" in response.body
+    assert "RTP/AVP" not in response.body
+    assert "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:" in response.body
+    # No re-key: the established keys are re-advertised, not rotated.
+    assert media.rekeys == []
 
 
 async def test_send_dtmf_delegates_to_media_without_reinvite() -> None:

@@ -139,6 +139,19 @@ first so SRTP is testable immediately.
   outbound with it) so SDES is a real opportunistic middle tier, and corrects the
   `_setup_sdes_call` docstring that claimed an SDES answer the code never produced
   (rule 27).
+- **In-dialog re-offer keying is part of Stage 1 (RFC 4568 §6 continuity).** A
+  secured call's SDES context survives any in-dialog re-offer — hold, resume, or a
+  peer re-INVITE — so the media stays `RTP/SAVP` + `a=crypto` and never silently
+  downgrades to cleartext `RTP/AVP` mid-call. `LocalMediaSession` carries the
+  accepted crypto (tag + suite); each re-offer we send mints a **fresh per-offer
+  master key** echoing that tag + suite (`generate_answer_crypto`, §6.1
+  per-sender keying) and re-keys the engine's outbound SRTP before it is sent; the
+  peer's answer (or, on the answer side, the peer's re-offer) re-keys our inbound.
+  `RtpMediaTransport.rekey_srtp` swaps both per-direction `SrtpSession`s atomically
+  (outbound under the TX lock, bound to the engine's outbound SSRC). A plain call's
+  re-offer stays plain. This was a real partial-ship of the answer wiring above
+  (the initial `200 OK` was secured but the re-offer paths were crypto-blind); it
+  is closed here, not deferred (rule 6).
 - **No mutual TLS.** The operator chose DTLS-SRTP media over a signalling client
   certificate; the SIP/WSS connection keeps server-cert-only verification.
 - **No SRTCP/`a=rtcp` separate port** beyond `a=rtcp-mux` (single 5-tuple), as on

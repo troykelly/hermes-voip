@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
@@ -57,7 +58,12 @@ from hermes_voip.refer import (
     parse_notify_sipfrag,
     parse_refer,
 )
-from hermes_voip.sdp import build_audio_offer
+from hermes_voip.sdp import (
+    CryptoAttribute,
+    SessionDescription,
+    build_audio_offer,
+    generate_answer_crypto,
+)
 
 __all__ = [
     "CallError",
@@ -109,6 +115,21 @@ class CallMedia(Protocol):
 
         Raises if the call negotiated no telephone-event payload type (ADR-0031) —
         DTMF is never silently dropped.
+        """
+        ...
+
+    async def rekey_srtp(
+        self,
+        *,
+        inbound: CryptoAttribute | None,
+        outbound: CryptoAttribute | None,
+    ) -> None:
+        """Re-key the SRTP context from a re-offer's SDES ``a=crypto`` (RFC 4568 §6.1).
+
+        Called on an in-dialog re-offer of a secured call so the media stays
+        encrypted across hold/resume/re-INVITE (ADR-0053). ``outbound`` is OUR new
+        key (encrypt + advertise), ``inbound`` is the peer's (decrypt); ``None``
+        leaves that direction unchanged. A plain call passes both ``None``.
         """
         ...
 
@@ -366,7 +387,16 @@ class CallSession:
     async def _reinvite(self, direction: str) -> None:
         self._local_offer_pending = True
         try:
-            result = build_hold_reinvite(self._dialog, self._local_media, direction)
+            # On a secured (SRTP) call mint a FRESH per-offer key echoing the call's
+            # accepted tag+suite (RFC 4568 §6.1) so the re-offer stays RTP/SAVP +
+            # a=crypto and never downgrades to cleartext RTP/AVP (ADR-0053). The new
+            # key is ADVERTISED in the offer but only COMMITTED to the engine after
+            # the peer accepts the re-INVITE (below) — a rejected/timed-out re-offer
+            # must never leave outbound encrypted with a key the peer never agreed to.
+            offer_crypto = self._reoffer_crypto()
+            result = build_hold_reinvite(
+                self._dialog, self._local_media, direction, crypto=offer_crypto
+            )
             self._dialog = result.dialog
             response = await self._send_and_await_final(
                 result.text, self._dialog.local_cseq
@@ -374,7 +404,11 @@ class CallSession:
             if response.status_code in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
                 auth = self._authorization(response, "INVITE")
                 result = build_hold_reinvite(
-                    self._dialog, self._local_media, direction, auth=auth
+                    self._dialog,
+                    self._local_media,
+                    direction,
+                    auth=auth,
+                    crypto=offer_crypto,
                 )
                 self._dialog = result.dialog
                 response = await self._send_and_await_final(
@@ -382,7 +416,14 @@ class CallSession:
                 )
             outcome = handle_reinvite_response(response)
             if isinstance(outcome, HoldConfirmed):
+                # ACK the 2xx first (RFC 3261 §13.2.2.4) — the transaction completes
+                # regardless of whether the negotiated media is acceptable. Then COMMIT
+                # the SRTP re-key: RFC 4568 §6.1 — outbound uses OUR offered key,
+                # inbound uses the peer's ANSWER key. A secured re-offer answered
+                # without a usable a=crypto is a failed negotiation (or a downgrade
+                # attempt) and raises — never silently confirmed as a media change.
                 await self._send_ack(response)
+                await self._commit_reoffer_keys(offer_crypto, outcome.answer)
                 return
             if isinstance(outcome, ReinviteRejected):
                 detail = (
@@ -396,6 +437,113 @@ class CallSession:
             raise CallError(msg)
         finally:
             self._local_offer_pending = False
+
+    # --- SDES SRTP continuity across in-dialog re-offers (ADR-0053) ----------
+
+    def _reoffer_crypto(self) -> CryptoAttribute | None:
+        """Mint a fresh per-offer SDES key for a re-offer WE send, or ``None``.
+
+        On a secured call (``self._local_media.crypto`` set) this echoes the call's
+        negotiated tag + suite with a fresh random key (RFC 4568 §6.1) so the
+        re-INVITE offer stays ``RTP/SAVP`` + ``a=crypto``. ``None`` on a plain call
+        keeps the re-offer plain ``RTP/AVP``.
+        """
+        accepted = self._local_media.crypto
+        if accepted is None:
+            return None
+        return generate_answer_crypto(accepted)
+
+    def _adopt_local_crypto(self, crypto: CryptoAttribute) -> None:
+        """Persist the re-offer's crypto as the call's current SDES context.
+
+        Keeps :attr:`_local_media.crypto` carrying a live tag + suite so the NEXT
+        re-offer echoes a current negotiation identifier (the tag/suite are stable
+        across a dialog; this also keeps an offerless re-INVITE answer secured).
+        """
+        self._local_media = replace(self._local_media, crypto=crypto)
+
+    def _peer_reoffer_is_downgrade(self, offer: SessionDescription) -> bool:
+        """``True`` if a peer re-offer would DOWNGRADE a secured call to cleartext.
+
+        On an established SRTP call (``_local_media.crypto`` set) a re-INVITE offer
+        that is plain ``RTP/AVP`` or carries no usable ``a=crypto`` cannot be answered
+        securely — answering it plain would drop the media to cleartext mid-call. Such
+        an offer is rejected (488) rather than honoured (ADR-0053 continuity).
+        """
+        if self._local_media.crypto is None:
+            return False  # a plain call has nothing to downgrade
+        audio = offer.audio
+        return audio is None or not audio.is_srtp or not audio.crypto_attrs
+
+    async def _reanswer_crypto(
+        self, offer: SessionDescription | None
+    ) -> CryptoAttribute | None:
+        """Pick the SDES ``a=crypto`` for a re-INVITE answer/offer WE emit in a 200.
+
+        - Peer re-offer (``offer`` set) on a secured call: mint our fresh answer key
+          echoing the OFFERED tag + suite and re-key the engine — inbound from the
+          peer's key, outbound from ours (RFC 4568 §6.1). A plain-call peer offer is
+          answered plain. (A secured call's downgrade re-offer never reaches here — it
+          is rejected 488 upstream by :meth:`_peer_reoffer_is_downgrade`.)
+        - Offerless re-INVITE (``offer`` is ``None``) on a secured call: WE offer, but
+          re-advertise the call's ESTABLISHED key (no rotation, no re-key). The peer's
+          answer rides the ACK, which this dialog does not parse for SDP; re-using the
+          current key keeps BOTH directions on their agreed keys, so continuity holds
+          without consuming the ACK answer. A plain call offers plain.
+
+        Returns the crypto to render, or ``None`` for a plain answer.
+        """
+        if offer is None:
+            # Offerless: re-advertise the current key unchanged (no fresh mint, no
+            # engine re-key) so there is no dependency on the peer's ACK-borne answer.
+            return self._local_media.crypto
+        audio = offer.audio
+        if self._local_media.crypto is None or audio is None or not audio.is_srtp:
+            return None
+        if not audio.crypto_attrs:
+            return None
+        peer_crypto = audio.crypto_attrs[0]
+        answer_crypto = generate_answer_crypto(peer_crypto)
+        await self._media.rekey_srtp(inbound=peer_crypto, outbound=answer_crypto)
+        self._adopt_local_crypto(answer_crypto)
+        return answer_crypto
+
+    async def _commit_reoffer_keys(
+        self, offer_crypto: CryptoAttribute | None, answer: SessionDescription
+    ) -> None:
+        """Commit a re-offer's SRTP keys after the peer ACCEPTED it (RFC 4568 §6.1).
+
+        Called only on a confirmed (2xx) re-INVITE WE sent. When we offered SRTP
+        (``offer_crypto`` set), the peer's answer MUST carry a usable ``a=crypto`` —
+        that is the peer's key for OUR inbound decrypt path. We then re-key outbound
+        with our offered key (now accepted) and inbound with the peer's, and adopt the
+        new context. A plain re-offer (``offer_crypto`` ``None``) commits nothing.
+
+        Raises:
+            CallError: If we offered SRTP but the answer is not ``RTP/SAVP`` with a
+                usable ``a=crypto`` (a downgrade), or the answer's crypto does not
+                echo the offered ``tag``/``suite`` (RFC 4568 §6.1: the answer's tag
+                identifies the accepted offered crypto). The media change is rejected,
+                never silently accepted on a key the peer never selected.
+        """
+        if offer_crypto is None:
+            return
+        audio = answer.audio
+        if audio is None or not audio.is_srtp or not audio.crypto_attrs:
+            msg = "secured re-INVITE answered without a usable a=crypto (downgrade)"
+            raise CallError(msg)
+        peer_answer = audio.crypto_attrs[0]
+        if (
+            peer_answer.tag != offer_crypto.tag
+            or peer_answer.suite != offer_crypto.suite
+        ):
+            # RFC 4568 §6.1: a compliant answer echoes the offered tag (and the suite
+            # it selected). A mismatch is a non-compliant/forged answer — committing it
+            # would key outbound to a tag the peer never accepted.
+            msg = "secured re-INVITE answer crypto does not match the offered tag/suite"
+            raise CallError(msg)
+        await self._media.rekey_srtp(inbound=peer_answer, outbound=offer_crypto)
+        self._adopt_local_crypto(offer_crypto)
 
     async def _refer(
         self, build: Callable[[tuple[str, str] | None], InDialogRequest]
@@ -496,14 +644,31 @@ class CallSession:
             await self._signaling.send(build_response(request, 491, "Request Pending"))
             return
         if isinstance(routing, MediaUpdate):
-            await self._answer_reinvite(request, routing.answer_direction)
+            # Downgrade resistance (ADR-0053): a secured call never answers a plain
+            # (no-a=crypto) re-offer with cleartext media — reject it 488 and leave
+            # the established SRTP context untouched.
+            if self._peer_reoffer_is_downgrade(routing.offer):
+                await self._signaling.send(
+                    build_response(request, 488, "Not Acceptable Here")
+                )
+                return
+            await self._answer_reinvite(
+                request, routing.answer_direction, offer=routing.offer
+            )
             self.on_hold = routing.held_by_peer
             await self._media.set_hold(routing.held_by_peer)
             return
         # OfferlessReinvite: re-offer our current media direction in the 2xx.
-        await self._answer_reinvite(request, "sendonly" if self.on_hold else "sendrecv")
+        await self._answer_reinvite(
+            request, "sendonly" if self.on_hold else "sendrecv", offer=None
+        )
 
-    async def _answer_reinvite(self, request: SipRequest, direction: str) -> None:
+    async def _answer_reinvite(
+        self, request: SipRequest, direction: str, *, offer: SessionDescription | None
+    ) -> None:
+        # SDES continuity (ADR-0053): on a secured call the re-negotiated media stays
+        # RTP/SAVP + a=crypto, never silently downgrading to cleartext RTP/AVP.
+        answer_crypto = await self._reanswer_crypto(offer)
         self._dialog = self._dialog.with_next_sdp_version()
         answer = build_audio_offer(
             local_address=self._local_media.local_address,
@@ -513,6 +678,7 @@ class CallSession:
             ptime=self._local_media.ptime,
             session_id=self._local_media.session_id,
             version=self._dialog.sdp_version,
+            crypto=answer_crypto,
         )
         await self._signaling.send(
             build_response(

@@ -24,7 +24,7 @@ from hermes_voip.dtmf_sipinfo import parse_dtmf_info
 from hermes_voip.incall import LocalMediaSession
 from hermes_voip.message import SipRequest, SipResponse
 from hermes_voip.providers.policy import GuardSessionState
-from hermes_voip.sdp import Codec
+from hermes_voip.sdp import Codec, CryptoAttribute
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,6 +52,14 @@ class _FakeMedia:
 
     async def send_dtmf(self, digits: str) -> None:
         self.dtmf.append(digits)
+
+    async def rekey_srtp(
+        self,
+        *,
+        inbound: CryptoAttribute | None,
+        outbound: CryptoAttribute | None,
+    ) -> None:
+        """No-op (these tests never exercise SRTP re-keying)."""
 
     async def stop(self) -> None:
         """No-op."""

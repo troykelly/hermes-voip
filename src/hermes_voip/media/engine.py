@@ -56,7 +56,7 @@ import struct
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from hermes_voip.dtmf import (
     DtmfEvent,
@@ -99,6 +99,9 @@ from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
 from hermes_voip.media.srtp import SrtpError
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket
+
+if TYPE_CHECKING:
+    from hermes_voip.sdp import CryptoAttribute
 
 __all__ = [
     "Codec",
@@ -2168,6 +2171,44 @@ class RtpMediaTransport:
         if on_hold:
             self._tx_buffer = b""
         self.on_hold = on_hold
+
+    async def rekey_srtp(
+        self,
+        *,
+        inbound: CryptoAttribute | None,
+        outbound: CryptoAttribute | None,
+    ) -> None:
+        """Re-key the SRTP context mid-call from new SDES ``a=crypto`` (RFC 4568 §6.1).
+
+        Called on an in-dialog re-offer (hold/resume/re-INVITE) of a secured call so
+        the security context survives the re-negotiation (ADR-0053). Each argument is
+        the new per-direction SDES key as a :class:`~hermes_voip.sdp.CryptoAttribute`,
+        or ``None`` to leave that direction's session unchanged — a re-offer that does
+        not re-key a direction keeps the established key, and a plain call (both
+        ``None``) is unaffected. RFC 4568 §6.1 directionality: ``outbound`` is OUR key
+        (we encrypt + advertise it); ``inbound`` is the peer's key (we decrypt with it).
+
+        The fresh outbound session is bound to the engine's fixed outbound SSRC so it
+        keys correctly from the first protected packet; the inbound session binds to
+        the peer's SSRC on its first packet (RFC 3711 §3.2.3). The outbound swap is
+        done under the TX lock so it cannot race a packet mid-protect; the inbound swap
+        is a single attribute store (the inbound reader sees the old or the new session,
+        never a torn one).
+
+        Raises:
+            ImportError: If the ``media`` extra is not installed (``SrtpSession``
+                construction needs the ``cryptography`` backend).
+            SrtpError: If a supplied crypto carries unsupported SDES session
+                parameters (a non-default lifetime or an MKI).
+        """
+        from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+
+        if outbound is not None:
+            new_out = SrtpSession(outbound, ssrc=_OUTBOUND_SSRC)
+            async with self._tx_lock:
+                self._srtp_out = new_out
+        if inbound is not None:
+            self._srtp_in = SrtpSession(inbound)
 
     async def flush_outbound(self, *, fade_ms: int) -> None:
         """Drop the pending outbound audio with a short click-free fade (ADR-0028).

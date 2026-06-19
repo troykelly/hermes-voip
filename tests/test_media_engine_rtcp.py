@@ -15,6 +15,7 @@ these tests exercise the capability through the injectable seams.
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 
 import pytest
@@ -485,3 +486,187 @@ class _CaptureTransport:
 
     def is_closing(self) -> bool:
         return False
+
+
+# ---------------------------------------------------------------------------
+# start_rtcp: the adapter-activation entry point (ADR-0061 §"Adapter activation")
+#
+# The adapter calls start_rtcp() AFTER connect(); it (1) chooses the RTCP
+# transport from the negotiated mux — muxed rides the RTP transport, non-muxed
+# opens a sibling socket on RTP-port+1 — (2) registers the run_rtcp loop task on
+# the engine so stop() cancels it, and (3) engages the inbound muxed-RTCP demux.
+# ---------------------------------------------------------------------------
+
+
+def _peer_rr_about_us(*, fraction_lost: int = 128, cumulative_lost: int = 7) -> bytes:
+    """A compound RTCP datagram the peer would send us (an RR about our SSRC)."""
+    rr = ReceiverReport(
+        ssrc=_PEER_SSRC,
+        report_blocks=(
+            ReportBlock(
+                ssrc=OUTBOUND_AUDIO_SSRC,
+                fraction_lost=fraction_lost,
+                cumulative_lost=cumulative_lost,
+                extended_highest_seq=1000,
+                jitter=0,
+                lsr=0,
+                dlsr=0,
+            ),
+        ),
+    )
+    return build_compound((rr,))
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_muxed_registers_loop_task_and_rides_rtp_transport() -> None:
+    """start_rtcp(mux=True) registers a run_rtcp task and muxes over the RTP path.
+
+    On the muxed (RFC 5761) path the engine sends RTCP over its existing RTP
+    transport (no separate socket), and the loop task is registered on the engine
+    so stop() cancels it.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    engine._transport = _CaptureTransport()  # deterministic, no real socket
+    await engine.start_rtcp(mux=True)
+    try:
+        assert engine._rtcp_task is not None
+        # Muxed: no separate RTCP sink is installed (RTCP rides _transport).
+        assert engine._rtcp_send is None
+    finally:
+        await engine.stop()
+    assert engine._rtcp_task is None
+
+
+@pytest.mark.asyncio
+async def test_start_rtcp_non_muxed_opens_sibling_socket_on_rtp_port_plus_one() -> None:
+    """start_rtcp(mux=False) opens an RTCP socket on RTP-port+1 and installs a sink.
+
+    RFC 3550 §11: when RTCP is not multiplexed it travels on the odd port one above
+    the RTP port. The engine binds that sibling socket and routes outbound RTCP to
+    the peer's RTCP address through it (so RTCP never lands on the RTP socket).
+    """
+    engine = _make_engine()
+    await engine.connect()
+    rtp_port = engine.local_port
+    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    try:
+        assert engine._rtcp_task is not None
+        # A separate sink was installed (NOT muxed over the RTP transport).
+        assert engine._rtcp_send is not None
+        # The sibling RTCP socket is bound one above the RTP port (RFC 3550 §11).
+        assert engine._rtcp_local_port == rtp_port + 1
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_inbound_muxed_rtcp_datagram_reaches_ingest_not_audio() -> None:
+    """A muxed inbound RTCP datagram is demuxed to ingest_rtcp, not decoded as audio.
+
+    RFC 5761 §4: on a muxed stream the second byte (the RTP M+PT byte aliases the
+    RTCP packet-type byte) discriminates — 200..204 is RTCP. When RTCP is active the
+    engine routes such a datagram to ingest_rtcp (updating call_quality) and never
+    yields it as a PcmFrame.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    engine._transport = _CaptureTransport()
+    await engine.start_rtcp(mux=True)
+    try:
+        remote = ("127.0.0.1", 5004)
+        # One real audio packet and one muxed RTCP packet, interleaved.
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=300, ts=0), remote))
+        engine._recv_queue.put_nowait((_peer_rr_about_us(), remote))
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=301, ts=160), remote))
+
+        gen = engine.inbound_audio()
+        # Exactly TWO audio frames come out (the RTCP datagram is NOT yielded).
+        f1 = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        f2 = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert f1.sample_rate == _G711_RATE
+        assert f2.sample_rate == _G711_RATE
+        # The RTCP datagram reached ingest_rtcp: the peer's loss is on call_quality.
+        assert engine.call_quality.remote_fraction_lost == pytest.approx(128 / 256)
+        assert engine.call_quality.remote_cumulative_lost == 7
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_inbound_muxed_rtcp_inert_when_rtcp_not_started() -> None:
+    """Without start_rtcp the muxed demux is OFF: an RTCP-typed datagram is dropped.
+
+    Zero-regression guarantee: an engine on which the adapter never activated RTCP
+    behaves exactly as before — an RTCP-typed datagram is an unknown payload type and
+    is dropped (never fed to ingest_rtcp, never decoded as audio).
+    """
+    engine = _make_engine()
+    await engine.connect()
+    engine._transport = _CaptureTransport()
+    try:
+        remote = ("127.0.0.1", 5004)
+        engine._recv_queue.put_nowait((_peer_rr_about_us(), remote))
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=400, ts=0), remote))
+        gen = engine.inbound_audio()
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert frame.sample_rate == _G711_RATE
+        # RTCP was NOT ingested (no peer report absorbed) — quality stays unset.
+        assert engine.call_quality.remote_fraction_lost is None
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_inbound_malformed_muxed_rtcp_is_dropped_not_fatal() -> None:
+    """A structurally broken muxed RTCP datagram is logged + dropped, not fatal.
+
+    Per ingest_rtcp's contract the adapter decides how to handle a bad inbound RTCP
+    datagram; the engine's muxed demux treats it like a malformed RTP datagram —
+    drop the one packet and keep the call alive (the next audio packet still flows).
+    """
+    engine = _make_engine()
+    await engine.connect()
+    engine._transport = _CaptureTransport()
+    await engine.start_rtcp(mux=True)
+    try:
+        remote = ("127.0.0.1", 5004)
+        # A datagram whose 2nd byte is an RTCP PT (200) but is truncated garbage.
+        engine._recv_queue.put_nowait((b"\x80\xc8\x00\x06bad", remote))
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=500, ts=0), remote))
+        gen = engine.inbound_audio()
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert frame.sample_rate == _G711_RATE
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
+    """The sibling RTCP socket pumps inbound RTCP into ingest_rtcp (non-muxed path).
+
+    With mux=False the engine reads its RTCP socket and feeds each datagram to
+    ingest_rtcp, so a peer report sent to RTP-port+1 updates call_quality. Sent over
+    a real loopback UDP socket (the engine bound a real one) to prove the reader.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    await engine.start_rtcp(mux=False, remote_rtcp_addr=("127.0.0.1", 5005))
+    try:
+        rtcp_port = engine._rtcp_local_port
+        assert rtcp_port is not None
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sender.sendto(
+                _peer_rr_about_us(cumulative_lost=11), ("127.0.0.1", rtcp_port)
+            )
+            # Give the event loop a few turns to read + ingest the datagram.
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if engine.call_quality.remote_cumulative_lost is not None:
+                    break
+        finally:
+            sender.close()
+        assert engine.call_quality.remote_cumulative_lost == 11
+    finally:
+        await engine.stop()

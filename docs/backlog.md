@@ -605,3 +605,11 @@ These span multiple modules or the repo as a whole.
   package licence gate.** ADRs 0006/0007/0009 each require a model-specific licence+checksum CI gate
   (repo + pinned revision + filenames + sha256 + SPDX allow-list) distinct from `pip-licenses`. Track that
   the existing `supply-chain.yml` covers only Python packages; the model gates land with each provider.
+
+## Future / deferred (nice-to-have, ADR-gated)
+
+- [ ] **[low] feature/observability** — Durable call-events + recordings store via AWS S3 Tables
+  (Iceberg). Researched + designed in ADR-0060 (Proposed/Deferred). Optional, dependency-free
+  call-event sink in core; S3-Tables writer as an optional extra (default off); audio blobs in plain
+  S3, queryable metadata in Iceberg. Requires explicit operator cost approval, an ADR flip to Accepted,
+  and a runbook before any implementation (rule 40).

@@ -18,6 +18,7 @@ import pytest
 
 from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import (
+    Cancel,
     InDialog,
     NewCall,
     RegistrationManager,
@@ -332,6 +333,36 @@ async def test_route_in_dialog_without_session_is_unroutable() -> None:
     assert isinstance(routing, Unroutable)
 
 
+def _cancel(*, call_id: str, branch: str, cseq_num: int = 1) -> SipRequest:
+    # RFC 3261 §9.1: a CANCEL copies the INVITE's Request-URI, Call-ID, From, To
+    # (no To-tag — it targets the pre-dialog INVITE transaction) and the top Via
+    # branch, with the same CSeq number but method CANCEL.
+    return SipRequest(
+        method="CANCEL",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", f"SIP/2.0/TLS 198.51.100.200:5061;branch={branch};rport"),
+            ("From", "<sip:caller@elsewhere.test>;tag=callertag"),
+            ("To", "<sip:1000@pbx.example.test>"),
+            ("Call-ID", call_id),
+            ("CSeq", f"{cseq_num} CANCEL"),
+        ),
+        body="",
+    )
+
+
+async def test_route_out_of_dialog_cancel_is_classified_as_cancel() -> None:
+    # RFC 3261 §9.2: a CANCEL targets a pending INVITE server transaction — it is
+    # neither a NewCall nor an in-dialog request nor Unroutable. The manager must
+    # classify it as Cancel so the transport can 200 the CANCEL + 487 the INVITE.
+    manager = RegistrationManager(_gateway(), _FakeTransport())
+    routing = manager.route_request(
+        _cancel(call_id="inbound-call-1", branch="z9hG4bKc")
+    )
+    assert isinstance(routing, Cancel)
+    assert routing.request.method == "CANCEL"
+
+
 async def test_route_out_of_dialog_non_invite_is_unroutable() -> None:
     manager = RegistrationManager(_gateway(), _FakeTransport())
     options = SipRequest(
@@ -423,3 +454,181 @@ async def test_aclose_cancels_refresh_tasks() -> None:
     await manager.on_response(_ok_for(transport.sent[0]))
     await manager.aclose()  # must not raise
     assert manager.is_up is True
+
+
+# ---- recovery: a registrar-rejected refresh (item 1) -----------------------
+
+
+def _failed_for(register_text: str, *, status: int, reason: str) -> SipResponse:
+    """Build a 4xx/5xx/6xx final to the REGISTER in ``register_text``."""
+    reg = SipRequest.parse(register_text)
+    return SipResponse.parse(
+        f"SIP/2.0 {status} {reason}\r\n"
+        f"Call-ID: {reg.header('Call-ID')}\r\n"
+        f"CSeq: {reg.header('CSeq')}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_failed_refresh_reports_and_schedules_reregister() -> None:
+    # RFC 3261 §10: a registrar that REJECTS a periodic refresh (503/403/...) must
+    # NOT silently take the extension down forever. The manager reports the failure
+    # via on_registration_error AND schedules a bounded-backoff re-REGISTER, so the
+    # binding recovers instead of dead-ending (the audit's terminal-silent gap).
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        refresh_fraction=0.0,  # refresh fires immediately after registration
+        retry_backoff=0.0,  # and the recovery re-REGISTER fires immediately too
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))  # 1000 is now up
+    # The refresh REGISTER fires (refresh_fraction=0.0); reject it with a 503.
+    await asyncio.sleep(0.05)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    sent_before = len(transport.sent)
+    await manager.on_response(
+        _failed_for(refresh, status=503, reason="Service Unavailable")
+    )
+    # The failure is surfaced (never swallowed, rule 37) ...
+    assert errors, "a rejected refresh must be reported via on_registration_error"
+    ext, exc = errors[0]
+    assert ext == "1000"
+    assert isinstance(exc, Exception)
+    # ... the extension is marked down ...
+    down = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert down.registered is False
+    # ... and a recovery re-REGISTER is scheduled and sent (not a dead-end).
+    await asyncio.sleep(0.05)
+    recovery = [
+        m
+        for m in transport.sent[sent_before:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+        and SipRequest.parse(m).method == "REGISTER"
+    ]
+    assert recovery, "a rejected refresh must schedule a re-REGISTER (bounded backoff)"
+    await manager.aclose()
+
+
+async def test_failed_refresh_recovers_back_to_registered() -> None:
+    # The recovery re-REGISTER, once the registrar accepts it again, brings the
+    # extension back up — end-to-end proof the dead-end is gone, not just that a
+    # retry was emitted.
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        refresh_fraction=0.0,
+        retry_backoff=0.0,
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))
+    await asyncio.sleep(0.05)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    sent_before = len(transport.sent)
+    await manager.on_response(
+        _failed_for(refresh, status=500, reason="Server Internal Error")
+    )
+    await asyncio.sleep(0.05)
+    recovery = next(
+        m
+        for m in transport.sent[sent_before:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+        and SipRequest.parse(m).method == "REGISTER"
+    )
+    # The registrar now accepts the recovery REGISTER.
+    await manager.on_response(_ok_for(recovery))
+    up = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert up.registered is True
+    await manager.aclose()
+
+
+# ---- recovery: a refresh that gets NO response (item 2, Timer-F/B) ----------
+
+
+async def test_refresh_with_no_response_times_out_and_reregisters() -> None:
+    # RFC 3261 Timer F/B: a refresh REGISTER that gets NO response at all must not
+    # leave the binding marked 'registered' forever. After a bounded response
+    # timeout the manager marks the extension down, reports it, and re-registers —
+    # rather than trusting a binding that may already have lapsed at the registrar.
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        refresh_fraction=0.0,  # refresh fires immediately
+        refresh_timeout=0.05,  # ... and times out fast (no response is fed)
+        retry_backoff=0.0,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))  # up
+    assert next(s for s in manager.snapshot() if s.extension == "1000").registered
+    sent_before = len(transport.sent)
+    # Deliberately feed NO response to the refresh; the timeout must fire.
+    await asyncio.sleep(0.2)
+    # The stale 'registered' is cleared ...
+    down = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert down.registered is False, "a refresh with no response must not stay 'up'"
+    # ... the timeout is surfaced ...
+    assert errors, "a refresh response-timeout must be reported, never swallowed"
+    assert errors[0][0] == "1000"
+    # ... and a fresh REGISTER is scheduled (recovery, not permanent stale-down).
+    recovery = [
+        m
+        for m in transport.sent[sent_before:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+        and SipRequest.parse(m).method == "REGISTER"
+    ]
+    assert recovery, "a refresh response-timeout must trigger a re-REGISTER"
+    await manager.aclose()
+
+
+async def test_refresh_response_cancels_the_timeout() -> None:
+    # The Timer-F/B response timeout must NOT fire when the refresh DOES get a
+    # timely 200 OK — otherwise every healthy refresh would spuriously flap the
+    # registration down. A 200 to the refresh keeps the extension up with no error.
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        refresh_fraction=0.0,
+        refresh_timeout=0.05,
+        retry_backoff=0.0,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))
+    await asyncio.sleep(0.01)  # let the refresh fire (but not time out yet)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    await manager.on_response(_ok_for(refresh))  # timely refresh OK
+    # Wait well past the timeout window: no flap, no error, still registered.
+    await asyncio.sleep(0.15)
+    assert not errors, "a refresh that got a 200 OK must not also time out"
+    up = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert up.registered is True
+    await manager.aclose()

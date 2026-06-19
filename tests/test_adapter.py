@@ -1453,6 +1453,62 @@ async def test_connect_brings_transport_up_before_building_manager() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression (item 4): the production adapter MUST wire on_registration_error
+# into the RegistrationManager. Without it, the manager's registration-recovery
+# reporting (a rejected/timed-out refresh) has nowhere to surface — the failure
+# is silently lost. The hook must log on the adapter logger and must NOT leak any
+# HERMES_SIP_* value (rule 34: extension number / host / password are sensitive).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_wires_on_registration_error_into_the_manager(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_establish`` passes a non-None ``on_registration_error`` that logs."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _ConnectOrderTransport()
+    config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+
+    captured: dict[str, object] = {}
+    real_manager_cls = RegistrationManager
+
+    def _capture_manager(*args: object, **kwargs: object) -> RegistrationManager:
+        captured.update(kwargs)
+        # Build the real manager so connect() proceeds normally.
+        gateway = args[0]
+        transport_arg = args[1]
+        assert isinstance(gateway, GatewayConfig)
+        return real_manager_cls(gateway, transport_arg, **kwargs)  # type: ignore[arg-type]  # test shim forwards the captured kwargs to the real ctor
+
+    with (
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", side_effect=_capture_manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+
+    hook = captured.get("on_registration_error")
+    assert hook is not None, (
+        "the adapter must pass on_registration_error so registration-failure "
+        "recovery can be surfaced (item 4)"
+    )
+    assert callable(hook)
+    # Invoking the hook logs the failure on the adapter logger (observed, not
+    # swallowed) and never leaks the extension number or any secret.
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        hook("1000", RuntimeError("registrar rejected refresh: 503"))
+    records = [r for r in caplog.records if r.name == "hermes_voip.adapter"]
+    assert records, "on_registration_error must log on the adapter logger"
+    message = " ".join(r.getMessage() for r in records)
+    # rule 34: the extension number is PII — it must not appear verbatim in the log.
+    assert "1000" not in message, "registration-error log must not leak the extension"
+
+
+# ---------------------------------------------------------------------------
 # Regression (live inbound-call failure, 2026-06-16): the 200 OK answering an
 # inbound INVITE MUST carry our dialog To-tag, so the gateway's subsequent
 # in-dialog ACK/BYE route back to the established CallSession instead of going

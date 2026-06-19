@@ -463,6 +463,13 @@ offerer's). A plain `RTP/AVP` offer is still answered plain (opportunistic).
   `a=crypto:<tag> AES_CM_128_HMAC_SHA1_80 inline:<our-key>`. Confirm the inline key
   differs from the one in the offer (each direction uses the sender's key).
 - The agreed-codec INFO log line is unchanged; audio is two-way as in step 8.
+- **In-dialog re-offer continuity (ADR-0053 Stage 1).** During the secured call,
+  trigger a hold then resume from the gateway/handset (or a peer-side re-INVITE).
+  Every re-INVITE SDP — the offer we send AND the 200 OK we send — must still show
+  `RTP/SAVP` + exactly one `a=crypto` line; it must **never** drop to `RTP/AVP`.
+  Audio must remain audible (decrypted) after resume — a downgrade or a stale key
+  would surface as silence/garble. The re-offer key is fresh per offer (its inline
+  key differs from the prior offer's), echoing the same tag + suite.
 - If the gateway only offers DTLS-SRTP (`UDP/TLS/RTP/SAVP` + `a=fingerprint`), that
   is **ADR-0053 Stage 2** (not yet built) — such an offer is currently declined; use
   SDES (`RTP/SAVP`) for this validation.

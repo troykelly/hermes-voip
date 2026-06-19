@@ -2246,6 +2246,10 @@ class VoipAdapter(BasePlatformAdapter):
             port=engine.local_port,
             codecs=agreed_sdp_codecs,
             session_id=int(time.monotonic() * 1000) & 0xFFFF_FFFF,
+            # SDES continuity (ADR-0053): carry the accepted SRTP crypto so an
+            # in-dialog re-offer (hold/resume/re-INVITE) stays RTP/SAVP + a=crypto
+            # and never downgrades to cleartext RTP/AVP. None ⇒ a plain RTP/AVP call.
+            crypto=answer_crypto,
         )
         try:
             answer_sdp = build_audio_answer(

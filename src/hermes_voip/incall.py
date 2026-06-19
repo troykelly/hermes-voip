@@ -19,12 +19,17 @@ peer sends one, we answer ``491 Request Pending``; if the peer answers ours with
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge
 from hermes_voip.message import SipRequest, SipResponse
-from hermes_voip.sdp import Codec, SessionDescription, build_audio_offer
+from hermes_voip.sdp import (
+    Codec,
+    CryptoAttribute,
+    SessionDescription,
+    build_audio_offer,
+)
 
 __all__ = [
     "Glare",
@@ -83,6 +88,13 @@ class LocalMediaSession:
         session_id: The SDP ``o=`` session id — constant for the dialog; the
             version comes from :attr:`Dialog.sdp_version`.
         ptime: The packetisation time in ms.
+        crypto: The call's accepted SDES ``a=crypto`` security context (RFC 4568)
+            when this is an ``RTP/SAVP`` (SRTP) call, or ``None`` for a plain
+            ``RTP/AVP`` call. It carries the negotiated tag + suite so an in-dialog
+            re-offer (hold/resume/re-INVITE) stays secured: a re-offer mints a
+            fresh per-offer key echoing this tag/suite rather than silently
+            downgrading to plain RTP (ADR-0053). ``field(repr=False)`` — it carries
+            SRTP key material that must never reach a log/`repr`.
     """
 
     local_address: str
@@ -90,6 +102,7 @@ class LocalMediaSession:
     codecs: tuple[Codec, ...]
     session_id: int
     ptime: int = 20
+    crypto: CryptoAttribute | None = field(default=None, repr=False)
 
 
 def build_hold_reinvite(
@@ -98,6 +111,7 @@ def build_hold_reinvite(
     direction: str,
     *,
     auth: tuple[str, str] | None = None,
+    crypto: CryptoAttribute | None = None,
 ) -> InDialogRequest:
     """Build a hold (``sendonly``) or resume (``sendrecv``) re-INVITE.
 
@@ -106,6 +120,11 @@ def build_hold_reinvite(
     the wire text and the dialog with **both** counters incremented and the
     session-id unchanged. ``auth`` is an optional ``(Authorization|
     Proxy-Authorization, value)`` header carried when re-sending after a 401/407.
+
+    ``crypto`` is the SDES ``a=crypto`` for this re-offer (RFC 4568): on a secured
+    (``RTP/SAVP``) call the caller supplies a fresh per-offer key so the re-offer
+    stays ``RTP/SAVP`` + ``a=crypto`` and never downgrades to cleartext RTP/AVP
+    (ADR-0053 §6 continuity). ``None`` keeps a plain call plain.
 
     Raises:
         IncallError: if ``direction`` is not ``sendonly`` or ``sendrecv``.
@@ -122,6 +141,7 @@ def build_hold_reinvite(
         ptime=media.ptime,
         session_id=media.session_id,
         version=offered.sdp_version,
+        crypto=crypto,
     )
     extra: tuple[tuple[str, str], ...] = (
         (_SDP_CONTENT_TYPE,) if auth is None else (_SDP_CONTENT_TYPE, auth)

@@ -28,6 +28,8 @@ design). This runbook is the operational HOW.
 | SIP **signalling over Secure-WebSocket** (`HERMES_SIP_TRANSPORT=wss`) | **Wired** (ADR-0038); see "SIP-over-WSS signalling" — full live validation needs the operator's WSS port + credential |
 | Trickle ICE **in-dialog transport** (SIP INFO, RFC 8840 `trickle-ice-sdpfrag`) | **Not required** for our SIP/WebRTC targets (ADR-0034 §2 determination) — half-trickle is fully interoperable; we don't advertise the `trickle-ice` SIP option-tag so peers fall back to the full-candidate exchange we serve |
 | WebRTC **video** | **Deferred** (ADR-0018) |
+| **Loss resilience** — adaptive jitter buffer, packet-loss concealment, Opus in-band FEC, ptime/maxptime negotiation | **Wired** (ADR-0056); see "Loss resilience" below |
+| **RTCP** sender/receiver reports (loss/jitter feedback on the wire) | **Deferred** — a separate later lane (the concealment path already tracks a per-call loss count it can read) |
 | **Live** validation against a real WebRTC client | **Pending** the operator's redeploy |
 
 ## Prerequisites
@@ -276,6 +278,50 @@ trickles; that would be tasked into a signalling lane (it is a latency optimisat
    is decoded at 48 kHz and **downsampled to 16 kHz** for the VAD/STT pipeline (Silero VAD
    accepts only 8/16 kHz); outbound TTS is resampled up to 48 kHz to encode.
 
+## Loss resilience (ADR-0056)
+
+The media plane survives a real (lossy, jittery) network rather than only a clean LAN. Four
+behaviours, all on by default, all driven by injectable seams so they are deterministic in
+tests (no wall clock / real network):
+
+- **Adaptive jitter buffer** (`rtp.JitterBuffer`). The reorder tolerance (the *depth*: how
+  many later packets pile up behind a gap before loss is declared) adapts to the link when the
+  buffer is built with `adapt=True` / `max_depth=N`. It GROWS on evidence it was too eager (a
+  packet arriving after its slot was emitted as `Lost`, or an in-window packet reordered by a
+  span ≥ the current depth) and SHRINKS one step toward the floor after a sustained clean run.
+  Bounds: floor = `target_depth` (default 2), ceiling = `max_depth` (default 10 ≈ 200 ms at
+  20 ms ptime). The non-adaptive default (`adapt=False`) is the legacy fixed depth. Read the
+  live value via `JitterBuffer.current_depth`.
+- **Packet-loss concealment** (`engine._conceal_frame`). A `Lost` no longer leaves a hole: the
+  engine yields one concealment frame at the analysis rate so the VAD/endpointer/STT see a
+  continuous stream. **Opus** recovers the lost frame from the **next** packet's in-band FEC
+  (`OpusDecoder.decode_fec`, used when the successor is already buffered — peeked via
+  `JitterBuffer.peek_next`), else uses Opus **PLC** (`decode_plc`); both keep the decoder
+  predictor coherent. **G.711 / G.722** repeat the last good frame attenuated ~6 dB per
+  consecutive loss, fading to silence after 5 frames — identical for both, so wideband is no
+  worse than narrowband under loss.
+- **Opus in-band FEC** (`media/opus.py`). `OpusEncoder` enables in-band FEC + an
+  expected-packet-loss hint (default 10%, `OpusEncoder(expected_packet_loss_pct=…)`). NOTE: the
+  `opuslib` 3.0.1 property *setters* for FEC/loss are broken (they drop the CTL value), so the
+  encoder sets them via the low-level `opuslib.api.encoder.encoder_ctl`; the working getters
+  (`OpusEncoder.inband_fec_enabled` / `.expected_packet_loss_pct`) confirm it. This is what
+  the `useinbandfec=1` already on the Opus fmtp wire actually delivers.
+- **ptime / maxptime negotiation** (`sdp.negotiate_ptime` + `RtpMediaTransport.ptime`). The
+  engine no longer assumes 20 ms: `sdp.py` parses `a=ptime` and `a=maxptime`, and
+  `negotiate_ptime(offer_ptime, offer_maxptime, supported=…, default=20)` picks the framing
+  (honour the offer's ptime when supported and within maxptime, else the default, clamped down
+  to the largest supported value that fits the cap). Apply it via the `engine.ptime` setter
+  (the adapter wiring that calls this lands in a sibling lane). 20 ms remains the default when
+  the offer is silent or unsupported.
+
+**Tuning / disable.** Concealment, Opus FEC, and ptime defaults are intrinsic to the engine —
+there is no env knob to turn them off (they only help). The jitter buffer is constructed
+non-adaptive by default at the engine's call sites; adaptation is enabled by passing
+`adapt=True` / `max_depth=N` where the engine builds the `JitterBuffer`. To change the
+attenuation curve or fade length, edit `_PLC_ATTENUATION_PER_FRAME` / `_PLC_MAX_REPEAT_FRAMES`
+in `media/engine.py`; to change the Opus expected-loss bias, the `expected_packet_loss_pct`
+default in `media/opus.py`.
+
 ## How to verify
 
 - **Unit / handshake evidence (no live gateway):** `uv sync --extra webrtc --extra media` then
@@ -289,6 +335,17 @@ trickles; that would be tasked into a signalling lane (it is a latency optimisat
   pipe and asserts the role-mirrored SRTP cross-decrypts. The adapter branch (the full
   is_webrtc path) is exercised by `tests/test_adapter_webrtc.py` in the `hermes-contract` CI
   job (which installs hermes + webrtc + media + libopus).
+
+- **Loss resilience (ADR-0056):** the adaptive jitter buffer is covered in `tests/test_rtp.py`
+  (the `adaptive` tests, default gate — no extras); packet-loss concealment + Opus FEC/PLC in
+
+  ```
+  uv run pytest tests/test_media_engine_plc.py tests/test_media_opus.py \
+                tests/test_media_engine.py -k "ptime or concealed"
+  ```
+
+  The Opus FEC/PLC cases need the `webrtc` extra + libopus (they `importorskip`); the G.711
+  concealment, adaptive-jitter, and ptime cases run on the default gate.
 
 - **SIP-over-WSS signalling (ADR-0038, no live gateway):**
 

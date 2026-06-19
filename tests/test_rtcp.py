@@ -136,8 +136,9 @@ def test_report_block_cumulative_lost_is_signed_24_bit() -> None:
         dlsr=0,
     )
     packed = block.pack()
-    # -1 in signed 24-bit two's complement is 0xFFFFFF.
-    assert packed[4:7] == b"\xff\xff\xff"
+    # Layout: SSRC(4) | fraction_lost(1) | cumulative_lost(3). The cumulative
+    # field is bytes 5..8; -1 in signed 24-bit two's complement is 0xFFFFFF.
+    assert packed[5:8] == b"\xff\xff\xff"
     assert ReportBlock.parse(packed).cumulative_lost == -1
 
 
@@ -453,11 +454,11 @@ def test_reception_stats_counts_and_extended_highest_seq() -> None:
     First packet seq=1000; after 5 in-order packets the extended highest sequence
     is 1004 (no wrap, cycles=0) and the report block shows zero loss.
     """
-    stats = ReceptionStats()
+    stats = ReceptionStats(clock_rate=8000)
     for i, seq in enumerate((1000, 1001, 1002, 1003, 1004)):
         # Arrival times and RTP timestamps advance one 20 ms G.711 frame each.
         stats.on_packet(seq=seq, rtp_timestamp=160 * i, arrival_ts=0.02 * i)
-    block = stats.report_block(source_ssrc=0xABCD, lsr=0, dlsr=0, clock_rate=8000)
+    block = stats.report_block(source_ssrc=0xABCD, lsr=0, dlsr=0)
     assert block.extended_highest_seq == 1004
     assert block.cumulative_lost == 0
     assert block.fraction_lost == 0
@@ -470,15 +471,15 @@ def test_reception_stats_fraction_lost_one_in_four() -> None:
     over the interval since the last report. Second interval expects 4 packets
     (2,3,4,5) but 4 is lost → 1 of 4 lost → 256 * 1/4 = 64.
     """
-    stats = ReceptionStats()
+    stats = ReceptionStats(clock_rate=8000)
     # First report interval: a clean baseline (seq 1).
     stats.on_packet(seq=1, rtp_timestamp=0, arrival_ts=0.0)
-    stats.report_block(source_ssrc=1, lsr=0, dlsr=0, clock_rate=8000)
+    stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
     # Second interval: expect 2,3,4,5 (4 packets) but 4 is lost → 1 of 4 lost.
     stats.on_packet(seq=2, rtp_timestamp=160, arrival_ts=0.02)
     stats.on_packet(seq=3, rtp_timestamp=320, arrival_ts=0.04)
     stats.on_packet(seq=5, rtp_timestamp=640, arrival_ts=0.08)
-    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0, clock_rate=8000)
+    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
     assert block.fraction_lost == 64  # 256 * 1/4
     assert block.cumulative_lost == 1
 
@@ -489,10 +490,10 @@ def test_reception_stats_handles_sequence_wrap() -> None:
     seq 65534, 65535, 0, 1 is a clean run across the wrap: extended highest
     sequence = (1 cycle << 16) | 1, and no loss is declared.
     """
-    stats = ReceptionStats()
+    stats = ReceptionStats(clock_rate=8000)
     for i, seq in enumerate((65534, 65535, 0, 1)):
         stats.on_packet(seq=seq, rtp_timestamp=160 * i, arrival_ts=0.02 * i)
-    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0, clock_rate=8000)
+    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
     assert block.extended_highest_seq == (1 << 16) | 1
     assert block.cumulative_lost == 0
 
@@ -503,23 +504,23 @@ def test_reception_stats_interarrival_jitter_zero_for_isochronous() -> None:
     When every packet's transit time D is identical, the smoothed jitter estimate
     converges to (and starts at) zero.
     """
-    stats = ReceptionStats()
+    stats = ReceptionStats(clock_rate=8000)
     # arrival advances 20 ms, RTP timestamp advances 160 (= 20 ms at 8 kHz): the
     # transit time is constant, so D(i-1,i) == 0 for every pair → jitter 0.
     for i, seq in enumerate(range(100, 110)):
         stats.on_packet(seq=seq, rtp_timestamp=160 * i, arrival_ts=0.02 * i)
-    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0, clock_rate=8000)
+    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
     assert block.jitter == 0
 
 
 def test_reception_stats_interarrival_jitter_positive_when_arrival_varies() -> None:
     """A late packet inflates the smoothed jitter estimate above zero (A.8)."""
-    stats = ReceptionStats()
+    stats = ReceptionStats(clock_rate=8000)
     stats.on_packet(seq=1, rtp_timestamp=0, arrival_ts=0.0)
     stats.on_packet(seq=2, rtp_timestamp=160, arrival_ts=0.02)
     # Third packet arrives 30 ms late (0.05 s gap vs the expected 0.02 s).
     stats.on_packet(seq=3, rtp_timestamp=320, arrival_ts=0.07)
-    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0, clock_rate=8000)
+    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
     assert block.jitter > 0
 
 
@@ -530,10 +531,10 @@ def test_reception_stats_jitter_in_rtp_clock_units() -> None:
     0.03 s * 8000 = 240 clock units; the first non-zero jitter sample is that
     delta / 16 (the §A.8 gain). |D| = 240, J += (|D| - J)/16 from J=0 → 15.
     """
-    stats = ReceptionStats()
+    stats = ReceptionStats(clock_rate=8000)
     stats.on_packet(seq=1, rtp_timestamp=0, arrival_ts=0.0)
     stats.on_packet(seq=2, rtp_timestamp=160, arrival_ts=0.05)  # 30 ms late
-    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0, clock_rate=8000)
+    block = stats.report_block(source_ssrc=1, lsr=0, dlsr=0)
     assert block.jitter == 15
 
 
@@ -549,9 +550,11 @@ def test_rtt_from_report_block_basic() -> None:
     DLSR (1/65536 s units) before sending this report. With now - LSR == 0.5 s
     (in 1/65536 units) and DLSR == 0.1 s, RTT == 0.4 s.
     """
-    lsr = 0x00000000  # middle 32 bits of our SR's send NTP time
-    # "now" expressed in the same compact NTP form (middle 32 bits): 0.5 s later.
-    now_compact = int(0.5 * (1 << 16))
+    # A non-zero LSR (LSR == 0 is the "no SR acknowledged" sentinel). Compact NTP
+    # is 16.16 fixed-point seconds; pick an arbitrary base time.
+    lsr = 1000 << 16  # middle 32 bits of our SR's send NTP time = 1000.0 s
+    # "now" expressed in the same compact NTP form: 0.5 s after the LSR.
+    now_compact = lsr + int(0.5 * (1 << 16))
     dlsr = int(0.1 * (1 << 16))
     rtt = rtt_from_report_block(now_compact_ntp=now_compact, lsr=lsr, dlsr=dlsr)
     assert rtt is not None
@@ -588,24 +591,30 @@ def test_rtcp_interval_respects_minimum() -> None:
 
 
 def test_rtcp_interval_scales_with_members() -> None:
-    """More members → a longer interval (the ~5% bandwidth rule, RFC 3550 §6.2)."""
+    """More members → a longer interval (the ~5% bandwidth rule, RFC 3550 §6.2).
+
+    Members are all senders (no §6.2 sender/receiver split), and the bandwidth /
+    size are chosen so both deterministic values clear the 5 s floor — so the test
+    pins the linear ``n * size / bw`` scaling, not the floor.
+    """
     small = compute_rtcp_interval(
-        members=2,
-        senders=1,
-        rtcp_bw=100_000.0,
-        we_sent=True,
-        avg_rtcp_size=100.0,
-        randomize=False,
-    )
-    large = compute_rtcp_interval(
-        members=200,
+        members=100,
         senders=100,
-        rtcp_bw=100_000.0,
+        rtcp_bw=10_000.0,
         we_sent=True,
-        avg_rtcp_size=100.0,
+        avg_rtcp_size=1000.0,
         randomize=False,
-    )
+    )  # 1000 * 100 / 10000 = 10 s
+    large = compute_rtcp_interval(
+        members=300,
+        senders=300,
+        rtcp_bw=10_000.0,
+        we_sent=True,
+        avg_rtcp_size=1000.0,
+        randomize=False,
+    )  # 1000 * 300 / 10000 = 30 s
     assert large > small
+    assert small >= 5.0  # both above the floor, so this exercises the scaling
 
 
 def test_rtcp_interval_randomization_within_compensated_band() -> None:
@@ -646,20 +655,23 @@ def test_rtcp_interval_receiver_uses_receiver_fraction() -> None:
     senders a minority, a receiver (we_sent=False) gets a DIFFERENT interval than
     the same node would as a sender — the function must branch on we_sent.
     """
+    # senders (2) < members*0.25 (25) → the §6.2 split applies. size/bw chosen so
+    # the receiver slice clears the 5 s floor and the two slices differ.
     as_sender = compute_rtcp_interval(
         members=100,
         senders=2,
-        rtcp_bw=100_000.0,
+        rtcp_bw=10_000.0,
         we_sent=True,
-        avg_rtcp_size=100.0,
+        avg_rtcp_size=1000.0,
         randomize=False,
-    )
+    )  # n=2, bw=2500 → 0.8 s → floored to 5 s
     as_receiver = compute_rtcp_interval(
         members=100,
         senders=2,
-        rtcp_bw=100_000.0,
+        rtcp_bw=10_000.0,
         we_sent=False,
-        avg_rtcp_size=100.0,
+        avg_rtcp_size=1000.0,
         randomize=False,
-    )
+    )  # n=98, bw=7500 → ~13.07 s
     assert as_sender != as_receiver
+    assert as_receiver > as_sender

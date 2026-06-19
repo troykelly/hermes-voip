@@ -647,10 +647,12 @@ def _comfort_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __ini
 
 @pytest.mark.asyncio
 async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
-    """When the gap exceeds the delay and no reply has started, one filler plays.
+    """When the gap exceeds the delay and no reply has started, a filler plays.
 
-    The injected sleep is released (the delay 'elapses') while no agent reply has
-    begun, so the filler synthesises exactly one phrase and sends its frames.
+    The injected delay 'elapses' (one stepped wait) while no agent reply has begun, so
+    the filler synthesises one phrase and sends its frames. ADR-0054: the loop would
+    re-fire on the NEXT repeat interval, so the seam releases only the initial delay
+    (the periodic re-fire is covered by its own test); this isolates the first fire.
     """
     delivered: list[str] = []
 
@@ -660,7 +662,7 @@ async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
     filler_frame = PcmFrame(
         samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # only the initial dead-air delay elapses
     transport = _HoldOpenTransport([_silence_frame(0)])
     tts = _FakeTTS([filler_frame, filler_frame])
     loop = _comfort_loop(
@@ -682,7 +684,7 @@ async def test_comfort_filler_fires_after_delay_when_no_reply() -> None:
     assert delivered == ["hello there"]
 
     # The delay elapses with no reply: the filler must synthesise + send.
-    sleep.release()
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
         if transport.sent_audio:
@@ -745,7 +747,7 @@ async def test_comfort_filler_uses_configured_phrase_text() -> None:
     filler_frame = PcmFrame(
         samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
     )
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # only the first fire (periodic re-fire: own test)
     transport = _HoldOpenTransport([_silence_frame(0)])
     tts = _CapturingTTS([filler_frame])
     loop = _comfort_loop(
@@ -761,7 +763,7 @@ async def test_comfort_filler_uses_configured_phrase_text() -> None:
         await asyncio.sleep(0)
         if sleep.calls:
             break
-    sleep.release()
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
         if transport.sent_audio:
@@ -872,8 +874,10 @@ async def test_comfort_filler_fires_periodically_on_sustained_gap() -> None:
         "the filler did not re-fire periodically on a sustained gap; "
         f"sent={len(transport.sent_audio)} frames, sleeps={sleep.calls!r}"
     )
-    # The loop awaited the initial delay then two repeat intervals (all 0.9 s here).
-    assert sleep.calls == [0.9, 0.9, 0.9], (
+    # The loop awaited the initial delay then a repeat interval after EACH fire (all
+    # 0.9 s here): delay + 3 repeats recorded — the 4th repeat wait is the one the loop
+    # is now parked on, blocked (no further step), proving it did not free-run.
+    assert sleep.calls == [0.9, 0.9, 0.9, 0.9], (
         f"unexpected periodic wait schedule: {sleep.calls!r}"
     )
 
@@ -1197,7 +1201,7 @@ async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None
                 await self.first_send_gate.wait()
             self.sent_audio.append(frame)
 
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # one fire, which parks on the blocked send_audio
     transport = _BlockingHoldOpenTransport([_silence_frame(0)])
     tts = _FakeTTS([filler_frame, filler_frame])
     loop = _comfort_loop(
@@ -1212,8 +1216,9 @@ async def test_comfort_filler_playing_is_cancelled_on_teardown_no_leak() -> None
         await asyncio.sleep(0)
         if sleep.calls:
             break
-    # Release the delay; the filler fires and parks inside _play on the send gate.
-    sleep.release()
+    # Elapse the delay; the filler fires and parks inside _play on the send gate. The
+    # periodic loop never reaches its repeat wait (the first send blocks).
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
     # White-box assertion: the filler task handle is kept for the task's whole life
@@ -1287,7 +1292,7 @@ async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None
             self.last_stream = stream
             return stream
 
-    sleep = _GatedSleep()
+    sleep = _SteppedSleep(steps=1)  # one delay elapses while the greeting is active
     transport = _HoldOpenTransport([_silence_frame(0)])
     tts = _GreetingTTS([greet_frame], [filler_frame])
     loop = CallLoop(
@@ -1317,8 +1322,10 @@ async def test_comfort_filler_does_not_supersede_already_playing_audio() -> None
     assert sleep.calls, "filler did not schedule"
     assert transport.sent_audio == [greet_frame], "greeting audio should be active"
 
-    # The delay elapses while the greeting audio is STILL active → no filler.
-    sleep.release()
+    # The delay elapses while the greeting audio is STILL active → no filler. The
+    # periodic loop's per-iteration guard skips this iteration (audio active) and parks
+    # on the repeat wait (no further step), so no filler is ever emitted here.
+    sleep.step()
     for _ in range(20):
         await asyncio.sleep(0)
     assert transport.sent_audio == [greet_frame], (

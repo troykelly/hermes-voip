@@ -17,6 +17,9 @@
 # N-group config file (ADR-0021)
 .hermes-caller-groups.json
 *.hermes-caller-groups.json
+# Caller-list working directory: any caller-list file dropped here holds phone
+# numbers (PII) and must NEVER be committed.
+/.caller-lists/
 # Multi-intercom openings config file (ADR-0045): maps caller-IDs (PII) to named
 # openings whose dtmf_code / webhook url+headers+body may carry secrets (door
 # codes, bearer tokens). The real file lives alongside .env / in 1Password; these

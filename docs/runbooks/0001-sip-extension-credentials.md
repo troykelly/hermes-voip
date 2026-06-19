@@ -15,8 +15,23 @@ and password are **sensitive**: they live ONLY in the gitignored repo-root `.env
 - **Template:** `.env.example` (tracked) lists the `HERMES_SIP_*` keys with placeholder
   values — never real ones.
 
-> The operator supplied the test gateway's password URL-encoded; `.env` stores the **decoded**
-> value as `HERMES_SIP_PASSWORD`, keeping the encoded original in a comment as a fallback.
+> **Which password is the SIP secret.** The SIP-extension 1Password item holds **two**
+> passwords. `HERMES_SIP_PASSWORD` must be the item's **VoIP-section `Password`** field (the
+> SIP-TLS digest secret) — **not** the item's **top-level portal `password`** (the GDMS/WAVE
+> web-app login). A live REGISTER returns `401` if the portal password is used on either the
+> SIP-TLS or the Secure-WebSocket edge. The WSS/WebRTC edge authenticates with the **same**
+> VoIP-section `Password`, so `HERMES_SIP_WS_PASSWORD` is left unset for this gateway (it falls
+> back to `HERMES_SIP_PASSWORD`). This matches
+> [`0002-voip-live-validation.md`](0002-voip-live-validation.md) §5 (selects the field by its
+> `VoIP.Password` `<section>.<label>` id to disambiguate it from the portal field).
+
+> **Provisioning-vs-code env-var name mismatch.** The 1Password-provisioned `.env` currently
+> sets `HERMES_SIP_SERVER_HOST` and `HERMES_SIP_TLS_PORT`, but the plugin code reads
+> `HERMES_SIP_HOST` and `HERMES_SIP_PORT` (default `5061`) — `SERVER_HOST` / `TLS_PORT` appear
+> nowhere in `src/`, so those keys are silently ignored and the host fails to load. Until the
+> provisioning template is aligned to the code's key names (a separate, code-side fix), set
+> `HERMES_SIP_HOST` / `HERMES_SIP_PORT=5061` in the `.env` (or export them, as
+> [`0002-voip-live-validation.md`](0002-voip-live-validation.md) §5 does).
 
 ## Verify
 

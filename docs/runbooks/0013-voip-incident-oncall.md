@@ -358,13 +358,23 @@ export HERMES_VOIP_BARGE_IN_MODE=full
 
 ## Symptom: Provider (LLM/STT/TTS) unreachable / 502 storms
 
-**Call setup works, agent is called, but errors appear: "API call failed", "502 Bad Gateway",
-or "overloaded_error".**
+**Call setup works, the agent is called, but the caller hears the apology
+"Sorry, I'm having trouble right now. Please bear with me." instead of a real answer.**
+
+Since ADR-0063 the plugin NEVER reads a raw backend error aloud: when an unrecoverable
+provider error arrives as the agent's reply (an HTTP 502/503, a provider error class, a
+stack trace), `VoipAdapter.send()` speaks a short safe apology
+(`hermes_voip.provider_error.safe_error_reply`, language-aware) and logs the REAL error at
+WARNING with secrets redacted. So the caller-facing symptom is the apology; the diagnosis
+lives in the log, not in what the caller heard. (A caller hearing a literal "502 Bad Gateway"
+means an OLD build predating ADR-0063 — upgrade.)
 
 ### 1. Check which provider failed
 
 ```bash
-grep -E "provider|502|overloaded|failed|timeout|unreachable|ConnectionError" \
+# The real provider error is logged at WARNING by the adapter (caller heard only the
+# apology). The "real error:" tail carries the HTTP status / provider class, redacted.
+grep -E "provider/runtime error reply|provider|502|overloaded|failed|timeout|unreachable|ConnectionError" \
   /path/to/hermes/log | tail -20
 ```
 

@@ -355,6 +355,22 @@ _DEFAULT_RTP_TIMEOUT_SECS = 20
 _MIN_RTP_TIMEOUT_SECS = 1
 _MAX_RTP_TIMEOUT_SECS = 300
 
+# Adaptive jitter-buffer ceiling (ADR-0056 activated by ADR-0063). The media
+# engine's RX JitterBuffer runs in ADAPTIVE mode: its reorder tolerance grows
+# under loss/wide-reorder up to this many packets and shrinks back after a clean
+# run (floor = the engine's small fixed target_depth). 10 packets ≈ 200 ms at the
+# standard 20 ms ptime — the upper bound on added latency the buffer may trade for
+# loss resilience. Must be positive (validated). Defaults to a sane value so a
+# bare install gets adaptive jitter without tuning.
+_JITTER_MAX_DEPTH_KEY = "HERMES_VOIP_JITTER_MAX_DEPTH"
+_DEFAULT_JITTER_MAX_DEPTH = 10
+# The adaptive ceiling is also the buffer's FLOOR's upper companion: the engine
+# builds the adaptive JitterBuffer with its fixed jitter_depth (2) as the floor, and
+# rtp.JitterBuffer requires max_depth >= target_depth (floor). A ceiling below the
+# floor would raise at engine construction (crashing the call), so the minimum valid
+# ceiling is the floor itself — validated here, not deferred to a runtime crash.
+_MIN_JITTER_MAX_DEPTH = 2
+
 # WebRTC ICE STUN servers (ADR-0032/0016, default revised ADR-0043). A comma-separated
 # list of ``stun:`` URLs used to gather server-reflexive (srflx) ICE candidates for the
 # WebRTC media path. UNSET ⇒ the default public list below; an explicit EMPTY value ⇒
@@ -702,6 +718,12 @@ class MediaConfig:
             must be positive (default 900). Inert while ``comfort_filler`` is off.
         comfort_filler_phrases: The filler phrase set (one chosen per gap, round-robin
             per call). Each phrase reads naturally on every TTS model; non-empty.
+        jitter_max_depth: The adaptive jitter-buffer ceiling (ADR-0056/0063) — the
+            maximum reorder tolerance in packets the RX :class:`JitterBuffer` grows
+            to under loss before shrinking back toward its fixed floor. Must be
+            ``>= 2`` (the buffer's floor; a lower ceiling would fail engine
+            construction). ``HERMES_VOIP_JITTER_MAX_DEPTH`` (default 10 ≈ 200 ms at
+            20 ms ptime).
     """
 
     stt_provider: str
@@ -821,6 +843,12 @@ class MediaConfig:
     # NLMS step size in the OPEN interval (0, 2); higher converges faster with a
     # higher steady-state residual (validated).
     aec_mu: float = _DEFAULT_AEC_MU
+    # Adaptive jitter-buffer ceiling (ADR-0056 activated by ADR-0063): the maximum
+    # reorder tolerance (packets) the RX JitterBuffer's adaptive depth may grow to
+    # under loss/reorder before shrinking back toward the engine's fixed floor. Must
+    # be positive (validated). Defaulted (10 ≈ 200 ms at 20 ms ptime) so existing
+    # direct constructions stay valid and a bare install gets adaptive jitter.
+    jitter_max_depth: int = _DEFAULT_JITTER_MAX_DEPTH
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -881,6 +909,13 @@ class MediaConfig:
                 f"media_timeout_secs must be in "
                 f"[{_MIN_RTP_TIMEOUT_SECS}, {_MAX_RTP_TIMEOUT_SECS}], "
                 f"got {self.media_timeout_secs}"
+            )
+            raise ConfigError(msg)
+        if self.jitter_max_depth < _MIN_JITTER_MAX_DEPTH:
+            msg = (
+                f"jitter_max_depth must be >= {_MIN_JITTER_MAX_DEPTH} (the adaptive "
+                f"jitter buffer's floor — a lower ceiling would fail engine "
+                f"construction), got {self.jitter_max_depth}"
             )
             raise ConfigError(msg)
         if self.dtmf_mode not in _DTMF_MODES:
@@ -1183,6 +1218,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _AEC_BULK_DELAY_MS_KEY, _DEFAULT_AEC_BULK_DELAY_MS
         ),
         aec_mu=_parse_aec_mu(env),
+        jitter_max_depth=_parse_positive_int(
+            env, _JITTER_MAX_DEPTH_KEY, _DEFAULT_JITTER_MAX_DEPTH
+        ),
     )
 
 

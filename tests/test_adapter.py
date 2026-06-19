@@ -2619,3 +2619,384 @@ async def test_inbound_invite_g722_dynamic_pt_opens_engine_with_that_pt() -> Non
         f"engine not opened with the negotiated dynamic PT 109; "
         f"got {captured.get('payload_type')!r} (sending static 9 is the bug)"
     )
+
+
+# ===========================================================================
+# ptime negotiation + adaptive jitter ACTIVATION (ADR-0063, completes ADR-0056)
+# ===========================================================================
+#
+# PR #142 built negotiate_ptime() + the engine ptime setter + the adaptive
+# JitterBuffer, but they were DORMANT (the adapter never called them). These
+# tests prove the adapter now activates both on the inbound answer path.
+
+# A G.722 offer that explicitly requests a 40 ms packetisation time (a value in
+# our supported framing set, != the 20 ms default) so the test proves the
+# NEGOTIATED ptime reaches the engine, not the hard-coded 20.
+_FAKE_SDP_OFFER_G722_PTIME40 = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 20000 RTP/AVP 9 0\r\n"
+    "a=rtpmap:9 G722/8000\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=ptime:40\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite_g722_ptime40(call_id: str) -> str:
+    content_length = len(_FAKE_SDP_OFFER_G722_PTIME40.encode("utf-8"))
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKpt40\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={new_tag()}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:5061;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{_FAKE_SDP_OFFER_G722_PTIME40}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_invite_activates_negotiated_ptime_and_adaptive_jitter() -> None:
+    """Inbound answer: the negotiated ptime + adaptive jitter reach the engine.
+
+    The offer requests ``a=ptime:40``; the adapter must set ``engine.ptime`` to
+    the negotiated 40 (not the 20 ms default) AND construct the engine with
+    ``jitter_adapt=True`` + the configured ``jitter_max_depth`` ceiling — the
+    activation that makes ADR-0056's launch-promoted features live.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport)
+    # Default media config → jitter_max_depth == 10.
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite_g722_ptime40(call_id=call_id))
+
+    captured: dict[str, object] = {}
+    engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        local_port=20010,
+    )
+
+    def _capture_engine(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
+        return engine
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", side_effect=_capture_engine),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    # Adaptive jitter activated at construction with the configured ceiling.
+    assert captured.get("jitter_adapt") is True, (
+        f"engine not opened with adaptive jitter; got "
+        f"jitter_adapt={captured.get('jitter_adapt')!r} (the dormant ADR-0056 path)"
+    )
+    assert captured.get("jitter_max_depth") == 10, (
+        f"engine not opened with the configured jitter ceiling; "
+        f"got jitter_max_depth={captured.get('jitter_max_depth')!r}"
+    )
+    # The NEGOTIATED ptime (40) was applied to the engine, not the 20 ms default.
+    assert engine.ptime == 40, (
+        f"engine.ptime was not set to the negotiated 40 ms; got {engine.ptime!r} "
+        f"(the adapter is still leaving the engine on its hard-coded default)"
+    )
+
+
+def test_negotiated_ptime_is_codec_aware_opus_pinned_to_20() -> None:
+    """Codec-aware ptime negotiation pins Opus to 20 ms (ADR-0063).
+
+    Codex review BLOCKING: the engine's Opus encoder frames EXACTLY one 20 ms packet
+    (960 samples @ 48 kHz) and raises on any other size, so negotiating a non-20 ms
+    ptime for an Opus call would crash send_audio. G.711/G.722 encode per-sample and
+    DO support the other framings. The negotiator must therefore honour a 40 ms offer
+    for G.722 but pin Opus to 20 ms regardless.
+    """
+    from hermes_voip.adapter import _negotiated_ptime  # noqa: PLC0415
+    from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
+    from hermes_voip.sdp import AudioMedia  # noqa: PLC0415
+    from hermes_voip.sdp import Codec as SdpCodecForTest  # noqa: PLC0415
+
+    def _audio_with_ptime(ms: int) -> AudioMedia:
+        return AudioMedia(
+            port=20000,
+            protocol="RTP/AVP",
+            codecs=(SdpCodecForTest(payload_type=0, encoding="PCMU", clock_rate=8000),),
+            crypto=(),
+            ptime=ms,
+            direction="sendrecv",
+            connection_address="127.0.0.1",
+            maxptime=None,
+        )
+
+    # G.722 (per-sample encode) honours a carriable 40 ms request …
+    assert _negotiated_ptime(_audio_with_ptime(40), EngineCodec.G722) == 40
+    # … but Opus is pinned to 20 ms even when the peer asks for 40 (engine can only
+    # frame 960-sample/20 ms Opus packets).
+    assert _negotiated_ptime(_audio_with_ptime(40), EngineCodec.OPUS) == 20
+    # G.711 honours 40 too.
+    assert _negotiated_ptime(_audio_with_ptime(40), EngineCodec.PCMU) == 40
+
+
+# ===========================================================================
+# Provider/LLM error sanitisation spoken to the caller (ADR-0063, LAUNCH #4)
+# ===========================================================================
+#
+# An unrecoverable backend error (a raw 502 / provider message / stack trace)
+# arrives at send() as the "reply" text; today it is read aloud verbatim — an
+# info leak + unprofessional. The adapter must speak a short safe line instead
+# and log the real error (redacted), never raising toward the caller.
+
+# A realistic provider error string the Hermes gateway can hand to send() as the
+# turn text on an unrecoverable LLM failure (HTTP status + provider error class).
+_PROVIDER_ERROR_REPLY = (
+    "API call failed: HTTP 502 Bad Gateway (overloaded_error: Overloaded)"
+)
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_speaks_safe_line_not_raw_error() -> None:
+    """A provider-error reply is replaced with a short safe spoken line.
+
+    The raw error text must never reach the TTS sink; the safe apology is spoken
+    instead, and the call still reports a successful send (no retry storm).
+    """
+    from hermes_voip.provider_error import safe_error_reply  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})  # language defaults to "en"
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    # The safe line was spoken …
+    assert spoken == [safe_error_reply("en")]
+    # … and the raw provider error reached the TTS sink NOWHERE.
+    joined = " ".join(spoken)
+    assert "502" not in joined
+    assert "overloaded_error" not in joined
+    assert "API call failed" not in joined
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_logs_real_error_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real provider error is logged at WARNING (so it is not lost)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # Some WARNING record references the backend error (so an operator sees it).
+    assert any(
+        "502" in r.getMessage() or "provider" in r.getMessage().lower()
+        for r in warnings
+    ), (
+        f"no WARNING logged the real provider error; "
+        f"records={[r.getMessage() for r in warnings]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_log_redacts_credential_shapes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The WARNING log masks credential-SHAPED tokens, not just exact secrets.
+
+    Codex review MINOR: a leaked error could carry a bearer token / api_key= /
+    password= value that is NOT the plugin's own configured secret; the WARNING log
+    must still not leak it. Built at runtime (never a literal — gitleaks all-refs).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    # Minimal speak()-only double for the typed call-loop slot (rule 20: a full
+    # CallLoop is unnecessary for this log-redaction assertion).
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    secret_token = base64.b64encode(bytes(range(33, 63))).decode()
+    err = (
+        f"API call failed: HTTP 502; Authorization: Bearer {secret_token}; "
+        f"api_key={secret_token}"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, err)
+
+    assert result.success
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    # The diagnostic status survives …
+    assert "502" in blob
+    # … but the credential-shaped value does not.
+    assert secret_token not in blob
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_log_redacts_json_credential_shapes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The WARNING log masks JSON-quoted credential shapes, not just header style.
+
+    Codex review BLOCKING: a backend error can embed a JSON body — e.g.
+    ``{"Authorization":"Bearer X","api_key":"X"}`` — where a closing quote sits
+    between the key and the ``:`` separator, so a header-only regex misses it and
+    the secret leaks (rule 34: the repo is PUBLIC). Built at runtime (never a
+    literal — gitleaks all-refs).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    # Minimal speak()-only double for the typed call-loop slot (rule 20: a full
+    # CallLoop is unnecessary for this log-redaction assertion).
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    secret_token = base64.b64encode(bytes(range(64, 94))).decode()
+    # A JSON body with a non-bearer Authorization scheme + an api_key field: a closing
+    # quote sits between each key and its ``:``, so a header-only regex misses both.
+    # (No "Bearer " here — otherwise a greedy bearer-token match would mask the rest
+    # of the compact JSON by accident and hide the real leak.)
+    err = (
+        "API call failed: HTTP 502; "
+        '{"Authorization": "Basic ' + secret_token + '", '
+        '"api_key": "' + secret_token + '"}'
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, err)
+
+    assert result.success
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    # The diagnostic status survives …
+    assert "502" in blob
+    # … but the JSON-embedded credential does not.
+    assert secret_token not in blob
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_log_redacts_json_value_with_escaped_quote(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    r"""A JSON credential value containing an escaped quote is fully masked.
+
+    Codex review BLOCKING: a value like ``{"api_key":"HEAD\"TAIL"}`` must not leak
+    the post-escaped-quote tail — the redactor treats ``\"`` as an escaped char
+    INSIDE the quoted value, not as the closing quote (rule 34). Built at runtime.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    # Minimal speak()-only double for the typed call-loop slot (rule 20).
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    head = base64.b64encode(bytes(range(94, 109))).decode()
+    tail = base64.b64encode(bytes(range(109, 124))).decode()
+    # The api_key value is head + an ESCAPED quote + tail; the ``\"`` must not be read
+    # as the closing quote (which would leave ``tail`` visible in the log).
+    err = 'API call failed: HTTP 502; {"api_key": "' + head + '\\"' + tail + '"}'
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, err)
+
+    assert result.success
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "502" in blob
+    assert head not in blob
+    # The tail AFTER the escaped quote must not leak either.
+    assert tail not in blob
+
+
+@pytest.mark.asyncio
+async def test_send_genuine_reply_not_treated_as_provider_error() -> None:
+    """A genuine reply mentioning an error/number is still spoken verbatim."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    reply = "Your reference number is 502 and there was no error with the booking."
+    result = await adapter.send(call_id, reply)
+    assert result.success
+    assert reply in spoken

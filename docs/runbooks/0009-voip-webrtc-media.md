@@ -289,9 +289,11 @@ tests (no wall clock / real network):
   buffer is built with `adapt=True` / `max_depth=N`. It GROWS on evidence it was too eager (a
   packet arriving after its slot was emitted as `Lost`, or an in-window packet reordered by a
   span ≥ the current depth) and SHRINKS one step toward the floor after a sustained clean run.
-  Bounds: floor = `target_depth` (default 2), ceiling = `max_depth` (default 10 ≈ 200 ms at
-  20 ms ptime). The non-adaptive default (`adapt=False`) is the legacy fixed depth. Read the
-  live value via `JitterBuffer.current_depth`.
+  Bounds: floor = `target_depth` (default 2), ceiling = `max_depth`. Read the live value via
+  `JitterBuffer.current_depth`. **Live on every call (ADR-0063):** the adapter opens all four
+  media engines with `jitter_adapt=True` and `jitter_max_depth=HERMES_VOIP_JITTER_MAX_DEPTH`
+  (default **10** ≈ 200 ms at 20 ms ptime — the knob, below). The engine's standalone default
+  remains `adapt=False` (fixed depth) for any direct construction.
 - **Packet-loss concealment** (`engine._conceal_frame`). A `Lost` no longer leaves a hole: the
   engine yields one concealment frame at the analysis rate so the VAD/endpointer/STT see a
   continuous stream. **Opus** recovers the lost frame from the **next** packet's in-band FEC
@@ -310,17 +312,34 @@ tests (no wall clock / real network):
   engine no longer assumes 20 ms: `sdp.py` parses `a=ptime` and `a=maxptime`, and
   `negotiate_ptime(offer_ptime, offer_maxptime, supported=…, default=20)` picks the framing
   (honour the offer's ptime when supported and within maxptime, else the default, clamped down
-  to the largest supported value that fits the cap). Apply it via the `engine.ptime` setter
-  (the adapter wiring that calls this lands in a sibling lane). 20 ms remains the default when
-  the offer is silent or unsupported.
+  to the largest supported value that fits the cap). **Live on every call (ADR-0063):** the
+  adapter sets `engine.ptime = negotiate_ptime(...)` once the SDP is negotiated — on the offer
+  (inbound) before `connect()`, on the 2xx answer (outbound) — with the engine's supported
+  framing set `(10, 20, 30, 40)` ms. 20 ms remains the default when the offer is silent or
+  requests an unsupported framing (ptime is a preference, never fails the call). There is no
+  env knob — the framing is negotiated per call.
 
-**Tuning / disable.** Concealment, Opus FEC, and ptime defaults are intrinsic to the engine —
-there is no env knob to turn them off (they only help). The jitter buffer is constructed
-non-adaptive by default at the engine's call sites; adaptation is enabled by passing
-`adapt=True` / `max_depth=N` where the engine builds the `JitterBuffer`. To change the
-attenuation curve or fade length, edit `_PLC_ATTENUATION_PER_FRAME` / `_PLC_MAX_REPEAT_FRAMES`
-in `media/engine.py`; to change the Opus expected-loss bias, the `expected_packet_loss_pct`
-default in `media/opus.py`.
+**The knob (adaptive-jitter ceiling).**
+
+| Item | Value |
+| --- | --- |
+| Env var | `HERMES_VOIP_JITTER_MAX_DEPTH` |
+| Type | integer **packets**, must be **positive** |
+| Default | `10` (≈ 200 ms at the standard 20 ms ptime) |
+| Field | `MediaConfig.jitter_max_depth` (ADR-0063) |
+
+The ceiling is the most reorder tolerance the adaptive depth may grow to before shrinking back
+toward the fixed floor (2). Raise it for a known-bad / high-jitter link (more loss resilience,
+at the cost of up to that many packets of added buffering latency); the floor and the
+clean-link behaviour are unchanged. A non-positive or malformed value is rejected at config
+load (`ConfigError`).
+
+**Tuning / disable (other behaviours).** Concealment, Opus FEC, and the ptime negotiation are
+intrinsic to the engine — there is no env knob to turn them off (they only help). To change the
+PLC attenuation curve or fade length, edit `_PLC_ATTENUATION_PER_FRAME` /
+`_PLC_MAX_REPEAT_FRAMES` in `media/engine.py`; to change the Opus expected-loss bias, the
+`expected_packet_loss_pct` default in `media/opus.py`; to change the negotiable ptime set, the
+`_SUPPORTED_PTIMES_MS` tuple in `adapter.py`.
 
 ## How to verify
 

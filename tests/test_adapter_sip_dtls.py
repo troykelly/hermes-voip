@@ -314,8 +314,15 @@ def _make_invite(offer: str, call_id: str) -> str:
     )
 
 
-async def _build_adapter(transport: _FakeTransport, media_cfg: object) -> VoipAdapter:
-    """A real VoipAdapter wired to fakes + a real RegistrationManager + media_cfg."""
+async def _build_adapter_with_manager(
+    transport: _FakeTransport, media_cfg: object
+) -> tuple[VoipAdapter, RegistrationManager]:
+    """A real VoipAdapter + the real RegistrationManager it routes through.
+
+    The manager is returned so a test can route an in-dialog ACK/BYE through it (the
+    same path ``SipOverTlsTransport._dispatch_request`` uses) to the answer-time dialog
+    guard registered during the handshake window.
+    """
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV))
@@ -332,6 +339,12 @@ async def _build_adapter(transport: _FakeTransport, media_cfg: object) -> VoipAd
     ):
         adapter = VoipAdapter(config)
         await adapter.connect()
+    return adapter, manager
+
+
+async def _build_adapter(transport: _FakeTransport, media_cfg: object) -> VoipAdapter:
+    """A real VoipAdapter wired to fakes + a real RegistrationManager + media_cfg."""
+    adapter, _manager = await _build_adapter_with_manager(transport, media_cfg)
     return adapter
 
 
@@ -361,6 +374,12 @@ class _FakeSipDtlsSession:
 
     last: _FakeSipDtlsSession | None = None
     fail_handshake: bool = False
+    # When set, run_handshake blocks on this event before completing/failing — so a
+    # test can deterministically inject an in-dialog ACK/BYE WHILE the handshake is in
+    # progress (the answer-time dialog guard is already registered), then release it.
+    gate: asyncio.Event | None = None
+    # Set once run_handshake has been entered (so a test can wait for the window).
+    in_handshake: asyncio.Event | None = None
 
     def __init__(
         self,
@@ -401,6 +420,12 @@ class _FakeSipDtlsSession:
 
     async def run_handshake(self, **kwargs: object) -> tuple[object, object]:
         self.handshake_args = kwargs
+        if _FakeSipDtlsSession.in_handshake is not None:
+            _FakeSipDtlsSession.in_handshake.set()
+        # Hold inside the handshake until released, so a test can deliver an in-dialog
+        # ACK/BYE to the answer-time guard mid-handshake (the realistic race).
+        if _FakeSipDtlsSession.gate is not None:
+            await _FakeSipDtlsSession.gate.wait()
         if _FakeSipDtlsSession.fail_handshake:
             msg = "DTLS handshake failed (fingerprint mismatch)"
             raise ValueError(msg)
@@ -428,6 +453,49 @@ def _reset_fake_session() -> None:
     """Reset the fake session's class-level state between tests."""
     _FakeSipDtlsSession.last = None
     _FakeSipDtlsSession.fail_handshake = False
+    _FakeSipDtlsSession.gate = None
+    _FakeSipDtlsSession.in_handshake = None
+
+
+def _in_dialog_request(method: str, ok: SipResponse, *, call_id: str) -> SipRequest:
+    """A gateway in-dialog ACK/BYE echoing the dialog To/From from our 200 OK.
+
+    Per RFC 3261 §12, the peer's in-dialog request carries OUR identity (the 200 OK's
+    ``To``, including the local tag we set) in ``To`` and the caller's in ``From`` — so
+    this is faithful to what a real gateway sends after our answer, and routes through
+    the real ``RegistrationManager`` to the registered dialog consumer.
+    """
+    to_value = ok.header("To") or ""
+    from_value = ok.header("From") or ""
+    cseq = 1 if method == "ACK" else 2
+    raw = (
+        f"{method} sip:1000@127.0.0.1:5061 SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.7:5061;branch=z9hG4bKdlg\r\n"
+        "Max-Forwards: 70\r\n"
+        f"From: {from_value}\r\n"
+        f"To: {to_value}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq} {method}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    return SipRequest.parse(raw)
+
+
+async def _deliver_in_dialog(
+    manager: RegistrationManager, request: SipRequest
+) -> object:
+    """Route an in-dialog request through the real manager to its consumer.
+
+    Mirrors ``SipOverTlsTransport._dispatch_request``'s ``InDialog`` branch: route,
+    then await the matched consumer's ``handle_request``. Returns the routing so the
+    caller can assert it matched a dialog (``InDialog``) and not ``Unroutable``.
+    """
+    from hermes_voip.manager import InDialog  # noqa: PLC0415
+
+    routing = manager.route_request(request)
+    if isinstance(routing, InDialog):
+        await routing.consumer.handle_request(routing.request)
+    return routing
 
 
 @pytest.mark.asyncio
@@ -633,15 +701,83 @@ async def test_sip_dtls_disabled_falls_through_to_sdes_plain() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sip_dtls_handshake_failure_byes_dialog_no_plaintext() -> None:
-    """A DTLS handshake failure ends the dialog with a BYE; NEVER answers plaintext.
+async def test_sip_dtls_handshake_failure_byes_after_ack_no_plaintext() -> None:
+    """A handshake failure, once the ACK has confirmed the dialog, BYEs it.
 
     The 200 OK is the DTLS answer (it precedes the handshake), so the peer holds an
-    ANSWERED UDP/TLS/RTP/SAVP call. When the handshake then fails the dialog is
-    HALF-OPEN on the gateway — it MUST be definitively closed with an in-dialog BYE
-    (not left to the peer's timer). And crucially no SECOND, plaintext answer is ever
-    sent (no plaintext fallback, RFC 5763 §5 / rule 37), and no CallLoop is built on
-    the dead media. The session is closed.
+    answered call; the dialog is registered at answer-time (ADR-0065) so the ACK
+    routes. When the ACK has arrived AND the handshake then fails, the now-CONFIRMED
+    dialog (RFC 3261 §15.1.1) is definitively closed with an in-dialog BYE; no SECOND
+    plaintext answer is ever sent, and no CallLoop is built on the dead media. The
+    session is closed.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    _FakeSipDtlsSession.fail_handshake = True
+    _FakeSipDtlsSession.gate = asyncio.Event()
+    _FakeSipDtlsSession.in_handshake = asyncio.Event()
+    engine = _fake_engine()
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        # Wait until the 200 OK is sent and the handshake is in progress — the
+        # answer-time dialog guard is registered by now.
+        assert _FakeSipDtlsSession.in_handshake is not None
+        await _FakeSipDtlsSession.in_handshake.wait()
+        ok = _sent_200_ok(transport)
+        # Deliver the peer's ACK mid-handshake: it MUST route to the dialog guard
+        # (not Unroutable), confirming the dialog.
+        from hermes_voip.manager import InDialog  # noqa: PLC0415
+
+        routing = await _deliver_in_dialog(
+            manager, _in_dialog_request("ACK", ok, call_id=call_id)
+        )
+        assert isinstance(routing, InDialog), (
+            f"the ACK must route to the answer-time dialog guard, got "
+            f"{type(routing).__name__}"
+        )
+        # Now release the handshake so it fails.
+        _FakeSipDtlsSession.gate.set()
+        session = _FakeSipDtlsSession.last
+        assert session is not None
+        await _until(lambda: session.closed)
+        # The confirmed dialog is closed with a BYE.
+        await _until(lambda: any(m.startswith("BYE ") for m in transport.sent))
+        await asyncio.sleep(0.01)
+
+    assert call_id not in adapter._call_loops
+    answers = [m for m in transport.sent if m.startswith("SIP/2.0 200")]
+    assert len(answers) == 1
+    plaintext_answers = [
+        m
+        for m in transport.sent
+        if m.startswith("SIP/2.0 200") and "RTP/AVP" in m and "SAVP" not in m
+    ]
+    assert plaintext_answers == [], "a handshake failure must NOT answer plaintext"
+    byes = [m for m in transport.sent if m.startswith("BYE ")]
+    assert len(byes) == 1, "a confirmed-dialog handshake failure sends exactly one BYE"
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_handshake_failure_pre_ack_waits_then_fallback_byes() -> None:
+    """A handshake failure BEFORE any ACK does NOT send an illegal pre-ACK BYE.
+
+    RFC 3261 §15.1.1: a UA MUST NOT BYE an unconfirmed dialog. With NO ACK delivered,
+    a post-200 handshake failure must (a) tear down media IMMEDIATELY, (b) NOT send a
+    BYE while the dialog is unconfirmed, and (c) send a fallback BYE only after the
+    bounded ACK-wait (≈Timer H) elapses. We shrink the timeout so the fallback is
+    fast and assert the ordering: media closed first, no BYE during the wait, BYE
+    after.
     """
     transport = _FakeTransport()
     adapter = await _build_adapter(transport, load_media_config({}))
@@ -653,36 +789,32 @@ async def test_sip_dtls_handshake_failure_byes_dialog_no_plaintext() -> None:
     with (
         patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
         patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        patch("hermes_voip.adapter._ANSWERED_ABORT_ACK_TIMEOUT_S", 0.2),
         patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
         adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
-        # The handshake failure tears the call down: no live CallLoop is registered.
+        # Media is torn down immediately on the failure.
         await _until(lambda: _FakeSipDtlsSession.last is not None)
         session = _FakeSipDtlsSession.last
         assert session is not None
         await _until(lambda: session.closed)
-        # The half-open answered dialog is closed with a BYE.
-        await _until(lambda: any(m.startswith("BYE ") for m in transport.sent))
+        # While the dialog is unconfirmed (no ACK) the abort must NOT have sent a BYE
+        # yet — it is waiting for the ACK. Check right after media close.
+        assert not any(m.startswith("BYE ") for m in transport.sent), (
+            "must NOT send a pre-ACK BYE on an unconfirmed dialog (RFC 3261 §15.1.1)"
+        )
+        # After the bounded fallback (0.2s) elapses with no ACK, a fallback BYE is
+        # sent so the dialog cannot linger forever.
+        await _until(
+            lambda: any(m.startswith("BYE ") for m in transport.sent), timeout=2.0
+        )
         await asyncio.sleep(0.01)
 
-    # No CallLoop was built on the dead (unkeyed) media.
     assert call_id not in adapter._call_loops
-    # The ONLY answer sent was the single DTLS-SRTP 200 OK; there is no second,
-    # plaintext answer. Count the answers (RTP/AVP body) — there must be none.
-    answers = [m for m in transport.sent if m.startswith("SIP/2.0 200")]
-    assert len(answers) == 1
-    plaintext_answers = [
-        m
-        for m in transport.sent
-        if m.startswith("SIP/2.0 200") and "RTP/AVP" in m and "SAVP" not in m
-    ]
-    assert plaintext_answers == [], "a handshake failure must NOT answer plaintext"
-    # A BYE definitively closed the answered dialog (not a 4xx — the call was
-    # answered, so RFC 3261 §15 requires a BYE to terminate the established dialog).
     byes = [m for m in transport.sent if m.startswith("BYE ")]
-    assert byes, "a post-200 handshake failure must BYE the half-open dialog"
+    assert len(byes) == 1, "exactly one fallback BYE after the bounded wait"
 
 
 @pytest.mark.asyncio
@@ -695,12 +827,17 @@ async def test_sip_dtls_engine_failure_after_handshake_byes_and_cleans_up() -> N
     session/pipe closed (no leaked UDP socket) — and no CallLoop built.
     """
     transport = _FakeTransport()
-    adapter = await _build_adapter(transport, load_media_config({}))
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
 
-    # The handshake succeeds; engine.connect() raises (a post-200, post-handshake
-    # failure) — the engine was constructed, so it must be stopped.
+    # The handshake succeeds (gated so we can deliver the ACK mid-flow); the engine's
+    # connect() then raises (a post-200, post-handshake failure) — the engine was
+    # constructed, so it must be stopped, and the now-confirmed dialog BYE'd.
+    _FakeSipDtlsSession.gate = asyncio.Event()
+    _FakeSipDtlsSession.in_handshake = asyncio.Event()
     engine = MagicMock(
         connect=AsyncMock(side_effect=RuntimeError("engine connect failed")),
         stop=AsyncMock(return_value=None),
@@ -716,7 +853,14 @@ async def test_sip_dtls_engine_failure_after_handshake_byes_and_cleans_up() -> N
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
         adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
-        await _until(lambda: _FakeSipDtlsSession.last is not None)
+        assert _FakeSipDtlsSession.in_handshake is not None
+        await _FakeSipDtlsSession.in_handshake.wait()
+        ok = _sent_200_ok(transport)
+        # Confirm the dialog with the ACK, then let the handshake succeed → engine fail.
+        await _deliver_in_dialog(
+            manager, _in_dialog_request("ACK", ok, call_id=call_id)
+        )
+        _FakeSipDtlsSession.gate.set()
         session = _FakeSipDtlsSession.last
         assert session is not None
         # The engine was stopped and the session closed (no leaked socket/SRTP).
@@ -729,7 +873,7 @@ async def test_sip_dtls_engine_failure_after_handshake_byes_and_cleans_up() -> N
     assert engine.stop.await_count == 1, "the constructed engine must be stopped"
     assert session.closed, "the DTLS session/pipe must be closed (no leaked socket)"
     byes = [m for m in transport.sent if m.startswith("BYE ")]
-    assert byes, "a post-200 engine failure must BYE the half-open dialog"
+    assert len(byes) == 1, "a post-200 engine failure must BYE the confirmed dialog"
 
 
 @pytest.mark.asyncio
@@ -779,6 +923,182 @@ async def test_sip_dtls_bind_failure_closes_session_even_if_488_send_raises() ->
     assert session.closed, (
         "a pre-answer bind failure must close the session even if the 488 send raises"
     )
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_peer_bye_during_handshake_ends_call_no_own_bye() -> None:
+    """A peer BYE during the handshake ends the call cleanly (we don't BYE back).
+
+    The dialog is registered at answer-time, so a peer BYE mid-handshake routes to the
+    guard, which answers 200 OK. When the handshake then fails, the abort sees the
+    dialog already ended by the peer and does NOT send its own (redundant) BYE — it
+    just releases media. (A BYE answered by 200 OK, then no second BYE from us.)
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    _FakeSipDtlsSession.fail_handshake = True
+    _FakeSipDtlsSession.gate = asyncio.Event()
+    _FakeSipDtlsSession.in_handshake = asyncio.Event()
+    engine = _fake_engine()
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        patch("hermes_voip.adapter._ANSWERED_ABORT_ACK_TIMEOUT_S", 0.2),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        assert _FakeSipDtlsSession.in_handshake is not None
+        await _FakeSipDtlsSession.in_handshake.wait()
+        ok = _sent_200_ok(transport)
+        # The caller hangs up mid-handshake: the peer BYE routes to the guard.
+        await _deliver_in_dialog(
+            manager, _in_dialog_request("BYE", ok, call_id=call_id)
+        )
+        # The guard answered the peer BYE with 200 OK.
+        assert any(
+            m.startswith("SIP/2.0 200") and "BYE" in m for m in transport.sent
+        ), "the peer BYE during the handshake must be answered 200 OK"
+        # Release the handshake (it fails); the abort must NOT send its own BYE.
+        _FakeSipDtlsSession.gate.set()
+        session = _FakeSipDtlsSession.last
+        assert session is not None
+        await _until(lambda: session.closed)
+        await asyncio.sleep(0.4)  # let the bounded fallback window pass
+
+    assert call_id not in adapter._call_loops
+    # We never send our OWN BYE — the peer already ended the dialog.
+    our_byes = [m for m in transport.sent if m.startswith("BYE ")]
+    assert our_byes == [], "must not BYE a dialog the peer already BYE'd"
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_no_media_engine_before_fingerprint_verified() -> None:
+    """No media engine / RTP path is constructed before the handshake verifies (§5).
+
+    The security invariant of registering the dialog early: it is SIGNALING only. The
+    RtpMediaTransport (and thus any inbound_audio/RTP path) must NOT be constructed
+    until run_handshake returns. We hold the handshake open and assert the engine ctor
+    has not been called while it is in progress.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    _FakeSipDtlsSession.gate = asyncio.Event()
+    _FakeSipDtlsSession.in_handshake = asyncio.Event()
+    engine = _fake_engine()
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    with (
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport", return_value=engine
+        ) as engine_ctor,
+        patch(
+            "hermes_voip.adapter.CallLoop", return_value=MagicMock(run=_blocking_run)
+        ),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        try:
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            assert _FakeSipDtlsSession.in_handshake is not None
+            await _FakeSipDtlsSession.in_handshake.wait()
+            # The dialog is registered (signaling) but the handshake has NOT returned —
+            # the engine MUST NOT be built yet (no media before fingerprint verify).
+            ok = _sent_200_ok(transport)
+            routing = await _deliver_in_dialog(
+                manager, _in_dialog_request("ACK", ok, call_id=call_id)
+            )
+            from hermes_voip.manager import InDialog  # noqa: PLC0415
+
+            assert isinstance(routing, InDialog), "dialog registered (signaling) early"
+            assert engine_ctor.call_count == 0, (
+                "the media engine must NOT be built before the handshake verifies "
+                "the peer fingerprint (RFC 5763 §5)"
+            )
+            # Release the handshake → success → NOW the engine is built.
+            assert _FakeSipDtlsSession.gate is not None
+            _FakeSipDtlsSession.gate.set()
+            await _until(lambda: call_id in adapter._call_loops)
+            assert engine_ctor.call_count == 1
+        finally:
+            in_call.set()
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_ack_during_handshake_then_success_normal_call() -> None:
+    """An ACK during a SUCCEEDING handshake confirms the dialog; the call proceeds.
+
+    The happy path through the answer-time-registration window: ACK arrives mid-
+    handshake (routes to the guard), the handshake succeeds, the real CallSession is
+    registered (upgrading the guard), and the call runs — no BYE, a live CallLoop.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_manager(
+        transport, load_media_config({})
+    )
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    _FakeSipDtlsSession.gate = asyncio.Event()
+    _FakeSipDtlsSession.in_handshake = asyncio.Event()
+    engine = _fake_engine()
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            assert _FakeSipDtlsSession.in_handshake is not None
+            await _FakeSipDtlsSession.in_handshake.wait()
+            ok = _sent_200_ok(transport)
+            await _deliver_in_dialog(
+                manager, _in_dialog_request("ACK", ok, call_id=call_id)
+            )
+            assert _FakeSipDtlsSession.gate is not None
+            _FakeSipDtlsSession.gate.set()
+            # The call proceeds: a live CallLoop is registered, no BYE.
+            await _until(lambda: call_id in adapter._call_loops)
+            assert not any(m.startswith("BYE ") for m in transport.sent), (
+                "a successful handshake must not BYE the call"
+            )
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

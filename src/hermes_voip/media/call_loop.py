@@ -1603,12 +1603,19 @@ class CallLoop:
         """
         reprompts_sent = 0
         while True:
-            # Open a fresh activity window: any caller life during the upcoming sleep
-            # sets this flag (a delivered turn or a barge-in); re-checked on wake.
-            self._caller_active_in_window = False
             await self._sleep(self._no_input_timeout_s)
+            # Consume the activity flag at exactly ONE point (here, after the window),
+            # never at the loop top (codex review): caller life that arrives AFTER this
+            # check — e.g. a barge-in WHILE a reprompt is playing, or during a skipped
+            # agent-audio window — would be wiped by a top-of-loop clear before the next
+            # window's check sees it, hanging up on a caller who just answered. Clearing
+            # only on consume makes such activity persist to the next window's check.
+            # Read-then-clear with no await between them: single-loop asyncio, so no
+            # activity can interleave and be lost across these two lines.
             if self._caller_active_in_window:
-                # The caller spoke / barged in during the window: reset and re-arm.
+                # The caller spoke / barged in within the window (or during the previous
+                # reprompt/skip): reset the reprompt cycle and re-arm.
+                self._caller_active_in_window = False
                 reprompts_sent = 0
                 continue
             if self._tts_audio_active:

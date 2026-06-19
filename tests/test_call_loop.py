@@ -3839,6 +3839,33 @@ def _no_input_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __in
     )
 
 
+class _DrainingSilentASR:
+    """ASR fake that DRAINS its audio input forever and yields NO transcript.
+
+    Models a recogniser hearing pure silence: it never produces a turn, but it keeps
+    consuming ``audio`` so the pump's bounded ``audio_q`` never fills (a non-draining
+    ``_FakeASR([])`` would wedge the pump on a continuous-frame transport once the queue
+    fills). Pair with :class:`_LiveSilenceTransport` for a silent-but-live caller whose
+    call runs for many frames before a loop-initiated graceful end.
+    """
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _frame in audio:  # drain so the pump never blocks on a full queue
+                pass
+            # Yield nothing: the typed empty tuple makes ``_gen`` an async generator
+            # (satisfying AsyncIterator[Transcript]) without ever emitting a turn.
+            empty: tuple[Transcript, ...] = ()
+            for transcript in empty:
+                yield transcript
+
+        return _gen()
+
+
 @pytest.mark.asyncio
 async def test_no_input_reprompt_fires_after_silence_window() -> None:
     """A live-but-silent caller gets a spoken reprompt after the silence window.
@@ -4005,7 +4032,7 @@ async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     tts = _CapturingTTS([reprompt_frame])
     loop = _no_input_loop(
         transport,
-        _FakeASR([]),
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
         tts,
         sleep=sleep,
         no_input_max_reprompts=2,
@@ -4113,7 +4140,7 @@ async def test_goodbye_spoken_before_graceful_end() -> None:
     tts = _RepromptThenGoodbyeTTS([])
     loop = _no_input_loop(
         transport,
-        _FakeASR([]),
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
         tts,
         sleep=sleep,
         no_input_max_reprompts=1,
@@ -4197,7 +4224,7 @@ async def test_goodbye_disabled_graceful_end_still_ends_cleanly() -> None:
     tts = _CapturingTTS([reprompt_frame])
     loop = _no_input_loop(
         transport,
-        _FakeASR([]),
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
         tts,
         sleep=sleep,
         no_input_max_reprompts=1,
@@ -4270,7 +4297,7 @@ async def test_no_input_barge_in_during_reprompt_resets_and_does_not_end() -> No
     tts = _CapturingTTS([reprompt_frame])
     loop = _no_input_loop(
         transport,
-        _FakeASR([]),
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
         tts,
         sleep=sleep,
         no_input_max_reprompts=1,

@@ -208,8 +208,11 @@ class CallQuality:
     concealment count consume.
 
     Attributes:
-        local_fraction_lost: Loss fraction (0..1) WE observed on the inbound stream
-            over the last report interval, or ``None`` if no RTP received yet.
+        local_fraction_lost: CUMULATIVE loss fraction (0..1) WE observed on the
+            inbound stream over the whole call so far (lost / expected), or ``None``
+            if no RTP received yet. This is a poll-anytime session view — distinct
+            from the per-interval fraction RFC 3550 §6.4.1 puts in a wire report
+            block (which `build_rtcp_report` computes separately, A.3).
         local_cumulative_lost: Total inbound packets lost this call (may be negative
             with duplicates), or ``None`` if no RTP received yet.
         local_jitter_ms: Our interarrival jitter estimate in milliseconds, or
@@ -2241,11 +2244,28 @@ class RtpMediaTransport:
                     self._emit_rtcp(report)
         finally:
             if send_bye_on_stop and self._rtcp_packets_sent > 0:
-                self._emit_rtcp(build_compound((self._bye(),)))
+                self._emit_rtcp(self._bye_compound())
 
-    def _bye(self) -> Bye:
-        """An RTCP BYE for our outbound SSRC (RFC 3550 §6.6)."""
-        return Bye(ssrcs=(_OUTBOUND_SSRC,), reason=None)
+    def _bye_compound(self) -> bytes:
+        """A compound RTCP datagram carrying a final report + SDES + BYE.
+
+        RFC 3550 §6.1: every RTCP packet — including a BYE — is sent in a compound
+        packet that begins with an SR or RR (and an SDES). A standalone BYE is not
+        a valid compound and peers may reject it (codex review, ADR-0061). So the
+        leaving datagram leads with the latest SR/RR + SDES, then the BYE for our
+        SSRC (§6.6). ``build_rtcp_report`` always returns non-None here because the
+        caller guards on ``_rtcp_packets_sent > 0`` (we have sent media → an SR).
+        """
+        report = self.build_rtcp_report()
+        bye = Bye(ssrcs=(_OUTBOUND_SSRC,), reason=None)
+        if report is None:
+            # Defensive: no SR/RR available (no media sent or received). Lead with an
+            # empty RR so the compound still begins with a report packet (§6.1).
+            rr = ReceiverReport(ssrc=_OUTBOUND_SSRC, report_blocks=())
+            return build_compound((rr, self._sdes(), bye))
+        # Append the BYE to the existing SR/RR + SDES compound (both already 32-bit
+        # aligned, so concatenation stays a valid compound).
+        return report + bye.pack()
 
     @property
     def call_quality(self) -> CallQuality:
@@ -2883,13 +2903,19 @@ class RtpMediaTransport:
         if self._ice is not None:
             await self._ice.close()
         # RTCP loop (ADR-0061): if the adapter started run_rtcp and registered its
-        # task here, cancel it so it does not outlive the call. The loop also watches
-        # the stop event set below, but a registered task is cancelled for promptness;
-        # its CancelledError propagates inside run_rtcp (rule 37). None when the
-        # adapter ran the loop without registering it (it then exits on the event).
+        # task here, cancel it AND AWAIT it so it does not outlive the call and its
+        # finally (the BYE flush) completes before stop() returns — otherwise the BYE
+        # may never go out and asyncio warns "task was destroyed but it is pending"
+        # (codex review). The loop also watches the stop event set below, but a
+        # registered task is cancelled for promptness; the CancelledError from the
+        # cancel is expected and suppressed here (the loop re-raises it, rule 37,
+        # after running its finally). None when the adapter ran the loop without
+        # registering it (it then exits on the event, unawaited by design).
         rtcp_task, self._rtcp_task = self._rtcp_task, None
         if rtcp_task is not None:
             rtcp_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await rtcp_task
         # Set the stop flag so the inbound generator wakes and exits cleanly.
         # Unlike a queued sentinel, this is independent of recv-queue capacity:
         # a full queue cannot drop the signal and strand the consumer.

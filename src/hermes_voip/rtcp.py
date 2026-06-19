@@ -80,10 +80,16 @@ _RTCP_SENDER_BW_FRACTION: float = 0.25  # senders share 25% of the RTCP bandwidt
 # §6.3.1 compensation for the [0.5, 1.5] uniform randomisation (e - 3/2).
 _COMPENSATION: float = 1.21828
 
-# RFC 3550 Appendix A.1: a sequence jump larger than this many packets is treated
-# as a source restart (the sequence is re-based) rather than a vast loss run.
+# RFC 3550 Appendix A.1 sequence-validity constants. A forward jump larger than
+# _MAX_DROPOUT, or a backward jump larger than _MAX_MISORDER, is not normal
+# loss/reorder: it is a possible source restart, validated by a second in-sequence
+# packet from the new base (the bad_seq mechanism) before the baseline is re-based.
 _MAX_DROPOUT: int = 3000
+_MAX_MISORDER: int = 100
 _SEQ_MOD: int = 1 << 16
+# The "impossible" sentinel A.1 seeds bad_seq with (one past the 16-bit space) so the
+# first out-of-range packet cannot accidentally match it.
+_RTP_SEQ_NONE: int = _SEQ_MOD + 1
 
 
 class RtcpError(Exception):
@@ -281,11 +287,26 @@ def _parse_header(data: bytes, offset: int) -> tuple[_CommonHeader, int]:
             f"{len(data) - offset}-byte remaining buffer"
         )
         raise RtcpError(msg)
+    body = data[offset + _COMMON_HEADER_LEN : end]
+    padding = bool(byte0 & _PADDING_BIT)
+    if padding:
+        # RFC 3550 §6.4.1: the padding bit means the last octet of THIS packet is
+        # the pad count (including itself); those octets are not part of the fields.
+        # Strip them so the body parser sees only the real content. The pad count
+        # must be in 1..len(body) — anything else is a malformed packet (rule 37).
+        if not body:
+            msg = "RTCP padding bit set on an empty packet body"
+            raise RtcpError(msg)
+        pad = body[-1]
+        if not 1 <= pad <= len(body):
+            msg = f"RTCP pad count {pad} out of range 1..{len(body)}"
+            raise RtcpError(msg)
+        body = body[:-pad]
     header = _CommonHeader(
         count=byte0 & _COUNT_MASK,
-        padding=bool(byte0 & _PADDING_BIT),
+        padding=padding,
         payload_type=payload_type,
-        body=data[offset + _COMMON_HEADER_LEN : end],
+        body=body,
     )
     return header, end
 
@@ -447,16 +468,23 @@ class ReceiverReport:
 
 
 def _parse_report_blocks(data: bytes, count: int) -> tuple[ReportBlock, ...]:
-    """Parse exactly ``count`` consecutive report blocks from ``data``.
+    """Parse EXACTLY ``count`` consecutive report blocks from ``data``.
+
+    The RC/SC field fixes the block count, and (padding already stripped by
+    :func:`_parse_header`) the region must be exactly ``count * 24`` bytes — we
+    advertise no RTP profile that defines a post-block extension, so any bytes
+    beyond the declared blocks are a malformed/oversized packet, not silently
+    ignored (codex review, ADR-0061).
 
     Raises:
-        RtcpError: If fewer than ``count`` whole blocks are present.
+        RtcpError: If the region is not exactly ``count`` whole blocks.
     """
     needed = count * _REPORT_BLOCK_LEN
-    if len(data) < needed:
+    if len(data) != needed:
         msg = (
             f"report-block region has {len(data)} bytes, "
-            f"need {needed} for {count} blocks"
+            f"expected exactly {needed} for {count} blocks "
+            f"(RC count and length field disagree, or trailing bytes present)"
         )
         raise RtcpError(msg)
     return tuple(
@@ -771,12 +799,30 @@ class ReceptionStats:
     # the previous packet's (arrival - rtp_timestamp) transit, in clock units.
     _jitter: float = field(default=0.0, init=False)
     _last_transit: float | None = field(default=None, init=False)
+    # RFC 3550 Appendix A.1 restart detection: the sequence one past the last
+    # out-of-range packet. A second packet equal to it confirms a source restart.
+    _bad_seq: int = field(default=_RTP_SEQ_NONE, init=False)
 
     def __post_init__(self) -> None:
         """Validate the source clock rate."""
         if self.clock_rate <= 0:
             msg = f"clock_rate must be positive, got {self.clock_rate}"
             raise ValueError(msg)
+
+    def _init_seq(self, seq: int) -> None:
+        """(Re)base the sequence bookkeeping on ``seq`` (RFC 3550 A.1 init_seq).
+
+        Used at the first packet and on a confirmed source restart: the new packet
+        becomes both the base and the highest, cycles reset, and the loss-interval
+        baselines re-anchor so loss is counted from the new stream, not the gap.
+        """
+        self._base_seq = seq
+        self._max_seq = seq
+        self._cycles = 0
+        self._received = 1  # this packet
+        self._expected_prior = 0
+        self._received_prior = 0
+        self._bad_seq = _RTP_SEQ_NONE
 
     def on_packet(self, *, seq: int, rtp_timestamp: int, arrival_ts: float) -> None:
         """Record one received RTP packet (RFC 3550 Appendix A.1 + A.8).
@@ -786,28 +832,23 @@ class ReceptionStats:
             rtp_timestamp: The packet's RTP timestamp (source-clock units).
             arrival_ts: Local arrival time in SECONDS (any monotonic origin).
 
-        Jitter (A.8) is maintained in source RTP clock units, using the clock
-        rate fixed at construction. The first packet only establishes the transit
+        Sequence handling follows RFC 3550 Appendix A.1 ``update_seq`` exactly,
+        including the source-restart path: a forward jump > ``_MAX_DROPOUT`` or a
+        backward jump > ``_MAX_MISORDER`` is held as a possible restart (``bad_seq``)
+        and only re-bases the stream once a SECOND in-sequence packet confirms it —
+        so a same-SSRC sender resync does not leave loss/EHSN wrong forever, and a
+        single stray packet does not corrupt a healthy stream.
+
+        Jitter (A.8) is maintained in source RTP clock units, using the clock rate
+        fixed at construction. The first packet only establishes the transit
         baseline (J starts at 0, the RFC 3550 warm-up); smoothing begins on the
         second packet.
         """
-        self._received += 1
         if not self._started:
             self._started = True
-            self._base_seq = seq
-            self._max_seq = seq
-            self._expected_prior = 0
-            self._received_prior = 0
+            self._init_seq(seq)
         else:
-            delta = (seq - self._max_seq) % _SEQ_MOD
-            if delta < _MAX_DROPOUT:
-                # In-order or a modest forward jump (possible loss): advance,
-                # counting a 16-bit wrap into the cycle count (A.1).
-                if seq < self._max_seq:
-                    self._cycles += _SEQ_MOD
-                self._max_seq = seq
-            # else: a large jump or an out-of-order/duplicate packet — counted in
-            # ``_received`` but it does not move the highest-sequence baseline.
+            self._update_seq(seq)
 
         # Interarrival jitter (A.8): transit = arrival (in clock units) - RTP
         # timestamp; D = transit(i) - transit(i-1); J += (|D| - J) / 16.
@@ -816,6 +857,39 @@ class ReceptionStats:
             d = abs(transit - self._last_transit)
             self._jitter += (d - self._jitter) / 16.0
         self._last_transit = transit
+
+    def _update_seq(self, seq: int) -> None:
+        """RFC 3550 Appendix A.1 ``update_seq`` (post-init): count + restart detect.
+
+        ``delta`` is the forward distance from the current highest in 16-bit serial
+        space. A small forward step (incl. a wrap) advances the highest and counts
+        the packet. A jump beyond ``_MAX_DROPOUT`` forward or ``_MAX_MISORDER``
+        backward is out of range: if it continues the previous out-of-range packet
+        (``seq == bad_seq``) two such in a row confirm a source restart and re-base;
+        otherwise it is held as the new ``bad_seq`` and DROPPED from the count. A
+        within-tolerance reorder/duplicate is simply counted.
+        """
+        delta = (seq - self._max_seq) % _SEQ_MOD
+        if delta < _MAX_DROPOUT:
+            # In order (with a permissible small forward gap = possible loss).
+            if seq < self._max_seq:
+                self._cycles += _SEQ_MOD  # 16-bit wraparound
+            self._max_seq = seq
+            self._received += 1
+        elif delta <= _SEQ_MOD - _MAX_MISORDER:
+            # Far out of range — a large forward jump or far-behind packet. The
+            # window (_MAX_DROPOUT, _SEQ_MOD - _MAX_MISORDER] is "the made-a-jump"
+            # zone (A.1): treat as a possible restart, confirmed by a successor.
+            if seq == self._bad_seq:
+                # Two out-of-range packets IN SEQUENCE → the source restarted.
+                self._init_seq(seq)
+            else:
+                self._bad_seq = (seq + 1) & (_SEQ_MOD - 1)
+                # Dropped: not counted in _received (it is not a valid packet yet).
+        else:
+            # A duplicate or a small-misorder reorder within tolerance: count it but
+            # do not move the highest-sequence baseline.
+            self._received += 1
 
     def _expected(self) -> int:
         """Total packets expected so far (A.3): extended highest - base + 1."""

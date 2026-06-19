@@ -2559,7 +2559,14 @@ class VoipAdapter(BasePlatformAdapter):
         rtcp_plan = _plan_rtcp_activation(
             audio,
             remote_address=remote_address,
-            secured=answer_crypto is not None,
+            # Gate on the ANSWERED transport profile (codex review #4): the SDES/plain
+            # answer echoes the offer's profile, so ``audio.protocol`` IS the answer
+            # profile — exactly ``RTP/AVP`` for a plain call, ``RTP/SAVP`` for SDES,
+            # ``UDP/TLS/RTP/SAVP`` for SIP-DTLS. RTCP activates only for plain RTP/AVP.
+            answer_profile=audio.protocol,
+            # The negotiated/answered RTP payload types for the RFC 5761 §4 mux check
+            # (codex review #2): rtcp-mux is refused if any PT lands in 64-95.
+            payload_types=tuple(c.payload_type for c in agreed_sdp_codecs),
             rtcp_enabled=media_cfg.rtcp_enabled,
         )
         if rtcp_plan is not None:
@@ -4784,6 +4791,22 @@ def _negotiated_ptime(audio: AudioMedia, codec: Codec) -> int:
 # sent on the wire, so it must carry no host/extension/number — rule 34).
 _RTCP_CNAME_TOKEN_BYTES: Final[int] = 8
 
+# The ONLY transport profile on which RTCP is activated (ADR-0061): plain cleartext
+# RTP. The engine has no SRTCP (RFC 3711 §3.4) transform, so any secured profile
+# (RTP/SAVP, RTP/SAVPF, UDP/TLS/RTP/SAVP, UDP/TLS/RTP/SAVPF) keeps RTCP dormant.
+# Gating on this exact string is FAIL-CLOSED (codex review #4): an unrecognised or
+# future profile is treated as not-activatable rather than wrongly cleartext.
+_RTCP_PLAIN_PROFILE: Final[str] = "RTP/AVP"
+
+# RFC 5761 §4: under rtcp-mux, RTP payload types 64-95 are FORBIDDEN — byte 2 of an
+# RTP packet is ``(marker<<7 | PT)``, so an RTP PT in this range with the marker set
+# becomes 192-223, overlapping the RTCP packet-type range (200-204) and making the
+# RTP-vs-RTCP demux ambiguous. If any negotiated RTP PT lands here, rtcp-mux is
+# refused (we fall back to a separate RTCP port). The plugin's own codecs
+# (PCMU 0 / PCMA 8 / G722 9 / dynamic 96-127 / telephone-event) are all outside it.
+_RTCP_MUX_FORBIDDEN_PT_MIN: Final[int] = 64
+_RTCP_MUX_FORBIDDEN_PT_MAX: Final[int] = 95
+
 
 def _mint_rtcp_cname() -> str:
     """Mint a fresh, opaque per-call RTCP SDES CNAME (RFC 3550 §6.5.1, ADR-0061).
@@ -4818,7 +4841,8 @@ def _plan_rtcp_activation(
     offer_audio: AudioMedia,
     *,
     remote_address: str,
-    secured: bool,
+    answer_profile: str,
+    payload_types: tuple[int, ...],
     rtcp_enabled: bool,
 ) -> _RtcpActivation | None:
     """Decide whether/how to activate RTCP for an inbound call (ADR-0061 step 1).
@@ -4826,29 +4850,46 @@ def _plan_rtcp_activation(
     Returns the activation plan, or ``None`` when RTCP must NOT be activated:
 
     * ``rtcp_enabled`` is the operator kill-switch (``HERMES_VOIP_RTCP_ENABLED``).
-    * ``secured`` (an SDES/SAVP or DTLS/SAVPF session) is NOT activated: the media
-      engine emits and parses CLEARTEXT RTCP only — it has no SRTCP (RFC 3711 §3.4)
-      transform — so multiplexing/sending cleartext RTCP on a secured 5-tuple would
-      be a protocol violation AND leak our SSRC/CNAME/timing in cleartext on an
-      otherwise-encrypted call. Secured-path RTCP (SRTCP) is a separate, named
-      capability follow-up (the bounded scope of this activation lane).
+    * ``answer_profile`` must be EXACTLY plain ``RTP/AVP`` (codex review #4 —
+      fail-closed): the media engine emits and parses CLEARTEXT RTCP only and has no
+      SRTCP (RFC 3711 §3.4) transform, so any secured profile (``RTP/SAVP``,
+      ``RTP/SAVPF``, ``UDP/TLS/RTP/SAVP``, ``UDP/TLS/RTP/SAVPF``) leaves RTCP dormant.
+      Gating on the ANSWERED PROFILE — not "no a=crypto present" — is fail-closed: an
+      unrecognised/future profile is treated as not-activatable, never wrongly
+      cleartext. Secured-path RTCP (SRTCP) is a separate, named capability follow-up.
 
     On the cleartext plain-RTP path the RTCP transport mirrors the offer's mux
     (RFC 5761 §5.1.1 via :func:`~hermes_voip.sdp.negotiate_rtcp_mux`): muxed RTCP
-    rides the RTP port; otherwise RTCP is on RTP-port+1 (RFC 3550 §11).
+    rides the RTP port; otherwise RTCP is on RTP-port+1 (RFC 3550 §11). BUT rtcp-mux
+    is REFUSED (falling back to the sibling port) when any negotiated RTP payload type
+    is in 64-95 (codex review #2, RFC 5761 §4): those PTs alias the RTCP packet-type
+    range on a muxed stream, making the RTP-vs-RTCP demux ambiguous. The plugin's own
+    codecs never use that range, so normal calls keep mux.
 
     Args:
         offer_audio: The inbound offer's audio media (its port + ``rtcp_mux`` flag).
         remote_address: The peer's effective RTP address (post c=/comedia resolution).
-        secured: Whether the negotiated media is encrypted (SDES/SAVP or DTLS/SAVPF).
+        answer_profile: The transport profile of the ANSWER we send (the negotiated
+            profile). RTCP activates only when this is exactly ``RTP/AVP``.
+        payload_types: The negotiated/answered RTP payload types (used for the RFC
+            5761 §4 mux conflict-range check).
         rtcp_enabled: The operator kill-switch (``MediaConfig.rtcp_enabled``).
 
     Returns:
         An :class:`_RtcpActivation` plan, or ``None`` to leave RTCP dormant.
     """
-    if not rtcp_enabled or secured:
+    if not rtcp_enabled or answer_profile != _RTCP_PLAIN_PROFILE:
         return None
     mux = negotiate_rtcp_mux(offer_audio)
+    # RFC 5761 §4: rtcp-mux is incompatible with an RTP payload type in 64-95 (it
+    # would alias the RTCP packet-type byte on the muxed stream). If the negotiated
+    # PTs include any such value, REFUSE mux and fall back to a separate RTCP port —
+    # the demux ambiguity then cannot arise (the RTP socket carries pure RTP).
+    if mux and any(
+        _RTCP_MUX_FORBIDDEN_PT_MIN <= pt <= _RTCP_MUX_FORBIDDEN_PT_MAX
+        for pt in payload_types
+    ):
+        mux = False
     # RFC 3550 §11: non-muxed RTCP uses the port one above the RTP port. No
     # ``a=rtcp:`` override is parsed, so the sibling port is the default.
     rtcp_port = offer_audio.port if mux else offer_audio.port + 1

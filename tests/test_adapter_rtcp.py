@@ -25,9 +25,14 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Callable
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from hermes_voip.adapter import VoipAdapter
+    from hermes_voip.media.engine import RtpMediaTransport
 
 pytest.importorskip("gateway.platforms.base")
 pytest.importorskip("gateway.config")
@@ -46,10 +51,11 @@ from hermes_voip.config import (
 )
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
+from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
-from hermes_voip.providers.guard import GuardResult, GuardVerdict
-from hermes_voip.providers.tts import TtsStream
+from hermes_voip.providers.guard import GuardResult, GuardVerdict, InjectionGuard
+from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.sdp import (
     AudioMedia,
     Fingerprint,
@@ -347,20 +353,33 @@ class _FakeTransport:
         self._calls.pop(call_id, None)
 
 
-class _FakeTtsStream:
-    def __aiter__(self) -> AsyncIterator[PcmFrame]:
-        return self._gen()
+class _FakeTtsStream(TtsStream):
+    """An empty, lifecycle-complete TtsStream (yields nothing). Typed, no ignores.
 
-    async def _gen(self) -> AsyncIterator[PcmFrame]:
-        empty: list[PcmFrame] = []
-        for frame in empty:
-            yield frame
+    Subclasses the ``TtsStream`` Protocol so mypy enforces the full surface
+    (``__anext__`` + ``flush``/``cancel``/``aclose``) — the call loop wraps playout
+    in ``aclosing`` and may barge-in, so all three lifecycle methods must exist.
+    """
+
+    def __aiter__(self) -> _FakeTtsStream:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        raise StopAsyncIteration
+
+    async def flush(self) -> None:
+        """No-op: nothing buffered."""
 
     async def cancel(self) -> None:
         """No-op."""
 
+    async def aclose(self) -> None:
+        """No-op: idempotent teardown."""
 
-class _FakeTTS:
+
+class _FakeTTS(StreamingTTS):
+    """A StreamingTTS that returns the empty stream (typed, Protocol-conformant)."""
+
     def synthesize(
         self,
         text: AsyncIterator[str],
@@ -368,19 +387,35 @@ class _FakeTTS:
         *,
         sample_rate: int | None = None,
     ) -> TtsStream:
-        return _FakeTtsStream()  # type: ignore[return-value]
+        return _FakeTtsStream()
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
 
 
-class _FakeASR:
-    async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+class _FakeASR(StreamingASR):
+    """A StreamingASR that drains audio and yields no transcripts (typed)."""
+
+    async def _drain(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
         async for _ in audio:
             pass
-        empty: list[object] = []
-        for chunk in empty:
-            yield chunk
+        # An async generator that yields nothing: the for-loop never iterates.
+        empty: tuple[Transcript, ...] = ()
+        for transcript in empty:
+            yield transcript
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        return self._drain(audio)
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
 
 
-class _FakeGuard:
+class _FakeGuard(InjectionGuard):
+    """An InjectionGuard that always allows (typed, Protocol-conformant)."""
+
     async def screen(self, text: str, *, call_id: str) -> GuardResult:
         return GuardResult(
             verdict=GuardVerdict.ALLOW,
@@ -392,7 +427,7 @@ class _FakeGuard:
 
 
 def _fake_providers() -> Providers:
-    return Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())  # type: ignore[arg-type]
+    return Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
 
 
 _PLAIN_INBOUND_OFFER = (
@@ -427,7 +462,7 @@ def _make_invite(offer: str, call_id: str) -> str:
     )
 
 
-async def _build_adapter(transport: _FakeTransport) -> object:
+async def _build_adapter(transport: _FakeTransport) -> VoipAdapter:
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV))
@@ -447,6 +482,20 @@ async def _build_adapter(transport: _FakeTransport) -> object:
         adapter = VoipAdapter(config)
         await adapter.connect()
     return adapter
+
+
+def _live_engine(adapter: VoipAdapter, call_id: str) -> RtpMediaTransport:
+    """The concrete live media engine for ``call_id`` (white-box narrowing).
+
+    ``CallSession._media`` is the ``CallMedia`` Protocol; these integration tests
+    inspect the concrete ``RtpMediaTransport`` RTCP internals, so narrow it with an
+    ``isinstance`` assert (no cast / no type-ignore — rule 17).
+    """
+    from hermes_voip.media.engine import RtpMediaTransport  # noqa: PLC0415
+
+    engine = adapter._call_sessions[call_id]._media
+    assert isinstance(engine, RtpMediaTransport)
+    return engine
 
 
 @pytest.mark.asyncio
@@ -479,10 +528,10 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             # The 200 OK is a plain RTP/AVP answer (no a=crypto) — the cleartext path.
             oks = [
@@ -494,15 +543,14 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
             assert "a=crypto" not in oks[-1].body
 
             # Reach the LIVE engine and assert RTCP was activated on it.
-            session = adapter._call_sessions[call_id]  # type: ignore[attr-defined]
-            engine = session._media  # white-box: the concrete RtpMediaTransport
+            engine = _live_engine(adapter, call_id)
             assert engine._rtcp_task is not None  # the run_rtcp loop is live
             assert engine._rtcp_active is True  # inbound muxed-demux engaged
             assert engine._rtcp_send is not None  # non-muxed: separate sink installed
             assert engine._rtcp_local_port == engine.local_port + 1
     finally:
         in_call.set()
-        await adapter.disconnect()  # type: ignore[attr-defined]
+        await adapter.disconnect()
         await asyncio.sleep(0)
 
 
@@ -584,10 +632,10 @@ async def test_inbound_sdes_savp_call_never_activates_rtcp_on_live_engine() -> N
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             # The 200 OK is an SDES answer (a=crypto present) — the secured path.
             oks = [
@@ -599,15 +647,14 @@ async def test_inbound_sdes_savp_call_never_activates_rtcp_on_live_engine() -> N
             assert "a=crypto" in oks[-1].body
 
             # The LIVE engine must have RTCP DORMANT (no SRTCP transform).
-            session = adapter._call_sessions[call_id]  # type: ignore[attr-defined]
-            engine = session._media  # white-box: the concrete RtpMediaTransport
+            engine = _live_engine(adapter, call_id)
             assert engine._rtcp_task is None  # no run_rtcp loop
             assert engine._rtcp_active is False  # muxed demux NOT engaged
             assert engine._rtcp_mux_active is False
             assert engine._rtcp_local_port is None  # no sibling socket
     finally:
         in_call.set()
-        await adapter.disconnect()  # type: ignore[attr-defined]
+        await adapter.disconnect()
         await asyncio.sleep(0)
 
 
@@ -719,10 +766,10 @@ async def test_inbound_webrtc_savpf_call_never_calls_start_rtcp() -> None:
             patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
             patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
         ):
-            adapter._on_inbound_invite(  # type: ignore[attr-defined]
+            adapter._on_inbound_invite(
                 NewCall(registration=_ext_config(), invite=invite)
             )
-            await _until(lambda: call_id in adapter._call_loops)  # type: ignore[attr-defined]
+            await _until(lambda: call_id in adapter._call_loops)
 
             # The answer is a WebRTC (DTLS) answer: fingerprint present, no a=crypto.
             oks = [

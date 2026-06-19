@@ -678,33 +678,33 @@ async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _identity_srtp() -> object:
+class _IdentitySrtp:
     """A minimal SRTP stand-in: protect/unprotect are byte-for-byte identity.
 
-    Satisfies the engine's ``_SrtpProtect`` (``protect(RtpPacket) -> bytes``) and
-    ``_SrtpUnprotect`` (``unprotect(bytes) -> RtpPacket``) Protocols enough to mark
-    the engine as *secured* for these tests, without pulling in the real
-    cryptography backend. Only the presence of ``_srtp_in``/``_srtp_out`` matters
-    here, not the transform.
+    Structurally satisfies BOTH the engine's ``_SrtpProtect``
+    (``protect(RtpPacket) -> bytes``) and ``_SrtpUnprotect``
+    (``unprotect(bytes) -> RtpPacket``) Protocols — so it can be assigned to the
+    engine's ``_srtp_in``/``_srtp_out`` slots with no cast or type-ignore — without
+    pulling in the real cryptography backend. Only the PRESENCE of those attributes
+    (which marks the engine secured) matters for the RTCP-refusal tests, not the
+    transform.
     """
 
-    class _IdentitySrtp:
-        def protect(self, packet: object) -> bytes:
-            assert isinstance(packet, RtpPacket)
-            return packet.pack()
+    def protect(self, packet: RtpPacket) -> bytes:
+        return packet.pack()
 
-        def unprotect(self, data: bytes) -> RtpPacket:
-            return RtpPacket.parse(data)
-
-    return _IdentitySrtp()
+    def unprotect(self, data: bytes) -> RtpPacket:
+        return RtpPacket.parse(data)
 
 
 class _FakeIcePipe:
     """A minimal ``_IceDatagramPipe`` stand-in (WebRTC marker for these tests).
 
-    Marks the engine as carrying an ICE/DTLS transport without a real ICE stack.
-    ``recv`` parks forever (no inbound) and ``send`` records, so the engine treats
-    it as the secured WebRTC media path; only ``_ice is not None`` matters here.
+    Structurally satisfies the engine's ``_IceDatagramPipe`` Protocol (async
+    send/recv/close) so it needs no type-ignore. Marks the engine as carrying an
+    ICE/DTLS transport without a real ICE stack: ``recv`` parks forever (no inbound)
+    and ``send`` records, so the engine treats it as the secured WebRTC media path;
+    only ``_ice is not None`` matters for the RTCP-refusal under test.
     """
 
     def __init__(self) -> None:
@@ -714,7 +714,7 @@ class _FakeIcePipe:
         await asyncio.Event().wait()  # park: no inbound for these tests
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def send(self, data: bytes) -> None:
+    async def send(self, data: bytes) -> None:
         self.sent.append(data)
 
     async def close(self) -> None:
@@ -780,7 +780,7 @@ async def test_start_rtcp_refuses_secured_engine_srtp_inbound() -> None:
     lane flips to ENABLE.
     """
     engine = _make_engine()
-    engine._srtp_in = _identity_srtp()  # mark inbound as secured
+    engine._srtp_in = _IdentitySrtp()  # mark inbound as secured
     await engine.connect()
     await engine.start_rtcp(mux=True)
     try:
@@ -795,7 +795,7 @@ async def test_start_rtcp_refuses_secured_engine_srtp_inbound() -> None:
 async def test_start_rtcp_refuses_secured_engine_srtp_outbound() -> None:
     """MAJOR #3: start_rtcp is a no-op on a secured engine (SRTP outbound set)."""
     engine = _make_engine()
-    engine._srtp_out = _identity_srtp()  # mark outbound as secured
+    engine._srtp_out = _IdentitySrtp()  # mark outbound as secured
     await engine.connect()
     await engine.start_rtcp(mux=True)
     try:
@@ -814,9 +814,19 @@ async def test_start_rtcp_refuses_secured_engine_ice_dtls() -> None:
     Constructed with the ICE pipe so the engine takes its ICE branch.
     """
     ice = _FakeIcePipe()
-    engine = _make_engine(ice_transport=ice)
-    engine._srtp_in = _identity_srtp()
-    engine._srtp_out = _identity_srtp()
+    # Construct directly with the ICE pipe so the engine takes its WebRTC branch
+    # (the shared _make_engine helper does not expose ice_transport).
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        cname="hermes@host.invalid",
+        ice_transport=ice,
+    )
+    engine._srtp_in = _IdentitySrtp()
+    engine._srtp_out = _IdentitySrtp()
     await engine.start_rtcp(mux=True)
     try:
         assert engine._rtcp_task is None

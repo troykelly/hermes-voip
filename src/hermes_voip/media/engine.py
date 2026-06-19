@@ -118,11 +118,13 @@ _log = logging.getLogger(__name__)
 _DEFAULT_PTIME_MS = 20
 
 # Packet-loss concealment (ADR-0056). For G.711/G.722 (no in-codec PLC) a lost
-# frame is concealed by repeating the last good decoded frame, attenuated by this
-# factor PER consecutive lost frame, and forced to silence after a short run so a
-# sustained outage fades out instead of droning a held tone. Opus uses its own
-# in-band FEC / native PLC instead and ignores these.
-_PLC_ATTENUATION_PER_FRAME: Final[float] = 0.5  # ~ -6 dB per held frame
+# frame is concealed by repeating the last good decoded frame. The FIRST held
+# frame plays at full energy (the standard G.711 Appendix-I-style repeat — the
+# lost frame most resembles its immediate predecessor); each SUBSEQUENT
+# consecutive loss multiplies by this factor (~-6 dB/step), and the repeat is
+# forced to silence after a short run so a sustained outage fades out instead of
+# droning a held tone. Opus uses its own in-band FEC / native PLC and ignores these.
+_PLC_ATTENUATION_PER_FRAME: Final[float] = 0.5  # ~ -6 dB per SUBSEQUENT held frame
 # After this many consecutive losses the repeat is dropped to silence (a long gap
 # is better represented as quiet than as a decaying buzz). 5 frames = 100 ms at
 # the standard 20 ms ptime.

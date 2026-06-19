@@ -283,7 +283,11 @@ class JitterBuffer:
             ):
                 # A wide reorder: this in-window packet arrived a span >= the
                 # current depth behind the highest we have seen, i.e. the link
-                # reorders further than we currently tolerate. Grow toward it.
+                # reorders further than we currently tolerate. Grow toward it by one
+                # step. Several packets of one wide burst may each step the depth up,
+                # but only until depth exceeds the burst's span (the condition then
+                # goes false), so the depth CONVERGES to ~the observed span and never
+                # overshoots past it — and _grow() caps it at the ceiling regardless.
                 self._grow()
         else:
             self._next = seq  # tentative anchor at the first arrival

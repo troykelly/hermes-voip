@@ -260,6 +260,13 @@ async def test_opus_lost_frame_recovered_via_fec() -> None:
     assert len(frames) == 5  # hole filled
     assert frames[1].sample_rate == _OPUS_ANALYSIS_RATE
     assert _rms(frames[1].samples) > 0.0  # real recovered audio, not a hole
+    # Predictor continuity: the FEC decode of frame 1 advances the decoder past it,
+    # so the SUCCESSOR (seq 2, frames[2]) must then decode normally to plausible
+    # audio — a garbled predictor would collapse it toward silence. This proves the
+    # libopus FEC-then-normal-decode pattern keeps the decoder state coherent.
+    assert frames[2].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[2].samples) > 0.0  # successor decodes cleanly post-FEC
+    assert _rms(frames[4].samples) > 0.0  # and the stream stays healthy after
 
 
 @pytest.mark.asyncio

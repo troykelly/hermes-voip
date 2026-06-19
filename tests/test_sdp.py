@@ -150,6 +150,23 @@ def test_negotiate_ptime_clamps_default_above_maxptime() -> None:
     assert negotiate_ptime(None, 10, supported=(10, 20, 30), default=20) == 10
 
 
+def test_negotiate_ptime_rejects_misconfiguration() -> None:
+    """A misconfigured engine (bad supported/default) is a loud error, not a bad ptime.
+
+    The docstring promises it never returns an unsupported/non-positive value, so a
+    default the engine cannot frame — or an empty/non-positive supported set — must
+    raise rather than silently emit an invalid ptime on the wire.
+    """
+    with pytest.raises(ValueError, match=r"non-empty|supported"):
+        negotiate_ptime(20, None, supported=(), default=20)
+    with pytest.raises(ValueError, match="positive"):
+        negotiate_ptime(20, None, supported=(0, 20), default=20)
+    with pytest.raises(ValueError, match="positive"):
+        negotiate_ptime(None, None, supported=(20, 30), default=0)
+    with pytest.raises(ValueError, match=r"supported|default"):
+        negotiate_ptime(None, None, supported=(20, 30), default=25)
+
+
 def test_parse_codecs_with_rtpmap_and_fmtp() -> None:
     sdp = SessionDescription.parse(_OFFER_AVP)
     assert sdp.audio is not None

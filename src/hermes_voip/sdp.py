@@ -1022,12 +1022,36 @@ def negotiate_ptime(
         offer_ptime: The peer's ``a=ptime`` in ms, or ``None`` if absent.
         offer_maxptime: The peer's ``a=maxptime`` in ms, or ``None`` if absent.
         supported: The frame sizes (ms) the engine can carry, e.g. ``(20, 30, 40)``.
+            Must be non-empty and all positive.
         default: The framing to use when the offer's is unusable (RFC 3551's 20 ms).
+            Must be positive and one of ``supported`` — the engine's own default
+            must be carriable, so a misconfiguration is a loud error, not a silent
+            invalid ptime on the wire.
 
     Returns:
         The agreed packetisation time in ms.
+
+    Raises:
+        ValueError: If ``supported`` is empty or has a non-positive value, or
+            ``default`` is non-positive or not in ``supported`` (a programming
+            error: the engine cannot frame at its own default).
     """
     supported_set = set(supported)
+    if not supported_set:
+        msg = "supported ptimes must be a non-empty set of frame sizes"
+        raise ValueError(msg)
+    if any(p <= 0 for p in supported_set):
+        msg = f"supported ptimes must all be positive, got {sorted(supported_set)}"
+        raise ValueError(msg)
+    if default <= 0:
+        msg = f"default ptime must be positive, got {default}"
+        raise ValueError(msg)
+    if default not in supported_set:
+        msg = (
+            f"default ptime {default} must be one of the supported frame sizes "
+            f"{sorted(supported_set)} (the engine must be able to frame at its default)"
+        )
+        raise ValueError(msg)
 
     def _within_cap(value: int) -> bool:
         return offer_maxptime is None or value <= offer_maxptime

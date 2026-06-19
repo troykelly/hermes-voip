@@ -84,10 +84,13 @@ frame (AEC reference alignment, in-band DTMF detect, `yield`), so the VAD/endpoi
   predictor coherent — so wideband degrades *less* than G.711, not more (gap 3).
 - **G.711 / G.722** — there is no in-codec concealment in the pure-Python G.722
   port, so the engine conceals with the **last good decoded analysis-rate frame,
-  attenuated** (≈ −3 dB per consecutive lost frame, silenced after a short run so a
-  long outage does not drone). This is identical for both, so G.722 loss handling is
-  no worse than G.711's (gap 3). The concealment frame is held at the analysis rate
-  (post-decode/-downsample), so it is codec- and rate-correct with no extra decode.
+  attenuated**: the first held frame plays at full energy (the lost frame most
+  resembles its immediate predecessor — the standard G.711 Appendix-I-style
+  repeat), each *subsequent* consecutive loss multiplies by ~−6 dB, and the repeat
+  is silenced after a short run (5 frames = 100 ms) so a long outage does not drone.
+  This is identical for both, so G.722 loss handling is no worse than G.711's (gap
+  3). The concealment frame is held at the analysis rate (post-decode/-downsample),
+  so it is codec- and rate-correct with no extra decode.
 
 The concealment seam is a single `_conceal_frame()` helper plus a small
 `_PlcState` holder, leaving `_inbound_gen`'s linear demux intact and leaving room

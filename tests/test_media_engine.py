@@ -32,7 +32,7 @@ from collections.abc import Iterator
 import pytest
 
 import hermes_voip.media.engine as engine_module
-from hermes_voip.media.audio import G711_SAMPLE_RATE, encode_ulaw
+from hermes_voip.media.audio import G711_SAMPLE_RATE, decode_ulaw, encode_ulaw
 from hermes_voip.media.engine import Codec, RtpMediaTransport
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.transport import MediaTransport
@@ -258,10 +258,23 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
         codec=Codec.PCMU,
         jitter_depth=3,  # wait for 3 later packets before declaring Lost
         clock=_dummy_clock,
+        aec_enabled=False,  # isolate concealment from the echo canceller
     )
     await engine.connect()
 
-    payload = _ulaw_silence()
+    # Each packet carries a DISTINCT constant-level payload so the output frames
+    # are individually identifiable — this proves ORDER and identity, not just the
+    # count: seq N decodes to a frame of level N, and the concealment frame for the
+    # lost seq 1 must equal the held repeat of seq 0 (the last good frame).
+    def _level_payload(level: int) -> bytes:
+        sample = level.to_bytes(2, "little", signed=True)
+        return encode_ulaw(sample * _SAMPLES_PER_FRAME)
+
+    # The decoded analysis frame for a given encoded level (mu-law is lossy, so we
+    # compare against the round-tripped value, not the raw level).
+    def _decoded(level: int) -> bytes:
+        return decode_ulaw(_level_payload(level))
+
     frames: list[PcmFrame] = []
     done = asyncio.Event()
 
@@ -275,31 +288,31 @@ async def test_dropped_packet_is_concealed_by_jitter_buffer() -> None:
     task = asyncio.create_task(_collect())
     await asyncio.sleep(0)  # let the task start and block on get()
 
-    # seq 0 arrives, then seq 1 is MISSING, then seqs 2, 3, 4 arrive.
-    # After seq 4 is pushed (3 packets behind the gap at seq 1), the buffer
-    # declares Lost(1); the engine conceals it, then yields 2, 3, 4 in order.
-    engine._recv_queue.put_nowait(
-        (_make_rtp(0, 0 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
-    )
-    engine._recv_queue.put_nowait(
-        (_make_rtp(2, 2 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
-    )
-    engine._recv_queue.put_nowait(
-        (_make_rtp(3, 3 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
-    )
-    engine._recv_queue.put_nowait(
-        (_make_rtp(4, 4 * _SAMPLES_PER_FRAME, payload), _FAKE_SRC)
-    )
+    # seq 0 arrives, then seq 1 is MISSING, then seqs 2, 3, 4 arrive (distinct
+    # levels). After seq 4 is pushed (3 packets behind the gap at seq 1), the
+    # buffer declares Lost(1); the engine conceals it, then yields 2, 3, 4 in order.
+    for seq in (0, 2, 3, 4):
+        engine._recv_queue.put_nowait(
+            (_make_rtp(seq, seq * _SAMPLES_PER_FRAME, _level_payload(seq)), _FAKE_SRC)
+        )
 
     await asyncio.wait_for(done.wait(), timeout=2.0)
     await asyncio.wait_for(task, timeout=2.0)
 
-    # Frames produced: seq 0, a concealment frame for Lost(1), then seqs 2, 3, 4.
-    assert len(frames) == 5  # the hole is filled, not skipped
+    # The hole is filled, not skipped: exactly five frames, all full 20 ms G.711.
+    assert len(frames) == 5
     for frame in frames:
         assert frame.sample_rate == G711_SAMPLE_RATE
-        # Each concealment/real frame is a full 20 ms G.711 frame.
         assert len(frame.samples) == _SAMPLES_PER_FRAME * 2
+    # Exact output ORDER + identity: real seq 0, the CONCEALMENT of Lost(1) (a
+    # full-energy repeat of the last good frame == seq 0), then seqs 2, 3, 4 in
+    # sequence — proving the concealed frame sits in the gap and the real packets
+    # after it are still delivered in order (not reordered or dropped).
+    assert frames[0].samples == _decoded(0)
+    assert frames[1].samples == _decoded(0)  # concealment = held repeat of seq 0
+    assert frames[2].samples == _decoded(2)
+    assert frames[3].samples == _decoded(3)
+    assert frames[4].samples == _decoded(4)
 
     await engine.stop()
 

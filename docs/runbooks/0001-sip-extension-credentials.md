@@ -25,13 +25,16 @@ and password are **sensitive**: they live ONLY in the gitignored repo-root `.env
 > [`0002-voip-live-validation.md`](0002-voip-live-validation.md) §5 (selects the field by its
 > `VoIP.Password` `<section>.<label>` id to disambiguate it from the portal field).
 
-> **Provisioning-vs-code env-var name mismatch.** The 1Password-provisioned `.env` currently
-> sets `HERMES_SIP_SERVER_HOST` and `HERMES_SIP_TLS_PORT`, but the plugin code reads
-> `HERMES_SIP_HOST` and `HERMES_SIP_PORT` (default `5061`) — `SERVER_HOST` / `TLS_PORT` appear
-> nowhere in `src/`, so those keys are silently ignored and the host fails to load. Until the
-> provisioning template is aligned to the code's key names (a separate, code-side fix), set
-> `HERMES_SIP_HOST` / `HERMES_SIP_PORT=5061` in the `.env` (or export them, as
-> [`0002-voip-live-validation.md`](0002-voip-live-validation.md) §5 does).
+> **Provisioning env-var name aliases (both names work).** The 1Password-provisioned `.env`
+> sets `HERMES_SIP_SERVER_HOST` and `HERMES_SIP_TLS_PORT`, while the canonical keys are
+> `HERMES_SIP_HOST` and `HERMES_SIP_PORT` (default `5061`). The parser
+> (`src/hermes_voip/config.py`) now accepts the provisioner names as **fallbacks**:
+> `HERMES_SIP_SERVER_HOST` is used for the host when `HERMES_SIP_HOST` is unset, and
+> `HERMES_SIP_TLS_PORT` for the port when `HERMES_SIP_PORT` is unset. The **canonical key
+> wins** when both are set, so an explicit `HERMES_SIP_HOST` / `HERMES_SIP_PORT` always
+> overrides the alias. Either name therefore loads the host/port — the provisioned `.env`
+> registers as-is, and exporting the canonical names (as
+> [`0002-voip-live-validation.md`](0002-voip-live-validation.md) §5 does) still works.
 
 ## Verify
 

@@ -823,6 +823,11 @@ class ReceptionStats:
         self._expected_prior = 0
         self._received_prior = 0
         self._bad_seq = _RTP_SEQ_NONE
+        # Re-seed the jitter transit baseline: on a confirmed restart the old
+        # stream's transit is stale, so the restart packet must ESTABLISH a fresh
+        # baseline (no spurious jitter spike). on_packet sets _last_transit from this
+        # packet right after; clearing it here makes the restart packet the new origin.
+        self._last_transit = None
 
     def on_packet(self, *, seq: int, rtp_timestamp: int, arrival_ts: float) -> None:
         """Record one received RTP packet (RFC 3550 Appendix A.1 + A.8).
@@ -847,18 +852,25 @@ class ReceptionStats:
         if not self._started:
             self._started = True
             self._init_seq(seq)
+            valid = True
         else:
-            self._update_seq(seq)
+            valid = self._update_seq(seq)
 
         # Interarrival jitter (A.8): transit = arrival (in clock units) - RTP
-        # timestamp; D = transit(i) - transit(i-1); J += (|D| - J) / 16.
+        # timestamp; D = transit(i) - transit(i-1); J += (|D| - J) / 16. A.1's
+        # update_seq returns false for a far out-of-range packet held as a possible
+        # restart; that packet is NOT a valid member of the stream, so it must not
+        # fold into reception-dependent stats — skip the jitter update for it (codex
+        # re-review). A confirmed restart (_init_seq) is valid and re-seeds transit.
+        if not valid:
+            return
         transit = arrival_ts * self.clock_rate - rtp_timestamp
         if self._last_transit is not None:
             d = abs(transit - self._last_transit)
             self._jitter += (d - self._jitter) / 16.0
         self._last_transit = transit
 
-    def _update_seq(self, seq: int) -> None:
+    def _update_seq(self, seq: int) -> bool:
         """RFC 3550 Appendix A.1 ``update_seq`` (post-init): count + restart detect.
 
         ``delta`` is the forward distance from the current highest in 16-bit serial
@@ -868,6 +880,12 @@ class ReceptionStats:
         (``seq == bad_seq``) two such in a row confirm a source restart and re-base;
         otherwise it is held as the new ``bad_seq`` and DROPPED from the count. A
         within-tolerance reorder/duplicate is simply counted.
+
+        Returns:
+            ``True`` if the packet is a valid member of the stream (in order,
+            duplicate/small-reorder, or a confirmed restart); ``False`` for a far
+            out-of-range packet merely held as a possible restart — the caller then
+            skips jitter and other reception-dependent updates (A.1).
         """
         delta = (seq - self._max_seq) % _SEQ_MOD
         if delta < _MAX_DROPOUT:
@@ -876,20 +894,23 @@ class ReceptionStats:
                 self._cycles += _SEQ_MOD  # 16-bit wraparound
             self._max_seq = seq
             self._received += 1
-        elif delta <= _SEQ_MOD - _MAX_MISORDER:
+            return True
+        if delta <= _SEQ_MOD - _MAX_MISORDER:
             # Far out of range — a large forward jump or far-behind packet. The
             # window (_MAX_DROPOUT, _SEQ_MOD - _MAX_MISORDER] is "the made-a-jump"
             # zone (A.1): treat as a possible restart, confirmed by a successor.
             if seq == self._bad_seq:
-                # Two out-of-range packets IN SEQUENCE → the source restarted.
+                # Two out-of-range packets IN SEQUENCE → the source restarted. The
+                # restart packet IS valid (it re-seeds the stream).
                 self._init_seq(seq)
-            else:
-                self._bad_seq = (seq + 1) & (_SEQ_MOD - 1)
-                # Dropped: not counted in _received (it is not a valid packet yet).
-        else:
-            # A duplicate or a small-misorder reorder within tolerance: count it but
-            # do not move the highest-sequence baseline.
-            self._received += 1
+                return True
+            self._bad_seq = (seq + 1) & (_SEQ_MOD - 1)
+            # Held, not counted: not a valid packet yet (A.1 returns false).
+            return False
+        # A duplicate or a small-misorder reorder within tolerance: count it but do
+        # not move the highest-sequence baseline.
+        self._received += 1
+        return True
 
     def _expected(self) -> int:
         """Total packets expected so far (A.3): extended highest - base + 1."""

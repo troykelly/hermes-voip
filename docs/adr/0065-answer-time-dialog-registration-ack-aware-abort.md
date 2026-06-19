@@ -51,24 +51,41 @@ Concretely (`src/hermes_voip/adapter.py`):
   (sets the event); a peer `BYE` is answered `200 OK`, marks `peer_bye`, and sets the
   event (the dialog is now ended by the peer); an in-window re-`INVITE` is answered
   `491 Request Pending` (media is not up yet); anything else is benignly absorbed.
-  `await wait_confirmed(timeout)` blocks until the ACK/BYE arrives or the timeout
-  elapses.
+- **An explicit terminal outcome (`_DialogOutcome`).** The guard's terminal state is an
+  **enum** — `ACK_CONFIRMED | PEER_BYE | TIMEOUT` — not a mutable flag read at one
+  moment. `peer_ended` is an instantaneous property (the success-path check);
+  `await wait_outcome(timeout)` blocks until the ACK/BYE arrives (or the bound elapses)
+  and returns the outcome, with **`PEER_BYE` winning over `ACK_CONFIRMED`** (re-checked
+  after the wake) so a peer BYE racing the ACK closes the double-BYE window. Making the
+  outcome explicit collapses the two concurrency edges (peer-BYE-during-success and
+  double-BYE) into one race-free decision used by both the success path and the abort.
 - **Registration at answer-time:** right after `_send_answer_200`, the setup helper
   registers the guard via `manager.add_call(dialog_id, guard)` +
   `transport.add_call(call_id, guard)`. The `2xx`-ACK now routes to the guard (no longer
   unroutable) and confirms the dialog.
-- **Success:** the inbound handler builds the real `CallSession` and its existing
-  `add_call`/`transport.add_call` **overwrite** the guard on the same keys — a seamless
-  upgrade; the guard is discarded.
-- **Failure (handshake or engine setup), shared `_abort_answered_call`:** close the
-  media session/engine **immediately** (release the UDP socket / SRTP state / ICE), then
-  `await guard.wait_confirmed(timeout=_ANSWERED_ABORT_ACK_TIMEOUT_S)` (≈ Timer H, 32 s).
-  If the peer already sent a `BYE`, the dialog is closed — only deregister. Otherwise
-  send the in-dialog `BYE` on the dialog (`build_in_dialog_request(dialog, "BYE")` — the
-  same request `CallSession.hang_up` builds), then deregister the guard. The bounded
-  wait guarantees the abort completes even if the ACK never comes (a fallback BYE is
-  still sent — a peer that answered but never ACKed is non-conformant; closing the
-  dialog is the safe action and a stray BYE on a truly-dead dialog is harmless).
+- **Success — peer-ended check (`_abort_if_peer_ended_during_setup`):** after the
+  handshake **and** the engine are up, but **before** the inbound handler registers the
+  real `CallSession` / starts the `CallLoop`, the setup helper checks `guard.peer_ended`.
+  If the peer BYE'd during the handshake, the dialog is gone: it stops the
+  just-connected engine, closes the session, deregisters the guard, and raises
+  `_AnsweredCallPeerEnded` so the inbound handler returns with **no `CallLoop`** (a clean
+  end, no BYE from us — the peer ended it). Otherwise the real `CallSession`'s existing
+  `add_call`/`transport.add_call` **overwrite** the guard on the same keys (a seamless
+  upgrade). There is no `await` between the `peer_ended` check returning and the
+  overwrite, so check + registration are atomic relative to inbound routing on the
+  single-threaded loop (a later BYE then routes to the real `CallSession`).
+- **Failure (handshake or engine setup), shared `_abort_answered_call`, non-blocking:**
+  release media **immediately and synchronously** (stop the engine / close the session —
+  release the UDP socket / SRTP state / ICE), then spawn the bounded ACK-wait + BYE as a
+  **tracked background task** (`_finish_answered_abort`) and return, so the inbound
+  handler and its **admission slot are freed at once** (a flood of failing handshakes
+  cannot exhaust admission). The background task `await guard.wait_outcome(...)`
+  (≈ Timer H, 32 s) and BYEs the dialog only on `ACK_CONFIRMED` / `TIMEOUT` — **never on
+  `PEER_BYE`** (the peer already ended it, so no double-BYE) — then deregisters the
+  guard. The `TIMEOUT` fallback BYE still closes a dialog whose peer answered but never
+  ACKed (non-conformant; a stray BYE on a truly-dead dialog is harmless). The task is
+  registered in `_call_tasks` so `disconnect` cancels + awaits it within the bounded
+  shutdown (no orphaned task / unobserved exception, rule 37).
 
 **Security invariant (preserved):** the guard is **signalling only** (ACK/BYE/CANCEL
 routing). The media engine is still constructed and `connect()`ed **only after the

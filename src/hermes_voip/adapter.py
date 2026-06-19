@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
 import random
 import re
@@ -211,12 +212,39 @@ class _MediaNegotiationRejected(Exception):  # noqa: N818 — control-flow signa
     """
 
 
+class _AnsweredCallPeerEnded(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Internal signal: the peer BYE'd a DTLS/WebRTC call DURING media setup (ADR-0065).
+
+    Raised by :meth:`VoipAdapter._setup_sip_dtls_call` / ``_setup_webrtc_call`` when the
+    answer-time dialog guard saw a peer ``BYE`` (already answered ``200``) by the time
+    the handshake + engine succeeded. The setup helper has already stopped media and
+    deregistered the guard, so the inbound handler must NOT build a ``CallLoop`` on the
+    peer-ended dialog — a clean ``return`` channel (no BYE from us; the peer ended it).
+    Distinct from :class:`_MediaNegotiationRejected` (a media FAILURE) — here media
+    SUCCEEDED but the dialog is already gone.
+    """
+
+
 # Bounded wait (seconds) for the peer's ACK to confirm an answered dialog before the
 # post-200 abort sends its fallback BYE (ADR-0065). Mirrors RFC 3261 Timer H
 # (64*T1 = 32 s): a peer that received our 2xx but never ACKs is non-conformant, so we
 # close the dialog anyway after this bound rather than wait forever. Media is released
 # IMMEDIATELY on the failure; only the BYE waits.
 _ANSWERED_ABORT_ACK_TIMEOUT_S = 32.0
+
+
+class _DialogOutcome(enum.Enum):
+    """Terminal state of an answered dialog seen by :class:`_AnsweredDialogGuard`.
+
+    An explicit outcome (rather than a mutable flag read at one moment) is what makes
+    the post-200 teardown race-free (ADR-0065): the success path and the abort both act
+    on the outcome, so a peer BYE that arrives mid-wait cannot produce a double-BYE and
+    a peer BYE during a successful handshake cannot start a CallLoop.
+    """
+
+    ACK_CONFIRMED = enum.auto()  # the peer ACKed our 2xx — the dialog is confirmed
+    PEER_BYE = enum.auto()  # the peer BYE'd (we answered 200) — the dialog is ended
+    TIMEOUT = enum.auto()  # neither arrived within the bound (non-conformant peer)
 
 
 class _AnsweredDialogGuard:
@@ -253,8 +281,15 @@ class _AnsweredDialogGuard:
         self._peer_bye = False
 
     @property
-    def peer_bye(self) -> bool:
-        """Whether the peer ended the dialog with a BYE during the window."""
+    def peer_ended(self) -> bool:
+        """Whether the peer has ALREADY ended the dialog with a BYE (instantaneous).
+
+        Read by the success path right before it would start the CallLoop: if the peer
+        BYE'd during the handshake, the call must end cleanly with no CallLoop. There is
+        no ``await`` between this check and the real CallSession ``add_call`` overwrite,
+        so the check + registration are atomic relative to inbound routing on the
+        single-threaded loop (a later BYE then routes to the real CallSession).
+        """
         return self._peer_bye
 
     async def handle_request(self, request: SipRequest) -> None:
@@ -287,19 +322,24 @@ class _AnsweredDialogGuard:
         same rationale as :meth:`CallSession.hang_up`), so nothing correlates here.
         """
 
-    async def wait_confirmed(self, *, timeout: float) -> bool:
-        """Wait up to ``timeout`` s for the dialog to be confirmed (ACK or peer BYE).
+    async def wait_outcome(self, *, timeout: float) -> _DialogOutcome:
+        """Wait up to ``timeout`` s and return the dialog's terminal outcome.
 
-        Returns ``True`` if confirmed within the bound, ``False`` on timeout (the
-        caller then sends a fallback BYE so the dialog cannot linger).
+        Returns :attr:`_DialogOutcome.PEER_BYE` if the peer BYE'd (whether before or
+        during the wait — checked AFTER the wake so a BYE racing the ACK wins, closing
+        the double-BYE window), :attr:`ACK_CONFIRMED` if the peer only ACKed, or
+        :attr:`TIMEOUT` if neither arrived within the bound. The caller sends our BYE
+        only on ``ACK_CONFIRMED`` / ``TIMEOUT`` — never on ``PEER_BYE`` (the peer
+        already ended the dialog).
         """
+        if not self._confirmed.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._confirmed.wait(), timeout=timeout)
+        if self._peer_bye:
+            return _DialogOutcome.PEER_BYE
         if self._confirmed.is_set():
-            return True
-        try:
-            await asyncio.wait_for(self._confirmed.wait(), timeout=timeout)
-        except TimeoutError:
-            return False
-        return True
+            return _DialogOutcome.ACK_CONFIRMED
+        return _DialogOutcome.TIMEOUT
 
 
 # Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):
@@ -2429,6 +2469,16 @@ class VoipAdapter(BasePlatformAdapter):
             # will run — release the admission slot here so capacity does not leak.
             self._release_admission(call_id)
             return
+        except _AnsweredCallPeerEnded:
+            # ADR-0065: the peer BYE'd during media setup (the answer-time guard
+            # answered it 200 OK). The setup helper already stopped media + deregistered
+            # the guard, so the dialog is closed — do NOT build a CallLoop. Release the
+            # admission slot (no CallSession/_teardown_call covers this clean end).
+            _log.info(
+                "INVITE %s: peer ended the call during setup — no CallLoop", call_id
+            )
+            self._release_admission(call_id)
+            return
         except BaseException:
             # An UNEXPECTED media-setup failure (e.g. engine.connect() raised) before
             # a CallSession exists: no _teardown_call covers this path, so release the
@@ -3000,6 +3050,18 @@ class VoipAdapter(BasePlatformAdapter):
         engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
+        # If the peer BYE'd during the ICE/DTLS handshake (the guard answered it 200),
+        # end cleanly here — do NOT start a video sender or return media the inbound
+        # handler would build a CallLoop on a dead dialog (ADR-0065). Raises
+        # _AnsweredCallPeerEnded after cleanup; checked BEFORE the video sender starts.
+        await self._abort_if_peer_ended_during_setup(
+            dialog=dialog,
+            transport=transport,
+            session=session,
+            engine=engine,
+            guard=guard,
+            call_id=call_id,
+        )
         # Outbound video (ADR-0044): only when we answered a=sendonly (a source is
         # configured + an H.264 codec was negotiated). The sender rides the SAME
         # BUNDLE'd ICE pipe + a video-SSRC SRTP session derived from the same DTLS
@@ -3281,6 +3343,17 @@ class VoipAdapter(BasePlatformAdapter):
         # 5-tuple would violate the profile and leak SSRC/CNAME/timing — same as the
         # SDES/WebRTC secured paths (a named follow-up adds SRTCP).
         _log.info("INVITE %s: SIP DTLS-SRTP media engine connected over UDP", call_id)
+        # If the peer BYE'd during the handshake (the guard answered it 200 OK), end
+        # cleanly here — do NOT return media the inbound handler would build a CallLoop
+        # on a dead dialog (ADR-0065). Raises _AnsweredCallPeerEnded after cleanup.
+        await self._abort_if_peer_ended_during_setup(
+            dialog=dialog,
+            transport=transport,
+            session=session,
+            engine=engine,
+            guard=guard,
+            call_id=call_id,
+        )
         return engine, local_media
 
     async def _abort_answered_call(  # noqa: PLR0913 — the answered-call teardown needs the dialog + transport + media session + engine + guard + call_id; all keyword-only
@@ -3293,32 +3366,31 @@ class VoipAdapter(BasePlatformAdapter):
         guard: _AnsweredDialogGuard,
         call_id: str,
     ) -> None:
-        """Definitively end a DTLS-SRTP / WebRTC call that failed AFTER the 200 OK.
+        """Abort a DTLS-SRTP / WebRTC call that failed AFTER the 200 OK (ADR-0065).
 
         Reached when the media handshake or the engine setup fails once the 200 OK has
-        gone out, so the peer holds an answered call (the SIP dialog is established,
-        RFC 3261 §12). Unlike the pre-answer reject (a 488), an established dialog is
-        ended with an in-dialog **BYE** (RFC 3261 §15.1) — but §15.1.1 forbids sending
-        BYE before the dialog is **confirmed** (the peer's ACK for our 2xx), and a DTLS
-        fingerprint mismatch can be detected before that ACK. So (ADR-0065):
+        gone out, so the peer holds an answered call (the dialog is established,
+        RFC 3261 §12). An established dialog is ended with an in-dialog **BYE**
+        (RFC 3261 §15.1) — but §15.1.1 forbids BYE before the dialog is **confirmed**
+        (the peer's ACK), and a fingerprint mismatch can be detected before that ACK.
 
-        1. Release media IMMEDIATELY — stop the engine (if it was constructed) and
-           close the session (release the UDP socket / ICE). Nothing is held in the
-           ACK wait.
-        2. If the peer already sent a BYE in the window, the dialog is closed — only
-           deregister; do not send a redundant BYE.
-        3. Otherwise wait (bounded, ≈Timer H) for the guard to observe the ACK, then
-           send the in-dialog BYE (the same request :meth:`CallSession.hang_up` builds).
-           A timeout still sends a fallback BYE so a non-conformant peer cannot leave
-           the dialog open forever.
-        4. Deregister the guard (the call never reaches the real CallSession
-           registration).
+        Two phases, so the call task + admission slot are freed immediately:
 
-        Each step is best-effort and independently guarded — one failing resource must
-        not strand the others (rule 37: logged, never swallowed, never a plaintext
-        fallback). No ``CallSession`` exists yet, so the BYE is sent directly on the
-        ``dialog`` (``_teardown_call`` is the post-registration chokepoint, unreachable
-        here).
+        1. **Synchronous (here):** release media NOW — stop the engine (if it was
+           constructed) and close the session (release the UDP socket / ICE), then spawn
+           the bounded ACK-wait + BYE as a TRACKED background task and return. The
+           inbound handler then re-raises the reject signal and frees its admission slot
+           at once (a flood of failing handshakes cannot exhaust admission).
+        2. **Background (:meth:`_finish_answered_abort`):** wait (bounded, ≈Timer H) for
+           the guard's terminal outcome and BYE the dialog only on ``ACK_CONFIRMED`` /
+           ``TIMEOUT`` (never ``PEER_BYE`` — the peer already ended it), then deregister
+           the guard. The task is tracked in ``_call_tasks`` so ``disconnect`` cancels +
+           awaits it within the bounded shutdown (no orphaned task, rule 37).
+
+        Media release is best-effort and independently guarded — a failing resource must
+        not strand the others (logged, never swallowed). No ``CallSession`` exists yet,
+        so the BYE is sent directly on the ``dialog`` (``_teardown_call`` is the
+        post-registration chokepoint, unreachable here).
         """
         if engine is not None:
             try:
@@ -3331,27 +3403,56 @@ class VoipAdapter(BasePlatformAdapter):
                 )
         try:
             await session.close()
-        except Exception as exc:  # noqa: BLE001 — best-effort; never strand the BYE
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
             _log.warning(
                 "INVITE %s: error closing media session on abort: %s", call_id, exc
             )
+        # Spawn the bounded ACK-wait + BYE in the background so the inbound handler (and
+        # its admission slot) is freed NOW. Tracked in _call_tasks so disconnect cancels
+        # + awaits it (bounded, like the ADR-0059 drain).
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._finish_answered_abort(
+                dialog=dialog, transport=transport, guard=guard, call_id=call_id
+            )
+        )
+        self._call_tasks.setdefault(call_id, set()).add(task)
+        task.add_done_callback(
+            lambda t: self._call_tasks.get(call_id, set()).discard(t)
+        )
+
+    async def _finish_answered_abort(
+        self,
+        *,
+        dialog: Dialog,
+        transport: SignalingTransport,
+        guard: _AnsweredDialogGuard,
+        call_id: str,
+    ) -> None:
+        """Background tail of :meth:`_abort_answered_call`: ACK-aware BYE + deregister.
+
+        Waits (bounded) for the guard's terminal outcome (ADR-0065) and acts on it:
+
+        * ``PEER_BYE`` — the peer already ended the dialog (its BYE was answered 200);
+          send NO BYE of our own (avoids the double-BYE when the peer BYEs during the
+          wait).
+        * ``ACK_CONFIRMED`` — the dialog is confirmed; send the in-dialog BYE
+          (RFC 3261 §15.1.1) — the same request :meth:`CallSession.hang_up` builds.
+        * ``TIMEOUT`` — no ACK within the bound (non-conformant peer); send a fallback
+          BYE anyway so the dialog cannot linger forever.
+
+        Always deregisters the answer-time guard. Best-effort: a BYE-send failure is
+        logged, never raised. Tolerates cancellation (``disconnect``): the ``finally``
+        deregisters even when the wait is cancelled (rule 37 — never swallowed).
+        """
         try:
-            if guard.peer_bye:
-                # The peer already terminated the dialog (its BYE was answered 200 OK by
-                # the guard) — sending our own BYE would be a redundant request on a
-                # dead dialog. Just deregister.
+            outcome = await guard.wait_outcome(timeout=_ANSWERED_ABORT_ACK_TIMEOUT_S)
+            if outcome is _DialogOutcome.PEER_BYE:
                 _log.info(
                     "INVITE %s: answered-call abort — peer already BYE'd; no BYE sent",
                     call_id,
                 )
             else:
-                # Wait (bounded) for the dialog to be confirmed before BYEing it
-                # (RFC 3261 §15.1.1). A timeout still BYEs (fallback) so the dialog
-                # cannot linger; media is already released, so the wait holds nothing.
-                confirmed = await guard.wait_confirmed(
-                    timeout=_ANSWERED_ABORT_ACK_TIMEOUT_S
-                )
-                if not confirmed:
+                if outcome is _DialogOutcome.TIMEOUT:
                     _log.warning(
                         "INVITE %s: no ACK within %.0fs — sending fallback BYE to "
                         "close the unconfirmed dialog",
@@ -3363,9 +3464,11 @@ class VoipAdapter(BasePlatformAdapter):
                 _log.info(
                     "INVITE %s: BYE sent to close the answered dialog (%s)",
                     call_id,
-                    "confirmed" if confirmed else "fallback",
+                    "confirmed"
+                    if outcome is _DialogOutcome.ACK_CONFIRMED
+                    else "fallback",
                 )
-        except Exception as exc:  # noqa: BLE001 — best-effort; the dialog will time out if the BYE cannot be sent
+        except Exception as exc:  # noqa: BLE001 — best-effort; the dialog times out if the BYE cannot be sent
             _log.warning(
                 "INVITE %s: error sending BYE on answered-call abort: %s", call_id, exc
             )
@@ -3375,6 +3478,58 @@ class VoipAdapter(BasePlatformAdapter):
             if self._manager is not None:
                 self._manager.remove_call(dialog.dialog_id)
             transport.remove_call(call_id)
+
+    async def _abort_if_peer_ended_during_setup(  # noqa: PLR0913 — the peer-ended check needs the dialog + transport + media session + engine + guard + call_id; all keyword-only
+        self,
+        *,
+        dialog: Dialog,
+        transport: SignalingTransport,
+        session: SipDtlsMediaSession | WebRtcMediaSession,
+        engine: RtpMediaTransport,
+        guard: _AnsweredDialogGuard,
+        call_id: str,
+    ) -> None:
+        """End the call cleanly if the peer BYE'd during media setup (ADR-0065).
+
+        Called by the setup helpers right before their success return — after the
+        handshake + engine are up but BEFORE the inbound handler builds the CallLoop.
+        If the answer-time guard observed a peer ``BYE`` (already answered ``200 OK``),
+        the dialog is gone: stop the (just-connected) engine, close the media session,
+        deregister the guard, and raise :class:`_AnsweredCallPeerEnded` so the inbound
+        handler returns without a CallLoop — no BYE from us (the peer ended it).
+
+        There is no ``await`` between this check returning normally and the caller's
+        success return + the inbound handler's ``add_call`` overwrite, so the check +
+        registration are atomic relative to inbound routing on the single-threaded loop
+        (a peer BYE after this point routes to the real CallSession). A no-op when the
+        peer has not BYE'd.
+        """
+        if not guard.peer_ended:
+            return
+        _log.info(
+            "INVITE %s: peer BYE'd during media setup — ending without a CallLoop",
+            call_id,
+        )
+        try:
+            await engine.stop()
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
+            _log.warning(
+                "INVITE %s: error stopping engine on peer-ended setup: %s",
+                call_id,
+                exc,
+            )
+        try:
+            await session.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort; never strand teardown
+            _log.warning(
+                "INVITE %s: error closing media session on peer-ended setup: %s",
+                call_id,
+                exc,
+            )
+        if self._manager is not None:
+            self._manager.remove_call(dialog.dialog_id)
+        transport.remove_call(call_id)
+        raise _AnsweredCallPeerEnded
 
     def _start_webrtc_video_sender(
         self,

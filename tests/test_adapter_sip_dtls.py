@@ -1254,12 +1254,12 @@ async def test_sip_dtls_abort_is_non_blocking_frees_admission_slot() -> None:
         # The admission slot is freed promptly — the abort wait does NOT block the
         # handler (it runs in the background). 1.0s ≪ the 30s ACK timeout.
         await _until(
-            lambda: call_id not in adapter._admitted_calls,  # type: ignore[attr-defined]
+            lambda: call_id not in adapter._admitted_calls,
             timeout=1.0,
         )
         # A tracked background teardown task exists (so shutdown can cancel/await it).
-        assert call_id in adapter._call_tasks  # type: ignore[attr-defined]
-        assert adapter._call_tasks[call_id]  # type: ignore[attr-defined]
+        assert call_id in adapter._call_tasks
+        assert adapter._call_tasks[call_id]
         # Tear down via disconnect (cancels the bg task within the bounded shutdown).
         await adapter.disconnect()
         await asyncio.sleep(0)

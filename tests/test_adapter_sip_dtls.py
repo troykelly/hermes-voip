@@ -1221,6 +1221,111 @@ async def test_sip_dtls_peer_bye_during_abort_wait_no_double_bye() -> None:
 
 
 @pytest.mark.asyncio
+async def test_answered_guard_trailing_bye_after_ack_wins_over_ack_confirmed() -> None:
+    """A trailing BYE after an ACK ⇒ PEER_BYE, not ACK_CONFIRMED (codex r4).
+
+    A peer can ACK (confirming the dialog) and THEN BYE within the same abort window —
+    e.g. when BOTH sides' media handshake failed. The transport drives one sequential
+    read loop, so the BYE is a separate, not-yet-read frame when the ACK wakes
+    ``wait_outcome``; a snapshot taken at that wake returns ``ACK_CONFIRMED`` and the
+    abort then sends OUR BYE — which collides with the peer's just-arriving BYE (glare).
+
+    The settle-grace makes ``wait_outcome`` wait briefly, after an ACK confirms, for a
+    trailing BYE so the BYE wins (no second BYE from us). This drives the guard's
+    ``wait_outcome`` directly so the ordering is deterministic: ACK first, then assert
+    the decision is still pending (it must NOT have committed to ACK_CONFIRMED), then
+    deliver the BYE and assert ``PEER_BYE``.
+    """
+    from hermes_voip.adapter import (  # noqa: PLC0415 — adapter-internal guard
+        _AnsweredDialogGuard,
+        _DialogOutcome,
+    )
+    from hermes_voip.dialog import Dialog  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+    dialog = Dialog.from_inbound_invite(
+        invite,
+        local_tag=new_tag(),
+        local_contact="<sip:1000@127.0.0.1:5061;transport=tls>",
+        local_sent_by="127.0.0.1:5061",
+        transport="TLS",
+    )
+    guard = _AnsweredDialogGuard(dialog=dialog, transport=transport, call_id=call_id)
+    # A synthetic 200 OK so the in-dialog ACK/BYE echo a consistent To/From (RFC 3261
+    # §12) — exactly what a gateway sends after our answer.
+    ok = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.7:5061;branch=z9hG4bKdlg\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag={new_tag()}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    ack = _in_dialog_request("ACK", ok, call_id=call_id)
+    bye = _in_dialog_request("BYE", ok, call_id=call_id)
+
+    task: asyncio.Task[_DialogOutcome] = asyncio.create_task(
+        guard.wait_outcome(timeout=30.0)
+    )
+    for _ in range(5):  # let wait_outcome reach its phase-1 wait
+        await asyncio.sleep(0)
+    await guard.handle_request(ack)
+    for _ in range(5):  # the ACK wakes phase-1; the guard now grace-waits for a BYE
+        await asyncio.sleep(0)
+    assert not task.done(), (
+        "wait_outcome committed to ACK_CONFIRMED on the ACK before a trailing BYE "
+        "could win — this reopens the double-BYE glare (codex r4)"
+    )
+    await guard.handle_request(bye)
+    assert await task is _DialogOutcome.PEER_BYE
+    # The guard answered the peer BYE 200; the abort (caller) sends no BYE of its own.
+    assert any(m.startswith("SIP/2.0 200") and "BYE" in m for m in transport.sent)
+
+
+@pytest.mark.asyncio
+async def test_answered_guard_ack_without_trailing_bye_confirms_after_grace() -> None:
+    """ACK with no trailing BYE ⇒ ACK_CONFIRMED after the (bounded) settle grace.
+
+    The control for the settle-grace fix: when the peer only ACKs, ``wait_outcome``
+    still returns ``ACK_CONFIRMED`` (so the abort sends its necessary BYE) — the grace
+    expires and does not change the outcome. A tiny grace keeps the test fast.
+    """
+    from hermes_voip.adapter import (  # noqa: PLC0415 — adapter-internal guard
+        _AnsweredDialogGuard,
+        _DialogOutcome,
+    )
+    from hermes_voip.dialog import Dialog  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+    dialog = Dialog.from_inbound_invite(
+        invite,
+        local_tag=new_tag(),
+        local_contact="<sip:1000@127.0.0.1:5061;transport=tls>",
+        local_sent_by="127.0.0.1:5061",
+        transport="TLS",
+    )
+    guard = _AnsweredDialogGuard(dialog=dialog, transport=transport, call_id=call_id)
+    ok = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.7:5061;branch=z9hG4bKdlg\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag={new_tag()}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    ack = _in_dialog_request("ACK", ok, call_id=call_id)
+    with patch("hermes_voip.adapter._ACK_BYE_SETTLE_S", 0.01):
+        await guard.handle_request(ack)
+        assert await guard.wait_outcome(timeout=30.0) is _DialogOutcome.ACK_CONFIRMED
+
+
+@pytest.mark.asyncio
 async def test_sip_dtls_abort_is_non_blocking_frees_admission_slot() -> None:
     """The post-200 abort does NOT hold the handler/admission slot during the wait.
 

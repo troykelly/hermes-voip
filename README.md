@@ -319,6 +319,16 @@ What is built and working today:
   speaking the first immediately, so first audio arrives in ~one short sentence (see
   [`docs/adr/0057-conversational-ux-silence-goodbye-streaming.md`](docs/adr/0057-conversational-ux-silence-goodbye-streaming.md)).
   Spoken output is cleaned up for the phone (no emoji read aloud).
+
+  > **Do not enable Hermes _reply_ streaming for the voip platform.** A phone call is real-time
+  > audio, not an editable chat message, so the plugin needs each reply as one complete string
+  > (it then sentence-streams the **audio** itself — that is what gives you fast first-audio).
+  > The plugin already tells the gateway it is non-editable, which keeps the normal in-process
+  > path on the single-complete-reply delivery. Leave Hermes message streaming **off** for voip
+  > (`streaming.enabled: false`, or `display.platforms.voip.streaming: false`) — turning it on,
+  > **especially when the gateway runs in proxy mode** (`GATEWAY_PROXY_URL` / `gateway.proxy_url`),
+  > makes the gateway feed replies as cumulative edits and garbles the speech. See
+  > [`docs/runbooks/0002-voip-live-validation.md`](docs/runbooks/0002-voip-live-validation.md).
 - **A choice of voices and ears** — run fully **offline** (local recognition + a local voice)
   or use a **cloud** voice/recognition, picked entirely by settings. See
   [Choosing a voice](#choosing-a-voice).

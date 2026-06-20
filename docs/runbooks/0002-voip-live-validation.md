@@ -518,6 +518,39 @@ keys SRTP from the handshake (no `a=crypto` — the master key is never in the S
   peer's real source on the first inbound datagram (the comedia latch), so two-way
   media works even when the offered `c=`/port is behind NAT.
 
+### 8f. Do NOT enable Hermes reply streaming for the voip platform
+
+Symptom: the agent's speech is garbled, stuttered, or repeats fragments of the reply
+(syllables doubled/overlapping), with no gateway-echo signature (this is NOT the §8c
+self-interruption loop — the caller is silent and the ASR is not transcribing the agent).
+
+Cause: Hermes message (reply) streaming is enabled for the voip platform. A phone call is a
+real-time **audio** surface, not an editable chat message. With streaming on, the gateway
+delivers the reply through its edit-in-place renderer (`GatewayStreamConsumer`): one
+partial-prefix `send()` then repeated `edit_message()` calls carrying *cumulative* growing
+text, flushed on a time/codepoint threshold (not sentence boundaries). The plugin's TTS path
+(`adapter.send()` → `CallLoop._speak_text → tts.synthesize()`) expects **one complete reply
+string**; cumulative-prefix deliveries make it synthesise overlapping partials. The plugin
+declares itself non-editable (`VoipAdapter.SUPPORTS_MESSAGE_EDITING = False`), which keeps the
+normal in-process gateway path on the single-complete-`send()` delivery — but the gateway's
+**proxy path** builds the streaming consumer regardless of that flag (a runtime-side gap, see
+ADR-0057 §3), so the safe operating posture is to leave streaming off for voip outright.
+
+Fix / required posture: in the Hermes runtime config, keep message streaming **off for the
+voip platform**:
+
+- Globally: `streaming.enabled: false` (this is the runtime default — `StreamingConfig.enabled`
+  defaults `False`).
+- Or per-platform (if streaming is on for other platforms):
+  `display.platforms.voip.streaming: false`.
+- **Especially** when the gateway runs in **proxy mode** (`GATEWAY_PROXY_URL` env or
+  `gateway.proxy_url` in `config.yaml`), where the flag does not protect the path — do not
+  enable streaming for voip there at all.
+
+Note: this is about Hermes *reply-text* streaming. The plugin still sentence-streams the
+**audio** itself (first audio in ~one short sentence); that is internal to the plugin and is
+not affected by this setting.
+
 ## 9. Teardown
 
 - Stop the validation process / gateway with `Ctrl-C` (the driver above calls

@@ -1,4 +1,4 @@
-# ADR-0066: Outbound SDES-SRTP offering on `place_call` — opt-in offer, fail-closed on a plaintext answer
+# ADR-0067: Outbound SDES-SRTP offering on `place_call` — opt-in offer, fail-closed on a plaintext answer
 
 - **Date:** 2026-06-19
 - **Status:** Accepted

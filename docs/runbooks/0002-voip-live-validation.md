@@ -551,7 +551,7 @@ Note: this is about Hermes *reply-text* streaming. The plugin still sentence-str
 **audio** itself (first audio in ~one short sentence); that is internal to the plugin and is
 not affected by this setting.
 
-### 8g. Verify outbound SDES-SRTP offering on `place_call` (ADR-0066)
+### 8g. Verify outbound SDES-SRTP offering on `place_call` (ADR-0067)
 
 By default an agent-originated outbound call (`place_call`) offers **plain `RTP/AVP`**
 (the live-validated default). Setting `HERMES_VOIP_SIP_SDES_OFFER=1` makes the outbound

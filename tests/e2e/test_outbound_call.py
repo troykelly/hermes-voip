@@ -898,7 +898,7 @@ async def test_call_on_connect_trigger() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ADR-0066: outbound SDES-SRTP offering on place_call.
+# ADR-0067: outbound SDES-SRTP offering on place_call.
 #
 # Today the outbound INVITE offers PLAIN RTP/AVP (srtp_*=None + build_audio_offer
 # with no crypto=), while the inbound answer path negotiates SDES — an asymmetry.
@@ -1042,7 +1042,7 @@ async def test_outbound_offer_is_plain_rtp_avp_by_default() -> None:
     """Default (flag unset): the outbound INVITE offers PLAIN RTP/AVP, no a=crypto.
 
     Regression guard for the safe default — turning SDES offering ON is opt-in
-    (ADR-0066), so an unconfigured deployment keeps offering cleartext exactly as
+    (ADR-0067), so an unconfigured deployment keeps offering cleartext exactly as
     today (the live-validated default). This already passes on main; it locks the
     default so the GREEN change cannot silently flip it.
     """
@@ -1086,7 +1086,7 @@ async def test_outbound_sdes_offer_advertises_savp_and_crypto() -> None:
     """Flag ON: the outbound INVITE offers RTP/SAVP with exactly one a=crypto.
 
     RED on main (the offer is always plain RTP/AVP — build_audio_offer is called with
-    no crypto=). After ADR-0066 the opt-in flag makes the INVITE offer SDES-SRTP with
+    no crypto=). After ADR-0067 the opt-in flag makes the INVITE offer SDES-SRTP with
     a fresh per-call AES_CM_128_HMAC_SHA1_80 key.
     """
     gateway = _SrtpAnsweringGateway()
@@ -1237,7 +1237,7 @@ async def _assert_refused_2xx_acks_then_byes_then_fails(
 async def test_outbound_sdes_plain_answer_fails_closed() -> None:
     """Flag ON + the peer answers PLAIN RTP/AVP to our SAVP offer → ACK+BYE+fail.
 
-    Fail-closed (ADR-0066): accepting a cleartext answer to an encrypted offer would
+    Fail-closed (ADR-0067): accepting a cleartext answer to an encrypted offer would
     silently stream plaintext for a call we asked to protect — a bid-down. The refused
     2xx is ACKed then BYE'd (no half-open dialog), the call raises, and NO call runs.
     RED on main (the answer's profile/crypto is ignored, so a plain answer is accepted).
@@ -1258,7 +1258,7 @@ async def test_outbound_sdes_answer_wrong_tag_fails_closed() -> None:
 
     RFC 4568 §6.1: the answerer selects by the offered tag. A tag the plugin never
     offered must not key inbound SRTP — fail closed (ACK+BYE), never key from it.
-    RED on main and on the first ADR-0066 cut (which took crypto_attrs[0] blindly).
+    RED on main and on the first ADR-0067 cut (which took crypto_attrs[0] blindly).
     """
     gateway = _SrtpWrongTagGateway()
     gateway.set_register_responder()

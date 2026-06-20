@@ -524,7 +524,7 @@ def _srtp_outbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | 
 
 
 def _outbound_offer_crypto() -> CryptoAttribute:
-    """Mint the SDES ``a=crypto`` for an outbound SRTP offer (ADR-0066, RFC 4568).
+    """Mint the SDES ``a=crypto`` for an outbound SRTP offer (ADR-0067, RFC 4568).
 
     Returns a fresh ``AES_CM_128_HMAC_SHA1_80`` :class:`CryptoAttribute` (tag 1, the
     preferred supported suite) with a cryptographically-random per-call master
@@ -542,7 +542,7 @@ def _outbound_offer_crypto() -> CryptoAttribute:
 
 
 def _srtp_outbound_from_offer(crypto: CryptoAttribute | None) -> SrtpSession | None:
-    """The outbound (TX/protect) SrtpSession keyed by OUR **offer** a=crypto (ADR-0066).
+    """The outbound (TX/protect) SrtpSession keyed by OUR **offer** a=crypto (ADR-0067).
 
     The offerer mirror of :func:`_srtp_outbound_from_answer`: as the UAC we encrypt our
     outbound stream with the key we advertised in the INVITE's ``a=crypto`` (RFC 4568
@@ -1444,7 +1444,7 @@ class VoipAdapter(BasePlatformAdapter):
         local_sent_by = transport.local_sent_by
 
         # --- Build the SDP offer -------------------------------------------
-        # Outbound SDES-SRTP offering (ADR-0066): when enabled, mint a fresh per-call
+        # Outbound SDES-SRTP offering (ADR-0067): when enabled, mint a fresh per-call
         # SDES key and offer RTP/SAVP + a=crypto. The OFFER key encrypts our outbound
         # stream (RFC 4568 §6.1 sender-keying) and is advertised in the INVITE; our
         # inbound is keyed from the peer's 2xx answer key (below). None ⇒ plain RTP/AVP
@@ -1458,7 +1458,7 @@ class VoipAdapter(BasePlatformAdapter):
             remote_port=9,  # discard port placeholder
             codec=Codec.PCMU,
             # Inbound (RX/decrypt) SRTP is keyed from the peer's ANSWER a=crypto, which
-            # is not known until the 2xx is parsed below — assigned there (ADR-0066).
+            # is not known until the 2xx is parsed below — assigned there (ADR-0067).
             srtp_inbound=None,
             # Outbound (TX/encrypt) SRTP is keyed from OUR offer a=crypto (None=plain).
             srtp_outbound=_srtp_outbound_from_offer(offer_crypto),
@@ -1490,7 +1490,7 @@ class VoipAdapter(BasePlatformAdapter):
             port=engine.local_port,
             codecs=_outbound_offer_codecs(),
             session_id=session_id,
-            # SDES-SRTP offer (ADR-0066): when set, the profile becomes RTP/SAVP and the
+            # SDES-SRTP offer (ADR-0067): when set, the profile becomes RTP/SAVP and the
             # a=crypto carries our offer key; None ⇒ plain RTP/AVP (unchanged default).
             crypto=offer_crypto,
         )
@@ -1770,7 +1770,7 @@ class VoipAdapter(BasePlatformAdapter):
             await transport.send(ack_text)
             _log.info("ACK sent: Call-ID %s", call_id)
 
-            # --- SDES-SRTP answer validation + inbound keying (ADR-0066) -------
+            # --- SDES-SRTP answer validation + inbound keying (ADR-0067) -------
             # Done AFTER the ACK (RFC 3261 §13.2.2.4: the UAC MUST ACK a 2xx, even one
             # it then rejects). When we offered RTP/SAVP, the 2xx MUST answer RTP/SAVP
             # with EXACTLY ONE a=crypto echoing our offered tag + suite (RFC 4568 §6.1):
@@ -1826,7 +1826,7 @@ class VoipAdapter(BasePlatformAdapter):
                 port=engine.local_port,
                 codecs=tuple(agreed_codecs),
                 session_id=session_id,
-                # SDES continuity (ADR-0066, mirrors the inbound ADR-0053 path): carry
+                # SDES continuity (ADR-0067, mirrors the inbound ADR-0053 path): carry
                 # our offer crypto so an in-dialog re-offer (hold/resume/re-INVITE)
                 # stays RTP/SAVP + a=crypto and never downgrades to cleartext. None ⇒ a
                 # plain RTP/AVP call (offer_crypto was None).
@@ -1960,7 +1960,7 @@ class VoipAdapter(BasePlatformAdapter):
     ) -> None:
         """BYE an outbound dialog we just ACKed, on a refused-2xx fail-closed teardown.
 
-        ADR-0066 / RFC 3261 §13.2.2.4 + §15: when an outbound 2xx is rejected (a plain
+        ADR-0067 / RFC 3261 §13.2.2.4 + §15: when an outbound 2xx is rejected (a plain
         or mis-keyed SRTP answer to our secured offer), the UAC has already ACKed it
         (the dialog is established on the callee), so it MUST be torn down with an
         in-dialog BYE rather than left half-open. Best-effort: a send failure is logged,

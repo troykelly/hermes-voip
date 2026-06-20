@@ -437,7 +437,7 @@ _WEBRTC_DTLS_SETUPS = frozenset({"auto", "active", "passive"})
 _SIP_DTLS_SRTP_KEY = "HERMES_VOIP_SIP_DTLS_SRTP"
 _DEFAULT_SIP_DTLS_SRTP = True
 
-# Outbound SDES-SRTP offering (ADR-0066). When True, an agent-originated outbound
+# Outbound SDES-SRTP offering (ADR-0067). When True, an agent-originated outbound
 # SIP-over-TLS INVITE offers ``RTP/SAVP`` with a fresh per-call ``a=crypto``
 # (SDES, RFC 4568) instead of plain ``RTP/AVP``; a 2xx that answers plain RTP/AVP
 # then FAILS the call (fail-closed — never a silent plaintext downgrade of a call we
@@ -866,7 +866,7 @@ class MediaConfig:
     # Defaulted so existing direct constructions stay valid; validated against the
     # allowed set. No effect on the WebRTC path.
     sip_dtls_setup: str = _DEFAULT_SIP_DTLS_SETUP
-    # Outbound SDES-SRTP offering (ADR-0066): when True an agent-originated outbound
+    # Outbound SDES-SRTP offering (ADR-0067): when True an agent-originated outbound
     # SIP-over-TLS INVITE offers ``RTP/SAVP`` + a fresh per-call ``a=crypto`` instead
     # of plain ``RTP/AVP``, and a 2xx that answers plain RTP/AVP fails the call
     # (fail-closed). Default OFF (opt-in) so existing outbound deployments keep

@@ -912,11 +912,11 @@ def test_media_sip_dtls_setup_forced_active() -> None:
     assert cfg.sip_dtls_setup == "active"
 
 
-# --- Outbound SDES-SRTP offering knob (ADR-0066) ---
+# --- Outbound SDES-SRTP offering knob (ADR-0067) ---
 
 
 def test_media_sip_sdes_offer_default_off() -> None:
-    """No knob => the outbound INVITE offers PLAIN RTP/AVP (opt-in, ADR-0066).
+    """No knob => the outbound INVITE offers PLAIN RTP/AVP (opt-in, ADR-0067).
 
     Default-off preserves today's live-validated cleartext outbound offer; turning
     SDES offering on is the operator's explicit opt-in (the fail-closed policy would

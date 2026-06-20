@@ -114,15 +114,34 @@ call instead, so the graceful end never relies on dead media.
   `gateway/run.py`). The runtime *does* generate token-by-token internally
   (`agent/chat_completion_helpers.py` `_fire_stream_delta`), but that stream is bridged to a
   platform **only** through `gateway/stream_consumer.py` `GatewayStreamConsumer`, an
-  edit-in-place renderer that (a) is gated off for non-editable platforms
-  (`gateway/run.py` raises *"skip streaming for non-editable platform"* unless
-  `SUPPORTS_MESSAGE_EDITING`) and (b) flushes **cumulative** text on a time/codepoint
-  threshold via `edit_message`, never per-sentence to `send()`. The TTS delta hook
+  edit-in-place renderer that flushes **cumulative** text on a time/codepoint threshold via
+  `edit_message`, never per-sentence to `send()`. The TTS delta hook
   (`run_conversation(stream_callback=…)`) is **never passed** by the gateway on the platform
   path. **The gap:** there is no plugin-registerable per-sentence/per-token TEXT callback
   wired through the gateway platform path. Closing it would require patching the runtime
   (forward `stream_delta_callback` to the voip adapter, or pass `stream_callback` into
   `run_conversation`), which is out of scope for a plugin.
+
+- **The streaming gate is opt-OUT, and an unhardened voice adapter falls on the WRONG side of
+  it (verified against hermes-agent 0.16.0, rule 23).** Whether the gateway uses
+  `GatewayStreamConsumer` for a platform is gated on
+  `getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)` (`gateway/run.py:17766`): when that is
+  falsy the gate raises *"skip streaming for non-editable platform"* (`run.py:17767-17768`)
+  and the platform receives the single complete `send()`; when truthy (AND `streaming` is
+  enabled) the gateway renders the reply via the consumer — one partial-prefix `send()` then
+  repeated `edit_message()` calls with cumulative growing text. `BasePlatformAdapter` declares
+  **no** `SUPPORTS_MESSAGE_EDITING` attribute and ships a **working default** `edit_message`,
+  so the *default* is editable. `VoipAdapter` originally overrode neither — meaning a VOICE
+  call was, with Hermes streaming enabled, on the **cumulative-edit-in-place** path (NOT the
+  "non-editable → skip streaming" branch), which would garble/duplicate the audio our pipeline
+  (`send()` → `CallLoop._speak_text → tts.synthesize()`) builds from one complete reply string.
+  It worked only because Hermes `streaming` happened to be off for the voip path; an operator
+  enabling it would break live calls. **Decision (hardened here): `VoipAdapter` now explicitly
+  sets `SUPPORTS_MESSAGE_EDITING = False`** (a class attribute), so the gate always takes the
+  *skip-streaming* branch and delivers each reply as a single complete `send()`, robust
+  regardless of the operator's `streaming` config. This neither needs nor enables true
+  streaming (still runtime-blocked above); it makes the runtime-blocked state the *only*
+  state, removing the latent breakage.
 
 - **The best available mitigation is ALREADY IMPLEMENTED in the plugin TTS layer.** Once the
   complete reply string reaches `CallLoop._speak_text → tts.synthesize()`, the TTS layer
@@ -134,10 +153,14 @@ call instead, so the graceful end never relies on dead media.
   reply. A call-loop sentence-splitter would **duplicate** this and is rejected (rule 23). The
   remaining pre-string wait (LLM think time) is covered by the comfort filler (ADR-0030/0054).
 
-**No production change is made for §3.** A call-loop regression-guard test pins the
-sentence-by-sentence pipelining end-to-end (first-sentence audio on the wire before the later
-sentence is opened) so a future `call_loop.py` change cannot silently regress first-audio
-latency back to whole-reply synthesis.
+**The §3 production change is the one-line adapter hardening above**
+(`VoipAdapter.SUPPORTS_MESSAGE_EDITING = False`); no call-loop change is made — true
+streaming stays runtime-blocked and the per-sentence TTS pipeline is already in place. A
+call-loop regression-guard test pins the sentence-by-sentence pipelining end-to-end
+(first-sentence audio on the wire before the later sentence is opened) so a future
+`call_loop.py` change cannot silently regress first-audio latency back to whole-reply
+synthesis, and an adapter test pins `SUPPORTS_MESSAGE_EDITING is False` so the editable-default
+breakage cannot silently return.
 
 ### Config surface (CallLoop kwargs; `MediaConfig`/env plumbing is a config.py follow-on)
 

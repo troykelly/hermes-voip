@@ -313,9 +313,12 @@ What is built and working today:
 - **WebRTC calls (inbound)** — a WebRTC client is a first-class caller, with encrypted media
   (DTLS-SRTP), connectivity handling (ICE), and Opus audio. Needs the `webrtc` extra +
   `libopus`.
-- **A natural spoken conversation** — streaming speech-to-text → your Hermes agent → streaming
-  text-to-speech, with the agent doing the thinking. Spoken output is cleaned up for the phone
-  (no emoji read aloud).
+- **A natural spoken conversation** — streaming speech-to-text → your Hermes agent →
+  sentence-streamed text-to-speech, with the agent doing the thinking. Hermes hands the plugin
+  each reply as **one complete string**; the plugin splits it into sentences and starts
+  speaking the first immediately, so first audio arrives in ~one short sentence (see
+  [`docs/adr/0057-conversational-ux-silence-goodbye-streaming.md`](docs/adr/0057-conversational-ux-silence-goodbye-streaming.md)).
+  Spoken output is cleaned up for the phone (no emoji read aloud).
 - **A choice of voices and ears** — run fully **offline** (local recognition + a local voice)
   or use a **cloud** voice/recognition, picked entirely by settings. See
   [Choosing a voice](#choosing-a-voice).
@@ -337,12 +340,25 @@ What is built and working today:
 > own gateway (its WSS port + credential, a real WebRTC client); the current state of each is
 > tracked in [`docs/adr/`](docs/adr/).
 
+### Hermes documentation
+
+Background on how this plugin fits into Hermes:
+
+- [Plugins](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins) — what a Hermes plugin is and how it loads.
+- [Text-to-speech (TTS)](https://hermes-agent.nousresearch.com/docs/user-guide/features/tts) — Hermes's voice/TTS feature.
+- [Adding platform adapters](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters) — the adapter contract this plugin implements (it registers `voip` as a platform).
+- [Build a Hermes plugin](https://hermes-agent.nousresearch.com/docs/guides/build-a-hermes-plugin) — the plugin-authoring guide.
+
 ---
 
 ## Configuration
 
-Everything is set with environment variables in your gitignored `.env` (copy from
-[`.env.example`](.env.example), which documents every option with fake example values).
+This plugin is a Hermes **platform adapter** (it registers `voip` as a platform the way
+Telegram or Slack adapters do — see
+[Adding platform adapters](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters)),
+so it loads and is configured like any other Hermes plugin. Everything is set with environment
+variables in your gitignored `.env` (copy from [`.env.example`](.env.example), which documents
+every option with fake example values).
 **Never commit real host / extension / password / phone-number values** — the repo is public.
 
 ### Your gateway (`HERMES_SIP_*`)

@@ -613,3 +613,38 @@ These span multiple modules or the repo as a whole.
   call-event sink in core; S3-Tables writer as an optional extra (default off); audio blobs in plain
   S3, queryable metadata in Iceberg. Requires explicit operator cost approval, an ADR flip to Accepted,
   and a runbook before any implementation (rule 40).
+- [ ] **[medium] feature** — Agent-screened inbound answering (opt-in "ring the agent, do not
+  auto-pick-up"). Today an inbound `INVITE` is auto-answered `200 OK` immediately (the
+  `_send_answer_200` path in `adapter.py`), so the agent only learns of the call once media is already
+  live and no `100 Trying` / `180 Ringing` provisional is sent. Proposal: add an opt-in mode via a new
+  env flag `HERMES_VOIP_AUTO_ANSWER` (default `true` = today's behaviour; `false` = screen). When
+  screening, *after* the automatic policy gates pass (drain `503` / capacity `486` / declined-caller
+  `603` / secure-media `488` / admission reserve), the adapter sends `180 Ringing` (keeping the `INVITE`
+  transaction alive and suppressing retransmits) and wakes the agent with the call metadata as an
+  `internal=True` "incoming call" turn — caller identity (`From` / display-name / `P-Asserted-Identity`),
+  called number (`To` / Request-URI), allow-listed custom headers, offered media (codecs,
+  secured-vs-cleartext, video?), and arrival time. The agent then decides via new call-control tools
+  `accept_call` / `decline_call(reason)` that mirror the existing `hang_up_call` / `transfer_*` tools in
+  `voip_tools.py`: accept builds the SDP answer + `200 OK` and starts the conversational loop exactly as
+  today; decline sends `603 Decline` (or `486` / `480` per the tool argument). A bounded screening
+  timeout (new env `HERMES_VOIP_SCREEN_TIMEOUT`, e.g. `20s`, below the gateway `INVITE` timeout) with a
+  configurable default-on-timeout action (`accept` | `decline`) guarantees the dialog never wedges.
+  * Composes *after* the automatic gates — never ring the agent for a call we would reject anyway
+    (capacity / declined caller / cleartext-under-mandate). Reserve the admission slot at ring time and
+    release it on decline/timeout (reuse `_admit_inbound` / `_teardown_call`).
+  * SIP mechanics: `180 Ringing` (optionally a leading `100 Trying`) stops `INVITE` retransmission
+    during deliberation; long deliberation may need a periodic provisional. MVP carries no early media;
+    the `200 OK` carries the secured SDP answer (ADR-0070); a decline sends a non-2xx final (`ACK`
+    handled as today).
+  * Agent wake-up reuses the half-duplex text surface: inject the incoming-call context as a system
+    turn. The `From` display-name is attacker-controlled and MUST be defanged like other caller-sourced
+    strings (injection guard). Document the decision contract so a non-responding agent hits the timeout
+    fallback, not a wedged dialog.
+  * Interactions: caller `CANCEL` during ring → `487`, abandon the screen; RFC 4028 session timers
+    arm only after `200`; call-progress/AMD runs only post-answer; graceful shutdown declines in-flight
+    screens.
+  * Advanced / later (its own ADR): `183 Session Progress` + early-media SRTP so the agent can *hear*
+    the caller and speak a screening prompt ("who is calling?") *before* formally answering — a
+    two-phase-keying problem, out of MVP scope.
+  * Needs a design ADR (the WHY + the ring/wake/decide SIP state-machine + the decision contract) before
+    build, TDD across ring → wake → accept/decline/timeout, and a runbook note for the new env flags.

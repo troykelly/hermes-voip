@@ -1038,6 +1038,71 @@ class _SrtpMultipleCryptoGateway(_SrtpAnsweringGateway):
         return base.replace(first, first + extra)
 
 
+class _NoCommonCodecGateway(OutboundGateway):
+    """Answers a 2xx whose only codec (G.729, PT 18) the plugin does not support.
+
+    A codec-negotiation failure on a 2xx is a refused answer just like a downgraded
+    SRTP answer: the 2xx established the dialog, so it MUST be ACKed then BYE'd (RFC
+    3261 §13.2.2.4 + §15) — never raised un-ACKed (half-open). Plain RTP/AVP profile,
+    so this is independent of the SDES flag.
+    """
+
+    def _sdp_answer(self) -> str:
+        rtp_port = self.rtp.port
+        return (
+            "v=0\r\n"
+            "o=- 8000 8000 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 127.0.0.1\r\n"
+            "t=0 0\r\n"
+            f"m=audio {rtp_port} RTP/AVP 18\r\n"
+            "a=rtpmap:18 G729/8000\r\n"
+            "a=ptime:20\r\n"
+            "a=sendrecv\r\n"
+        )
+
+
+async def test_outbound_codec_mismatch_2xx_acks_then_byes_no_half_open() -> None:
+    """A 2xx answering an unsupported codec is ACKed THEN BYE'd, not left half-open.
+
+    The pre-existing codec-mismatch 488 paths (no-common-codec / no-voice-codec /
+    not-carriable / unparseable-SDP) used to raise BEFORE ACKing the 2xx — the same
+    half-open-dialog shape as the SRTP downgrade. ADR-0067 routes them through the
+    same ACK+BYE teardown. RED on the prior cut (no BYE — await_bye_from_plugin
+    times out). Flag OFF: this is a pure codec rejection, independent of SDES.
+    """
+    gateway = _NoCommonCodecGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+            await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+
+            # The refused 2xx is still ACKed (TU owns the 2xx ACK), THEN BYE'd.
+            ack = await gateway.await_ack_from_plugin(timeout=5.0)
+            assert ack.method == "ACK"
+            bye = await gateway.await_bye_from_plugin(timeout=5.0)
+            assert bye.method == "BYE"
+
+            with pytest.raises(OutboundCallFailed) as exc_info:
+                await asyncio.wait_for(place_task, timeout=5.0)
+            assert exc_info.value.status == 488
+
+            await asyncio.sleep(0.05)
+            assert not adapter._call_sessions
+            assert not adapter._call_loops
+    finally:
+        await gateway.stop()
+
+
 async def test_outbound_offer_is_plain_rtp_avp_by_default() -> None:
     """Default (flag unset): the outbound INVITE offers PLAIN RTP/AVP, no a=crypto.
 
@@ -1232,6 +1297,84 @@ async def _assert_refused_2xx_acks_then_byes_then_fails(
             "a refused-2xx call was left running (possible silent downgrade)"
         )
         assert not adapter._call_loops
+
+
+class _SrtpUnsupportedCodecGateway(_SrtpAnsweringGateway):
+    """Answers RTP/SAVP with a matching a=crypto but ONLY an unsupported codec.
+
+    The crypto is fine (tag 1 / 80-bit, as offered), but the m=audio lists only an
+    unknown payload type, so codec negotiation fails (488). codex r2: that post-2xx
+    failure must ACK + BYE the dialog (established once we ACK), not leave it
+    half-open — the same teardown as the crypto-rejection paths.
+    """
+
+    def _sdp_answer(self) -> str:
+        rtp_port = self.rtp.port
+        return (
+            "v=0\r\n"
+            "o=- 8000 8000 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 127.0.0.1\r\n"
+            "t=0 0\r\n"
+            f"m=audio {rtp_port} RTP/SAVP 99\r\n"
+            "a=rtpmap:99 EXOTIC/8000\r\n"
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}\r\n"
+            "a=ptime:20\r\n"
+            "a=sendrecv\r\n"
+        )
+
+
+class _SrtpMatchingPlusMalformedCryptoGateway(_SrtpAnsweringGateway):
+    """Answers RTP/SAVP with the matching crypto PLUS a malformed extra a=crypto.
+
+    The extra line's key-params do not start with ``inline:``, so it is dropped from the
+    parse-filtered ``crypto_attrs`` — leaving exactly one *parsed* crypto. codex r2:
+    counting only the filtered list wrongly accepts this; the raw count is two, which an
+    answer must never carry (RFC 4568 §5.1.2). The validator counts RAW ``a=crypto``
+    lines and fails closed.
+    """
+
+    def _sdp_answer(self) -> str:
+        first = (
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}\r\n"
+        )
+        # A second, MALFORMED a=crypto (non-inline key-params → dropped by the parser).
+        extra = "a=crypto:2 AES_CM_128_HMAC_SHA1_80 notinline:deadbeef\r\n"
+        return super()._sdp_answer().replace(first, first + extra)
+
+
+async def test_outbound_sdes_no_common_codec_acks_and_byes() -> None:
+    """Flag ON + a 2xx with no common codec → ACK+BYE+fail (codec path, codex r2).
+
+    The crypto matches, but codec negotiation fails (the answer offers only an unknown
+    payload). This is a post-2xx rejection like the crypto cases, so it MUST ACK then
+    BYE the dialog — never leave it half-open. RED before the codec-path teardown (the
+    488 was raised before the ACK was sent).
+    """
+    gateway = _SrtpUnsupportedCodecGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_matching_plus_malformed_crypto_fails_closed() -> None:
+    """Flag ON + matching crypto PLUS a malformed extra a=crypto → fail closed.
+
+    RFC 4568 §5.1.2: an answer carries exactly one a=crypto. A matching line plus a
+    malformed extra has raw count two but filters to one; counting only the filtered
+    subset wrongly accepts it (codex r2). The validator counts RAW a=crypto lines and
+    fails closed (ACK+BYE). RED before the raw-count fix.
+    """
+    gateway = _SrtpMatchingPlusMalformedCryptoGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
 
 
 async def test_outbound_sdes_plain_answer_fails_closed() -> None:

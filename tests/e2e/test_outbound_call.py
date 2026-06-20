@@ -1343,6 +1343,28 @@ class _SrtpMatchingPlusMalformedCryptoGateway(_SrtpAnsweringGateway):
         return super()._sdp_answer().replace(first, first + extra)
 
 
+class _SrtpMatchingPlusUnsupportedCryptoGateway(_SrtpAnsweringGateway):
+    """Answers RTP/SAVP with the matching crypto PLUS an UNSUPPORTED-suite extra.
+
+    Distinct from the malformed case: the extra line is a *well-formed* ``a=crypto``
+    (valid ``inline:`` key) but names a suite we do not support, so the parser drops it
+    from ``crypto_attrs`` — again raw count two, filtered to one. Same RFC 4568 §5.1.2
+    violation; the RAW-line count fails it closed.
+    """
+
+    def _sdp_answer(self) -> str:
+        first = (
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}\r\n"
+        )
+        # A second, well-formed-but-UNSUPPORTED-suite a=crypto (parser drops it; the
+        # raw line is still present, so the raw count is two — ambiguous).
+        extra = (
+            "a=crypto:2 AES_256_CM_HMAC_SHA1_80 "
+            f"inline:{_GATEWAY_ANSWER_SDES_KEY_2}\r\n"
+        )
+        return super()._sdp_answer().replace(first, first + extra)
+
+
 async def test_outbound_sdes_no_common_codec_acks_and_byes() -> None:
     """Flag ON + a 2xx with no common codec → ACK+BYE+fail (codec path, codex r2).
 
@@ -1369,6 +1391,24 @@ async def test_outbound_sdes_matching_plus_malformed_crypto_fails_closed() -> No
     fails closed (ACK+BYE). RED before the raw-count fix.
     """
     gateway = _SrtpMatchingPlusMalformedCryptoGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_matching_plus_unsupported_crypto_fails_closed() -> None:
+    """Flag ON + matching crypto PLUS a well-formed UNSUPPORTED-suite extra → fail.
+
+    The codex-r2 companion to the malformed case: the extra a=crypto is syntactically
+    valid (good inline: key) but an unsupported suite, so it parses out of crypto_attrs
+    yet still counts as a second RAW a=crypto line (RFC 4568 §5.1.2 — an answer selects
+    exactly one). The RAW-line count fails it closed (ACK+BYE), proving the guard
+    rejects an ambiguous answer regardless of WHY the extra line is unusable.
+    """
+    gateway = _SrtpMatchingPlusUnsupportedCryptoGateway()
     gateway.set_register_responder()
     await gateway.start()
     try:

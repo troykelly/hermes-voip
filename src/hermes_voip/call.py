@@ -20,7 +20,7 @@ inbound re-INVITE is answered ``491 Request Pending`` (glare).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Protocol, runtime_checkable
 
@@ -384,7 +384,23 @@ class CallSession:
                 )
             )
 
-    async def _reinvite(self, direction: str) -> None:
+    async def refresh_session(self, extra_headers: Sequence[tuple[str, str]]) -> None:
+        """Send an RFC 4028 session-refresh re-INVITE (ADR-0071).
+
+        A session refresh is an in-dialog ``sendrecv`` re-INVITE carrying the
+        ``Session-Expires`` (with the negotiated refresher) + ``Supported: timer``
+        headers so the session timer resets on both sides. It REUSES the existing
+        re-INVITE machinery (:meth:`_reinvite`) — no new transaction type — with the
+        session-timer headers threaded through ``extra_headers``. On a rejection,
+        timeout, or glare it raises :class:`CallError` (the watchdog then BYEs the
+        dead dialog), exactly like a hold/resume re-INVITE.
+        """
+        async with self._lock:
+            await self._reinvite("sendrecv", extra_headers=extra_headers)
+
+    async def _reinvite(
+        self, direction: str, *, extra_headers: Sequence[tuple[str, str]] = ()
+    ) -> None:
         self._local_offer_pending = True
         try:
             # On a secured (SRTP) call mint a FRESH per-offer key echoing the call's
@@ -395,7 +411,11 @@ class CallSession:
             # must never leave outbound encrypted with a key the peer never agreed to.
             offer_crypto = self._reoffer_crypto()
             result = build_hold_reinvite(
-                self._dialog, self._local_media, direction, crypto=offer_crypto
+                self._dialog,
+                self._local_media,
+                direction,
+                crypto=offer_crypto,
+                extra_headers=extra_headers,
             )
             self._dialog = result.dialog
             response = await self._send_and_await_final(
@@ -409,6 +429,7 @@ class CallSession:
                     direction,
                     auth=auth,
                     crypto=offer_crypto,
+                    extra_headers=extra_headers,
                 )
                 self._dialog = result.dialog
                 response = await self._send_and_await_final(

@@ -50,15 +50,21 @@ ALLOW_METHODS: tuple[str, ...] = (
 )
 
 _ALLOW_HEADER: tuple[str, str] = ("Allow", ", ".join(ALLOW_METHODS))
+# RFC 4028 §8: a UA that supports session timers advertises ``Supported: timer`` so a
+# querying peer/proxy knows it can engage them (ADR-0071). Advertised in the OPTIONS
+# capability response alongside the Allow methods.
+_SUPPORTED_HEADER: tuple[str, str] = ("Supported", "timer")
 
 
 def build_options_ok(request: SipRequest, *, to_tag: str) -> str:
     """Build a ``200 OK`` to an out-of-dialog ``OPTIONS`` (RFC 3261 §11).
 
     The response echoes the ping's ``Via``/``From``/``To``/``Call-ID``/``CSeq``,
-    appends ``to_tag`` to ``To`` (no body, ``Content-Length: 0``), and advertises
+    appends ``to_tag`` to ``To`` (no body, ``Content-Length: 0``), advertises
     :data:`ALLOW_METHODS` in an ``Allow`` header so the registrar keeps the
-    contact *qualified* and rings it for inbound calls.
+    contact *qualified* and rings it for inbound calls, and advertises
+    ``Supported: timer`` (RFC 4028 §8) so a peer/proxy knows we engage session
+    timers (ADR-0071).
 
     Args:
         request: The inbound ``OPTIONS`` request being answered.
@@ -76,7 +82,7 @@ def build_options_ok(request: SipRequest, *, to_tag: str) -> str:
         200,
         "OK",
         to_tag=to_tag,
-        extra_headers=(_ALLOW_HEADER,),
+        extra_headers=(_ALLOW_HEADER, _SUPPORTED_HEADER),
     )
 
 

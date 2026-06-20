@@ -76,6 +76,19 @@ def test_options_ok_allow_lists_invite_and_options() -> None:
     assert {"ACK", "CANCEL", "BYE", "REFER", "NOTIFY"} <= methods
 
 
+def test_options_ok_advertises_supported_timer() -> None:
+    """The OPTIONS 200 OK advertises ``Supported: timer`` (RFC 4028 §8, ADR-0071).
+
+    A peer/proxy querying our capabilities learns we engage RFC 4028 session timers.
+    """
+    response = build_options_ok(_options(), to_tag="ua-tag-1")
+    parsed = SipRequest.parse(_swap_status_for_request_line(response))
+    supported = ",".join(parsed.headers_all("Supported")).lower()
+    assert "timer" in supported, (
+        f"OPTIONS 200 missing Supported: timer; got {supported!r}"
+    )
+
+
 def test_options_ok_echoes_call_id_and_cseq() -> None:
     response = build_options_ok(
         _options(call_id="echo-me", cseq="7 OPTIONS"), to_tag="ua-tag-1"

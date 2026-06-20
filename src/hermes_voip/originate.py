@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import secrets
+from collections.abc import Sequence
 
 from hermes_voip.message import build_request, new_branch, new_call_id, new_tag
 from hermes_voip.sdp import CryptoAttribute
@@ -128,6 +129,7 @@ def build_outbound_invite(  # noqa: PLR0913 — UAC INVITE needs the full local 
     call_id: str | None = None,
     cseq: int = 1,
     auth: tuple[str, str] | None = None,
+    extra_headers: Sequence[tuple[str, str]] = (),
     user_agent: str = _DEFAULT_USER_AGENT,
 ) -> tuple[str, str, str]:
     """Build an out-of-dialog INVITE (UAC originate).
@@ -156,6 +158,9 @@ def build_outbound_invite(  # noqa: PLR0913 — UAC INVITE needs the full local 
             on re-auth).
         auth: An optional ``(Authorization | Proxy-Authorization, value)``
             header pair — carried on the re-auth re-send.
+        extra_headers: Additional ``(name, value)`` header pairs emitted after the
+            standard block and before any SDP ``Content-Type`` (e.g. the RFC 4028
+            ``Session-Expires`` + ``Supported: timer`` session-timer headers).
         user_agent: The ``User-Agent`` header value.
 
     Returns:
@@ -178,6 +183,7 @@ def build_outbound_invite(  # noqa: PLR0913 — UAC INVITE needs the full local 
     ]
     if auth is not None:
         headers.append(auth)
+    headers.extend(extra_headers)
     if body:
         headers.append(_SDP_CONTENT_TYPE)
     text = build_request("INVITE", target_uri, headers, body)

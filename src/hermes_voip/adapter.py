@@ -68,7 +68,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource
 
-from hermes_voip.call import CallSession, CallSignaling
+from hermes_voip.call import CallError, CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
     extract_call_context,
@@ -184,6 +184,17 @@ from hermes_voip.sdp import (
 )
 from hermes_voip.sdp import (
     Codec as SdpCodec,
+)
+from hermes_voip.session_timer import (
+    AcceptTimers,
+    Refresher,
+    Reject422,
+    SessionExpires,
+    build_session_expires_value,
+    negotiate_uas_timers,
+    parse_min_se,
+    refresh_interval_secs,
+    teardown_deadline_secs,
 )
 from hermes_voip.tools import gate_voip_tool
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
@@ -490,6 +501,7 @@ _SIP_PROXY_AUTH = 407
 _SIP_FINAL_FLOOR = 200  # responses at or above this are final
 _SIP_ERROR_FLOOR = 300  # responses at or above this are errors
 _SIP_REQUEST_TERMINATED = 487  # the 2xx-to-INVITE was CANCELled (RFC 3261 §9.1)
+_SIP_INTERVAL_TOO_SMALL = 422  # Session Interval Too Small (RFC 4028 §6) — retry larger
 _CSEQ_PARTS = 2  # a CSeq value is "<number> <method>" (RFC 3261 §20.16)
 
 # Maximum outstanding responses buffered in _QueueSink (N2). A 407 + final
@@ -845,6 +857,15 @@ class VoipAdapter(BasePlatformAdapter):
         # negotiated; stopped + cancelled in _teardown_call alongside engine.stop().
         self._video_sender_tasks: dict[str, asyncio.Task[None]] = {}
         self._video_senders: dict[str, RtpVideoSender] = {}
+        # RFC 4028 session-timer watchdogs (ADR-0071), keyed by call_id. Started after
+        # a dialog is confirmed; the refresher fires a refresh re-INVITE at SE/2 and the
+        # non-refresher arms a BYE near expiry. Cancelled in _teardown_call (and via
+        # disconnect's _call_tasks sweep) so a watchdog never outlives its call.
+        self._session_timers: dict[str, asyncio.Task[None]] = {}
+        # The watchdog's sleep seam — injectable so tests drive the SE/2 (and teardown)
+        # timing deterministically instead of sleeping real minutes. Production uses the
+        # real event-loop sleep.
+        self._session_timer_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
         # Active call sessions mirrored here so they can be re-attached after
         # a reconnect: {call_id → CallSession}
         self._call_sessions: dict[str, CallSession] = {}
@@ -1623,6 +1644,18 @@ class VoipAdapter(BasePlatformAdapter):
         # --- Register a _QueueSink so we can await responses ---------------
         sink: CallResponseSink = _QueueSink()
 
+        # --- RFC 4028 session timers on the outbound offer (ADR-0071) --------
+        # We are the UAC: offer our configured session interval as the refresher (we
+        # send the refreshes — a dead peer is detected by OUR refresh re-INVITE failing)
+        # and advertise Supported: timer. The interval we offer can be RAISED by a peer
+        # 422 (Session Interval Too Small) carrying its Min-SE — handled below; it is
+        # held in ``offered_se`` so the retry re-sends a larger value.
+        offered_se = media_cfg.session_expires
+        session_timer_headers: tuple[tuple[str, str], ...] = (
+            ("Session-Expires", build_session_expires_value(offered_se, Refresher.UAC)),
+            ("Supported", "timer"),
+        )
+
         # --- Send initial INVITE (no auth) ----------------------------------
         invite_text, call_id, from_tag = build_outbound_invite(
             target_uri=target_uri,
@@ -1631,6 +1664,7 @@ class VoipAdapter(BasePlatformAdapter):
             local_sent_by=local_sent_by,
             transport="TLS",
             body=offer_body,
+            extra_headers=session_timer_headers,
         )
         transport.add_call(call_id, sink)
         session: CallSession | None = None
@@ -1678,6 +1712,48 @@ class VoipAdapter(BasePlatformAdapter):
             assert isinstance(sink, _QueueSink)  # noqa: S101 — mypy narrowing aid; _QueueSink is the only impl here
             response = await self._await_invite_response(sink, call_id)
 
+            # --- RFC 4028 422 retry (ADR-0071) ----------------------------
+            # A 422 (Session Interval Too Small) means the peer's Min-SE is above the
+            # interval we offered: RAISE our Session-Expires to the peer's Min-SE and
+            # re-send the INVITE once (RFC 4028 §6). Done BEFORE the auth/final handling
+            # so a 422 is never mis-classified as a call failure. Capped at one retry:
+            # a peer that 422s its own advertised Min-SE is a normal failure.
+            if response.status_code == _SIP_INTERVAL_TOO_SMALL:
+                min_se_header = response.header("Min-SE")
+                if min_se_header is not None:
+                    offered_se = max(offered_se, parse_min_se(min_se_header))
+                    session_timer_headers = (
+                        (
+                            "Session-Expires",
+                            build_session_expires_value(offered_se, Refresher.UAC),
+                        ),
+                        ("Supported", "timer"),
+                    )
+                    last_cseq += 1
+                    invite_retry, _, _ = build_outbound_invite(
+                        target_uri=target_uri,
+                        local_aor=local_aor,
+                        local_contact=local_contact,
+                        local_sent_by=local_sent_by,
+                        transport="TLS",
+                        body=offer_body,
+                        call_id=call_id,
+                        from_tag=from_tag,
+                        cseq=last_cseq,
+                        extra_headers=session_timer_headers,
+                    )
+                    await transport.send(invite_retry)
+                    _log.info(
+                        "INVITE %s: 422 Session Interval Too Small — retrying with "
+                        "Session-Expires %d (RFC 4028 §6)",
+                        call_id,
+                        offered_se,
+                    )
+                    while True:
+                        response = await self._await_invite_response(sink, call_id)
+                        if _cseq_num(response) == last_cseq:
+                            break  # final response for the raised-SE transaction
+
             if response.status_code in (_SIP_UNAUTHORIZED, _SIP_PROXY_AUTH):
                 # Challenge: build Proxy-Authorization and re-send.
                 is_proxy_auth = response.status_code == _SIP_PROXY_AUTH
@@ -1703,7 +1779,7 @@ class VoipAdapter(BasePlatformAdapter):
                 auth_hdr_out = (
                     "Proxy-Authorization" if is_proxy_auth else "Authorization"
                 )
-                last_cseq = 2
+                last_cseq += 1
                 invite_text2, _, _ = build_outbound_invite(
                     target_uri=target_uri,
                     local_aor=local_aor,
@@ -1715,6 +1791,7 @@ class VoipAdapter(BasePlatformAdapter):
                     from_tag=from_tag,
                     cseq=last_cseq,
                     auth=(auth_hdr_out, auth_resp_value),
+                    extra_headers=session_timer_headers,
                 )
                 await transport.send(invite_text2)
                 _log.info("INVITE re-sent with auth: Call-ID %s", call_id)
@@ -2032,6 +2109,16 @@ class VoipAdapter(BasePlatformAdapter):
             if manager is not None:
                 manager.add_call(session.dialog_id, session)
             self._call_sessions[call_id] = session
+
+            # --- Arm the RFC 4028 session-timer watchdog (ADR-0071) --------
+            # We are the UAC. The 2xx may echo a Session-Expires (the peer MAY reduce
+            # our offered interval + names the refresher); honour it, else fall back to
+            # the interval we offered with us (UAC) as the refresher. The watchdog then
+            # refreshes at SE/2 if we are the refresher, or BYEs near expiry otherwise.
+            outbound_timer = self._outbound_session_timer(response, offered_se)
+            self._start_session_timer(
+                call_id, session, outbound_timer, local_role=Refresher.UAC
+            )
 
             # The callee identity the agent sees (fixes "I don't know you"): the
             # dialled target, framed by the OUTBOUND persona preamble in
@@ -2849,6 +2936,33 @@ class VoipAdapter(BasePlatformAdapter):
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
 
+        # --- RFC 4028 session timers (ADR-0071) -----------------------------
+        # Negotiate the session timer BEFORE any media engine / dialog is built, after
+        # the ADR-0070 secure-media guard. An inbound Session-Expires below our
+        # configured Min-SE is REJECTED 422 (Session Interval Too Small) carrying our
+        # Min-SE — no dialog, no media, no admission slot — so the UAC retries with a
+        # larger interval. Otherwise the accepted interval + elected refresher are
+        # carried into the 2xx (Session-Expires + Supported/Require: timer) and drive
+        # the per-call refresh/teardown watchdog. A request that offered no
+        # Session-Expires still gets our own inserted (we support timers).
+        session_timer = self._negotiate_inbound_session_timer(invite, media_cfg)
+        if isinstance(session_timer, Reject422):
+            _log.info(
+                "INVITE %s: REJECTED 422 Session Interval Too Small — offered "
+                "Session-Expires below Min-SE %d (RFC 4028 §6)",
+                call_id,
+                session_timer.min_se,
+            )
+            await transport.send(
+                build_response(
+                    invite,
+                    422,
+                    "Session Interval Too Small",
+                    extra_headers=(("Min-SE", str(session_timer.min_se)),),
+                )
+            )
+            return
+
         # Pick the media path. Three branches:
         #   * WebRTC (UDP/TLS/RTP/SAVPF) → the ICE + DTLS-SRTP answer path (ADR-0032),
         #     negotiated against the Opus-first menu.
@@ -2990,6 +3104,7 @@ class VoipAdapter(BasePlatformAdapter):
                     local_rtp_host=local_rtp_host,
                     media_cfg=media_cfg,
                     call_id=call_id,
+                    session_timer=session_timer,
                 )
             elif is_sip_dtls:
                 engine, local_media = await self._setup_sip_dtls_call(
@@ -3006,6 +3121,7 @@ class VoipAdapter(BasePlatformAdapter):
                     local_rtp_host=local_rtp_host,
                     media_cfg=media_cfg,
                     call_id=call_id,
+                    session_timer=session_timer,
                 )
             else:
                 engine, local_media = await self._setup_sdes_call(
@@ -3021,6 +3137,7 @@ class VoipAdapter(BasePlatformAdapter):
                     local_rtp_host=local_rtp_host,
                     media_cfg=media_cfg,
                     call_id=call_id,
+                    session_timer=session_timer,
                 )
         except _MediaNegotiationRejected:
             # The 488 was already sent and any partial media torn down inside the
@@ -3088,6 +3205,15 @@ class VoipAdapter(BasePlatformAdapter):
             call_id,
             session.dialog_id,
         )
+
+        # --- Arm the RFC 4028 session-timer watchdog (ADR-0071) -------------
+        # Now the dialog is confirmed (200 OK sent, in-dialog routes installed): start
+        # the per-call watchdog. As the refresher we send a refresh re-INVITE at SE/2;
+        # as the non-refresher we BYE near expiry if no refresh arrives. Cancelled in
+        # _teardown_call. A no-op when the call negotiated no session timer (e.g. a peer
+        # that did not support timer and we still inserted ours — we always insert, so
+        # an answered inbound call is timer-driven).
+        self._start_session_timer(call_id, session, session_timer)
 
         # --- Extract caller info from the inbound INVITE -------------------
         # `group` (classified at the top of this handler) drives the per-turn
@@ -3197,6 +3323,7 @@ class VoipAdapter(BasePlatformAdapter):
         local_rtp_host: str,
         media_cfg: MediaConfig,
         call_id: str,
+        session_timer: AcceptTimers | None = None,
     ) -> tuple[RtpMediaTransport, LocalMediaSession]:
         """Open the SDES/plain-RTP media engine, build + send the 200 OK answer.
 
@@ -3385,6 +3512,7 @@ class VoipAdapter(BasePlatformAdapter):
             local_contact=local_contact,
             answer_sdp=answer_sdp,
             call_id=call_id,
+            session_timer=session_timer,
         )
         return engine, local_media
 
@@ -3404,6 +3532,7 @@ class VoipAdapter(BasePlatformAdapter):
         local_rtp_host: str,
         media_cfg: MediaConfig,
         call_id: str,
+        session_timer: AcceptTimers | None = None,
     ) -> tuple[RtpMediaTransport, LocalMediaSession]:
         """Run the WebRTC media setup: validate → ICE → answer/200 OK → DTLS → engine.
 
@@ -3527,6 +3656,7 @@ class VoipAdapter(BasePlatformAdapter):
             local_contact=local_contact,
             answer_sdp=answer_sdp,
             call_id=call_id,
+            session_timer=session_timer,
         )
 
         # Register the answered dialog's in-dialog route AT ANSWER-TIME — before the
@@ -3696,6 +3826,7 @@ class VoipAdapter(BasePlatformAdapter):
         local_rtp_host: str,
         media_cfg: MediaConfig,
         call_id: str,
+        session_timer: AcceptTimers | None = None,
     ) -> tuple[RtpMediaTransport, LocalMediaSession]:
         """Run the SIP DTLS-SRTP media setup: bind → answer/200 OK → DTLS → engine.
 
@@ -3822,6 +3953,7 @@ class VoipAdapter(BasePlatformAdapter):
             local_contact=local_contact,
             answer_sdp=answer_sdp,
             call_id=call_id,
+            session_timer=session_timer,
         )
 
         # Register the answered dialog's in-dialog route AT ANSWER-TIME — before the
@@ -4192,6 +4324,218 @@ class VoipAdapter(BasePlatformAdapter):
             fps,
         )
 
+    def _negotiate_inbound_session_timer(
+        self, invite: SipRequest, media_cfg: MediaConfig
+    ) -> AcceptTimers | Reject422:
+        """Decide the inbound INVITE's RFC 4028 session-timer outcome (ADR-0071).
+
+        Parses the inbound ``Session-Expires`` (delta + optional ``;refresher=``), and
+        runs :func:`negotiate_uas_timers` against our configured ``min_se``/
+        ``session_expires``: a Session-Expires below ``min_se`` → :class:`Reject422`
+        (the caller answers 422 + Min-SE); otherwise :class:`AcceptTimers` with the
+        agreed interval + elected refresher. A malformed ``Session-Expires`` is treated
+        as ABSENT (RFC 3261 §8.1.3.2 robustness: ignore a header we cannot parse) so a
+        garbled header never crashes call setup — we then insert our own interval. Our
+        default refresher is ``UAS`` (we send the refreshes), so a peer that never
+        refreshes is detected by OUR refresh re-INVITE failing, not silent dead air.
+        """
+        se_header = invite.header("Session-Expires") or invite.header("x")
+        offered: SessionExpires | None = None
+        if se_header is not None:
+            try:
+                offered = SessionExpires.parse(se_header)
+            except ValueError:
+                offered = None  # tolerate a malformed header: treat as no offer
+        return negotiate_uas_timers(
+            offered=offered,
+            min_se=media_cfg.min_se,
+            local_se=media_cfg.session_expires,
+            default_refresher=Refresher.UAS,
+        )
+
+    @staticmethod
+    def _outbound_session_timer(response: SipResponse, offered_se: int) -> AcceptTimers:
+        """The session timer for an outbound call from the 2xx answer (ADR-0071).
+
+        RFC 4028 §7.4: the 2xx to our INVITE echoes a ``Session-Expires`` — the peer MAY
+        reduce our offered interval and names the refresher. We honour the answered
+        value + refresher when present; absent it (a peer that does not support timers),
+        we fall back to the interval WE offered with us (the UAC) as the refresher. A
+        malformed answer header is treated as absent (robustness).
+        """
+        se_header = response.header("Session-Expires") or response.header("x")
+        if se_header is not None:
+            try:
+                answered = SessionExpires.parse(se_header)
+            except ValueError:
+                answered = None
+            if answered is not None:
+                refresher = answered.refresher or Refresher.UAC
+                return AcceptTimers(delta=answered.delta, refresher=refresher)
+        return AcceptTimers(delta=offered_se, refresher=Refresher.UAC)
+
+    @staticmethod
+    def _session_timer_2xx_headers(
+        accept: AcceptTimers,
+    ) -> tuple[tuple[str, str], ...]:
+        """The RFC 4028 headers a 2xx carries to engage session timers (ADR-0071).
+
+        ``Session-Expires`` (with the elected ``refresher``), ``Supported: timer`` (we
+        support the extension), and ``Require: timer``. RFC 4028 §9: when the refresher
+        is the UAC the UAS MUST add ``Require: timer``; when it is the UAS it SHOULD —
+        we always add it so the UAC engages the timer rather than ignoring our 2xx.
+        """
+        return (
+            (
+                "Session-Expires",
+                build_session_expires_value(accept.delta, accept.refresher),
+            ),
+            ("Require", "timer"),
+            ("Supported", "timer"),
+        )
+
+    def _start_session_timer(
+        self,
+        call_id: str,
+        session: CallSession,
+        accept: AcceptTimers | None,
+        *,
+        local_role: Refresher = Refresher.UAS,
+    ) -> None:
+        """Start this call's RFC 4028 session-timer watchdog task (ADR-0071).
+
+        ``local_role`` is the role WE play in the dialog — ``UAS`` for an inbound call
+        we answered, ``UAC`` for an outbound call we placed. When ``accept`` is ``None``
+        (no session timer negotiated) this is a no-op. The task is tracked in
+        ``_session_timers`` (cancelled in :meth:`_teardown_call`) and also in
+        ``_call_tasks`` so ``disconnect`` cancels it; a done-callback surfaces any
+        unexpected error (rule 37).
+        """
+        if accept is None:
+            return
+        we_refresh = accept.refresher is local_role
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._run_session_timer(
+                call_id,
+                session,
+                accept.delta,
+                refresher=accept.refresher,
+                we_refresh=we_refresh,
+            )
+        )
+        self._session_timers[call_id] = task
+        self._call_tasks.setdefault(call_id, set()).add(task)
+        task.add_done_callback(lambda t: self._on_session_timer_done(call_id, t))
+
+    def _on_session_timer_done(self, call_id: str, task: asyncio.Task[None]) -> None:
+        """Log a session-timer watchdog that ended on its own with an error (ADR-0071).
+
+        A clean return (the refresher BYE'd, or the loop was told to stop) or a
+        cancellation (teardown / disconnect) is normal and silent; an unexpected
+        exception is logged so a broken watchdog is diagnosable. The done-task is also
+        discarded from ``_call_tasks`` (mirrors ``_on_call_task_done``).
+        """
+        tasks = self._call_tasks.get(call_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._call_tasks.pop(call_id, None)
+        if self._session_timers.get(call_id) is task:
+            del self._session_timers[call_id]
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.error(
+                "INVITE %s: session-timer watchdog failed: %s",
+                call_id,
+                exc,
+                exc_info=exc,
+            )
+
+    async def _run_session_timer(
+        self,
+        call_id: str,
+        session: CallSession,
+        delta: int,
+        *,
+        refresher: Refresher,
+        we_refresh: bool,
+    ) -> None:
+        """Drive one call's RFC 4028 session refresh / teardown (ADR-0071).
+
+        As the refresher (``we_refresh``) we loop: sleep SE/2 (RFC 4028 §7.2/§9), then
+        send a session-refresh re-INVITE (reusing the in-dialog re-INVITE machinery via
+        :meth:`CallSession.refresh_session`). A refresh that is rejected/timed-out
+        raises :class:`CallError`, which we treat as a dead dialog and tear down by BYE
+        (:meth:`CallSession.hang_up`) — RFC 4028 §10. As the non-refresher we sleep to
+        the teardown deadline ``SE - min(32, SE/3)`` and, if the dialog has not ended in
+        the meantime (the peer never refreshed), BYE it.
+
+        The loop exits when the session has ended (a hangup/BYE from any source) or the
+        task is cancelled (teardown/disconnect). Sleeps go through the injectable
+        ``_session_timer_sleep`` seam so tests drive the timing deterministically.
+        """
+        refresh_secs = refresh_interval_secs(delta)
+        teardown_secs = teardown_deadline_secs(delta)
+        # The refresh re-INVITE re-advertises the same interval + refresher (us) so the
+        # timer resets symmetrically on both sides (RFC 4028 §10). Supported: timer is
+        # carried too. Only built on the refresher path.
+        refresh_headers: tuple[tuple[str, str], ...] = (
+            (
+                "Session-Expires",
+                build_session_expires_value(delta, refresher),
+            ),
+            ("Supported", "timer"),
+        )
+        # ``while True`` (not ``while not session.ended``) so the post-sleep
+        # ``session.ended`` checks are not narrowed away by mypy: another task (an
+        # inbound BYE / agent hangup) can flip ``ended`` during the sleep, which is the
+        # whole point of re-checking it after each await. The session is freshly
+        # confirmed when this starts, so the first sleep always runs.
+        while True:
+            if we_refresh:
+                await self._session_timer_sleep(refresh_secs)
+                if session.ended:
+                    return
+                try:
+                    await session.refresh_session(refresh_headers)
+                except CallError as exc:
+                    _log.info(
+                        "INVITE %s: session refresh failed (%s) — BYE the dead dialog "
+                        "(RFC 4028 §10)",
+                        call_id,
+                        exc,
+                    )
+                    await session.hang_up()
+                    return
+                _log.debug("INVITE %s: session refreshed (RFC 4028)", call_id)
+            else:
+                await self._session_timer_sleep(teardown_secs)
+                if session.ended:
+                    return
+                _log.info(
+                    "INVITE %s: no session refresh before the deadline — BYE the "
+                    "expired dialog (RFC 4028 §10)",
+                    call_id,
+                )
+                await session.hang_up()
+                return
+
+    async def _cancel_session_timer(self, call_id: str) -> None:
+        """Cancel + await this call's session-timer watchdog, if running (ADR-0071)."""
+        task = self._session_timers.pop(call_id, None)
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        tasks = self._call_tasks.get(call_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._call_tasks.pop(call_id, None)
+
     async def _send_answer_200(  # noqa: PLR0913 — the dialog-forming 200 OK needs all of these to build the response
         self,
         *,
@@ -4201,6 +4545,7 @@ class VoipAdapter(BasePlatformAdapter):
         local_contact: str,
         answer_sdp: str,
         call_id: str,
+        session_timer: AcceptTimers | None = None,
     ) -> None:
         """Send the dialog-forming 200 OK carrying the SDP answer (shared seam).
 
@@ -4210,16 +4555,23 @@ class VoipAdapter(BasePlatformAdapter):
         manager routes them out-of-dialog — the call answers but never establishes a
         routable dialog. It must match ``dialog.local_tag`` so the registered
         dialog_id matches the routed key.
+
+        ``session_timer`` (RFC 4028, ADR-0071), when set, adds the ``Session-Expires`` +
+        ``Require: timer`` + ``Supported: timer`` headers so the negotiated timer is
+        engaged on the dialog. ``None`` answers without session timers (unchanged).
         """
+        extra: list[tuple[str, str]] = [
+            ("Contact", local_contact),
+            ("Content-Type", "application/sdp"),
+        ]
+        if session_timer is not None:
+            extra.extend(self._session_timer_2xx_headers(session_timer))
         ok_response = build_response(
             invite,
             200,
             "OK",
             to_tag=local_tag,
-            extra_headers=(
-                ("Contact", local_contact),
-                ("Content-Type", "application/sdp"),
-            ),
+            extra_headers=tuple(extra),
             body=answer_sdp,
         )
         await transport.send(ok_response)
@@ -4607,6 +4959,10 @@ class VoipAdapter(BasePlatformAdapter):
         is_current = session is None or self._call_sessions.get(call_id) is session
         already_ended = bool(self._call_info.get(call_id, {}).get("ended", False))
         if is_current:
+            # Cancel the RFC 4028 session-timer watchdog FIRST (ADR-0071) so an
+            # in-flight refresh re-INVITE cannot race this teardown's BYE on the same
+            # dialog. A no-op when no watchdog runs (pre-session teardown / no timer).
+            await self._cancel_session_timer(call_id)
             # Only flag the call ended / drop its metadata when WE own it — else a
             # newer same-Call-ID task is live and must keep reporting as active.
             # Set ``ended`` BEFORE signalling so a late agent reply to the replayed

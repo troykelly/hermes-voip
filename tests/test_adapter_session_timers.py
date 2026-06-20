@@ -326,25 +326,34 @@ def _sent_requests(transport: _FakeTransport, method: str) -> list[SipRequest]:
     return out
 
 
-_INVITE_PATCHES = (
-    "hermes_voip.adapter.CallLoop",
-    "hermes_voip.adapter.GuardSessionState",
-    "hermes_voip.adapter._make_vad",
-    "hermes_voip.adapter._make_endpointer",
-)
+async def _block_forever() -> None:
+    """A CallLoop.run stand-in that never returns (until the task is cancelled).
+
+    The watchdog tests need the call to stay UP so the SE/2 refresh can fire; a
+    ``run`` that returns immediately would tear the call down (MEDIA_TIMEOUT) and cancel
+    the watchdog before it ever sleeps. Disconnect cancels the loop task at the end.
+    """
+    await asyncio.Event().wait()
 
 
-def _patched_invite_env() -> contextlib.ExitStack:
-    """Patch the conversational-pipeline collaborators to inert fakes."""
+def _patched_invite_env(*, block_loop: bool = False) -> contextlib.ExitStack:
+    """Patch the conversational-pipeline collaborators to inert fakes.
+
+    ``block_loop`` makes the fake ``CallLoop.run`` block forever instead of returning
+    immediately, so the call stays established long enough to observe the long-lived
+    session-timer watchdog (cancelled when the test disconnects).
+    """
+    run: AsyncMock = (
+        AsyncMock(side_effect=_block_forever)
+        if block_loop
+        else AsyncMock(return_value=None)
+    )
     stack = contextlib.ExitStack()
     stack.enter_context(
         patch("hermes_voip.adapter.RtpMediaTransport", return_value=_fake_engine())
     )
     stack.enter_context(
-        patch(
-            "hermes_voip.adapter.CallLoop",
-            return_value=MagicMock(run=AsyncMock(return_value=None)),
-        )
+        patch("hermes_voip.adapter.CallLoop", return_value=MagicMock(run=run))
     )
     stack.enter_context(
         patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock())
@@ -464,7 +473,7 @@ async def test_refresher_emits_refresh_reinvite_at_half_interval() -> None:
         )
     )
 
-    with _patched_invite_env():
+    with _patched_invite_env(block_loop=True):
         adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         # Wait for the dialog to be wired and the watchdog to request its first sleep.
         await _until(lambda: call_id in adapter._call_sessions)
@@ -547,7 +556,7 @@ async def test_refresh_failure_byes_the_dialog() -> None:
         )
     )
 
-    with _patched_invite_env():
+    with _patched_invite_env(block_loop=True):
         adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         await _until(lambda: call_id in adapter._call_sessions)
         session = adapter._call_sessions[call_id]

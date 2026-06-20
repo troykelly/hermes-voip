@@ -2077,7 +2077,11 @@ async def test_start_attended_consult_dials_allowlisted_target() -> None:
     dialled: list[str] = []
 
     async def _fake_place_call(
-        extension: str, *, objective: str | None = None, origin: object = None
+        extension: str,
+        *,
+        objective: str | None = None,
+        origin: object = None,
+        ring_timeout_secs: float | None = None,
     ) -> str:
         dialled.append(extension)
         return "consult-call-id"
@@ -2107,7 +2111,11 @@ async def test_start_attended_consult_rejects_unlisted_target() -> None:
     dialled: list[str] = []
 
     async def _fake_place_call(
-        extension: str, *, objective: str | None = None, origin: object = None
+        extension: str,
+        *,
+        objective: str | None = None,
+        origin: object = None,
+        ring_timeout_secs: float | None = None,
     ) -> str:
         dialled.append(extension)
         return "x"
@@ -2137,7 +2145,11 @@ async def test_start_attended_consult_blocks_non_operator() -> None:
     dialled: list[str] = []
 
     async def _fake_place_call(
-        extension: str, *, objective: str | None = None, origin: object = None
+        extension: str,
+        *,
+        objective: str | None = None,
+        origin: object = None,
+        ring_timeout_secs: float | None = None,
     ) -> str:
         dialled.append(extension)
         return "x"

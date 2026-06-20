@@ -634,7 +634,9 @@ def _final_2xx_with_contact(invite: SipRequest) -> str:
     )
 
 
-async def test_remove_call_sink_mismatch_still_clears_outbound_cancel_tracking() -> None:
+async def test_remove_call_sink_mismatch_still_clears_outbound_cancel_tracking() -> (
+    None
+):
     # Fix (a): remove_call's sink-identity early-return (an earlier call's teardown
     # must not evict a later same-Call-ID sink) used to sit ABOVE the outbound
     # CANCEL-tracking cleanup, so a sink-mismatch remove_call returned before clearing

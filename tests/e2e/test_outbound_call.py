@@ -23,7 +23,7 @@ import asyncio
 import base64
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
 
@@ -45,7 +45,7 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.tts import TtsStream
-from hermes_voip.sdp import CryptoAttribute
+from hermes_voip.sdp import AudioMedia, Codec, CryptoAttribute, negotiate_audio
 from hermes_voip.transport.connection import SipOverTlsTransport
 from tests.e2e._fake_gateway import (
     FakeRtpEndpoint,
@@ -1893,13 +1893,10 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
     same-tick race, then delegates to the real negotiation so the rest of acceptance
     runs unchanged.
     """
-    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
-
     gateway = OutboundGateway()  # answers normally (200 OK with SDP)
     gateway.set_register_responder()
     await gateway.start()
 
-    real_negotiate = adapter_mod.negotiate_audio
     fired = {"done": False}
 
     providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
@@ -1910,8 +1907,8 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
             assert isinstance(adapter, VoipAdapter)
 
             def _negotiate_then_race(
-                offer: object, supported: object
-            ) -> tuple[object, ...]:
+                offer: AudioMedia, supported: Sequence[str]
+            ) -> tuple[Codec, ...]:
                 # On the first (and only) acceptance, simulate an abort that landed
                 # in this same tick: the 2xx is already dequeued and ACKed, but the
                 # session is not wired yet. Flip the in-flight call's cancel flag.
@@ -1920,10 +1917,11 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
                     pending = next(iter(adapter._outbound_pending.values()))
                     pending.cancel_requested = True
                     pending.reason = "raced abort"
-                return real_negotiate(offer, supported)  # type: ignore[arg-type]
+                return negotiate_audio(offer, supported)
 
-            with patch.object(
-                adapter_mod, "negotiate_audio", side_effect=_negotiate_then_race
+            with patch(
+                "hermes_voip.adapter.negotiate_audio",
+                side_effect=_negotiate_then_race,
             ):
                 place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
                 with pytest.raises(OutboundCallCancelled):

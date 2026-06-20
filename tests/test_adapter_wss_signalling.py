@@ -712,9 +712,11 @@ async def test_place_call_with_ring_timeout_over_wss_raises_not_supported() -> N
         _mark_registered(manager)
         transport.sent.clear()
 
-        with patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession):
-            with pytest.raises(NotImplementedError, match="ring_timeout_secs"):
-                await adapter.place_call("1001", ring_timeout_secs=5.0)
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            pytest.raises(NotImplementedError, match="ring_timeout_secs"),
+        ):
+            await adapter.place_call("1001", ring_timeout_secs=5.0)
 
     # The guard fires BEFORE the INVITE — nothing was dialled.
     assert not any(m.startswith("INVITE") for m in transport.sent), (

@@ -1430,8 +1430,10 @@ class VoipAdapter(BasePlatformAdapter):
             ring_timeout_secs: If set, the maximum time to ring an unanswered call
                 before sending a CANCEL (RFC 3261 §9.1, ADR-0069); the call then
                 raises :class:`OutboundCallCancelled`. ``None`` (default) leaves only
-                the hard ``_OUTBOUND_INVITE_TIMEOUT`` sink bound. Ignored on the WSS
-                path (no client CANCEL there yet).
+                the hard ``_OUTBOUND_INVITE_TIMEOUT`` sink bound. Only supported on the
+                SIP/TLS UAC; passing it on a WSS gateway raises
+                :class:`NotImplementedError` (the WSS WebRTC UAC has no client CANCEL
+                yet — ADR-0069 scope).
 
         Returns:
             The SIP ``Call-ID`` of the established call.
@@ -1442,6 +1444,8 @@ class VoipAdapter(BasePlatformAdapter):
             OutboundCallCancelled: When the INVITE is CANCELled before it is answered
                 (a ``ring_timeout_secs`` expiry or an :meth:`abort_call`) and the peer
                 returns ``487 Request Terminated``.
+            NotImplementedError: When ``ring_timeout_secs`` is set on a WSS gateway
+                (the WebRTC outbound path has no client CANCEL yet — ADR-0069 scope).
             RuntimeError: When the transport or manager is not initialised.
         """
         # ADR-0049 (lifts ADR-0032 §5 / ADR-0038 §4): on a WSS gateway, outbound
@@ -1451,6 +1455,18 @@ class VoipAdapter(BasePlatformAdapter):
         # tls => the existing SDES UAC.
         gateway_cfg = self._gateway_cfg
         is_wss = gateway_cfg is not None and gateway_cfg.transport == "wss"
+        # ring_timeout_secs (the ADR-0069 outbound CANCEL / ring-timeout abort) is
+        # wired only on the SIP/TLS UAC: the WSS WebRTC UAC has no client CANCEL yet
+        # (ADR-0069 scope; WssSipTransport.send_cancel is a uniform no-op). Rather than
+        # silently DROP the requested ring bound on the WSS path — leaving the call to
+        # ring with no abort lever and breaking this method's documented contract
+        # (rule 27) — reject the unsupported combination loudly BEFORE any dial.
+        if is_wss and ring_timeout_secs is not None:
+            msg = (
+                "ring_timeout_secs is not supported on the WebRTC (WSS) outbound "
+                "path yet; it is wired only on the SIP/TLS UAC (ADR-0069)"
+            )
+            raise NotImplementedError(msg)
         if extension in self._outbound_extensions:
             raise OutboundCallFailed(
                 503, f"outbound call to {extension!r} already in progress"
@@ -1904,6 +1920,25 @@ class VoipAdapter(BasePlatformAdapter):
                 # Key inbound (RX/decrypt) from the validated answer crypto (our
                 # outbound was keyed from the offer at engine construction).
                 engine._srtp_in = _srtp_inbound_from_answer(answer_inbound_crypto)
+
+            # --- Re-check the abort that may have raced the 2xx (ADR-0069) ------
+            # An abort (a ring_timeout expiry or an explicit abort_call) can flip
+            # cancel_requested in the SAME loop tick the 2xx is accepted — after the
+            # response was dequeued but before the CallSession is wired. The await on
+            # the ACK send (above) is a yield point where that abort's coroutine can
+            # run. If it did, the engine is already stopped and a CANCEL is on the wire;
+            # proceeding to wire a live session here would establish exactly the call we
+            # were told to abandon. Raise OutboundCallCancelled instead — the finally
+            # (ack_sent is True) BYEs the now-confirmed dialog (§15) and tears down.
+            if pending.cancel_requested:
+                reason = pending.reason or "aborted"
+                _log.info(
+                    "outbound %s: abort raced the 2xx — aborting the answered call "
+                    "(%s)",
+                    call_id,
+                    reason,
+                )
+                raise OutboundCallCancelled(call_id, reason)
 
             # --- Wire the CallSession and CallLoop -------------------------
             # ADR-0021 (amended from ADR-0020): an outbound call's remote party

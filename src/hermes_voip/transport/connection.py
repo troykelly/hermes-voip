@@ -203,6 +203,11 @@ class SipOverTlsTransport:
         # Outbound Call-IDs we have CANCELled: a 2xx racing the CANCEL for one of
         # these is suppressed (not routed to the sink) and the remote dialog ACK+BYE'd.
         self._cancelled_outbound: set[str] = set()
+        # Outbound Call-IDs whose glare 2xx we have already BYE'd. The UAS retransmits
+        # its 2xx until the ACK arrives (RFC 3261 §13.3.1.4), so every retransmit is
+        # ACKed again, but the in-dialog BYE is sent ONCE — a second BYE on an
+        # already-closed dialog is spurious. Cleared with the call in remove_call.
+        self._glare_byed: set[str] = set()
         # Inbound INVITE server transactions awaiting a final response, keyed by
         # Via branch (RFC 3261 §9.2 CANCEL matching).
         self._pending_invites: dict[str, _PendingInvite] = {}
@@ -484,13 +489,17 @@ class SipOverTlsTransport:
     async def _ack_and_bye_glare(
         self, outbound: _OutboundInvite, response: SipResponse
     ) -> None:
-        """ACK then BYE a 2xx that raced our CANCEL (best-effort, never raises).
+        """ACK a 2xx that raced our CANCEL, and BYE its dialog once (best-effort).
 
         Builds the ACK and in-dialog BYE from the tracked INVITE plus the 2xx's
         ``To`` (with its tag), ``Contact`` (the in-dialog request target) and
-        reversed ``Record-Route`` route set (RFC 3261 §13.2.2.4 / §12.2). A
-        send/parse failure is logged structurally (never the body — rule 34) and the
-        callee's own session timer reaps the dialog if the BYE cannot be built.
+        reversed ``Record-Route`` route set (RFC 3261 §13.2.2.4 / §12.2). The UAS
+        retransmits its 2xx until it sees the ACK (RFC 3261 §13.3.1.4), so EVERY
+        retransmission is ACKed again — but the in-dialog BYE is sent only ONCE per
+        Call-ID (tracked in ``_glare_byed``); a second BYE on the already-closed
+        dialog is spurious. A send/parse failure is logged structurally (never the
+        body — rule 34) and the callee's own session timer reaps the dialog if the BYE
+        cannot be built.
         """
         try:
             to_header = response.header("To") or outbound.to_header
@@ -503,6 +512,11 @@ class SipOverTlsTransport:
                 outbound, to_header, remote_target, route_set, transport_token
             )
             await self.send(ack)
+            # BYE exactly once: the first glare 2xx closes the dialog; later 2xx
+            # retransmits are ACKed (above) but not re-BYE'd.
+            if outbound.call_id in self._glare_byed:
+                return
+            self._glare_byed.add(outbound.call_id)
             bye = _build_glare_bye(
                 outbound, to_header, remote_target, route_set, transport_token
             )
@@ -536,15 +550,25 @@ class SipOverTlsTransport:
         CANCELled call kept to keep suppressing a late 2xx) is also cleared here —
         the call is definitively gone once its teardown runs.
         """
+        # The outbound-INVITE CANCEL-tracking + cancelled flag are keyed by Call-ID
+        # and are NOT sink-identity-sensitive: each outbound place_call mints a unique
+        # Call-ID, so there is no later overlapping independent outbound call to
+        # protect. Clear them UNCONDITIONALLY — before the sink-identity early-return —
+        # so a sink-mismatch remove_call (an earlier same-Call-ID sink owner tearing
+        # down) still clears the tracking instead of leaking it (the §9.1 records would
+        # otherwise outlive the call and keep a stale Call-ID in _cancelled_outbound).
+        for okey in [k for k in self._outbound_invites if k[0] == call_id]:
+            del self._outbound_invites[okey]
+        self._cancelled_outbound.discard(call_id)
+        self._glare_byed.discard(call_id)
+        # The sink/inbound state IS sink-identity-sensitive: a later overlapping
+        # same-Call-ID INVITE may have overwritten _calls, so an earlier call's
+        # teardown (passing its own sink) must not evict the live later one.
         if sink is not None and self._calls.get(call_id) is not sink:
             return
         self._calls.pop(call_id, None)
         for key in [k for k in self._client_txns if k[0] == call_id]:
             del self._client_txns[key]
-        # The outbound-INVITE CANCEL-tracking + cancelled flag die with the call.
-        for okey in [k for k in self._outbound_invites if k[0] == call_id]:
-            del self._outbound_invites[okey]
-        self._cancelled_outbound.discard(call_id)
         for branch in [
             b for b, p in self._pending_invites.items() if p.call_id == call_id
         ]:

@@ -56,7 +56,14 @@ from hermes_voip.manager import (
     RegistrationManager,
     Unroutable,
 )
-from hermes_voip.message import SipRequest, SipResponse, build_response, new_tag
+from hermes_voip.message import (
+    SipRequest,
+    SipResponse,
+    build_request,
+    build_response,
+    new_branch,
+    new_tag,
+)
 from hermes_voip.transport.framing import SipMessageFramer
 from hermes_voip.transport.transaction import (
     InviteClientTransaction,
@@ -75,6 +82,9 @@ _TO_TAG_PARAM = re.compile(r";\s*tag=", re.IGNORECASE)
 _VIA_BRANCH = re.compile(r";\s*branch=([^;,\s]+)", re.IGNORECASE)
 _FINAL_STATUS = 200  # status >= 200 is a final response (terminates the txn)
 _FIRST_FAILURE = 300  # status >= 300 is a non-2xx final
+_MAX_FORWARDS = "70"
+# The addr-spec inside a name-addr ``<...>`` (a Contact/Record-Route URI).
+_ANGLE_ADDR = re.compile(r"<([^>]*)>")
 
 
 @dataclass(slots=True)
@@ -93,6 +103,27 @@ class _PendingInvite:
     txn: InviteServerTransaction
     local_tag: str
     cancelled: bool = False
+
+
+@dataclass(slots=True)
+class _OutboundInvite:
+    """The fields of an INVITE **we** sent that a §9.1 CANCEL must echo.
+
+    Captured alongside the :class:`InviteClientTransaction` when we originate an
+    INVITE, keyed by ``(Call-ID, CSeq-num)`` (same key as ``_client_txns``). A
+    CANCEL reuses the INVITE's Request-URI, top ``Via`` (same branch), ``From``,
+    ``To`` (no tag added), ``Call-ID``, the CSeq number with method ``CANCEL``, and
+    repeats the ``Route`` set (RFC 3261 §9.1). These same fields also build the
+    ACK+BYE for a 2xx that races the CANCEL (the glare, §9.1).
+    """
+
+    request_uri: str
+    via: str
+    from_header: str
+    to_header: str
+    call_id: str
+    cseq_number: int
+    routes: tuple[str, ...]
 
 
 @runtime_checkable
@@ -165,6 +196,18 @@ class SipOverTlsTransport:
         self._manager: RegistrationManager | None = None
         self._calls: dict[str, CallResponseSink] = {}
         self._client_txns: dict[tuple[str, int], InviteClientTransaction] = {}
+        # Outbound INVITEs WE sent, keyed by (Call-ID, CSeq-num) — the fields a §9.1
+        # CANCEL (and a glare 2xx's ACK+BYE) must echo (RFC 3261 §9.1). The re-auth
+        # INVITE (CSeq 2) is a separate key, so send_cancel targets the latest.
+        self._outbound_invites: dict[tuple[str, int], _OutboundInvite] = {}
+        # Outbound Call-IDs we have CANCELled: a 2xx racing the CANCEL for one of
+        # these is suppressed (not routed to the sink) and the remote dialog ACK+BYE'd.
+        self._cancelled_outbound: set[str] = set()
+        # Outbound Call-IDs whose glare 2xx we have already BYE'd. The UAS retransmits
+        # its 2xx until the ACK arrives (RFC 3261 §13.3.1.4), so every retransmit is
+        # ACKed again, but the in-dialog BYE is sent ONCE — a second BYE on an
+        # already-closed dialog is spurious. Cleared with the call in remove_call.
+        self._glare_byed: set[str] = set()
         # Inbound INVITE server transactions awaiting a final response, keyed by
         # Via branch (RFC 3261 §9.2 CANCEL matching).
         self._pending_invites: dict[str, _PendingInvite] = {}
@@ -298,6 +341,30 @@ class SipOverTlsTransport:
         key = _txn_key(request.header("Call-ID"), request.header("CSeq"))
         if key is not None:
             self._client_txns[key] = InviteClientTransaction(message)
+            self._track_outbound_invite(request, key)
+
+    def _track_outbound_invite(self, invite: SipRequest, key: tuple[str, int]) -> None:
+        """Record the §9.1 CANCEL-relevant fields of an INVITE we sent.
+
+        A malformed INVITE missing a header a CANCEL must echo (Via/From/To/
+        Call-ID/CSeq) is left untracked — it just cannot be CANCELled (the call
+        would never establish either). The Route set is repeated verbatim.
+        """
+        via = invite.header("Via")
+        from_header = invite.header("From")
+        to_header = invite.header("To")
+        call_id = invite.header("Call-ID")
+        if via is None or from_header is None or to_header is None or call_id is None:
+            return
+        self._outbound_invites[key] = _OutboundInvite(
+            request_uri=invite.request_uri,
+            via=via,
+            from_header=from_header,
+            to_header=to_header,
+            call_id=call_id,
+            cseq_number=key[1],
+            routes=invite.headers_all("Route"),
+        )
 
     def _suppress_or_track_response(self, message: str) -> bool:
         """Handle an outbound INVITE response vs a pending CANCEL; return suppress.
@@ -346,6 +413,122 @@ class SipOverTlsTransport:
         pending = self._pending_invites.get(branch)
         return (branch, pending) if pending is not None else None
 
+    # --- outbound CANCEL (RFC 3261 §9.1) -------------------------------------
+
+    async def send_cancel(self, call_id: str) -> bool:
+        """CANCEL the latest in-flight INVITE **we** sent for ``call_id`` (§9.1).
+
+        Builds and sends a CANCEL that echoes that INVITE's Request-URI, top
+        ``Via`` (same branch), ``From``, ``To`` (no tag added), ``Call-ID`` and the
+        CSeq number with method ``CANCEL``, repeating the ``Route`` set; the body is
+        empty. The call is then recorded as cancelled, so a 2xx racing the CANCEL is
+        suppressed and its dialog torn down (:meth:`_handle_glare_2xx`).
+
+        When more than one INVITE is tracked for the Call-ID (a re-auth re-send), the
+        one with the **highest CSeq** is targeted — it is the transaction still
+        awaiting a final response.
+
+        Returns ``True`` when an INVITE was tracked and a CANCEL was sent; ``False``
+        when there is nothing to cancel (no in-flight INVITE for ``call_id`` — never
+        sent, or its final response already arrived and cleared the entry). §9.1
+        forbids CANCELling a transaction that has had its final response, so a
+        ``False`` here means the abort is a no-op at the wire.
+
+        Raises:
+            RuntimeError: if called before :meth:`connect` (``send`` enforces this).
+        """
+        outbound = self._latest_outbound_invite(call_id)
+        if outbound is None:
+            return False
+        # Mark cancelled BEFORE sending so a 2xx that arrives the instant the CANCEL
+        # hits the wire is already classified for suppression (the read loop and this
+        # send are on the same task, so there is no true concurrency, but the flag is
+        # set first for clarity and to mirror the inbound §9.2 ordering).
+        self._cancelled_outbound.add(call_id)
+        await self.send(_build_cancel(outbound))
+        _log.info("INVITE %s: sent CANCEL (RFC 3261 §9.1)", call_id)
+        return True
+
+    def _latest_outbound_invite(self, call_id: str) -> _OutboundInvite | None:
+        """The tracked outbound INVITE with the highest CSeq for ``call_id``."""
+        candidates = [
+            inv for inv in self._outbound_invites.values() if inv.call_id == call_id
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda inv: inv.cseq_number)
+
+    async def _handle_glare_2xx(self, response: SipResponse) -> bool:
+        """Suppress + tear down a 2xx that races a CANCEL we sent (§9.1 glare).
+
+        Returns ``True`` (the 2xx is consumed here, never routed to the sink) when
+        the response is a 2xx to an INVITE for a Call-ID we CANCELled. A 2xx
+        established the dialog on the callee, so we ACK it and then send an in-dialog
+        BYE to close it — never leaving the remote stranded. This mirrors the inbound
+        §9.2 late-200 suppression. Returns ``False`` for any other response (the
+        normal routing path then applies).
+        """
+        if _method_of(response.header("CSeq")) != "INVITE":
+            return False
+        status = response.status_code
+        if not _FINAL_STATUS <= status < _FIRST_FAILURE:
+            return False  # provisional or non-2xx — not a racing answer
+        call_id = response.header("Call-ID")
+        if call_id is None or call_id not in self._cancelled_outbound:
+            return False
+        outbound = self._latest_outbound_invite(call_id)
+        if outbound is None:
+            return True  # cancelled, nothing tracked to ACK/BYE — still suppress
+        _log.warning(
+            "INVITE %s: 2xx raced our CANCEL — ACK+BYE to close the remote dialog",
+            call_id,
+        )
+        await self._ack_and_bye_glare(outbound, response)
+        return True
+
+    async def _ack_and_bye_glare(
+        self, outbound: _OutboundInvite, response: SipResponse
+    ) -> None:
+        """ACK a 2xx that raced our CANCEL, and BYE its dialog once (best-effort).
+
+        Builds the ACK and in-dialog BYE from the tracked INVITE plus the 2xx's
+        ``To`` (with its tag), ``Contact`` (the in-dialog request target) and
+        reversed ``Record-Route`` route set (RFC 3261 §13.2.2.4 / §12.2). The UAS
+        retransmits its 2xx until it sees the ACK (RFC 3261 §13.3.1.4), so EVERY
+        retransmission is ACKed again — but the in-dialog BYE is sent only ONCE per
+        Call-ID (tracked in ``_glare_byed``); a second BYE on the already-closed
+        dialog is spurious. A send/parse failure is logged structurally (never the
+        body — rule 34) and the callee's own session timer reaps the dialog if the BYE
+        cannot be built.
+        """
+        try:
+            to_header = response.header("To") or outbound.to_header
+            remote_target = (
+                _addr_spec(response.header("Contact")) or outbound.request_uri
+            )
+            route_set = tuple(reversed(response.headers_all("Record-Route")))
+            transport_token = _via_transport(outbound.via)
+            ack = _build_glare_ack(
+                outbound, to_header, remote_target, route_set, transport_token
+            )
+            await self.send(ack)
+            # BYE exactly once: the first glare 2xx closes the dialog; later 2xx
+            # retransmits are ACKed (above) but not re-BYE'd.
+            if outbound.call_id in self._glare_byed:
+                return
+            self._glare_byed.add(outbound.call_id)
+            bye = _build_glare_bye(
+                outbound, to_header, remote_target, route_set, transport_token
+            )
+            await self.send(bye)
+        except (ValueError, RuntimeError) as exc:
+            _log.warning(
+                "INVITE %s: could not ACK/BYE the glare 2xx (%s) — "
+                "the remote session timer will reap it",
+                outbound.call_id,
+                type(exc).__name__,
+            )
+
     # --- call registry (response routing) -----------------------------------
 
     def add_call(self, call_id: str, sink: CallResponseSink) -> None:
@@ -367,6 +550,20 @@ class SipOverTlsTransport:
         CANCELled call kept to keep suppressing a late 2xx) is also cleared here —
         the call is definitively gone once its teardown runs.
         """
+        # The outbound-INVITE CANCEL-tracking + cancelled flag are keyed by Call-ID
+        # and are NOT sink-identity-sensitive: each outbound place_call mints a unique
+        # Call-ID, so there is no later overlapping independent outbound call to
+        # protect. Clear them UNCONDITIONALLY — before the sink-identity early-return —
+        # so a sink-mismatch remove_call (an earlier same-Call-ID sink owner tearing
+        # down) still clears the tracking instead of leaking it (the §9.1 records would
+        # otherwise outlive the call and keep a stale Call-ID in _cancelled_outbound).
+        for okey in [k for k in self._outbound_invites if k[0] == call_id]:
+            del self._outbound_invites[okey]
+        self._cancelled_outbound.discard(call_id)
+        self._glare_byed.discard(call_id)
+        # The sink/inbound state IS sink-identity-sensitive: a later overlapping
+        # same-Call-ID INVITE may have overwritten _calls, so an earlier call's
+        # teardown (passing its own sink) must not evict the live later one.
         if sink is not None and self._calls.get(call_id) is not sink:
             return
         self._calls.pop(call_id, None)
@@ -408,6 +605,12 @@ class SipOverTlsTransport:
             await self._dispatch_request(SipRequest.parse(raw))
 
     async def _dispatch_response(self, response: SipResponse) -> None:
+        # A 2xx racing a CANCEL we sent (RFC 3261 §9.1 glare) is consumed here: the
+        # remote dialog is ACK+BYE'd and the 2xx is NOT routed to the sink (the call
+        # is cancelled, not answered). Checked before the auto-ACK / sink routing so a
+        # suppressed answer never reaches place_call as success.
+        if await self._handle_glare_2xx(response):
+            return
         await self._auto_ack_non_2xx(response)
         call_id = response.header("Call-ID")
         manager = self._manager
@@ -631,3 +834,106 @@ def _txn_key(call_id: str | None, cseq: str | None) -> tuple[str, int] | None:
     if not parts or not parts[0].isdigit():
         return None
     return (call_id, int(parts[0]))
+
+
+def _build_cancel(outbound: _OutboundInvite) -> str:
+    """Build the §9.1 CANCEL for a tracked outbound INVITE.
+
+    RFC 3261 §9.1: the CANCEL's Request-URI, ``Call-ID``, ``From`` (with tag), the
+    single topmost ``Via`` (**same branch** as the INVITE) and the CSeq number all
+    match the INVITE; the method is ``CANCEL``; the ``To`` is the INVITE's, with **no
+    tag added** (a CANCEL is sent before the dialog-establishing 2xx); the ``Route``
+    set is repeated; the body is empty.
+    """
+    headers: list[tuple[str, str]] = [
+        ("Via", outbound.via),
+        ("Max-Forwards", _MAX_FORWARDS),
+    ]
+    headers += [("Route", route) for route in outbound.routes]
+    headers += [
+        ("From", outbound.from_header),
+        ("To", outbound.to_header),
+        ("Call-ID", outbound.call_id),
+        ("CSeq", f"{outbound.cseq_number} CANCEL"),
+    ]
+    return build_request("CANCEL", outbound.request_uri, headers)
+
+
+def _build_glare_ack(
+    outbound: _OutboundInvite,
+    to_header: str,
+    remote_target: str,
+    route_set: tuple[str, ...],
+    transport_token: str,
+) -> str:
+    """The ACK for a 2xx that raced our CANCEL (RFC 3261 §13.2.2.4, fresh branch)."""
+    sent_by = _sent_by(outbound.via)
+    headers: list[tuple[str, str]] = [
+        ("Via", f"SIP/2.0/{transport_token} {sent_by};branch={new_branch()};rport"),
+        ("Max-Forwards", _MAX_FORWARDS),
+    ]
+    headers += [("Route", route) for route in route_set]
+    headers += [
+        ("From", outbound.from_header),
+        ("To", to_header),
+        ("Call-ID", outbound.call_id),
+        ("CSeq", f"{outbound.cseq_number} ACK"),
+    ]
+    return build_request("ACK", remote_target, headers)
+
+
+def _build_glare_bye(
+    outbound: _OutboundInvite,
+    to_header: str,
+    remote_target: str,
+    route_set: tuple[str, ...],
+    transport_token: str,
+) -> str:
+    """The in-dialog BYE that closes the dialog a glare 2xx established (§15)."""
+    sent_by = _sent_by(outbound.via)
+    headers: list[tuple[str, str]] = [
+        ("Via", f"SIP/2.0/{transport_token} {sent_by};branch={new_branch()};rport"),
+        ("Max-Forwards", _MAX_FORWARDS),
+    ]
+    headers += [("Route", route) for route in route_set]
+    headers += [
+        ("From", outbound.from_header),
+        ("To", to_header),
+        ("Call-ID", outbound.call_id),
+        ("CSeq", f"{outbound.cseq_number + 1} BYE"),
+    ]
+    return build_request("BYE", remote_target, headers)
+
+
+def _addr_spec(header_value: str | None) -> str | None:
+    """The addr-spec from a name-addr/addr-spec header value (Contact), or None.
+
+    Inside ``<...>`` if present (the in-dialog request target), else up to the first
+    ``;`` (header params). An empty/absent value yields ``None`` (the caller falls
+    back to the INVITE Request-URI).
+    """
+    if header_value is None:
+        return None
+    match = _ANGLE_ADDR.search(header_value)
+    spec = (
+        match.group(1).strip()
+        if match is not None
+        else header_value.split(";", 1)[0].strip()
+    )
+    return spec or None
+
+
+def _via_transport(via: str) -> str:
+    """The transport token of a Via value (``TLS``/``WSS``); defaults to ``TLS``."""
+    match = re.match(r"\s*SIP/2\.0/(\S+)", via)
+    return match.group(1) if match is not None else "TLS"
+
+
+def _sent_by(via: str) -> str:
+    """The ``sent-by`` (host:port) of the topmost Via value."""
+    topmost = via.split(",", 1)[0].strip()
+    match = re.match(r"\s*SIP/2\.0/\S+\s+([^\s;]+)", topmost)
+    if match is None:
+        msg = f"malformed Via, no sent-by: {via!r}"
+        raise ValueError(msg)
+    return match.group(1)

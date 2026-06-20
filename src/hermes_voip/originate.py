@@ -15,6 +15,7 @@ from hermes_voip.message import build_request, new_branch, new_call_id, new_tag
 from hermes_voip.sdp import CryptoAttribute
 
 __all__ = [
+    "OutboundCallCancelled",
     "OutboundCallFailed",
     "OutboundCallNotAllowed",
     "build_outbound_invite",
@@ -43,6 +44,28 @@ class OutboundCallFailed(Exception):  # noqa: N818 — "Failed" suffix is intent
         self.status = status
         self.reason = reason
         super().__init__(f"{status} {reason}")
+
+
+class OutboundCallCancelled(Exception):  # noqa: N818 — a cancellation, not a programming error: a 487 after WE asked to CANCEL is the expected abort outcome; ADR-0069 public API
+    """An outbound INVITE was CANCELled before it was answered (RFC 3261 §9.1).
+
+    Raised by :meth:`VoipAdapter.place_call` when, after we sent a CANCEL (via an
+    explicit :meth:`VoipAdapter.abort_call` or a ``ring_timeout_secs`` expiry), the
+    INVITE is answered ``487 Request Terminated``. This is **distinct** from
+    :class:`OutboundCallFailed`: a 487 here is the *intended* result of our own
+    abort, not a peer rejection (a 4xx/5xx/6xx the peer chose), so callers can react
+    to "we gave up" differently from "the call could not be placed".
+
+    Attributes:
+        call_id: The SIP ``Call-ID`` of the cancelled outbound call.
+        reason: The human-readable abort reason (e.g. ``"ring timeout"``).
+    """
+
+    def __init__(self, call_id: str, reason: str) -> None:
+        """Initialise with the cancelled call's Call-ID and the abort reason."""
+        self.call_id = call_id
+        self.reason = reason
+        super().__init__(f"outbound call {call_id} cancelled: {reason}")
 
 
 class OutboundCallNotAllowed(Exception):  # noqa: N818 — a policy refusal (the dial target is not allowlisted), not a programming error; ADR-0029 public API

@@ -676,3 +676,49 @@ async def test_outbound_webrtc_offer_includes_dtmf_and_g711_fallback() -> None:
     assert "pcma" in encodings, "outbound WebRTC offer must offer G.711 PCMA fallback"
     # Opus is offered first (preference order); DTMF is offered, not the only entry.
     assert offer.audio.codecs[0].encoding.lower() == "opus"
+
+
+@pytest.mark.asyncio
+async def test_place_call_with_ring_timeout_over_wss_raises_not_supported() -> None:
+    """Fix (c): ring_timeout_secs on the WSS/WebRTC UAC path is rejected, not dropped.
+
+    The outbound CANCEL / ring-timeout abort (ADR-0069) is wired only on the SIP/TLS
+    UAC (``_handle_outbound_invite``); the WSS WebRTC UAC has no client CANCEL yet.
+    Forwarding ``ring_timeout_secs`` there used to be a silent no-op — the caller asks
+    for a ring bound, the call rings forever with no abort lever, and the docstring's
+    promise is unmet (rule 27). place_call must raise a clear ``NotImplementedError``
+    BEFORE any INVITE is sent, rather than dial without the requested safety bound.
+    """
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway_config("wss"), transport)
+    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV_WSS))
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=_gateway_config("wss"),
+        ),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.WssSipTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+        _mark_registered(manager)
+        transport.sent.clear()
+
+        with (
+            patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
+            pytest.raises(NotImplementedError, match="ring_timeout_secs"),
+        ):
+            await adapter.place_call("1001", ring_timeout_secs=5.0)
+
+    # The guard fires BEFORE the INVITE — nothing was dialled.
+    assert not any(m.startswith("INVITE") for m in transport.sent), (
+        "place_call must not dial when it cannot honour the requested ring timeout"
+    )

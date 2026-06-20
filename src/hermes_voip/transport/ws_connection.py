@@ -313,6 +313,18 @@ class WssSipTransport:
         for key in [k for k in self._client_txns if k[0] == call_id]:
             del self._client_txns[key]
 
+    async def send_cancel(self, call_id: str) -> bool:
+        """Outbound CANCEL is not supported on the WSS UAC yet (ADR-0069 scope).
+
+        Provided so the :class:`~hermes_voip.adapter.SignalingTransport` union has a
+        uniform ``send_cancel`` surface; the WSS WebRTC origination path frames a
+        different exchange and has no Via client-transaction registry to build a §9.1
+        CANCEL from, so this is a no-op returning ``False`` (nothing was CANCELled).
+        The ``call_id`` is accepted for signature parity with the SIP/TLS transport.
+        """
+        _ = call_id  # accepted for parity; the WSS path has no CANCEL to send
+        return False
+
     def bind_manager(self, manager: RegistrationManager) -> None:
         """Bind the registration manager the transport demuxes through."""
         self._manager = manager

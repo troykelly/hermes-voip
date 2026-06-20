@@ -526,11 +526,17 @@ async def test_refresher_emits_refresh_reinvite_at_half_interval() -> None:
 
 
 # ===========================================================================
-# (d) the refresh re-INVITE fails -> the dialog is BYE'd.
+# (d) the refresh re-INVITE hits a DEAD-DIALOG status -> the dialog is BYE'd.
+#
+# NOTE: this test previously answered the refresh 488 and asserted a BYE — but
+# RFC 4028 §10 BYEs ONLY on a timeout / 408 / 481; a 488 is a transient non-2xx
+# the call must SURVIVE (now covered by test_refresh_transient_5xx_continues_…).
+# The dead-dialog 481 here keeps the original "a refusal that means the dialog is
+# gone tears it down" intent on a status the RFC actually classifies as fatal.
 # ===========================================================================
 @pytest.mark.asyncio
 async def test_refresh_failure_byes_the_dialog() -> None:
-    """A refresh re-INVITE that is rejected (no 2xx) tears the dialog down with BYE."""
+    """A refresh that draws a dead-dialog 481 tears the dialog down with BYE."""
     transport = _FakeTransport()
     adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
 
@@ -562,8 +568,8 @@ async def test_refresh_failure_byes_the_dialog() -> None:
         session = adapter._call_sessions[call_id]
         await _until(first_released.is_set)
 
-        # Fail the refresh: answer the re-INVITE 488 (a final non-2xx) so the watchdog's
-        # refresh await raises CallError and the watchdog BYEs the dialog.
+        # Fail the refresh with a dead-dialog 481 so the watchdog classifies it as a
+        # gone dialog and BYEs it (RFC 4028 §10).
         async def _reject_reinvites() -> None:
             seen: set[int] = set()
             while True:
@@ -573,7 +579,9 @@ async def test_refresh_failure_byes_the_dialog() -> None:
                     if num in seen:
                         continue
                     seen.add(num)
-                    rej = _build_response_for(req, session, 488, "Not Acceptable Here")
+                    rej = _build_response_for(
+                        req, session, 481, "Call/Transaction Does Not Exist"
+                    )
                     await session.on_response(SipResponse.parse(rej))
                 await asyncio.sleep(0.001)
 
@@ -586,7 +594,7 @@ async def test_refresh_failure_byes_the_dialog() -> None:
                 await rejecter
 
     byes = _sent_requests(transport, "BYE")
-    assert byes, "a failed session refresh must BYE the dialog"
+    assert byes, "a dead-dialog (481) session refresh must BYE the dialog"
     assert session.ended, (
         "the session should be marked ended after the refresh-failure BYE"
     )
@@ -973,13 +981,17 @@ async def test_held_call_refresh_offers_sendonly() -> None:
     transport = _FakeTransport()
     adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
 
-    first_released = asyncio.Event()
+    # The first SE/2 sleep BLOCKS until the test opens ``hold_set`` — so the refresh
+    # cannot fire before the call is put on hold (no on_hold race). Later sleeps block.
     se_sleeps: list[float] = []
+    hold_set = asyncio.Event()
+    first_armed = asyncio.Event()
 
     async def _fake_sleep(secs: float) -> None:
         se_sleeps.append(secs)
         if len(se_sleeps) == 1:
-            first_released.set()
+            first_armed.set()
+            await hold_set.wait()  # release only once the test has set on_hold
             return
         await asyncio.Event().wait()
 
@@ -992,9 +1004,11 @@ async def test_held_call_refresh_offers_sendonly() -> None:
         )
         await _until(lambda: call_id in adapter._call_sessions)
         session = adapter._call_sessions[call_id]
-        # Put the call on hold BEFORE the refresh fires (mirror a long-held call).
+        # Wait until the watchdog has armed its first SE/2 sleep, THEN put the call on
+        # hold and release the sleep — so the refresh is offered with on_hold set.
+        await _until(first_armed.is_set)
         session.on_hold = True
-        await _until(first_released.is_set)
+        hold_set.set()
 
         responder = _ScriptedRefreshResponder(transport, session, [(200, "OK")])
         task = asyncio.create_task(responder.run())

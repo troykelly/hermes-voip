@@ -68,7 +68,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource
 
-from hermes_voip.call import CallError, CallSession, CallSignaling
+from hermes_voip.call import CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
     extract_call_context,
@@ -187,10 +187,14 @@ from hermes_voip.sdp import (
 )
 from hermes_voip.session_timer import (
     AcceptTimers,
+    RefreshContinue,
     Refresher,
+    RefreshSucceeded,
+    RefreshTeardown,
     Reject422,
     SessionExpires,
     build_session_expires_value,
+    glare_backoff_secs,
     negotiate_uas_timers,
     parse_min_se,
     refresh_interval_secs,
@@ -503,6 +507,9 @@ _SIP_ERROR_FLOOR = 300  # responses at or above this are errors
 _SIP_REQUEST_TERMINATED = 487  # the 2xx-to-INVITE was CANCELled (RFC 3261 §9.1)
 _SIP_INTERVAL_TOO_SMALL = 422  # Session Interval Too Small (RFC 4028 §6) — retry larger
 _CSEQ_PARTS = 2  # a CSeq value is "<number> <method>" (RFC 3261 §20.16)
+# How many consecutive 491-glare retries a session refresh attempts before giving up
+# and BYEing the (apparently stuck) dialog (RFC 3261 §14.1 retry + RFC 4028 §10 BYE).
+_SESSION_REFRESH_MAX_GLARE_RETRIES = 5
 
 # Maximum outstanding responses buffered in _QueueSink (N2). A 407 + final
 # = 2; with re-auth it is at most ~4. 32 is generous without being unbounded.
@@ -866,6 +873,12 @@ class VoipAdapter(BasePlatformAdapter):
         # timing deterministically instead of sleeping real minutes. Production uses the
         # real event-loop sleep.
         self._session_timer_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        # The 491-glare retry backoff sleep (RFC 3261 §14.1) — a SEPARATE seam from the
+        # SE/2 cadence sleep so a test can release the cadence sleep while NOT having to
+        # release the backoff. Production uses the real event-loop sleep.
+        self._session_timer_backoff_sleep: Callable[[float], Awaitable[None]] = (
+            asyncio.sleep
+        )
         # Active call sessions mirrored here so they can be re-attached after
         # a reconnect: {call_id → CallSession}
         self._call_sessions: dict[str, CallSession] = {}
@@ -4354,6 +4367,27 @@ class VoipAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
+    def _request_advertises_timer(invite: SipRequest) -> bool:
+        """Whether the INVITE advertised the ``timer`` option-tag (RFC 4028 §8/§9).
+
+        Checks the ``Supported`` (compact ``k``) and ``Require`` option-tag lists for a
+        ``timer`` token (each header may list several comma-separated tags, and may be
+        repeated). A peer that lists ``timer`` in either supports session timers, so the
+        UAS may engage ``Require: timer``; a peer that lists it nowhere is
+        timer-IGNORANT and the 2xx MUST omit ``Require: timer`` (RFC 4028 §9 Table 2).
+        """
+        values = (
+            *invite.headers_all("Supported"),
+            *invite.headers_all("k"),  # RFC 3261 §20 compact form of Supported
+            *invite.headers_all("Require"),
+        )
+        return any(
+            token.strip().lower() == "timer"
+            for value in values
+            for token in value.split(",")
+        )
+
+    @staticmethod
     def _outbound_session_timer(response: SipResponse, offered_se: int) -> AcceptTimers:
         """The session timer for an outbound call from the 2xx answer (ADR-0071).
 
@@ -4376,23 +4410,36 @@ class VoipAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _session_timer_2xx_headers(
-        accept: AcceptTimers,
+        accept: AcceptTimers, *, peer_supports_timer: bool
     ) -> tuple[tuple[str, str], ...]:
         """The RFC 4028 headers a 2xx carries to engage session timers (ADR-0071).
 
-        ``Session-Expires`` (with the elected ``refresher``), ``Supported: timer`` (we
-        support the extension), and ``Require: timer``. RFC 4028 §9: when the refresher
-        is the UAC the UAS MUST add ``Require: timer``; when it is the UAS it SHOULD —
-        we always add it so the UAC engages the timer rather than ignoring our 2xx.
+        Always ``Session-Expires`` (with the elected ``refresher``) + ``Supported:
+        timer`` (we support the extension). ``Require: timer`` is GATED, per RFC 4028
+        §9 / Table 2:
+
+        * refresher = UAC → the UAS MUST add ``Require: timer`` (and a UAC refresher is
+          only possible when the peer supports timers).
+        * refresher = UAS → the UAS SHOULD add ``Require: timer`` ONLY when the request
+          advertised ``Supported: timer``; to a timer-IGNORANT UAC it MUST be OMITTED
+          (Table 2 forbids ``Require: timer`` with a non-supporting peer — a strict
+          stack rejects the dialog). We still insert our ``Session-Expires`` +
+          ``Supported: timer`` and become the UAS refresher, just without forcing the
+          requirement on a peer that cannot honour it.
+
+        So ``Require: timer`` is emitted iff the refresher is the UAC OR the peer
+        advertised ``Supported: timer``.
         """
-        return (
+        headers: list[tuple[str, str]] = [
             (
                 "Session-Expires",
                 build_session_expires_value(accept.delta, accept.refresher),
             ),
-            ("Require", "timer"),
             ("Supported", "timer"),
-        )
+        ]
+        if accept.refresher is Refresher.UAC or peer_supports_timer:
+            headers.append(("Require", "timer"))
+        return tuple(headers)
 
     def _start_session_timer(
         self,
@@ -4466,15 +4513,27 @@ class VoipAdapter(BasePlatformAdapter):
 
         As the refresher (``we_refresh``) we loop: sleep SE/2 (RFC 4028 §7.2/§9), then
         send a session-refresh re-INVITE (reusing the in-dialog re-INVITE machinery via
-        :meth:`CallSession.refresh_session`). A refresh that is rejected/timed-out
-        raises :class:`CallError`, which we treat as a dead dialog and tear down by BYE
-        (:meth:`CallSession.hang_up`) — RFC 4028 §10. As the non-refresher we sleep to
-        the teardown deadline ``SE - min(32, SE/3)`` and, if the dialog has not ended in
-        the meantime (the peer never refreshed), BYE it.
+        :meth:`CallSession.refresh_session`). The refresh outcome is **classified** per
+        RFC 4028 §10 / RFC 3261 §14.1 rather than treated as uniformly fatal:
+
+        * accepted (2xx) → the timer reset; sleep to the next SE/2;
+        * timeout / 408 / 481 → the dialog is dead → BYE (:meth:`CallSession.hang_up`);
+        * 491 glare → wait a randomized backoff (RFC 3261 §14.1) and **retry** the
+          refresh, bounded to a few consecutive attempts (we do NOT reset the SE
+          deadline — the retry stays inside the current window, which has slack since
+          SE/2 ≪ SE); only after the retries are exhausted do we give up and BYE;
+        * any other non-2xx (5xx/6xx/488…) → log a WARNING and CONTINUE — the call
+          stays up and the next SE/2 tick (or the peer's own deadline) still guards
+          liveness; a transient server error must not kill a live call.
+
+        As the non-refresher we sleep to the teardown deadline ``SE - min(32, SE/3)``
+        and, if the dialog has not ended in the meantime (the peer never refreshed),
+        BYE it.
 
         The loop exits when the session has ended (a hangup/BYE from any source) or the
         task is cancelled (teardown/disconnect). Sleeps go through the injectable
-        ``_session_timer_sleep`` seam so tests drive the timing deterministically.
+        ``_session_timer_sleep`` (cadence) / ``_session_timer_backoff_sleep`` (glare)
+        seams so tests drive the timing deterministically.
         """
         refresh_secs = refresh_interval_secs(delta)
         teardown_secs = teardown_deadline_secs(delta)
@@ -4498,18 +4557,10 @@ class VoipAdapter(BasePlatformAdapter):
                 await self._session_timer_sleep(refresh_secs)
                 if session.ended:
                     return
-                try:
-                    await session.refresh_session(refresh_headers)
-                except CallError as exc:
-                    _log.info(
-                        "INVITE %s: session refresh failed (%s) — BYE the dead dialog "
-                        "(RFC 4028 §10)",
-                        call_id,
-                        exc,
-                    )
-                    await session.hang_up()
-                    return
-                _log.debug("INVITE %s: session refreshed (RFC 4028)", call_id)
+                if not await self._refresh_once_with_glare_retry(
+                    call_id, session, refresh_headers, our_role=refresher
+                ):
+                    return  # the dialog was torn down (or already ended)
             else:
                 await self._session_timer_sleep(teardown_secs)
                 if session.ended:
@@ -4521,6 +4572,69 @@ class VoipAdapter(BasePlatformAdapter):
                 )
                 await session.hang_up()
                 return
+
+    async def _refresh_once_with_glare_retry(
+        self,
+        call_id: str,
+        session: CallSession,
+        refresh_headers: tuple[tuple[str, str], ...],
+        *,
+        our_role: Refresher,
+    ) -> bool:
+        """Send one session refresh, retrying 491 glare, and classify it (§10 / §14.1).
+
+        Returns ``True`` when the watchdog should keep running (the refresh succeeded,
+        or a transient non-2xx left the call up), and ``False`` when the call has been
+        torn down (a dead-dialog BYE) or already ended — the caller then stops the loop.
+
+        A 491 glare is retried after a randomized backoff (RFC 3261 §14.1), bounded to
+        :data:`_SESSION_REFRESH_MAX_GLARE_RETRIES` consecutive attempts so a peer that
+        glares permanently (or both ends locked) eventually frees the dialog with a BYE
+        instead of refreshing forever. The retry does NOT wait another SE/2 — it stays
+        within the current refresh window (which has slack: SE/2 ≪ SE).
+        """
+        for _ in range(_SESSION_REFRESH_MAX_GLARE_RETRIES + 1):
+            if session.ended:
+                return False
+            outcome = await session.refresh_session(refresh_headers)
+            if isinstance(outcome, RefreshSucceeded):
+                _log.debug("INVITE %s: session refreshed (RFC 4028)", call_id)
+                return True
+            if isinstance(outcome, RefreshTeardown):
+                _log.info(
+                    "INVITE %s: session refresh failed (dialog dead: timeout/408/481) "
+                    "— BYE the dead dialog (RFC 4028 §10)",
+                    call_id,
+                )
+                await session.hang_up()
+                return False
+            if isinstance(outcome, RefreshContinue):
+                _log.warning(
+                    "INVITE %s: session refresh got a transient %d — keeping the call "
+                    "up and retrying at the next SE/2 (RFC 4028 §10)",
+                    call_id,
+                    outcome.status_code,
+                )
+                return True
+            # RefreshRetry (491 glare): back off a randomized interval and retry.
+            backoff = glare_backoff_secs(our_role)
+            _log.info(
+                "INVITE %s: session refresh hit 491 glare — retrying after %.2fs "
+                "(RFC 3261 §14.1)",
+                call_id,
+                backoff,
+            )
+            await self._session_timer_backoff_sleep(backoff)
+        # Consecutive glare retries exhausted — the dialog is stuck; tear it down.
+        _log.info(
+            "INVITE %s: session refresh still glaring after %d retries — BYE "
+            "(RFC 4028 §10)",
+            call_id,
+            _SESSION_REFRESH_MAX_GLARE_RETRIES,
+        )
+        if not session.ended:
+            await session.hang_up()
+        return False
 
     async def _cancel_session_timer(self, call_id: str) -> None:
         """Cancel + await this call's session-timer watchdog, if running (ADR-0071)."""
@@ -4565,7 +4679,12 @@ class VoipAdapter(BasePlatformAdapter):
             ("Content-Type", "application/sdp"),
         ]
         if session_timer is not None:
-            extra.extend(self._session_timer_2xx_headers(session_timer))
+            extra.extend(
+                self._session_timer_2xx_headers(
+                    session_timer,
+                    peer_supports_timer=self._request_advertises_timer(invite),
+                )
+            )
         ok_response = build_response(
             invite,
             200,

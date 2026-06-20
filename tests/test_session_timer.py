@@ -345,8 +345,9 @@ def test_classify_refresh_actions_are_distinct_types() -> None:
     assert isinstance(teardown, RefreshTeardown)
     assert isinstance(retry, RefreshRetry)
     assert isinstance(cont, RefreshContinue)
-    assert not isinstance(retry, RefreshTeardown)
-    assert not isinstance(cont, RefreshTeardown)
+    # The three failure actions are genuinely distinct classes, so the watchdog's
+    # isinstance ladder can never confuse a retry/continue for a teardown (BYE).
+    assert len({type(teardown), type(retry), type(cont)}) == 3
 
 
 # ---------------------------------------------------------------------------

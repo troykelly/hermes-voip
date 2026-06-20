@@ -60,9 +60,14 @@ slot is created:
   `Min-SE` header — no dialog, no media, no leaked task — and the UAC retries larger.
 - Otherwise the accepted interval + elected refresher are carried into the dialog-forming
   `200 OK` (the single shared `_send_answer_200` seam, so all three media paths — SDES,
-  SIP-DTLS, WebRTC — emit it identically): `Session-Expires` + `Require: timer` +
-  `Supported: timer`. Our default refresher is **UAS** — *we* send the refreshes, so a
-  peer that silently stops responding is detected by *our* refresh re-INVITE failing, not
+  SIP-DTLS, WebRTC — emit it identically): `Session-Expires` + `Supported: timer`, and
+  `Require: timer` **only when permitted by RFC 4028 §9 / Table 2** — i.e. when the
+  refresher is the UAC, or the refresher is the UAS *and the request advertised
+  `Supported: timer`*. To a timer-IGNORANT UAC (no `Supported: timer`) we still insert our
+  `Session-Expires` + `Supported: timer` and become the UAS refresher, but **omit
+  `Require: timer`** (Table 2 disallows it with a non-supporting peer — a strict stack
+  would reject the dialog). Our default refresher is **UAS** — *we* send the refreshes, so
+  a peer that silently stops responding is detected by *our* refresh re-INVITE failing, not
   by waiting for the peer to refresh.
 
 ### Outbound (UAC) negotiation in `place_call`
@@ -80,10 +85,18 @@ started, tracked in `_session_timers` and `_call_tasks`:
 
 - **Refresher:** sleep `SE/2`, then send a session-refresh re-INVITE. This **reuses the
   existing in-dialog re-INVITE machinery** — `CallSession.refresh_session` calls the same
-  `_reinvite("sendrecv")` path as hold/resume (so SDES re-key continuity, glare/491
-  handling, and digest re-auth all apply unchanged), carrying `Session-Expires` +
-  `Supported: timer`. A refresh that is rejected/timed-out raises `CallError`, which we
-  treat as a dead dialog and tear down with a `BYE` (RFC 4028 §10).
+  `_reinvite` path as hold/resume (so SDES re-key continuity, glare/491 handling, and
+  digest re-auth all apply unchanged), carrying `Session-Expires` + `Supported: timer`.
+  The refresh **re-asserts** the current media direction — `sendonly` while the call is on
+  hold, else `sendrecv` — so refreshing a held call never silently un-holds it.
+  `refresh_session` returns a **discriminated outcome** that the watchdog acts on per
+  RFC 4028 §10 / RFC 3261 §14.1, rather than tearing the call down on every non-2xx: a
+  **timeout / 408 / 481** is a dead dialog → `BYE`; a **491 glare** is retried after a
+  randomized backoff (RFC 3261 §14.1: 2.1–4 s as the UAC, 0–2 s as the UAS), bounded to a
+  few consecutive attempts and without resetting the SE deadline; **any other non-2xx**
+  (5xx/6xx/488…) logs a warning and **continues** — a transient server error must not kill
+  a live call, and the next `SE/2` tick (or the non-refresher's own deadline) still guards
+  liveness.
 - **Non-refresher:** sleep to `SE - min(32, SE/3)`; if the dialog has not ended (the peer
   never refreshed), `BYE` it.
 
@@ -139,9 +152,14 @@ Two integer fields with the RFC floor enforced at load (and on direct constructi
 ## References
 
 - RFC 4028 (Session Timers): §4/§5 (the 90 s floor), §6 (422 Session Interval Too Small +
-  Min-SE), §7.2/§9 (refresh at SE/2; UAS 2xx Session-Expires + Require: timer; refresher
-  election), §10 (refresher re-INVITE / non-refresher BYE at `SE - min(32, SE/3)`).
-- RFC 3261 §8.1.3.2 (ignore an unparseable header), §14 (re-INVITE), §15 (BYE).
+  Min-SE), §7.2/§9 (refresh at SE/2; the UAS 2xx carries Session-Expires + Supported: timer,
+  and `Require: timer` per §9 Table 2 — required when refresher=uac, allowed when
+  refresher=uas *only if the request advertised Supported: timer*, otherwise omitted;
+  refresher election), §10 (refresher re-INVITE; the refresher BYEs **only** on a
+  timeout / 408 / 481 — other non-2xx follow that response code's rules and retry if
+  possible; non-refresher BYE at `SE - min(32, SE/3)`).
+- RFC 3261 §8.1.3.2 (ignore an unparseable header), §14 / §14.1 (re-INVITE; UAC retries a
+  491 Request Pending after a random 2.1–4 s / 0–2 s interval), §15 (BYE).
 - ADR-0011 (in-dialog re-INVITE/hold), ADR-0053 + PR #135 (SDES re-key continuity),
   ADR-0026 (RTP-inactivity watchdog + teardown reasons), ADR-0059 (admission/teardown),
   ADR-0070 (secure-media guard ordering).

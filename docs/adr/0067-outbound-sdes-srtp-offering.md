@@ -98,22 +98,33 @@ with the keying in §2.
 Every other answer is **rejected, fail-closed**:
 
 - plain `RTP/AVP` (a downgrade of our encrypted offer);
-- `RTP/SAVP` with **no** usable `a=crypto` (absent / malformed / unsupported);
+- **multiple** `a=crypto` lines **as sent on the wire** (an answer must select exactly
+  one — RFC 4568 §5.1.2). The count is the **raw** `a=crypto` line count, not the
+  parse-filtered supported subset: a matching line plus a *malformed* extra has a raw
+  count of two (ambiguous) but filters to one, so counting only the filtered subset would
+  wrongly accept it (codex r2);
+- a single `a=crypto` that is **malformed or an unsupported suite** (the one raw line does
+  not parse — equivalent to no usable key);
 - a crypto whose **tag or suite we did not offer** (keying from it would use parameters
-  we never proposed — a mis-key);
-- **multiple** `a=crypto` lines (an answer must select exactly one — ambiguous).
+  we never proposed — a mis-key).
 
-**Teardown of a rejected 2xx (RFC 3261 §13.2.2.4 + §15 — the codex-r1 BLOCKING fix).** A
-2xx **establishes the dialog** and **MUST be ACKed by the UAC** (the transaction layer
+**Teardown of a rejected 2xx (RFC 3261 §13.2.2.4 + §15 — the codex-r1/r2 BLOCKING fix).**
+A 2xx **establishes the dialog** and **MUST be ACKed by the UAC** (the transaction layer
 auto-ACKs only *non*-2xx; an un-ACKed 2xx leaves a half-open, remote-established dialog +
-retransmits — the same bug fixed inbound in ADR-0065). So the validation runs **after the
-ACK is sent**: on rejection the plugin **ACKs the 2xx, then sends an in-dialog BYE**
-(`_bye_answered_outbound_dialog`) to tear the dialog down, and only then raises
+retransmits — the same bug fixed inbound in ADR-0065). So the dialog is built and the 2xx
+**ACKed FIRST**, and **then** every "we cannot accept this answer" check runs inside one
+`try` whose `except OutboundCallFailed` **sends an in-dialog BYE**
+(`_bye_answered_outbound_dialog`) to tear the dialog down before re-raising
 `OutboundCallFailed(488, …)`; the existing `finally` stops the engine and frees the RTP
-socket. No media is ever started, and no half-open dialog is left on the callee. The
-`OutboundCallFailed` message is **structural** (tags / suites / counts only) — it must
-never carry the offending key or `a=crypto` line (rule 34: it lands in logs, and the repo
-is PUBLIC).
+socket. No media is ever started, and no half-open dialog is left on the callee.
+
+**This single teardown covers BOTH the SDES-crypto rejections above AND the
+codec-acceptance rejections** (no common codec / no voice codec / negotiated codec not
+carriable by the engine / codec dependency unavailable) — those pre-existing 488 paths
+formerly raised *before* the ACK with the same half-open shape, and are now routed through
+the same post-ACK BYE (codex r2). The `OutboundCallFailed` message is **structural** (tags
+/ suites / counts only) — it must never carry the offending key or `a=crypto` line (rule
+34: it lands in logs, and the repo is PUBLIC).
 
 This is **not** a contradiction of ADR-0053's opportunism: opportunism is the
 **answerer's** stance (don't downgrade the *peer's* request). The **offerer** that asked

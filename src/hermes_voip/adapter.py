@@ -712,8 +712,12 @@ class VoipAdapter(BasePlatformAdapter):
     # (``send()`` → :meth:`CallLoop.speak` → sentence aggregation → RTP) consumes ONE
     # complete reply string. Declaring the adapter non-editable makes the gate take its
     # ``if not SUPPORTS_MESSAGE_EDITING: skip streaming`` branch and always deliver the
-    # reply as a single complete ``send()`` — robust regardless of the operator's
-    # Hermes streaming config (ADR-0057 §3).
+    # reply as a single complete ``send()``. This closes the MAIN in-process gateway
+    # path (``gateway/run.py:17767`` skip-streaming branch); the gateway PROXY path
+    # (``gateway/run.py:16769``, taken only when ``GATEWAY_PROXY_URL`` /
+    # ``gateway.proxy_url`` is set) ignores the flag — a documented residual
+    # (ADR-0057 §3), mitigated by keeping Hermes reply streaming off for voip in proxy
+    # mode (runbook 0002 §8f).
     SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: object) -> None:

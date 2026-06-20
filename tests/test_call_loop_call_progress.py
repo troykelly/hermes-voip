@@ -167,12 +167,18 @@ class _FakeTransport:
 class _EmptyTtsStream:
     """A TtsStream that yields no frames (no greeting audio in these tests)."""
 
-    def __aiter__(self) -> AsyncIterator[PcmFrame]:
-        async def _gen() -> AsyncIterator[PcmFrame]:
-            return
-            yield  # pragma: no cover - makes this an async generator
+    def __init__(self) -> None:
+        self._frames: list[PcmFrame] = []
 
-        return _gen()
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self._iter()
+
+    async def _iter(self) -> AsyncIterator[PcmFrame]:
+        for frame in self._frames:  # always empty — forces the async-gen shape
+            yield frame
+
+    async def __anext__(self) -> PcmFrame:
+        raise StopAsyncIteration
 
     async def flush(self) -> None:
         pass
@@ -210,11 +216,13 @@ class _FakeASR:
         return _RATE
 
     def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        finals: list[Transcript] = []
+
         async def _gen() -> AsyncIterator[Transcript]:
             async for _ in audio:
-                pass
-            return
-            yield  # pragma: no cover - makes this an async generator
+                pass  # consume so the pump does not stall
+            for transcript in finals:  # always empty — forces the async-gen shape
+                yield transcript
 
         return _gen()
 
@@ -448,12 +456,17 @@ async def test_voiced_human_short_greeting_then_pause_is_human_not_amd() -> None
     surface LikelyHuman, and NEVER surface AnsweringMachine or ReadyToLeaveMessage
     — the agent must not start leaving a voicemail to a live human.
     """
-    # ~0.8 s of voiced greeting (40 frames) then 1.5 s silence.
+    # ~0.8 s of voiced greeting (40 frames), ~1.6 s silence, then the caller speaks
+    # AGAIN (a second "hello?") — the later onset closes the >= 1 s response-gap
+    # silence so the AMD classifier can decide LikelyHuman (the detector decides a
+    # human pause only on the silence segment that a subsequent onset closes).
     voiced = _voiced_frames(180.0, duration_ms=800, start_idx=0)
-    tail = _silence_frames(duration_ms=1500, start_idx=40)
-    transport = _FakeTransport(voiced + tail)
-    # 25 windows of speech (~0.8 s < 2 s human threshold) then silence windows.
-    probs = [1.0] * 25 + [0.0] * 60
+    gap = _silence_frames(duration_ms=1600, start_idx=40)
+    voiced2 = _voiced_frames(180.0, duration_ms=200, start_idx=120)
+    transport = _FakeTransport(voiced + gap + voiced2)
+    # 25 windows speech (~0.8 s < 2 s human threshold), 50 windows silence (~1.6 s >=
+    # 1 s response gap), then a second onset (the closing edge).
+    probs = [1.0] * 25 + [0.0] * 50 + [1.0] * 6
     vad = VoiceActivityDetector(model=_ScriptedVadModel(probs), sample_rate_hz=_RATE)
     detector = CallProgressDetector(sample_rate=_RATE, outbound=True)
     events, cb = _collect_callback()

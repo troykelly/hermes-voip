@@ -143,10 +143,11 @@ class _FakeTTS:
 
 class _FakeASR:
     async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+        finals: list[object] = []
         async for _ in audio:
-            pass
-        return
-        yield  # pragma: no cover
+            pass  # consume so the pump does not stall
+        for transcript in finals:  # always empty — forces the async-gen shape
+            yield transcript
 
 
 class _FakeGuard:
@@ -205,7 +206,11 @@ async def _build_adapter(
         patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
         patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
     ):
-        return VoipAdapter(config)
+        adapter = VoipAdapter(config)
+    # connect() (which sets _media_cfg from load_media_config) is not called in these
+    # unit tests, so wire the media config the fax-hangup gate reads directly.
+    adapter._media_cfg = media  # type: ignore[assignment]  # test double / MagicMock
+    return adapter
 
 
 def _outbound_info() -> dict[str, object]:
@@ -238,7 +243,7 @@ async def _collect(captured: list[str]) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event", [FaxCng(elapsed_s=0.5), FaxCed(elapsed_s=1.2)])
-async def test_fax_event_hangs_up_when_enabled(event: object) -> None:
+async def test_fax_event_hangs_up_when_enabled(event: FaxCng | FaxCed) -> None:
     """A fax tone auto-hangs-up the call when ``amd_hang_up_on_fax`` is on."""
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
@@ -259,9 +264,7 @@ async def test_fax_event_hangs_up_when_enabled(event: object) -> None:
             hung_up = True
 
     adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]
-    engine = MagicMock()
-
-    await adapter._handle_call_progress(call_id, engine, event)
+    await adapter._handle_call_progress(call_id, event)
 
     assert hung_up is True
 
@@ -288,9 +291,7 @@ async def test_fax_event_does_not_hang_up_when_disabled() -> None:
             hung_up = True
 
     adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]
-    engine = MagicMock()
-
-    await adapter._handle_call_progress(call_id, engine, FaxCng(elapsed_s=0.5))
+    await adapter._handle_call_progress(call_id, FaxCng(elapsed_s=0.5))
 
     assert hung_up is False
 
@@ -316,11 +317,8 @@ async def test_answering_machine_injects_voicemail_context_turn() -> None:
 
     call_id = new_call_id()
     adapter._call_info[call_id] = _outbound_info()
-    engine = MagicMock()
-
     await adapter._handle_call_progress(
         call_id,
-        engine,
         AnsweringMachine(elapsed_s=4.0, beep_at_s=None, why="continuous greeting"),
     )
     await _collect(captured)
@@ -353,10 +351,8 @@ async def test_ready_to_leave_message_injects_record_cue_turn() -> None:
 
     call_id = new_call_id()
     adapter._call_info[call_id] = _outbound_info()
-    engine = MagicMock()
-
     await adapter._handle_call_progress(
-        call_id, engine, ReadyToLeaveMessage(elapsed_s=6.0, beep_at_s=None)
+        call_id, ReadyToLeaveMessage(elapsed_s=6.0, beep_at_s=None)
     )
     await _collect(captured)
 
@@ -400,10 +396,8 @@ async def test_likely_human_injects_no_turn_and_no_hangup() -> None:
             hung_up = True
 
     adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]
-    engine = MagicMock()
-
     await adapter._handle_call_progress(
-        call_id, engine, LikelyHuman(elapsed_s=1.8, why="short greeting then pause")
+        call_id, LikelyHuman(elapsed_s=1.8, why="short greeting then pause")
     )
     # Give any (erroneous) injected turn a chance to land.
     await asyncio.sleep(0.05)

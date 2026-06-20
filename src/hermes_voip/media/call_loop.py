@@ -89,6 +89,7 @@ from enum import Enum
 from typing import Final, Protocol
 
 from hermes_voip.media.audio import generate_tone_frames
+from hermes_voip.media.call_progress import CallProgressDetector, CallProgressEvent
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import SpeechEdge, VadEvent, VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR
@@ -620,6 +621,18 @@ class CallLoop:
             no-input silence window (ADR-0057), AND the DTMF inter-digit timer await.
             Defaults to :func:`asyncio.sleep`; tests inject a controllable sleep for
             determinism (the loop has no other wall-clock dependency).
+        call_progress_detector: The sans-IO :class:`CallProgressDetector` (ADR-0064)
+            for this call, or ``None`` (the default) to leave call-progress detection
+            OFF. When set, the pump feeds every decoded inbound frame to
+            ``on_audio_frame`` and every VAD edge to ``on_vad_event`` — surfacing any
+            emitted :class:`CallProgressEvent` through ``call_progress_callback``. The
+            adapter constructs it with the call's wire sample rate and direction.
+        call_progress_callback: An async callback the loop awaits (off the pump's hot
+            path, as a tracked task) for each :class:`CallProgressEvent` the detector
+            emits, so the adapter can advise the agent (fax => hang up; answering
+            machine => voicemail context; record cue => leave a message). ``None`` (the
+            default) with no detector means the feature is inert. Best-effort: a
+            callback failure is logged and never kills the call (rule 37).
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
@@ -654,6 +667,10 @@ class CallLoop:
         rng: random.Random | None = None,
         dtmf_interdigit_ms: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        call_progress_detector: CallProgressDetector | None = None,
+        call_progress_callback: (
+            Callable[[CallProgressEvent], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         """Store injected dependencies; initialise mutable state."""
         self._transport = transport
@@ -780,6 +797,20 @@ class CallLoop:
         # Strong refs held until done (asyncio keeps only weak refs); cancelled + joined
         # at loop teardown.
         self._dtmf_delivery_tasks: set[asyncio.Task[None]] = set()
+
+        # Call-progress detection (ADR-0064): the sans-IO CallProgressDetector and the
+        # async callback the adapter wires to surface its events to the agent. Both
+        # None => the feature is OFF (the pump skips the feed entirely, zero cost). The
+        # pump is the single place that has BOTH the decoded inbound frame AND its VAD
+        # edges on one shared timeline, which is exactly what the detector's
+        # interleaving-independent no-beep fallback needs (ADR-0064 §Wiring).
+        self._call_progress = call_progress_detector
+        self._call_progress_callback = call_progress_callback
+        # In-flight call-progress callback DELIVERY tasks: surfacing an event runs the
+        # adapter callback (which may inject a turn / hang up — slow), so it is
+        # dispatched as a tracked best-effort task off the pump's hot path, like the
+        # DTMF delivery tasks. Cancelled + joined at loop teardown (no leak).
+        self._call_progress_tasks: set[asyncio.Task[None]] = set()
 
     def bind_confirmation(self, confirmation: _DtmfConfirmationSink) -> None:
         """Bind the armed-confirmation resolver received digits route to (ADR-0010).
@@ -942,6 +973,66 @@ class CallLoop:
         _log.info("dtmf: delivering menu group %r", text)
         await self._deliver_turn(text)
 
+    def _feed_call_progress(
+        self, frame: PcmFrame, frame_events: list[VadEvent]
+    ) -> None:
+        """Feed one inbound frame + its VAD edges to the call-progress detector.
+
+        ADR-0064. A no-op when call-progress is OFF (no detector wired). Otherwise
+        every decoded frame goes to ``on_audio_frame`` (fax CNG/CED both directions +
+        the record-cue beep AND the audio-clock no-beep fallback) and every VAD edge to
+        ``on_vad_event`` (AMD human-vs-machine on outbound). Each emitted
+        :class:`CallProgressEvent` is surfaced to the agent off the hot path via
+        :meth:`_surface_call_progress`. Synchronous: the detector is sans-IO and O(n)
+        per frame (rule 22); only the callback (which may inject a turn / hang up) runs
+        as a task.
+        """
+        detector = self._call_progress
+        if detector is None:
+            return
+        audio_event = detector.on_audio_frame(frame)
+        if audio_event is not None:
+            self._surface_call_progress(audio_event)
+        for vad_event in frame_events:
+            vad_progress = detector.on_vad_event(vad_event)
+            if vad_progress is not None:
+                self._surface_call_progress(vad_progress)
+
+    def _surface_call_progress(self, event: CallProgressEvent) -> None:
+        """Dispatch one call-progress event to the adapter callback as a tracked task.
+
+        The callback may inject a turn or hang the call up (slow, awaits Hermes), so it
+        runs OFF the pump's hot path as a tracked best-effort task — like the DTMF
+        delivery tasks. A no-op when no callback is wired. The done-callback discards
+        the task and logs any failure (rule 37: a surfacing failure must not kill the
+        call), ignoring the expected teardown cancellation.
+        """
+        callback = self._call_progress_callback
+        if callback is None:
+            return
+        _log.info("call-progress: %s at %.2fs", event.kind, event.elapsed_s)
+
+        async def _runner() -> None:
+            await callback(event)
+
+        task = asyncio.create_task(_runner())
+        self._call_progress_tasks.add(task)
+        task.add_done_callback(self._on_call_progress_done)
+
+    def _on_call_progress_done(self, task: asyncio.Task[None]) -> None:
+        """Discard a finished call-progress task; log a failure, ignore cancel.
+
+        Surfacing an event routes through the adapter callback; a failure there is
+        logged and is non-fatal (a dropped advisory must not kill an otherwise-working
+        call). A cancellation only happens at loop teardown.
+        """
+        self._call_progress_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.warning("call-progress surfacing failed (call continues): %r", exc)
+
     async def run(self) -> None:  # noqa: PLR0915 — run() hosts three nested tasks; statement count reflects pipeline complexity, not a refactor opportunity
         """Run the duplex loop until the transport's inbound stream ends.
 
@@ -1046,6 +1137,15 @@ class CallLoop:
                         vad_event.edge.name,
                         vad_event.frame_index,
                     )
+                # Call-progress detection (ADR-0064): feed EVERY decoded frame to
+                # on_audio_frame and EVERY VAD edge to on_vad_event, unconditionally —
+                # NOT gated by the echo-suppression branch below. The detector needs the
+                # continuous audio/sample clock (its no-beep record-cue fallback fires
+                # during post-greeting SILENCE, when no later VAD edge arrives), and its
+                # fax Goertzel runs on the raw decoded tone. Surfaces any emitted event
+                # through the adapter callback off the hot path. No-op when off (no
+                # detector wired).
+                self._feed_call_progress(frame, frame_events)
                 # ``window_index`` (the VAD property) is the NEXT window ordinal, so
                 # the last scored window is one less; -1 before any window is scored
                 # is harmless (no onset is pending then). The echo gate is armed
@@ -1279,6 +1379,17 @@ class CallLoop:
                 delivery.cancel()
             if dtmf_tasks:
                 await asyncio.wait(dtmf_tasks)
+            # The call-progress surfacing tasks (ADR-0064) are tracked outside the
+            # TaskGroup too (dispatched per emitted event). Cancel + JOIN them all so a
+            # mid-flight advisory/hang-up callback never outlives the call. Best-effort
+            # join (like the DTMF tasks): each result is handled by its own
+            # done-callback (rule 37). Snapshot before cancelling (the callbacks mutate
+            # the set).
+            cp_tasks: set[asyncio.Task[None]] = set(self._call_progress_tasks)
+            for cp_task in cp_tasks:
+                cp_task.cancel()
+            if cp_tasks:
+                await asyncio.wait(cp_tasks)
 
     async def speak(
         self,

@@ -2415,6 +2415,7 @@ async def test_run_call_loop_builds_detectors_at_engine_inbound_rate() -> None:
             call_id="call-rate-1",
             engine=engine,
             guard_state=MagicMock(),
+            outbound=False,
         )
 
     assert vad_rates == [8_000]

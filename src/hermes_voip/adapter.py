@@ -44,7 +44,7 @@ import re
 import secrets
 import ssl
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -109,6 +109,15 @@ from hermes_voip.intercom import (
 )
 from hermes_voip.manager import NewCall, RegistrationManager, Unroutable
 from hermes_voip.media.call_loop import BargeInMode, CallLoop
+from hermes_voip.media.call_progress import (
+    AnsweringMachine,
+    CallProgressDetector,
+    CallProgressEvent,
+    FaxCed,
+    FaxCng,
+    LikelyHuman,
+    ReadyToLeaveMessage,
+)
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.engine import (
     OUTBOUND_AUDIO_SSRC,
@@ -2061,10 +2070,13 @@ class VoipAdapter(BasePlatformAdapter):
                 # (→ /stop) at the chokepoint (ADR-0026).
                 _raised = True
                 try:
+                    # Outbound call: AMD/record-cue are live (the callee greeting may be
+                    # an answering machine), ADR-0064.
                     _loop = await self._run_call_loop(
                         call_id=_bg_call_id,
                         engine=_bg_engine,
                         guard_state=_bg_guard_state,
+                        outbound=True,
                     )
                     _raised = False
                 finally:
@@ -2629,10 +2641,13 @@ class VoipAdapter(BasePlatformAdapter):
                 _loop: CallLoop | None = None
                 _raised = True
                 try:
+                    # Outbound call: AMD/record-cue are live (the callee greeting may be
+                    # an answering machine), ADR-0064.
                     _loop = await self._run_call_loop(
                         call_id=_bg_call_id,
                         engine=_bg_engine,
                         guard_state=_bg_guard_state,
+                        outbound=True,
                     )
                     _raised = False
                 finally:
@@ -3124,10 +3139,13 @@ class VoipAdapter(BasePlatformAdapter):
         # it False, so any propagating exception classifies as a failure.
         loop_raised = True
         try:
+            # Inbound call: the agent IS the answerer, so AMD/record-cue are inert;
+            # fax detection still runs both directions (ADR-0064).
             this_call_loop = await self._run_call_loop(
                 call_id=call_id,
                 engine=engine,
                 guard_state=guard_state,
+                outbound=False,
             )
             loop_raised = False
         finally:
@@ -4191,12 +4209,18 @@ class VoipAdapter(BasePlatformAdapter):
         call_id: str,
         engine: RtpMediaTransport,
         guard_state: GuardSessionState,
+        outbound: bool,
     ) -> CallLoop:
         """Build the per-call ``CallLoop``, drive it to completion, return it.
 
         The returned ``CallLoop`` is THIS task's object; the caller passes it to
         ``_teardown_call`` for the identity-based isolation check that prevents
         a concurrent task's teardown from removing a still-running call's loop.
+
+        ``outbound`` is ``True`` for an agent-placed call and ``False`` for an inbound
+        call; it sets the call-progress detector's direction (ADR-0064) — AMD/record-cue
+        run only on outbound (on inbound the agent IS the answerer), while fax detection
+        runs both directions.
 
         Raises if providers/media config are absent or any collaborator
         construction fails; the caller's ``finally`` performs teardown.
@@ -4232,6 +4256,33 @@ class VoipAdapter(BasePlatformAdapter):
             media_cfg.barge_in_min_speech_ms, inbound_rate
         )
         barge_in_tail_windows = windows_for_ms(media_cfg.barge_in_tail_ms, inbound_rate)
+
+        # Call-progress detection (ADR-0064): when enabled, build the sans-IO detector
+        # at the engine's wire rate. AMD is gated by BOTH the call direction (outbound)
+        # AND the enable_amd sub-switch — passing outbound=False keeps the detector's
+        # AMD/record-cue path inert (fax detection, which is direction-independent,
+        # still runs). Off entirely => no detector, the CallLoop pump skips the feed
+        # (zero cost). The callback surfaces events to the agent.
+        call_progress_detector: CallProgressDetector | None = None
+        call_progress_callback: (
+            Callable[[CallProgressEvent], Awaitable[None]] | None
+        ) = None
+        if media_cfg.enable_call_progress:
+            amd_active = outbound and media_cfg.enable_amd
+            call_progress_detector = CallProgressDetector(
+                sample_rate=inbound_rate, outbound=amd_active
+            )
+
+            async def _on_call_progress(event: CallProgressEvent) -> None:
+                await self._handle_call_progress(call_id, event)
+
+            call_progress_callback = _on_call_progress
+            _log.info(
+                "INVITE %s: call-progress detection on (amd=%s, fax_hangup=%s)",
+                call_id,
+                amd_active,
+                media_cfg.amd_hang_up_on_fax,
+            )
 
         call_loop = CallLoop(
             transport=engine,
@@ -4275,6 +4326,11 @@ class VoipAdapter(BasePlatformAdapter):
             # with no ``#`` terminator is delivered after this gap. None => the loop's
             # built-in default. Drives real behaviour for HERMES_SIP_DTMF_INTERDIGIT_MS.
             dtmf_interdigit_ms=media_cfg.dtmf_interdigit_ms,
+            # Call-progress detection (ADR-0064): the pump feeds the detector and
+            # surfaces fax/AMD/record-cue events to the agent via the callback. Both
+            # None when the feature is off (the pump skips the feed entirely).
+            call_progress_detector=call_progress_detector,
+            call_progress_callback=call_progress_callback,
         )
         self._call_loops[call_id] = call_loop
         # Wire inbound DTMF receive (ADR-0010): resolve the per-call receive mode from
@@ -4287,6 +4343,120 @@ class VoipAdapter(BasePlatformAdapter):
         _log.info("INVITE %s: CallLoop started", call_id)
         await call_loop.run()
         return call_loop
+
+    async def _handle_call_progress(
+        self,
+        call_id: str,
+        event: CallProgressEvent,
+    ) -> None:
+        """Act on one call-progress event: advise the agent, hang up on fax (ADR-0064).
+
+        The CallLoop pump surfaces each :class:`CallProgressEvent` here (off its hot
+        path). Operator intent: detect fax + answering machine, ADVISE the agent, and
+        let the agent decide (for an answering machine) whether to hang up or wait and
+        leave a message. So:
+
+        * ``FaxCng`` / ``FaxCed`` — a fax cannot converse. When ``amd_hang_up_on_fax``
+          is on (the default), auto hang up (a soft AGENT_HANGUP, like the hang_up
+          tool); either way inject a system turn so the agent knows what happened.
+        * ``AnsweringMachine`` — inject a system turn telling the agent it reached
+          voicemail, so the agent decides whether to hang up or wait and leave a
+          message (the agent's call-control tools, ADR-0009/0010/0029/0031).
+        * ``ReadyToLeaveMessage`` — inject the record cue: the agent may now speak its
+          message (the beep fired, or the greeting ended and the line went silent).
+        * ``LikelyHuman`` — advisory only; the normal case, no injected turn, no hangup.
+
+        Matches exhaustively on the event type (rule 17). Best-effort: a failure here is
+        logged and never strands the call (rule 37); the CallLoop's surfacing-task
+        done-callback also catches anything that escapes.
+        """
+        if isinstance(event, (FaxCng, FaxCed)):
+            await self._handle_fax_event(call_id, event)
+            return
+        if isinstance(event, AnsweringMachine):
+            text = (
+                "[System: this call reached an ANSWERING MACHINE / voicemail "
+                f"(detected after {event.elapsed_s:.1f}s: {_defang_fence(event.why)}). "
+                "Decide whether to hang up now (hang_up) or wait for the record tone "
+                "and leave a concise message pursuing your objective. You will be told "
+                "when it is time to leave the message.]"
+            )
+            await self._inject_call_progress_turn(call_id, text)
+            return
+        if isinstance(event, ReadyToLeaveMessage):
+            text = (
+                "[System: the answering machine is now READY TO RECORD — leave your "
+                "message now if you intend to. Speak a concise voicemail pursuing your "
+                "objective, then hang up (hang_up) when done.]"
+            )
+            await self._inject_call_progress_turn(call_id, text)
+            return
+        if isinstance(event, LikelyHuman):
+            # The normal case (a live person answered): advisory only — no system turn,
+            # no hangup. The conversational pipeline handles the human from here.
+            _log.info(
+                "call %s: call-progress LikelyHuman (%s) — no action",
+                call_id,
+                event.why,
+            )
+            return
+
+    async def _handle_fax_event(self, call_id: str, event: FaxCng | FaxCed) -> None:
+        """Advise the agent of a fax tone and (config-gated) auto hang up (ADR-0064)."""
+        media_cfg = self._media_cfg
+        hang_up = media_cfg is None or media_cfg.amd_hang_up_on_fax
+        kind = "calling fax (CNG)" if isinstance(event, FaxCng) else "fax/modem (CED)"
+        _log.info(
+            "call %s: fax tone detected (%s at %.1fs); hang_up=%s",
+            call_id,
+            kind,
+            event.elapsed_s,
+            hang_up,
+        )
+        text = (
+            f"[System: a FAX tone was detected on this call ({kind}). A fax line "
+            "cannot hold a conversation"
+            + (
+                "; the call is being hung up."
+                if hang_up
+                else ". Decide how to proceed (e.g. hang_up)."
+            )
+            + "]"
+        )
+        await self._inject_call_progress_turn(call_id, text)
+        if hang_up:
+            await self.hang_up_call(call_id)
+
+    async def _inject_call_progress_turn(self, call_id: str, text: str) -> None:
+        """Inject a call-progress system turn into the call's OWN session (ADR-0064).
+
+        Mirrors the objective / call-context first-turn injections: one
+        ``internal=True`` :class:`MessageEvent` on the call's channel (``chat_id`` ==
+        Call-ID), framed as a trusted system directive (it is generated from our own
+        detector, not caller-supplied). Best-effort: a failure is logged, never raised,
+        so it cannot strand the call (rule 37).
+        """
+        info = self._call_info.get(call_id, {})
+        party = str(info.get("name", call_id))
+        try:
+            source = self._call_source(
+                call_id,
+                chat_name=party,
+                user_id=call_id,
+                user_name="system",
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.VOICE,
+                source=source,
+                media_urls=[],
+                internal=True,
+            )
+            await self.handle_message(event)
+        except Exception as exc:  # noqa: BLE001 — best-effort advisory; never strand the call
+            _log.warning(
+                "call %s: failed to inject call-progress turn: %s", call_id, exc
+            )
 
     def _wire_dtmf_receive(
         self,

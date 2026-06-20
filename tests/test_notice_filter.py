@@ -125,6 +125,44 @@ _SUBAGENT_ACK = (
     "(use /stop to cancel everything)."
 )
 
+# A realistic *long namespaced MCP tool name* inside the status detail. The
+# gateway interpolates the running tool verbatim into `status_detail` and the
+# tool name is UNBOUNDED (vendored gateway/run.py builds
+# " (… running: {current_tool})" with no length limit). Real MCP servers expose
+# tools like ``mcp__<server>__<verb>_<long_descriptive_suffix>`` — easily 60-110+
+# characters. With a short tool ("place_call", gap ~55) the ack was suppressed;
+# with a long namespaced tool the opening→tail distance exceeds a fixed-width gap,
+# so the matcher must key on the gateway's *structure* (the optional "(…)" status
+# detail is unbounded but is the only unbounded element) rather than a char cap.
+_LONG_TOOL = "mcp__atlassian_confluence__create_page_in_space_with_attachments"
+_LONGER_TOOL = (
+    "mcp__atlassian_confluence__create_page_in_space_with_attachments"
+    "_and_inline_comments_and_labels_and_backlinks"
+)
+
+# The same four busy modes, but with a long namespaced MCP tool in the status
+# detail. These are the verbatim shapes the gateway emits — interrupt/queued/
+# steered close the opening sentence with the "(…)." status detail then a period;
+# subagent uses the em-dash separator with its parenthetical detail. EVERY one of
+# these is spoken to the caller today (the leak this fix closes) because the long
+# tool name pushes the opening→tail distance past the old 90-char gap cap.
+_INTERRUPT_ACK_LONG_TOOL = (
+    f"⚡ Interrupting current task (3 min elapsed, iteration 2/5, "
+    f"running: {_LONG_TOOL}). I'll respond to your message shortly."
+)
+_QUEUED_ACK_LONG_TOOL = (
+    f"⏳ Queued for the next turn (3 min elapsed, iteration 2/5, "
+    f"running: {_LONG_TOOL}). I'll respond once the current task finishes."
+)
+_STEERED_ACK_LONG_TOOL = (
+    f"⏩ Steered into current run (3 min elapsed, iteration 2/5, "
+    f"running: {_LONG_TOOL}). Your message arrives after the next tool call."
+)
+_SUBAGENT_ACK_LONG_TOOL = (
+    f"⏳ Subagent working ({_LONGER_TOOL}) — your message is queued for "
+    f"when it finishes (use /stop to cancel everything)."
+)
+
 
 @pytest.mark.parametrize(
     "ack",
@@ -134,6 +172,12 @@ _SUBAGENT_ACK = (
         _QUEUED_ACK,
         _STEERED_ACK,
         _SUBAGENT_ACK,
+        # All four busy modes with a long namespaced MCP tool name in the status
+        # detail — the leak this fix closes (gap exceeds the old 90-char cap).
+        _INTERRUPT_ACK_LONG_TOOL,
+        _QUEUED_ACK_LONG_TOOL,
+        _STEERED_ACK_LONG_TOOL,
+        _SUBAGENT_ACK_LONG_TOOL,
     ],
 )
 def test_interruption_acks_are_recognised(ack: str) -> None:
@@ -149,6 +193,12 @@ def test_interruption_acks_are_recognised(ack: str) -> None:
         _QUEUED_ACK,
         _STEERED_ACK,
         _SUBAGENT_ACK,
+        # The long-tool variants must reach the send() guard's drop too — a long
+        # MCP tool name must never make the busy-ack audible to the caller.
+        _INTERRUPT_ACK_LONG_TOOL,
+        _QUEUED_ACK_LONG_TOOL,
+        _STEERED_ACK_LONG_TOOL,
+        _SUBAGENT_ACK_LONG_TOOL,
     ],
 )
 def test_interruption_acks_are_internal_notices(ack: str) -> None:
@@ -188,6 +238,57 @@ def test_genuine_replies_are_not_interruption_acks(reply: str) -> None:
     ("Interrupting current task … I'll respond", "Queued for the next turn …",
     "Steered into current run …", "Subagent working … your message is queued"),
     which natural speech does not reproduce verbatim.
+    """
+    assert is_interruption_ack(reply) is False
+    assert is_internal_system_notice(reply) is False
+
+
+@pytest.mark.parametrize("tool_len", [1, 10, 60, 90, 120, 240])
+def test_interruption_ack_suppressed_regardless_of_tool_name_length(
+    tool_len: int,
+) -> None:
+    """The busy-ack is suppressed for ANY running-tool name length.
+
+    Regression guard for the long-tool leak: the gateway interpolates the running
+    tool name into the status detail unbounded, so the opening→tail distance grows
+    with the tool name. A fixed-width gap cap let a long namespaced MCP tool slip
+    past suppression and be spoken to the caller. The matcher must depend on the
+    gateway's *structure* (the optional "(…)" detail), not the tool's length, so
+    every length — short, around the old cap, and far beyond it — is suppressed.
+    """
+    tool = "mcp__server__" + ("x" * tool_len)
+    interrupt = (
+        f"⚡ Interrupting current task (4 min elapsed, iteration 2/9, "
+        f"running: {tool}). I'll respond to your message shortly."
+    )
+    assert is_interruption_ack(interrupt) is True
+    assert is_internal_system_notice(interrupt) is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The matcher must not bridge an opening and its tail across ARBITRARY
+        # prose just because the gateway's keywords appear — a structural gap
+        # (whitespace / a sentence period / an em-dash / one "(…)" status detail)
+        # is the only thing it accepts between the halves. These contrived replies
+        # carry both an opening phrase and a tail phrase but separated by real
+        # conversational words, so they are NOT the gateway ack and must be spoken.
+        "Queued for the next turn? No — I'll respond to you right now, I promise.",
+        "Steered into current run? Actually, your message arrives only after lunch.",
+        "Interrupting current task management is genuinely hard, but I'll respond.",
+        "Subagent working today is going well, but your message is queued is wrong.",
+    ],
+)
+def test_prose_between_opening_and_tail_is_not_an_ack(reply: str) -> None:
+    r"""Real prose between the gateway's opening and tail is not the ack.
+
+    The previous fixed-width wildcard gap (``[^\n]{0,90}?``) would bridge an
+    opening and a tail across up to ~90 chars of *any* text. The structural gap
+    accepts only the connectives the gateway actually emits (whitespace, the
+    opening's terminating period, the subagent em-dash, and at most one unbounded
+    ``(…)`` status detail), so a sentence of ordinary words between the halves is
+    not classified as a busy-ack — these legitimate replies are still spoken.
     """
     assert is_interruption_ack(reply) is False
     assert is_internal_system_notice(reply) is False

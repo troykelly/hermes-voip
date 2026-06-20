@@ -76,12 +76,35 @@ _NO_HOME_CHANNEL_RE = re.compile(
 #   queued    -> opens "Queued for the next turn",  tail "I'll respond"
 #   steered   -> opens "Steered into current run",  tail "Your message arrives"
 #   subagent  -> opens "Subagent working",          tail "your message is queued"
-# The optional " (N min elapsed, iteration X/Y, running: <tool>)." status detail —
-# which ends the opening sentence with a period — can sit between the two halves, so
-# the gap (``_ACK_GAP``) allows up to ~one short clause (90 chars incl. that period)
-# but not arbitrary prose. Emoji glyphs are TTS-dependent and NOT matched; only the
+#
+# Between the two halves the gateway emits ONLY structural connective text, never
+# prose: whitespace, the opening sentence's terminating period, the subagent
+# form's em-dash, and — optionally — exactly ONE status-detail parenthetical
+# " (N min elapsed, iteration X/Y, running: <tool>)". The interpolated ``<tool>``
+# is UNBOUNDED (run.py interpolates the running tool name with no length limit), so
+# a realistic long namespaced MCP tool ("mcp__server__verb_long_suffix", 60-110+
+# chars) is the only part of the gap that grows. ``_ACK_GAP`` therefore matches
+# that structure directly — a short run of connective punctuation/whitespace plus
+# at most one unbounded ``(...)`` group — instead of a fixed-width wildcard. A
+# fixed cap (formerly ``[^\n]{0,90}?``) failed BOTH ways: a long tool name pushed
+# the tail out of reach and the ack LEAKED to TTS, while ~90 chars of arbitrary
+# text could bridge an opening to a tail that were really separate sentences. The
+# structural gap is immune to tool length yet refuses to span ordinary prose
+# (letters/commas/question-marks are not connective), so only the gateway's own
+# shape is suppressed. Emoji glyphs are TTS-dependent and NOT matched; only the
 # wording is. (Natural conversational speech does not reproduce a full pair verbatim.)
-_ACK_GAP = r"[^\n]{0,90}?"
+#
+# ``_ACK_CONNECT`` is the connective character class the gateway puts between the
+# halves: whitespace, the opening sentence's terminating period, a hyphen, and the
+# subagent form's em-dash (U+2014, written as the ``—`` escape so the literal
+# is unambiguous in source). ``_ACK_GAP`` is a short run of it wrapping at most one
+# unbounded ``(...)`` status detail (whose interior is paren-free and newline-free).
+_ACK_CONNECT = "[\\s.\u2014-]"
+_ACK_GAP = (
+    rf"{_ACK_CONNECT}{{0,4}}"
+    rf"(?:\([^()\n]*\){_ACK_CONNECT}{{0,4}})?"
+    rf"{_ACK_CONNECT}{{0,4}}"
+)
 _INTERRUPTION_ACK_RE = re.compile(
     rf"\binterrupting\s+current\s+task\b{_ACK_GAP}\bi['\u2019]?ll\s+respond\b"
     rf"|\bqueued\s+for\s+the\s+next\s+turn\b{_ACK_GAP}\bi['\u2019]?ll\s+respond\b"

@@ -20,11 +20,16 @@ import pytest
 from hermes_voip.session_timer import (
     MIN_SE_FLOOR,
     AcceptTimers,
+    RefreshContinue,
     Refresher,
+    RefreshRetry,
+    RefreshTeardown,
     Reject422,
     SessionExpires,
     build_session_expires_value,
+    classify_refresh_failure,
     elect_refresher,
+    glare_backoff_secs,
     negotiate_uas_timers,
     parse_min_se,
     refresh_interval_secs,
@@ -297,3 +302,92 @@ def test_build_session_expires_value_round_trips_through_parse() -> None:
     parsed = SessionExpires.parse(rendered)
     assert parsed.delta == 1234
     assert parsed.refresher is Refresher.UAC
+
+
+# ---------------------------------------------------------------------------
+# Refresh-failure classification (RFC 4028 §10 + RFC 3261 §14.1).
+#
+# A failed session-refresh re-INVITE must NOT always BYE the call. Only a
+# timeout / 408 / 481 means the dialog is dead (BYE); a 491 is glare and MUST be
+# retried after a randomized backoff; every other non-2xx is transient and the
+# call CONTINUES (the next SE/2 tick / the peer's own deadline still protects
+# liveness).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_refresh_timeout_is_teardown() -> None:
+    """A refresh with no final response (timeout) means a dead dialog → BYE."""
+    assert classify_refresh_failure(None) == RefreshTeardown()
+
+
+@pytest.mark.parametrize("status", [408, 481])
+def test_classify_refresh_408_481_is_teardown(status: int) -> None:
+    """RFC 4028 §10: 408 Request Timeout / 481 Call Leg Does Not Exist → BYE."""
+    assert classify_refresh_failure(status) == RefreshTeardown()
+
+
+def test_classify_refresh_491_is_retry() -> None:
+    """RFC 4028 §10 / RFC 3261 §14.1: 491 glare is retried, never torn down."""
+    assert classify_refresh_failure(491) == RefreshRetry()
+
+
+@pytest.mark.parametrize("status", [488, 500, 503, 600, 603])
+def test_classify_refresh_other_non_2xx_continues(status: int) -> None:
+    """A transient non-2xx (5xx/6xx/488…) must NOT kill a live call — continue."""
+    assert classify_refresh_failure(status) == RefreshContinue(status_code=status)
+
+
+def test_classify_refresh_actions_are_distinct_types() -> None:
+    """The three outcomes are distinct discriminated types (exhaustive branching)."""
+    teardown = classify_refresh_failure(481)
+    retry = classify_refresh_failure(491)
+    cont = classify_refresh_failure(503)
+    assert isinstance(teardown, RefreshTeardown)
+    assert isinstance(retry, RefreshRetry)
+    assert isinstance(cont, RefreshContinue)
+    assert not isinstance(retry, RefreshTeardown)
+    assert not isinstance(cont, RefreshTeardown)
+
+
+# ---------------------------------------------------------------------------
+# 491 glare backoff window (RFC 3261 §14.1).
+#
+# When WE are the UAC of the original INVITE the retry waits a random interval
+# uniformly distributed 2.1-4.0 s; when WE are the UAS it is 0-2.0 s. The window
+# is computed by an injected ``uniform`` so the test is deterministic.
+# ---------------------------------------------------------------------------
+
+
+def test_glare_backoff_uac_window_is_2_1_to_4() -> None:
+    """The UAC retry window is [2.1, 4.0] s (RFC 3261 §14.1)."""
+    seen: list[tuple[float, float]] = []
+
+    def _fake_uniform(low: float, high: float) -> float:
+        seen.append((low, high))
+        return low
+
+    secs = glare_backoff_secs(Refresher.UAC, uniform=_fake_uniform)
+    assert seen == [(2.1, 4.0)]
+    assert secs == pytest.approx(2.1)
+
+
+def test_glare_backoff_uas_window_is_0_to_2() -> None:
+    """The UAS retry window is [0.0, 2.0] s (RFC 3261 §14.1)."""
+    seen: list[tuple[float, float]] = []
+
+    def _fake_uniform(low: float, high: float) -> float:
+        seen.append((low, high))
+        return high
+
+    secs = glare_backoff_secs(Refresher.UAS, uniform=_fake_uniform)
+    assert seen == [(0.0, 2.0)]
+    assert secs == pytest.approx(2.0)
+
+
+def test_glare_backoff_default_uniform_stays_in_window() -> None:
+    """The default (real ``random.uniform``) backoff stays inside the RFC window."""
+    for _ in range(200):
+        uac = glare_backoff_secs(Refresher.UAC)
+        uas = glare_backoff_secs(Refresher.UAS)
+        assert 2.1 <= uac <= 4.0
+        assert 0.0 <= uas <= 2.0

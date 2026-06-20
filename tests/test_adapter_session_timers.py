@@ -47,7 +47,7 @@ from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
-from hermes_voip.session_timer import SessionExpires
+from hermes_voip.session_timer import Refresher, SessionExpires
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -96,7 +96,7 @@ def _register_voip_platform() -> None:
 # Fakes (no real network / ML). Mirror tests/test_adapter_secure_media.py.
 # ---------------------------------------------------------------------------
 class _FakeTransport:
-    def __init__(self, *, local_sent_by: str = "172.23.0.2:5061") -> None:
+    def __init__(self, *, local_sent_by: str = "127.0.0.1:5061") -> None:
         self.sent: list[str] = []
         self._local_sent_by = local_sent_by
         self._sinks: dict[str, object] = {}
@@ -589,6 +589,430 @@ async def test_refresh_failure_byes_the_dialog() -> None:
     assert byes, "a failed session refresh must BYE the dialog"
     assert session.ended, (
         "the session should be marked ended after the refresh-failure BYE"
+    )
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
+# (f) refresh-failure CLASSIFICATION (RFC 4028 §10 + RFC 3261 §14.1).
+#
+# The refresher watchdog must NOT BYE on every non-2xx refresh response:
+#   * 491 (glare)            -> RETRY after a randomized backoff, no BYE;
+#   * 408 / 481 / timeout    -> BYE (the dialog is dead);
+#   * any other non-2xx (5xx)-> log + CONTINUE, no BYE.
+# These drive the real watchdog through the controllable sleep seam + a fake
+# transport that scripts each refresh attempt's response status.
+# ===========================================================================
+
+
+def _drive_inbound_call_to_established(
+    adapter: VoipAdapter,
+    transport: _FakeTransport,
+    call_id: str,
+    *,
+    session_expires: str,
+) -> SipRequest:
+    """Build + dispatch an inbound INVITE that engages a UAS refresher watchdog."""
+    invite = SipRequest.parse(
+        _make_invite(
+            _SDP_PLAIN,
+            call_id,
+            session_expires=session_expires,
+            supported_timer=True,
+        )
+    )
+    adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+    return invite
+
+
+class _ScriptedRefreshResponder:
+    """Answers each refresh re-INVITE (by CSeq order) with a scripted status.
+
+    ``responses`` is the per-attempt list of ``(status, reason)`` the test gateway
+    returns to the Nth refresh re-INVITE. A ``status`` of ``None`` means *do not
+    answer* — drop the refresh so it times out (drives the timeout → BYE path).
+    """
+
+    def __init__(
+        self,
+        transport: _FakeTransport,
+        session: object,
+        responses: list[tuple[int, str] | None],
+    ) -> None:
+        self._transport = transport
+        self._session = session
+        self._responses = responses
+        self._seen: set[int] = set()
+        self.attempts: list[int] = []
+
+    async def run(self) -> None:
+        while True:
+            for req in _sent_requests(self._transport, "INVITE"):
+                cseq = req.header("CSeq") or ""
+                num = int(cseq.split()[0]) if cseq.split() else 0
+                if num in self._seen:
+                    continue
+                self._seen.add(num)
+                self.attempts.append(num)
+                idx = len(self.attempts) - 1
+                scripted = (
+                    self._responses[idx] if idx < len(self._responses) else (200, "OK")
+                )
+                if scripted is None:
+                    continue  # drop -> the refresh times out
+                status, reason = scripted
+                with_sdp = 200 <= status < 300
+                resp = _build_response_for(
+                    req, self._session, status, reason, with_sdp=with_sdp
+                )
+                await self._session.on_response(SipResponse.parse(resp))  # type: ignore[attr-defined]
+            await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_refresh_491_glare_is_retried_not_byed() -> None:
+    """A 491 to our refresh re-INVITE is retried after backoff — the call is NOT BYE'd.
+
+    RFC 4028 §10 / RFC 3261 §14.1: 491 is glare, not a dead dialog. The watchdog
+    must back off (a randomized interval) and re-send the refresh, never tear the
+    live call down.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+
+    # Release the first TWO SE/2 refresh sleeps (so a retry's next cadence sleep also
+    # runs), block the rest. The backoff sleep returns immediately (recorded).
+    se_sleeps: list[float] = []
+    backoff_sleeps: list[float] = []
+    release_budget = 2
+
+    async def _fake_sleep(secs: float) -> None:
+        se_sleeps.append(secs)
+        if len(se_sleeps) <= release_budget:
+            return
+        await asyncio.Event().wait()
+
+    async def _fake_backoff(secs: float) -> None:
+        backoff_sleeps.append(secs)
+
+    adapter._session_timer_sleep = _fake_sleep
+    adapter._session_timer_backoff_sleep = _fake_backoff
+
+    call_id = new_call_id()
+    with _patched_invite_env(block_loop=True):
+        _drive_inbound_call_to_established(
+            adapter, transport, call_id, session_expires="600;refresher=uas"
+        )
+        await _until(lambda: call_id in adapter._call_sessions)
+        session = adapter._call_sessions[call_id]
+
+        # First refresh -> 491 glare; second refresh -> 200 OK (proves the retry).
+        responder = _ScriptedRefreshResponder(
+            transport, session, [(491, "Request Pending"), (200, "OK")]
+        )
+        task = asyncio.create_task(responder.run())
+        try:
+            await _until(lambda: len(responder.attempts) >= 2, timeout=3.0)
+            # Give any erroneous BYE a chance to be emitted (it must NOT be).
+            await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert len(responder.attempts) >= 2, (
+        "a 491 glare must trigger a retried refresh re-INVITE"
+    )
+    assert backoff_sleeps, "a 491 retry must wait a randomized backoff before retrying"
+    assert not _sent_requests(transport, "BYE"), (
+        "a 491 glare must NOT tear the call down (no BYE)"
+    )
+    assert not session.ended, "the call must stay up across a 491 glare retry"
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_refresh_408_byes_the_dialog() -> None:
+    """A 408 Request Timeout to our refresh tears the dialog down (BYE).
+
+    RFC 4028 §10: a timeout / 408 means the dialog is dead — BYE it. (The literal
+    no-response timeout maps to the same :class:`RefreshTeardown` outcome; that
+    mapping is covered by ``test_classify_refresh_timeout_is_teardown`` in
+    ``tests/test_session_timer.py``. Here we drive the 408 final deterministically.)
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+
+    first_released = asyncio.Event()
+    se_sleeps: list[float] = []
+
+    async def _fake_sleep(secs: float) -> None:
+        se_sleeps.append(secs)
+        if len(se_sleeps) == 1:
+            first_released.set()
+            return
+        await asyncio.Event().wait()
+
+    adapter._session_timer_sleep = _fake_sleep
+
+    call_id = new_call_id()
+    with _patched_invite_env(block_loop=True):
+        _drive_inbound_call_to_established(
+            adapter, transport, call_id, session_expires="600;refresher=uas"
+        )
+        await _until(lambda: call_id in adapter._call_sessions)
+        session = adapter._call_sessions[call_id]
+        await _until(first_released.is_set)
+
+        responder = _ScriptedRefreshResponder(
+            transport, session, [(408, "Request Timeout")]
+        )
+        task = asyncio.create_task(responder.run())
+        try:
+            await _until(lambda: bool(_sent_requests(transport, "BYE")), timeout=3.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert _sent_requests(transport, "BYE"), "a 408 refresh must BYE the dialog"
+    assert session.ended, "the session must be ended after the 408 BYE"
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_refresh_481_byes_the_dialog() -> None:
+    """A 481 Call Leg/Transaction Does Not Exist to our refresh BYEs the dialog.
+
+    RFC 4028 §10: 481 (like 408) means the dialog is gone — BYE it.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+
+    first_released = asyncio.Event()
+    se_sleeps: list[float] = []
+
+    async def _fake_sleep(secs: float) -> None:
+        se_sleeps.append(secs)
+        if len(se_sleeps) == 1:
+            first_released.set()
+            return
+        await asyncio.Event().wait()
+
+    adapter._session_timer_sleep = _fake_sleep
+
+    call_id = new_call_id()
+    with _patched_invite_env(block_loop=True):
+        _drive_inbound_call_to_established(
+            adapter, transport, call_id, session_expires="600;refresher=uas"
+        )
+        await _until(lambda: call_id in adapter._call_sessions)
+        session = adapter._call_sessions[call_id]
+        await _until(first_released.is_set)
+
+        responder = _ScriptedRefreshResponder(
+            transport, session, [(481, "Call/Transaction Does Not Exist")]
+        )
+        task = asyncio.create_task(responder.run())
+        try:
+            await _until(lambda: bool(_sent_requests(transport, "BYE")), timeout=3.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert _sent_requests(transport, "BYE"), "a 481 refresh must BYE the dialog"
+    assert session.ended, "the session must be ended after the 481 BYE"
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_refresh_transient_5xx_continues_without_bye() -> None:
+    """A transient 5xx to our refresh must NOT BYE — log a warning and continue.
+
+    RFC 4028 §10: only timeout/408/481 mean a dead dialog. A 503 is transient; the
+    next SE/2 tick (or the peer's own deadline) still protects liveness, so the call
+    stays up.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+
+    se_sleeps: list[float] = []
+    release_budget = 2
+
+    async def _fake_sleep(secs: float) -> None:
+        se_sleeps.append(secs)
+        if len(se_sleeps) <= release_budget:
+            return
+        await asyncio.Event().wait()
+
+    adapter._session_timer_sleep = _fake_sleep
+
+    call_id = new_call_id()
+    with _patched_invite_env(block_loop=True):
+        _drive_inbound_call_to_established(
+            adapter, transport, call_id, session_expires="600;refresher=uas"
+        )
+        await _until(lambda: call_id in adapter._call_sessions)
+        session = adapter._call_sessions[call_id]
+
+        # First refresh -> 503 (transient); the watchdog must continue to a 2nd refresh.
+        responder = _ScriptedRefreshResponder(
+            transport, session, [(503, "Service Unavailable"), (200, "OK")]
+        )
+        task = asyncio.create_task(responder.run())
+        try:
+            await _until(lambda: len(responder.attempts) >= 2, timeout=3.0)
+            await asyncio.sleep(0.02)  # let any erroneous BYE surface
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert len(responder.attempts) >= 2, (
+        "after a transient 5xx the watchdog must continue and refresh again"
+    )
+    assert not _sent_requests(transport, "BYE"), (
+        "a transient 5xx must NOT tear the call down (no BYE)"
+    )
+    assert not session.ended, "the call must stay up across a transient 5xx refresh"
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
+# (g) FINDING 2 — Require: timer is gated on the peer's Supported: timer.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_inbound_timer_ignorant_peer_omits_require_timer() -> None:
+    """A peer that did NOT advertise Supported: timer gets NO Require: timer.
+
+    RFC 4028 §9: ``Require: timer`` is only valid when the refresher is the UAC,
+    which a timer-ignorant UAC can never be. We still insert our Session-Expires +
+    Supported: timer and become the (UAS) refresher, but MUST omit Require: timer.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+    # No Session-Expires AND no Supported: timer -> the peer is timer-ignorant.
+    invite = SipRequest.parse(
+        _make_invite(_SDP_PLAIN, call_id, session_expires=None, supported_timer=False)
+    )
+
+    with _patched_invite_env():
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: any(m.startswith("SIP/2.0 200") for m in transport.sent))
+        await asyncio.sleep(0)
+
+    ok = next(r for r in _sent_responses(transport) if r.status_code == 200)
+    # We still engage timers as the UAS: Session-Expires + Supported: timer present.
+    se_hdr = ok.header("Session-Expires")
+    assert se_hdr is not None, "we still insert our own Session-Expires (UAS refresher)"
+    assert SessionExpires.parse(se_hdr).delta == 600
+    supported = ",".join(ok.headers_all("Supported")).lower()
+    assert "timer" in supported, "the 200 OK still advertises Supported: timer"
+    # But Require: timer MUST be absent for a timer-ignorant peer (RFC 4028 §9).
+    require = ",".join(ok.headers_all("Require")).lower()
+    assert "timer" not in require, (
+        f"Require: timer must be OMITTED to a timer-ignorant UAC; got {require!r}"
+    )
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_inbound_uac_refresher_still_requires_timer() -> None:
+    """An inbound INVITE pinning refresher=uac still gets Require: timer in the 2xx.
+
+    RFC 4028 §9: when the refresher is the UAC the UAS MUST add Require: timer. This
+    locks the positive branch so the §9 gating did not over-correct.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+    invite = SipRequest.parse(
+        _make_invite(
+            _SDP_PLAIN,
+            call_id,
+            session_expires="600;refresher=uac",
+            supported_timer=True,
+        )
+    )
+
+    with _patched_invite_env():
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: any(m.startswith("SIP/2.0 200") for m in transport.sent))
+        await asyncio.sleep(0)
+
+    ok = next(r for r in _sent_responses(transport) if r.status_code == 200)
+    se = SessionExpires.parse(ok.header("Session-Expires") or "")
+    assert se.refresher is Refresher.UAC, "the peer pinned refresher=uac; honour it"
+    require = ",".join(ok.headers_all("Require")).lower()
+    assert "timer" in require, (
+        f"refresher=uac MUST carry Require: timer (RFC 4028 §9); got {require!r}"
+    )
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
+# (h) FINDING 3 — a held call's refresh re-asserts hold (sendonly), not sendrecv.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_held_call_refresh_offers_sendonly() -> None:
+    """A call on hold whose watchdog fires offers a=sendonly in the refresh re-INVITE.
+
+    A session refresh re-asserts state; it must not silently un-hold the call. The
+    refresh re-INVITE of a held call must therefore offer ``sendonly`` (mirroring the
+    re-INVITE direction logic), never ``sendrecv``.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+
+    first_released = asyncio.Event()
+    se_sleeps: list[float] = []
+
+    async def _fake_sleep(secs: float) -> None:
+        se_sleeps.append(secs)
+        if len(se_sleeps) == 1:
+            first_released.set()
+            return
+        await asyncio.Event().wait()
+
+    adapter._session_timer_sleep = _fake_sleep
+
+    call_id = new_call_id()
+    with _patched_invite_env(block_loop=True):
+        _drive_inbound_call_to_established(
+            adapter, transport, call_id, session_expires="600;refresher=uas"
+        )
+        await _until(lambda: call_id in adapter._call_sessions)
+        session = adapter._call_sessions[call_id]
+        # Put the call on hold BEFORE the refresh fires (mirror a long-held call).
+        session.on_hold = True
+        await _until(first_released.is_set)
+
+        responder = _ScriptedRefreshResponder(transport, session, [(200, "OK")])
+        task = asyncio.create_task(responder.run())
+        try:
+            await _until(lambda: bool(_sent_requests(transport, "INVITE")), timeout=3.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    refreshes = _sent_requests(transport, "INVITE")
+    assert refreshes, "the held call must still emit a refresh re-INVITE"
+    refresh = refreshes[0]
+    assert "sendonly" in refresh.body, (
+        "a held call's refresh must re-assert hold (a=sendonly), not un-hold it"
+    )
+    assert "sendrecv" not in refresh.body, (
+        "a held call's refresh must NOT offer sendrecv (silent un-hold)"
     )
 
     await adapter.disconnect()

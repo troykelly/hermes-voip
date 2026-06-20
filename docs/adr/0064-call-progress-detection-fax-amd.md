@@ -83,11 +83,16 @@ heuristic (the long-understood industry approach):
 - **Machine** ≈ a *long* greeting — continuous speech beyond a machine threshold
   (default 3.5 s) — and/or a detected beep. Classified `AnsweringMachine`.
 
-A long enough opening speech run fires `AnsweringMachine` the moment it crosses the machine
-threshold; otherwise the verdict fires at the **first** silence that follows the opening
-speech — if the opening speech was short and the trailing silence reaches the response gap
-it is a human, and if it spoke for a while (between the human and machine thresholds) then
-went quiet it is a machine. Internal pauses inside a machine greeting ("Hi, you've reached
+The verdict fires on a **completed** VAD segment, never mid-segment: the detector is fed
+only closed speech/silence runs (a speech run closes on its OFFSET edge, a silence run on
+the next ONSET). A long enough opening greeting fires `AnsweringMachine` when that opening
+speech run **closes** (the OFFSET edge) and its accumulated speech duration has reached the
+machine threshold — so a machine that talks continuously without ever pausing yields no
+verdict from this state machine until it first stops. Otherwise the verdict fires at the
+**first** silence that follows the opening speech — if the opening speech was short and the
+trailing silence reaches the response gap it is a human, and if it spoke for a while
+(between the human and machine thresholds) then went quiet it is a machine. Internal pauses
+inside a machine greeting ("Hi, you've reached
 … *beat* … please leave a message") are handled by accumulating speech across short gaps (a
 gap shorter than the response gap does **not** end the greeting).
 
@@ -169,6 +174,42 @@ length and allocation-light, matching the per-frame CPU
 budget (rule 22). The inner `_FaxToneDetector` and `_AnsweringMachineDetector` are
 independently unit-testable (raw PCM frames / raw segment durations) without the facade.
 
+### Wiring (the same-push follow-on, #43)
+
+The detector is wired into the **`CallLoop` pump** (`media/call_loop.py`), not split across
+`engine.py` + `adapter.py`. The pump is the single component that holds **both** the decoded
+inbound `PcmFrame` **and** its VAD `frame_events` on one shared call-elapsed timeline — which
+is exactly what the detector's two input streams need (the no-beep record-cue fallback is
+interleaving-independent only because both the audio sample clock and the VAD window-ordinal
+clock derive from the same audio; feeding them from two different objects/tasks would
+reintroduce the ordering coupling the codex round-2 fix removed). The engine's `__init__` also
+does not know the call direction, and bridging audio-path events from `engine._inbound_gen` (a
+different `asyncio` task) to the loop would need a cross-task queue — more coupling for no gain.
+
+* `CallLoop` gains two keyword-only constructor params: `call_progress_detector:
+  CallProgressDetector | None` and `call_progress_callback: Callable[[CallProgressEvent],
+  Awaitable[None]] | None`. Both `None` ⇒ the feature is OFF and the pump skips the feed (zero
+  cost). The pump feeds **every** decoded frame to `on_audio_frame` and **every** VAD edge to
+  `on_vad_event`, *unconditionally* — independent of the ADR-0023 echo-suppression branch, and
+  continuing through post-greeting silence (the audio-clock fallback fires when no further VAD
+  edge arrives). Each emitted event is surfaced through the callback as a tracked best-effort
+  task off the hot path (cancelled+joined at loop teardown, like the DTMF delivery tasks).
+* `adapter.py` `_run_call_loop` takes an explicit `outbound: bool` (inbound call site `False`,
+  the two outbound UAC sites `True`) and, when `MediaConfig.enable_call_progress`, constructs
+  `CallProgressDetector(sample_rate=engine.inbound_sample_rate, outbound=(outbound and
+  enable_amd))` — so AMD/record-cue are inert unless the call is outbound **and** AMD is
+  enabled, while fax detection (direction-independent) still runs.
+* `_handle_call_progress` is the callback. It ADVISES the agent and acts: `FaxCng`/`FaxCed`
+  inject a system turn and (when `amd_hang_up_on_fax`, the default) auto hang up via the soft
+  `hang_up_call` path; `AnsweringMachine` injects a voicemail-context system turn so the agent
+  decides hang-up-vs-wait; `ReadyToLeaveMessage` injects the record cue; `LikelyHuman` is
+  advisory only (no turn, no hangup). System turns go through the same `_call_source` +
+  `internal=True` `MessageEvent` path as the objective/context seeds (ADR-0029/0052).
+* Three new `MediaConfig` switches, all safe-by-default: `enable_call_progress`
+  (`HERMES_VOIP_CALL_PROGRESS`, default **off** — the whole feature), `enable_amd`
+  (`HERMES_VOIP_AMD`, default **off**), `amd_hang_up_on_fax` (`HERMES_VOIP_AMD_HANGUP_ON_FAX`,
+  default **on**).
+
 ## Consequences
 
 - **Easier:** the engine/adapter can route a fax-tone call away from STT (hang up or hand
@@ -182,16 +223,17 @@ independently unit-testable (raw PCM frames / raw segment durations) without the
   existing VAD/STT/DTMF work. Each is O(n) (n = 160 samples per 20 ms G.711 frame; ~480 at
   16 kHz), the same order as one `InbandDtmfDetector` low+high+harmonic pass already on the
   path. No FFT, no allocation beyond the per-frame sample list the detectors already build.
-- **Same-push wiring follow-on (named, not deferred — rule 6):** the integrator wires
-  `CallProgressDetector` into `media/engine.py` (feed `on_audio_frame` the decoded inbound
-  frame already passed to the DTMF/VAD path) and `adapter.py` (construct it with the call's
-  `outbound` direction; surface `FaxCng`/`FaxCed`/`AnsweringMachine`/`ReadyToLeaveMessage`
-  to the agent as context/events, gating AMD on outbound). This module + the wiring ship in
-  the **same** launch push.
-- **Scope boundary (rule 28):** this lane delivers the sans-IO module + this ADR + unit
-  tests only. It edits neither `engine.py` nor `adapter.py` (those are the integrator's
-  serial step). No new dependency (stdlib `math`/`struct`/`array` + the existing
-  `_goertzel_power`); no `ml`/`media`/`webrtc` extra is required to import or test it.
+- **Wiring shipped (#43):** the detector is live in the `CallLoop` pump and surfaced to the
+  agent by `adapter._handle_call_progress`, gated by the three `MediaConfig` switches above
+  (see **Wiring** under Decision). It went in as `media/call_loop.py` + `adapter.py` +
+  `config.py`, NOT `engine.py` — the pump, not the engine, is where both detector input
+  streams meet on one timeline. The module (#149) and the wiring (#43) shipped across the
+  same launch push (rule 6).
+- **No new dependency:** the detector uses stdlib `math`/`struct`/`array` + the existing
+  `_goertzel_power`; the wiring adds no import beyond `media.call_progress`. No
+  `ml`/`media`/`webrtc` extra is required to import or test the detector + the `CallLoop`
+  wiring (the adapter surfacing test runs in the hermes-contract job, like the other adapter
+  tests).
 
 ## Alternatives considered
 

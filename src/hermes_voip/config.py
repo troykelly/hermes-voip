@@ -352,6 +352,24 @@ _DEFAULT_RTP_SYMMETRIC = True
 _RTCP_ENABLED_KEY = "HERMES_VOIP_RTCP_ENABLED"
 _DEFAULT_RTCP_ENABLED = True
 
+# Call-progress detection (fax CNG/CED + answering-machine detection), ADR-0064.
+# The whole feature is OFF by default — the conversational pipeline assumes a human
+# caller, and turning the detector on adds per-frame Goertzel work and surfaces
+# extra system turns; an operator opts in. When on, fax detection runs both
+# directions and AMD runs only on outbound calls (and only when `enable_amd`).
+_CALL_PROGRESS_KEY = "HERMES_VOIP_CALL_PROGRESS"
+_DEFAULT_CALL_PROGRESS = False
+# Answering-machine detection — a sub-switch of call-progress, OFF by default. Only
+# meaningful on OUTBOUND calls (on inbound the agent is the answerer); off keeps fax
+# detection live while AMD/record-cue stay silent.
+_AMD_KEY = "HERMES_VOIP_AMD"
+_DEFAULT_AMD = False
+# When a fax tone is detected, auto hang up rather than leave the line open for a
+# conversation that cannot happen. ON by default (a detected fax never converses);
+# an operator who wants the agent to decide can turn it off.
+_AMD_HANGUP_ON_FAX_KEY = "HERMES_VOIP_AMD_HANGUP_ON_FAX"
+_DEFAULT_AMD_HANGUP_ON_FAX = True
+
 # RTP-inactivity watchdog (ADR-0026). A silent media/network drop otherwise hangs
 # the call forever (the inbound generator blocks on the recv queue with nothing
 # ever setting the stop event). When no inbound RTP arrives within this window the
@@ -836,6 +854,19 @@ class MediaConfig:
     # model (no bracket tag). Defaults to the selected language's built-in set; a blank
     # override falls back to it; empty members are dropped (parser).
     comfort_filler_phrases: tuple[str, ...] = _DEFAULT_COMFORT_FILLER_PHRASES
+    # Call-progress detection (fax CNG/CED + AMD), ADR-0064. The whole feature is OFF
+    # by default (the pipeline assumes a human; the detector adds per-frame Goertzel
+    # work + extra system turns). When on, the CallLoop feeds the sans-IO detector and
+    # surfaces its events to the agent. Defaulted so existing direct constructions stay
+    # valid.
+    enable_call_progress: bool = _DEFAULT_CALL_PROGRESS
+    # Answering-machine detection — a sub-switch, OFF by default; only active on
+    # OUTBOUND calls (on inbound the agent is the answerer). Off keeps fax detection
+    # live while AMD and the record cue stay silent.
+    enable_amd: bool = _DEFAULT_AMD
+    # When a fax tone is detected, auto hang up (a fax cannot converse). ON by default;
+    # off lets the agent decide via its call-control tools.
+    amd_hang_up_on_fax: bool = _DEFAULT_AMD_HANGUP_ON_FAX
     # WebRTC ICE STUN servers (ADR-0032; default revised ADR-0043), as ``stun:`` URLs
     # for srflx candidate gathering. Defaults to the public dual-stack list; an explicit
     # empty env value ⇒ host-only ICE. No effect on the SIP-over-TLS path. The dataclass
@@ -1238,6 +1269,13 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _COMFORT_FILLER_REPEAT_MS_KEY, _DEFAULT_COMFORT_FILLER_REPEAT_MS
         ),
         comfort_filler_phrases=_parse_comfort_filler_phrases(env, language),
+        enable_call_progress=_parse_bool(
+            env, _CALL_PROGRESS_KEY, _DEFAULT_CALL_PROGRESS
+        ),
+        enable_amd=_parse_bool(env, _AMD_KEY, _DEFAULT_AMD),
+        amd_hang_up_on_fax=_parse_bool(
+            env, _AMD_HANGUP_ON_FAX_KEY, _DEFAULT_AMD_HANGUP_ON_FAX
+        ),
         injection_guard=_value_lower(env, _INJECTION_GUARD_KEY)
         or _DEFAULT_INJECTION_GUARD,
         injection_guard_model_dir=_optional(env, _INJECTION_GUARD_MODEL_DIR_KEY),

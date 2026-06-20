@@ -190,6 +190,7 @@ from hermes_voip.voip_tools import (
 )
 
 if TYPE_CHECKING:
+    from hermes_voip.media.srtcp import SrtcpSession
     from hermes_voip.media.srtp import SrtpSession
 
 __all__ = ["VoipAdapter"]
@@ -532,6 +533,35 @@ def _srtp_outbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | 
     from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
 
     return SrtpSession(crypto)
+
+
+def _srtcp_inbound_from_offer(audio: AudioMedia) -> SrtcpSession | None:
+    """The inbound (RX/unprotect) SrtcpSession keyed by the OFFERER's a=crypto.
+
+    The SRTCP mirror of :func:`_srtp_inbound_from_offer` (ADR-0066): secured RTCP rides
+    the SAME SDES master key||salt as SRTP — only the RFC 3711 §4.3.2 KDF labels differ,
+    so our inbound RTCP is decrypted with the offerer's inline key. ``None`` for a plain
+    ``RTP/AVP`` offer. Lazy import (``media`` extra; error surfaces at construction).
+    """
+    if not audio.is_srtp or not audio.crypto_attrs:
+        return None
+    from hermes_voip.media.srtcp import SrtcpSession  # noqa: PLC0415
+
+    return SrtcpSession(audio.crypto_attrs[0])
+
+
+def _srtcp_outbound_from_answer(crypto: CryptoAttribute | None) -> SrtcpSession | None:
+    """The outbound (TX/protect) SrtcpSession keyed by OUR answer a=crypto.
+
+    The SRTCP mirror of :func:`_srtp_outbound_from_answer` (ADR-0066): our outbound RTCP
+    is encrypted with our own key — the same one advertised in the SDP answer's
+    ``a=crypto``. ``None`` for a plain-RTP answer. Lazy import (rule 37, as above).
+    """
+    if crypto is None:
+        return None
+    from hermes_voip.media.srtcp import SrtcpSession  # noqa: PLC0415
+
+    return SrtcpSession(crypto)
 
 
 def _outbound_offer_crypto() -> CryptoAttribute:
@@ -3182,6 +3212,12 @@ class VoipAdapter(BasePlatformAdapter):
             inband_dtmf_rx_enabled=inband_rx,
             srtp_inbound=_srtp_inbound_from_offer(audio),
             srtp_outbound=_srtp_outbound_from_answer(answer_crypto),
+            # SRTCP (RFC 3711 §3.4, ADR-0066): secure the RTCP control channel with the
+            # SAME SDES keys as SRTP (offerer's key inbound, our answer key outbound) so
+            # RTCP ACTIVATES on this secured call instead of being dormant. None on a
+            # plain RTP/AVP call (RTCP then rides in clear, the cleartext path).
+            srtcp_inbound=_srtcp_inbound_from_offer(audio),
+            srtcp_outbound=_srtcp_outbound_from_answer(answer_crypto),
             # Symmetric-RTP (comedia) latching for NAT traversal: send our media
             # to the peer's real RTP source, not blindly to the SDP address.
             symmetric=media_cfg.rtp_symmetric,
@@ -3207,8 +3243,8 @@ class VoipAdapter(BasePlatformAdapter):
             jitter_max_depth=media_cfg.jitter_max_depth,
             # RTCP SDES CNAME (RFC 3550 §6.5.1, ADR-0061): a fresh opaque per-call
             # token (never the SIP host/extension — rule 34). Held by the engine even
-            # if RTCP is not activated (e.g. a secured call); only used on the wire
-            # once start_rtcp runs below.
+            # if RTCP is not activated (e.g. the kill-switch is off); only used on the
+            # wire once start_rtcp runs below.
             cname=_mint_rtcp_cname(),
         )
         # ptime negotiation (ADR-0056 activated by ADR-0063): honour the peer's
@@ -3217,40 +3253,51 @@ class VoipAdapter(BasePlatformAdapter):
         # outbound packet is framed correctly.
         engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
-        # RTCP activation (RFC 3550 §6 / RFC 5761, ADR-0061): turn the dormant RTCP
-        # control channel live for this call — but ONLY on the cleartext plain-RTP
-        # path (``answer_crypto is None``). A secured SDES/SAVP call is NOT activated:
-        # the engine emits/parses cleartext RTCP and has no SRTCP (RFC 3711 §3.4)
-        # transform, so cleartext RTCP on a secured 5-tuple would violate the profile
-        # and leak our SSRC/CNAME/timing in cleartext (a named follow-up). Done AFTER
+        # RTCP activation (RFC 3550 §6 / RFC 5761 / RFC 3711 §3.4, ADR-0061/0066): turn
+        # the dormant RTCP control channel live for this call. On a SECURED SDES/SAVP
+        # call (``answer_crypto is not None``) the engine now carries the SRTCP
+        # transform (wired above), so RTCP is encrypted+authenticated and may ride the
+        # secured 5-tuple — it is activated via the secured planner (kill-switch only,
+        # no profile gate). On the cleartext plain-RTP path the fail-closed cleartext
+        # planner applies (it gates on the answered profile == RTP/AVP). Done AFTER
         # connect() so the OS-assigned RTP port (hence the non-muxed RTCP port+1) is
-        # known. The plan mirrors the offer's rtcp-mux (RFC 5761 §5.1.1).
-        rtcp_plan = _plan_rtcp_activation(
-            audio,
-            remote_address=remote_address,
-            # Gate on the ANSWERED transport profile (codex review #4): the SDES/plain
-            # answer echoes the offer's profile, so ``audio.protocol`` IS the answer
-            # profile — exactly ``RTP/AVP`` for a plain call, ``RTP/SAVP`` for SDES,
-            # ``UDP/TLS/RTP/SAVP`` for SIP-DTLS. RTCP activates only for plain RTP/AVP.
-            answer_profile=audio.protocol,
-            # The negotiated/answered RTP payload types for the RFC 5761 §4 mux check
-            # (codex review #2): rtcp-mux is refused if any PT lands in 64-95.
-            payload_types=tuple(c.payload_type for c in agreed_sdp_codecs),
-            rtcp_enabled=media_cfg.rtcp_enabled,
-        )
+        # known; the plan mirrors the offer's rtcp-mux (RFC 5761 §5.1.1).
+        answered_payload_types = tuple(c.payload_type for c in agreed_sdp_codecs)
+        if answer_crypto is not None:
+            rtcp_plan = _plan_secured_rtcp_activation(
+                audio,
+                remote_address=remote_address,
+                payload_types=answered_payload_types,
+                rtcp_enabled=media_cfg.rtcp_enabled,
+            )
+        else:
+            rtcp_plan = _plan_rtcp_activation(
+                audio,
+                remote_address=remote_address,
+                # Gate on the ANSWERED transport profile (codex review #4): the plain
+                # answer echoes the offer's profile, so ``audio.protocol`` IS the answer
+                # profile — exactly ``RTP/AVP`` here (SDES is handled above). RTCP
+                # activates on the cleartext path only for plain RTP/AVP.
+                answer_profile=audio.protocol,
+                # The negotiated/answered RTP payload types for the RFC 5761 §4 mux
+                # check (codex review #2): rtcp-mux is refused if any PT lands in 64-95.
+                payload_types=answered_payload_types,
+                rtcp_enabled=media_cfg.rtcp_enabled,
+            )
         if rtcp_plan is not None:
             await engine.start_rtcp(
                 mux=rtcp_plan.mux,
                 # Engine-side RFC 5761 §4 last-line guard (codex review): the full
                 # answered RTP payload set (agreed_sdp_codecs already includes
                 # telephone-event) — the engine refuses mux if any PT is in 64-95.
-                rtp_payload_types=tuple(c.payload_type for c in agreed_sdp_codecs),
+                rtp_payload_types=answered_payload_types,
                 remote_rtcp_addr=None if rtcp_plan.mux else rtcp_plan.remote_rtcp_addr,
             )
             _log.info(
-                "INVITE %s: RTCP active (%s)",
+                "INVITE %s: RTCP active (%s%s)",
                 call_id,
                 "rtcp-mux" if rtcp_plan.mux else f"port {engine.local_port + 1}",
+                ", SRTCP" if answer_crypto is not None else "",
             )
 
         local_media = LocalMediaSession(
@@ -3490,6 +3537,11 @@ class VoipAdapter(BasePlatformAdapter):
             )
             raise _MediaNegotiationRejected from None
 
+        # SRTCP (RFC 3711 §3.4, ADR-0066): derive the secured-RTCP session pair from the
+        # SAME completed DTLS handshake (fingerprint already verified by run_handshake),
+        # so RTCP rides the encrypted ICE pipe (muxed) instead of being dormant.
+        srtcp_inbound, srtcp_outbound = session.derive_srtcp_sessions()
+
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
         # Resolve the DTMF send/receive backends for the WebRTC call too (ADR-0036) so a
         # forced sip_info routes SIP INFO via the CallSession (not the media engine) and
@@ -3519,6 +3571,12 @@ class VoipAdapter(BasePlatformAdapter):
             # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
             srtp_inbound=srtp_inbound,
             srtp_outbound=srtp_outbound,
+            # DTLS-derived SRTCP (RFC 3711 §3.4, ADR-0066): keyed from the SAME DTLS
+            # export as SRTP, so RTCP is activated (muxed) over the encrypted ICE pipe
+            # instead of being dormant. Wired as a pair so the engine can both protect
+            # outbound and unprotect inbound RTCP.
+            srtcp_inbound=srtcp_inbound,
+            srtcp_outbound=srtcp_outbound,
             # Carry media over the ICE datagram pipe instead of a bound UDP socket.
             ice_transport=session.ice,
             media_timeout_secs=media_cfg.media_timeout_secs,
@@ -3542,6 +3600,15 @@ class VoipAdapter(BasePlatformAdapter):
         engine.ptime = _negotiated_ptime(audio, engine_codec)
         await engine.connect()
         _log.info("INVITE %s: WebRTC media engine connected over ICE", call_id)
+        # RTCP over SRTCP (ADR-0066): WebRTC always rtcp-muxes onto the single ICE/DTLS
+        # 5-tuple (RFC 8843/8829), and the engine carries the SRTCP transform, so RTCP
+        # is activated muxed + encrypted. Kill-switch-gated (see the shared helper).
+        await _activate_muxed_srtcp_rtcp(
+            engine,
+            payload_types=tuple(c.payload_type for c in agreed_sdp_codecs),
+            rtcp_enabled=media_cfg.rtcp_enabled,
+            call_id=call_id,
+        )
         # If the peer BYE'd during the ICE/DTLS handshake (the guard answered it 200),
         # end cleanly here — do NOT start a video sender or return media the inbound
         # handler would build a CallLoop on a dead dialog (ADR-0065). Raises
@@ -3573,7 +3640,7 @@ class VoipAdapter(BasePlatformAdapter):
             )
         return engine, local_media
 
-    async def _setup_sip_dtls_call(  # noqa: PLR0913 — the inbound handler's locals threaded through
+    async def _setup_sip_dtls_call(  # noqa: PLR0913, PLR0915 — the inbound handler's locals threaded through; a flat answer→handshake→key(SRTP+SRTCP)→engine→RTCP sequence, not branching logic (splitting would scatter the half-open-dialog cleanup)
         self,
         *,
         invite: SipRequest,
@@ -3760,6 +3827,11 @@ class VoipAdapter(BasePlatformAdapter):
             )
             raise _MediaNegotiationRejected from None
 
+        # SRTCP (RFC 3711 §3.4, ADR-0066): derive the secured-RTCP session pair from the
+        # SAME completed DTLS handshake (fingerprint already verified), so RTCP rides
+        # the encrypted UDP/TLS pipe (muxed) instead of being dormant.
+        srtcp_inbound, srtcp_outbound = session.derive_srtcp_sessions()
+
         te_pt = _telephone_event_payload_type(agreed_sdp_codecs)
         # Resolve the DTMF send/receive backends (ADR-0036) so a forced sip_info routes
         # SIP INFO via the CallSession (not the media engine) and the receive wiring is
@@ -3797,6 +3869,11 @@ class VoipAdapter(BasePlatformAdapter):
                 # DTLS-derived SRTP (RFC 5764) — the same SrtpSession transform as SDES.
                 srtp_inbound=srtp_inbound,
                 srtp_outbound=srtp_outbound,
+                # DTLS-derived SRTCP (RFC 3711 §3.4, ADR-0066): keyed from the SAME DTLS
+                # export as SRTP, so RTCP is activated (muxed) over the encrypted
+                # UDP/TLS pipe instead of being dormant.
+                srtcp_inbound=srtcp_inbound,
+                srtcp_outbound=srtcp_outbound,
                 # Carry media over the session's UDP datagram pipe instead of a bound
                 # socket — the same engine seam the WebRTC path uses for its ICE pipe.
                 ice_transport=session.pipe,
@@ -3830,11 +3907,17 @@ class VoipAdapter(BasePlatformAdapter):
                 call_id=call_id,
             )
             raise _MediaNegotiationRejected from None
-        # RTCP (ADR-0061) is NOT activated on the secured DTLS-SRTP path: the engine
-        # has no SRTCP (RFC 3711 §3.4) transform, so cleartext RTCP on a secured
-        # 5-tuple would violate the profile and leak SSRC/CNAME/timing — same as the
-        # SDES/WebRTC secured paths (a named follow-up adds SRTCP).
         _log.info("INVITE %s: SIP DTLS-SRTP media engine connected over UDP", call_id)
+        # RTCP over SRTCP (ADR-0066): DTLS-SRTP rides the session's single UDP pipe (the
+        # engine binds no socket), so RTCP must rtcp-mux onto that 5-tuple; the engine
+        # carries the SRTCP transform, so it is activated muxed + encrypted. The shared
+        # helper applies the kill-switch.
+        await _activate_muxed_srtcp_rtcp(
+            engine,
+            payload_types=tuple(c.payload_type for c in agreed_sdp_codecs),
+            rtcp_enabled=media_cfg.rtcp_enabled,
+            call_id=call_id,
+        )
         # If the peer BYE'd during the handshake (the guard answered it 200 OK), end
         # cleanly here — do NOT return media the inbound handler would build a CallLoop
         # on a dead dialog (ADR-0065). Raises _AnsweredCallPeerEnded after cleanup.
@@ -5979,11 +6062,12 @@ def _negotiated_ptime(audio: AudioMedia, codec: Codec) -> int:
 # sent on the wire, so it must carry no host/extension/number — rule 34).
 _RTCP_CNAME_TOKEN_BYTES: Final[int] = 8
 
-# The ONLY transport profile on which RTCP is activated (ADR-0061): plain cleartext
-# RTP. The engine has no SRTCP (RFC 3711 §3.4) transform, so any secured profile
-# (RTP/SAVP, RTP/SAVPF, UDP/TLS/RTP/SAVP, UDP/TLS/RTP/SAVPF) keeps RTCP dormant.
-# Gating on this exact string is FAIL-CLOSED (codex review #4): an unrecognised or
-# future profile is treated as not-activatable rather than wrongly cleartext.
+# The ONLY transport profile the CLEARTEXT RTCP planner activates (ADR-0061): plain
+# RTP/AVP. Secured profiles (RTP/SAVP, RTP/SAVPF, UDP/TLS/RTP/SAVP, UDP/TLS/RTP/SAVPF)
+# carry RTCP over SRTCP via _plan_secured_rtcp_activation (ADR-0066) instead — they
+# never use this cleartext planner. Gating it on this exact string is
+# FAIL-CLOSED (codex review #4): an unrecognised/future profile is treated as
+# not-cleartext-activatable rather than wrongly emitting cleartext RTCP.
 _RTCP_PLAIN_PROFILE: Final[str] = "RTP/AVP"
 
 # RFC 5761 §4: under rtcp-mux, RTP payload types 64-95 are FORBIDDEN — byte 2 of an
@@ -6033,18 +6117,20 @@ def _plan_rtcp_activation(
     payload_types: tuple[int, ...],
     rtcp_enabled: bool,
 ) -> _RtcpActivation | None:
-    """Decide whether/how to activate RTCP for an inbound call (ADR-0061 step 1).
+    """Decide whether/how to activate CLEARTEXT RTCP for an inbound call (ADR-0061).
 
-    Returns the activation plan, or ``None`` when RTCP must NOT be activated:
+    This is the CLEARTEXT planner — secured (SDES/DTLS/WebRTC) calls carry RTCP over
+    SRTCP via :func:`_plan_secured_rtcp_activation` (ADR-0066) and never reach here.
+
+    Returns the activation plan, or ``None`` when cleartext RTCP must NOT be activated:
 
     * ``rtcp_enabled`` is the operator kill-switch (``HERMES_VOIP_RTCP_ENABLED``).
     * ``answer_profile`` must be EXACTLY plain ``RTP/AVP`` (codex review #4 —
-      fail-closed): the media engine emits and parses CLEARTEXT RTCP only and has no
-      SRTCP (RFC 3711 §3.4) transform, so any secured profile (``RTP/SAVP``,
-      ``RTP/SAVPF``, ``UDP/TLS/RTP/SAVP``, ``UDP/TLS/RTP/SAVPF``) leaves RTCP dormant.
-      Gating on the ANSWERED PROFILE — not "no a=crypto present" — is fail-closed: an
-      unrecognised/future profile is treated as not-activatable, never wrongly
-      cleartext. Secured-path RTCP (SRTCP) is a separate, named capability follow-up.
+      fail-closed): cleartext RTCP may only ride a cleartext 5-tuple, so any secured
+      profile (``RTP/SAVP``, ``RTP/SAVPF``, ``UDP/TLS/RTP/SAVP``, ``UDP/TLS/RTP/SAVPF``)
+      returns ``None`` here (those use the SRTCP-secured planner instead). Gating on the
+      ANSWERED PROFILE — not "no a=crypto present" — is fail-closed: an unrecognised/
+      future profile is treated as not-cleartext-activatable, never wrongly cleartext.
 
     On the cleartext plain-RTP path the RTCP transport mirrors the offer's mux
     (RFC 5761 §5.1.1 via :func:`~hermes_voip.sdp.negotiate_rtcp_mux`): muxed RTCP
@@ -6082,6 +6168,71 @@ def _plan_rtcp_activation(
     # ``a=rtcp:`` override is parsed, so the sibling port is the default.
     rtcp_port = offer_audio.port if mux else offer_audio.port + 1
     return _RtcpActivation(mux=mux, remote_rtcp_addr=(remote_address, rtcp_port))
+
+
+def _plan_secured_rtcp_activation(
+    offer_audio: AudioMedia,
+    *,
+    remote_address: str,
+    payload_types: tuple[int, ...],
+    rtcp_enabled: bool,
+) -> _RtcpActivation | None:
+    """Decide whether/how to activate SECURED (SRTCP) RTCP for a SDES call (ADR-0066).
+
+    The secured counterpart of :func:`_plan_rtcp_activation`. It is NOT gated on the
+    answered profile — the SDES caller has already wired the SRTCP transform onto the
+    engine, so RTCP is encrypted+authenticated (RFC 3711 §3.4) and may ride the secured
+    5-tuple. Only the operator kill-switch suppresses it. The transport choice (mux vs
+    sibling port) is identical to the cleartext path: mirror the offer's ``a=rtcp-mux``
+    (RFC 5761 §5.1.1), but REFUSE mux (fall back to RTP-port+1, RFC 3550 §11) when any
+    negotiated RTP payload type lands in the RFC 5761 §4 conflict range (64-95). The
+    plugin's own codecs never use that range, so a normal SDES call keeps mux.
+
+    This is for the SDES/SIP-over-TLS path, where the engine binds its OWN UDP socket
+    and can therefore open the non-muxed sibling. The DTLS/WebRTC paths ride a single
+    ICE/UDP pipe (no second socket) and so always mux — they call the muxed helper.
+
+    Args:
+        offer_audio: The inbound offer's audio media (port + ``rtcp_mux`` flag).
+        remote_address: The peer's effective RTP address (post c=/comedia resolution).
+        payload_types: The negotiated/answered RTP payload types (RFC 5761 §4 check).
+        rtcp_enabled: The operator kill-switch (``MediaConfig.rtcp_enabled``).
+
+    Returns:
+        An :class:`_RtcpActivation` plan, or ``None`` when the kill-switch is off.
+    """
+    if not rtcp_enabled:
+        return None
+    mux = negotiate_rtcp_mux(offer_audio)
+    if mux and any(
+        _RTCP_MUX_FORBIDDEN_PT_MIN <= pt <= _RTCP_MUX_FORBIDDEN_PT_MAX
+        for pt in payload_types
+    ):
+        mux = False
+    rtcp_port = offer_audio.port if mux else offer_audio.port + 1
+    return _RtcpActivation(mux=mux, remote_rtcp_addr=(remote_address, rtcp_port))
+
+
+async def _activate_muxed_srtcp_rtcp(
+    engine: RtpMediaTransport,
+    *,
+    payload_types: tuple[int, ...],
+    rtcp_enabled: bool,
+    call_id: str,
+) -> None:
+    """Activate MUXED RTCP-over-SRTCP on a DTLS/WebRTC engine (ADR-0066).
+
+    Shared by the WebRTC and SIP-DTLS paths: both ride a single ICE/UDP pipe (the engine
+    binds no UDP socket of its own), so RTCP MUST rtcp-mux onto that one 5-tuple — a
+    separate RTCP port is impossible. The engine already carries the SRTCP transform
+    (wired from the DTLS export), so RTCP is encrypted+authenticated (RFC 3711 §3.4) on
+    the secured pipe. The operator kill-switch still applies; ``remote_rtcp_addr`` is
+    unused when muxed (RTCP follows the pipe). A no-op when the kill-switch is off.
+    """
+    if not rtcp_enabled:
+        return
+    await engine.start_rtcp(mux=True, rtp_payload_types=payload_types)
+    _log.info("INVITE %s: RTCP active (rtcp-mux, SRTCP)", call_id)
 
 
 def _host_of(sent_by: str) -> str:

@@ -98,6 +98,7 @@ from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
 # Importing it at module scope — rather than per-packet inside the inbound loop
 # — means an import failure propagates at module load (rule 37) instead of
 # being silently swallowed as a per-packet drop.
+from hermes_voip.media.srtcp import SrtcpError
 from hermes_voip.media.srtp import SrtpError
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 from hermes_voip.rtcp import (
@@ -497,6 +498,32 @@ class _SrtpUnprotect(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Narrow SRTCP Protocol seam (RFC 3711 §3.4) — the secured-RTCP transform.
+#
+# SRTCP works on RAW compound-RTCP BYTES (not RtpPacket): protect() wraps an
+# outbound compound RTCP datagram into an SRTCP packet, unprotect() reverses it.
+# media.srtcp.SrtcpSession is structurally assignable to both (same as the SRTP
+# seam above) — no concrete import is needed at type-check time.
+# ---------------------------------------------------------------------------
+
+
+class _SrtcpProtect(Protocol):
+    """The protect (outbound encrypt) method surface of SrtcpSession."""
+
+    def protect(self, rtcp_compound: bytes) -> bytes:
+        """Encrypt and authenticate an outbound compound RTCP datagram."""
+        ...
+
+
+class _SrtcpUnprotect(Protocol):
+    """The unprotect (inbound decrypt) method surface of SrtcpSession."""
+
+    def unprotect(self, data: bytes) -> bytes:
+        """Authenticate and decrypt an inbound SRTCP packet to cleartext RTCP."""
+        ...
+
+
+# ---------------------------------------------------------------------------
 # Narrow Opus codec Protocol seam (no opuslib import needed at type-check time).
 #
 # media.opus.OpusEncoder/OpusDecoder are imported LAZILY inside _encode/_decode so
@@ -770,6 +797,14 @@ class RtpMediaTransport:
         srtp_outbound:   Optional SRTP session for encrypting outbound packets.
                          Must satisfy :class:`_SrtpProtect`.
                          ``None`` → plain RTP/AVP.
+        srtcp_inbound:   Optional SRTCP session for decrypting inbound RTCP (RFC 3711
+                         §3.4, ADR-0066). Must satisfy :class:`_SrtcpUnprotect` (i.e. be
+                         a :class:`~hermes_voip.media.srtcp.SrtcpSession`). ``None`` →
+                         RTCP is parsed/ingested in the clear (plain-RTP path).
+        srtcp_outbound:  Optional SRTCP session for encrypting outbound RTCP. Must
+                         satisfy :class:`_SrtcpProtect`. ``None`` → RTCP is emitted in
+                         the clear. Pair with ``srtcp_inbound`` to ACTIVATE RTCP on a
+                         secured (SDES/DTLS/WebRTC) call (see :meth:`start_rtcp`).
         jitter_depth:    ``target_depth`` parameter for
                          :class:`~hermes_voip.rtp.JitterBuffer` (the fixed depth, or
                          the FLOOR when ``jitter_adapt`` is on).
@@ -801,6 +836,8 @@ class RtpMediaTransport:
         ptime: int = _DEFAULT_PTIME_MS,
         srtp_inbound: _SrtpUnprotect | None = None,
         srtp_outbound: _SrtpProtect | None = None,
+        srtcp_inbound: _SrtcpUnprotect | None = None,
+        srtcp_outbound: _SrtcpProtect | None = None,
         jitter_depth: int = 2,
         jitter_adapt: bool = False,
         jitter_max_depth: int | None = None,
@@ -943,6 +980,16 @@ class RtpMediaTransport:
         self._ptime = ptime
         self._srtp_in = srtp_inbound
         self._srtp_out = srtp_outbound
+        # SRTCP sessions (RFC 3711 §3.4, ADR-0066): secure the RTCP control channel on
+        # a SECURED media path. When BOTH are set the engine wraps every outbound RTCP
+        # datagram in ``_srtcp_out.protect`` (_emit_rtcp) and unwraps every inbound one
+        # with ``_srtcp_in.unprotect`` (_ingest_rtcp_datagram) — so a SDES/DTLS/WebRTC
+        # call carries authenticated+encrypted RTCP instead of leaking SSRC/CNAME/timing
+        # in cleartext. ``None`` on the cleartext plain-RTP path (RTCP rides in clear)
+        # and on a secured engine before SRTCP keys are wired (then RTCP stays dormant —
+        # start_rtcp's secured guard only flips when ``_has_srtcp``).
+        self._srtcp_in = srtcp_inbound
+        self._srtcp_out = srtcp_outbound
         self._jitter_depth = jitter_depth
         # Adaptive jitter (ADR-0056): when ``jitter_adapt`` the RX JitterBuffer's
         # reorder tolerance grows under loss/reorder up to ``jitter_max_depth`` and
@@ -1515,26 +1562,28 @@ class RtpMediaTransport:
                 return
             data, source = item
 
-            # Inbound RTCP demux (RFC 5761 §4, ADR-0061 adapter activation): on a
-            # MUXED stream RTP and RTCP share the 5-tuple, and the discriminator is
-            # the second byte — RTP's M+PT byte aliases the RTCP packet-type byte, so
-            # 200..204 (SR/RR/SDES/BYE/APP) is RTCP. Feed such a datagram to
-            # ingest_rtcp and consume it (it is control, never audio). Engaged ONLY
-            # when RTCP is MULTIPLEXED (``_rtcp_mux_active`` — NOT ``_rtcp_active``,
-            # which is also set on the non-muxed path where RTCP rides a SEPARATE
-            # socket and the RTP socket carries pure RTP; codex review #1) AND the
-            # stream is cleartext (``_srtp_in is None`` belt-and-suspenders: the engine
-            # has no SRTCP (RFC 3711 §3.4) transform, and start_rtcp already refuses a
-            # secured engine, so a secured session never multiplexes RTCP here). On the
-            # non-muxed path inbound RTCP arrives on the sibling socket
+            # Inbound RTCP demux (RFC 5761 §4, ADR-0061/0066): on a MUXED stream RTP
+            # and RTCP share the 5-tuple; the discriminator is the second byte — RTP's
+            # M+PT byte aliases the RTCP packet-type byte, so 200..204 (SR/RR/SDES/BYE/
+            # APP) is RTCP. That byte is in the clear on BOTH plain RTCP and SRTCP (RFC
+            # 3711 §3.4 leaves the RTCP header through the sender SSRC unencrypted), so
+            # the same discriminator works on a secured muxed stream. Feed such a
+            # datagram to ingest_rtcp (which SRTCP-unprotects it when secured) and
+            # consume it (control, never audio). Engaged ONLY when RTCP is MULTIPLEXED
+            # (``_rtcp_mux_active`` — NOT ``_rtcp_active``, also set on the non-muxed
+            # path where RTCP rides a SEPARATE socket and the RTP socket carries pure
+            # RTP; codex review #1) AND the stream is either cleartext (``_srtp_in is
+            # None``) or has the SRTCP transform wired (``_srtcp_in is not None``) — so
+            # a secured engine without SRTCP (RTCP dormant) never mis-routes here. On
+            # the non-muxed path inbound RTCP arrives on the sibling socket
             # (_rtcp_recv_loop), not this queue. The mux activation also guarantees no
             # negotiated RTP payload type lies in 64-95 (the adapter refuses rtcp-mux
             # for those per RFC 5761 §4), so a 200..204 second byte here is RTCP, never
-            # an aliased RTP M+PT. A malformed datagram is dropped, not fatal (mirrors
-            # the malformed-RTP drop below; per the ingest_rtcp contract).
+            # an aliased RTP M+PT. A malformed/auth-fail datagram is dropped, not fatal
+            # (mirrors the malformed-RTP drop below; per the ingest_rtcp contract).
             if (
                 self._rtcp_mux_active
-                and self._srtp_in is None
+                and (self._srtp_in is None or self._srtcp_in is not None)
                 and len(data) >= _RTCP_DEMUX_MIN_LEN
                 and RTCP_PT_SR <= data[1] <= RTCP_PT_APP
             ):
@@ -2311,21 +2360,31 @@ class RtpMediaTransport:
     def _emit_rtcp(self, datagram: bytes) -> None:
         """Send one RTCP datagram via the injected sink, or muxed over the RTP path.
 
+        On a SECURED engine (``_srtcp_out`` set, RFC 3711 §3.4 / ADR-0066) the cleartext
+        compound is first wrapped in the SRTCP transform — so the bytes that ever leave
+        this process are authenticated+encrypted, never cleartext RTCP on a secured
+        5-tuple. On the plain-RTP path (``_srtcp_out`` is ``None``) the cleartext
+        compound is sent unchanged (the legacy behaviour, byte-for-byte).
+
         With an ``rtcp_send`` sink injected (the separate-RTCP-port case the adapter
-        wires) the datagram goes there; otherwise it is multiplexed onto the RTP
+        wires) the (S)RTCP wire goes there; otherwise it is multiplexed onto the RTP
         transport (RFC 5761 rtcp-mux) via ``_transport.sendto``. A closed/absent
-        transport drops the datagram silently (the call is ending). Also smooths the
-        average RTCP size (§6.3.3) for the next interval calculation.
+        transport drops the datagram silently (the call is ending). The average RTCP
+        size (§6.3.3) is smoothed over the ACTUAL wire bytes (the SRTCP trailer + tag
+        count toward the bandwidth budget) for the next interval calculation.
         """
-        self._avg_rtcp_size += (
-            len(datagram) - self._avg_rtcp_size
-        ) * _AVG_RTCP_SIZE_GAIN
+        wire = (
+            self._srtcp_out.protect(datagram)
+            if self._srtcp_out is not None
+            else datagram
+        )
+        self._avg_rtcp_size += (len(wire) - self._avg_rtcp_size) * _AVG_RTCP_SIZE_GAIN
         if self._rtcp_send is not None:
-            self._rtcp_send(datagram)
+            self._rtcp_send(wire)
             return
         transport = self._transport
         if transport is not None:
-            transport.sendto(datagram, self._outbound_addr)
+            transport.sendto(wire, self._outbound_addr)
 
     async def run_rtcp(
         self,
@@ -2415,15 +2474,16 @@ class RtpMediaTransport:
 
         Idempotent-safe: a second call while RTCP is already active is a no-op.
 
-        FAIL-CLOSED on a secured transport (codex review #3): if this engine carries
-        SRTP (``_srtp_in``/``_srtp_out`` set) or an ICE/DTLS pipe (``_ice``), RTCP is
-        NOT started — it is a no-op + WARNING. The engine emits and parses CLEARTEXT
-        RTCP only; it has NO SRTCP (RFC 3711 §3.4) transform, so starting RTCP on a
-        secured 5-tuple would send cleartext RTCP on an otherwise-encrypted call,
-        violating the negotiated profile and leaking our SSRC/CNAME/timing. The
-        adapter also gates on the answered profile, but this engine-level guard is the
-        last line of defence. *** This guard is the seam a future SRTCP lane flips to
-        ENABLE secured RTCP (wrap the RTCP datagrams in an SRTCP transform first). ***
+        SECURED-TRANSPORT GUARD (codex review #3, flipped by ADR-0066): on a secured
+        engine (SRTP ``_srtp_in``/``_srtp_out`` set, or an ICE/DTLS pipe ``_ice``) RTCP
+        activates ONLY when the SRTCP transform is wired (``_has_srtcp`` — BOTH
+        ``_srtcp_in`` and ``_srtcp_out`` set). With SRTCP, every outbound RTCP is
+        encrypted+authenticated (:meth:`_emit_rtcp`) and every inbound one is
+        unprotected (:meth:`_ingest_rtcp_datagram`), so no cleartext RTCP ever rides the
+        secured 5-tuple. WITHOUT SRTCP a secured engine leaves RTCP DORMANT (no-op +
+        WARNING): cleartext RTCP on an encrypted call would violate the negotiated
+        profile and leak SSRC/CNAME/timing. The adapter also gates the secured paths,
+        but this engine-level guard is the last line of defence.
 
         Args:
             mux: ``True`` to multiplex RTCP onto the RTP transport (RFC 5761), ``False``
@@ -2444,13 +2504,17 @@ class RtpMediaTransport:
         """
         if self._rtcp_active:
             return
-        if self._is_secured:
-            # Cleartext RTCP must never ride a secured 5-tuple (no SRTCP yet). No-op.
+        if self._is_secured and not self._has_srtcp:
+            # Cleartext RTCP must never ride a secured 5-tuple. On a secured engine WITH
+            # the SRTCP transform wired (``_has_srtcp``) RTCP is activated and every
+            # datagram is SRTCP-protected (the guard FLIP, ADR-0066). Without it (SRTP
+            # media only, no SRTCP keys) RTCP stays DORMANT — emitting cleartext RTCP on
+            # an encrypted call would violate the profile and leak SSRC/CNAME/timing.
             _log.warning(
-                "start_rtcp called on a secured engine (SRTP/ICE) — RTCP left "
-                "DORMANT (no SRTCP transform; cleartext RTCP on an encrypted call "
-                "would violate the profile and leak SSRC/CNAME). The future SRTCP "
-                "lane flips this guard."
+                "start_rtcp called on a secured engine with NO SRTCP transform — RTCP "
+                "left DORMANT (cleartext RTCP on an encrypted 5-tuple would violate "
+                "the profile and leak SSRC/CNAME). Wire srtcp_inbound + srtcp_outbound "
+                "to activate secured RTCP."
             )
             return
         # RFC 5761 §4 defense-in-depth: an RTP payload type in 64-95 aliases the RTCP
@@ -2504,16 +2568,30 @@ class RtpMediaTransport:
     def _is_secured(self) -> bool:
         """True when this engine's media is encrypted (SRTP/SDES or ICE/DTLS-SRTP).
 
-        RTCP activation is fail-closed on this (codex review #3): the engine has no
-        SRTCP (RFC 3711 §3.4) transform, so a secured session must never send/receive
-        cleartext RTCP. ``_srtp_in``/``_srtp_out`` cover SDES + DTLS-derived SRTP;
-        ``_ice`` covers the WebRTC ICE/DTLS path (which is always secured).
+        RTCP activation is gated on this (codex review #3, ADR-0066): a secured session
+        must never send/receive CLEARTEXT RTCP — it activates RTCP only when the SRTCP
+        transform is wired (:attr:`_has_srtcp`). ``_srtp_in``/``_srtp_out`` cover SDES +
+        DTLS-derived SRTP; ``_ice`` covers the WebRTC ICE/DTLS path (always secured); a
+        non-None ``_srtcp_in``/``_srtcp_out`` (a secured-but-SRTP-stubbed test, or a
+        secured call mid-wiring) also counts as secured.
         """
         return (
             self._srtp_in is not None
             or self._srtp_out is not None
             or self._ice is not None
+            or self._srtcp_in is not None
+            or self._srtcp_out is not None
         )
+
+    @property
+    def _has_srtcp(self) -> bool:
+        """True when the SRTCP transform is fully wired for BOTH directions (ADR-0066).
+
+        Secured RTCP needs both an inbound (unprotect) and an outbound (protect) SRTCP
+        session — a half-wired engine could not both send and receive secured RTCP, so
+        :meth:`start_rtcp` requires both before flipping a secured engine to ACTIVE.
+        """
+        return self._srtcp_in is not None and self._srtcp_out is not None
 
     async def _open_rtcp_socket(self, remote_rtcp_addr: tuple[str, int]) -> None:
         """Bind the sibling RTCP socket on RTP-port+1 and start its reader (non-mux).
@@ -2572,14 +2650,29 @@ class RtpMediaTransport:
     def _ingest_rtcp_datagram(self, data: bytes) -> None:
         """Feed one inbound RTCP datagram to :meth:`ingest_rtcp`, dropping a bad one.
 
+        On a SECURED engine (``_srtcp_in`` set, RFC 3711 §3.4 / ADR-0066) the inbound
+        SRTCP packet is first authenticated + decrypted to its cleartext compound; only
+        then is it parsed. An SRTCP auth/replay/format failure (:class:`SrtcpError`) is
+        an environmental event — the datagram is logged at DEBUG and DROPPED (the call
+        stays up), exactly as a malformed RTP/RTCP datagram is, and the cleartext
+        parser never sees unauthenticated bytes. On the plain-RTP path the cleartext
+        datagram is parsed directly (unchanged).
+
         :meth:`ingest_rtcp` raises :class:`RtcpError` on a structurally broken
-        datagram and leaves to the caller whether that ends the call (its contract).
-        A single malformed inbound RTCP datagram is an environmental event, not a
-        programming error — so it is logged at DEBUG and dropped, exactly as a
-        malformed inbound RTP datagram is (the call stays up). Not swallowed silently
-        (rule 37): it is logged, and only an :class:`RtcpError` is caught — any other
-        exception propagates.
+        (cleartext) datagram and leaves to the caller whether that ends the call (its
+        contract). A single malformed inbound RTCP datagram is logged at DEBUG and
+        dropped. Not swallowed silently (rule 37): it is logged, and only an
+        :class:`SrtcpError` / :class:`RtcpError` is caught — any other exception
+        propagates.
         """
+        if self._srtcp_in is not None:
+            try:
+                data = self._srtcp_in.unprotect(data)
+            except SrtcpError as exc:
+                _log.debug(
+                    "inbound SRTCP auth/replay/format failure — dropped: %s", exc
+                )
+                return
         try:
             self.ingest_rtcp(data)
         except RtcpError as exc:

@@ -51,6 +51,7 @@ import logging
 from typing import Protocol
 
 from hermes_voip.media.dtls import DtlsEndpoint, DtlsRole
+from hermes_voip.media.srtcp import SrtcpSession
 from hermes_voip.media.srtp import SrtpSession
 from hermes_voip.media.webrtc_session import answer_setup_for_offer
 from hermes_voip.sdp import Fingerprint, SetupRole
@@ -476,6 +477,21 @@ class SipDtlsMediaSession:
         inbound, outbound = self._dtls.derive_srtp_sessions()
         _log.info("sip-dtls: DTLS-SRTP keyed (setup=%s)", self._setup.value)
         return inbound, outbound
+
+    def derive_srtcp_sessions(self) -> tuple[SrtcpSession, SrtcpSession]:
+        """Derive the inbound + outbound :class:`SrtcpSession` pair (RFC 3711 §3.4).
+
+        Secured-path RTCP rides SRTCP, keyed from the SAME DTLS export as this call's
+        SRTP (only the KDF labels differ). The adapter wires the returned pair onto the
+        engine's ``srtcp_inbound``/``srtcp_outbound`` so RTCP is activated (muxed) over
+        the encrypted UDP/TLS pipe instead of being dormant (ADR-0066). Must be called
+        after :meth:`run_handshake`; the fingerprint-verified precondition is enforced
+        by the underlying DTLS endpoint.
+
+        Returns:
+            ``(inbound, outbound)`` — the role-mirrored SRTCP session pair.
+        """
+        return self._dtls.derive_srtcp_sessions()
 
     async def _pump_dtls_handshake(self, pipe: _DatagramPipe) -> None:
         """Exchange DTLS records over the UDP pipe until the handshake completes.

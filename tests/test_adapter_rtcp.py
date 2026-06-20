@@ -555,13 +555,18 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex review #8: secured-path negative controls through the REAL adapter paths
+# Secured-path RTCP ACTIVATION via SRTCP (ADR-0066) — the dormancy FLIP.
 #
-# The pure-helper tests prove the planner returns None for a secured profile; these
-# drive the REAL inbound INVITE → setup path with an SDES (RTP/SAVP) and a WebRTC
-# (SAVPF) offer and assert RTCP is NEVER activated on the live media (no cleartext
-# RTCP on a secured 5-tuple). The SDES path reaches a REAL engine; the WebRTC path
-# uses a fake engine whose start_rtcp is asserted never-called.
+# SRTCP (RFC 3711 §3.4) now secures the RTCP control channel, so the three secured
+# media paths ACTIVATE RTCP (wrapped in SRTCP) instead of leaving it dormant. These
+# drive the REAL inbound INVITE → setup path with an SDES (RTP/SAVP), a SIP-DTLS
+# (UDP/TLS/RTP/SAVP), and a WebRTC (SAVPF) offer and assert RTCP is activated with
+# the SRTCP transform wired (the SDES path reaches a REAL engine; the DTLS/WebRTC
+# paths use a fake engine whose start_rtcp + SRTCP ctor args are asserted).
+#
+# Test change (rule 19): these supersede the pre-SRTCP negative controls that asserted
+# secured paths NEVER activate RTCP — that dormancy was a stated, bounded limitation
+# ("until SRTCP lands"), and this lane lands SRTCP, so the expected behaviour inverts.
 # ---------------------------------------------------------------------------
 
 
@@ -604,13 +609,14 @@ _WEBRTC_OFFER = (
 
 
 @pytest.mark.asyncio
-async def test_inbound_sdes_savp_call_never_activates_rtcp_on_live_engine() -> None:
-    """MAJOR #8 (SDES): a real RTP/SAVP INVITE leaves RTCP DORMANT on the live engine.
+async def test_inbound_sdes_savp_call_activates_rtcp_via_srtcp_on_live_engine() -> None:
+    """SDES: a real RTP/SAVP INVITE ACTIVATES RTCP over SRTCP on the live engine.
 
     Through ``_on_inbound_invite`` with the REAL ``RtpMediaTransport``: the answer is
-    SDES (a=crypto present, RTP/SAVP), and the live engine must have RTCP inactive —
-    no loop task, no muxed demux engaged, no sibling socket. Cleartext RTCP on a
-    secured 5-tuple is forbidden until SRTCP lands.
+    SDES (a=crypto present, RTP/SAVP), and the live engine has RTCP ACTIVE with the
+    SRTCP transform wired (``_srtcp_in``/``_srtcp_out`` set from the negotiated keys).
+    The offer has no a=rtcp-mux, so RTCP uses the sibling socket on RTP-port+1 — and
+    the outbound RTCP is SRTCP-protected (never cleartext on the secured 5-tuple).
     """
     transport = _FakeTransport()
     adapter = await _build_adapter(transport)
@@ -646,12 +652,15 @@ async def test_inbound_sdes_savp_call_never_activates_rtcp_on_live_engine() -> N
             assert oks
             assert "a=crypto" in oks[-1].body
 
-            # The LIVE engine must have RTCP DORMANT (no SRTCP transform).
+            # The LIVE engine has RTCP ACTIVE, wrapped in SRTCP (no cleartext leak).
             engine = _live_engine(adapter, call_id)
-            assert engine._rtcp_task is None  # no run_rtcp loop
-            assert engine._rtcp_active is False  # muxed demux NOT engaged
-            assert engine._rtcp_mux_active is False
-            assert engine._rtcp_local_port is None  # no sibling socket
+            assert engine._rtcp_task is not None  # the run_rtcp loop is live
+            assert engine._rtcp_active is True
+            assert engine._has_srtcp is True  # SRTCP in+out wired
+            assert engine._srtcp_in is not None
+            assert engine._srtcp_out is not None
+            # Non-muxed offer → sibling RTCP socket on RTP-port+1 (RFC 3550 §11).
+            assert engine._rtcp_local_port == engine.local_port + 1
     finally:
         in_call.set()
         await adapter.disconnect()
@@ -722,18 +731,23 @@ class _FakeWebRtcSession:
         self.handshake_args = kwargs
         return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
 
+    def derive_srtcp_sessions(self) -> tuple[object, object]:
+        """The SRTCP (inbound, outbound) pair from the same DTLS export (ADR-0066)."""
+        return (MagicMock(name="srtcp_in"), MagicMock(name="srtcp_out"))
+
     async def close(self) -> None:
         self.closed = True
 
 
 @pytest.mark.asyncio
-async def test_inbound_webrtc_savpf_call_never_calls_start_rtcp() -> None:
-    """MAJOR #8 (WebRTC): a real SAVPF INVITE never calls start_rtcp on the engine.
+async def test_inbound_webrtc_savpf_call_activates_rtcp_via_srtcp() -> None:
+    """WebRTC: a real SAVPF INVITE activates RTCP (muxed) wired with SRTCP.
 
     Through ``_on_inbound_invite`` with the WebRTC (DTLS-SRTP) path: the engine is a
-    fake whose ``start_rtcp`` is an AsyncMock. The secured WebRTC profile must leave
-    RTCP dormant — ``start_rtcp`` is asserted NEVER called (no cleartext RTCP over the
-    encrypted ICE/DTLS 5-tuple).
+    fake whose ``start_rtcp`` is an AsyncMock. WebRTC always rtcp-muxes onto the single
+    ICE/DTLS 5-tuple, so ``start_rtcp(mux=True)`` IS called, and the engine is built
+    with the SRTCP sessions derived from the SAME DTLS export (so the RTCP is encrypted
+    + authenticated, never cleartext over the encrypted pipe).
     """
     transport = _FakeTransport()
     adapter = await _build_adapter(transport)
@@ -753,11 +767,16 @@ async def test_inbound_webrtc_savpf_call_never_calls_start_rtcp() -> None:
         local_port=0,
         inbound_sample_rate=16_000,
     )
+    ctor_kwargs: dict[str, object] = {}
+
+    def _capture_engine(**kwargs: object) -> MagicMock:
+        ctor_kwargs.update(kwargs)
+        return fake_engine
 
     try:
         with (
             patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession),
-            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch("hermes_voip.adapter.RtpMediaTransport", _capture_engine),
             patch(
                 "hermes_voip.adapter.CallLoop",
                 return_value=MagicMock(run=_blocking_run),
@@ -781,8 +800,12 @@ async def test_inbound_webrtc_savpf_call_never_calls_start_rtcp() -> None:
             assert "a=fingerprint" in oks[-1].body
             assert "a=crypto" not in oks[-1].body
 
-            # The secured WebRTC path NEVER activates RTCP.
-            fake_engine.start_rtcp.assert_not_called()
+            # RTCP activated, MUXED (single ICE/DTLS 5-tuple).
+            fake_engine.start_rtcp.assert_called_once()
+            assert fake_engine.start_rtcp.call_args.kwargs["mux"] is True
+            # The engine was built with SRTCP wired from the DTLS export.
+            assert ctor_kwargs.get("srtcp_inbound") is not None
+            assert ctor_kwargs.get("srtcp_outbound") is not None
     finally:
         in_call.set()
         await asyncio.sleep(0)

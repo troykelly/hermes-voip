@@ -431,17 +431,25 @@ class _FakeSipDtlsSession:
             raise ValueError(msg)
         return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
 
+    def derive_srtcp_sessions(self) -> tuple[object, object]:
+        """The SRTCP (inbound, outbound) pair from the same DTLS export (ADR-0066)."""
+        return (MagicMock(name="srtcp_in"), MagicMock(name="srtcp_out"))
+
     async def close(self) -> None:
         self.closed = True
 
 
 def _fake_engine() -> MagicMock:
-    """A fake RtpMediaTransport sufficient for the SIP-DTLS branch + call tail."""
+    """A fake RtpMediaTransport sufficient for the SIP-DTLS branch + call tail.
+
+    ``start_rtcp`` is an AsyncMock: the secured DTLS path now ACTIVATES RTCP wrapped in
+    SRTCP (ADR-0066), so the engine awaits it; ``_rtcp_active`` stays a plain attribute
+    (the fake never runs the real loop, so teardown's quality-log guard reads False).
+    """
     return MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # The secured DTLS path does NOT activate RTCP (no SRTCP transform) — the
-        # flag stays inert and teardown logs no quality, like the WebRTC path.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=_SESSION_PORT,
         inbound_sample_rate=8_000,
@@ -562,6 +570,59 @@ async def test_sip_dtls_offer_yields_savp_answer_with_fingerprint_and_pipe() -> 
             assert kwargs["ice_transport"] is session.pipe
             assert kwargs["srtp_inbound"] is not None
             assert kwargs["srtp_outbound"] is not None
+    finally:
+        in_call.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_sip_dtls_call_activates_rtcp_via_srtcp() -> None:
+    """The SIP DTLS-SRTP path ACTIVATES RTCP (muxed) wrapped in SRTCP (ADR-0066).
+
+    DTLS-SRTP rides a single UDP pipe (the session owns the socket; the engine binds
+    none), so RTCP must rtcp-mux. The adapter builds the engine with the SRTCP sessions
+    derived from the SAME DTLS export and calls ``start_rtcp(mux=True)`` — so the
+    secured SIP-DTLS call gets authenticated+encrypted RTCP, never cleartext on the
+    secured 5-tuple. Supersedes the pre-SRTCP dormancy on this path (rule 19: stated
+    limitation "until SRTCP lands", now landed).
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, load_media_config({}))
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    engine = _fake_engine()
+    try:
+        with (
+            patch("hermes_voip.adapter.SipDtlsMediaSession", _FakeSipDtlsSession),
+            patch(
+                "hermes_voip.adapter.RtpMediaTransport", return_value=engine
+            ) as engine_ctor,
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)
+
+            # The engine was built with SRTCP wired from the DTLS export.
+            kwargs = engine_ctor.call_args.kwargs
+            assert kwargs["srtcp_inbound"] is not None
+            assert kwargs["srtcp_outbound"] is not None
+            # RTCP was activated, MUXED (the single DTLS-SRTP UDP pipe).
+            engine.start_rtcp.assert_awaited_once()
+            assert engine.start_rtcp.call_args.kwargs["mux"] is True
     finally:
         in_call.set()
         await asyncio.sleep(0)
@@ -1463,7 +1524,9 @@ async def test_sdes_offer_never_touches_sip_dtls_branch() -> None:
     engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # SDES (secured) path does not activate RTCP.
+        # SDES (secured) path now activates RTCP over SRTCP (ADR-0066); the real engine
+        # awaits start_rtcp, so the fake must provide an AsyncMock.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=20002,
         inbound_sample_rate=8_000,

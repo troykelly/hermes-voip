@@ -126,19 +126,39 @@ The activation lane shipped the above with two refinements to what is written ab
    are read), gated on the activation flag so a non-activated engine is byte-for-byte
    unchanged. `engine.call_quality` is logged at adapter teardown (runbook 0014).
 
-2. **RTCP is activated ONLY on the cleartext plain-RTP path; secured paths are NOT.**
-   Step 4 above assumed an "SRTP unprotect" of RTCP — i.e. **SRTCP** (RFC 3711 §3.4). The
-   media engine and `media/srtp.py` implement **SRTP only**: `_emit_rtcp`/`ingest_rtcp`
-   handle CLEARTEXT RTCP, and `SrtpSession` has no `protect_rtcp`/`unprotect_rtcp`. Sending
-   cleartext RTCP on an RTP/SAVP (SDES) or SAVPF (WebRTC/DTLS) 5-tuple would violate the
-   secured profile **and** leak our SSRC/CNAME/timing in cleartext on an otherwise-encrypted
-   call — worse than no RTCP. So the adapter's `_plan_rtcp_activation` returns `None` for a
-   secured session, and `_setup_sdes_call` activates RTCP only when the answer is plain
-   RTP/AVP (`answer_crypto is None`); the WebRTC path never activates it. Activating RTCP on
-   secured calls requires an SRTCP transform — a separate, named capability follow-up
-   (SRTCP, RFC 3711 §3.4). Until it lands, RTCP is dormant on encrypted calls (which
-   includes the SDES-SRTP live test gateway). The operator kill-switch is
-   `HERMES_VOIP_RTCP_ENABLED` (default on).
+2. **At first, RTCP was activated ONLY on the cleartext plain-RTP path; secured paths were
+   NOT** (because `media/srtp.py` was SRTP-only and the engine emitted/parsed CLEARTEXT RTCP,
+   which on an RTP/SAVP or SAVPF 5-tuple would violate the profile and leak SSRC/CNAME/timing
+   in cleartext — worse than no RTCP). This was an explicitly-named, bounded limitation: RTCP
+   stayed dormant on encrypted calls (including the SDES-SRTP live test gateway) "until SRTCP
+   lands". **See the secured-activation refinement below — SRTCP has now landed.**
+
+### Secured-path RTCP activation via SRTCP (refinement, 2026-06-20, ADR-0066)
+
+The dormancy of point 2 is **resolved**: SRTCP (RFC 3711 §3.4) shipped as `media/srtcp.py`
+(ADR-0066, PR #152), and this lane wires it into the engine + adapter so RTCP **activates**
+on every secured path (SDES, SIP-DTLS, WebRTC) instead of staying dormant.
+
+- **Engine seam.** `RtpMediaTransport` gained narrow `_SrtcpProtect`/`_SrtcpUnprotect`
+  Protocols and `srtcp_inbound`/`srtcp_outbound` fields. `_emit_rtcp` wraps every outbound
+  compound RTCP in `_srtcp_out.protect`; `_ingest_rtcp_datagram` unwraps every inbound one
+  with `_srtcp_in.unprotect` (an `SrtcpError` — auth/replay/format — drops the datagram, the
+  call continues). The secured-transport guard in `start_rtcp` **flips**: a secured engine
+  now activates RTCP when SRTCP is wired (`_has_srtcp` = both sessions set) and stays dormant
+  only when secured **without** SRTCP. The inbound muxed demux (RFC 5761 §4 second byte
+  200–204, in the clear even under SRTCP per §3.4) now recognises secured RTCP.
+- **Keying.** SDES SRTCP is keyed from the SAME negotiated `a=crypto` master key||salt as
+  SRTP (offerer's key inbound, our answer key outbound) — only the §4.3.2 KDF labels differ
+  (0x03/0x04/0x05 vs 0x00/0x01/0x02), so the keystreams never collide. DTLS/WebRTC SRTCP is
+  derived from the SAME RFC 5764 export as SRTP via a new `DtlsEndpoint.derive_srtcp_sessions`
+  (proxied by both session wrappers).
+- **Adapter.** `_setup_sdes_call` builds the SRTCP pair and activates RTCP via a new
+  `_plan_secured_rtcp_activation` (mux mirrors the offer, kill-switch only, no profile gate;
+  SDES can use the non-muxed sibling port because the engine owns a UDP socket).
+  `_setup_webrtc_call` and `_setup_sip_dtls_call` derive SRTCP from the handshake and activate
+  RTCP **muxed** (a single ICE/UDP pipe has no second socket) via `_activate_muxed_srtcp_rtcp`.
+- The operator kill-switch is still `HERMES_VOIP_RTCP_ENABLED` (default on); it now suppresses
+  RTCP on secured calls too.
 
 ## Consequences
 
@@ -154,9 +174,10 @@ The activation lane shipped the above with two refinements to what is written ab
 - **Maintenance commitment:** the byte-level KAT vectors pin the wire format; any future
   RTCP profile addition (XR, feedback RFC 4585) extends `parse_compound`'s skip-unknown
   traversal without breaking it.
-- **The live path is not exercised until the adapter wires it** (named above). Until then
-  RTCP is fully built + unit-tested but dormant — explicitly a same-push adapter follow-up,
-  not deferred debt (rule 6): the capability and its activation contract ship together.
+- **The live path is wired in the adapter** (named above): RTCP is activated on the cleartext
+  plain-RTP path, and — since the SRTCP refinement (ADR-0066) — on every secured path (SDES,
+  SIP-DTLS, WebRTC) too, so the SLO signals are populated on encrypted calls (including the
+  SDES-SRTP live test gateway), not only cleartext ones.
 
 ## Alternatives considered
 

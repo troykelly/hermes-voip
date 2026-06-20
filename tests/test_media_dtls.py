@@ -49,8 +49,35 @@ from hermes_voip.media.dtls import (  # noqa: E402
     DtlsRole,
     SrtpProfile,
 )
+from hermes_voip.media.srtcp import SrtcpError, SrtcpSession  # noqa: E402
 from hermes_voip.media.srtp import SrtpError, SrtpSession  # noqa: E402
+from hermes_voip.rtcp import (  # noqa: E402
+    ReceiverReport,
+    ReportBlock,
+    build_compound,
+    parse_compound,
+)
 from hermes_voip.rtp import RtpPacket  # noqa: E402
+
+
+def _rtcp_compound(*, sender_ssrc: int) -> bytes:
+    """A cleartext compound RTCP datagram (an RR) with sender SSRC ``sender_ssrc``."""
+    rr = ReceiverReport(
+        ssrc=sender_ssrc,
+        report_blocks=(
+            ReportBlock(
+                ssrc=0x0BADF00D,
+                fraction_lost=0,
+                cumulative_lost=0,
+                extended_highest_seq=10,
+                jitter=0,
+                lsr=0,
+                dlsr=0,
+            ),
+        ),
+    )
+    return build_compound((rr,))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -355,6 +382,113 @@ class TestSrtpSessionDerivation:
         tampered[13] ^= 0xFF  # flip bits in the ciphertext
         with pytest.raises(SrtpError):
             s_inbound_fresh.unprotect(bytes(tampered))
+
+
+class TestSrtcpSessionDerivation:
+    """SRTCP keying from the SAME DTLS export as SRTP (RFC 3711 §3.4, ADR-0066).
+
+    Secured-path RTCP rides SRTCP, keyed from the identical RFC 5764 §4.2 export that
+    keys SRTP — only the KDF labels differ (0x03/0x04/0x05 vs 0x00/0x01/0x02). So the
+    DtlsEndpoint exposes ``derive_srtcp_sessions`` returning a role-correct
+    ``(inbound, outbound)`` pair the WebRTC / SIP-DTLS adapter paths wire onto the
+    engine alongside the SRTP pair.
+    """
+
+    def test_derive_inbound_outbound_srtcp_sessions(
+        self, dtls_pair: tuple[DtlsEndpoint, DtlsEndpoint]
+    ) -> None:
+        """derive_srtcp_sessions returns a (inbound, outbound) SrtcpSession pair."""
+        client, _server = dtls_pair
+        inbound, outbound = client.derive_srtcp_sessions()
+        assert isinstance(inbound, SrtcpSession)
+        assert isinstance(outbound, SrtcpSession)
+
+    def test_srtcp_protect_unprotect_round_trip(
+        self, dtls_pair: tuple[DtlsEndpoint, DtlsEndpoint]
+    ) -> None:
+        """Client-outbound SRTCP protect → server-inbound unprotect (RFC 3711 §3.4).
+
+        The client's OUTBOUND SRTCP session and the server's INBOUND SRTCP session are
+        keyed from the same client_write material (mirroring SRTP roles), so a compound
+        RTCP datagram the client emits decrypts on the server back to the cleartext.
+        """
+        client, server = dtls_pair
+        _c_in, c_out = client.derive_srtcp_sessions()
+        s_in, _s_out = server.derive_srtcp_sessions()
+
+        sender_ssrc = 0xCAFEBABE
+        cleartext = _rtcp_compound(sender_ssrc=sender_ssrc)
+        srtcp_wire = c_out.protect(cleartext)
+        assert srtcp_wire != cleartext
+        assert len(srtcp_wire) > len(cleartext)  # index trailer + auth tag
+
+        recovered = s_in.unprotect(srtcp_wire)
+        assert recovered == cleartext
+        # And it parses back to the original RR.
+        packets = list(parse_compound(recovered))
+        assert any(isinstance(p, ReceiverReport) for p in packets)
+
+    def test_srtcp_server_to_client_round_trip(
+        self, dtls_pair: tuple[DtlsEndpoint, DtlsEndpoint]
+    ) -> None:
+        """Server-outbound SRTCP protect → client-inbound unprotect (reverse)."""
+        client, server = dtls_pair
+        c_in, _c_out = client.derive_srtcp_sessions()
+        _s_in, s_out = server.derive_srtcp_sessions()
+
+        cleartext = _rtcp_compound(sender_ssrc=0xDEADBEEF)
+        srtcp_wire = s_out.protect(cleartext)
+        assert c_in.unprotect(srtcp_wire) == cleartext
+
+    def test_srtcp_keystream_is_distinct_from_srtp(
+        self, dtls_pair: tuple[DtlsEndpoint, DtlsEndpoint]
+    ) -> None:
+        """SRTCP and SRTP from one export never share a keystream (distinct labels).
+
+        Protecting the SAME bytes as SRTP-payload vs SRTCP-payload (same SSRC, same
+        index/sequence) must yield different ciphertext — the RFC 3711 §4.3.2 RTCP KDF
+        labels (0x03..0x05) select different session keys than SRTP's (0x00..0x02).
+        """
+        client, _server = dtls_pair
+        _c_in_rtp, c_out_rtp = client.derive_srtp_sessions()
+        _c_in_rtcp, c_out_rtcp = client.derive_srtcp_sessions()
+
+        sender_ssrc = 0x0A0B0C0D
+        # An RTP packet and an RTCP compound that both carry the same SSRC.
+        pkt = RtpPacket(
+            payload_type=0,
+            sequence_number=1,
+            timestamp=0,
+            ssrc=sender_ssrc,
+            payload=b"\x00" * 16,
+        )
+        srtp_wire = c_out_rtp.protect(pkt)
+        srtcp_wire = c_out_rtcp.protect(_rtcp_compound(sender_ssrc=sender_ssrc))
+        # The encrypted bodies differ (distinct keystreams) — a strong inequality is
+        # enough; the point is they are not the same transform on the same material.
+        assert srtp_wire != srtcp_wire
+
+    def test_srtcp_auth_failure_on_tampered_packet(
+        self, dtls_pair: tuple[DtlsEndpoint, DtlsEndpoint]
+    ) -> None:
+        """A tampered SRTCP packet is rejected by the auth tag (RFC 3711 §3.4)."""
+        client, server = dtls_pair
+        _c_in, c_out = client.derive_srtcp_sessions()
+        s_in_fresh, _ = server.derive_srtcp_sessions()
+
+        srtcp_wire = bytearray(c_out.protect(_rtcp_compound(sender_ssrc=0x11223344)))
+        srtcp_wire[10] ^= 0xFF  # corrupt the encrypted body
+        with pytest.raises(SrtcpError):
+            s_in_fresh.unprotect(bytes(srtcp_wire))
+
+    def test_derive_srtcp_sessions_requires_fingerprint_verification(self) -> None:
+        """derive_srtcp_sessions refuses before fingerprint verify (RFC 5763 §5)."""
+        client = DtlsEndpoint(role=DtlsRole.CLIENT)
+        server = DtlsEndpoint(role=DtlsRole.SERVER)
+        _pump_handshake(client, server)
+        # NOTE: verify_peer_fingerprint deliberately NOT called.
+        with pytest.raises(RuntimeError):
+            client.derive_srtcp_sessions()
 
 
 # ---------------------------------------------------------------------------

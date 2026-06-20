@@ -41,6 +41,7 @@ from typing import Protocol
 
 from hermes_voip.media.dtls import DtlsEndpoint, DtlsRole
 from hermes_voip.media.ice import IceCandidate, IceConnection
+from hermes_voip.media.srtcp import SrtcpSession
 from hermes_voip.media.srtp import SrtpSession
 from hermes_voip.sdp import Fingerprint, SetupRole
 from hermes_voip.sdp import IceCandidate as SdpIceCandidate
@@ -496,6 +497,21 @@ class WebRtcMediaSession:
             A new outbound :class:`SrtpSession` bound to ``ssrc``.
         """
         return self._dtls.derive_outbound_srtp_session(ssrc=ssrc)
+
+    def derive_srtcp_sessions(self) -> tuple[SrtcpSession, SrtcpSession]:
+        """Derive the inbound + outbound :class:`SrtcpSession` pair (RFC 3711 §3.4).
+
+        Secured-path RTCP rides SRTCP, keyed from the SAME DTLS export as this call's
+        SRTP (only the KDF labels differ). The adapter wires the returned pair onto the
+        engine's ``srtcp_inbound``/``srtcp_outbound`` so RTCP is activated (muxed) over
+        the encrypted ICE/DTLS pipe instead of being dormant (ADR-0066). Must be called
+        after :meth:`run_handshake`; the fingerprint-verified precondition is enforced
+        by the underlying DTLS endpoint.
+
+        Returns:
+            ``(inbound, outbound)`` — the role-mirrored SRTCP session pair.
+        """
+        return self._dtls.derive_srtcp_sessions()
 
     async def _pump_dtls_handshake(self) -> None:
         """Exchange DTLS records over the ICE pipe until the handshake completes.

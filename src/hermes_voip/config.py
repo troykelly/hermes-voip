@@ -382,6 +382,23 @@ _DEFAULT_RTP_TIMEOUT_SECS = 20
 _MIN_RTP_TIMEOUT_SECS = 1
 _MAX_RTP_TIMEOUT_SECS = 300
 
+# RFC 4028 session timers (ADR-0071). ``session_expires`` is the interval (seconds)
+# we OFFER outbound and INSERT into an inbound 2xx (the refresher then refreshes at
+# SE/2; the non-refresher BYEs near expiry if no refresh arrives), so a dead dialog
+# is detected and torn down instead of lingering. ``min_se`` is the smallest interval
+# we ACCEPT inbound — an INVITE offering a Session-Expires below it is rejected
+# ``422 Session Interval Too Small`` carrying our Min-SE (the UAC then retries
+# larger). RFC 4028 §4/§5 floor BOTH at 90 s; the parser/post-init enforce
+# ``min_se >= 90`` and ``session_expires >= min_se`` (a sub-floor or below-minimum
+# session interval is a misconfiguration surfaced at load, never silently accepted).
+# Default 600 s session interval is a conservative liveness window for a voice call.
+_SESSION_EXPIRES_KEY = "HERMES_VOIP_SESSION_EXPIRES"
+_MIN_SE_KEY = "HERMES_VOIP_MIN_SE"
+_DEFAULT_SESSION_EXPIRES = 600
+_DEFAULT_MIN_SE = 90
+# RFC 4028 §4/§5 absolute minimum for Session-Expires / Min-SE.
+_RFC4028_MIN_SE_FLOOR = 90
+
 # Adaptive jitter-buffer ceiling (ADR-0056 activated by ADR-0063). The media
 # engine's RX JitterBuffer runs in ADAPTIVE mode: its reorder tolerance grows
 # under loss/wide-reorder up to this many packets and shrinks back after a clean
@@ -970,6 +987,15 @@ class MediaConfig:
     # RTCP SR/RR/SDES/BYE control channel on the cleartext plain-RTP path (a secured
     # session is not activated — no SRTCP transform). The operator kill-switch.
     rtcp_enabled: bool = _DEFAULT_RTCP_ENABLED
+    # RFC 4028 session timers (ADR-0071). ``session_expires`` is the interval (seconds)
+    # we offer outbound / insert into an inbound 2xx; the refresher refreshes at SE/2
+    # and the non-refresher BYEs near expiry, so a dead dialog is reclaimed. ``min_se``
+    # is the smallest interval we accept inbound — a smaller offered Session-Expires is
+    # rejected 422 with our Min-SE. RFC 4028 §4/§5 floors both at 90 s; __post_init__
+    # enforces ``min_se >= 90`` and ``session_expires >= min_se``. Defaulted so existing
+    # direct constructions stay valid.
+    session_expires: int = _DEFAULT_SESSION_EXPIRES
+    min_se: int = _DEFAULT_MIN_SE
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -1023,22 +1049,7 @@ class MediaConfig:
             raise ConfigError(msg)
         self._validate_aec()
         self._validate_comfort_filler()
-        if not (
-            _MIN_RTP_TIMEOUT_SECS <= self.media_timeout_secs <= _MAX_RTP_TIMEOUT_SECS
-        ):
-            msg = (
-                f"media_timeout_secs must be in "
-                f"[{_MIN_RTP_TIMEOUT_SECS}, {_MAX_RTP_TIMEOUT_SECS}], "
-                f"got {self.media_timeout_secs}"
-            )
-            raise ConfigError(msg)
-        if self.jitter_max_depth < _MIN_JITTER_MAX_DEPTH:
-            msg = (
-                f"jitter_max_depth must be >= {_MIN_JITTER_MAX_DEPTH} (the adaptive "
-                f"jitter buffer's floor — a lower ceiling would fail engine "
-                f"construction), got {self.jitter_max_depth}"
-            )
-            raise ConfigError(msg)
+        self._validate_media_timers()
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))
             msg = f"dtmf_mode must be one of {{{allowed}}}, got {self.dtmf_mode!r}"
@@ -1136,6 +1147,51 @@ class MediaConfig:
             raise ConfigError(msg)
         if any(not phrase.strip() for phrase in self.comfort_filler_phrases):
             msg = "comfort_filler_phrases must not contain a blank phrase"
+            raise ConfigError(msg)
+
+    def _validate_media_timers(self) -> None:
+        """Validate media-plane timer bounds: RTP-inactivity, jitter, session timers.
+
+        Groups the bounded media-timing invariants so :meth:`__post_init__` stays under
+        the statement budget: the RTP-inactivity watchdog window (ADR-0026, [1, 300] s),
+        the adaptive jitter-buffer ceiling floor (ADR-0056/0063), and the RFC 4028
+        session timers (ADR-0071). Holds regardless of how the config is built so a
+        direct :class:`MediaConfig` construction is self-validating.
+
+        RFC 4028 session timers: both intervals are floored at 90 s (RFC 4028 §4/§5: the
+        absolute minimum for ``Session-Expires``/``Min-SE``), and the offered/inserted
+        ``session_expires`` must not be below the ``min_se`` we accept — otherwise our
+        own ``Session-Expires`` would be below our advertised minimum and a strict peer
+        could 422 it.
+        """
+        if not (
+            _MIN_RTP_TIMEOUT_SECS <= self.media_timeout_secs <= _MAX_RTP_TIMEOUT_SECS
+        ):
+            msg = (
+                f"media_timeout_secs must be in "
+                f"[{_MIN_RTP_TIMEOUT_SECS}, {_MAX_RTP_TIMEOUT_SECS}], "
+                f"got {self.media_timeout_secs}"
+            )
+            raise ConfigError(msg)
+        if self.jitter_max_depth < _MIN_JITTER_MAX_DEPTH:
+            msg = (
+                f"jitter_max_depth must be >= {_MIN_JITTER_MAX_DEPTH} (the adaptive "
+                f"jitter buffer's floor — a lower ceiling would fail engine "
+                f"construction), got {self.jitter_max_depth}"
+            )
+            raise ConfigError(msg)
+        if self.min_se < _RFC4028_MIN_SE_FLOOR:
+            msg = (
+                f"min_se must be >= {_RFC4028_MIN_SE_FLOOR} (the RFC 4028 §4/§5 "
+                f"floor), got {self.min_se}"
+            )
+            raise ConfigError(msg)
+        if self.session_expires < self.min_se:
+            msg = (
+                f"session_expires ({self.session_expires}) must be >= min_se "
+                f"({self.min_se}) — RFC 4028: the session interval must not be below "
+                f"the minimum we accept"
+            )
             raise ConfigError(msg)
 
     def _validate_aec(self) -> None:
@@ -1358,6 +1414,14 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         jitter_max_depth=_parse_positive_int(
             env, _JITTER_MAX_DEPTH_KEY, _DEFAULT_JITTER_MAX_DEPTH
         ),
+        # RFC 4028 session timers (ADR-0071). Parsed as strictly-positive ints; the
+        # RFC 4028 §4/§5 floor (min_se >= 90) and the session_expires >= min_se
+        # ordering are enforced in MediaConfig.__post_init__ (so a direct construction
+        # is self-validating too).
+        session_expires=_parse_positive_int(
+            env, _SESSION_EXPIRES_KEY, _DEFAULT_SESSION_EXPIRES
+        ),
+        min_se=_parse_positive_int(env, _MIN_SE_KEY, _DEFAULT_MIN_SE),
     )
 
 

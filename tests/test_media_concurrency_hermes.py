@@ -326,6 +326,10 @@ async def test_adapter_concurrent_same_call_id_teardown_isolation() -> None:  # 
                 # Plain RTP/AVP concurrency test — the secure-media mandate (ADR-0070)
                 # is off so the cleartext offers are admitted, not 488'd.
                 require_secure_media=False,
+                # Real ints so the RFC 4028 session-timer negotiation (ADR-0071)
+                # compares them, not TypeError on a MagicMock.
+                session_expires=600,
+                min_se=90,
             ),
         ),
         patch(
@@ -626,6 +630,10 @@ async def test_concurrent_same_call_id_all_tasks_tracked_and_cancelled() -> None
                 # Plain RTP/AVP concurrency test — the secure-media mandate (ADR-0070)
                 # is off so the cleartext offers are admitted, not 488'd.
                 require_secure_media=False,
+                # Real ints so the RFC 4028 session-timer negotiation (ADR-0071)
+                # compares them, not TypeError on a MagicMock.
+                session_expires=600,
+                min_se=90,
             ),
         ),
         patch(

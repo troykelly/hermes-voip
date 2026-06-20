@@ -20,7 +20,7 @@ inbound re-INVITE is answered ``491 Request Pending`` (glare).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Protocol, runtime_checkable
 
@@ -64,6 +64,11 @@ from hermes_voip.sdp import (
     build_audio_offer,
     generate_answer_crypto,
 )
+from hermes_voip.session_timer import (
+    RefreshOutcome,
+    RefreshSucceeded,
+    classify_refresh_failure,
+)
 
 __all__ = [
     "CallError",
@@ -82,7 +87,20 @@ _DEFAULT_RESPONSE_TIMEOUT = 32.0
 
 
 class CallError(RuntimeError):
-    """An in-call control verb could not complete (rejected, timed out, glare)."""
+    """An in-call control verb could not complete (rejected, timed out, glare).
+
+    ``status_code`` carries the SIP final-response status that failed the verb, or
+    ``None`` when the verb timed out with no final response. It lets a caller that
+    needs to branch on *why* a re-INVITE failed (the RFC 4028 refresh watchdog —
+    491 glare vs 408/481 dead-dialog vs a transient 5xx) classify the failure
+    instead of treating every non-2xx identically. Verbs that do not care (hold,
+    transfer) simply ignore it.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        """Bind the human-readable ``message`` and the optional SIP ``status_code``."""
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @runtime_checkable
@@ -384,7 +402,50 @@ class CallSession:
                 )
             )
 
-    async def _reinvite(self, direction: str) -> None:
+    async def refresh_session(
+        self, extra_headers: Sequence[tuple[str, str]]
+    ) -> RefreshOutcome:
+        """Send an RFC 4028 session-refresh re-INVITE; classify the outcome (ADR-0071).
+
+        A session refresh is an in-dialog re-INVITE carrying the ``Session-Expires``
+        (with the negotiated refresher) + ``Supported: timer`` headers so the session
+        timer resets on both sides. It REUSES the existing re-INVITE machinery
+        (:meth:`_reinvite`) — no new transaction type — with the session-timer headers
+        threaded through ``extra_headers``.
+
+        A refresh **re-asserts** the call's current state; it never changes it. So the
+        offered direction mirrors the live media direction — ``sendonly`` while the
+        call is on hold, else ``sendrecv`` — exactly like an offerless re-INVITE
+        answer (:meth:`_answer_reinvite`). Refreshing a held call with ``sendrecv``
+        would silently un-hold it at the SDP layer while ``on_hold`` and the engine
+        hold-gate stayed set.
+
+        Returns a discriminated :data:`RefreshOutcome` (RFC 4028 §10 / RFC 3261 §14.1)
+        so the watchdog can act correctly per response class instead of tearing the
+        call down on every non-2xx:
+
+        * :class:`RefreshSucceeded` — the peer accepted (2xx); the timer is reset.
+        * :class:`RefreshTeardown` — timeout / 408 / 481: the dialog is dead → BYE.
+        * :class:`RefreshRetry` — 491 glare: retry after a randomized backoff.
+        * :class:`RefreshContinue` — any other non-2xx (5xx/6xx/488…): keep the call
+          up; the next refresh tick / the peer's deadline still guards liveness.
+        """
+        async with self._lock:
+            # Read the live direction UNDER the lock — hold/unhold take the same lock,
+            # so the refresh offers a direction consistent with the committed state.
+            direction = "sendonly" if self.on_hold else "sendrecv"
+            try:
+                await self._reinvite(direction, extra_headers=extra_headers)
+            except CallError as exc:
+                # A failed refresh is NOT uniformly fatal — surface the SIP status
+                # (carried on the error; None for a timeout) and let the pure
+                # classifier decide BYE / retry / continue (RFC 4028 §10).
+                return classify_refresh_failure(exc.status_code)
+            return RefreshSucceeded()
+
+    async def _reinvite(
+        self, direction: str, *, extra_headers: Sequence[tuple[str, str]] = ()
+    ) -> None:
         self._local_offer_pending = True
         try:
             # On a secured (SRTP) call mint a FRESH per-offer key echoing the call's
@@ -395,7 +456,11 @@ class CallSession:
             # must never leave outbound encrypted with a key the peer never agreed to.
             offer_crypto = self._reoffer_crypto()
             result = build_hold_reinvite(
-                self._dialog, self._local_media, direction, crypto=offer_crypto
+                self._dialog,
+                self._local_media,
+                direction,
+                crypto=offer_crypto,
+                extra_headers=extra_headers,
             )
             self._dialog = result.dialog
             response = await self._send_and_await_final(
@@ -409,6 +474,7 @@ class CallSession:
                     direction,
                     auth=auth,
                     crypto=offer_crypto,
+                    extra_headers=extra_headers,
                 )
                 self._dialog = result.dialog
                 response = await self._send_and_await_final(
@@ -432,7 +498,9 @@ class CallSession:
                     else f"{outcome.status_code} {outcome.reason}"
                 )
                 msg = f"re-INVITE rejected: {detail}"
-                raise CallError(msg)
+                # Carry the SIP status so a caller that must classify the failure
+                # (the RFC 4028 refresh watchdog) can tell 491/408/481/5xx apart.
+                raise CallError(msg, status_code=outcome.status_code)
             msg = "re-INVITE not confirmed after authentication"
             raise CallError(msg)
         finally:

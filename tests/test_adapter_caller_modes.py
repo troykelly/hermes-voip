@@ -280,7 +280,11 @@ async def _build_adapter(
             # tests use are not 488'd by the secure-media mandate (ADR-0070) — these
             # tests cover caller classification/context, not the media-security policy
             # (which is asserted in tests/test_adapter_secure_media.py).
-            return_value=MagicMock(require_secure_media=False),
+            # session_expires/min_se are real ints so the RFC 4028 session-timer
+            # negotiation (ADR-0071) compares them, not TypeError on a MagicMock.
+            return_value=MagicMock(
+                require_secure_media=False, session_expires=600, min_se=90
+            ),
         ),
         patch(
             "hermes_voip.adapter.load_caller_modes",
@@ -404,7 +408,11 @@ async def test_connect_fails_loud_on_empty_privileged_allow_file(
             # tests use are not 488'd by the secure-media mandate (ADR-0070) — these
             # tests cover caller classification/context, not the media-security policy
             # (which is asserted in tests/test_adapter_secure_media.py).
-            return_value=MagicMock(require_secure_media=False),
+            # session_expires/min_se are real ints so the RFC 4028 session-timer
+            # negotiation (ADR-0071) compares them, not TypeError on a MagicMock.
+            return_value=MagicMock(
+                require_secure_media=False, session_expires=600, min_se=90
+            ),
         ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),

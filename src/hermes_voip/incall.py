@@ -19,6 +19,7 @@ peer sends one, we answer ``491 Request Pending``; if the peer answers ours with
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
@@ -105,15 +106,16 @@ class LocalMediaSession:
     crypto: CryptoAttribute | None = field(default=None, repr=False)
 
 
-def build_hold_reinvite(
+def build_hold_reinvite(  # noqa: PLR0913 — a re-INVITE binds the dialog + media + direction + optional auth + crypto + session-timer headers; the last three are keyword-only
     dialog: Dialog,
     media: LocalMediaSession,
     direction: str,
     *,
     auth: tuple[str, str] | None = None,
     crypto: CryptoAttribute | None = None,
+    extra_headers: Sequence[tuple[str, str]] = (),
 ) -> InDialogRequest:
-    """Build a hold (``sendonly``) or resume (``sendrecv``) re-INVITE.
+    """Build a hold (``sendonly``) or resume/refresh (``sendrecv``) re-INVITE.
 
     Advances the SDP version first (new offer), then builds the in-dialog INVITE
     (advances CSeq) — invariant 1. The returned :class:`InDialogRequest` carries
@@ -125,6 +127,11 @@ def build_hold_reinvite(
     (``RTP/SAVP``) call the caller supplies a fresh per-offer key so the re-offer
     stays ``RTP/SAVP`` + ``a=crypto`` and never downgrades to cleartext RTP/AVP
     (ADR-0053 §6 continuity). ``None`` keeps a plain call plain.
+
+    ``extra_headers`` are additional header pairs carried on the re-INVITE before the
+    SDP ``Content-Type`` — e.g. the RFC 4028 ``Session-Expires`` + ``Supported: timer``
+    headers of a session refresh (ADR-0071), which reuses this exact ``sendrecv``
+    re-INVITE machinery rather than inventing a new transaction type.
 
     Raises:
         IncallError: if ``direction`` is not ``sendonly`` or ``sendrecv``.
@@ -143,9 +150,10 @@ def build_hold_reinvite(
         version=offered.sdp_version,
         crypto=crypto,
     )
-    extra: tuple[tuple[str, str], ...] = (
-        (_SDP_CONTENT_TYPE,) if auth is None else (_SDP_CONTENT_TYPE, auth)
-    )
+    extra: list[tuple[str, str]] = [_SDP_CONTENT_TYPE]
+    if auth is not None:
+        extra.append(auth)
+    extra.extend(extra_headers)
     return build_in_dialog_request(
         offered,
         "INVITE",

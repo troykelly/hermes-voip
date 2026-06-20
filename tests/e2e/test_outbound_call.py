@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
@@ -410,6 +411,10 @@ class OutboundGateway:
     async def await_ack_from_plugin(self, *, timeout: float = 5.0) -> SipRequest:
         """Wait for an ACK from the plugin after our 200 OK."""
         return await asyncio.wait_for(self._received_acks.get(), timeout)
+
+    async def await_bye_from_plugin(self, *, timeout: float = 5.0) -> SipRequest:
+        """Wait for an in-dialog BYE from the plugin (e.g. a refused-2xx teardown)."""
+        return await asyncio.wait_for(self._received_byes.get(), timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -908,14 +913,45 @@ async def test_call_on_connect_trigger() -> None:
 # ---------------------------------------------------------------------------
 
 _GATEWAY_ANSWER_SDES_KEY = base64.b64encode(bytes(range(30))).decode("ascii")
+# A SECOND distinct fake key (bytes 30..59) for the multiple-a=crypto answer; built
+# at runtime so no high-entropy literal sits in this file (gitleaks path-scoping).
+_GATEWAY_ANSWER_SDES_KEY_2 = base64.b64encode(bytes(range(30, 60))).decode("ascii")
+
+# Every fake inline key||salt that appears in an SDP in this file. A failure-assertion
+# message must NEVER echo one (rule 34: the repo is PUBLIC and a CI failure log is too),
+# so _redact_sdp scrubs them; this list keeps the redactor in lockstep with the keys.
+_FAKE_SDES_KEYS = (_GATEWAY_ANSWER_SDES_KEY, _GATEWAY_ANSWER_SDES_KEY_2)
+
+
+def _redact_sdp(text: str | None) -> str:
+    """Redact SDES inline key material from an SDP before it enters a log/assert msg.
+
+    Rule 34: an ``a=crypto`` line carries the inline master key||salt, which must never
+    reach a log line — including a CI **failure** message that echoes the body. Replaces
+    each known fake key with ``<redacted>`` AND, defensively, any ``inline:`` token (so
+    an unexpected key the plugin generated is scrubbed too). Used in every assertion
+    message in this file that references an SDP body or crypto line.
+    """
+    redacted = text or ""
+    for key in _FAKE_SDES_KEYS:
+        redacted = redacted.replace(key, "<redacted>")
+    # Defensive catch-all: scrub any remaining inline:<...> token (to end-of-token).
+    return re.sub(r"inline:[^\s|]+", "inline:<redacted>", redacted)
+
+
+def _crypto_lines_of(invite: SipRequest) -> list[str]:
+    """Return all ``a=crypto:`` line bodies of an INVITE/answer SDP, in order."""
+    return [
+        line[len("a=crypto:") :]
+        for line in (invite.body or "").splitlines()
+        if line.startswith("a=crypto:")
+    ]
 
 
 def _crypto_line_of(invite: SipRequest) -> str | None:
     """Return the single ``a=crypto:`` line body of an INVITE SDP offer, or None."""
-    for line in (invite.body or "").splitlines():
-        if line.startswith("a=crypto:"):
-            return line[len("a=crypto:") :]
-    return None
+    lines = _crypto_lines_of(invite)
+    return lines[0] if lines else None
 
 
 class _SrtpAnsweringGateway(OutboundGateway):
@@ -945,6 +981,63 @@ class _SrtpAnsweringGateway(OutboundGateway):
         )
 
 
+class _SrtpWrongTagGateway(_SrtpAnsweringGateway):
+    """Answers RTP/SAVP but with a DIFFERENT crypto tag than the offer (tag 9).
+
+    RFC 4568 §6.1: the answerer MUST select by the offered tag. A tag the plugin
+    never offered must be rejected, not keyed.
+    """
+
+    def _sdp_answer(self) -> str:
+        return (
+            super()
+            ._sdp_answer()
+            .replace(
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}",
+                f"a=crypto:9 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}",
+            )
+        )
+
+
+class _SrtpWrongSuiteGateway(_SrtpAnsweringGateway):
+    """Answers RTP/SAVP with the offered tag but a DIFFERENT suite (32-bit).
+
+    The plugin offered only AES_CM_128_HMAC_SHA1_80; a 32-bit-suite answer was not
+    offered and must be rejected (RFC 4568 §6.1).
+    """
+
+    def _sdp_answer(self) -> str:
+        return (
+            super()
+            ._sdp_answer()
+            .replace(
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}",
+                f"a=crypto:1 AES_CM_128_HMAC_SHA1_32 inline:{_GATEWAY_ANSWER_SDES_KEY}",
+            )
+        )
+
+
+class _SrtpMultipleCryptoGateway(_SrtpAnsweringGateway):
+    """Answers RTP/SAVP with MULTIPLE a=crypto lines (RFC 4568 §5.1.2 violation).
+
+    An SDP *answer* must carry exactly one a=crypto (the selected one). An ambiguous
+    multi-line answer must be rejected, not silently keyed from the first line.
+    """
+
+    def _sdp_answer(self) -> str:
+        base = super()._sdp_answer()
+        # A SECOND a=crypto (tag 2, distinct key) inserted after the first — an answer
+        # must select exactly one (RFC 4568 §5.1.2), so this ambiguous pair is invalid.
+        extra = (
+            "a=crypto:2 AES_CM_128_HMAC_SHA1_80 "
+            f"inline:{_GATEWAY_ANSWER_SDES_KEY_2}\r\n"
+        )
+        first = (
+            f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_GATEWAY_ANSWER_SDES_KEY}\r\n"
+        )
+        return base.replace(first, first + extra)
+
+
 async def test_outbound_offer_is_plain_rtp_avp_by_default() -> None:
     """Default (flag unset): the outbound INVITE offers PLAIN RTP/AVP, no a=crypto.
 
@@ -966,15 +1059,18 @@ async def test_outbound_offer_is_plain_rtp_avp_by_default() -> None:
             place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
 
             first_invite = await gateway.await_invite_from_plugin(timeout=5.0)
-            assert "m=audio" in (first_invite.body or "")
-            assert "RTP/AVP" in (first_invite.body or ""), (
-                f"default offer is not plain RTP/AVP; body:\n{first_invite.body}"
+            body = first_invite.body or ""
+            assert "m=audio" in body
+            # SDP appears in failure messages only via _redact_sdp (rule 34): a plain
+            # offer has no key, but the redactor keeps every SDP message uniformly safe.
+            assert "RTP/AVP" in body, (
+                f"default offer is not plain RTP/AVP; body:\n{_redact_sdp(body)}"
             )
-            assert "RTP/SAVP" not in (first_invite.body or ""), (
-                f"default offer wrongly advertises SAVP; body:\n{first_invite.body}"
+            assert "RTP/SAVP" not in body, (
+                f"default offer wrongly advertises SAVP; body:\n{_redact_sdp(body)}"
             )
             assert _crypto_line_of(first_invite) is None, (
-                f"default offer wrongly carries a=crypto; body:\n{first_invite.body}"
+                f"default offer wrongly carries a=crypto; body:\n{_redact_sdp(body)}"
             )
 
             # Drain the flow so the adapter tears down cleanly.
@@ -1010,17 +1106,23 @@ async def test_outbound_sdes_offer_advertises_savp_and_crypto() -> None:
 
             first_invite = await gateway.await_invite_from_plugin(timeout=5.0)
             body = first_invite.body or ""
-            assert "m=audio" in body, f"offer has no audio m-line; body:\n{body}"
+            # SDP enters failure messages only via _redact_sdp (rule 34): this offer
+            # carries our per-call inline key, which must never reach a CI log.
+            assert "m=audio" in body, (
+                f"offer has no audio m-line; body:\n{_redact_sdp(body)}"
+            )
             assert "RTP/SAVP" in body, (
-                f"opt-in outbound offer is not RTP/SAVP; body:\n{body}"
+                f"opt-in outbound offer is not RTP/SAVP; body:\n{_redact_sdp(body)}"
             )
             assert body.count("a=crypto:") == 1, (
-                f"expected exactly one a=crypto in the offer; body:\n{body}"
+                f"expected one a=crypto in the offer; body:\n{_redact_sdp(body)}"
             )
             crypto = _crypto_line_of(first_invite)
             assert crypto is not None
-            assert "AES_CM_128_HMAC_SHA1_80 inline:" in crypto, (
-                f"offer crypto is not the preferred suite; line: {crypto}"
+            # Assert the suite token + that the line carries an inline key, WITHOUT
+            # echoing the key (rule 34 — a failure message is a public log too).
+            assert crypto.startswith("1 AES_CM_128_HMAC_SHA1_80 inline:"), (
+                f"offer crypto is not the preferred suite; line: {_redact_sdp(crypto)}"
             )
             # Our offer key must be OUR OWN, never the gateway's answer key.
             assert _GATEWAY_ANSWER_SDES_KEY not in crypto, (
@@ -1028,7 +1130,8 @@ async def test_outbound_sdes_offer_advertises_savp_and_crypto() -> None:
             )
 
             # The re-auth re-send MUST carry the SAME offer body (same a=crypto), so
-            # the key we keyed the engine with matches what the gateway sees.
+            # the key we keyed the engine with matches what the gateway sees. Compare
+            # by identity; never echo either line in the failure message.
             second_invite = await gateway.await_invite_from_plugin(timeout=5.0)
             assert _crypto_line_of(second_invite) == crypto, (
                 "re-auth INVITE offered a different a=crypto than the first INVITE"
@@ -1084,45 +1187,114 @@ async def test_outbound_sdes_secured_answer_brings_engine_up_secured() -> None:
         await gateway.stop()
 
 
+async def _assert_refused_2xx_acks_then_byes_then_fails(
+    gateway: OutboundGateway,
+) -> None:
+    """Assert the refused-2xx teardown for a place_call against ``gateway`` (flag ON).
+
+    The UAC ACKs the 2xx, then BYEs the dialog (RFC 3261 §13.2.2.4 + §15), raises
+    OutboundCallFailed, and leaves no running call/engine.
+
+    Shared by every fail-closed case (plain answer, wrong tag, wrong suite, multiple
+    a=crypto). A 2xx MUST be ACKed by the UAC even when we then reject it — leaving it
+    un-ACKed produces a half-open remote-established dialog + retransmits (ADR-0065).
+    """
+    async with _real_adapter(
+        gateway,
+        providers=Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard()),
+        extra_env={"HERMES_VOIP_SIP_SDES_OFFER": "true"},
+    ) as adapter:
+        from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+        assert isinstance(adapter, VoipAdapter)
+        place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+        await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+        await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+
+        # The refused 2xx is still ACKed (TU owns the 2xx ACK), THEN BYE'd to tear
+        # down the remote-established dialog — never left un-ACKed (half-open).
+        ack = await gateway.await_ack_from_plugin(timeout=5.0)
+        assert ack.method == "ACK"
+        bye = await gateway.await_bye_from_plugin(timeout=5.0)
+        assert bye.method == "BYE"
+
+        with pytest.raises(OutboundCallFailed) as exc_info:
+            await asyncio.wait_for(place_task, timeout=5.0)
+        # 488 — we cannot accept this answer for a secured offer (mirrors the
+        # codec-mismatch 488 in the same handler). Message is structural, never the key.
+        assert exc_info.value.status == 488
+
+        # No call may be running — neither secured nor (worse) cleartext — and the
+        # media socket is released (no engine left behind).
+        await asyncio.sleep(0.05)
+        assert not adapter._call_sessions, (
+            "a refused-2xx call was left running (possible silent downgrade)"
+        )
+        assert not adapter._call_loops
+
+
 async def test_outbound_sdes_plain_answer_fails_closed() -> None:
-    """Flag ON + the peer answers PLAIN RTP/AVP to our SAVP offer → the call FAILS.
+    """Flag ON + the peer answers PLAIN RTP/AVP to our SAVP offer → ACK+BYE+fail.
 
     Fail-closed (ADR-0066): accepting a cleartext answer to an encrypted offer would
-    silently stream plaintext for a call we asked to protect — a bid-down. The call
-    must raise OutboundCallFailed and leave NO secured/cleartext call running. RED on
-    main (the answer's profile/crypto is ignored, so a plain answer is accepted and the
-    engine streams cleartext).
+    silently stream plaintext for a call we asked to protect — a bid-down. The refused
+    2xx is ACKed then BYE'd (no half-open dialog), the call raises, and NO call runs.
+    RED on main (the answer's profile/crypto is ignored, so a plain answer is accepted).
     """
     # The base OutboundGateway answers plain RTP/AVP; with the flag on we OFFERED SAVP,
     # so this plain answer is the downgrade case.
     gateway = OutboundGateway()
     gateway.set_register_responder()
     await gateway.start()
-
-    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
-    extra = {"HERMES_VOIP_SIP_SDES_OFFER": "true"}
     try:
-        async with _real_adapter(
-            gateway, providers=providers, extra_env=extra
-        ) as adapter:
-            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
 
-            assert isinstance(adapter, VoipAdapter)
 
-            with pytest.raises(OutboundCallFailed) as exc_info:
-                await adapter.place_call(_TARGET_EXT)
+async def test_outbound_sdes_answer_wrong_tag_fails_closed() -> None:
+    """Flag ON + the SAVP answer uses a crypto tag we never offered → ACK+BYE+fail.
 
-            # 488 Not Acceptable Here — we cannot accept a plaintext answer to a
-            # secured offer (mirrors the codec-mismatch 488 in the same handler).
-            assert exc_info.value.status == 488
+    RFC 4568 §6.1: the answerer selects by the offered tag. A tag the plugin never
+    offered must not key inbound SRTP — fail closed (ACK+BYE), never key from it.
+    RED on main and on the first ADR-0066 cut (which took crypto_attrs[0] blindly).
+    """
+    gateway = _SrtpWrongTagGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
 
-            # No call may be running — neither secured nor (worse) cleartext.
-            await asyncio.sleep(0.05)
-            assert not adapter._call_sessions, (
-                "a downgraded (plaintext) call was left running after the SAVP offer "
-                "was answered plain"
-            )
-            assert not adapter._call_loops
+
+async def test_outbound_sdes_answer_wrong_suite_fails_closed() -> None:
+    """Flag ON + the SAVP answer uses a suite we never offered → ACK+BYE+fail.
+
+    We offered only AES_CM_128_HMAC_SHA1_80; an answer selecting the 32-bit suite was
+    never offered (RFC 4568 §6.1) and must be rejected, not keyed.
+    """
+    gateway = _SrtpWrongSuiteGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_sdes_answer_multiple_crypto_fails_closed() -> None:
+    """Flag ON + the SAVP answer carries MULTIPLE a=crypto lines → ACK+BYE+fail.
+
+    An SDP answer must select exactly one crypto (RFC 4568 §5.1.2). An ambiguous
+    multi-line answer must be rejected — never silently keyed from the first line.
+    """
+    gateway = _SrtpMultipleCryptoGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
     finally:
         await gateway.stop()
 

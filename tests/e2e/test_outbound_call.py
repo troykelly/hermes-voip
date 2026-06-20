@@ -1365,6 +1365,41 @@ class _SrtpMatchingPlusUnsupportedCryptoGateway(_SrtpAnsweringGateway):
         return super()._sdp_answer().replace(first, first + extra)
 
 
+class _SrtpDtlsProfileMatchingCryptoGateway(_SrtpAnsweringGateway):
+    """Answers a SECURE-but-NON-RTP/SAVP profile (UDP/TLS/RTP/SAVP) + matching a=crypto.
+
+    codex r3 BLOCKING 2: ``is_srtp`` is true for ANY ``*SAVP`` profile, so a DTLS-SRTP
+    profile (``UDP/TLS/RTP/SAVP``) — or WebRTC ``RTP/SAVPF`` — carrying one matching
+    a=crypto would be wrongly accepted and keyed as bare SDES (spec-invalid: SDES keying
+    on a DTLS/AVPF media line is a dead call). The validator must require the answer
+    profile is EXACTLY ``RTP/SAVP`` and fail closed otherwise.
+    """
+
+    def _sdp_answer(self) -> str:
+        # Same SDP as the SDES gateway but with the DTLS-SRTP profile token instead of
+        # plain SDES RTP/SAVP. The single a=crypto still matches our offer (tag 1 /
+        # 80-bit) — proving the rejection is on the PROFILE, not the crypto.
+        return super()._sdp_answer().replace("RTP/SAVP", "UDP/TLS/RTP/SAVP")
+
+
+async def test_outbound_sdes_non_savp_secure_answer_fails_closed() -> None:
+    """Flag ON + a SECURE non-RTP/SAVP answer (UDP/TLS/RTP/SAVP) + matching crypto.
+
+    Codex r3 BLOCKING 2: ``answer_audio.is_srtp`` is true for any ``*SAVP`` profile, so
+    a DTLS-SRTP (or WebRTC SAVPF) 2xx with one matching a=crypto would be wrongly keyed
+    as bare SDES. The validator must require the answer profile is EXACTLY ``RTP/SAVP``;
+    anything else fails closed (ACK+BYE), even with an otherwise-matching crypto. RED
+    before the exact-profile check.
+    """
+    gateway = _SrtpDtlsProfileMatchingCryptoGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+    try:
+        await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
+
+
 async def test_outbound_sdes_no_common_codec_acks_and_byes() -> None:
     """Flag ON + a 2xx with no common codec → ACK+BYE+fail (codec path, codex r2).
 
@@ -1413,6 +1448,62 @@ async def test_outbound_sdes_matching_plus_unsupported_crypto_fails_closed() -> 
     await gateway.start()
     try:
         await _assert_refused_2xx_acks_then_byes_then_fails(gateway)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_unexpected_exception_after_ack_byes_once_no_half_open() -> None:
+    """Codex r3 BLOCKING 3: a NON-OutboundCallFailed error after the ACK BYEs once.
+
+    The 2xx is ACKed (dialog established), then a later step raises something OTHER than
+    OutboundCallFailed (here CallSession wiring is patched to raise ValueError). That
+    post-ACK exception MUST tear the established dialog down with EXACTLY ONE BYE before
+    propagating — never leave it half-open, never double-BYE. RED before the ack_sent
+    teardown guard (the old except only caught OutboundCallFailed, so the session-wiring
+    failure left the dialog un-BYE'd). The error still propagates (rule 37) and no call
+    runs.
+    """
+    gateway = OutboundGateway()  # plain RTP/AVP answer — flag OFF, so no crypto path
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            # Patch a POST-ACK step (CallSession construction, which runs after the ACK
+            # and outside the codec/crypto try) to raise a non-OutboundCallFailed error.
+            with patch(
+                "hermes_voip.adapter.CallSession",
+                side_effect=ValueError("injected post-ACK failure"),
+            ):
+                place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+                await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+                await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+                # The 2xx is ACKed (TU owns the 2xx ACK) before the patched step raises.
+                ack = await gateway.await_ack_from_plugin(timeout=5.0)
+                assert ack.method == "ACK"
+                # The injected post-ACK failure must BYE the established dialog.
+                bye = await gateway.await_bye_from_plugin(timeout=5.0)
+                assert bye.method == "BYE"
+
+                # The error propagates (not swallowed) — place_call raises ValueError.
+                with pytest.raises(ValueError, match="injected post-ACK failure"):
+                    await asyncio.wait_for(place_task, timeout=5.0)
+
+            # EXACTLY ONE BYE — the teardown must not double-BYE. Give any stray
+            # second BYE a moment to (not) arrive, then assert the queue is empty.
+            await asyncio.sleep(0.1)
+            assert gateway._received_byes.empty(), (
+                "a second BYE was sent — the post-ACK teardown double-BYE'd the dialog"
+            )
+            # No call/engine left running.
+            assert not adapter._call_sessions
+            assert not adapter._call_loops
     finally:
         await gateway.stop()
 
@@ -1543,14 +1634,19 @@ async def test_outbound_sdes_offer_key_is_never_logged(
             assert engine._srtp_in is not None
 
             # The inline key||salt must appear in NO log record — neither in the
-            # formatted message nor in any record's repr/args.
+            # formatted message nor in any record's repr/args. CRITICAL (rule 34): the
+            # failure message itself must NEVER interpolate the captured record payload
+            # — if the key DID leak, printing record.getMessage() here would re-leak it
+            # to the PUBLIC CI log. Report only the logger name + level + which check
+            # failed, never the raw message/args.
             for record in caplog.records:
                 assert known_key_b64 not in record.getMessage(), (
-                    f"SDES offer key leaked into a log message ({record.name} "
-                    f"{record.levelname}): {record.getMessage()!r}"
+                    f"SDES offer key leaked into a log message "
+                    f"({record.name} {record.levelname}) — payload withheld (rule 34)"
                 )
                 assert known_key_b64 not in repr(record.args), (
-                    f"SDES offer key leaked via log args ({record.name})"
+                    f"SDES offer key leaked via log args "
+                    f"({record.name} {record.levelname}) — args withheld (rule 34)"
                 )
     finally:
         await gateway.stop()

@@ -77,9 +77,13 @@ _HOST_KEY = "HERMES_SIP_HOST"
 _PORT_KEY = "HERMES_SIP_PORT"
 # Provisioning aliases (launch-blocker fix; runbook 0001). The 1Password-provisioned
 # .env emits HERMES_SIP_SERVER_HOST / HERMES_SIP_TLS_PORT, but the canonical keys this
-# parser reads are HERMES_SIP_HOST / HERMES_SIP_PORT. Accept the provisioner names as
-# FALLBACKS so a first live launch from the sanctioned secret registers instead of
-# failing "HERMES_SIP_HOST is required"; the canonical key wins when both are set.
+# parser reads are HERMES_SIP_HOST / HERMES_SIP_PORT. Accept the provisioner names so a
+# first live launch from the sanctioned secret registers instead of failing
+# "HERMES_SIP_HOST is required". For the HOST the canonical key wins when both are set
+# (_require_host). The TLS PORT is transport-aware: HERMES_SIP_TLS_PORT is the SIP-TLS
+# port and on the tls transport it takes PRECEDENCE over HERMES_SIP_PORT (which a
+# provisioner sets to the cleartext 5060) — see _parse_port — because the TLS handshake
+# must target the TLS port. On wss the TLS alias is not consulted.
 _SERVER_HOST_KEY = "HERMES_SIP_SERVER_HOST"
 _TLS_PORT_KEY = "HERMES_SIP_TLS_PORT"
 _TRANSPORT_KEY = "HERMES_SIP_TRANSPORT"
@@ -1516,16 +1520,28 @@ def _parse_transport(env: Mapping[str, str]) -> str:
 
 
 def _parse_port(env: Mapping[str, str], transport: str) -> int:
-    # Canonical HERMES_SIP_PORT wins; HERMES_SIP_TLS_PORT (the provisioner alias) is
-    # the fallback (launch-blocker fix; runbook 0001). The error names the key the
-    # value actually came from so a malformed alias points the operator at the right
-    # variable; unset on both falls back to the transport default.
-    if canonical := _value(env, _PORT_KEY):
-        source_key, raw = _PORT_KEY, canonical
-    elif alias := _value(env, _TLS_PORT_KEY):
-        source_key, raw = _TLS_PORT_KEY, alias
-    else:
-        source_key, raw = _PORT_KEY, _DEFAULT_PORT[transport]
+    # Port resolution is transport-aware. HERMES_SIP_TLS_PORT is the provisioner's
+    # SIP-TLS port and applies ONLY on the tls transport (there is no symmetric wss
+    # alias). A real GDMS/Grandstream provisioner exports BOTH HERMES_SIP_PORT=5060
+    # (the plain/UDP SIP port) and HERMES_SIP_TLS_PORT=5061 (the SIP-TLS port); on tls
+    # the TLS handshake must target the TLS port, so for tls the precedence is
+    # HERMES_SIP_TLS_PORT > HERMES_SIP_PORT > default(5061). (Preferring the canonical
+    # cleartext 5060 made the TLS handshake hit the plain port -> ConnectionReset and
+    # registration never started; confirmed live by forcing 5061 -> 401 challenge.)
+    # On wss the TLS alias is irrelevant and is not consulted: HERMES_SIP_PORT > 443.
+    # The error names the key the value actually came from so a malformed alias points
+    # the operator at the right variable; a blank candidate falls through to the next.
+    candidates: list[tuple[str, str]] = []
+    if transport == "tls":
+        candidates.append((_TLS_PORT_KEY, _value(env, _TLS_PORT_KEY)))
+    candidates.append((_PORT_KEY, _value(env, _PORT_KEY)))
+
+    source_key, raw = _PORT_KEY, _DEFAULT_PORT[transport]
+    for key, value in candidates:
+        if value:
+            source_key, raw = key, value
+            break
+
     port = _parse_int(raw, source_key)
     if not _MIN_PORT <= port <= _MAX_PORT:
         msg = f"{source_key} must be in [{_MIN_PORT}, {_MAX_PORT}], got {port}"

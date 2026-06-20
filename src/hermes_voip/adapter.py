@@ -189,6 +189,7 @@ from hermes_voip.session_timer import (
     AcceptTimers,
     RefreshContinue,
     Refresher,
+    RefreshRetry,
     RefreshSucceeded,
     RefreshTeardown,
     Reject422,
@@ -4609,6 +4610,14 @@ class VoipAdapter(BasePlatformAdapter):
                 await session.hang_up()
                 return False
             if isinstance(outcome, RefreshContinue):
+                # A transient refresh failure (e.g. a 5xx on the re-INVITE): keep the
+                # call up and retry on the next SE/2 tick rather than BYE-ing a live
+                # dialog. Note the SE timer was NOT reset by this failed refresh — so
+                # against a strict non-refresher peer that peer's own teardown deadline
+                # (SE - min(32, SE/3)) may fire first and BYE the dialog before our next
+                # attempt. That is acceptable: it is a clean BYE of a session whose
+                # refresh is failing — we never premature-BYE a healthy dialog and never
+                # leave a dead one running. The retry-at-SE/2 optimism is deliberate.
                 _log.warning(
                     "INVITE %s: session refresh got a transient %d — keeping the call "
                     "up and retrying at the next SE/2 (RFC 4028 §10)",
@@ -4616,15 +4625,23 @@ class VoipAdapter(BasePlatformAdapter):
                     outcome.status_code,
                 )
                 return True
-            # RefreshRetry (491 glare): back off a randomized interval and retry.
-            backoff = glare_backoff_secs(our_role)
-            _log.info(
-                "INVITE %s: session refresh hit 491 glare — retrying after %.2fs "
-                "(RFC 3261 §14.1)",
-                call_id,
-                backoff,
-            )
-            await self._session_timer_backoff_sleep(backoff)
+            if isinstance(outcome, RefreshRetry):
+                # 491 glare: back off a randomized interval (RFC 3261 §14.1) and retry
+                # within the current refresh window — the backoff does NOT reset the SE
+                # deadline (a separate sleep seam), so the slack (SE/2 ≪ SE) absorbs it.
+                backoff = glare_backoff_secs(our_role)
+                _log.info(
+                    "INVITE %s: session refresh hit 491 glare — retrying after %.2fs "
+                    "(RFC 3261 §14.1)",
+                    call_id,
+                    backoff,
+                )
+                await self._session_timer_backoff_sleep(backoff)
+                continue
+            # Every RefreshOutcome variant is handled above; assert_never closes the
+            # union so a future 5th variant is a mypy error here, not silent glare
+            # (rule 17, mirroring _handle_call_progress / manifest.py / providers).
+            assert_never(outcome)
         # Consecutive glare retries exhausted — the dialog is stuck; tear it down.
         _log.info(
             "INVITE %s: session refresh still glaring after %d retries — BYE "
@@ -4670,9 +4687,13 @@ class VoipAdapter(BasePlatformAdapter):
         routable dialog. It must match ``dialog.local_tag`` so the registered
         dialog_id matches the routed key.
 
-        ``session_timer`` (RFC 4028, ADR-0071), when set, adds the ``Session-Expires`` +
-        ``Require: timer`` + ``Supported: timer`` headers so the negotiated timer is
-        engaged on the dialog. ``None`` answers without session timers (unchanged).
+        ``session_timer`` (RFC 4028, ADR-0071), when set, adds the ``Session-Expires``
+        (with the elected refresher) and ``Supported: timer`` headers so the negotiated
+        timer is engaged on the dialog. ``Require: timer`` is added only when the peer
+        advertised ``Supported: timer`` or the refresher is the UAC — it is OMITTED for
+        a timer-ignorant UAC, which RFC 4028 Table 2 forbids (see
+        :meth:`_session_timer_2xx_headers`). ``None`` answers without session timers
+        (unchanged).
         """
         extra: list[tuple[str, str]] = [
             ("Contact", local_contact),

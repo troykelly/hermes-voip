@@ -56,7 +56,9 @@ echoes the key) is reused and re-raised as the module-typed `SrtcpError`.
   **E (encrypt) flag**. The index is the `i` in the AES-CM IV
   (`IV = (k_s||0000) XOR (SSRC<<64) XOR (index<<16)`). Index 0 is reserved unused:
   the first protected packet carries index 1, incrementing by one per sent packet,
-  and the index is never reset on re-key. The index space **must not wrap** under a
+  and is never reset while the same master key is in use (a re-key — a fresh
+  `SrtcpSession` with a new master key — legitimately restarts at index 1 with no
+  IV reuse). The index space **must not wrap** under a
   single master key — a wrapped index reproduces a prior IV and reuses the keystream
   (a two-time pad), so `protect()` **raises `SrtcpError` on exhaustion** (reaching
   `0x7fffffff`) instead of wrapping; continuing requires a re-key (a fresh

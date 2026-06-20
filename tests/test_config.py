@@ -219,18 +219,24 @@ def test_canonical_host_wins_over_server_host_alias() -> None:
     assert cfg.host == "canonical.example.test"
 
 
-def test_canonical_port_wins_over_tls_port_alias() -> None:
-    """When both names are set, the canonical HERMES_SIP_PORT takes precedence."""
+def test_tls_port_alias_wins_over_canonical_port_on_tls() -> None:
+    """On the (default) tls transport, HERMES_SIP_TLS_PORT wins over HERMES_SIP_PORT.
+
+    Corrected from the original "canonical always wins" assertion: a live GDMS
+    provisioner exports both PORT=5060 (cleartext) and TLS_PORT=5061, and the tls
+    handshake must target the TLS port. HERMES_SIP_TLS_PORT is a TLS-only alias, so
+    on tls it takes precedence over the canonical (often cleartext) HERMES_SIP_PORT.
+    """
     cfg = load_gateway_config(
         {
             "HERMES_SIP_HOST": "pbx.example.test",
-            "HERMES_SIP_PORT": "5070",
+            "HERMES_SIP_PORT": "5060",
             "HERMES_SIP_TLS_PORT": "5061",
             "HERMES_SIP_EXTENSION": "1000",
             "HERMES_SIP_PASSWORD": "secret",
         }
     )
-    assert cfg.port == 5070
+    assert cfg.port == 5061
 
 
 def test_blank_canonical_host_falls_back_to_server_host_alias() -> None:
@@ -278,6 +284,111 @@ def test_tls_port_alias_out_of_range_rejected() -> None:
                 "HERMES_SIP_EXTENSION": "1000",
                 "HERMES_SIP_PASSWORD": "secret",
             }
+        )
+
+
+# ---- transport-aware TLS port precedence (live gateway bug) -----------------
+#
+# A real GDMS/Grandstream provisioner exports BOTH the plain/UDP SIP port
+# (HERMES_SIP_PORT=5060) AND the SIP-TLS port (HERMES_SIP_TLS_PORT=5061). On the
+# tls transport the TLS port is the one a TLS handshake must target; resolving the
+# cleartext 5060 makes the handshake hit the plain port -> ConnectionReset/Timeout
+# and registration never starts (confirmed live: forcing 5061 drew a 401 challenge).
+# So for transport=tls the precedence is TLS_PORT > PORT > default(5061); the wss
+# transport (which has no symmetric alias) keeps PORT > default(443) unchanged.
+
+
+def _tls_base(**over: str) -> dict[str, str]:
+    """A minimal tls-transport env (tls is the default, stated for clarity)."""
+    env = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_TRANSPORT": "tls",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "secret",
+    }
+    env.update(over)
+    return env
+
+
+def test_tls_prefers_tls_port_over_canonical_port() -> None:
+    """TLS + PORT=5060 (cleartext) + TLS_PORT=5061 => the TLS port 5061 wins.
+
+    This is the live-gateway bug: the provisioner exports both, and a TLS handshake
+    against the cleartext 5060 fails. For tls, HERMES_SIP_TLS_PORT MUST take
+    precedence over HERMES_SIP_PORT.
+    """
+    cfg = load_gateway_config(
+        _tls_base(HERMES_SIP_PORT="5060", HERMES_SIP_TLS_PORT="5061")
+    )
+    assert cfg.port == 5061
+
+
+def test_tls_uses_canonical_port_when_no_tls_port() -> None:
+    """TLS + only HERMES_SIP_PORT=5061 (no TLS_PORT) => 5061 (canonical is honoured)."""
+    cfg = load_gateway_config(_tls_base(HERMES_SIP_PORT="5061"))
+    assert cfg.port == 5061
+
+
+def test_tls_uses_tls_port_when_no_canonical_port() -> None:
+    """TLS + only HERMES_SIP_TLS_PORT=5061 (no PORT) => 5061."""
+    cfg = load_gateway_config(_tls_base(HERMES_SIP_TLS_PORT="5061"))
+    assert cfg.port == 5061
+
+
+def test_tls_defaults_when_neither_port_set() -> None:
+    """TLS + neither PORT nor TLS_PORT => the tls default 5061."""
+    cfg = load_gateway_config(_tls_base())
+    assert cfg.port == 5061
+
+
+def test_tls_blank_tls_port_falls_back_to_canonical_port() -> None:
+    """TLS + PORT=5070 + present-but-blank TLS_PORT => 5070 (blank alias is ignored)."""
+    cfg = load_gateway_config(
+        _tls_base(HERMES_SIP_PORT="5070", HERMES_SIP_TLS_PORT="   ")
+    )
+    assert cfg.port == 5070
+
+
+def test_wss_ignores_tls_port_alias() -> None:
+    """WSS has no symmetric alias: HERMES_SIP_TLS_PORT must NOT affect a wss port.
+
+    On wss the precedence is unchanged (HERMES_SIP_PORT > default 443); a stray
+    TLS_PORT (the tls-only alias) is irrelevant and ignored.
+    """
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_SIP_TRANSPORT="wss",
+            HERMES_SIP_TLS_PORT="5061",
+        )
+    )
+    assert cfg.port == 443
+
+
+def test_wss_canonical_port_honoured_with_stray_tls_port() -> None:
+    """WSS + PORT=8443 + a stray TLS_PORT => 8443 (canonical wins, alias ignored)."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_SIP_TRANSPORT="wss",
+            HERMES_SIP_PORT="8443",
+            HERMES_SIP_TLS_PORT="5061",
+        )
+    )
+    assert cfg.port == 8443
+
+
+def test_tls_port_out_of_range_reports_tls_port_key() -> None:
+    """An out-of-range TLS_PORT on tls raises naming HERMES_SIP_TLS_PORT (the source).
+
+    Even though a valid HERMES_SIP_PORT is also present, the TLS port is the one
+    consulted first on tls, so the error must point the operator at the bad key.
+    """
+    with pytest.raises(ConfigError, match="HERMES_SIP_TLS_PORT"):
+        load_gateway_config(
+            _tls_base(HERMES_SIP_PORT="5060", HERMES_SIP_TLS_PORT="70000")
         )
 
 

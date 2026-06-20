@@ -54,8 +54,14 @@ echoes the key) is reused and re-raised as the module-typed `SrtcpError`.
 - **Explicit 31-bit SRTCP index.** In place of SRTP's implicit ROC/SEQ index, every
   SRTCP packet carries a 31-bit index in a 4-byte trailer word whose MSB is the
   **E (encrypt) flag**. The index is the `i` in the AES-CM IV
-  (`IV = (k_s||0000) XOR (SSRC<<64) XOR (index<<16)`), starts at zero, increments by
-  one mod 2^31 per sent packet, and is never reset on re-key.
+  (`IV = (k_s||0000) XOR (SSRC<<64) XOR (index<<16)`). Index 0 is reserved unused:
+  the first protected packet carries index 1, incrementing by one per sent packet,
+  and the index is never reset on re-key. The index space **must not wrap** under a
+  single master key — a wrapped index reproduces a prior IV and reuses the keystream
+  (a two-time pad), so `protect()` **raises `SrtcpError` on exhaustion** (reaching
+  `0x7fffffff`) instead of wrapping; continuing requires a re-key (a fresh
+  `SrtcpSession`). At one RTCP compound every few seconds (RFC 3550 §6.2) this is a
+  safety assertion, not a live limit.
 - **Encrypt from the ninth octet; auth without ROC.** Only octets 9..end (the RTCP
   payload) are encrypted; octets 0..7 (the first report's header + sender SSRC) stay
   in the clear. The auth tag is HMAC-SHA1 over the **entire** packet plus the
@@ -74,6 +80,13 @@ first packet, and rejects a foreign SSRC *before* mutating index/replay state.
 Replay protection keeps a **separate** 64-index replay list keyed on the explicit
 SRTCP index (RFC 3711 §3.3.2): the receiver verifies auth, binds the SSRC, checks
 the replay window, decrypts, then records the index.
+
+The SDES inline-key decode is **self-defending** (defence in depth): although
+`CryptoAttribute` already validates the `inline:` key on the normal path, this
+module decodes with `base64` `validate=True`, rejects non-base64 input, and requires
+exactly key(16)+salt(14)=30 octets — raising a typed `SrtcpError` (never a raw
+`binascii`/index error or silently-malformed keys), and never echoing the corrupt
+token. It does not *rely* on the upstream validator's invariant.
 
 ### 4. Always-encrypt on the send path (E=1)
 

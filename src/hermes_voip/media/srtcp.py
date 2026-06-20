@@ -49,6 +49,7 @@ module adds no new escape hatch and no second copy of the cipher plumbing.
 from __future__ import annotations
 
 import base64
+import binascii
 import hmac
 from dataclasses import dataclass, field
 
@@ -94,8 +95,14 @@ _SRTCP_INDEX_LEN = 4
 _E_FLAG = 0x80000000
 # The 31-bit index occupies the remaining bits.
 _SRTCP_INDEX_MASK = 0x7FFFFFFF
-# The index increments modulo 2^31 (RFC 3711 §3.4).
-_SRTCP_INDEX_MOD = 1 << 31
+# The highest 31-bit SRTCP index. The index space must NOT wrap under one master
+# key: wrapping reuses the AES-CM IV/keystream (a two-time pad), so the sender
+# raises on exhaustion instead (RFC 3711 §3.4 — re-key required).
+_SRTCP_INDEX_MAX = 0x7FFFFFFF
+
+# The SDES inline master key||salt is exactly key(16) + salt(14) = 30 octets for
+# both supported suites (RFC 4568 §6.2).
+_MASTER_KEY_SALT_LEN = _MASTER_KEY_LEN + _MASTER_SALT_LEN
 
 
 class SrtcpError(ValueError):
@@ -163,6 +170,44 @@ def _srtcp_packet_iv(session_salt: bytes, ssrc: int, index: int) -> bytes:
     i_int = index << 16  # the index occupies bits 16..47
     iv_int = salt_int ^ ssrc_int ^ i_int
     return iv_int.to_bytes(_AES_BLOCK, "big")
+
+
+def _decode_inline_key(b64: str) -> tuple[bytes, bytes]:
+    """Decode an SDES ``inline:`` base64 master key||salt (RFC 4568 §6.1).
+
+    Self-defending decode (codex r1, defence in depth): although
+    :class:`~hermes_voip.sdp.CryptoAttribute` already validates the inline key on
+    the normal construction path, this module does not *rely* on that invariant —
+    it decodes with ``validate=True``, rejects non-base64 input, and requires the
+    decoded master key||salt to be exactly :data:`_MASTER_KEY_SALT_LEN` octets.
+    Any fault raises :class:`SrtcpError` (a typed error, never a raw
+    ``binascii``/index error). The offending token is never echoed — it is (or
+    carries) the SRTP master key (AGENTS.md secrets invariant).
+
+    Args:
+        b64: The base64 portion of an ``inline:<key||salt>`` key-params string
+            (any ``|lifetime|MKI`` suffix already split off by the caller).
+
+    Returns:
+        ``(master_key, master_salt)`` — 16-byte key and 14-byte salt.
+
+    Raises:
+        SrtcpError: If ``b64`` is not valid base64, or the decoded length is not
+            exactly :data:`_MASTER_KEY_SALT_LEN` octets.
+    """
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        # Never echo the token: corrupt base64 is still (corrupt) key material.
+        msg = "SRTCP inline key is not valid base64"
+        raise SrtcpError(msg) from exc
+    if len(raw) != _MASTER_KEY_SALT_LEN:
+        msg = (
+            f"SRTCP inline key||salt must be exactly {_MASTER_KEY_SALT_LEN} octets "
+            f"(got {len(raw)})"
+        )
+        raise SrtcpError(msg)
+    return raw[:_MASTER_KEY_LEN], raw[_MASTER_KEY_LEN:_MASTER_KEY_SALT_LEN]
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +306,7 @@ class SrtcpSession:
         if len(segments) > 1:
             self._reject_params(segments[1:])
 
-        raw = base64.b64decode(b64)
-        master_key = raw[:_MASTER_KEY_LEN]
-        master_salt = raw[_MASTER_KEY_LEN : _MASTER_KEY_LEN + _MASTER_SALT_LEN]
+        master_key, master_salt = _decode_inline_key(b64)
 
         self._k_e, self._k_s, self._k_a = _derive_srtcp_session_keys(
             master_key, master_salt
@@ -379,7 +422,17 @@ class SrtcpSession:
         — header + sender SSRC — stay in the clear), appends the E-flag + 31-bit
         SRTCP index trailer, and appends the auth tag computed over the whole
         SRTCP packet up to and including that trailer (no ROC).  The sender's
-        SRTCP index advances by one (mod 2^31) per call.
+        SRTCP index advances by one per call; index 0 is reserved unused, so the
+        first protected packet carries index 1 and the last carries
+        :data:`_SRTCP_INDEX_MAX` (0x7fffffff).
+
+        The index space MUST NOT wrap under a single master key: a wrapped index
+        would reproduce a previous AES-CM IV and hence reuse the keystream (a
+        catastrophic two-time pad).  When the index is exhausted, :meth:`protect`
+        raises :class:`SrtcpError` rather than wrapping — the call must be re-keyed
+        (a fresh master key / :class:`SrtcpSession`) to continue.  At one RTCP
+        compound packet every few seconds (RFC 3550 §6.2) exhaustion is ~hundreds
+        of years away, so in practice this is a safety assertion, not a live limit.
 
         Args:
             rtcp_compound: A complete compound RTCP datagram (e.g. from
@@ -389,8 +442,9 @@ class SrtcpSession:
             SRTCP wire bytes: clear-prefix || encrypted-payload || E+index || tag.
 
         Raises:
-            SrtcpError: If the datagram is shorter than the 8-octet clear prefix,
-                or its SSRC differs from this session's bound SSRC.
+            SrtcpError: If the datagram is shorter than the 8-octet clear prefix;
+                its SSRC differs from this session's bound SSRC; or the SRTCP index
+                space is exhausted (a re-key is required — never wrap).
         """
         if len(rtcp_compound) < _SRTCP_CLEAR_PREFIX:
             msg = (
@@ -404,8 +458,17 @@ class SrtcpSession:
         # Bind/verify the SSRC BEFORE advancing the sender index.
         self._bind_ssrc(ssrc)
 
-        # Advance the explicit SRTCP index (first packet → 1), mod 2^31.
-        self.index = (self.index + 1) % _SRTCP_INDEX_MOD
+        # Advance the explicit SRTCP index (index 0 unused → first packet = 1).
+        # Refuse to wrap past the 31-bit max: wrapping reuses the IV/keystream
+        # under one master key (two-time pad). Exhaustion → hard error, re-key.
+        if self.index >= _SRTCP_INDEX_MAX:
+            msg = (
+                "SRTCP index space exhausted (reached the 31-bit maximum); "
+                "the session must be re-keyed — the index must not wrap "
+                "(RFC 3711 §3.4: a wrapped index reuses the keystream)"
+            )
+            raise SrtcpError(msg)
+        self.index += 1
         index = self.index
 
         clear = rtcp_compound[:_SRTCP_CLEAR_PREFIX]

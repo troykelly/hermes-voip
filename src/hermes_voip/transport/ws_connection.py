@@ -314,7 +314,7 @@ class WssSipTransport:
             del self._client_txns[key]
 
     async def send_cancel(self, call_id: str) -> bool:
-        """Outbound CANCEL is not supported on the WSS UAC yet (ADR-0068 scope).
+        """Outbound CANCEL is not supported on the WSS UAC yet (ADR-0069 scope).
 
         Provided so the :class:`~hermes_voip.adapter.SignalingTransport` union has a
         uniform ``send_cancel`` surface; the WSS WebRTC origination path frames a

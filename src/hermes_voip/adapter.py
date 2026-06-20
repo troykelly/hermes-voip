@@ -834,7 +834,7 @@ class VoipAdapter(BasePlatformAdapter):
         # _outbound_extensions: extensions with an active outbound call in progress
         # (prevents a second concurrent outbound per extension).
         self._outbound_extensions: set[str] = set()
-        # _outbound_pending (ADR-0068): outbound calls still in their INVITE
+        # _outbound_pending (ADR-0069): outbound calls still in their INVITE
         # transaction (ringing), keyed by Call-ID, so abort_call / ring_timeout_secs
         # can CANCEL the ring. Removed once the call establishes (2xx accepted) or
         # fails — so abort_call on an answered/finished call finds nothing (a no-op).
@@ -1428,7 +1428,7 @@ class VoipAdapter(BasePlatformAdapter):
             origin: The originating Hermes session ``(platform, chat_id)`` to report
                 the outcome back to (ADR-0029), or ``None`` (the env-trigger path).
             ring_timeout_secs: If set, the maximum time to ring an unanswered call
-                before sending a CANCEL (RFC 3261 §9.1, ADR-0068); the call then
+                before sending a CANCEL (RFC 3261 §9.1, ADR-0069); the call then
                 raises :class:`OutboundCallCancelled`. ``None`` (default) leaves only
                 the hard ``_OUTBOUND_INVITE_TIMEOUT`` sink bound. Ignored on the WSS
                 path (no client CANCEL there yet).
@@ -1593,7 +1593,7 @@ class VoipAdapter(BasePlatformAdapter):
         # the post-ACK acceptance/session-wiring steps) MUST BYE the dialog before
         # propagating (RFC 3261 §15) — the finally is the single BYE point (codex r3).
         ack_sent = False
-        # Register the call as a ringing outbound (ADR-0068) BEFORE the INVITE goes
+        # Register the call as a ringing outbound (ADR-0069) BEFORE the INVITE goes
         # out, so abort_call / the ring-timeout can CANCEL it the instant a response
         # is awaited. Removed once the call establishes or fails (the finally / the
         # 2xx path), so a later abort_call finds nothing (a no-op).
@@ -1603,7 +1603,7 @@ class VoipAdapter(BasePlatformAdapter):
             await transport.send(invite_text)
             _log.info("INVITE sent: Call-ID %s -> %s", call_id, target_uri)
 
-            # Arm the ring-timeout (ADR-0068): an unanswered call is CANCELled after
+            # Arm the ring-timeout (ADR-0069): an unanswered call is CANCELled after
             # ring_timeout_secs and raises OutboundCallCancelled. Cancelled on the 2xx
             # (below). The timer fires abort_call, which sends the CANCEL; the gateway
             # then 487s the INVITE and this awaiter raises OutboundCallCancelled.
@@ -1669,7 +1669,7 @@ class VoipAdapter(BasePlatformAdapter):
                 # in the sink after we sent the second INVITE (CSeq 2). Accepting
                 # it as the final response causes the call to fail even though the
                 # 2xx for CSeq 2 is in-flight (W1). Filter by CSeq sequence number.
-                # _await_invite_response also drops the 200-to-CANCEL (ADR-0068).
+                # _await_invite_response also drops the 200-to-CANCEL (ADR-0069).
                 while True:
                     response = await self._await_invite_response(sink, call_id)
                     if _cseq_num(response) == last_cseq:
@@ -1689,7 +1689,7 @@ class VoipAdapter(BasePlatformAdapter):
                 response = await self._await_invite_response(sink, call_id)
 
             # --- Handle final response to INVITE ---------------------------
-            # A 487 Request Terminated means our CANCEL took effect (ADR-0068, RFC
+            # A 487 Request Terminated means our CANCEL took effect (ADR-0069, RFC
             # 3261 §9.1) — a cancellation, not a peer failure. It is raised as the
             # distinct OutboundCallCancelled (carrying the abort reason if known).
             if response.status_code == _SIP_REQUEST_TERMINATED:
@@ -1703,7 +1703,7 @@ class VoipAdapter(BasePlatformAdapter):
                 )
 
             # The 2xx answered the call: cancel the ring-timeout so it cannot fire a
-            # spurious CANCEL on the now-established dialog (ADR-0068).
+            # spurious CANCEL on the now-established dialog (ADR-0069).
             self._disarm_ring_timeout(pending)
 
             # 2xx success: parse the SDP answer and build UAC dialog.
@@ -2039,7 +2039,7 @@ class VoipAdapter(BasePlatformAdapter):
             # The call has left its INVITE transaction (established or failed): drop
             # the ringing-pending registration and disarm the ring-timeout so neither
             # abort_call nor the timer acts on a call that is no longer ringing
-            # (ADR-0068). Identity-checked so a same-Call-ID re-use is not evicted.
+            # (ADR-0069). Identity-checked so a same-Call-ID re-use is not evicted.
             if self._outbound_pending.get(call_id) is pending:
                 del self._outbound_pending[call_id]
             self._disarm_ring_timeout(pending)
@@ -2107,7 +2107,7 @@ class VoipAdapter(BasePlatformAdapter):
             )
 
     # -----------------------------------------------------------------------
-    # Outbound CANCEL — abort a ringing call (RFC 3261 §9.1, ADR-0068)
+    # Outbound CANCEL — abort a ringing call (RFC 3261 §9.1, ADR-0069)
     # -----------------------------------------------------------------------
 
     async def abort_call(self, call_id: str, reason: str) -> bool:
@@ -2154,7 +2154,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._disarm_ring_timeout(pending)
         # Stop the engine NOW, before we (the place_call coroutine) keep awaiting the
         # late 487 — releasing the RTP socket immediately rather than holding it for
-        # the whole sink-timeout window (the socket-leak guard, ADR-0068). Idempotent.
+        # the whole sink-timeout window (the socket-leak guard, ADR-0069). Idempotent.
         await pending.engine.stop()
         sent = await transport.send_cancel(call_id)
         if not sent:
@@ -2167,7 +2167,7 @@ class VoipAdapter(BasePlatformAdapter):
         return True
 
     async def _ring_timeout(self, call_id: str, ring_timeout_secs: float) -> None:
-        """Sleep ``ring_timeout_secs`` then abort the call if still ringing (ADR-0068).
+        """Sleep ``ring_timeout_secs`` then abort the call if still ringing (ADR-0069).
 
         Run as the per-call ring-timeout task; cancelled on the 2xx and in the
         outbound ``finally``. A cancellation (the call answered) is the normal exit
@@ -2198,7 +2198,7 @@ class VoipAdapter(BasePlatformAdapter):
         """Await the next response that belongs to the INVITE transaction.
 
         Skips provisional (1xx) responses and the ``200 OK`` to our own CANCEL (CSeq
-        method ``CANCEL``, ADR-0068) — neither is the INVITE's final response — so the
+        method ``CANCEL``, ADR-0069) — neither is the INVITE's final response — so the
         caller only ever sees a final response whose CSeq method is ``INVITE`` (a
         ``2xx`` / ``4xx`` / ``487`` …). The CANCEL's own ``200 OK`` is absorbed here.
         """
@@ -5656,7 +5656,7 @@ def _cseq_method(response: SipResponse) -> str | None:
     """Return the CSeq method of a SIP response (``INVITE`` / ``CANCEL`` …), or None.
 
     Used to absorb the ``200 OK`` to our own CANCEL (CSeq method ``CANCEL``) so it is
-    never mistaken for the INVITE's final response (ADR-0068).
+    never mistaken for the INVITE's final response (ADR-0069).
     """
     parts = (response.header("CSeq") or "").split()
     return parts[1] if len(parts) >= _CSEQ_PARTS else None

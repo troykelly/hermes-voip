@@ -1,4 +1,4 @@
-# ADR-0068: Outbound SIP CANCEL (RFC 3261 §9.1) for an unanswered `place_call`
+# ADR-0069: Outbound SIP CANCEL (RFC 3261 §9.1) for an unanswered `place_call`
 
 - **Date:** 2026-06-20
 - **Status:** Accepted

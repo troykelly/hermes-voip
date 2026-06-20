@@ -1653,7 +1653,7 @@ async def test_outbound_sdes_offer_key_is_never_logged(
 
 
 # ---------------------------------------------------------------------------
-# ADR-0068: outbound SIP CANCEL (RFC 3261 §9.1) — abort_call + ring_timeout_secs.
+# ADR-0069: outbound SIP CANCEL (RFC 3261 §9.1) — abort_call + ring_timeout_secs.
 # ---------------------------------------------------------------------------
 
 
@@ -1730,7 +1730,7 @@ async def test_abort_call_sends_cancel_and_leaves_no_running_call() -> None:
     """abort_call on a ringing outbound INVITE sends a §9.1 CANCEL and tears down.
 
     RED on main: there is no abort_call / send_cancel, so place_call has no abort
-    lever and the call hangs until the 35 s sink timeout. After ADR-0068, abort_call
+    lever and the call hangs until the 35 s sink timeout. After ADR-0069, abort_call
     sends a CANCEL, the gateway 487s, place_call raises OutboundCallCancelled, and no
     call session/loop/outbound-slot remains.
     """
@@ -1771,7 +1771,7 @@ async def test_abort_call_sends_cancel_and_leaves_no_running_call() -> None:
 async def test_ring_timeout_fires_cancel_and_raises_cancelled() -> None:
     """place_call(ring_timeout_secs=...) cancels an unanswered ring automatically.
 
-    RED on main: place_call has no ring_timeout_secs kwarg. After ADR-0068 the timer
+    RED on main: place_call has no ring_timeout_secs kwarg. After ADR-0069 the timer
     fires a CANCEL after the bound, the gateway 487s, and place_call raises
     OutboundCallCancelled — never hanging for the full sink timeout.
     """

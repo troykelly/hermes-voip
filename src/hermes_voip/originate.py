@@ -46,7 +46,7 @@ class OutboundCallFailed(Exception):  # noqa: N818 — "Failed" suffix is intent
         super().__init__(f"{status} {reason}")
 
 
-class OutboundCallCancelled(Exception):  # noqa: N818 — a cancellation, not a programming error: a 487 after WE asked to CANCEL is the expected abort outcome; ADR-0068 public API
+class OutboundCallCancelled(Exception):  # noqa: N818 — a cancellation, not a programming error: a 487 after WE asked to CANCEL is the expected abort outcome; ADR-0069 public API
     """An outbound INVITE was CANCELled before it was answered (RFC 3261 §9.1).
 
     Raised by :meth:`VoipAdapter.place_call` when, after we sent a CANCEL (via an

@@ -1,7 +1,7 @@
 # ADR-0027: ElevenLabs v3 as a first-class expressive tier + model-conditional audio tags
 
 - **Date:** 2026-06-17
-- **Status:** Accepted (amends ADR-0007; relates to ADR-0025)
+- **Status:** Accepted (amends ADR-0007; relates to ADR-0025; **extended by ADR-0068**)
 - **Deciders:** agent session (VoIP expressiveness), operator-directed (live-validated)
 
 ## Context
@@ -95,6 +95,12 @@ a mid-call provider switch.
   here. `eleven_v3_conversational` remains excluded (Agents-platform-only / 401).
 - **Latency is per-deployment, LLM-dominated.** v3's ~454 ms first-audio vs Flash's ~310 ms
   is immaterial next to the Hermes LLM turn; both are well within the phone-path budget.
+- **This ADR is purely defensive (make tags *safe*); it does not *ask* for them.** It relies
+  on the agent emitting tags spontaneously. **ADR-0068 extends it** to actively **prompt** the
+  agent to use tags (sparingly) — gated on the same `model_supports_audio_tags` predicate, so
+  the prompt appears only on a v3 voice and the strip here remains the guarantee on every
+  other model (a two-sided prompt-gate + strip-fallback design). See
+  `docs/reference/elevenlabs-v3-audio-tags.md` for the tag vocabulary and caveats.
 
 ## Alternatives considered
 

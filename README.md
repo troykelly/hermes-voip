@@ -434,7 +434,11 @@ so a misconfigured fallback fails loudly instead of going silent later.
 (including your own custom or cloned voices). A palette of verified starter voices, the
 expressive `eleven_v3` model (with `[breath]` / `[laughs]` style audio tags), and the dynamism
 dials (`HERMES_VOIP_TTS_STABILITY`, `STYLE`, `SIMILARITY`, `SPEAKER_BOOST`) are all documented
-in [the voice runbook](docs/runbooks/0004-voip-tts-voice.md).
+in [the voice runbook](docs/runbooks/0004-voip-tts-voice.md). On a `eleven_v3` voice the agent
+is automatically prompted (per turn) to use those audio tags sparingly so it sounds natural; on
+any non-v3 model that prompt is omitted and stray tags are stripped before synthesis so a
+bracketed cue is never spoken literally — see
+[the audio-tag reference](docs/reference/elevenlabs-v3-audio-tags.md) (ADR-0027 / ADR-0068).
 
 ### The conversation feel (optional)
 

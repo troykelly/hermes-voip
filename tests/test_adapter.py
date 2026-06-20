@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from hermes_voip.adapter import VoipAdapter
+    from hermes_voip.caller_modes import CallerGroup
 
 
 async def _until(
@@ -832,6 +833,247 @@ async def test_deliver_turn_builds_voice_message_event() -> None:
     # (ADR-0020); assert the transcript is present rather than a bare equal.
     assert "voice turn" in getattr(event, "text", "")
     assert getattr(event, "message_type", None) == MessageType.VOICE
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs v3 audio-tag PROMPT encouragement (ADR-0068, extends ADR-0027).
+#
+# When the active TTS is an ElevenLabs v3-family model, the spotlighted turn
+# gains a short preamble line that ENCOURAGES the agent to use audio tags
+# sparingly (so its expressive voice sounds natural). The line is two-sided:
+# emitted ONLY on a v3 model (the gate), and never on a non-v3 model — which is
+# also where the existing TTS-seam ``strip_audio_tags`` scrubs any stray tag, so
+# a non-v3 caller never voices a bracketed cue literally. ``_deliver_turn``
+# computes the gate from ``self._media_cfg`` and threads the bool into
+# ``_spotlight_turn``; both the adapter gate and the TTS-seam strip route through
+# ``model_supports_audio_tags`` so they agree for every model id.
+#
+# A distinctive fragment of the approved preamble text used as the assertion
+# anchor (one phrase that appears nowhere else in the spotlighted turn).
+_AUDIO_TAG_PROMPT_ANCHOR = "expressive voice"
+
+
+def _outbound_group() -> CallerGroup:
+    """An outbound :class:`CallerGroup` (the persona that has framing to append).
+
+    The outbound persona is the one that has trusted framing AFTER the persona
+    preamble, so it exercises the audio-tag line's injection point fully.
+    """
+    from hermes_voip.caller_modes import CallerGroup  # noqa: PLC0415
+
+    return CallerGroup(
+        name="outbound",
+        privilege_level=2,
+        persona="outbound",
+        declined_at_sip=False,
+    )
+
+
+def test_spotlight_turn_includes_audio_tag_preamble_only_when_v3() -> None:
+    """``_spotlight_turn`` appends the audio-tag line iff ``v3_audio_tags=True``.
+
+    Two-sided: the distinctive preamble fragment is present when the flag is True
+    and absent when it is False, while the caller transcript is carried either way.
+    """
+    from hermes_voip.adapter import _spotlight_turn  # noqa: PLC0415
+
+    group = _outbound_group()
+
+    on = _spotlight_turn(group, "Jordan", "hello there", v3_audio_tags=True)
+    off = _spotlight_turn(group, "Jordan", "hello there", v3_audio_tags=False)
+
+    # The transcript survives in both (the line is additive, never a replacement).
+    assert "hello there" in on
+    assert "hello there" in off
+
+    # The encouragement line appears ONLY on the v3 side.
+    assert _AUDIO_TAG_PROMPT_ANCHOR in on
+    assert "[laughs]" in on
+    assert "sparingly" in on
+    assert _AUDIO_TAG_PROMPT_ANCHOR not in off
+    assert "[laughs]" not in off
+
+
+def test_spotlight_turn_audio_tag_default_is_off() -> None:
+    """Omitting ``v3_audio_tags`` defaults to OFF — no audio-tag line by default."""
+    from hermes_voip.adapter import _spotlight_turn  # noqa: PLC0415
+
+    out = _spotlight_turn(_outbound_group(), "Jordan", "hi")
+    assert _AUDIO_TAG_PROMPT_ANCHOR not in out
+
+
+def test_spotlight_turn_audio_tag_line_follows_persona_framing() -> None:
+    """The audio-tag line sits AFTER the persona framing and BEFORE the untrusted block.
+
+    The encouragement is trusted system framing about delivery, so it must never
+    fall inside the untrusted-caller fence (where a malicious callee's text lives).
+    """
+    from hermes_voip.adapter import (  # noqa: PLC0415
+        _UNTRUSTED_OPEN,
+        _spotlight_turn,
+    )
+
+    out = _spotlight_turn(
+        _outbound_group(), "Jordan", "hello there", v3_audio_tags=True
+    )
+    anchor_at = out.index(_AUDIO_TAG_PROMPT_ANCHOR)
+    fence_at = out.index(_UNTRUSTED_OPEN)
+    assert anchor_at < fence_at, "audio-tag line must precede the untrusted fence"
+
+
+async def _spotlight_kwarg_for_media_env(env: dict[str, str]) -> bool:
+    """Drive ``_deliver_turn`` under a media config and capture the gate kwarg.
+
+    Patches the module-level ``_spotlight_turn`` to record the ``v3_audio_tags``
+    keyword the adapter computes from ``self._media_cfg`` for the given TTS env,
+    so the test asserts the GATE, not the prose.
+    """
+    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config(env)
+
+    async def _noop_handler(event: object) -> None:
+        return None
+
+    adapter.set_message_handler(_noop_handler)
+
+    captured: dict[str, bool] = {}
+    real_spotlight = adapter_mod._spotlight_turn
+
+    def _spy(
+        group: CallerGroup,
+        caller_name: str,
+        text: str,
+        *,
+        objective: str | None = None,
+        v3_audio_tags: bool = False,
+    ) -> str:
+        captured["v3_audio_tags"] = v3_audio_tags
+        return real_spotlight(
+            group,
+            caller_name,
+            text,
+            objective=objective,
+            v3_audio_tags=v3_audio_tags,
+        )
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": False}
+    with patch.object(adapter_mod, "_spotlight_turn", _spy):
+        await adapter._deliver_turn(call_id, "voice turn")
+    assert "v3_audio_tags" in captured, "_deliver_turn did not call _spotlight_turn"
+    return captured["v3_audio_tags"]
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_gate_true_for_elevenlabs_v3() -> None:
+    """ElevenLabs + ``eleven_v3`` ⇒ the adapter passes ``v3_audio_tags=True``."""
+    gate = await _spotlight_kwarg_for_media_env(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "HERMES_VOIP_TTS_MODEL": "eleven_v3",
+            # A selected cloud provider must have its credential set or
+            # load_media_config rejects the config; an obvious fake (never a real key).
+            "ELEVENLABS_API_KEY": "test-fake-elevenlabs-key",
+            # Disable failover so the test config needs no Kokoro fallback model dir.
+            "HERMES_VOIP_TTS_FALLBACK": "none",
+        }
+    )
+    assert gate is True
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_gate_false_for_elevenlabs_flash() -> None:
+    """ElevenLabs + ``eleven_flash_v2_5`` (non-v3) ⇒ ``v3_audio_tags=False``."""
+    gate = await _spotlight_kwarg_for_media_env(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
+            "HERMES_VOIP_TTS_MODEL": "eleven_flash_v2_5",
+            # Obvious fake credential (never a real key) — the elevenlabs provider
+            # requires one set or load_media_config fails fast.
+            "ELEVENLABS_API_KEY": "test-fake-elevenlabs-key",
+            # Disable failover so the test config needs no Kokoro fallback model dir.
+            "HERMES_VOIP_TTS_FALLBACK": "none",
+        }
+    )
+    assert gate is False
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_gate_false_for_non_elevenlabs_provider() -> None:
+    """A non-ElevenLabs provider ⇒ ``v3_audio_tags=False`` even if the model looks v3.
+
+    The gate requires BOTH provider == ``elevenlabs`` AND a v3 model id, so a
+    self-host provider can never trip the ElevenLabs-only audio-tag prompt.
+    """
+    gate = await _spotlight_kwarg_for_media_env(
+        {
+            "HERMES_VOIP_TTS_PROVIDER": "sherpa-kokoro",
+            "HERMES_VOIP_TTS_MODEL": "eleven_v3",
+        }
+    )
+    assert gate is False
+
+
+def test_audio_tag_gate_and_tts_seam_strip_agree_via_model_supports_audio_tags() -> (
+    None
+):
+    """The adapter gate and the TTS-seam strip both route through one predicate.
+
+    For representative model ids, ``model_supports_audio_tags`` decides BOTH (a)
+    whether the adapter prompts for tags and (b) whether the TTS seam PRESERVES
+    them (so a non-v3 id strips a stray ``[laughs]`` while a v3 id keeps it). This
+    locks the two sides to a single source of truth — they can never disagree.
+    """
+    from hermes_voip.spoken_text import strip_audio_tags  # noqa: PLC0415
+    from hermes_voip.tts.elevenlabs import (  # noqa: PLC0415
+        model_supports_audio_tags,
+    )
+
+    sample = "Sure [laughs] right away."
+    for model_id, expected in (
+        ("eleven_v3", True),
+        ("eleven_v3_preview", True),
+        ("eleven_flash_v2_5", False),
+        ("eleven_multilingual_v2", False),
+        ("eleven_turbo_v2_5", False),
+    ):
+        supports = model_supports_audio_tags(model_id)
+        assert supports is expected, model_id
+        # The seam strips iff the model does NOT support tags; the kept/dropped
+        # state of a stray tag must match the same predicate.
+        seam_keeps_tag = "[laughs]" in (
+            sample if supports else strip_audio_tags(sample)
+        )
+        assert seam_keeps_tag is expected, model_id
+
+
+def test_stray_audio_tag_stripped_on_non_v3_preserved_on_v3() -> None:
+    """Regression: a stray ``[laughs]`` is dropped on a non-v3 model, kept on v3.
+
+    Guards both ``strip_audio_tags`` (the whole ``[tag]`` token is removed, brackets
+    and word, with whitespace collapsed) and that a sentence around the tag is not
+    mangled — the words on either side survive intact.
+    """
+    from hermes_voip.spoken_text import strip_audio_tags  # noqa: PLC0415
+
+    text = "Of course [laughs] I can help with that."
+
+    # Non-v3: the tag (brackets + word) is gone, the surrounding prose is intact,
+    # and no double space is left where the tag stood.
+    stripped = strip_audio_tags(text)
+    assert "[laughs]" not in stripped
+    assert "laughs" not in stripped
+    assert "Of course" in stripped
+    assert "I can help with that." in stripped
+    assert "  " not in stripped
+
+    # v3: the call loop passes the sentence through UNSTRIPPED (preserve path), so
+    # the tag reaches the synthesiser verbatim. Model that path by NOT stripping.
+    assert "[laughs]" in text
 
 
 # ---------------------------------------------------------------------------

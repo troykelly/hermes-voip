@@ -83,11 +83,16 @@ heuristic (the long-understood industry approach):
 - **Machine** ≈ a *long* greeting — continuous speech beyond a machine threshold
   (default 3.5 s) — and/or a detected beep. Classified `AnsweringMachine`.
 
-A long enough opening speech run fires `AnsweringMachine` the moment it crosses the machine
-threshold; otherwise the verdict fires at the **first** silence that follows the opening
-speech — if the opening speech was short and the trailing silence reaches the response gap
-it is a human, and if it spoke for a while (between the human and machine thresholds) then
-went quiet it is a machine. Internal pauses inside a machine greeting ("Hi, you've reached
+The verdict fires on a **completed** VAD segment, never mid-segment: the detector is fed
+only closed speech/silence runs (a speech run closes on its OFFSET edge, a silence run on
+the next ONSET). A long enough opening greeting fires `AnsweringMachine` when that opening
+speech run **closes** (the OFFSET edge) and its accumulated speech duration has reached the
+machine threshold — so a machine that talks continuously without ever pausing yields no
+verdict from this state machine until it first stops. Otherwise the verdict fires at the
+**first** silence that follows the opening speech — if the opening speech was short and the
+trailing silence reaches the response gap it is a human, and if it spoke for a while
+(between the human and machine thresholds) then went quiet it is a machine. Internal pauses
+inside a machine greeting ("Hi, you've reached
 … *beat* … please leave a message") are handled by accumulating speech across short gaps (a
 gap shorter than the response gap does **not** end the greeting).
 

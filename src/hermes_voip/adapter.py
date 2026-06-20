@@ -47,7 +47,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, assert_never
 
 # The real hermes-agent runtime surface. This module is imported ONLY lazily
 # (inside ``hermes_voip.plugin._adapter_factory``), so a bare ``import
@@ -4366,9 +4366,11 @@ class VoipAdapter(BasePlatformAdapter):
           message (the beep fired, or the greeting ended and the line went silent).
         * ``LikelyHuman`` — advisory only; the normal case, no injected turn, no hangup.
 
-        Matches exhaustively on the event type (rule 17). Best-effort: a failure here is
-        logged and never strands the call (rule 37); the CallLoop's surfacing-task
-        done-callback also catches anything that escapes.
+        Dispatches over every :data:`CallProgressEvent` variant; the trailing
+        :func:`assert_never` closes the union, so adding a new variant without a branch
+        here is a ``mypy`` error rather than a silently-dropped event (rule 17).
+        Best-effort: a failure here is logged and never strands the call (rule 37); the
+        CallLoop's surfacing-task done-callback also catches anything that escapes.
         """
         if isinstance(event, (FaxCng, FaxCed)):
             await self._handle_fax_event(call_id, event)
@@ -4400,6 +4402,7 @@ class VoipAdapter(BasePlatformAdapter):
                 event.why,
             )
             return
+        assert_never(event)
 
     async def _handle_fax_event(self, call_id: str, event: FaxCng | FaxCed) -> None:
         """Advise the agent of a fax tone and (config-gated) auto hang up (ADR-0064)."""

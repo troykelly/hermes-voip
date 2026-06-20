@@ -436,12 +436,23 @@ async def test_plain_rtp_avp_accepted_when_mandate_off() -> None:
 
 
 # ===========================================================================
-# (d) The mandate ACCEPTS every secured profile and rejects only cleartext. Each
-# secured profile (the SDES, DTLS-SRTP and WebRTC m-line transports) reports
-# ``is_srtp``; plain audio over RTP slash AVP is the sole ``is_srtp`` False case.
-# The guard rejects iff ``require_secure_media and not is_srtp``, so the DTLS and
-# WebRTC tiers are never rejected by it. This pins the secured-profile set at the
-# SDP layer (no OpenSSL extra needed) alongside the end-to-end SDES acceptance.
+# (d) The guard's INPUT: ``AudioMedia.is_srtp`` profile classification.
+#
+# The mandate guard rejects iff ``require_secure_media and not audio.is_srtp``, so
+# ``audio.is_srtp`` is the single bit it branches on. This pins that classifier at
+# the SDP layer (no OpenSSL/libopus extra needed): each secured m-line transport
+# (SDES ``RTP/SAVP``, DTLS-SRTP ``UDP/TLS/RTP/SAVP``, WebRTC ``UDP/TLS/RTP/SAVPF``)
+# reports ``is_srtp`` True; plain ``RTP/AVP`` is the sole False case. The guard's
+# OUTPUT — that the mandate ACCEPTS a secured offer (200) and REJECTS a cleartext
+# one (488) end-to-end through ``_handle_inbound_invite`` — is covered by
+# ``test_sdes_savp_offer_accepted_when_mandate_on`` and
+# ``test_plain_rtp_avp_rejected_488_when_mandate_on`` above; this case deliberately
+# does NOT re-assert the guard predicate (that would be tautological given the
+# ``is_srtp`` assertion here and is already exercised on the wire there). Driving the
+# DTLS/WebRTC tiers end-to-end is intentionally left to their own suites
+# (tests/test_adapter_sip_dtls.py / tests/test_adapter_webrtc.py): past the guard
+# those paths can emit a 488 of their own (codec/fingerprint/keying preflight), so a
+# bare "not 488" here could not distinguish the guard passing from a setup failure.
 # ===========================================================================
 def _audio_of(sdp: str) -> AudioMedia:
     audio = SessionDescription.parse(sdp).audio
@@ -462,12 +473,17 @@ def _audio_of(sdp: str) -> AudioMedia:
         ("UDP/TLS/RTP/SAVPF", "a=fingerprint:sha-256 AA:BB\r\n", True),
     ],
 )
-def test_secured_profiles_pass_the_mandate_guard(
+def test_audio_is_srtp_classifies_each_profile(
     profile: str, extra_attrs: str, is_srtp_expected: bool
 ) -> None:
-    """Every secured profile reports is_srtp; only plain RTP/AVP does not.
+    """``AudioMedia.is_srtp`` is True for every secured profile, False for plain RTP.
 
-    The mandate guard rejects iff ``require_secure_media and not audio.is_srtp``.
+    ``is_srtp`` is the sole input to the mandate guard
+    (``require_secure_media and not audio.is_srtp``): each secured m-line transport
+    (SDES ``RTP/SAVP``, DTLS ``UDP/TLS/RTP/SAVP``, WebRTC ``UDP/TLS/RTP/SAVPF``) must
+    classify True so the guard lets it through, and plain ``RTP/AVP`` must classify
+    False so the guard rejects it. The end-to-end accept/reject behaviour itself is
+    asserted on the wire by the 200/488 tests above.
     """
     sdp = (
         "v=0\r\n"
@@ -483,7 +499,3 @@ def test_secured_profiles_pass_the_mandate_guard(
     )
     audio = _audio_of(sdp)
     assert audio.is_srtp is is_srtp_expected
-    # The guard's reject predicate with the mandate ON: ``require and not is_srtp``.
-    require_secure_media = True
-    rejected = require_secure_media and not audio.is_srtp
-    assert rejected is (not is_srtp_expected)

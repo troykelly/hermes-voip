@@ -484,15 +484,28 @@ async def test_admission_slot_released_on_teardown_no_leak() -> None:
 
 
 async def test_inbound_invite_under_capacity_is_admitted() -> None:
-    """Below the cap, a new INVITE reserves a slot and is not rejected 486.
+    """Below the cap, a new INVITE is admitted, answered 200 OK, and leaks no slot.
 
     The media collaborators (RTP engine / CallSession / CallLoop / VAD / endpointer)
     are mocked — like ``tests/test_adapter.py``'s inbound tests — so this exercises
     ADMISSION only, not the real silero VAD model load.
+
+    The offer here is plain ``RTP/AVP`` (``_FAKE_SDP_OFFER``), and the ADR-0070
+    secure-media mandate defaults ON, which would 488-reject a cleartext offer at
+    the guard that sits BEFORE ``_admit_inbound`` — masking this admission test
+    entirely (the INVITE would never reach admission, yet the old "no 486" /
+    "no leaked slot" assertions would still hold for a 488). This test exercises the
+    CLEARTEXT admission path, so the mandate is turned OFF for it; the mandate has
+    its own end-to-end coverage in ``tests/test_adapter_secure_media.py``.
     """
     transport = _FakeTransport()
     adapter = await _build_adapter(
         transport, _FakeManager(), env={"HERMES_SIP_MAX_CALLS": "4"}
+    )
+    # Cleartext admission path: disable the secure-media mandate so the plain
+    # RTP/AVP offer is admitted rather than 488'd before admission control runs.
+    adapter._media_cfg = load_media_config(
+        {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
     )
 
     call_id = new_call_id()
@@ -528,8 +541,19 @@ async def test_inbound_invite_under_capacity_is_admitted() -> None:
     ):
         await adapter._handle_inbound_invite(new_call)
 
+    # Admission must have been REACHED and PASSED: the only way a 200 OK is sent is
+    # for the INVITE to clear the 486 fast-path, the 488 mandate guard (off here) and
+    # the codec preflight, then be admitted by ``_admit_inbound`` and answered. A 488
+    # (the masking failure this test guards against) would emit no 200 OK.
+    assert any(m.startswith("SIP/2.0 200") for m in transport.sent), (
+        f"an under-capacity INVITE must be admitted and answered 200 OK, "
+        f"sent: {transport.sent!r}"
+    )
     assert not any(m.startswith("SIP/2.0 486") for m in transport.sent), (
         "a call under capacity must NOT be rejected 486"
+    )
+    assert not any(m.startswith("SIP/2.0 488") for m in transport.sent), (
+        "the mandate is off here, so the cleartext offer must NOT be 488-rejected"
     )
     # The slot was reserved during the call and released by the teardown that runs
     # when the (mocked) CallLoop returns — no leak.

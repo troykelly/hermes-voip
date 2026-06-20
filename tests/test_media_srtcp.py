@@ -611,3 +611,116 @@ class TestSrtcpKeyRedaction:
             rx.unprotect(bytes(srtcp))
         assert key_b64 not in str(exc_info.value)
         assert master_key.hex() not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 (codex r1, BLOCKING): SRTCP index space must NOT wrap under one
+# master key — wrapping 0x7fffffff -> 0 reuses the IV/keystream (two-time pad).
+# The sender must raise SrtcpError on index exhaustion instead of wrapping.
+# ---------------------------------------------------------------------------
+
+# The maximum 31-bit SRTCP index (RFC 3711 §3.4).
+_SRTCP_INDEX_MAX = 0x7FFFFFFF
+
+
+class TestSrtcpIndexExhaustion:
+    def test_protect_accepts_up_to_max_index(self) -> None:
+        """protect() emits the final two valid indices 0x7ffffffe and 0x7fffffff."""
+        crypto = _make_crypto()
+        tx = SrtcpSession(crypto)
+        # Fast-forward the sender to one before the penultimate index.
+        tx.index = _SRTCP_INDEX_MAX - 2
+        srtcp_pen = tx.protect(_sr())
+        trailer = srtcp_pen[-_TAG_80 - _SRTCP_INDEX_LEN : -_TAG_80]
+        assert (int.from_bytes(trailer, "big") & ~_E_FLAG) == _SRTCP_INDEX_MAX - 1
+        srtcp_last = tx.protect(_sr())
+        trailer = srtcp_last[-_TAG_80 - _SRTCP_INDEX_LEN : -_TAG_80]
+        assert (int.from_bytes(trailer, "big") & ~_E_FLAG) == _SRTCP_INDEX_MAX
+        assert tx.index == _SRTCP_INDEX_MAX
+
+    def test_protect_raises_at_index_exhaustion(self) -> None:
+        """The protect() after the max index raises instead of wrapping to 0.
+
+        Wrapping would reuse the IV/keystream under the same master key (a
+        catastrophic two-time-pad); exhaustion is a hard error requiring rekey.
+        """
+        crypto = _make_crypto()
+        tx = SrtcpSession(crypto)
+        tx.index = _SRTCP_INDEX_MAX  # the last index has been emitted
+        with pytest.raises(SrtcpError, match=r"exhaust|rekey|index space"):
+            tx.protect(_sr())
+        # The index must NOT have wrapped to 0 (no keystream reuse).
+        assert tx.index == _SRTCP_INDEX_MAX
+
+    def test_exhaustion_error_does_not_expose_key(self) -> None:
+        """The exhaustion SrtcpError must not leak key material."""
+        master_key = bytes(range(16))
+        master_salt = bytes(range(14))
+        key_b64 = base64.b64encode(master_key + master_salt).decode()
+        crypto = _make_crypto(master_key=master_key, master_salt=master_salt)
+        tx = SrtcpSession(crypto)
+        tx.index = _SRTCP_INDEX_MAX
+        with pytest.raises(SrtcpError) as exc_info:
+            tx.protect(_sr())
+        assert key_b64 not in str(exc_info.value)
+        assert master_key.hex() not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 (codex r1, MAJOR): the SDES inline-key decode in srtcp.py must be
+# self-defending — base64 with validate=True, catch decode errors, and require
+# EXACTLY 30 octets — raising a typed SrtcpError rather than a low-level crypto
+# error or silently-malformed keys. (CryptoAttribute already validates upstream,
+# so these tests forge a malformed-but-typed attribute via object.__new__ to hit
+# srtcp.py's own decode guard — defence in depth, not a redundant upstream check.)
+# ---------------------------------------------------------------------------
+
+
+def _forge_crypto(suite: str, key_params: str) -> CryptoAttribute:
+    """Build a CryptoAttribute bypassing __post_init__ validation.
+
+    CryptoAttribute is a frozen, validated dataclass, so a malformed key_params
+    can never reach SrtcpSession through normal construction. To exercise
+    srtcp.py's OWN decode guard (defence in depth), forge an instance directly.
+    """
+    obj = object.__new__(CryptoAttribute)
+    object.__setattr__(obj, "tag", 1)
+    object.__setattr__(obj, "suite", suite)
+    object.__setattr__(obj, "key_params", key_params)
+    return obj
+
+
+class TestSrtcpInlineKeyDecodeGuard:
+    def test_invalid_base64_raises_srtcp_error(self) -> None:
+        """A non-base64 inline key raises SrtcpError, not a raw binascii error."""
+        crypto = _forge_crypto(_AES_CM_128_HMAC_SHA1_80, "inline:not valid base64!!!")
+        with pytest.raises(SrtcpError):
+            SrtcpSession(crypto)
+
+    def test_short_key_salt_raises_srtcp_error(self) -> None:
+        """An inline key that decodes to fewer than 30 octets raises SrtcpError."""
+        short = base64.b64encode(bytes(20)).decode()  # 20 octets, need 30
+        crypto = _forge_crypto(_AES_CM_128_HMAC_SHA1_80, f"inline:{short}")
+        with pytest.raises(SrtcpError):
+            SrtcpSession(crypto)
+
+    def test_long_key_salt_raises_srtcp_error(self) -> None:
+        """An inline key that decodes to more than 30 octets raises SrtcpError."""
+        long = base64.b64encode(bytes(40)).decode()  # 40 octets, need 30
+        crypto = _forge_crypto(_AES_CM_128_HMAC_SHA1_80, f"inline:{long}")
+        with pytest.raises(SrtcpError):
+            SrtcpSession(crypto)
+
+    def test_decode_guard_error_does_not_expose_key(self) -> None:
+        """The decode-guard SrtcpError must not echo the (corrupt) key material."""
+        short_b64 = base64.b64encode(bytes(range(20))).decode()
+        crypto = _forge_crypto(_AES_CM_128_HMAC_SHA1_80, f"inline:{short_b64}")
+        with pytest.raises(SrtcpError) as exc_info:
+            SrtcpSession(crypto)
+        assert short_b64 not in str(exc_info.value)
+
+    def test_valid_inline_key_still_constructs(self) -> None:
+        """A valid 30-octet inline key still constructs cleanly (no regression)."""
+        crypto = _make_crypto()  # the normal validated path
+        session = SrtcpSession(crypto)
+        assert session.index == 0

@@ -87,27 +87,41 @@ So `srtp_outbound = SrtpSession(our_offer_crypto)` and
 `srtp_inbound = SrtpSession(peer_answer_crypto)`. This is the exact mirror of the inbound
 helpers `_srtp_outbound_from_answer` (our key) / `_srtp_inbound_from_offer` (peer key).
 
-### 3. Plain-answer policy — **fail closed**, never silently downgrade
+### 3. Answer validation + fail-closed teardown — never silently downgrade or mis-key
 
-When we offered `RTP/SAVP` and parse the 2xx answer:
+When we offered `RTP/SAVP`, the 2xx answer is validated against **our offer**
+(`_validate_outbound_answer_crypto`, RFC 4568 §5.1.2 / §6.1). The answer is **accepted**
+only when it is `RTP/SAVP` carrying **exactly one** supported, well-formed `a=crypto`
+whose **tag AND suite echo our offered crypto** — then the engine comes up **secured**
+with the keying in §2.
 
-- **Answer is `RTP/SAVP` with a usable `a=crypto`:** bring the engine up **secured** with
-  the keying in §2. Success.
-- **Answer is plain `RTP/AVP` (or `RTP/SAVP` with no usable `a=crypto`):** **FAIL the call
-  cleanly** — raise `OutboundCallFailed(488, …)` **before** sending the ACK, never key a
-  plain engine. This is consistent with the established precedent in the *same* function:
-  a 2xx whose codec we cannot accept already raises `OutboundCallFailed(488)` before the
-  ACK (the transport auto-ACKs only non-2xx; an un-ACKed 2xx is absorbed by
-  retransmission/the proxy). No silent plaintext fallback — the security regression the
-  task forbids.
+Every other answer is **rejected, fail-closed**:
+
+- plain `RTP/AVP` (a downgrade of our encrypted offer);
+- `RTP/SAVP` with **no** usable `a=crypto` (absent / malformed / unsupported);
+- a crypto whose **tag or suite we did not offer** (keying from it would use parameters
+  we never proposed — a mis-key);
+- **multiple** `a=crypto` lines (an answer must select exactly one — ambiguous).
+
+**Teardown of a rejected 2xx (RFC 3261 §13.2.2.4 + §15 — the codex-r1 BLOCKING fix).** A
+2xx **establishes the dialog** and **MUST be ACKed by the UAC** (the transaction layer
+auto-ACKs only *non*-2xx; an un-ACKed 2xx leaves a half-open, remote-established dialog +
+retransmits — the same bug fixed inbound in ADR-0065). So the validation runs **after the
+ACK is sent**: on rejection the plugin **ACKs the 2xx, then sends an in-dialog BYE**
+(`_bye_answered_outbound_dialog`) to tear the dialog down, and only then raises
+`OutboundCallFailed(488, …)`; the existing `finally` stops the engine and frees the RTP
+socket. No media is ever started, and no half-open dialog is left on the callee. The
+`OutboundCallFailed` message is **structural** (tags / suites / counts only) — it must
+never carry the offending key or `a=crypto` line (rule 34: it lands in logs, and the repo
+is PUBLIC).
 
 This is **not** a contradiction of ADR-0053's opportunism: opportunism is the
 **answerer's** stance (don't downgrade the *peer's* request). The **offerer** that asked
-for encryption must not accept a plaintext answer — the two stances are the two sides of
-"never downgrade an encrypted media leg to plaintext".
+for encryption must not accept a plaintext-or-mis-keyed answer — the two stances are the
+two sides of "never downgrade or mis-key an encrypted media leg".
 
-When the flag is **off** we offer plain and the 2xx answer is plain — unchanged, no new
-failure mode.
+When the flag is **off** we offer plain and the 2xx answer is plain — no validation, no
+new failure mode, unchanged.
 
 ### 4. Engine wiring
 

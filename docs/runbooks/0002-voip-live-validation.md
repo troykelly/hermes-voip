@@ -556,9 +556,10 @@ not affected by this setting.
 By default an agent-originated outbound call (`place_call`) offers **plain `RTP/AVP`**
 (the live-validated default). Setting `HERMES_VOIP_SIP_SDES_OFFER=1` makes the outbound
 INVITE offer **`RTP/SAVP` + a fresh per-call `a=crypto`** (SDES, RFC 4568) instead. This
-is **opt-in** because the policy is **fail-closed**: if the callee answers plain
-`RTP/AVP` to our secured offer, the call FAILS (it is never silently downgraded to
-cleartext).
+is **opt-in** because the policy is **fail-closed**: a 2xx that does not answer with a
+matching SRTP crypto (a plain `RTP/AVP` answer, an `a=crypto` whose tag/suite we did not
+offer, or multiple/absent `a=crypto`) fails the call — it is never silently downgraded to
+cleartext or keyed from parameters we never proposed.
 
 ```sh
 # Enable the opt-in outbound SDES offer, then trigger an outbound call (the agent
@@ -573,10 +574,15 @@ export HERMES_VOIP_SIP_SDES_OFFER=1
 - When the callee answers **`RTP/SAVP` + a usable `a=crypto`**: the call connects with
   two-way SRTP — we encrypt outbound with our offer key and decrypt inbound with the
   callee's answer key (RFC 4568 §6.1). Audio is two-way as in step 8.
-- When the callee answers **plain `RTP/AVP`** (a downgrade of our secured offer): the
-  call FAILS with `OutboundCallFailed(488, …)` and **no media flows** — the adapter logs
-  the 488 and tears down; it never streams plaintext. This is the fail-closed posture
-  (the offerer that asked for encryption must not accept a plaintext answer).
+- When the callee answers in a way that does not match our SRTP offer — **plain
+  `RTP/AVP`**, an `a=crypto` whose **tag/suite we did not offer**, or **multiple/absent**
+  `a=crypto` — the call FAILS with `OutboundCallFailed(488, …)` and **no media flows**.
+  The plugin still **ACKs the 2xx then sends a BYE** (RFC 3261 §13.2.2.4 + §15 — a 2xx
+  establishes the dialog, so it must be ACKed even when rejected, then torn down; never
+  left half-open), logs the structural 488 (never the key), and releases the socket. On
+  the wire you will see: our INVITE (`RTP/SAVP`) → the callee's mismatched 2xx → our ACK
+  → our BYE → the callee's 200 OK to the BYE. This is the fail-closed posture (the
+  offerer that asked for encryption must not accept a plaintext-or-mis-keyed answer).
 - Rollback switch: unset `HERMES_VOIP_SIP_SDES_OFFER` (or `=0`) to return to the plain
   `RTP/AVP` outbound offer without a code change. No effect on the inbound answer path or
   the WebRTC outbound path (which already offers DTLS-SRTP).

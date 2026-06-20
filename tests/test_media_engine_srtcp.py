@@ -42,9 +42,27 @@ from hermes_voip.rtcp import (
     build_compound,
     parse_compound,
 )
+from hermes_voip.rtp import RtpPacket
 from hermes_voip.sdp import CryptoAttribute
 
 _PEER_SSRC = 0x12345678
+
+
+class _IdentitySrtp:
+    """A byte-for-byte identity SRTP stand-in (marks the engine secured, no crypto).
+
+    Structurally satisfies the engine's ``_SrtpProtect``/``_SrtpUnprotect`` Protocols,
+    so it can be assigned to ``_srtp_in``/``_srtp_out`` without a cast. Only the
+    PRESENCE matters — it makes ``_is_secured`` true so a NO-SRTCP secured engine is
+    genuinely secured (the dormant-without-SRTCP case), independent of the SRTCP unit.
+    """
+
+    def protect(self, packet: RtpPacket) -> bytes:
+        return packet.pack()
+
+    def unprotect(self, data: bytes) -> RtpPacket:
+        return RtpPacket.parse(data)
+
 
 # Two distinct 30-byte SDES master key||salt values, generated at runtime (never a
 # literal secret in a tracked file — rule 34). Each is a valid AES_CM_128_HMAC_SHA1_80
@@ -73,10 +91,12 @@ def _make_secured_engine(
     srtcp_inbound: SrtcpSession | None,
     srtcp_outbound: SrtcpSession | None,
 ) -> RtpMediaTransport:
-    """A secured (SRTP-marked) engine optionally carrying SRTCP sessions.
+    """A SECURED engine (SRTP-marked) optionally carrying the SRTCP sessions under test.
 
-    The SRTCP sessions are the units under test; ``_is_secured`` is satisfied because
-    a non-None ``srtcp_inbound``/``srtcp_outbound`` also marks the engine secured.
+    The engine is always marked secured via identity SRTP stand-ins on ``_srtp_in`` /
+    ``_srtp_out`` (so ``_is_secured`` is true regardless of SRTCP) — this models a real
+    SDES/DTLS call. The SRTCP sessions are the units under test: present → secured RTCP
+    activates; absent → secured engine with no SRTCP stays dormant.
     """
     return RtpMediaTransport(
         local_address="127.0.0.1",
@@ -87,6 +107,8 @@ def _make_secured_engine(
         initial_seq=1000,
         initial_ts=0,
         cname="hermes@host.invalid",
+        srtp_inbound=_IdentitySrtp(),
+        srtp_outbound=_IdentitySrtp(),
         srtcp_inbound=srtcp_inbound,
         srtcp_outbound=srtcp_outbound,
     )

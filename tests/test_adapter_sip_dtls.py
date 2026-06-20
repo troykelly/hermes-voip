@@ -1524,7 +1524,9 @@ async def test_sdes_offer_never_touches_sip_dtls_branch() -> None:
     engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # SDES (secured) path does not activate RTCP.
+        # SDES (secured) path now activates RTCP over SRTCP (ADR-0066); the real engine
+        # awaits start_rtcp, so the fake must provide an AsyncMock.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=20002,
         inbound_sample_rate=8_000,

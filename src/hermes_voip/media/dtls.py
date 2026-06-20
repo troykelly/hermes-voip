@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from hermes_voip._lazy_singleton import LazySingleton
+from hermes_voip.media.srtcp import SrtcpSession
 from hermes_voip.media.srtp import SrtpSession
 
 # ---------------------------------------------------------------------------
@@ -693,6 +694,53 @@ class DtlsEndpoint:
             # SERVER outbound → server_write; SERVER inbound → client_write
             outbound = SrtpSession.from_raw_keys(swk, sws, suite=suite)
             inbound = SrtpSession.from_raw_keys(cwk, cws, suite=suite)
+
+        return inbound, outbound
+
+    def derive_srtcp_sessions(self) -> tuple[SrtcpSession, SrtcpSession]:
+        """Derive inbound + outbound :class:`SrtcpSession` pairs (RFC 3711 §3.4).
+
+        Secured-path RTCP rides SRTCP, keyed from the IDENTICAL RFC 5764 §4.2 export
+        that keys SRTP (:meth:`derive_srtp_sessions`) — only the KDF labels differ
+        (0x03/0x04/0x05 vs 0x00/0x01/0x02), so the SRTCP keystream is independent of the
+        SRTP keystream derived from the same write key/salt. The role→direction mapping
+        is identical to SRTP (CLIENT uses client_write outbound / server_write inbound;
+        SERVER mirrors), so the SRTP and SRTCP pairs agree on which master material is
+        ours vs the peer's. The adapter wires the returned pair onto the engine's
+        ``srtcp_inbound``/``srtcp_outbound`` alongside the SRTP pair (ADR-0066).
+
+        Returns:
+            ``(inbound, outbound)`` — a pair of :class:`SrtcpSession` instances ready
+            for :meth:`~SrtcpSession.unprotect` / :meth:`~SrtcpSession.protect`.
+
+        Raises:
+            RuntimeError: If called before the handshake completes, or before
+                :meth:`verify_peer_fingerprint` (RFC 5763 §5 — fingerprint verification
+                precedes keying), mirroring :meth:`derive_srtp_sessions`.
+        """
+        if not self._fingerprint_verified:
+            msg = (
+                "verify_peer_fingerprint() must be called before "
+                "derive_srtcp_sessions() — RFC 5763 §5 requires fingerprint "
+                "verification before keying"
+            )
+            raise RuntimeError(msg)
+        material: bytes = self.export_srtp_keying_material()
+        suite: str = _PROFILE_TO_SUITE.get(
+            self._conn.get_selected_srtp_profile(), _SUITE_80
+        )
+        # RFC 5764 §4.2 layout (identical to derive_srtp_sessions).
+        cwk: bytes = material[0:_SRTP_KEY_LEN]
+        swk: bytes = material[_SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN]
+        cws: bytes = material[2 * _SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN + _SRTP_SALT_LEN]
+        sws: bytes = material[2 * _SRTP_KEY_LEN + _SRTP_SALT_LEN : _EXPORT_LEN]
+
+        if self.role is DtlsRole.CLIENT:
+            outbound = SrtcpSession.from_raw_keys(cwk, cws, suite=suite)
+            inbound = SrtcpSession.from_raw_keys(swk, sws, suite=suite)
+        else:
+            outbound = SrtcpSession.from_raw_keys(swk, sws, suite=suite)
+            inbound = SrtcpSession.from_raw_keys(cwk, cws, suite=suite)
 
         return inbound, outbound
 

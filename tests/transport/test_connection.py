@@ -634,6 +634,124 @@ def _final_2xx_with_contact(invite: SipRequest) -> str:
     )
 
 
+async def test_remove_call_sink_mismatch_still_clears_outbound_cancel_tracking() -> None:
+    # Fix (a): remove_call's sink-identity early-return (an earlier call's teardown
+    # must not evict a later same-Call-ID sink) used to sit ABOVE the outbound
+    # CANCEL-tracking cleanup, so a sink-mismatch remove_call returned before clearing
+    # _outbound_invites / _cancelled_outbound — leaking the CANCEL tracking for a call
+    # that is being torn down. The outbound-tracking cleanup must run regardless of the
+    # sink identity. Observable: after a CANCEL + a MISMATCHED remove_call, a second
+    # send_cancel for the same Call-ID has nothing tracked and returns False.
+    branch = new_branch()
+    call_id = new_call_id()
+    owner_sink = _RecordingSink()
+    other_sink = _RecordingSink()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []  # never answer — the call is "ringing"
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    transport.add_call(call_id, owner_sink)
+    try:
+        await transport.send(_outbound_invite(branch, call_id=call_id))
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        assert await transport.send_cancel(call_id) is True
+
+        # A DIFFERENT sink than the one registered for this Call-ID: the identity
+        # guard makes the _calls removal a no-op, but the outbound CANCEL tracking
+        # must still be cleared (the call is being torn down).
+        transport.remove_call(call_id, other_sink)
+
+        # The outbound INVITE record is gone, so there is nothing left to CANCEL.
+        assert await transport.send_cancel(call_id) is False, (
+            "a sink-mismatch remove_call must still clear the outbound CANCEL "
+            "tracking — a second send_cancel must find nothing in-flight"
+        )
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_retransmitted_glare_2xx_is_acked_each_time_but_byed_only_once() -> None:
+    # Fix (b): RFC 3261 §13.3.1.4 — a UAS retransmits its 2xx until the ACK arrives.
+    # For a 2xx that raced our CANCEL, the transport must ACK EVERY retransmission
+    # (so the UAS stops retransmitting) but send the in-dialog BYE only ONCE (a second
+    # BYE on an already-BYE'd dialog is spurious). The bug ACK+BYE'd on every 2xx.
+    branch = new_branch()
+    call_id = new_call_id()
+    sink = _RecordingSink()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    transport.add_call(call_id, sink)
+    try:
+        invite_text = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite_text)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        assert await transport.send_cancel(call_id) is True
+        await server.wait_for_received(lambda raw: raw.startswith("CANCEL "))
+
+        late_200 = _final_2xx_with_contact(SipRequest.parse(invite_text))
+
+        # First 2xx: ACK + BYE the racing answer.
+        await server.push(late_200)
+        await server.wait_for_received(
+            lambda raw: raw.startswith("BYE ") and f"Call-ID: {call_id}" in raw,
+            timeout=3.0,
+        )
+
+        def _ack_count() -> int:
+            return sum(
+                1
+                for raw in server.received
+                if raw.startswith("ACK ") and f"Call-ID: {call_id}" in raw
+            )
+
+        def _bye_count() -> int:
+            return sum(
+                1
+                for raw in server.received
+                if raw.startswith("BYE ") and f"Call-ID: {call_id}" in raw
+            )
+
+        assert _ack_count() == 1
+        assert _bye_count() == 1
+
+        # The UAS retransmits the SAME 2xx (it has not yet "seen" our ACK).
+        await server.push(late_200)
+        # The retransmit must be ACKed again (so the UAS stops retransmitting).
+        await _until(lambda: _ack_count() == 2, timeout=3.0)
+        # But the dialog was already BYE'd — no second BYE.
+        await asyncio.sleep(0.15)
+        assert _bye_count() == 1, (
+            "a retransmitted glare 2xx must be ACKed again but BYE'd only once "
+            "(RFC 3261 §13.3.1.4)"
+        )
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
 # --------------------------------------------------------------------------
 # Non-2xx final to an INVITE we sent is ACKed by this layer
 # --------------------------------------------------------------------------

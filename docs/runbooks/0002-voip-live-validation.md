@@ -587,7 +587,173 @@ export HERMES_VOIP_SIP_SDES_OFFER=1
   `RTP/AVP` outbound offer without a code change. No effect on the inbound answer path or
   the WebRTC outbound path (which already offers DTLS-SRTP).
 
-## 9. Teardown
+## 9. Secured-call, RFC 4028 session-timer & call-progress validation (ADR-0070/0071/0064/0066)
+
+The launch-push hardening. Everything here runs on top of a registered extension and an
+answered call — **stand up + REGISTER exactly as in §6, watch for the
+`SIP registration established (expires %ss)` INFO from `hermes_voip.manager`, and place the
+test call as in §8** — these checks only add what to watch for once the call is up. The WHY
+is ADR-0070 (secure-media mandate), ADR-0071 (session timers), ADR-0064 (call-progress) and
+ADR-0066/0061 (SRTCP-secured RTCP).
+
+### Pre-flight & rollback (do this before the first secured call)
+
+- **Secure-media is ON by default** (`HERMES_VOIP_REQUIRE_SECURE_MEDIA`, default `true`). With
+  it on, an inbound `INVITE` whose audio is **plain `RTP/AVP`** is **rejected `488 Not
+  Acceptable Here` with no media** — so the gateway/extension **MUST offer a secured profile**:
+  SDES (`m=audio … RTP/SAVP` + `a=crypto`), DTLS-SRTP (`UDP/TLS/RTP/SAVP` + `a=fingerprint`),
+  or WebRTC (`UDP/TLS/RTP/SAVPF`). Confirm the offered profile in the `SDP offer` INFO line
+  **before** expecting a two-way call (see §8b/§8d for that log line).
+- **Rollback for a cleartext-only gateway:** if the gateway cannot yet offer a secured profile
+  and you need to validate the rest of the path first, set
+  `HERMES_VOIP_REQUIRE_SECURE_MEDIA=false` (restores the opportunistic plaintext answer of
+  §8), validate, then **re-enable** (unset / `=true`) and re-run the secured checks. Do not
+  ship with the mandate disabled.
+
+### 9a. Secure-media mandate — plain RTP/AVP is refused 488 (ADR-0070)
+
+```bash
+# With the mandate ON (default), dial from an extension whose INVITE offers plain RTP/AVP.
+# The plugin refuses BEFORE any dialog/media/admission slot is created.
+grep -E "REJECTED 488 — secure-media mandate|SDP offer" /tmp/hermes-voip-live.log | tail -5
+# → INVITE <id>: REJECTED 488 — secure-media mandate (HERMES_VOIP_REQUIRE_SECURE_MEDIA): the
+#   offered audio profile is cleartext RTP/AVP, not SRTP (SDES/DTLS/WebRTC)
+```
+
+Pass criteria:
+
+- A plain-`RTP/AVP` offer is answered with `488 Not Acceptable Here`; **no `200 OK`, no RTP,
+  no greeting** (the `488` is sent in `_handle_inbound_invite` before the media engine exists).
+- A **secured** offer (SDES `RTP/SAVP`, DTLS `UDP/TLS/RTP/SAVP`, or WebRTC `UDP/TLS/RTP/SAVPF`)
+  is **not** refused here — it proceeds to the §8d/§8e/WebRTC media path. The guard keys off
+  `audio.is_srtp`, which is true for all three secured profiles and false only for `RTP/AVP`.
+- With `HERMES_VOIP_REQUIRE_SECURE_MEDIA=false`, the same plain offer is answered as a
+  cleartext call (the §8 opportunistic path) — the rollback escape hatch, not the shipping
+  posture.
+
+### 9b. RFC 4028 session timers — long-call refresh & 491-glare survival (ADR-0071)
+
+Defaults: `HERMES_VOIP_SESSION_EXPIRES=600` (the interval we offer outbound and insert into an
+inbound `2xx`; the refresher refreshes at **SE/2 ≈ 300 s**) and `HERMES_VOIP_MIN_SE=90` (the
+smallest interval we accept — an inbound `Session-Expires` below it is rejected
+`422 Session Interval Too Small` carrying our `Min-SE`). Both are floored at 90 s (RFC 4028
+§4/§5).
+
+```bash
+# Place a secured call and KEEP IT UP past ~SE/2 (~300 s with the default). Then read the log.
+grep -E "session refreshed \(RFC 4028\)|session refresh hit 491 glare|Session Interval Too Small" \
+  /tmp/hermes-voip-live.log | tail -10
+# Healthy refresh →  INVITE <id>: session refreshed (RFC 4028)
+# Glare, retried  →  INVITE <id>: session refresh hit 491 glare — retrying after <N>s (RFC 3261 §14.1)
+```
+
+Pass criteria:
+
+- Around **SE/2 (~300 s)** the plugin (the elected refresher) sends a **mid-dialog refresh
+  re-INVITE** that round-trips `2xx`, and **audio survives the refresh** (no silence/teardown):
+  the `session refreshed (RFC 4028)` DEBUG line appears and the call continues. Confirm the
+  timer resets on **a refresh we send** AND **one we receive** — receiving a peer refresh
+  re-INVITE (`sendrecv`, with `Session-Expires`) re-arms our watchdog the same way.
+- **491-glare WATCH-ITEM (the BLOCKER we fixed).** If the gateway also runs session timers, or
+  our refresh crosses a peer re-INVITE (hold/resume), the refresh can collide → `491 Request
+  Pending`. The plugin **must retry with a randomized backoff (RFC 3261 §14.1) and the call
+  must NOT drop**: `classify_refresh_failure` maps `491` → `RefreshRetry`, the watchdog sleeps
+  `glare_backoff_secs(role)` and retries within the current window (the SE/2-vs-SE slack
+  absorbs the backoff). Verify the `session refresh hit 491 glare — retrying` line is followed
+  by a later `session refreshed (RFC 4028)` (recovery), **not** a BYE. Only after
+  consecutive-glare exhaustion does it BYE — that path should not trigger on a healthy peer.
+- An inbound `INVITE` offering a `Session-Expires` **below** `HERMES_VOIP_MIN_SE` is rejected
+  `422` (the `REJECTED 422 Session Interval Too Small` INFO line) and the UAC retries with a
+  larger interval. A timeout/`408`/`481` on our refresh is a **dead dialog → clean BYE**
+  (`RefreshTeardown`); a transient `5xx`/`488` keeps the call up and retries at the next SE/2
+  (`RefreshContinue`) — these are correct, not failures.
+
+### 9c. Secured-path RTCP rides SRTCP (ADR-0066/0061) — verify it is ACTIVE, not dormant
+
+On a **secured** call (SDES / DTLS-SRTP / WebRTC) RTCP is **active and protected by SRTCP**
+(RFC 3711 §3.4) — it is **not** dormant and it is **never** cleartext. The engine's
+`start_rtcp` activates a secured engine only once the SRTCP transform is wired
+(`_is_secured and not _has_srtcp` stays dormant; `_has_srtcp` ⇒ both `_srtcp_in` and
+`_srtcp_out` set ⇒ activates). The adapter wires it per path: SDES via
+`_srtcp_inbound_from_offer`/`_srtcp_outbound_from_answer` → `_plan_secured_rtcp_activation`
+(its own UDP socket, so rtcp-mux is negotiable / a sibling port is possible); DTLS-SRTP and
+WebRTC via `session.derive_srtcp_sessions()` → `_activate_muxed_srtcp_rtcp` (one ICE/UDP
+pipe, so **mux is forced**). Every outbound RTCP is encrypted+authenticated by
+`_emit_rtcp → _srtcp_out.protect`; every inbound one is verified+decrypted by
+`_ingest_rtcp_datagram → _srtcp_in.unprotect` (a bad tag is dropped, not fatal). The kill
+switch is `HERMES_VOIP_RTCP_ENABLED` (default `true`).
+
+```bash
+# On a secured call, RTCP activation logs the muxed-SRTCP line (DTLS/WebRTC path):
+grep -E "RTCP active \(rtcp-mux, SRTCP\)|RTCP active" /tmp/hermes-voip-live.log | tail -5
+# → INVITE <id>: RTCP active (rtcp-mux, SRTCP)
+```
+
+Pass criteria:
+
+- On a secured call RTCP is **activated** (the `RTCP active … SRTCP` line on the muxed
+  DTLS/WebRTC path; the SDES path activates equivalently via the secured planner). It is
+  **not** left dormant the way a secured-without-SRTCP engine would be.
+- The cleartext RTCP planner (`_plan_rtcp_activation`, gated on the answered profile being
+  **exactly** `RTP/AVP`) is **NOT** used for any secured profile — secured calls never emit
+  cleartext RTCP (no SSRC/CNAME/timing leak on the secured 5-tuple). On a **plain `RTP/AVP`**
+  call (only reachable with the §9a mandate disabled) cleartext RTCP rides RTP-port or
+  RTP-port+1 per RFC 5761/3550.
+- The CNAME is an opaque per-call token (`secrets.token_hex`), never a SIP host/extension/
+  caller — confirm no identifying value appears in any RTCP-related log line.
+
+### 9d. Call-progress detection — fax (CNG/CED) + answering-machine + leave-message (ADR-0064)
+
+Call-progress detection is **opt-in** (`HERMES_VOIP_CALL_PROGRESS`, default `false`). When on,
+the detector runs **post-answer** off the media hot path: **fax (CNG/CED)** detection runs in
+**both** directions, while **answering-machine detection (AMD) + record-cue** are **outbound-
+only** (on an inbound call the agent **is** the answerer, so AMD/record-cue are inert; fax
+still runs). To exercise it, enable the flag and place an **outbound** call (the `place_call`
+agent tool, or `HERMES_VOIP_CALL_ON_CONNECT=<ext>` for a one-shot test dial) to a fax or an
+answering machine.
+
+```bash
+export HERMES_VOIP_CALL_PROGRESS=1     # opt-in; off by default
+grep -E "call-progress detection on|call-progress (LikelyHuman|.*fax)|READY TO RECORD" \
+  /tmp/hermes-voip-live.log | tail -10
+# → INVITE <id>: call-progress detection on (amd=…, fax_hangup=…)
+```
+
+What to expect:
+
+- **Dial a fax:** the detector raises `FaxCng`/`FaxCed`; a fax cannot converse, so with
+  `HERMES_VOIP_AMD_HANGUP_ON_FAX` (default `true`) the plugin **hangs up**; otherwise it
+  advises the agent.
+- **Dial an answering machine (outbound):** the detector advises the agent (a system turn),
+  and on the record tone injects `the answering machine is now READY TO RECORD — leave your
+  message now`; the agent decides whether to leave a voicemail or hang up.
+- **A live human** is advisory-only (`call-progress LikelyHuman … no action`) — the normal
+  conversational pipeline takes over. On an **inbound** call AMD/record-cue never fire (only
+  fax detection does).
+
+### 9e. WATCH-ITEMS & explicitly NOT-validated-here
+
+WATCH-ITEMS (things to actively look for during a secured long call):
+
+- **491 glare** (§9b): a refresh collision must be **retried with backoff**, never a dropped
+  call. Grep `session refresh hit 491 glare` and confirm a later `session refreshed`.
+- **Confirm the actually-offered media profile** (§9a/§8b/§8d): read the `SDP offer` line and
+  verify the gateway offered the **secured** profile you intended (`RTP/SAVP` /
+  `UDP/TLS/RTP/SAVP` / `UDP/TLS/RTP/SAVPF`). With the mandate ON there is **no silent drop to
+  cleartext** — a plain offer is a hard `488`, not a quiet downgrade.
+
+**NOT validated by this runbook (known gaps, not failures):**
+
+- **Real-UDP WebRTC media** end-to-end is not exercised here — it needs a TURN relay / a
+  UDP-reachable container (tracked as task #1). The WebRTC **signalling/keying** path (§8d
+  Stage-2 notes, SRTCP §9c) is wired; the live UDP media leg is the open item.
+- **Agent-screened inbound answering** (an opt-in "do not auto-answer, let the agent decide")
+  is **NOT built** (tracked as task #81): there is **no** disable-auto-answer env key, so an
+  admitted inbound call that passes the §8/§9a guards **auto-answers**. Caller-group `603
+  Decline` (§8 / caller modes) is the only pre-answer rejection; there is no
+  ring-then-screen-then-answer mode yet.
+
+## 10. Teardown
 
 - Stop the validation process / gateway with `Ctrl-C` (the driver above calls
   `adapter.disconnect()`, which cancels call loops, closes the manager and the TLS transport).

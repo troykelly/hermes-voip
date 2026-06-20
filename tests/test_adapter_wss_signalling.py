@@ -422,6 +422,10 @@ class _FakeWebRtcSession:
         self.handshake_args = kwargs
         return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
 
+    def derive_srtcp_sessions(self) -> tuple[object, object]:
+        """The SRTCP (inbound, outbound) pair from the same DTLS export (ADR-0066)."""
+        return (MagicMock(name="srtcp_in"), MagicMock(name="srtcp_out"))
+
     async def close(self) -> None:
         """No-op."""
 

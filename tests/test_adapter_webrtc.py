@@ -431,6 +431,10 @@ class _FakeWebRtcSession:
             raise ValueError(msg)
         return (MagicMock(name="srtp_in"), MagicMock(name="srtp_out"))
 
+    def derive_srtcp_sessions(self) -> tuple[object, object]:
+        """The SRTCP (inbound, outbound) pair from the same DTLS export (ADR-0066)."""
+        return (MagicMock(name="srtcp_in"), MagicMock(name="srtcp_out"))
+
     def derive_outbound_srtp_session(self, *, ssrc: int) -> object:
         # Records the video SSRC and returns a fake SRTP whose protect() yields
         # bytes the (fake) ICE pipe can send (ADR-0044).
@@ -462,8 +466,11 @@ async def test_webrtc_offer_yields_savpf_answer_with_opus_dtls_ice() -> None:
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
-        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        # RTCP over SRTCP (ADR-0066): the WebRTC path now activates RTCP (muxed), so the
+        # real engine awaits start_rtcp; the fake provides an AsyncMock. _rtcp_active
+        # stays a plain attribute (the fake never runs the loop) so teardown's
+        # quality-log guard reads False.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
@@ -575,8 +582,11 @@ async def test_webrtc_av_offer_answers_sendonly_video_and_starts_sender(
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
-        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        # RTCP over SRTCP (ADR-0066): the WebRTC path now activates RTCP (muxed), so the
+        # real engine awaits start_rtcp; the fake provides an AsyncMock. _rtcp_active
+        # stays a plain attribute (the fake never runs the loop) so teardown's
+        # quality-log guard reads False.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
@@ -656,8 +666,11 @@ async def test_webrtc_video_ssrc_never_collides_with_audio(
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
-        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        # RTCP over SRTCP (ADR-0066): the WebRTC path now activates RTCP (muxed), so the
+        # real engine awaits start_rtcp; the fake provides an AsyncMock. _rtcp_active
+        # stays a plain attribute (the fake never runs the loop) so teardown's
+        # quality-log guard reads False.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
@@ -719,8 +732,11 @@ async def test_webrtc_av_offer_no_source_answers_inactive_video(
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
-        # RTCP (ADR-0061): the WebRTC (secured) path does not activate RTCP — no
-        # SRTCP transform — so _rtcp_active stays inert and teardown logs no quality.
+        # RTCP over SRTCP (ADR-0066): the WebRTC path now activates RTCP (muxed), so the
+        # real engine awaits start_rtcp; the fake provides an AsyncMock. _rtcp_active
+        # stays a plain attribute (the fake never runs the loop) so teardown's
+        # quality-log guard reads False.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
@@ -1023,6 +1039,9 @@ async def test_webrtc_ack_during_handshake_then_success_guard_replaced() -> None
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # WebRTC now activates RTCP over SRTCP (ADR-0066); the real engine awaits
+        # start_rtcp, so the fake provides an AsyncMock.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
@@ -1095,6 +1114,9 @@ async def test_webrtc_peer_bye_during_successful_handshake_no_callloop() -> None
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # WebRTC now activates RTCP over SRTCP (ADR-0066); the real engine awaits
+        # start_rtcp, so the fake provides an AsyncMock.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,
@@ -1161,6 +1183,9 @@ async def test_webrtc_handshake_failure_byes_after_ack() -> None:
     fake_engine = MagicMock(
         connect=AsyncMock(return_value=True),
         stop=AsyncMock(return_value=None),
+        # WebRTC now activates RTCP over SRTCP (ADR-0066); the real engine awaits
+        # start_rtcp, so the fake provides an AsyncMock.
+        start_rtcp=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=0,
         inbound_sample_rate=16_000,

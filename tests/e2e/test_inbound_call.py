@@ -300,6 +300,11 @@ _FAKE_ENV: dict[str, str] = {
     "HERMES_SIP_EXTENSION": _TO_USER,
     "HERMES_SIP_PASSWORD": "fake-password",
     "HERMES_SIP_EXPIRES": "120",
+    # This e2e exercises the cleartext G.711 RTP/AVP answer path end-to-end, so the
+    # secure-media mandate (ADR-0070) is disabled here; with it on (the production
+    # default) the plain offer would be 488'd. The mandate is covered in
+    # tests/test_adapter_secure_media.py.
+    "HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false",
     # Provider/model env is irrelevant — build_providers is replaced with fakes —
     # but a valid media config still parses with defaults from just the SIP keys.
 }

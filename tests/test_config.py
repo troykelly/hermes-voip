@@ -932,6 +932,25 @@ def test_media_sip_sdes_offer_enabled() -> None:
     assert cfg.sip_sdes_offer is True
 
 
+# --- Secure-media mandate knob (ADR-0070) ---
+
+
+def test_media_require_secure_media_default_on() -> None:
+    """No knob => the secure-media mandate is ON (cleartext RTP/AVP is 488'd).
+
+    Signalling is already TLS/WSS, so the inbound answer path defaults to rejecting
+    a cleartext media offer rather than answering it (ADR-0070).
+    """
+    cfg = load_media_config({})
+    assert cfg.require_secure_media is True
+
+
+def test_media_require_secure_media_disabled() -> None:
+    """HERMES_VOIP_REQUIRE_SECURE_MEDIA=false rolls back to opportunistic plaintext."""
+    cfg = load_media_config({"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"})
+    assert cfg.require_secure_media is False
+
+
 def test_media_sip_dtls_setup_forced_passive() -> None:
     """HERMES_VOIP_SIP_DTLS_SETUP=passive forces the passive (DTLS server) role."""
     cfg = load_media_config({"HERMES_VOIP_SIP_DTLS_SETUP": "passive"})

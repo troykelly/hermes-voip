@@ -2827,6 +2827,28 @@ class VoipAdapter(BasePlatformAdapter):
             msg = f"INVITE {call_id}: media config not initialised"
             raise RuntimeError(msg)
 
+        # --- Secure-media mandate (ADR-0070) --------------------------------
+        # Signalling is already TLS/WSS (the transport is restricted to {tls, wss}),
+        # so the only remaining cleartext exposure is the MEDIA plane. When the
+        # mandate is on (the default), an offer of plain ``RTP/AVP`` audio is
+        # REJECTED 488 here — BEFORE any dialog, CallSession, media engine or
+        # admission slot is created — rather than answered as a cleartext call. Any
+        # secured profile passes: ``audio.is_srtp`` is true for SDES ``RTP/SAVP``,
+        # DTLS-SRTP ``UDP/TLS/RTP/SAVP`` and WebRTC ``UDP/TLS/RTP/SAVPF`` alike, so
+        # only plain ``RTP/AVP`` is refused. This composes with (does not duplicate)
+        # the opportunistic SDES answer + the DTLS/WebRTC tiers below: they make
+        # secured media WORK; this makes cleartext media REFUSED. The rollback
+        # switch (``require_secure_media`` false) restores opportunistic plaintext.
+        if media_cfg.require_secure_media and not audio.is_srtp:
+            _log.warning(
+                "INVITE %s: REJECTED 488 — secure-media mandate "
+                "(HERMES_VOIP_REQUIRE_SECURE_MEDIA): the offered audio profile is "
+                "cleartext RTP/AVP, not SRTP (SDES/DTLS/WebRTC)",
+                call_id,
+            )
+            await transport.send(build_response(invite, 488, "Not Acceptable Here"))
+            return
+
         # Pick the media path. Three branches:
         #   * WebRTC (UDP/TLS/RTP/SAVPF) → the ICE + DTLS-SRTP answer path (ADR-0032),
         #     negotiated against the Opus-first menu.

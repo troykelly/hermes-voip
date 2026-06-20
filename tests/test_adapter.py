@@ -975,6 +975,11 @@ async def test_deliver_turn_gate_true_for_elevenlabs_v3() -> None:
         {
             "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
             "HERMES_VOIP_TTS_MODEL": "eleven_v3",
+            # A selected cloud provider must have its credential set or
+            # load_media_config rejects the config; an obvious fake (never a real key).
+            "ELEVENLABS_API_KEY": "test-fake-elevenlabs-key",
+            # Disable failover so the test config needs no Kokoro fallback model dir.
+            "HERMES_VOIP_TTS_FALLBACK": "none",
         }
     )
     assert gate is True
@@ -987,6 +992,11 @@ async def test_deliver_turn_gate_false_for_elevenlabs_flash() -> None:
         {
             "HERMES_VOIP_TTS_PROVIDER": "elevenlabs",
             "HERMES_VOIP_TTS_MODEL": "eleven_flash_v2_5",
+            # Obvious fake credential (never a real key) — the elevenlabs provider
+            # requires one set or load_media_config fails fast.
+            "ELEVENLABS_API_KEY": "test-fake-elevenlabs-key",
+            # Disable failover so the test config needs no Kokoro fallback model dir.
+            "HERMES_VOIP_TTS_FALLBACK": "none",
         }
     )
     assert gate is False

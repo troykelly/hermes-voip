@@ -408,6 +408,35 @@ def test_voip_adapter_instance_is_base_and_has_inherited_methods() -> None:
         assert callable(getattr(adapter, name)), f"missing inherited {name}"
 
 
+def test_voip_adapter_declares_not_editable_to_force_complete_send() -> None:
+    """A voice call must receive each reply as ONE complete ``send()`` (ADR-0057 §3).
+
+    ``BasePlatformAdapter`` declares **no** ``SUPPORTS_MESSAGE_EDITING`` class
+    attribute, and the gateway's streaming gate reads it with a ``True`` default
+    (``getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)`` in ``gateway/run.py``):
+    so an adapter that does not override it is treated as **editable**. The base also
+    ships a working default ``edit_message``. With Hermes streaming enabled, the
+    gateway therefore feeds an editable adapter its reply as a partial-prefix
+    ``send()`` followed by repeated ``edit_message()`` calls carrying *cumulative*
+    growing text (the ``GatewayStreamConsumer`` edit-in-place renderer, flushed on a
+    time/codepoint threshold — never on sentence boundaries). Our real-time audio
+    pipeline (``send()`` → ``CallLoop.speak`` → sentence aggregation → RTP) consumes
+    ONE complete reply string; cumulative-prefix edits would garble/duplicate audio.
+
+    ``VoipAdapter`` therefore explicitly sets ``SUPPORTS_MESSAGE_EDITING = False``,
+    which makes the gate take its ``if not SUPPORTS_MESSAGE_EDITING: skip streaming``
+    branch (``gateway/run.py`` raises *"skip streaming for non-editable platform"*) and
+    deliver the reply as a single complete ``send()`` — regardless of the operator's
+    Hermes streaming config. This pins that contract.
+    """
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    # The base declares no such attribute (the gateway defaults it to editable);
+    # ours is an explicit, deliberate opt-out that forces the single complete send().
+    assert not hasattr(BasePlatformAdapter, "SUPPORTS_MESSAGE_EDITING")
+    assert VoipAdapter.SUPPORTS_MESSAGE_EDITING is False
+
+
 # ---------------------------------------------------------------------------
 # (a) connect() returns True when the fake manager is up; False when down
 # ---------------------------------------------------------------------------

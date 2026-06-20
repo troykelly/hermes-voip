@@ -147,6 +147,7 @@ from hermes_voip.originate import (
     OutboundCallFailed,
     OutboundCallNotAllowed,
     build_outbound_invite,
+    build_srtp_crypto_attrs,
 )
 from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowlist
 from hermes_voip.provider_error import is_provider_error, safe_error_reply
@@ -395,6 +396,13 @@ _SUPPORTED_ENCODINGS = ("G722", "PCMU", "PCMA", "telephone-event")
 # call loudly (ImportError) rather than answering dead — never a silent miss.
 _WEBRTC_SUPPORTED_ENCODINGS = ("opus", "PCMU", "PCMA", "telephone-event")
 
+# The EXACT SDP transport-profile token for SDES-SRTP (RFC 4568). An outbound 2xx that
+# we keyed with a bare SDES a=crypto MUST use exactly this profile — not the broader
+# ``*SAVP`` family (``UDP/TLS/RTP/SAVP`` is DTLS-SRTP, ``RTP/SAVPF`` is WebRTC), which
+# ``AudioMedia.is_srtp`` would also match. Used by the outbound answer validator to
+# reject a secure-but-non-SDES answer fail-closed (codex r3).
+_SDES_ANSWER_PROFILE = "RTP/SAVP"
+
 # Opus on the SIP (SDES/TLS) path (ADR-0049). Opus is offered on the SIP menu ONLY
 # when libopus is actually loadable at runtime (``_opus_sip_available``), so a host
 # without the ``webrtc`` extra advertises exactly the G.722/G.711 floor menu and the
@@ -522,6 +530,121 @@ def _srtp_outbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | 
     return SrtpSession(crypto)
 
 
+def _outbound_offer_crypto() -> CryptoAttribute:
+    """Mint the SDES ``a=crypto`` for an outbound SRTP offer (ADR-0067, RFC 4568).
+
+    Returns a fresh ``AES_CM_128_HMAC_SHA1_80`` :class:`CryptoAttribute` (tag 1, the
+    preferred supported suite) with a cryptographically-random per-call master
+    key‖salt. As the OFFERER this key encrypts our **outbound** stream (RFC 4568 §6.1
+    sender-keying) and is advertised in the INVITE's ``a=crypto``; our inbound is keyed
+    from the peer's answer key. We offer one strong suite (not the 32-bit fallback that
+    :func:`originate.build_srtp_crypto_attrs` also mints) because
+    :func:`sdp.build_audio_offer` renders exactly one ``a=crypto`` — matching the
+    inbound answer's single-suite behaviour. The key never reaches a log/``repr``
+    (``CryptoAttribute.key_params`` is ``field(repr=False)``).
+    """
+    # build_srtp_crypto_attrs returns (80-bit, 32-bit); offer the 80-bit suite only.
+    offer_80bit, _offer_32bit = build_srtp_crypto_attrs()
+    return offer_80bit
+
+
+def _srtp_outbound_from_offer(crypto: CryptoAttribute | None) -> SrtpSession | None:
+    """The outbound (TX/protect) SrtpSession keyed by OUR **offer** a=crypto (ADR-0067).
+
+    The offerer mirror of :func:`_srtp_outbound_from_answer`: as the UAC we encrypt our
+    outbound stream with the key we advertised in the INVITE's ``a=crypto`` (RFC 4568
+    §6.1 — each direction is keyed by its sender). ``None`` ⇒ a plain RTP/AVP offer.
+    Lazy SrtpSession import (rule 37).
+    """
+    if crypto is None:
+        return None
+    from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+
+    return SrtpSession(crypto)
+
+
+def _srtp_inbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | None:
+    """The inbound (RX/unprotect) SrtpSession keyed by the PEER's answer a=crypto.
+
+    The offerer mirror of :func:`_srtp_inbound_from_offer`: as the UAC we decrypt the
+    callee's media with the key the callee advertised in its 2xx ``a=crypto`` (RFC 4568
+    §6.1). ``None`` ⇒ a plain RTP/AVP answer. Lazy SrtpSession import (rule 37).
+    """
+    if crypto is None:
+        return None
+    from hermes_voip.media.srtp import SrtpSession  # noqa: PLC0415
+
+    return SrtpSession(crypto)
+
+
+def _validate_outbound_answer_crypto(
+    offer_crypto: CryptoAttribute, answer_audio: AudioMedia
+) -> CryptoAttribute:
+    """Validate the callee's 2xx ``a=crypto`` against OUR offer crypto (RFC 4568 §6.1).
+
+    When we offered SDES-SRTP (``offer_crypto`` non-None), the 2xx answer MUST:
+
+    * use the ``RTP/SAVP`` profile (a plain ``RTP/AVP`` answer is a downgrade); and
+    * carry EXACTLY ONE ``a=crypto`` line **as sent on the wire** — an answer selects
+      exactly one (RFC 4568 §5.1.2). This counts the RAW ``a=crypto`` lines, not the
+      parse-filtered ``crypto_attrs`` subset: a matching line plus a *malformed* extra
+      has a raw count of two (ambiguous) but filters to one, so counting only the
+      filtered subset would wrongly accept it (codex r2); and
+    * that one line must parse as a supported, well-formed crypto (so ``crypto_attrs``
+      also has exactly one — a lone malformed/unsupported line raw-counts one but parses
+      to zero); and
+    * echo OUR offered ``tag`` AND ``suite`` (RFC 4568 §6.1: the answerer identifies
+      its selection by the offered tag, and may only pick a suite we offered).
+
+    Returns the validated answer :class:`CryptoAttribute` (its key decrypts the
+    callee's inbound media). Raises :class:`OutboundCallFailed` (status 488) with a
+    STRUCTURAL message — never the offending key/line (rule 34, the repo is PUBLIC and
+    the message lands in logs) — on any violation, so the caller can fail closed
+    (ACK + BYE + teardown) rather than key from an answer we never offered or stream
+    cleartext for a secured offer.
+    """
+    # Require the answer profile is EXACTLY RTP/SAVP (SDES). ``is_srtp`` is too broad —
+    # it is true for ANY *SAVP profile, incl. UDP/TLS/RTP/SAVP (DTLS-SRTP) and
+    # RTP/SAVPF (WebRTC). Keying a DTLS/AVPF media line with a bare SDES a=crypto is
+    # spec-invalid (a dead call), so a secure-but-non-RTP/SAVP answer is fail-closed
+    # here exactly like a plain RTP/AVP downgrade (codex r3). ``answer_audio.protocol``
+    # is the verbatim m-line profile token.
+    if answer_audio.protocol != _SDES_ANSWER_PROFILE:
+        msg = (
+            "2xx answer profile is not RTP/SAVP for our SDES offer "
+            f"(got {answer_audio.protocol!r}) — refusing to key it as SDES"
+        )
+        raise OutboundCallFailed(488, msg)
+    # Count the RAW a=crypto lines (as sent), not the parse-filtered subset: an answer
+    # MUST carry exactly one (RFC 4568 §5.1.2). A matching line + a malformed extra has
+    # raw count 2 (ambiguous) yet filters to 1 — counting only the filtered list would
+    # wrongly accept it (codex r2).
+    raw_count = len(answer_audio.crypto)
+    if raw_count != 1:
+        msg = f"2xx SRTP answer must carry exactly one a=crypto line (got {raw_count})"
+        raise OutboundCallFailed(488, msg)
+    attrs = answer_audio.crypto_attrs
+    if len(attrs) != 1:
+        # The single raw line did not parse as a supported, well-formed crypto
+        # (malformed key-params / unsupported suite) — unusable to key from.
+        msg = "2xx SRTP answer a=crypto is malformed or an unsupported suite"
+        raise OutboundCallFailed(488, msg)
+    answer_crypto = attrs[0]
+    if (
+        answer_crypto.tag != offer_crypto.tag
+        or answer_crypto.suite != offer_crypto.suite
+    ):
+        # Tag/suite we never offered — keying from it would use parameters we did not
+        # propose. Report tags/suites only (safe), never the key material.
+        msg = (
+            "2xx SRTP answer crypto does not match our offer "
+            f"(offered tag {offer_crypto.tag}/{offer_crypto.suite}, "
+            f"answered tag {answer_crypto.tag}/{answer_crypto.suite})"
+        )
+        raise OutboundCallFailed(488, msg)
+    return answer_crypto
+
+
 class _QueueSink:
     """Temporary :class:`CallResponseSink` for an outbound INVITE transaction.
 
@@ -589,8 +712,12 @@ class VoipAdapter(BasePlatformAdapter):
     # (``send()`` → :meth:`CallLoop.speak` → sentence aggregation → RTP) consumes ONE
     # complete reply string. Declaring the adapter non-editable makes the gate take its
     # ``if not SUPPORTS_MESSAGE_EDITING: skip streaming`` branch and always deliver the
-    # reply as a single complete ``send()`` — robust regardless of the operator's
-    # Hermes streaming config (ADR-0057 §3).
+    # reply as a single complete ``send()``. This closes the MAIN in-process gateway
+    # path (``gateway/run.py:17767`` skip-streaming branch); the gateway PROXY path
+    # (``gateway/run.py:16769``, taken only when ``GATEWAY_PROXY_URL`` /
+    # ``gateway.proxy_url`` is set) ignores the flag — a documented residual
+    # (ADR-0057 §3), mitigated by keeping Hermes reply streaming off for voip in proxy
+    # mode (runbook 0002 §8f).
     SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: object) -> None:
@@ -1347,14 +1474,24 @@ class VoipAdapter(BasePlatformAdapter):
         local_sent_by = transport.local_sent_by
 
         # --- Build the SDP offer -------------------------------------------
+        # Outbound SDES-SRTP offering (ADR-0067): when enabled, mint a fresh per-call
+        # SDES key and offer RTP/SAVP + a=crypto. The OFFER key encrypts our outbound
+        # stream (RFC 4568 §6.1 sender-keying) and is advertised in the INVITE; our
+        # inbound is keyed from the peer's 2xx answer key (below). None ⇒ plain RTP/AVP
+        # offer (today's default), so srtp_outbound stays None and the engine is
+        # cleartext exactly as before.
+        offer_crypto = _outbound_offer_crypto() if media_cfg.sip_sdes_offer else None
         engine = RtpMediaTransport(
             local_address="0.0.0.0",  # noqa: S104 — bind all interfaces for RTP
             local_port=0,
             remote_address="127.0.0.1",  # placeholder; updated from 2xx SDP answer
             remote_port=9,  # discard port placeholder
             codec=Codec.PCMU,
+            # Inbound (RX/decrypt) SRTP is keyed from the peer's ANSWER a=crypto, which
+            # is not known until the 2xx is parsed below — assigned there (ADR-0067).
             srtp_inbound=None,
-            srtp_outbound=None,
+            # Outbound (TX/encrypt) SRTP is keyed from OUR offer a=crypto (None=plain).
+            srtp_outbound=_srtp_outbound_from_offer(offer_crypto),
             symmetric=media_cfg.rtp_symmetric,
             # RTP-inactivity watchdog (ADR-0026): an outbound call whose media
             # goes silent ends as MEDIA_TIMEOUT, not an indefinite hang.
@@ -1383,6 +1520,9 @@ class VoipAdapter(BasePlatformAdapter):
             port=engine.local_port,
             codecs=_outbound_offer_codecs(),
             session_id=session_id,
+            # SDES-SRTP offer (ADR-0067): when set, the profile becomes RTP/SAVP and the
+            # a=crypto carries our offer key; None ⇒ plain RTP/AVP (unchanged default).
+            crypto=offer_crypto,
         )
 
         # --- Register a _QueueSink so we can await responses ---------------
@@ -1407,6 +1547,12 @@ class VoipAdapter(BasePlatformAdapter):
         # is running — the outer finally must NOT teardown in that case (the
         # background task owns teardown from that point on).
         session_established = False
+        # Set to True the instant the 2xx ACK is sent. Once true, the 2xx has
+        # ESTABLISHED the dialog on the callee, so ANY subsequent failure before
+        # session_established (a codec/crypto rejection OR an unexpected exception in
+        # the post-ACK acceptance/session-wiring steps) MUST BYE the dialog before
+        # propagating (RFC 3261 §15) — the finally is the single BYE point (codex r3).
+        ack_sent = False
         try:
             await transport.send(invite_text)
             _log.info("INVITE sent: Call-ID %s -> %s", call_id, target_uri)
@@ -1504,20 +1650,14 @@ class VoipAdapter(BasePlatformAdapter):
             if answer_audio is None:
                 raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
 
-            try:
-                # ADR-0049: the SIP answer may negotiate Opus when we offered it
-                # (libopus available) — accept it here too, not only G.722/G.711.
-                agreed_codecs = negotiate_audio(
-                    answer_audio, _sip_supported_encodings()
-                )
-            except ValueError as exc:
-                raise OutboundCallFailed(
-                    488, f"no common codec in 2xx answer: {exc}"
-                ) from exc
-
-            if _first_voice_codec(agreed_codecs) is None:
-                raise OutboundCallFailed(488, "2xx answer has no voice codec")
-
+            # Build the UAC dialog from the 2xx and ACK it BEFORE any acceptance check
+            # (ADR-0067 / RFC 3261 §13.2.2.4 + §17.1.2.1). A 2xx ESTABLISHES the dialog
+            # and the TU MUST ACK it — even a 2xx we then reject (the transaction layer
+            # auto-ACKs only NON-2xx). So every "we cannot accept this 2xx" check below
+            # (codec negotiation AND SDES-crypto validation) runs AFTER the ACK and, on
+            # failure, BYEs the now-confirmed dialog via _bye_answered_outbound_dialog
+            # before raising — never a half-open, remote-established dialog.
+            #
             # Build a synthetic SipRequest carrying the headers Dialog.from_invite_2xx
             # reads (From, To, Via, CSeq, Contact, Call-ID). This avoids keeping the
             # raw text of the last INVITE we sent; from_invite_2xx only reads these
@@ -1536,6 +1676,54 @@ class VoipAdapter(BasePlatformAdapter):
             parsed_invite = SipRequest.parse(synthetic_invite_text)
 
             dialog = Dialog.from_invite_2xx(parsed_invite, response)
+
+            # --- Send ACK for 2xx (RFC 3261 §17.1.2.1 — TU owns ACK for 2xx) ---
+            # RFC 3261 §13.2.2.4: the 2xx ACK MUST be sent using the dialog's
+            # route set (Record-Route from the 2xx, reversed, as Route headers).
+            # Omitting Route causes any stateful proxy in the chain to reject the
+            # ACK as out-of-dialog (B1).
+            ack_cseq_num = int(dialog.local_cseq)
+            ack_via = f"SIP/2.0/TLS {local_sent_by};branch={new_branch()};rport"
+            ack_headers: list[tuple[str, str]] = [
+                ("Via", ack_via),
+                ("Max-Forwards", "70"),
+            ]
+            # Emit Route headers in route-set order (UAC: reversed Record-Route).
+            ack_headers.extend(("Route", route) for route in dialog.route_set)
+            ack_headers += [
+                ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                ("Call-ID", call_id),
+                ("CSeq", f"{ack_cseq_num} ACK"),
+                ("Contact", local_contact),
+            ]
+            ack_text = build_request("ACK", dialog.remote_target, ack_headers)
+            await transport.send(ack_text)
+            ack_sent = True
+            _log.info("ACK sent: Call-ID %s", call_id)
+
+            # --- Accept-or-reject the ACKed 2xx ---------------------------------
+            # All "we cannot accept this answer" checks live here, AFTER the ACK. Any
+            # exception they raise — a codec/crypto OutboundCallFailed OR an unexpected
+            # error — propagates with session_established still False, so the function's
+            # `finally` BYEs the now-established dialog (§15, the single ack_sent-gated
+            # BYE point) instead of leaving it half-open (ADR-0067, codex r3). This
+            # unifies the codec rejections (no-common-codec / no-voice-codec /
+            # not-carriable / dependency) AND the SDES-crypto rejection AND any
+            # unexpected post-ACK failure through one teardown path.
+            try:
+                # ADR-0049: the SIP answer may negotiate Opus when we offered it
+                # (libopus available) — accept it here too, not only G.722/G.711.
+                agreed_codecs = negotiate_audio(
+                    answer_audio, _sip_supported_encodings()
+                )
+            except ValueError as exc:
+                raise OutboundCallFailed(
+                    488, f"no common codec in 2xx answer: {exc}"
+                ) from exc
+
+            if _first_voice_codec(agreed_codecs) is None:
+                raise OutboundCallFailed(488, "2xx answer: no voice codec")
 
             # Update the engine's remote destination from the 2xx SDP answer.
             remote_address = _effective_address(answer_audio, answer_sdp)
@@ -1560,50 +1748,49 @@ class VoipAdapter(BasePlatformAdapter):
                 except UnsupportedCodecError as exc:
                     # Defense-in-depth (unreachable over the current menu, since
                     # negotiate_audio above already rejects an offer whose voice
-                    # codec is outside _sip_supported_encodings()): if the advertised
-                    # menu ever drifts ahead of the engine table, FAIL the call
-                    # loudly here rather than leave the engine on a placeholder
-                    # codec and stream dead audio. OutboundCallFailed propagates to
-                    # the caller (never swallowed) — the outbound mirror of the
-                    # inbound guard.
+                    # codec is outside _sip_supported_encodings()): if the
+                    # advertised menu ever drifts ahead of the engine table, FAIL
+                    # the call loudly here rather than leave the engine on a
+                    # placeholder codec and stream dead audio.
                     raise OutboundCallFailed(
                         488, f"2xx answer codec not carriable: {exc}"
                     ) from exc
-                # Adopt the negotiated engine codec (the outbound engine is built on
-                # a PCMU placeholder before the answer is known; reassign it here).
+                # Adopt the negotiated engine codec (the outbound engine is built
+                # on a PCMU placeholder before the answer is known; reassign here).
                 engine._codec = negotiated_engine_codec
                 # ADR-0049: if the SIP answer negotiated Opus, preflight the runtime
-                # dependency so a host that somehow advertised Opus but lost libopus
-                # fails the call cleanly (488) rather than streaming dead audio. A
-                # no-op for G.722/G.711 (stdlib/pure-Python). Preflight the
-                # locally-computed codec, not a re-read of the engine's private attr.
+                # dependency so a host that somehow advertised Opus but lost
+                # libopus fails the call cleanly (488) rather than streaming dead
+                # audio. A no-op for G.722/G.711 (stdlib/pure-Python). Preflight
+                # the locally-computed codec, not a re-read of the engine's attr.
                 try:
                     _preflight_codec_dependency(negotiated_engine_codec)
                 except ImportError as exc:
                     raise OutboundCallFailed(
                         488, f"2xx answer codec dependency unavailable: {exc}"
                     ) from exc
-                # Also adopt the negotiated RTP payload type (the answer's PT may be
-                # a dynamic value for G.722, differing from the codec's static PT) so
-                # outbound packets and the comedia latch use the wire PT, not 9/0/8.
+                # Also adopt the negotiated RTP payload type (the answer's PT may
+                # be a dynamic value for G.722, differing from the codec's static
+                # PT) so outbound packets + the comedia latch use the wire PT.
                 engine.payload_type = negotiated_voice.payload_type
                 # ptime negotiation (ADR-0056 activated by ADR-0063): the 2xx answer
-                # carries the agreed a=ptime/a=maxptime; honour it (else 20 ms) so the
-                # outbound stream is framed at the negotiated packetisation time —
-                # codec-aware (Opus pinned to 20 ms). Set here, alongside the other
-                # negotiated engine values, where the negotiated codec is in scope.
+                # carries the agreed a=ptime/a=maxptime; honour it (else 20 ms) so
+                # the outbound stream is framed at the negotiated packetisation time
+                # — codec-aware (Opus pinned to 20 ms). Set here, alongside the
+                # other negotiated engine values, where the negotiated codec is in
+                # scope.
                 engine.ptime = _negotiated_ptime(answer_audio, negotiated_engine_codec)
 
-            # Adopt the negotiated telephone-event PT for in-call DTMF (ADR-0031), or
-            # None when the answer carried none (send_dtmf then raises). The outbound
-            # engine was built before the answer was known, so set it here.
+            # Adopt the negotiated telephone-event PT for in-call DTMF (ADR-0031),
+            # or None when the answer carried none (send_dtmf then raises). The
+            # outbound engine was built before the answer was known; set it here.
             engine.telephone_event_payload_type = _telephone_event_payload_type(
                 agreed_codecs
             )
             # Resolve + apply the DTMF send/receive backends now the codec + PT are
-            # known (ADR-0036): the engine adopts the send backend and arms the in-band
-            # detector on a G.711 call with no telephone-event. ``codec_encoding``
-            # reflects the codec adopted just above (no longer the PCMU placeholder).
+            # known (ADR-0036): the engine adopts the send backend and arms the
+            # in-band detector on a G.711 call with no telephone-event.
+            # ``codec_encoding`` reflects the codec adopted just above.
             engine.dtmf_send_mode = resolve_dtmf_send_mode(
                 media_cfg,
                 telephone_event_payload_type=engine.telephone_event_payload_type,
@@ -1630,29 +1817,23 @@ class VoipAdapter(BasePlatformAdapter):
                 answer_audio.direction or "unset",
             )
 
-            # --- Send ACK for 2xx (RFC 3261 §17.1.2.1 — TU owns ACK for 2xx) ---
-            # RFC 3261 §13.2.2.4: the 2xx ACK MUST be sent using the dialog's
-            # route set (Record-Route from the 2xx, reversed, as Route headers).
-            # Omitting Route causes any stateful proxy in the chain to reject the
-            # ACK as out-of-dialog (B1).
-            ack_cseq_num = int(dialog.local_cseq)
-            ack_via = f"SIP/2.0/TLS {local_sent_by};branch={new_branch()};rport"
-            ack_headers: list[tuple[str, str]] = [
-                ("Via", ack_via),
-                ("Max-Forwards", "70"),
-            ]
-            # Emit Route headers in route-set order (UAC: reversed Record-Route).
-            ack_headers.extend(("Route", route) for route in dialog.route_set)
-            ack_headers += [
-                ("From", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
-                ("To", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
-                ("Call-ID", call_id),
-                ("CSeq", f"{ack_cseq_num} ACK"),
-                ("Contact", local_contact),
-            ]
-            ack_text = build_request("ACK", dialog.remote_target, ack_headers)
-            await transport.send(ack_text)
-            _log.info("ACK sent: Call-ID %s", call_id)
+            # --- SDES-SRTP answer validation + inbound keying (ADR-0067) -------
+            # When we offered RTP/SAVP, the 2xx MUST answer RTP/SAVP with EXACTLY
+            # ONE a=crypto echoing our offered tag + suite (RFC 4568 §6.1): that
+            # key decrypts the callee's inbound media. A plain RTP/AVP answer, a
+            # tag/suite we did not offer, an unusable/absent a=crypto, or an
+            # ambiguous multi-crypto answer is a downgrade/mis-key of a call we
+            # asked to protect — it raises OutboundCallFailed (structural message,
+            # never the key — rule 34) and is torn down by the shared BYE handler
+            # below, never keyed, never plaintext. No check when we offered plain
+            # (offer_crypto is None): the engine stays cleartext exactly as before.
+            if offer_crypto is not None:
+                answer_inbound_crypto = _validate_outbound_answer_crypto(
+                    offer_crypto, answer_audio
+                )
+                # Key inbound (RX/decrypt) from the validated answer crypto (our
+                # outbound was keyed from the offer at engine construction).
+                engine._srtp_in = _srtp_inbound_from_answer(answer_inbound_crypto)
 
             # --- Wire the CallSession and CallLoop -------------------------
             # ADR-0021 (amended from ADR-0020): an outbound call's remote party
@@ -1683,6 +1864,11 @@ class VoipAdapter(BasePlatformAdapter):
                 port=engine.local_port,
                 codecs=tuple(agreed_codecs),
                 session_id=session_id,
+                # SDES continuity (ADR-0067, mirrors the inbound ADR-0053 path): carry
+                # our offer crypto so an in-dialog re-offer (hold/resume/re-INVITE)
+                # stays RTP/SAVP + a=crypto and never downgrades to cleartext. None ⇒ a
+                # plain RTP/AVP call (offer_crypto was None).
+                crypto=offer_crypto,
             )
             session = CallSession(
                 dialog=dialog,
@@ -1787,6 +1973,15 @@ class VoipAdapter(BasePlatformAdapter):
                 dialog_id: tuple[str, str, str] = (
                     session.dialog_id if session is not None else (call_id, "", "")
                 )
+                # The 2xx-established dialog must be BYE'd before teardown (RFC 3261
+                # §15, codex r3). This is the SINGLE BYE point for EVERY post-ACK
+                # failure — a codec/crypto OutboundCallFailed (which now just re-raises)
+                # OR an unexpected exception in the post-ACK acceptance / session-wiring
+                # steps. Gated on ack_sent so it never fires before the dialog exists,
+                # and reached exactly once per failure (no double-BYE). dialog is
+                # non-None whenever ack_sent is True (set right after the dialog build).
+                if ack_sent and dialog is not None:
+                    await self._bye_answered_outbound_dialog(transport, dialog)
                 # Remove the temporary sink if it is still installed (failure
                 # before we replaced it with the CallSession).
                 transport_cur = self._transport
@@ -1806,6 +2001,33 @@ class VoipAdapter(BasePlatformAdapter):
                     call_loop=None,
                     reason=CallEndReason.SIP_ERROR,
                 )
+
+    async def _bye_answered_outbound_dialog(
+        self, transport: SignalingTransport, dialog: Dialog
+    ) -> None:
+        """BYE an outbound dialog we just ACKed, on a refused-2xx fail-closed teardown.
+
+        ADR-0067 / RFC 3261 §13.2.2.4 + §15: when an outbound 2xx is rejected (a plain
+        or mis-keyed SRTP answer to our secured offer), the UAC has already ACKed it
+        (the dialog is established on the callee), so it MUST be torn down with an
+        in-dialog BYE rather than left half-open. Best-effort: a send failure is logged,
+        never raised over the OutboundCallFailed the caller is propagating (rule 37 —
+        that real failure is already surfaced); the callee's own session timer reaps a
+        dialog whose BYE never lands. The engine/socket are released by the finally.
+        """
+        try:
+            bye = build_in_dialog_request(dialog, "BYE")
+            await transport.send(bye.text)
+            _log.info(
+                "outbound %s: BYE sent to close the refused-answer dialog",
+                dialog.call_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort teardown; never mask the OutboundCallFailed
+            _log.warning(
+                "outbound %s: error sending BYE on refused-answer teardown: %s",
+                dialog.call_id,
+                exc,
+            )
 
     async def _handle_outbound_webrtc_invite(  # noqa: PLR0912,PLR0915 — UAC WebRTC flow: offer/challenge/2xx/handshake/ACK/loop, one sequence
         self,

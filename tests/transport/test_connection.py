@@ -25,6 +25,7 @@ from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import (
     SipRequest,
+    SipResponse,
     build_request,
     build_response,
     new_branch,
@@ -421,6 +422,219 @@ async def test_retransmitted_cancel_is_absorbed_no_second_487_or_abort() -> None
 
 
 # --------------------------------------------------------------------------
+# Outbound CANCEL for an INVITE WE sent (RFC 3261 §9.1)
+# --------------------------------------------------------------------------
+
+
+_OK_STATUS = 200  # a 2xx final response to our INVITE
+
+
+class _RecordingSink:
+    """A :class:`CallResponseSink` that records every response routed to it."""
+
+    def __init__(self) -> None:
+        self.responses: list[SipResponse] = []
+
+    async def on_response(self, response: SipResponse) -> None:
+        self.responses.append(response)
+
+
+async def test_send_cancel_builds_a_rfc9_1_cancel_for_our_invite() -> None:
+    # RFC 3261 §9.1: a UAC that gives up on an INVITE for which it has had no final
+    # response sends a CANCEL whose Request-URI/Call-ID/From/To match the INVITE,
+    # whose top Via carries the SAME branch, and whose CSeq has the SAME number with
+    # method CANCEL — and no body.
+    branch = new_branch()
+    call_id = new_call_id()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []  # never answer — the call is "ringing"
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    try:
+        invite_text = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite_text)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+
+        sent = await transport.send_cancel(call_id)
+        assert sent is True, "send_cancel must report it sent a CANCEL"
+
+        cancel_raw = await server.wait_for_received(
+            lambda raw: raw.startswith("CANCEL "), timeout=3.0
+        )
+        cancel = SipRequest.parse(cancel_raw)
+        invite = SipRequest.parse(invite_text)
+
+        # §9.1: Request-URI matches the INVITE.
+        assert cancel.request_uri == invite.request_uri
+        # Top Via carries the SAME branch as the INVITE.
+        cancel_via = cancel.header("Via")
+        assert cancel_via is not None
+        assert f"branch={branch}" in cancel_via
+        # CSeq: same number, method CANCEL.
+        assert cancel.header("CSeq") == "1 CANCEL"
+        # Call-ID / From / To echoed verbatim (To carries no added tag).
+        assert cancel.header("Call-ID") == call_id
+        assert cancel.header("From") == invite.header("From")
+        assert cancel.header("To") == invite.header("To")
+        # No body.
+        assert cancel.body == ""
+        assert cancel.header("Content-Length") == "0"
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_send_cancel_returns_false_when_no_invite_is_tracked() -> None:
+    # An outbound call that has no in-flight INVITE for this Call-ID (never sent, or
+    # already given its final response) cannot be CANCELled — send_cancel is a no-op
+    # that reports False and puts nothing on the wire.
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    try:
+        sent = await transport.send_cancel("never-sent-this-call")
+        assert sent is False
+        await asyncio.sleep(0.05)
+        assert not any(raw.startswith("CANCEL ") for raw in server.received)
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_send_cancel_uses_the_re_auth_invite_branch_after_a_challenge() -> None:
+    # After a 401/407 challenge the UAC re-sends the INVITE with a NEW branch (CSeq 2).
+    # A CANCEL must target the LATEST in-flight transaction — the re-auth branch —
+    # since that is the one still awaiting a final response (§9.1).
+    branch1 = new_branch()
+    branch2 = new_branch()
+    call_id = new_call_id()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    try:
+        await transport.send(_outbound_invite(branch1, call_id=call_id))
+        await transport.send(_outbound_invite(branch2, call_id=call_id, cseq=2))
+        await server.wait_for_received(
+            lambda raw: raw.startswith("INVITE ") and f"branch={branch2}" in raw
+        )
+        assert await transport.send_cancel(call_id) is True
+        cancel_raw = await server.wait_for_received(
+            lambda raw: raw.startswith("CANCEL "), timeout=3.0
+        )
+        cancel = SipRequest.parse(cancel_raw)
+        via = cancel.header("Via")
+        assert via is not None
+        assert f"branch={branch2}" in via, "CANCEL must target the re-auth branch"
+        assert cancel.header("CSeq") == "2 CANCEL"
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_late_200_to_invite_after_cancel_is_suppressed_and_acked_byed() -> None:
+    # RFC 3261 §9.1 glare: a 2xx can race the CANCEL. The transport must NOT surface
+    # that 2xx to the call's response sink (the call is cancelled, not answered), and
+    # because the 2xx established a dialog on the callee it must ACK then BYE it so the
+    # remote is not stranded. Mirrors the inbound §9.2 late-200 suppression.
+    branch = new_branch()
+    call_id = new_call_id()
+    sink = _RecordingSink()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    transport.add_call(call_id, sink)
+    try:
+        invite_text = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite_text)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        assert await transport.send_cancel(call_id) is True
+        await server.wait_for_received(lambda raw: raw.startswith("CANCEL "))
+
+        # The gateway, racing our CANCEL, answers the INVITE 200 OK.
+        late_200 = _final_2xx_with_contact(SipRequest.parse(invite_text))
+        await server.push(late_200)
+
+        # The transport must ACK then BYE the racing 2xx (clean up the remote dialog).
+        ack = await server.wait_for_received(
+            lambda raw: raw.startswith("ACK ") and f"Call-ID: {call_id}" in raw,
+            timeout=3.0,
+        )
+        assert "CSeq: 1 ACK" in ack
+        bye = await server.wait_for_received(
+            lambda raw: raw.startswith("BYE ") and f"Call-ID: {call_id}" in raw,
+            timeout=3.0,
+        )
+        assert bye.startswith("BYE ")
+
+        # The suppressed 2xx must NOT have been delivered to the call's sink as a
+        # successful answer.
+        await asyncio.sleep(0.1)
+        invite_2xx = [r for r in sink.responses if r.status_code == _OK_STATUS]
+        assert invite_2xx == [], (
+            "a 200 OK racing the CANCEL must be suppressed at the sink"
+        )
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+def _final_2xx_with_contact(invite: SipRequest) -> str:
+    """A 200 OK to our outbound INVITE with a To-tag and a Contact (a real answer)."""
+    return (
+        "SIP/2.0 200 OK\r\n"
+        f"Via: {invite.header('Via')}\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag=answered-srv\r\n"
+        f"Call-ID: {invite.header('Call-ID')}\r\n"
+        f"CSeq: {invite.header('CSeq')}\r\n"
+        "Contact: <sip:2000@127.0.0.1:5061;transport=tls>\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+# --------------------------------------------------------------------------
 # Non-2xx final to an INVITE we sent is ACKed by this layer
 # --------------------------------------------------------------------------
 
@@ -502,7 +716,7 @@ async def test_2xx_to_our_invite_unregisters_txn_and_no_late_ack() -> None:
         await server.stop()
 
 
-def _outbound_invite(branch: str, *, call_id: str | None = None) -> str:
+def _outbound_invite(branch: str, *, call_id: str | None = None, cseq: int = 1) -> str:
     return build_request(
         "INVITE",
         "sip:2000@127.0.0.1:5061;transport=tls",
@@ -512,7 +726,7 @@ def _outbound_invite(branch: str, *, call_id: str | None = None) -> str:
             ("From", f"<sip:1000@pbx.example.test>;tag={new_tag()}"),
             ("To", "<sip:2000@pbx.example.test>"),
             ("Call-ID", call_id if call_id is not None else new_call_id()),
-            ("CSeq", "1 INVITE"),
+            ("CSeq", f"{cseq} INVITE"),
             ("Contact", "<sip:1000@127.0.0.1:5061;transport=tls>"),
         ],
     )

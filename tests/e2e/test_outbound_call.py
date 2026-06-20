@@ -39,7 +39,7 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_voip.media.engine import RtpMediaTransport
 from hermes_voip.message import SipRequest, build_request, new_branch, new_tag
-from hermes_voip.originate import OutboundCallFailed
+from hermes_voip.originate import OutboundCallCancelled, OutboundCallFailed
 from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
@@ -1648,5 +1648,231 @@ async def test_outbound_sdes_offer_key_is_never_logged(
                     f"SDES offer key leaked via log args "
                     f"({record.name} {record.levelname}) — args withheld (rule 34)"
                 )
+    finally:
+        await gateway.stop()
+
+
+# ---------------------------------------------------------------------------
+# ADR-0068: outbound SIP CANCEL (RFC 3261 §9.1) — abort_call + ring_timeout_secs.
+# ---------------------------------------------------------------------------
+
+
+class _RingingGateway(OutboundGateway):
+    """A gateway that auth-challenges, then RINGS forever (no final response).
+
+    On the re-auth INVITE it sends 100 Trying + 180 Ringing but never a 200/4xx, so
+    the plugin's awaiter is parked exactly as during a real no-answer ring. When the
+    plugin CANCELs (RFC 3261 §9.1) the gateway answers the CANCEL 200 OK and the
+    pending INVITE 487 Request Terminated, recording the CANCEL it received.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._received_cancels: asyncio.Queue[SipRequest] = asyncio.Queue()
+        # The most recent ringing INVITE per Call-ID, so the CANCEL handler can 487
+        # the exact transaction (same Via/From/To/CSeq).
+        self._ringing_invite: dict[str, SipRequest] = {}
+
+    async def _respond(self, request: SipRequest) -> list[str]:
+        if request.method == "CANCEL":
+            return await self._handle_cancel(request)
+        return await super()._respond(request)
+
+    async def _handle_invite(self, request: SipRequest) -> list[str]:
+        await self._received_invites.put(request)
+        call_id = request.header("Call-ID") or ""
+        seen = self._invite_challenges.get(call_id, 0)
+        self._invite_challenges[call_id] = seen + 1
+        if seen == 0:
+            return [self._build_407(request)]
+        # Re-INVITE with auth: ring, but never answer with a final response.
+        self._ringing_invite[call_id] = request
+        return [self._build_100(request), self._build_180(request)]
+
+    async def _handle_cancel(self, request: SipRequest) -> list[str]:
+        await self._received_cancels.put(request)
+        call_id = request.header("Call-ID") or ""
+        replies = [self._build_200_ok_simple(request)]
+        invite = self._ringing_invite.get(call_id)
+        if invite is not None:
+            replies.append(self._build_487(invite))
+        return replies
+
+    def _build_487(self, invite: SipRequest) -> str:
+        """487 Request Terminated for the CANCELled INVITE (its own transaction)."""
+        via = invite.header("Via") or ""
+        from_ = invite.header("From") or ""
+        to = invite.header("To") or ""
+        call_id = invite.header("Call-ID") or ""
+        cseq = invite.header("CSeq") or ""
+        return (
+            "SIP/2.0 487 Request Terminated\r\n"
+            f"Via: {via}\r\n"
+            f"From: {from_}\r\n"
+            f"To: {to};tag=cancelled-{new_tag()}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {cseq}\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+
+    async def await_cancel_from_plugin(self, *, timeout: float = 5.0) -> SipRequest:
+        """Wait for a CANCEL from the plugin (RFC 3261 §9.1)."""
+        return await asyncio.wait_for(self._received_cancels.get(), timeout)
+
+
+async def _call_id_of_latest_invite(gateway: OutboundGateway) -> str:
+    """The Call-ID of the latest INVITE the gateway received (drains the queue)."""
+    invite = await gateway.await_invite_from_plugin(timeout=5.0)
+    return invite.header("Call-ID") or ""
+
+
+async def test_abort_call_sends_cancel_and_leaves_no_running_call() -> None:
+    """abort_call on a ringing outbound INVITE sends a §9.1 CANCEL and tears down.
+
+    RED on main: there is no abort_call / send_cancel, so place_call has no abort
+    lever and the call hangs until the 35 s sink timeout. After ADR-0068, abort_call
+    sends a CANCEL, the gateway 487s, place_call raises OutboundCallCancelled, and no
+    call session/loop/outbound-slot remains.
+    """
+    gateway = _RingingGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+            await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+            call_id = await _call_id_of_latest_invite(gateway)  # re-auth (ringing)
+
+            # Abort the ringing call.
+            aborted = await adapter.abort_call(call_id, "operator abort")
+            assert aborted is True, "abort_call must report it issued a CANCEL"
+
+            cancel = await gateway.await_cancel_from_plugin(timeout=5.0)
+            assert cancel.method == "CANCEL"
+            assert cancel.header("Call-ID") == call_id
+
+            with pytest.raises(OutboundCallCancelled):
+                await asyncio.wait_for(place_task, timeout=5.0)
+
+            await asyncio.sleep(0.05)
+            assert not adapter._call_sessions
+            assert not adapter._call_loops
+            assert _TARGET_EXT not in adapter._outbound_extensions
+    finally:
+        await gateway.stop()
+
+
+async def test_ring_timeout_fires_cancel_and_raises_cancelled() -> None:
+    """place_call(ring_timeout_secs=...) cancels an unanswered ring automatically.
+
+    RED on main: place_call has no ring_timeout_secs kwarg. After ADR-0068 the timer
+    fires a CANCEL after the bound, the gateway 487s, and place_call raises
+    OutboundCallCancelled — never hanging for the full sink timeout.
+    """
+    gateway = _RingingGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(
+                adapter.place_call(_TARGET_EXT, ring_timeout_secs=0.3)
+            )
+
+            await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+            await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth (ringing)
+
+            # The ring-timeout fires the CANCEL with no further action from the test.
+            cancel = await gateway.await_cancel_from_plugin(timeout=5.0)
+            assert cancel.method == "CANCEL"
+
+            with pytest.raises(OutboundCallCancelled):
+                await asyncio.wait_for(place_task, timeout=5.0)
+
+            await asyncio.sleep(0.05)
+            assert not adapter._call_sessions
+            assert not adapter._call_loops
+    finally:
+        await gateway.stop()
+
+
+async def test_abort_call_after_200_is_a_noop_no_cancel() -> None:
+    """abort_call on an ALREADY-answered call is a no-op (returns False, no CANCEL).
+
+    RFC 3261 §9.1 applies only before the final response. Once the 2xx has arrived the
+    dialog is established; CANCEL is too late (the right teardown is an in-dialog BYE,
+    not CANCEL). abort_call must return False and put no CANCEL on the wire.
+    """
+    gateway = OutboundGateway()  # answers normally (200 OK with SDP)
+    gateway.set_register_responder()
+    await gateway.start()
+
+    # Record every SIP byte the gateway saw, so we can assert no CANCEL was sent.
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+            await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+            await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+            await gateway.await_ack_from_plugin(timeout=5.0)
+            call_id = await asyncio.wait_for(place_task, timeout=5.0)
+            await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+
+            aborted = await adapter.abort_call(call_id, "too late")
+            assert aborted is False, "abort_call after the 2xx must be a no-op"
+            await asyncio.sleep(0.1)
+            assert not any(raw.startswith("CANCEL ") for raw in gateway.received_sip), (
+                "no CANCEL may be sent for an already-answered call"
+            )
+            # The established call is untouched by the failed abort.
+            assert call_id in adapter._call_sessions
+    finally:
+        await gateway.stop()
+
+
+async def test_double_abort_is_idempotent_one_cancel() -> None:
+    """Two abort_call invocations for the same ringing call send exactly one CANCEL.
+
+    The second abort_call is a no-op (returns False); the call is already cancelling.
+    """
+    gateway = _RingingGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+            place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+            await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+            call_id = await _call_id_of_latest_invite(gateway)  # re-auth (ringing)
+
+            first = await adapter.abort_call(call_id, "abort 1")
+            second = await adapter.abort_call(call_id, "abort 2")
+            assert first is True
+            assert second is False, "a second abort_call must be a no-op"
+
+            await gateway.await_cancel_from_plugin(timeout=5.0)
+            with pytest.raises(OutboundCallCancelled):
+                await asyncio.wait_for(place_task, timeout=5.0)
+
+            await asyncio.sleep(0.1)
+            cancels = [raw for raw in gateway.received_sip if raw.startswith("CANCEL ")]
+            assert len(cancels) == 1, "exactly one CANCEL must reach the gateway"
     finally:
         await gateway.stop()

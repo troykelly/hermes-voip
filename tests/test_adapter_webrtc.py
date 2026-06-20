@@ -287,7 +287,14 @@ async def _build_adapter_with_manager(
             "hermes_voip.adapter.load_gateway_config", return_value=_gateway_config()
         ),
         patch(
-            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+            "hermes_voip.adapter.load_media_config",
+            # require_secure_media off so the plain RTP/AVP regression test (a plain
+            # offer must fall to the SDES/plain path, never WebRTC) is admitted, not
+            # 488'd by the secure-media mandate (ADR-0070). WebRTC SAVPF offers are
+            # is_srtp and so are accepted regardless of this flag.
+            return_value=load_media_config(
+                {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+            ),
         ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),

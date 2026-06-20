@@ -323,6 +323,9 @@ async def test_adapter_concurrent_same_call_id_teardown_isolation() -> None:  # 
                 barge_in_min_speech_ms=400,
                 barge_in_tail_ms=250,
                 barge_in_fade_ms=30,
+                # Plain RTP/AVP concurrency test — the secure-media mandate (ADR-0070)
+                # is off so the cleartext offers are admitted, not 488'd.
+                require_secure_media=False,
             ),
         ),
         patch(
@@ -620,6 +623,9 @@ async def test_concurrent_same_call_id_all_tasks_tracked_and_cancelled() -> None
                 barge_in_min_speech_ms=400,
                 barge_in_tail_ms=250,
                 barge_in_fade_ms=30,
+                # Plain RTP/AVP concurrency test — the secure-media mandate (ADR-0070)
+                # is off so the cleartext offers are admitted, not 488'd.
+                require_secure_media=False,
             ),
         ),
         patch(

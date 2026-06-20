@@ -344,11 +344,26 @@ async def _build_adapter(
     manager: _FakeManager,
     *,
     connect: bool = True,
+    media_cfg: MediaConfig | None = None,
 ) -> VoipAdapter:
-    """Construct a real ``VoipAdapter`` wired to fakes, optionally calling connect()."""
+    """Construct a real ``VoipAdapter`` wired to fakes, optionally calling connect().
+
+    The default media config DISABLES the secure-media mandate (ADR-0070) so the
+    many plain-``RTP/AVP``-offer mechanics tests below (codec negotiation, dialog
+    tag, ptime/jitter, resource release …) keep exercising the cleartext answer
+    path they were written for — that path still exists, it is merely opt-in now.
+    The mandate's own accept/reject behaviour is asserted directly, both flag
+    states, in ``tests/test_adapter_secure_media.py``. Pass ``media_cfg`` to
+    override (e.g. a secured-profile test that wants the mandate on).
+    """
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+    media = (
+        media_cfg
+        if media_cfg is not None
+        else load_media_config({"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"})
+    )
 
     with (
         patch(
@@ -371,9 +386,7 @@ async def _build_adapter(
                 shutdown_drain_secs=5.0,
             ),
         ),
-        patch(
-            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
-        ),
+        patch("hermes_voip.adapter.load_media_config", return_value=media),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch(
             "hermes_voip.adapter._make_tls_context",
@@ -710,7 +723,12 @@ async def test_inbound_invite_threads_greeting_into_call_loop() -> None:
     # Replace the (mocked) media config with a real one carrying a concrete
     # greeting, so we assert the adapter threads THAT value into CallLoop.
     adapter._media_cfg = load_media_config(
-        {"HERMES_VOIP_GREETING": "Hello from the gateway."}
+        {
+            "HERMES_VOIP_GREETING": "Hello from the gateway.",
+            # plain RTP/AVP offer in this test — keep the secure-media mandate
+            # (ADR-0070) off so it is answered, not 488'd.
+            "HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false",
+        }
     )
 
     call_id = new_call_id()
@@ -933,7 +951,11 @@ async def _spotlight_kwarg_for_media_env(env: dict[str, str]) -> bool:
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager)
-    adapter._media_cfg = load_media_config(env)
+    # Keep the secure-media mandate (ADR-0070) off — this test drives a plain
+    # RTP/AVP offer to assert the v3-audio-tags gate, not the media-security policy.
+    adapter._media_cfg = load_media_config(
+        {**env, "HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+    )
 
     async def _noop_handler(event: object) -> None:
         return None
@@ -1917,20 +1939,32 @@ def _gateway_in_dialog_request(
 
 async def _build_adapter_with_real_manager(
     transport: _FakeTransport,
+    *,
+    media_cfg: MediaConfig | None = None,
 ) -> tuple[VoipAdapter, RegistrationManager]:
-    """A real VoipAdapter + a real RegistrationManager over the fake transport."""
+    """A real VoipAdapter + a real RegistrationManager over the fake transport.
+
+    The default media config DISABLES the secure-media mandate (ADR-0070): the
+    real-dialog tests here offer plain ``RTP/AVP`` to exercise the on-the-wire 200
+    OK / dialog routing, which is the cleartext answer path (now opt-in). The
+    secured-profile SDES test below passes its own mandate-on config. The mandate
+    itself is covered in ``tests/test_adapter_secure_media.py``.
+    """
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = _platform_config(_FAKE_ENV | _FAKE_MEDIA_ENV)
+    media = (
+        media_cfg
+        if media_cfg is not None
+        else load_media_config({"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"})
+    )
     manager = RegistrationManager(_real_gateway_config(), transport)
     with (
         patch(
             "hermes_voip.adapter.load_gateway_config",
             return_value=_real_gateway_config(),
         ),
-        patch(
-            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
-        ),
+        patch("hermes_voip.adapter.load_media_config", return_value=media),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
         patch("hermes_voip.adapter.SipOverTlsTransport", return_value=transport),
@@ -2189,11 +2223,15 @@ async def test_inbound_savp_offer_answered_with_sdes_srtp() -> None:
 
     The answer must be RTP/SAVP carrying an ``a=crypto`` with OUR OWN key (RFC 4568
     §6.1 — each direction uses the sender's key), distinct from the offerer's key.
-    Today the adapter omits the answer key, so this offer is rejected with 488 and
-    no 200 OK is sent (the dormant-SDES wiring gap this stage closes).
+
+    The mandate is left ON (the production default) so this also locks ADR-0070: a
+    secured ``RTP/SAVP`` offer is ``is_srtp`` and so passes the secure-media guard
+    and is answered, never 488'd alongside the cleartext path.
     """
     transport = _FakeTransport(local_sent_by="172.23.0.2:55728")
-    adapter, _manager = await _build_adapter_with_real_manager(transport)
+    adapter, _manager = await _build_adapter_with_real_manager(
+        transport, media_cfg=load_media_config({})
+    )
 
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite_savp(call_id))
@@ -3000,8 +3038,12 @@ async def test_inbound_invite_activates_negotiated_ptime_and_adaptive_jitter() -
     """
     transport = _FakeTransport()
     adapter, _manager = await _build_adapter_with_real_manager(transport)
-    # Default media config → jitter_max_depth == 10.
-    adapter._media_cfg = load_media_config({})
+    # Default media config → jitter_max_depth == 10. The mandate (ADR-0070) is off
+    # because this test offers plain RTP/AVP to assert ptime/jitter activation, not
+    # the media-security policy.
+    adapter._media_cfg = load_media_config(
+        {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+    )
 
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite_g722_ptime40(call_id=call_id))

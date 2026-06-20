@@ -466,6 +466,21 @@ _DEFAULT_SIP_DTLS_SRTP = True
 _SIP_SDES_OFFER_KEY = "HERMES_VOIP_SIP_SDES_OFFER"
 _DEFAULT_SIP_SDES_OFFER = False
 
+# Secure-media mandate on the inbound answer path (ADR-0070). When True (the
+# default), an inbound INVITE whose audio m-line offers plain ``RTP/AVP`` (no
+# SRTP) is REJECTED with ``488 Not Acceptable Here`` instead of being answered as
+# a cleartext RTP call. The plugin only ever REGISTERS over TLS/WSS (the transport
+# is restricted to ``_VIA_TRANSPORT`` = {tls, wss}), so every SIP *signalling* leg
+# is already encrypted; this closes the remaining MEDIA-plane cleartext gap. Any
+# SECURED profile is still accepted — SDES (``RTP/SAVP``), DTLS-SRTP
+# (``UDP/TLS/RTP/SAVP``) and WebRTC (``UDP/TLS/RTP/SAVPF``) — i.e. every profile
+# for which ``AudioMedia.is_srtp`` is true; only plain ``RTP/AVP`` is refused.
+# Setting it false is the rollback switch (opportunistic plaintext, the pre-ADR
+# behaviour) for a gateway that can only offer cleartext media. No effect on the
+# outbound offer path (its own SRTP knobs are independent).
+_REQUIRE_SECURE_MEDIA_KEY = "HERMES_VOIP_REQUIRE_SECURE_MEDIA"
+_DEFAULT_REQUIRE_SECURE_MEDIA = True
+
 # SIP DTLS-SRTP answerer role (ADR-0053 §2, RFC 8842 §5.3 / RFC 5763 §5). For an
 # ``a=setup:actpass`` offer the answerer picks its DTLS role; ``auto`` (the default)
 # makes us ``active`` (the DTLS client, sending the ClientHello) — many gateways offer
@@ -905,6 +920,15 @@ class MediaConfig:
     # answer path or the WebRTC outbound path. Defaulted so existing direct
     # constructions stay valid.
     sip_sdes_offer: bool = _DEFAULT_SIP_SDES_OFFER
+    # Secure-media mandate on the inbound answer path (ADR-0070): when True (the
+    # default) an inbound INVITE that offers plain ``RTP/AVP`` audio is rejected
+    # with 488 instead of being answered as a cleartext RTP call (signalling is
+    # already TLS/WSS, so this closes the media-plane cleartext gap). Any secured
+    # profile — SDES ``RTP/SAVP``, DTLS-SRTP ``UDP/TLS/RTP/SAVP`` and WebRTC
+    # ``UDP/TLS/RTP/SAVPF`` (any ``is_srtp`` offer) — is still accepted. False is
+    # the rollback switch (opportunistic plaintext). Defaulted so existing direct
+    # constructions stay valid.
+    require_secure_media: bool = _DEFAULT_REQUIRE_SECURE_MEDIA
     # WebRTC ICE TURN relay (ADR-0034), as ``turn:``/``turns:`` URLs for relay
     # candidate gathering. Empty (the default) ⇒ no relay candidate. When set, the
     # username + password are required (validated at load). No effect on the
@@ -1313,6 +1337,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         sip_dtls_setup=_value_lower(env, _SIP_DTLS_SETUP_KEY)
         or _DEFAULT_SIP_DTLS_SETUP,
         sip_sdes_offer=_parse_bool(env, _SIP_SDES_OFFER_KEY, _DEFAULT_SIP_SDES_OFFER),
+        require_secure_media=_parse_bool(
+            env, _REQUIRE_SECURE_MEDIA_KEY, _DEFAULT_REQUIRE_SECURE_MEDIA
+        ),
         ice_turn_urls=_ice_turn[0],
         ice_turn_username=_ice_turn[1],
         ice_turn_password=_ice_turn[2],

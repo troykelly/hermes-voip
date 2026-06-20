@@ -472,7 +472,14 @@ async def _build_adapter(transport: _FakeTransport) -> VoipAdapter:
             "hermes_voip.adapter.load_gateway_config", return_value=_gateway_config()
         ),
         patch(
-            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+            "hermes_voip.adapter.load_media_config",
+            # require_secure_media disabled: these RTCP-activation tests offer plain
+            # RTP/AVP to exercise the cleartext-path RTCP, which the secure-media
+            # mandate (ADR-0070) would otherwise 488. The secured-path RTCP tests in
+            # this file offer RTP/SAVP and are unaffected by the flag.
+            return_value=load_media_config(
+                {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+            ),
         ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),

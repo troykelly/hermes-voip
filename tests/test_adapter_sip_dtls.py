@@ -1437,7 +1437,12 @@ async def test_sip_dtls_abort_is_non_blocking_frees_admission_slot() -> None:
 async def test_plain_offer_never_touches_sip_dtls_branch() -> None:
     """A plain RTP/AVP offer never builds a SIP-DTLS session (no regression)."""
     transport = _FakeTransport()
-    adapter = await _build_adapter(transport, load_media_config({}))
+    # require_secure_media off: this test offers plain RTP/AVP to prove it falls to
+    # the SDES/plain path (never the SIP-DTLS branch); the secure-media mandate
+    # (ADR-0070) would otherwise 488 it before any media-path selection.
+    adapter = await _build_adapter(
+        transport, load_media_config({"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"})
+    )
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite(_PLAIN_OFFER, call_id))
 

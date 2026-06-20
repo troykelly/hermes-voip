@@ -274,7 +274,14 @@ async def _build_adapter(
                 shutdown_drain_secs=5.0,
             ),
         ),
-        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.load_media_config",
+            # require_secure_media=False so the plain RTP/AVP offers these caller-mode
+            # tests use are not 488'd by the secure-media mandate (ADR-0070) — these
+            # tests cover caller classification/context, not the media-security policy
+            # (which is asserted in tests/test_adapter_secure_media.py).
+            return_value=MagicMock(require_secure_media=False),
+        ),
         patch(
             "hermes_voip.adapter.load_caller_modes",
             return_value=caller_modes,
@@ -391,7 +398,14 @@ async def test_connect_fails_loud_on_empty_privileged_allow_file(
                 shutdown_drain_secs=5.0,
             ),
         ),
-        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.load_media_config",
+            # require_secure_media=False so the plain RTP/AVP offers these caller-mode
+            # tests use are not 488'd by the secure-media mandate (ADR-0070) — these
+            # tests cover caller classification/context, not the media-security policy
+            # (which is asserted in tests/test_adapter_secure_media.py).
+            return_value=MagicMock(require_secure_media=False),
+        ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
         patch("hermes_voip.adapter.SipOverTlsTransport", return_value=_FakeTransport()),

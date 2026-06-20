@@ -151,9 +151,10 @@ class _FakeTTS:
 
 class _FakeASR:
     async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
+        finals: list[object] = []
         async for _ in audio:
-            pass
-        for transcript in ():  # always empty — forces the async-gen shape
+            pass  # consume so the pump does not stall
+        for transcript in finals:  # always empty — forces the async-gen shape
             yield transcript
 
 

@@ -265,6 +265,10 @@ _FAKE_ENV: dict[str, str] = {
     "HERMES_SIP_EXTENSION": _TO_USER,
     "HERMES_SIP_PASSWORD": "fake-password",
     "HERMES_SIP_EXPIRES": "120",
+    # Cleartext G.711 RTP/AVP concurrency e2e — the secure-media mandate (ADR-0070)
+    # is off so the plain offers are answered, not 488'd (the mandate itself is
+    # covered in tests/test_adapter_secure_media.py).
+    "HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false",
 }
 
 

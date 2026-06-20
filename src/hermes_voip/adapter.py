@@ -576,6 +576,23 @@ class VoipAdapter(BasePlatformAdapter):
     so ``Platform("voip")`` resolves via the enum's ``_missing_`` hook).
     """
 
+    # A live call is a real-time AUDIO surface, not an editable message. The Hermes
+    # gateway gates incremental (streaming) reply delivery on
+    # ``getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)`` (gateway/run.py): when an
+    # adapter is editable AND ``streaming`` is enabled, the gateway renders the reply
+    # through ``GatewayStreamConsumer`` — one partial-prefix ``send()`` then repeated
+    # ``edit_message()`` calls carrying *cumulative* growing text, flushed on a
+    # time/codepoint threshold (never on sentence boundaries). ``BasePlatformAdapter``
+    # declares no ``SUPPORTS_MESSAGE_EDITING`` (so the default is editable) and ships a
+    # working default ``edit_message``, which would put a VOICE call on that
+    # cumulative-edit path and garble/duplicate its audio: our pipeline
+    # (``send()`` → :meth:`CallLoop.speak` → sentence aggregation → RTP) consumes ONE
+    # complete reply string. Declaring the adapter non-editable makes the gate take its
+    # ``if not SUPPORTS_MESSAGE_EDITING: skip streaming`` branch and always deliver the
+    # reply as a single complete ``send()`` — robust regardless of the operator's
+    # Hermes streaming config (ADR-0057 §3).
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(self, config: object) -> None:
         """Initialise the base adapter; defer all IO until ``connect()``."""
         if not isinstance(config, PlatformConfig):

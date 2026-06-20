@@ -570,6 +570,55 @@ def _srtp_inbound_from_answer(crypto: CryptoAttribute | None) -> SrtpSession | N
     return SrtpSession(crypto)
 
 
+def _validate_outbound_answer_crypto(
+    offer_crypto: CryptoAttribute, answer_audio: AudioMedia
+) -> CryptoAttribute:
+    """Validate the callee's 2xx ``a=crypto`` against OUR offer crypto (RFC 4568 §6.1).
+
+    When we offered SDES-SRTP (``offer_crypto`` non-None), the 2xx answer MUST:
+
+    * use the ``RTP/SAVP`` profile (a plain ``RTP/AVP`` answer is a downgrade); and
+    * carry EXACTLY ONE supported, well-formed ``a=crypto`` (an answer selects one —
+      RFC 4568 §5.1.2; ``crypto_attrs`` is the parse-filtered supported subset, so a
+      single malformed/unsupported line yields zero here); and
+    * echo OUR offered ``tag`` AND ``suite`` (RFC 4568 §6.1: the answerer identifies
+      its selection by the offered tag, and may only pick a suite we offered).
+
+    Returns the validated answer :class:`CryptoAttribute` (its key decrypts the
+    callee's inbound media). Raises :class:`OutboundCallFailed` (status 488) with a
+    STRUCTURAL message — never the offending key/line (rule 34, the repo is PUBLIC and
+    the message lands in logs) — on any violation, so the caller can fail closed
+    (ACK + BYE + teardown) rather than key from an answer we never offered or stream
+    cleartext for a secured offer.
+    """
+    if not answer_audio.is_srtp:
+        msg = "2xx answered plain RTP/AVP to our SRTP offer (downgrade refused)"
+        raise OutboundCallFailed(488, msg)
+    attrs = answer_audio.crypto_attrs
+    if len(attrs) != 1:
+        # Zero = SAVP with no usable a=crypto (absent/malformed/unsupported);
+        # >1 = an ambiguous answer that did not select exactly one (RFC 4568 §5.1.2).
+        msg = (
+            "2xx SRTP answer did not select exactly one supported a=crypto "
+            f"(got {len(attrs)})"
+        )
+        raise OutboundCallFailed(488, msg)
+    answer_crypto = attrs[0]
+    if (
+        answer_crypto.tag != offer_crypto.tag
+        or answer_crypto.suite != offer_crypto.suite
+    ):
+        # Tag/suite we never offered — keying from it would use parameters we did not
+        # propose. Report tags/suites only (safe), never the key material.
+        msg = (
+            "2xx SRTP answer crypto does not match our offer "
+            f"(offered tag {offer_crypto.tag}/{offer_crypto.suite}, "
+            f"answered tag {answer_crypto.tag}/{answer_crypto.suite})"
+        )
+        raise OutboundCallFailed(488, msg)
+    return answer_crypto
+
+
 class _QueueSink:
     """Temporary :class:`CallResponseSink` for an outbound INVITE transaction.
 
@@ -1565,27 +1614,6 @@ class VoipAdapter(BasePlatformAdapter):
             if answer_audio is None:
                 raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
 
-            # SDES-SRTP answer handling (ADR-0066). When we offered RTP/SAVP, the 2xx
-            # MUST answer RTP/SAVP with a usable a=crypto: that key decrypts the
-            # callee's inbound media (RFC 4568 §6.1 — keyed by its sender). A plain
-            # RTP/AVP answer (or an SAVP answer with no usable a=crypto) is a DOWNGRADE
-            # of a call we asked to protect — FAIL CLOSED (raise before ACK, mirroring
-            # the codec-mismatch 488 below) rather than silently streaming plaintext. No
-            # check when we offered plain (offer_crypto is None): the plain answer is
-            # expected and answer_inbound_crypto stays None (cleartext, unchanged).
-            answer_inbound_crypto: CryptoAttribute | None = None
-            if offer_crypto is not None:
-                if not answer_audio.is_srtp or not answer_audio.crypto_attrs:
-                    # The transport auto-ACKs only non-2xx; raising here leaves the 2xx
-                    # un-ACKed (absorbed by retransmission/the proxy), the same shape as
-                    # the codec-mismatch 488 path — no plaintext engine is ever started.
-                    raise OutboundCallFailed(
-                        488,
-                        "2xx answered plain RTP (or SAVP without a usable a=crypto) to "
-                        "an SRTP offer — refusing to downgrade to cleartext",
-                    )
-                answer_inbound_crypto = answer_audio.crypto_attrs[0]
-
             try:
                 # ADR-0049: the SIP answer may negotiate Opus when we offered it
                 # (libopus available) — accept it here too, not only G.722/G.711.
@@ -1628,14 +1656,11 @@ class VoipAdapter(BasePlatformAdapter):
             engine._remote_port = answer_audio.port
             engine._outbound_addr = (remote_address, answer_audio.port)
 
-            # Key the inbound (RX/decrypt) SRTP from the callee's ANSWER a=crypto
-            # (ADR-0066, RFC 4568 §6.1). The engine was built before the answer was
-            # known (srtp_inbound=None); set it here, alongside the other negotiated
-            # engine values. None ⇒ a plain RTP/AVP call (offer_crypto was None), so the
-            # engine stays cleartext. The fail-closed guard above guarantees that when
-            # we OFFERED SAVP this is non-None (a plain answer already raised), so a
-            # secured outbound call is never left with a half-keyed engine.
-            engine._srtp_in = _srtp_inbound_from_answer(answer_inbound_crypto)
+            # SDES-SRTP inbound (RX/decrypt) keying happens AFTER the ACK is sent
+            # (below): a refused 2xx must still be ACKed + BYE'd (RFC 3261 §13.2.2.4 +
+            # §15), so the answer-crypto validation/keying is deferred past the ACK to
+            # the _validate_outbound_answer_crypto call. The engine stays cleartext
+            # (srtp_inbound=None) until then; it does not transmit before the CallLoop.
 
             # Update the engine codec from the negotiated answer (the engine was
             # constructed with Codec.PCMU as a placeholder before the answer was
@@ -1744,6 +1769,33 @@ class VoipAdapter(BasePlatformAdapter):
             ack_text = build_request("ACK", dialog.remote_target, ack_headers)
             await transport.send(ack_text)
             _log.info("ACK sent: Call-ID %s", call_id)
+
+            # --- SDES-SRTP answer validation + inbound keying (ADR-0066) -------
+            # Done AFTER the ACK (RFC 3261 §13.2.2.4: the UAC MUST ACK a 2xx, even one
+            # it then rejects). When we offered RTP/SAVP, the 2xx MUST answer RTP/SAVP
+            # with EXACTLY ONE a=crypto echoing our offered tag + suite (RFC 4568 §6.1):
+            # that key decrypts the callee's inbound media. A plain RTP/AVP answer, a
+            # tag/suite we did not offer, an unusable/absent a=crypto, or an ambiguous
+            # multi-crypto answer is a downgrade/mis-key of a call we asked to protect —
+            # FAIL CLOSED: BYE the (now ACK-confirmed) dialog and raise, never key from
+            # it and never stream plaintext. _validate_outbound_answer_crypto raises
+            # OutboundCallFailed with a STRUCTURAL message (never the key, rule 34). No
+            # check when we offered plain (offer_crypto is None): the engine stays
+            # cleartext exactly as before.
+            if offer_crypto is not None:
+                try:
+                    answer_inbound_crypto = _validate_outbound_answer_crypto(
+                        offer_crypto, answer_audio
+                    )
+                except OutboundCallFailed:
+                    # BYE the dialog the 2xx established (we just ACKed it) so no
+                    # half-open call lingers on the callee; the outer finally then
+                    # stops the engine + frees the socket. Re-raise to fail the call.
+                    await self._bye_answered_outbound_dialog(transport, dialog)
+                    raise
+                # Key inbound (RX/decrypt) from the validated answer crypto (our
+                # outbound was keyed from the offer at engine construction).
+                engine._srtp_in = _srtp_inbound_from_answer(answer_inbound_crypto)
 
             # --- Wire the CallSession and CallLoop -------------------------
             # ADR-0021 (amended from ADR-0020): an outbound call's remote party
@@ -1902,6 +1954,33 @@ class VoipAdapter(BasePlatformAdapter):
                     call_loop=None,
                     reason=CallEndReason.SIP_ERROR,
                 )
+
+    async def _bye_answered_outbound_dialog(
+        self, transport: SignalingTransport, dialog: Dialog
+    ) -> None:
+        """BYE an outbound dialog we just ACKed, on a refused-2xx fail-closed teardown.
+
+        ADR-0066 / RFC 3261 §13.2.2.4 + §15: when an outbound 2xx is rejected (a plain
+        or mis-keyed SRTP answer to our secured offer), the UAC has already ACKed it
+        (the dialog is established on the callee), so it MUST be torn down with an
+        in-dialog BYE rather than left half-open. Best-effort: a send failure is logged,
+        never raised over the OutboundCallFailed the caller is propagating (rule 37 —
+        that real failure is already surfaced); the callee's own session timer reaps a
+        dialog whose BYE never lands. The engine/socket are released by the finally.
+        """
+        try:
+            bye = build_in_dialog_request(dialog, "BYE")
+            await transport.send(bye.text)
+            _log.info(
+                "outbound %s: BYE sent to close the refused-answer dialog",
+                dialog.call_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort teardown; never mask the OutboundCallFailed
+            _log.warning(
+                "outbound %s: error sending BYE on refused-answer teardown: %s",
+                dialog.call_id,
+                exc,
+            )
 
     async def _handle_outbound_webrtc_invite(  # noqa: PLR0912,PLR0915 — UAC WebRTC flow: offer/challenge/2xx/handshake/ACK/loop, one sequence
         self,

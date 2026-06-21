@@ -349,3 +349,109 @@ def test_sustained_run_beginning_in_tail_authorises_and_is_not_suppressed() -> N
     assert fired is True, "a sustained run starting in the tail must barge in"
     # …and because it is authorised, its end-of-turn must not be suppressed.
     assert gate.delivery_suppressed(101 + _MIN_WINDOWS + 1) is False
+
+
+# ---------------------------------------------------------------------------
+# TRUE HALF-DUPLEX (live self-echo regression, call 2026-06-21 Yealink T48G
+# HANDSET so NO acoustic echo): the gateway (UCM6304) reflects the agent's own
+# outbound TTS back on the inbound leg under the gateway's SSRC. A ~1 s comfort
+# filler ("One moment please.") is a SUSTAINED continuous voiced run that EXCEEDS
+# the sustained barge-in threshold, so ``should_barge_in`` FIRES on the agent's
+# OWN echo and ``_fire`` authorises the run — and the OLD ``delivery_suppressed``
+# then returned False for that authorised run while still armed, delivering the
+# agent's own filler to the STT as a caller turn ("ONE MOMENT PLEASE" @ 100%).
+#
+# The fix: while the gate is ARMED (the agent's TTS is on the wire, or within the
+# echo tail) NOTHING is delivered as a transcript — authorisation may RELEASE
+# suppression only AFTER the agent has actually stopped (gate disarmed). A real
+# caller still interrupts (``should_barge_in`` stops the agent, which flips
+# ``_tts_audio_active`` False and disarms the gate); their CONTINUED speech then
+# flows to the STT normally once the gate is disarmed. The ONLY behaviour change
+# is: a sustained self-echo can no longer "authorise" its own transcript.
+# ---------------------------------------------------------------------------
+
+
+def test_sustained_echo_during_active_tts_is_suppressed_unconditionally() -> None:
+    """A sustained run while the agent's TTS is STILL on the wire is suppressed.
+
+    This is the live comfort-filler self-echo: the gateway reflects the ~1 s
+    filler while ``_tts_audio_active`` is True, the run exceeds the sustained
+    threshold so ``should_barge_in`` fires and authorises it — but because the
+    agent's audio is still playing it is the agent's OWN echo, and its end-of-turn
+    must be suppressed REGARDLESS of authorisation (true half-duplex). The OLD
+    gate returned ``False`` here, delivering the agent's filler as a caller turn.
+    """
+    gate = _make_gate()
+    gate.tts_active(True)  # the agent's TTS stays on the wire throughout
+    gate.on_event(_onset(200))
+    fired = False
+    # A sustained voiced run past the threshold — the reflected filler echo.
+    for w in range(200, 200 + _MIN_WINDOWS + 5):
+        fired = fired or gate.should_barge_in(w)
+    assert fired is True, "the sustained echo run does reach the barge-in threshold"
+    # While the agent's audio is still on the wire the run is its own echo: the
+    # endpointer's end-of-turn on it must be suppressed despite authorisation.
+    assert gate.delivery_suppressed(200 + _MIN_WINDOWS + 6) is True
+
+
+def test_sustained_echo_in_tail_is_suppressed_unconditionally() -> None:
+    """A sustained authorised run within the post-TTS tail is still suppressed.
+
+    After the agent's own filler is barged in, ``_tts_audio_active`` flips False
+    but the echo of the already-transmitted filler keeps arriving across the tail
+    (jitter buffer + network). That residual echo is a sustained run that
+    authorises itself — yet while ARMED (the tail) nothing may be delivered.
+    """
+    gate = _make_gate()
+    gate.tts_active(True)
+    gate.tts_active(False)  # the agent's audio stopped (e.g. barge-in cut it)…
+    gate.tail_from(300)  # …and the echo tail covers windows 300..307.
+    gate.on_event(_onset(301))
+    fired = False
+    for w in range(301, 301 + _MIN_WINDOWS + 2):  # sustained run inside the tail
+        fired = fired or gate.should_barge_in(w)
+    assert fired is True, "a sustained run in the tail still reaches the threshold"
+    # Within the tail the gate is armed → suppressed regardless of authorisation.
+    assert gate.delivery_suppressed(305) is True
+
+
+def test_full_mode_suppresses_delivery_while_armed() -> None:
+    """Even ``full`` mode suppresses STT delivery while the agent's TTS is on air.
+
+    ``full`` authorises every onset (legacy immediate barge-in), but half-duplex
+    binds it too: nothing the gate hears WHILE our audio is on the wire may be
+    delivered as a transcript. The OLD gate delivered an authorised ``full``-mode
+    run during playout — the same self-echo route on an echoing gateway.
+    """
+    gate = _make_gate(BargeInMode.FULL)
+    gate.tts_active(True)
+    gate.on_event(_onset(0))
+    assert gate.should_barge_in(0) is True  # full mode authorises immediately
+    gate.on_event(_offset(3))
+    assert gate.delivery_suppressed(10) is True
+
+
+def test_authorised_run_delivers_after_gate_disarms_post_playout() -> None:
+    """No-regression: once the gate disarms (TTS off + tail elapsed) delivery resumes.
+
+    A genuine interruption stops the agent (``_tts_audio_active`` → False); after
+    the tail elapses the gate is no longer armed, so the caller's CONTINUED speech
+    flows to the STT normally. Authorisation RELEASES suppression only here — after
+    the agent has actually stopped — never while our audio is on the wire.
+    """
+    gate = _make_gate()
+    gate.tts_active(True)
+    # A sustained run authorises a real barge-in and the agent stops.
+    gate.on_event(_onset(0))
+    fired = False
+    for w in range(0, _MIN_WINDOWS + 2):
+        fired = fired or gate.should_barge_in(w)
+    assert fired is True
+    gate.tts_active(False)
+    gate.tail_from(_MIN_WINDOWS + 2)  # tail = (m+2)..(m+2+_TAIL_WINDOWS-1)
+    tail_last = _MIN_WINDOWS + 2 + _TAIL_WINDOWS - 1
+    # Still armed across the tail → suppressed (it is residual echo of the cut audio).
+    assert gate.delivery_suppressed(tail_last) is True
+    # One window past the tail the gate has disarmed → the caller's continued
+    # speech (still the authorised run) is delivered.
+    assert gate.delivery_suppressed(tail_last + 1) is False

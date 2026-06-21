@@ -3307,6 +3307,77 @@ async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_sustained_self_echo_during_playout_delivers_no_turn() -> None:
+    """A SUSTAINED reflected-TTS echo during the agent's playout delivers no turn.
+
+    The live self-echo regression (call 2026-06-21, Yealink T48G HANDSET so NO
+    acoustic echo): the gateway reflects the agent's own ~1 s comfort filler back
+    on the inbound leg while the agent is STILL speaking. The reflected filler is a
+    SUSTAINED continuous voiced run that EXCEEDS the sustained barge-in threshold,
+    so ``should_barge_in`` fires on the agent's OWN echo and authorises the run —
+    and the OLD gate then delivered that authorised echo to the STT as a caller
+    turn (the agent's own "ONE MOMENT PLEASE" transcribed at 100% confidence).
+
+    True half-duplex: while the gate is armed (the agent's TTS is on the wire, or
+    within the echo tail) NOTHING the gate hears is delivered as a transcript.
+    Here a LONG greeting stays on the wire across the whole inbound run and a LARGE
+    tail (40 windows > the 30-window run) keeps the gate armed for the entire run
+    even after the self-barge-in cuts the agent — so the reflected echo authorises
+    itself yet not a single window may reach the STT. A native-EOT ASR (Deepgram
+    style) is used so the deterministic variable is purely the half-duplex mute and
+    NOT the endpointer (a native EOT would otherwise deliver the echo on its own).
+    Against the OLD code this FAILS: the authorised echo is delivered.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # 30 continuous voiced windows (no offset) = the reflected filler echo, well
+    # past the 13-window threshold so it authorises a (self-)barge-in.
+    sustained = [0.95] * 30
+    vad = _scripted_vad_8k(sustained)
+    tts = _LongSlowGreetingTTS(n_frames=120)  # stays the active TTS across the run
+    transport = _ScriptedInboundTransport(len(sustained))
+    # Native end-of-turn so delivery does NOT depend on the endpointer firing: the
+    # only thing that can stop the echo turn is the half-duplex mute itself.
+    asr = _DrainThenFinalASR("ONE MOMENT PLEASE", end_of_turn=True)
+
+    loop = CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=_FakeGuard([_allow_result()]),
+        vad=vad,
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="The agent says one moment please while the gateway reflects it.",
+        barge_in_mode=BargeInMode.GATED,
+        barge_in_min_voiced_windows=13,
+        barge_in_tail_windows=40,  # tail outlasts the run → armed for the whole run
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    transport.release.set()
+    await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert delivered == [], (
+        "the agent's own filler reflected by the gateway during playout must NOT "
+        "be delivered as a caller turn (true half-duplex)"
+    )
+    # And the echo audio was withheld from the ASR entirely while armed.
+    assert asr.frames_drained == 0, (
+        "no reflected-echo frame may reach the STT while the agent's audio is on "
+        "the wire (or within the echo tail)"
+    )
+
+
 class _PerFrameFinalASR:
     """ASR fake that yields one end-of-turn-less final per frame it RECEIVES.
 

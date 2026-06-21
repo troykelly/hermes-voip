@@ -311,14 +311,6 @@ class BargeInGate:
         # True once a barge-in has fired for the current run, so the same run does
         # not re-fire on every later window (which would spam barge_in()).
         self._fired_for_run = False
-        # True iff the MOST RECENT speech run was an authorised (real) barge-in.
-        # Unlike ``_fired_for_run`` (cleared on OFFSET so the gate can re-arm),
-        # this PERSISTS through the run's trailing silence — the endpointer fires
-        # its end-of-turn there, and ``delivery_suppressed`` consults this to drop
-        # an unauthorised echo turn. Reset only on a NEW onset (a fresh run is
-        # unauthorised until it earns a barge-in), so authorisation never leaks
-        # across runs.
-        self._last_run_authorised = False
 
     def tts_active(self, active: bool) -> None:
         """Record whether the agent's TTS is currently playing.
@@ -358,15 +350,8 @@ class BargeInGate:
         if event.edge is SpeechEdge.ONSET:
             self._onset_window = event.frame_index
             self._fired_for_run = False
-            # A fresh run is unauthorised until it earns a barge-in: clear the
-            # persisted authorisation so the prior run's verdict cannot leak into
-            # this one (e.g. an authorised interruption followed by a short echo
-            # blip must still have its blip-turn suppressed).
-            self._last_run_authorised = False
         else:  # SpeechEdge.OFFSET — voicing stopped; the candidate run ends.
-            # Clear only the live-run state so the gate can re-arm; KEEP
-            # ``_last_run_authorised`` so the endpointer's end-of-turn on the
-            # trailing silence still knows whether this run was a real barge-in.
+            # Clear the live-run state so the gate can re-arm on the next onset.
             self._onset_window = None
             self._fired_for_run = False
 
@@ -396,28 +381,46 @@ class BargeInGate:
         return False
 
     def _fire(self) -> bool:
-        """Latch the barge-in for the current run and authorise its turn."""
+        """Latch the barge-in for the current run (fire once, then stay latched).
+
+        Firing STOPS the agent (the caller drives ``barge_in()`` from a True
+        return), which flips ``_tts_audio_active`` False and — after the tail
+        elapses — disarms the gate so inbound audio reaches the STT again. It does
+        NOT release delivery suppression while the agent's audio is still on the
+        wire: ``delivery_suppressed`` is unconditional while armed (half-duplex), so
+        a sustained self-echo can never transcribe itself by firing.
+        """
         self._fired_for_run = True
-        self._last_run_authorised = True
         return True
 
     def delivery_suppressed(self, current_window: int) -> bool:
-        """Whether an end-of-turn at this window is unauthorised echo to be dropped.
+        """Whether inbound audio at this window must be withheld from the STT (echo).
 
-        Even when a short echo blip does not fire ``should_barge_in`` (so it never
-        cancels the TTS), the endpointer still fires an end-of-turn on the echo's
-        trailing silence and the recogniser's final fragment would be delivered to
-        the agent as a caller turn — re-triggering an interrupt. The call loop
-        calls this when the endpointer fires; it returns ``True`` (drop the turn)
-        while the gate is armed (the agent's TTS is playing, or within the echo
-        tail) AND the most-recent speech run was NOT an authorised barge-in.
+        TRUE HALF-DUPLEX (ADR-0023, live self-echo fix 2026-06-21): while the gate
+        is ARMED — the agent's TTS is on the wire (``_tts_audio_active``) or within
+        the echo tail — NOTHING the gate hears may be delivered as a transcript,
+        REGARDLESS of authorisation. The gateway reflects the agent's own outbound
+        TTS back on the inbound leg; a comfort-filler-length (~1 s) reflection is a
+        SUSTAINED voiced run that exceeds the barge-in threshold, so it fires
+        ``should_barge_in`` and ``_fire`` authorises it — yet it is still the
+        agent's OWN echo and must never be transcribed as a caller turn. A
+        per-run authorisation check (the pre-fix ``and not _last_run_authorised``)
+        let such a sustained self-echo "authorise" its own transcript; this gate is
+        unconditional while armed.
 
-        A genuine sustained interruption authorises its run (``should_barge_in``
-        fired and also cancelled the TTS, so the agent is no longer speaking),
-        so its transcript is delivered. Outside playout/tail nothing is
-        suppressed — normal caller turns during silence always deliver.
+        The call loop withholds the frame entirely (no audio_q, no endpointer
+        advance) whenever this returns ``True``, so no echo transcript is produced
+        on the endpointer path OR a native-EOT recogniser's own end_of_turn.
+
+        Authorisation does NOT release suppression while we speak — it only matters
+        for STOPPING the agent (``should_barge_in`` → ``barge_in()``), which flips
+        ``_tts_audio_active`` False and, after the tail elapses, DISARMS the gate.
+        Only then (gate disarmed) does inbound audio flow to the STT again, so a
+        genuine caller's CONTINUED speech delivers normally once the agent has
+        actually gone quiet. Outside playout/tail nothing is suppressed — normal
+        caller turns during silence always deliver.
         """
-        return self._armed(current_window) and not self._last_run_authorised
+        return self._armed(current_window)
 
 
 class _ToneStream:
@@ -1162,28 +1165,34 @@ class CallLoop:
                     self._barge_in_gate.tail_from(latest_vad_window)
                 self._barge_in_gate.tts_active(tts_audio)
                 prev_tts_active = tts_audio
-                # Drive the gate's authorisation on EVERY frame (codex finding #B),
-                # not only while TTS is active: a sustained run that authorises
-                # during the post-TTS tail must still count, or its turn would be
-                # withheld below. ``should_barge_in`` fires (and authorises the run)
-                # under the gate's own armed/sustained rules; ``barge_in()`` is a
-                # no-op when no TTS stream is active, so calling it unconditionally
-                # is safe.
+                # Drive the barge-in decision on EVERY frame (codex finding #B), not
+                # only while TTS is active: a sustained run reaching threshold during
+                # the post-TTS tail must still be able to STOP the agent. A True
+                # return cuts the agent off (flushes its audio); ``barge_in()`` is a
+                # no-op when no TTS stream is active, so calling it unconditionally is
+                # safe. Stopping the agent flips ``_tts_audio_active`` False and, once
+                # the tail elapses, DISARMS the gate so the caller's continued speech
+                # then flows to the STT below.
                 if self._barge_in_gate.should_barge_in(latest_vad_window):
                     _log.debug(
                         "pump: barge-in authorised at vad-window %d",
                         latest_vad_window,
                     )
                     await self.barge_in()
-                # Echo-robust turn gate (ADR-0023, codex findings #1/#A): while the
-                # agent's TTS is playing (or in the tail) and the current speech run
-                # is NOT an authorised barge-in, the inbound audio is the gateway's
-                # echo of the agent's own speech. WITHHOLD it from the ASR entirely
-                # (do not forward the frame, do not feed/advance the endpointer), so
-                # no echo transcript is ever produced — on the endpointer path OR a
-                # native-EOT recogniser's own end_of_turn (e.g. Deepgram Flux). A
-                # genuine sustained interruption authorises its run (and cancels the
-                # TTS), after which audio flows and its transcript is delivered.
+                # TRUE HALF-DUPLEX turn gate (ADR-0023, live self-echo fix
+                # 2026-06-21): while the gate is ARMED — the agent's TTS is on the
+                # wire (``_tts_audio_active``) OR within the echo tail — WITHHOLD the
+                # inbound frame from the ASR entirely (do not forward it, do not
+                # feed/advance the endpointer), REGARDLESS of any barge-in
+                # authorisation. The gateway reflects the agent's own outbound TTS
+                # back on the inbound leg; a comfort-filler-length (~1 s) reflection
+                # is a SUSTAINED voiced run that authorises a (self-)barge-in, and the
+                # pre-fix per-run authorisation check let it transcribe its OWN echo
+                # as a caller turn. Suppressing unconditionally while armed closes
+                # that on the endpointer path AND a native-EOT recogniser's own
+                # end_of_turn (e.g. Deepgram Flux). A genuine interruption still STOPS
+                # the agent above; its transcript is delivered AFTER the gate disarms
+                # (TTS off + tail elapsed), so the caller's continued speech is heard.
                 suppress_echo = self._barge_in_gate.delivery_suppressed(
                     latest_vad_window
                 )

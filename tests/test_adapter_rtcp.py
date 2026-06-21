@@ -258,6 +258,29 @@ def test_media_config_rtcp_enabled_defaults_true() -> None:
     )
 
 
+def test_media_config_secured_rtcp_enabled_defaults_false() -> None:
+    """Secured-path RTCP (SRTCP) is OFF by default — opt-in via the env knob.
+
+    Emitting SRTCP on a real gateway that did not negotiate a=rtcp-mux muted the media
+    on a live call, so the secured planner stays dormant unless explicitly enabled
+    (ADR-0061 §live finding). The master HERMES_VOIP_RTCP_ENABLED kill-switch still
+    applies on top; this flag specifically gates the secured (SDES/SRTCP) path.
+    """
+    assert load_media_config({}).secured_rtcp_enabled is False
+    assert (
+        load_media_config(
+            {"HERMES_VOIP_SECURED_RTCP_ENABLED": "true"}
+        ).secured_rtcp_enabled
+        is True
+    )
+    assert (
+        load_media_config(
+            {"HERMES_VOIP_SECURED_RTCP_ENABLED": "false"}
+        ).secured_rtcp_enabled
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
 # Integration: a real inbound plain-RTP INVITE activates RTCP on the live engine
 # ---------------------------------------------------------------------------
@@ -462,24 +485,28 @@ def _make_invite(offer: str, call_id: str) -> str:
     )
 
 
-async def _build_adapter(transport: _FakeTransport) -> VoipAdapter:
+async def _build_adapter(
+    transport: _FakeTransport, *, media_env: dict[str, str] | None = None
+) -> VoipAdapter:
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV))
     manager = RegistrationManager(_gateway_config(), transport)
+    # require_secure_media disabled: the plain-RTP RTCP-activation tests offer plain
+    # RTP/AVP to exercise the cleartext-path RTCP, which the secure-media mandate
+    # (ADR-0070) would otherwise 488. The secured-path RTCP tests offer RTP/SAVP and
+    # are unaffected by that flag. ``media_env`` lets a test layer extra media-config
+    # knobs (e.g. HERMES_VOIP_SECURED_RTCP_ENABLED) onto this base.
+    media_config_env = {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+    if media_env is not None:
+        media_config_env.update(media_env)
     with (
         patch(
             "hermes_voip.adapter.load_gateway_config", return_value=_gateway_config()
         ),
         patch(
             "hermes_voip.adapter.load_media_config",
-            # require_secure_media disabled: these RTCP-activation tests offer plain
-            # RTP/AVP to exercise the cleartext-path RTCP, which the secure-media
-            # mandate (ADR-0070) would otherwise 488. The secured-path RTCP tests in
-            # this file offer RTP/SAVP and are unaffected by the flag.
-            return_value=load_media_config(
-                {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
-            ),
+            return_value=load_media_config(media_config_env),
         ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
         patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
@@ -562,18 +589,23 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Secured-path RTCP ACTIVATION via SRTCP (ADR-0066) — the dormancy FLIP.
+# Secured-path RTCP via SRTCP (ADR-0066) — FAIL-CLOSED by default (ADR-0061 §live).
 #
-# SRTCP (RFC 3711 §3.4) now secures the RTCP control channel, so the three secured
-# media paths ACTIVATE RTCP (wrapped in SRTCP) instead of leaving it dormant. These
-# drive the REAL inbound INVITE → setup path with an SDES (RTP/SAVP), a SIP-DTLS
-# (UDP/TLS/RTP/SAVP), and a WebRTC (SAVPF) offer and assert RTCP is activated with
-# the SRTCP transform wired (the SDES path reaches a REAL engine; the DTLS/WebRTC
-# paths use a fake engine whose start_rtcp + SRTCP ctor args are asserted).
+# SRTCP (RFC 3711 §3.4) secures the RTCP control channel, so the SDES path CAN carry
+# RTCP wrapped in SRTCP. But emitting unexpected SRTCP on a real gateway that did NOT
+# negotiate a=rtcp-mux MUTED the media on a live call (the sibling SRTCP socket on
+# RTP-port+1 broke the session) — so secured-path RTCP is now OPT-IN, gated on
+# HERMES_VOIP_SECURED_RTCP_ENABLED (default false). By default a secured (RTP/SAVP)
+# inbound call stays RTCP-DORMANT (no sibling socket, no SRTCP on the wire), matching
+# the pre-#160 behaviour. The capability still activates when the flag is set true.
 #
-# Test change (rule 19): these supersede the pre-SRTCP negative controls that asserted
-# secured paths NEVER activate RTCP — that dormancy was a stated, bounded limitation
-# ("until SRTCP lands"), and this lane lands SRTCP, so the expected behaviour inverts.
+# Test change (rule 19): the pre-existing
+# test_inbound_sdes_savp_call_activates_rtcp_via_srtcp_on_live_engine asserted the
+# SDES path ALWAYS activates RTCP — that expectation broke a real call (unexpected
+# SRTCP muted the media on a non-mux Grandstream). It is INVERTED here to the
+# now-correct default (dormant), with an explicit opt-in test proving the capability
+# still works when chosen. The WebRTC SAVPF path always rtcp-muxes onto its single
+# ICE/DTLS 5-tuple (no sibling socket) and is unchanged by this gate.
 # ---------------------------------------------------------------------------
 
 
@@ -616,17 +648,79 @@ _WEBRTC_OFFER = (
 
 
 @pytest.mark.asyncio
-async def test_inbound_sdes_savp_call_activates_rtcp_via_srtcp_on_live_engine() -> None:
-    """SDES: a real RTP/SAVP INVITE ACTIVATES RTCP over SRTCP on the live engine.
+async def test_inbound_sdes_savp_call_leaves_rtcp_dormant_by_default() -> None:
+    """SDES: a real RTP/SAVP INVITE leaves RTCP DORMANT by default (fail-closed).
 
     Through ``_on_inbound_invite`` with the REAL ``RtpMediaTransport``: the answer is
-    SDES (a=crypto present, RTP/SAVP), and the live engine has RTCP ACTIVE with the
-    SRTCP transform wired (``_srtcp_in``/``_srtcp_out`` set from the negotiated keys).
-    The offer has no a=rtcp-mux, so RTCP uses the sibling socket on RTP-port+1 — and
-    the outbound RTCP is SRTCP-protected (never cleartext on the secured 5-tuple).
+    still SDES (a=crypto present, RTP/SAVP) — but because the offer has no a=rtcp-mux
+    and HERMES_VOIP_SECURED_RTCP_ENABLED defaults FALSE, the secured planner returns
+    ``None`` and RTCP is NOT activated: no run_rtcp loop, ``_rtcp_active`` stays False,
+    no sibling SRTCP socket on RTP-port+1. This is the pre-#160 behaviour the live
+    regression restored — emitting unexpected SRTCP on a non-mux gateway muted the
+    media, so secured RTCP is opt-in. The SRTCP transform is still wired on the engine
+    (zero datapath effect while RTCP is inactive), ready for the opt-in case.
     """
     transport = _FakeTransport()
     adapter = await _build_adapter(transport)
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SDES_OFFER, call_id))
+
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    try:
+        with (
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            adapter._on_inbound_invite(
+                NewCall(registration=_ext_config(), invite=invite)
+            )
+            await _until(lambda: call_id in adapter._call_loops)
+
+            # The 200 OK is still an SDES answer (a=crypto present) — the secured path
+            # is unchanged; only RTCP activation is gated off.
+            oks = [
+                SipResponse.parse(m)
+                for m in transport.sent
+                if m.startswith("SIP/2.0 200")
+            ]
+            assert oks
+            assert "a=crypto" in oks[-1].body
+
+            # RTCP is DORMANT: no loop task, not active, no sibling RTCP socket.
+            engine = _live_engine(adapter, call_id)
+            assert engine._rtcp_task is None  # no run_rtcp loop started
+            assert engine._rtcp_active is False  # never activated
+            assert engine._rtcp_local_port is None  # no sibling SRTCP socket bound
+    finally:
+        in_call.set()
+        await adapter.disconnect()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_inbound_sdes_savp_call_activates_srtcp_when_opted_in() -> None:
+    """SDES + HERMES_VOIP_SECURED_RTCP_ENABLED=true ACTIVATES RTCP over SRTCP.
+
+    The capability is retained behind the flag (default-off restores audio on non-mux
+    gateways; on a validated gateway the operator opts in). With the flag true, the
+    same RTP/SAVP INVITE drives the live engine to RTCP ACTIVE with the SRTCP transform
+    wired (``_srtcp_in``/``_srtcp_out`` set), and — the offer having no a=rtcp-mux — the
+    sibling SRTCP socket bound on RTP-port+1 (RFC 3550 §11). The outbound RTCP is
+    SRTCP-protected (never cleartext on the secured 5-tuple).
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(
+        transport, media_env={"HERMES_VOIP_SECURED_RTCP_ENABLED": "true"}
+    )
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite(_SDES_OFFER, call_id))
 

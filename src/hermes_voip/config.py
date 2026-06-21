@@ -356,6 +356,17 @@ _DEFAULT_RTP_SYMMETRIC = True
 _RTCP_ENABLED_KEY = "HERMES_VOIP_RTCP_ENABLED"
 _DEFAULT_RTCP_ENABLED = True
 
+# Secured-path RTCP over SRTCP (RFC 3711 §3.4, ADR-0066) — gated OFF by default.
+# When a secured (SDES RTP/SAVP) inbound call has no a=rtcp-mux, activating RTCP
+# opens a sibling SRTCP socket on RTP-port+1 and emits SRTCP on the wire. A live
+# Grandstream UCM that did NOT negotiate rtcp-mux MUTED the media session on that
+# unexpected SRTCP (no two-way audio). So secured-path RTCP is OPT-IN: by default a
+# secured call stays RTCP-dormant (the pre-#160 behaviour, audio works), and the
+# SRTCP capability is retained behind this flag for a gateway-validated rollout. The
+# master _RTCP_ENABLED_KEY kill-switch still applies on top of this.
+_SECURED_RTCP_ENABLED_KEY = "HERMES_VOIP_SECURED_RTCP_ENABLED"
+_DEFAULT_SECURED_RTCP_ENABLED = False
+
 # Call-progress detection (fax CNG/CED + answering-machine detection), ADR-0064.
 # The whole feature is OFF by default — the conversational pipeline assumes a human
 # caller, and turning the detector on adds per-frame Goertzel work and surfaces
@@ -988,9 +999,16 @@ class MediaConfig:
     # direct constructions stay valid and a bare install gets adaptive jitter.
     jitter_max_depth: int = _DEFAULT_JITTER_MAX_DEPTH
     # RTCP (RFC 3550 §6, ADR-0061): when True (the default) the adapter activates the
-    # RTCP SR/RR/SDES/BYE control channel on the cleartext plain-RTP path (a secured
-    # session is not activated — no SRTCP transform). The operator kill-switch.
+    # RTCP SR/RR/SDES/BYE control channel on the cleartext plain-RTP path. The master
+    # operator kill-switch (suppresses ALL RTCP, cleartext and secured).
     rtcp_enabled: bool = _DEFAULT_RTCP_ENABLED
+    # Secured-path RTCP over SRTCP (RFC 3711 §3.4, ADR-0066): when True the adapter
+    # ALSO activates RTCP (wrapped in SRTCP) on the secured SDES (RTP/SAVP) path.
+    # Default FALSE — a live non-mux Grandstream muted the media on the unexpected
+    # SRTCP, so secured RTCP is opt-in pending real-gateway validation; by default the
+    # secured path stays RTCP-dormant (the pre-#160 behaviour). Gated additionally by
+    # ``rtcp_enabled`` (the master kill-switch).
+    secured_rtcp_enabled: bool = _DEFAULT_SECURED_RTCP_ENABLED
     # RFC 4028 session timers (ADR-0071). ``session_expires`` is the interval (seconds)
     # we offer outbound / insert into an inbound 2xx; the refresher refreshes at SE/2
     # and the non-refresher BYEs near expiry, so a dead dialog is reclaimed. ``min_se``
@@ -1332,6 +1350,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         greeting=_parse_greeting(env),
         rtp_symmetric=_parse_bool(env, _RTP_SYMMETRIC_KEY, _DEFAULT_RTP_SYMMETRIC),
         rtcp_enabled=_parse_bool(env, _RTCP_ENABLED_KEY, _DEFAULT_RTCP_ENABLED),
+        secured_rtcp_enabled=_parse_bool(
+            env, _SECURED_RTCP_ENABLED_KEY, _DEFAULT_SECURED_RTCP_ENABLED
+        ),
         barge_in_mode=_parse_enum(
             env, _BARGE_IN_MODE_KEY, _BARGE_IN_MODES, _DEFAULT_BARGE_IN_MODE
         ),

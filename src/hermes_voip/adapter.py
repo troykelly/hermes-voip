@@ -3438,11 +3438,14 @@ class VoipAdapter(BasePlatformAdapter):
         # the dormant RTCP control channel live for this call. On a SECURED SDES/SAVP
         # call (``answer_crypto is not None``) the engine now carries the SRTCP
         # transform (wired above), so RTCP is encrypted+authenticated and may ride the
-        # secured 5-tuple — it is activated via the secured planner (kill-switch only,
-        # no profile gate). On the cleartext plain-RTP path the fail-closed cleartext
-        # planner applies (it gates on the answered profile == RTP/AVP). Done AFTER
-        # connect() so the OS-assigned RTP port (hence the non-muxed RTCP port+1) is
-        # known; the plan mirrors the offer's rtcp-mux (RFC 5761 §5.1.1).
+        # secured 5-tuple — it is activated via the secured planner, which is
+        # FAIL-CLOSED by default: it stays dormant unless the
+        # HERMES_VOIP_SECURED_RTCP_ENABLED opt-in is set (a live non-mux Grandstream
+        # muted the media on unexpected SRTCP), gated additionally by the master
+        # rtcp_enabled kill-switch. On the cleartext plain-RTP path the fail-closed
+        # cleartext planner applies (it gates on the answered profile == RTP/AVP). Done
+        # AFTER connect() so the OS-assigned RTP port (hence the non-muxed RTCP port+1)
+        # is known; the plan mirrors the offer's rtcp-mux (RFC 5761 §5.1.1).
         answered_payload_types = tuple(c.payload_type for c in agreed_sdp_codecs)
         if answer_crypto is not None:
             rtcp_plan = _plan_secured_rtcp_activation(
@@ -3450,6 +3453,7 @@ class VoipAdapter(BasePlatformAdapter):
                 remote_address=remote_address,
                 payload_types=answered_payload_types,
                 rtcp_enabled=media_cfg.rtcp_enabled,
+                secured_rtcp_enabled=media_cfg.secured_rtcp_enabled,
             )
         else:
             rtcp_plan = _plan_rtcp_activation(
@@ -6867,17 +6871,28 @@ def _plan_secured_rtcp_activation(
     remote_address: str,
     payload_types: tuple[int, ...],
     rtcp_enabled: bool,
+    secured_rtcp_enabled: bool,
 ) -> _RtcpActivation | None:
     """Decide whether/how to activate SECURED (SRTCP) RTCP for a SDES call (ADR-0066).
 
-    The secured counterpart of :func:`_plan_rtcp_activation`. It is NOT gated on the
-    answered profile — the SDES caller has already wired the SRTCP transform onto the
-    engine, so RTCP is encrypted+authenticated (RFC 3711 §3.4) and may ride the secured
-    5-tuple. Only the operator kill-switch suppresses it. The transport choice (mux vs
-    sibling port) is identical to the cleartext path: mirror the offer's ``a=rtcp-mux``
-    (RFC 5761 §5.1.1), but REFUSE mux (fall back to RTP-port+1, RFC 3550 §11) when any
-    negotiated RTP payload type lands in the RFC 5761 §4 conflict range (64-95). The
-    plugin's own codecs never use that range, so a normal SDES call keeps mux.
+    The secured counterpart of :func:`_plan_rtcp_activation`. Like the cleartext
+    planner it is FAIL-CLOSED by default: it returns ``None`` (RTCP dormant) UNLESS the
+    secured-RTCP opt-in is set, mirroring the cleartext path's posture. The opt-in
+    exists because emitting SRTCP on a real gateway that did NOT negotiate
+    ``a=rtcp-mux`` MUTED the media on a live call — the sibling SRTCP socket on
+    RTP-port+1 broke the session (the live regression behind ADR-0061 §live). So the
+    default restores the pre-#160 behaviour (secured calls stay RTCP-dormant, audio
+    works), and the SRTCP capability is retained behind the flag for a
+    gateway-validated rollout.
+
+    When BOTH gates are open, activation is unconditional on the answered profile (the
+    SDES caller has already wired the SRTCP transform onto the engine, so RTCP is
+    encrypted+authenticated per RFC 3711 §3.4 and may ride the secured 5-tuple). The
+    transport choice (mux vs sibling port) is identical to the cleartext path: mirror
+    the offer's ``a=rtcp-mux`` (RFC 5761 §5.1.1), but REFUSE mux (fall back to
+    RTP-port+1, RFC 3550 §11) when any negotiated RTP payload type lands in the RFC
+    5761 §4 conflict range (64-95). The plugin's own codecs never use that range, so a
+    normal SDES call keeps mux.
 
     This is for the SDES/SIP-over-TLS path, where the engine binds its OWN UDP socket
     and can therefore open the non-muxed sibling. The DTLS/WebRTC paths ride a single
@@ -6887,12 +6902,15 @@ def _plan_secured_rtcp_activation(
         offer_audio: The inbound offer's audio media (port + ``rtcp_mux`` flag).
         remote_address: The peer's effective RTP address (post c=/comedia resolution).
         payload_types: The negotiated/answered RTP payload types (RFC 5761 §4 check).
-        rtcp_enabled: The operator kill-switch (``MediaConfig.rtcp_enabled``).
+        rtcp_enabled: The master operator kill-switch (``MediaConfig.rtcp_enabled``).
+        secured_rtcp_enabled: The secured-path opt-in
+            (``MediaConfig.secured_rtcp_enabled``, ``HERMES_VOIP_SECURED_RTCP_ENABLED``,
+            default ``False``). When ``False`` the secured path stays RTCP-dormant.
 
     Returns:
-        An :class:`_RtcpActivation` plan, or ``None`` when the kill-switch is off.
+        An :class:`_RtcpActivation` plan, or ``None`` when either gate is closed.
     """
-    if not rtcp_enabled:
+    if not rtcp_enabled or not secured_rtcp_enabled:
         return None
     mux = negotiate_rtcp_mux(offer_audio)
     if mux and any(

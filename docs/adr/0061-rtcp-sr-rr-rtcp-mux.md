@@ -160,6 +160,32 @@ on every secured path (SDES, SIP-DTLS, WebRTC) instead of staying dormant.
 - The operator kill-switch is still `HERMES_VOIP_RTCP_ENABLED` (default on); it now suppresses
   RTCP on secured calls too.
 
+### Secured-path RTCP is OPT-IN, default off (live finding, 2026-06-21)
+
+The "activate on every secured path" posture of the 2026-06-20 refinement broke a **real
+call**. On a live inbound SDES (RTP/SAVP) call to a Grandstream UCM that did **not** negotiate
+`a=rtcp-mux`, `_plan_secured_rtcp_activation` (then gated by the kill-switch only) activated
+RTCP, so the engine opened the sibling SRTCP socket on RTP-port+1 and emitted SRTCP on the
+wire. The gateway **muted the media session** in response — no two-way audio. Setting
+`HERMES_VOIP_RTCP_ENABLED=false` restored audio, confirming the activation as the cause.
+(Engine-isolation probes showed the RTP datapath itself survives RTCP activation on loopback;
+the break is the wire interaction with a strict real gateway, which localhost cannot
+reproduce.)
+
+**Decision:** secured-path RTCP is now **opt-in, default off**, mirroring the cleartext
+planner's fail-closed posture. A new `MediaConfig.secured_rtcp_enabled`
+(env `HERMES_VOIP_SECURED_RTCP_ENABLED`, default `False`) gates
+`_plan_secured_rtcp_activation`: it returns `None` (RTCP dormant, no sibling socket, no SRTCP
+on the wire) unless the flag is true **and** the master `rtcp_enabled` kill-switch is true.
+So by default a secured call has exactly the pre-#160 behaviour (audio works); the SRTCP
+capability is **retained behind the flag** for a gateway-validated rollout. This corrects the
+earlier "kill-switch only, no profile gate" description of the SDES secured planner. The
+muxed DTLS/WebRTC path (`_activate_muxed_srtcp_rtcp`, single ICE/UDP pipe, no sibling socket)
+is unchanged and still governed by the master kill-switch only — the non-mux sibling-socket
+hazard does not arise there. **Follow-up (integration-seam gap):** there is no end-to-end
+real-socket test of a secured inbound call (the e2e fake gateway sends only cleartext RTP),
+so the opt-in path's wire behaviour against a strict gateway remains validated only by hand.
+
 ## Consequences
 
 - The SLO catalogue's packet-loss / jitter / RTT / packets-sent-received signals now have a

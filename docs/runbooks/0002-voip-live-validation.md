@@ -668,32 +668,45 @@ Pass criteria:
   (`RefreshTeardown`); a transient `5xx`/`488` keeps the call up and retries at the next SE/2
   (`RefreshContinue`) — these are correct, not failures.
 
-### 9c. Secured-path RTCP rides SRTCP (ADR-0066/0061) — verify it is ACTIVE, not dormant
+### 9c. Secured-path RTCP over SRTCP (ADR-0066/0061) — DEFAULT-OFF after a live finding
 
-On a **secured** call (SDES / DTLS-SRTP / WebRTC) RTCP is **active and protected by SRTCP**
-(RFC 3711 §3.4) — it is **not** dormant and it is **never** cleartext. The engine's
-`start_rtcp` activates a secured engine only once the SRTCP transform is wired
-(`_is_secured and not _has_srtcp` stays dormant; `_has_srtcp` ⇒ both `_srtcp_in` and
-`_srtcp_out` set ⇒ activates). The adapter wires it per path: SDES via
-`_srtcp_inbound_from_offer`/`_srtcp_outbound_from_answer` → `_plan_secured_rtcp_activation`
-(its own UDP socket, so rtcp-mux is negotiable / a sibling port is possible); DTLS-SRTP and
-WebRTC via `session.derive_srtcp_sessions()` → `_activate_muxed_srtcp_rtcp` (one ICE/UDP
-pipe, so **mux is forced**). Every outbound RTCP is encrypted+authenticated by
-`_emit_rtcp → _srtcp_out.protect`; every inbound one is verified+decrypted by
-`_ingest_rtcp_datagram → _srtcp_in.unprotect` (a bad tag is dropped, not fatal). The kill
-switch is `HERMES_VOIP_RTCP_ENABLED` (default `true`).
+**Live finding (2026-06-21):** when secured-path RTCP was activated unconditionally
+(`HERMES_VOIP_SECURED_RTCP_ENABLED` did not yet exist), a real Grandstream UCM that did
+**not** negotiate `a=rtcp-mux` **MUTED the media** on a secured SDES call — the unexpected
+SRTCP on the sibling RTP-port+1 socket broke the session (no two-way audio). Setting
+`HERMES_VOIP_RTCP_ENABLED=false` restored audio. So secured-path RTCP is now **opt-in,
+default off**: by default a secured call stays **RTCP-dormant** (no sibling socket, no SRTCP
+on the wire), which is the audio-working posture.
+
+The SRTCP capability (RFC 3711 §3.4) is retained behind the flag. With
+`HERMES_VOIP_SECURED_RTCP_ENABLED=true` (and the master `HERMES_VOIP_RTCP_ENABLED=true`),
+secured RTCP activates: the engine's `start_rtcp` runs only once the SRTCP transform is
+wired (`_has_srtcp` ⇒ both `_srtcp_in` and `_srtcp_out` set). The adapter wires it per path:
+SDES via `_srtcp_inbound_from_offer`/`_srtcp_outbound_from_answer` →
+`_plan_secured_rtcp_activation` (its own UDP socket, so rtcp-mux is negotiable / a sibling
+port is possible); DTLS-SRTP and WebRTC via `session.derive_srtcp_sessions()` →
+`_activate_muxed_srtcp_rtcp` (one ICE/UDP pipe, so **mux is forced**). Every outbound RTCP
+is encrypted+authenticated by `_emit_rtcp → _srtcp_out.protect`; every inbound one is
+verified+decrypted by `_ingest_rtcp_datagram → _srtcp_in.unprotect` (a bad tag is dropped,
+not fatal).
 
 ```bash
-# On a secured call, RTCP activation logs the muxed-SRTCP line (DTLS/WebRTC path):
+# DEFAULT (flag off): a secured call shows NO "RTCP active" line — RTCP is dormant.
+grep -E "RTCP active" /tmp/hermes-voip-live.log | tail -5   # → (no output on a secured call)
+
+# OPT-IN (HERMES_VOIP_SECURED_RTCP_ENABLED=true): secured RTCP activates, logged as SRTCP.
 grep -E "RTCP active \(rtcp-mux, SRTCP\)|RTCP active" /tmp/hermes-voip-live.log | tail -5
-# → INVITE <id>: RTCP active (rtcp-mux, SRTCP)
+# → INVITE <id>: RTCP active (rtcp-mux, SRTCP)   (DTLS/WebRTC; SDES logs the port+1/SRTCP line)
 ```
 
 Pass criteria:
 
-- On a secured call RTCP is **activated** (the `RTCP active … SRTCP` line on the muxed
-  DTLS/WebRTC path; the SDES path activates equivalently via the secured planner). It is
-  **not** left dormant the way a secured-without-SRTCP engine would be.
+- **Default (flag off):** a secured call has **no** `RTCP active` line and two-way audio
+  works — RTCP stays dormant (the pre-regression behaviour). This is the baseline to run
+  for the live two-way-audio check (§9a/§9b).
+- **Opt-in (flag on), only on a gateway validated to tolerate it:** a secured call **does**
+  activate (`RTCP active … SRTCP`), and two-way audio still works. Do not enable this
+  against a gateway that mutes on non-mux SRTCP.
 - The cleartext RTCP planner (`_plan_rtcp_activation`, gated on the answered profile being
   **exactly** `RTP/AVP`) is **NOT** used for any secured profile — secured calls never emit
   cleartext RTCP (no SSRC/CNAME/timing leak on the secured 5-tuple). On a **plain `RTP/AVP`**

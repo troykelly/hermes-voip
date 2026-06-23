@@ -95,6 +95,86 @@ jobs:
       - run: uv run python -c "import cryptography; from hermes_voip.media.srtp import SrtpSession, SrtpError; print('media stack cryptography', cryptography.__version__)"
       - run: uv run pytest -rs
 
+  # Builds the wheel + sdist from a CLEAN environment (no editable dev install),
+  # installs the built wheel into a fresh venv, and asserts the three release-
+  # blocker properties:
+  #   1. hermes_voip.__version__ resolves from installed distribution metadata
+  #      (not the "0+unknown" fallback) and matches pyproject.toml [project].version.
+  #   2. plugin.yaml is actually packaged INSIDE the wheel zipfile (hatchling does
+  #      not include non-.py files by default; the pyproject.toml artifacts
+  #      declaration is what causes it to land — this job proves it does).
+  #   3. The hermes_agent.plugins entry point group resolves via
+  #      importlib.metadata.entry_points() to hermes_voip, which exposes a
+  #      `register` callable (the Hermes runtime entry point).
+  #
+  # A broken wheel (missing plugin.yaml, wrong/missing entry point, absent
+  # metadata) would pass every other CI job green yet fail to load in the real
+  # Hermes runtime. This job closes that gap. Separate job so the build +
+  # fresh-venv install is isolated from the editable dev install used by the
+  # other jobs (rule 11: never trust an agent's in-worktree install for
+  # distribution verification).
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      # Build wheel + sdist. No editable install: uv build uses a temporary
+      # isolated build environment; the output lands in dist/.
+      - run: uv build
+      # Install the built wheel into a FRESH venv (not the dev venv). Using
+      # uv pip install --python keeps us uv-only (rule 38). The venv lives
+      # under the worktree-local dist dir so it is cleaned with the worktree
+      # (rule 10: no /tmp build dirs).
+      - run: uv venv dist/.smoke-venv
+      - run: uv pip install --python dist/.smoke-venv/bin/python dist/*.whl
+      # Assertion 1: __version__ resolves from installed metadata and matches
+      # pyproject.toml [project].version (not the "0+unknown" fallback produced
+      # when no distribution metadata is present).
+      - name: assert version metadata
+        run: |
+          PYPROJECT_VER=$(uv run python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); print(d['project']['version'])")
+          INSTALLED_VER=$(dist/.smoke-venv/bin/python -c "import hermes_voip; print(hermes_voip.__version__)")
+          echo "pyproject.toml version : $PYPROJECT_VER"
+          echo "installed __version__  : $INSTALLED_VER"
+          test "$INSTALLED_VER" != "0+unknown" || { echo "FAIL: __version__ is 0+unknown — no distribution metadata in wheel"; exit 1; }
+          test "$INSTALLED_VER" = "$PYPROJECT_VER" || { echo "FAIL: __version__ ($INSTALLED_VER) != pyproject.toml ($PYPROJECT_VER)"; exit 1; }
+          echo "PASS: version $INSTALLED_VER matches pyproject.toml"
+      # Assertion 2: plugin.yaml is packaged inside the wheel zipfile.
+      - name: assert plugin.yaml in wheel
+        run: |
+          dist/.smoke-venv/bin/python -c "
+          import zipfile, glob, sys
+          wheels = glob.glob('dist/*.whl')
+          assert wheels, 'no wheel found in dist/'
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if not any(n.endswith('plugin.yaml') for n in names):
+              print('FAIL: plugin.yaml NOT in wheel', wheels[0])
+              print('Contents:', [n for n in names if 'plugin' in n or 'yaml' in n])
+              sys.exit(1)
+          print('PASS: plugin.yaml found in wheel', wheels[0])
+          "
+      # Assertion 3: hermes_agent.plugins entry point resolves to hermes_voip
+      # with a `register` callable.
+      - name: assert entry point resolves
+        run: |
+          dist/.smoke-venv/bin/python -c "
+          from importlib.metadata import entry_points
+          import sys
+          eps = list(entry_points(group='hermes_agent.plugins'))
+          voip = next((ep for ep in eps if ep.name == 'hermes-voip'), None)
+          if voip is None:
+              print('FAIL: no hermes-voip in hermes_agent.plugins entry points:', eps)
+              sys.exit(1)
+          module = voip.load()
+          if not hasattr(module, 'register') or not callable(module.register):
+              print('FAIL: hermes_voip.register not found or not callable')
+              sys.exit(1)
+          print('PASS: entry point hermes-voip ->', voip.value, '| register:', module.register)
+          "
+
   # Runs the WebRTC transport tests with the optional `webrtc` extra installed
   # (websockets + pyopenssl + aioice — ADR-0016 building blocks: PR-A WSS,
   # PR-C DTLS, PR-D ICE).  Separate job so the WebRTC libraries stay out of

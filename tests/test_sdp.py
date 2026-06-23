@@ -34,6 +34,7 @@ from hermes_voip.sdp import (
     SessionDescription,
     SetupRole,
     _AudioAccumulator,
+    _negotiate_answer_crypto,
     build_audio_answer,
     build_audio_offer,
     build_sip_dtls_answer,
@@ -2596,3 +2597,94 @@ def test_parse_rejects_ptime_zero() -> None:
     """The parser MUST reject ptime=0 with SdpError (non-positive ptime is invalid)."""
     with pytest.raises(SdpError, match=r"ptime"):
         SessionDescription.parse(_SDP_PTIME_ZERO)
+
+
+# --- W3 (security): SDES answer selects the STRONGEST offered suite, not the
+# first-offered (within-SRTP downgrade fix). RFC 4568 lets the answerer pick any
+# ONE offered crypto; honouring offer ORDER lets a gateway (or a MITM that can
+# reorder the offer) put AES_CM_128_HMAC_SHA1_32 (32-bit auth tag) first and pull
+# the answer to the weaker integrity tag while both stay encrypted. The answerer
+# MUST select the offered+supported suite with the strongest auth tag (SHA1_80
+# over SHA1_32), falling back to the single/only suite when there is just one.
+
+_SUITE_80 = "AES_CM_128_HMAC_SHA1_80"
+
+
+def _savp_offer_two_crypto(first: str, second: str) -> str:
+    """An RTP/SAVP audio offer carrying two a=crypto lines (tag 1 then tag 2)."""
+    return (
+        "v=0\r\n"
+        "o=- 1 1 IN IP4 192.0.2.2\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.2\r\n"
+        "t=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:1 {first} inline:{_FAKE_KEY}\r\n"
+        f"a=crypto:2 {second} inline:{_FAKE_KEY}\r\n"
+        "a=sendrecv\r\n"
+    )
+
+
+def test_answer_selects_sha1_80_when_sha1_32_offered_first() -> None:
+    # DOWNGRADE FIX: SHA1_32 (tag 1) is listed BEFORE SHA1_80 (tag 2). The answer
+    # MUST select the STRONGER SHA1_80 (tag 2), NOT the first-offered SHA1_32.
+    offer = SessionDescription.parse(_savp_offer_two_crypto(_SUITE_32, _SUITE_80))
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        crypto=f"{_SUITE_80} inline:{_FAKE_ANSWER_KEY}",
+    )
+    # The answer echoes the STRONGER suite under its tag (2), with OUR key.
+    assert f"a=crypto:2 {_SUITE_80} inline:{_FAKE_ANSWER_KEY}" in text
+    # The weaker first-offered suite is NOT selected.
+    assert f"a=crypto:1 {_SUITE_32}" not in text
+    assert _SUITE_32 not in text
+    # Negative control: the offerer's key material is never echoed back.
+    assert _FAKE_KEY not in text
+
+
+def test_answer_selects_sha1_80_when_sha1_80_offered_first() -> None:
+    # No regression: SHA1_80 first already wins; tag is preserved.
+    offer = SessionDescription.parse(_savp_offer_two_crypto(_SUITE_80, _SUITE_32))
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        crypto=f"{_SUITE_80} inline:{_FAKE_ANSWER_KEY}",
+    )
+    assert f"a=crypto:1 {_SUITE_80} inline:{_FAKE_ANSWER_KEY}" in text
+    assert _SUITE_32 not in text
+
+
+def test_answer_keeps_sha1_32_when_only_weak_suite_offered() -> None:
+    # No regression: when SHA1_32 is the ONLY offered suite, it is still accepted
+    # (selecting the strongest among one suite is that suite).
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\ns=-\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:5 {_SUITE_32} inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        crypto=f"{_SUITE_32} inline:{_FAKE_ANSWER_KEY}",
+    )
+    assert f"a=crypto:5 {_SUITE_32} inline:{_FAKE_ANSWER_KEY}" in text
+
+
+def test_negotiate_answer_crypto_picks_strongest_directly() -> None:
+    # Direct (sans-IO) check of _negotiate_answer_crypto: SHA1_32 first, SHA1_80
+    # second -> the returned attribute echoes the SHA1_80 suite + its tag.
+    offer = SessionDescription.parse(_savp_offer_two_crypto(_SUITE_32, _SUITE_80))
+    assert offer.audio is not None
+    accepted = _negotiate_answer_crypto(
+        offer.audio, f"{_SUITE_80} inline:{_FAKE_ANSWER_KEY}"
+    )
+    assert accepted.suite == _SUITE_80
+    assert accepted.tag == 2

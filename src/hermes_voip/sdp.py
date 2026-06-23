@@ -2023,10 +2023,16 @@ def _negotiate_answer_crypto(
 ) -> CryptoAttribute:
     """Pick the answer's ``a=crypto`` for a secured (SAVP) offer (RFC 4568).
 
-    Selects the first supported, well-formed crypto the offer carried
-    (``audio.crypto_attrs`` already excludes malformed/unsupported lines), and
-    returns a :class:`CryptoAttribute` echoing that accepted offer's tag + suite
-    with our own key material taken from ``our_crypto``.
+    Among the supported, well-formed crypto the offer carried
+    (``audio.crypto_attrs`` already excludes malformed/unsupported lines),
+    selects the STRONGEST suite — the one with the longest SRTP auth tag
+    (``AES_CM_128_HMAC_SHA1_80`` over ``AES_CM_128_HMAC_SHA1_32``) — and returns
+    a :class:`CryptoAttribute` echoing that accepted offer's tag + suite with our
+    own key material taken from ``our_crypto``. RFC 4568 lets the answerer pick
+    any one offered suite; choosing by strength (not offer order) closes a
+    within-SRTP integrity downgrade where an offer (or a MITM that reordered it)
+    lists the weaker 32-bit-tag suite first. On a strength tie (or a single
+    suite) the first-offered of the strongest suites wins.
 
     Raises:
         SdpError: If ``our_crypto`` is missing, the offer carried no supported
@@ -2039,7 +2045,15 @@ def _negotiate_answer_crypto(
     if not audio.crypto_attrs:
         msg = "RTP/SAVP offer carried no supported, well-formed a=crypto to accept"
         raise SdpError(msg)
-    accepted = audio.crypto_attrs[0]
+    # Lazy import: media.srtp imports CryptoAttribute from this module at import
+    # time, so a module-level import here would be circular.
+    from hermes_voip.media.srtp import crypto_suite_strength  # noqa: PLC0415
+
+    # max() returns the FIRST element of maximal key, so a strength tie (or a
+    # single suite) keeps the first-offered — preserving prior behaviour.
+    accepted = max(
+        audio.crypto_attrs, key=lambda attr: crypto_suite_strength(attr.suite)
+    )
     our_attr = _coerce_crypto(our_crypto)
     # our_attr is non-None: our_crypto was non-None above and _coerce_crypto only
     # returns None for a None input.

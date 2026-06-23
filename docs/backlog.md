@@ -991,7 +991,7 @@ These span multiple modules or the repo as a whole.
 
 ## Review follow-ups (Wave 4 release-blocker reviews, 2026-06-23)
 
-- [ ] **[high] security** — `transfer_blind(target, ...)` passes an agent-supplied `target` (extension OR
+- [x] **[high] security** (#193) — `transfer_blind(target, ...)` passes an agent-supplied `target` (extension OR
   SIP URI) straight into a `Refer-To: <target>` REFER header via `build_blind_refer` (`refer.py`) with
   `urllib.quote/unquote` handling and NO dialable-grammar gate. A `target` like `1001@evil.com` or one
   bearing `?Replaces=` / `;`-params could redirect/smuggle into the REFER-To URI — the SAME injection class

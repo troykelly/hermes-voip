@@ -32,6 +32,8 @@ from pathlib import Path
 
 import yaml
 
+import hermes_voip
+
 # ---------------------------------------------------------------------------
 # Locations: the repo source tree (so the test runs from a checkout) + the
 # importable package-data copy (so the built wheel is covered too).
@@ -161,6 +163,21 @@ def test_manifest_version_matches_pyproject() -> None:
     manifest = _load_manifest(_PACKAGING_MANIFEST)
     assert manifest.get("version") == _pyproject_version(), (
         "plugin.yaml version must match pyproject.toml [project].version"
+    )
+
+
+def test_package_version_matches_pyproject() -> None:
+    """hermes_voip.__version__ must equal pyproject.toml [project].version.
+
+    A release bump can silently leave the package runtime version out of sync
+    with the declared package version.  This guard catches that drift: if a
+    developer bumps pyproject.toml [project].version without updating
+    ``src/hermes_voip/__init__.py __version__`` (or vice-versa), this test
+    fails at release time rather than silently shipping a mismatched package.
+    """
+    assert hermes_voip.__version__ == _pyproject_version(), (
+        f"hermes_voip.__version__ ({hermes_voip.__version__!r}) must match "
+        f"pyproject.toml [project].version ({_pyproject_version()!r})"
     )
 
 

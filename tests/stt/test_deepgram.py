@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import struct
 from collections.abc import AsyncIterator
 
@@ -291,3 +292,131 @@ async def test_deepgram_asr_send_error_surfaces_promptly() -> None:
 
 async def _collect(it: AsyncIterator[Transcript]) -> list[Transcript]:
     return [t async for t in it]
+
+
+# ---------------------------------------------------------------------------
+# Malformed-frame guard tests (robustness — a single bad frame must not kill
+# the stream; rule 37: genuine errors still propagate).
+# ---------------------------------------------------------------------------
+
+
+def test_map_event_returns_none_for_non_json() -> None:
+    """_map_event must return None for a non-JSON frame (not raise JSONDecodeError).
+
+    A transient Deepgram hiccup or binary-misclassified-as-text frame must not
+    propagate json.JSONDecodeError up through _receive → _generate → CallLoop.
+    """
+    from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
+
+    result = _map_event("this is not json at all!!!")
+    assert result is None
+
+
+def test_map_event_returns_none_for_valid_json_wrong_shape() -> None:
+    """_map_event must return None for valid JSON that lacks the expected fields.
+
+    A valid-JSON-but-wrong-shape Flux frame (e.g. unexpected schema variant)
+    must not propagate KeyError or TypeError — it should be skipped silently.
+    """
+    from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
+
+    # A JSON object that has neither "transcript" nor "type" at the top level.
+    result = _map_event(json.dumps({"totally": "unexpected", "keys": [1, 2, 3]}))
+    # No "transcript" key means empty text → already returns None via existing
+    # logic, so this also exercises that path is safe.
+    assert result is None
+
+    # A JSON primitive (not a dict) — event.get() would raise AttributeError.
+    result = _map_event(json.dumps(["list", "not", "dict"]))
+    assert result is None
+
+    # A JSON dict with a non-string "type" — no TypeError must escape.
+    result = _map_event(json.dumps({"type": 42, "transcript": "hello"}))
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_stream_survives_malformed_frame_between_valid_ones() -> None:
+    """A malformed frame between valid Flux events must not kill the stream.
+
+    The receiver must skip bad frames and continue delivering subsequent
+    valid transcripts — the live call must not end due to a single bad frame.
+    """
+    # Interleave a non-JSON frame between two valid Update events.
+    events = (
+        json.dumps({"type": "Update", "transcript": "hello", "end_of_turn": False}),
+        "<<<not json>>>",  # malformed — must be skipped, not fatal
+        json.dumps(
+            {"type": "EndOfTurn", "transcript": "hello world", "end_of_turn": True}
+        ),
+    )
+    socket = _FakeFluxSocket(events)
+    asr = _asr_with(socket)
+
+    out = await asyncio.wait_for(
+        _collect(asr.stream(_frames(_frame(0)))),
+        timeout=2.0,
+    )
+
+    # Both valid transcripts must arrive; the malformed frame must be skipped.
+    assert [(t.text, t.is_final) for t in out] == [
+        ("hello", False),
+        ("hello world", True),
+    ]
+
+
+def test_malformed_frame_warning_does_not_log_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The dropped-frame warning must NOT contain any slice of raw frame bytes.
+
+    Rule 34 (content-leak guard): Flux frames carry transcribed speech and call
+    metadata — logging ANY byte of content (even a 1-byte prefix) would leak
+    sensitive data to the operator log stream.  Only the frame length (a safe
+    integer) is permitted.
+
+    The sentinel ``Zorblax-private-utterance`` is distinctive enough that a
+    1-character or 8-character prefix appearing in a log message is unambiguously
+    a content leak, not a coincidence.  This test catches the prior regression
+    where ``first_byte=%r`` logged ``raw[:1]`` — the existing full-string check
+    would have missed that because ``"Z"`` is NOT ``"Zorblax-private-utterance"``.
+    """
+    from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
+
+    # Distinctive, low-entropy sentinel (recognisable words, no high-entropy run)
+    # so the public-repo leak scanner (.gitleaks.toml, rule 34) does not flag this
+    # fixture as a credential; the recognisable prefix still makes partial-slice
+    # leaks (raw[:1] = "Z", raw[:8] = "Zorblax-") detectable.
+    sensitive_content = "Zorblax-private-utterance caller said transfer to account"
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.stt.deepgram"):
+        result = _map_event(sensitive_content)
+
+    assert result is None  # still returns None (non-regression)
+
+    # The warning MUST have been emitted — proves the guard path actually ran.
+    assert len(caplog.records) >= 1, "expected at least one warning log record"
+
+    # No log message may contain ANY slice of the raw frame content:
+    #   - the full string (original assertion)
+    #   - the first byte  raw[:1]  = "Z"        ← caught the prior first_byte=%r leak
+    #   - an 8-char prefix raw[:8] = "Zorblax-" ← catches any short-prefix variant
+    #   - the distinctive marker itself (subset of the full string, belt-and-braces)
+    first_byte = sensitive_content[:1]  # "Z"
+    first_eight = sensitive_content[:8]  # "Zorblax-"
+    marker_phrase = "Zorblax-private-utterance"
+
+    for record in caplog.records:
+        msg = record.getMessage()
+        assert sensitive_content not in msg, (
+            f"full raw frame content leaked into log: {msg!r}"
+        )
+        assert first_byte not in msg, (
+            f"first-byte prefix of raw frame leaked into log"
+            f" (raw[:1]={first_byte!r}): {msg!r}"
+        )
+        assert first_eight not in msg, (
+            f"8-char prefix of raw frame leaked into log"
+            f" (raw[:8]={first_eight!r}): {msg!r}"
+        )
+        assert marker_phrase not in msg, f"distinctive marker leaked into log: {msg!r}"

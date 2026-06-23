@@ -43,6 +43,7 @@ import asyncio
 import contextlib
 import importlib
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Final, Protocol
 
@@ -51,6 +52,8 @@ from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 
 __all__ = ["DeepgramASR"]
+
+_log = logging.getLogger(__name__)
 
 # Deepgram Flux WebSocket endpoint + native telephony framing (mu-law @ 8 kHz).
 _FLUX_ENDPOINT: Final[str] = (
@@ -275,17 +278,59 @@ async def _receive(socket: _FluxSocket, out: asyncio.Queue[Transcript]) -> None:
             await out.put(transcript)
 
 
+def _parse_flux_frame(raw: str) -> tuple[str, str] | None:
+    """Parse a raw Flux text frame into ``(text, event_type)``, or ``None`` to skip.
+
+    Returns ``None`` for any malformed or wrong-shape frame — a single bad
+    frame must not kill the live call (robustness).  Each bad frame is logged
+    at WARNING level with a safe summary (NO raw frame content — rule 34).
+    Genuine task/connection failures propagate normally (rule 37).
+    """
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        _log.warning(
+            "deepgram: dropping unparseable Flux frame (len=%d)",
+            len(raw),
+        )
+        return None
+
+    # Guard: Flux events are JSON objects; any other JSON shape is unexpected.
+    if not isinstance(event, dict):
+        _log.warning(
+            "deepgram: skipping unexpected Flux frame shape (type=%s)",
+            type(event).__name__,
+        )
+        return None
+
+    text = event.get("transcript", "")
+    event_type = event.get("type", "")
+
+    # Guard: both fields must be strings for the subsequent comparisons to be
+    # meaningful.  A non-string "type" (e.g. integer) is not a valid Flux event.
+    if not isinstance(text, str) or not isinstance(event_type, str):
+        _log.warning(
+            "deepgram: Flux frame has non-string transcript/type fields, skipping"
+        )
+        return None
+
+    return text, event_type
+
+
 def _map_event(raw: str) -> Transcript | None:
     """Map one Flux JSON event to a ``Transcript``, or ``None`` to skip it.
 
     Control/metadata events (and empty hypotheses) yield ``None``; ``Update`` is
     interim; ``EndOfTurn`` / ``EagerEndOfTurn`` finalise the turn natively.
+    Malformed or wrong-shape frames are skipped via :func:`_parse_flux_frame`
+    so a single bad frame cannot kill the live call.
     """
-    event = json.loads(raw)
-    text = event.get("transcript", "")
+    parsed = _parse_flux_frame(raw)
+    if parsed is None:
+        return None
+    text, event_type = parsed
     if not text:
         return None
-    event_type = event.get("type", "")
     is_turn_end = event_type in _END_OF_TURN
     if event_type != _UPDATE and not is_turn_end:
         return None

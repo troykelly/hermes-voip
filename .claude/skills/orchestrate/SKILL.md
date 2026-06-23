@@ -32,12 +32,22 @@ Banned end-states (treat each as a trigger, not a terminus):
   conclusion. Decisions gate on **observable evidence** (queue counts, gate exit codes,
   dry-streak), never a vibe.
 
-**Continuation guarantee (do this every wave, last):** if running under `/loop` (dynamic
-mode), your final action is
-`ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…, reason=…)`. This is mandatory
-even when a wave shipped nothing — a wave that returns without scheduling the next is a
-broken loop. See **Exit condition** for the only escape, which is itself a long idle-poll,
-not a halt.
+**Continuation guarantee (do this every wave, last):** The loop runs in one of two modes:
+
+- **Dynamic mode** (`/loop` with no interval): your final action is
+  `ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…, reason=…)`. Mandatory even
+  when a wave shipped nothing.
+- **Cron mode** (`/loop /orchestrate` with an interval, e.g. `*/10 * * * *`): the `/loop`
+  skill fires `/orchestrate` on its fixed schedule — that cron IS the continuation. If
+  `ScheduleWakeup` responds with "the /loop dynamic runtime gate is off … the loop has
+  ended; do not re-issue", you are in cron mode. This is NORMAL, not an error. Do NOT
+  delete the cron (doing so breaks the loop), and do NOT re-issue `ScheduleWakeup` after it
+  refuses. A cron-fired `/orchestrate` lands in the same session with preserved context, so
+  a mid-wave tick is recognised as already in-flight and handled — never treated as an
+  overlapping wave.
+
+Either way, the next wave is guaranteed. See **Exit condition** for the only escape, which
+is itself a long idle-poll, not a halt.
 
 ---
 
@@ -72,7 +82,7 @@ You keep **no long-term state in context**. Every wave reconstructs from disk:
 |---|---|
 | `docs/backlog.md` | **Canonical prioritized queue.** Checkbox items, `[high]/[medium]/[low]` + kind tags. Shipped → checked off with the PR #. New gaps → appended. |
 | `gh pr list` / `gh issue list` | In-flight state + secondary queue. |
-| `.orchestrator/state.json` (gitignored) | Optimization only: wave #, in-flight `{item↔branch}`, retry counts, gap-review cadence, **dry-streak**. If absent/lost, rebuild from `backlog.md` + `gh`. |
+| `.orchestrator/state.json` (gitignored) | **Best-effort / optional.** Attempt the write; if the worktree hook blocks it (the `enforce-worktree` PreToolUse hook blocks ALL root-checkout writes, including gitignored paths — this is the current behaviour), run stateless and rebuild from `backlog.md` + `gh`; treat a blocked write as expected, not a failure. See schema below. |
 | memory MCP (qdrant) | Decisions, gotchas, operator feedback. **Orchestrator-only** (single-process lock — subagents must NEVER call qdrant). Degrade gracefully if locked/unavailable. |
 
 `.orchestrator/state.json` schema (all optional; rebuildable):
@@ -157,6 +167,14 @@ For each item with a **clean** verdict:
    squash title. Slow CI must **not** block the wave — leave the PR open and let Phase 0 of
    the next wave reap it. PR shepherding is idempotent across waves.
 
+   > **Branch-protection note.** This repo may have NO required-status-check branch
+   > protection, so `gh pr merge --auto` merges immediately without waiting for CI. For any
+   > CODE change, do NOT use `--auto` blindly: poll `gh pr checks <n>` until the CI jobs
+   > you care about are green, then merge explicitly. Docs/config PRs (no Python surface, no
+   > gate-relevant change) may be merged once the fast `gate` + `scan` jobs pass while
+   > slower extras jobs (`hermes-contract`, etc.) are still running — but verify those slower
+   > jobs do not cover the changed surface before proceeding.
+
 ### Phase 6 — INTEGRATE & CLEAN
 1. Check off the shipped backlog item(s) with the PR # (batch into the next docs lane).
 2. `git worktree remove --force <lane>` + `git worktree prune`.
@@ -168,12 +186,21 @@ For each item with a **clean** verdict:
    in a batched docs lane.
 
 ### Phase 7 — CONTINUE  (never skip)
-1. Update `.orchestrator/state.json` (wave++, in-flight, counters, dryStreak).
+1. Attempt to update `.orchestrator/state.json` (wave++, in-flight, counters, dryStreak).
+   If the `enforce-worktree` hook blocks the write (it currently does — it blocks all
+   root-checkout writes even to gitignored paths), skip it silently and run stateless; the
+   wave-state is rebuilt next wave from `backlog.md` + `gh` + memory.
 2. Emit a tight wave report: shipped+merged, opened, discovered, cleaned, and the **next
    wave's plan**. Never end on a "good stopping point".
-3. **Guarantee the next wave:** `ScheduleWakeup(prompt="/loop /orchestrate", …)`. Pick the
-   delay by what you're waiting on (CI in flight → ~270s; otherwise 1200–1800s). This is the
-   anti-stop backstop independent of the `/loop` harness.
+3. **Guarantee the next wave:**
+   - If in **dynamic mode**: `ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…,
+     reason="next orchestration wave")`. Pick the delay by what you're waiting on
+     (CI in flight → ~270s; otherwise 1200–1800s).
+   - If `ScheduleWakeup` reports the dynamic runtime gate is off (cron mode): the fixed
+     cron IS the continuation — do not delete it, do not re-issue `ScheduleWakeup`; the
+     next wave fires automatically. This is the normal operating mode when the loop was
+     started with an interval (e.g. `/loop /orchestrate` via a `*/10 * * * *` cron).
+   Either path guarantees the next wave.
 
 ---
 
@@ -284,5 +311,7 @@ Workflow({scriptPath:".claude/skills/orchestrate/wave.workflow.js", args:{phase:
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest
 
 # continuation (you, last action every wave)
+# dynamic mode: issue ScheduleWakeup
 ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…, reason="next orchestration wave")
+# cron mode: if ScheduleWakeup says dynamic gate is off, the fixed cron IS the heartbeat — do nothing, do NOT delete the cron
 ```

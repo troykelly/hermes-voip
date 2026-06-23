@@ -130,7 +130,15 @@ def build_request(
             this function).
     """
     _reject_controls(method, "method")
+    if not method or _HEADER_NAME.fullmatch(method) is None:
+        msg = f"method must be a non-empty RFC 3261 token (no spaces): {method!r}"
+        raise ValueError(msg)
     _reject_controls(request_uri, "request URI")
+    if not request_uri or any(c in request_uri for c in (" ", "\t")):
+        msg = (
+            f"request URI must be non-empty and contain no whitespace: {request_uri!r}"
+        )
+        raise ValueError(msg)
     lines = [f"{method} {request_uri} SIP/2.0"]
     for name, value in headers:
         if _HEADER_NAME.fullmatch(name) is None:

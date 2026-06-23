@@ -346,7 +346,7 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/dtmf.py
 
-- [ ] **[high] robustness** — `DtmfReceiver` does not validate `history >= 1`. `history=0` leaks `_seen`
+- [x] **[high] robustness** (#180) — `DtmfReceiver` does not validate `history >= 1`. `history=0` leaks `_seen`
   unbounded (eviction guard at line 175 short-circuits; `_order` is a no-op `maxlen=0` deque) — verified
   growing `_seen`, an unbounded leak on a long call, silently breaking the bounded-window contract.
   `history<0` raises a raw `ValueError` from deque. Validate `if history < 1: raise ValueError(...)`
@@ -898,7 +898,7 @@ These span multiple modules or the repo as a whole.
   release requires manual synchronization of all three, inviting drift. The test at
   `tests/test_plugin_manifest.py:159-164` guards `pyproject.toml` ↔ `plugin.yaml` drift but there is no
   guard for `__init__.__version__`, and no documented release process.
-- [ ] **[high] test** — No test for `__version__` equality with `pyproject.toml`. `test_plugin_manifest.py`
+- [x] **[high] test** (#181) — No test for `__version__` equality with `pyproject.toml`. `test_plugin_manifest.py`
   asserts `plugin.yaml` version matches `pyproject.toml` (line 159) but there is no corresponding test for
   `src/hermes_voip/__init__.py.__version__` (line 49) — a release bump could easily leave it out of sync
   (`src/hermes_voip/__init__.py:49`, `tests/test_plugin_manifest.py:159-164`).

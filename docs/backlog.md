@@ -635,7 +635,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/stt/deepgram.py
 
-- [ ] **[high] robustness** — `_map_event` (line 284): `event = json.loads(raw)` has no `try/except`. A
+- [x] **[high] robustness** (#174) — `_map_event` (line 284): `event = json.loads(raw)` has no `try/except`. A
   single malformed text frame from the Deepgram Flux WebSocket raises `json.JSONDecodeError`, which propagates
   through `_receive()` → `_generate()` → `asyncio.TaskGroup` → cancels `_pump` and `_delivery` → the call
   ends. A one-line `try/except json.JSONDecodeError` that logs and returns `None` makes bad frames survivable.
@@ -659,7 +659,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/registration.py (Wave-1 additions)
 
-- [ ] **[high] security** — SHA-256→MD5 digest downgrade: `registration.py:285` picks only the FIRST
+- [x] **[high] security** (#173) — SHA-256→MD5 digest downgrade: `registration.py:285` picks only the FIRST
   `WWW-Authenticate` challenge (`SipResponse.header()` returns first-match-only, confirmed `message.py:78`).
   RFC 8760 §2.4 requires choosing the most-preferred supported algorithm when a registrar sends multiple
   challenges (e.g. SHA-256 AND MD5). The strongest-algorithm machinery in `digest.py` (`_ALGORITHM_PREFERENCE`

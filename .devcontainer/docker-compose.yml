@@ -22,7 +22,7 @@ services:
       # Keep the pnpm content-addressable store off the bind mount.
       - hermes-voip-pnpm-store:/home/vscode/.local/share/pnpm/store
     command: sleep infinity
-    mem_limit: 8g
+    mem_limit: 64g
     networks:
       - devnet
 

@@ -4,6 +4,17 @@ version = "0.0.0"
 description = "Hermes plugin for two-way voice over telephony, on any RFC-compliant SIP-over-TLS or WebRTC voice gateway."
 readme = "README.md"
 requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Troy Kelly" }]
+keywords = ["sip", "voip", "telephony", "webrtc", "hermes", "voice-agent"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Telephony",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+]
 dependencies = [
     "audioop-lts==0.2.2",
 ]
@@ -66,6 +77,10 @@ webrtc = [
     "pyopenssl==26.2.0",
     "websockets==16.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/troykelly/hermes-voip"
+Repository = "https://github.com/troykelly/hermes-voip"
 
 # ---------------------------------------------------------------------------
 # Hermes plugin discovery (hermes_agent.plugins entry point group).

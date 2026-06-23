@@ -64,6 +64,95 @@ _DEFAULT_SUBSCRIPTION_STATE = "active;expires=60"
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
 _SIPFRAG_STATUS = re.compile(r"SIP/2\.0\s+(\d{3})\s*(.*)")
 
+# Refer-To injection guard (security; the transfer analogue of the outbound
+# Request-URI guard ``adapter._validate_dialable_target``).
+#
+# ``build_blind_refer`` interpolates the AGENT-SUPPLIED transfer target into a
+# ``Refer-To: <target>`` header. Unlike the digits-only dial target, a blind
+# transfer target may LEGITIMATELY be EITHER (a) a bare dialable extension —
+# optional leading ``+``, decimal digits, ``*`` / ``#`` for feature codes — OR
+# (b) a full ``sip:``/``sips:`` URI for an attended/cross-domain transfer. Any
+# other shape is an injection vector: a bare ``1001@evil.com`` hijacks the host;
+# a ``?Replaces=`` / ``;``-param smuggles URI parameters; an unescaped ``>`` or
+# CR/LF breaks out of the bracketed addr-spec to forge headers. The guard is a
+# STRICT ALLOWLIST applied BEFORE the header is built, so an injection-bearing
+# target raises ``ValueError`` and NO REFER is produced.
+_DIALABLE_TARGET = re.compile(r"\+?[0-9*#]+")
+# A well-formed sip:/sips: URI: scheme, a non-empty user@host, then optional
+# ``;``-params / ``?``-headers. No angle brackets, whitespace, or controls — the
+# bracket/control/whitespace checks below reject those before this even runs, so
+# this only constrains the structural shape (a scheme and an ``@`` authority).
+_SIP_URI = re.compile(
+    r"sips?:[^\s@<>]+@[^\s@<>;?]+(?:[;?][^\s<>]*)?",
+    re.IGNORECASE,
+)
+# A bound on the target length: ample for an international E.164 number with a
+# few DTMF digits, or a sip URI with a host and a couple of params, but short
+# enough to refuse an absurd value before it reaches the wire.
+_MAX_TRANSFER_TARGET_LEN = 256
+# Forbidden control characters: the ASCII C0 range (below this) and DEL — the
+# CR/LF/NUL header-injection bytes (mirrors ``message._C0_END`` / ``message._DEL``).
+_C0_END = 0x20
+_DEL = 0x7F
+
+
+def _validate_transfer_target(target: str) -> None:
+    """Reject a blind-transfer target that is not a clean extension or sip URI.
+
+    Validates the agent-supplied ``Refer-To`` target against a strict allowlist
+    BEFORE it is interpolated into the ``Refer-To: <target>`` header. A target is
+    accepted only if it is EITHER a bare dialable user-part (optional leading
+    ``+``, digits, ``*`` / ``#``) OR a well-formed ``sip:``/``sips:`` URI
+    (``user@host`` with optional ``;``-params / ``?``-headers). Anything else —
+    a bare-extension host hijack (``1001@evil.com``), a ``?Replaces=`` /
+    ``;``-param smuggle on a bare extension, an angle-bracket ``>`` breakout, a
+    CR/LF or other control character (including a percent-escaped ``%0D%0A`` that
+    a gateway would unescape), whitespace, an over-long value, or empty — raises
+    :class:`ValueError`, so the injection never reaches the header and no REFER is
+    built.
+
+    Args:
+        target: The agent-supplied transfer target (extension or sip URI).
+
+    Raises:
+        ValueError: If ``target`` is empty, over-long, carries a control char
+            (literal or percent-encoded), an angle bracket, or whitespace, or is
+            neither a dialable extension nor a well-formed sip:/sips: URI.
+    """
+    if not target:
+        msg = "transfer target is empty"
+        raise ValueError(msg)
+    if len(target) > _MAX_TRANSFER_TARGET_LEN:
+        msg = f"transfer target too long (>{_MAX_TRANSFER_TARGET_LEN} chars)"
+        raise ValueError(msg)
+    # Reject control chars in BOTH the literal value and the percent-decoded
+    # value: a ``%0D%0A`` survives the literal check but a gateway unescaping the
+    # URI would inject CR/LF. ``unquote`` never raises and leaves non-escapes
+    # intact, so this catches both forms.
+    for candidate in (target, unquote(target)):
+        if any(ord(char) < _C0_END or ord(char) == _DEL for char in candidate):
+            # Do NOT echo the raw value (it may carry injection bytes); name the
+            # rule that was violated instead.
+            msg = "transfer target contains a control character"
+            raise ValueError(msg)
+    # ``<`` / ``>`` would break out of the ``Refer-To: <...>`` addr-spec.
+    if "<" in target or ">" in target:
+        msg = "transfer target contains an angle bracket"
+        raise ValueError(msg)
+    if any(char.isspace() for char in target):
+        msg = "transfer target contains whitespace"
+        raise ValueError(msg)
+    if _DIALABLE_TARGET.fullmatch(target) is not None:
+        return
+    if _SIP_URI.fullmatch(target) is not None:
+        return
+    msg = (
+        "transfer target is neither a dialable extension "
+        "(optional leading '+', digits, '*' and '#') nor a well-formed "
+        "sip:/sips: URI"
+    )
+    raise ValueError(msg)
+
 
 class ReferError(ValueError):
     """A REFER / Replaces / NOTIFY message is malformed or incomplete."""
@@ -136,7 +225,16 @@ def build_blind_refer(
 
     ``auth`` is an optional ``(Authorization|Proxy-Authorization, value)`` header
     carried when re-sending after a 401/407.
+
+    Raises:
+        ValueError: If ``target_uri`` is not a clean transfer target — neither a
+            dialable extension nor a well-formed sip:/sips: URI, or it carries an
+            injection vector (``@`` host hijack on a bare extension, ``;``/``?``
+            params, an angle bracket, CR/LF or other control char, or whitespace).
+            The guard runs BEFORE the header is built, so an injection-bearing
+            target never reaches the ``Refer-To`` and no REFER is produced.
     """
+    _validate_transfer_target(target_uri)
     extra: list[tuple[str, str]] = [("Refer-To", f"<{target_uri}>")]
     if referred_by is not None:
         extra.append(("Referred-By", _wrap_uri(referred_by)))

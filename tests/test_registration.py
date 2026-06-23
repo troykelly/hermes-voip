@@ -11,6 +11,11 @@ import re
 import pytest
 
 import hermes_voip
+from hermes_voip.digest import (
+    DigestChallenge,
+    DigestCredentials,
+    build_authorization,
+)
 from hermes_voip.message import SipResponse
 from hermes_voip.registration import (
     Challenged,
@@ -101,6 +106,84 @@ def test_407_uses_proxy_authorization() -> None:
     assert isinstance(outcome, Challenged)
     assert _h(outcome.request, "Proxy-Authorization") is not None
     assert _h(outcome.request, "Authorization") is None  # 407 -> Proxy-Authorization
+
+
+def _multi_challenge(code: int = 401, header: str = "WWW-Authenticate") -> SipResponse:
+    """A 401/407 offering MD5 *first*, then SHA-256 (RFC 8760 §2.4 back-compat).
+
+    An on-path attacker can reorder or strip challenges (SIP digest has no header
+    integrity), so listing the weaker algorithm first must NOT downgrade the
+    client off the strongest algorithm it supports.
+    """
+    return SipResponse.parse(
+        f"SIP/2.0 {code} Unauthorized\r\n"
+        f'{header}: Digest realm="pbx.example.test", nonce="abc123", '
+        'algorithm=MD5, qop="auth"\r\n'
+        f'{header}: Digest realm="pbx.example.test", nonce="abc123", '
+        'algorithm=SHA-256, qop="auth"\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _auth_param(auth: str, name: str) -> str | None:
+    """Extract a single auth-param (quoted or bare) from a Digest header value."""
+    match = re.search(rf'{name}=(?:"([^"]*)"|([^,\s]+))', auth)
+    if match is None:
+        return None
+    return match.group(1) if match.group(1) is not None else match.group(2)
+
+
+def test_multiple_challenges_select_strongest_not_first() -> None:
+    """RFC 8760 §2.4: with MD5 *and* SHA-256 offered, authenticate with SHA-256.
+
+    Guards against a silent SHA-256 -> MD5 downgrade when a gateway (or on-path
+    attacker) lists MD5 first: the client must pick the strongest algorithm it
+    supports, not whichever challenge happens to be parsed first.
+    """
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_multi_challenge())
+    assert isinstance(outcome, Challenged)
+    auth = _h(outcome.request, "Authorization")
+    assert auth is not None
+    # The chosen algorithm must be SHA-256, not the MD5 listed first.
+    assert _auth_param(auth, "algorithm") == "SHA-256"
+    # 64 hex digits is a SHA-256 digest; 32 would be MD5.
+    response = _auth_param(auth, "response")
+    assert response is not None
+    assert re.fullmatch(r"[0-9a-f]{64}", response)
+    # The digest must equal the independently-computed SHA-256 value (not MD5).
+    cnonce = _auth_param(auth, "cnonce")
+    assert cnonce is not None
+    expected = build_authorization(
+        DigestChallenge(
+            realm="pbx.example.test",
+            nonce="abc123",
+            algorithm="SHA-256",
+            qop=("auth",),
+        ),
+        DigestCredentials("1000", "s3cr3t"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce=cnonce,
+    )
+    expected_response = _auth_param(expected, "response")
+    assert expected_response is not None
+    assert response == expected_response
+
+
+def test_multiple_proxy_challenges_select_strongest_not_first() -> None:
+    """A 407 with MD5-first / SHA-256 must also pick SHA-256 (handled symmetrically)."""
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_multi_challenge(code=407, header="Proxy-Authenticate"))
+    assert isinstance(outcome, Challenged)
+    auth = _h(outcome.request, "Proxy-Authorization")
+    assert auth is not None
+    assert _auth_param(auth, "algorithm") == "SHA-256"
+    response = _auth_param(auth, "response")
+    assert response is not None
+    assert re.fullmatch(r"[0-9a-f]{64}", response)
 
 
 def test_call_id_and_from_tag_stable_across_requests() -> None:

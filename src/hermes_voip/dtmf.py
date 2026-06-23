@@ -189,7 +189,20 @@ class DtmfReceiver:
     """
 
     def __init__(self, history: int = _RECEIVER_HISTORY) -> None:
-        """Create a receiver remembering the last ``history`` press timestamps."""
+        """Create a receiver remembering the last ``history`` press timestamps.
+
+        Args:
+            history: The size of the bounded dedup window (must be >= 1).  With
+                ``history=0`` the eviction guard never fires and ``_seen`` would
+                grow unbounded across a long call — a memory leak that silently
+                breaks the dedup contract.
+
+        Raises:
+            ValueError: If ``history`` is less than 1.
+        """
+        if history < 1:
+            msg = f"history must be >= 1, got {history}"
+            raise ValueError(msg)
         self._order: deque[int] = deque(maxlen=history)
         self._seen: set[int] = set()
 

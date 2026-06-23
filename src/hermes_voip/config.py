@@ -329,6 +329,46 @@ _DEFAULT_COMFORT_FILLER_PHRASES: tuple[str, ...] = _COMFORT_FILLER_PHRASES_BY_LA
 ]
 _SUPPORTED_LANGUAGES: frozenset[str] = frozenset(_COMFORT_FILLER_PHRASES_BY_LANGUAGE)
 
+# Caller-silence reprompt / no-input handling (ADR-0057). When the caller is live
+# (RTP flowing) but never speaks, the engine's RTP watchdog never fires (it only
+# fires on DEAD media). The no-input watchdog speaks a short reprompt after a silence
+# window, and ends the call gracefully (goodbye → clean run() return) after N
+# unanswered reprompts so an abandoned/dropped line is noticed promptly. ON by default
+# (the operator wants a live-but-silent caller prompted, not left in dead air forever).
+_NO_INPUT_REPROMPT_KEY = "HERMES_VOIP_NO_INPUT_REPROMPT"
+_DEFAULT_NO_INPUT_REPROMPT = True
+# Silence window (ms) of no caller end-of-turn before a reprompt fires. Must be
+# strictly positive. 10 s is long enough not to nag a thinking caller, short enough
+# that a dropped/abandoned line is noticed promptly.
+_NO_INPUT_TIMEOUT_MS_KEY = "HERMES_VOIP_NO_INPUT_TIMEOUT_MS"
+_DEFAULT_NO_INPUT_TIMEOUT_MS = 10_000
+# Number of unanswered reprompts before the loop ends the call gracefully. 0 = end on
+# first silent window with no reprompt; must be non-negative.
+_NO_INPUT_MAX_REPROMPTS_KEY = "HERMES_VOIP_NO_INPUT_MAX_REPROMPTS"
+_DEFAULT_NO_INPUT_MAX_REPROMPTS = 2
+# Pipe-separated reprompt phrase set; blank/empty → the built-in English default.
+# Same parse convention as HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES.
+_NO_INPUT_REPROMPT_PHRASES_KEY = "HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES"
+# The built-in English reprompt set — MUST exactly match
+# _DEFAULT_NO_INPUT_REPROMPT_PHRASES in media/call_loop.py so behaviour is
+# unchanged when env vars are unset.
+_DEFAULT_NO_INPUT_REPROMPT_PHRASES: tuple[str, ...] = (
+    "Are you still there?",
+    "Hello, are you still there?",
+    "Sorry, I can't hear anything. Are you still there?",
+)
+
+# Spoken goodbye on a loop-initiated graceful end (ADR-0057). When ON (the default),
+# the call loop speaks ``goodbye_phrase`` and flushes it BEFORE run() returns, so the
+# caller hears a clean closing line rather than a silent BYE. NOT spoken on a
+# caller-hangup / inbound-EOS / error end (no media path there). ON by default;
+# HERMES_VOIP_GOODBYE_PHRASE selects the phrase.
+_GOODBYE_KEY = "HERMES_VOIP_GOODBYE"
+_DEFAULT_GOODBYE = True
+# The goodbye phrase — MUST exactly match _DEFAULT_GOODBYE_PHRASE in call_loop.py.
+_GOODBYE_PHRASE_KEY = "HERMES_VOIP_GOODBYE_PHRASE"
+_DEFAULT_GOODBYE_PHRASE = "Goodbye."
+
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
 # 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
@@ -830,6 +870,28 @@ class MediaConfig:
             ``>= 2`` (the buffer's floor; a lower ceiling would fail engine
             construction). ``HERMES_VOIP_JITTER_MAX_DEPTH`` (default 10 ≈ 200 ms at
             20 ms ptime).
+        no_input_reprompt: Caller-silence reprompt master switch (ADR-0057), ``True``
+            by default. When ``True``, a live-but-silent caller (RTP flowing, no
+            end-of-turn) is reprompted after ``no_input_timeout_ms`` of silence, and
+            after ``no_input_max_reprompts`` unanswered reprompts the loop ends the
+            call gracefully. ``HERMES_VOIP_NO_INPUT_REPROMPT``.
+        no_input_timeout_ms: Silence window (ms) of no caller end-of-turn before a
+            reprompt fires (ADR-0057). Must be strictly positive; default 10 000.
+            ``HERMES_VOIP_NO_INPUT_TIMEOUT_MS``.
+        no_input_max_reprompts: Unanswered reprompts before the loop ends the call
+            gracefully (ADR-0057). ``0`` = end on the first silent window with no
+            reprompt; must be non-negative; default 2.
+            ``HERMES_VOIP_NO_INPUT_MAX_REPROMPTS``.
+        no_input_reprompt_phrases: The reprompt phrase set; one is chosen at random
+            per fire, never repeating the immediately-previous phrase. Must be
+            non-empty. ``HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES`` (pipe-separated).
+        goodbye: Spoken-goodbye master switch (ADR-0057), ``True`` by default. When
+            ``True``, the loop-initiated graceful end (no-input limit exhausted) speaks
+            ``goodbye_phrase`` before :meth:`run` returns so the caller hears a clean
+            closing line. ``HERMES_VOIP_GOODBYE``.
+        goodbye_phrase: The closing line spoken on a loop-initiated graceful end
+            (ADR-0057). Reads naturally on every TTS model. Default ``"Goodbye."``.
+            ``HERMES_VOIP_GOODBYE_PHRASE``.
     """
 
     stt_provider: str
@@ -1018,6 +1080,24 @@ class MediaConfig:
     # direct constructions stay valid.
     session_expires: int = _DEFAULT_SESSION_EXPIRES
     min_se: int = _DEFAULT_MIN_SE
+    # Caller-silence reprompt / no-input handling (ADR-0057). When
+    # ``no_input_reprompt`` is True (the default), the call loop reprompts the caller
+    # after ``no_input_timeout_ms`` of silence, and ends the call gracefully after
+    # ``no_input_max_reprompts`` unanswered reprompts. ``no_input_reprompt_phrases``
+    # is the phrase set (one chosen at random per fire, no immediate repeat). All
+    # five defaults MUST exactly match call_loop.py module-level constants so
+    # behaviour is UNCHANGED when env vars are unset. ``HERMES_VOIP_NO_INPUT_*``.
+    no_input_reprompt: bool = _DEFAULT_NO_INPUT_REPROMPT
+    no_input_timeout_ms: int = _DEFAULT_NO_INPUT_TIMEOUT_MS
+    no_input_max_reprompts: int = _DEFAULT_NO_INPUT_MAX_REPROMPTS
+    no_input_reprompt_phrases: tuple[str, ...] = _DEFAULT_NO_INPUT_REPROMPT_PHRASES
+    # Spoken goodbye on a loop-initiated graceful end (ADR-0057). When True (the
+    # default), the loop speaks ``goodbye_phrase`` before run() returns so the caller
+    # hears a clean closing line. The phrase MUST exactly match call_loop.py's
+    # _DEFAULT_GOODBYE_PHRASE so behaviour is unchanged when env vars are unset.
+    # ``HERMES_VOIP_GOODBYE`` / ``HERMES_VOIP_GOODBYE_PHRASE``.
+    goodbye: bool = _DEFAULT_GOODBYE
+    goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -1071,6 +1151,7 @@ class MediaConfig:
             raise ConfigError(msg)
         self._validate_aec()
         self._validate_comfort_filler()
+        self._validate_no_input()
         self._validate_media_timers()
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))
@@ -1169,6 +1250,37 @@ class MediaConfig:
             raise ConfigError(msg)
         if any(not phrase.strip() for phrase in self.comfort_filler_phrases):
             msg = "comfort_filler_phrases must not contain a blank phrase"
+            raise ConfigError(msg)
+
+    def _validate_no_input(self) -> None:
+        """Validate the caller-silence reprompt / no-input invariants (ADR-0057).
+
+        The timeout must be strictly positive (a non-positive silence window fires
+        immediately and is meaningless); the max-reprompts count must be non-negative
+        (``0`` is valid — end on the first silent window, no reprompt); the phrase
+        set must be non-empty and contain no blank phrase. These hold regardless of
+        the master switch so a direct :class:`MediaConfig` construction is
+        self-validating.
+        """
+        if self.no_input_timeout_ms <= 0:
+            msg = (
+                f"no_input_timeout_ms must be positive, got {self.no_input_timeout_ms}"
+            )
+            raise ConfigError(msg)
+        if self.no_input_max_reprompts < 0:
+            msg = (
+                "no_input_max_reprompts must be non-negative, "
+                f"got {self.no_input_max_reprompts}"
+            )
+            raise ConfigError(msg)
+        if not self.no_input_reprompt_phrases:
+            msg = "no_input_reprompt_phrases must not be empty"
+            raise ConfigError(msg)
+        if any(not phrase.strip() for phrase in self.no_input_reprompt_phrases):
+            msg = "no_input_reprompt_phrases must not contain a blank phrase"
+            raise ConfigError(msg)
+        if not self.goodbye_phrase.strip():
+            msg = "goodbye_phrase must not be blank"
             raise ConfigError(msg)
 
     def _validate_media_timers(self) -> None:
@@ -1447,6 +1559,21 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _SESSION_EXPIRES_KEY, _DEFAULT_SESSION_EXPIRES
         ),
         min_se=_parse_positive_int(env, _MIN_SE_KEY, _DEFAULT_MIN_SE),
+        # Caller-silence reprompt / no-input handling (ADR-0057). Default values
+        # MUST match call_loop.py's module-level constants so behaviour is UNCHANGED
+        # when the env vars are unset (no regression).
+        no_input_reprompt=_parse_bool(
+            env, _NO_INPUT_REPROMPT_KEY, _DEFAULT_NO_INPUT_REPROMPT
+        ),
+        no_input_timeout_ms=_parse_positive_int(
+            env, _NO_INPUT_TIMEOUT_MS_KEY, _DEFAULT_NO_INPUT_TIMEOUT_MS
+        ),
+        no_input_max_reprompts=_parse_non_negative_int(
+            env, _NO_INPUT_MAX_REPROMPTS_KEY, _DEFAULT_NO_INPUT_MAX_REPROMPTS
+        ),
+        no_input_reprompt_phrases=_parse_no_input_reprompt_phrases(env),
+        goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),
+        goodbye_phrase=_parse_goodbye_phrase(env),
     )
 
 
@@ -1857,6 +1984,37 @@ def _parse_comfort_filler_phrases(
         part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
     )
     return phrases or default
+
+
+def _parse_no_input_reprompt_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Parse the ``|``-separated no-input reprompt phrase set (ADR-0057).
+
+    Each member is trimmed; empty members (from a trailing or doubled ``|``) are
+    dropped. An unset or all-blank value falls back to
+    :data:`_DEFAULT_NO_INPUT_REPROMPT_PHRASES` — the exact phrases hardcoded in
+    ``call_loop.py`` — so behaviour is UNCHANGED when the env var is unset. An
+    explicit set always wins. The result is always non-empty.
+    """
+    raw = _value(env, _NO_INPUT_REPROMPT_PHRASES_KEY)
+    if not raw:
+        return _DEFAULT_NO_INPUT_REPROMPT_PHRASES
+    phrases = tuple(
+        part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
+    )
+    return phrases or _DEFAULT_NO_INPUT_REPROMPT_PHRASES
+
+
+def _parse_goodbye_phrase(env: Mapping[str, str]) -> str:
+    """Parse ``HERMES_VOIP_GOODBYE_PHRASE``, defaulting when unset or blank.
+
+    Unlike the greeting (which distinguishes 'unset' from 'explicitly empty'),
+    a blank/whitespace goodbye phrase falls back to the default — an empty goodbye
+    is a misconfiguration (the goodbye speech path is always non-trivially short).
+    The operator disables the goodbye entirely via ``HERMES_VOIP_GOODBYE=false``,
+    not by blanking the phrase.
+    """
+    raw = _value(env, _GOODBYE_PHRASE_KEY)
+    return raw or _DEFAULT_GOODBYE_PHRASE
 
 
 def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:

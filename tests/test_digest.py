@@ -16,8 +16,11 @@ import re
 import pytest
 
 from hermes_voip.digest import (
+    _PARAM,
     DigestChallenge,
     DigestCredentials,
+    _quoted,
+    _unescape,
     build_authorization,
     pick_best_challenge,
 )
@@ -255,6 +258,39 @@ def test_username_with_quote_is_escaped_on_the_wire_and_hashed_raw() -> None:
     expected = md5_hex(f"{ha1}:{nonce}:00000001:c:auth:{ha2}")
     assert r'username="jo\"hn"' in header
     assert f'response="{expected}"' in header
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'a"b\\c',  # literal quote and literal backslash
+        '"',  # a lone quote
+        "\\",  # a lone backslash
+        'realm "with" quotes \\ and slashes',  # mixed
+        "plain",  # no escapes at all (must survive the round-trip too)
+    ],
+)
+def test_quoted_then_parse_round_trip_recovers_the_literal_value(value: str) -> None:
+    # The builder (_quoted) and the parser (_PARAM + _unescape) are inverses:
+    # a value rendered into a quoted-string must parse back to the same literal.
+    # An asymmetric escape/unescape silently corrupts realm/nonce before they
+    # reach HA1/HA2, so the round-trip is the load-bearing invariant.
+    rendered = f'realm="{_quoted(value)}"'
+    match = _PARAM.search(rendered)
+    assert match is not None
+    quoted_body = match.group(2)
+    assert quoted_body is not None  # the quoted alternative (not the bare one) matched
+    assert _unescape(quoted_body) == value
+
+
+def test_parse_bare_value_stops_at_semicolon_not_swallowing_trailing_params() -> None:
+    # RFC 3261/2617 token cannot contain ';' (it is a separator). A bare value
+    # must terminate at ';', not run on and swallow semicolon-delimited trailing
+    # content. The original bare alternative [^,\s]+ swallowed it, so a realm of
+    # 'r;x=y' fed a corrupted realm into HA1.
+    challenge = DigestChallenge.parse("Digest realm=r;x=y, nonce=n")
+    assert challenge.realm == "r"
+    assert challenge.nonce == "n"
 
 
 # ---------------------------------------------------------------------------

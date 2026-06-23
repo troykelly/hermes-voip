@@ -291,3 +291,74 @@ async def test_deepgram_asr_send_error_surfaces_promptly() -> None:
 
 async def _collect(it: AsyncIterator[Transcript]) -> list[Transcript]:
     return [t async for t in it]
+
+
+# ---------------------------------------------------------------------------
+# Malformed-frame guard tests (robustness — a single bad frame must not kill
+# the stream; rule 37: genuine errors still propagate).
+# ---------------------------------------------------------------------------
+
+
+def test_map_event_returns_none_for_non_json() -> None:
+    """_map_event must return None for a non-JSON frame (not raise JSONDecodeError).
+
+    A transient Deepgram hiccup or binary-misclassified-as-text frame must not
+    propagate json.JSONDecodeError up through _receive → _generate → CallLoop.
+    """
+    from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
+
+    result = _map_event("this is not json at all!!!")
+    assert result is None
+
+
+def test_map_event_returns_none_for_valid_json_wrong_shape() -> None:
+    """_map_event must return None for valid JSON that lacks the expected fields.
+
+    A valid-JSON-but-wrong-shape Flux frame (e.g. unexpected schema variant)
+    must not propagate KeyError or TypeError — it should be skipped silently.
+    """
+    from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
+
+    # A JSON object that has neither "transcript" nor "type" at the top level.
+    result = _map_event(json.dumps({"totally": "unexpected", "keys": [1, 2, 3]}))
+    # No "transcript" key means empty text → already returns None via existing
+    # logic, so this also exercises that path is safe.
+    assert result is None
+
+    # A JSON primitive (not a dict) — event.get() would raise AttributeError.
+    result = _map_event(json.dumps(["list", "not", "dict"]))
+    assert result is None
+
+    # A JSON dict with a non-string "type" — no TypeError must escape.
+    result = _map_event(json.dumps({"type": 42, "transcript": "hello"}))
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_stream_survives_malformed_frame_between_valid_ones() -> None:
+    """A malformed frame between valid Flux events must not kill the stream.
+
+    The receiver must skip bad frames and continue delivering subsequent
+    valid transcripts — the live call must not end due to a single bad frame.
+    """
+    # Interleave a non-JSON frame between two valid Update events.
+    events = (
+        json.dumps({"type": "Update", "transcript": "hello", "end_of_turn": False}),
+        "<<<not json>>>",  # malformed — must be skipped, not fatal
+        json.dumps(
+            {"type": "EndOfTurn", "transcript": "hello world", "end_of_turn": True}
+        ),
+    )
+    socket = _FakeFluxSocket(events)
+    asr = _asr_with(socket)
+
+    out = await asyncio.wait_for(
+        _collect(asr.stream(_frames(_frame(0)))),
+        timeout=2.0,
+    )
+
+    # Both valid transcripts must arrive; the malformed frame must be skipped.
+    assert [(t.text, t.is_final) for t in out] == [
+        ("hello", False),
+        ("hello world", True),
+    ]

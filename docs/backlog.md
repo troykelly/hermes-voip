@@ -733,7 +733,7 @@ These span multiple modules or the repo as a whole.
   the "greeting: first RTP sent" log (`call_loop.py:1953`) carries no `call_id` and no elapsed time. Thread
   the INVITE receipt timestamp into `CallLoop` construction; log `first_audio_latency_ms=...` at INFO at
   first-RTP-sent (`adapter.py`, `media/call_loop.py`).
-- [ ] **[high] ux** — Reprompt/goodbye phrases and no-input timing have no operator config surface
+- [x] **[high] ux** (#188) — Reprompt/goodbye phrases and no-input timing have no operator config surface
   (ADR-0057 follow-on never plumbed). `config.py` has zero `HERMES_VOIP_NO_INPUT` / `GOODBYE` / `REPROMPT`
   env parsing (verified: `grep -rn 'HERMES_VOIP_NO_INPUT\|HERMES_VOIP_GOODBYE\|HERMES_VOIP_REPROMPT'
   config.py` returns nothing). `MediaConfig` carries no such fields; the adapter's `CallLoop` construction
@@ -802,7 +802,7 @@ These span multiple modules or the repo as a whole.
   keepalives; a non-numeric value crashes with an untyped `ValueError` at connect time rather than a readable
   `ConfigError`. Fix: add validation and declaration in `config.py`; add to `plugin.yaml`; document in a
   runbook (`adapter.py`, `config.py`, `plugin.yaml`).
-- [ ] **[high] docs** — No runbook documenting the release / version-bump process. AGENTS.md rule 42 requires
+- [x] **[high] docs** (#187, runbook 0019) — No runbook documenting the release / version-bump process. AGENTS.md rule 42 requires
   runbooks as you work for any operational process. No runbook documents how to release hermes-voip: which
   three version strings to update (`pyproject.toml:3`, `src/hermes_voip/__init__.py:49`,
   `packaging/hermes-plugins/hermes-voip/plugin.yaml:27`), in what order, how to verify sync, whether to
@@ -892,7 +892,7 @@ These span multiple modules or the repo as a whole.
 
 ## Packaging / release
 
-- [ ] **[high] operability** — No automated version bumping mechanism or release workflow. The version is
+- [ ] **[high] operability** (partial — manual release process documented in runbook 0019 / version single-sourced #187; automated CI-publish is PROPOSE-ONLY pending the operator's publish-target decision, rule 40/41) — No automated version bumping mechanism or release workflow. The version is
   hardcoded to `'0.0.0'` in three places (`pyproject.toml:3`, `src/hermes_voip/__init__.py:49`,
   `packaging/hermes-plugins/hermes-voip/plugin.yaml:27`) with no automation to keep them synchronized. A
   release requires manual synchronization of all three, inviting drift. The test at
@@ -988,3 +988,17 @@ These span multiple modules or the repo as a whole.
     two-phase-keying problem, out of MVP scope.
   * Needs a design ADR (the WHY + the ring/wake/decide SIP state-machine + the decision contract) before
     build, TDD across ring → wake → accept/decline/timeout, and a runbook note for the new env flags.
+
+## Review follow-ups (Wave 4 release-blocker reviews, 2026-06-23)
+
+- [ ] **[high] security** — `transfer_blind(target, ...)` passes an agent-supplied `target` (extension OR
+  SIP URI) straight into a `Refer-To: <target>` REFER header via `build_blind_refer` (`refer.py`) with
+  `urllib.quote/unquote` handling and NO dialable-grammar gate. A `target` like `1001@evil.com` or one
+  bearing `?Replaces=` / `;`-params could redirect/smuggle into the REFER-To URI — the SAME injection class
+  the outbound-INVITE guard (`_validate_dialable_target`, place_call) closes. The INVITE hole is fixed but
+  the REFER hole is open; close it (validate/allow-list the transfer target, or strictly escape it for the
+  Refer-To URI) so the injection class is fully mitigated. Surfaced by the outbound-URI security review.
+- [ ] **[low] test** — `test_no_input_defaults_match_call_loop_constants` (#188) asserts HARDCODED literals
+  rather than importing `media/call_loop.py`'s `_DEFAULT_*` constants. It catches a `config.py`-side drift
+  but NOT a `call_loop.py`-side change to the same defaults. Strengthen it to assert
+  `cfg.goodbye_phrase == call_loop._DEFAULT_GOODBYE_PHRASE` (etc.) so the must-match invariant is bulletproof.

@@ -23,21 +23,21 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/digest.py
 
-- [ ] **[high] correctness** — Parser ignores RFC 2617 quoted-pair escapes inside quoted-strings.
+- [x] **[high] correctness** (done: f2e10de) — Parser ignores RFC 2617 quoted-pair escapes inside quoted-strings.
   `_PARAM` (line 24) uses `"([^"]*)"`, stopping at the first inner `"` and never honouring `\"`/`\\`.
   Verified: `Digest realm="a\"b", nonce="xyz"` yields `realm == 'a\\'` (a backslash, `b"` dropped)
   instead of `a"b`. Since `realm`/`nonce` feed HA1/HA2 verbatim, a server whose realm legitimately
   contains an escaped quote/backslash produces a wrong `response` and registration fails silently.
   The build side (`_quoted`, line 53) *does* emit quoted-pair escapes, so parse/emit are asymmetric.
   Fix: escape-aware pattern `"((?:[^"\\]|\\.)*)"` + unescape; add a KAT + round-trip test.
-- [ ] **[high] correctness** — Quoted-param values escaped for the wire are NOT escaped before
+- [x] **[high] correctness** (done: f2e10de) — Quoted-param values escaped for the wire are NOT escaped before
   hashing — HA1/response. `build_authorization` hashes `challenge.realm` verbatim (line 154) but
   renders through `_quoted` (lines 184-187). This is correct per spec, but there is **no test** proving
   the hash uses the unescaped form, so a future "simplification" (escape-before-hash, or stop escaping)
   would pass the suite. Mutation-weak around the most security-sensitive computation. Add a KAT with
   `"`/`\` in realm/username proving the header is escaped AND the response equals the digest of the
   *unescaped* inputs (compute the vector independently).
-- [ ] **[medium] correctness** — Bare (unquoted) auth-param values swallow `;`-delimited trailing
+- [x] **[medium] correctness** (#176) — Bare (unquoted) auth-param values swallow `;`-delimited trailing
   content. Bare alternative `([^,\s]+)` (line 24) terminates only on comma/whitespace, not `;`.
   Verified: `Digest realm=r;x=y, nonce=n` parses realm as `r;x=y`. A permissive/garbled gateway could
   poison realm (and thus HA1). Tighten the bare class or post-validate realm/nonce against the
@@ -94,16 +94,16 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/message.py
 
-- [ ] **[high] correctness** — `parse()` raises `AttributeError` (not `ValueError`) on a reason-less
+- [x] **[high] correctness** (done on main; verified Wave 2) — `parse()` raises `AttributeError` (not `ValueError`) on a reason-less
   status-line. Status-line regex (line 23) makes the reason optional; `SIP/2.0 200\r\n\r\n` matches but
   `group(2)` is `None`, and line 162 calls `.strip()` → `AttributeError` (verified). Contradicts the
   docstring (lines 130-133) and rule 37. Make the second SP mandatory: `r"SIP/2\.0 (\d{3}) (.*)"`; add
   red tests for the reason-less form (must `ValueError`) and the empty-reason form (`reason==""`).
-- [ ] **[high] correctness** — `build_request` emits a DUPLICATE `Content-Length` when the caller
+- [x] **[high] correctness** (done on main; verified Wave 2) — `build_request` emits a DUPLICATE `Content-Length` when the caller
   supplies one. Computed value is unconditionally appended (line 87) after every caller header; passing
   `("Content-Length","999")` yields two headers (verified) → malformed framing per RFC 7230, possible
   mis-framing. Reject (or drop) a caller-supplied Content-Length with `ValueError`; red test for the raise.
-- [ ] **[high] test** — No test for the reason-less status-line (the `AttributeError` bug). Existing
+- [x] **[high] test** (done on main; verified Wave 2) — No test for the reason-less status-line (the `AttributeError` bug). Existing
   `test_parse_rejects_malformed_status_line` only covers `SIP/2.0 200OK`. Add the two cases above.
 - [ ] **[medium] polish** — Control-character rejection logic is duplicated verbatim between
   `message.py` (lines 27-36) and `digest.py` (lines 30-32, 50). Two copies of an injection-guard
@@ -409,16 +409,16 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/media/audio.py
 
-- [ ] **[high] robustness** — Decode/resample paths raise `audioop.error` (NOT `ValueError`) for inputs
+- [x] **[high] robustness** (#177) — Decode/resample paths raise `audioop.error` (NOT `ValueError`) for inputs
   the module's own validators would reject — verified `audioop.error` is not a `ValueError` subclass, so
   `except ValueError` (the module's advertised contract) won't catch them. e.g. `Resampler(0, 16000)
   .resample(b'\x00\x00')` raises `audioop.error: sampling rate not > 0`. Validate positive rates (below)
   and/or wrap `audioop.error` into a coherent module error type; document which exceptions propagate.
-- [ ] **[high] robustness** — `Resampler.__init__` does not validate positive rates; the failure is
+- [x] **[high] robustness** (done: f219dea) — `Resampler.__init__` does not validate positive rates; the failure is
   deferred to the first `resample()` deep in the C backend (verified `Resampler(0, …)`/`Resampler(-8000,
   …)` construct fine). A config-derived rate of 0 lies dormant until mid-call. Add
   `if from_rate <= 0 or to_rate <= 0: raise ValueError(...)`; tests for each non-positive rate.
-- [ ] **[high] api** — A-law frame-bridge gap: `ulaw_to_frame`/`frame_to_ulaw` exist but there is no
+- [x] **[high] api** (done: f219dea) — A-law frame-bridge gap: `ulaw_to_frame`/`frame_to_ulaw` exist but there is no
   `alaw_to_frame`/`frame_to_alaw`, despite ADR-0005 advertising PCMA. When a gateway answers PCMA the
   transport must hand-roll frame construction + the 8kHz guard that `frame_to_ulaw` centralises. Add the
   a-law pair, OR better a codec-parameterised `frame_to_g711(frame, codec)` / `g711_to_frame(...)`; mirror

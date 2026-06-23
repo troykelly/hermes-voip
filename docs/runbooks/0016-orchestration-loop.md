@@ -55,8 +55,15 @@ unauthenticated `gh`.
 /loop /orchestrate
 ```
 
-That's the whole trigger. `/loop` with no interval runs in **dynamic mode** — the orchestrator
-paces itself and guarantees the next wave with `ScheduleWakeup`. You can walk away.
+That's the whole trigger. In this Claude Code harness, `/loop /orchestrate` installs a
+**fixed cron** (`*/10 * * * *`) that fires `/orchestrate` every 10 minutes — this cron IS
+the continuation heartbeat. The orchestrator does not need to call `ScheduleWakeup`; if it
+tries, `ScheduleWakeup` reports "the /loop dynamic runtime gate is off … do not re-issue"
+and is a no-op. This is normal. Do NOT delete the cron expecting `ScheduleWakeup` to
+replace it — that breaks the loop.
+
+A cron-fired `/orchestrate` lands in the same session with preserved context, so a mid-wave
+tick is handled as already in-flight, not an overlapping wave.
 
 To preview a single wave without committing to the loop, run `/orchestrate` once on its own.
 
@@ -70,7 +77,7 @@ To preview a single wave without committing to the loop, run `/orchestrate` once
 | Wave reports | The orchestrator prints a tight summary at the end of every wave (shipped, merged, opened, discovered, cleaned, next plan). |
 | PRs in flight / merged | `gh pr list --state open` · `gh pr list --state merged --limit 20` |
 | Work register | `docs/backlog.md` (items get checked off with their PR #; new gaps appended) |
-| Wave journal (local) | `.orchestrator/state.json` (gitignored) |
+| Wave journal (local) | `.orchestrator/state.json` (gitignored) — unwritable in this harness (hook blocks root writes); orchestrator runs stateless instead |
 | Active lanes | `git worktree list` |
 
 The loop is healthy when, over time: open PRs cycle to merged, backlog items get checked off,
@@ -80,8 +87,13 @@ new gaps appear, and `git worktree list` does not accumulate stale lanes.
 
 ## The `.orchestrator/` journal (local, gitignored)
 
-A per-clone optimization, **not** a source of truth — if deleted, the next wave rebuilds it
-from `docs/backlog.md` + `gh`.
+A per-clone optimization, **not** a source of truth — if deleted, the next wave rebuilds
+state from `docs/backlog.md` + `gh`. **In this harness the journal is currently
+unwritable:** the `enforce-worktree` PreToolUse hook blocks all writes to the root checkout,
+including gitignored paths such as `.orchestrator/`. The orchestrator therefore runs
+**stateless** — it rebuilds wave state from `backlog.md` + `gh` + memory each wave and
+treats the blocked write as expected, not a failure. The schema below is kept for
+environments where the path is writable.
 
 ```json
 {
@@ -97,17 +109,19 @@ from `docs/backlog.md` + `gh`.
 
 ## Pause / stop
 
-The loop continues via `ScheduleWakeup` (and, with an interval, the `/loop` cadence). To stop:
+In this harness the loop runs as a **fixed cron** (`*/10 * * * *`) managed by the `/loop`
+skill. `ScheduleWakeup` is a no-op (the dynamic gate is off). To stop:
 
 ```text
-/loop                       # invoking the loop skill again lets you cancel/stop the active loop
+/loop                       # invoking the loop skill again lets you cancel/stop the active cron
 ```
 
-or interrupt the session (Esc) and clear scheduled wakeups:
+or interrupt the session (Esc) and cancel the cron via the loop skill's stop/cancel path:
 
-- List scheduled jobs and cancel the orchestration wake-up (the skill schedules with reason
-  "next orchestration wave"). Use the loop skill's own stop/cancel path, or remove the job via
-  the scheduler.
+- List active loop jobs (the `/loop` skill tracks them by ID). Cancel the orchestration cron;
+  once cancelled, no further `/orchestrate` invocations fire automatically.
+- `ScheduleWakeup` is not used in cron mode — there is no scheduled wakeup to cancel
+  separately.
 - In-flight PRs are unaffected — they sit green+reviewed until you merge them or restart the
   loop (the next wave's Phase 0 reaps them).
 
@@ -124,15 +138,16 @@ let the next run rebase and continue it.
 ```
 
 Phase 0 reconstructs everything: it refreshes root, lists open PRs (reaps the green ones),
-reads `docs/backlog.md`, and loads `.orchestrator/state.json` if present. An empty
-`.orchestrator/` is fine — state is rebuilt from the backlog + `gh`.
+reads `docs/backlog.md`, and attempts to load `.orchestrator/state.json` if present. An
+absent or unwritable `.orchestrator/` is fine — state is rebuilt from `backlog.md` + `gh` +
+memory (the current mode in this harness, since the hook blocks root-checkout writes).
 
 ### The 7-day `/loop` expiry (long runs)
 
-`/loop` (dynamic mode) auto-expires after ~7 days. For runs longer than a week, **re-arm** by
-re-issuing `/loop /orchestrate` before/after expiry. Nothing is lost at expiry — it only stops
-the heartbeat; the backlog, PRs, and journal persist, so a re-issue continues seamlessly. Note
-the expiry on your calendar if you intend a multi-week unattended run.
+The `/loop` cron auto-expires after ~7 days. For runs longer than a week, **re-arm** by
+re-issuing `/loop /orchestrate` before/after expiry. Nothing is lost at expiry — it only
+cancels the cron; the backlog, PRs, and memory persist, so a re-issue continues seamlessly.
+Note the expiry on your calendar if you intend a multi-week unattended run.
 
 ---
 
@@ -146,7 +161,7 @@ the expiry on your calendar if you intend a multi-week unattended run.
 | `codex` unavailable/unauthenticated | The review driver reports `codex-unavailable` and falls back to the cross-tier Claude reviewer, noting the gap honestly — it does not silently pass. Restore codex auth to regain true cross-vendor review (rule 21). |
 | Memory MCP locked | Another session has the clone open. Close it (one session per clone). The loop degrades gracefully without memory but loses recall continuity. |
 | Orphaned worktrees accumulate | Phase 0 sweeps them (`git worktree prune` + remove merged/ephemeral dirs). To sweep manually: `git worktree prune && git worktree list`. |
-| The loop seems to have stopped | It must not. Check `/workflows` and scheduled wake-ups; re-issue `/loop /orchestrate`. Report the transcript context — a stop is a defect to fix in the skill, per ADR-0072. |
+| The loop seems to have stopped | It must not. Check `/workflows` and the active cron (list via the `/loop` skill — the cron fires every 10 min). If the cron was accidentally cancelled, re-issue `/loop /orchestrate` to reinstall it. `ScheduleWakeup` is not used in cron mode and cannot restart it. Report the transcript context — a stop is a defect to fix in the skill, per ADR-0072. |
 
 ---
 

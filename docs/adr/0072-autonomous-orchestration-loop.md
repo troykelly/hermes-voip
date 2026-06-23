@@ -147,3 +147,17 @@ stands up infrastructure.
 - Built-in `/loop` skill (dynamic mode + `ScheduleWakeup`); the Workflow tool
   (`parallel`/`pipeline`, `isolation: worktree`, per-agent `model`/`effort`); `codex` CLI
   (cross-vendor review, v0.141).
+
+## Update 2026-06-23 — harness pacing reality
+
+Three verified gaps between this ADR's assumptions and the Claude Code harness as deployed:
+(1) **Continuation is cron, not ScheduleWakeup.** `/loop /orchestrate` runs under a fixed
+cron (`*/10 * * * *`); `ScheduleWakeup` is a no-op in this mode (returns "dynamic gate is
+off"). The cron is the heartbeat — deleting it breaks the loop. (2) **The
+`.orchestrator/state.json` journal is unwritable.** The `enforce-worktree` PreToolUse hook
+blocks all root-checkout writes including gitignored paths; the orchestrator runs stateless
+and rebuilds wave state from `docs/backlog.md` + `gh` + memory each wave. (3) **No
+required-status-check branch protection.** `gh pr merge --auto` merges immediately; for any
+code change, poll `gh pr checks` to green before merging explicitly. The SKILL.md and
+runbook 0016 are updated to match. See `docs/runbooks/0016-orchestration-loop.md` for
+operational detail.

@@ -207,7 +207,7 @@ hermes plugins list
 If you installed the manifest directory from Step 3, `hermes-voip` appears in the table with
 its description and version. (This is a **filesystem listing** — it shows the plugin but does
 not load it. The in-session `/plugins` command, once the gateway is running, shows it loaded
-with its tool count — `9 tools, 1 hook`.)
+with its tool count — `10 tools, 1 hook`.)
 
 To see what Hermes actually **discovers and loads** at startup, set `HERMES_PLUGINS_DEBUG=1`
 when you start the gateway (not on `plugins list`):
@@ -614,4 +614,50 @@ uv run pytest            # tests
 
 ## Licence
 
-Not yet specified (operator to choose).
+[Apache-2.0](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the
+licences of all third-party components used by this project.
+
+---
+
+## Acknowledgements / Built with
+
+`hermes-voip` stands on the shoulders of several excellent open-source libraries and models:
+
+- **[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)** (Apache-2.0) — the on-device
+  inference runtime used for both streaming speech-to-text (k2/icefall Zipformer model) and
+  text-to-speech (Kokoro-82M voice model). The default offline path runs entirely through
+  sherpa-onnx.
+- **[onnxruntime](https://onnxruntime.ai)** (MIT) — ONNX inference engine used for the
+  Silero VAD model and the DeBERTa prompt-injection guard.
+- **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** (Apache-2.0 ONNX packaging
+  `csukuangfj/kokoro-en-v0_19`) — the default offline text-to-speech voice model.
+- **[Silero VAD](https://github.com/snakers4/silero-vad)** (MIT) — voice-activity detection
+  model used to detect when callers start and stop speaking.
+- **[protectai/deberta-v3-base-prompt-injection-v2](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2)**
+  (Apache-2.0) — on-device prompt-injection guard that screens every caller utterance before
+  it reaches the agent.
+- **[aioice](https://github.com/aiortc/aioice)** (BSD-3-Clause) — ICE agent for WebRTC
+  connectivity negotiation (RFC 8445).
+- **[websockets](https://github.com/python-websockets/websockets)** (BSD-3-Clause) —
+  asyncio WebSocket client used for SIP-over-Secure-WebSocket (RFC 6455 / RFC 7118).
+- **[cryptography](https://cryptography.io/)** (Apache-2.0 OR BSD-3-Clause) — AES-CM
+  keystream and HMAC-SHA1 authentication for SDES-SRTP media encryption (RFC 3711).
+- **[pyOpenSSL](https://pyopenssl.org/)** (Apache-2.0) — DTLS handshake and RFC 5705
+  keying-material export for WebRTC media encryption.
+- **[opuslib](https://github.com/onbeep/opuslib)** (BSD-3-Clause) — pure-Python ctypes
+  binding to the system `libopus` library, used for WebRTC/Opus audio codec.
+- **[numpy](https://numpy.org)** (BSD-3-Clause et al.) — PCM audio frame arithmetic.
+- **[tokenizers](https://github.com/huggingface/tokenizers)** (Apache-2.0) — SentencePiece
+  tokenizer loading for the DeBERTa prompt-injection guard.
+- **[audioop-lts](https://github.com/AbstractUmbra/audioop)** (PSF-2.0) — G.711 μ-law/A-law
+  encode/decode and audio rate conversion (the Python 3.13-compatible fork of stdlib audioop).
+- **G.722 codec** — vendored pure-Python port of the public-domain G.722 reference by Steve
+  Underwood, based on the CMU 1993 single-channel G.722 codec ("completely unrestricted");
+  no runtime dependency added (see `src/hermes_voip/media/g722.py` and ADR-0022).
+- Optional self-hosted TTS alternatives: **[Piper](https://github.com/rhasspy/piper)** (MIT
+  engine; `en_US-libritts/high` voice is MIT — the libritts-trained voice, not the
+  non-commercial lessac variant); **KittenTTS** (Apache-2.0); **Kyutai TTS** (CC-BY-4.0
+  weights; only CC0/CC-BY voice packs are permitted in committed config — see ADR-0007).
+
+For the complete list of all third-party components with their SPDX licence identifiers and
+project URLs, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

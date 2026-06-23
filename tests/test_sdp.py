@@ -2501,3 +2501,98 @@ def test_build_sip_dtls_answer_does_not_regress_sdes() -> None:
     assert "UDP/TLS/RTP/SAVP" not in text
     assert "a=crypto:" in text
     assert "a=fingerprint" not in text
+
+
+# ---------------------------------------------------------------------------
+# Parse-path port and ptime validation (hostile inbound, robustness).
+# RFC 4566 §5.7: port 0 is VALID (signals a disabled/rejected media stream);
+# only NEGATIVE and out-of-range (>65535) ports are invalid.
+# ---------------------------------------------------------------------------
+
+_SDP_NEGATIVE_PORT = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio -5 RTP/AVP 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+_SDP_PORT_TOO_LARGE = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 65536 RTP/AVP 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+_SDP_PORT_ZERO = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 0 RTP/AVP 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+_SDP_PTIME_NEGATIVE = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 40000 RTP/AVP 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=ptime:-3\r\n"
+    "a=sendrecv\r\n"
+)
+
+_SDP_PTIME_ZERO = (
+    "v=0\r\n"
+    "o=- 1 1 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 40000 RTP/AVP 0\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=ptime:0\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def test_parse_rejects_negative_port() -> None:
+    """The parser MUST reject a negative media port with SdpError (hostile inbound)."""
+    with pytest.raises(SdpError, match=r"port"):
+        SessionDescription.parse(_SDP_NEGATIVE_PORT)
+
+
+def test_parse_rejects_port_above_65535() -> None:
+    """The parser MUST reject a port > 65535 with SdpError (hostile inbound)."""
+    with pytest.raises(SdpError, match=r"port"):
+        SessionDescription.parse(_SDP_PORT_TOO_LARGE)
+
+
+def test_parse_accepts_port_zero() -> None:
+    """Port 0 is VALID per RFC 4566 §5.7 (disabled/rejected stream); must not raise."""
+    sdp = SessionDescription.parse(_SDP_PORT_ZERO)
+    assert sdp.audio is not None
+    assert sdp.audio.port == 0
+
+
+def test_parse_rejects_negative_ptime() -> None:
+    """The parser MUST reject a negative ptime with SdpError (hostile inbound)."""
+    with pytest.raises(SdpError, match=r"ptime"):
+        SessionDescription.parse(_SDP_PTIME_NEGATIVE)
+
+
+def test_parse_rejects_ptime_zero() -> None:
+    """The parser MUST reject ptime=0 with SdpError (non-positive ptime is invalid)."""
+    with pytest.raises(SdpError, match=r"ptime"):
+        SessionDescription.parse(_SDP_PTIME_ZERO)

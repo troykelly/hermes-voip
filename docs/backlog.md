@@ -52,7 +52,7 @@ defect or a load-bearing test gap.
 - [ ] **[low] robustness** — Empty `cnonce` (`cnonce=""`) is accepted and emitted (`is not None` check,
   line 167). Defeats the client-nonce purpose; some registrars reject it. Reject empty (or treat falsy
   as "generate") and document; add a test.
-- [ ] **[low] correctness** — `_PARAM` key pattern `\w+` (line 24) cannot match hyphenated extension
+- [ ] **[low] correctness** (partial — residual: no test asserting unknown/hyphenated params are silently ignored (no test with an unknown x-custom-param= in tests/test_digest.py).) — `_PARAM` key pattern `\w+` (line 24) cannot match hyphenated extension
   param names. No test asserts unknown/hyphenated params are ignored gracefully. Broaden to `[\w-]+`
   for forward-compat or pin the silent-skip behaviour with a test.
 - [ ] **[low] robustness** — `algorithm` token rendered unquoted (line 163) after only a lowercase
@@ -64,7 +64,7 @@ defect or a load-bearing test gap.
 - [ ] **[low] api** — Caller cannot supply a precomputed HA1; `DigestCredentials` holds plaintext
   password (line 112) and recomputes HA1 each call. RFC 2617 allows storing A1. Offer an HA1-based
   credential variant so security-conscious callers need not keep plaintext resident; record in the ADR.
-- [ ] **[low] api** — `qop` selection silently drops `auth-int`; auth-int unimplemented. Correct/in-scope
+- [ ] **[low] api** (partial — residual: the build_authorization docstring does not explicitly state that auth-int-only is the rejection path or scope this as SIP REGISTER / empty b) — `qop` selection silently drops `auth-int`; auth-int unimplemented. Correct/in-scope
   for SIP REGISTER (empty body) but the docstring doesn't call out that auth-int-only is the rejection
   path. State the scope in the docstring/ADR; keep the auth-int-only rejection test.
 - [ ] **[low] api** — `build_authorization` returns a bare value string; `registration.py` (lines 161-164)
@@ -118,7 +118,7 @@ defect or a load-bearing test gap.
   `_reject_controls` runs (lines 78-79); an empty method, embedded-space method, or empty/space URI
   passes. Verified: `build_request("", "sip:x", [])` → start-line `' sip:x SIP/2.0'`. Validate method
   against the token rule + reject empty; reject empty/space URI. Red tests for each.
-- [ ] **[medium] test** — Duplicate Content-Length and caller-owned-header collisions are untested.
+- [ ] **[medium] test** (partial — residual: the multibyte-UTF-8 body test pinning byte-length Content-Length is still absent (test at line 150 uses ASCII-only body).) — Duplicate Content-Length and caller-owned-header collisions are untested.
   Add a test after deciding the policy; also a multibyte-UTF-8 body test pinning the byte-length
   Content-Length (a `len(body)` mutant survives today).
 - [ ] **[medium] test** — Token-generator tests under-constrain format/length (mutation-weak).
@@ -168,7 +168,7 @@ defect or a load-bearing test gap.
   Verified: `m=audio -5 RTP/AVP 0` → port `-5`; `a=ptime:-3` → ptime `-3`. The *builder* validates these
   but the *parser* (hostile inbound data) does not. Validate port range and `ptime>0` on parse → `SdpError`;
   decide/document `port==0` (held/declined media) explicitly.
-- [ ] **[medium] test** — No negative-control on negotiate ordering / TE-only rejection. No test where
+- [x] **[medium] test** (done — Wave 3 audit) — No negative-control on negotiate ordering / TE-only rejection. No test where
   offer order differs from `supported` (an order-by-supported mutant survives); no test for the
   telephone-event-shared-but-no-voice branch (`has_voice` guard, lines 236-239). Add both.
 - [ ] **[low] robustness** — Direction attribute matching is exact-case only; `a=SENDONLY` is silently
@@ -184,7 +184,7 @@ defect or a load-bearing test gap.
 - [ ] **[low] efficiency** — `SessionDescription.parse` does `text.replace(_CRLF,'\n').split('\n')`
   (line 189), allocating two transient buffers. SDP is NOT the 50pkt/s path. Use `splitlines()` (drops
   the copy, handles bare CR) — micro-optimisation; correctness of bare-CR handling is the better reason.
-- [ ] **[low] polish** — `o=` line collapses three distinct RFC 4566 fields. `o=- {session_id}
+- [ ] **[low] polish** (partial — residual: addrtype is still hardcoded to IP4 at sdp.py:1330, 1332, 1464, 1689, 1691 — "derive addrtype from the address family" is unimplemented.) — `o=` line collapses three distinct RFC 4566 fields. `o=- {session_id}
   {session_id} IN IP4 {local_address}` (line 285) forces sess-id == sess-version (a re-INVITE must keep
   sess-id and increment only sess-version — the docstring's re-INVITE claim at 260-261 is aspirational,
   rule 27), hard-codes username `-`, and hard-codes `IP4` so an IPv6 local_address emits a wrong addrtype.
@@ -199,14 +199,14 @@ defect or a load-bearing test gap.
   (the resolved media-level-or-session-fallback). A caller reaching for the session field when they meant
   the media's effective address gets the wrong value. Document that `audio.connection_address` is the
   effective address.
-- [ ] **[low] docs** — No module-level statement of scope/leniency (video ignored is stated; 2nd+ audio
+- [ ] **[low] docs** (partial — residual: No "Scope and leniency" paragraph was added to the module docstring (sdp.py:1-20); it still only describes the two keying paths. DONE (reque) — No module-level statement of scope/leniency (video ignored is stated; 2nd+ audio
   sections ignored, unknown `a=` dropped, dup rtpmap last-wins, no DTLS fingerprint, port 0 not special
   are NOT). Add a "Scope and leniency" paragraph; consider modelling `a=fingerprint`/`a=setup` so the
   ADR-0005 DTLS-SRTP profile is representable.
 - [ ] **[low] test** — Build-side under-asserted (mutation-weak round-trip): no literal-line assertions
   (`v=0` first, single `m=audio … RTP/AVP`, `a=ptime:20`, `a=sendrecv`, trailing CRLF). A dropped `v=0`
   round-trips through our own lenient parser. Assert key literal lines.
-- [ ] **[low] test** — Direction round-trip untested for sendonly/recvonly/inactive (every assertion is
+- [ ] **[low] test** (partial — residual: test_build_rejects_bad_direction (specifically named in the item) does not exist — no test asserts that build_audio_offer/build_audio_answer) — Direction round-trip untested for sendonly/recvonly/inactive (every assertion is
   `sendrecv`); build-side direction validation (lines 270-272) and `session_id`-into-`o=` are untested.
   Parameterise over all four directions for parse+build; add `test_build_rejects_bad_direction` and a
   session-id-in-o= test.
@@ -215,15 +215,15 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/registration.py
 
-- [ ] **[high] robustness** — `423 Interval Too Brief` is treated as a hard failure. `handle()` maps
+- [x] **[high] robustness** (done — Wave 3 audit) — `423 Interval Too Brief` is treated as a hard failure. `handle()` maps
   everything not 200/401/407 to `Failed` (lines 145-151); a registrar enforcing a minimum interval
   (`Min-Expires`) ends the flow with no retry → silent total outage. Read `Min-Expires`, re-issue with
   `expires = max(requested, min_expires)`; surface a new outcome or transparently re-build. Red-then-green
   regression test.
-- [ ] **[high] api** — Registration API is not exported from `__init__.py` (only `sip_address_of_record`).
+- [x] **[high] api** (done — Wave 3 audit) — Registration API is not exported from `__init__.py` (only `sip_address_of_record`).
   `RegistrationFlow`/`RegistrationConfig`/`Challenged`/`Registered`/`Failed` are reachable only via the
   deep path. For a plugin whose reason to exist is registration, export them and add a public-import test.
-- [ ] **[high] robustness** — `_registrar_uri` (lines 93-97) silently produces malformed URIs.
+- [x] **[high] robustness** (done — Wave 3 audit) — `_registrar_uri` (lines 93-97) silently produces malformed URIs.
   Verified: `1000@pbx.example.test` → `1000@pbx.example.test:` (trailing colon), `''` → `':'`. A malformed
   AOR corrupts the request-URI and digest uri and surfaces much later as a confusing gateway rejection.
   Validate scheme + non-empty host in `RegistrationConfig.__post_init__`/`_registrar_uri`, raise
@@ -260,10 +260,10 @@ defect or a load-bearing test gap.
   validate `parts[1].upper() == 'REGISTER'`; test a method mismatch.
 - [ ] **[low] robustness** — Missing/garbled CSeq is silently accepted (lines 181-182), bypassing the
   only correlation check. Reconsider raising; if leniency is deliberate, pin it with a test.
-- [ ] **[low] robustness** — `_granted_expires` falls back to the *requested* Expires when the 200 omits
+- [ ] **[low] robustness** (partial — residual: registration.py:358-384 — multi-Contact parsing via `_split_contacts`/`_binding_uri` is implemented and our-binding matching exists. Tests f) — `_granted_expires` falls back to the *requested* Expires when the 200 omits
   expiry (lines 188-197), masking a shorter grant → silent registration drop. It also doesn't match the
   Contact against ours. Log/flag the missing-expiry case; tests for multi-Contact/Expires-only/neither.
-- [ ] **[low] correctness** — `_EXPIRES_PARAM` matches the first `;expires=` across a folded multi-Contact
+- [x] **[low] correctness** (done — Wave 3 audit) — `_EXPIRES_PARAM` matches the first `;expires=` across a folded multi-Contact
   header, risking the wrong binding's lifetime. Iterate `headers_all('Contact')`, parse each into
   URI+params, read `;expires` from the binding whose URI matches ours; multi-binding fixture.
 - [ ] **[low] polish** — Via `rport`/`branch` assembly is hand-rolled (line 201) and the response Via's
@@ -290,7 +290,7 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/rtp.py
 
-- [ ] **[high] correctness** — `JitterBuffer` anchors playout on the FIRST arrival, dropping an earlier
+- [x] **[high] correctness** (done — Wave 3 audit) — `JitterBuffer` anchors playout on the FIRST arrival, dropping an earlier
   reordered packet at stream start. `push()` sets `_next = seq` on the first packet (lines 188-189);
   `push(12)` then `push(10)` drops 10 (verified). At call start the first packets are the most
   reordering-prone — this permanently loses the greeting / first words feeding STT. Defer anchoring until
@@ -309,7 +309,7 @@ defect or a load-bearing test gap.
   payload, the guard (lines 114-117) fails and the raw payload (incl. the bogus pad byte) is returned with
   no error — inconsistent with the other parse paths that raise. Verified: P=1, payload `b'\x05'` →
   `b'\x05'`. Raise `ValueError` when `pad > len(payload)`; decide/document `pad==0`-with-P. Tests both.
-- [ ] **[medium] api** — `JitterBuffer` exposes no `__len__`/peek/flush/reset. The media loop needs depth
+- [ ] **[medium] api** (partial — residual: `__len__`, `flush()`, `reset()` are absent; no SSRC-awareness or auto-reset on SSRC change.) — `JitterBuffer` exposes no `__len__`/peek/flush/reset. The media loop needs depth
   (metrics/adaptive), drain-on-BYE (trailing audio), and reset-on-SSRC-change (re-INVITE/source resync) —
   none exist, and an SSRC change mis-classifies the new stream against the stale anchor. Add
   `__len__`/peek/`flush()`/`reset()`; have the buffer know the SSRC and auto-reset on change.
@@ -434,7 +434,7 @@ defect or a load-bearing test gap.
 - [ ] **[medium] test** — Continuity test only covers 8k↔16k; the 24k↔8k TTS path (ADR-0004/0005) and
   24k↔16k are untested — exactly the non-integer-ratio cases where boundary clicks appear. Extend the
   parametrize to include 24000↔8000/16000↔24000/24000↔16000; add sample-count sanity for 24k↔8k.
-- [ ] **[medium] test** — Mutation-weak assertions: wide resample tolerances (`300 <= … <= 340`); the
+- [ ] **[medium] test** (partial — residual: wide resample tolerance `300 <= out_samples <= 340` (line 63) unchanged; no a-law near-lossless value test; no golden-vector assertion (e.g.) — Mutation-weak assertions: wide resample tolerances (`300 <= … <= 340`); the
   ulaw/alaw one-byte-per-sample tests assert no decoded values (a `lin2ulaw`→`lin2alaw` swap survives);
   a-law has NO round-trip value assertion at all (a `decode_alaw`→`ulaw2lin` mutant survives). Add an
   a-law near-lossless value test; tighten counts; add an `encode_ulaw != encode_alaw` discrimination test;
@@ -447,7 +447,7 @@ defect or a load-bearing test gap.
 - [ ] **[low] docs** — `ratecv` low-pass weights are left at defaults `(1, 0)` with no comment — a real
   audio-quality decision for the STT path. Add a one-line comment (defaults adequate for narrowband
   speech) or expose weights as params; record in ADR-0005.
-- [ ] **[low] test** — No test pins that `decode_ulaw`/`decode_alaw` are distinct codecs / that
+- [ ] **[low] test** (partial — residual: no assertion against a known-good G.711 reference value (e.g. `encode_ulaw(pcm16_of_0) == b'\xff'`); bare `decode_ulaw`/`decode_alaw` distin) — No test pins that `decode_ulaw`/`decode_alaw` are distinct codecs / that
   `ulaw_to_frame` uses mu-law specifically (the frame round-trip uses mu-law both ways, so a global
   mu→a swap still passes). Assert against a known-good G.711 reference value.
 - [ ] **[low] polish** — `Resampler` forbids equal rates but there's no symmetric guard catching
@@ -471,13 +471,13 @@ defect or a load-bearing test gap.
 
 ## src/hermes_voip/providers/ (audio, asr, tts, guard, policy, transport, registry)
 
-- [ ] **[high] test** — Async Protocol methods are never awaited/executed in any test. The conformance
+- [x] **[high] test** (done — Wave 3 audit) — Async Protocol methods are never awaited/executed in any test. The conformance
   suite touches only sync members (`input_sample_rate`, `isinstance`); `screen`/`connect`/`send_audio`/
   `inbound_audio`/`stream`/`synthesize`/`flush`/`cancel`/`__anext__` are never run (`runtime_checkable`
   only checks attribute presence). A `def`-instead-of-`async def` or non-iterator fake passes. Add async
   tests that drive each fake (await `screen`, iterate `inbound_audio`/`stream`/the TtsStream, await
   `connect`/`flush`/`cancel`).
-- [ ] **[high] test** — No async test runner dependency. `pyproject.toml` lists `pytest==9.1.0` but no
+- [x] **[high] test** (done — Wave 3 audit) — No async test runner dependency. `pyproject.toml` lists `pytest==9.1.0` but no
   `pytest-asyncio`/`anyio` and no `asyncio_mode`; plain pytest can't run `async def test_…`, which is why
   the async contract is untested. Add and pin `pytest-asyncio` (or `anyio`), set `asyncio_mode = "auto"`,
   regenerate `uv.lock`, convert the conformance tests to await the async members.
@@ -490,11 +490,11 @@ defect or a load-bearing test gap.
   never enforce it (asr.py:20, guard.py:35). For `score` this is security-adjacent (ADR-0009 thresholds
   on it). Validate in `__post_init__` (reject out-of-range/NaN) or introduce a branded `Probability`
   newtype; tests for the range.
-- [ ] **[medium] correctness** — `GuardSessionState.flagged_turns` is declared but never populated by
+- [x] **[medium] correctness** (done — Wave 3 audit) — `GuardSessionState.flagged_turns` is declared but never populated by
   `record()` (policy.py:41, 43-45 fold only `degraded`); `GuardResult` carries no turn id, so it *cannot*
   be populated (aspirational field, rule 27). Either wire it up (give `screen`/`GuardResult` a turn id and
   append on warranting verdicts, with a test) or remove it until implemented (rule 6).
-- [ ] **[medium] correctness** — `record()` ignores `GuardResult.verdict` entirely — only `degraded` is
+- [x] **[medium] correctness** (done — Wave 3 audit) — `record()` ignores `GuardResult.verdict` entirely — only `degraded` is
   folded (policy.py:45), so REFUSE/RESTRICT produce no session-state change and cumulative risk (ADR-0009)
   is unrepresentable. Implement the cumulative-risk model (at minimum count suspicious turns) with tests,
   or correct the docstring to stop implying cumulative risk.
@@ -514,7 +514,7 @@ defect or a load-bearing test gap.
   make(s)); tighten the duplicate assertion to include kind + quoted name.
 - [ ] **[low] efficiency** — `names()` re-sorts the dict each call (registry.py:49) — fine (startup/
   diagnostic), but add a one-line comment so a future caller doesn't reach for it per-turn.
-- [ ] **[low] api** — `providers/__init__.py` exports nothing (no `__all__`, no re-exports); none of the
+- [ ] **[low] api** (partial — residual: the six individual modules (asr.py, tts.py, guard.py, policy.py, transport.py, registry.py) still define no __all__, so deep-path imports ar) — `providers/__init__.py` exports nothing (no `__all__`, no re-exports); none of the
   seven modules define `__all__`. The most-imported contract (ADR-0004) forces deep-path imports. Re-export
   the canonical public names from the package under one `__all__`.
 - [ ] **[low] api** — `GuardVerdict`/`ToolRisk` are documented "ascending severity" but derive from plain
@@ -533,10 +533,10 @@ defect or a load-bearing test gap.
 - [ ] **[low] test** — No property-based tests for the audio invariants (no `hypothesis`); equality/hash
   tested for one equal pair but never inequality (frames differing only in ts/rate never asserted `!=`).
   Add inequality assertions; consider a hypothesis `sample_count` test over arbitrary bytes.
-- [ ] **[low] test** — The conformance fakes' empty async generators (`return; yield`) only exercise the
+- [x] **[low] test** (done — Wave 3 audit) — The conformance fakes' empty async generators (`return; yield`) only exercise the
   empty-stream path, so non-empty iteration is never validated. Add fakes that yield a scripted sequence
   and drain them asserting exact order.
-- [ ] **[low] test** — `TtsStream` flush/cancel barge-in (the single most important TTS behaviour) has no
+- [x] **[low] test** (done — Wave 3 audit) — `TtsStream` flush/cancel barge-in (the single most important TTS behaviour) has no
   behavioural test — `isinstance` ignores signatures, flush/cancel are never awaited. Add a fake whose
   `cancel()` flips a flag and whose `__anext__` then raises `StopAsyncIteration`; assert post-cancel
   iteration is empty and `flush()` emits buffered frames.
@@ -556,7 +556,7 @@ defect or a load-bearing test gap.
 
 These span multiple modules or the repo as a whole.
 
-- [ ] **[high] test/infra** — **No async test runner.** The entire provider seam is async yet untestable
+- [x] **[high] test/infra** (done — Wave 3 audit) — **No async test runner.** The entire provider seam is async yet untestable
   as written (no `pytest-asyncio`/`anyio`, no `asyncio_mode`). This blocks behavioural coverage of every
   streaming/transport/guard contract. Add + pin the runner, set `asyncio_mode`, regenerate `uv.lock`.
   (Listed per-module under providers too; called out here because it gates the whole async surface.)
@@ -575,17 +575,17 @@ These span multiple modules or the repo as a whole.
 - [ ] **[medium] api/consistency** — **`typing.Final` on module constants is inconsistent.**
   `media/audio.py` annotates public constants with `Final`; `dtmf.py`/`rtp.py` do not. Adopt `Final`
   uniformly for mutation-resistance and consistency.
-- [ ] **[medium] correctness/consistency** — **Exception-type contract is inconsistent across the
+- [ ] **[medium] correctness/consistency** (partial — residual: audioop.error not wrapped/documented as propagating.) — **Exception-type contract is inconsistent across the
   foundation.** Some guards raise `ValueError`/`SdpError`, others leak `AttributeError` (message.py
   reason-less status) or `audioop.error` (media/audio decode/resample). Define and document one coherent
   exception contract per layer (parse layers raise `ValueError`/domain errors on hostile input; never leak
   a foreign type a caller wouldn't catch). Audit each public function's docstring against what it actually
   raises (rule 27, rule 37).
-- [ ] **[medium] robustness/consistency** — **Constructor-time validation is uneven.** `JitterBuffer`
+- [ ] **[medium] robustness/consistency** (partial — residual: Resampler rate validation IS now implemented (src/hermes_voip/media/audio.py:201-215: validates positive rates and plain int). However: src/) — **Constructor-time validation is uneven.** `JitterBuffer`
   and `DtmfEvent` validate in `__init__`/`__post_init__`; `Resampler` (rates), `DtmfReceiver` (history),
   `RegistrationConfig` (aor/transport/expires), and `PcmFrame` (length/rate) do not — deferring failures
   to deep, mid-call sites. Standardise fail-fast construction across the foundation.
-- [ ] **[medium] api/consistency** — **Public-import discoverability.** Only `sip_address_of_record` is
+- [ ] **[medium] api/consistency** (partial — residual: provider Protocols/types (PcmFrame, MediaTransport, AsrProvider, TtsProvider, GuardProvider) and media codecs are still deep-import only; no) — **Public-import discoverability.** Only `sip_address_of_record` is
   exported from `hermes_voip/__init__.py`; `RegistrationFlow`, the provider Protocols/types, and the media
   codecs are reachable only via deep paths and are untested at the package boundary. Decide a deliberate
   public surface and pin it with import tests.
@@ -594,7 +594,7 @@ These span multiple modules or the repo as a whole.
   rtp payload fidelity, dtmf encode byte, media/audio codec identity, registration reason/branch/stale,
   sdp ordering). AGENTS 19 names mutation score as the target; run a mutation pass (e.g. `mutmut`/
   `cosmic-ray` as dev tooling) over the foundation and close the surviving-mutant gaps.
-- [ ] **[low] docs** — **No `docs/plan/` until now.** The phased plan lives in
+- [x] **[low] docs** (done — Wave 3 audit) — **No `docs/plan/` until now.** The phased plan lives in
   `docs/plan/IMPLEMENTATION-PLAN.md` (this change). Keep it current as units land (rule 42 spirit for
   plans).
 - [ ] **[low] docs/consistency** — **Module docstrings vs reality (rule 27).** `media/__init__.py`
@@ -902,7 +902,7 @@ These span multiple modules or the repo as a whole.
   asserts `plugin.yaml` version matches `pyproject.toml` (line 159) but there is no corresponding test for
   `src/hermes_voip/__init__.py.__version__` (line 49) — a release bump could easily leave it out of sync
   (`src/hermes_voip/__init__.py:49`, `tests/test_plugin_manifest.py:159-164`).
-- [ ] **[medium] operability** — Wheel artifacts remain in the git-tracked `dist/` directory.
+- [x] **[medium] operability** (done — Wave 3 audit) — Wheel artifacts remain in the git-tracked `dist/` directory.
   `dist/hermes_voip-0.0.0-py3-none-any.whl` exists and is not in `.gitignore`. Build artifacts in the repo
   create a stale-artifact risk and violate deterministic-builds rule 33. Add `dist/` to `.gitignore` and
   remove the committed artifact.

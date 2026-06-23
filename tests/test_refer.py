@@ -407,3 +407,104 @@ def test_build_blind_refer_carries_auth_header() -> None:
     )
     parsed = SipRequest.parse(result.text)
     assert parsed.header("Proxy-Authorization") == "Digest username=1000"
+
+
+# ---- Refer-To injection guard (security) -----------------------------------
+#
+# ``transfer_blind`` passes an AGENT-SUPPLIED target straight into the
+# ``Refer-To: <target>`` header. A bare extension target may LEGITIMATELY be a
+# dialable user-part OR a full ``sip:``/``sips:`` URI; anything else — a host
+# hijack on a bare extension (``1001@evil.com``), a ``?Replaces=`` / ``;``-param
+# smuggle, a ``>`` angle-bracket breakout, CR/LF header injection, or any
+# control char (including percent-encoded CRLF that the gateway would decode) —
+# must be REJECTED with ``ValueError`` so NO REFER is built.
+
+
+def test_build_blind_refer_accepts_bare_extension() -> None:
+    # A plain dialable extension is a legitimate blind-transfer target.
+    result = build_blind_refer(_dialog(), "3000")
+    req = SipRequest.parse(result.text)
+    assert req.header("Refer-To") == "<3000>"
+
+
+def test_build_blind_refer_accepts_dialable_extension_with_plus_star_hash() -> None:
+    result = build_blind_refer(_dialog(), "+1*2#3")
+    req = SipRequest.parse(result.text)
+    assert req.header("Refer-To") == "<+1*2#3>"
+
+
+def test_build_blind_refer_accepts_valid_sip_uri() -> None:
+    result = build_blind_refer(_dialog(), "sip:3000@pbx.example.test")
+    req = SipRequest.parse(result.text)
+    assert req.header("Refer-To") == "<sip:3000@pbx.example.test>"
+
+
+def test_build_blind_refer_accepts_valid_sips_uri_with_params() -> None:
+    result = build_blind_refer(_dialog(), "sips:3000@pbx.example.test;transport=tls")
+    req = SipRequest.parse(result.text)
+    assert req.header("Refer-To") == "<sips:3000@pbx.example.test;transport=tls>"
+
+
+def test_build_blind_refer_rejects_bare_extension_host_hijack() -> None:
+    # ``1001@evil.com`` on a bare extension would redirect the transfer to an
+    # arbitrary host — reject it (it is neither a dialable user-part nor a
+    # well-formed sip: URI).
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "1001@evil.com")
+
+
+def test_build_blind_refer_rejects_bare_extension_with_replaces() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "1001?Replaces=abc%3Bto-tag%3Dx")
+
+
+def test_build_blind_refer_rejects_bare_extension_with_params() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "1001;maddr=evil.com")
+
+
+def test_build_blind_refer_rejects_crlf_header_injection() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test>\r\nEvil-Header: x")
+
+
+def test_build_blind_refer_rejects_angle_bracket_breakout() -> None:
+    # A ``>`` inside the target would close the ``Refer-To: <...>`` early and let
+    # the remainder smuggle out of the bracketed addr-spec.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test>")
+
+
+def test_build_blind_refer_rejects_bare_cr_in_uri() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test\rmore")
+
+
+def test_build_blind_refer_rejects_control_char_in_uri() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test\x00null")
+
+
+def test_build_blind_refer_rejects_percent_encoded_crlf() -> None:
+    # %0D%0A decodes to CR/LF: a gateway that unescapes the URI would inject a
+    # header. Reject the encoded form too (no percent-escaped controls).
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test%0D%0AEvil:%20x")
+
+
+def test_build_blind_refer_rejects_whitespace_in_uri() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test evil")
+
+
+def test_build_blind_refer_rejects_empty_target() -> None:
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "")
+
+
+def test_build_blind_refer_rejects_non_sip_scheme() -> None:
+    # Only sip:/sips: URIs are valid transfer targets; a tel:/http: scheme (or a
+    # bare ``user@host`` that looks URI-ish) is not a dialable extension and not a
+    # sip URI — reject it.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "http://evil.com/")

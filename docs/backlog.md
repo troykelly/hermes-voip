@@ -773,17 +773,16 @@ These span multiple modules or the repo as a whole.
 
 ## docs/runbooks/
 
-- [ ] **[high] docs** — Runbook 0012 numbering collision: two runbooks share the same prefix.
+- [x] **[high] docs** — Runbook 0012 numbering collision: two runbooks share the same prefix.
   `docs/runbooks/0012-voip-acoustic-echo-cancellation.md` (committed 2026-06-17) and
   `docs/runbooks/0012-voip-inbound-call-context.md` (committed 2026-06-18) both occupy the same number slot,
-  breaking the monotone numbering convention. Fix: rename `0012-voip-acoustic-echo-cancellation.md` to
-  `0017-voip-acoustic-echo-cancellation.md` (the first free slot above 0016) and update all cross-references
-  (README, ADR-0033).
-- [ ] **[high] docs** — AEC runbook default is stale: says 16 ms; code default is 64 ms since commit ff73953.
-  `docs/runbooks/0012-voip-acoustic-echo-cancellation.md` has three stale references to the old 16 ms default
+  breaking the monotone numbering convention. Fixed: renamed `0012-voip-acoustic-echo-cancellation.md` to
+  `0018-voip-acoustic-echo-cancellation.md` (first free slot; 0017 was already taken by
+  `0017-devcontainer-resources.md`).
+- [x] **[high] docs** — AEC runbook default is stale: says 16 ms; code default is 64 ms since commit ff73953.
+  `docs/runbooks/0018-voip-acoustic-echo-cancellation.md` had three stale references to the old 16 ms default
   for `HERMES_VOIP_AEC_FILTER_MS`: the knobs table (line 26), and the two verify-output examples (lines 99-100).
-  `config.py:256` `_DEFAULT_AEC_FILTER_MS = 64` (verified: running the verify step prints `True 64 0.3 200`,
-  not `True 16 0.3 200`). Rule 27: update the table and both example outputs to 64 ms.
+  `config.py:256` `_DEFAULT_AEC_FILTER_MS = 64` (verified). Fixed: updated table and both example outputs to 64 ms.
 - [ ] **[medium] docs** — Add outbound SIP CANCEL coverage to runbook 0007. ADR-0069 (outbound SIP CANCEL,
   RFC 3261 §9.1) is Accepted and fully implemented (`transport/connection.py:418` `send_cancel`,
   `adapter.py:2309` `abort_call`, `adapter.py:2347` `_ring_timeout`). `docs/runbooks/0007-voip-outbound-calling.md`
@@ -812,13 +811,14 @@ These span multiple modules or the repo as a whole.
 
 ## README.md
 
-- [ ] **[high] docs** — README Security section falsely states call transfer is unavailable. `README.md:587-588`
-  says "call transfer stays unavailable until its spoof-resistant confirmation channel ships." This is factually
+- [x] **[high] docs** — README Security section falsely stated call transfer is unavailable. `README.md:587-588`
+  said "call transfer stays unavailable until its spoof-resistant confirmation channel ships." This was factually
   wrong: `transfer_blind` and `transfer_attended` are both in `plugin.yaml provides_tools` (lines 49-50);
   `dtmf_confirm.py` implements `ArmedConfirmation` (the spoof-resistant DTMF confirmation channel, ADR-0010/0031);
   `refer.py` implements REFER/Replaces; `voip_tools.py` has `transfer_blind_handler` and
-  `transfer_attended_handler`. Rule 27 violation: correct the Security section to accurately describe the
-  shipped trust model (transfer is available at operator privilege level, gated by DTMF confirmation).
+  `transfer_attended_handler`. Fixed: Security section now accurately describes the shipped trust model
+  (transfer is available at operator privilege level, gated by DTMF confirmation for blind and outbound
+  allow-list for attended).
 - [ ] **[medium] docs** — README reports stale tool count: "9 tools, 1 hook" should be "10 tools, 1 hook".
   `README.md:210` says the plugin registers `9 tools, 1 hook`. `plugin.yaml provides_tools` (lines 41-50) has
   10 entries including `transfer_attended` (added in commit `d8097cc`). The discrepancy will mislead operators.

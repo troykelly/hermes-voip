@@ -36,6 +36,10 @@
 # Worktree lanes — disposable, never committed
 .worktrees/
 
+# Autonomous orchestration-loop wave journal (ADR-0072) — a per-clone optimisation
+# rebuilt from docs/backlog.md + GitHub each wave; never committed.
+.orchestrator/
+
 # Local model-weight cache — large binaries, NEVER committed (rule 33). The STT/
 # TTS/VAD/guard weights are downloaded + sha256-verified at validation time from
 # their pinned manifest revisions (see docs/runbooks/0002-voip-live-validation.md);

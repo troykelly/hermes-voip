@@ -148,3 +148,17 @@ def test_receiver_dedups_reordered_end_packets() -> None:
         rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
         is None
     )
+
+
+def test_receiver_rejects_history_zero_and_negative() -> None:
+    """DtmfReceiver must raise ValueError when history < 1.
+
+    history=0 makes _order a maxlen=0 deque (no-op) so the eviction guard never
+    fires; _seen grows unbounded for the call's lifetime — a memory leak that
+    silently breaks the bounded-window dedup contract (Wave-3 audit).
+    history=-1 is equally invalid.  The guard must fail fast at construction.
+    """
+    with pytest.raises(ValueError, match="history"):
+        DtmfReceiver(history=0)
+    with pytest.raises(ValueError, match="history"):
+        DtmfReceiver(history=-1)

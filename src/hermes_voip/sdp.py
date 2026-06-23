@@ -784,19 +784,25 @@ class _AudioAccumulator:
         """Apply an ``m=audio <port> <proto> <fmt...>`` line.
 
         Raises:
-            SdpError: If the line is truncated or carries a non-integer port or
-                payload type.
+            SdpError: If the line is truncated, carries a non-integer port or
+                payload type, or carries a port that is negative or > 65535.
+                Port 0 is VALID (RFC 4566 §5.7 / RFC 3264: signals a
+                disabled/rejected media stream) and is accepted.
         """
         fields = value.split()
         if len(fields) < _M_AUDIO_MIN_FIELDS:
             msg = f"malformed m=audio line: {value!r}"
             raise SdpError(msg)
         try:
-            self.port = int(fields[1])
+            port = int(fields[1])
             self.fmt_order = [int(pt) for pt in fields[3:]]
         except ValueError as exc:
             msg = f"malformed m=audio line: {value!r}"
             raise SdpError(msg) from exc
+        if port < 0 or port > _MAX_PORT:
+            msg = f"m=audio port out of range 0..{_MAX_PORT}: {port}"
+            raise SdpError(msg)
+        self.port = port
         self.protocol = fields[2]
 
     def add_attribute(self, value: str) -> None:
@@ -830,7 +836,11 @@ class _AudioAccumulator:
         elif tag == "crypto":
             self.crypto.append(rest.strip())
         elif tag == "ptime":
-            self.ptime = int(rest.strip())
+            ptime = int(rest.strip())
+            if ptime <= 0:
+                msg = f"a=ptime must be positive, got {ptime}"
+                raise SdpError(msg)
+            self.ptime = ptime
         elif tag == "maxptime":
             # RFC 4566 §6: the maximum packetisation time the peer accepts (ms),
             # an upper bound negotiate_ptime honours (ADR-0056).

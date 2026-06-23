@@ -2178,3 +2178,107 @@ def test_jitter_max_depth_must_be_positive_on_direct_construction() -> None:
             tone_secs=0.0,
             jitter_max_depth=0,
         )
+
+
+# ===========================================================================
+# Caller-silence / no-input reprompt + goodbye phrase env knobs (ADR-0057)
+# ===========================================================================
+#
+# HERMES_VOIP_GOODBYE_PHRASE, HERMES_VOIP_NO_INPUT_REPROMPT,
+# HERMES_VOIP_NO_INPUT_TIMEOUT_MS, HERMES_VOIP_NO_INPUT_MAX_REPROMPTS,
+# HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES.
+#
+# The critical invariant: when ALL FIVE keys are absent from env the parsed
+# config must carry EXACTLY the current call_loop.py module-level hardcoded
+# defaults (so behaviour is unchanged when env vars are unset — no regression).
+
+
+def test_no_input_defaults_match_call_loop_constants() -> None:
+    """Absent env → MediaConfig fields carry the exact call_loop.py defaults.
+
+    This is the regression guard: if the defaults diverge, existing
+    deployments change behaviour on upgrade without setting any env var.
+    """
+    cfg = load_media_config({})
+    # Defaults that MUST match the call_loop.py module-level constants exactly.
+    assert cfg.no_input_reprompt is True
+    assert cfg.no_input_timeout_ms == 10_000
+    assert cfg.no_input_max_reprompts == 2
+    assert cfg.no_input_reprompt_phrases == (
+        "Are you still there?",
+        "Hello, are you still there?",
+        "Sorry, I can't hear anything. Are you still there?",
+    )
+    assert cfg.goodbye is True
+    assert cfg.goodbye_phrase == "Goodbye."
+
+
+def test_goodbye_phrase_env_override() -> None:
+    """HERMES_VOIP_GOODBYE_PHRASE is parsed into MediaConfig.goodbye_phrase."""
+    cfg = load_media_config({"HERMES_VOIP_GOODBYE_PHRASE": "Cheerio!"})
+    assert cfg.goodbye_phrase == "Cheerio!"
+
+
+def test_no_input_reprompt_env_off() -> None:
+    """HERMES_VOIP_NO_INPUT_REPROMPT=false disables the reprompt watchdog."""
+    cfg = load_media_config({"HERMES_VOIP_NO_INPUT_REPROMPT": "false"})
+    assert cfg.no_input_reprompt is False
+
+
+def test_no_input_timeout_ms_override() -> None:
+    """HERMES_VOIP_NO_INPUT_TIMEOUT_MS is parsed as a positive integer (ms)."""
+    cfg = load_media_config({"HERMES_VOIP_NO_INPUT_TIMEOUT_MS": "5000"})
+    assert cfg.no_input_timeout_ms == 5000
+
+
+def test_no_input_max_reprompts_override() -> None:
+    """HERMES_VOIP_NO_INPUT_MAX_REPROMPTS is parsed as a non-negative integer."""
+    cfg = load_media_config({"HERMES_VOIP_NO_INPUT_MAX_REPROMPTS": "3"})
+    assert cfg.no_input_max_reprompts == 3
+
+
+def test_no_input_max_reprompts_zero_accepted() -> None:
+    """HERMES_VOIP_NO_INPUT_MAX_REPROMPTS=0 is valid (end call on first silence)."""
+    cfg = load_media_config({"HERMES_VOIP_NO_INPUT_MAX_REPROMPTS": "0"})
+    assert cfg.no_input_max_reprompts == 0
+
+
+def test_no_input_reprompt_phrases_pipe_separated() -> None:
+    """HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES is parsed as a pipe-separated set."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES": "Still there?|Hello?|Anyone there?"}
+    )
+    assert cfg.no_input_reprompt_phrases == (
+        "Still there?",
+        "Hello?",
+        "Anyone there?",
+    )
+
+
+def test_no_input_reprompt_phrases_blank_members_dropped() -> None:
+    """Blank pipe-separated members are silently dropped (same as comfort filler)."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES": "Hi? | | Still there? "}
+    )
+    # Trimmed non-blank members only; blank/whitespace-only members are dropped.
+    assert cfg.no_input_reprompt_phrases == ("Hi?", "Still there?")
+
+
+def test_no_input_reprompt_phrases_blank_falls_back_to_default() -> None:
+    """A blank/empty HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES uses the built-in default."""
+    cfg = load_media_config({"HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES": "  "})
+    # Falls back to the built-in default (same as unset).
+    assert "Are you still there?" in cfg.no_input_reprompt_phrases
+    assert len(cfg.no_input_reprompt_phrases) > 1
+
+
+def test_no_input_timeout_ms_must_be_positive() -> None:
+    """HERMES_VOIP_NO_INPUT_TIMEOUT_MS=0 is rejected (must be positive)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_NO_INPUT_TIMEOUT_MS": "0"})
+
+
+def test_goodbye_phrase_empty_string_keeps_default() -> None:
+    """A blank HERMES_VOIP_GOODBYE_PHRASE keeps the default (same as unset)."""
+    cfg = load_media_config({"HERMES_VOIP_GOODBYE_PHRASE": "  "})
+    assert cfg.goodbye_phrase == "Goodbye."

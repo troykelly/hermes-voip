@@ -4840,6 +4840,19 @@ class VoipAdapter(BasePlatformAdapter):
             comfort_filler_delay_ms=media_cfg.comfort_filler_delay_ms,
             comfort_filler_repeat_ms=media_cfg.comfort_filler_repeat_ms,
             comfort_filler_phrases=media_cfg.comfort_filler_phrases,
+            # Caller-silence reprompt + spoken goodbye (ADR-0057). A live-but-silent
+            # caller (RTP flowing, no end-of-turn) is reprompted after the silence
+            # window; after the max-reprompts limit the call ends gracefully (spoken
+            # goodbye → clean run() return). All five fields are operator-configurable
+            # via HERMES_VOIP_NO_INPUT_* / HERMES_VOIP_GOODBYE* env knobs; defaults
+            # MATCH call_loop.py's module-level constants so behaviour is unchanged
+            # when the env vars are unset (no regression).
+            no_input_reprompt=media_cfg.no_input_reprompt,
+            no_input_timeout_ms=media_cfg.no_input_timeout_ms,
+            no_input_max_reprompts=media_cfg.no_input_max_reprompts,
+            no_input_reprompt_phrases=media_cfg.no_input_reprompt_phrases,
+            goodbye=media_cfg.goodbye,
+            goodbye_phrase=media_cfg.goodbye_phrase,
             # Inbound DTMF menu-group aggregation timeout (ADR-0010): a buffered group
             # with no ``#`` terminator is delivered after this gap. None => the loop's
             # built-in default. Drives real behaviour for HERMES_SIP_DTMF_INTERDIGIT_MS.

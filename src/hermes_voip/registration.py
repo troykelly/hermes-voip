@@ -15,7 +15,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
+from hermes_voip.digest import (
+    DigestChallenge,
+    DigestCredentials,
+    build_authorization,
+    pick_best_challenge,
+)
 from hermes_voip.message import (
     SipResponse,
     build_request,
@@ -282,7 +287,7 @@ class RegistrationFlow:
             challenge_header, auth_header = "WWW-Authenticate", "Authorization"
         else:
             challenge_header, auth_header = "Proxy-Authenticate", "Proxy-Authorization"
-        challenge = DigestChallenge.parse(response.header(challenge_header) or "")
+        challenge = self._strongest_challenge(response, challenge_header)
         auth_value = build_authorization(
             challenge,
             DigestCredentials(self._cfg.username, self._cfg.password),
@@ -295,6 +300,35 @@ class RegistrationFlow:
         return self._build(
             expires=txn.requested_expires, auth=(auth_header, auth_value)
         )
+
+    def _strongest_challenge(
+        self, response: SipResponse, challenge_header: str
+    ) -> DigestChallenge:
+        """Select the strongest digest challenge the registrar offered (RFC 8760 §2.4).
+
+        A registrar that supports SHA-256 sends MULTIPLE
+        ``WWW-Authenticate``/``Proxy-Authenticate`` challenges (e.g. SHA-256 AND
+        MD5 for back-compat), and the client MUST authenticate with the
+        most-preferred algorithm it supports. Reading only the first header would
+        let a gateway — or an on-path attacker who reorders headers (SIP digest
+        has no header integrity) — silently downgrade us from SHA-256 to MD5.
+
+        Every challenge header is parsed; ``pick_best_challenge`` then applies the
+        RFC 8760 §3 preference order (SHA-256-sess > SHA-256 > MD5-sess > MD5) and
+        skips any unsupported/unknown algorithm. A single-MD5 challenge (the
+        legacy case) is returned unchanged.
+
+        Raises:
+            ValueError: If the response carries no challenge header, or no offered
+                challenge uses a supported algorithm.
+        """
+        raw_challenges = response.headers_all(challenge_header)
+        if not raw_challenges:
+            # No header at all: parse("") raises the same "missing nonce" error as
+            # before, keeping the no-challenge failure path identical.
+            return DigestChallenge.parse("")
+        challenges = [DigestChallenge.parse(raw) for raw in raw_challenges]
+        return pick_best_challenge(challenges)
 
     def _retry_interval(self, response: SipResponse, txn: _Transaction) -> Retry | None:
         """Re-issue REGISTER honouring ``Min-Expires`` after a 423, or ``None``.

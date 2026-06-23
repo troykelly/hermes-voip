@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Sequence
+from importlib.metadata import version as _dist_version
 from pathlib import Path
 
 import yaml
@@ -179,6 +180,51 @@ def test_package_version_matches_pyproject() -> None:
         f"hermes_voip.__version__ ({hermes_voip.__version__!r}) must match "
         f"pyproject.toml [project].version ({_pyproject_version()!r})"
     )
+
+
+def test_package_version_is_derived_from_installed_metadata() -> None:
+    """``__version__`` is single-sourced from installed package metadata.
+
+    The release blocker: the version lived hard-coded in THREE places
+    (pyproject.toml, ``__init__.py``, plugin.yaml) and could drift. We
+    single-source the RUNTIME version by deriving
+    ``src/hermes_voip/__init__.py __version__`` from the installed package
+    metadata (``importlib.metadata.version("hermes-voip")``) — which is itself
+    populated from ``pyproject.toml [project].version`` at build/install time.
+
+    This guard asserts the derivation is LIVE: ``__version__`` equals the
+    distribution metadata version, not an independently-maintained literal. A
+    future release is then a single edit in ``pyproject.toml`` (the metadata
+    follows automatically) rather than three edits that can desync.
+    """
+    assert hermes_voip.__version__ == _dist_version("hermes-voip"), (
+        f"hermes_voip.__version__ ({hermes_voip.__version__!r}) must be derived "
+        f"from importlib.metadata.version('hermes-voip') "
+        f"({_dist_version('hermes-voip')!r}) — it must not be a hand-maintained literal"
+    )
+
+
+def test_init_source_single_sources_the_version() -> None:
+    """``__init__.py`` derives the version from metadata — no bare literal assign.
+
+    Complements the runtime check above with a SOURCE-level guard so the
+    derivation cannot be quietly reverted to a hard-coded
+    ``__version__ = "X.Y.Z"`` (which would re-introduce the third drift point
+    even while the runtime value happens to match). The module must reference
+    ``importlib.metadata`` and must not assign ``__version__`` to a quoted
+    string literal.
+    """
+    init_py = _REPO_ROOT / "src" / "hermes_voip" / "__init__.py"
+    source = init_py.read_text(encoding="utf-8")
+    assert "importlib.metadata" in source, (
+        "__init__.py must derive __version__ from importlib.metadata"
+    )
+    # No bare-literal assignment such as ``__version__ = "0.0.0"``.
+    for quote in ('__version__ = "', "__version__ = '"):
+        assert quote not in source, (
+            "__version__ must be derived from package metadata, not assigned a "
+            f"string literal (found {quote!r})"
+        )
 
 
 # ---------------------------------------------------------------------------

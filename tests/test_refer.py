@@ -412,12 +412,18 @@ def test_build_blind_refer_carries_auth_header() -> None:
 # ---- Refer-To injection guard (security) -----------------------------------
 #
 # ``transfer_blind`` passes an AGENT-SUPPLIED target straight into the
-# ``Refer-To: <target>`` header. A bare extension target may LEGITIMATELY be a
-# dialable user-part OR a full ``sip:``/``sips:`` URI; anything else — a host
-# hijack on a bare extension (``1001@evil.com``), a ``?Replaces=`` / ``;``-param
-# smuggle, a ``>`` angle-bracket breakout, CR/LF header injection, or any
-# control char (including percent-encoded CRLF that the gateway would decode) —
-# must be REJECTED with ``ValueError`` so NO REFER is built.
+# ``Refer-To: <target>`` header. A target may LEGITIMATELY be a dialable
+# user-part OR a well-formed ``sip:``/``sips:`` URI ``scheme:user@host[:port]``
+# with only allowlisted ``;``-params (``transport``/``user``/``method``/``ttl``/
+# ``maddr``/``lr``). Anything else must be REJECTED with ``ValueError`` so NO
+# REFER is built:
+#   * a host hijack on a bare extension (``1001@evil.com``);
+#   * a ``?``-header form (``?Replaces=`` / any ``?Header=``) — no ``?`` at all;
+#   * a non-allowlisted ``;``-param (``;Replaces=`` / ``;Route=``);
+#   * a malformed authority (``host/path``, a non-numeric port, quote/comma);
+#   * a ``>`` angle-bracket breakout or CR/LF header injection;
+#   * any control char, whitespace, or angle bracket — literal OR percent-encoded
+#     (``%0D%0A`` / ``%20`` / ``%3C`` / ``%3E``), since a gateway would decode it.
 
 
 def test_build_blind_refer_accepts_bare_extension() -> None:
@@ -440,9 +446,27 @@ def test_build_blind_refer_accepts_valid_sip_uri() -> None:
 
 
 def test_build_blind_refer_accepts_valid_sips_uri_with_params() -> None:
-    result = build_blind_refer(_dialog(), "sips:3000@pbx.example.test;transport=tls")
+    # The tightened policy still accepts a sips: URI carrying ONLY allowlisted
+    # ``;``-params (here ``transport``/``ttl``/``maddr``, names compared
+    # case-insensitively) — ``transport=tls`` is the common legitimate case.
+    target = "sips:3000@pbx.example.test;transport=tls;ttl=1;Maddr=198.51.100.1"
+    result = build_blind_refer(_dialog(), target)
     req = SipRequest.parse(result.text)
-    assert req.header("Refer-To") == "<sips:3000@pbx.example.test;transport=tls>"
+    assert req.header("Refer-To") == f"<{target}>"
+
+
+def test_build_blind_refer_accepts_sip_uri_with_port() -> None:
+    # A numeric port on the authority is well-formed and accepted.
+    result = build_blind_refer(_dialog(), "sip:3000@198.51.100.50:5061")
+    req = SipRequest.parse(result.text)
+    assert req.header("Refer-To") == "<sip:3000@198.51.100.50:5061>"
+
+
+def test_build_blind_refer_accepts_sip_uri_with_ipv6_host() -> None:
+    # A bracketed IPv6 literal authority is well-formed and accepted.
+    result = build_blind_refer(_dialog(), "sip:3000@[2001:db8::1]:5061;transport=tls")
+    req = SipRequest.parse(result.text)
+    assert req.header("Refer-To") == "<sip:3000@[2001:db8::1]:5061;transport=tls>"
 
 
 def test_build_blind_refer_rejects_bare_extension_host_hijack() -> None:
@@ -508,3 +532,79 @@ def test_build_blind_refer_rejects_non_sip_scheme() -> None:
     # sip URI — reject it.
     with pytest.raises(ValueError, match="transfer target"):
         build_blind_refer(_dialog(), "http://evil.com/")
+
+
+# -- must-fix #1: ``?``-header form / dangerous ``;``-param on a sip: URI ------
+
+
+def test_build_blind_refer_rejects_sip_uri_with_replaces_header() -> None:
+    # ``?Replaces=`` on a sip: URI would point the triggered INVITE at another
+    # dialog (RFC 3891) — a dialog-seizing header-injection vector. No ``?`` form
+    # is accepted at all.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(
+            _dialog(), "sips:3000@pbx.example.test?Replaces=abc%3Bto-tag%3Dx"
+        )
+
+
+def test_build_blind_refer_rejects_sip_uri_with_arbitrary_header() -> None:
+    # Any embedded ``?Header=`` is rejected, not only ``?Replaces=``.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test?Subject=evil")
+
+
+def test_build_blind_refer_rejects_sip_uri_with_unknown_param() -> None:
+    # A token-shaped but non-allowlisted ``;``-param (here a dangerous ``;Route=``
+    # that would source-route the request) is rejected; only the safe allowlist
+    # (transport/user/method/ttl/maddr/lr) passes.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test;Route=<sip:evil>")
+
+
+def test_build_blind_refer_rejects_sip_uri_with_replaces_param() -> None:
+    # ``;Replaces=`` smuggled as a URI parameter is rejected (not allowlisted).
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test;Replaces=abc")
+
+
+# -- must-fix #2: malformed authority (host[:port]) ---------------------------
+
+
+def test_build_blind_refer_rejects_sip_uri_with_path_in_host() -> None:
+    # ``host/path`` is not a well-formed authority — a ``/`` must not pass.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test/path")
+
+
+def test_build_blind_refer_rejects_sip_uri_with_non_numeric_port() -> None:
+    # A non-numeric port (``:badport``) is a malformed authority — reject it.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test:badport")
+
+
+def test_build_blind_refer_rejects_sip_uri_with_comma_in_host() -> None:
+    # A comma in the authority is malformed (and could smuggle a second URI in a
+    # comma-separated header) — reject it.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test,evil.test")
+
+
+# -- must-fix #3: percent-encoded whitespace / angle brackets -----------------
+
+
+def test_build_blind_refer_rejects_percent_encoded_space() -> None:
+    # ``%20`` decodes to a space: a gateway unescaping the URI would split on it.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test%20evil")
+
+
+def test_build_blind_refer_rejects_percent_encoded_open_angle() -> None:
+    # ``%3C`` decodes to ``<`` — an addr-spec breakout once unescaped.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test%3Cevil")
+
+
+def test_build_blind_refer_rejects_percent_encoded_close_angle() -> None:
+    # ``%3E`` decodes to ``>`` — closes the ``Refer-To: <...>`` early.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test%3Eevil")

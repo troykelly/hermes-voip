@@ -6,13 +6,18 @@ opportunities regardless of priority — nothing here is pre-prioritised away. E
 checklist entry with a severity tag: **[high]** / **[medium]** / **[low]**, plus a kind tag
 (correctness / robustness / efficiency / api / test / docs / polish).
 
-This is a backlog of the *merged foundation* (sans-IO SIP/RTP signalling + provider-interface +
-media-codec layer). The unbuilt subsystems (streaming STT/TTS, VAD, injection guard, media plane,
-Hermes adapter) are tracked in `docs/plan/IMPLEMENTATION-PLAN.md`, not here.
+This backlog now spans the **full current codebase**: the original sans-IO SIP/RTP signalling +
+provider-interface + media-codec foundation, PLUS the subsystems that were once "unbuilt" but have
+since shipped — `stt/`, `tts/`, `media/vad.py`, `media/engine.py`, `media/call_loop.py`, `guard/`,
+`adapter.py`, `plugin.py`, `call.py`, `incall.py`, `dialog.py`, `transport/`, and the end-to-end
+test suite. Findings in those shipped subsystems were added by the autonomous Wave-1 `/orchestrate`
+gap-review (ADR-0072; 2026-06-23; 11 of 12 dimensions — see Gap-review provenance below).
 
-Severity reflects impact *within the foundation as it stands*: a `[high]` is a correctness/contract
-defect or a load-bearing test gap; it is **not** a claim that the foundation is broken end-to-end
-(it is not wired end-to-end yet).
+`docs/plan/IMPLEMENTATION-PLAN.md` predates the above subsystems and is now significantly stale
+(tracked as a docs-drift item below).
+
+Severity reflects impact on the codebase as it stands: a `[high]` is a correctness/contract
+defect or a load-bearing test gap.
 
 ---
 
@@ -605,6 +610,341 @@ These span multiple modules or the repo as a whole.
   package licence gate.** ADRs 0006/0007/0009 each require a model-specific licence+checksum CI gate
   (repo + pinned revision + filenames + sha256 + SPDX allow-list) distinct from `pip-licenses`. Track that
   the existing `supply-chain.yml` covers only Python packages; the model gates land with each provider.
+
+## src/hermes_voip/dialog.py
+
+- [ ] **[low] correctness** — `build_in_dialog_request` can emit a CSeq >= 2**31, the exact value its own
+  parser rejects (RFC 3261 §8.1.1.5). `dialog.py:230` computes `next_cseq = dialog.local_cseq + 1` with no
+  upper-bound guard, while the parse path (`_cseq`, lines ~339-345) explicitly raises `DialogError` when
+  `sequence >= _MAX_CSEQ (2**31)`. A dialog at `local_cseq = 2**31 - 1` produces `CSeq: 2147483648 BYE`
+  (verified) — a value the same module would reject on parse. Fix: guard `next_cseq` against `_MAX_CSEQ` in
+  `build_in_dialog_request`; TDD red test asserting the dialog at `2**31 - 1` raises rather than emitting
+  the out-of-range value.
+
+## src/hermes_voip/incall.py
+
+- [ ] **[medium] correctness** — An offer-carrying re-INVITE with no `m=audio` line is misclassified as
+  `OfferlessReinvite` and answered with a fresh OFFER, violating RFC 3264 offer/answer. `classify_inbound_reinvite`
+  returns `OfferlessReinvite()` whenever `offer.audio is None` (`incall.py`) — conflating "no SDP body at all"
+  with "an SDP body that parses but carries no m=audio". `call.py:729-732` (`_on_reinvite`) then treats
+  `OfferlessReinvite` by re-OFFERING, but a re-INVITE that carried any SDP body is an offer per RFC 3264;
+  the 2xx must carry an ANSWER, never a fresh offer. Fix: distinguish "empty body" (`OfferlessReinvite`) from
+  "non-empty body without usable audio" (should yield 488 or an explicit reject-audio answer). TDD: red test
+  feeding a non-empty SDP body with no `m=audio` and asserting no fresh offer in the 2xx (`incall.py`,
+  `call.py`).
+
+## src/hermes_voip/stt/deepgram.py
+
+- [ ] **[high] robustness** — `_map_event` (line 284): `event = json.loads(raw)` has no `try/except`. A
+  single malformed text frame from the Deepgram Flux WebSocket raises `json.JSONDecodeError`, which propagates
+  through `_receive()` → `_generate()` → `asyncio.TaskGroup` → cancels `_pump` and `_delivery` → the call
+  ends. A one-line `try/except json.JSONDecodeError` that logs and returns `None` makes bad frames survivable.
+  Not tracked previously.
+
+## src/hermes_voip/transport/
+
+- [ ] **[medium] robustness / test** — SIP parse error in TLS/WSS `_dispatch` kills the entire connection and
+  drops all active calls with no regression test. `transport/connection.py:601-605` and
+  `transport/ws_connection.py:364-368` call `SipRequest.parse()` / `SipResponse.parse()` with no
+  `try/except`; a single malformed message tears down all calls simultaneously. The behaviour is documented as
+  intentional but has zero regression tests for: (1) parse error → connection loss (not silent drop);
+  (2) reconnect supervisor fires; (3) active calls terminate cleanly. Needs tests in `tests/test_adapter_reconnect.py`.
+
+## src/hermes_voip/guard/_onnx_runtime.py
+
+- [ ] **[low] robustness** — `_injection_label_index` (line 146): `json.loads(config_path.read_text(...))` has
+  no `try/except`. A corrupt `config.json` (partial write, truncated model download) raises a bare
+  `json.JSONDecodeError` with no context about which file or why. Wrap with
+  `ValueError(f"corrupt config.json at {config_path}: {e}") from e` for actionable diagnostics.
+
+## src/hermes_voip/registration.py (Wave-1 additions)
+
+- [ ] **[high] security** — SHA-256→MD5 digest downgrade: `registration.py:285` picks only the FIRST
+  `WWW-Authenticate` challenge (`SipResponse.header()` returns first-match-only, confirmed `message.py:78`).
+  RFC 8760 §2.4 requires choosing the most-preferred supported algorithm when a registrar sends multiple
+  challenges (e.g. SHA-256 AND MD5). The strongest-algorithm machinery in `digest.py` (`_ALGORITHM_PREFERENCE`
+  lines 46-50) exists but is never used to select among offered challenges — only to validate a single token.
+  Fix: read ALL challenge headers via `headers_all`, parse each, select the strongest via the existing
+  preference order. TDD: red test feeding two `WWW-Authenticate` headers (MD5 first, SHA-256 second) asserting
+  the Authorization echoes `algorithm=SHA-256` (`registration.py`, `digest.py`, `message.py`).
+
+## src/hermes_voip/adapter.py (Wave-1 additions)
+
+- [ ] **[medium] security** — Outbound dial Request-URI built by unvalidated interpolation
+  `sip:{extension}@{host}` (`adapter.py:1601`) from the agent-supplied `number`/`extension`. The only
+  downstream guard is `message.py _reject_controls` which rejects only C0/DEL — not `@`, spaces, or SIP URI
+  metacharacters. Additionally, `outbound_allow.py`'s documented URI-form allowlist entries (e.g.
+  `sip:1000@pbx.example.test`) can never match the dial path because `extension="sip:1000@pbx.example.test"`
+  interpolates to `sip:sip:1000@pbx.example.test@<host>` — the documented URI-form feature is
+  broken/aspirational (rule 27). Two-part fix: (a) validate `extension` against RFC 3261 user/token grammar
+  before interpolation; (b) make outbound_allow + dial consistent on URI-form entries. TDD: red test that an
+  allowlisted `extension` containing `@evil.com` is rejected before any INVITE is built
+  (`adapter.py`, `outbound_allow.py`, `message.py`, `tests/test_outbound_allow.py`).
+- [ ] **[high] observability** — Wire RTCP `CallQuality` snapshot to structured log fields. `adapter.py:5181-5190`
+  logs RTCP teardown quality as a plain `%`-formatted string with no `extra={}` kwargs (runbook-0014 §Packet
+  loss & jitter marks emission as "SOURCE EXISTS, EMISSION TBD"). No test asserts the teardown log line is
+  emitted when `_rtcp_active` is True — every adapter test that reaches `_teardown_call` explicitly sets
+  `engine._rtcp_active=False` to skip the path (`tests/test_adapter.py:680,746,1628,2086,2148,2247`). Emit
+  structured log dict with `event='rtcp_call_quality'`; add a test with a fake engine where
+  `_rtcp_active=True` using `pytest caplog`.
+- [ ] **[high] observability** — Add structured per-call lifecycle log events with machine-parseable fields for
+  SLO counting. Current log lines at `adapter.py:2819-2822` (INVITE received), `:2852-2856` and `:2944-2950`
+  (REJECTED), `:4722` (200 OK), `:4861` (CallLoop started) use positional `printf`-style with no `extra=`
+  dict. Runbook-0014 §Call setup success marks these events as NOT YET INSTRUMENTED. Emit
+  `logging.info(..., extra={'event':'invite_received','call_id':...,'outcome':'rejected','sip_code':488})`
+  — no new infra, stdlib `logging` supports `extra=` natively.
+- [ ] **[medium] observability** — Emit per-call duration and concurrent-call gauge to structured log at
+  teardown. `adapter.py:902` maintains `_admitted_calls` (live set) whose `len()` is the real-time concurrency
+  count but is never logged at admission (`:5248`) or release (`:5258`). Call duration is never logged: the
+  INVITE-received timestamp is a log string only (`adapter.py:2819`) with no `time.monotonic()` anchor and
+  `_teardown_call` (`:5173`) has no start-time to subtract. Runbook-0014 §Concurrent calls marks
+  `voip.calls.active_count`/`started`/`ended` as NOT YET INSTRUMENTED. Add `time.monotonic()` at admission;
+  log `duration_s` and `len(_admitted_calls)` at release.
+- [ ] **[medium] observability** — Log RTCP dormant-path reason per call so operators know which calls lack
+  quality data. When RTCP stays dormant (secured call without SRTCP keys, kill-switch off, or PT conflict),
+  `adapter.py:5179` silently skips the call-quality log — no record that a given call produced no quality data
+  or why. On the live test gateway (SDES-SRTP, runbook-0014 §Secured paths: RTCP is dormant), every
+  production call is silent at teardown. Emit a single `DEBUG/INFO` "INVITE %s: RTCP dormant — no call
+  quality data (secured=%s, enabled=%s)" at teardown (`adapter.py`, `media/engine.py`).
+- [ ] **[medium] observability** — Add test asserting RTCP call-quality INFO log is emitted at teardown when
+  `_rtcp_active` is True. No existing test covers `adapter.py:5179-5190`; every adapter test sets
+  `engine._rtcp_active=False` to skip it. A parameterised test with a fake engine where `_rtcp_active=True`
+  and `call_quality` returns a known `CallQuality`, using `pytest caplog`, pins this mutation-invisible path
+  (`tests/test_adapter.py`).
+
+## src/hermes_voip/media/call_loop.py
+
+- [ ] **[medium] test** — Add REFUSE-verdict caller-activity tests to `CallLoop` (two mutation-surviving
+  paths). In `_screen_and_deliver` (`call_loop.py:2015-2027`): (1) line 2017 sets `_caller_active_in_window
+  = True` even on REFUSE — a mutant omitting this assignment would silently trigger spurious reprompts; (2)
+  the `if result.verdict is not GuardVerdict.REFUSE:` guard (line 2020) prevents `_schedule_comfort_filler`
+  from firing — a mutant that always schedules the filler on refused turns would survive because
+  `test_refuse_verdict_blocks_deliver_turn` (`tests/test_call_loop.py:329`) only asserts `delivered == []`
+  without inspecting filler scheduling or the caller-active flag. Not tracked previously.
+- [ ] **[medium] observability** — Instrument per-turn latency (STT-finalize → first TTS frame) with a
+  structured log event. Runbook-0014 §Per-turn latency defines `voip.turn.latency_ms` as NOT YET INSTRUMENTED
+  ("manual estimate from logs"). `call_loop.py` logs "asr: delivering turn" only at DEBUG (line 1294-1299);
+  `speak()`'s `on_first_frame` fires only for the greeting (line 1953). Add `time.monotonic()` at
+  `transcript_q.put` (line 1300) and at each `on_first_frame` of the delivery path; log
+  `event='turn_latency_ms'` at INFO. Zero new dependencies.
+- [ ] **[medium] observability** — Instrument time-to-first-audio latency (INVITE received → first RTP tx)
+  with a structured log event. Runbook-0014 §Time to first audio defines `voip.media.first_audio_latency_ms`
+  as NOT YET INSTRUMENTED (target < 2 s). No `time.monotonic()` is stored at INVITE receipt (`adapter.py:2819`);
+  the "greeting: first RTP sent" log (`call_loop.py:1953`) carries no `call_id` and no elapsed time. Thread
+  the INVITE receipt timestamp into `CallLoop` construction; log `first_audio_latency_ms=...` at INFO at
+  first-RTP-sent (`adapter.py`, `media/call_loop.py`).
+- [ ] **[high] ux** — Reprompt/goodbye phrases and no-input timing have no operator config surface
+  (ADR-0057 follow-on never plumbed). `config.py` has zero `HERMES_VOIP_NO_INPUT` / `GOODBYE` / `REPROMPT`
+  env parsing (verified: `grep -rn 'HERMES_VOIP_NO_INPUT\|HERMES_VOIP_GOODBYE\|HERMES_VOIP_REPROMPT'
+  config.py` returns nothing). `MediaConfig` carries no such fields; the adapter's `CallLoop` construction
+  (`adapter.py:4810-4852`) passes greeting/comfort-filler kwargs but NONE of the no-input/goodbye kwargs —
+  so every call runs `CallLoop`'s hardcoded English defaults (`_DEFAULT_GOODBYE_PHRASE='Goodbye.'`,
+  `_DEFAULT_NO_INPUT_REPROMPT_PHRASES` in `media/call_loop.py:162-183`). Fix: add
+  `HERMES_VOIP_GOODBYE` / `HERMES_VOIP_GOODBYE_PHRASE` / `HERMES_VOIP_NO_INPUT_*` env parsing + `MediaConfig`
+  fields mirroring comfort-filler; thread into adapter's `CallLoop` kwargs; update runbook-0015. TDD:
+  red config-parse + adapter-wiring tests first (`config.py`, `adapter.py:4810`, `media/call_loop.py:162`,
+  `docs/adr/0057-conversational-ux-silence-goodbye-streaming.md`, `docs/runbooks/0015-voip-silence-reprompt-and-goodbye.md`).
+- [ ] **[medium] ux** — Multi-language UX is advertised everywhere but every non-`'en'` language is rejected
+  at startup. `_SUPPORTED_LANGUAGES` is derived solely from `_COMFORT_FILLER_PHRASES_BY_LANGUAGE` which has
+  only an `'en'` key (`config.py:311,330`), so `ConfigError` is raised for any other code. Even within 'en':
+  `media_cfg.language` is consumed in exactly two places repo-wide (`adapter.py:1332` safe_error_reply, and
+  comfort-filler selection); `DEFAULT_GREETING` (`config.py:56`), reprompt set, and goodbye line are bare
+  English literals with no language dict. Data-mostly fix: add at least one real non-`'en'` phrase set across
+  comfort-filler + reprompt + goodbye + greeting + `safe_error_reply`; key each by language dict; add the
+  language to the supported set (`config.py:56,311`, `provider_error.py`, `media/call_loop.py:162`,
+  `adapter.py:1332`).
+- [ ] **[low] ux** — Inbound greeting is not language-keyed even within the existing language mechanism.
+  `DEFAULT_GREETING` is a single English literal (`config.py:56`) and `_parse_greeting` returns it for any
+  language (`config.py:1811-1821`) — unlike comfort filler which selects from a language-keyed dict. The
+  greeting is the first thing every inbound caller hears (ADR-0002 NAT-latch). Making greeting a
+  language-keyed default (a `_DEFAULT_GREETING_BY_LANGUAGE` dict consumed by `_parse_greeting`, mirroring
+  comfort filler) closes an inconsistency. TDD: red test that a configured non-`'en'` language selects that
+  language's built-in greeting when `HERMES_SIP_GREETING` is unset (`config.py:56,1811`).
+
+## .github/workflows/
+
+- [ ] **[medium] security** — Supply-chain advisory audit only fires on dependency-file changes — no scheduled
+  run, so a newly-disclosed CVE against an unchanged pinned dep is invisible to CI. `.github/workflows/supply-chain.yml`
+  triggers ONLY on `pull_request`/`push` filtered to paths `[pyproject.toml, uv.lock, supply-chain.yml]`;
+  `grep -rn 'schedule|cron' .github/workflows/` returns nothing. pip-audit / OSV databases update
+  continuously; the pyjwt PYSEC-2026-175..179 case (ADR-0062) is exactly this class. Fix: add a
+  `schedule: - cron:` trigger (e.g. `7 6 * * *`) running the existing `uv run pip-audit` job. Update
+  `docs/runbooks/0003-supply-chain-audit.md` in the same commit (rule 42).
+
+## docs/runbooks/
+
+- [ ] **[high] docs** — Runbook 0012 numbering collision: two runbooks share the same prefix.
+  `docs/runbooks/0012-voip-acoustic-echo-cancellation.md` (committed 2026-06-17) and
+  `docs/runbooks/0012-voip-inbound-call-context.md` (committed 2026-06-18) both occupy the same number slot,
+  breaking the monotone numbering convention. Fix: rename `0012-voip-acoustic-echo-cancellation.md` to
+  `0017-voip-acoustic-echo-cancellation.md` (the first free slot above 0016) and update all cross-references
+  (README, ADR-0033).
+- [ ] **[high] docs** — AEC runbook default is stale: says 16 ms; code default is 64 ms since commit ff73953.
+  `docs/runbooks/0012-voip-acoustic-echo-cancellation.md` has three stale references to the old 16 ms default
+  for `HERMES_VOIP_AEC_FILTER_MS`: the knobs table (line 26), and the two verify-output examples (lines 99-100).
+  `config.py:256` `_DEFAULT_AEC_FILTER_MS = 64` (verified: running the verify step prints `True 64 0.3 200`,
+  not `True 16 0.3 200`). Rule 27: update the table and both example outputs to 64 ms.
+- [ ] **[medium] docs** — Add outbound SIP CANCEL coverage to runbook 0007. ADR-0069 (outbound SIP CANCEL,
+  RFC 3261 §9.1) is Accepted and fully implemented (`transport/connection.py:418` `send_cancel`,
+  `adapter.py:2309` `abort_call`, `adapter.py:2347` `_ring_timeout`). `docs/runbooks/0007-voip-outbound-calling.md`
+  has zero CANCEL coverage: no mention of what happens when an outbound ringing call is aborted, no log line
+  to watch for, no mention of the ring-timeout auto-CANCEL path, and no note that `ring_timeout_secs` on the
+  WSS transport raises `NotImplementedError`. Rule 42: update runbook 0007 with CANCEL mechanics.
+- [ ] **[low] docs** — Document `HERMES_VOIP_CALL_ON_CONNECT` in `plugin.yaml` `optional_env` and runbook
+  0007. This live operator-facing env var (`adapter.py:483`, `:993`) bypasses the
+  `HERMES_VOIP_OUTBOUND_ALLOW` allowlist (`adapter.py:920-921`) and fires a one-shot outbound dial on first
+  registration. It has no entry in `plugin.yaml optional_env`, no "how to set / verify / disable" section in
+  runbook 0007, and the allowlist bypass is undocumented. An operator who sets this var without knowing it
+  bypasses the security gate may dial unintentionally.
+- [ ] **[low] operability** — Document and validate `HERMES_VOIP_KEEPALIVE_INTERVAL`. Read from env at
+  `adapter.py:992-993` via bare `float()` with no validation, no `ConfigError` on invalid input, not declared
+  in `config.py`, not in `plugin.yaml optional_env`, not mentioned in any runbook. Controls RFC 5626 §5.4
+  double-CRLF keepalive interval (ADR-0038, default 30 s). Setting it to 0 or a negative number suppresses
+  keepalives; a non-numeric value crashes with an untyped `ValueError` at connect time rather than a readable
+  `ConfigError`. Fix: add validation and declaration in `config.py`; add to `plugin.yaml`; document in a
+  runbook (`adapter.py`, `config.py`, `plugin.yaml`).
+- [ ] **[high] docs** — No runbook documenting the release / version-bump process. AGENTS.md rule 42 requires
+  runbooks as you work for any operational process. No runbook documents how to release hermes-voip: which
+  three version strings to update (`pyproject.toml:3`, `src/hermes_voip/__init__.py:49`,
+  `packaging/hermes-plugins/hermes-voip/plugin.yaml:27`), in what order, how to verify sync, whether to
+  build/test the wheel, and where to publish. The plugin-manifest tests guard against drift after the fact but
+  do not serve as a runbook.
+
+## README.md
+
+- [ ] **[high] docs** — README Security section falsely states call transfer is unavailable. `README.md:587-588`
+  says "call transfer stays unavailable until its spoof-resistant confirmation channel ships." This is factually
+  wrong: `transfer_blind` and `transfer_attended` are both in `plugin.yaml provides_tools` (lines 49-50);
+  `dtmf_confirm.py` implements `ArmedConfirmation` (the spoof-resistant DTMF confirmation channel, ADR-0010/0031);
+  `refer.py` implements REFER/Replaces; `voip_tools.py` has `transfer_blind_handler` and
+  `transfer_attended_handler`. Rule 27 violation: correct the Security section to accurately describe the
+  shipped trust model (transfer is available at operator privilege level, gated by DTMF confirmation).
+- [ ] **[medium] docs** — README reports stale tool count: "9 tools, 1 hook" should be "10 tools, 1 hook".
+  `README.md:210` says the plugin registers `9 tools, 1 hook`. `plugin.yaml provides_tools` (lines 41-50) has
+  10 entries including `transfer_attended` (added in commit `d8097cc`). The discrepancy will mislead operators.
+
+## docs/plan/IMPLEMENTATION-PLAN.md
+
+- [ ] **[medium] docs** — `IMPLEMENTATION-PLAN.md` is massively stale: describes the entire plugin as
+  not-started. Line 25 marks ADR-0002 as not-started and says "No `register(ctx)`, no `plugin.yaml`, no
+  `VoipAdapter`". In reality: `plugin.py` has `register()`, `plugin.yaml` is shipped, `adapter.py` has
+  `class VoipAdapter(BasePlatformAdapter)`, `media/vad.py` exists (the plan's ADR-0008 entry says "no
+  `media/vad.py`"), and the STT/TTS/guard/media/manager/call modules are all built. Section 5 ("Smallest
+  next shippable step") says to ship P0.1+P0.3 first, but those are already shipped. A future agent reading
+  this plan will perform duplicate work or make wrong decisions. Update the plan to reflect current status or
+  supersede it with a note pointing to the ADR index.
+
+## docs/adr/
+
+- [ ] **[low] docs** — ADR numbering has four unexplained gaps: 0039, 0040, 0041, 0051. The ADR sequence
+  jumps from 0038 to 0042 (skipping 0039-0041) and from 0050 to 0052 (skipping 0051). `docs/adr/CLAUDE.md`
+  states "Numbered NNNN-kebab-title.md" with no mention of intentional gaps or a reservation policy. The `adr`
+  skill finds the next free slot by scanning the directory (producing numbers after 0073, not filling gaps),
+  leaving the gaps permanently undocumented. Update `docs/adr/CLAUDE.md` to note whether gaps are intentional
+  (reserved) or voided.
+- [ ] **[low] docs** — Propose an ADR for a local-only structured-log metric protocol (no external sink).
+  Runbook-0014 §Instrumentation roadmap says "wire metric emission (likely via StatsD, Prometheus, or
+  structured logging)" but makes no decision. All current SLO signals are plain `%`-format log strings with no
+  `extra=` fields. Without a decision on field names and format, the individual observability findings above
+  will produce ad-hoc field names that diverge across lanes. An ADR specifying the local-only structured-log
+  event schema (field names, log level, logger name) costs nothing to deploy (no infra, no paid service,
+  satisfies rule 40) and gives lane authors a shared contract (`docs/adr/`, `docs/runbooks/0014-voip-slo-metrics.md`).
+
+## src/hermes_voip/providers/ (Wave-1 additions)
+
+- [ ] **[high] api** — `providers/__init__.py` re-exports only `Providers` and `build_providers`; the 12
+  other public names forming the ADR-0004 provider seam — `StreamingASR`, `Transcript`, `StreamingTTS`,
+  `TtsStream`, `InjectionGuard`, `GuardResult`, `GuardVerdict`, `MediaTransport`, `PcmFrame`, `AsrFactory`,
+  `TtsFactory`, `GuardFactory` — all require deep submodule paths. There are ~178 such deep-path import sites
+  across `src/` and `tests/` (confirmed: `rg -rn 'from hermes_voip.providers.(asr|tts|guard|audio|transport|policy)'`).
+  The existing backlog entry (line 512) is now stale — `Providers`/`build_providers` ARE re-exported; the
+  remaining gap is the Protocol+type surface. Fix: re-export all ADR-0004 public names from
+  `providers/__init__.py` and add a package-boundary import test.
+- [ ] **[medium] api** — `hermes_voip` top-level missing config and provider types; accidental submodule names
+  leak into the namespace. `import hermes_voip; dir(hermes_voip)` shows sub-module objects (`caller_modes`,
+  `config`, `digest`, `message`, `plugin`, `registration`, `sip`) leaking because those modules have no `__all__`
+  and are imported transitively. Meanwhile `MediaConfig`, `GatewayConfig`, `ConfigError`, `Providers`,
+  `build_providers`, `PcmFrame`, `StreamingASR`, `StreamingTTS`, `InjectionGuard` are absent and require deep
+  paths. The existing backlog item (line 583) was written when only `sip_address_of_record` was in the
+  top-level `__init__`; the `Registration` types have since been added (`hermes_voip/__init__.py:26-48`) but
+  the config and provider surface remains absent. Fix: promote `MediaConfig`, `ConfigError`, and key provider
+  Protocol types into `hermes_voip/__init__.__all__`; add `__all__` to transitively-imported modules
+  (`src/hermes_voip/__init__.py`, `config.py`, `sip.py`, `digest.py`, `message.py`).
+- [ ] **[low] api** — `stt` package promotes internal bridging utilities into its public `__all__`. `stt/__init__.py:16-29`
+  re-exports `RECOGNISER_SAMPLE_RATE`, `FrameUpsampler`, `float32_to_pcm16`, `pcm16_to_float32` in `__all__`.
+  These are intra-package implementation details: `RECOGNISER_SAMPLE_RATE` is only referenced inside
+  `stt.resample` and `stt.sherpa_onnx`; the conversion functions are used by `stt.sherpa_onnx` and one test
+  (`test_audio_content.py` imports `FrameUpsampler` directly from `hermes_voip.stt.resample`, not from
+  `hermes_voip.stt`). Remove them from `stt/__init__.py/__all__` or prefix with `_`
+  (`src/hermes_voip/stt/__init__.py`, `src/hermes_voip/stt/resample.py`).
+- [ ] **[low] api** — `tts` package re-exports ElevenLabs-specific testability seams and ambiguously-named
+  `Synthesizer` Protocol as package-level public API. `tts/__init__.py:13-18` re-exports `HttpByteStream`,
+  `HttpCancellation`, and `ElevenLabsRequest` alongside proper provider implementations; no test imports them
+  via `hermes_voip.tts` (all consumers import from `hermes_voip.tts.elevenlabs` directly). `Synthesizer` (the
+  Kokoro backend injection Protocol) is exported with a generic name that does not signal "Kokoro-only seam".
+  Fix: remove `HttpByteStream`/`HttpCancellation`/`ElevenLabsRequest` from `tts/__init__.__all__`; rename
+  `Synthesizer` to `SherpaKokoroBackend` or keep it in `sherpa_kokoro.py` only
+  (`src/hermes_voip/tts/__init__.py`, `tts/elevenlabs.py`, `tts/sherpa_kokoro.py`).
+- [ ] **[medium] api** — `__all__` missing from modules added after the original backlog audit: `call_context.py`,
+  `hermes_surface.py`, `notice_filter.py`, `provider_error.py`, `media/call_loop.py`, `media/dtls.py`,
+  `media/srtp.py`, `media/srtcp.py`. All expose implementation-private symbols to star-imports and autodoc.
+  The existing backlog item (line 566) enumerates the original modules; this covers the new ones.
+
+## Packaging / release
+
+- [ ] **[high] operability** — No automated version bumping mechanism or release workflow. The version is
+  hardcoded to `'0.0.0'` in three places (`pyproject.toml:3`, `src/hermes_voip/__init__.py:49`,
+  `packaging/hermes-plugins/hermes-voip/plugin.yaml:27`) with no automation to keep them synchronized. A
+  release requires manual synchronization of all three, inviting drift. The test at
+  `tests/test_plugin_manifest.py:159-164` guards `pyproject.toml` ↔ `plugin.yaml` drift but there is no
+  guard for `__init__.__version__`, and no documented release process.
+- [ ] **[high] test** — No test for `__version__` equality with `pyproject.toml`. `test_plugin_manifest.py`
+  asserts `plugin.yaml` version matches `pyproject.toml` (line 159) but there is no corresponding test for
+  `src/hermes_voip/__init__.py.__version__` (line 49) — a release bump could easily leave it out of sync
+  (`src/hermes_voip/__init__.py:49`, `tests/test_plugin_manifest.py:159-164`).
+- [ ] **[medium] operability** — Wheel artifacts remain in the git-tracked `dist/` directory.
+  `dist/hermes_voip-0.0.0-py3-none-any.whl` exists and is not in `.gitignore`. Build artifacts in the repo
+  create a stale-artifact risk and violate deterministic-builds rule 33. Add `dist/` to `.gitignore` and
+  remove the committed artifact.
+- [ ] **[medium] test** — No wheel build/test in CI or local gate. `.github/workflows/gate.yml` runs
+  format/lint/mypy/pytest but never builds the wheel or tests its contents. `test_manifest_is_importable_package_data`
+  (`test_plugin_manifest.py:405`) checks *source* package data, but there is no CI job verifying a built
+  wheel can be installed and that `importlib.resources` works inside it. A broken wheel (missing `plugin.yaml`,
+  wrong entry-point) would pass the current gate.
+- [ ] **[low] docs** — No documentation on how to distribute / publish the plugin. README covers installation
+  but contains no section on distributing hermes-voip to end users: no mention of PyPI, GitHub Releases, wheel
+  publishing, or the two install models (pip entry-point vs directory plugin) from an operator's perspective
+  (`README.md`, `docs/adr/0037-hermes-plugin-manifest-and-install-models.md`).
+
+## src/hermes_voip/media/engine.py
+
+- [ ] **[low] observability** — Add RTCP periodic quality poll (mid-call snapshot) at configurable interval
+  for long calls. `engine.py` reads `engine.call_quality` only once at teardown via the adapter. For a 30-minute
+  call a single end-of-call snapshot provides no insight into degradation that occurred and recovered mid-call.
+  `rtcp.py:922-936` `ReceptionStats.snapshot()` is designed for non-disturbing quality polls. Add a periodic
+  call (e.g. every 60 s) emitting a structured log event; `snapshot()` explicitly does not roll the loss-interval
+  baseline (`media/engine.py`, `adapter.py`, `rtcp.py`).
+
+## src/hermes_voip/keepalive.py
+
+- [ ] **[low] feature** — Surface inbound MWI (message-summary NOTIFY, RFC 3842) to the agent instead of
+  dropping the body. The gateway sends unsolicited `Event: message-summary` NOTIFY to report waiting voicemail;
+  the plugin acknowledges with a bare 200 OK and parses nothing (`keepalive.py:21,92`;
+  `transport/connection.py:752`; `ws_connection.py:433`). The MWI body (`Messages-Waiting: yes` + voicemail
+  counts) is a real, observed-live telephony signal. Shippable, fully local, sans-IO: add a typed
+  `MwiState` parser (RFC 3842 simple-message-summary grammar), have the transport's unsolicited-NOTIFY path
+  hand it to an adapter hook that injects an `internal=True` notification turn. Needs a short ADR for scope
+  before build (RFC 3842 grammar + existing not-processed comment in `keepalive.py:21`).
+
+## Gap-review provenance
+
+- **2026-06-23**: 44 new items above were discovered by the Wave-1 `/orchestrate` autonomous gap-review
+  (ADR-0072). The review fanned out across 11 of 12 dimensions; the `performance` dimension's agent failed
+  with an API error (HTTP 200, empty/malformed response) and its dimension still needs a re-run. Items already
+  tracked in this backlog before this date (12 items, primarily DTMF encode/boundary vectors, jitter-buffer
+  payload fidelity, resampler 24 kHz paths, and digest quoting assertions) were deduplicated and not
+  re-appended. The `backlog.md preamble is stale` docs-drift finding was resolved in-place (preamble rewrite
+  above) rather than tracked as a separate item.
 
 ## Future / deferred (nice-to-have, ADR-gated)
 

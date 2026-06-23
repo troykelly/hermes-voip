@@ -170,8 +170,8 @@ function gapPrompt(d) {
   ].join('\n')
 }
 
-function implPrompt(item) {
-  const branchHint = item.branch || `${item.type || 'feat'}/${(item.topic || item.id || 'change')}`
+function implPrompt(item, index) {
+  const branchHint = branchFor(item, index)
   return [
     `You are an IMPLEMENTATION agent for the hermes-voip repo. You are in your OWN isolated git`,
     `worktree (a linked worktree of the same repo; \`origin\` is configured). Deliver ONE backlog`,
@@ -242,6 +242,40 @@ function claudeReviewPrompt(impl, item, reviewerModel) {
   ].join('\n')
 }
 
+function slugify(s) {
+  return (
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 48) || 'item'
+  )
+}
+
+// A unique, conventional branch name per item. The `-${index}` suffix guarantees
+// uniqueness within a wave even when two item titles slugify identically (gap-review
+// items carry no branch/id), so parallel implementation agents never collide on one
+// remote branch. The orchestrator may pre-assign item.branch to override this.
+function branchFor(item, index) {
+  if (item.branch) return item.branch
+  const typeByKind = {
+    test: 'test',
+    docs: 'docs',
+    correctness: 'fix',
+    robustness: 'fix',
+    security: 'fix',
+    efficiency: 'perf',
+    observability: 'feat',
+    ux: 'feat',
+    api: 'feat',
+    operability: 'chore',
+    packaging: 'chore',
+    feature: 'feat',
+  }
+  const type = item.type || typeByKind[item.kind] || 'chore'
+  return `${type}/${slugify(item.topic || item.id || item.title)}-${index}`
+}
+
 function pickReviewer(authorModel) {
   switch (authorModel) {
     case 'opus':
@@ -301,11 +335,17 @@ if (phaseArg === 'implement') {
   }
   log(`implement: ${items.length} items through TDD → cross-vendor review`)
 
+  // pipeline() awaits each stage's return value (incl. Promise-returning stages) before
+  // passing it to the next — the canonical Workflow pattern is exactly a stage that returns
+  // `parallel(...).then(...)` (see the Workflow tool docs), and items pipeline independently
+  // so review starts the moment each impl is green. So stage 2 may return a Promise.
   const results = await pipeline(
     items,
     // Stage 1: implement (TDD + full gate + push), isolated worktree, model per item.
-    (item) =>
-      agent(implPrompt(item), {
+    // Stage callbacks receive (prevResult, originalItem, index); for stage 1 the first arg
+    // is the item itself and the third is its index (used for a unique branch name).
+    (item, _orig, index) =>
+      agent(implPrompt(item, index), {
         label: `impl:${item.id || item.title}`,
         phase: 'Implement',
         model: item.model || 'sonnet',
@@ -315,8 +355,16 @@ if (phaseArg === 'implement') {
       }),
     // Stage 2: adversarial review (codex cross-vendor + cross-tier Claude), in parallel.
     (impl, item) => {
-      if (!impl || impl.failed) {
-        return { item: item.title, branch: null, clean: false, failed: true, reason: (impl && impl.reason) || 'implementation returned null' }
+      // Treat a success without a pushed branch as a failure: IMPL_SCHEMA only requires
+      // `failed`, so a malformed `{failed:false}` (no branch) must NOT reach review — the
+      // reviewers diff `origin/<branch>`, and `origin/undefined` would fake an empty review.
+      if (!impl || impl.failed || !impl.branch) {
+        const reason = !impl
+          ? 'implementation returned null'
+          : impl.failed
+            ? impl.reason || 'implementation reported failure'
+            : 'implementation reported success but pushed no branch'
+        return { item: item.title, branch: null, clean: false, failed: true, reason }
       }
       const reviewerModel = pickReviewer(item.model || 'sonnet')
       return parallel([
@@ -340,8 +388,13 @@ if (phaseArg === 'implement') {
         const vs = verdicts.filter(Boolean)
         const mustFix = vs.flatMap((v) => v.mustFix || [])
         const clean = vs.length > 0 && mustFix.length === 0 && vs.every((v) => v.verdict === 'approve')
-        // A rubber-stamp (clean with zero noted observations from anyone) is a yellow flag.
-        const rubberStamp = clean && vs.every((v) => !(v.noted && v.noted.length))
+        // A rubber-stamp = a clean pass where NO reviewer offered a substantive risk
+        // statement or observation (rule 16: unanimous low-effort approval is a yellow flag
+        // the orchestrator must escalate). Trigger on absent signal, not on a missing field.
+        const substantive = (v) =>
+          (Array.isArray(v.noted) && v.noted.length > 0) ||
+          (typeof v.riskStatement === 'string' && v.riskStatement.trim().length >= 40)
+        const rubberStamp = clean && !vs.some(substantive)
         return {
           item: item.title,
           branch: impl.branch,

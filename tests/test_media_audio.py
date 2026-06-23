@@ -224,3 +224,32 @@ def test_alaw_frame_bridge_is_distinct_from_ulaw() -> None:
         samples=_pcm16(1000, -1000, 8000), sample_rate=8000, monotonic_ts_ns=0
     )
     assert frame_to_alaw(frame) != frame_to_ulaw(frame)
+
+
+# ---------------------------------------------------------------------------
+# Resampler — integer-type guard (coherent ValueError contract)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("from_rate", "to_rate"),
+    [
+        (1.5, 16000),  # float from_rate
+        (16000, 2.5),  # float to_rate
+        # bool: isinstance(True, int) is True, but bool is not a valid sample rate
+        (True, 16000),
+        (16000, False),
+    ],
+)
+def test_resampler_rejects_non_integer_and_bool_rates(
+    from_rate: object, to_rate: object
+) -> None:
+    """Resampler.__init__ raises ValueError for non-int or bool rates at construction.
+
+    A float rate passes the positivity check (1.5 > 0) but audioop.ratecv later
+    raises TypeError deep inside the C layer — NOT the ValueError the module
+    contract advertises. A bool rate (True/False) silently runs as 1/0, violating
+    the typed contract (rule 39). Both are caught at construction with ValueError.
+    """
+    with pytest.raises(ValueError, match="integer"):
+        Resampler(from_rate, to_rate)  # type: ignore[arg-type]

@@ -368,25 +368,55 @@ async def test_stream_survives_malformed_frame_between_valid_ones() -> None:
 def test_malformed_frame_warning_does_not_log_raw_content(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The dropped-frame warning must NOT contain raw frame bytes (rule 34).
+    """The dropped-frame warning must NOT contain any slice of raw frame bytes.
 
-    Flux frames carry transcribed speech and call metadata — logging any byte
-    of content would leak sensitive data to the operator log stream.  Only the
-    frame length (a safe integer) is permitted.
+    Rule 34 (content-leak guard): Flux frames carry transcribed speech and call
+    metadata — logging ANY byte of content (even a 1-byte prefix) would leak
+    sensitive data to the operator log stream.  Only the frame length (a safe
+    integer) is permitted.
+
+    The sentinel ``Zorblax-private-utterance`` is distinctive enough that a
+    1-character or 8-character prefix appearing in a log message is unambiguously
+    a content leak, not a coincidence.  This test catches the prior regression
+    where ``first_byte=%r`` logged ``raw[:1]`` — the existing full-string check
+    would have missed that because ``"Z"`` is NOT ``"Zorblax-private-utterance"``.
     """
     from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
 
-    sensitive_content = "this is transcribed speech and must not appear in logs"
+    # Distinctive, low-entropy sentinel (recognisable words, no high-entropy run)
+    # so the public-repo leak scanner (.gitleaks.toml, rule 34) does not flag this
+    # fixture as a credential; the recognisable prefix still makes partial-slice
+    # leaks (raw[:1] = "Z", raw[:8] = "Zorblax-") detectable.
+    sensitive_content = "Zorblax-private-utterance caller said transfer to account"
+
     with caplog.at_level(logging.WARNING, logger="hermes_voip.stt.deepgram"):
         result = _map_event(sensitive_content)
 
     assert result is None  # still returns None (non-regression)
 
-    # The warning must have been emitted (proves the log path was exercised).
+    # The warning MUST have been emitted — proves the guard path actually ran.
     assert len(caplog.records) >= 1, "expected at least one warning log record"
 
-    # Critically: none of the log message text may contain the raw frame content.
+    # No log message may contain ANY slice of the raw frame content:
+    #   - the full string (original assertion)
+    #   - the first byte  raw[:1]  = "Z"        ← caught the prior first_byte=%r leak
+    #   - an 8-char prefix raw[:8] = "Zorblax-" ← catches any short-prefix variant
+    #   - the distinctive marker itself (subset of the full string, belt-and-braces)
+    first_byte = sensitive_content[:1]  # "Z"
+    first_eight = sensitive_content[:8]  # "Zorblax-"
+    marker_phrase = "Zorblax-private-utterance"
+
     for record in caplog.records:
-        assert sensitive_content not in record.getMessage(), (
-            f"raw frame content leaked into log: {record.getMessage()!r}"
+        msg = record.getMessage()
+        assert sensitive_content not in msg, (
+            f"full raw frame content leaked into log: {msg!r}"
         )
+        assert first_byte not in msg, (
+            f"first-byte prefix of raw frame leaked into log"
+            f" (raw[:1]={first_byte!r}): {msg!r}"
+        )
+        assert first_eight not in msg, (
+            f"8-char prefix of raw frame leaked into log"
+            f" (raw[:8]={first_eight!r}): {msg!r}"
+        )
+        assert marker_phrase not in msg, f"distinctive marker leaked into log: {msg!r}"

@@ -183,14 +183,33 @@ class Resampler:
     def __init__(self, from_rate: int, to_rate: int) -> None:
         """Create a converter from ``from_rate`` to ``to_rate``.
 
-        Both rates must be positive and differ. Validating here fails a
-        config-derived rate of 0 (or negative) at construction with a
-        ``ValueError`` rather than letting ``audioop.ratecv`` raise its own
-        ``audioop.error`` deep inside the first ``resample`` call mid-stream.
+        Both rates must be plain ``int`` values (not ``bool``) and must be
+        positive and differ from each other.
+
+        Validating type and sign here fails a config-derived bad rate at
+        construction with ``ValueError`` rather than letting ``audioop.ratecv``
+        raise a ``TypeError`` ('float' object cannot be interpreted as an integer)
+        deep inside the C layer on the first ``resample`` call mid-stream. ``bool``
+        is rejected explicitly because ``isinstance(True, int)`` is ``True`` in
+        Python; a caller passing ``True``/``False`` as a rate is a programming
+        error, not a valid 1 Hz or 0 Hz rate.
 
         Raises:
-            ValueError: If either rate is not positive, or the rates are equal.
+            ValueError: If either rate is a ``bool``, not an ``int``, not
+                positive, or the rates are equal.
         """
+        if isinstance(from_rate, bool) or not isinstance(from_rate, int):
+            msg = (
+                f"sample rates must be a plain integer, got from_rate={from_rate!r}"
+                f" ({type(from_rate).__name__})"
+            )
+            raise ValueError(msg)  # noqa: TRY004 — module contract is ValueError throughout
+        if isinstance(to_rate, bool) or not isinstance(to_rate, int):
+            msg = (
+                f"sample rates must be a plain integer, got to_rate={to_rate!r}"
+                f" ({type(to_rate).__name__})"
+            )
+            raise ValueError(msg)  # noqa: TRY004 — module contract is ValueError throughout
         if from_rate <= 0 or to_rate <= 0:
             msg = f"sample rates must be positive, got {from_rate} -> {to_rate}"
             raise ValueError(msg)

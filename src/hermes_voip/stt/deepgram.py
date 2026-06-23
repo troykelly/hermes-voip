@@ -290,9 +290,8 @@ def _parse_flux_frame(raw: str) -> tuple[str, str] | None:
         event = json.loads(raw)
     except json.JSONDecodeError:
         _log.warning(
-            "deepgram: skipping unparseable Flux frame (len=%d, first_byte=%r)",
+            "deepgram: dropping unparseable Flux frame (len=%d)",
             len(raw),
-            raw[:1],
         )
         return None
 

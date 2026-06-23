@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import struct
 from collections.abc import AsyncIterator
 
@@ -362,3 +363,30 @@ async def test_stream_survives_malformed_frame_between_valid_ones() -> None:
         ("hello", False),
         ("hello world", True),
     ]
+
+
+def test_malformed_frame_warning_does_not_log_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The dropped-frame warning must NOT contain raw frame bytes (rule 34).
+
+    Flux frames carry transcribed speech and call metadata — logging any byte
+    of content would leak sensitive data to the operator log stream.  Only the
+    frame length (a safe integer) is permitted.
+    """
+    from hermes_voip.stt.deepgram import _map_event  # noqa: PLC0415
+
+    sensitive_content = "this is transcribed speech and must not appear in logs"
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.stt.deepgram"):
+        result = _map_event(sensitive_content)
+
+    assert result is None  # still returns None (non-regression)
+
+    # The warning must have been emitted (proves the log path was exercised).
+    assert len(caplog.records) >= 1, "expected at least one warning log record"
+
+    # Critically: none of the log message text may contain the raw frame content.
+    for record in caplog.records:
+        assert sensitive_content not in record.getMessage(), (
+            f"raw frame content leaked into log: {record.getMessage()!r}"
+        )

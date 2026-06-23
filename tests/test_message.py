@@ -300,3 +300,32 @@ def test_new_tag_and_call_id_are_unique() -> None:
     assert new_tag() != new_tag()
     assert new_call_id() != new_call_id()
     assert re.fullmatch(r"[0-9a-f]+", new_tag())
+
+
+# RFC 3261 token validation for the request-line method and request-URI
+# (Wave-3 robustness audit finding: build_request previously accepted an empty
+# method and empty/space URI, producing a malformed start-line).
+
+
+def test_build_request_rejects_empty_method() -> None:
+    """An empty method produces a malformed SIP start-line; must raise ValueError."""
+    with pytest.raises(ValueError, match="method"):
+        build_request("", "sip:1000@pbx.example.test", [])
+
+
+def test_build_request_rejects_method_with_embedded_space() -> None:
+    """A method containing a space is not an RFC 3261 token; must raise ValueError."""
+    with pytest.raises(ValueError, match="method"):
+        build_request("INVI TE", "sip:1000@pbx.example.test", [])
+
+
+def test_build_request_rejects_empty_request_uri() -> None:
+    """An empty request URI produces a malformed SIP start-line; ValueError expected."""
+    with pytest.raises(ValueError, match=r"request.?uri|URI"):
+        build_request("REGISTER", "", [])
+
+
+def test_build_request_rejects_request_uri_with_whitespace() -> None:
+    """A request URI with whitespace breaks start-line framing (ValueError expected)."""
+    with pytest.raises(ValueError, match=r"request.?uri|URI"):
+        build_request("REGISTER", "sip:1000@pbx.example.test transport=tls", [])

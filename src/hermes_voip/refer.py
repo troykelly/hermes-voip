@@ -73,19 +73,44 @@ _SIPFRAG_STATUS = re.compile(r"SIP/2\.0\s+(\d{3})\s*(.*)")
 # optional leading ``+``, decimal digits, ``*`` / ``#`` for feature codes — OR
 # (b) a full ``sip:``/``sips:`` URI for an attended/cross-domain transfer. Any
 # other shape is an injection vector: a bare ``1001@evil.com`` hijacks the host;
-# a ``?Replaces=`` / ``;``-param smuggles URI parameters; an unescaped ``>`` or
-# CR/LF breaks out of the bracketed addr-spec to forge headers. The guard is a
-# STRICT ALLOWLIST applied BEFORE the header is built, so an injection-bearing
-# target raises ``ValueError`` and NO REFER is produced.
+# a ``?Header=`` smuggles an embedded SIP header (``?Replaces=`` would redirect
+# the triggered INVITE to seize another dialog); a rogue ``;``-param smuggles
+# routing (``;Route=``); an unescaped ``>`` or CR/LF (literal or percent-encoded)
+# breaks out of the bracketed addr-spec to forge headers. The guard is a STRICT
+# ALLOWLIST applied BEFORE the header is built, so an injection-bearing target
+# raises ``ValueError`` and NO REFER is produced.
 _DIALABLE_TARGET = re.compile(r"\+?[0-9*#]+")
-# A well-formed sip:/sips: URI: scheme, a non-empty user@host, then optional
-# ``;``-params / ``?``-headers. No angle brackets, whitespace, or controls — the
-# bracket/control/whitespace checks below reject those before this even runs, so
-# this only constrains the structural shape (a scheme and an ``@`` authority).
+# A well-formed sip:/sips: URI, constrained to a clean ``scheme:user@authority``
+# with optional ``;``-params — and deliberately NO ``?``-header form (a
+# ``Refer-To`` transfer target has no legitimate embedded-header need, and
+# ``?Header=`` is a header-injection vector; rejected outright below). The
+# authority is a well-formed ``host[:port]``: an RFC-1123 hostname, an IPv4
+# literal, or a bracketed IPv6 literal, with an optional numeric port — so a
+# ``/path``, a quote/comma, or a non-numeric port cannot pass. ``;``-param NAMES
+# are further restricted to ``_ALLOWED_URI_PARAMS`` in code (so a token-shaped
+# but dangerous ``;Replaces=`` / ``;Route=`` is rejected); this regex only fixes
+# the structural shape. Angle brackets, whitespace, and control characters are
+# rejected (literal and percent-decoded) before this runs, so it need not.
+_HOST_LABEL = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+_HOSTNAME = rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*\.?"
+_IPV4 = r"(?:\d{1,3}\.){3}\d{1,3}"
+_IPV6_REF = r"\[[0-9A-Fa-f:.]+\]"
+_AUTHORITY = rf"(?:{_IPV4}|{_IPV6_REF}|{_HOSTNAME})(?::\d{{1,5}})?"
+# user-part: any URI char except the structural separators / brackets / ws / a
+# password-introducing ``:`` — kept restrictive so ``;``/``?``/``@`` cannot hide.
+_URI_USER = r"[^\s@<>;?:/\"',]+"
+# A ``;``-param token's character class (RFC 3261 token chars); param names are
+# allowlisted in code.
+_URI_PARAM_CHARS = r"[A-Za-z0-9\-.!%*_+`'~]+"
 _SIP_URI = re.compile(
-    r"sips?:[^\s@<>]+@[^\s@<>;?]+(?:[;?][^\s<>]*)?",
+    rf"sips?:{_URI_USER}@{_AUTHORITY}(?:;{_URI_PARAM_CHARS}(?:={_URI_PARAM_CHARS})?)*",
     re.IGNORECASE,
 )
+# Allowlisted sip-URI ``;``-parameter names (RFC 3261 §19.1.1). These carry no
+# routing/dialog-seizing capability; ANY other param name (notably ``replaces``,
+# ``route``, ``refer-to``) is rejected so a transfer cannot be re-aimed via a
+# smuggled parameter.
+_ALLOWED_URI_PARAMS = frozenset({"transport", "user", "method", "ttl", "maddr", "lr"})
 # A bound on the target length: ample for an international E.164 number with a
 # few DTMF digits, or a sip URI with a host and a couple of params, but short
 # enough to refuse an absurd value before it reaches the wire.
@@ -102,22 +127,38 @@ def _validate_transfer_target(target: str) -> None:
     Validates the agent-supplied ``Refer-To`` target against a strict allowlist
     BEFORE it is interpolated into the ``Refer-To: <target>`` header. A target is
     accepted only if it is EITHER a bare dialable user-part (optional leading
-    ``+``, digits, ``*`` / ``#``) OR a well-formed ``sip:``/``sips:`` URI
-    (``user@host`` with optional ``;``-params / ``?``-headers). Anything else —
-    a bare-extension host hijack (``1001@evil.com``), a ``?Replaces=`` /
-    ``;``-param smuggle on a bare extension, an angle-bracket ``>`` breakout, a
-    CR/LF or other control character (including a percent-escaped ``%0D%0A`` that
-    a gateway would unescape), whitespace, an over-long value, or empty — raises
-    :class:`ValueError`, so the injection never reaches the header and no REFER is
-    built.
+    ``+``, digits, ``*`` / ``#``) OR a well-formed ``sip:``/``sips:`` URI of the
+    shape ``scheme:user@host[:port]`` where:
+
+    * the **authority** is a well-formed ``host[:port]`` — an RFC-1123 hostname,
+      an IPv4 literal, or a bracketed IPv6 literal, with an optional numeric port
+      — so a ``/path``, a quote/comma, or a non-numeric port is rejected;
+    * the URI carries **no** ``?``-header form at all — a ``?`` anywhere in the
+      target is rejected, because a ``Refer-To`` transfer target has no legitimate
+      embedded-SIP-header need and ``?Header=`` (e.g. ``?Replaces=``) is a
+      header-injection / dialog-seizing vector;
+    * any ``;``-**parameters** are restricted to the safe allowlist
+      ``_ALLOWED_URI_PARAMS`` (``transport``, ``user``, ``method``, ``ttl``,
+      ``maddr``, ``lr``) with token-only names/values; any other/unknown param
+      name (notably ``replaces``, ``route``, ``refer-to``) is rejected, so a
+      transfer cannot be re-aimed via a smuggled parameter.
+
+    Anything else — a bare-extension host hijack (``1001@evil.com``), a
+    ``?Replaces=`` header or a ``;Route=`` param smuggle, an angle-bracket ``>``
+    breakout, a CR/LF or other control character, whitespace, or an angle bracket
+    in EITHER the literal value OR its percent-decoded form (so a percent-escaped
+    ``%0D%0A`` / ``%20`` / ``%3C`` that a gateway would unescape is caught), an
+    over-long value, or empty — raises :class:`ValueError`, so the injection
+    never reaches the header and no REFER is built.
 
     Args:
         target: The agent-supplied transfer target (extension or sip URI).
 
     Raises:
-        ValueError: If ``target`` is empty, over-long, carries a control char
-            (literal or percent-encoded), an angle bracket, or whitespace, or is
-            neither a dialable extension nor a well-formed sip:/sips: URI.
+        ValueError: If ``target`` is empty, over-long, carries a control char,
+            whitespace, or an angle bracket (literal or percent-encoded), embeds a
+            ``?``-header form, carries a non-allowlisted ``;``-param, or is neither
+            a dialable extension nor a well-formed sip:/sips: URI.
     """
     if not target:
         msg = "transfer target is empty"
@@ -125,33 +166,57 @@ def _validate_transfer_target(target: str) -> None:
     if len(target) > _MAX_TRANSFER_TARGET_LEN:
         msg = f"transfer target too long (>{_MAX_TRANSFER_TARGET_LEN} chars)"
         raise ValueError(msg)
-    # Reject control chars in BOTH the literal value and the percent-decoded
-    # value: a ``%0D%0A`` survives the literal check but a gateway unescaping the
-    # URI would inject CR/LF. ``unquote`` never raises and leaves non-escapes
-    # intact, so this catches both forms.
+    # Reject control chars, whitespace, and ``<`` / ``>`` in BOTH the literal
+    # value and the percent-decoded value: a ``%0D%0A`` / ``%20`` / ``%3C``
+    # survives the literal check, but a gateway unescaping the URI would then
+    # inject CR/LF, split on the decoded space, or break out of the
+    # ``Refer-To: <...>`` addr-spec on the decoded ``<``/``>``. ``unquote`` never
+    # raises and leaves non-escapes intact, so this catches both forms. Do NOT
+    # echo the raw value (it may carry injection bytes); name the violated rule.
     for candidate in (target, unquote(target)):
         if any(ord(char) < _C0_END or ord(char) == _DEL for char in candidate):
-            # Do NOT echo the raw value (it may carry injection bytes); name the
-            # rule that was violated instead.
             msg = "transfer target contains a control character"
             raise ValueError(msg)
-    # ``<`` / ``>`` would break out of the ``Refer-To: <...>`` addr-spec.
-    if "<" in target or ">" in target:
-        msg = "transfer target contains an angle bracket"
-        raise ValueError(msg)
-    if any(char.isspace() for char in target):
-        msg = "transfer target contains whitespace"
-        raise ValueError(msg)
+        if any(char.isspace() for char in candidate):
+            msg = "transfer target contains whitespace"
+            raise ValueError(msg)
+        if "<" in candidate or ">" in candidate:
+            msg = "transfer target contains an angle bracket"
+            raise ValueError(msg)
     if _DIALABLE_TARGET.fullmatch(target) is not None:
         return
-    if _SIP_URI.fullmatch(target) is not None:
+    # A ``?``-header form is rejected outright (header-injection vector); name it
+    # explicitly so the failure is not conflated with a malformed authority.
+    if "?" in target:
+        msg = "transfer target embeds a '?' SIP-header form (rejected)"
+        raise ValueError(msg)
+    if _SIP_URI.fullmatch(target) is not None and _uri_params_allowed(target):
         return
     msg = (
         "transfer target is neither a dialable extension "
         "(optional leading '+', digits, '*' and '#') nor a well-formed "
-        "sip:/sips: URI"
+        "sip:/sips: URI (scheme:user@host[:port] with only allowlisted "
+        ";params)"
     )
     raise ValueError(msg)
+
+
+def _uri_params_allowed(uri: str) -> bool:
+    """Return ``True`` iff every ``;``-param name in ``uri`` is allowlisted.
+
+    The URI has already matched :data:`_SIP_URI` (so it is
+    ``scheme:user@authority`` followed by zero or more ``;``-params and carries no
+    ``?``). The user-part forbids ``@``/``;``, so the first ``@`` splits off the
+    authority-and-params; the authority is the segment before the first ``;`` and
+    each later ``;``-segment is a ``name`` or ``name=value`` param whose name must
+    be in :data:`_ALLOWED_URI_PARAMS` (compared case-insensitively).
+    """
+    after_at = uri.split("@", 1)[1]
+    for param in after_at.split(";")[1:]:
+        name = param.split("=", 1)[0].lower()
+        if name not in _ALLOWED_URI_PARAMS:
+            return False
+    return True
 
 
 class ReferError(ValueError):
@@ -228,11 +293,15 @@ def build_blind_refer(
 
     Raises:
         ValueError: If ``target_uri`` is not a clean transfer target — neither a
-            dialable extension nor a well-formed sip:/sips: URI, or it carries an
-            injection vector (``@`` host hijack on a bare extension, ``;``/``?``
-            params, an angle bracket, CR/LF or other control char, or whitespace).
-            The guard runs BEFORE the header is built, so an injection-bearing
-            target never reaches the ``Refer-To`` and no REFER is produced.
+            dialable extension nor a well-formed ``sip:/sips:`` URI
+            (``scheme:user@host[:port]``), or it carries an injection vector: a
+            ``@`` host hijack on a bare extension, a ``?``-header form (e.g.
+            ``?Replaces=``), a non-allowlisted ``;``-param (e.g. ``;Route=``), a
+            malformed authority (``/path``, quote/comma, non-numeric port), an
+            angle bracket, or a CR/LF / other control char / whitespace (literal
+            or percent-encoded). The guard runs BEFORE the header is built, so an
+            injection-bearing target never reaches the ``Refer-To`` and no REFER
+            is produced.
     """
     _validate_transfer_target(target_uri)
     extra: list[tuple[str, str]] = [("Refer-To", f"<{target_uri}>")]

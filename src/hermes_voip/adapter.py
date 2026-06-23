@@ -523,6 +523,62 @@ _SINK_QUEUE_MAX = 32
 _CONSULT_PENDING = "\x00pending"
 
 
+# Outbound Request-URI injection guard (RELEASE BLOCKER #4, security).
+#
+# The outbound dial Request-URI is built by interpolating the AGENT-SUPPLIED dial
+# target into ``sip:{target}@{host}`` (the SDES/TLS UAC and the WebRTC/WSS UAC both
+# do this). ``message.build_request`` already rejects C0/DEL control chars (CR/LF/NUL
+# injection), but NOT ``@``, whitespace, or SIP URI metacharacters — so a target like
+# ``1001@evil.com`` would hijack the host (dial an arbitrary destination), and
+# ``1001;p=v`` / ``1001?Header=x`` would smuggle URI parameters/headers.
+#
+# This guard is a STRICT ALLOWLIST grammar on the SHAPE of the user-part, applied
+# BEFORE any interpolation. It is COMPLEMENTARY to ``HERMES_VOIP_OUTBOUND_ALLOW``
+# (which gates WHICH destinations are permitted): a value can be on the allowlist and
+# still be rejected here if it is not a clean dialable target. The grammar is the
+# dialable digits an SIP user-part legitimately carries: an optional leading ``+``
+# (E.164), the decimal digits, and ``*`` / ``#`` for DTMF-style feature/extension
+# codes. Everything else — ``@``, whitespace, ``;`` ``?`` ``<`` ``>`` ``,`` ``"``
+# ``/`` ``\`` and any control char — is rejected, the call is NOT placed.
+_DIALABLE_TARGET = re.compile(r"\+?[0-9*#]+")
+# A bound on the user-part length: long enough for an international E.164 number with
+# a few DTMF digits, short enough to refuse an absurd value before it reaches the wire.
+_MAX_DIAL_TARGET_LEN = 32
+
+
+def _validate_dialable_target(target: str) -> None:
+    """Reject an outbound dial target that is not a clean dialable user-part.
+
+    Validates ``target`` (the agent-supplied number/extension) against a strict
+    allowlist grammar — optional leading ``+``, decimal digits, and ``*`` / ``#`` —
+    BEFORE it is interpolated into the ``sip:{target}@{host}`` Request-URI. Any
+    ``@``, whitespace, SIP URI metacharacter, control char, or empty value raises
+    :class:`ValueError`, so an injection-bearing target never reaches the URI builder
+    and the call is not placed.
+
+    Args:
+        target: The agent-supplied dial target (extension or E.164-ish number).
+
+    Raises:
+        ValueError: If ``target`` is empty, over-long, or carries any character
+            outside the dialable grammar.
+    """
+    if not target:
+        msg = "dial target is empty"
+        raise ValueError(msg)
+    if len(target) > _MAX_DIAL_TARGET_LEN:
+        msg = f"dial target too long (>{_MAX_DIAL_TARGET_LEN} chars)"
+        raise ValueError(msg)
+    if _DIALABLE_TARGET.fullmatch(target) is None:
+        # Do NOT echo the raw value (it may carry injection bytes / be sensitive);
+        # name the rule that was violated instead.
+        msg = (
+            "dial target is not a valid dialable number/extension "
+            "(allowed: optional leading '+', digits, '*' and '#')"
+        )
+        raise ValueError(msg)
+
+
 def _make_tls_context(host: str) -> ssl.SSLContext:
     """Build a client TLS context that verifies the server certificate."""
     ctx = ssl.create_default_context()
@@ -1520,8 +1576,19 @@ class VoipAdapter(BasePlatformAdapter):
                 returns ``487 Request Terminated``.
             NotImplementedError: When ``ring_timeout_secs`` is set on a WSS gateway
                 (the WebRTC outbound path has no client CANCEL yet — ADR-0069 scope).
+            ValueError: When ``extension`` is not a clean dialable target (carries
+                ``@``, whitespace, a SIP URI metacharacter, or a control char) — the
+                Request-URI injection guard (RELEASE BLOCKER #4); the call is NOT
+                placed.
             RuntimeError: When the transport or manager is not initialised.
         """
+        # Request-URI injection guard (RELEASE BLOCKER #4): validate the agent-supplied
+        # target against the strict dialable grammar BEFORE any transport work, so an
+        # injection-bearing value (``1001@evil.com``, ``1001;p=v``, whitespace, CRLF)
+        # can never reach the ``sip:{extension}@{host}`` interpolation on either the
+        # SDES/TLS or the WebRTC/WSS UAC path. Complementary to the
+        # ``HERMES_VOIP_OUTBOUND_ALLOW`` destination allowlist (this gates URI SHAPE).
+        _validate_dialable_target(extension)
         # ADR-0049 (lifts ADR-0032 §5 / ADR-0038 §4): on a WSS gateway, outbound
         # origination carries OUR OWN WebRTC offer (DTLS/ICE/Opus) over the
         # WebSocket — never the SDES/TLS-Via INVITE the WSS transport cannot frame

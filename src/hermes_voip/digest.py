@@ -32,8 +32,11 @@ from dataclasses import dataclass, field
 # An auth-param is ``name=token`` or ``name="quoted-string"``. The quoted
 # alternative is escape-aware (RFC 2617 quoted-pair): ``\"`` is a literal quote
 # and ``\\`` a literal backslash, so the value spans to the matching unescaped
-# ``"`` instead of stopping at the first inner quote.
-_PARAM = re.compile(r'(\w[\w-]*)=(?:"((?:[^"\\]|\\.)*)"|([^,\s]+))')
+# ``"`` instead of stopping at the first inner quote. The bare (unquoted)
+# alternative is an RFC 3261/2617 ``token``, which excludes the separators
+# ``,``, ``;`` and whitespace — so it must stop at ``;`` rather than running on
+# and swallowing semicolon-delimited trailing content into the value.
+_PARAM = re.compile(r'(\w[\w-]*)=(?:"((?:[^"\\]|\\.)*)"|([^,;\s]+))')
 # A quoted-pair: a backslash followed by any single character it escapes.
 _QUOTED_PAIR = re.compile(r"\\(.)")
 

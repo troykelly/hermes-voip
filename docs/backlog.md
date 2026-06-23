@@ -114,7 +114,7 @@ defect or a load-bearing test gap.
   lines 156-159). Verified: a `garbageline` between headers vanishes with no error — inconsistent with
   the module's otherwise-strict stance. Decide and document: prefer raising `ValueError('malformed header
   line: …')`; if leniency is wanted, comment it and pin with a test.
-- [ ] **[medium] robustness** — `build_request` does not validate request-line method/URI shape. Only
+- [x] **[medium] robustness** (#184) — `build_request` does not validate request-line method/URI shape. Only
   `_reject_controls` runs (lines 78-79); an empty method, embedded-space method, or empty/space URI
   passes. Verified: `build_request("", "sip:x", [])` → start-line `' sip:x SIP/2.0'`. Validate method
   against the token rule + reject empty; reject empty/space URI. Red tests for each.
@@ -164,7 +164,7 @@ defect or a load-bearing test gap.
   `build_audio_answer` in `sdp.py` parses the offer → negotiates → builds the answer with reciprocal
   direction + keyed crypto, so callers no longer re-derive RFC 3264 reciprocity by hand. Wired in
   `adapter.py`.
-- [ ] **[medium] robustness** — Parser accepts negative/zero ports and negative ptime silently.
+- [x] **[medium] robustness** (#185) — Parser accepts negative/zero ports and negative ptime silently.
   Verified: `m=audio -5 RTP/AVP 0` → port `-5`; `a=ptime:-3` → ptime `-3`. The *builder* validates these
   but the *parser* (hostile inbound data) does not. Validate port range and `ptime>0` on parse → `SdpError`;
   decide/document `port==0` (held/declined media) explicitly.
@@ -232,7 +232,7 @@ defect or a load-bearing test gap.
   SIP-over-TLS mandate. `_registrar_uri` echoes whatever scheme the AOR carries; a `sip:` AOR over a TLS
   transport is internally inconsistent with no signal. Either document scheme as the transport's
   responsibility, or add a `transport in {TLS,WSS} ⇒ sips:` consistency check; record the stance.
-- [ ] **[medium] robustness** — `RegistrationConfig.transport` and `expires` are unvalidated. `transport`
+- [ ] **[medium] robustness** (attempted Wave 4 — BLOCKED: a `transport` Literal on RegistrationConfig conflicts with `GatewayConfig.via_transport` dict typing at config.py:684; reconcile both files in one lane) — `RegistrationConfig.transport` and `expires` are unvalidated. `transport`
   is a free str injected into the Via line (line 201); `expires` accepts negatives (`Expires: -1`). Make
   `transport` a `Literal['TLS','WSS','UDP','TCP']`, reject negative `expires` in `__post_init__`
   (AGENTS 17 prefer types). Test an unknown-transport rejection.

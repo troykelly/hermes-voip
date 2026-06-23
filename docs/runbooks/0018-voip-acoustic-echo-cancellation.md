@@ -23,7 +23,7 @@ the operational HOW for the operator knobs.
 | Env var | Type | Default | Read into |
 | --- | --- | --- | --- |
 | `HERMES_VOIP_AEC_ENABLED` | boolean (`true/1/yes/on` \| `false/0/no/off`) | `true` (**ON**) | `MediaConfig.aec_enabled` |
-| `HERMES_VOIP_AEC_FILTER_MS` | integer **ms**, `> 0` | `16` | `MediaConfig.aec_filter_ms` |
+| `HERMES_VOIP_AEC_FILTER_MS` | integer **ms**, `> 0` | `64` | `MediaConfig.aec_filter_ms` |
 | `HERMES_VOIP_AEC_BULK_DELAY_MS` | integer **ms**, `>= 0` | `0` | `MediaConfig.aec_bulk_delay_ms` |
 | `HERMES_VOIP_AEC_MU` | float in the **open** `(0, 2)` | `0.30` | `MediaConfig.aec_mu` |
 
@@ -96,8 +96,8 @@ load; a running call keeps the settings it started with).
      print(c.aec_enabled, c.aec_filter_ms, c.aec_mu, c.barge_in_min_speech_ms)"
    ```
 
-   Prints `True 16 0.3 200` (AEC on → the 200 ms barge-in default). With
-   `{'HERMES_VOIP_AEC_ENABLED':'false'}` it prints `False 16 0.3 600` (the 600 ms default
+   Prints `True 64 0.3 200` (AEC on → the 200 ms barge-in default). With
+   `{'HERMES_VOIP_AEC_ENABLED':'false'}` it prints `False 64 0.3 600` (the 600 ms default
    restored). A bad `mu` fails loud:
 
    ```

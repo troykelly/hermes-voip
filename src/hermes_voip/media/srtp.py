@@ -60,6 +60,23 @@ _AUTH_TAG_LEN: dict[str, int] = {
     _AES_CM_128_HMAC_SHA1_32: 4,  # 32 bits
 }
 
+
+def crypto_suite_strength(suite: str) -> int:
+    """Rank an SRTP crypto-suite by integrity strength (higher == stronger).
+
+    The two supported AES_CM_128 suites share the same 128-bit cipher and differ
+    only in the SRTP auth-tag length, so the auth-tag length IS the strength
+    ordering: ``AES_CM_128_HMAC_SHA1_80`` (10 octets / 80 bits) outranks
+    ``AES_CM_128_HMAC_SHA1_32`` (4 octets / 32 bits). The SDES answerer
+    (:func:`hermes_voip.sdp._negotiate_answer_crypto`) uses this to pick the
+    STRONGEST offered+supported suite rather than honouring offer order, closing
+    a within-SRTP integrity downgrade when an offer (or a MITM that reordered it)
+    lists the weaker suite first. An unknown suite ranks ``0`` (weaker than any
+    supported suite) so callers never prefer something they cannot key.
+    """
+    return _AUTH_TAG_LEN.get(suite, 0)
+
+
 # SRTP session key lengths (RFC 3711 §4.3, Table 4).
 _SESSION_ENCRYPT_KEY_LEN = 16  # 128 bits (AES-128)
 _SESSION_AUTH_KEY_LEN = 20  # 160 bits (HMAC-SHA1)

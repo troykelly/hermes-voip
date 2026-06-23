@@ -46,4 +46,30 @@ __all__ = [
     "register",
     "sip_address_of_record",
 ]
-__version__ = "0.0.0"
+
+
+def _resolve_version() -> str:
+    """Single-source the package version from installed distribution metadata.
+
+    The canonical version lives in ``pyproject.toml [project].version``; the build
+    backend (hatchling) writes it into the distribution metadata, from which
+    :func:`importlib.metadata.version` reads it for both wheel and editable
+    installs. Deriving ``__version__`` here means a release is a SINGLE edit in
+    ``pyproject.toml`` rather than three hand-maintained copies that can drift
+    (the plugin.yaml manifest is pinned equal by the test suite).
+
+    Fallback: when the package is imported from a source tree that was never
+    installed — so no distribution metadata exists — there is no canonical version
+    to report; ``"0+unknown"`` (PEP 440 local-version form) signals exactly that
+    rather than fabricating a release number. This path is not hit in any installed
+    deployment (wheel, editable, or directory-install), where metadata is present.
+    """
+    from importlib.metadata import PackageNotFoundError, version  # noqa: PLC0415
+
+    try:
+        return version("hermes-voip")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
+__version__ = _resolve_version()

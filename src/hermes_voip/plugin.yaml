@@ -24,7 +24,7 @@
 # pyproject.toml (a test asserts version parity and that provides_tools/provides_hooks
 # match the tools/hooks register() actually registers).
 name: hermes-voip
-version: "0.0.0"
+version: "0.1.0"
 description: >-
   Two-way voice over telephony for a Hermes agent — answer and place phone calls on
   any RFC-compliant SIP-over-TLS or WebRTC voice gateway, with streaming STT/TTS, a

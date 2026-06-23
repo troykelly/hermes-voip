@@ -670,7 +670,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/adapter.py (Wave-1 additions)
 
-- [ ] **[medium] security** — Outbound dial Request-URI built by unvalidated interpolation
+- [x] **[medium] security** (#190) — Outbound dial Request-URI built by unvalidated interpolation
   `sip:{extension}@{host}` (`adapter.py:1601`) from the agent-supplied `number`/`extension`. The only
   downstream guard is `message.py _reject_controls` which rejects only C0/DEL — not `@`, spaces, or SIP URI
   metacharacters. Additionally, `outbound_allow.py`'s documented URI-form allowlist entries (e.g.
@@ -906,7 +906,7 @@ These span multiple modules or the repo as a whole.
   `dist/hermes_voip-0.0.0-py3-none-any.whl` exists and is not in `.gitignore`. Build artifacts in the repo
   create a stale-artifact risk and violate deterministic-builds rule 33. Add `dist/` to `.gitignore` and
   remove the committed artifact.
-- [ ] **[medium] test** — No wheel build/test in CI or local gate. `.github/workflows/gate.yml` runs
+- [x] **[medium] test** (#191) — No wheel build/test in CI or local gate. `.github/workflows/gate.yml` runs
   format/lint/mypy/pytest but never builds the wheel or tests its contents. `test_manifest_is_importable_package_data`
   (`test_plugin_manifest.py:405`) checks *source* package data, but there is no CI job verifying a built
   wheel can be installed and that `importlib.resources` works inside it. A broken wheel (missing `plugin.yaml`,

@@ -28,8 +28,17 @@ def split_header_list(header_value: str) -> list[str]:
     current: list[str] = []
     in_angle = False
     in_quote = False
+    escaped = False
     for char in header_value:
-        if char == '"' and not in_angle:
+        if escaped:
+            # The previous char was an unescaped backslash inside a quoted-string:
+            # this char is a literal quoted-pair (RFC 3261 §25.1), never structural.
+            current.append(char)
+            escaped = False
+            continue
+        if in_quote and char == "\\":
+            escaped = True
+        elif char == '"' and not in_angle:
             in_quote = not in_quote
         elif char == "<" and not in_quote:
             in_angle = True

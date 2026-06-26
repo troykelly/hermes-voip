@@ -30,15 +30,13 @@ def test_comma_inside_quoted_display_name_is_not_a_separator() -> None:
 
 
 def test_escaped_quote_in_display_name_does_not_end_the_quoted_string() -> None:
-    """RFC 3261 quoted-pair: ``\\"`` is a literal quote, not a string terminator.
+    """A backslash-escaped quote (RFC 3261 quoted-pair) is a literal, not a terminator.
 
-    A naive toggle on every ``"`` ends the quoted display-name early, so a comma
+    A naive toggle on every quote ends the quoted display-name early, so a comma
     inside it is wrongly treated as a top-level separator. The escaped quotes here
     keep the whole display-name (incl. its comma) inside one entry.
     """
-    value = (
-        r'"Sales \"East, West\"" <sip:p1.example.test;lr>, <sip:p2.example.test;lr>'
-    )
+    value = r'"Sales \"East, West\"" <sip:p1.example.test;lr>, <sip:p2.example.test;lr>'
     assert split_header_list(value) == [
         r'"Sales \"East, West\"" <sip:p1.example.test;lr>',
         "<sip:p2.example.test;lr>",

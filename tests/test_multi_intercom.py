@@ -15,9 +15,11 @@ PUBLIC repo: obvious fakes only (``pbx.example.test``, ext ``1000``,
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -26,6 +28,8 @@ from hermes_voip.multi_intercom import (
     MultiIntercomConfig,
     Opening,
     OpeningType,
+    WebhookError,
+    fire_webhook_opening,
     load_multi_intercom_config,
 )
 
@@ -267,3 +271,125 @@ def test_invalid_json_fails_loud(tmp_path: Path) -> None:
     path.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(ConfigError, match="JSON"):
         load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=str(path)))
+
+
+# --- control-char rejection in headers at config load (CRLF/NUL hardening) ----
+
+
+def test_header_name_with_crlf_rejected_at_load(tmp_path: Path) -> None:
+    """A webhook header NAME containing CRLF is rejected at config load (ConfigError).
+
+    http.client raises ValueError('Invalid header name') when a header name
+    contains control chars, at the point the HTTP request is sent. That ValueError
+    bypasses the existing except chain (HTTPError, URLError, TimeoutError, OSError)
+    in _fire_webhook_blocking, propagating uncaught and violating the WebhookError
+    contract. Reject the bad value at config load.
+    """
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {"X-Bad\r\nHeader": "value"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
+def test_header_value_with_crlf_rejected_at_load(tmp_path: Path) -> None:
+    """A webhook header VALUE containing CRLF is rejected at config load."""
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {"Authorization": "Bearer tok\r\nen"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
+def test_header_value_with_nul_rejected_at_load(tmp_path: Path) -> None:
+    """A webhook header VALUE containing a NUL byte is rejected at config load."""
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {"Authorization": "Bearer tok\x00en"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
+def test_header_name_with_nul_rejected_at_load(tmp_path: Path) -> None:
+    """A webhook header NAME containing a NUL byte is rejected at config load."""
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {"X-Bad\x00Header": "value"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
+# --- ValueError in _fire_webhook_blocking surfaces as WebhookError -------------
+
+
+def test_value_error_in_fire_webhook_surfaces_as_webhook_error() -> None:
+    """A ValueError raised inside _fire_webhook_blocking is re-raised as WebhookError.
+
+    http.client raises ValueError('Invalid header value') when a header contains
+    control chars. If such a value slips through to the network call (defense-in-
+    depth), the existing except chain (HTTPError, URLError, TimeoutError, OSError)
+    does NOT catch ValueError — it propagates uncaught, violating the documented
+    WebhookError contract. The fix wraps ValueError in WebhookError.
+    """
+    opening = Opening(
+        name="gate",
+        type=OpeningType.WEBHOOK,
+        url=_FAKE_WEBHOOK_URL,
+        headers={"Authorization": f"Bearer {_FAKE_HEADER_TOKEN}"},
+    )
+
+    def _raise_value_error(_opening: Opening) -> None:
+        raise ValueError("Invalid header value")
+
+    with (
+        patch(
+            "hermes_voip.multi_intercom._fire_webhook_blocking",
+            side_effect=_raise_value_error,
+        ),
+        pytest.raises(WebhookError),
+    ):
+        asyncio.run(fire_webhook_opening(opening))

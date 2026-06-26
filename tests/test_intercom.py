@@ -14,7 +14,9 @@ silent door opening). PUBLIC repo: fakes only (``relay.example.test``).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
+from unittest.mock import patch
 
 import pytest
 
@@ -22,6 +24,8 @@ from hermes_voip.config import ConfigError
 from hermes_voip.intercom import (
     IntercomConfig,
     IntercomOpenMode,
+    IntercomRelayClient,
+    IntercomRelayError,
     load_intercom_config,
 )
 
@@ -129,3 +133,78 @@ def test_repr_does_not_leak_the_relay_token() -> None:
         relay_token=_FAKE_TOKEN,
     )
     assert _FAKE_TOKEN not in repr(cfg)
+
+
+# --- control-char rejection at config load (CRLF/NUL hardening) ---------------
+
+
+def test_relay_token_with_crlf_rejected_at_load() -> None:
+    """A relay token containing CR+LF is rejected at config load (ConfigError).
+
+    An embedded CRLF in an HTTP header value causes urllib to raise a bare
+    ValueError (HTTP header injection) — which bypasses the existing
+    (HTTPError, URLError, TimeoutError, OSError) catch in _open_blocking and
+    violates the IntercomRelayError contract. Reject at load before it can reach
+    the network call.
+    """
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN="tok\r\nen:bad",
+            )
+        )
+
+
+def test_relay_token_with_nul_rejected_at_load() -> None:
+    """A relay token containing a NUL byte is rejected at config load."""
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN="tok\x00en",
+            )
+        )
+
+
+def test_relay_token_with_lone_lf_rejected_at_load() -> None:
+    """A relay token containing a lone LF is rejected at config load."""
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN="tok\nen",
+            )
+        )
+
+
+# --- ValueError in _open_blocking surfaces as IntercomRelayError ---------------
+
+
+def test_value_error_in_open_blocking_surfaces_as_relay_error() -> None:
+    """A ValueError raised inside _open_blocking is re-raised as IntercomRelayError.
+
+    urllib raises ValueError('Invalid header value') when a header contains
+    control chars. If such a value slips through to the network call (defense-in-
+    depth), the existing except chain (HTTPError, URLError, TimeoutError, OSError)
+    does NOT catch ValueError — it propagates uncaught, violating the documented
+    IntercomRelayError contract. The fix wraps ValueError in IntercomRelayError.
+    """
+    cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.RELAY,
+        relay_url=_FAKE_RELAY_URL,
+        relay_token=_FAKE_TOKEN,
+    )
+    client = IntercomRelayClient(cfg)
+
+    def _raise_value_error() -> None:
+        raise ValueError("Invalid header value")
+
+    with (
+        patch.object(client, "_open_blocking", side_effect=_raise_value_error),
+        pytest.raises(IntercomRelayError),
+    ):
+        asyncio.run(client.open())

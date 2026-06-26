@@ -47,19 +47,26 @@ def test_runbook_0013_section3_graceful_shutdown_documents_shipped_behavior() ->
         "ADR-0059 shipped graceful shutdown. Rewrite to describe what IS."
     )
 
-    # FAIL: Section 3 recommends kill -9 as the primary stop method
-    # (It should be SIGTERM + drain, with kill -9 as the fallback only.)
+    # Section 3 must POSITIVELY document the graceful drain path — a regression to
+    # hard-kill-only guidance (no SIGTERM/drain) is itself a rule-27 defect and must
+    # FAIL this test (the previous gated check let that regression pass silently).
+    assert "kill -TERM" in section3, (
+        "Section 3 must document the graceful 'kill -TERM' drain path (ADR-0059), "
+        "not only a hard kill."
+    )
+    assert "drain" in section3.lower() or "graceful" in section3.lower(), (
+        "Section 3 must describe the BYE-drain / graceful shutdown (ADR-0059)."
+    )
+
+    # When kill -9 is mentioned (the fallback), kill -TERM must come FIRST.
     section3_lines = section3.split("\n")
+    sigterm_line = next(
+        i for i, line in enumerate(section3_lines) if "kill -TERM" in line
+    )
     kill9_line = next(
         (i for i, line in enumerate(section3_lines) if "kill -9" in line), None
     )
-    sigterm_line = next(
-        (i for i, line in enumerate(section3_lines) if "kill -TERM" in line),
-        None,
-    )
-
-    if kill9_line is not None and sigterm_line is not None:
-        # FAIL if kill -9 comes before (primary method) or if no SIGTERM mention
+    if kill9_line is not None:
         assert sigterm_line < kill9_line, (
             f"Section 3 lists 'kill -TERM' at line {sigterm_line} but "
             f"'kill -9' at line {kill9_line}. The section must recommend SIGTERM "

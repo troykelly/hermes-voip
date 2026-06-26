@@ -493,10 +493,14 @@ grep -E "CallLoop started|Turn ended|hung|deadlock|stuck" /path/to/hermes/log | 
 - **Each turn says `Turn ended: reason=timeout` or `error`** but the next turn starts anyway →
   the loop is active and recovering (expected; the agent is resilient).
 
-### 3. Graceful shutdown (BYE-drain via SIGTERM — ADR-0059)
+### 3. Graceful shutdown (BYE-drain via the host's `disconnect()` path — ADR-0059)
 
-The plugin implements graceful shutdown: when it receives `SIGTERM` (or the process
-`disconnect()` is called), it:
+The plugin's `disconnect()` performs a graceful BYE-drain. It is a **library/plugin**, not a
+standalone service (AGENTS rule 40) — it installs **no `SIGTERM` handler of its own**. The
+**Hermes host runtime** invokes `disconnect()` on its shutdown / `aclose()` path (ADR-0059
+calls this "the `aclose()`/SIGTERM path"); a typical host wires its `SIGTERM` to that
+shutdown, so `kill -TERM <host-PID>` reaches `disconnect()` **only if the host is wired that
+way**. When `disconnect()` runs, it:
 
 1. **Stops accepting new INVITEs** — a racing inbound INVITE gets a `503 Service Unavailable`.
 2. **Drains active calls** — sends a SIP BYE to every live call concurrently (up to
@@ -506,11 +510,13 @@ The plugin implements graceful shutdown: when it receives `SIGTERM` (or the proc
 **Recommended shutdown:**
 
 ```bash
-# SIGTERM triggers graceful drain with BYE to all live calls.
+# Use the host runtime's graceful stop (its SIGTERM path, if wired, calls disconnect()).
 kill -TERM <PID>
-# The process logs "graceful shutdown: draining N live call(s) with BYE (timeout 5.0s)"
-# and exits once the drain completes or times out (max 5 s + cancellation grace).
-# Wait a few seconds for it to exit cleanly.
+# VERIFY the drain actually ran — look for this exact log line:
+#   "graceful shutdown: draining N live call(s) with BYE (timeout 5.0s)"
+# If that line does NOT appear, the host did NOT trigger disconnect() (unwired SIGTERM):
+# live calls were NOT drained — treat it as a hard kill and escalate.
+# Otherwise the process exits once the drain completes or times out (max 5 s + grace).
 ```
 
 **If the process does not exit within ~10 seconds after SIGTERM:**

@@ -72,7 +72,7 @@ _STALE_DEVCONTAINER_RE = re.compile(
 )
 _FORWARD_PORT_RE = re.compile(r"\b(?:forwardPorts|appPort)\b", re.IGNORECASE)
 _POSTGRES_ENV_RE = re.compile(
-    r"[\"']?\b(?P<name>POSTGRES_(?:USER|DB|PASSWORD|HOST_AUTH_METHOD))\b[\"']?\s*(?::|=)\s*[\"']?(?P<value>[^\s,#\]}\"']+)",
+    r"[\"']?\b(?P<name>POSTGRES_(?:USER|DB|PASSWORD|HOST_AUTH_METHOD))\b[\"']?\s*(?::|=)\s*[\"']?(?P<value>[^\s,#\]}\"']*)",
     re.IGNORECASE,
 )
 _LISTEN_ALL_RE = re.compile(
@@ -86,7 +86,8 @@ _PG_HBA_PUBLIC_RE = re.compile(
 _SHORT_PORT_RE = re.compile(
     r"(?:^|[\s\"'])"
     r"(?:(?:\[[0-9a-f:.]+\]|(?:\d{1,3}\.){3}\d{1,3}):)?"
-    r"(?P<published>\d+):(?P<target>5432)(?:[/\"'\s]|$)"
+    r"(?P<published>\d+):(?P<target>5432)(?:[/\"'\s]|$)",
+    re.IGNORECASE,
 )
 _PUBLISHED_RE = re.compile(
     r"\bpublished\s*:\s*[\"']?(?P<port>\d+)[\"']?", re.IGNORECASE
@@ -216,8 +217,10 @@ def _scan_public_ports(
     relative_path: Path, lines: Sequence[str]
 ) -> Iterator[Violation]:
     for line_number, line in _numbered(lines):
-        if _nearby_forward_port_key(lines, line_number) and _NUMERIC_5432_RE.search(
-            line
+        if (
+            _is_devcontainer_json(relative_path)
+            and _nearby_forward_port_key(lines, line_number)
+            and _NUMERIC_5432_RE.search(line)
         ):
             yield from _forwarded_port_violations(relative_path, line_number, line)
         if _line_publishes_postgres(line) and _has_database_context(lines, line_number):
@@ -227,13 +230,17 @@ def _scan_public_ports(
                 line_number,
                 "do not publish PostgreSQL port 5432 from tracked config",
             )
-        if _published_postgres_target(lines, line_number):
+        if _line_targets_postgres(line) and _has_database_context(lines, line_number):
             yield Violation(
                 "DB002",
                 relative_path,
                 line_number,
                 "do not publish PostgreSQL port 5432 from tracked config",
             )
+
+
+def _is_devcontainer_json(relative_path: Path) -> bool:
+    return relative_path.as_posix() == ".devcontainer/devcontainer.json"
 
 
 def _forwarded_port_violations(
@@ -271,17 +278,12 @@ def _line_publishes_postgres(line: str) -> bool:
     return published != 0
 
 
-def _published_postgres_target(lines: Sequence[str], line_number: int) -> bool:
-    line = lines[line_number - 1]
-    if _PUBLISHED_RE.search(line) is None:
-        return False
-    return _has_nearby_match(
-        lines, line_number, _TARGET_RE, radius=3
-    ) and _has_database_context(lines, line_number)
+def _line_targets_postgres(line: str) -> bool:
+    return _TARGET_RE.search(line) is not None
 
 
 def _nearby_forward_port_key(lines: Sequence[str], line_number: int) -> bool:
-    return _has_nearby_match(lines, line_number, _FORWARD_PORT_RE, radius=3)
+    return _has_nearby_match(lines, line_number, _FORWARD_PORT_RE, radius=20)
 
 
 def _scan_postgres_defaults(
@@ -328,7 +330,7 @@ def _scan_public_auth_config(
                 line_number,
                 "do not configure PostgreSQL to listen on all interfaces",
             )
-        if _PG_HBA_PUBLIC_RE.search(line.strip("\"'")):
+        if _PG_HBA_PUBLIC_RE.search(_unquote_config_line(line)):
             yield Violation(
                 "DB004",
                 relative_path,
@@ -337,8 +339,12 @@ def _scan_public_auth_config(
             )
 
 
+def _unquote_config_line(line: str) -> str:
+    return line.strip().lstrip("-").strip().strip("\"'")
+
+
 def _has_database_context(lines: Sequence[str], line_number: int) -> bool:
-    return _has_nearby_match(lines, line_number, _DB_CONTEXT_RE, radius=40)
+    return _has_nearby_match(lines, line_number, _DB_CONTEXT_RE, radius=len(lines))
 
 
 def _has_nearby_match(

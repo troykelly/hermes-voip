@@ -9,6 +9,7 @@ types and does not redefine them.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
@@ -40,6 +41,18 @@ class GuardResult:
     reasons: tuple[str, ...]
     degraded: bool
     score: float
+
+    def __post_init__(self) -> None:
+        """Validate that score is a finite real number in [0.0, 1.0]."""
+        # SECURITY-ADJACENT: ADR-0009 injection thresholds gate on ``score``.
+        # NaN comparisons always return False, so NaN/inf could silently bypass
+        # a threshold such as ``score > 0.7``.  Reject here as defence-in-depth.
+        if not (math.isfinite(self.score) and 0.0 <= self.score <= 1.0):
+            msg = (
+                f"GuardResult.score must be a finite real number in [0.0, 1.0], "
+                f"got {self.score!r}"
+            )
+            raise ValueError(msg)
 
 
 @runtime_checkable

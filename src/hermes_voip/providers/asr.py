@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -24,6 +25,15 @@ class Transcript:
     is_final: bool
     end_of_turn: bool
     confidence: float
+
+    def __post_init__(self) -> None:
+        """Validate that confidence is a finite real number in [0.0, 1.0]."""
+        if not (math.isfinite(self.confidence) and 0.0 <= self.confidence <= 1.0):
+            msg = (
+                f"Transcript.confidence must be a finite real number in [0.0, 1.0], "
+                f"got {self.confidence!r}"
+            )
+            raise ValueError(msg)
 
 
 @runtime_checkable

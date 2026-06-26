@@ -54,7 +54,8 @@ def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
     """Unfold (RFC 3261 §7.3.1) and split header lines into ``(name, value)`` pairs.
 
     Raises:
-        ValueError: If a continuation line has no preceding header.
+        ValueError: If a continuation line has no preceding header, or a non-empty
+            header line has no colon separator (malformed header field).
     """
     unfolded: list[str] = []
     for line in lines:
@@ -273,8 +274,9 @@ class SipResponse:
             The parsed response.
 
         Raises:
-            ValueError: If the first line is not a valid SIP status-line, or a
-                header continuation line has no preceding header.
+            ValueError: If the first line is not a valid SIP status-line, a header
+                continuation line has no preceding header, or a non-empty header line
+                has no colon separator (malformed header field).
 
         Note:
             ``raw`` must be exactly one complete message. Octet-accurate stream
@@ -331,8 +333,9 @@ class SipRequest:
             The parsed request.
 
         Raises:
-            ValueError: If the first line is not a valid SIP request-line, or a
-                header continuation line has no preceding header.
+            ValueError: If the first line is not a valid SIP request-line, a header
+                continuation line has no preceding header, or a non-empty header line
+                has no colon separator (malformed header field).
         """
         head, _, body = raw.partition(_CRLF + _CRLF)
         lines = head.split(_CRLF)

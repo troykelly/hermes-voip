@@ -22,6 +22,7 @@ from hermes_voip.media.audio import (
     frame_to_alaw,
     frame_to_ulaw,
     linear_fade_out,
+    resample_frame,
     ulaw_to_frame,
 )
 from hermes_voip.providers.audio import PcmFrame
@@ -375,3 +376,128 @@ def test_resampler_24k_to_8k_sample_count() -> None:
     assert 156 <= out_samples <= 164, (
         f"24k->8k: expected ~160 output samples (1/3 of 480), got {out_samples}"
     )
+
+
+# ---------------------------------------------------------------------------
+# resample_frame — PcmFrame-level sample-rate converter helper
+# ---------------------------------------------------------------------------
+
+
+def test_resample_frame_8k_to_16k_returns_pcmframe() -> None:
+    """resample_frame returns a PcmFrame with sample_rate set to the target rate."""
+    pcm = _pcm16(*([1000, -1000] * 80))  # 160 samples @ 8 kHz = 20 ms
+    frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=0)
+    out = resample_frame(frame, target_rate=16000)
+    assert isinstance(out, PcmFrame)
+    assert out.sample_rate == 16000
+
+
+def test_resample_frame_8k_to_16k_preserves_duration() -> None:
+    """8kHz -> 16kHz: output has ~double the samples, preserving 20ms duration.
+
+    audioop.ratecv of 160 samples 8k->16k yields 319; allow ±4 for edge rounding.
+    """
+    pcm = _pcm16(*([1000, -1000] * 80))  # 160 samples @ 8 kHz = 20 ms
+    frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=0)
+    out = resample_frame(frame, target_rate=16000)
+    out_samples = out.sample_count
+    assert 315 <= out_samples <= 323, (
+        f"8k->16k: expected ~319 samples, got {out_samples}"
+    )
+
+
+def test_resample_frame_16k_to_8k_preserves_duration() -> None:
+    """16kHz -> 8kHz: output has ~half the samples, preserving 20ms duration.
+
+    audioop.ratecv of 320 samples 16k->8k yields 160; allow ±4 for edge rounding.
+    """
+    pcm = _pcm16(*([500] * 320))  # 320 samples @ 16 kHz = 20 ms
+    frame = PcmFrame(samples=pcm, sample_rate=16000, monotonic_ts_ns=0)
+    out = resample_frame(frame, target_rate=8000)
+    out_samples = out.sample_count
+    assert 156 <= out_samples <= 164, (
+        f"16k->8k: expected ~160 samples, got {out_samples}"
+    )
+
+
+def test_resample_frame_ts_scaled_to_new_rate() -> None:
+    """resample_frame scales monotonic_ts_ns so frame timing stays monotonic.
+
+    A frame at 8000 Hz with ts=20_000_000 ns (one 20ms frame in) becomes a frame
+    at 16000 Hz; the ts must be scaled by (target_rate / source_rate) = 2, so the
+    16kHz-domain timestamp is 40_000_000 ns — same wall-clock moment, expressed in
+    the 16kHz sample domain. This ensures consumers (VAD, endpointing) that
+    integrate durations from sample_rate + monotonic_ts_ns stay coherent.
+    """
+    # One 20ms frame in at 8kHz: 160 samples @ 8000 Hz = 20ms = 20_000_000 ns
+    pcm = _pcm16(*([1000] * 160))
+    ts_in = 20_000_000
+    frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=ts_in)
+    out = resample_frame(frame, target_rate=16000)
+    expected_ts = int(ts_in * 16000 / 8000)
+    assert out.monotonic_ts_ns == expected_ts
+
+
+def test_resample_frame_ts_zero_stays_zero() -> None:
+    """resample_frame with ts=0 returns ts=0 at the new rate."""
+    pcm = _pcm16(*([1000] * 160))
+    frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=0)
+    out = resample_frame(frame, target_rate=16000)
+    assert out.monotonic_ts_ns == 0
+
+
+def test_resample_frame_identity_returns_pcmframe() -> None:
+    """target_rate == frame.sample_rate returns a PcmFrame with correct fields.
+
+    Identity case: the samples and ts are preserved exactly (no DSP applied).
+    The return value is still a PcmFrame (not the original object) — frozen
+    dataclasses are immutable so the returned instance may be the same object,
+    but the contract guarantees it is a PcmFrame with the correct field values.
+    """
+    pcm = _pcm16(*([1000, -1000] * 80))  # 160 samples @ 8 kHz
+    frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=42_000_000)
+    out = resample_frame(frame, target_rate=8000)
+    assert isinstance(out, PcmFrame)
+    assert out.sample_rate == 8000
+    assert out.samples == pcm
+    assert out.monotonic_ts_ns == 42_000_000
+
+
+def test_resample_frame_rejects_zero_target_rate() -> None:
+    """target_rate=0 raises the same ValueError as Resampler(rate, 0)."""
+    frame = PcmFrame(samples=_pcm16(1, 2, 3), sample_rate=8000, monotonic_ts_ns=0)
+    with pytest.raises(ValueError, match="positive"):
+        resample_frame(frame, target_rate=0)
+
+
+def test_resample_frame_rejects_negative_target_rate() -> None:
+    """target_rate < 0 raises ValueError from the underlying Resampler."""
+    frame = PcmFrame(samples=_pcm16(1, 2, 3), sample_rate=8000, monotonic_ts_ns=0)
+    with pytest.raises(ValueError, match="positive"):
+        resample_frame(frame, target_rate=-8000)
+
+
+def test_resample_frame_rejects_bool_target_rate() -> None:
+    """Bool target_rate raises the same ValueError as Resampler rejects bool rates."""
+    frame = PcmFrame(samples=_pcm16(1, 2, 3), sample_rate=8000, monotonic_ts_ns=0)
+    with pytest.raises(ValueError, match="integer"):
+        resample_frame(frame, target_rate=True)  # type: ignore[arg-type]
+
+
+def test_resample_frame_rejects_float_target_rate() -> None:
+    """Float target_rate raises ValueError (non-int rate contract from Resampler)."""
+    frame = PcmFrame(samples=_pcm16(1, 2, 3), sample_rate=8000, monotonic_ts_ns=0)
+    with pytest.raises(ValueError, match="integer"):
+        resample_frame(frame, target_rate=16000.0)  # type: ignore[arg-type]
+
+
+def test_resample_frame_does_not_mutate_input() -> None:
+    """resample_frame never mutates the input frame (PcmFrame is frozen)."""
+    pcm = _pcm16(*([1000] * 160))
+    frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=0)
+    out = resample_frame(frame, target_rate=16000)
+    # Input frame is unchanged.
+    assert frame.samples == pcm
+    assert frame.sample_rate == 8000
+    # Output is a different PcmFrame.
+    assert out is not frame or out.sample_rate != frame.sample_rate

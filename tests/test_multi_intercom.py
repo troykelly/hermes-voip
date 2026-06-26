@@ -434,8 +434,12 @@ def test_webhook_error_from_value_error_does_not_leak_secret() -> None:
     assert secret not in str(excinfo.value), (
         "WebhookError message leaked the bearer token from the ValueError text"
     )
-    # The cause is still chained for the traceback (so diagnostics are not lost).
-    assert isinstance(excinfo.value.__cause__, ValueError)
+    # The secret-bearing cause is SUPPRESSED (`from None`): chaining it as __cause__
+    # would re-expose the token in any printed traceback / logging.exception, so the
+    # wrapper drops it (the dedicated traceback test asserts the full traceback is
+    # secret-free).
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
 
 
 # --- broaden control-char rejection to DEL (0x7f) and C1 (0x80-0x9f) -----------

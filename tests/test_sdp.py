@@ -739,9 +739,13 @@ def test_answer_requires_audio_in_offer() -> None:
         )
 
 
-def test_answer_preserves_offer_codec_order_not_supported_order() -> None:
-    # Offer lists PCMA before PCMU; answer must follow the OFFER order, not the
-    # order of `supported` (RFC 3264: answer uses the offerer's preference).
+def test_answer_orders_codecs_by_supported_not_offer_order() -> None:
+    # Offer lists PCMA before PCMU; the answer must follow OUR `supported` order
+    # (PCMU before PCMA), not the offer's (ADR-0078, RFC 3264 §6.1: the answer
+    # expresses the ANSWERER's preference). This is the same end-to-end behaviour
+    # asserted by test_answer_orders_codecs_by_our_preference_not_offer above; kept
+    # here under the W3 build_audio_answer suite as the regression anchor for the
+    # superseded offer-order contract.
     offer = SessionDescription.parse(
         "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
         "m=audio 40000 RTP/AVP 8 0\r\na=rtpmap:8 PCMA/8000\r\n"
@@ -750,7 +754,7 @@ def test_answer_preserves_offer_codec_order_not_supported_order() -> None:
     text = build_audio_answer(
         offer, local_address="192.0.2.20", port=42000, supported=("PCMU", "PCMA")
     )
-    assert "m=audio 42000 RTP/AVP 8 0" in text
+    assert "m=audio 42000 RTP/AVP 0 8" in text
 
 
 # --- W3 (review): typed a=crypto parse + validation + negotiation (RFC 4568) ---

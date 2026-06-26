@@ -1029,21 +1029,41 @@ class SessionDescription:
 
 
 def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec, ...]:
-    """Choose the codecs common to ``offer`` and ``supported``, in offer order.
+    """Choose the codecs common to ``offer`` and ``supported``, in OUR order.
+
+    RFC 3264 §6.1: the answer expresses the **answerer's** preference, not the
+    offerer's. We therefore intersect the offer with ``supported`` and then order
+    the result by our preference — ``supported`` is the menu, first = most
+    preferred — so a gateway that lists a narrowband codec ahead of our preferred
+    wideband one (PCMU before Opus, or PCMU before G.722) is still answered with
+    the wideband codec we advertise, never silently downgraded.
+
+    The reorder is a **stable** sort by preference rank: when the offer already
+    matches our order the output is unchanged (the same codecs in the same order);
+    two offered codecs that share an encoding (hence one rank) keep their relative
+    offer order; and ``telephone-event`` stays wherever it sits in ``supported``
+    (conventionally last).
 
     Args:
         offer: The peer's offered audio media.
-        supported: Encoding names we can handle (case-insensitive).
+        supported: Encoding names we can handle, most-preferred first
+            (case-insensitive). Order is significant: it is OUR preference.
 
     Returns:
-        The agreed codecs (including ``telephone-event`` for DTMF when offered).
+        The agreed codecs ordered by our preference (including
+        ``telephone-event`` for DTMF when offered).
 
     Raises:
         ValueError: If no actual voice codec is shared (a DTMF-only match is
             not a usable call).
     """
-    wanted = {name.upper() for name in supported}
-    chosen = tuple(c for c in offer.codecs if c.encoding.upper() in wanted)
+    # Preference rank by encoding (upper-cased): index in `supported`, lowest =
+    # most preferred. An encoding offered but somehow absent from `wanted` is
+    # filtered out first, so .index() below is always defined for survivors.
+    rank = {name.upper(): i for i, name in enumerate(supported)}
+    common = [c for c in offer.codecs if c.encoding.upper() in rank]
+    # Stable sort: ties (same encoding, so same rank) keep their offer order.
+    chosen = tuple(sorted(common, key=lambda c: rank[c.encoding.upper()]))
     has_voice = any(c.encoding.lower() != _TELEPHONE_EVENT for c in chosen)
     if not has_voice:
         msg = f"no common audio codec (offered {[c.encoding for c in offer.codecs]})"
@@ -1592,15 +1612,16 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
     ADR-0013).  For a WebRTC / DTLS-SRTP offer (``UDP/TLS/RTP/SAVPF``), use
     :func:`build_webrtc_answer` instead.
 
-    Negotiates the codecs common to the offer and ``supported`` (in the offer's
-    preference order, via :func:`negotiate_audio`), mirrors the offered
+    Negotiates the codecs common to the offer and ``supported`` (ordered by OUR
+    preference — the ``supported`` menu, first = most preferred — via
+    :func:`negotiate_audio`, ADR-0078/RFC 3264 §6.1), mirrors the offered
     direction (sendrecv->sendrecv, sendonly->recvonly, recvonly->sendonly,
     inactive->inactive), and answers a secured (``RTP/SAVP``) offer by selecting
     a supported offered crypto and emitting an ``a=crypto`` that echoes that
     accepted offer's **tag and suite** (RFC 4568: the answerer identifies its
     choice by the offer's tag) but carries **our own** key material from
-    ``crypto``. The answer's payload ordering follows the offer, not
-    ``supported`` — the answerer honours the offerer's preference. It also mirrors
+    ``crypto``. The answer's payload ordering follows ``supported``, not the
+    offer — the answer expresses the answerer's preference. It also mirrors
     the offer's ``a=rtcp-mux`` (RFC 5761 §5.1.1, via :func:`negotiate_rtcp_mux`):
     the answer carries it iff the offer requested it.
 

@@ -430,14 +430,18 @@ class _AnsweredDialogGuard:
 # Supported encoding names for SDP negotiation, wideband-preferred (ADR-0005/0022):
 # G.722 (16 kHz wideband) FIRST, then G.711 PCMU/PCMA (the universal fallback),
 # then telephone-event (DTMF). Every voice entry maps to a runnable engine codec
-# (the drift guard enforces it); negotiate_audio honours the peer's offer order and
-# falls back to G.711 when the peer does not offer G.722.
+# (the drift guard enforces it). This order IS our answer preference: negotiate_audio
+# orders the negotiated codecs by THIS list (ADR-0078, RFC 3264 §6.1), so a peer that
+# offers PCMU before G.722 is still answered G.722, and a peer that does not offer
+# G.722 falls back to G.711.
 _SUPPORTED_ENCODINGS = ("G722", "PCMU", "PCMA", "telephone-event")
 
 # Supported encodings advertised on the WebRTC (DTLS-SRTP) path, Opus-first
 # (ADR-0032/0005): Opus (48 kHz, the WebRTC codec) preferred, then G.711 PCMU/PCMA
-# fallback, then telephone-event. negotiate_audio honours the peer's offer order, so
-# a peer that prefers G.711 still gets it. Opus appears here ONLY because the engine
+# fallback, then telephone-event. This order IS our answer preference: negotiate_audio
+# orders the negotiated codecs by THIS list (ADR-0078, RFC 3264 §6.1), so a peer that
+# offers PCMU before Opus is still answered Opus. Opus appears here ONLY because the
+# engine
 # can now carry it (the WebRTC drift guard enforces advertise-only-if-carry, like the
 # SDES menu). The WebRTC path requires the ``webrtc`` extra (opuslib + libopus for
 # Opus, pyOpenSSL/aioice for DTLS/ICE); a WebRTC offer to a host without it fails the

@@ -112,6 +112,15 @@ def test_parse_audio_media_line() -> None:
     assert sdp.audio.direction == "sendrecv"
 
 
+def test_parse_audio_direction_case_insensitively() -> None:
+    offer = _OFFER_AVP.replace("a=sendrecv\r\n", "a=SENDONLY\r\n")
+
+    sdp = SessionDescription.parse(offer)
+
+    assert sdp.audio is not None
+    assert sdp.audio.direction == "sendonly"
+
+
 def test_parse_audio_maxptime_absent_is_none() -> None:
     """An offer without a=maxptime parses maxptime as None (ADR-0056 item 5)."""
     sdp = SessionDescription.parse(_OFFER_AVP)

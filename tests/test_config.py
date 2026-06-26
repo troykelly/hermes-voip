@@ -2272,6 +2272,56 @@ def test_no_input_reprompt_phrases_blank_falls_back_to_default() -> None:
     assert len(cfg.no_input_reprompt_phrases) > 1
 
 
+def test_refuse_decline_phrases_default_matches_call_loop() -> None:
+    """The default safe-decline set (ADR-0075) is the built-in English set, on default.
+
+    MUST match ``_DEFAULT_REFUSE_DECLINE_PHRASES`` in media/call_loop.py exactly so a
+    REFUSE speaks the same line whether the loop is built directly or from env.
+    """
+    cfg = load_media_config({})
+    assert cfg.refuse_decline_phrases == (
+        "Sorry, I can't help with that. Is there anything else?",
+        "I'm not able to do that. Is there something else I can help with?",
+        "Sorry, that's something I can't do. How else can I help?",
+    )
+
+
+def test_refuse_decline_phrases_pipe_separated() -> None:
+    """HERMES_VOIP_REFUSE_DECLINE_PHRASES parses as a pipe-separated set (ADR-0075)."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_REFUSE_DECLINE_PHRASES": "No can do.|Sorry, not that.|Cannot."}
+    )
+    assert cfg.refuse_decline_phrases == (
+        "No can do.",
+        "Sorry, not that.",
+        "Cannot.",
+    )
+
+
+def test_refuse_decline_phrases_blank_members_dropped() -> None:
+    """Blank pipe-separated members are silently dropped (same as comfort filler)."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_REFUSE_DECLINE_PHRASES": "No can do. | | Sorry. "}
+    )
+    assert cfg.refuse_decline_phrases == ("No can do.", "Sorry.")
+
+
+def test_refuse_decline_phrases_blank_falls_back_to_default() -> None:
+    """A blank/empty override falls back to the built-in default (never all-silence)."""
+    cfg = load_media_config({"HERMES_VOIP_REFUSE_DECLINE_PHRASES": "  "})
+    assert "Sorry, I can't help with that. Is there anything else?" in (
+        cfg.refuse_decline_phrases
+    )
+    assert len(cfg.refuse_decline_phrases) > 1
+
+
+def test_refuse_decline_phrases_blank_member_in_direct_construction_rejected() -> None:
+    """A directly-constructed MediaConfig with a blank decline phrase is rejected."""
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="refuse_decline_phrases"):
+        dataclasses.replace(base, refuse_decline_phrases=("ok", "   "))
+
+
 def test_no_input_timeout_ms_must_be_positive() -> None:
     """HERMES_VOIP_NO_INPUT_TIMEOUT_MS=0 is rejected (must be positive)."""
     with pytest.raises(ConfigError):

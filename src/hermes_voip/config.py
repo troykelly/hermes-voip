@@ -369,6 +369,26 @@ _DEFAULT_GOODBYE = True
 _GOODBYE_PHRASE_KEY = "HERMES_VOIP_GOODBYE_PHRASE"
 _DEFAULT_GOODBYE_PHRASE = "Goodbye."
 
+# Safe-decline line spoken on a guard REFUSE (ADR-0075). When the injection guard
+# refuses a turn it is never forwarded to the agent; without a spoken line a caller the
+# guard false-positived hears pure dead air, repeats into the same wall, and is hung up
+# on. The loop speaks ONE short language-keyed decline line instead. Pipe-separated
+# override; blank/empty → the selected language's built-in set (never all-silence — that
+# would re-introduce the bug). Each set MUST mirror _DEFAULT_REFUSE_DECLINE_PHRASES in
+# media/call_loop.py for the English default so behaviour matches when env is unset. To
+# add a language, add an entry here — nothing else changes.
+_REFUSE_DECLINE_PHRASES_KEY = "HERMES_VOIP_REFUSE_DECLINE_PHRASES"
+_REFUSE_DECLINE_PHRASES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
+    "en": (
+        "Sorry, I can't help with that. Is there anything else?",
+        "I'm not able to do that. Is there something else I can help with?",
+        "Sorry, that's something I can't do. How else can I help?",
+    ),
+}
+_DEFAULT_REFUSE_DECLINE_PHRASES: tuple[str, ...] = _REFUSE_DECLINE_PHRASES_BY_LANGUAGE[
+    _DEFAULT_LANGUAGE
+]
+
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
 # 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
@@ -1098,6 +1118,12 @@ class MediaConfig:
     # ``HERMES_VOIP_GOODBYE`` / ``HERMES_VOIP_GOODBYE_PHRASE``.
     goodbye: bool = _DEFAULT_GOODBYE
     goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE
+    # Safe-decline line spoken on a guard REFUSE (ADR-0075): one phrase chosen at
+    # random per refusal (no immediate repeat) so a false-positived caller hears a
+    # short line instead of dead air. The refused turn is STILL never delivered to the
+    # agent. The default MUST match call_loop.py's _DEFAULT_REFUSE_DECLINE_PHRASES so
+    # behaviour matches when env is unset. ``HERMES_VOIP_REFUSE_DECLINE_PHRASES``.
+    refuse_decline_phrases: tuple[str, ...] = _DEFAULT_REFUSE_DECLINE_PHRASES
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -1281,6 +1307,12 @@ class MediaConfig:
             raise ConfigError(msg)
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
+            raise ConfigError(msg)
+        # An EMPTY refuse_decline_phrases tuple is allowed (the operator opting OUT of
+        # the spoken decline, back to the prior pure-silence behaviour); a tuple WITH a
+        # blank member is a misconfiguration — the loop would synthesise empty speech.
+        if any(not phrase.strip() for phrase in self.refuse_decline_phrases):
+            msg = "refuse_decline_phrases must not contain a blank phrase"
             raise ConfigError(msg)
 
     def _validate_media_timers(self) -> None:
@@ -1574,6 +1606,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         no_input_reprompt_phrases=_parse_no_input_reprompt_phrases(env),
         goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),
         goodbye_phrase=_parse_goodbye_phrase(env),
+        refuse_decline_phrases=_parse_refuse_decline_phrases(env, language),
     )
 
 
@@ -2002,6 +2035,28 @@ def _parse_no_input_reprompt_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
         part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
     )
     return phrases or _DEFAULT_NO_INPUT_REPROMPT_PHRASES
+
+
+def _parse_refuse_decline_phrases(
+    env: Mapping[str, str], language: str
+) -> tuple[str, ...]:
+    """Parse the ``|``-separated guard-REFUSE safe-decline phrase set (ADR-0075).
+
+    Each member is trimmed; empty members (from a trailing or doubled ``|``) are
+    dropped. An unset or all-blank value falls back to the selected *language*'s
+    built-in set (:data:`_REFUSE_DECLINE_PHRASES_BY_LANGUAGE`) so a misconfigured-empty
+    override never re-strands a false-positived caller in silence. An explicit set
+    always wins. The result is always non-empty. ``language`` is pre-validated by
+    :func:`_parse_language`.
+    """
+    default = _REFUSE_DECLINE_PHRASES_BY_LANGUAGE[language]
+    raw = _value(env, _REFUSE_DECLINE_PHRASES_KEY)
+    if not raw:
+        return default
+    phrases = tuple(
+        part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
+    )
+    return phrases or default
 
 
 def _parse_goodbye_phrase(env: Mapping[str, str]) -> str:

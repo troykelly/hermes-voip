@@ -4920,6 +4920,11 @@ class VoipAdapter(BasePlatformAdapter):
             no_input_reprompt_phrases=media_cfg.no_input_reprompt_phrases,
             goodbye=media_cfg.goodbye,
             goodbye_phrase=media_cfg.goodbye_phrase,
+            # Safe-decline line on a guard REFUSE (ADR-0075): a caller the injection
+            # guard false-positived hears ONE short language-keyed line instead of pure
+            # dead air (the refused turn is still never delivered). Operator-set via
+            # HERMES_VOIP_REFUSE_DECLINE_PHRASES; the default mirrors call_loop.py.
+            refuse_decline_phrases=media_cfg.refuse_decline_phrases,
             # Inbound DTMF menu-group aggregation timeout (ADR-0010): a buffered group
             # with no ``#`` terminator is delivered after this gap. None => the loop's
             # built-in default. Drives real behaviour for HERMES_SIP_DTMF_INTERDIGIT_MS.

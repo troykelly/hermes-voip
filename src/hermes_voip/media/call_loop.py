@@ -182,6 +182,21 @@ _DEFAULT_GOODBYE: Final[bool] = True
 #: language-appropriate line).
 _DEFAULT_GOODBYE_PHRASE: Final[str] = "Goodbye."
 
+#: Default safe-decline phrase set (ADR-0075), spoken on a guard REFUSE so a
+#: legitimate caller false-positived by the injection guard hears conversational
+#: feedback instead of pure dead air. The refused turn is NEVER forwarded to the agent
+#: — this line is the only response. Each phrase reads naturally on every TTS model (no
+#: bracket tag), is short, and declines WITHOUT confirming an injection attempt or
+#: coaching one (a deliberate caller is simply told it cannot be helped with that).
+#: Chosen at RANDOM per fire (no immediate repeat) so repeated refusals on one call do
+#: not sound mechanical. Multi-language-ready: the adapter/config selects a language set
+#: the same way as the comfort-filler / reprompt phrases (ADR-0054/0057).
+_DEFAULT_REFUSE_DECLINE_PHRASES: Final[tuple[str, ...]] = (
+    "Sorry, I can't help with that. Is there anything else?",
+    "I'm not able to do that. Is there something else I can help with?",
+    "Sorry, that's something I can't do. How else can I help?",
+)
+
 #: Default inter-digit gap (ms) after which a buffered DTMF group is delivered as a
 #: menu turn when no ``#`` terminator arrives (ADR-0010). Used when the adapter passes
 #: ``dtmf_interdigit_ms=None`` (the config key was unset). 2 s is comfortably longer
@@ -611,9 +626,17 @@ class CallLoop:
         goodbye_phrase: The closing line spoken on a loop-initiated graceful end. Reads
             naturally on every TTS model; multi-language selection follows the
             comfort-filler phrase mechanism.
-        rng: The random source for filler AND reprompt phrase selection (ADR-0054/0057).
-            Defaults to a fresh :class:`random.Random`; tests inject a seeded one for
-            determinism. It is for variety only, never security.
+        refuse_decline_phrases: The safe-decline phrase set spoken on a guard REFUSE
+            (ADR-0075), so a caller false-positived by the injection guard hears ONE
+            short line instead of pure dead air. One is chosen at RANDOM per refusal,
+            never repeating the immediately-previous phrase; each reads naturally on
+            every TTS model and declines without confirming/coaching an injection. The
+            refused turn is STILL never delivered to the agent. Multi-language-ready
+            like the comfort-filler / reprompt phrases (ADR-0054/0057). An EMPTY set
+            disables the line (the prior pure-silence behaviour) — defaults to the set.
+        rng: The random source for filler, reprompt AND refuse-decline phrase selection
+            (ADR-0054/0057/0058). Defaults to a fresh :class:`random.Random`; tests
+            inject a seeded one for determinism. It is for variety only, never security.
         dtmf_interdigit_ms: Inter-digit gap (ms) after which a buffered DTMF menu
             group is delivered when no ``#`` terminator arrives (ADR-0010 §surfacing).
             ``None`` (the config key unset) uses the built-in default (2000 ms). The
@@ -667,6 +690,7 @@ class CallLoop:
         no_input_reprompt_phrases: tuple[str, ...] = _DEFAULT_NO_INPUT_REPROMPT_PHRASES,
         goodbye: bool = _DEFAULT_GOODBYE,
         goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE,
+        refuse_decline_phrases: tuple[str, ...] = _DEFAULT_REFUSE_DECLINE_PHRASES,
         rng: random.Random | None = None,
         dtmf_interdigit_ms: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -754,6 +778,13 @@ class CallLoop:
         # Spoken goodbye on the loop-initiated graceful end (ADR-0057).
         self._goodbye = goodbye
         self._goodbye_phrase = goodbye_phrase
+        # Safe-decline phrase set spoken on a guard REFUSE (ADR-0075), so a caller the
+        # injection guard false-positived is not met with silence. The refused turn is
+        # never delivered; this line is the only response.
+        self._refuse_decline_phrases = refuse_decline_phrases
+        # The decline phrase chosen on the previous REFUSE, so the random selector can
+        # avoid an immediate repeat. ``None`` until the first refusal. Loop-only.
+        self._last_refuse_decline_phrase: str | None = None
         # The single in-flight no-input watchdog task, or None when off / not yet armed.
         # ``run`` arms it at loop start (when enabled) and cancels+joins it at teardown
         # so it never leaks. The done-callback nulls it on completion.
@@ -1695,6 +1726,24 @@ class CallLoop:
         self._last_reprompt_phrase = phrase
         return phrase
 
+    def _next_refuse_decline_phrase(self) -> str:
+        """Return a RANDOM safe-decline phrase, never the immediately-previous one.
+
+        Same selection discipline as the comfort filler and the no-input reprompt
+        (:meth:`_next_comfort_phrase` / :meth:`_next_reprompt_phrase`, ADR-0054/0057):
+        random for variety, with the one guarantee of no back-to-back repeat, and a
+        direct choice among the distinct alternatives so it terminates even for a
+        single-phrase or all-duplicate set. Uses the shared injected ``_comfort_rng``
+        (seeded in tests).
+        """
+        phrases = self._refuse_decline_phrases
+        alternatives = tuple(
+            dict.fromkeys(p for p in phrases if p != self._last_refuse_decline_phrase)
+        )
+        phrase = self._comfort_rng.choice(alternatives) if alternatives else phrases[0]
+        self._last_refuse_decline_phrase = phrase
+        return phrase
+
     async def _no_input_gap(self) -> None:
         """Reprompt a silent caller; end gracefully after N unanswered reprompts.
 
@@ -1769,11 +1818,12 @@ class CallLoop:
     async def _speak_phrase_best_effort(self, phrase: str, *, what: str) -> None:
         """Speak one short ``phrase`` through the normal TTS path; best-effort.
 
-        Used for a no-input reprompt and the goodbye. Routes through :meth:`_speak_text`
-        (sanitised, model-tag-aware, echo-gate-arming, flushable) — NOT :meth:`speak`,
-        so it does not cancel the no-input watchdog task calling it (mirroring how the
-        comfort filler calls ``_speak_text`` directly). A synthesis/send failure is
-        logged and swallowed so a working call survives a TTS hiccup (rule 37); a
+        Used for a no-input reprompt, the goodbye (ADR-0057), and the guard-REFUSE
+        safe-decline line (ADR-0075). Routes through :meth:`_speak_text` (sanitised,
+        model-tag-aware, echo-gate-arming, flushable) — NOT :meth:`speak`, so it does
+        not cancel the no-input watchdog task calling it (mirroring how the comfort
+        filler calls ``_speak_text`` directly). A synthesis/send failure is logged and
+        swallowed so a working call survives a TTS hiccup (rule 37); a
         ``CancelledError`` (the teardown / barge-in stop) propagates to end it cleanly.
         """
 
@@ -1786,7 +1836,7 @@ class CallLoop:
             raise
         except Exception:  # noqa: BLE001 — best-effort spoken UX; logged, never fatal (rule 37)
             _log.warning(
-                "no-input: %s synthesis/send failed (call continues): %r",
+                "spoken-phrase: %s synthesis/send failed (call continues): %r",
                 what,
                 phrase,
                 exc_info=True,
@@ -2004,7 +2054,11 @@ class CallLoop:
 
         On a non-REFUSE verdict the dead-air comfort filler is armed (ADR-0030) and
         then the turn is handed to the agent. A REFUSE never reaches the agent, so no
-        gap and no filler.
+        gap and no filler — but the caller still gets ONE short spoken safe-decline line
+        (ADR-0075) so a legitimate caller false-positived by the injection guard is not
+        met with pure dead air (it would otherwise repeat into the same wall, get
+        no-input-reprompted, and eventually be hung up on). The refused turn is STILL
+        never delivered to the agent — the decline line is the only response.
 
         A delivered turn is also caller activity for the no-input watchdog (ADR-0057):
         the caller finished a turn, so the silence window resets (a pending reprompt
@@ -2017,11 +2071,22 @@ class CallLoop:
         self._caller_active_in_window = True
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
-        if result.verdict is not GuardVerdict.REFUSE:
-            # Arm the filler BEFORE handing off the turn, so its delay measures the
-            # dead-air gap from the caller-finish moment (this point) — robust even if
-            # ``_deliver_turn`` were to block on agent work, rather than relying on it
-            # being a non-blocking enqueue. The filler task runs concurrently with the
-            # hand-off and the agent turn (no-op when disabled).
-            self._schedule_comfort_filler()
-            await self._deliver_turn(text)
+        if result.verdict is GuardVerdict.REFUSE:
+            # The guard refused this turn: it is NEVER handed to the agent (and no
+            # filler is armed — there is no agent gap to fill). But silence here strands
+            # a false-positived caller, so speak ONE short safe-decline line (ADR-0075)
+            # via the normal TTS path (sanitised, model-tag-aware, echo-gate-arming,
+            # flushable, best-effort like the reprompt/goodbye). An empty phrase set
+            # (operator-disabled) speaks nothing — the prior pure-silence behaviour.
+            if self._refuse_decline_phrases:
+                phrase = self._next_refuse_decline_phrase()
+                _log.info("guard REFUSE: speaking safe-decline line: %r", phrase)
+                await self._speak_phrase_best_effort(phrase, what="decline")
+            return
+        # Arm the filler BEFORE handing off the turn, so its delay measures the
+        # dead-air gap from the caller-finish moment (this point) — robust even if
+        # ``_deliver_turn`` were to block on agent work, rather than relying on it
+        # being a non-blocking enqueue. The filler task runs concurrently with the
+        # hand-off and the agent turn (no-op when disabled).
+        self._schedule_comfort_filler()
+        await self._deliver_turn(text)

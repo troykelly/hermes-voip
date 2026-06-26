@@ -533,3 +533,47 @@ def test_packaged_and_importable_manifests_are_identical() -> None:
         "the importable (package-data) manifest and the directory-install manifest "
         "have drifted — they must be byte-identical"
     )
+
+
+# ---------------------------------------------------------------------------
+# (f) Documentation consistency: all docs must use the correct tool count.
+# ---------------------------------------------------------------------------
+
+
+def test_docs_use_correct_tool_count() -> None:
+    """README, ADRs, and runbooks mention the correct tool count.
+
+    When a tool is added or removed from provides_tools, the documentation
+    that references the tool count must be updated. This guard catches stale
+    count references in key docs.
+    """
+    registered = _registered_tools()
+    tool_count = len(registered)
+    hook_count = 1  # always 1 (pre_tool_call)
+    expected_mention = f"{tool_count} tools, {hook_count} hook"
+
+    # Check README
+    readme_path = _REPO_ROOT / "README.md"
+    readme = readme_path.read_text(encoding="utf-8")
+    assert expected_mention in readme, (
+        f"README.md must mention '{expected_mention}' — it uses a stale tool count"
+    )
+
+    # Check ADR-0037
+    adr_0037_file = "0037-hermes-plugin-manifest-and-install-models.md"
+    adr_0037_path = _REPO_ROOT / "docs" / "adr" / adr_0037_file
+    if adr_0037_path.is_file():
+        adr_0037 = adr_0037_path.read_text(encoding="utf-8")
+        assert expected_mention in adr_0037, (
+            f"ADR-0037 must mention '{expected_mention}' — it uses a stale tool count"
+        )
+
+    # Check runbook 0011
+    runbook_0011_file = "0011-voip-enable-plugin.md"
+    runbook_0011_path = _REPO_ROOT / "docs" / "runbooks" / runbook_0011_file
+    if runbook_0011_path.is_file():
+        runbook_0011 = runbook_0011_path.read_text(encoding="utf-8")
+        assert expected_mention in runbook_0011, (
+            f"Runbook 0011 must mention '{expected_mention}' — "
+            "it uses a stale tool count"
+        )

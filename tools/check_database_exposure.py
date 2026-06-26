@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -26,6 +28,7 @@ _SCAN_EXACT_NAMES = frozenset(
     }
 )
 _SCAN_SUFFIXES = (
+    ".conf",
     ".dockerfile",
     ".env.example",
     ".json",
@@ -69,7 +72,7 @@ _STALE_DEVCONTAINER_RE = re.compile(
 )
 _FORWARD_PORT_RE = re.compile(r"\b(?:forwardPorts|appPort)\b", re.IGNORECASE)
 _POSTGRES_ENV_RE = re.compile(
-    r"\b(?P<name>POSTGRES_(?:USER|DB|PASSWORD|HOST_AUTH_METHOD))\b\s*(?::|=)\s*(?P<value>[^\s,#\]}]+)",
+    r"[\"']?\b(?P<name>POSTGRES_(?:USER|DB|PASSWORD|HOST_AUTH_METHOD))\b[\"']?\s*(?::|=)\s*[\"']?(?P<value>[^\s,#\]}\"']+)",
     re.IGNORECASE,
 )
 _LISTEN_ALL_RE = re.compile(
@@ -77,11 +80,13 @@ _LISTEN_ALL_RE = re.compile(
     re.IGNORECASE,
 )
 _PG_HBA_PUBLIC_RE = re.compile(
-    r"^\s*host(?:ssl|nossl)?\s+\S+\s+\S+\s+(?:0\.0\.0\.0/0|::/0)\s+(?:trust|md5|password)\b",
+    r"^\s*host(?:ssl|nossl)?\s+\S+\s+\S+\s+(?:0\.0\.0\.0/0|::/0)\s+(?:trust|md5|password|scram-sha-256)\b",
     re.IGNORECASE,
 )
 _SHORT_PORT_RE = re.compile(
-    r"(?:^|[\s\"'])\[?(?:0\.0\.0\.0|::)?\]?:?(?P<published>\d+):(?P<target>5432)(?:[/\"'\s]|$)"
+    r"(?:^|[\s\"'])"
+    r"(?:(?:\[[0-9a-f:.]+\]|(?:\d{1,3}\.){3}\d{1,3}):)?"
+    r"(?P<published>\d+):(?P<target>5432)(?:[/\"'\s]|$)"
 )
 _PUBLISHED_RE = re.compile(
     r"\bpublished\s*:\s*[\"']?(?P<port>\d+)[\"']?", re.IGNORECASE
@@ -89,6 +94,8 @@ _PUBLISHED_RE = re.compile(
 _TARGET_RE = re.compile(r"\btarget\s*:\s*[\"']?5432[\"']?", re.IGNORECASE)
 _POSTGRES_PORT = 5432
 _NUMERIC_5432_RE = re.compile(r"(?<!\d)5432(?!\d)")
+_COMPOSE_FILE_RE = re.compile(r"(?:^|/)(?:docker-)?compose[^/]*\.ya?ml$", re.IGNORECASE)
+_ENV_FILE_RE = re.compile(r"(?:^|/)\.env(?:\..+)?$")
 
 
 def scan_repository(root: Path) -> tuple[Violation, ...]:
@@ -123,21 +130,46 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _candidate_paths(root: Path) -> Iterator[Path]:
+    git_files = _git_tracked_paths(root)
+    if git_files is not None:
+        yield from git_files
+        return
     yield from (path for path in root.rglob("*") if path.is_file())
+
+
+def _git_tracked_paths(root: Path) -> tuple[Path, ...] | None:
+    git_path = shutil.which("git")
+    if git_path is None:
+        return None
+    try:
+        # Fixed git subcommand over a local repo root; no shell or dynamic flags.
+        result = subprocess.run(  # noqa: S603
+            (git_path, "-C", str(root), "ls-files", "-z"),
+            check=False,
+            capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    decoded = result.stdout.decode("utf-8", errors="surrogateescape")
+    return tuple(root / name for name in decoded.split("\0") if name)
 
 
 def _is_skipped(relative_path: Path) -> bool:
     parts = set(relative_path.parts)
     if parts & _SKIP_PARTS:
         return True
-    if relative_path.name == ".env" or relative_path.name.startswith(".env."):
-        return relative_path.name != ".env.example"
-    return False
+    return relative_path.name == ".env" or relative_path.as_posix().endswith("/.env")
 
 
 def _is_scanned_path(relative_path: Path) -> bool:
     path_text = relative_path.as_posix()
+    if _ENV_FILE_RE.search(path_text):
+        return True
     if path_text.startswith((".devcontainer/", ".github/workflows/", "tools/")):
+        return True
+    if _COMPOSE_FILE_RE.search(path_text):
         return True
     if relative_path.name in _SCAN_EXACT_NAMES:
         return True
@@ -184,7 +216,9 @@ def _scan_public_ports(
     relative_path: Path, lines: Sequence[str]
 ) -> Iterator[Violation]:
     for line_number, line in _numbered(lines):
-        if _FORWARD_PORT_RE.search(line):
+        if _nearby_forward_port_key(lines, line_number) and _NUMERIC_5432_RE.search(
+            line
+        ):
             yield from _forwarded_port_violations(relative_path, line_number, line)
         if _line_publishes_postgres(line) and _has_database_context(lines, line_number):
             yield Violation(
@@ -193,7 +227,7 @@ def _scan_public_ports(
                 line_number,
                 "do not publish PostgreSQL port 5432 from tracked config",
             )
-        if _published_5432_with_target(lines, line_number):
+        if _published_postgres_target(lines, line_number):
             yield Violation(
                 "DB002",
                 relative_path,
@@ -237,14 +271,17 @@ def _line_publishes_postgres(line: str) -> bool:
     return published != 0
 
 
-def _published_5432_with_target(lines: Sequence[str], line_number: int) -> bool:
+def _published_postgres_target(lines: Sequence[str], line_number: int) -> bool:
     line = lines[line_number - 1]
-    match = _PUBLISHED_RE.search(line)
-    if match is None or int(match.group("port")) != _POSTGRES_PORT:
+    if _PUBLISHED_RE.search(line) is None:
         return False
     return _has_nearby_match(
         lines, line_number, _TARGET_RE, radius=3
     ) and _has_database_context(lines, line_number)
+
+
+def _nearby_forward_port_key(lines: Sequence[str], line_number: int) -> bool:
+    return _has_nearby_match(lines, line_number, _FORWARD_PORT_RE, radius=3)
 
 
 def _scan_postgres_defaults(
@@ -301,7 +338,7 @@ def _scan_public_auth_config(
 
 
 def _has_database_context(lines: Sequence[str], line_number: int) -> bool:
-    return _has_nearby_match(lines, line_number, _DB_CONTEXT_RE, radius=8)
+    return _has_nearby_match(lines, line_number, _DB_CONTEXT_RE, radius=40)
 
 
 def _has_nearby_match(

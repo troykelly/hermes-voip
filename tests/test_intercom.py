@@ -208,3 +208,109 @@ def test_value_error_in_open_blocking_surfaces_as_relay_error() -> None:
         pytest.raises(IntercomRelayError),
     ):
         asyncio.run(client.open())
+
+
+# --- the wrapped ValueError MUST NOT leak the offending header value -----------
+
+
+def test_relay_error_from_value_error_does_not_leak_secret() -> None:
+    """The IntercomRelayError wrapping a ValueError must NOT echo the secret.
+
+    Python's http.client puts the OFFENDING HEADER VALUE into the ValueError text
+    (e.g. ``Invalid header value b'Bearer <token>...'``). For the relay path that
+    value is ``Authorization: Bearer <token>`` — interpolating the raw exception
+    text into the user-facing IntercomRelayError message would leak the bearer
+    token into logs/callers (PUBLIC-repo invariant violation). The wrapper must
+    use a FIXED, generic message carrying NO interpolated exception text; the
+    original is chained via ``from exc`` for the traceback only.
+    """
+    secret = "SECRET-fake-bearer-token-0000"  # obvious fake
+    cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.RELAY,
+        relay_url=_FAKE_RELAY_URL,
+        relay_token=secret,
+    )
+    client = IntercomRelayClient(cfg)
+
+    def _raise_value_error_with_secret() -> None:
+        # Mirrors http.client: the whole offending header value is in the message.
+        raise ValueError(f"Invalid header value b'Bearer {secret}\\r\\nX-Evil: 1'")
+
+    with (
+        patch.object(
+            client, "_open_blocking", side_effect=_raise_value_error_with_secret
+        ),
+        pytest.raises(IntercomRelayError) as excinfo,
+    ):
+        asyncio.run(client.open())
+
+    assert secret not in str(excinfo.value), (
+        "IntercomRelayError message leaked the bearer token from the ValueError text"
+    )
+    # The cause is still chained for the traceback (so diagnostics are not lost).
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+# --- validate-before-strip: a trailing/leading CR/LF must be REJECTED ----------
+
+
+def test_relay_token_with_trailing_lf_rejected_at_load() -> None:
+    r"""A relay token with a TRAILING LF is rejected, not silently stripped.
+
+    The token must be validated for control characters on its RAW value BEFORE any
+    trimming. A trailing ``\n`` that ``.strip()`` would remove must still be
+    rejected (an operator who pasted a token with a stray newline has a malformed
+    secret — fail loud, do not silently accept a mangled token).
+    """
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN=f"{_FAKE_TOKEN}\n",
+            )
+        )
+
+
+def test_relay_token_with_leading_cr_rejected_at_load() -> None:
+    """A relay token with a LEADING CR is rejected, not silently stripped."""
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN=f"\r{_FAKE_TOKEN}",
+            )
+        )
+
+
+# --- broaden control-char rejection to DEL (0x7f) and C1 (0x80-0x9f) -----------
+
+
+def test_relay_token_with_del_rejected_at_load() -> None:
+    """A relay token containing DEL (0x7f) is rejected at config load.
+
+    DEL and the C1 controls (0x80-0x9f) are not below 0x20, so a check that only
+    rejects ``ord < 0x20`` lets them through. They are still header-unsafe, so the
+    rejection band must include 0x7f-0x9f.
+    """
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN="tok\x7fen",
+            )
+        )
+
+
+def test_relay_token_with_c1_control_rejected_at_load() -> None:
+    """A relay token containing a C1 control (0x85 NEL) is rejected at load."""
+    with pytest.raises(ConfigError, match="control"):
+        load_intercom_config(
+            _env(
+                HERMES_VOIP_INTERCOM_OPEN_MODE="relay",
+                HERMES_VOIP_INTERCOM_RELAY_URL=_FAKE_RELAY_URL,
+                HERMES_VOIP_INTERCOM_RELAY_TOKEN="tok\x85en",
+            )
+        )

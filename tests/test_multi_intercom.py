@@ -393,3 +393,93 @@ def test_value_error_in_fire_webhook_surfaces_as_webhook_error() -> None:
         pytest.raises(WebhookError),
     ):
         asyncio.run(fire_webhook_opening(opening))
+
+
+# --- the wrapped ValueError MUST NOT leak the offending header value -----------
+
+
+def test_webhook_error_from_value_error_does_not_leak_secret() -> None:
+    """The WebhookError wrapping a ValueError must NOT echo the secret.
+
+    Python's http.client puts the OFFENDING HEADER VALUE into the ValueError text
+    (e.g. ``Invalid header value b'Bearer <token>...'``). A webhook header may be
+    ``Authorization: Bearer <token>`` — interpolating the raw exception text into
+    the user-facing WebhookError message would leak the bearer token into
+    logs/callers (PUBLIC-repo invariant violation). The wrapper must use a FIXED,
+    generic message carrying NO interpolated exception text; the original is
+    chained via ``from exc`` for the traceback only.
+    """
+    secret = "SECRET-fake-bearer-token-0000"  # obvious fake
+    opening = Opening(
+        name="gate",
+        type=OpeningType.WEBHOOK,
+        url=_FAKE_WEBHOOK_URL,
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+
+    def _raise_value_error_with_secret(_opening: Opening) -> None:
+        # Mirrors http.client: the whole offending header value is in the message.
+        raise ValueError(f"Invalid header value b'Bearer {secret}\\r\\nX-Evil: 1'")
+
+    with (
+        patch(
+            "hermes_voip.multi_intercom._fire_webhook_blocking",
+            side_effect=_raise_value_error_with_secret,
+        ),
+        pytest.raises(WebhookError) as excinfo,
+    ):
+        asyncio.run(fire_webhook_opening(opening))
+
+    assert secret not in str(excinfo.value), (
+        "WebhookError message leaked the bearer token from the ValueError text"
+    )
+    # The cause is still chained for the traceback (so diagnostics are not lost).
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+# --- broaden control-char rejection to DEL (0x7f) and C1 (0x80-0x9f) -----------
+
+
+def test_header_value_with_del_rejected_at_load(tmp_path: Path) -> None:
+    """A webhook header VALUE containing DEL (0x7f) is rejected at config load.
+
+    DEL and the C1 controls (0x80-0x9f) are not below 0x20, so a check that only
+    rejects ``ord < 0x20`` lets them through. They are still header-unsafe, so the
+    rejection band must include 0x7f-0x9f.
+    """
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {"Authorization": "Bearer tok\x7fen"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
+def test_header_name_with_c1_control_rejected_at_load(tmp_path: Path) -> None:
+    """A webhook header NAME containing a C1 control (0x85 NEL) is rejected at load."""
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {"X-Bad\x85Header": "value"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control"):
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))

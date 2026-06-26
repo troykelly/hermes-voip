@@ -111,6 +111,27 @@ services:
 services:
   db:
     image: postgres:18
+    ports:
+      - "5432"
+""",
+        """
+services:
+  db:
+    image: postgres:18
+    ports:
+      - 5432
+""",
+        """
+services:
+  db:
+    image: postgres:18
+    ports:
+      - "0:5432"
+""",
+        """
+services:
+  db:
+    image: postgres:18
     environment:
       SAFE_01: value
       SAFE_02: value
@@ -292,6 +313,16 @@ def test_rejects_public_postgres_auth_config(tmp_path: Path, config_text: str) -
     violations = scan_repository(tmp_path)
 
     assert "DB004" in _rule_ids(violations)
+
+
+def test_allows_bare_5432_without_ports_or_database_context(tmp_path: Path) -> None:
+    _write_file(
+        tmp_path,
+        "config.yml",
+        "retry_after_ms: 5432\nbatch:\n  - 5432\n  - 8080\n",
+    )
+
+    assert scan_repository(tmp_path) == ()
 
 
 def test_rejects_tracked_postgres_conf_public_auth(tmp_path: Path) -> None:

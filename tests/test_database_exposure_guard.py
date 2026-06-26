@@ -345,6 +345,24 @@ def test_ignores_untracked_secret_env_files(tmp_path: Path) -> None:
     assert scan_repository(tmp_path) == ()
 
 
+def test_scan_is_robust_to_inherited_git_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Git hooks (pre-commit/pre-push) export GIT_DIR/GIT_WORK_TREE into the
+    # environment. A naive ``git -C <root> ls-files`` is hijacked by those vars
+    # and lists the hook's repo instead of <root>, so the scanner would silently
+    # examine the wrong tree and miss real violations. The scan must depend only
+    # on its ``root`` argument, never on inherited git context.
+    repo_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("GIT_DIR", str(repo_root / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo_root))
+    _write_file(tmp_path, ".env.ci", "POSTGRES_PASSWORD=postgres\n")
+
+    violations = scan_repository(tmp_path)
+
+    assert _rule_ids(violations) == ["DB003"]
+
+
 def test_cli_reports_relative_paths_line_numbers_and_rule_ids(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

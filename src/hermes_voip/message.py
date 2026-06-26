@@ -70,6 +70,13 @@ def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
         name, sep, value = line.partition(":")
         if sep:
             headers.append((name.strip(), value.strip()))
+        elif line:
+            # A non-empty line with no colon is not a valid header field — it is
+            # not a continuation (those are handled above) and not blank. Silently
+            # dropping it would allow garbage to vanish undetected, which is
+            # inconsistent with the module's strict-parse stance.
+            msg = f"malformed header line (no colon separator): {line!r}"
+            raise ValueError(msg)
     return tuple(headers)
 
 

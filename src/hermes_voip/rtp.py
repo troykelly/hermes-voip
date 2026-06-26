@@ -188,6 +188,11 @@ class JitterBuffer:
     floor after a sustained clean run, so a jittery link stops underrunning and a
     calm link stops paying needless latency. Adaptation is driven ONLY by the
     push/pop sequence stream (no wall clock), so it is fully deterministic.
+
+    The buffer also tracks the stream SSRC: the first packet learns the current
+    SSRC, and a later packet with a different SSRC auto-resets sequence state
+    before anchoring on the new source. This treats re-INVITE/source resync as a
+    new stream instead of comparing it against stale sequence numbers.
     """
 
     def __init__(
@@ -246,6 +251,7 @@ class JitterBuffer:
         self._max_ahead = max_ahead
         self._packets: dict[int, RtpPacket] = {}
         self._next: int | None = None
+        self._ssrc: int | None = None
         self._emitted = False
         # Highest sequence (RFC 1982 order) ever pushed — the reference for a
         # reorder-span measurement. ``None`` until the first push. Adaptive only.
@@ -253,6 +259,10 @@ class JitterBuffer:
         # Consecutive clean pops (real in-order packet, no loss/late-drop) since
         # the last grow or shrink. Drives the shrink-toward-floor decision.
         self._clean_run = 0
+
+    def __len__(self) -> int:
+        """Return the current buffered packet count."""
+        return len(self._packets)
 
     @property
     def current_depth(self) -> int:
@@ -262,6 +272,16 @@ class JitterBuffer:
         it moves within ``[target_depth, max_depth]`` as the link is observed.
         """
         return self._depth
+
+    def reset(self) -> None:
+        """Clear buffered packets, sequencing state, SSRC, and adaptation history."""
+        self._packets.clear()
+        self._next = None
+        self._ssrc = None
+        self._emitted = False
+        self._highest = None
+        self._clean_run = 0
+        self._depth = self._floor
 
     def _grow(self) -> None:
         """Widen the reorder tolerance by one, bounded by the ceiling (adaptive)."""
@@ -286,6 +306,11 @@ class JitterBuffer:
         the reorder tolerance — both are evidence the buffer was too eager.
         """
         seq = packet.sequence_number
+        if self._ssrc is None:
+            self._ssrc = packet.ssrc
+        elif packet.ssrc != self._ssrc:
+            self.reset()
+            self._ssrc = packet.ssrc
         if self._next is not None:
             if _seq_before(seq, self._next):
                 if self._emitted:
@@ -351,6 +376,36 @@ class JitterBuffer:
                 self._clean_run = 0  # a declared loss breaks the clean run
             return Lost(expected)
         return None
+
+    def peek(self) -> JitterOutput | None:
+        """Return the next :meth:`pop` result without consuming buffer state."""
+        if self._next is None:
+            return None
+        expected = self._next
+        packet = self._packets.get(expected)
+        if packet is not None:
+            return packet
+        if len(self._packets) >= self._depth:
+            return Lost(expected)
+        return None
+
+    def flush(self) -> list[RtpPacket]:
+        """Drain and return all currently buffered packets in playout order."""
+        if self._next is None:
+            return []
+        anchor = self._next
+        ordered_sequences = sorted(
+            self._packets,
+            key=lambda seq: (seq - anchor) % _SEQ_MOD,
+        )
+        drained = [self._packets[seq] for seq in ordered_sequences]
+        self._packets.clear()
+        if drained:
+            self._next = _seq_next(drained[-1].sequence_number)
+            self._emitted = True
+            if self._adapt:
+                self._clean_run = 0
+        return drained
 
     def peek_next(self) -> RtpPacket | None:
         """Return the buffered packet at the current anchor WITHOUT consuming it.

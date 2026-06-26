@@ -13,12 +13,18 @@ import pytest
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket, _seq_before
 
 
-def _pkt(seq: int, *, timestamp: int = 0, payload: bytes = b"\xff" * 160) -> RtpPacket:
+def _pkt(
+    seq: int,
+    *,
+    timestamp: int = 0,
+    ssrc: int = 0xDEADBEEF,
+    payload: bytes = b"\xff" * 160,
+) -> RtpPacket:
     return RtpPacket(
         payload_type=0,
         sequence_number=seq,
         timestamp=timestamp,
-        ssrc=0xDEADBEEF,
+        ssrc=ssrc,
         payload=payload,
         marker=False,
     )
@@ -241,6 +247,68 @@ def test_jitter_permanent_gap_stays_bounded() -> None:
     else:
         pytest.fail("jitter buffer never reached the buffered cluster")
     assert seen_loss
+
+
+def test_jitter_len_reports_buffered_packet_count() -> None:
+    jb = JitterBuffer(target_depth=3)
+    assert len(jb) == 0
+    jb.push(_pkt(10))
+    jb.push(_pkt(12))
+    jb.push(_pkt(12))  # duplicate does not add depth
+    assert len(jb) == 2
+    assert _packet(jb.pop()).sequence_number == 10
+    assert len(jb) == 1
+
+
+def test_jitter_peek_is_non_destructive_and_matches_next_pop() -> None:
+    jb = JitterBuffer(target_depth=3)
+    for seq in (10, 12, 11):
+        jb.push(_pkt(seq))
+    first_peek = jb.peek()
+    second_peek = jb.peek()
+    assert first_peek == _pkt(10)
+    assert second_peek == _pkt(10)
+    assert len(jb) == 3
+    assert jb.pop() == first_peek
+    assert _packet(jb.pop()).sequence_number == 11
+
+
+def test_jitter_flush_returns_ordered_remainder_and_empties() -> None:
+    jb = JitterBuffer(target_depth=3)
+    for seq in (10, 13, 11, 12):
+        jb.push(_pkt(seq))
+    assert _packet(jb.pop()).sequence_number == 10
+    assert [packet.sequence_number for packet in jb.flush()] == [11, 12, 13]
+    assert len(jb) == 0
+    assert jb.pop() is None
+    assert jb.peek() is None
+    assert jb.flush() == []
+
+
+def test_jitter_reset_clears_buffer_and_sequence_state() -> None:
+    jb = JitterBuffer(target_depth=2)
+    for seq in (1000, 1002):
+        jb.push(_pkt(seq))
+    assert len(jb) == 2
+    jb.reset()
+    assert len(jb) == 0
+    assert jb.pop() is None
+    assert jb.peek() is None
+    jb.push(_pkt(1))
+    assert _packet(jb.pop()).sequence_number == 1
+
+
+def test_jitter_ssrc_change_auto_resets_sequence_anchor() -> None:
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    old_ssrc = 0x11111111
+    new_ssrc = 0x22222222
+    for seq in (65000, 65001):
+        jb.push(_pkt(seq, ssrc=old_ssrc))
+    assert _packet(jb.pop()).sequence_number == 65000
+    jb.push(_pkt(1, ssrc=new_ssrc))
+    assert len(jb) == 1
+    assert _packet(jb.pop()).sequence_number == 1
+    assert jb.pop() is None
 
 
 def test_jitter_handles_sequence_wraparound() -> None:

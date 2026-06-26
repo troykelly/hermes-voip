@@ -635,7 +635,7 @@ class CallLoop:
             like the comfort-filler / reprompt phrases (ADR-0054/0057). An EMPTY set
             disables the line (the prior pure-silence behaviour) — defaults to the set.
         rng: The random source for filler, reprompt AND refuse-decline phrase selection
-            (ADR-0054/0057/0058). Defaults to a fresh :class:`random.Random`; tests
+            (ADR-0054/0057). Defaults to a fresh :class:`random.Random`; tests
             inject a seeded one for determinism. It is for variety only, never security.
         dtmf_interdigit_ms: Inter-digit gap (ms) after which a buffered DTMF menu
             group is delivered when no ``#`` terminator arrives (ADR-0010 §surfacing).

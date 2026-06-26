@@ -80,6 +80,39 @@ services:
 """,
         """
 services:
+  db:
+    image: postgres:18
+    ports:
+      - target: 5432
+        published: 15432
+""",
+        """
+services:
+  db:
+    image: postgres:18
+    ports:
+      - "203.0.113.10:15432:5432"
+""",
+        """
+services:
+  db:
+    image: postgres:18
+    environment:
+      SAFE_01: value
+      SAFE_02: value
+      SAFE_03: value
+      SAFE_04: value
+      SAFE_05: value
+      SAFE_06: value
+      SAFE_07: value
+      SAFE_08: value
+      SAFE_09: value
+      SAFE_10: value
+    ports:
+      - "15432:5432"
+""",
+        """
+services:
   api:
     image: example/api:latest
     ports:
@@ -103,7 +136,16 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
     _write_file(
         tmp_path,
         ".devcontainer/devcontainer.json",
-        '{"forwardPorts":[5432],"appPort":["127.0.0.1:5432:5432"]}\n',
+        """
+{
+  "forwardPorts": [
+    5432
+  ],
+  "appPort": [
+    "127.0.0.1:5432:5432"
+  ]
+}
+""",
     )
 
     violations = scan_repository(tmp_path)
@@ -118,6 +160,7 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
         "POSTGRES_DB: postgres\n",
         "POSTGRES_PASSWORD=postgres\n",
         "POSTGRES_PASSWORD: password\n",
+        '{"POSTGRES_PASSWORD": "postgres"}\n',
         "- POSTGRES_PASSWORD=changeme\n",
         "POSTGRES_HOST_AUTH_METHOD=trust\n",
         "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}\n",
@@ -139,6 +182,7 @@ def test_rejects_default_postgres_credentials(tmp_path: Path, config_text: str) 
         "host all all 0.0.0.0/0 trust\n",
         "hostssl all all ::/0 md5\n",
         "host all all 0.0.0.0/0 password\n",
+        "host all all 0.0.0.0/0 scram-sha-256\n",
     ],
 )
 def test_rejects_public_postgres_auth_config(tmp_path: Path, config_text: str) -> None:
@@ -147,6 +191,14 @@ def test_rejects_public_postgres_auth_config(tmp_path: Path, config_text: str) -
     violations = scan_repository(tmp_path)
 
     assert "DB004" in _rule_ids(violations)
+
+
+def test_rejects_tracked_postgres_conf_public_auth(tmp_path: Path) -> None:
+    _write_file(tmp_path, "pg_hba.conf", "host all all 0.0.0.0/0 scram-sha-256\n")
+
+    violations = scan_repository(tmp_path)
+
+    assert _rule_ids(violations) == ["DB004"]
 
 
 def test_allows_safe_private_and_non_database_literals(tmp_path: Path) -> None:
@@ -177,7 +229,15 @@ services:
     assert scan_repository(tmp_path) == ()
 
 
-def test_ignores_untracked_env_files(tmp_path: Path) -> None:
+def test_rejects_tracked_env_variant_defaults(tmp_path: Path) -> None:
+    _write_file(tmp_path, ".env.ci", "POSTGRES_PASSWORD=postgres\n")
+
+    violations = scan_repository(tmp_path)
+
+    assert _rule_ids(violations) == ["DB003"]
+
+
+def test_ignores_untracked_secret_env_files(tmp_path: Path) -> None:
     _write_file(tmp_path, ".env", "POSTGRES_PASSWORD=postgres\n")
     _write_file(tmp_path, ".devcontainer/.env", "POSTGRES_HOST_AUTH_METHOD=trust\n")
 

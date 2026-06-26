@@ -131,3 +131,74 @@ def test_audit_job_runs_on_schedule() -> None:
             f"type but does not include `schedule` -- the job will be skipped on "
             f"scheduled runs.  Condition: {if_condition!r}"
         )
+
+
+def test_on_block_contains_workflow_dispatch() -> None:
+    """The ``on:`` block must contain a ``workflow_dispatch:`` key.
+
+    The runbook (docs/runbooks/0003-supply-chain-audit.md) instructs operators to
+    trigger an ad-hoc re-scan via the GitHub Actions UI "Run workflow" button
+    (Actions → supply-chain → Run workflow).  That button only renders when the
+    workflow declares ``workflow_dispatch:`` in its ``on:`` block.  Without it the
+    documented manual trigger does not exist, violating AGENTS.md rule 27
+    (no aspirational docs).
+    """
+    workflow = _load_workflow()
+    on_block = _get_on_block(workflow)
+    assert "workflow_dispatch" in on_block, (
+        "supply-chain.yml has no `workflow_dispatch:` trigger -- the GitHub Actions "
+        "'Run workflow' button will not appear, making the runbook's ad-hoc re-scan "
+        "instruction aspirational rather than true.  Add `workflow_dispatch:` to the "
+        "workflow's `on:` block (AGENTS.md rule 27)."
+    )
+
+
+def test_pip_audit_step_not_gated_from_schedule() -> None:
+    """No pip-audit step in the ``audit`` job may carry a schedule-excluding ``if:``.
+
+    A pip-audit step with ``if: github.event_name != 'schedule'`` (or equivalent) would
+    silently skip the advisory scan on every scheduled run -- the job itself passes
+    but no audit is performed.  The job-level ``if:`` test
+    (``test_audit_job_runs_on_schedule``) does not cover this gap because a step-level
+    gate is evaluated after the job starts.
+
+    A step-level ``if: github.event_name != 'schedule'`` (or equivalent) would
+    silently skip the advisory scan on every scheduled run -- the job itself passes
+    but no audit is performed.  The job-level ``if:`` test
+    (``test_audit_job_runs_on_schedule``) does not cover this gap because a step-level
+    gate is evaluated after the job starts.
+
+    This test inspects every step whose ``run:`` command contains ``pip-audit`` and
+    asserts that none of them carry an ``if:`` referencing ``event_name`` /
+    ``github.event`` without also including ``schedule``.
+    """
+    workflow = _load_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict), "No `jobs` mapping found in supply-chain.yml"
+    assert "audit" in jobs, "No `audit` job found in supply-chain.yml"
+    audit_job = jobs["audit"]
+    assert isinstance(audit_job, dict), "`audit` job must be a mapping"
+
+    steps = audit_job.get("steps", [])
+    assert isinstance(steps, list), "`steps` in `audit` job must be a list"
+
+    for i, step in enumerate(steps):
+        assert isinstance(step, dict), f"Step {i} must be a mapping, got {step!r}"
+        run_cmd = step.get("run", "")
+        if not isinstance(run_cmd, str) or "pip-audit" not in run_cmd:
+            continue  # not a pip-audit step -- skip
+
+        step_if = step.get("if")
+        if step_if is None:
+            continue  # no condition -- step always runs, which is correct
+
+        assert isinstance(step_if, str), (
+            f"pip-audit step {i} `if:` must be a string, got {type(step_if)}"
+        )
+        # If the condition references the event type it must allow 'schedule' through.
+        if "event_name" in step_if or "github.event" in step_if:
+            assert "schedule" in step_if, (
+                f"pip-audit step {i} has an `if:` condition that references the event "
+                f"type but does not include `schedule` -- the advisory scan will be "
+                f"silently skipped on every scheduled run.  Condition: {step_if!r}"
+            )

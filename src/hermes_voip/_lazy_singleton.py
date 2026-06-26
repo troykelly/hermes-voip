@@ -177,10 +177,24 @@ class LazySingleton[T]:
         # shape at runtime AND narrows the static type, so no escape-hatch cast is
         # needed. A handle that ALSO happens to be callable is still driven via its
         # ``get()`` (the documented contract), so the order of these checks matters.
-        if isinstance(runtime, _RuntimeLazySingleton):
+        #
+        # ``runtime_checkable`` verifies attribute PRESENCE, not callability — a member
+        # that is present but a non-callable VALUE (e.g. ``get = "x"``) structurally
+        # satisfies the Protocol yet would crash when driven (``runtime.get()``). So we
+        # additionally require the members we actually CALL to be callable; anything
+        # that is not selects the stdlib fallback rather than crashing.
+        if (
+            isinstance(runtime, _RuntimeLazySingleton)
+            and callable(runtime.get)
+            and callable(runtime.reset)
+        ):
             return runtime
-        # Otherwise accept the callable-accessor shape (callable + ``reset()``).
-        if isinstance(runtime, _RuntimeCallableAccessor):
+        # Otherwise accept the callable-accessor shape (callable + callable reset).
+        if (
+            isinstance(runtime, _RuntimeCallableAccessor)
+            and callable(runtime)
+            and callable(runtime.reset)
+        ):
             return _CallableAccessorHandle(runtime)
         # Unrecognised shape — fall back to the stdlib singleton rather than crash.
         return None

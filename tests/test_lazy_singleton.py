@@ -33,12 +33,14 @@ def _install_fake_plugin_utils(lazy_singleton: object) -> Iterator[None]:
     the suite (which legitimately falls back to stdlib) is unaffected.
     """
     pkg = types.ModuleType("plugins")
-    # ``setattr`` (not ``pkg.__path__ = ...`` / ``sub.x = ...``) keeps this
-    # mypy-strict clean without an escape hatch: a ModuleType exposes no static
-    # stub for an injected attribute.
-    setattr(pkg, "__path__", [])  # mark as a package so the submodule import resolves  # noqa: B010
+    pkg.__path__ = []  # mark as a package so the submodule import resolves
     sub = types.ModuleType("plugins.plugin_utils")
-    setattr(sub, "lazy_singleton", lazy_singleton)  # noqa: B010 — test stub attr
+    # Inject ``lazy_singleton`` via the module's ``__dict__`` (typed ``dict[str, Any]``)
+    # rather than ``sub.lazy_singleton = ...`` (which mypy rejects — a ModuleType has
+    # no static stub for an injected attribute) or ``setattr`` (ruff B010). This keeps
+    # the fake mypy-strict clean with NO escape hatch; the gate's ``from
+    # plugins.plugin_utils import lazy_singleton`` resolves it by name.
+    sub.__dict__["lazy_singleton"] = lazy_singleton
     added = {"plugins": pkg, "plugins.plugin_utils": sub}
     saved = {name: sys.modules.get(name) for name in added}
     sys.modules.update(added)

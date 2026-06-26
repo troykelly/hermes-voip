@@ -230,6 +230,26 @@ SignalingTransport = SipOverTlsTransport | WssSipTransport
 _log = logging.getLogger(__name__)
 
 
+def _rejected_extra(call_id: str, sip_code: int, reason: str) -> dict[str, str | int]:
+    """Structured ``extra={}`` for an inbound INVITE rejected pre-answer (runbook 0014).
+
+    Every pre-200-OK reject path (486 at capacity, 603 declined caller, 488 media/codec,
+    422 session interval) attaches this to its existing human-readable reject log so a
+    log pipeline can filter ``event='call_rejected'`` and group by ``sip_code`` /
+    ``reason`` without parsing the message text. ``reason`` is a short stable token
+    (e.g. ``at_capacity``, ``caller_declined``, ``no_common_codec``) — never caller
+    PII — so the record is PUBLIC-repo safe (rule 34). ``call_id`` ties it to the same
+    call's ``invite_received`` record.
+    """
+    return {
+        "event": "call_rejected",
+        "call_id": call_id,
+        "outcome": "rejected",
+        "sip_code": sip_code,
+        "reason": reason,
+    }
+
+
 class _MediaNegotiationRejected(Exception):  # noqa: N818 — control-flow signal, not an error condition
     """Internal signal: the call was rejected (488) inside a media-setup helper.
 
@@ -957,6 +977,14 @@ class VoipAdapter(BasePlatformAdapter):
         # does not double-count and a release is idempotent.
         self._admitted_calls: set[str] = set()
 
+        # Observability (runbook 0014): the ``time.monotonic()`` instant each
+        # admitted Call-ID reserved its slot, so ``_release_admission`` can log the
+        # call's in-system duration (release minus admit) plus the live concurrency
+        # gauge. LOCAL-ONLY stdlib logging — no new infra. Pruned in lockstep with
+        # ``_admitted_calls`` (the reserve records, the release consumes), so it
+        # never outlives the slot it measures.
+        self._admission_start: dict[str, float] = {}
+
         # Outbound call state (ADR-0019).
         # _call_on_connect_fired: True once the CALL_ON_CONNECT trigger has fired
         # (set permanently after first connect to prevent re-triggering on reconnect).
@@ -1227,6 +1255,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._dtmf_confirmations.clear()
         self._call_sessions.clear()
         self._admitted_calls.clear()
+        self._admission_start.clear()
 
         manager = self._manager
         if manager is not None:
@@ -2887,6 +2916,15 @@ class VoipAdapter(BasePlatformAdapter):
             "INVITE received: Call-ID %s, registration ext %s",
             call_id,
             new_call.registration.extension,
+            # Per-call lifecycle event (runbook 0014): a log pipeline correlates a
+            # call across invite_received → call_answered/call_rejected →
+            # call_loop_started → call_released by the shared call_id. The extension
+            # is the registration index, not caller PII — PUBLIC-repo safe (rule 34).
+            extra={
+                "event": "invite_received",
+                "call_id": call_id,
+                "extension": new_call.registration.extension,
+            },
         )
         transport = self._transport
         if transport is None:
@@ -2920,6 +2958,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "INVITE %s: REJECTED 486 Busy Here — at concurrent-call cap (%d)",
                 call_id,
                 gateway_cfg.max_calls,
+                extra=_rejected_extra(call_id, 486, "at_capacity"),
             )
             await transport.send(build_response(invite, 486, "Busy Here"))
             return
@@ -2956,6 +2995,7 @@ class VoipAdapter(BasePlatformAdapter):
                 group.name,
                 classification.source,
                 _redact_number(caller_number),
+                extra=_rejected_extra(call_id, 603, "caller_declined"),
             )
             await transport.send(build_response(invite, 603, "Decline"))
             return
@@ -2972,13 +3012,22 @@ class VoipAdapter(BasePlatformAdapter):
         try:
             offer = SessionDescription.parse(sdp_body)
         except Exception as exc:  # noqa: BLE001 — malformed peer SDP; reject call
-            _log.warning("INVITE %s: unparseable SDP offer: %s", call_id, exc)
+            _log.warning(
+                "INVITE %s: unparseable SDP offer: %s",
+                call_id,
+                exc,
+                extra=_rejected_extra(call_id, 488, "unparseable_sdp"),
+            )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
 
         audio = offer.audio
         if audio is None:
-            _log.warning("INVITE %s: SDP offer has no audio media — 488", call_id)
+            _log.warning(
+                "INVITE %s: SDP offer has no audio media — 488",
+                call_id,
+                extra=_rejected_extra(call_id, 488, "no_audio_media"),
+            )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
         _log.info(
@@ -3013,6 +3062,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "(HERMES_VOIP_REQUIRE_SECURE_MEDIA): the offered audio profile is "
                 "cleartext RTP/AVP, not SRTP (SDES/DTLS/WebRTC)",
                 call_id,
+                extra=_rejected_extra(call_id, 488, "secure_media_mandate"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
@@ -3033,6 +3083,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "Session-Expires below Min-SE %d (RFC 4028 §6)",
                 call_id,
                 session_timer.min_se,
+                extra=_rejected_extra(call_id, 422, "session_interval_too_small"),
             )
             await transport.send(
                 build_response(
@@ -3076,6 +3127,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "INVITE %s: REJECTED 488 — no common codec with the offer: %s",
                 call_id,
                 exc,
+                extra=_rejected_extra(call_id, 488, "no_common_codec"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
@@ -3087,6 +3139,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "INVITE %s: REJECTED 488 — negotiated set has no voice codec "
                 "(DTMF-only match is not a usable call)",
                 call_id,
+                extra=_rejected_extra(call_id, 488, "no_voice_codec"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
@@ -3108,6 +3161,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "media engine: %s",
                 call_id,
                 exc,
+                extra=_rejected_extra(call_id, 488, "codec_not_carriable"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             return
@@ -3126,6 +3180,7 @@ class VoipAdapter(BasePlatformAdapter):
                     "(install the 'webrtc' extra + system libopus): %s",
                     call_id,
                     exc,
+                    extra=_rejected_extra(call_id, 488, "codec_dependency_unavailable"),
                 )
                 await transport.send(build_response(invite, 488, "Not Acceptable Here"))
                 return
@@ -3166,6 +3221,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "after classification",
                 call_id,
                 gateway_cfg.max_calls,
+                extra=_rejected_extra(call_id, 486, "at_capacity"),
             )
             await transport.send(build_response(invite, 486, "Busy Here"))
             return
@@ -3575,7 +3631,12 @@ class VoipAdapter(BasePlatformAdapter):
                 crypto=answer_crypto,
             )
         except Exception as exc:
-            _log.warning("INVITE %s: cannot build SDP answer: %s", call_id, exc)
+            _log.warning(
+                "INVITE %s: cannot build SDP answer: %s",
+                call_id,
+                exc,
+                extra=_rejected_extra(call_id, 488, "cannot_build_answer"),
+            )
             # RFC 3261 §13.3.1.4: 488 Not Acceptable Here for media negotiation
             # failure (e.g. SRTP-only offer with no crypto key available) so the
             # caller can retry with plain RTP. Reserve 500 for genuine server faults.
@@ -3651,6 +3712,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "INVITE %s: REJECTED 488 — WebRTC offer missing fingerprint/ICE "
                 "credentials (a=fingerprint / a=ice-ufrag / a=ice-pwd)",
                 call_id,
+                extra=_rejected_extra(call_id, 488, "webrtc_missing_fingerprint_ice"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected
@@ -3666,6 +3728,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "(install the 'webrtc' extra + system libopus): %s",
                 call_id,
                 exc,
+                extra=_rejected_extra(call_id, 488, "codec_dependency_unavailable"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected from exc
@@ -3721,7 +3784,12 @@ class VoipAdapter(BasePlatformAdapter):
             # Any ICE-gather / answer-build failure before the 200 OK is a clean
             # pre-answer reject (488), the ICE session is closed, and we re-raise the
             # internal reject signal — so this except never swallows (rule 37).
-            _log.warning("INVITE %s: cannot build WebRTC answer: %s", call_id, exc)
+            _log.warning(
+                "INVITE %s: cannot build WebRTC answer: %s",
+                call_id,
+                exc,
+                extra=_rejected_extra(call_id, 488, "cannot_build_answer"),
+            )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             await session.close()
             raise _MediaNegotiationRejected from exc
@@ -3955,6 +4023,7 @@ class VoipAdapter(BasePlatformAdapter):
             _log.error(
                 "INVITE %s: REJECTED 488 — SIP DTLS-SRTP offer missing a=fingerprint",
                 call_id,
+                extra=_rejected_extra(call_id, 488, "sip_dtls_missing_fingerprint"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected
@@ -3969,6 +4038,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "(install the 'webrtc' extra + system libopus): %s",
                 call_id,
                 exc,
+                extra=_rejected_extra(call_id, 488, "codec_dependency_unavailable"),
             )
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
             raise _MediaNegotiationRejected from exc
@@ -4012,7 +4082,10 @@ class VoipAdapter(BasePlatformAdapter):
             # the 488 and re-raise the internal reject signal (never swallowed, rule
             # 37). The call was NOT answered, so this is a 488, not a BYE.
             _log.warning(
-                "INVITE %s: cannot build SIP DTLS-SRTP answer: %s", call_id, exc
+                "INVITE %s: cannot build SIP DTLS-SRTP answer: %s",
+                call_id,
+                exc,
+                extra=_rejected_extra(call_id, 488, "cannot_build_answer"),
             )
             await session.close()
             await transport.send(build_response(invite, 488, "Not Acceptable Here"))
@@ -4786,7 +4859,21 @@ class VoipAdapter(BasePlatformAdapter):
             body=answer_sdp,
         )
         await transport.send(ok_response)
-        _log.info("INVITE %s: 200 OK sent (To-tag %s)", call_id, local_tag)
+        _log.info(
+            "INVITE %s: 200 OK sent (To-tag %s)",
+            call_id,
+            local_tag,
+            # Per-call lifecycle event (runbook 0014): the inbound call was answered.
+            # Reached only from the three inbound media-setup helpers (SDES / WebRTC /
+            # SIP-DTLS), so it marks the answer of an INBOUND call — never an outbound
+            # leg (WE send the INVITE and receive the 2xx there). PUBLIC-repo safe.
+            extra={
+                "event": "call_answered",
+                "call_id": call_id,
+                "outcome": "answered",
+                "sip_code": 200,
+            },
+        )
 
     async def _run_call_loop(
         self,
@@ -4938,7 +5025,18 @@ class VoipAdapter(BasePlatformAdapter):
         self._wire_dtmf_receive(
             call_id=call_id, engine=engine, call_loop=call_loop, media_cfg=media_cfg
         )
-        _log.info("INVITE %s: CallLoop started", call_id)
+        _log.info(
+            "INVITE %s: CallLoop started",
+            call_id,
+            # Per-call lifecycle event (runbook 0014): the conversational loop is live
+            # (media pumping, agent turns flowing). ``direction`` distinguishes an
+            # inbound answered call from an outbound placed call — both run this loop.
+            extra={
+                "event": "call_loop_started",
+                "call_id": call_id,
+                "direction": "outbound" if outbound else "inbound",
+            },
+        )
         await call_loop.run()
         return call_loop
 
@@ -5267,6 +5365,19 @@ class VoipAdapter(BasePlatformAdapter):
                 q.remote_fraction_lost,
                 q.remote_jitter_ms,
                 q.rtt_seconds,
+                # Machine-parseable mirror of the message (runbook 0014): a log
+                # pipeline filters on event='rtcp_call_quality' and aggregates the
+                # numeric quality fields per call. Only numeric metrics + the Call-ID
+                # — no caller identity — so it is PUBLIC-repo safe (rule 34).
+                extra={
+                    "event": "rtcp_call_quality",
+                    "call_id": call_id,
+                    "local_fraction_lost": q.local_fraction_lost,
+                    "local_jitter_ms": q.local_jitter_ms,
+                    "remote_fraction_lost": q.remote_fraction_lost,
+                    "remote_jitter_ms": q.remote_jitter_ms,
+                    "rtt_seconds": q.rtt_seconds,
+                },
             )
         try:
             await engine.stop()
@@ -5326,6 +5437,11 @@ class VoipAdapter(BasePlatformAdapter):
         if len(self._admitted_calls) >= max_calls:
             return False
         self._admitted_calls.add(call_id)
+        # Stamp the admission instant (runbook 0014) so the matching release can log
+        # the call's in-system duration. Only the FIRST reserve stamps it (the early
+        # return above covers a same-Call-ID retransmit), so duration measures from
+        # the original admission, not a later retransmit.
+        self._admission_start[call_id] = time.monotonic()
         return True
 
     def _release_admission(self, call_id: str) -> None:
@@ -5334,8 +5450,33 @@ class VoipAdapter(BasePlatformAdapter):
         Idempotent (``discard``): called from :meth:`_teardown_call` for the normal
         path and from the pre-session media-setup failure paths in
         :meth:`_handle_inbound_invite`; a double release is a harmless no-op.
+
+        Observability (runbook 0014): when this release actually frees a slot we held
+        (the ``_admission_start`` stamp is present), emit a structured ``call_released``
+        record carrying the call's in-system ``duration_s`` and the live concurrency
+        gauge (``active_calls`` = slots still held AFTER this release). A no-op release
+        (no stamp — never admitted, or already released) emits nothing, so a
+        double-release stays silent. LOCAL-ONLY stdlib logging; the fields carry only
+        a Call-ID + numeric metrics — no caller identity — so it is PUBLIC-repo safe.
         """
         self._admitted_calls.discard(call_id)
+        started = self._admission_start.pop(call_id, None)
+        if started is None:
+            return
+        duration_s = time.monotonic() - started
+        active_calls = len(self._admitted_calls)
+        _log.info(
+            "INVITE %s: call released — duration %.3fs, active calls now %d",
+            call_id,
+            duration_s,
+            active_calls,
+            extra={
+                "event": "call_released",
+                "call_id": call_id,
+                "duration_s": duration_s,
+                "active_calls": active_calls,
+            },
+        )
 
     def _mark_agent_hangup(self, call_id: str) -> None:
         """Record that the agent's hang-up tool initiated this call's end (ADR-0026).

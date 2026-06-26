@@ -17,7 +17,7 @@ or degradation. The **WHY** (design decisions on latency budgets, capacity, etc.
 | Signal | Target | Unit | Observable today? | Notes |
 |--------|--------|------|-------------------|-------|
 | **Registration uptime** | 99.9% | % (monthly) | **MEASURABLE** from logs | See [Registration uptime](#registration-uptime) |
-| **Call setup success** | 99.5% | % (per attempt) | **NOT YET** — requires instrumentation | See [Call setup success](#call-setup-success) |
+| **Call setup success** | 99.5% | % (per attempt) | **MEASURABLE** — structured lifecycle events | See [Call setup success](#call-setup-success) |
 | **Time to first audio** | < 2 s | s | **MEASURABLE** from logs | See [Time to first audio](#time-to-first-audio) |
 | **Per-turn latency (p50)** | < 1.0 s | s | **MEASURABLE** from logs (rough) | See [Per-turn latency](#per-turn-latency) |
 | **Per-turn latency (p99)** | < 3.0 s | s | **MEASURABLE** from logs (rough) | See [Per-turn latency](#per-turn-latency) |
@@ -73,28 +73,55 @@ and active media (not rejected with 4xx/5xx).
 
 **Target:** 99.5% (1 failure per 200 calls is acceptable).
 
-**How to observe today:**
+**How to observe today (structured events, ADR-0075).**
 
-Requires **manual counting** from logs (not yet automated):
+Each inbound call emits machine-parseable per-call lifecycle records via the stdlib
+logger's `extra={}` (LOCAL-ONLY — no external sink). The human message text is unchanged;
+the structured fields ride alongside it so a log pipeline (journald JSON, Loki, etc.) can
+count by `event` without grepping prose. All carry `call_id` to correlate one call across
+its lifecycle. The events:
+
+| `event` | Emitted when | Key fields |
+|---------|--------------|------------|
+| `invite_received` | inbound INVITE arrives | `call_id`, `extension` |
+| `call_rejected` | any pre-200-OK reject (486/603/488/422) | `call_id`, `outcome="rejected"`, `sip_code`, `reason` |
+| `call_answered` | the inbound `200 OK` is sent | `call_id`, `outcome="answered"`, `sip_code=200` |
+| `call_loop_started` | the conversational loop goes live | `call_id`, `direction` (`inbound`/`outbound`) |
+| `call_released` | the admission slot is freed at teardown | `call_id`, `duration_s`, `active_calls` |
+
+Setup success ≈ `count(call_answered) / (count(call_answered) + count(call_rejected))`.
+
+With JSON-formatted logs (`jq`):
 
 ```bash
-# Count inbound INVITEs:
-grep -c "^.*INVITE.*received" /path/to/hermes/log
-# Count successful answers (200 OK with media engine active):
-grep -c "CallLoop started" /path/to/hermes/log
-# Count rejections (488, 486, etc.):
-grep -E "REJECTED [4-5][0-9][0-9]" /path/to/hermes/log | wc -l
+# Inbound INVITEs, answers, rejects (structured event field):
+jq -c 'select(.event=="invite_received")' /path/to/hermes/log.jsonl | wc -l
+jq -c 'select(.event=="call_answered")'  /path/to/hermes/log.jsonl | wc -l
+jq -c 'select(.event=="call_rejected")'  /path/to/hermes/log.jsonl | wc -l
+# Reject breakdown by SIP code + reason token:
+jq -r 'select(.event=="call_rejected") | "\(.sip_code) \(.reason)"' /path/to/hermes/log.jsonl | sort | uniq -c
 ```
 
-**Typical rejection causes:**
-- `488 Not Acceptable Here` — codec negotiation failed (gateway offered no G.722 or G.711).
-- `480 Temporarily Unavailable` — adapter overloaded or no call loop capacity.
-- `500 Server Internal Error` — SDP parsing or media engine setup failed.
+The human-readable text is still greppable for plain-text logs:
 
-**NOT YET INSTRUMENTED** — a future code lane should emit:
-- `voip.calls.inbound_invite_received` — counter.
-- `voip.calls.setup_success` — counter (200 OK + media started).
-- `voip.calls.setup_rejected` — counter (any rejection).
+```bash
+grep -c "INVITE received" /path/to/hermes/log
+grep -c "CallLoop started" /path/to/hermes/log
+grep -E "REJECTED [4-6][0-9][0-9]" /path/to/hermes/log | wc -l
+```
+
+**Typical rejection `reason` tokens (the `reason` field on `call_rejected`):**
+- `at_capacity` (486) — concurrent-call cap reached.
+- `caller_declined` (603) — caller-group deny match.
+- `secure_media_mandate` / `no_common_codec` / `no_voice_codec` / `codec_not_carriable` /
+  `codec_dependency_unavailable` / `cannot_build_answer` / `unparseable_sdp` /
+  `no_audio_media` / `webrtc_missing_fingerprint_ice` / `sip_dtls_missing_fingerprint` (488).
+- `session_interval_too_small` (422) — offered Session-Expires below Min-SE.
+
+**Metrics sink still TBD** — a future lane maps these structured events to gauges/counters:
+- `voip.calls.inbound_invite_received` — counter (`event=invite_received`).
+- `voip.calls.setup_success` — counter (`event=call_answered`).
+- `voip.calls.setup_rejected` — counter (`event=call_rejected`, label `sip_code`/`reason`).
 - `voip.calls.setup_success_pct` — gauge, `success / (success + rejected)`.
 
 ---
@@ -207,8 +234,20 @@ on the **cleartext plain-RTP path**: after `connect()` it calls
 `engine.start_rtcp(mux=…, remote_rtcp_addr=…)`, which starts the periodic SR/RR sender,
 demuxes inbound RTCP (RFC 5761 §4 on the muxed port, or a sibling socket on RTP-port+1 when
 not muxed — RFC 3550 §11), and flushes a closing BYE on stop. At call teardown the adapter
-logs the final `call_quality` snapshot (an INFO line: local/remote loss, jitter, RTT). RTCP
+logs the final `call_quality` snapshot (an INFO line: local/remote loss, jitter, RTT). That
+line now ALSO carries a structured `extra={}` (ADR-0075): `event="rtcp_call_quality"`,
+`call_id`, and the five numeric quality fields (`local_fraction_lost`, `local_jitter_ms`,
+`remote_fraction_lost`, `remote_jitter_ms`, `rtt_seconds`) — so a log pipeline filters and
+aggregates per-call quality without parsing the message. The record is gated on the call
+having actually run RTCP (`_rtcp_active`), so a secured/disabled call emits nothing. RTCP
 is on by default; the operator kill-switch is `HERMES_VOIP_RTCP_ENABLED=false`.
+
+```bash
+# Per-call quality from JSON logs:
+jq -c 'select(.event=="rtcp_call_quality")
+       | {call_id, loss: .local_fraction_lost, jitter: .local_jitter_ms, rtt: .rtt_seconds}' \
+  /path/to/hermes/log.jsonl
+```
 
 **Secured paths (SDES / WebRTC) do NOT run RTCP yet.** The engine emits/parses CLEARTEXT
 RTCP only and has no SRTCP (RFC 3711 §3.4) transform, so RTCP on an RTP/SAVP or SAVPF
@@ -293,11 +332,23 @@ INBOUND leg may be dead. The adapter lane turns this into the counters below.
 
 **How to observe:**
 
-**Measurable today** (but manual):
+**Measurable today (structured gauge, ADR-0075).** Every `call_released` event carries
+`active_calls` — the live admission-slot count AFTER that release — which is the
+concurrency gauge sampled at each call end, plus `duration_s` for the released call:
 
 ```bash
-# From logs, count "CallLoop started" lines that have not yet seen "Call ended" or hung up:
-grep -E "CallLoop started|Call ended|BYE|CANCELLED" /path/to/hermes/log | tail -200
+# Live concurrency over time (the value AFTER each release) + the call's duration:
+jq -r 'select(.event=="call_released") | "\(.call_id) dur=\(.duration_s)s active=\(.active_calls)"' \
+  /path/to/hermes/log.jsonl
+# Peak concurrency observed at release points:
+jq -r 'select(.event=="call_released") | .active_calls' /path/to/hermes/log.jsonl | sort -n | tail -1
+```
+
+Plain-text fallback (correlate started vs released):
+
+```bash
+# From logs, count "CallLoop started" lines that have not yet seen a release or hung up:
+grep -E "CallLoop started|call released|BYE|CANCELLED" /path/to/hermes/log | tail -200
 # Count live calls (started but not ended).
 
 # From system metrics:
@@ -325,10 +376,12 @@ ss -tn | grep -c "5061\|5000" # SIP and RTP connections
 # 5. Hang up and verify all calls end cleanly (no hung processes).
 ```
 
-**NOT YET INSTRUMENTED:**
-- `voip.calls.active_count` — gauge (real-time call count).
-- `voip.calls.started` — counter (lifetime call count).
-- `voip.calls.ended` — counter.
+**Metrics sink still TBD** (the structured `active_calls` / `duration_s` source exists):
+- `voip.calls.active_count` — gauge (`active_calls` from `call_released`, or `call_loop_started`
+  minus `call_released`).
+- `voip.calls.started` — counter (`event=call_loop_started`).
+- `voip.calls.ended` — counter (`event=call_released`).
+- `voip.calls.duration_s` — histogram (`duration_s` from `call_released`).
 - `voip.memory.bytes` — gauge.
 - `voip.memory.per_call_avg` — gauge.
 
@@ -380,14 +433,17 @@ See ADR backlog Task #26 and the `llm-502-spoken-error-finding-verified` memory 
 
 ## Instrumentation roadmap
 
-**Current state (as of 2026-06-19):**
+**Current state (as of 2026-06-26):**
+- ✅ **STRUCTURED LOG EVENTS (ADR-0075):** per-call lifecycle (`invite_received`,
+  `call_rejected`, `call_answered`, `call_loop_started`, `call_released`) and RTCP
+  call-quality (`rtcp_call_quality`) emit machine-parseable `extra={}` fields — call setup
+  success, RTP loss/jitter/RTT, and concurrency gauge are now countable from logs without
+  prose-grepping. LOCAL-ONLY stdlib logging; no external sink.
 - ✅ **MEASURABLE from logs:** registration events, call setup (INVITE → 200 OK), time to first audio,
-  per-turn latency (rough), concurrent calls (rough).
-- 🟡 **SOURCE EXISTS, EMISSION TBD:** RTP packet loss / jitter / RTT and one-way-audio inference —
-  computed by the media engine via RTCP (ADR-0061) and exposed on `RtpMediaTransport.call_quality`;
-  the adapter lane wires `ingest_rtcp`/`run_rtcp` and pushes the numbers to a metrics sink.
-- ❌ **NOT YET INSTRUMENTED:** call setup success rate (automated), media quality score,
-  error-to-caller rate (automated).
+  per-turn latency (rough), concurrent calls.
+- 🟡 **SOURCE EXISTS, EMISSION TBD:** the structured events above are not yet PUSHED to a
+  metrics sink (StatsD/Prometheus) — that mapping is the remaining step.
+- ❌ **NOT YET INSTRUMENTED:** media quality score, error-to-caller rate (automated).
 
 **Next code lane:** wire metric emission (likely via StatsD, Prometheus, or structured logging)
 so that:

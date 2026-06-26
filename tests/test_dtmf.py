@@ -162,3 +162,118 @@ def test_receiver_rejects_history_zero_and_negative() -> None:
         DtmfReceiver(history=0)
     with pytest.raises(ValueError, match="history"):
         DtmfReceiver(history=-1)
+
+
+# ---------------------------------------------------------------------------
+# Mutation-hardening: encode() end-bit / volume byte (backlog §370)
+# ---------------------------------------------------------------------------
+
+
+def test_encode_end_false_volume_10() -> None:
+    """end=False must leave the 0x80 bit clear in byte 1.
+
+    Byte 1 layout: E(bit7) | volume(bits5-0).
+    end=False, volume=10 -> 0x00 | 0x0A = 0x0A.
+
+    Kills a mutant that replaces `0` with `_END_BIT` in the false branch of
+    ``(_END_BIT if self.end else 0) | self.volume``, and a mutant that drops the
+    conditional entirely (always OR-ing END_BIT).
+    """
+    raw = DtmfEvent(event=5, end=False, volume=10, duration=160).encode()
+    assert raw[1] == 0x0A  # E=0, volume=10
+
+
+def test_encode_end_true_volume_zero() -> None:
+    """end=True with volume=0 must produce exactly 0x80 (only the end bit set).
+
+    Kills a mutant that replaces ``|`` with ``&`` (result would be 0x00 for
+    volume=0) and a mutant that always clears the end bit (result 0x00).
+    """
+    raw = DtmfEvent(event=5, end=True, volume=0, duration=160).encode()
+    assert raw[1] == 0x80  # E=1, volume=0
+
+
+def test_encode_end_false_volume_zero() -> None:
+    """end=False, volume=0 -> byte 1 must be 0x00 (no bits set).
+
+    Differentiates a dropped-END_BIT mutant from a swapped-branch mutant:
+    a ``always-set-end-bit`` mutant would produce 0x80 here.
+    """
+    raw = DtmfEvent(event=5, end=False, volume=0, duration=160).encode()
+    assert raw[1] == 0x00  # E=0, volume=0
+
+
+def test_encode_end_true_volume_max() -> None:
+    """end=True, volume=63 (0x3F) -> byte 1 must be 0xBF (all 7 payload bits set).
+
+    0x80 | 0x3F = 0xBF.  A ``|``->``&`` mutant yields 0x00; an end-bit-drop
+    mutant yields 0x3F; a VOLUME_MASK misapplication on encode yields a different
+    value if volume bits bleed into bit 7.
+    """
+    raw = DtmfEvent(event=5, end=True, volume=0x3F, duration=160).encode()
+    assert raw[1] == 0xBF  # E=1, volume=63
+
+
+def test_encode_end_false_volume_max() -> None:
+    """end=False, volume=63 (0x3F) -> byte 1 must be 0x3F (volume only, no end bit).
+
+    Distinguishes from end=True,volume=max (0xBF).  Kills a mutant that
+    always sets the end bit regardless of self.end.
+    """
+    raw = DtmfEvent(event=5, end=False, volume=0x3F, duration=160).encode()
+    assert raw[1] == 0x3F  # E=0, volume=63
+
+
+# ---------------------------------------------------------------------------
+# Mutation-hardening: DtmfReceiver bounded-window eviction (backlog §373)
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_bounded_window_evicts_oldest_timestamp() -> None:
+    """With history=2 the window holds exactly 2 timestamps; the third evicts the first.
+
+    Sequence:
+      1. Press ts=1000 -> emits '3'.  _seen={1000}, _order=[1000].
+      2. Press ts=2000 -> emits '3'.  _seen={1000,2000}, _order=[1000,2000].
+      3. Press ts=3000 -> emits '3'.  Window is full; ts=1000 is evicted before
+         ts=3000 is added.  _seen={2000,3000}, _order=[2000,3000].
+      4. Late duplicate of ts=1000 arrives.  Because 1000 was evicted from _seen,
+         the receiver treats it as a NEW press and RE-EMITS '3'.
+
+    This pins the eviction-on-overflow behaviour: a mutant that never discards from
+    _seen (e.g. removes the ``self._seen.discard`` call) would suppress step 4 instead
+    of re-emitting, causing the assertion to fail.
+    """
+    rx = DtmfReceiver(history=2)
+    ev = DtmfEvent(event=3, end=True, volume=10, duration=480)
+
+    # press 1: ts=1000
+    assert rx.feed(ev, timestamp=1000) == "3"
+    # press 2: ts=2000 — window now full
+    assert rx.feed(ev, timestamp=2000) == "3"
+    # press 3: ts=3000 — evicts ts=1000 from _seen
+    assert rx.feed(ev, timestamp=3000) == "3"
+    # late duplicate of ts=1000: evicted, so re-emits
+    assert rx.feed(ev, timestamp=1000) == "3", (
+        "evicted timestamp must re-emit; _seen must not retain it past the window"
+    )
+
+
+def test_receiver_bounded_window_retains_recent_timestamps() -> None:
+    """Timestamps still within the window are suppressed (dedup still works).
+
+    With history=2 and three presses (ts 1000, 2000, 3000), ts=2000 and ts=3000
+    remain in the window.  A duplicate of either must NOT re-emit.
+
+    Kills a mutant that evicts too aggressively (e.g. evicts all entries instead
+    of just the oldest).
+    """
+    rx = DtmfReceiver(history=2)
+    ev = DtmfEvent(event=3, end=True, volume=10, duration=480)
+    rx.feed(ev, timestamp=1000)
+    rx.feed(ev, timestamp=2000)
+    rx.feed(ev, timestamp=3000)
+
+    # ts=2000 and ts=3000 are still in the window — must be suppressed
+    assert rx.feed(ev, timestamp=2000) is None
+    assert rx.feed(ev, timestamp=3000) is None

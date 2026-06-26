@@ -222,8 +222,10 @@ def test_relay_error_from_value_error_does_not_leak_secret() -> None:
     value is ``Authorization: Bearer <token>`` — interpolating the raw exception
     text into the user-facing IntercomRelayError message would leak the bearer
     token into logs/callers (PUBLIC-repo invariant violation). The wrapper must
-    use a FIXED, generic message carrying NO interpolated exception text; the
-    original is chained via ``from exc`` for the traceback only.
+    use a FIXED, generic message carrying NO interpolated exception text; and the
+    secret-bearing ValueError cause MUST be suppressed (``from None``) so it cannot
+    resurface in a printed traceback (``__cause__ is None``,
+    ``__suppress_context__`` True).
     """
     secret = "SECRET-fake-bearer-token-0000"  # obvious fake
     cfg = IntercomConfig(

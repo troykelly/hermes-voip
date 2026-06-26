@@ -464,9 +464,12 @@ def _parse_headers(name: str, raw: object) -> Mapping[str, str]:
     headers: dict[str, str] = {}
     for key, value in raw.items():
         if not isinstance(value, str):
+            # Report only a generic location (the non-secret opening name) — never
+            # the raw header name {key!r}, for consistency with the control-char
+            # path's "don't echo raw config strings in a ConfigError" contract.
             msg = (
-                f"{_CONFIG_FILE_KEY}: webhook opening {name!r} header {key!r} must "
-                "be a string value"
+                f"{_CONFIG_FILE_KEY}: webhook opening {name!r} each header value "
+                "must be a string"
             )
             raise ConfigError(msg)
         # Reject control chars in both the name and the value. The label carries

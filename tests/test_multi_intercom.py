@@ -580,3 +580,32 @@ def test_header_value_control_error_does_not_echo_raw_name(tmp_path: Path) -> No
     assert raw_name not in str(excinfo.value), (
         "the control-char ConfigError echoed the raw header NAME"
     )
+
+
+def test_non_string_header_value_error_does_not_echo_raw_name(tmp_path: Path) -> None:
+    """A non-string header VALUE is rejected without echoing the raw header name.
+
+    Consistency with the control-char path's "don't echo raw config strings in a
+    ConfigError" contract: the rejection reports only a generic location, not the
+    raw header name.
+    """
+    raw_name = "X-SECRET-fake-bearer-token-0000"  # obvious fake
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {raw_name: 1234},  # non-string value
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="string") as excinfo:
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+    assert raw_name not in str(excinfo.value), (
+        "the non-string-value ConfigError echoed the raw header NAME"
+    )

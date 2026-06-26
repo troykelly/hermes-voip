@@ -109,8 +109,19 @@ class SipMessageFramer:
 
 def _content_length(head: str) -> int:
     """Extract the Content-Length value from a decoded message head (§20.14)."""
-    # Skip the start-line; scan header lines for Content-Length / compact ``l``.
+    # Skip the start-line; unfold RFC 3261 §7.3.1 continuations before scanning
+    # for Content-Length / compact ``l`` so folded headers frame identically to
+    # the full header parser in ``message._parse_headers``.
+    unfolded: list[str] = []
     for line in head.split(_CRLF.decode())[1:]:
+        if line[:1] in (" ", "\t"):
+            if not unfolded:
+                msg = "header continuation line with no preceding header"
+                raise FramingError(msg)
+            unfolded[-1] = f"{unfolded[-1]} {line.strip()}"
+        else:
+            unfolded.append(line)
+    for line in unfolded:
         name, sep, value = line.partition(":")
         if sep and name.strip().lower() in _CONTENT_LENGTH_NAMES:
             stripped = value.strip()

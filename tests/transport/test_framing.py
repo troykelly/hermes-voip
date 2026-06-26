@@ -119,6 +119,21 @@ def test_body_consumes_exactly_content_length_not_more() -> None:
     assert list(framer) == []
 
 
+def test_folded_content_length_header_is_unfolded_before_framing() -> None:
+    framer = SipMessageFramer()
+    body = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"
+    message = (
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKabc\r\n"
+        "Call-ID: call-folded\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Type: application/sdp\r\n"
+        f"Content-Length:\r\n\t{len(body.encode())}\r\n\r\n{body}"
+    )
+    framer.feed(message.encode())
+    assert list(framer) == [message]
+
+
 def test_leading_crlf_keepalive_ping_is_skipped_before_a_message() -> None:
     # RFC 5626 §3.5.1: a bare CRLF (ping) / CRLFCRLF (pong) precedes no message.
     framer = SipMessageFramer()

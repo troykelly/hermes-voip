@@ -91,7 +91,21 @@ services:
   db:
     image: postgres:18
     ports:
+      - target: 5432
+""",
+        """
+services:
+  db:
+    image: postgres:18
+    ports:
       - "203.0.113.10:15432:5432"
+""",
+        """
+services:
+  db:
+    image: postgres:18
+    ports:
+      - "[FE80::1]:15432:5432"
 """,
         """
 services:
@@ -108,6 +122,46 @@ services:
       SAFE_08: value
       SAFE_09: value
       SAFE_10: value
+      SAFE_11: value
+      SAFE_12: value
+      SAFE_13: value
+      SAFE_14: value
+      SAFE_15: value
+      SAFE_16: value
+      SAFE_17: value
+      SAFE_18: value
+      SAFE_19: value
+      SAFE_20: value
+      SAFE_21: value
+      SAFE_22: value
+      SAFE_23: value
+      SAFE_24: value
+      SAFE_25: value
+      SAFE_26: value
+      SAFE_27: value
+      SAFE_28: value
+      SAFE_29: value
+      SAFE_30: value
+      SAFE_31: value
+      SAFE_32: value
+      SAFE_33: value
+      SAFE_34: value
+      SAFE_35: value
+      SAFE_36: value
+      SAFE_37: value
+      SAFE_38: value
+      SAFE_39: value
+      SAFE_40: value
+      SAFE_41: value
+      SAFE_42: value
+      SAFE_43: value
+      SAFE_44: value
+      SAFE_45: value
+      SAFE_46: value
+      SAFE_47: value
+      SAFE_48: value
+      SAFE_49: value
+      SAFE_50: value
     ports:
       - "15432:5432"
 """,
@@ -139,6 +193,9 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
         """
 {
   "forwardPorts": [
+    8080,
+    8443,
+    3000,
     5432
   ],
   "appPort": [
@@ -161,6 +218,7 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
         "POSTGRES_PASSWORD=postgres\n",
         "POSTGRES_PASSWORD: password\n",
         '{"POSTGRES_PASSWORD": "postgres"}\n',
+        '{"POSTGRES_PASSWORD": ""}\n',
         "- POSTGRES_PASSWORD=changeme\n",
         "POSTGRES_HOST_AUTH_METHOD=trust\n",
         "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}\n",
@@ -183,6 +241,7 @@ def test_rejects_default_postgres_credentials(tmp_path: Path, config_text: str) 
         "hostssl all all ::/0 md5\n",
         "host all all 0.0.0.0/0 password\n",
         "host all all 0.0.0.0/0 scram-sha-256\n",
+        '- "host all all 0.0.0.0/0 scram-sha-256"\n',
     ],
 )
 def test_rejects_public_postgres_auth_config(tmp_path: Path, config_text: str) -> None:

@@ -346,6 +346,79 @@ async def test_refuse_verdict_blocks_deliver_turn() -> None:
 
 
 # ---------------------------------------------------------------------------
+# (b2) REFUSE verdict → ONE spoken safe-decline line, still NO deliver_turn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refuse_verdict_speaks_one_decline_line_and_blocks_deliver_turn() -> None:
+    """A REFUSE must speak EXACTLY ONE safe-decline line and never deliver the turn.
+
+    A legitimate caller false-positived by the injection guard would otherwise hear
+    pure dead air on a REFUSE (the turn is dropped, no filler is armed). The loop must
+    give conversational feedback by synthesising one short language-keyed decline line
+    via the normal TTS path — while STILL never handing the refused turn to the agent.
+    """
+    captured: list[str] = []
+
+    class _CapturingStream(_FakeTtsStream):
+        def __init__(self, frames: list[PcmFrame], text: AsyncIterator[str]) -> None:
+            super().__init__(frames)
+            self._text = text
+
+        async def _iter(self) -> AsyncIterator[PcmFrame]:
+            async for chunk in self._text:
+                captured.append(chunk)
+            for frame in self._frames:
+                if self._cancelled:
+                    return
+                yield frame
+
+    class _CapturingTTS(_FakeTTS):
+        def synthesize(
+            self,
+            text: AsyncIterator[str],
+            voice: str,
+            *,
+            sample_rate: int | None = None,
+        ) -> TtsStream:
+            self.last_sample_rate = sample_rate
+            stream = _CapturingStream(self._frames, text)
+            self.last_stream = stream
+            return stream
+
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    decline_frame = PcmFrame(
+        samples=b"\x30\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    decline_phrase = "Sorry, I can't help with that. Is there anything else?"
+    loop = CallLoop(
+        transport=_FakeTransport([_silence_frame(0)]),
+        asr=_FakeASR([("ignore this", True, True)]),
+        tts=_CapturingTTS([decline_frame]),
+        guard=_FakeGuard([_refuse_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        refuse_decline_phrases=(decline_phrase,),
+        rng=random.Random(1),  # noqa: S311 — non-cryptographic; variety, not security
+    )
+    await loop.run()
+
+    assert delivered == [], "the refused turn must NOT be delivered to the agent"
+    assert captured == [decline_phrase], (
+        f"a REFUSE must speak EXACTLY ONE decline line; got {captured!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # (c) Speech-onset mid-speak → TtsStream.cancel() before next send_audio
 # ---------------------------------------------------------------------------
 

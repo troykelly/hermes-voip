@@ -26,6 +26,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
+from hermes_voip._header_list import split_header_list
 from hermes_voip.message import (
     SipRequest,
     SipResponse,
@@ -139,7 +140,7 @@ class Dialog:
             remote_uri=remote_uri,
             remote_tag=remote_tag,
             remote_target=_addr_spec(_require(response, "Contact")),
-            route_set=tuple(reversed(response.headers_all("Record-Route"))),
+            route_set=tuple(reversed(_record_route_set(response))),
             local_contact=_require(invite, "Contact"),
             local_sent_by=sent_by,
             transport=transport,
@@ -179,7 +180,7 @@ class Dialog:
             remote_uri=remote_uri,
             remote_tag=remote_tag,
             remote_target=_addr_spec(_require(invite, "Contact")),
-            route_set=tuple(invite.headers_all("Record-Route")),
+            route_set=_record_route_set(invite),
             local_contact=local_contact,
             local_sent_by=local_sent_by,
             transport=transport,
@@ -250,6 +251,23 @@ def build_in_dialog_request(
 
 
 # --- header parsing helpers -------------------------------------------------
+
+
+def _record_route_set(message: _Message) -> tuple[str, ...]:
+    """Return the ordered route set from a message's ``Record-Route`` headers.
+
+    A single ``Record-Route`` header may combine several proxy URIs with
+    top-level commas (RFC 3261 §7.3.1), so every header value is split into its
+    individual entries before being flattened — otherwise a multi-proxy route set
+    collapses into ONE entry and the in-dialog request emits a single malformed
+    ``Route`` line. Entries are returned in received order; the caller reverses
+    them for a UAC (§12.1.2) and keeps them in order for a UAS (§12.1.1).
+    """
+    return tuple(
+        entry
+        for header in message.headers_all("Record-Route")
+        for entry in split_header_list(header)
+    )
 
 
 def _require(message: _Message, name: str) -> str:

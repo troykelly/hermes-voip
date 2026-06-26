@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from hermes_voip._header_list import split_header_list
 from hermes_voip.digest import (
     DigestChallenge,
     DigestCredentials,
@@ -44,31 +45,11 @@ def _split_contacts(header_value: str) -> list[str]:
     """Split a Contact header into its individual bindings (RFC 3261 §10.3).
 
     A REGISTER 200 OK may carry several bindings either as repeated ``Contact``
-    headers or comma-separated within one header value. Commas inside a
-    name-addr's ``<...>`` or a quoted display-name are NOT separators, so the
-    split tracks angle-bracket and double-quote depth and only breaks on a
-    top-level comma.
+    headers or comma-separated within one header value. Delegates to the shared
+    :func:`~hermes_voip._header_list.split_header_list`, which breaks only on a
+    top-level comma (one outside a name-addr's ``<...>`` or a quoted display-name).
     """
-    bindings: list[str] = []
-    current: list[str] = []
-    in_angle = False
-    in_quote = False
-    for char in header_value:
-        if char == '"' and not in_angle:
-            in_quote = not in_quote
-        elif char == "<" and not in_quote:
-            in_angle = True
-        elif char == ">" and not in_quote:
-            in_angle = False
-        elif char == "," and not in_angle and not in_quote:
-            bindings.append("".join(current))
-            current = []
-            continue
-        current.append(char)
-    tail = "".join(current).strip()
-    if tail:
-        bindings.append(tail)
-    return [b.strip() for b in bindings if b.strip()]
+    return split_header_list(header_value)
 
 
 def _binding_uri(binding: str) -> str:

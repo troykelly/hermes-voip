@@ -96,9 +96,15 @@ class RtpPacket:
         Skips any CSRC list and the RFC 3550 §5.3.1 extension header (if the X
         bit is set), and strips padding, so ``payload`` is the media bytes only.
 
+        When the padding (P) bit is set, RFC 3550 §5.1 puts the pad count in the
+        last payload octet and counts that octet itself, so a valid count is
+        ``1..len(payload)``. A count of zero, a count exceeding the payload, or
+        the P bit with no payload at all is malformed and raises — consistent
+        with every other parse path, never a silent leak of the bogus byte.
+
         Raises:
-            ValueError: If the data is too short for its declared fields or the
-                RTP version is not 2.
+            ValueError: If the data is too short for its declared fields, the
+                RTP version is not 2, or the padding is malformed.
         """
         if len(data) < _HEADER_LEN:
             msg = f"RTP packet too short: {len(data)} bytes"
@@ -122,10 +128,18 @@ class RtpPacket:
                 msg = "RTP packet too short for its extension data"
                 raise ValueError(msg)
         payload = data[offset:]
-        if byte0 & _PADDING_BIT and payload:
+        if byte0 & _PADDING_BIT:
+            if not payload:
+                msg = "RTP padding bit set but no payload to hold a pad count"
+                raise ValueError(msg)
             pad = payload[-1]
-            if 0 < pad <= len(payload):
-                payload = payload[:-pad]
+            if not 0 < pad <= len(payload):
+                msg = (
+                    f"malformed RTP padding: count {pad} not in 1..{len(payload)} "
+                    "(the count octet counts itself, RFC 3550 §5.1)"
+                )
+                raise ValueError(msg)
+            payload = payload[:-pad]
         return cls(
             payload_type=byte1 & _MAX_PAYLOAD_TYPE,
             sequence_number=seq,
@@ -187,9 +201,20 @@ class JitterBuffer:
         """Create the buffer.
 
         Args:
-            target_depth: Declare loss once this many later packets have piled
-                up behind a gap. When ``adapt`` is on this is the FLOOR (minimum)
-                reorder tolerance the adaptive depth never drops below.
+            target_depth: Declare loss once this many packets are buffered behind
+                a gap. The count is TOTAL buffered occupancy, not the contiguous
+                run sitting immediately behind the gap: a single far-future
+                cluster (still within ``max_ahead``) is enough to reach the depth
+                and declare the immediate gap :class:`Lost`, even when nothing
+                contiguous sits right behind it. This total-occupancy rule is
+                what guarantees forward progress past a permanent gap — a
+                buffered cluster always drains rather than stalling the playout —
+                at the cost of declaring a near gap lost eagerly when an isolated
+                far cluster is present. Gating loss on the contiguous backlog
+                instead is the larger jitter-buffer API redesign (a separate
+                backlog item), not done here. When ``adapt`` is on this is the
+                FLOOR (minimum) reorder tolerance the adaptive depth never drops
+                below.
             max_ahead: Playout window — packets more than this many sequence
                 numbers ahead of the next expected one are dropped, bounding
                 storage even under a permanent gap or a source resync.
@@ -316,6 +341,9 @@ class JitterBuffer:
                     self._depth -= 1
                     self._clean_run = 0
             return packet
+        # Total buffered occupancy (NOT the contiguous backlog behind the gap)
+        # gates loss; see ``target_depth`` for why — it guarantees the buffer
+        # drains past a permanent gap instead of stalling.
         if len(self._packets) >= self._depth:
             self._emitted = True
             self._next = _seq_next(expected)

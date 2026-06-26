@@ -15,6 +15,11 @@ on:
   # on every trigger including this one.  (AGENTS.md rule 35, ADR-0062.)
   schedule:
     - cron: "7 6 * * *"
+  # Ad-hoc manual trigger — enables the GitHub Actions UI "Run workflow" button
+  # (Actions → supply-chain → Run workflow).  Useful for on-demand CVE re-scans
+  # during an incident without pushing a change to a path-filtered file.
+  # Documented in docs/runbooks/0003-supply-chain-audit.md.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

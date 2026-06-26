@@ -10,6 +10,13 @@ it, and a behaviourally-identical stdlib double-checked-lock fallback when it do
 not. Both paths build the value at most once under a concurrent first-call stampede
 and expose a ``reset()`` for test isolation.
 
+The runtime helper exists in the wild in two shapes (issue #201), and the shim
+accepts both — falling back to the stdlib path for anything matching neither:
+
+* a *handle* object exposing ``get()`` + ``reset()`` (the documented shape); and
+* a *callable accessor* exposing ``reset()`` but NO ``get()`` — you **call** the
+  accessor to obtain the value.
+
 The single, narrow surface the rest of the plugin uses is :class:`LazySingleton`:
 ``.get()`` returns the value (building it on first call), ``.reset()`` drops it so
 the next ``.get()`` rebuilds.
@@ -42,12 +49,56 @@ class _RuntimeLazySingleton(Protocol):
 
 
 @runtime_checkable
-class _LazySingletonFactory(Protocol):
-    """The ``lazy_singleton(factory)`` callable surface (narrow, only our use)."""
+class _RuntimeCallableAccessor(Protocol):
+    """The callable-accessor runtime shape (issue #201): ``__call__`` + ``reset``.
 
-    def __call__(self, factory: Callable[[], object]) -> _RuntimeLazySingleton:
-        """Build a runtime lazy-singleton handle around ``factory``."""
+    Some Hermes runtimes expose ``lazy_singleton(factory)`` as an object you **call**
+    to obtain the build-once value, with a ``reset()`` for test isolation but no
+    ``get()`` method. We consume only those two members, so this narrow Protocol is the
+    full surface — no ``Any`` crosses the boundary.
+    """
+
+    def __call__(self) -> object:
+        """Return the singleton value, constructing it on first call."""
         ...
+
+    def reset(self) -> None:
+        """Drop the cached value so the next call rebuilds it."""
+        ...
+
+
+@runtime_checkable
+class _LazySingletonFactory(Protocol):
+    """The ``lazy_singleton(factory)`` callable surface (narrow, only our use).
+
+    The return is typed ``object`` because the runtime helper yields one of two
+    distinct shapes (handle vs callable accessor); :meth:`LazySingleton._adapt_runtime`
+    narrows it by runtime shape detection.
+    """
+
+    def __call__(self, factory: Callable[[], object]) -> object:
+        """Build a runtime lazy-singleton handle/accessor around ``factory``."""
+        ...
+
+
+class _CallableAccessorHandle:
+    """Adapt a callable-accessor runtime (issue #201) to a ``get()``/``reset()`` handle.
+
+    Wraps a :class:`_RuntimeCallableAccessor` so :class:`LazySingleton` drives a single
+    uniform handle surface regardless of which runtime shape was returned. ``get()``
+    calls the accessor (its build-once coordination); ``reset()`` delegates through.
+    """
+
+    def __init__(self, accessor: _RuntimeCallableAccessor) -> None:
+        self._accessor = accessor
+
+    def get(self) -> object:
+        """Drive the accessor's build-once coordination."""
+        return self._accessor()
+
+    def reset(self) -> None:
+        """Drop the accessor's cached value so the next :meth:`get` rebuilds it."""
+        self._accessor.reset()
 
 
 class LazySingleton[T]:
@@ -102,8 +153,37 @@ class LazySingleton[T]:
             self._value = built
             return built
 
-        self._runtime = factory(_build)
+        self._runtime = self._adapt_runtime(factory(_build))
         return self._runtime
+
+    @staticmethod
+    def _adapt_runtime(runtime: object) -> _RuntimeLazySingleton | None:
+        """Normalise a runtime helper return into a ``get()``/``reset()`` handle.
+
+        The Hermes runtime helper returns one of two shapes (issue #201):
+
+        * a *handle* exposing ``get()`` + ``reset()`` — used directly; or
+        * a *callable accessor* exposing ``reset()`` but no ``get()`` — wrapped in
+          :class:`_CallableAccessorHandle` so the rest of the shim drives one uniform
+          surface.
+
+        Anything matching neither (no usable build-once driver) returns ``None``, so
+        :class:`LazySingleton` falls back to its stdlib double-checked-lock path rather
+        than crashing on an unexpected runtime shape. ``reset`` is required either way —
+        without it test isolation would silently break, so its absence selects fallback.
+        """
+        # Prefer the documented handle shape: a usable ``get()`` (+ ``reset()``) wins.
+        # ``isinstance`` against the ``@runtime_checkable`` Protocols both detects the
+        # shape at runtime AND narrows the static type, so no escape-hatch cast is
+        # needed. A handle that ALSO happens to be callable is still driven via its
+        # ``get()`` (the documented contract), so the order of these checks matters.
+        if isinstance(runtime, _RuntimeLazySingleton):
+            return runtime
+        # Otherwise accept the callable-accessor shape (callable + ``reset()``).
+        if isinstance(runtime, _RuntimeCallableAccessor):
+            return _CallableAccessorHandle(runtime)
+        # Unrecognised shape — fall back to the stdlib singleton rather than crash.
+        return None
 
     def get(self) -> T:
         """Return the singleton value, constructing it at most once.

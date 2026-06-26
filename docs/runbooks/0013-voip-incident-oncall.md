@@ -493,21 +493,43 @@ grep -E "CallLoop started|Turn ended|hung|deadlock|stuck" /path/to/hermes/log | 
 - **Each turn says `Turn ended: reason=timeout` or `error`** but the next turn starts anyway →
   the loop is active and recovering (expected; the agent is resilient).
 
-### 3. Graceful shutdown (available in future; current = hard kill)
+### 3. Graceful shutdown (BYE-drain via the host's `disconnect()` path — ADR-0059)
+
+The plugin's `disconnect()` performs a graceful BYE-drain. It is a **library/plugin**, not a
+standalone service (AGENTS rule 40) — it installs **no `SIGTERM` handler of its own**. The
+**Hermes host runtime** invokes `disconnect()` on its shutdown / `aclose()` path (ADR-0059
+calls this "the `aclose()`/SIGTERM path"); a typical host wires its `SIGTERM` to that
+shutdown, so `kill -TERM <host-PID>` reaches `disconnect()` **only if the host is wired that
+way**. When `disconnect()` runs, it:
+
+1. **Stops accepting new INVITEs** — a racing inbound INVITE gets a `503 Service Unavailable`.
+2. **Drains active calls** — sends a SIP BYE to every live call concurrently (up to
+   `HERMES_SIP_SHUTDOWN_DRAIN_SECS`, default 5 s).
+3. **Closes cleanly** — deregisters the extension (sends `Expires: 0`) and closes the transport.
+
+**Recommended shutdown:**
 
 ```bash
-# Today: hard kill (drops live calls until graceful shutdown ships).
-kill -9 <PID>
-# Wait 30 s, then restart.
+# Use the host runtime's graceful stop (its SIGTERM path, if wired, calls disconnect()).
+kill -TERM <PID>
+# VERIFY the drain actually ran — look for this exact log line:
+#   "graceful shutdown: draining N live call(s) with BYE (timeout 5.0s)"
+# If that line does NOT appear, the host did NOT trigger disconnect() (unwired SIGTERM):
+# live calls were NOT drained — treat it as a hard kill and escalate.
+# Otherwise the process exits once the drain completes or times out (max 5 s + grace).
 ```
 
-The plugin does not currently implement graceful shutdown (closing active calls cleanly,
-rejecting new INVITEs). This is in the backlog. A hard kill:
-- Immediately terminates the process and all active call loops.
-- Each call's caller hears a `CANCELLED` or the gateway emits a `487 Request Terminated`
-  (depending on call state).
-- New INVITEs arriving ~30 s after the process dies are rejected by the gateway (REGISTER
-  expires).
+**If the process does not exit within ~10 seconds after SIGTERM:**
+
+```bash
+# Use hard kill as a fallback only; graceful drain has already tried.
+kill -9 <PID>
+# Wait 5 s, then restart.
+```
+
+A hard kill (without SIGTERM drain first) immediately terminates the process and drops all
+live calls into dangling dialogs. Always use `kill -TERM` first so connected callers get a
+clean in-dialog BYE.
 
 ---
 

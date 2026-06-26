@@ -80,6 +80,32 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
+
+# ASCII C0 control-char boundary: ord < _C0_LIMIT means a control character
+# (CR=0x0D, LF=0x0A, NUL=0x00, …). http.client raises bare ValueError for these
+# in header names/values, bypassing the typed exception chain.
+_C0_LIMIT = 0x20
+
+
+def _reject_control_chars(value: str, label: str) -> None:
+    r"""Raise ConfigError if ``value`` contains any ASCII C0 control character.
+
+    C0 controls (U+0000-U+001F) include CR (\r), LF (\n), NUL (\x00), and other
+    bytes that cause HTTP header-injection or are rejected by ``http.client`` with a
+    bare ``ValueError`` that bypasses the ``(HTTPError, URLError, TimeoutError,
+    OSError)`` catch in ``_fire_webhook_blocking``.  Reject at load so the error is
+    deterministic and the contract (WebhookError from ``fire_webhook_opening()``)
+    holds.
+    """
+    for ch in value:
+        if ord(ch) < _C0_LIMIT:
+            msg = (
+                f"{label} must not contain ASCII control characters "
+                f"(found {ch!r} - rejecting to prevent HTTP header injection)"
+            )
+            raise ConfigError(msg)
+
+
 #: The env key naming the JSON config file (opt-in; a gitignored path — the document
 #: holds caller-IDs + possibly secrets, so the PATH is in env and the FILE is
 #: gitignored, never a tracked file).
@@ -408,7 +434,14 @@ def _parse_webhook_opening(name: str, raw_opening: Mapping[str, object]) -> Open
 
 
 def _parse_headers(name: str, raw: object) -> Mapping[str, str]:
-    """Validate the optional ``headers`` object (a string→string map)."""
+    """Validate the optional ``headers`` object (a string→string map).
+
+    Rejects any header name or value that contains an ASCII C0 control character
+    (CR, LF, NUL, …). ``http.client`` raises a bare ``ValueError`` for such values
+    at request-send time; that ``ValueError`` bypasses the existing except chain in
+    ``_fire_webhook_blocking`` and violates the ``WebhookError`` contract. Reject at
+    load so the failure is deterministic.
+    """
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -424,6 +457,15 @@ def _parse_headers(name: str, raw: object) -> Mapping[str, str]:
                 "be a string value"
             )
             raise ConfigError(msg)
+        # Reject control chars in both name and value.
+        _reject_control_chars(
+            str(key),
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} header name {key!r}",
+        )
+        _reject_control_chars(
+            value,
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} header {key!r} value",
+        )
         headers[str(key)] = value
     return headers
 
@@ -470,7 +512,9 @@ async def fire_webhook_opening(opening: Opening) -> None:
     secrets); only the opening name + HTTP status / failure class are.
 
     Raises:
-        WebhookError: on a network error or a non-2xx HTTP response.
+        WebhookError: on a network error, a non-2xx HTTP response, or an
+            invalid-value error (e.g. a control char in a header that bypasses
+            the load-time rejection).
         ValueError: if ``opening`` is not a WEBHOOK opening (a programming error).
     """
     import asyncio  # noqa: PLC0415 — local import keeps the module import-light
@@ -478,7 +522,17 @@ async def fire_webhook_opening(opening: Opening) -> None:
     if opening.type is not OpeningType.WEBHOOK:
         msg = f"fire_webhook_opening called for a non-webhook opening {opening.name!r}"
         raise ValueError(msg)
-    await asyncio.to_thread(_fire_webhook_blocking, opening)
+    try:
+        await asyncio.to_thread(_fire_webhook_blocking, opening)
+    except WebhookError:
+        raise
+    except ValueError as exc:
+        # Defense-in-depth: http.client raises ValueError for invalid header names
+        # or values (e.g. HTTP header injection via a control char that slips past
+        # load-time validation). Wrap so the documented WebhookError contract holds
+        # from the caller's perspective.
+        msg = f"webhook opening {opening.name!r} request failed: invalid value ({exc})"
+        raise WebhookError(msg) from exc
 
 
 def _fire_webhook_blocking(opening: Opening) -> None:
@@ -509,6 +563,14 @@ def _fire_webhook_blocking(opening: Opening) -> None:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # Network failure: report the reason class, never the url/headers/body.
         msg = f"webhook opening {opening.name!r} request failed: {type(exc).__name__}"
+        raise WebhookError(msg) from exc
+    except ValueError as exc:
+        # Defense-in-depth: http.client raises ValueError for invalid header names
+        # or values (e.g. HTTP header injection via a control char). This bypasses
+        # the except chain above; wrap it so the documented WebhookError contract
+        # always holds, even if a bad value reaches the network call despite the
+        # load-time rejection.
+        msg = f"webhook opening {opening.name!r} request failed: invalid value ({exc})"
         raise WebhookError(msg) from exc
     if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
         msg = f"webhook opening {opening.name!r} returned HTTP {status}"

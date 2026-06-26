@@ -46,6 +46,31 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
+
+# ASCII C0 control-char boundary: ord < _C0_LIMIT means a control character
+# (CR=0x0D, LF=0x0A, NUL=0x00, …). urllib/http.client raises bare ValueError
+# for these in header values, bypassing the typed exception chain.
+_C0_LIMIT = 0x20
+
+
+def _reject_control_chars(value: str, label: str) -> None:
+    r"""Raise ConfigError if ``value`` contains any ASCII C0 control character.
+
+    C0 controls (U+0000-U+001F) include CR (\r), LF (\n), NUL (\x00), and other
+    bytes that cause HTTP header-injection or are rejected by ``http.client`` with a
+    bare ``ValueError`` that bypasses the ``(HTTPError, URLError, TimeoutError,
+    OSError)`` catch in ``_open_blocking``.  Reject at load so the error is
+    deterministic and the contract (IntercomRelayError from ``open()``) holds.
+    """
+    for ch in value:
+        if ord(ch) < _C0_LIMIT:
+            msg = (
+                f"{label} must not contain ASCII control characters "
+                f"(found {ch!r} - rejecting to prevent HTTP header injection)"
+            )
+            raise ConfigError(msg)
+
+
 # Env keys (PII-safe: the relay token is a secret, read from env/1Password only).
 _OPEN_MODE_KEY = "HERMES_VOIP_INTERCOM_OPEN_MODE"
 _DTMF_KEY = "HERMES_VOIP_INTERCOM_DTMF"
@@ -124,9 +149,21 @@ class IntercomRelayClient:
         """Call the relay to open the entry; raise on failure (never silent).
 
         Raises:
-            IntercomRelayError: On a network error or a non-2xx HTTP response.
+            IntercomRelayError: On a network error, a non-2xx HTTP response, or
+                an invalid-value error (e.g. a control char in a header that
+                bypasses the load-time rejection).
         """
-        await asyncio.to_thread(self._open_blocking)
+        try:
+            await asyncio.to_thread(self._open_blocking)
+        except IntercomRelayError:
+            raise
+        except ValueError as exc:
+            # Defense-in-depth: urllib/http.client raises ValueError for invalid
+            # header values (e.g. HTTP header injection via a control char that
+            # slips past load-time validation). Wrap so the documented
+            # IntercomRelayError contract holds from the caller's perspective.
+            msg = f"intercom relay request failed: invalid value ({exc})"
+            raise IntercomRelayError(msg) from exc
 
     def _open_blocking(self) -> None:
         """The blocking relay request (run in a worker thread)."""
@@ -154,6 +191,14 @@ class IntercomRelayClient:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             # Network failure: report the reason class, never the URL/token.
             msg = f"intercom relay request failed: {type(exc).__name__}"
+            raise IntercomRelayError(msg) from exc
+        except ValueError as exc:
+            # Defense-in-depth: urllib/http.client raises ValueError for invalid
+            # header values (e.g. HTTP header injection via a control char). This
+            # bypasses the except chain above; wrap it so the documented
+            # IntercomRelayError contract always holds, even if a bad value reaches
+            # the network call despite the load-time rejection.
+            msg = f"intercom relay request failed: invalid value ({exc})"
             raise IntercomRelayError(msg) from exc
         if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
             msg = f"intercom relay returned HTTP {status}"
@@ -243,6 +288,12 @@ def _load_relay_config(env: Mapping[str, str]) -> IntercomConfig:
         )
         raise ConfigError(msg)
     token = (env.get(_RELAY_TOKEN_KEY) or "").strip()
+    # Reject control chars (CR, LF, NUL, and other C0 controls) in the bearer token:
+    # an embedded CRLF causes urllib to raise a bare ValueError (HTTP header injection)
+    # that bypasses the existing except chain in _open_blocking, violating the
+    # IntercomRelayError contract. Reject at load so the failure is deterministic.
+    if token:
+        _reject_control_chars(token, _RELAY_TOKEN_KEY)
     if not token:
         # Physical-access actuation with NO bearer token: the relay is unauthenticated
         # unless the endpoint enforces auth another way (mTLS / IP allowlist / a secret

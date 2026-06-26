@@ -22,18 +22,19 @@ none of the ADR's decided surface exists.
 
 | ADR | Title (short) | Status | Evidence in merged code | What's missing (one line) |
 |-----|---------------|--------|--------------------------|----------------------------|
-| **0002** | VoIP `kind:platform` plugin owning the in-process media plane | **not-started** | Only adjacent sans-IO building blocks (`registration.py`, `message.py`, `digest.py`, `sip.py`). **No** `register(ctx)`, **no** `[project.entry-points."hermes_agent.plugins"]`, **no** `plugin.yaml`, **no** `VoipAdapter(BasePlatformAdapter)`. | The entire plugin entry point + adapter + call→session mapping. |
+| **0002** | VoIP `kind:platform` plugin owning the in-process media plane | **built** | `plugin.py:register(ctx)` (line 289) wired to `ctx.register_platform`; `plugin.yaml` shipped; `adapter.py:VoipAdapter(BasePlatformAdapter)` (line 833); `media/vad.py` (VAD + endpoint timer); `call.py`, `manager.py`, `tools.py` all shipped and wired; `hermes_surface.py` typed shim; `pytest-asyncio` async runner in place. | Live measurement on target (rule 26); the de-risking spike (P2.1) still gates on-target latency numbers. |
 | **0003** | Cascaded STT → Hermes → TTS (reject fused S2S) | **partial** | The one code artifact it directly demands — streaming, cancellable `StreamingASR`/`StreamingTTS` Protocols over `PcmFrame` — is built (`providers/asr.py`, `providers/tts.py`, `providers/audio.py`) and conformance-tested. | The cascade orchestration, the text agent boundary, concrete providers, the latency mitigations as measured behaviour. |
 | **0004** | Typed async provider interfaces (the seam, not the vendor) | **built** | `providers/{audio,asr,tts,guard,policy,transport,registry}.py` + `media/audio.py`; mypy-strict clean (10 files), 29 tests green; conformance proves fakes satisfy all five Protocols statically + at runtime. | Concrete provider factories; the Hermes batch-hook adapter + `plugin.yaml`; a live call-loop consumer. |
 | **0005** | In-process media/transport (aiortc-behind-SIPS leading, audioop-lts) | **partial** | `audioop-lts==0.2.2` pinned; `media/audio.py` (G.711 + stateful `Resampler`); `rtp.py` (pack/parse + reordering `JitterBuffer` + `Lost` signal); `sdp.py` (parse/build/negotiate, `a=crypto` detect); sans-IO `registration.py` (REGISTER only). | The concrete `MediaTransport` engine; transport-lib choice (aiortc/pjsua2); the de-risking spike; TLS signalling I/O; SRTP/DTLS/ICE keying; Opus; PLC; `NarrowbandCodec`. |
 | **0006** | Streaming STT (sherpa-onnx default + Deepgram Flux fallback) | **partial** | `StreamingASR`/`Transcript` seam, `PcmFrame`, the `audioop-lts` G.711+resample glue (incl. the continuity test), and the generic `ProviderRegistry`. | Both recognizer implementations, env selection, the model-licence gate, the media-plane wiring, the on-target WER/latency measurement. |
 | **0007** | Streaming TTS (sherpa-onnx + Kokoro default; cloud fallbacks) | **partial** | `StreamingTTS`/`TtsStream` (sync factory; `flush()`/`cancel()`), `PcmFrame`, generic `Resampler`+G.711 encode, generic registry, structural conformance. | Every concrete provider (default + cloud), sentence segmentation, env selection, the model-licence gate, the TDD streaming/flush/cancel behaviour tests. |
-| **0008** | VAD + endpointing (silero-vad, Phase 1 accepted; full-duplex deferred) | **not-started** | **Nothing** of Phase 1 (no `media/vad.py`, no `VoiceActivityDetector`/`SpeechEdge`/`VadEvent`, env vars unread, silero-vad not a dep). Only the substrate `PcmFrame` + the `TtsStream.cancel()`/`Transcript.end_of_turn` seams the ADR reserves. | The VAD detector + endpoint timer + half-duplex gate (Phase 1); Phase 2 (full-duplex/AEC) explicitly deferred. |
+| **0008** | VAD + endpointing (silero-vad, Phase 1 accepted; full-duplex deferred) | **built** | `media/vad.py` shipped (`VoiceActivityDetector`, `SpeechEdge`, `VadEvent`, onset/offset state machine, configurable silence timer); `media/endpoint.py` wires the endpointing logic; silero-vad is a pinned dep. Phase 2 (full-duplex/AEC) is explicitly deferred by the ADR. | Phase 2 full-duplex/AEC (out of scope per ADR). |
 | **0009** | In-process offline prompt-injection guard + enforceable tool-policy gate | **partial** | The **load-bearing enforceable control is built and tested**: `providers/policy.py` (`ToolRisk`, `GuardSessionState`, `gate_tool_call` with `assert_never`; degraded blocks IRREVERSIBLE even when confirmed) + the canonical `InjectionGuard`/`GuardResult`/`GuardVerdict` seam (`providers/guard.py`). | The actual detector (DeBERTa-ONNX), normalize/decode pipeline, grading + stateful risk, fail-open wiring, the model artifact + licence gate, the seam-level classifier-miss test, the eval harness, the sidecar. |
 | **0010** | DTMF (RFC 4733 primary, SIP INFO fallback, in-band last resort) | **partial** | The RFC 4733 codec slice is built: `dtmf.py` (`DtmfEvent.encode/decode`, digit↔event map, `event_payloads` per-press train, `DtmfReceiver` dedup) + `sdp.py` telephone-event parse/negotiate. | The mode-negotiation helper, the `DtmfDetector`/`DtmfDigit` seam, SIP-INFO + in-band backends, `send_dtmf` tool, controller routing, env config, RTP wiring, the `dtmf/` package layout. |
 
-**One-sentence read:** ADR-0004 is fully built; ADRs 0003/0005/0006/0007/0009/0010 have their
-**seam/foundation** merged but not their behaviour; ADRs 0002 and 0008(Phase 1) are not started.
+**One-sentence read:** ADRs 0002 and 0004 are fully built; ADR-0008 Phase 1 is built (Phase 2
+explicitly deferred); ADRs 0003/0005/0006/0007/0009/0010 have their **seam/foundation** merged
+but not their full behaviour (concrete providers, live transport, on-target measurement).
 
 ---
 
@@ -250,23 +251,15 @@ here and is gated on operator cost approval + an ADR flip to Accepted + a runboo
 
 ## 5. Smallest next shippable step ("get back to shipping")
 
-**Ship P0.1 + P0.3 as the first lane: the Hermes typed-surface shim with its reflection contract
-test, and the async test runner.**
+**P0.1 and P0.3 are shipped.** `hermes_surface.py`, `tests/test_hermes_contract.py`,
+`pytest-asyncio` (pinned, `asyncio_mode="auto"`), and `hermes-agent==0.16.0` as an optional dep
+group all landed in an earlier PR. The full P0 phase is complete.
 
-Why this first:
-- It is **unblocked** — no model download, no gateway, no credential. `hermes-agent==0.16.0` and its
-  exact consumed surface are already verified.
-- It **removes the single highest-leverage unknown** (how we satisfy `mypy --strict` against an
-  untyped third-party runtime) and produces the typed boundary that *every* later adapter/loop unit
-  (P3.x) compiles against.
-- It is **small, red-first, and end-to-end**: the shim is fully wired; `tests/test_hermes_contract.py`
-  uses `importorskip` so it asserts real-package conformance when Hermes is installed and skips
-  cleanly otherwise — a genuine, non-stub deliverable that lands green in one push.
-- Pairing P0.3 (the async runner) in the same lane unblocks behavioural testing of the entire async
-  provider seam, which is otherwise untestable today.
+**The current unblocked frontier is P1 (concrete providers) and P2.1 (the de-risking spike).**
+P1 items (VAD, guard detector, STT, TTS, provider registry) are parallelisable and credential-free.
+P2.1 is gated on a reachable gateway (the SIPS endpoint with existing digest creds is the leading
+path — see §4). P3 (the Hermes adapter + call loop) depends on P1 + P2.1.
 
-Concretely, the first PR delivers: `src/hermes_voip/hermes_surface.py`,
-`tests/test_hermes_contract.py`, `pytest-asyncio` (pinned, `asyncio_mode="auto"`, `uv.lock`
-regenerated), the conformance suite converted to await its async members, and `hermes-agent==0.16.0`
-added as an optional dependency group. Immediately after, P0.2 (bridge + model manifest + licence
-gate) and the P1 providers can fan out in parallel while P2.1's spike credential is sorted.
+The next highest-leverage unblocked lane is **P1.2 (injection guard detector, ADR-0009)** or
+**P1.3 (sherpa-onnx StreamingASR, ADR-0006)** — both are credential-free and unblock the
+call-loop integration.

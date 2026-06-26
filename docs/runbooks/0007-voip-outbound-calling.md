@@ -139,6 +139,64 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
    receives `[Outbound call to '<number>' ended (…): <summary>]`. Dialling an **un-approved**
    number returns an error to the agent and sends no INVITE.
 
+## Aborting a ringing outbound call (CANCEL — ADR-0069, RFC 3261 §9.1)
+
+A ringing outbound call (INVITE sent, no 2xx yet) can be cancelled in two ways: an explicit
+agent tool call (`abort_call`) or an automatic ring-timeout. Both paths send a SIP CANCEL to
+the gateway, which causes the far end to return a `487 Request Terminated` to the INVITE; the
+caller then receives `OutboundCallCancelled`.
+
+### Explicit abort via `abort_call`
+
+`VoipAdapter.abort_call(call_id, reason)` (adapter.py line 2387) looks up the pending INVITE
+by Call-ID, marks it `cancel_requested`, and calls `transport.send_cancel(call_id)` on the TLS
+connection (transport/connection.py line 418). The `reason` string is logged but not sent to the
+peer.
+
+Log lines to watch:
+
+```
+abort_call: CANCEL sent for ringing call <call-id> (<reason>)
+```
+
+If the call has already answered or finished (no ringing entry found):
+
+```
+abort_call: no ringing outbound call <call-id> — no-op
+```
+
+If `abort_call` is called twice concurrently on the same call:
+
+```
+abort_call: <call-id> already cancelling — no-op
+```
+
+### Automatic ring-timeout
+
+When `place_call` is invoked with `ring_timeout_secs` set, `VoipAdapter._ring_timeout`
+(adapter.py line 2443) fires after the specified interval and calls `abort_call` internally with
+`reason="ring timeout"`.
+
+Log line emitted by the timeout path before it calls `abort_call`:
+
+```
+outbound <call-id>: ring timeout (<N.1>s) — cancelling the unanswered call
+```
+
+This is then followed by the normal `abort_call` log line above.
+
+The ring-timeout task is armed at INVITE send time and disarmed the instant a 2xx arrives, so a
+call that answers just before the timer fires produces only the disarm (no CANCEL).
+
+### WSS (WebRTC) transport — ring-timeout not supported
+
+`ring_timeout_secs` is **not supported on a WSS gateway** (`HERMES_SIP_TRANSPORT=wss`). The WSS
+transport's `send_cancel` (transport/ws_connection.py line 316) is a no-op that returns `False`
+because the WebRTC origination path has no RFC 3261 client-transaction registry to build a §9.1
+CANCEL from. Passing `ring_timeout_secs` on a WSS gateway raises `NotImplementedError` immediately
+at `place_call` (adapter.py line 1634), before any INVITE is sent. Do not set `ring_timeout_secs`
+on a WSS transport; use application-level timeout logic instead.
+
 ## Transport: how the dial goes out (ADR-0049)
 
 `place_call` picks the outbound media/signalling shape from the gateway transport

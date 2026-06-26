@@ -12,12 +12,11 @@ addresses.
   `dialog.py`, `incall.py` (hold/unhold + inbound classify + 491), `refer.py` (REFER/Replaces/
   NOTIFY-sipfrag build+parse), the `RegistrationFlow.call_id` property. These mirror the
   existing foundation and need no transport, model, or credential.
-- **Blocked on the live transport (P2/P3):** PR7–PR9 — `manager.py` (IO: N flows + shared
-  transport + demux), `call.py` (IO: the `CallSession` orchestrator), `tools.py` wired into
-  the real `register(ctx)`. These need ADR-0005's concrete `SipTransport`/`MediaTransport`
-  and (for `tools.py`) the Hermes adapter. The same external blocker as the rest of P3 — the
-  path-B WebRTC credential / a live call — gates end-to-end verification, **not** the
-  unit-level logic, which is testable against fakes throughout.
+- **Shipped (PR7–PR9):** `manager.py` (`RegistrationManager`, N flows, shared transport, demux),
+  `call.py` (`CallSession` orchestrator), and `tools.py` (hold/resume/transfer/dtmf/list tools
+  wired into `register(ctx)`) are all merged and wired. The "blocked on live transport" caveat
+  from the original plan no longer applies — all three modules shipped alongside the concrete
+  `SipTransport`/`MediaTransport` and the Hermes adapter.
 
 ## Phased PRs
 
@@ -29,9 +28,9 @@ addresses.
 | **PR4** | `incall.py` | `build_hold_reinvite(sendonly/sendrecv)`, `handle_reinvite_response` → `HoldConfirmed|ReinviteChallenged(401/407)|ReinviteRejected(491…)`, `classify_inbound_reinvite` (answer mirrored direction; `c=0.0.0.0`/`sendonly`/`inactive` → held; glare → 491). | hold/unhold offer SDP (`a=sendonly`/`a=sendrecv` + o= version bump), inbound-hold classify, 491 glare, digest re-auth on challenge. |
 | **PR5** | `refer.py` | `build_blind_refer`, `build_attended_refer` (Replaces-into-Refer-To), `parse_refer`, `build_triggered_invite`, `match_replaces` (RFC 3891 tag orientation), `build_notify_sipfrag` + tiny status-line sipfrag parser, `norefersub` handling. | blind vs attended REFER shape, Replaces escape/parse round-trip, Replaces match (481/603/486 cases), sipfrag 1xx/2xx/≥300 classification. |
 | **PR6** | `registration.py` | +1: read-only `call_id` property for manager demux. | property returns the flow's stable Call-ID. |
-| **PR7 [live]** | `manager.py` | `RegistrationManager`: owns N flows, shared-per-registrar transport, per-flow refresh timers, `on_response`/`on_request` demux (Call-ID for responses; Request-URI user-part for INVITEs; dialog key for in-dialog). | demux routing (**invariant 2**: response→right flow, INVITE→right registration by user-part), at-least-one-up `connect`. Logic testable with a fake `SipTransport`. |
-| **PR8 [live]** | `call.py` | `CallSession`: owns `Dialog`+`MediaTransport`+`GuardSessionState`; `hold/unhold/transfer_blind/transfer_attended`; inbound re-INVITE/REFER/NOTIFY handling; glare serialisation; MOH/jitter-pause on hold. | the verb orchestration against a fake transport + the sans-IO modules; attended = hold + consult + Replaces REFER. |
-| **PR9 [live]** | `tools.py` + adapter wiring | Register `hold_call`/`resume_call`/`transfer_blind`/`transfer_attended`/`list_registrations` with `ToolRisk`; `pre_tool_call` → `gate_tool_call`; confirmation sourced from the per-call `DtmfReceiver`. | **invariant 3**: `IRREVERSIBLE` transfer blocked unconfirmed / while `degraded`, even when the guard returned `ALLOW` (the ADR-0009 classifier-miss test). |
+| **PR7 [shipped]** | `manager.py` | `RegistrationManager`: owns N flows, shared-per-registrar transport, per-flow refresh timers, `on_response`/`on_request` demux (Call-ID for responses; Request-URI user-part for INVITEs; dialog key for in-dialog). | demux routing (**invariant 2**: response→right flow, INVITE→right registration by user-part), at-least-one-up `connect`. Logic testable with a fake `SipTransport`. |
+| **PR8 [shipped]** | `call.py` | `CallSession`: owns `Dialog`+`MediaTransport`+`GuardSessionState`; `hold/unhold/transfer_blind/transfer_attended`; inbound re-INVITE/REFER/NOTIFY handling; glare serialisation; MOH/jitter-pause on hold. | the verb orchestration against a fake transport + the sans-IO modules; attended = hold + consult + Replaces REFER. |
+| **PR9 [shipped]** | `tools.py` + adapter wiring | Register `hold_call`/`resume_call`/`transfer_blind`/`transfer_attended`/`list_registrations` with `ToolRisk`; `pre_tool_call` → `gate_tool_call`; confirmation sourced from the per-call `DtmfReceiver`. | **invariant 3**: `IRREVERSIBLE` transfer blocked unconfirmed / while `degraded`, even when the guard returned `ALLOW` (the ADR-0009 classifier-miss test). |
 
 ## Sequencing vs the main plan
 

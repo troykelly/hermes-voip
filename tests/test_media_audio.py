@@ -60,13 +60,20 @@ def test_resampler_8k_to_16k_roughly_doubles_samples() -> None:
     pcm = _pcm16(*([1000, -1000] * 80))  # 160 samples @ 8 kHz = 20 ms
     out = Resampler(8000, 16000).resample(pcm)
     out_samples = len(out) // 2
-    assert 300 <= out_samples <= 340  # ~2x 160, allowing for filter edge
+    # audioop.ratecv 8k->16k of 160 samples yields 319; allow ±4 for edge rounding
+    assert 315 <= out_samples <= 323, (
+        f"8k->16k: expected ~319 output samples, got {out_samples}"
+    )
 
 
 def test_resampler_16k_to_8k_roughly_halves_samples() -> None:
     pcm = _pcm16(*([500] * 320))  # 320 samples @ 16 kHz = 20 ms
     out = Resampler(16000, 8000).resample(pcm)
-    assert 140 <= len(out) // 2 <= 180  # ~0.5x 320
+    out_samples = len(out) // 2
+    # audioop.ratecv 16k->8k of 320 samples yields 160; allow ±4 for edge rounding
+    assert 156 <= out_samples <= 164, (
+        f"16k->8k: expected ~160 output samples, got {out_samples}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,11 +134,25 @@ def test_linear_fade_out_preserves_byte_length() -> None:
     assert len(linear_fade_out(pcm, fade_samples=20)) == len(pcm)
 
 
-@pytest.mark.parametrize(("from_rate", "to_rate"), [(8000, 16000), (16000, 8000)])
+@pytest.mark.parametrize(
+    ("from_rate", "to_rate"),
+    [
+        (8000, 16000),
+        (16000, 8000),
+        # Non-integer-ratio TTS paths (ADR-0004/0005): boundary clicks appear when
+        # sub-sample phase is discarded between frames; the stateful Resampler must
+        # carry the phase forward so streaming == single-pass.
+        (24000, 8000),  # integer-ratio (3:1) 24kHz TTS -> 8kHz wire
+        (16000, 24000),  # non-integer-ratio (2:3) 16kHz -> 24kHz TTS output
+        (24000, 16000),  # non-integer-ratio (3:2) 24kHz -> 16kHz ASR input
+    ],
+)
 def test_resampler_state_continuity_matches_single_pass(
     from_rate: int, to_rate: int
 ) -> None:
-    # both directions: streaming repeated 20 ms chunks must equal a single pass
+    # Streaming repeated 20ms chunks must produce identical output to one-shot
+    # conversion — proves the Resampler carries sub-sample phase across frame
+    # boundaries, eliminating click artefacts at every supported rate pair.
     chunk = _pcm16(*range(-160, 160))  # 320 samples
     streamed = Resampler(from_rate, to_rate)
     streamed_out = b"".join(streamed.resample(chunk) for _ in range(4))
@@ -253,3 +274,104 @@ def test_resampler_rejects_non_integer_and_bool_rates(
     """
     with pytest.raises(ValueError, match="integer"):
         Resampler(from_rate, to_rate)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# decode_ulaw / decode_alaw — empty-input behaviour (no validation on decode)
+# ---------------------------------------------------------------------------
+
+
+def test_decode_ulaw_empty_input_returns_empty() -> None:
+    """decode_ulaw(b"") returns b"" — empty payload produces empty PCM frame.
+
+    Deliberate design: unlike encode_ulaw/encode_alaw (which validate alignment),
+    decode_ulaw and decode_alaw do NOT validate input length. An empty G.711
+    payload from the wire (e.g. comfort noise, keep-alive) silently decodes to
+    an empty PCM buffer, leaving jitter-buffer or silence-concealment logic in
+    the transport/call-loop layer to handle the zero-duration frame. Validation
+    at decode time would require the decoder to know the framing semantics (ptime,
+    packet expectations) — those live higher up. This test pins the no-validation
+    behaviour so a future "helpful" validation cannot silently break the RX path.
+    """
+    assert decode_ulaw(b"") == b""
+
+
+def test_decode_alaw_empty_input_returns_empty() -> None:
+    """decode_alaw(b"") returns b"" — same deliberate no-validation-on-decode policy.
+
+    See test_decode_ulaw_empty_input_returns_empty for the rationale: length
+    validation belongs in the transport/jitter layer, not the codec layer.
+    """
+    assert decode_alaw(b"") == b""
+
+
+def test_decode_ulaw_single_byte_returns_two_bytes() -> None:
+    """A single mu-law byte decodes to exactly 2 PCM16 bytes (one sample)."""
+    result = decode_ulaw(b"\xff")
+    assert len(result) == 2  # one sample = 2 bytes of PCM16-LE
+
+
+def test_decode_alaw_single_byte_returns_two_bytes() -> None:
+    """A single a-law byte decodes to exactly 2 PCM16 bytes (one sample)."""
+    result = decode_alaw(b"\xff")
+    assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# a-law round-trip near-lossless value assertion
+# ---------------------------------------------------------------------------
+
+
+def test_alaw_round_trip_is_near_lossless_for_midrange() -> None:
+    """G.711 a-law encode + decode preserves sample values within quantisation error.
+
+    G.711 a-law is ~12-bit accurate (same as mu-law); this test pins the actual
+    reconstructed values so a codec swap (lin2ulaw <-> lin2alaw) or sign-flip
+    cannot survive mutation. The tolerance mirrors the mu-law test: each restored
+    sample must be within max(64, |original| / 16) of the original.
+    """
+    pcm = _pcm16(0, 2000, -2000, 8000, -8000, 100, -100)
+    back = _samples(decode_alaw(encode_alaw(pcm)))
+    for original, restored in zip(_samples(pcm), back, strict=True):
+        tol = max(64, abs(original) // 16)
+        assert abs(original - restored) <= tol, (
+            f"a-law round-trip: {original} -> {restored}, "
+            f"diff={abs(original - restored)} > tol={tol}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# encode_ulaw vs encode_alaw discrimination
+# ---------------------------------------------------------------------------
+
+
+def test_encode_ulaw_differs_from_encode_alaw() -> None:
+    """mu-law and a-law produce distinct wire bytes for a non-trivial signal.
+
+    Guards a copy-paste or argument-order swap between lin2ulaw and lin2alaw
+    at the encode path. The tests for one-byte-per-sample only checked lengths;
+    this test checks the actual encoded byte values differ, catching a codec
+    substitution that preserves the length contract but swaps the algorithm.
+    """
+    pcm = _pcm16(1000, -1000, 8000, -8000, 16000)
+    assert encode_ulaw(pcm) != encode_alaw(pcm)
+
+
+# ---------------------------------------------------------------------------
+# Resampler — 24kHz sample-count sanity (TTS paths per ADR-0004/0005)
+# ---------------------------------------------------------------------------
+
+
+def test_resampler_24k_to_8k_sample_count() -> None:
+    """24kHz -> 8kHz (3:1 integer ratio) produces ~1/3 the input samples.
+
+    The TTS-to-wire path resamples 24kHz synthesis output to the 8kHz G.711
+    wire rate. A 480-sample (20ms @ 24kHz) input must yield ~160 samples
+    (20ms @ 8kHz). audioop.ratecv yields exactly 160; allow ±4 for edge.
+    """
+    pcm = _pcm16(*([1000, -1000] * 240))  # 480 samples @ 24 kHz = 20 ms
+    out = Resampler(24000, 8000).resample(pcm)
+    out_samples = len(out) // 2
+    assert 156 <= out_samples <= 164, (
+        f"24k->8k: expected ~160 output samples (1/3 of 480), got {out_samples}"
+    )

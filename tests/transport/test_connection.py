@@ -877,6 +877,163 @@ def _final(invite: SipRequest, status: int, reason: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# A malformed message is skipped, NOT a connection-tearing event (bk646)
+# --------------------------------------------------------------------------
+
+
+def _malformed_but_framable() -> str:
+    """A message that FRAMES cleanly (valid Content-Length head) but fails parse.
+
+    The framer delimits it by ``Content-Length: 0`` and yields it as one complete
+    message, but its first line is neither a SIP request-line nor a status-line, so
+    :meth:`SipRequest.parse` raises ``ValueError``. This is a *post-framing* parse
+    failure (bk646): the stream is still synchronised, so only this one message is
+    dropped — the connection and its other calls survive.
+    """
+    return (
+        "GARBAGE-NOT-A-SIP-START-LINE\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.5:5061;branch=z9hG4bKbad;rport\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_malformed_message_is_skipped_connection_survives_next_dispatches() -> (
+    None
+):
+    # bk646: a single malformed (but framable) message must NOT tear the connection
+    # down. The framer delimited it cleanly, so the stream is still synchronised — the
+    # one bad message is skipped (surfaced via a WARNING, never swallowed silently) and
+    # a SUBSEQUENT well-formed message on the SAME connection is still dispatched. A
+    # bare parse() in _dispatch used to propagate out of the reader and fire
+    # on_connection_lost, dropping ALL active calls because one peer sent one bad frame.
+    new_calls: list[NewCall] = []
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_connection_lost=on_lost,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        # The peer sends ONE malformed message, then a well-formed INVITE.
+        await server.push(_malformed_but_framable())
+        await server.push(_inbound_invite(to_user="1000"))
+        # The well-formed INVITE that FOLLOWED the bad message must still be dispatched.
+        await _until(lambda: len(new_calls) == 1)
+        assert new_calls[0].invite.method == "INVITE"
+        # The reader must NOT have ended: on_connection_lost stays unfired. Give a
+        # short grace so a (buggy) teardown would have had time to surface.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(lost_called.wait(), timeout=0.25)
+        assert lost == [], "a malformed message must not fire on_connection_lost"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_active_call_survives_a_malformed_message_on_the_connection() -> None:
+    # bk646 (the DoS angle): an ESTABLISHED call's response routing must survive a
+    # malformed message arriving on the shared connection. A response sink is
+    # registered for an active Call-ID; the peer interleaves a malformed message and
+    # then a well-formed response for that call. The bad message is skipped and the
+    # call's own response is still delivered to its sink — one malformed frame is not a
+    # DoS against unrelated, already-active calls.
+    sink = _RecordingSink()
+    call_id = new_call_id()
+    branch = new_branch()
+    lost: list[BaseException | None] = []
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    await transport.connect()
+    transport.add_call(call_id, sink)
+    try:
+        invite_text = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite_text)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        # A malformed message arrives on the connection, then the call's own 200 OK.
+        await server.push(_malformed_but_framable())
+        await server.push(_final_2xx_with_contact(SipRequest.parse(invite_text)))
+        # The active call's response is still routed to its sink despite the bad frame.
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in sink.responses))
+        assert lost == [], "the active call's connection must survive a bad message"
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_framing_corruption_still_tears_down_the_reader() -> None:
+    # bk646 boundary: only a POST-FRAMING parse failure is skipped. A genuine FRAMING
+    # corruption (a complete head with NO Content-Length — the stream can no longer be
+    # delimited) is unrecoverable and MUST still end the reader and fire
+    # on_connection_lost (the pre-existing, correct behaviour preserved). The framer
+    # raises FramingError from the read loop's iteration, which propagates — the
+    # _dispatch parse fail-safe must NOT swallow it.
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    await transport.connect()
+    try:
+        # A complete head with no Content-Length: the framer cannot delimit the stream.
+        await server.push(
+            "INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+            "Via: SIP/2.0/TLS 203.0.113.5:5061;branch=z9hG4bKnocl;rport\r\n\r\n"
+        )
+        await asyncio.wait_for(lost_called.wait(), timeout=3.0)
+        assert len(lost) == 1
+        assert lost[0] is not None, "a framing corruption must surface as a real error"
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+# --------------------------------------------------------------------------
 # local_sent_by / contact_uri reflect the live socket
 # --------------------------------------------------------------------------
 

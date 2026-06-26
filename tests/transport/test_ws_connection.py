@@ -48,6 +48,8 @@ except ImportError:
 
 pytestmark = pytest.mark.asyncio
 
+_OK_STATUS = 200  # a 2xx final response
+
 # ---------------------------------------------------------------------------
 # Helper: poll until a predicate holds
 # ---------------------------------------------------------------------------
@@ -647,6 +649,115 @@ async def test_empty_keepalive_frame_is_ignored() -> None:
         assert "200 OK" in response_frame
     finally:
         await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+def _malformed_but_nonempty_frame() -> str:
+    """A non-empty text frame that is not a valid SIP message (fails parse).
+
+    It is not whitespace-only (so it is not treated as a CRLF keepalive) but its
+    first line is neither a request-line nor a status-line, so
+    :meth:`SipRequest.parse` raises ``ValueError``. Over WSS each frame is one whole
+    message (RFC 7118 §5), so this is a per-message parse failure (bk646): it must be
+    skipped (surfaced via a WARNING) without ending the reader and dropping the
+    registration + every active call on the connection.
+    """
+    return (
+        "GARBAGE-NOT-A-SIP-START-LINE\r\n"
+        "Via: SIP/2.0/WSS gw.pbx.example.test;branch=z9hG4bKbad;rport\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_malformed_frame_is_skipped_connection_survives_next_frames() -> None:
+    # bk646: a single malformed WS frame must NOT tear the connection down. The bad
+    # frame is skipped (surfaced via a WARNING, never swallowed silently) and a
+    # SUBSEQUENT well-formed frame on the SAME connection is still dispatched — proven
+    # by a following OPTIONS still being answered 200 OK (the registration, and thus
+    # every active call, survives). A bare parse() in _dispatch used to raise out of
+    # the reader, ending it and firing on_connection_lost (dropping all active calls).
+    lost: list[BaseException | None] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    gateway = _gateway()
+    manager = RegistrationManager(gateway, transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        # The gateway sends ONE malformed frame, then a normal OPTIONS.
+        await server.push(_malformed_but_nonempty_frame())
+        await server.push(_inbound_options(to_user="1000"))
+        # If the bad frame crashed the reader, the OPTIONS 200 OK never arrives.
+        response_frame = await server.wait_for_received(
+            lambda f: f.startswith("SIP/2.0 200 "), timeout=3.0
+        )
+        assert "200 OK" in response_frame
+        assert lost == [], "a malformed frame must not fire on_connection_lost"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_malformed_response_frame_is_skipped_active_call_survives() -> None:
+    # bk646 (the DoS angle, WSS): an established call's response routing must survive a
+    # malformed frame on the shared WS connection. A response sink is registered for an
+    # active Call-ID; the peer interleaves a malformed frame and then a well-formed
+    # response for that call. The bad frame is skipped and the call's own response is
+    # still delivered to its sink — one malformed frame is not a DoS against unrelated,
+    # already-active calls.
+    call_id = new_call_id()
+    branch = new_branch()
+    responses: list[SipResponse] = []
+    lost: list[BaseException | None] = []
+
+    class _Sink:
+        async def on_response(self, response: SipResponse) -> None:
+            responses.append(response)
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    try:
+        await transport.connect()
+        transport.add_call(call_id, _Sink())
+        # A well-formed in-dialog 200 OK (e.g. to a re-INVITE) for the active call.
+        ok = (
+            "SIP/2.0 200 OK\r\n"
+            f"Via: SIP/2.0/WSS {transport.local_sent_by};branch={branch};rport\r\n"
+            "From: <sip:1000@pbx.example.test>;tag=local\r\n"
+            "To: <sip:2000@pbx.example.test>;tag=remote\r\n"
+            f"Call-ID: {call_id}\r\n"
+            "CSeq: 2 INVITE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        await server.push(_malformed_but_nonempty_frame())
+        await server.push(ok)
+        await _until(lambda: len(responses) == 1, timeout=3.0)
+        assert responses[0].status_code == _OK_STATUS  # the call's own 200 OK
+        assert lost == [], "the active call's connection must survive a bad frame"
+    finally:
         await transport.aclose()
         await server.stop()
 

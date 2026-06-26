@@ -366,7 +366,9 @@ def _set_origin(
 
     # Attribute assignment on a fresh ModuleType — the gate does ``from
     # gateway.session_context import get_session_env``, so the name must resolve.
-    module.get_session_env = _get_session_env  # type: ignore[attr-defined]  # fake module has no stub
+    # ``setattr`` (not ``module.x = ...``) keeps this mypy-strict clean without an
+    # escape hatch: a ModuleType exposes no static stub for an injected attribute.
+    setattr(module, "get_session_env", _get_session_env)  # noqa: B010
     monkeypatch.setitem(sys.modules, "gateway", ModuleType("gateway"))
     monkeypatch.setitem(sys.modules, "gateway.session_context", module)
 
@@ -391,6 +393,30 @@ def test_voip_tools_gate_proactive_place_call(
     # No originating session context at all => still blocked (nothing to match).
     _set_origin(monkeypatch, None, None)
     verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_voip_tools_gate_proactive_blocked_when_live_call_in_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching origin does NOT unblock when a live Call-ID is in scope.
+
+    ``state is None`` covers TWO cases: (a) no live call at all (true proactive —
+    the only case the relaxation is for), and (b) a live/claimed Call-ID IS in
+    scope but ``guard_state_for`` MISSED (the unknown/spoofed inbound-call fail-safe
+    path, which MUST stay level 0). The proactive relaxation must require case (a)
+    only: with a Call-ID present and its guard state missing, a configured origin
+    must NOT grant level 3 — otherwise the inbound fail-safe is weakened.
+    """
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
+    host = _FakeHost(guard=None)  # adapter present, guard_state_for() misses
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "some-live-call-id")  # a Call-ID IS in scope
+    _set_origin(monkeypatch, "telegram", "123")  # and the origin matches
+
+    verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
+
     assert verdict is not None
     assert verdict["action"] == "block"
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
@@ -483,3 +484,95 @@ def test_header_name_with_c1_control_rejected_at_load(tmp_path: Path) -> None:
     path = _write(tmp_path, doc)
     with pytest.raises(ConfigError, match="control"):
         load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+
+
+# --- the secret must not leak via the EXCEPTION CHAIN (traceback), not just str ---
+
+
+def test_webhook_error_traceback_does_not_leak_secret_via_cause() -> None:
+    """The full traceback of the wrapped WebhookError must NOT contain the token.
+
+    ``str(WebhookError)`` is already secret-free, but chaining the original
+    ValueError as ``__cause__`` (``raise ... from exc``) means a printed traceback /
+    ``logging.exception`` re-exposes the token (the cause ValueError's text is
+    ``Invalid header value b'Bearer <token>...'``). The fix suppresses the cause
+    (``raise ... from None``). This drives the REAL http.client path so the genuine
+    secret-bearing ValueError is produced as the (now-suppressed) cause.
+    """
+    secret = "SECRET-fake-bearer-token-0000"  # obvious fake
+    # An opening carrying a CRLF-injected header value directly (as if it slipped
+    # past load-time validation), so the REAL http.client raises the secret-bearing
+    # ValueError inside _fire_webhook_blocking.
+    opening = Opening(
+        name="gate",
+        type=OpeningType.WEBHOOK,
+        url=_FAKE_WEBHOOK_URL,
+        headers={"Authorization": f"Bearer {secret}\r\nX-Evil: 1"},
+    )
+
+    with pytest.raises(WebhookError) as excinfo:
+        asyncio.run(fire_webhook_opening(opening))
+
+    err = excinfo.value
+    formatted = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    assert secret not in formatted, (
+        "the bearer token leaked into the wrapped WebhookError's traceback via the "
+        "exception cause chain"
+    )
+    assert secret not in str(err)
+
+
+# --- the control-char ConfigError must report only the code point, not the raw name -
+
+
+def test_header_name_control_error_does_not_echo_raw_name(tmp_path: Path) -> None:
+    """The header-NAME control-char ConfigError reports only the code point.
+
+    The header name is operator config that may itself be sensitive; the spec
+    requires the rejection message to carry ONLY the offending code point (U+XXXX)
+    and a generic location, never the raw header name.
+    """
+    raw_name = "X-SECRET-fake-bearer-token-0000"  # obvious fake, stands in for a name
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {f"{raw_name}\r\nEvil": "value"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control") as excinfo:
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+    assert raw_name not in str(excinfo.value), (
+        "the control-char ConfigError echoed the raw header NAME"
+    )
+
+
+def test_header_value_control_error_does_not_echo_raw_name(tmp_path: Path) -> None:
+    """The header-VALUE control-char ConfigError does not echo the raw header name."""
+    raw_name = "X-SECRET-fake-bearer-token-0000"  # obvious fake
+    doc = {
+        "intercoms": {
+            "1000": {
+                "openings": {
+                    "gate": {
+                        "type": "webhook",
+                        "url": _FAKE_WEBHOOK_URL,
+                        "headers": {raw_name: "Bearer tok\r\nen"},
+                    }
+                }
+            }
+        }
+    }
+    path = _write(tmp_path, doc)
+    with pytest.raises(ConfigError, match="control") as excinfo:
+        load_multi_intercom_config(_env(HERMES_VOIP_INTERCOM_CONFIG_FILE=path))
+    assert raw_name not in str(excinfo.value), (
+        "the control-char ConfigError echoed the raw header NAME"
+    )

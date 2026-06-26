@@ -15,6 +15,7 @@ silent door opening). PUBLIC repo: fakes only (``relay.example.test``).
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Mapping
 from unittest.mock import patch
 
@@ -314,3 +315,41 @@ def test_relay_token_with_c1_control_rejected_at_load() -> None:
                 HERMES_VOIP_INTERCOM_RELAY_TOKEN="tok\x85en",
             )
         )
+
+
+# --- the secret must not leak via the EXCEPTION CHAIN (traceback), not just str ---
+
+
+def test_relay_error_traceback_does_not_leak_secret_via_cause() -> None:
+    """The full traceback of the wrapped error must NOT contain the bearer token.
+
+    ``str(IntercomRelayError)`` is already secret-free, but chaining the original
+    ValueError as ``__cause__`` (``raise ... from exc``) means a printed traceback /
+    ``logging.exception`` / ``exc_info=True`` re-exposes the token, because the cause
+    ValueError's text is ``Invalid header value b'Bearer <token>...'``. The fix
+    suppresses the cause (``raise ... from None``) while still propagating the typed
+    error. This drives the REAL http.client path so the genuine secret-bearing
+    ValueError is produced as the (now-suppressed) cause.
+    """
+    secret = "SECRET-fake-bearer-token-0000"  # obvious fake
+    # Construct a config carrying a CRLF-injected token directly (as if a bad value
+    # slipped past load-time validation), so the REAL urllib/http.client raises the
+    # secret-bearing ValueError inside _open_blocking.
+    cfg = IntercomConfig(
+        open_mode=IntercomOpenMode.RELAY,
+        relay_url=_FAKE_RELAY_URL,
+        relay_token=f"{secret}\r\nX-Evil: 1",
+    )
+    client = IntercomRelayClient(cfg)
+
+    with pytest.raises(IntercomRelayError) as excinfo:
+        asyncio.run(client.open())
+
+    err = excinfo.value
+    formatted = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    assert secret not in formatted, (
+        "the bearer token leaked into the wrapped error's traceback via the "
+        "exception cause chain"
+    )
+    # The message itself stays clean too.
+    assert secret not in str(err)

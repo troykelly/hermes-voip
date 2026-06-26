@@ -469,14 +469,17 @@ def _parse_headers(name: str, raw: object) -> Mapping[str, str]:
                 "be a string value"
             )
             raise ConfigError(msg)
-        # Reject control chars in both name and value.
+        # Reject control chars in both the name and the value. The label carries
+        # ONLY a generic location (the non-secret opening name) — never the raw
+        # header name {key!r}, which is operator config that may itself be
+        # sensitive; the helper appends only the offending code point (U+XXXX).
         _reject_control_chars(
             str(key),
-            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} header name {key!r}",
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} a header name",
         )
         _reject_control_chars(
             value,
-            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} header {key!r} value",
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} a header value",
         )
         headers[str(key)] = value
     return headers
@@ -538,16 +541,18 @@ async def fire_webhook_opening(opening: Opening) -> None:
         await asyncio.to_thread(_fire_webhook_blocking, opening)
     except WebhookError:
         raise
-    except ValueError as exc:
+    except ValueError:
         # Defense-in-depth: http.client raises ValueError for invalid header names
         # or values (e.g. HTTP header injection via a control char that slips past
         # load-time validation). The ValueError's text embeds the OFFENDING HEADER
         # VALUE — which may be an "Authorization: Bearer <token>" header — so it MUST
-        # NOT be interpolated into the message (it would leak the token into
-        # logs/callers). Use a fixed message (the opening NAME is non-secret); the
-        # original is chained via `from exc` so the cause survives in the traceback.
+        # NOT reach a caller/log. Use a fixed message (the opening NAME is
+        # non-secret) AND suppress the cause (`from None`): chaining it as __cause__
+        # would re-expose the token in any printed traceback / logging.exception.
+        # The typed WebhookError still propagates; only the secret-bearing cause is
+        # dropped.
         msg = f"webhook opening {opening.name!r} request failed: invalid request value"
-        raise WebhookError(msg) from exc
+        raise WebhookError(msg) from None
 
 
 def _fire_webhook_blocking(opening: Opening) -> None:
@@ -579,17 +584,19 @@ def _fire_webhook_blocking(opening: Opening) -> None:
         # Network failure: report the reason class, never the url/headers/body.
         msg = f"webhook opening {opening.name!r} request failed: {type(exc).__name__}"
         raise WebhookError(msg) from exc
-    except ValueError as exc:
+    except ValueError:
         # Defense-in-depth: http.client raises ValueError for invalid header names
         # or values (e.g. HTTP header injection via a control char). This bypasses
         # the except chain above; wrap it so the documented WebhookError contract
         # always holds, even if a bad value reaches the network call despite the
         # load-time rejection. The ValueError's text embeds the OFFENDING HEADER
         # VALUE (which may be an "Authorization: Bearer <token>" header), so it MUST
-        # NOT be interpolated — that would leak the token. Use a fixed message (the
-        # opening NAME is non-secret); the cause is preserved via `from exc`.
+        # NOT be interpolated AND its cause MUST be suppressed (`from None`):
+        # chaining it as __cause__ would re-expose the token in any printed
+        # traceback / logging.exception. The typed error still propagates (the
+        # opening NAME is non-secret); only the secret-bearing cause is dropped.
         msg = f"webhook opening {opening.name!r} request failed: invalid request value"
-        raise WebhookError(msg) from exc
+        raise WebhookError(msg) from None
     if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
         msg = f"webhook opening {opening.name!r} returned HTTP {status}"
         raise WebhookError(msg)

@@ -170,16 +170,18 @@ class IntercomRelayClient:
             await asyncio.to_thread(self._open_blocking)
         except IntercomRelayError:
             raise
-        except ValueError as exc:
+        except ValueError:
             # Defense-in-depth: urllib/http.client raises ValueError for invalid
             # header values (e.g. HTTP header injection via a control char that
             # slips past load-time validation). The ValueError's text embeds the
             # OFFENDING HEADER VALUE — for the relay path that is "Bearer <token>",
-            # so it MUST NOT be interpolated into the message (it would leak the
-            # bearer token into logs/callers). Use a fixed message; the original is
-            # chained via `from exc` so the cause survives in the traceback only.
+            # so it MUST NOT reach a caller/log. Use a fixed message AND suppress
+            # the cause (`from None`): chaining it as __cause__ would re-expose the
+            # token in any printed traceback / logging.exception / exc_info=True.
+            # Propagation is preserved (a typed IntercomRelayError still raises);
+            # only the secret-bearing cause is dropped.
             msg = "intercom relay request failed: invalid request value"
-            raise IntercomRelayError(msg) from exc
+            raise IntercomRelayError(msg) from None
 
     def _open_blocking(self) -> None:
         """The blocking relay request (run in a worker thread)."""
@@ -208,17 +210,19 @@ class IntercomRelayClient:
             # Network failure: report the reason class, never the URL/token.
             msg = f"intercom relay request failed: {type(exc).__name__}"
             raise IntercomRelayError(msg) from exc
-        except ValueError as exc:
+        except ValueError:
             # Defense-in-depth: urllib/http.client raises ValueError for invalid
             # header values (e.g. HTTP header injection via a control char). This
             # bypasses the except chain above; wrap it so the documented
             # IntercomRelayError contract always holds, even if a bad value reaches
             # the network call despite the load-time rejection. The ValueError's
             # text embeds the OFFENDING HEADER VALUE (the "Bearer <token>" header),
-            # so it MUST NOT be interpolated — that would leak the token. Use a
-            # fixed message; the cause is preserved via `from exc` for the traceback.
+            # so it MUST NOT be interpolated AND its cause MUST be suppressed
+            # (`from None`) — chaining it as __cause__ would re-expose the token in
+            # any printed traceback / logging.exception. The typed error still
+            # propagates; only the secret-bearing cause is dropped.
             msg = "intercom relay request failed: invalid request value"
-            raise IntercomRelayError(msg) from exc
+            raise IntercomRelayError(msg) from None
         if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
             msg = f"intercom relay returned HTTP {status}"
             raise IntercomRelayError(msg)

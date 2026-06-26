@@ -791,12 +791,17 @@ def _proactive_place_call_allowed(tool_name: str) -> bool:
     allowed = os.environ.get(_PROACTIVE_CALL_FROM_ENV, "")
     if not allowed:
         return False  # opt-in unset => fully fail-safe (the default)
+    # FAIL CLOSED: this is a privilege-gate decision, so ANY failure to resolve the
+    # originating session (runtime absent, context unavailable/misconfigured) denies
+    # — it must never raise out of the gate (which could bypass denial handling or
+    # break unrelated tool calls) nor grant on an unresolved origin.
     try:
         from gateway.session_context import get_session_env  # noqa: PLC0415
-    except ImportError:
+
+        platform = get_session_env(_SESSION_PLATFORM_ENV)
+        chat_id = get_session_env(_SESSION_CHAT_ID_ENV)
+    except Exception:  # noqa: BLE001 — deliberate fail-closed security boundary
         return False
-    platform = get_session_env(_SESSION_PLATFORM_ENV)
-    chat_id = get_session_env(_SESSION_CHAT_ID_ENV)
     if not platform or not chat_id:
         return False
     needle = f"{platform}:{chat_id}"
@@ -1348,12 +1353,17 @@ def voip_pre_tool_call(
         # in scope, so an unknown/spoofed context can never reach a privileged tool.
         # The ONLY relaxation (issue #202): a PROACTIVE place_call from a configured
         # operator origin (HERMES_VOIP_PROACTIVE_CALL_FROM) resolves operator level 3
-        # — opt-in and place_call-only. The inbound fail-safe is untouched (a live
-        # call resolves its real privilege above), and the static
+        # — opt-in and place_call-only. It applies ONLY when there is genuinely NO
+        # live call in scope (``call_id is None``). When a Call-ID IS present but its
+        # guard state is missing (an unknown/spoofed live-call context), the inbound
+        # fail-safe is preserved unconditionally — the proactive origin is NOT
+        # consulted, so this branch can never weaken it. The static
         # HERMES_VOIP_OUTBOUND_ALLOW allowlist (ADR-0029) still gates the dial target
         # at the chokepoint regardless.
-        privilege = 3 if _proactive_place_call_allowed(tool_name) else 0
-        state = GuardSessionState(call_id=call_id or "", privilege_level=privilege)
+        proactive = call_id is None and _proactive_place_call_allowed(tool_name)
+        state = GuardSessionState(
+            call_id=call_id or "", privilege_level=3 if proactive else 0
+        )
     # ``confirmed`` is a fixed per-tool property, never a model input. The two
     # IRREVERSIBLE tools (``place_call``, ``transfer_blind``) are gated WITH
     # confirmation satisfied so ``gate_tool_call`` applies the level-3 + non-degraded

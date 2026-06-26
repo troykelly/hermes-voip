@@ -94,6 +94,10 @@ _PUBLISHED_RE = re.compile(
     r"\bpublished\s*:\s*[\"']?(?P<port>\d+)[\"']?", re.IGNORECASE
 )
 _TARGET_RE = re.compile(r"\btarget\s*:\s*[\"']?5432[\"']?", re.IGNORECASE)
+# A bare Compose ports list entry of just 5432 (e.g. ``- "5432"`` / ``- 5432``)
+# publishes the container port on an ephemeral host port — still a public publish.
+_BARE_PORT_RE = re.compile(r"^\s*-\s*[\"']?5432[\"']?\s*$")
+_PORTS_KEY_RE = re.compile(r"(?:^|[\s{,])ports\s*:", re.IGNORECASE)
 _POSTGRES_PORT = 5432
 _NUMERIC_5432_RE = re.compile(r"(?<!\d)5432(?!\d)")
 _COMPOSE_FILE_RE = re.compile(r"(?:^|/)(?:docker-)?compose[^/]*\.ya?ml$", re.IGNORECASE)
@@ -230,15 +234,10 @@ def _scan_public_ports(
 ) -> Iterator[Violation]:
     if _is_devcontainer_json(relative_path):
         yield from _scan_devcontainer_forwarded_ports(relative_path, lines)
-    for line_number, line in _numbered(lines):
-        if _line_publishes_postgres(line) and _has_database_context(lines, line_number):
-            yield Violation(
-                "DB002",
-                relative_path,
-                line_number,
-                "do not publish PostgreSQL port 5432 from tracked config",
-            )
-        if _line_targets_postgres(line) and _has_database_context(lines, line_number):
+    for line_number in range(1, len(lines) + 1):
+        if _line_publishes_postgres_5432(lines, line_number) and _has_database_context(
+            lines, line_number
+        ):
             yield Violation(
                 "DB002",
                 relative_path,
@@ -291,16 +290,21 @@ def _forwarded_endpoint(line: str, match_start: int) -> str:
     return line[start:end]
 
 
-def _line_publishes_postgres(line: str) -> bool:
-    match = _SHORT_PORT_RE.search(line)
-    if match is None:
-        return False
-    published = int(match.group("published"))
-    return published != 0
-
-
-def _line_targets_postgres(line: str) -> bool:
-    return _TARGET_RE.search(line) is not None
+def _line_publishes_postgres_5432(lines: Sequence[str], line_number: int) -> bool:
+    line = lines[line_number - 1]
+    # ``HOST:5432`` short form — incl. ``0:5432`` (Docker allocates an ephemeral
+    # host port) and loopback binds (conservative: this repo ships no DB, so any
+    # tracked host-publish of 5432 must surface).
+    if _SHORT_PORT_RE.search(line) is not None:
+        return True
+    # Compose long-form target/published mapping onto container port 5432.
+    if _TARGET_RE.search(line) is not None:
+        return True
+    # Bare Compose ports entry (``- "5432"`` / ``- 5432``) publishes 5432 on an
+    # ephemeral host port; require a nearby ``ports:`` key to stay precise.
+    return bool(_BARE_PORT_RE.match(line)) and _has_nearby_match(
+        lines, line_number, _PORTS_KEY_RE, radius=20
+    )
 
 
 def _scan_postgres_defaults(

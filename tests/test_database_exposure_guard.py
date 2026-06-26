@@ -193,9 +193,6 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
         """
 {
   "forwardPorts": [
-    8080,
-    8443,
-    3000,
     5432
   ],
   "appPort": [
@@ -208,6 +205,51 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
     violations = scan_repository(tmp_path)
 
     assert _rule_ids(violations) == ["DB002", "DB002"]
+
+
+def test_rejects_devcontainer_forwarded_postgres_port_after_long_array(
+    tmp_path: Path,
+) -> None:
+    _write_file(
+        tmp_path,
+        ".devcontainer/devcontainer.json",
+        """
+{
+  "forwardPorts": [
+    8001,
+    8002,
+    8003,
+    8004,
+    8005,
+    8006,
+    8007,
+    8008,
+    8009,
+    8010,
+    8011,
+    8012,
+    8013,
+    8014,
+    8015,
+    8016,
+    8017,
+    8018,
+    8019,
+    8020,
+    8021,
+    8022,
+    8023,
+    8024,
+    8025,
+    5432
+  ]
+}
+""",
+    )
+
+    violations = scan_repository(tmp_path)
+
+    assert _rule_ids(violations) == ["DB002"]
 
 
 @pytest.mark.parametrize(

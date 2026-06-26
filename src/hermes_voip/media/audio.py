@@ -51,7 +51,22 @@ def encode_ulaw(pcm16: bytes) -> bytes:
 
 
 def decode_ulaw(ulaw: bytes) -> bytes:
-    """Decode G.711 mu-law to PCM16-LE mono (two bytes per sample)."""
+    """Decode G.711 mu-law to PCM16-LE mono (two bytes per sample).
+
+    **No length validation is performed on the input** — this is deliberate. Each
+    G.711 byte maps to exactly one PCM16 sample regardless of context, so any
+    byte sequence is a valid decode input. An empty payload (comfort-noise RTP,
+    keep-alive, truncated packet) decodes to an empty PCM buffer ``b""``. The
+    caller (jitter buffer, call-loop) owns the policy for how to handle a
+    zero-duration frame (silence concealment, discard, log). Validating here
+    would require the codec to know framing semantics (expected ptime, packet
+    count) that live in higher-level layers — the wrong abstraction level.
+
+    This asymmetry with :func:`encode_ulaw` (which validates alignment) is
+    intentional: encoding an odd-byte buffer is always a programming error because
+    PCM16 samples are two bytes; decoding a short or empty G.711 payload is a
+    normal wire event that must propagate upward, not be rejected in the codec.
+    """
     return audioop.ulaw2lin(ulaw, PCM16_BYTES_PER_SAMPLE)
 
 
@@ -62,7 +77,13 @@ def encode_alaw(pcm16: bytes) -> bytes:
 
 
 def decode_alaw(alaw: bytes) -> bytes:
-    """Decode G.711 a-law to PCM16-LE mono (two bytes per sample)."""
+    """Decode G.711 a-law to PCM16-LE mono (two bytes per sample).
+
+    No length validation is performed — same deliberate policy as
+    :func:`decode_ulaw`. An empty or short a-law payload decodes to an empty
+    or short PCM buffer; the transport/call-loop layer handles the
+    zero-duration frame.
+    """
     return audioop.alaw2lin(alaw, PCM16_BYTES_PER_SAMPLE)
 
 

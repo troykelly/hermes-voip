@@ -1,4 +1,4 @@
-# ADR-0075: Speak a safe-decline line on a guard REFUSE so a false-positived caller is not met with silence
+# ADR-0076: Speak a safe-decline line on a guard REFUSE so a false-positived caller is not met with silence
 
 - **Date:** 2026-06-26
 - **Status:** Accepted

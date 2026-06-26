@@ -182,7 +182,7 @@ _DEFAULT_GOODBYE: Final[bool] = True
 #: language-appropriate line).
 _DEFAULT_GOODBYE_PHRASE: Final[str] = "Goodbye."
 
-#: Default safe-decline phrase set (ADR-0075), spoken on a guard REFUSE so a
+#: Default safe-decline phrase set (ADR-0076), spoken on a guard REFUSE so a
 #: legitimate caller false-positived by the injection guard hears conversational
 #: feedback instead of pure dead air. The refused turn is NEVER forwarded to the agent
 #: — this line is the only response. Each phrase reads naturally on every TTS model (no
@@ -627,7 +627,7 @@ class CallLoop:
             naturally on every TTS model; multi-language selection follows the
             comfort-filler phrase mechanism.
         refuse_decline_phrases: The safe-decline phrase set spoken on a guard REFUSE
-            (ADR-0075), so a caller false-positived by the injection guard hears ONE
+            (ADR-0076), so a caller false-positived by the injection guard hears ONE
             short line instead of pure dead air. One is chosen at RANDOM per refusal,
             never repeating the immediately-previous phrase; each reads naturally on
             every TTS model and declines without confirming/coaching an injection. The
@@ -778,7 +778,7 @@ class CallLoop:
         # Spoken goodbye on the loop-initiated graceful end (ADR-0057).
         self._goodbye = goodbye
         self._goodbye_phrase = goodbye_phrase
-        # Safe-decline phrase set spoken on a guard REFUSE (ADR-0075), so a caller the
+        # Safe-decline phrase set spoken on a guard REFUSE (ADR-0076), so a caller the
         # injection guard false-positived is not met with silence. The refused turn is
         # never delivered; this line is the only response.
         self._refuse_decline_phrases = refuse_decline_phrases
@@ -1819,7 +1819,7 @@ class CallLoop:
         """Speak one short ``phrase`` through the normal TTS path; best-effort.
 
         Used for a no-input reprompt, the goodbye (ADR-0057), and the guard-REFUSE
-        safe-decline line (ADR-0075). Routes through :meth:`_speak_text` (sanitised,
+        safe-decline line (ADR-0076). Routes through :meth:`_speak_text` (sanitised,
         model-tag-aware, echo-gate-arming, flushable) — NOT :meth:`speak`, so it does
         not cancel the no-input watchdog task calling it (mirroring how the comfort
         filler calls ``_speak_text`` directly). A synthesis/send failure is logged and
@@ -2055,7 +2055,7 @@ class CallLoop:
         On a non-REFUSE verdict the dead-air comfort filler is armed (ADR-0030) and
         then the turn is handed to the agent. A REFUSE never reaches the agent, so no
         gap and no filler — but the caller still gets ONE short spoken safe-decline line
-        (ADR-0075) so a legitimate caller false-positived by the injection guard is not
+        (ADR-0076) so a legitimate caller false-positived by the injection guard is not
         met with pure dead air (it would otherwise repeat into the same wall, get
         no-input-reprompted, and eventually be hung up on). The refused turn is STILL
         never delivered to the agent — the decline line is the only response.
@@ -2074,7 +2074,7 @@ class CallLoop:
         if result.verdict is GuardVerdict.REFUSE:
             # The guard refused this turn: it is NEVER handed to the agent (and no
             # filler is armed — there is no agent gap to fill). But silence here strands
-            # a false-positived caller, so speak ONE short safe-decline line (ADR-0075)
+            # a false-positived caller, so speak ONE short safe-decline line (ADR-0076)
             # via the normal TTS path (sanitised, model-tag-aware, echo-gate-arming,
             # flushable, best-effort like the reprompt/goodbye). An empty phrase set
             # (operator-disabled) speaks nothing — the prior pure-silence behaviour.

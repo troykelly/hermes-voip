@@ -184,6 +184,23 @@ async def test_streams_recorded_pcm_as_8k_wire_rate_frames() -> None:
     assert len(body) % PCM16_BYTES_PER_SAMPLE == 0
 
 
+@pytest.mark.asyncio
+async def test_stream_realigns_odd_length_pcm_chunks_without_losing_bytes() -> None:
+    """Short HTTP reads may split a PCM16 sample across chunk boundaries."""
+    chunks = (
+        bytes(value % 256 for value in range(161)),
+        bytes(value % 256 for value in range(161, 320)),
+    )
+    http = _RecordedHttp(chunks=chunks)
+    tts = _make(http)
+
+    frames = await _drain(tts.synthesize(_text("Odd transport chunks. "), voice="x"))
+
+    assert frames
+    assert all(len(frame.samples) % PCM16_BYTES_PER_SAMPLE == 0 for frame in frames)
+    assert b"".join(frame.samples for frame in frames) == b"".join(chunks)
+
+
 # --- request shape (the wire contract) --------------------------------------
 
 

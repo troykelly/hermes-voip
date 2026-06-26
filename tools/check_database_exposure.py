@@ -216,13 +216,9 @@ def _scan_stale_devcontainer(
 def _scan_public_ports(
     relative_path: Path, lines: Sequence[str]
 ) -> Iterator[Violation]:
+    if _is_devcontainer_json(relative_path):
+        yield from _scan_devcontainer_forwarded_ports(relative_path, lines)
     for line_number, line in _numbered(lines):
-        if (
-            _is_devcontainer_json(relative_path)
-            and _nearby_forward_port_key(lines, line_number)
-            and _NUMERIC_5432_RE.search(line)
-        ):
-            yield from _forwarded_port_violations(relative_path, line_number, line)
         if _line_publishes_postgres(line) and _has_database_context(lines, line_number):
             yield Violation(
                 "DB002",
@@ -237,6 +233,19 @@ def _scan_public_ports(
                 line_number,
                 "do not publish PostgreSQL port 5432 from tracked config",
             )
+
+
+def _scan_devcontainer_forwarded_ports(
+    relative_path: Path, lines: Sequence[str]
+) -> Iterator[Violation]:
+    inside_forwarded_port_block = False
+    for line_number, line in _numbered(lines):
+        if _FORWARD_PORT_RE.search(line):
+            inside_forwarded_port_block = True
+        if inside_forwarded_port_block and _NUMERIC_5432_RE.search(line):
+            yield from _forwarded_port_violations(relative_path, line_number, line)
+        if inside_forwarded_port_block and "]" in line:
+            inside_forwarded_port_block = False
 
 
 def _is_devcontainer_json(relative_path: Path) -> bool:
@@ -280,10 +289,6 @@ def _line_publishes_postgres(line: str) -> bool:
 
 def _line_targets_postgres(line: str) -> bool:
     return _TARGET_RE.search(line) is not None
-
-
-def _nearby_forward_port_key(lines: Sequence[str], line_number: int) -> bool:
-    return _has_nearby_match(lines, line_number, _FORWARD_PORT_RE, radius=20)
 
 
 def _scan_postgres_defaults(

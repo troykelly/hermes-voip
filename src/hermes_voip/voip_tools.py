@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -208,6 +209,21 @@ class AttendedTransferOutcome(Enum):
 
 #: The Hermes ``chat_id`` (== SIP Call-ID) session-context variable name.
 _SESSION_CHAT_ID_ENV = "HERMES_SESSION_CHAT_ID"
+
+#: The originating session's PLATFORM session-context variable name (e.g.
+#: ``telegram``). Paired with ``_SESSION_CHAT_ID_ENV`` (the originating chat id is
+#: the SAME key the inbound path reads as the Call-ID — for a non-VoIP origin it is
+#: the platform's chat id, not a SIP Call-ID) to identify the operator origin a
+#: proactive ``place_call`` came from. Mirrors ``adapter._SESSION_PLATFORM_KEY``.
+_SESSION_PLATFORM_ENV = "HERMES_SESSION_PLATFORM"
+
+#: Opt-in env gate (issue #202): a comma-separated list of ``platform:chat_id``
+#: origins permitted to trigger a PROACTIVE ``place_call`` (one originating from a
+#: NON-VoIP session — e.g. a Telegram chat turn — where there is no live SIP call in
+#: scope). EMPTY / unset (the default) => the privilege gate stays fully fail-safe
+#: (level 0) in the no-live-call branch, i.e. byte-identical to the pre-#202
+#: behaviour. See :func:`_proactive_place_call_allowed`.
+_PROACTIVE_CALL_FROM_ENV = "HERMES_VOIP_PROACTIVE_CALL_FROM"
 
 #: The agent-facing tool name. ``hang_up`` (not ``end_call``) matches the verb the
 #: persona preambles name, so the model invokes the tool it is told about.
@@ -741,6 +757,57 @@ def _current_call_id() -> str | None:
     return value or None
 
 
+def _proactive_place_call_allowed(tool_name: str) -> bool:
+    """True iff this proactive (no-live-call) ``place_call`` is from a trusted origin.
+
+    The opt-in relaxation for issue #202: when the privilege gate has NO live SIP
+    call in scope (so it would otherwise fall back to a least-privilege level-0
+    state), permit ``place_call`` — and ONLY ``place_call`` — when the originating
+    ``(platform, chat_id)`` matches a ``HERMES_VOIP_PROACTIVE_CALL_FROM`` entry. This
+    lets the operator drive a proactive outbound call from a NON-VoIP session (e.g. a
+    Telegram chat: "call me with a brief"), which the design already anticipated —
+    ``adapter._capture_origin_session`` captures the same origin and
+    ``HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`` reports the outcome back to it.
+
+    Returns ``False`` unless ALL hold:
+
+    * the tool is EXACTLY ``place_call`` — ``transfer_blind`` / ``send_dtmf`` /
+      ``open_entry`` are meaningless without a live call and stay blocked in the
+      no-call branch (the relaxation is place_call-scoped);
+    * ``HERMES_VOIP_PROACTIVE_CALL_FROM`` is set (EMPTY / unset => ``False``, so the
+      gate is byte-identical to the fail-safe default);
+    * the originating ``(platform, chat_id)`` is readable from
+      ``gateway.session_context`` and its ``platform:chat_id`` is one of the
+      configured entries (exact match after trimming).
+
+    This NEVER weakens the inbound fail-safe: it is consulted ONLY in the no-live-call
+    branch of :func:`voip_pre_tool_call`, and a live call still resolves its real
+    caller-group privilege. The static ``HERMES_VOIP_OUTBOUND_ALLOW`` allowlist
+    (ADR-0029) still enforces the dial target at the chokepoint regardless, so even a
+    misconfigured operator origin can only reach pre-approved numbers.
+    """
+    if tool_name != PLACE_CALL_TOOL_NAME:
+        return False
+    allowed = os.environ.get(_PROACTIVE_CALL_FROM_ENV, "")
+    if not allowed:
+        return False  # opt-in unset => fully fail-safe (the default)
+    # FAIL CLOSED: this is a privilege-gate decision, so ANY failure to resolve the
+    # originating session (runtime absent, context unavailable/misconfigured) denies
+    # — it must never raise out of the gate (which could bypass denial handling or
+    # break unrelated tool calls) nor grant on an unresolved origin.
+    try:
+        from gateway.session_context import get_session_env  # noqa: PLC0415
+
+        platform = get_session_env(_SESSION_PLATFORM_ENV)
+        chat_id = get_session_env(_SESSION_CHAT_ID_ENV)
+    except Exception:  # noqa: BLE001 — deliberate fail-closed security boundary
+        return False
+    if not platform or not chat_id:
+        return False
+    needle = f"{platform}:{chat_id}"
+    return needle in {entry.strip() for entry in allowed.split(",") if entry.strip()}
+
+
 async def hang_up_handler(
     args: Mapping[str, object] | None = None,
     **_kwargs: object,
@@ -1235,6 +1302,19 @@ def voip_pre_tool_call(
     context falls back to a level-0 state, so it can never accidentally grant a
     privileged tool (fail safe).
 
+    **Proactive ``place_call`` (issue #202).** The one opt-in exception to the
+    no-live-call fail-safe: when ``HERMES_VOIP_PROACTIVE_CALL_FROM`` lists the
+    originating ``platform:chat_id`` (read from ``gateway.session_context``), a
+    ``place_call`` from that NON-VoIP operator session resolves operator level 3
+    instead of 0 — so the operator can drive a proactive outbound call from a chat
+    (``adapter._capture_origin_session`` captures the same origin;
+    ``HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`` reports the outcome back). It is
+    place_call-only (transfer/dtmf/open_entry stay blocked), opt-in (EMPTY / unset =>
+    byte-identical to the fail-safe default), and never touches the INBOUND fail-safe
+    (a live call still resolves its real caller-group privilege). The static
+    ``HERMES_VOIP_OUTBOUND_ALLOW`` allowlist (ADR-0029) still gates the dial target at
+    the chokepoint regardless. See :func:`_proactive_place_call_allowed`.
+
     **The ``confirmed`` argument (ADR-0010/0029).** A model-set confirmation is never
     trusted — ``confirmed`` here is a fixed per-tool property, not a model input. For
     every SAFE/ELEVATED tool the gate passes ``confirmed=False`` (they never consult
@@ -1269,7 +1349,21 @@ def voip_pre_tool_call(
     if adapter is not None and call_id is not None:
         state = adapter.guard_state_for(call_id)
     if state is None:
-        state = GuardSessionState(call_id=call_id or "", privilege_level=0)
+        # Fail-safe default: least-privilege (level 0) when there is no live SIP call
+        # in scope, so an unknown/spoofed context can never reach a privileged tool.
+        # The ONLY relaxation (issue #202): a PROACTIVE place_call from a configured
+        # operator origin (HERMES_VOIP_PROACTIVE_CALL_FROM) resolves operator level 3
+        # — opt-in and place_call-only. It applies ONLY when there is genuinely NO
+        # live call in scope (``call_id is None``). When a Call-ID IS present but its
+        # guard state is missing (an unknown/spoofed live-call context), the inbound
+        # fail-safe is preserved unconditionally — the proactive origin is NOT
+        # consulted, so this branch can never weaken it. The static
+        # HERMES_VOIP_OUTBOUND_ALLOW allowlist (ADR-0029) still gates the dial target
+        # at the chokepoint regardless.
+        proactive = call_id is None and _proactive_place_call_allowed(tool_name)
+        state = GuardSessionState(
+            call_id=call_id or "", privilege_level=3 if proactive else 0
+        )
     # ``confirmed`` is a fixed per-tool property, never a model input. The two
     # IRREVERSIBLE tools (``place_call``, ``transfer_blind``) are gated WITH
     # confirmation satisfied so ``gate_tool_call`` applies the level-3 + non-degraded

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,6 +149,7 @@ def _git_tracked_paths(root: Path) -> tuple[Path, ...] | None:
             (git_path, "-C", str(root), "ls-files", "-z"),
             check=False,
             capture_output=True,
+            env=_git_neutral_env(),
         )
     except OSError:
         return None
@@ -155,6 +157,16 @@ def _git_tracked_paths(root: Path) -> tuple[Path, ...] | None:
         return None
     decoded = result.stdout.decode("utf-8", errors="surrogateescape")
     return tuple(root / name for name in decoded.split("\0") if name)
+
+
+def _git_neutral_env() -> Mapping[str, str]:
+    # Git hooks (pre-commit/pre-push) export GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE
+    # into the environment; with them set, ``git -C <root> ls-files`` ignores
+    # ``-C`` and reports the hook's repo instead. Strip every GIT_* override so
+    # the enumeration depends only on ``root``.
+    return {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
 
 
 def _is_skipped(relative_path: Path) -> bool:

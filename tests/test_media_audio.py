@@ -481,7 +481,9 @@ def test_resample_frame_rejects_bool_target_rate() -> None:
     """Bool target_rate raises the same ValueError as Resampler rejects bool rates."""
     frame = PcmFrame(samples=_pcm16(1, 2, 3), sample_rate=8000, monotonic_ts_ns=0)
     with pytest.raises(ValueError, match="integer"):
-        resample_frame(frame, target_rate=True)  # type: ignore[arg-type]
+        resample_frame(
+            frame, target_rate=True
+        )  # bool is subtype of int; runtime guard catches it
 
 
 def test_resample_frame_rejects_float_target_rate() -> None:

@@ -24,6 +24,9 @@
 # pyproject.toml (a test asserts version parity and that provides_tools/provides_hooks
 # match the tools/hooks register() actually registers).
 name: hermes-voip
+# Human-readable platform label — the canonical kind:platform field (mirrors the
+# label passed to ctx.register_platform and the shape in plugins/platforms/irc/).
+label: VoIP (SIP/WebRTC telephony)
 version: "0.1.0"
 description: >-
   Two-way voice over telephony for a Hermes agent — answer and place phone calls on
@@ -57,9 +60,14 @@ provides_hooks:
 # Environment variables that GATE plugin loading (Hermes prompts for any that are
 # missing during `hermes plugins install` and saves them to .env). Only the genuinely
 # required SIP credentials belong here — listing an optional/defaulted var would
-# wrongly disable the plugin when it is absent. Rich format: name/description/url/
-# secret (verified against hermes-agent 0.16.0; the field is `secret`, not `password`).
-# NAMES + fake examples only.
+# wrongly disable the plugin when it is absent.
+#
+# Rich entry fields (verified against hermes-agent 0.16.0): name / description / prompt
+# / url / secret. Two consumers: `hermes plugins install` reads `secret` for the masked
+# prompt; the `hermes config` setup wizard's platform env injector reads `prompt` for
+# the input label and `password` OR `secret` for masking. We use `secret` (honoured by
+# BOTH; `password` alone is not read by the install prompt) and give every entry a
+# `prompt`. NAMES + fake examples only.
 #
 # These are the SINGLE-registration credential names (the common case, == the runtime
 # gate hermes_voip.plugin._REQUIRED_ENV). A multi-registration deployment uses the
@@ -69,12 +77,15 @@ provides_hooks:
 requires_env:
   - name: HERMES_SIP_HOST
     description: "Your SIP/WebRTC gateway's hostname (e.g. pbx.example.test)."
+    prompt: "SIP gateway hostname"
   - name: HERMES_SIP_EXTENSION
     description: >-
       The extension to register as (e.g. 1000). For multiple registrations use the
       indexed form HERMES_SIP_EXTENSION_<n> instead.
+    prompt: "SIP extension"
   - name: HERMES_SIP_PASSWORD
     description: "The SIP digest password for that extension."
+    prompt: "SIP password"
     secret: true
 
 # Optional knobs the operator may want to set — each has a safe default, or is only
@@ -82,40 +93,55 @@ requires_env:
 # under requires_env would wrongly disable the plugin when absent). The cloud provider
 # keys are required ONLY when their provider is selected.
 #
-# RULE-27 NOTE (verified against hermes-agent 0.16.0): the `hermes plugins install`
-# prompt reads ONLY `requires_env` — it does NOT prompt for `optional_env`, and no
-# other loader code path reads this key. It is kept here as in-manifest documentation
-# of the supported knobs (and because the Hermes plugin guide lists optional_env as a
-# recognised platform-manifest key); it is the README + docs/runbooks that operators
-# actually configure these from, NOT an install prompt. Same rich format as above.
+# RULE-27 NOTE (verified against hermes-agent 0.16.0): `optional_env` is read by the
+# `hermes config` setup-wizard injector (_inject_platform_plugin_env_vars), but that
+# injector scans ONLY bundled platform plugins (repo plugins/platforms/), NOT pip /
+# user-dir plugins — so for hermes-voip these are NOT auto-prompted today. They are
+# kept here as the canonical, self-describing list of supported knobs (each carries a
+# `prompt` so it is wizard-ready if Hermes broadens the injector); the README +
+# docs/runbooks are where operators configure these. The `hermes plugins install`
+# prompt reads ONLY `requires_env`, never `optional_env`. Same rich format as above.
 optional_env:
   - name: HERMES_SIP_PORT
     description: "SIP signalling port (TLS is 5061 by default; 5060 is UDP and fails TLS)."
+    prompt: "SIP port (TLS=5061)"
   - name: HERMES_SIP_TRANSPORT
     description: "Signalling transport: tls (default) or wss (WebRTC)."
+    prompt: "SIP transport (tls/wss)"
   - name: HERMES_VOIP_GREETING
     description: "What the agent says when it answers an inbound call."
+    prompt: "Inbound greeting line"
   - name: HERMES_VOIP_TTS_MODEL
     description: "Path to the local Kokoro voice model dir (self-host TTS, the default)."
+    prompt: "Local TTS (Kokoro) model dir"
   - name: HERMES_VOIP_STT_MODEL_DIR
     description: "Path to the local sherpa-onnx speech-to-text model dir (self-host STT, the default)."
+    prompt: "Local STT (sherpa-onnx) model dir"
   - name: HERMES_VOIP_VAD_MODEL_DIR
     description: "Path to the local Silero VAD model dir (always required — runs on every call)."
+    prompt: "Silero VAD model dir"
   - name: HERMES_VOIP_INJECTION_GUARD_MODEL_DIR
     description: "Path to the local prompt-injection guard model dir (always required — screens caller speech)."
+    prompt: "Injection-guard model dir"
   - name: HERMES_VOIP_TTS_PROVIDER
     description: "TTS backend: sherpa-kokoro (default), elevenlabs, cartesia, aura2, piper, kittentts, kyutai."
+    prompt: "TTS provider"
   - name: ELEVENLABS_API_KEY
     description: "ElevenLabs API key — required only when HERMES_VOIP_TTS_PROVIDER=elevenlabs."
+    prompt: "ElevenLabs API key"
     url: "https://elevenlabs.io/app/settings/api-keys"
     secret: true
   - name: HERMES_VOIP_STT_PROVIDER
     description: "STT backend: sherpa-onnx (default) or deepgram."
+    prompt: "STT provider"
   - name: DEEPGRAM_API_KEY
     description: "Deepgram API key — required only when HERMES_VOIP_STT_PROVIDER=deepgram (or TTS aura2)."
+    prompt: "Deepgram API key"
     url: "https://console.deepgram.com/"
     secret: true
   - name: HERMES_SIP_MAX_CALLS
     description: "Maximum concurrent active calls before new inbound INVITEs are rejected 486 Busy Here (default: 8)."
+    prompt: "Max concurrent calls (default: 8)"
   - name: HERMES_SIP_SHUTDOWN_DRAIN_SECS
     description: "Seconds to wait for in-flight calls to BYE-drain on shutdown before forcing teardown (default: 5.0)."
+    prompt: "Shutdown drain timeout in seconds (default: 5.0)"

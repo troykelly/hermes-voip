@@ -21,6 +21,28 @@ entry-point** plugin (entry-point group `hermes_agent.plugins`, declared in
 > **Public repo — no secrets here.** This runbook contains no host/extension/password. The SIP
 > credentials are a separate concern: see [`0001-sip-extension-credentials.md`](0001-sip-extension-credentials.md).
 
+## Installing the package (what makes it loadable)
+
+The plugin's code must be **installed as the `hermes_voip` Python package** for Hermes to load
+it (Hermes auto-discovers it via the `hermes_agent.plugins` entry point once installed):
+
+```bash
+pip install "hermes-voip[ml,media,webrtc] @ git+https://github.com/troykelly/hermes-voip"
+# …or from a repo clone:  uv sync --frozen --all-extras
+```
+
+> **Verified (rule 27): `hermes plugins install owner/repo` does NOT install this package.**
+> The real `hermes plugins install <identifier>` (hermes-agent 0.16.0; `identifier` = a Git URL
+> or `owner/repo` shorthand) **`git clone --depth 1`s** the repo into `~/.hermes/plugins/<name>/`
+> and prompts for the **clone-root** `plugin.yaml`'s `requires_env` — it never runs `pip`. Because
+> `hermes-voip` is a *src-layout package* (code under `src/hermes_voip/`, not at the repo root),
+> a bare clone can't import it, and with no **root** `plugin.yaml` the installer even names the
+> plugin after the repo directory and skips the env prompt (confirmed empirically against this
+> repo via a `file://` install). So `hermes plugins install` is the right tool for *self-contained
+> directory plugins* (code at the repo root) — **not** for a packaged plugin like this one.
+> `pip install git+…` is the supported install. (`hermes plugins update`/`remove` likewise act on
+> the cloned directory, not the pip package.)
+
 ## Recommended: install the directory manifest, then enable
 
 The repo ships the **complete plugin manifest** at

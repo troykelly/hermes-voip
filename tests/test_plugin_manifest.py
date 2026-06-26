@@ -160,6 +160,20 @@ def test_manifest_identity_fields() -> None:
     assert author.strip(), "the manifest must name an author (Hermes manifest spec)"
 
 
+def test_manifest_declares_a_platform_label() -> None:
+    """A kind: platform manifest declares a human-readable ``label``.
+
+    The canonical platform-manifest field (see plugins/platforms/irc/plugin.yaml,
+    and the ``label`` consumed by hermes_cli/config.py's platform env injector). It
+    mirrors the label passed to ``ctx.register_platform`` so the operator-facing name
+    is consistent across the manifest and the running registry.
+    """
+    manifest = _load_manifest(_PACKAGING_MANIFEST)
+    label = manifest.get("label")
+    assert isinstance(label, str), "a kind: platform manifest must declare a label"
+    assert label.strip(), "the platform label must be non-empty"
+
+
 def test_manifest_version_matches_pyproject() -> None:
     """The manifest version must track pyproject.toml (no silent drift)."""
     manifest = _load_manifest(_PACKAGING_MANIFEST)
@@ -335,8 +349,11 @@ def test_requires_env_lists_the_required_sip_vars() -> None:
 def test_password_env_is_marked_secret() -> None:
     """The SIP password's rich entry uses secret: true (Hermes masks the prompt).
 
-    Verified against hermes-agent 0.16.0: the rich entry field is ``secret`` (there
-    is NO ``password`` field); ``secret: true`` drives the masked prompt.
+    Verified against hermes-agent 0.16.0: ``hermes plugins install`` reads ``secret``
+    (``spec.get("secret", …)``), and the ``hermes config`` platform env injector reads
+    ``password`` OR ``secret`` (config.py:_inject_platform_plugin_env_vars). We use
+    ``secret: true`` because it is honoured by BOTH paths (``password`` is not read by
+    the install prompt). The masked prompt depends on it.
     """
     manifest = _load_manifest(_PACKAGING_MANIFEST)
     entries = manifest.get("requires_env")
@@ -351,6 +368,25 @@ def test_password_env_is_marked_secret() -> None:
     )
     assert password is not None, "HERMES_SIP_PASSWORD must be a rich entry"
     assert password.get("secret") is True, "HERMES_SIP_PASSWORD must be secret: true"
+
+
+def test_every_env_entry_has_a_prompt() -> None:
+    """Every requires_env / optional_env rich entry declares a ``prompt``.
+
+    ``prompt`` is the canonical platform-manifest field (plugins/platforms/irc/
+    plugin.yaml) that the ``hermes config`` setup-wizard injector
+    (hermes_cli/config.py:_inject_platform_plugin_env_vars) shows as the input label
+    — without it the wizard falls back to the raw variable name. A guided, friendly
+    env prompt is the operator-facing win this manifest is for, so we require it on
+    every declared variable.
+    """
+    for entry in (*_requires_env_block(), *_optional_env_block()):
+        name = _entry_name(entry)
+        prompt = entry.get("prompt")
+        assert isinstance(prompt, str), (
+            f"env entry {name!r} must declare a 'prompt' label"
+        )
+        assert prompt.strip(), f"env entry {name!r} 'prompt' must be non-empty"
 
 
 def test_optional_env_advertises_transport_and_provider_keys() -> None:

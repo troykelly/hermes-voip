@@ -6,6 +6,8 @@ drops duplicates/late/too-far-ahead packets, signals loss for concealment, and
 is RFC 1982 wraparound-safe.
 """
 
+import struct
+
 import pytest
 
 from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket, _seq_before
@@ -90,6 +92,61 @@ def test_parse_rejects_truncated_extension() -> None:
     truncated = header + (0xBEDE).to_bytes(2, "big") + (4).to_bytes(2, "big") + b"\x00"
     with pytest.raises(ValueError, match="extension"):
         RtpPacket.parse(truncated)
+
+
+def _padded(payload: bytes) -> bytes:
+    """A minimal V=2, P=1 RTP packet (no CSRC/extension) wrapping ``payload``."""
+    byte0 = (2 << 6) | 0x20  # V=2, P=1, X=0, CC=0
+    header = struct.pack("!BBHII", byte0, 0, 7, 0, 0xDEADBEEF)
+    return header + payload
+
+
+def test_parse_strips_valid_padding() -> None:
+    # P=1 with a trailing count byte of 3 means the last 3 octets (the two pad
+    # bytes plus the count byte itself) are padding: b"AB\x00\x00\x03" -> b"AB".
+    pkt = RtpPacket.parse(_padded(b"AB\x00\x00\x03"))
+    assert pkt.payload == b"AB"
+
+
+def test_parse_rejects_padding_count_exceeding_payload() -> None:
+    # A trailing pad count larger than the padded region is malformed; it must
+    # raise like every other parse failure, never silently leak the bogus byte.
+    with pytest.raises(ValueError, match="padding"):
+        RtpPacket.parse(_padded(b"\x05"))  # count 5 > 1 byte present
+
+
+def test_parse_rejects_zero_padding_count_with_padding_bit() -> None:
+    # P=1 but a zero trailing count byte is malformed: a padded packet always
+    # counts at least the count byte itself, so 0 is never valid (RFC 3550 §5.1).
+    with pytest.raises(ValueError, match="padding"):
+        RtpPacket.parse(_padded(b"\x00"))
+
+
+def test_parse_rejects_padding_bit_with_empty_payload() -> None:
+    # P=1 with no payload at all has no trailing count byte to read: malformed.
+    with pytest.raises(ValueError, match="padding"):
+        RtpPacket.parse(_padded(b""))
+
+
+def test_jitter_depth_counts_total_occupancy_not_contiguous_backlog() -> None:
+    # PINNED SEMANTICS: target_depth gates loss on TOTAL buffered occupancy, not
+    # the contiguous backlog sitting immediately behind the next gap. So a single
+    # far-future cluster (here 100/101/102, all within max_ahead) is enough to
+    # push occupancy to the depth and make pop() declare the immediate gap Lost,
+    # even though nothing contiguous sits right behind it. This total-occupancy
+    # rule is what guarantees forward progress past a permanent gap (a buffered
+    # cluster always drains rather than stalling); the cost pinned here is that an
+    # isolated far-future cluster declares the near gap lost eagerly. Changing
+    # this is the larger jitter-buffer API redesign (separate backlog item).
+    jb = JitterBuffer(target_depth=3, max_ahead=256)
+    for seq in (10, 100, 101, 102):
+        jb.push(_pkt(seq))
+    assert _packet(jb.pop()).sequence_number == 10  # anchor advances to 11
+    # Occupancy is 3 (100, 101, 102) == depth, so the gap at 11 is declared Lost
+    # immediately even though 100/101/102 are far from it.
+    lost = jb.pop()
+    assert isinstance(lost, Lost)
+    assert lost.sequence == 11
 
 
 def test_construction_validates_field_ranges() -> None:

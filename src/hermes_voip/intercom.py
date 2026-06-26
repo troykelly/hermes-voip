@@ -47,26 +47,39 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 
-# ASCII C0 control-char boundary: ord < _C0_LIMIT means a control character
-# (CR=0x0D, LF=0x0A, NUL=0x00, …). urllib/http.client raises bare ValueError
-# for these in header values, bypassing the typed exception chain.
+# Control-char boundaries. A character is a control character if its code point is
+# a C0 control (U+0000-U+001F: CR=0x0D, LF=0x0A, NUL=0x00, …), DEL (U+007F), or a
+# C1 control (U+0080-U+009F). urllib/http.client raises a bare ValueError for some
+# of these in header values (and DEL/C1 are header-unsafe), bypassing the typed
+# exception chain — so we reject the whole band at load.
 _C0_LIMIT = 0x20
+_DEL = 0x7F
+_C1_LAST = 0x9F
+
+
+def _is_control_char(ch: str) -> bool:
+    """Return True if ``ch`` is a C0 (< 0x20), DEL (0x7f), or C1 (0x80-0x9f) control."""
+    code = ord(ch)
+    return code < _C0_LIMIT or _DEL <= code <= _C1_LAST
 
 
 def _reject_control_chars(value: str, label: str) -> None:
-    r"""Raise ConfigError if ``value`` contains any ASCII C0 control character.
+    r"""Raise ConfigError if ``value`` contains any control character.
 
-    C0 controls (U+0000-U+001F) include CR (\r), LF (\n), NUL (\x00), and other
-    bytes that cause HTTP header-injection or are rejected by ``http.client`` with a
-    bare ``ValueError`` that bypasses the ``(HTTPError, URLError, TimeoutError,
-    OSError)`` catch in ``_open_blocking``.  Reject at load so the error is
-    deterministic and the contract (IntercomRelayError from ``open()``) holds.
+    Rejects C0 controls (U+0000-U+001F: CR (\r), LF (\n), NUL (\x00), …), DEL
+    (U+007F), and C1 controls (U+0080-U+009F). These either cause HTTP header
+    injection or are rejected by ``http.client`` with a bare ``ValueError`` that
+    bypasses the ``(HTTPError, URLError, TimeoutError, OSError)`` catch in
+    ``_open_blocking``.  Reject at load so the error is deterministic and the
+    contract (IntercomRelayError from ``open()``) holds. The error reports only the
+    offending character's code point (e.g. ``U+000A``), never the surrounding value
+    (which may be a secret).
     """
     for ch in value:
-        if ord(ch) < _C0_LIMIT:
+        if _is_control_char(ch):
             msg = (
-                f"{label} must not contain ASCII control characters "
-                f"(found {ch!r} - rejecting to prevent HTTP header injection)"
+                f"{label} must not contain control characters "
+                f"(found U+{ord(ch):04X} - rejecting to prevent HTTP header injection)"
             )
             raise ConfigError(msg)
 
@@ -160,9 +173,12 @@ class IntercomRelayClient:
         except ValueError as exc:
             # Defense-in-depth: urllib/http.client raises ValueError for invalid
             # header values (e.g. HTTP header injection via a control char that
-            # slips past load-time validation). Wrap so the documented
-            # IntercomRelayError contract holds from the caller's perspective.
-            msg = f"intercom relay request failed: invalid value ({exc})"
+            # slips past load-time validation). The ValueError's text embeds the
+            # OFFENDING HEADER VALUE — for the relay path that is "Bearer <token>",
+            # so it MUST NOT be interpolated into the message (it would leak the
+            # bearer token into logs/callers). Use a fixed message; the original is
+            # chained via `from exc` so the cause survives in the traceback only.
+            msg = "intercom relay request failed: invalid request value"
             raise IntercomRelayError(msg) from exc
 
     def _open_blocking(self) -> None:
@@ -197,8 +213,11 @@ class IntercomRelayClient:
             # header values (e.g. HTTP header injection via a control char). This
             # bypasses the except chain above; wrap it so the documented
             # IntercomRelayError contract always holds, even if a bad value reaches
-            # the network call despite the load-time rejection.
-            msg = f"intercom relay request failed: invalid value ({exc})"
+            # the network call despite the load-time rejection. The ValueError's
+            # text embeds the OFFENDING HEADER VALUE (the "Bearer <token>" header),
+            # so it MUST NOT be interpolated — that would leak the token. Use a
+            # fixed message; the cause is preserved via `from exc` for the traceback.
+            msg = "intercom relay request failed: invalid request value"
             raise IntercomRelayError(msg) from exc
         if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
             msg = f"intercom relay returned HTTP {status}"
@@ -287,13 +306,15 @@ def _load_relay_config(env: Mapping[str, str]) -> IntercomConfig:
             "that must not travel in cleartext)"
         )
         raise ConfigError(msg)
-    token = (env.get(_RELAY_TOKEN_KEY) or "").strip()
-    # Reject control chars (CR, LF, NUL, and other C0 controls) in the bearer token:
-    # an embedded CRLF causes urllib to raise a bare ValueError (HTTP header injection)
-    # that bypasses the existing except chain in _open_blocking, violating the
-    # IntercomRelayError contract. Reject at load so the failure is deterministic.
-    if token:
-        _reject_control_chars(token, _RELAY_TOKEN_KEY)
+    raw_token = env.get(_RELAY_TOKEN_KEY) or ""
+    # Validate the RAW value for control characters BEFORE trimming. ``.strip()``
+    # removes leading/trailing CR/LF, so stripping first would silently accept a
+    # token with a stray newline (a malformed secret) instead of rejecting it. An
+    # embedded control char causes urllib to raise a bare ValueError (HTTP header
+    # injection) that bypasses the except chain in _open_blocking, violating the
+    # IntercomRelayError contract — so reject at load, on the untrimmed value.
+    _reject_control_chars(raw_token, _RELAY_TOKEN_KEY)
+    token = raw_token.strip()
     if not token:
         # Physical-access actuation with NO bearer token: the relay is unauthenticated
         # unless the endpoint enforces auth another way (mTLS / IP allowlist / a secret

@@ -81,27 +81,39 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 
-# ASCII C0 control-char boundary: ord < _C0_LIMIT means a control character
-# (CR=0x0D, LF=0x0A, NUL=0x00, …). http.client raises bare ValueError for these
-# in header names/values, bypassing the typed exception chain.
+# Control-char boundaries. A character is a control character if its code point is
+# a C0 control (U+0000-U+001F: CR=0x0D, LF=0x0A, NUL=0x00, …), DEL (U+007F), or a
+# C1 control (U+0080-U+009F). http.client raises a bare ValueError for some of these
+# in header names/values (and DEL/C1 are header-unsafe), bypassing the typed
+# exception chain — so we reject the whole band at load.
 _C0_LIMIT = 0x20
+_DEL = 0x7F
+_C1_LAST = 0x9F
+
+
+def _is_control_char(ch: str) -> bool:
+    """Return True if ``ch`` is a C0 (< 0x20), DEL (0x7f), or C1 (0x80-0x9f) control."""
+    code = ord(ch)
+    return code < _C0_LIMIT or _DEL <= code <= _C1_LAST
 
 
 def _reject_control_chars(value: str, label: str) -> None:
-    r"""Raise ConfigError if ``value`` contains any ASCII C0 control character.
+    r"""Raise ConfigError if ``value`` contains any control character.
 
-    C0 controls (U+0000-U+001F) include CR (\r), LF (\n), NUL (\x00), and other
-    bytes that cause HTTP header-injection or are rejected by ``http.client`` with a
-    bare ``ValueError`` that bypasses the ``(HTTPError, URLError, TimeoutError,
-    OSError)`` catch in ``_fire_webhook_blocking``.  Reject at load so the error is
-    deterministic and the contract (WebhookError from ``fire_webhook_opening()``)
-    holds.
+    Rejects C0 controls (U+0000-U+001F: CR (\r), LF (\n), NUL (\x00), …), DEL
+    (U+007F), and C1 controls (U+0080-U+009F). These either cause HTTP header
+    injection or are rejected by ``http.client`` with a bare ``ValueError`` that
+    bypasses the ``(HTTPError, URLError, TimeoutError, OSError)`` catch in
+    ``_fire_webhook_blocking``.  Reject at load so the error is deterministic and the
+    contract (WebhookError from ``fire_webhook_opening()``) holds. The error reports
+    only the offending character's code point (e.g. ``U+000A``), never the
+    surrounding value (which may be a secret).
     """
     for ch in value:
-        if ord(ch) < _C0_LIMIT:
+        if _is_control_char(ch):
             msg = (
-                f"{label} must not contain ASCII control characters "
-                f"(found {ch!r} - rejecting to prevent HTTP header injection)"
+                f"{label} must not contain control characters "
+                f"(found U+{ord(ch):04X} - rejecting to prevent HTTP header injection)"
             )
             raise ConfigError(msg)
 
@@ -529,9 +541,12 @@ async def fire_webhook_opening(opening: Opening) -> None:
     except ValueError as exc:
         # Defense-in-depth: http.client raises ValueError for invalid header names
         # or values (e.g. HTTP header injection via a control char that slips past
-        # load-time validation). Wrap so the documented WebhookError contract holds
-        # from the caller's perspective.
-        msg = f"webhook opening {opening.name!r} request failed: invalid value ({exc})"
+        # load-time validation). The ValueError's text embeds the OFFENDING HEADER
+        # VALUE — which may be an "Authorization: Bearer <token>" header — so it MUST
+        # NOT be interpolated into the message (it would leak the token into
+        # logs/callers). Use a fixed message (the opening NAME is non-secret); the
+        # original is chained via `from exc` so the cause survives in the traceback.
+        msg = f"webhook opening {opening.name!r} request failed: invalid request value"
         raise WebhookError(msg) from exc
 
 
@@ -569,8 +584,11 @@ def _fire_webhook_blocking(opening: Opening) -> None:
         # or values (e.g. HTTP header injection via a control char). This bypasses
         # the except chain above; wrap it so the documented WebhookError contract
         # always holds, even if a bad value reaches the network call despite the
-        # load-time rejection.
-        msg = f"webhook opening {opening.name!r} request failed: invalid value ({exc})"
+        # load-time rejection. The ValueError's text embeds the OFFENDING HEADER
+        # VALUE (which may be an "Authorization: Bearer <token>" header), so it MUST
+        # NOT be interpolated — that would leak the token. Use a fixed message (the
+        # opening NAME is non-secret); the cause is preserved via `from exc`.
+        msg = f"webhook opening {opening.name!r} request failed: invalid request value"
         raise WebhookError(msg) from exc
     if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
         msg = f"webhook opening {opening.name!r} returned HTTP {status}"

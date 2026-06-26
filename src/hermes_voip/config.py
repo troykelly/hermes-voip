@@ -369,7 +369,7 @@ _DEFAULT_GOODBYE = True
 _GOODBYE_PHRASE_KEY = "HERMES_VOIP_GOODBYE_PHRASE"
 _DEFAULT_GOODBYE_PHRASE = "Goodbye."
 
-# Safe-decline line spoken on a guard REFUSE (ADR-0075). When the injection guard
+# Safe-decline line spoken on a guard REFUSE (ADR-0076). When the injection guard
 # refuses a turn it is never forwarded to the agent; without a spoken line a caller the
 # guard false-positived hears pure dead air, repeats into the same wall, and is hung up
 # on. The loop speaks ONE short language-keyed decline line instead. Pipe-separated
@@ -1118,7 +1118,7 @@ class MediaConfig:
     # ``HERMES_VOIP_GOODBYE`` / ``HERMES_VOIP_GOODBYE_PHRASE``.
     goodbye: bool = _DEFAULT_GOODBYE
     goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE
-    # Safe-decline line spoken on a guard REFUSE (ADR-0075): one phrase chosen at
+    # Safe-decline line spoken on a guard REFUSE (ADR-0076): one phrase chosen at
     # random per refusal (no immediate repeat) so a false-positived caller hears a
     # short line instead of dead air. The refused turn is STILL never delivered to the
     # agent. The default MUST match call_loop.py's _DEFAULT_REFUSE_DECLINE_PHRASES so
@@ -2040,7 +2040,7 @@ def _parse_no_input_reprompt_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
 def _parse_refuse_decline_phrases(
     env: Mapping[str, str], language: str
 ) -> tuple[str, ...]:
-    """Parse the ``|``-separated guard-REFUSE safe-decline phrase set (ADR-0075).
+    """Parse the ``|``-separated guard-REFUSE safe-decline phrase set (ADR-0076).
 
     Each member is trimmed; empty members (from a trailing or doubled ``|``) are
     dropped. An unset or all-blank value falls back to the selected *language*'s

@@ -2273,7 +2273,7 @@ def test_no_input_reprompt_phrases_blank_falls_back_to_default() -> None:
 
 
 def test_refuse_decline_phrases_default_matches_call_loop() -> None:
-    """The default safe-decline set (ADR-0075) is the built-in English set, on default.
+    """The default safe-decline set (ADR-0076) is the built-in English set, on default.
 
     MUST match ``_DEFAULT_REFUSE_DECLINE_PHRASES`` in media/call_loop.py exactly so a
     REFUSE speaks the same line whether the loop is built directly or from env.
@@ -2287,7 +2287,7 @@ def test_refuse_decline_phrases_default_matches_call_loop() -> None:
 
 
 def test_refuse_decline_phrases_pipe_separated() -> None:
-    """HERMES_VOIP_REFUSE_DECLINE_PHRASES parses as a pipe-separated set (ADR-0075)."""
+    """HERMES_VOIP_REFUSE_DECLINE_PHRASES parses as a pipe-separated set (ADR-0076)."""
     cfg = load_media_config(
         {"HERMES_VOIP_REFUSE_DECLINE_PHRASES": "No can do.|Sorry, not that.|Cannot."}
     )

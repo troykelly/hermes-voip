@@ -64,7 +64,7 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
 ## Decision
 
 1. **Ship a complete `plugin.yaml`.** `name: hermes-voip`, `version` (kept equal to
-   `pyproject.toml`), `description`, `author`, `kind: platform`, `provides_tools` (the nine
+   `pyproject.toml`), `description`, `author`, `kind: platform`, `provides_tools` (the ten
    agent tools `register_voip_tools` registers), `provides_hooks: [pre_tool_call]`, and
    `requires_env` in the rich format.
 
@@ -94,7 +94,7 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
 4. **No double-registration.** When both the pip entry point and the directory plugin are
    present, the loader dedups by key (`manifest.key or manifest.name`, both `"hermes-voip"`)
    and the entry point wins, so the directory `__init__.py` is **not** re-imported — the
-   platform registers **exactly once** (verified live: `voip` registered once, 9 tools, 1
+   platform registers **exactly once** (verified live: `voip` registered once, 10 tools, 1
    hook). The directory `__init__.py` does `from hermes_voip.plugin import register`, so it
    is the canonical guide model (a) layout — but note the **`hermes_voip` package must still
    be installed** (`pip install` / `uv sync`) for that import to resolve: this plugin's code
@@ -114,7 +114,7 @@ throwaway `HERMES_HOME` (never the live gateway). Captured in
 
 - **Operators get the canonical guide experience**: `hermes plugins list` shows
   `hermes-voip` with its version + description; `hermes plugins enable hermes-voip` works and
-  writes `plugins.enabled`; the loaded `/plugins` view shows `9 tools, 1 hook`. The README +
+  writes `plugins.enabled`; the loaded `/plugins` view shows `10 tools, 1 hook`. The README +
   runbook 0011 are corrected to these **verified** commands (rule 27), keeping the
   hand-edit-`config.yaml` fallback as the no-stub alternative.
 - **A documented runtime nuance remains** (it is a Hermes-runtime property, not ours, so we

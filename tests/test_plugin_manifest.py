@@ -26,6 +26,7 @@ docs/runbooks/0011-voip-enable-plugin.md.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from collections.abc import Sequence
 from importlib.metadata import version as _dist_version
@@ -533,3 +534,51 @@ def test_packaged_and_importable_manifests_are_identical() -> None:
         "the importable (package-data) manifest and the directory-install manifest "
         "have drifted — they must be byte-identical"
     )
+
+
+# ---------------------------------------------------------------------------
+# (f) Documentation consistency: all docs must use the correct tool count.
+# ---------------------------------------------------------------------------
+
+
+#: Every "<N> tools, <M> hook(s)" mention in the docs, so the guard can assert that
+#: EVERY occurrence matches the registered surface — not merely that the correct one
+#: is present somewhere (a doc carrying both a stale and a fresh count would otherwise
+#: pass). Tolerates singular/plural on both nouns.
+_TOOL_COUNT_MENTION = re.compile(r"(\d+) tools?, (\d+) hooks?\b")
+
+
+def test_docs_use_correct_tool_count() -> None:
+    """Every doc 'N tools, M hook' mention equals the registered tool/hook surface.
+
+    When a tool/hook is added or removed, the docs that quote the count must be
+    updated. This guard fails if any key doc states a stale count — including a doc
+    that accidentally keeps BOTH the old and the new count — by checking that every
+    matched mention equals the registered surface (and that each doc still has one).
+    """
+    tool_count = len(_registered_tools())
+    hook_count = len(_registered_hooks())
+    expected = f"{tool_count} tools, {hook_count} hook"
+
+    docs = {
+        "README.md": _REPO_ROOT / "README.md",
+        "ADR-0037": (
+            _REPO_ROOT
+            / "docs"
+            / "adr"
+            / "0037-hermes-plugin-manifest-and-install-models.md"
+        ),
+        "runbook 0011": _REPO_ROOT / "docs" / "runbooks" / "0011-voip-enable-plugin.md",
+    }
+    for label, path in docs.items():
+        assert path.is_file(), f"{label} is missing at {path} — cannot verify its count"
+        mentions = _TOOL_COUNT_MENTION.findall(path.read_text(encoding="utf-8"))
+        assert mentions, (
+            f"{label} no longer states a 'N tools, M hook' count — the guard would be "
+            f"vacuous; restore an explicit '{expected}' mention."
+        )
+        for n_tools, n_hooks in mentions:
+            assert (int(n_tools), int(n_hooks)) == (tool_count, hook_count), (
+                f"{label} has a stale '{n_tools} tools, {n_hooks} hook' mention; "
+                f"the registered surface is '{expected}'"
+            )

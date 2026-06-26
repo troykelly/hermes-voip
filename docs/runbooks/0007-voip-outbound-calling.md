@@ -141,12 +141,22 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
 
 ## Aborting a ringing outbound call (CANCEL — ADR-0069, RFC 3261 §9.1)
 
-A ringing outbound call (INVITE sent, no 2xx yet) can be cancelled in two ways: an explicit
-agent tool call (`abort_call`) or an automatic ring-timeout. Both paths send a SIP CANCEL to
-the gateway, which causes the far end to return a `487 Request Terminated` to the INVITE; the
-caller then receives `OutboundCallCancelled`.
+This outbound CANCEL path is currently implemented for the **TLS SIP UAC**. On the
+**WSS/WebRTC UAC**, `send_cancel()` is a no-op and `ring_timeout_secs` is rejected up front with
+`NotImplementedError`; see the WSS subsection below before assuming uniform behaviour.
 
-### Explicit abort via `abort_call`
+On the TLS path, a ringing outbound call (INVITE sent, no 2xx yet) can be cancelled in two ways:
+an explicit agent tool call (`abort_call`) or an automatic ring-timeout. Both paths aim to cancel
+the unanswered INVITE; when the gateway returns `487 Request Terminated`, the caller sees
+`OutboundCallCancelled`.
+
+The implementation detail that matters for RFC 3261 §9.1 is this: the transport tracks outbound
+INVITEs as soon as they are sent and `abort_call()`/`send_cancel()` do **not** wait for a logged
+`100 Trying`/`180 Ringing`/other provisional response before attempting CANCEL. The code does skip
+provisional responses while awaiting the INVITE's final response, but this runbook does **not**
+claim a verified provisional-response guard before sending CANCEL.
+
+### Explicit abort via `abort_call` (TLS path)
 
 `VoipAdapter.abort_call(call_id, reason)` (adapter.py line 2387) looks up the pending INVITE
 by Call-ID, marks it `cancel_requested`, and calls `transport.send_cancel(call_id)` on the TLS
@@ -171,7 +181,7 @@ If `abort_call` is called twice concurrently on the same call:
 abort_call: <call-id> already cancelling — no-op
 ```
 
-### Automatic ring-timeout
+### Automatic ring-timeout (TLS path)
 
 When `place_call` is invoked with `ring_timeout_secs` set, `VoipAdapter._ring_timeout`
 (adapter.py line 2443) fires after the specified interval and calls `abort_call` internally with
@@ -188,14 +198,35 @@ This is then followed by the normal `abort_call` log line above.
 The ring-timeout task is armed at INVITE send time and disarmed the instant a 2xx arrives, so a
 call that answers just before the timer fires produces only the disarm (no CANCEL).
 
-### WSS (WebRTC) transport — ring-timeout not supported
+### WSS (WebRTC) transport — outbound CANCEL/ring-timeout are not supported
 
 `ring_timeout_secs` is **not supported on a WSS gateway** (`HERMES_SIP_TRANSPORT=wss`). The WSS
 transport's `send_cancel` (transport/ws_connection.py line 316) is a no-op that returns `False`
 because the WebRTC origination path has no RFC 3261 client-transaction registry to build a §9.1
 CANCEL from. Passing `ring_timeout_secs` on a WSS gateway raises `NotImplementedError` immediately
-at `place_call` (adapter.py line 1634), before any INVITE is sent. Do not set `ring_timeout_secs`
-on a WSS transport; use application-level timeout logic instead.
+at `place_call` (adapter.py line 1634), before any INVITE is sent.
+
+That means the outbound abort behaviours documented above are **TLS-only today**. On WSS/WebRTC:
+
+- `abort_call()` can mark the call as cancelling, but `send_cancel()` itself does not emit a SIP
+  CANCEL on the wire.
+- automatic ring-timeout is rejected before dial, via `NotImplementedError`.
+
+Do not set `ring_timeout_secs` on a WSS transport; use application-level timeout logic instead.
+
+### RFC 3261 §9.1 note: provisional-response timing
+
+This runbook cites RFC 3261 §9.1 because the feature is an outbound SIP CANCEL path, but the code
+verification here found no explicit guard that waits for a received provisional response before
+sending CANCEL. The TLS transport tracks outbound INVITEs when they are sent and can attempt
+`send_cancel(call_id)` from that tracked state alone. So the verified statement is: the code
+implements a CANCEL attempt for an unanswered outbound TLS INVITE, and the caller-side await loop
+continues past provisional responses until it receives the INVITE's final response (for example the
+`487 Request Terminated` after a successful cancel).
+
+Do not read this section as a verified claim that the implementation enforces every RFC timing
+precondition before transmitting CANCEL; that specific provisional-response guard was not present in
+code.
 
 ## Transport: how the dial goes out (ADR-0049)
 

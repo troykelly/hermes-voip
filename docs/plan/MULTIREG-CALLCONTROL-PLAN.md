@@ -14,9 +14,11 @@ addresses.
   existing foundation and need no transport, model, or credential.
 - **Shipped (PR7–PR9):** `manager.py` (`RegistrationManager`, N flows, shared transport, demux),
   `call.py` (`CallSession` orchestrator), and `tools.py` (hold/resume/transfer/dtmf/list tools
-  wired into `register(ctx)`) are all merged and wired. The "blocked on live transport" caveat
-  from the original plan no longer applies — all three modules shipped alongside the concrete
-  `SipTransport`/`MediaTransport` and the Hermes adapter.
+  wired into `register(ctx)`) are all merged and wired. They run against the shipped Hermes adapter
+  and the live signalling/media stack (`SipOverTlsTransport`, `WssSipTransport`,
+  `RtpMediaTransport`, `WebRtcMediaSession`). The remaining frontier is real-gateway
+  validation/measurement and transport-specific parity gaps, not missing `manager.py`/
+  `call.py`/`tools.py` integration.
 
 ## Phased PRs
 

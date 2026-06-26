@@ -26,6 +26,7 @@ docs/runbooks/0011-voip-enable-plugin.md.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from collections.abc import Sequence
 from importlib.metadata import version as _dist_version
@@ -540,40 +541,44 @@ def test_packaged_and_importable_manifests_are_identical() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Every "<N> tools, <M> hook(s)" mention in the docs, so the guard can assert that
+#: EVERY occurrence matches the registered surface — not merely that the correct one
+#: is present somewhere (a doc carrying both a stale and a fresh count would otherwise
+#: pass). Tolerates singular/plural on both nouns.
+_TOOL_COUNT_MENTION = re.compile(r"(\d+) tools?, (\d+) hooks?\b")
+
+
 def test_docs_use_correct_tool_count() -> None:
-    """README, ADRs, and runbooks mention the correct tool count.
+    """Every doc 'N tools, M hook' mention equals the registered tool/hook surface.
 
-    When a tool is added or removed from provides_tools, the documentation
-    that references the tool count must be updated. This guard catches stale
-    count references in key docs.
+    When a tool/hook is added or removed, the docs that quote the count must be
+    updated. This guard fails if any key doc states a stale count — including a doc
+    that accidentally keeps BOTH the old and the new count — by checking that every
+    matched mention equals the registered surface (and that each doc still has one).
     """
-    registered = _registered_tools()
-    tool_count = len(registered)
-    hook_count = 1  # always 1 (pre_tool_call)
-    expected_mention = f"{tool_count} tools, {hook_count} hook"
+    tool_count = len(_registered_tools())
+    hook_count = len(_registered_hooks())
+    expected = f"{tool_count} tools, {hook_count} hook"
 
-    # Check README
-    readme_path = _REPO_ROOT / "README.md"
-    readme = readme_path.read_text(encoding="utf-8")
-    assert expected_mention in readme, (
-        f"README.md must mention '{expected_mention}' — it uses a stale tool count"
-    )
-
-    # Check ADR-0037
-    adr_0037_file = "0037-hermes-plugin-manifest-and-install-models.md"
-    adr_0037_path = _REPO_ROOT / "docs" / "adr" / adr_0037_file
-    if adr_0037_path.is_file():
-        adr_0037 = adr_0037_path.read_text(encoding="utf-8")
-        assert expected_mention in adr_0037, (
-            f"ADR-0037 must mention '{expected_mention}' — it uses a stale tool count"
+    docs = {
+        "README.md": _REPO_ROOT / "README.md",
+        "ADR-0037": (
+            _REPO_ROOT
+            / "docs"
+            / "adr"
+            / "0037-hermes-plugin-manifest-and-install-models.md"
+        ),
+        "runbook 0011": _REPO_ROOT / "docs" / "runbooks" / "0011-voip-enable-plugin.md",
+    }
+    for label, path in docs.items():
+        assert path.is_file(), f"{label} is missing at {path} — cannot verify its count"
+        mentions = _TOOL_COUNT_MENTION.findall(path.read_text(encoding="utf-8"))
+        assert mentions, (
+            f"{label} no longer states a 'N tools, M hook' count — the guard would be "
+            f"vacuous; restore an explicit '{expected}' mention."
         )
-
-    # Check runbook 0011
-    runbook_0011_file = "0011-voip-enable-plugin.md"
-    runbook_0011_path = _REPO_ROOT / "docs" / "runbooks" / runbook_0011_file
-    if runbook_0011_path.is_file():
-        runbook_0011 = runbook_0011_path.read_text(encoding="utf-8")
-        assert expected_mention in runbook_0011, (
-            f"Runbook 0011 must mention '{expected_mention}' — "
-            "it uses a stale tool count"
-        )
+        for n_tools, n_hooks in mentions:
+            assert (int(n_tools), int(n_hooks)) == (tool_count, hook_count), (
+                f"{label} has a stale '{n_tools} tools, {n_hooks} hook' mention; "
+                f"the registered surface is '{expected}'"
+            )

@@ -78,8 +78,54 @@ that is expected, not a failure.
 
 ## Trigger
 
-`supply-chain.yml` runs on push to `main` and on PRs that touch `pyproject.toml`,
-`uv.lock`, or `supply-chain.yml` itself. To force a run, change one of those.
+`supply-chain.yml` runs on three event types:
+
+1. **Push to `main`** — filtered to `pyproject.toml`, `uv.lock`,
+   `.github/workflows/supply-chain.yml`.
+2. **Pull requests** — same path filter.
+3. **Daily schedule** — `cron: '7 6 * * *'` (06:07 UTC every day).
+   The off-:00 minute avoids fleet pile-up on GitHub's shared runners.
+   Schedule events carry no path context, so the path filters above do not apply;
+   the `audit` job has no `if:` condition, so it runs unconditionally on every
+   trigger including the daily cron.
+
+**Why a schedule?** Path-filtered push/PR events only fire when a tracked file
+changes.  A CVE disclosed against an unchanged pinned dependency (e.g. the
+PYSEC-2026-175..179 / pyjwt class of issue) is invisible to CI until the next
+dependency-bump PR.  The daily cron closes this gap: new advisories are surfaced
+within 24 hours regardless of repo activity.
+
+**To force an ad-hoc run** without changing a tracked file: trigger the workflow
+manually from the GitHub Actions UI (Actions → supply-chain → Run workflow) or
+push any change to one of the path-filtered files.
+
+## Triaging a scheduled-run failure
+
+When the `audit` job fails on a scheduled run (not triggered by a PR or push),
+the failure appears in GitHub Actions → supply-chain → the failed run.  The
+workflow run will show `schedule` as the trigger event.
+
+Triage steps:
+
+1. Open the failed run; read the `uv run pip-audit` step output to identify:
+   - Package name
+   - Advisory ID(s) (PYSEC-YYYY-NNN / CVE-YYYY-NNNNN)
+   - Severity and fix version
+
+2. Verify it is a real new advisory (not a re-scan of a known-suppressed issue):
+   confirm the advisory ID is not already listed in a `--ignore-vuln` flag with a
+   documented justification in `supply-chain.yml`.
+
+3. Reproduce locally (from a worktree, not the root checkout):
+   ```bash
+   uv sync --frozen --all-extras
+   uv run pip-audit
+   ```
+
+4. Follow the **When a NEW advisory fires** section below to resolve.
+
+5. Once resolved and merged to `main`, the next scheduled run (or a manually
+   triggered run) must exit green before the issue is considered closed.
 
 ## When a NEW advisory fires (the gate goes red)
 

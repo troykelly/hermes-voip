@@ -493,21 +493,37 @@ grep -E "CallLoop started|Turn ended|hung|deadlock|stuck" /path/to/hermes/log | 
 - **Each turn says `Turn ended: reason=timeout` or `error`** but the next turn starts anyway →
   the loop is active and recovering (expected; the agent is resilient).
 
-### 3. Graceful shutdown (available in future; current = hard kill)
+### 3. Graceful shutdown (BYE-drain via SIGTERM — ADR-0059)
+
+The plugin implements graceful shutdown: when it receives `SIGTERM` (or the process
+`disconnect()` is called), it:
+
+1. **Stops accepting new INVITEs** — a racing inbound INVITE gets a `503 Service Unavailable`.
+2. **Drains active calls** — sends a SIP BYE to every live call concurrently (up to
+   `HERMES_SIP_SHUTDOWN_DRAIN_SECS`, default 5 s).
+3. **Closes cleanly** — deregisters the extension (sends `Expires: 0`) and closes the transport.
+
+**Recommended shutdown:**
 
 ```bash
-# Today: hard kill (drops live calls until graceful shutdown ships).
-kill -9 <PID>
-# Wait 30 s, then restart.
+# SIGTERM triggers graceful drain with BYE to all live calls.
+kill -TERM <PID>
+# The process logs "graceful shutdown: draining N live call(s) with BYE (timeout 5.0s)"
+# and exits once the drain completes or times out (max 5 s + cancellation grace).
+# Wait a few seconds for it to exit cleanly.
 ```
 
-The plugin does not currently implement graceful shutdown (closing active calls cleanly,
-rejecting new INVITEs). This is in the backlog. A hard kill:
-- Immediately terminates the process and all active call loops.
-- Each call's caller hears a `CANCELLED` or the gateway emits a `487 Request Terminated`
-  (depending on call state).
-- New INVITEs arriving ~30 s after the process dies are rejected by the gateway (REGISTER
-  expires).
+**If the process does not exit within ~10 seconds after SIGTERM:**
+
+```bash
+# Use hard kill as a fallback only; graceful drain has already tried.
+kill -9 <PID>
+# Wait 5 s, then restart.
+```
+
+A hard kill (without SIGTERM drain first) immediately terminates the process and drops all
+live calls into dangling dialogs. Always use `kill -TERM` first so connected callers get a
+clean in-dialog BYE.
 
 ---
 

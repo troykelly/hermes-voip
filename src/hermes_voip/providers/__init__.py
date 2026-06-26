@@ -9,7 +9,7 @@ and 8<->16 kHz resampling are the media layer's job, never a provider's.
 :func:`build_providers` wires a :class:`~hermes_voip.config.MediaConfig` to live
 concrete provider instances; :class:`Providers` carries the result.
 
-All 15 ADR-0004 public names are re-exported here so callers can import from
+All 14 ADR-0004 public names are re-exported here so callers can import from
 ``hermes_voip.providers`` instead of reaching into sub-modules.
 """
 

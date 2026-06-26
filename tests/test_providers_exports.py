@@ -42,12 +42,8 @@ ADR0004_PUBLIC_NAMES: list[tuple[str, str]] = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("name", "submodule"),
-    ADR0004_PUBLIC_NAMES,
-    ids=[name for name, _ in ADR0004_PUBLIC_NAMES],
-)
-def test_name_importable_from_providers_package(name: str, submodule: str) -> None:
+@pytest.mark.parametrize("name", [name for name, _ in ADR0004_PUBLIC_NAMES])
+def test_name_importable_from_providers_package(name: str) -> None:
     """Each ADR-0004 name is importable from hermes_voip.providers."""
     pkg = importlib.import_module("hermes_voip.providers")
     assert hasattr(pkg, name), (

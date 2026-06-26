@@ -329,3 +329,52 @@ def test_build_request_rejects_request_uri_with_whitespace() -> None:
     """A request URI with whitespace breaks start-line framing (ValueError expected)."""
     with pytest.raises(ValueError, match=r"request.?uri|URI"):
         build_request("REGISTER", "sip:1000@pbx.example.test transport=tls", [])
+
+
+# Malformed header-block line rejection (Wave-3 robustness audit finding:
+# a non-empty, non-continuation header-block line without a colon was silently
+# dropped instead of being rejected, allowing garbage to vanish undetected).
+
+
+def test_parse_response_rejects_colon_less_header_line() -> None:
+    """A non-empty, non-continuation header line without a colon is malformed.
+
+    Previously _parse_headers() silently dropped such lines (``if sep:`` with
+    no else branch). The parser must instead raise ValueError to prevent garbage
+    data from being swallowed undetected.
+    """
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS a.invalid;branch=z9hG4bK1\r\n"
+        "GARBAGELINE\r\n"  # no colon — must raise, not silently drop
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    with pytest.raises(ValueError, match=r"malformed header"):
+        SipResponse.parse(raw)
+
+
+def test_parse_request_rejects_colon_less_header_line() -> None:
+    """SipRequest.parse() delegates to _parse_headers() and must also reject garbage."""
+    raw = (
+        "REGISTER sip:pbx.example.test SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS host.invalid;branch=z9hG4bKxyz\r\n"
+        "NOTAHEADER\r\n"  # no colon — must raise, not silently drop
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    with pytest.raises(ValueError, match=r"malformed header"):
+        SipRequest.parse(raw)
+
+
+def test_parse_response_accepts_valid_folded_continuation_line() -> None:
+    """A SP/HTAB-led continuation line is valid RFC 3261 folding — must not raise."""
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "Contact: <sip:1000@198.51.100.7:5061;\r\n"
+        "  transport=tls>\r\n"  # valid continuation (starts with SP)
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    resp = SipResponse.parse(raw)
+    assert "transport=tls" in (resp.header("Contact") or "")

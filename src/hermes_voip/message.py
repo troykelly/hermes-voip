@@ -54,7 +54,8 @@ def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
     """Unfold (RFC 3261 §7.3.1) and split header lines into ``(name, value)`` pairs.
 
     Raises:
-        ValueError: If a continuation line has no preceding header.
+        ValueError: If a continuation line has no preceding header, or a non-empty
+            header line has no colon separator (malformed header field).
     """
     unfolded: list[str] = []
     for line in lines:
@@ -70,6 +71,13 @@ def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
         name, sep, value = line.partition(":")
         if sep:
             headers.append((name.strip(), value.strip()))
+        elif line:
+            # A non-empty line with no colon is not a valid header field — it is
+            # not a continuation (those are handled above) and not blank. Silently
+            # dropping it would allow garbage to vanish undetected, which is
+            # inconsistent with the module's strict-parse stance.
+            msg = f"malformed header line (no colon separator): {line!r}"
+            raise ValueError(msg)
     return tuple(headers)
 
 
@@ -266,8 +274,9 @@ class SipResponse:
             The parsed response.
 
         Raises:
-            ValueError: If the first line is not a valid SIP status-line, or a
-                header continuation line has no preceding header.
+            ValueError: If the first line is not a valid SIP status-line, a header
+                continuation line has no preceding header, or a non-empty header line
+                has no colon separator (malformed header field).
 
         Note:
             ``raw`` must be exactly one complete message. Octet-accurate stream
@@ -324,8 +333,9 @@ class SipRequest:
             The parsed request.
 
         Raises:
-            ValueError: If the first line is not a valid SIP request-line, or a
-                header continuation line has no preceding header.
+            ValueError: If the first line is not a valid SIP request-line, a header
+                continuation line has no preceding header, or a non-empty header line
+                has no colon separator (malformed header field).
         """
         head, _, body = raw.partition(_CRLF + _CRLF)
         lines = head.split(_CRLF)

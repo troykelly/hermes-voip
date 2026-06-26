@@ -33,9 +33,12 @@ def _install_fake_plugin_utils(lazy_singleton: object) -> Iterator[None]:
     the suite (which legitimately falls back to stdlib) is unaffected.
     """
     pkg = types.ModuleType("plugins")
-    pkg.__path__ = []  # mark as a package so the submodule import resolves
+    # ``setattr`` (not ``pkg.__path__ = ...`` / ``sub.x = ...``) keeps this
+    # mypy-strict clean without an escape hatch: a ModuleType exposes no static
+    # stub for an injected attribute.
+    setattr(pkg, "__path__", [])  # mark as a package so the submodule import resolves  # noqa: B010
     sub = types.ModuleType("plugins.plugin_utils")
-    sub.lazy_singleton = lazy_singleton  # type: ignore[attr-defined]  # test stub attr
+    setattr(sub, "lazy_singleton", lazy_singleton)  # noqa: B010 — test stub attr
     added = {"plugins": pkg, "plugins.plugin_utils": sub}
     saved = {name: sys.modules.get(name) for name in added}
     sys.modules.update(added)
@@ -228,3 +231,45 @@ def test_get_falls_back_to_stdlib_for_unrecognised_shape() -> None:
     singleton.reset()
     assert singleton.get() is sentinel
     assert calls == 2
+
+
+@pytest.fixture
+def _non_callable_get_runtime() -> Iterator[None]:
+    """A ``lazy_singleton`` whose ``get`` is PRESENT but NOT callable (a value).
+
+    ``isinstance`` against a ``@runtime_checkable`` Protocol verifies attribute
+    PRESENCE, not callability: an object carrying a non-callable, non-``None`` ``get``
+    (here a string) plus a real ``reset`` STILL matches the handle Protocol. Driving it
+    would crash (``TypeError: 'str' object is not callable`` from ``runtime.get()``);
+    the shim must detect the members are not callable and fall back to the stdlib
+    singleton instead of crashing.
+    """
+
+    class _NonCallableGet:
+        get = "not-callable"  # present and truthy, but NOT callable
+
+        def reset(self) -> None:
+            return None
+
+    def lazy_singleton(factory: Callable[[], object]) -> _NonCallableGet:
+        return _NonCallableGet()
+
+    yield from _install_fake_plugin_utils(lazy_singleton)
+
+
+@pytest.mark.usefixtures("_non_callable_get_runtime")
+def test_get_falls_back_when_runtime_members_not_callable() -> None:
+    """A structurally-matching-but-non-callable runtime falls back, never crashes."""
+    calls = 0
+    sentinel = object()
+
+    def factory() -> object:
+        nonlocal calls
+        calls += 1
+        return sentinel
+
+    singleton: LazySingleton[object] = LazySingleton(factory)
+    # Must NOT raise TypeError from calling a non-callable .get(): falls back instead.
+    assert singleton.get() is sentinel
+    assert singleton.get() is sentinel
+    assert calls == 1

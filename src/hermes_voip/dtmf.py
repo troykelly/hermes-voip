@@ -22,7 +22,6 @@ from __future__ import annotations
 import enum
 import math
 import struct
-from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -36,6 +35,37 @@ _MAX_VOLUME = 0x3F
 _MAX_DURATION = 0xFFFF
 _REDUNDANT_END_COUNT = 3
 _RECEIVER_HISTORY = 32
+
+
+@dataclass(frozen=True, slots=True)
+class DtmfPress:
+    """A completed DTMF key-press returned by :meth:`DtmfReceiver.feed` (ADR-0077).
+
+    Attributes:
+        digit: The keypad character that was pressed (``"0"``-``"9"``, ``"*"``,
+            ``"#"``, ``"A"``-``"D"``).
+    """
+
+    digit: str
+
+
+class DtmfNoPress(enum.Enum):
+    """Non-press outcomes of :meth:`DtmfReceiver.feed` (ADR-0077).
+
+    Replaces the bare ``None`` that previously conflated all non-press cases,
+    letting callers branch on the exact reason without extra bookkeeping:
+
+    * ``STILL_PRESSING``  - the end bit is not set; the tone is still in progress.
+    * ``DUPLICATE_END``   - the end bit is set but this RTP timestamp was already
+      recorded as a completed press (RFC 4733 redundant end or a reordered
+      duplicate).
+    * ``NON_DIGIT_EVENT`` - the end bit is set and the timestamp is new, but the
+      telephone-event code is not a keypad digit (e.g. flash = event 16).
+    """
+
+    STILL_PRESSING = "still_pressing"
+    DUPLICATE_END = "duplicate_end"
+    NON_DIGIT_EVENT = "non_digit_event"
 
 
 class DtmfSendMode(enum.Enum):
@@ -186,6 +216,12 @@ class DtmfReceiver:
     is emitted again. The end packet is the trigger: a press whose start/update
     packets were all lost is still surfaced (favouring not missing a digit), and
     a non-digit event (e.g. flash) is not surfaced as a digit.
+
+    ``_window`` is an insertion-ordered ``dict[int, None]`` that acts as a
+    bounded ordered set: the keys are the remembered timestamps in oldest-to-
+    newest order, and the ``None`` values carry no information. This replaces
+    the previous ``_order: deque[int]`` + ``_seen: set[int]`` pair, which
+    required manual synchronisation on every write (bk354).
     """
 
     def __init__(self, history: int = _RECEIVER_HISTORY) -> None:
@@ -193,9 +229,9 @@ class DtmfReceiver:
 
         Args:
             history: The size of the bounded dedup window (must be >= 1).  With
-                ``history=0`` the eviction guard never fires and ``_seen`` would
-                grow unbounded across a long call — a memory leak that silently
-                breaks the dedup contract.
+                ``history=0`` the eviction guard never fires and the window
+                would grow unbounded across a long call — a memory leak that
+                silently breaks the dedup contract.
 
         Raises:
             ValueError: If ``history`` is less than 1.
@@ -203,25 +239,39 @@ class DtmfReceiver:
         if history < 1:
             msg = f"history must be >= 1, got {history}"
             raise ValueError(msg)
-        self._order: deque[int] = deque(maxlen=history)
-        self._seen: set[int] = set()
+        self._history = history
+        # Single insertion-ordered structure: keys are remembered timestamps
+        # in insertion order; eviction pops the oldest (first) key when the
+        # window is full.  Acts as an ordered set with O(1) membership tests
+        # and O(1) oldest-key access (next(iter(d))).
+        self._window: dict[int, None] = {}
 
-    def feed(self, event: DtmfEvent, *, timestamp: int) -> str | None:
+    def feed(self, event: DtmfEvent, *, timestamp: int) -> DtmfPress | DtmfNoPress:
         """Process one decoded event at its RTP ``timestamp``.
 
         Returns:
-            The pressed digit when a new key-press ends, else ``None`` (still
-            pressing, a duplicate/reordered end packet, or a non-digit event).
+            :class:`DtmfPress` carrying the pressed digit when a new key-press
+            ends.  One of the :class:`DtmfNoPress` variants otherwise:
+
+            * ``STILL_PRESSING``  — the end bit is not set.
+            * ``DUPLICATE_END``   — the end bit is set but this timestamp is
+              already in the bounded window (RFC 4733 redundant end or reordered
+              duplicate).
+            * ``NON_DIGIT_EVENT`` — the end bit is set and the timestamp is new,
+              but the event code is not a keypad digit (e.g. flash = 16).
         """
-        if not event.end or timestamp in self._seen:
-            return None
-        if len(self._order) == self._order.maxlen and self._order:
-            self._seen.discard(self._order[0])  # evicted with the deque append
-        self._order.append(timestamp)
-        self._seen.add(timestamp)
+        if not event.end:
+            return DtmfNoPress.STILL_PRESSING
+        if timestamp in self._window:
+            return DtmfNoPress.DUPLICATE_END
+        # Evict the oldest entry if the window is full.
+        if len(self._window) >= self._history:
+            oldest = next(iter(self._window))
+            del self._window[oldest]
+        self._window[timestamp] = None
         if 0 <= event.event < len(_DIGITS):
-            return _DIGITS[event.event]
-        return None  # a non-digit telephone-event (e.g. flash); not surfaced
+            return DtmfPress(digit=_DIGITS[event.event])
+        return DtmfNoPress.NON_DIGIT_EVENT
 
 
 # ---------------------------------------------------------------------------

@@ -62,6 +62,7 @@ import audioop  # audioop-lts (rule 38) — used for PLC attenuation of a held f
 
 from hermes_voip.dtmf import (
     DtmfEvent,
+    DtmfPress,
     DtmfReceiver,
     DtmfSendMode,
     InbandDtmfDetector,
@@ -2959,13 +2960,13 @@ class RtpMediaTransport:
             return  # inbound DTMF ignored; the packet is still kept off the audio path
         try:
             event = DtmfEvent.decode(packet.payload)
-            digit = self._dtmf_receiver.feed(event, timestamp=packet.timestamp)
+            result = self._dtmf_receiver.feed(event, timestamp=packet.timestamp)
         except ValueError as exc:
             _log.debug("malformed telephone-event packet — dropped: %s", exc)
             return
-        if digit is not None:
-            _log.info("dtmf rx: digit %r", digit)
-            self._on_dtmf(digit)
+        if isinstance(result, DtmfPress):
+            _log.info("dtmf rx: digit %r", result.digit)
+            self._on_dtmf(result.digit)
 
     @property
     def on_dtmf(self) -> Callable[[str], None] | None:

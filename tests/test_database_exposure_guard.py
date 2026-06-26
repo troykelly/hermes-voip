@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from tools.check_database_exposure import Violation, main, scan_repository
 
 
@@ -124,9 +123,7 @@ def test_rejects_devcontainer_forwarded_postgres_port(tmp_path: Path) -> None:
         "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}\n",
     ],
 )
-def test_rejects_default_postgres_credentials(
-    tmp_path: Path, config_text: str
-) -> None:
+def test_rejects_default_postgres_credentials(tmp_path: Path, config_text: str) -> None:
     _write_file(tmp_path, "compose.yml", config_text)
 
     violations = scan_repository(tmp_path)
@@ -144,9 +141,7 @@ def test_rejects_default_postgres_credentials(
         "host all all 0.0.0.0/0 password\n",
     ],
 )
-def test_rejects_public_postgres_auth_config(
-    tmp_path: Path, config_text: str
-) -> None:
+def test_rejects_public_postgres_auth_config(tmp_path: Path, config_text: str) -> None:
     _write_file(tmp_path, "docker-compose.yml", config_text)
 
     violations = scan_repository(tmp_path)

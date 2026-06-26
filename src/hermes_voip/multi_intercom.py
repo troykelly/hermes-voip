@@ -80,6 +80,44 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
+
+# Control-char boundaries. A character is a control character if its code point is
+# a C0 control (U+0000-U+001F: CR=0x0D, LF=0x0A, NUL=0x00, …), DEL (U+007F), or a
+# C1 control (U+0080-U+009F). http.client raises a bare ValueError for some of these
+# in header names/values (and DEL/C1 are header-unsafe), bypassing the typed
+# exception chain — so we reject the whole band at load.
+_C0_LIMIT = 0x20
+_DEL = 0x7F
+_C1_LAST = 0x9F
+
+
+def _is_control_char(ch: str) -> bool:
+    """Return True if ``ch`` is a C0 (< 0x20), DEL (0x7f), or C1 (0x80-0x9f) control."""
+    code = ord(ch)
+    return code < _C0_LIMIT or _DEL <= code <= _C1_LAST
+
+
+def _reject_control_chars(value: str, label: str) -> None:
+    r"""Raise ConfigError if ``value`` contains any control character.
+
+    Rejects C0 controls (U+0000-U+001F: CR (\r), LF (\n), NUL (\x00), …), DEL
+    (U+007F), and C1 controls (U+0080-U+009F). These either cause HTTP header
+    injection or are rejected by ``http.client`` with a bare ``ValueError`` that
+    bypasses the ``(HTTPError, URLError, TimeoutError, OSError)`` catch in
+    ``_fire_webhook_blocking``.  Reject at load so the error is deterministic and the
+    contract (WebhookError from ``fire_webhook_opening()``) holds. The error reports
+    only the offending character's code point (e.g. ``U+000A``), never the
+    surrounding value (which may be a secret).
+    """
+    for ch in value:
+        if _is_control_char(ch):
+            msg = (
+                f"{label} must not contain control characters "
+                f"(found U+{ord(ch):04X} - rejecting to prevent HTTP header injection)"
+            )
+            raise ConfigError(msg)
+
+
 #: The env key naming the JSON config file (opt-in; a gitignored path — the document
 #: holds caller-IDs + possibly secrets, so the PATH is in env and the FILE is
 #: gitignored, never a tracked file).
@@ -408,7 +446,14 @@ def _parse_webhook_opening(name: str, raw_opening: Mapping[str, object]) -> Open
 
 
 def _parse_headers(name: str, raw: object) -> Mapping[str, str]:
-    """Validate the optional ``headers`` object (a string→string map)."""
+    """Validate the optional ``headers`` object (a string→string map).
+
+    Rejects any header name or value that contains an ASCII C0 control character
+    (CR, LF, NUL, …). ``http.client`` raises a bare ``ValueError`` for such values
+    at request-send time; that ``ValueError`` bypasses the existing except chain in
+    ``_fire_webhook_blocking`` and violates the ``WebhookError`` contract. Reject at
+    load so the failure is deterministic.
+    """
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -419,11 +464,26 @@ def _parse_headers(name: str, raw: object) -> Mapping[str, str]:
     headers: dict[str, str] = {}
     for key, value in raw.items():
         if not isinstance(value, str):
+            # Report only a generic location (the non-secret opening name) — never
+            # the raw header name {key!r}, for consistency with the control-char
+            # path's "don't echo raw config strings in a ConfigError" contract.
             msg = (
-                f"{_CONFIG_FILE_KEY}: webhook opening {name!r} header {key!r} must "
-                "be a string value"
+                f"{_CONFIG_FILE_KEY}: webhook opening {name!r} each header value "
+                "must be a string"
             )
             raise ConfigError(msg)
+        # Reject control chars in both the name and the value. The label carries
+        # ONLY a generic location (the non-secret opening name) — never the raw
+        # header name {key!r}, which is operator config that may itself be
+        # sensitive; the helper appends only the offending code point (U+XXXX).
+        _reject_control_chars(
+            str(key),
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} a header name",
+        )
+        _reject_control_chars(
+            value,
+            f"{_CONFIG_FILE_KEY}: webhook opening {name!r} a header value",
+        )
         headers[str(key)] = value
     return headers
 
@@ -470,7 +530,9 @@ async def fire_webhook_opening(opening: Opening) -> None:
     secrets); only the opening name + HTTP status / failure class are.
 
     Raises:
-        WebhookError: on a network error or a non-2xx HTTP response.
+        WebhookError: on a network error, a non-2xx HTTP response, or an
+            invalid-value error (e.g. a control char in a header that bypasses
+            the load-time rejection).
         ValueError: if ``opening`` is not a WEBHOOK opening (a programming error).
     """
     import asyncio  # noqa: PLC0415 — local import keeps the module import-light
@@ -478,7 +540,22 @@ async def fire_webhook_opening(opening: Opening) -> None:
     if opening.type is not OpeningType.WEBHOOK:
         msg = f"fire_webhook_opening called for a non-webhook opening {opening.name!r}"
         raise ValueError(msg)
-    await asyncio.to_thread(_fire_webhook_blocking, opening)
+    try:
+        await asyncio.to_thread(_fire_webhook_blocking, opening)
+    except WebhookError:
+        raise
+    except ValueError:
+        # Defense-in-depth: http.client raises ValueError for invalid header names
+        # or values (e.g. HTTP header injection via a control char that slips past
+        # load-time validation). The ValueError's text embeds the OFFENDING HEADER
+        # VALUE — which may be an "Authorization: Bearer <token>" header — so it MUST
+        # NOT reach a caller/log. Use a fixed message (the opening NAME is
+        # non-secret) AND suppress the cause (`from None`): chaining it as __cause__
+        # would re-expose the token in any printed traceback / logging.exception.
+        # The typed WebhookError still propagates; only the secret-bearing cause is
+        # dropped.
+        msg = f"webhook opening {opening.name!r} request failed: invalid request value"
+        raise WebhookError(msg) from None
 
 
 def _fire_webhook_blocking(opening: Opening) -> None:
@@ -510,6 +587,19 @@ def _fire_webhook_blocking(opening: Opening) -> None:
         # Network failure: report the reason class, never the url/headers/body.
         msg = f"webhook opening {opening.name!r} request failed: {type(exc).__name__}"
         raise WebhookError(msg) from exc
+    except ValueError:
+        # Defense-in-depth: http.client raises ValueError for invalid header names
+        # or values (e.g. HTTP header injection via a control char). This bypasses
+        # the except chain above; wrap it so the documented WebhookError contract
+        # always holds, even if a bad value reaches the network call despite the
+        # load-time rejection. The ValueError's text embeds the OFFENDING HEADER
+        # VALUE (which may be an "Authorization: Bearer <token>" header), so it MUST
+        # NOT be interpolated AND its cause MUST be suppressed (`from None`):
+        # chaining it as __cause__ would re-expose the token in any printed
+        # traceback / logging.exception. The typed error still propagates (the
+        # opening NAME is non-secret); only the secret-bearing cause is dropped.
+        msg = f"webhook opening {opening.name!r} request failed: invalid request value"
+        raise WebhookError(msg) from None
     if not 200 <= status < 300:  # noqa: PLR2004 — HTTP 2xx success band
         msg = f"webhook opening {opening.name!r} returned HTTP {status}"
         raise WebhookError(msg)

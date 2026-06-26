@@ -57,6 +57,10 @@ _ALGORITHM_PREFERENCE: tuple[str, ...] = (
 _C0_END = 0x20
 _DEL = 0x7F
 
+# RFC 2617/7616 nonce-count is exactly 8 lowercase hex digits on the wire.
+_NC_MIN = 1
+_NC_MAX = 0xFFFFFFFF
+
 
 def _unescape(quoted: str) -> str:
     r"""Resolve RFC 2617 quoted-pair escapes (``\X`` -> ``X``) in a parsed value.
@@ -274,7 +278,8 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
         method: The SIP method of the request being authorized (e.g. ``REGISTER``).
         uri: The digest URI — for SIP this is the request URI (e.g. ``sip:host``).
         cnonce: The client nonce; a random one is generated when omitted.
-        nc: The nonce-count for this cnonce (rendered as 8 hex digits).
+        nc: The nonce-count for this cnonce (must be 1..0xffffffff and
+            renders as 8 hex digits).
 
     Returns:
         The full header value, beginning with ``Digest ``.
@@ -290,6 +295,10 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
         raise ValueError(msg)
     if challenge.qop and "auth" not in challenge.qop:
         msg = f"challenge offers qop without 'auth': {challenge.qop!r}"
+        raise ValueError(msg)
+
+    if not _NC_MIN <= nc <= _NC_MAX:
+        msg = "nonce-count must be in the range 1..0xffffffff"
         raise ValueError(msg)
 
     use_auth_qop = "auth" in challenge.qop

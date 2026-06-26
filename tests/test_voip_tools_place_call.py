@@ -25,10 +25,13 @@ import pytest
 from hermes_voip.originate import OutboundCallNotAllowed
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.voip_tools import (
+    OPEN_ENTRY_TOOL_NAME,
     PLACE_CALL_TOOL_NAME,
     PLACE_CALL_TOOL_SCHEMA,
     REPORT_RESULT_TOOL_NAME,
     REPORT_RESULT_TOOL_SCHEMA,
+    SEND_DTMF_TOOL_NAME,
+    TRANSFER_BLIND_TOOL_NAME,
     AttendedTransferOutcome,
     TransferOutcome,
     place_call_handler,
@@ -321,6 +324,132 @@ def test_gate_fails_safe_for_place_call_when_call_unknown(
     """
     set_active_adapter(None)
     _set_chat(monkeypatch, None)
+
+    verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+# --- proactive place_call from a configured operator origin (issue #202) -----
+#
+# HERMES_VOIP_PROACTIVE_CALL_FROM lets a place_call originate from a NON-VoIP
+# session (e.g. a Telegram chat turn) whose (platform, chat_id) matches a
+# configured operator origin — and ONLY place_call, ONLY in the no-live-call
+# branch. The static HERMES_VOIP_OUTBOUND_ALLOW allowlist (ADR-0029) still gates
+# the dial target at the chokepoint regardless. Empty/unset => byte-identical to
+# the fully fail-safe default. Public-repo: fake origins only (telegram:123).
+
+
+def _set_origin(
+    monkeypatch: pytest.MonkeyPatch, platform: str | None, chat_id: str | None
+) -> None:
+    """Install a fake ``gateway.session_context`` exposing the originating session.
+
+    The proactive gate reads the originating ``(platform, chat_id)`` via a lazy
+    ``from gateway.session_context import get_session_env``; the default test gate
+    has no hermes runtime, so inject a minimal fake module whose ``get_session_env``
+    returns the supplied originating values (and ``""`` for anything else, matching
+    the real reader's empty-string-for-unset contract).
+    """
+    import sys  # noqa: PLC0415
+    from types import ModuleType  # noqa: PLC0415
+
+    module = ModuleType("gateway.session_context")
+    values = {
+        "HERMES_SESSION_PLATFORM": platform or "",
+        "HERMES_SESSION_CHAT_ID": chat_id or "",
+    }
+
+    def _get_session_env(key: str) -> str:
+        return values.get(key, "")
+
+    # Attribute assignment on a fresh ModuleType — the gate does ``from
+    # gateway.session_context import get_session_env``, so the name must resolve.
+    module.get_session_env = _get_session_env  # type: ignore[attr-defined]  # fake module has no stub
+    monkeypatch.setitem(sys.modules, "gateway", ModuleType("gateway"))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", module)
+
+
+def test_voip_tools_gate_proactive_place_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching operator origin unblocks a proactive (no-live-call) place_call.
+
+    With ``HERMES_VOIP_PROACTIVE_CALL_FROM`` set to the originating
+    ``platform:chat_id`` and NO live SIP call in scope, ``place_call`` is ALLOWED
+    (the gate returns ``None``). With no originating session context, it stays
+    blocked — the fail-safe is only relaxed for a configured origin.
+    """
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
+    set_active_adapter(None)  # no live SIP call / adapter in scope
+    _set_chat(monkeypatch, None)  # the Telegram chat_id is NOT a SIP Call-ID
+    _set_origin(monkeypatch, "telegram", "123")
+
+    assert voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={}) is None
+
+    # No originating session context at all => still blocked (nothing to match).
+    _set_origin(monkeypatch, None, None)
+    verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [TRANSFER_BLIND_TOOL_NAME, SEND_DTMF_TOOL_NAME, OPEN_ENTRY_TOOL_NAME],
+)
+def test_voip_tools_gate_proactive_not_place_call(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    """A matching operator origin unblocks ONLY place_call — never the others.
+
+    ``transfer_blind`` / ``send_dtmf`` / ``open_entry`` are meaningless without a
+    live call and MUST stay blocked in the no-live-call branch even from a
+    configured operator origin (the relaxation is place_call-scoped).
+    """
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
+    set_active_adapter(None)
+    _set_chat(monkeypatch, None)
+    _set_origin(monkeypatch, "telegram", "123")
+
+    verdict = voip_pre_tool_call(tool_name=tool_name, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_voip_tools_gate_proactive_off_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset ``HERMES_VOIP_PROACTIVE_CALL_FROM`` => place_call blocked (byte-identical).
+
+    With the opt-in env unset (the default), a place_call from a Telegram session
+    is blocked exactly as today — the fail-safe is fully intact.
+    """
+    monkeypatch.delenv("HERMES_VOIP_PROACTIVE_CALL_FROM", raising=False)
+    set_active_adapter(None)
+    _set_chat(monkeypatch, None)
+    _set_origin(monkeypatch, "telegram", "123")
+
+    verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
+def test_voip_tools_gate_proactive_wrong_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-matching origin is NOT unblocked (scoped to the configured pair).
+
+    ``HERMES_VOIP_PROACTIVE_CALL_FROM="telegram:999"`` must not permit a
+    ``telegram:123`` origin — permission is tied to the exact ``platform:chat_id``.
+    """
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:999")
+    set_active_adapter(None)
+    _set_chat(monkeypatch, None)
+    _set_origin(monkeypatch, "telegram", "123")
 
     verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
 

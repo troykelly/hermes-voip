@@ -22,6 +22,11 @@ repos:
         entry: bash -c 'if command -v gitleaks >/dev/null 2>&1; then gitleaks git --pre-commit --staged --redact --verbose; else echo "gitleaks not installed; skipping local scan (CI is authoritative)"; fi'
         language: system
         pass_filenames: false
+      - id: database-exposure-guard
+        name: database exposure guard
+        entry: uv run python tools/check_database_exposure.py
+        language: system
+        pass_filenames: false
       - id: mypy
         name: mypy (strict)
         entry: uv run mypy

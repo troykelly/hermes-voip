@@ -5,10 +5,6 @@
 FROM mcr.microsoft.com/devcontainers/typescript-node:24-trixie
 USER root
 ARG DEBIAN_FRONTEND=noninteractive
-# postgresql-client (psql / pg_isready) for the +timescale variant.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends postgresql-client \
- && rm -rf /var/lib/apt/lists/*
 USER vscode
 
 # ===========================================================================

@@ -127,7 +127,7 @@ artifacts = [
 [tool.ruff]
 line-length = 88
 target-version = "py313"
-src = ["src", "tests"]
+src = ["src", "tests", "tools"]
 
 [tool.ruff.lint]
 select = [
@@ -191,7 +191,7 @@ python_version = "3.13"
 strict = true
 warn_unreachable = true
 disallow_any_explicit = true
-files = ["src", "tests"]
+files = ["src", "tests", "tools"]
 # ``src/hermes_voip/adapter.py`` imports the real hermes-agent runtime
 # (``gateway.platforms.base`` / ``gateway.config``), which is an OPTIONAL extra
 # absent from the default install and ships no ``py.typed``. Type-checking it

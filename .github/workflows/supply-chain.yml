@@ -7,6 +7,14 @@ on:
     branches: [main]
     paths:
       ["pyproject.toml", "uv.lock", ".github/workflows/supply-chain.yml"]
+  # Daily scheduled run so a newly-disclosed CVE against an UNCHANGED pinned
+  # dependency is caught on cadence — not only when a dep-changing PR lands.
+  # Non-:00 minute avoids fleet pile-up on shared GitHub Actions runners.
+  # Schedule events carry no path context, so the path filters above do not
+  # apply; the `audit` job has no `if:` condition, so it runs unconditionally
+  # on every trigger including this one.  (AGENTS.md rule 35, ADR-0062.)
+  schedule:
+    - cron: "7 6 * * *"
 permissions:
   contents: read
 jobs:

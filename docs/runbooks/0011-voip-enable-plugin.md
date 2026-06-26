@@ -49,7 +49,7 @@ hermes gateway run
 **No double-registration (verified).** When both the pip entry point and this directory are
 present, the loader dedups by key (both resolve to `hermes-voip`) and the **entry point wins**,
 so this directory's `__init__.py` is not re-imported and the `voip` platform registers
-**exactly once** (verified live: `platform_registry.is_registered("voip")` is `True` with 9
+**exactly once** (verified live: `platform_registry.is_registered("voip")` is `True` with 10
 tools + 1 hook, no duplicate). The directory copy's job is purely the CLI affordance — it makes
 `hermes plugins list` show the plugin and lets `hermes plugins enable`/`disable hermes-voip`
 edit `plugins.enabled` in `config.yaml`.
@@ -57,8 +57,8 @@ edit `plugins.enabled` in `config.yaml`.
 > **`hermes plugins list` vs `/plugins` — a runtime nuance.** `hermes plugins list` reads this
 > directory `plugin.yaml`, so it shows `hermes-voip … 0.0.0 … <description> … user`. The
 > in-session `/plugins` *loaded* view, however, shows the version from the manifest that **won
-> the load dedup — the entry point's — which is empty**; its **tool/hook count (9 tools, 1
-> hook) is computed from the real registration, not from `provides_tools`**. Both are correct;
+> the load dedup — the entry point's — which is empty**. Its tool/hook count (10 tools, 1 hook)
+> is computed from the real registration, not from `provides_tools`. Both views are correct;
 > they read different sources. (`hermes plugins list` has no tool-count column at all.)
 
 The manifest is the single source of truth: its `provides_tools` / `provides_hooks` are pinned
@@ -139,7 +139,7 @@ lp = next(p for k, p in mgr._plugins.items() if "hermes-voip" in k)
 print("tools:", len(lp.tools_registered), "hooks:", len(lp.hooks_registered))
 PY
 # → voip registered: True -> Platform.VOIP
-# → tools: 9 hooks: 1
+# → tools: 10 hooks: 1
 ```
 
 For the end-to-end "register on the gateway and place a test call" procedure, see

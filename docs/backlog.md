@@ -110,7 +110,7 @@ defect or a load-bearing test gap.
   invariant will drift. Hoist a shared `contains_control`/`reject_controls` into an internal
   `_text.py`/`_chars.py`; keep per-call-site wording; add a focused test (NUL/CR/LF/HTAB/DEL + a high
   code point that must be allowed).
-- [ ] **[medium] robustness** — Header-block lines without a colon are silently dropped (`if sep:`,
+- [x] (done #208) **[medium] robustness** — Header-block lines without a colon are silently dropped (`if sep:`,
   lines 156-159). Verified: a `garbageline` between headers vanishes with no error — inconsistent with
   the module's otherwise-strict stance. Decide and document: prefer raising `ValueError('malformed header
   line: …')`; if leniency is wanted, comment it and pin with a test.
@@ -171,7 +171,7 @@ defect or a load-bearing test gap.
 - [x] **[medium] test** (done — Wave 3 audit) — No negative-control on negotiate ordering / TE-only rejection. No test where
   offer order differs from `supported` (an order-by-supported mutant survives); no test for the
   telephone-event-shared-but-no-voice branch (`has_voice` guard, lines 236-239). Add both.
-- [ ] **[low] robustness** — Direction attribute matching is exact-case only; `a=SENDONLY` is silently
+- [x] (done #209) **[low] robustness** — Direction attribute matching is exact-case only; `a=SENDONLY` is silently
   ignored (defaults to `sendrecv`, lines 146-147) → wrong media direction (e.g. a hold treated as
   sendrecv). Lower-case before the membership test; add a mixed-case test.
 - [ ] **[low] robustness** — Duplicate rtpmap (last-wins) and duplicate payload-type in `m=` (dup
@@ -680,20 +680,20 @@ These span multiple modules or the repo as a whole.
   before interpolation; (b) make outbound_allow + dial consistent on URI-form entries. TDD: red test that an
   allowlisted `extension` containing `@evil.com` is rejected before any INVITE is built
   (`adapter.py`, `outbound_allow.py`, `message.py`, `tests/test_outbound_allow.py`).
-- [ ] **[high] observability** — Wire RTCP `CallQuality` snapshot to structured log fields. `adapter.py:5181-5190`
+- [x] (done #210) **[high] observability** — Wire RTCP `CallQuality` snapshot to structured log fields. `adapter.py:5181-5190`
   logs RTCP teardown quality as a plain `%`-formatted string with no `extra={}` kwargs (runbook-0014 §Packet
   loss & jitter marks emission as "SOURCE EXISTS, EMISSION TBD"). No test asserts the teardown log line is
   emitted when `_rtcp_active` is True — every adapter test that reaches `_teardown_call` explicitly sets
   `engine._rtcp_active=False` to skip the path (`tests/test_adapter.py:680,746,1628,2086,2148,2247`). Emit
   structured log dict with `event='rtcp_call_quality'`; add a test with a fake engine where
   `_rtcp_active=True` using `pytest caplog`.
-- [ ] **[high] observability** — Add structured per-call lifecycle log events with machine-parseable fields for
+- [x] (done #210) **[high] observability** — Add structured per-call lifecycle log events with machine-parseable fields for
   SLO counting. Current log lines at `adapter.py:2819-2822` (INVITE received), `:2852-2856` and `:2944-2950`
   (REJECTED), `:4722` (200 OK), `:4861` (CallLoop started) use positional `printf`-style with no `extra=`
   dict. Runbook-0014 §Call setup success marks these events as NOT YET INSTRUMENTED. Emit
   `logging.info(..., extra={'event':'invite_received','call_id':...,'outcome':'rejected','sip_code':488})`
   — no new infra, stdlib `logging` supports `extra=` natively.
-- [ ] **[medium] observability** — Emit per-call duration and concurrent-call gauge to structured log at
+- [x] (done #210) **[medium] observability** — Emit per-call duration and concurrent-call gauge to structured log at
   teardown. `adapter.py:902` maintains `_admitted_calls` (live set) whose `len()` is the real-time concurrency
   count but is never logged at admission (`:5248`) or release (`:5258`). Call duration is never logged: the
   INVITE-received timestamp is a log string only (`adapter.py:2819`) with no `time.monotonic()` anchor and
@@ -706,7 +706,7 @@ These span multiple modules or the repo as a whole.
   or why. On the live test gateway (SDES-SRTP, runbook-0014 §Secured paths: RTCP is dormant), every
   production call is silent at teardown. Emit a single `DEBUG/INFO` "INVITE %s: RTCP dormant — no call
   quality data (secured=%s, enabled=%s)" at teardown (`adapter.py`, `media/engine.py`).
-- [ ] **[medium] observability** — Add test asserting RTCP call-quality INFO log is emitted at teardown when
+- [x] (done #210) **[medium] observability** — Add test asserting RTCP call-quality INFO log is emitted at teardown when
   `_rtcp_active` is True. No existing test covers `adapter.py:5179-5190`; every adapter test sets
   `engine._rtcp_active=False` to skip it. A parameterised test with a fake engine where `_rtcp_active=True`
   and `call_quality` returns a known `CallQuality`, using `pytest caplog`, pins this mutation-invisible path
@@ -852,7 +852,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/providers/ (Wave-1 additions)
 
-- [ ] **[high] api** — `providers/__init__.py` re-exports only `Providers` and `build_providers`; the 12
+- [x] (done #207) **[high] api** — `providers/__init__.py` re-exports only `Providers` and `build_providers`; the 12
   other public names forming the ADR-0004 provider seam — `StreamingASR`, `Transcript`, `StreamingTTS`,
   `TtsStream`, `InjectionGuard`, `GuardResult`, `GuardVerdict`, `MediaTransport`, `PcmFrame`, `AsrFactory`,
   `TtsFactory`, `GuardFactory` — all require deep submodule paths. There are ~178 such deep-path import sites
@@ -1051,13 +1051,13 @@ These span multiple modules or the repo as a whole.
 
 ### UX / conversational
 
-- [ ] **[high] ux** — On a guard REFUSE the caller hears only dead air — no spoken acknowledgment, no recovery path. `call_loop.py:2020` — when `result.verdict is GuardVerdict.REFUSE`, `_screen_and_deliver` records the verdict and returns without calling `deliver_turn` and without scheduling a comfort filler (line 2026 is gated behind the non-REFUSE branch), so a legitimate caller false-positived by the injection guard experiences pure silence and will typically repeat themselves into the same wall, then get no-input-reprompted and eventually hung up on. Fix: on REFUSE, speak a short language-keyed safe decline line through `_speak_phrase_best_effort` so the caller gets conversational feedback; TDD a red test that a REFUSE verdict drives exactly one spoken phrase via TTS and still does NOT call `deliver_turn`; honour the rng/no-immediate-repeat and language-keyed conventions (ADR-0054/0057). The two existing REFUSE backlog items (lines 717-723) cover caller-active flags and mutation coverage only — none addresses spoken feedback to the caller (`src/hermes_voip/media/call_loop.py:2020-2026`).
+- [x] (done #211) **[high] ux** — On a guard REFUSE the caller hears only dead air — no spoken acknowledgment, no recovery path. `call_loop.py:2020` — when `result.verdict is GuardVerdict.REFUSE`, `_screen_and_deliver` records the verdict and returns without calling `deliver_turn` and without scheduling a comfort filler (line 2026 is gated behind the non-REFUSE branch), so a legitimate caller false-positived by the injection guard experiences pure silence and will typically repeat themselves into the same wall, then get no-input-reprompted and eventually hung up on. Fix: on REFUSE, speak a short language-keyed safe decline line through `_speak_phrase_best_effort` so the caller gets conversational feedback; TDD a red test that a REFUSE verdict drives exactly one spoken phrase via TTS and still does NOT call `deliver_turn`; honour the rng/no-immediate-repeat and language-keyed conventions (ADR-0054/0057). The two existing REFUSE backlog items (lines 717-723) cover caller-active flags and mutation coverage only — none addresses spoken feedback to the caller (`src/hermes_voip/media/call_loop.py:2020-2026`).
 - [ ] **[medium] ux** — Provider/runtime error spoken apology has no operator override and is English-hardcoded with no fallback line per language. `provider_error.py:_SAFE_ERROR_REPLY_BY_LANGUAGE` has only an `'en'` entry; `adapter.py:1388-1389` selects it by `self._media_cfg.language`; unlike comfort-filler/reprompt/goodbye phrases (which the operator can override via env), the error apology is entirely uncustomisable and silently falls back to English for any non-`'en'` language. Fix: add a `safe_error_reply` phrase to the language-keyed config mechanism with a `HERMES_VOIP_SAFE_ERROR_REPLY` env override and a `MediaConfig` field, mirroring comfort-filler plumbing; thread into the adapter's `safe_error_reply` call. This is narrower than the broadly-tracked multi-language item (backlog line 747-762), which lists comfort-filler/reprompt/goodbye/greeting but NOT the error-reply line (`src/hermes_voip/provider_error.py`, `adapter.py:1388`, `config.py`).
 - [ ] **[low] ux** — Empty / whitespace-only ASR final is delivered as a real caller turn (phantom empty turn to the agent). `call_loop.py:1300` puts `transcript.text` onto `transcript_q` whenever end-of-turn is reached, with no guard against empty or whitespace-only text; a cough or door slam endpointed as a turn emits an empty final that is guard-screened and handed to `deliver_turn` (line 2027) as a genuine caller utterance, prompting a confused agent reply. Fix: skip delivery when `transcript.text.strip()` is empty; optionally surface to the no-input watchdog as a non-event so it does not reset the silence window; TDD a red test that an end-of-turn transcript with text `''` or `'   '` does NOT reach `deliver_turn` while a non-empty one does (`src/hermes_voip/media/call_loop.py:1300`).
 
 ### Operability
 
-- [ ] **[high] docs** — Runbook 0013 §3 falsely states graceful shutdown is unimplemented — contradicts §Restart in the same file. `docs/runbooks/0013-voip-incident-oncall.md` lines 496-511 say "The plugin does not currently implement graceful shutdown … A hard kill: kill -9" — but ADR-0059 shipped a full BYE-drain `disconnect()` (adapter.py:1175-1240), and the same runbook's Restart §1 (lines 523-536) already correctly documents `kill -TERM` + drain with the expected log line. An on-call engineer reading §3 will hard-kill a running gateway, dropping live callers, when a graceful SIGTERM is available. Fix: update §3 to match §Restart; align both sections to describe the shipped ADR-0059 behaviour (rule 27) (`docs/runbooks/0013-voip-incident-oncall.md:496-511`).
+- [x] (done #206) **[high] docs** — Runbook 0013 §3 falsely states graceful shutdown is unimplemented — contradicts §Restart in the same file. `docs/runbooks/0013-voip-incident-oncall.md` lines 496-511 say "The plugin does not currently implement graceful shutdown … A hard kill: kill -9" — but ADR-0059 shipped a full BYE-drain `disconnect()` (adapter.py:1175-1240), and the same runbook's Restart §1 (lines 523-536) already correctly documents `kill -TERM` + drain with the expected log line. An on-call engineer reading §3 will hard-kill a running gateway, dropping live callers, when a graceful SIGTERM is available. Fix: update §3 to match §Restart; align both sections to describe the shipped ADR-0059 behaviour (rule 27) (`docs/runbooks/0013-voip-incident-oncall.md:496-511`).
 - [ ] **[medium] docs** — Admission-control and shutdown-drain knobs (`HERMES_SIP_MAX_CALLS`, `HERMES_SIP_SHUTDOWN_DRAIN_SECS`) absent from `plugin.yaml` `optional_env`. Both env vars are declared and validated in `config.py` (lines 104-107, 661-717) and operational (runbook-0013 lines 151-156, 526), but neither appears in `src/hermes_voip/plugin.yaml` `optional_env` (verified: grep returns no output). An operator tuning capacity or adjusting how long live callers are given to finish on restart has no manifest-visible signal these knobs exist. Fix: add both to `plugin.yaml optional_env` with description and default (rule 42) (`src/hermes_voip/plugin.yaml`, `config.py`).
 
 ### Packaging

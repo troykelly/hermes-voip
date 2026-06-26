@@ -124,6 +124,53 @@ def test_from_invite_2xx_route_set_reversed() -> None:
     )
 
 
+def test_from_invite_2xx_splits_comma_combined_record_route() -> None:
+    # A single Record-Route header may combine several proxy URIs with top-level
+    # commas (RFC 3261 §7.3.1). They must split into separate route-set entries,
+    # not collapse into one; the UAC then reverses that order (§12.1.2).
+    combined = "<sip:p1.example.test;lr>, <sip:p2.example.test;lr>"
+    d = Dialog.from_invite_2xx(_invite(), _ok(record_route=(combined,)))
+    assert d.route_set == (
+        "<sip:p2.example.test;lr>",
+        "<sip:p1.example.test;lr>",
+    )
+
+
+def test_from_inbound_invite_splits_comma_combined_record_route() -> None:
+    # The UAS keeps the order; a comma-combined header must still yield two
+    # distinct entries (RFC 3261 §12.1.1).
+    combined = "<sip:p1.example.test;lr>, <sip:p2.example.test;lr>"
+    d = Dialog.from_inbound_invite(
+        _inbound_invite(record_route=(combined,)),
+        local_tag="ourtag",
+        local_contact=_LOCAL_CONTACT,
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    assert d.route_set == (
+        "<sip:p1.example.test;lr>",
+        "<sip:p2.example.test;lr>",
+    )
+
+
+def test_build_emits_separate_route_lines_for_comma_combined_record_route() -> None:
+    # The downgrade bug: a comma-combined Record-Route must produce two separate
+    # Route: lines in an in-dialog BYE, not one malformed combined line.
+    combined = "<sip:p1.example.test;lr>, <sip:p2.example.test;lr>"
+    d = Dialog.from_inbound_invite(
+        _inbound_invite(record_route=(combined,)),
+        local_tag="ourtag",
+        local_contact=_LOCAL_CONTACT,
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    req = SipRequest.parse(build_in_dialog_request(d, "BYE").text)
+    assert req.headers_all("Route") == (
+        "<sip:p1.example.test;lr>",
+        "<sip:p2.example.test;lr>",
+    )
+
+
 def test_dialog_id_is_callid_localtag_remotetag() -> None:
     d = Dialog.from_invite_2xx(_invite(), _ok())
     assert d.dialog_id == ("call-abc", "ftag", "ttag")

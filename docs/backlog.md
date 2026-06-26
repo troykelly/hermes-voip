@@ -42,10 +42,10 @@ defect or a load-bearing test gap.
   Verified: `Digest realm=r;x=y, nonce=n` parses realm as `r;x=y`. A permissive/garbled gateway could
   poison realm (and thus HA1). Tighten the bare class or post-validate realm/nonce against the
   token/quoted-string grammar; add a boundary test.
-- [ ] **[medium] robustness** — `nc` accepts negative and `>0xffffffff` values, producing malformed
+- [x] (done #214) **[medium] robustness** — `nc` accepts negative and `>0xffffffff` values, producing malformed
   nonce-count. `f"{nc:08x}"` renders `nc=-1` as `-0000001`, `nc=2**40` as 9+ hex digits (both verified).
   RFC 2617 nc is exactly 8 hex digits. Validate `0 < nc <= 0xFFFFFFFF`; tests for nc=0/-1/2**32.
-- [ ] **[medium] robustness** — No control-char-rejection tests for each caller/challenge-sourced
+- [x] (done #214) **[medium] robustness** — No control-char-rejection tests for each caller/challenge-sourced
   quoted param. `_quoted`'s guard is shared, but only `nonce` is covered (`test_rejects_crlf_in_auth_param_value`).
   `uri` is both hashed and rendered; `username`, `opaque`, `realm`, `cnonce` are rendered too. Add
   per-field CRLF-rejection tests — the per-field coverage is what mutation testing rewards.
@@ -296,7 +296,7 @@ defect or a load-bearing test gap.
   reordering-prone — this permanently loses the greeting / first words feeding STT. Defer anchoring until
   the first `pop()`, or allow `_next` to revise downward while nothing has been emitted; reorder-pair-first
   test.
-- [ ] **[medium] correctness** — `target_depth` counts ALL buffered packets, so a far-future cluster
+- [x] (done #215; partial: total-occupancy semantics documented + pinned; contiguous-backlog correctness fix deferred to the JitterBuffer __len__/flush/reset/SSRC API redesign) **[medium] correctness** — `target_depth` counts ALL buffered packets, so a far-future cluster
   triggers premature loss for the immediate gap. `pop()` declares `Lost` when `len(_packets) >= _depth`
   (line 200) measuring total occupancy, not contiguous backlog behind the gap (verified with
   depth=3, push 10/100/101/102). Gate loss on backlog ahead of the next contiguous run; at minimum
@@ -305,7 +305,7 @@ defect or a load-bearing test gap.
   (verified: depth=1, push 10 then 50 → 39 separate `Lost`), each allocating a frozen dataclass, spinning
   the media loop. Coalesce into `Lost(sequence, count)` / a run-length scanned in one step; even if the
   per-packet API is kept, add a fast-path and document the per-pop cost.
-- [ ] **[medium] robustness** — Malformed RTP padding silently accepted. When the pad byte exceeds the
+- [x] (done #215) **[medium] robustness** — Malformed RTP padding silently accepted. When the pad byte exceeds the
   payload, the guard (lines 114-117) fails and the raw payload (incl. the bogus pad byte) is returned with
   no error — inconsistent with the other parse paths that raise. Verified: P=1, payload `b'\x05'` →
   `b'\x05'`. Raise `ValueError` when `pad > len(payload)`; decide/document `pad==0`-with-P. Tests both.
@@ -427,14 +427,14 @@ defect or a load-bearing test gap.
   hot-path loop to unwrap frames and re-stamp `sample_rate`/`monotonic_ts_ns` by hand (the error-prone
   part — a forgotten rate update makes the frame lie). Add `resample_frame(frame) -> PcmFrame` that sets
   the new rate and propagates ts; document the ts policy. Keep the byte-level primitives.
-- [ ] **[medium] robustness** — `decode_ulaw`/`decode_alaw` validate nothing (asymmetric with the
+- [x] (done #217) **[medium] robustness** — `decode_ulaw`/`decode_alaw` validate nothing (asymmetric with the
   validating encode path), so a zero-length/truncated payload becomes a silent empty/short frame. Add
   tests pinning empty-input behaviour; decide whether zero-length payloads should be rejected (here or in
   the transport/jitter layer) and document the deliberate no-validation choice for decode.
-- [ ] **[medium] test** — Continuity test only covers 8k↔16k; the 24k↔8k TTS path (ADR-0004/0005) and
+- [x] (done #217) **[medium] test** — Continuity test only covers 8k↔16k; the 24k↔8k TTS path (ADR-0004/0005) and
   24k↔16k are untested — exactly the non-integer-ratio cases where boundary clicks appear. Extend the
   parametrize to include 24000↔8000/16000↔24000/24000↔16000; add sample-count sanity for 24k↔8k.
-- [ ] **[medium] test** (partial — residual: wide resample tolerance `300 <= out_samples <= 340` (line 63) unchanged; no a-law near-lossless value test; no golden-vector assertion (e.g.) — Mutation-weak assertions: wide resample tolerances (`300 <= … <= 340`); the
+- [x] (done #217) **[medium] test** (partial — residual: wide resample tolerance `300 <= out_samples <= 340` (line 63) unchanged; no a-law near-lossless value test; no golden-vector assertion (e.g.) — Mutation-weak assertions: wide resample tolerances (`300 <= … <= 340`); the
   ulaw/alaw one-byte-per-sample tests assert no decoded values (a `lin2ulaw`→`lin2alaw` swap survives);
   a-law has NO round-trip value assertion at all (a `decode_alaw`→`ulaw2lin` mutant survives). Add an
   a-law near-lossless value test; tighten counts; add an `encode_ulaw != encode_alaw` discrimination test;
@@ -819,7 +819,7 @@ These span multiple modules or the repo as a whole.
   `transfer_attended_handler`. Fixed: Security section now accurately describes the shipped trust model
   (transfer is available at operator privilege level, gated by DTMF confirmation for blind and outbound
   allow-list for attended).
-- [ ] **[medium] docs** — README reports stale tool count: "9 tools, 1 hook" should be "10 tools, 1 hook".
+- [x] (done #219) **[medium] docs** — README reports stale tool count: "9 tools, 1 hook" should be "10 tools, 1 hook".
   `README.md:210` says the plugin registers `9 tools, 1 hook`. `plugin.yaml provides_tools` (lines 41-50) has
   10 entries including `transfer_attended` (added in commit `d8097cc`). The discrepancy will mislead operators.
 
@@ -1007,8 +1007,8 @@ These span multiple modules or the repo as a whole.
 
 ### Correctness
 
-- [ ] **[medium] correctness** — Dialog route set does not split comma-combined Record-Route headers (RFC 3261 §7.3.1) — mid-dialog routing corrupted on multi-proxy paths. `dialog.py` builds the in-dialog route set directly from `response.headers_all("Record-Route")` (dialog.py:142 for the UAC, :182 for the UAS) without splitting single header values that combine several URIs with top-level commas (e.g. `Record-Route: <sip:p1;lr>, <sip:p2;lr>`), causing the entire multi-proxy route set to collapse into one element and in-dialog BYE/re-INVITE to emit a single malformed `Route:` line. Fix: lift `registration._split_contacts`' angle/quote-aware top-level-comma splitter into a shared helper and apply it over each Record-Route value before building `route_set`; TDD red test parsing a 2xx with a comma-combined Record-Route row and asserting `route_set` has two elements in the correct order plus a BYE emitting two separate `Route:` lines (`src/hermes_voip/dialog.py:142,182,238`, `registration.py:43-71`, `tests/test_dialog.py`).
-- [ ] **[low] robustness** — SIP stream framer faults the connection on a line-folded Content-Length instead of unfolding it (RFC 3261 §7.3.1). `framing._content_length` (framing.py:110-126) splits the head line-by-line but never unfolds RFC 3261 §7.3.1 continuation lines, unlike `message._parse_headers` (message.py:59-67); a `Content-Length:\r\n  42` row yields an empty value that fails `isdecimal()` → `FramingError` and tears down the TLS stream. Fix: unfold continuation lines in `_content_length` (or share `message._parse_headers`'s unfold step) before the name scan; add a unit test feeding a folded Content-Length and asserting the message frames (`src/hermes_voip/transport/framing.py:110-126`, `tests/test_framing.py`).
+- [x] (done #218) **[medium] correctness** — Dialog route set does not split comma-combined Record-Route headers (RFC 3261 §7.3.1) — mid-dialog routing corrupted on multi-proxy paths. `dialog.py` builds the in-dialog route set directly from `response.headers_all("Record-Route")` (dialog.py:142 for the UAC, :182 for the UAS) without splitting single header values that combine several URIs with top-level commas (e.g. `Record-Route: <sip:p1;lr>, <sip:p2;lr>`), causing the entire multi-proxy route set to collapse into one element and in-dialog BYE/re-INVITE to emit a single malformed `Route:` line. Fix: lift `registration._split_contacts`' angle/quote-aware top-level-comma splitter into a shared helper and apply it over each Record-Route value before building `route_set`; TDD red test parsing a 2xx with a comma-combined Record-Route row and asserting `route_set` has two elements in the correct order plus a BYE emitting two separate `Route:` lines (`src/hermes_voip/dialog.py:142,182,238`, `registration.py:43-71`, `tests/test_dialog.py`).
+- [x] (done #216) **[low] robustness** — SIP stream framer faults the connection on a line-folded Content-Length instead of unfolding it (RFC 3261 §7.3.1). `framing._content_length` (framing.py:110-126) splits the head line-by-line but never unfolds RFC 3261 §7.3.1 continuation lines, unlike `message._parse_headers` (message.py:59-67); a `Content-Length:\r\n  42` row yields an empty value that fails `isdecimal()` → `FramingError` and tears down the TLS stream. Fix: unfold continuation lines in `_content_length` (or share `message._parse_headers`'s unfold step) before the name scan; add a unit test feeding a folded Content-Length and asserting the message frames (`src/hermes_voip/transport/framing.py:110-126`, `tests/test_framing.py`).
 
 ### Robustness
 

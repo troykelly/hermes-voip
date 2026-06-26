@@ -718,8 +718,8 @@ class _VideoAccumulator:
             self.fmtps[int(pt_str)] = params.strip()
         elif tag == "mid":
             self.mid = rest.strip()
-        elif value in _DIRECTIONS:
-            self.direction = value
+        elif value.lower() in _DIRECTIONS:
+            self.direction = value.lower()
         elif value == "rtcp-mux":
             self.rtcp_mux = True
 
@@ -845,8 +845,8 @@ class _AudioAccumulator:
             # RFC 4566 §6: the maximum packetisation time the peer accepts (ms),
             # an upper bound negotiate_ptime honours (ADR-0056).
             self.maxptime = int(rest.strip())
-        elif value in _DIRECTIONS:
-            self.direction = value
+        elif value.lower() in _DIRECTIONS:
+            self.direction = value.lower()
         # WebRTC attributes (ADR-0016, RFC 5763/8839).  Malformed lines are
         # tolerated: a bad fingerprint or candidate leaves the field None/empty
         # (same leniency as SDES crypto lines) so a single bad attr does not

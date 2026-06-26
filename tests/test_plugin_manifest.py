@@ -385,6 +385,28 @@ def test_optional_env_advertises_transport_and_provider_keys() -> None:
             )
 
 
+def test_optional_env_advertises_admission_control_knobs() -> None:
+    """optional_env documents the admission-control and shutdown-drain knobs.
+
+    HERMES_SIP_MAX_CALLS and HERMES_SIP_SHUTDOWN_DRAIN_SECS are declared and
+    validated in config.py (lines ~104-107) and documented in runbook-0013.
+    They are NOT in requires_env (each has a safe runtime default so they never
+    gate plugin loading), but they must be visible in the manifest so an operator
+    tuning admission capacity or shutdown drain has a manifest-visible signal that
+    these knobs exist.
+
+    Defaults verified against config.py: MAX_CALLS=8, SHUTDOWN_DRAIN_SECS=5.0.
+    """
+    entries = _optional_env_block()
+    names = {_entry_name(e) for e in entries}
+    for expected in ("HERMES_SIP_MAX_CALLS", "HERMES_SIP_SHUTDOWN_DRAIN_SECS"):
+        assert expected in names, (
+            f"optional_env must advertise {expected} (admission-control knob, "
+            f"config.py line ~104-107, runbook-0013) — "
+            f"operator has no manifest-visible signal it exists otherwise"
+        )
+
+
 # ---------------------------------------------------------------------------
 # (d) PUBLIC-repo invariant: the manifest contains env-var NAMES only — no real
 #     host/extension/password/IP VALUES. A coarse but effective leak guard.

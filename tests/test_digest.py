@@ -164,6 +164,94 @@ def test_rejects_crlf_in_auth_param_value() -> None:
         )
 
 
+@pytest.mark.parametrize("invalid_nc", [0, -1, 2**32])
+def test_rejects_out_of_range_nonce_count(invalid_nc: int) -> None:
+    challenge = DigestChallenge.parse('Digest realm="r", nonce="n", qop="auth"')
+    creds = DigestCredentials(username="u", password="p")
+    with pytest.raises(ValueError, match="nonce-count"):
+        build_authorization(
+            challenge,
+            creds,
+            method="REGISTER",
+            uri="sip:x",
+            cnonce="c",
+            nc=invalid_nc,
+        )
+
+
+def test_rejects_control_char_in_realm_auth_param_value() -> None:
+    challenge = DigestChallenge(
+        realm="pbx.example.test\x1fzone", nonce="n", qop=("auth",)
+    )
+    with pytest.raises(ValueError, match="control"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="fixedcnonce",
+        )
+
+
+def test_rejects_control_char_in_uri_auth_param_value() -> None:
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", qop="auth"'
+    )
+    with pytest.raises(ValueError, match="control"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test\ninvalid",
+            cnonce="fixedcnonce",
+        )
+
+
+def test_rejects_control_char_in_username_auth_param_value() -> None:
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", qop="auth"'
+    )
+    with pytest.raises(ValueError, match="control"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000\rname", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="fixedcnonce",
+        )
+
+
+def test_rejects_control_char_in_opaque_auth_param_value() -> None:
+    challenge = DigestChallenge(
+        realm="pbx.example.test",
+        nonce="n",
+        qop=("auth",),
+        opaque="opaque\x7fvalue",
+    )
+    with pytest.raises(ValueError, match="control"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="fixedcnonce",
+        )
+
+
+def test_rejects_control_char_in_cnonce_auth_param_value() -> None:
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", qop="auth"'
+    )
+    with pytest.raises(ValueError, match="control"):
+        build_authorization(
+            challenge,
+            DigestCredentials(username="1000", password="s3cr3t"),
+            method="REGISTER",
+            uri="sip:pbx.example.test",
+            cnonce="fixed\r\ncnonce",
+        )
+
+
 def test_nc_is_zero_padded_hex() -> None:
     challenge = DigestChallenge.parse('Digest realm="r", nonce="n", qop="auth"')
     creds = DigestCredentials(username="u", password="p")

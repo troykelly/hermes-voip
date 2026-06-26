@@ -32,7 +32,7 @@ import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 
-from hermes_voip.providers.audio import PcmFrame
+from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 from hermes_voip.spoken_text import strip_audio_tags
 from hermes_voip.tts.segment import DEFAULT_FIRST_SEGMENT_MAX_CHARS, FlushableSegmenter
 
@@ -201,12 +201,24 @@ class PcmFrameStream:
                 source = self._open_segment(speakable)
                 self._active = source.chunks
                 self._abort = source.abort
+                carry = b""
                 try:
                     async for chunk in source.chunks:
                         if self._stop.is_set():
                             return
-                        if chunk:
-                            yield self._frame(chunk)
+                        if not chunk:
+                            continue
+                        pcm16 = carry + chunk
+                        frame_length = len(pcm16) - (
+                            len(pcm16) % PCM16_BYTES_PER_SAMPLE
+                        )
+                        frame_bytes = pcm16[:frame_length]
+                        carry = pcm16[frame_length:]
+                        if frame_bytes:
+                            yield self._frame(frame_bytes)
+                    if carry:
+                        msg = "PCM16 byte stream ended with a partial sample"
+                        raise ValueError(msg)
                 finally:
                     # Close this segment's source before the next one (and on the
                     # GeneratorExit that cancel()/early-return raises here).

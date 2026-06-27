@@ -22,6 +22,12 @@ instantiates the platform.
 # hermes-agent runtime nor any heavy media/ML dependency, so a bare
 # ``import hermes_voip`` stays cheap. The Hermes plugin loader calls
 # ``hermes_voip.register(ctx)`` immediately after importing the package.
+from hermes_voip.call_context import (
+    DiversionHop,
+    HistoryInfoEntry,
+    InboundCallContext,
+    extract_call_context,
+)
 from hermes_voip.plugin import register
 from hermes_voip.registration import (
     Challenged,
@@ -36,13 +42,17 @@ from hermes_voip.sip import sip_address_of_record
 
 __all__ = [
     "Challenged",
+    "DiversionHop",
     "Failed",
+    "HistoryInfoEntry",
+    "InboundCallContext",
     "Registered",
     "RegistrationConfig",
     "RegistrationFlow",
     "RegistrationOutcome",
     "Retry",
     "__version__",
+    "extract_call_context",
     "register",
     "sip_address_of_record",
 ]

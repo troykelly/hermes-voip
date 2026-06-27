@@ -393,6 +393,10 @@ _DEFAULT_REFUSE_DECLINE_PHRASES: tuple[str, ...] = _REFUSE_DECLINE_PHRASES_BY_LA
     _DEFAULT_LANGUAGE
 ]
 
+# Operator-overridable apology for provider/runtime errors (ADR-0063).
+# Empty string → use per-language built-in from provider_error.py.
+_ERROR_APOLOGY_KEY = "HERMES_VOIP_ERROR_APOLOGY"
+
 _DEFAULT_BARGE_IN_MODE = "gated"
 _BARGE_IN_MODES = frozenset({"off", "gated", "full"})
 # 600 ms ≈ 19 VAD windows at 8 kHz — above the longest observed gateway-echo
@@ -1135,6 +1139,13 @@ class MediaConfig:
     # agent. The default MUST match call_loop.py's _DEFAULT_REFUSE_DECLINE_PHRASES so
     # behaviour matches when env is unset. ``HERMES_VOIP_REFUSE_DECLINE_PHRASES``.
     refuse_decline_phrases: tuple[str, ...] = _DEFAULT_REFUSE_DECLINE_PHRASES
+    # Operator-overridable spoken apology for provider/runtime errors (ADR-0063).
+    # When set to a non-empty string (``HERMES_VOIP_ERROR_APOLOGY`` env var), this
+    # line is spoken instead of the built-in per-language apology, allowing operators
+    # to customise the message for their deployment.  Empty string (the default) means
+    # use the per-language built-in line (or English fallback for an unknown language).
+    # NOT repr-suppressed: the apology text is safe to log (no secret content).
+    error_apology: str = ""
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -1628,6 +1639,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),
         goodbye_phrase=_parse_goodbye_phrase(env),
         refuse_decline_phrases=_parse_refuse_decline_phrases(env, language),
+        error_apology=_value(env, _ERROR_APOLOGY_KEY) or "",
     )
 
 

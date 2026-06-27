@@ -160,7 +160,11 @@ from hermes_voip.originate import (
     build_srtp_crypto_attrs,
 )
 from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowlist
-from hermes_voip.provider_error import is_provider_error, safe_error_reply
+from hermes_voip.provider_error import (
+    classify_provider_error,
+    is_provider_error,
+    resolve_error_apology,
+)
 from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import (
@@ -1411,20 +1415,36 @@ class VoipAdapter(BasePlatformAdapter):
         # provider error class, or a stack trace. Reading that aloud to the caller is
         # unprofessional and leaks backend detail (the gateway's own sanitiser only
         # fires for platform=="telegram", so voip gets raw text). Speak a SHORT safe
-        # apology instead, language-aware, and log the REAL error at WARNING with the
-        # adapter's known secrets redacted (rule 34). The error is NOT raised toward
-        # the caller — it is already surfaced in the log (rule 37). A genuine reply
-        # that merely mentions a number/"error" is not matched (is_provider_error is
+        # apology instead — operator-overridable via HERMES_VOIP_ERROR_APOLOGY, with
+        # a per-language fallback (non-'en' gets a native line when one is registered),
+        # falling back to English when no per-language line exists. Log the REAL error
+        # at WARNING with the adapter's known secrets redacted (rule 34) and structured
+        # extra={} fields per runbook-0014 §Error handling so a log pipeline can count
+        # by event/category without grepping prose. The error is NOT raised toward the
+        # caller — it is already surfaced in the log (rule 37). A genuine reply that
+        # merely mentions a number/"error" is not matched (is_provider_error is
         # conservative), so the agent is never wrongly silenced.
         text = content
         if is_provider_error(content):
             language = self._media_cfg.language if self._media_cfg is not None else "en"
-            text = safe_error_reply(language)
+            override = (
+                self._media_cfg.error_apology if self._media_cfg is not None else ""
+            )
+            override_applied = bool(override)
+            text = resolve_error_apology(language, override=override or None)
+            error_category = classify_provider_error(content)
             _log.warning(
                 "provider/runtime error reply for %s replaced with safe spoken "
                 "line (caller did not hear the raw error); real error: %s",
                 chat_id,
                 self._redact_secrets_for_log(content),
+                extra={
+                    "event": "provider_error_replaced",
+                    "call_id": chat_id,
+                    "error_category": error_category,
+                    "language": language,
+                    "override_applied": override_applied,
+                },
             )
 
         async def _single_chunk() -> AsyncIterator[str]:

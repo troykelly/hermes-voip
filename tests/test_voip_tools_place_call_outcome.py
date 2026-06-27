@@ -361,10 +361,10 @@ async def test_ring_timeout_env_not_set_passes_none(
 
 
 @pytest.mark.asyncio
-async def test_ring_timeout_env_invalid_value_is_ignored(
+async def test_ring_timeout_env_invalid_value_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-numeric HERMES_VOIP_RING_TIMEOUT_SECS is ignored (treated as absent)."""
+    """A non-numeric HERMES_VOIP_RING_TIMEOUT_SECS is rejected before any dial."""
     ring_log: list[float | None] = []
     host = _FakeHost(call_id="call-rt-3", ring_timeout_received=ring_log)
     set_active_adapter(host)
@@ -375,9 +375,95 @@ async def test_ring_timeout_env_invalid_value_is_ignored(
         {"number": "1000", "objective": "check availability"}
     )
 
-    assert json.loads(result) == {"call_id": "call-rt-3"}
-    # An unparseable value must not crash; ring_timeout_secs falls back to None.
-    assert ring_log == [None]
+    assert json.loads(result) == {
+        "error": (
+            "place_call failed: HERMES_VOIP_RING_TIMEOUT_SECS must be a number "
+            "of seconds, got 'not-a-number'"
+        )
+    }
+    assert ring_log == []
+    assert host.placed == []
+
+
+@pytest.mark.asyncio
+async def test_ring_timeout_env_inf_is_rejected_before_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-finite timeout is rejected before any outbound dial is attempted."""
+    ring_log: list[float | None] = []
+    host = _FakeHost(call_id="call-rt-inf", ring_timeout_received=ring_log)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "origin-chat")
+    monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", "inf")
+
+    result = await place_call_handler(
+        {"number": "1000", "objective": "check availability"}
+    )
+
+    assert json.loads(result) == {
+        "error": (
+            "place_call failed: HERMES_VOIP_RING_TIMEOUT_SECS must be finite, got 'inf'"
+        )
+    }
+    assert ring_log == []
+    assert host.placed == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "fragment"),
+    [
+        ("inf", "must be finite"),
+        ("Infinity", "must be finite"),
+        ("+inf", "must be finite"),
+        ("-inf", "must be finite"),
+        ("nan", "must be finite"),
+    ],
+)
+def test_parse_ring_timeout_rejects_infinity(
+    monkeypatch: pytest.MonkeyPatch, raw: str, fragment: str
+) -> None:
+    """_parse_ring_timeout rejects non-finite values with a typed config error."""
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+    from hermes_voip.config import ConfigError  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", raw)
+    with pytest.raises(ConfigError, match=fragment):
+        vt._parse_ring_timeout()
+
+
+# ---------------------------------------------------------------------------
+# Ring timeout: positive infinity must be rejected (bounded-timeout policy)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ring_timeout_over_max_is_rejected_before_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absurdly large timeout is rejected before any outbound dial is attempted."""
+    ring_log: list[float | None] = []
+    host = _FakeHost(call_id="call-rt-max", ring_timeout_received=ring_log)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "origin-chat")
+    monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", "3601")
+
+    result = await place_call_handler(
+        {"number": "1000", "objective": "check availability"}
+    )
+
+    assert json.loads(result) == {
+        "error": (
+            "place_call failed: HERMES_VOIP_RING_TIMEOUT_SECS must be <= 3600 "
+            "seconds; got 3601.0"
+        )
+    }
+    assert ring_log == []
+    assert host.placed == []
+
+
+# ---------------------------------------------------------------------------
+# Ring timeout: positive infinity must be rejected (bounded-timeout policy)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -492,43 +578,6 @@ async def test_place_call_runtime_error_does_not_leak_gateway_detail(
 # ---------------------------------------------------------------------------
 # Ring timeout: positive infinity must be rejected (bounded-timeout policy)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_ring_timeout_inf_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """HERMES_VOIP_RING_TIMEOUT_SECS='inf' is rejected (defeats the bounded policy).
-
-    ``float('inf') > 0`` is True, so a bare ``value > 0`` check would accept
-    positive infinity — an unbounded timeout, which is exactly what the bounded
-    ring-timeout policy forbids.  ``inf`` must be treated as absent (None), so
-    the adapter's hard sink bound governs instead.
-    """
-    ring_log: list[float | None] = []
-    host = _FakeHost(call_id="call-rt-inf", ring_timeout_received=ring_log)
-    set_active_adapter(host)
-    _set_chat(monkeypatch, "origin-chat")
-    monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", "inf")
-
-    result = await place_call_handler(
-        {"number": "1000", "objective": "check availability"}
-    )
-
-    assert json.loads(result) == {"call_id": "call-rt-inf"}
-    # Positive infinity is NOT a valid bounded timeout — falls back to None.
-    assert ring_log == [None]
-
-
-def test_parse_ring_timeout_rejects_infinity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """_parse_ring_timeout returns None for 'inf' / 'infinity' (non-finite values)."""
-    import hermes_voip.voip_tools as vt  # noqa: PLC0415
-
-    for raw in ("inf", "Infinity", "+inf", "-inf", "nan"):
-        monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", raw)
-        assert vt._parse_ring_timeout() is None, raw
 
 
 # ---------------------------------------------------------------------------

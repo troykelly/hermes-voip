@@ -22,6 +22,7 @@ from hermes_voip.media.vad import (
     SpeechEdge,
     VadEvent,
     VoiceActivityDetector,
+    _NodeArg,  # private symbol; test-only
     load_silero_model,
 )
 from hermes_voip.providers.audio import PcmFrame
@@ -405,17 +406,70 @@ class _FakeNumpy:
         return _FakeArray("sr")
 
 
+class _FakeNodeArg:
+    """A stand-in for ``onnxruntime.NodeArg`` exposing just ``.name`` and ``.shape``.
+
+    Satisfies the ``_NodeArg`` Protocol from ``hermes_voip.media.vad`` so
+    ``_FakeSession.get_inputs()`` can be typed as ``list[_NodeArg]``. ``shape``
+    elements are ``int`` (fixed), ``None`` (unnamed dynamic), or ``str`` (a
+    symbolic/named dynamic dim) — exactly what onnxruntime's ``NodeArg.shape``
+    yields.
+    """
+
+    def __init__(self, name: str, shape: list[int | str | None]) -> None:
+        self.name: str = name
+        self.shape: list[int | str | None] = shape
+
+
 class _FakeSession:
     """An ``_OrtSession`` returning scripted probabilities and a fresh next-state.
 
     Records each call's ``state`` input and the full input feed so the test can
     assert the recurrent state is threaded and the inputs are well-formed.
+
+    ``state_shape`` configures what ``get_inputs()`` reports for the state input.
+    The default mirrors what the REAL silero v5 ONNX reports — ``[2, None, 128]``:
+    the batch dim (index 1) is **dynamic** (onnxruntime returns ``None`` or a
+    symbolic ``str`` for a dynamic dim), and only dim0 (``2``) and dim2 (``128``)
+    are fixed. The incompatible silero v4 mirror (``deepghs/silero-vad-onnx``)
+    instead reports dim2 ``64`` (e.g. ``[2, None, 64]`` / ``[2, 1, 64]``).
+    Pass ``state_shape=None`` to drop the ``state`` input entirely (not a silero
+    model at all).
     """
 
-    def __init__(self, probabilities: list[float]) -> None:
+    #: Sentinel distinguishing "default v5 shape" from "no state input at all".
+    _NO_STATE_INPUT: object = object()
+
+    def __init__(
+        self,
+        probabilities: list[float],
+        state_shape: list[int | str | None] | object = _NO_STATE_INPUT,
+    ) -> None:
         self._probs = iter(probabilities)
         self.seen_states: list[object] = []
         self.feeds: list[dict[str, object]] = []
+        # Default mirrors the real v5 model: dynamic batch dim (None), fixed
+        # dim0=2 and dim2=128. ``None`` would mean "no state input"; the default
+        # sentinel keeps that case explicit (state_shape=None drops the input).
+        self._state_shape: list[int | str | None] | None
+        if state_shape is _FakeSession._NO_STATE_INPUT:
+            self._state_shape = [2, None, 128]
+        elif state_shape is None:
+            self._state_shape = None
+        else:
+            assert isinstance(state_shape, list)
+            self._state_shape = state_shape
+
+    def get_inputs(self) -> list[_NodeArg]:
+        """Return the silero ONNX inputs (input, sr, and state unless dropped)."""
+        # _FakeNodeArg satisfies the _NodeArg Protocol (name/shape attributes).
+        inputs: list[_NodeArg] = [
+            _FakeNodeArg("input", [None, None]),
+            _FakeNodeArg("sr", []),
+        ]
+        if self._state_shape is not None:
+            inputs.append(_FakeNodeArg("state", self._state_shape))
+        return inputs
 
     def run(
         self, output_names: Sequence[str] | None, input_feed: dict[str, object], /
@@ -475,6 +529,128 @@ def test_silero_onnx_wrapper_reset_restores_zero_state() -> None:
     last_state = session.seen_states[-1]
     assert isinstance(last_state, _FakeArray)
     assert last_state.tag == "zero-state"
+
+
+# --- silero v5 shape guard (offline; no ml extra needed) -----------------
+#
+# An operator who grabs the ``deepghs/silero-vad-onnx`` HuggingFace mirror
+# gets a silero v4 model whose recurrent state's last dim is ``64`` rather than
+# the ``128`` that v5 needs.  Without a load-time guard the failure surfaces as
+# an opaque onnxruntime shape mismatch on the FIRST inference call — too late
+# and too cryptic to debug.  _SileroOnnxModel.__init__ must validate
+# ``session.get_inputs()`` immediately and raise a human-readable ``ValueError``
+# so the operator can act before the call stack is live.
+#
+# CRITICAL: the REAL silero v5 ONNX reports its ``state`` input shape as
+# ``[2, None, 128]`` — the **batch dim (index 1) is DYNAMIC** (onnxruntime
+# returns ``None`` or a symbolic ``str`` for a dynamic dim, NOT a fixed ``1``).
+# The guard must therefore compare only the LOAD-BEARING fixed dims (dim0==2,
+# dim2==128) and treat dim1 as dynamic, otherwise it WRONGLY REJECTS the genuine
+# v5 model (the opposite of its purpose).  v4 is identified by dim2==64.
+
+
+def test_silero_v5_dynamic_batch_dim_constructs_without_error() -> None:
+    """The REAL v5 shape ``[2, None, 128]`` (dynamic batch) must PASS the guard.
+
+    onnxruntime reports the silero v5 ``state`` input as ``[2, None, 128]`` — the
+    batch dim is dynamic (``None``), not a fixed ``1``. An EXACT match against
+    ``(2, 1, 128)`` would wrongly reject the genuine model; the guard must accept
+    a length-3 shape whose dim0==2 and dim2==128, treating dim1 as dynamic.
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v5_session = _FakeSession([], state_shape=[2, None, 128])
+    # must not raise
+    _SileroOnnxModel(v5_session, _FakeNumpy())
+
+
+def test_silero_v5_symbolic_batch_dim_constructs_without_error() -> None:
+    """A v5 ``state`` with a SYMBOLIC (string) dynamic batch dim must PASS.
+
+    onnxruntime can report a dynamic dim as a named symbol (a ``str``, e.g.
+    ``"batch"``) rather than ``None``. The guard must treat any non-int dim1 as
+    dynamic and still accept the model when dim0==2 and dim2==128.
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v5_session = _FakeSession([], state_shape=[2, "batch_size", 128])
+    # must not raise
+    _SileroOnnxModel(v5_session, _FakeNumpy())
+
+
+def test_silero_v5_fixed_batch_dim_constructs_without_error() -> None:
+    """A v5 ``state`` reported with a fixed batch dim ``[2, 1, 128]`` must PASS.
+
+    Some export toolchains pin the batch dim to a literal ``1``. dim1 is not
+    load-bearing for the version check, so a fixed ``1`` is accepted just like a
+    dynamic dim — only dim0==2 and dim2==128 matter.
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v5_session = _FakeSession([], state_shape=[2, 1, 128])
+    # must not raise
+    _SileroOnnxModel(v5_session, _FakeNumpy())
+
+
+def test_silero_v4_dynamic_batch_dim_raises_clear_error_at_model_init() -> None:
+    """A v4 model with the realistic dynamic batch shape ``[2, None, 64]`` is rejected.
+
+    A v4 model's state last dim is ``64`` (v5 needs ``128``). With a dynamic
+    batch dim it reports ``[2, None, 64]``. ``_SileroOnnxModel.__init__`` must
+    detect this via ``session.get_inputs()`` and raise a ``ValueError`` that
+    names the loaded shape and the incompatible ``deepghs/silero-vad-onnx``
+    mirror, at INIT time (not at the first ``__call__``).
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v4_session = _FakeSession([], state_shape=[2, None, 64])
+    with pytest.raises(ValueError, match="64") as excinfo:
+        _SileroOnnxModel(v4_session, _FakeNumpy())
+    # the message must be actionable: name v4, the mirror, and runbook 0002
+    message = str(excinfo.value)
+    assert "deepghs/silero-vad-onnx" in message
+    assert "runbook 0002" in message
+
+
+def test_silero_v4_fixed_batch_dim_raises_clear_error_at_model_init() -> None:
+    """A v4 model reported with a literal batch dim ``[2, 1, 64]`` is also rejected.
+
+    Whether v4 reports a fixed or dynamic batch dim, the last dim ``64`` marks it
+    as v4 and the guard must reject it with the same clear, actionable error.
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v4_session = _FakeSession([], state_shape=[2, 1, 64])
+    with pytest.raises(ValueError, match="64"):
+        _SileroOnnxModel(v4_session, _FakeNumpy())
+
+
+def test_missing_state_input_raises_clear_error_at_model_init() -> None:
+    """An ONNX with no ``state`` input at all is rejected with a clear ValueError.
+
+    A model lacking the recurrent ``state`` input is not a recognisable silero
+    model; the guard must say so at init rather than fail cryptically on the
+    first inference (which would ``KeyError`` on ``inputs["state"]``).
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    no_state_session = _FakeSession([], state_shape=None)
+    with pytest.raises(ValueError, match="no 'state' input"):
+        _SileroOnnxModel(no_state_session, _FakeNumpy())
+
+
+def test_silero_state_with_unexpected_rank_raises_clear_error() -> None:
+    """A ``state`` whose shape is not rank-3 is rejected (not silently accepted).
+
+    The v5 state is rank-3 ``[2, ?, 128]``. A shape of the wrong length (e.g. a
+    flattened ``[256]``) is not a v5 state and must raise at init rather than
+    being indexed out of bounds or accepted.
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    odd_session = _FakeSession([], state_shape=[256])
+    with pytest.raises(ValueError, match="state shape"):
+        _SileroOnnxModel(odd_session, _FakeNumpy())
 
 
 # --- real-model smoke (skipped in the model-free gate) --------------------

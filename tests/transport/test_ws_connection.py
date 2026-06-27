@@ -22,6 +22,7 @@ Per RFC 7118 / ADR-0016 §1, asserts:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Callable
 
@@ -942,3 +943,75 @@ async def test_remove_call_sink_identity_guard_matches_tls() -> None:
     transport.add_call("call-2", first)
     transport.remove_call("call-2")
     assert "call-2" not in transport._calls
+
+
+# ---------------------------------------------------------------------------
+# caplog regression: malformed-SIP skip log must be non-PII (WSS, bk646)
+# ---------------------------------------------------------------------------
+
+
+async def test_malformed_frame_caplog_non_pii(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """WARNING log for a skipped malformed frame is non-PII (WSS transport, bk646).
+
+    Over WebSocket each frame is one whole SIP message (RFC 7118 §5), so a frame
+    that fails to parse is logged as a WARNING and skipped. This test
+    regression-guards the log format: it must carry ONLY the exception type name
+    + the byte length of the raw frame — never the raw bytes themselves (which can
+    contain From/To/Call-ID/SDP and therefore PII).
+
+    A mutation that logs ``str(exc)`` or the raw frame will include the first line
+    of the malformed payload ("GARBAGE-NOT-A-SIP-START-LINE") in caplog and
+    trigger the second assertion here.
+    """
+    malformed = _malformed_but_nonempty_frame()
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+    )
+    await transport.connect()
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.ws_connection"):
+        try:
+            await server.push(malformed)
+            # Wait for the WARNING (reader processes asynchronously).
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 3.0
+            while not caplog.records and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+        finally:
+            await transport.aclose()
+            await server.stop()
+
+    # (1) At least one WARNING record; it carries the exc type name and byte length.
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) >= 1, (
+        "expected at least one WARNING for the malformed frame"
+    )
+    record = warning_records[0]
+    formatted = record.getMessage()
+    # Must match "ValueError" (the exception type name) in the formatted message.
+    assert "ValueError" in formatted, (
+        f"log record must carry type(exc).__name__='ValueError', got: {formatted!r}"
+    )
+    # Must carry the byte length (len=NN shape).
+    assert re.search(r"len=\d+", formatted) is not None, (
+        f"log record must carry 'len=<N>' byte length, got: {formatted!r}"
+    )
+    # (2) No raw SIP content from the malformed frame must appear in caplog.
+    # "GARBAGE-NOT-A-SIP-START-LINE" would appear if str(exc) or raw bytes were logged.
+    assert "GARBAGE-NOT-A-SIP-START-LINE" not in caplog.text, (
+        "raw malformed-frame content must NOT appear in the log (rule 34 / PII guard)"
+    )
+    # The branch parameter in the Via header of the malformed fixture must not leak.
+    assert "z9hG4bKbad" not in caplog.text, (
+        "Via branch from the malformed fixture must NOT appear in the log (PII guard)"
+    )

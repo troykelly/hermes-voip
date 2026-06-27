@@ -103,8 +103,30 @@ def test_sip_register_shape_echoes_algorithm_and_opaque() -> None:
     assert _param(header, "algorithm") == "md5"  # echoed as challenged
     assert _param(header, "opaque") == "55aa"
     assert _param(header, "qop") == "auth"
+    assert "algorithm=md5" in header
+    assert "qop=auth" in header
+    assert "nc=00000001" in header
+    assert 'algorithm="md5"' not in header
+    assert 'qop="auth"' not in header
+    assert 'nc="00000001"' not in header
     # pinned known-answer for these fixed inputs (rule 19: no shape-only assertions)
     assert _param(header, "response") == "74e090d5d1ded4f9c97e68d9823d559e"
+
+
+def test_omits_opaque_when_challenge_does_not_send_it() -> None:
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="171/9c", algorithm=MD5, qop="auth"'
+    )
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="1000", password="s3cr3t"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="fixedcnonce",
+        nc=1,
+    )
+    assert "opaque" not in header
+    assert _param(header, "opaque") is None
 
 
 def test_no_qop_uses_rfc2069_response() -> None:
@@ -283,6 +305,22 @@ def test_generated_cnonce_is_random_when_not_supplied() -> None:
     a = build_authorization(challenge, creds, method="REGISTER", uri="sip:x")
     b = build_authorization(challenge, creds, method="REGISTER", uri="sip:x")
     assert _param(a, "cnonce") != _param(b, "cnonce")
+
+
+def test_empty_cnonce_is_treated_as_absent_and_regenerated() -> None:
+    challenge = DigestChallenge.parse('Digest realm="r", nonce="n", qop="auth"')
+    creds = DigestCredentials(username="u", password="p")
+    header = build_authorization(
+        challenge,
+        creds,
+        method="REGISTER",
+        uri="sip:x",
+        cnonce="",
+    )
+    emitted_cnonce = _param(header, "cnonce")
+    assert emitted_cnonce is not None
+    assert emitted_cnonce != ""
+    assert 'cnonce=""' not in header
 
 
 def test_parse_honours_quoted_pair_escapes_in_quoted_strings() -> None:

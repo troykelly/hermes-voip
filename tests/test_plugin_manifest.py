@@ -35,6 +35,7 @@ from pathlib import Path
 import yaml
 
 import hermes_voip
+from hermes_voip.config import _DEFAULT_MAX_CALLS, _DEFAULT_SHUTDOWN_DRAIN_SECS
 
 # ---------------------------------------------------------------------------
 # Locations: the repo source tree (so the test runs from a checkout) + the
@@ -434,13 +435,32 @@ def test_optional_env_advertises_admission_control_knobs() -> None:
     Defaults verified against config.py: MAX_CALLS=8, SHUTDOWN_DRAIN_SECS=5.0.
     """
     entries = _optional_env_block()
-    names = {_entry_name(e) for e in entries}
-    for expected in ("HERMES_SIP_MAX_CALLS", "HERMES_SIP_SHUTDOWN_DRAIN_SECS"):
-        assert expected in names, (
+    defaults = {
+        _entry_name(entry): entry.get("default")
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    for expected, config_default in (
+        ("HERMES_SIP_MAX_CALLS", _DEFAULT_MAX_CALLS),
+        ("HERMES_SIP_SHUTDOWN_DRAIN_SECS", _DEFAULT_SHUTDOWN_DRAIN_SECS),
+    ):
+        assert expected in defaults, (
             f"optional_env must advertise {expected} (admission-control knob, "
             f"config.py line ~104-107, runbook-0013) — "
             f"operator has no manifest-visible signal it exists otherwise"
         )
+        manifest_default = defaults[expected]
+        assert manifest_default == config_default, (
+            f"{expected} default in plugin.yaml must match config.py"
+        )
+        if expected == "HERMES_SIP_MAX_CALLS":
+            assert isinstance(manifest_default, int), (
+                f"{expected} default should be a YAML number"
+            )
+        else:
+            assert isinstance(manifest_default, float), (
+                f"{expected} default should be a YAML number"
+            )
 
 
 # ---------------------------------------------------------------------------

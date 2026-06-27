@@ -296,9 +296,10 @@ _DEFAULT_COMFORT_FILLER_DELAY_MS = 900
 # to reason about); overridable independently. Must be > 0.
 _DEFAULT_COMFORT_FILLER_REPEAT_MS = _DEFAULT_COMFORT_FILLER_DELAY_MS
 _COMFORT_FILLER_PHRASE_SEP = "|"
-# The active conversation language (ADR-0054), selecting the built-in comfort-filler
-# phrase set. English only for now; the structure (a dict keyed by language code) makes
-# adding a language later a data-only change. Validated against the known set.
+# The active conversation language (ADR-0054, ADR-0084), selecting the built-in
+# comfort-filler phrase set.  Any well-formed BCP-47 primary subtag is accepted
+# (structural validation via _LANGUAGE_RE); languages without a built-in phrase set
+# fall back to the English default.  Adding a language is a data-only change here.
 _LANGUAGE_KEY = "HERMES_VOIP_LANGUAGE"
 _DEFAULT_LANGUAGE = "en"
 # Built-in comfort-filler phrase sets, keyed by language code. Each phrase reads
@@ -327,7 +328,10 @@ _COMFORT_FILLER_PHRASES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
 _DEFAULT_COMFORT_FILLER_PHRASES: tuple[str, ...] = _COMFORT_FILLER_PHRASES_BY_LANGUAGE[
     _DEFAULT_LANGUAGE
 ]
-_SUPPORTED_LANGUAGES: frozenset[str] = frozenset(_COMFORT_FILLER_PHRASES_BY_LANGUAGE)
+# BCP-47 primary-subtag format: 2-8 ASCII alpha chars, optionally followed by
+# hyphen-separated subtags of 1-8 alphanumeric chars each (ADR-0084).  Acceptance is
+# structural (well-formed), not a registry lookup — see ADR-0084 for rationale.
+_LANGUAGE_RE: re.Pattern[str] = re.compile(r"^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$")
 
 # Caller-silence reprompt / no-input handling (ADR-0057). When the caller is live
 # (RTP flowing) but never speaks, the engine's RTP watchdog never fires (it only
@@ -965,9 +969,10 @@ class MediaConfig:
     # hanging the call forever. Defaulted (20) so existing direct constructions stay
     # valid; the parser validates the operator override's bounds.
     media_timeout_secs: int = _DEFAULT_RTP_TIMEOUT_SECS
-    # Active conversation language (ADR-0054), selecting the built-in comfort-filler
-    # phrase set. English only for now; validated against the known set. Defaulted so
-    # existing direct constructions stay valid.
+    # Active conversation language (ADR-0054, ADR-0084), selecting the built-in
+    # comfort-filler phrase set.  Any well-formed BCP-47 primary subtag is accepted;
+    # languages without a built-in phrase set fall back to the English default.
+    # Defaulted so existing direct constructions stay valid.
     language: str = _DEFAULT_LANGUAGE
     # Dead-air comfort filler (ADR-0030, extended ADR-0054). ON by default (the
     # operator wants a slow turn to never leave the caller in silence). When on, the
@@ -1138,6 +1143,13 @@ class MediaConfig:
         it validates the bounded/enumerated fields itself rather than trusting
         :func:`load_media_config` to have done so.
         """
+        # Normalise the language tag to lowercase so both the direct-construction
+        # path and the env path (which lowercases via _value_lower) behave
+        # identically.  _validate_comfort_filler then matches against _LANGUAGE_RE
+        # on the already-lowercased value.  object.__setattr__ is required because
+        # MediaConfig is a frozen dataclass; this is the standard pattern for
+        # normalising frozen-dataclass fields in __post_init__.
+        object.__setattr__(self, "language", self.language.lower())
         if not _finite_in_range(
             self.vad_threshold, _MIN_VAD_THRESHOLD, _MAX_VAD_THRESHOLD
         ):
@@ -1252,11 +1264,12 @@ class MediaConfig:
             raise ConfigError(msg)
 
     def _validate_comfort_filler(self) -> None:
-        """Validate the dead-air comfort-filler invariants (ADR-0030, ADR-0054).
+        """Validate the dead-air comfort-filler invariants (ADR-0030/0054/0084).
 
         The delay and the periodic repeat interval must be strictly positive (a
         non-positive dead-air / repeat interval is meaningless); the language must be
-        one we have a phrase set for; the phrase set must be non-empty and contain no
+        a well-formed BCP-47 primary subtag (ADR-0084 — acceptance is structural, not
+        membership in the phrase dict); the phrase set must be non-empty and contain no
         blank phrase (a filler with nothing to say is a silent no-op). These hold
         regardless of the master switch so a direct :class:`MediaConfig` construction
         is also self-validating.
@@ -1273,9 +1286,11 @@ class MediaConfig:
                 f"got {self.comfort_filler_repeat_ms}"
             )
             raise ConfigError(msg)
-        if self.language not in _SUPPORTED_LANGUAGES:
-            allowed = ", ".join(sorted(_SUPPORTED_LANGUAGES))
-            msg = f"language must be one of {{{allowed}}}, got {self.language!r}"
+        if not _LANGUAGE_RE.match(self.language):
+            msg = (
+                f"language must be a well-formed BCP-47 language tag "
+                f"(e.g. 'en', 'fr', 'pt-BR'), got {self.language!r}"
+            )
             raise ConfigError(msg)
         if not self.comfort_filler_phrases:
             msg = "comfort_filler_phrases must not be empty"
@@ -1989,16 +2004,20 @@ def _parse_greeting(env: Mapping[str, str]) -> str:
 
 
 def _parse_language(env: Mapping[str, str]) -> str:
-    """Parse and validate the active conversation language (ADR-0054).
+    """Parse and validate the active conversation language (ADR-0054, ADR-0084).
 
-    Lower-cased; defaults to :data:`_DEFAULT_LANGUAGE` when unset. An unknown code
-    (one we have no phrase set for) is rejected fail-fast rather than silently
-    falling back, so a typo'd language is caught at startup.
+    Lower-cased; defaults to :data:`_DEFAULT_LANGUAGE` when unset.  A structurally
+    malformed code (not a well-formed BCP-47 primary subtag) is rejected fail-fast so
+    a typo is caught at startup.  A valid code that has no built-in comfort-filler
+    phrase set is accepted; ``_parse_comfort_filler_phrases`` falls back to the
+    English default phrase set for such languages (ADR-0084).
     """
     token = _value_lower(env, _LANGUAGE_KEY) or _DEFAULT_LANGUAGE
-    if token not in _SUPPORTED_LANGUAGES:
-        allowed = ", ".join(sorted(_SUPPORTED_LANGUAGES))
-        msg = f"{_LANGUAGE_KEY} must be one of {{{allowed}}}, got {token!r}"
+    if not _LANGUAGE_RE.match(token):
+        msg = (
+            f"{_LANGUAGE_KEY} must be a well-formed BCP-47 language tag "
+            f"(e.g. 'en', 'fr', 'pt-BR'), got {token!r}"
+        )
         raise ConfigError(msg)
     return token
 
@@ -2006,16 +2025,19 @@ def _parse_language(env: Mapping[str, str]) -> str:
 def _parse_comfort_filler_phrases(
     env: Mapping[str, str], language: str
 ) -> tuple[str, ...]:
-    """Parse the `|`-separated comfort-filler phrase set (ADR-0030, ADR-0054).
+    """Parse the `|`-separated comfort-filler phrase set (ADR-0030, ADR-0054, ADR-0084).
 
     Each member is trimmed; empty members (e.g. from a trailing or doubled ``|``)
     are dropped. An unset or all-blank value falls back to the selected *language*'s
-    built-in set (:data:`_COMFORT_FILLER_PHRASES_BY_LANGUAGE`) so a misconfigured-empty
-    override never yields a filler with no phrase to speak. An explicit set always
-    wins (it overrides the language default). The result is always non-empty.
-    ``language`` is pre-validated by :func:`_parse_language`.
+    built-in set (:data:`_COMFORT_FILLER_PHRASES_BY_LANGUAGE`), or to the English
+    default when the language has no built-in set (ADR-0084), so a missing-phrase-set
+    language never yields a filler with no phrase to speak. An explicit set always
+    wins (it overrides both the language default and the English fallback). The result
+    is always non-empty. ``language`` is pre-validated by :func:`_parse_language`.
     """
-    default = _COMFORT_FILLER_PHRASES_BY_LANGUAGE[language]
+    default = _COMFORT_FILLER_PHRASES_BY_LANGUAGE.get(
+        language, _DEFAULT_COMFORT_FILLER_PHRASES
+    )
     raw = _value(env, _COMFORT_FILLER_PHRASES_KEY)
     if not raw:
         return default
@@ -2046,16 +2068,19 @@ def _parse_no_input_reprompt_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
 def _parse_refuse_decline_phrases(
     env: Mapping[str, str], language: str
 ) -> tuple[str, ...]:
-    """Parse the ``|``-separated guard-REFUSE safe-decline phrase set (ADR-0076).
+    """Parse the ``|``-separated guard-REFUSE safe-decline phrase set (ADR-0076/0084).
 
     Each member is trimmed; empty members (from a trailing or doubled ``|``) are
     dropped. An unset or all-blank value falls back to the selected *language*'s
-    built-in set (:data:`_REFUSE_DECLINE_PHRASES_BY_LANGUAGE`) so a misconfigured-empty
-    override never re-strands a false-positived caller in silence. An explicit set
+    built-in set (:data:`_REFUSE_DECLINE_PHRASES_BY_LANGUAGE`), or to the English
+    default when the language has no built-in set (ADR-0084), so a missing-phrase-set
+    language never re-strands a false-positived caller in silence. An explicit set
     always wins. The result is always non-empty. ``language`` is pre-validated by
     :func:`_parse_language`.
     """
-    default = _REFUSE_DECLINE_PHRASES_BY_LANGUAGE[language]
+    default = _REFUSE_DECLINE_PHRASES_BY_LANGUAGE.get(
+        language, _DEFAULT_REFUSE_DECLINE_PHRASES
+    )
     raw = _value(env, _REFUSE_DECLINE_PHRASES_KEY)
     if not raw:
         return default

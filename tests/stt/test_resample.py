@@ -216,13 +216,13 @@ class _NotobytesFakeArray:
         raise AssertionError(msg)
 
     def astype(self, dtype: object) -> FloatArray:
-        return self  # type: ignore[return-value]  # structural fake, not a real ndarray
+        return self
 
     def __truediv__(self, other: float) -> FloatArray:
-        return self  # type: ignore[return-value]
+        return self
 
     def __mul__(self, other: float) -> FloatArray:
-        return self  # type: ignore[return-value]
+        return self
 
 
 @dataclass

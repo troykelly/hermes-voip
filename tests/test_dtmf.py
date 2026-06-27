@@ -4,12 +4,17 @@ Covers the 4-byte telephone-event payload codec, the digit<->event mapping, the
 outbound payload sequence for a key-press (incremental duration + redundant end),
 and a receiver that emits each pressed digit exactly once despite RFC 4733's
 triplicated end packets.
+
+bk354: DtmfReceiver._order/_seen replaced with a single insertion-ordered dict.
+bk366: feed() returns DtmfPress | DtmfNoPress instead of str | None (ADR-0077).
 """
 
 import pytest
 
 from hermes_voip.dtmf import (
     DtmfEvent,
+    DtmfNoPress,
+    DtmfPress,
     DtmfReceiver,
     digit_to_event,
     event_payloads,
@@ -75,41 +80,127 @@ def test_event_payloads_for_keypress_end_with_redundant_end_packets() -> None:
     assert all(e.duration == 480 for e in end_packets)
 
 
-def test_receiver_emits_digit_once_per_press() -> None:
+# ---------------------------------------------------------------------------
+# bk366: DtmfReceiver.feed() returns DtmfPress | DtmfNoPress (ADR-0077)
+# ---------------------------------------------------------------------------
+
+
+def test_dtmf_press_carries_digit() -> None:
+    """DtmfPress is a frozen dataclass with a digit field.
+
+    A completed key-press returns DtmfPress(digit='3'), not the bare string '3'.
+    This lets callers distinguish a press from every no-press case via isinstance.
+    """
+    press = DtmfPress(digit="3")
+    assert press.digit == "3"
+    # immutable
+    with pytest.raises((AttributeError, TypeError)):
+        # Justification for type: ignore[misc] below: mypy statically rejects
+        # assignment to a frozen dataclass field — that IS the behaviour under
+        # test; the assignment must raise FrozenInstanceError at runtime.
+        press.digit = "5"  # type: ignore[misc]
+
+
+def test_dtmf_no_press_variants_exist() -> None:
+    """DtmfNoPress has the three distinguishable no-press cases (ADR-0077).
+
+    Callers who previously tested 'result is None' must now pick the right variant:
+      STILL_PRESSING  — end bit not set; tone still in progress
+      DUPLICATE_END   — end bit set but this timestamp was already recorded
+      NON_DIGIT_EVENT — end bit set, new timestamp, but the event is not a keypad digit
+    """
+    assert DtmfNoPress.STILL_PRESSING is DtmfNoPress.STILL_PRESSING
+    assert DtmfNoPress.DUPLICATE_END is DtmfNoPress.DUPLICATE_END
+    assert DtmfNoPress.NON_DIGIT_EVENT is DtmfNoPress.NON_DIGIT_EVENT
+    # All three must be distinct
+    variants = {
+        DtmfNoPress.STILL_PRESSING,
+        DtmfNoPress.DUPLICATE_END,
+        DtmfNoPress.NON_DIGIT_EVENT,
+    }
+    assert len(variants) == 3
+
+
+def test_receiver_emits_press_once_and_suppresses_duplicates() -> None:
+    """feed() returns DtmfPress on first end packet and DtmfNoPress for others.
+
+    Replaces test_receiver_emits_digit_once_per_press with the new API (bk366).
+    The two start/update packets yield STILL_PRESSING; the first end packet yields
+    DtmfPress('3'); the two redundant end packets yield DUPLICATE_END.
+    """
     rx = DtmfReceiver()
-    # one key-press: two start packets, then three redundant end packets, one RTP ts
-    assert (
-        rx.feed(DtmfEvent(event=3, end=False, volume=10, duration=160), timestamp=1000)
-        is None
+    # two start/update packets — not end, must be STILL_PRESSING
+    result = rx.feed(
+        DtmfEvent(event=3, end=False, volume=10, duration=160), timestamp=1000
     )
-    assert (
-        rx.feed(DtmfEvent(event=3, end=False, volume=10, duration=320), timestamp=1000)
-        is None
+    assert result is DtmfNoPress.STILL_PRESSING
+    result = rx.feed(
+        DtmfEvent(event=3, end=False, volume=10, duration=320), timestamp=1000
     )
-    assert (
-        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
-        == "3"
+    assert result is DtmfNoPress.STILL_PRESSING
+    # first end packet — new timestamp, keypad digit → DtmfPress
+    result = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
     )
-    assert (
-        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
-        is None
+    assert result == DtmfPress(digit="3")
+    # redundant end packets — same timestamp already seen → DUPLICATE_END
+    result = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
     )
-    assert (
-        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
-        is None
+    assert result is DtmfNoPress.DUPLICATE_END
+    result = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
     )
+    assert result is DtmfNoPress.DUPLICATE_END
 
 
 def test_receiver_distinguishes_repeated_digit_by_timestamp() -> None:
+    """Two presses of the same digit with different timestamps each yield DtmfPress.
+
+    New timestamp = new press, regardless of the digit character (bk366).
+    """
     rx = DtmfReceiver()
-    assert (
-        rx.feed(DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=1000)
-        == "7"
+    assert rx.feed(
+        DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=1000
+    ) == DtmfPress(digit="7")
+    # same digit pressed again -> new RTP timestamp -> a distinct DtmfPress
+    assert rx.feed(
+        DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=2000
+    ) == DtmfPress(digit="7")
+
+
+def test_receiver_non_digit_event_yields_non_digit_variant() -> None:
+    """A flash event (event=16) on a new end packet yields NON_DIGIT_EVENT (bk366).
+
+    Previously both a duplicate end AND a non-digit event were indistinguishable None.
+    Now NON_DIGIT_EVENT lets callers handle them explicitly.
+    """
+    rx = DtmfReceiver()
+    # event=16 is flash — valid telephone-event, but NOT a keypad digit
+    result = rx.feed(
+        DtmfEvent(event=16, end=True, volume=10, duration=480), timestamp=5000
     )
-    # same digit pressed again -> new RTP timestamp -> a distinct emission
+    assert result is DtmfNoPress.NON_DIGIT_EVENT
+
+
+def test_receiver_dedups_reordered_end_packets() -> None:
+    """Late duplicate end packet after the window is suppressed as DUPLICATE_END.
+
+    Tests the old test_receiver_dedups_reordered_end_packets semantics with the
+    new API: a re-ordered end packet for an already-recorded timestamp is
+    DUPLICATE_END, not a new DtmfPress (bk366).
+    """
+    rx = DtmfReceiver()
+    assert rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
+    ) == DtmfPress(digit="3")
+    assert rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=2000
+    ) == DtmfPress(digit="3")
+    # a late duplicate of the first press must NOT double-emit
     assert (
-        rx.feed(DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=2000)
-        == "7"
+        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.DUPLICATE_END
     )
 
 
@@ -131,23 +222,6 @@ def test_event_payloads_validates_step_and_duration() -> None:
         list(event_payloads("5", total_duration=0, step=160))
     with pytest.raises(ValueError, match="total_duration"):
         list(event_payloads("5", total_duration=70000, step=160))
-
-
-def test_receiver_dedups_reordered_end_packets() -> None:
-    rx = DtmfReceiver()
-    assert (
-        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
-        == "3"
-    )
-    assert (
-        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=2000)
-        == "3"
-    )
-    # a late duplicate of the first press must NOT double-emit
-    assert (
-        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
-        is None
-    )
 
 
 def test_receiver_rejects_history_zero_and_negative() -> None:
@@ -226,6 +300,7 @@ def test_encode_end_false_volume_max() -> None:
 
 # ---------------------------------------------------------------------------
 # Mutation-hardening: DtmfReceiver bounded-window eviction (backlog §373)
+# Updated to use DtmfPress | DtmfNoPress API (bk366).
 # ---------------------------------------------------------------------------
 
 
@@ -233,37 +308,39 @@ def test_receiver_bounded_window_evicts_oldest_timestamp() -> None:
     """With history=2 the window holds exactly 2 timestamps; the third evicts the first.
 
     Sequence:
-      1. Press ts=1000 -> emits '3'.  _seen={1000}, _order=[1000].
-      2. Press ts=2000 -> emits '3'.  _seen={1000,2000}, _order=[1000,2000].
-      3. Press ts=3000 -> emits '3'.  Window is full; ts=1000 is evicted before
-         ts=3000 is added.  _seen={2000,3000}, _order=[2000,3000].
-      4. Late duplicate of ts=1000 arrives.  Because 1000 was evicted from _seen,
-         the receiver treats it as a NEW press and RE-EMITS '3'.
+      1. Press ts=1000 -> DtmfPress('3').  _window={1000: None}.
+      2. Press ts=2000 -> DtmfPress('3').  _window={1000: None, 2000: None}.
+      3. Press ts=3000 -> DtmfPress('3').  Window is full; ts=1000 is evicted before
+         ts=3000 is added.  _window={2000: None, 3000: None}.
+      4. Late duplicate of ts=1000 arrives.  Because 1000 was evicted from _window,
+         the receiver treats it as a NEW press and returns DtmfPress('3') again.
 
-    This pins the eviction-on-overflow behaviour: a mutant that never discards from
-    _seen (e.g. removes the ``self._seen.discard`` call) would suppress step 4 instead
-    of re-emitting, causing the assertion to fail.
+    This pins the eviction-on-overflow behaviour: a mutant that never discards
+    from the window would return DUPLICATE_END at step 4 instead of re-emitting.
+    It also verifies that the single-structure (bk354) preserves the old eviction
+    semantics exactly — _window acts as an insertion-ordered bounded set.
     """
     rx = DtmfReceiver(history=2)
     ev = DtmfEvent(event=3, end=True, volume=10, duration=480)
 
     # press 1: ts=1000
-    assert rx.feed(ev, timestamp=1000) == "3"
+    assert rx.feed(ev, timestamp=1000) == DtmfPress(digit="3")
     # press 2: ts=2000 — window now full
-    assert rx.feed(ev, timestamp=2000) == "3"
-    # press 3: ts=3000 — evicts ts=1000 from _seen
-    assert rx.feed(ev, timestamp=3000) == "3"
-    # late duplicate of ts=1000: evicted, so re-emits
-    assert rx.feed(ev, timestamp=1000) == "3", (
-        "evicted timestamp must re-emit; _seen must not retain it past the window"
+    assert rx.feed(ev, timestamp=2000) == DtmfPress(digit="3")
+    # press 3: ts=3000 — evicts ts=1000 from _window
+    assert rx.feed(ev, timestamp=3000) == DtmfPress(digit="3")
+    # late duplicate of ts=1000: evicted, so re-emits as a new press
+    assert rx.feed(ev, timestamp=1000) == DtmfPress(digit="3"), (
+        "evicted timestamp must re-emit as DtmfPress; _window must not retain it "
+        "past the bounded window"
     )
 
 
 def test_receiver_bounded_window_retains_recent_timestamps() -> None:
-    """Timestamps still within the window are suppressed (dedup still works).
+    """Timestamps still within the window yield DUPLICATE_END (dedup still works).
 
     With history=2 and three presses (ts 1000, 2000, 3000), ts=2000 and ts=3000
-    remain in the window.  A duplicate of either must NOT re-emit.
+    remain in the window.  A duplicate of either must return DUPLICATE_END.
 
     Kills a mutant that evicts too aggressively (e.g. evicts all entries instead
     of just the oldest).
@@ -274,6 +351,23 @@ def test_receiver_bounded_window_retains_recent_timestamps() -> None:
     rx.feed(ev, timestamp=2000)
     rx.feed(ev, timestamp=3000)
 
-    # ts=2000 and ts=3000 are still in the window — must be suppressed
-    assert rx.feed(ev, timestamp=2000) is None
-    assert rx.feed(ev, timestamp=3000) is None
+    # ts=2000 and ts=3000 are still in the window — must be DUPLICATE_END
+    assert rx.feed(ev, timestamp=2000) is DtmfNoPress.DUPLICATE_END
+    assert rx.feed(ev, timestamp=3000) is DtmfNoPress.DUPLICATE_END
+
+
+# ---------------------------------------------------------------------------
+# bk354: single _window structure replaces _order + _seen (structural test)
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_has_no_separate_order_and_seen_attrs() -> None:
+    """DtmfReceiver must NOT expose _order and _seen as separate attributes (bk354).
+
+    The two-structure sync (deque + set) is replaced by a single insertion-ordered
+    dict (_window). A mutant that keeps both would fail this test.
+    """
+    rx = DtmfReceiver()
+    assert not hasattr(rx, "_order"), "_order must be removed (bk354 consolidation)"
+    assert not hasattr(rx, "_seen"), "_seen must be removed (bk354 consolidation)"
+    assert hasattr(rx, "_window"), "_window must be the single dedup structure (bk354)"

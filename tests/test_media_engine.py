@@ -2099,14 +2099,14 @@ async def test_send_dtmf_round_trips_through_receiver() -> None:
     pkts = _dtmf_packets(recorder)
     receiver = dtmf_module.DtmfReceiver()
     decoded = [
-        d
+        result.digit
         for p in pkts
-        if (
-            d := receiver.feed(
+        if isinstance(
+            result := receiver.feed(
                 dtmf_module.DtmfEvent.decode(p.payload), timestamp=p.timestamp
-            )
+            ),
+            dtmf_module.DtmfPress,
         )
-        is not None
     ]
     assert "".join(decoded) == "19#"
 

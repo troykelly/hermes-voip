@@ -144,6 +144,7 @@ class DtmfEvent:
         if len(data) != _PAYLOAD_LEN:
             msg = f"DTMF telephone-event payload must be 4 bytes, got {len(data)}"
             raise ValueError(msg)
+        # The reserved R bit (0x40, bit 6) in byte 1 is intentionally ignored.
         return cls(
             event=data[0],
             end=bool(data[1] & _END_BIT),

@@ -950,6 +950,198 @@ async def test_remove_call_sink_identity_guard_matches_tls() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Inbound CANCEL handling (RFC 3261 §9.2) — WSS server-transaction tracking
+# ---------------------------------------------------------------------------
+# These tests cover the ported §9.2 behaviour from SipOverTlsTransport:
+#   - a CANCEL matching a tracked pending inbound INVITE fires on_cancel, sends
+#     200 OK (to CANCEL) + 487 Request Terminated (to INVITE)
+#   - an unmatched CANCEL (no prior INVITE tracked) is answered 481
+# ---------------------------------------------------------------------------
+
+
+def _wss_inbound_invite_with(*, to_user: str, call_id: str, branch: str) -> str:
+    """A WSS inbound INVITE with an explicit branch for CANCEL matching."""
+    return (
+        f"INVITE sip:{to_user}@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/WSS gw.pbx.example.test;branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+        f"To: <sip:{to_user}@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Contact: <sip:caller@gw.pbx.example.test;transport=ws>\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _wss_cancel_for(*, to_user: str, call_id: str, branch: str) -> str:
+    """A CANCEL matching the branch/Call-ID of a prior WSS inbound INVITE."""
+    return (
+        f"CANCEL sip:{to_user}@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/WSS gw.pbx.example.test;branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+        f"To: <sip:{to_user}@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 CANCEL\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_wss_inbound_cancel_487s_invite_and_200s_cancel_and_fires_on_cancel() -> (
+    None
+):
+    # RFC 3261 §9.2 on the WSS transport: a CANCEL matching a tracked pending
+    # inbound INVITE must answer the CANCEL 200 OK, the INVITE 487 Request
+    # Terminated, and fire the on_cancel hook (Call-ID) so the adapter tears
+    # down the half-built call. Mirrors the TLS equivalent in test_connection.py.
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKwscancel"
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        # Step 1: inbound INVITE arrives and is tracked.
+        await server.push(
+            _wss_inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1, timeout=3.0)
+        # Step 2: caller abandons — a CANCEL for the same transaction.
+        await server.push(
+            _wss_cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        )
+        # Transport must answer the CANCEL 200 OK ...
+        ok = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw,
+            timeout=3.0,
+        )
+        assert "CSeq: 1 CANCEL" in ok
+        # ... the pending INVITE 487 Request Terminated ...
+        terminated = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        assert "CSeq: 1 INVITE" in terminated
+        # ... and the abort hook must fire with this call's Call-ID.
+        await _until(lambda: cancelled == [call_id])
+        assert cancelled == [call_id]
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_wss_cancel_for_unknown_invite_is_481() -> None:
+    # RFC 3261 §9.2: a CANCEL matching no tracked INVITE server transaction
+    # on the WSS transport is answered 481 Call/Transaction Does Not Exist
+    # (not routed to on_unroutable — the §9.2 handler owns this code path).
+    # Mirrors test_cancel_for_unknown_invite_is_481 on the TLS transport.
+    unroutable: list[object] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=lambda _nc: None,
+        on_cancel=lambda _cid: None,
+        on_unroutable=unroutable.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(
+            _wss_cancel_for(
+                to_user="1000", call_id="wss-never-seen", branch="z9hG4bKwsghost"
+            )
+        )
+        resp = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 481"), timeout=3.0
+        )
+        assert "CSeq: 1 CANCEL" in resp
+        # The 481 is sent by the §9.2 handler; on_unroutable must NOT fire.
+        await asyncio.sleep(0.1)
+        assert unroutable == [], "an unmatched WSS CANCEL must not fire on_unroutable"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_wss_retransmitted_cancel_is_absorbed_no_second_487_or_abort() -> None:
+    # A retransmitted CANCEL on the WSS transport must be absorbed: the 200 OK
+    # to the CANCEL is re-sent, but the INVITE is NOT 487'd a second time and
+    # on_cancel fires only once (idempotent RFC 3261 §9.2).
+    # Mirrors test_retransmitted_cancel_is_absorbed_no_second_487_or_abort (TLS).
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKwsretx"
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(
+            _wss_inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1, timeout=3.0)
+        cancel = _wss_cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(cancel)
+        await _until(lambda: cancelled == [call_id])
+        await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        # The peer retransmits the CANCEL.
+        await server.push(cancel)
+        await asyncio.sleep(0.1)
+        # Exactly one 487 (the retransmit was absorbed).
+        terminated = [raw for raw in server.received if raw.startswith("SIP/2.0 487")]
+        assert len(terminated) == 1, (
+            "a retransmitted WSS CANCEL must not re-487 the INVITE"
+        )
+        assert cancelled == [call_id], "on_cancel must fire only once for a WSS CANCEL"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 async def test_malformed_frame_caplog_non_pii(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

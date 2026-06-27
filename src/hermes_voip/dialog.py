@@ -229,6 +229,12 @@ def build_in_dialog_request(
         )
         raise DialogError(msg)
     next_cseq = dialog.local_cseq + 1
+    if next_cseq >= _MAX_CSEQ:
+        msg = (
+            f"CSeq sequence {next_cseq} must be below 2**31 (RFC 3261 §8.1.1.5); "
+            "dialog has exhausted its local sequence number space"
+        )
+        raise DialogError(msg)
     via = (
         f"SIP/2.0/{dialog.transport} {dialog.local_sent_by};branch={new_branch()};rport"
     )

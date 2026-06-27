@@ -35,6 +35,13 @@ def test_gate_decision_is_immutable() -> None:
         decision.allowed = False  # type: ignore[misc]  # asserting frozen: this MUST raise
 
 
+def test_gate_decision_rejects_drifted_allowed_reason_pairs() -> None:
+    with pytest.raises(ValueError, match="allowed iff reason"):
+        GateDecision(allowed=True, reason=GateReason.DEGRADED)
+    with pytest.raises(ValueError, match="allowed iff reason"):
+        GateDecision(allowed=False, reason=GateReason.ALLOWED)
+
+
 def test_gate_tool_call_returns_a_gate_decision() -> None:
     state = GuardSessionState(call_id="c1")
     decision = gate_tool_call(ToolRisk.SAFE, state, confirmed=False)

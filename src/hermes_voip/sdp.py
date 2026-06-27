@@ -21,6 +21,23 @@ A media description is EITHER SDES OR DTLS-SRTP, never both.
 
 from __future__ import annotations
 
+__all__ = [
+    "AudioMedia",
+    "Codec",
+    "CryptoAttribute",
+    "Fingerprint",
+    "IceCandidate",
+    "MediaSecurity",
+    "SdpError",
+    "SessionDescription",
+    "SetupRole",
+    "VideoAnswer",
+    "VideoAnswerMode",
+    "VideoMedia",
+    "negotiate_audio",
+    "negotiate_ptime",
+]
+
 import base64
 import binascii
 import contextlib

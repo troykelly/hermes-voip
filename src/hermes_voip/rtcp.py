@@ -34,6 +34,31 @@ The statistics maths (:class:`ReceptionStats`, :func:`compute_rtcp_interval`,
 
 from __future__ import annotations
 
+__all__ = [
+    "RTCP_PT_APP",
+    "RTCP_PT_BYE",
+    "RTCP_PT_RR",
+    "RTCP_PT_SDES",
+    "RTCP_PT_SR",
+    "Bye",
+    "ReceiverReport",
+    "ReceptionSnapshot",
+    "ReceptionStats",
+    "ReportBlock",
+    "RtcpError",
+    "RtcpPacket",
+    "SdesChunk",
+    "SenderReport",
+    "SourceDescription",
+    "build_compound",
+    "compact_ntp_now",
+    "compute_rtcp_interval",
+    "from_ntp",
+    "parse_compound",
+    "rtt_from_report_block",
+    "to_ntp",
+]
+
 import random
 import struct
 from dataclasses import dataclass, field

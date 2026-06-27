@@ -18,6 +18,7 @@ import json
 
 import pytest
 
+from hermes_voip.config import ConfigError
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.voip_tools import (
     HANG_UP_TOOL_NAME,
@@ -28,6 +29,8 @@ from hermes_voip.voip_tools import (
     LIST_REGISTRATIONS_TOOL_SCHEMA,
     OPEN_ENTRY_TOOL_NAME,
     OPEN_ENTRY_TOOL_SCHEMA,
+    PLACE_CALL_TOOL_NAME,
+    PLACE_CALL_TOOL_SCHEMA,
     RESUME_TOOL_NAME,
     RESUME_TOOL_SCHEMA,
     SEND_DTMF_TOOL_NAME,
@@ -36,11 +39,13 @@ from hermes_voip.voip_tools import (
     TRANSFER_BLIND_TOOL_SCHEMA,
     AttendedTransferOutcome,
     TransferOutcome,
+    _parse_ring_timeout,
     active_voip_adapter,
     hang_up_handler,
     hold_call_handler,
     list_registrations_handler,
     open_entry_handler,
+    place_call_handler,
     resume_call_handler,
     send_dtmf_handler,
     set_active_adapter,
@@ -70,6 +75,7 @@ class _FakeHost:
         self.resumed: list[str] = []
         self.listed: int = 0
         self.placed: list[tuple[str, str]] = []
+        self.ring_timeouts: list[float | None] = []
         self.results: list[tuple[str, str]] = []
         self.dtmf_sent: list[tuple[str, str]] = []
         self.entries_opened: list[str] = []
@@ -114,9 +120,10 @@ class _FakeHost:
         *,
         ring_timeout_secs: float | None = None,
     ) -> str:
-        # ADR-0029/0084 VoipToolHost member (unused by this module's tests; satisfies
-        # the protocol so set_active_adapter type-checks).
+        # ADR-0029/0084 VoipToolHost member: record the dial request and the
+        # validated ring-timeout forwarded by the tool handler.
         self.placed.append((number, objective))
+        self.ring_timeouts.append(ring_timeout_secs)
         return "call-out"
 
     def record_call_result(self, call_id: str, summary: str) -> bool:
@@ -519,6 +526,80 @@ def test_gate_fails_safe_for_elevated_tool_when_call_unknown(
 def _trusted() -> GuardSessionState:
     """A level-2 trusted call state — allows ELEVATED tools (e.g. send_dtmf)."""
     return GuardSessionState(call_id="c", privilege_level=2)
+
+
+def _set_ring_timeout(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+    """Set or unset the outbound ring-timeout env knob for a test."""
+    if value is None:
+        monkeypatch.delenv("HERMES_VOIP_RING_TIMEOUT_SECS", raising=False)
+        return
+    monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", value)
+
+
+def test_place_call_schema_takes_number_and_objective() -> None:
+    assert PLACE_CALL_TOOL_SCHEMA["name"] == PLACE_CALL_TOOL_NAME
+    assert PLACE_CALL_TOOL_SCHEMA["description"]
+    params = PLACE_CALL_TOOL_SCHEMA["parameters"]
+    assert isinstance(params, dict)
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    assert "number" in props
+    assert "objective" in props
+    assert params.get("required") == ["number", "objective"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "fragment"),
+    [
+        ("bogus", "must be a number"),
+        ("0", "must be > 0"),
+        ("-1", "must be > 0"),
+        ("inf", "must be finite"),
+        ("nan", "must be finite"),
+        ("3601", "must be <= 3600"),
+    ],
+)
+def test_parse_ring_timeout_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, raw: str, fragment: str
+) -> None:
+    _set_ring_timeout(monkeypatch, raw)
+
+    with pytest.raises(ConfigError, match=fragment):
+        _parse_ring_timeout()
+
+
+@pytest.mark.asyncio
+async def test_place_call_handler_forwards_valid_ring_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_ring_timeout(monkeypatch, "42.5")
+
+    result = await place_call_handler({"number": "1000", "objective": "Check in"})
+
+    assert host.placed == [("1000", "Check in")]
+    assert host.ring_timeouts == [42.5]
+    assert json.loads(result) == {"call_id": "call-out"}
+
+
+@pytest.mark.asyncio
+async def test_place_call_handler_rejects_invalid_ring_timeout_before_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_ring_timeout(monkeypatch, "0")
+
+    result = await place_call_handler({"number": "1000", "objective": "Check in"})
+
+    assert host.placed == []
+    assert json.loads(result) == {
+        "error": (
+            "place_call failed: HERMES_VOIP_RING_TIMEOUT_SECS must be > 0 "
+            "seconds; got 0.0"
+        )
+    }
 
 
 def test_send_dtmf_schema_takes_a_digits_string() -> None:

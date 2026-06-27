@@ -761,3 +761,128 @@ def test_coalesced_lost_wraparound_boundary() -> None:
     out = jb.pop()
     assert isinstance(out, RtpPacket)
     assert out.sequence_number == 5
+
+
+# ---------------------------------------------------------------------------
+# Coalescing gap-cap boundary (finding #1: gap must cap at EXACTLY max_ahead)
+# ---------------------------------------------------------------------------
+
+
+def test_coalesced_boundary_successor_is_delivered() -> None:
+    """The real successor at the window boundary is delivered, never skipped.
+
+    The successor buried behind a long gap sits at the far edge of the playout
+    window (``max_ahead`` sequence numbers ahead of the anchor that pop() will
+    reach after consuming the gap). The coalesced ``Lost`` must advance the anchor
+    to EXACTLY that slot so the very next pop() returns the buffered packet — an
+    anchor that over-advanced by one would step past it and return ``None``.
+
+    Reachable end-to-end through push/pop (the window edge is admitted by push,
+    then the coalescing scan walks up to it), so this guards the observable
+    contract directly.
+    """
+    max_ahead = 8
+    jb = JitterBuffer(target_depth=1, max_ahead=max_ahead)
+    jb.push(_pkt(10))  # anchor learns seq 10
+    # The successor at the push-window edge (10 + max_ahead) survives push; after
+    # popping seq 10 the anchor is 11 and the successor is at scan-diff
+    # max_ahead - 1, the deepest reachable empty-run before a buffered slot.
+    edge = 10 + max_ahead  # 18
+    jb.push(_pkt(edge))
+
+    assert _packet(jb.pop()).sequence_number == 10
+
+    lost = jb.pop()
+    assert isinstance(lost, Lost)
+    assert lost.sequence == 11
+    assert lost.count == edge - 11  # gap 11..(edge-1), anchor lands on edge
+
+    out = jb.pop()
+    assert isinstance(out, RtpPacket), (
+        "boundary successor must be delivered, not skipped by an over-advanced anchor"
+    )
+    assert out.sequence_number == edge
+
+
+def test_coalesced_scan_caps_gap_at_exactly_max_ahead() -> None:
+    """pop()'s coalescing scan caps the gap at EXACTLY ``max_ahead`` — never +1.
+
+    This drives the defensive bound the public push/pop API provably cannot reach
+    (push admits only packets within ``max_ahead`` of the anchor, and every
+    backward anchor revision deposits a packet inside the scan window, so an
+    all-empty window with occupancy beyond it never forms through the API — a
+    >4.6M-sequence search found no path). The off-by-one therefore can only be
+    exercised by constructing that internal state directly: anchor at the head, a
+    single buffered packet BEYOND the window, and every slot in
+    ``[anchor+1, anchor+max_ahead]`` empty. The scan must then advance the anchor
+    by ``max_ahead`` (``Lost(count=max_ahead)``), not ``max_ahead + 1``.
+
+    The bug: ``<=`` in the scan condition lets the gap reach ``max_ahead + 1`` and
+    ``_next`` over-advances past the boundary slot, so a packet that later arrives
+    there is dropped as "behind" the anchor.
+    """
+    max_ahead = 256
+    jb = JitterBuffer(target_depth=1, max_ahead=max_ahead)
+    jb.push(_pkt(1000))  # learn the SSRC and anchor at 1000
+
+    # Construct the otherwise-unreachable all-positions-fail state: anchor 1000,
+    # nothing in 1001..1256, one packet far beyond the window (diff 400 > 256) to
+    # satisfy occupancy >= depth so the loss branch runs the full scan.
+    # Private-member access is deliberate here: this is the ONLY way to reach the
+    # defensive scan bound (see the docstring — the public API cannot form this
+    # state). It exercises a real pop() code path, not internal plumbing.
+    anchor = 1000
+    jb._next = anchor
+    jb._packets.clear()
+    beyond = anchor + max_ahead + 144  # 1400 — past the scan window
+    jb._packets[beyond] = _pkt(beyond)
+    jb._emitted = True  # past the start-reorder phase
+
+    out = jb.pop()
+    assert isinstance(out, Lost)
+    assert out.sequence == anchor
+    # Bug: count == max_ahead + 1 (257). Correct: capped at exactly max_ahead.
+    assert out.count == max_ahead
+    # The anchor advances by the capped count, never one past the window edge.
+    assert jb._next == (anchor + max_ahead) % (1 << 16)
+
+
+# ---------------------------------------------------------------------------
+# Lost.count construction validation (finding #2)
+# ---------------------------------------------------------------------------
+
+
+def test_lost_count_zero_rejected() -> None:
+    """Lost(count=0) is rejected — a zero-length run breaks stream continuity."""
+    with pytest.raises(ValueError, match="count"):
+        Lost(sequence=10, count=0)
+
+
+def test_lost_count_negative_rejected() -> None:
+    """Lost(count=-1) is rejected — a negative run would crash the consumer."""
+    with pytest.raises(ValueError, match="count"):
+        Lost(sequence=10, count=-1)
+
+
+def test_lost_count_bool_rejected() -> None:
+    """Lost(count=True) is rejected — bool is an int subclass but not a count."""
+    with pytest.raises(TypeError, match="count"):
+        Lost(sequence=10, count=True)  # type: ignore[arg-type]
+
+
+def test_lost_count_float_rejected() -> None:
+    """Lost(count=1.5) is rejected — a non-int count is a type error."""
+    with pytest.raises(TypeError, match="count"):
+        Lost(sequence=10, count=1.5)  # type: ignore[arg-type]
+
+
+def test_lost_count_one_accepted() -> None:
+    """Lost(count=1) is the valid single-packet-loss case."""
+    lost = Lost(sequence=10, count=1)
+    assert lost.count == 1
+
+
+def test_lost_count_thirtynine_accepted() -> None:
+    """Lost(count=39) is a valid coalesced far-ahead run."""
+    lost = Lost(sequence=11, count=39)
+    assert lost.count == 39

@@ -230,7 +230,7 @@ class RegistrationManager:
 
         ``min_refresh_delay`` floors the scheduled refresh delay so a tiny granted
         lifetime cannot arm a near-zero-delay refresh that hot-loops the registrar
-        (ADR-0087). It MUST be a positive number of seconds: a ``0`` or negative
+        (ADR-0088). It MUST be a positive number of seconds: a ``0`` or negative
         floor would defeat the very guard it exists to provide, so it is rejected at
         construction (codex MUST-FIX 2) — the public knob can never be set to a
         guard-defeating value. Tests that need an immediate hand-driven refresh

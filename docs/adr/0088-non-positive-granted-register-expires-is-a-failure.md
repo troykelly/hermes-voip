@@ -1,4 +1,4 @@
-# ADR-0087 — A non-positive granted REGISTER expiry is a registration failure, and the refresh delay is floored
+# ADR-0088 — A non-positive granted REGISTER expiry is a registration failure, and the refresh delay is floored
 
 **Status:** Accepted
 **Date:** 2026-06-27

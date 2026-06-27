@@ -56,7 +56,7 @@ class _FakeConsumer:
 def _disable_refresh_floor(manager: RegistrationManager) -> RegistrationManager:
     """Private test seam: drop the production refresh floor for an immediate refresh.
 
-    The PUBLIC ``min_refresh_delay`` knob hard-enforces ``> 0`` (ADR-0087 / codex
+    The PUBLIC ``min_refresh_delay`` knob hard-enforces ``> 0`` (ADR-0088 / codex
     MUST-FIX 2) — it can never be set to a guard-defeating ``0``. Tests that drive a
     refresh by hand and want it to fire immediately (``refresh_fraction=0.0`` makes
     the nominal delay ``0``, which the floor would otherwise lift to ``1 s``) reach
@@ -149,7 +149,7 @@ async def test_builds_one_flow_per_extension() -> None:
 async def test_min_refresh_delay_must_be_positive(bad_floor: float) -> None:
     # codex MUST-FIX 2: the refresh floor is the guard that stops a tiny/zero granted
     # lifetime arming a near-zero-delay refresh that hot-loops the registrar
-    # (ADR-0087). A 0 (or negative) ``min_refresh_delay`` DEFEATS that guard, so the
+    # (ADR-0088). A 0 (or negative) ``min_refresh_delay`` DEFEATS that guard, so the
     # public knob must hard-enforce ``> 0`` at construction — it can never be set to
     # a guard-defeating value. Tests that want an immediate hand-driven refresh use a
     # PRIVATE seam (``_disable_refresh_floor``), not this public knob.
@@ -747,18 +747,28 @@ async def test_zero_granted_expires_does_not_arm_a_busyloop_refresh() -> None:
     # ... the anomaly is surfaced, never swallowed ...
     assert errors, "a non-positive granted lifetime must be reported (rule 37)"
     assert errors[0][0] == "1000"
-    # ... and NO 0-delay refresh task floods the gateway with re-REGISTERs. Give a
-    # busy-loop ample wall-clock to manifest: a 0s-delay refresh would emit many
-    # REGISTERs here.
-    await asyncio.sleep(0.2)
-    flood = [
+    # ... and NO refresh task is armed at all (DETERMINISTIC: assert the scheduling
+    # DECISION, not a wall-clock window). A 0-grant must route through Failed, so
+    # _schedule_refresh is never called and no <=0-delay refresh task exists — the
+    # stronger, race-free proof that no busy-loop can fire. (This is a cold-start
+    # failure, so recovery is not scheduled either; recovery is connect()'s concern.)
+    state = manager._by_extension["1000"]
+    assert state.refresh_task is None, (
+        "a 0-expires grant must NOT arm a refresh task (no 0-delay re-REGISTER loop)"
+    )
+    assert state.recovery_task is None, (
+        "a cold-start 0-grant failure must not schedule recovery here"
+    )
+    # Drain the event loop once; with no refresh/recovery armed, no further REGISTER
+    # can have been emitted (belt-and-braces over the scheduling-decision assertions).
+    await asyncio.sleep(0)
+    sent_after = [
         m
         for m in transport.sent[sent_after_initial:]
         if SipRequest.parse(m).method == "REGISTER"
     ]
-    assert not flood, (
-        "a 0-expires grant must NOT arm a 0-delay refresh re-REGISTER loop; "
-        f"saw {len(flood)} re-REGISTERs"
+    assert not sent_after, (
+        f"a 0-expires grant must NOT emit any further REGISTER; saw {len(sent_after)}"
     )
     await manager.aclose()
 

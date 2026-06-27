@@ -882,7 +882,17 @@ class CallLoop:
         Delivery and the timer are async, so this schedules them as tracked tasks (the
         engine callback cannot await). :meth:`feed_dtmf_async` is the awaitable twin
         the tests use to drive delivery deterministically.
+
+        The RAW keypress is caller activity for the no-input watchdog (ADR-0057), so
+        :meth:`_mark_caller_active` runs FIRST — before any routing. Marking on the raw
+        event (not only on group DELIVERY in :meth:`_deliver_dtmf_group`) is what keeps
+        a caller pressing digits with inter-digit gaps — the group still buffered, the
+        inter-digit timeout not yet fired — from being treated as silent and reprompted
+        / hung up on mid-dialing (the keypad-only / accessibility path, cross-vendor
+        review). It also marks a confirmation-consumed digit, which never becomes a
+        delivered group at all: pressing the confirm key is still proof of life.
         """
+        self._mark_caller_active()
         if self._route_confirmation(digit):
             return
         if digit == _DTMF_TERMINATOR:
@@ -903,7 +913,14 @@ class CallLoop:
         than scheduling it as a task — used by tests (and any awaiting caller) to
         observe the delivered turn deterministically. A non-terminator digit (re)arms
         the inter-digit timer exactly as :meth:`feed_dtmf` does.
+
+        The RAW keypress marks caller activity FIRST (:meth:`_mark_caller_active`), at
+        exact parity with :meth:`feed_dtmf` — a digit pressed via the awaitable path is
+        proof of life for the no-input watchdog (ADR-0057) even before its group is
+        delivered, so an awaiting caller dialing with inter-digit gaps is never treated
+        as silent and reprompted / hung up on mid-dialing.
         """
+        self._mark_caller_active()
         if self._route_confirmation(digit):
             return
         if digit == _DTMF_TERMINATOR:
@@ -912,6 +929,19 @@ class CallLoop:
         else:
             self._dtmf_buffer.append(digit)
             self._arm_dtmf_flush_timer()
+
+    def _mark_caller_active(self) -> None:
+        """Mark caller activity for the no-input watchdog (ADR-0057): proof of life.
+
+        Sets ``_caller_active_in_window`` — EXACTLY the reset a finalised speech turn
+        (:meth:`_screen_and_deliver`) and a barge-in (:meth:`barge_in`) perform. The
+        watchdog reads-then-clears this flag once per silence window: a set flag stands
+        a pending reprompt down and restarts the reprompt cycle (its ``reprompts_sent``
+        local resets to 0 on the next wake — there is no instance-level reprompt count
+        to clear). Idempotent within a window (already-True stays True). Touched only
+        from the event loop, so no lock is needed.
+        """
+        self._caller_active_in_window = True
 
     def _route_confirmation(self, digit: str) -> bool:
         """Offer ``digit`` to a bound, armed confirmation; return whether consumed."""
@@ -1013,9 +1043,23 @@ class CallLoop:
         (never a fake STT transcript), so a normal turn can act on keypad menu input.
         The buffer was already taken by :meth:`_take_dtmf_group` at the firing instant,
         so this method holds no shared state a concurrent feed could race.
+
+        A delivered DTMF group is also caller activity for the no-input watchdog
+        (ADR-0057), exactly equivalent to a finalised speech turn (see
+        :meth:`_screen_and_deliver`): pressing a key proves the caller is present and
+        engaged, so the silence window resets — a pending reprompt stands down and the
+        reprompt count clears on the watchdog's next wake. Without this a caller
+        navigating purely by keypad — INCLUDING a hearing/speech-impaired caller for
+        whom DTMF is the accessibility path, or anyone pausing longer than the no-input
+        window between menu digits — is treated as silent and eventually hung up on. Set
+        only once the group is non-empty (a real delivered turn), mirroring the speech
+        path's marking on an actual finalised turn.
         """
         if not digits:
             return
+        # The caller pressed a key (a delivered menu turn): reset the no-input silence
+        # window, equivalent to a finalised speech turn (ADR-0057).
+        self._caller_active_in_window = True
         text = f"{_DTMF_TURN_PREFIX}{digits}"
         _log.info("dtmf: delivering menu group %r", text)
         await self._deliver_turn(text)

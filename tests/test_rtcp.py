@@ -774,51 +774,69 @@ def test_stray_out_of_range_packet_does_not_poison_jitter() -> None:
 
 
 def test_module_constants_pinned_values() -> None:
-    """Verify that module constants have the documented, invariant values.
+    """Pin the documented numeric contract between module constants.
 
-    Module-level constants should be annotated with typing.Final to signal that
-    they are immutable configuration/protocol values, never reassignable. This
-    test pins their documented values so a typo in any constant is caught
-    deterministically (e.g. a transcription error in _NTP_UNIX_EPOCH_DELTA or
-    _SEQ_MOD).
+    ``typing.Final`` is enforced statically by mypy --strict (not at runtime);
+    these assertions are value-typo regression guards, not behavioural tests.
+    They catch a transcription error in any constant and pin the cross-constant
+    relationships the code relies on.
     """
-    # RTCP packet types (RFC 3550 §12.1 / IANA)
+    # RTCP packet types are consecutive (RFC 3550 §12.1 / IANA): SR=200, RR=201,
+    # SDES=202, BYE=203, APP=204.
     assert rtcp_module.RTCP_PT_SR == 200
-    assert rtcp_module.RTCP_PT_RR == 201
-    assert rtcp_module.RTCP_PT_SDES == 202
-    assert rtcp_module.RTCP_PT_BYE == 203
-    assert rtcp_module.RTCP_PT_APP == 204
-    # SDES item type for canonical name
+    assert rtcp_module.RTCP_PT_RR == rtcp_module.RTCP_PT_SR + 1
+    assert rtcp_module.RTCP_PT_SDES == rtcp_module.RTCP_PT_RR + 1
+    assert rtcp_module.RTCP_PT_BYE == rtcp_module.RTCP_PT_SDES + 1
+    assert rtcp_module.RTCP_PT_APP == rtcp_module.RTCP_PT_BYE + 1
+
+    # SDES CNAME is item type 1 (RFC 3550 §6.5.1); item type 0 is END.
     assert rtcp_module._SDES_ITEM_CNAME == 1
-    # Version and header bitfields
+
+    # Version and header bitfields: V=2 in top 2 bits (shift 6), padding in bit 5,
+    # count in low 5 bits; they must not overlap.
     assert rtcp_module._RTP_VERSION == 2
     assert rtcp_module._VERSION_SHIFT == 6
-    assert rtcp_module._COUNT_MASK == 0x1F
-    assert rtcp_module._PADDING_BIT == 0x20
-    # Field widths
+    assert rtcp_module._COUNT_MASK == 0x1F  # low 5 bits
+    assert rtcp_module._PADDING_BIT == 0x20  # bit 5
+    assert rtcp_module._MAX_COUNT == rtcp_module._COUNT_MASK  # same 5-bit field
+    assert (rtcp_module._COUNT_MASK & rtcp_module._PADDING_BIT) == 0  # no overlap
+
+    # Field-width masks: unsigned byte, word, double-word, and signed 24-bit range.
     assert rtcp_module._U8_MAX == 0xFF
     assert rtcp_module._U32 == 0xFFFFFFFF
     assert rtcp_module._U64 == (1 << 64) - 1
-    assert rtcp_module._S24_MIN == -(1 << 23)
+    assert rtcp_module._S24_MIN == -(rtcp_module._S24_MAX + 1)  # symmetric 24-bit range
     assert rtcp_module._S24_MAX == (1 << 23) - 1
-    assert rtcp_module._MAX_COUNT == 0x1F
-    # Length constants
+
+    # Length constants: WORD=4; SSRC and common header are both one word; report
+    # block is 6 words (24 bytes); sender info is 5 words (20 bytes).
     assert rtcp_module._WORD == 4
-    assert rtcp_module._SSRC_LEN == 4
-    assert rtcp_module._SDES_ITEM_HEADER_LEN == 2
-    assert rtcp_module._COMMON_HEADER_LEN == 4
-    assert rtcp_module._REPORT_BLOCK_LEN == 24
-    assert rtcp_module._SENDER_INFO_LEN == 20
-    # NTP conversion constants
-    assert rtcp_module._NTP_UNIX_EPOCH_DELTA == 2_208_988_800
+    assert rtcp_module._SSRC_LEN == rtcp_module._WORD
+    assert rtcp_module._COMMON_HEADER_LEN == rtcp_module._WORD
+    assert rtcp_module._REPORT_BLOCK_LEN == 6 * rtcp_module._WORD
+    assert rtcp_module._SENDER_INFO_LEN == 5 * rtcp_module._WORD
+    assert rtcp_module._SDES_ITEM_HEADER_LEN == 2  # type(1) + length(1)
+
+    # NTP conversion: the fractional scale is 2^32; the compact (LSR/DLSR) scale
+    # is 2^16 — exactly the square root of the full scale.
     assert rtcp_module._FRAC_SCALE == 1 << 32
     assert rtcp_module._COMPACT_FRAC_SCALE == 1 << 16
-    # RFC 3550 timing constants
-    assert rtcp_module._RTCP_MIN_TIME == 5.0
-    assert rtcp_module._RTCP_SENDER_BW_FRACTION == 0.25
-    assert rtcp_module._COMPENSATION == 1.21828
-    # Sequence validity constants
-    assert rtcp_module._MAX_DROPOUT == 3000
-    assert rtcp_module._MAX_MISORDER == 100
+    assert (
+        rtcp_module._COMPACT_FRAC_SCALE * rtcp_module._COMPACT_FRAC_SCALE
+        == rtcp_module._FRAC_SCALE
+    )
+    assert rtcp_module._NTP_UNIX_EPOCH_DELTA == 2_208_988_800  # 70 years in seconds
+
+    # RFC 3550 timing: sender bandwidth fraction is less than 1; compensation factor
+    # approximates e - 3/2 and must be positive.
+    assert 0.0 < rtcp_module._RTCP_SENDER_BW_FRACTION < 1.0
+    assert rtcp_module._RTCP_MIN_TIME > 0.0
+    assert rtcp_module._COMPENSATION > 1.0  # e - 3/2 ≈ 1.218
+
+    # Sequence-validity thresholds: dropout window is much larger than misorder
+    # window (RFC 3550 App. A.1), and both are less than the full modulus.
     assert rtcp_module._SEQ_MOD == 1 << 16
-    assert rtcp_module._RTP_SEQ_NONE == rtcp_module._SEQ_MOD + 1
+    assert rtcp_module._MAX_DROPOUT > rtcp_module._MAX_MISORDER
+    assert rtcp_module._MAX_DROPOUT < rtcp_module._SEQ_MOD
+    # _RTP_SEQ_NONE must be outside the valid 16-bit space so it can never match.
+    assert rtcp_module._RTP_SEQ_NONE > rtcp_module._SEQ_MOD - 1

@@ -201,11 +201,16 @@ type JitterOutput = RtpPacket | Lost
 
 
 # RFC 1982 serial-number arithmetic: the following functions implement the
-# 16-bit sequence-number comparison and increment semantics from RFC 1982 "Serial
-# Number Arithmetic" so that sequence-number wraparound (at 65536) is handled
-# correctly. Used by the JitterBuffer for reordering detection and jitter
-# compensation. The key insight is that a "distance" d is in the "forward"
-# direction if d < 2^15; anything >= 2^15 is considered backward.
+# 16-bit sequence-number comparison and increment semantics from RFC 1982 §3.2
+# so that sequence-number wraparound (at 2^16 = 65536) is handled correctly.
+# Used by the JitterBuffer for reordering detection and jitter compensation.
+# _seq_before(a, b) is True iff a precedes b in 16-bit serial space, using the
+# modular test (b - a) % 65536 < 32768. This is the RFC 1982 §3.2 predicate —
+# i1 < i2 when either both are ordered normally with a gap below the half-window,
+# or they straddle the wrap point with the reverse gap above the half-window —
+# collapsed to a single expression. The half-window is 2^15 = 32768:
+# forward distances are 1..32767; backward distances are 32769..65535;
+# distance 32768 is undefined (ambiguous) per the RFC.
 
 
 def _seq_before(a: int, b: int) -> bool:

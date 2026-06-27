@@ -898,3 +898,73 @@ def test_missing_cseq_is_tolerated_and_yields_registered() -> None:
     flow.start()
     outcome = flow.handle(_ok_without_cseq())
     assert isinstance(outcome, Registered)
+
+
+# ---- Unicode-digit crash guard (isdigit → isascii+isdecimal) -----------------
+#
+# str.isdigit() returns True for Unicode superscript digits such as U+00B2 (²)
+# but int(chr(0xB2)) raises ValueError.  The three isdigit() guards in
+# registration.py must use isascii()+isdecimal() (the framing.py precedent) so
+# a malformed expires carrying a Unicode digit does NOT propagate a bare
+# ValueError through _granted_expires → _handle_success → handle, which would
+# tear down the SIP connection on the transport async read loop.
+
+
+def test_granted_expires_unicode_digit_contact_param_does_not_crash() -> None:
+    # U+00B2 (²) passes str.isdigit() but raises ValueError from int(); a Contact
+    # expires param carrying this codepoint must be treated as absent/invalid and
+    # fall back gracefully — the handler must NOT raise.
+    unicode_digit = chr(0xB2)
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    # Build a 200 OK whose Contact has expires=² (Unicode superscript two)
+    response = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"CSeq: {_cseq_num(started)} REGISTER\r\n"
+        "Contact: <sip:1000@198.51.100.7:5061;transport=tls>"
+        f";expires={unicode_digit}\r\n"
+        "Expires: 300\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    # Must not raise; falls back to the Expires header (300) → Registered
+    outcome = flow.handle(response)
+    assert isinstance(outcome, Registered)
+    assert outcome.expires == 300
+
+
+def test_granted_expires_unicode_digit_expires_header_does_not_crash() -> None:
+    # U+00B2 (²) in the Expires header must also be treated as absent/invalid and
+    # fall back to the configured expires — the handler must NOT raise.
+    unicode_digit = chr(0xB2)
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    response = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"CSeq: {_cseq_num(started)} REGISTER\r\n"
+        f"Contact: <sip:1000@198.51.100.7:5061;transport=tls>\r\n"
+        f"Expires: {unicode_digit}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    # Must not raise; falls back to config expires (300) → Registered
+    outcome = flow.handle(response)
+    assert isinstance(outcome, Registered)
+    assert outcome.expires == _CONFIG.expires
+
+
+def test_min_expires_unicode_digit_does_not_crash() -> None:
+    # U+00B2 (²) in a 423 Min-Expires header must be treated as absent/invalid —
+    # _min_expires() must return None rather than raising ValueError, so the flow
+    # falls back to a safe Retry outcome.
+    unicode_digit = chr(0xB2)
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    response = SipResponse.parse(
+        "SIP/2.0 423 Interval Too Brief\r\n"
+        f"CSeq: {_cseq_num(started)} REGISTER\r\n"
+        f"Min-Expires: {unicode_digit}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    # Must not raise; _min_expires returns None → flow treats 423 without a
+    # valid Min-Expires as Failed (no valid retry interval can be computed).
+    outcome = flow.handle(response)
+    assert not isinstance(outcome, Registered)

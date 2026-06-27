@@ -475,6 +475,36 @@ def test_build_audio_offer_version_defaults_to_session_id() -> None:
     assert "o=- 42 42 IN IP4 192.0.2.10" in text
 
 
+def test_build_audio_offer_literal_sdp_structure() -> None:
+    """Literal substring assertions on build_audio_offer output.
+
+    Strengthens mutation coverage by asserting the exact SDP structure emitted:
+    starts with v=0, contains m=audio with RTP/AVP profile, the exact ptime line,
+    the exact direction line, and ends with CRLF. Guards against dropped lines
+    and mismatches between offer construction and parser round-trip.
+    """
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=codecs,
+        direction="sendrecv",
+        ptime=20,
+    )
+    # Starts with v=0 CRLF.
+    assert text.startswith("v=0\r\n"), "SDP must start with v=0\\r\\n"
+    # Contains m=audio with RTP/AVP profile (not SAVP for plaintext offer).
+    assert "m=audio 41000 RTP/AVP 0" in text, (
+        "m=audio line must be present with RTP/AVP"
+    )
+    # Contains the exact ptime line.
+    assert "a=ptime:20\r\n" in text, "a=ptime:20\\r\\n must be present"
+    # Contains the exact direction line.
+    assert "a=sendrecv\r\n" in text, "a=sendrecv\\r\\n must be present"
+    # Ends with CRLF.
+    assert text.endswith("\r\n"), "SDP must end with \\r\\n"
+
+
 def test_parse_without_audio_media_returns_none() -> None:
     video_only = (
         "v=0\r\n"
@@ -776,6 +806,40 @@ def test_answer_orders_codecs_by_supported_not_offer_order() -> None:
         offer, local_address="192.0.2.20", port=42000, supported=("PCMU", "PCMA")
     )
     assert "m=audio 42000 RTP/AVP 0 8" in text
+
+
+def test_build_audio_answer_literal_sdp_structure() -> None:
+    """Literal substring assertions on build_audio_answer output.
+
+    Strengthens mutation coverage by asserting the exact SDP structure emitted:
+    starts with v=0, contains m=audio with RTP/AVP profile, the exact ptime line,
+    the exact direction line, and ends with CRLF. Guards against dropped lines and
+    ensures the answer matches what the parser expects (guards mutation: dropped v=0).
+    """
+    offer_text = (
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+    )
+    offer = SessionDescription.parse(offer_text)
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+        ptime=20,
+    )
+    # Starts with v=0 CRLF.
+    assert text.startswith("v=0\r\n"), "SDP must start with v=0\\r\\n"
+    # Contains m=audio with RTP/AVP profile (mirrored from offer).
+    assert "m=audio 42000 RTP/AVP 0" in text, (
+        "m=audio line must be present with RTP/AVP"
+    )
+    # Contains the exact ptime line.
+    assert "a=ptime:20\r\n" in text, "a=ptime:20\\r\\n must be present"
+    # Contains the exact direction line (sendrecv->sendrecv per RFC 3264 §6.1).
+    assert "a=sendrecv\r\n" in text, "a=sendrecv\\r\\n must be present"
+    # Ends with CRLF.
+    assert text.endswith("\r\n"), "SDP must end with \\r\\n"
 
 
 # --- W3 (review): typed a=crypto parse + validation + negotiation (RFC 4568) ---

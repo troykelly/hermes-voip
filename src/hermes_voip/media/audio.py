@@ -198,9 +198,13 @@ def resample_frame(frame: PcmFrame, *, target_rate: int) -> PcmFrame:
     ``ValueError``/``TypeError`` contracts apply at the PcmFrame level.  The input
     frame is never mutated (it is frozen).
 
-    Timestamp scaling: ``monotonic_ts_ns`` is multiplied by
-    ``target_rate / frame.sample_rate`` so that frame timing remains monotonic and
-    coherent in the new sample-rate domain.  A zero timestamp stays zero.
+    Timestamp contract: ``monotonic_ts_ns`` is a rate-independent wall-clock
+    nanosecond presentation timestamp that is PRESERVED UNCHANGED across a rate
+    change.  Scaling it would break the shared monotonic timebase used by VAD,
+    endpointing, A/V-sync, and barge-in — the same contract that
+    :meth:`~hermes_voip.media.engine.MediaEngine._to_wire_rate` and
+    :class:`~hermes_voip.stt.resample.FrameUpsampler` both follow: the presentation
+    clock is unaffected by the rate change.
 
     Identity: when ``target_rate == frame.sample_rate`` the function returns a
     :class:`PcmFrame` with the same ``samples``, ``sample_rate``, and
@@ -214,8 +218,8 @@ def resample_frame(frame: PcmFrame, *, target_rate: int) -> PcmFrame:
             :class:`Resampler` enforces on ``to_rate``.
 
     Returns:
-        A new :class:`PcmFrame` at ``target_rate`` with ``monotonic_ts_ns`` scaled
-        to the new rate.
+        A new :class:`PcmFrame` at ``target_rate`` with ``monotonic_ts_ns``
+        preserved unchanged from the input frame.
 
     Raises:
         ValueError: If ``target_rate`` is a ``bool``, not an ``int``, not positive,
@@ -248,13 +252,13 @@ def resample_frame(frame: PcmFrame, *, target_rate: int) -> PcmFrame:
     resampler = Resampler(frame.sample_rate, target_rate)
     new_samples = resampler.resample(frame.samples)
 
-    # Scale ts so timing is coherent in the new rate domain.
-    new_ts = int(frame.monotonic_ts_ns * target_rate / frame.sample_rate)
-
+    # monotonic_ts_ns is a wall-clock nanosecond presentation timestamp; it is
+    # rate-independent and must be preserved unchanged across the rate change
+    # (same contract as FrameUpsampler.upsample and MediaEngine._to_wire_rate).
     return PcmFrame(
         samples=new_samples,
         sample_rate=target_rate,
-        monotonic_ts_ns=new_ts,
+        monotonic_ts_ns=frame.monotonic_ts_ns,
     )
 
 

@@ -755,7 +755,7 @@ class SrtpSession:
 
         # Update sender ROC on sequence-number wraparound.
         if self._seq_top == _SEQ_MAX and seq == 0:
-            self.roc += 1
+            self.roc = (self.roc + 1) % _ROC_MOD
         self._seq_top = seq
 
         # Encrypt only the payload (the header stays clear, authenticated).
@@ -872,7 +872,7 @@ class SrtpSession:
             if seq - s_l > _SEQ_HALF:
                 v = (self.roc - 1) % _ROC_MOD
         elif s_l - seq > _SEQ_HALF:
-            v = self.roc + 1
+            v = (self.roc + 1) % _ROC_MOD
         return v
 
     def _check_replay(self, packet_index: int) -> None:

@@ -484,12 +484,12 @@ class TestRolloverCounter:
         # We want s_l in the upper half and seq in the lower half to reach wrap-UP:
         #   s_l >= _SEQ_HALF AND s_l - seq > _SEQ_HALF  => v = roc + 1
         # Use s_l = 0xC000, seq = 0x0001 so s_l - seq = 0xBFFF > 0x7FFF = _SEQ_HALF.
-        rx._seq_top = 0xC000  # type: ignore[attr-defined]  # test-only state injection
+        rx._seq_top = 0xC000  # test-only state injection
 
         # _estimate_roc must return 0 (== (0xFFFFFFFF + 1) % 2**32), not 0x100000000.
         # Access the private method directly to test just the estimation logic in
         # isolation without needing a valid SRTP packet at ROC=0xFFFFFFFF.
-        estimated_roc = rx._estimate_roc(0x0001)  # type: ignore[attr-defined]
+        estimated_roc = rx._estimate_roc(0x0001)
         assert estimated_roc == 0, (
             f"_estimate_roc wrap-UP at ROC=0xFFFFFFFF must yield 0 (32-bit wrap), "
             f"got {estimated_roc:#x}"
@@ -506,7 +506,7 @@ class TestRolloverCounter:
         tx = SrtpSession(crypto)
         # Manually place the sender at ROC = 0xFFFFFFFF and seq_top = 0xFFFF.
         tx.roc = 0xFFFFFFFF
-        tx._seq_top = 0xFFFF  # type: ignore[attr-defined]  # test-only state injection
+        tx._seq_top = 0xFFFF  # test-only state injection
 
         # protect() with seq=0 triggers the wraparound branch (seq_top==SEQ_MAX, seq==0)
         # so roc += 1 fires; it must wrap to 0, not become 0x100000000.

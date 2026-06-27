@@ -492,17 +492,16 @@ async def test_inbound_invite_routes_to_new_call() -> None:
         await server.stop()
 
 
-async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
-    """Over WSS a CANCEL surfaces via on_unroutable (TLS-only handling, follow-up).
+async def test_out_of_dialog_cancel_for_unknown_invite_is_481_wss() -> None:
+    """Over WSS a CANCEL with no matching pending INVITE is answered 481.
 
-    The shared :class:`~hermes_voip.manager.RegistrationManager` now classifies a
-    CANCEL as :class:`~hermes_voip.manager.Cancel`; the WSS transport does not yet
-    implement the §9.2 200/487 server-transaction handling (that lives on the TLS
-    transport), so a CANCEL falls through to the unroutable observer exactly as it
-    did before — this pins that behaviour so the typed routing change is covered.
+    The WSS transport now implements RFC 3261 §9.2 server-transaction tracking
+    (ported from SipOverTlsTransport).  A CANCEL that does not match any tracked
+    pending inbound INVITE is answered ``481 Call/Transaction Does Not Exist``
+    by the §9.2 handler; it is NOT routed to ``on_unroutable`` (the handler owns
+    this code path).  This supersedes the previous "fall-through to unroutable"
+    pinning test, which documented a known interim gap now closed.
     """
-    from hermes_voip.manager import Unroutable  # noqa: PLC0415
-
     unroutable: list[object] = []
 
     def responder(_frame: str) -> list[str]:
@@ -515,6 +514,7 @@ async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
         port=server.port,
         ws_path="/ws",
         connect_address="127.0.0.1",
+        on_cancel=lambda _cid: None,
         on_unroutable=unroutable.append,
     )
     manager = RegistrationManager(_gateway(), transport)
@@ -532,10 +532,13 @@ async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
             "Content-Length: 0\r\n\r\n"
         )
         await server.push(cancel)
-        await _until(lambda: len(unroutable) == 1, timeout=3.0)
-        reported = unroutable[0]
-        assert isinstance(reported, Unroutable)
-        assert reported.request.method == "CANCEL"
+        resp = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 481"), timeout=3.0
+        )
+        assert "CSeq: 1 CANCEL" in resp
+        # The §9.2 handler sends the 481; on_unroutable must NOT fire.
+        await asyncio.sleep(0.1)
+        assert unroutable == [], "an unmatched WSS CANCEL must not fire on_unroutable"
     finally:
         await manager.aclose()
         await transport.aclose()

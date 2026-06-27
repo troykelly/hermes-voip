@@ -496,9 +496,10 @@ def test_config_rejects_sip_aor_on_secure_transport(transport: ViaTransport) -> 
 
 def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
     # The transport token is normalised to uppercase in __post_init__ before the
-    # secure-transport check runs: a lower-case ``tls`` input must reject a ``sip:``
-    # AOR identically to ``TLS``, and the stored .transport must be the normalised
-    # uppercase form.
+    # secure-transport check runs: a lower-case ``tls`` input must trigger the
+    # sip:-AOR rejection identically to ``TLS``, proving normalisation fires before
+    # the check. The stored .transport normalisation itself is asserted separately
+    # in test_config_normalises_lowercase_transport_to_uppercase.
     with pytest.raises(ValueError, match=r"sips"):
         RegistrationConfig(
             aor="sip:1000@pbx.example.test",

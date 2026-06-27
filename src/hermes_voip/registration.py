@@ -176,11 +176,24 @@ class RegistrationConfig:
         construction rather than surfacing mid-flow as a confusing gateway
         rejection.
 
+        ``transport`` is normalised to uppercase before validation so a caller
+        who passes a lowercase token (e.g. ``"tls"``) gets the canonical
+        ``ViaTransport`` Literal value stored (``"TLS"``). The dataclass is
+        frozen, so normalisation uses ``object.__setattr__`` (the only safe
+        mutation path for a frozen dataclass in ``__post_init__``).
+
         Raises:
             ValueError: If ``aor`` has no ``sip``/``sips`` scheme, an empty host,
-                uses the ``sip`` scheme on a TLS/WSS transport, or ``expires < 0``.
+                uses the ``sip`` scheme on a TLS/WSS transport, or ``expires < 0``,
+                or ``transport`` is not a recognised token (bk236).
         """
-        if self.transport.upper() not in _VALID_TRANSPORTS:
+        # Normalise to uppercase first so the stored field always satisfies the
+        # Literal["TLS","WSS","UDP","TCP"] contract at runtime; must precede the
+        # membership check so the check and _require_secure_scheme both see the
+        # canonical form.
+        normalised = self.transport.upper()
+        object.__setattr__(self, "transport", normalised)
+        if normalised not in _VALID_TRANSPORTS:
             allowed = ", ".join(sorted(_VALID_TRANSPORTS))
             msg = f"transport must be one of {allowed}; got {self.transport!r}"
             raise ValueError(msg)

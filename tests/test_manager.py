@@ -129,6 +129,18 @@ async def test_builds_one_flow_per_extension() -> None:
     assert manager.is_up is False
 
 
+@pytest.mark.parametrize("bad_floor", [0.0, -0.5, -1.0])
+async def test_min_refresh_delay_must_be_positive(bad_floor: float) -> None:
+    # codex MUST-FIX 2: the refresh floor is the guard that stops a tiny/zero granted
+    # lifetime arming a near-zero-delay refresh that hot-loops the registrar
+    # (ADR-0087). A 0 (or negative) ``min_refresh_delay`` DEFEATS that guard, so the
+    # public knob must hard-enforce ``> 0`` at construction — it can never be set to
+    # a guard-defeating value. Tests that want an immediate hand-driven refresh use a
+    # PRIVATE seam (``_disable_refresh_floor``), not this public knob.
+    with pytest.raises(ValueError, match=r"min_refresh_delay"):
+        RegistrationManager(_gateway(), _FakeTransport(), min_refresh_delay=bad_floor)
+
+
 async def test_start_sends_one_register_per_extension() -> None:
     transport = _FakeTransport()
     manager = RegistrationManager(_gateway(), transport)

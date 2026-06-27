@@ -314,6 +314,42 @@ def test_200_granting_zero_expires_to_a_registration_is_failed_not_registered() 
     assert "expires" in outcome.reason.lower()
 
 
+def test_200_echoing_negative_expires_on_our_binding_is_failed_not_registered() -> None:
+    # codex MUST-FIX 1: RFC 3261 §10.2/§10.3 — Expires is a non-negative
+    # delta-seconds, so a NEGATIVE value on OUR returned Contact (e.g. ``expires=-1``)
+    # is MALFORMED. The old expires regex matched only ``\d+``, so a negative token
+    # did NOT parse and ``_granted_expires`` silently fell back to the positive
+    # REQUESTED lifetime — yielding ``Registered`` and arming a refresh off a binding
+    # the registrar effectively did not grant. Fail closed: a malformed/negative
+    # expires on our binding is treated the SAME as a non-positive grant (Failed),
+    # never a silent positive fallback.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_ok(_cseq_num(started), contact_expires=";expires=-1"))
+    assert isinstance(outcome, Failed), (
+        "a negative (malformed) expires on our binding must be Failed, "
+        "not Registered with a positive fallback"
+    )
+    assert outcome.status not in range(200, 300)
+    assert "expires" in outcome.reason.lower()
+
+
+def test_200_echoing_non_numeric_expires_on_our_binding_is_failed() -> None:
+    # codex MUST-FIX 1: a non-numeric expires token (``expires=abc``) on our returned
+    # binding is equally malformed. It must NOT silently fall back to the positive
+    # requested lifetime; it is surfaced as Failed (fail-closed), mirroring the
+    # negative-expires case.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_ok(_cseq_num(started), contact_expires=";expires=abc"))
+    assert isinstance(outcome, Failed), (
+        "a non-numeric (malformed) expires on our binding must be Failed, "
+        "not Registered with a positive fallback"
+    )
+    assert outcome.status not in range(200, 300)
+    assert "expires" in outcome.reason.lower()
+
+
 def test_403_yields_failed() -> None:
     flow = RegistrationFlow(_CONFIG)
     flow.start()

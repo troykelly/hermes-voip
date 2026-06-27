@@ -9,6 +9,32 @@ import hermes_voip.rtcp
 import hermes_voip.rtp
 import hermes_voip.sdp
 import hermes_voip.sip
+import hermes_voip.stt
+import hermes_voip.tts
+
+
+def test_tts_package_all_excludes_internal_seams() -> None:
+    # Not advertised in __all__ (trimmed from public surface)
+    assert "HttpByteStream" not in hermes_voip.tts.__all__
+    assert "HttpCancellation" not in hermes_voip.tts.__all__
+    assert "ElevenLabsRequest" not in hermes_voip.tts.__all__
+    # Still importable as package attributes (back-compat for existing consumers)
+    assert hasattr(hermes_voip.tts, "HttpByteStream")
+    assert hasattr(hermes_voip.tts, "HttpCancellation")
+    assert hasattr(hermes_voip.tts, "ElevenLabsRequest")
+
+
+def test_stt_package_all_excludes_internal_helpers() -> None:
+    # Not advertised in __all__ (trimmed from public surface)
+    assert "RECOGNISER_SAMPLE_RATE" not in hermes_voip.stt.__all__
+    assert "FrameUpsampler" not in hermes_voip.stt.__all__
+    assert "float32_to_pcm16" not in hermes_voip.stt.__all__
+    assert "pcm16_to_float32" not in hermes_voip.stt.__all__
+    # Still importable as package attributes (back-compat for existing consumers)
+    assert hasattr(hermes_voip.stt, "RECOGNISER_SAMPLE_RATE")
+    assert hasattr(hermes_voip.stt, "FrameUpsampler")
+    assert hasattr(hermes_voip.stt, "float32_to_pcm16")
+    assert hasattr(hermes_voip.stt, "pcm16_to_float32")
 
 
 def test_rtcp_exports_rtcp_packet() -> None:

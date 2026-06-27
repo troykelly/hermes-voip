@@ -910,3 +910,40 @@ async def test_inbound_webrtc_savpf_call_activates_rtcp_via_srtcp() -> None:
     finally:
         in_call.set()
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Port-isolation for non-muxed RTCP adapter tests (flake-hardening, rule 19).
+#
+# ``test_inbound_plain_rtp_call_activates_rtcp_on_live_engine`` and
+# ``test_inbound_sdes_savp_call_activates_srtcp_when_opted_in`` assert
+# ``engine._rtcp_local_port == engine.local_port + 1``. The adapter always
+# constructs its ``RtpMediaTransport`` with ``local_port=0``, so the OS picks
+# the RTP port WITHOUT reserving RTP-port+1. Under full-suite ephemeral-port
+# churn a sibling test's socket can already hold RTP-port+1; the engine
+# correctly degrades to RTCP-off, leaving ``_rtcp_local_port`` None — the same
+# load-only flake PR #238 fixed in ``test_media_engine_rtcp.py``.
+#
+# The fix (green commit) adds ``_reserve_consecutive_udp_pair`` +
+# ``_adapter_run_non_muxed_rtcp_isolated`` to guarantee a free (P, P+1) pair
+# and uses them in the two non-muxed SIP integration tests. The tests below are
+# the TDD red step: they call those helpers before they exist, failing with
+# ``NameError`` until the green commit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adapter_rtcp_plain_rtp_port_isolation_smoke() -> None:
+    """Port-isolation smoke: the adapter binds RTCP on a deterministic consecutive pair.
+
+    Uses ``_reserve_consecutive_udp_pair`` (added by the green commit) to prove the
+    isolation helper exists and produces a valid (P, P+1) pair — a prerequisite for
+    the hardened integration tests. FAILS with ``NameError`` until the green commit
+    adds the helper.
+    """
+    rtp_port, sibling = _reserve_consecutive_udp_pair("127.0.0.1")  # noqa: F821  # added in green commit
+    try:
+        assert rtp_port > 0
+        assert sibling.getsockname()[1] == rtp_port + 1
+    finally:
+        sibling.close()

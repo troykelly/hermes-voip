@@ -295,6 +295,25 @@ def test_granted_expiry_falls_back_to_first_contact_when_ours_absent() -> None:
     assert outcome.expires == 222
 
 
+def test_200_granting_zero_expires_to_a_registration_is_failed_not_registered() -> None:
+    # RFC 3261 §10.3: a registrar MAY grant a SHORTER lifetime than requested,
+    # including 0 — which means it REMOVED our binding (a de-registration we did
+    # not ask for). A 2xx that echoes OUR Contact with expires=0 must therefore
+    # NOT be a Registered outcome (arming a 0-second refresh would busy-loop
+    # re-REGISTERing a binding the registrar keeps tearing down). It is surfaced
+    # as Failed so the manager treats it as an anomaly, not a live registration.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_ok(_cseq_num(started), contact_expires=";expires=0"))
+    assert isinstance(outcome, Failed), (
+        "a non-positive granted lifetime is a binding removal, not a registration"
+    )
+    # The status is non-2xx (so a downstream RegistrationRejectedError is honest)
+    # and the reason names the anomaly without leaking any SIP host/extension.
+    assert outcome.status not in range(200, 300)
+    assert "expires" in outcome.reason.lower()
+
+
 def test_403_yields_failed() -> None:
     flow = RegistrationFlow(_CONFIG)
     flow.start()

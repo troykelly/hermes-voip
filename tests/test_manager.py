@@ -660,6 +660,91 @@ async def test_recovery_send_failure_reschedules_another_attempt() -> None:
     await manager.aclose()
 
 
+# ---- a registrar that grants a non-positive (0) lifetime --------------------
+
+
+async def test_zero_granted_expires_does_not_arm_a_busyloop_refresh() -> None:
+    # RFC 3261 §10.3: a registrar MAY echo OUR binding with expires=0 in a 200 OK,
+    # which means it REMOVED the binding. Treating that as a live Registered would
+    # arm a refresh whose delay = 0 * fraction = 0s, firing an immediate
+    # re-REGISTER -> the registrar grants 0 again -> a TIGHT re-REGISTER loop that
+    # floods the gateway and never keeps the binding up. The manager must instead
+    # treat the non-positive grant as a FAILURE, never arm a <=0-delay refresh, and
+    # surface the anomaly (rule 37) — proven by: no flood of REGISTERs, the
+    # extension is NOT registered, and the failure is reported.
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _single_gateway(),
+        transport,
+        refresh_fraction=0.5,
+        retry_backoff=10.0,  # keep cold-start/recovery from re-REGISTERing in-window
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    first = transport.sent[0]
+    sent_after_initial = len(transport.sent)
+    # The registrar grants 0 — our binding was removed, not registered.
+    await manager.on_response(_ok_for(first, expires=0))
+    # No live registration: the manager must not report itself up off a removed
+    # binding ...
+    assert manager.is_up is False, "a 0-expires grant is not a live registration"
+    down = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert down.registered is False
+    # ... the anomaly is surfaced, never swallowed ...
+    assert errors, "a non-positive granted lifetime must be reported (rule 37)"
+    assert errors[0][0] == "1000"
+    # ... and NO 0-delay refresh task floods the gateway with re-REGISTERs. Give a
+    # busy-loop ample wall-clock to manifest: a 0s-delay refresh would emit many
+    # REGISTERs here.
+    await asyncio.sleep(0.2)
+    flood = [
+        m
+        for m in transport.sent[sent_after_initial:]
+        if SipRequest.parse(m).method == "REGISTER"
+    ]
+    assert not flood, (
+        "a 0-expires grant must NOT arm a 0-delay refresh re-REGISTER loop; "
+        f"saw {len(flood)} re-REGISTERs"
+    )
+    await manager.aclose()
+
+
+async def test_tiny_positive_grant_refresh_is_clamped_to_a_positive_minimum() -> None:
+    # Defence-in-depth for _schedule_refresh: even a *positive* but tiny granted
+    # lifetime (e.g. 1s) must not arm a sub-second refresh. The scheduler clamps the
+    # refresh delay to a sane positive minimum (>= ~1s), so a tiny grant does NOT
+    # produce a near-immediate re-REGISTER. The flow stays registered (a positive
+    # grant IS a registration); only the refresh cadence is floored.
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _single_gateway(),
+        transport,
+        refresh_fraction=0.5,  # 1s grant -> 0.5s nominal, below the positive floor
+    )
+    await manager.start()
+    first = transport.sent[0]
+    sent_after_initial = len(transport.sent)
+    await manager.on_response(_ok_for(first, expires=1))
+    up = next(s for s in manager.snapshot() if s.extension == "1000")
+    assert up.registered is True, "a positive grant is a live registration"
+    # The nominal delay (1s * 0.5 = 0.5s) is below the clamp floor. Wait 0.7s — long
+    # enough that an UNCLAMPED 0.5s refresh would already have fired, but inside the
+    # clamped floor (>= 1s) so a correctly-floored refresh has not. Zero refreshes
+    # proves the delay was clamped up off the tiny grant.
+    await asyncio.sleep(0.7)
+    refreshes = [
+        m
+        for m in transport.sent[sent_after_initial:]
+        if SipRequest.parse(m).method == "REGISTER"
+    ]
+    assert not refreshes, (
+        "a tiny positive grant must be clamped to a positive refresh minimum, "
+        f"not fire a sub-second refresh; saw {len(refreshes)} refreshes in 0.7s"
+    )
+    await manager.aclose()
+
+
 # ---- recovery: a refresh that gets NO response (item 2, Timer-F/B) ----------
 
 

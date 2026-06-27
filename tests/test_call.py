@@ -816,6 +816,8 @@ async def test_inbound_notify_records_progress_and_answers_200() -> None:
             ("To", "<sip:1000@pbx.example.test>;tag=ours"),
             ("Call-ID", "call-1"),
             ("CSeq", "12 NOTIFY"),
+            # Event:refer is the only package that carries a sipfrag body (RFC 3515).
+            ("Event", "refer"),
             ("Subscription-State", "terminated;reason=noresource"),
             ("Content-Type", "message/sipfrag"),
         ),
@@ -999,6 +1001,9 @@ async def test_inbound_notify_malformed_answers_400_does_not_propagate() -> None
             ("To", "<sip:1000@pbx.example.test>;tag=ours"),
             ("Call-ID", "call-1"),
             ("CSeq", "12 NOTIFY"),
+            # Event:refer routes to parse_notify_sipfrag; the malformed body (missing
+            # Subscription-State) is what makes it raise ReferError → 400.
+            ("Event", "refer"),
             ("Content-Type", "message/sipfrag"),
             # no Subscription-State header — parse_notify_sipfrag raises ReferError
         ),

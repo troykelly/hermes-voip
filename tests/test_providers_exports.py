@@ -101,7 +101,7 @@ def test_guard_module_has_all() -> None:
 def test_guard_all_contains_public_names() -> None:
     """guard.__all__ contains every expected public name."""
     guard = importlib.import_module("hermes_voip.providers.guard")
-    declared: set[str] = set(guard.__all__)  # type: ignore[attr-defined]
+    declared: set[str] = set(guard.__all__)
     missing = _GUARD_PUBLIC_NAMES - declared
     assert not missing, f"guard.__all__ is missing: {sorted(missing)}"
 
@@ -109,7 +109,7 @@ def test_guard_all_contains_public_names() -> None:
 def test_guard_all_contains_no_private_names() -> None:
     """guard.__all__ must not expose underscore-private names."""
     guard = importlib.import_module("hermes_voip.providers.guard")
-    declared: set[str] = set(guard.__all__)  # type: ignore[attr-defined]
+    declared: set[str] = set(guard.__all__)
     private = {n for n in declared if n.startswith("_")}
     assert not private, f"guard.__all__ exposes private names: {sorted(private)}"
 
@@ -140,7 +140,7 @@ def test_transport_module_has_all() -> None:
 def test_transport_all_contains_public_names() -> None:
     """transport.__all__ contains every expected public name."""
     transport = importlib.import_module("hermes_voip.providers.transport")
-    declared: set[str] = set(transport.__all__)  # type: ignore[attr-defined]
+    declared: set[str] = set(transport.__all__)
     missing = _TRANSPORT_PUBLIC_NAMES - declared
     assert not missing, f"transport.__all__ is missing: {sorted(missing)}"
 
@@ -148,6 +148,6 @@ def test_transport_all_contains_public_names() -> None:
 def test_transport_all_contains_no_private_names() -> None:
     """transport.__all__ must not expose underscore-private names."""
     transport = importlib.import_module("hermes_voip.providers.transport")
-    declared: set[str] = set(transport.__all__)  # type: ignore[attr-defined]
+    declared: set[str] = set(transport.__all__)
     private = {n for n in declared if n.startswith("_")}
     assert not private, f"transport.__all__ exposes private names: {sorted(private)}"

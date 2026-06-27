@@ -19,7 +19,7 @@ maps to level 3/0 via the constructor keyword.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import assert_never
 
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
@@ -93,12 +93,18 @@ class GateDecision:
             raise ValueError(msg)
 
 
-class ToolRisk(Enum):
-    """Action risk class for a registered tool (ascending)."""
+class ToolRisk(IntEnum):
+    """Action risk class for a registered tool (ascending severity).
 
-    SAFE = "safe"  # read-only / no side effects
-    ELEVATED = "elevated"  # mutating but reversible / low blast radius
-    IRREVERSIBLE = "irreversible"  # payments, bookings, transfers, account mutation
+    The integer values encode severity order: the least-severe class is 0 and
+    the most-severe is 2, enabling direct ``>``/``<`` comparisons such as
+    ``risk >= ToolRisk.ELEVATED``.  The documented ascending order is
+    ``SAFE < ELEVATED < IRREVERSIBLE``.
+    """
+
+    SAFE = 0  # read-only / no side effects
+    ELEVATED = 1  # mutating but reversible / low blast radius
+    IRREVERSIBLE = 2  # payments, bookings, transfers, account mutation
 
 
 class GuardSessionState:

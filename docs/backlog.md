@@ -657,7 +657,7 @@ These span multiple modules or the repo as a whole.
   `try/except`; a single malformed message tears down all calls simultaneously. The behaviour is documented as
   intentional but has zero regression tests for: (1) parse error → connection loss (not silent drop);
   (2) reconnect supervisor fires; (3) active calls terminate cleanly. Needs tests in `tests/test_adapter_reconnect.py`.
-- [ ] **[medium] robustness** — `WssSipTransport` inbound CANCEL falls through to unroutable in `ws_connection.py`. (Wave-3: ws_connection.py CANCEL handling implemented on branch fix/wss-inbound-cancel-2 but NOT merged — review found it is a partial-ship: also needs adapter.py to wire on_cancel into the WssSipTransport construction (mirror the TLS path) + fix the stale adapter.py:1148 comment. Complete the adapter wiring orchestrator-direct or in a fresh session, then merge.)
+- [x] **[medium] robustness** — `WssSipTransport` inbound CANCEL falls through to unroutable in `ws_connection.py`. (Wave-3: ws_connection.py CANCEL handling implemented on branch fix/wss-inbound-cancel-2 but NOT merged — review found it is a partial-ship: also needs adapter.py to wire on_cancel into the WssSipTransport construction (mirror the TLS path) + fix the stale adapter.py:1148 comment. Complete the adapter wiring orchestrator-direct or in a fresh session, then merge.) (#300)
 
 ## src/hermes_voip/guard/_onnx_runtime.py
 
@@ -1105,3 +1105,9 @@ below were not in the backlog before the issues were filed.
 - [x] (#253) **[low] docs** — `docs/runbooks/0011-voip-enable-plugin.md` did not explain that `hermes plugins enable/list` uses filesystem discovery only and never consults `importlib.metadata` entry-points (issue #244, upstream NousResearch/hermes-agent#23802). Cross-reference added.
 - [x] (#253) **[low] docs** — `docs/runbooks/0011-voip-enable-plugin.md` did not warn that the Hermes runtime imports `hermes_voip` from the pip-installed site-packages copy, not a git-cloned `~/.hermes/plugins/hermes-voip/` directory (issue #243). Warning added so operators applying local patches target the right location.
 - [x] (#245) **[low] test** — Non-muxed RTCP adapter tests were flaky: `start_rtcp(mux=False)` binds an RTP-port+1 sibling socket; tests using `local_port=0` did not reserve the consecutive pair, so under ephemeral-port churn a sibling test could hold port+1 causing the engine to degrade the call to RTCP-off and `assert rtcp_port is not None` to fail. Fix: new `reserve_consecutive_udp_pair` helper reserves the (P, P+1) pair before binding the engine to P, closing the sub-ms steal window. Reproduced at 7/200 under 800 held loopback sockets.
+
+### Discovered — Wave-4 gap-review
+
+- [ ] **[medium] obs** — Adapter call path: emit a structured `extra={event,…}` per-turn latency/timing log (local-only emission; observability, runbook-0014 SLOs). Note: this touches the hot serialized `adapter.py` — orchestrator-owned, single lane.
+- [ ] **[low] docs** — Reconcile drift in `docs/runbooks/0009` against current behaviour (rule 27/42).
+- [ ] **[low] docs/packaging** — Document the built-wheel / dist / PyPI trove classifiers + `py.typed` packaging story in README (follows #307).

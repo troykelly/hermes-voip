@@ -2031,7 +2031,7 @@ class VoipAdapter(BasePlatformAdapter):
                 # ADR-0049: the SIP answer may negotiate Opus when we offered it
                 # (libopus available) — accept it here too, not only G.722/G.711.
                 agreed_codecs = negotiate_audio(
-                    answer_audio, _sip_supported_encodings()
+                    answer_audio, _sip_supported_encodings(), prefer_local=False
                 )
             except ValueError as exc:
                 raise OutboundCallFailed(
@@ -2685,7 +2685,9 @@ class VoipAdapter(BasePlatformAdapter):
             # gateway echoing a codec we never offered is rejected, not silently
             # accepted (e.g. an answer naming G.722, which we don't offer on WebRTC).
             try:
-                agreed_codecs = negotiate_audio(answer_audio, offered_encodings)
+                agreed_codecs = negotiate_audio(
+                    answer_audio, offered_encodings, prefer_local=False
+                )
             except ValueError as exc:
                 raise OutboundCallFailed(
                     488, f"no common codec in 2xx WebRTC answer: {exc}"

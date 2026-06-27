@@ -204,11 +204,11 @@ def test_is_srtp_detects_savp_and_crypto() -> None:
     assert savp.audio.crypto[0].startswith("1 AES_CM_128_HMAC_SHA1_80")
 
 
-def test_negotiate_keeps_common_codecs_in_offer_order() -> None:
+def test_negotiate_keeps_common_codecs_in_supported_order() -> None:
     sdp = SessionDescription.parse(_OFFER_AVP)
     assert sdp.audio is not None
     chosen = negotiate_audio(sdp.audio, supported=("PCMU", "telephone-event"))
-    # PCMA is dropped (unsupported); order follows the offer (PCMU then 101)
+    # PCMA is dropped (unsupported); order follows our supported menu.
     assert [c.encoding for c in chosen] == ["PCMU", "telephone-event"]
 
 
@@ -272,7 +272,7 @@ def test_g722_static_payload_9_parses_without_rtpmap() -> None:
 
 
 def test_negotiate_prefers_g722_when_offered() -> None:
-    # Offer [G722, PCMU, PCMA, DTMF] against our menu -> G722 wins (offer order
+    # Offer [G722, PCMU, PCMA, DTMF] against our menu -> G722 wins (our menu
     # promotes it first), and the chosen voice codec is carriable by the engine.
     from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
     from hermes_voip.media.engine import codec_for_encoding  # noqa: PLC0415
@@ -668,7 +668,7 @@ def test_answer_negotiates_codecs_and_mirrors_sendrecv() -> None:
         supported=("PCMU", "telephone-event"),
     )
     parsed = _audio(SessionDescription.parse(text))
-    # PCMA dropped (unsupported); PCMU + telephone-event kept in offer order.
+    # PCMA dropped (unsupported); PCMU + telephone-event follow our supported menu.
     assert [c.encoding for c in parsed.codecs] == ["PCMU", "telephone-event"]
     assert parsed.port == 42000
     assert parsed.connection_address == "192.0.2.20"

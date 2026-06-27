@@ -35,17 +35,25 @@ the answerer, not the offerer, decides.)
 
 ## Decision
 
-`negotiate_audio` orders the negotiated codecs by **our** preference — the `supported`
-sequence the caller passes, first = most preferred — via a **stable** sort on each
-codec's preference rank (its encoding's index in `supported`):
+`negotiate_audio` has an explicit role switch:
+
+- `prefer_local=True` (the default): we are the **answerer** building an SDP answer.
+  The negotiated codecs are ordered by **our** preference — the `supported` sequence
+  the caller passes, first = most preferred — via a **stable** sort on each codec's
+  preference rank (its encoding's index in `supported`).
+- `prefer_local=False`: we are the **offerer** parsing a received SDP answer. The peer
+  is the answerer, so its `m=audio` order is the selection signal. We preserve that
+  peer order while still filtering to the intersection of codecs in the answer and the
+  menu we actually offered/supported.
 
 ```python
 rank = {name.upper(): i for i, name in enumerate(supported)}
 common = [c for c in offer.codecs if c.encoding.upper() in rank]
-chosen = tuple(sorted(common, key=lambda c: rank[c.encoding.upper()]))
+chosen = tuple(sorted(common, key=lambda c: rank[c.encoding.upper()]))  # prefer_local
+chosen = tuple(common)  # received answer parse
 ```
 
-Properties that fall out of a stable sort by rank:
+Properties that fall out of a stable sort by rank when `prefer_local=True`:
 
 - **Wideband/preferred wins regardless of offer order.** `PCMU`-before-`Opus` →
   `Opus` leads; `PCMU`-before-`G.722` → `G.722` leads.
@@ -57,8 +65,11 @@ Properties that fall out of a stable sort by rank:
 - **`telephone-event` stays where it sits in `supported`** (conventionally last), so
   DTMF negotiation is unaffected.
 
-No public signature change: callers already pass the menu in preference order. The
-voice-codec floor (`has_voice` guard, DTMF-only rejection) is unchanged.
+The keyword-only `prefer_local` parameter makes the SDP role explicit without changing
+existing answer-building callers: the default remains local preference. Outbound 2xx
+answer parsing passes `prefer_local=False` so `_first_voice_codec()` selects the peer
+answerer's first accepted voice codec. The voice-codec floor (`has_voice` guard,
+DTMF-only rejection) is unchanged.
 
 ## Consequences
 
@@ -67,6 +78,9 @@ voice-codec floor (`has_voice` guard, DTMF-only rejection) is unchanged.
 - `build_audio_answer`'s answer `m=` payload order now follows `supported`, not the
   offer. The docstring and the two adapter menu comments that claimed offer-order
   behaviour are corrected in the same change (rule 27 — they were now contradictory).
+- Outbound call answer validation preserves the received 2xx answer order. A peer that
+  answers `PCMU` before `Opus` selected `PCMU`; we must not reorder that answer to our
+  offer/support menu before choosing the RTP engine codec.
 - One existing test (`test_answer_preserves_offer_codec_order_not_supported_order`)
   asserted the old, now-superseded contract; it is rewritten as
   `test_answer_orders_codecs_by_supported_not_offer_order` (its own commit, justified)
@@ -89,7 +103,9 @@ voice-codec floor (`has_voice` guard, DTMF-only rejection) is unchanged.
 
 - TDD: red tests assert `PCMU`-before-`Opus` → `Opus`, `PCMU`-before-`G.722` →
   `G.722`, and `build_audio_answer` leads `PCMU` before `PCMA` when our menu prefers
-  `PCMU`; companion tests pin the stable no-op and same-rank-keeps-offer-order
-  invariants. Implementation turns them green without touching the tests.
+  `PCMU`; companion tests pin the stable no-op, same-rank-keeps-offer-order,
+  telephone-event-menu-position, and received-answer-preserves-peer-order invariants.
+  The outbound E2E regression proves a 2xx answer listing `PCMU` before `Opus` leaves
+  the RTP engine on `PCMU`. Implementation turns them green without touching the tests.
 - Full local gate (ruff format/lint, mypy --strict, pytest) plus the hermes-contract
   extra gate (`adapter.py` is the contract surface).

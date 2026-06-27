@@ -1028,42 +1028,57 @@ class SessionDescription:
         return cls(connection_address=session_conn, audio=audio, video=video)
 
 
-def negotiate_audio(offer: AudioMedia, supported: Sequence[str]) -> tuple[Codec, ...]:
-    """Choose the codecs common to ``offer`` and ``supported``, in OUR order.
+def negotiate_audio(
+    offer: AudioMedia, supported: Sequence[str], *, prefer_local: bool = True
+) -> tuple[Codec, ...]:
+    """Choose the codecs common to ``offer`` and ``supported``.
 
-    RFC 3264 §6.1: the answer expresses the **answerer's** preference, not the
-    offerer's. We therefore intersect the offer with ``supported`` and then order
-    the result by our preference — ``supported`` is the menu, first = most
-    preferred — so a gateway that lists a narrowband codec ahead of our preferred
-    wideband one (PCMU before Opus, or PCMU before G.722) is still answered with
-    the wideband codec we advertise, never silently downgraded.
+    When building an answer (``prefer_local=True``), RFC 3264 §6.1 says the
+    answer expresses the **answerer's** preference, not the offerer's. We
+    therefore intersect the offer with ``supported`` and then order the result by
+    our preference — ``supported`` is the menu, first = most preferred — so a
+    gateway that lists a narrowband codec ahead of our preferred wideband one
+    (PCMU before Opus, or PCMU before G.722) is still answered with the wideband
+    codec we advertise, never silently downgraded.
 
-    The reorder is a **stable** sort by preference rank: when the offer already
-    matches our order the output is unchanged (the same codecs in the same order);
-    two offered codecs that share an encoding (hence one rank) keep their relative
-    offer order; and ``telephone-event`` stays wherever it sits in ``supported``
-    (conventionally last).
+    When parsing a received answer to an offer we sent (``prefer_local=False``),
+    the peer is the answerer. Its ``m=`` order is the selection signal, so the
+    intersection preserves the peer's order and only drops codecs outside the
+    offer/support menu.
+
+    The local-preference reorder is a **stable** sort by preference rank: when
+    the offer already matches our order the output is unchanged (the same codecs
+    in the same order); two offered codecs that share an encoding (hence one
+    rank) keep their relative offer order; and ``telephone-event`` stays wherever
+    it sits in ``supported`` (conventionally last).
 
     Args:
-        offer: The peer's offered audio media.
-        supported: Encoding names we can handle, most-preferred first
-            (case-insensitive). Order is significant: it is OUR preference.
+        offer: The peer's audio media: an offer when we are building an answer,
+            or a received answer when we are validating an outbound call.
+        supported: Encoding names we can handle or offered, most-preferred first
+            when ``prefer_local`` is true (case-insensitive).
+        prefer_local: ``True`` when we are the answerer and should order by our
+            ``supported`` menu; ``False`` when we are the offerer parsing a
+            received answer and must preserve the peer answerer's order.
 
     Returns:
-        The agreed codecs ordered by our preference (including
-        ``telephone-event`` for DTMF when offered).
+        The agreed codecs ordered by our preference or by the received answer's
+        order, including ``telephone-event`` for DTMF when offered.
 
     Raises:
         ValueError: If no actual voice codec is shared (a DTMF-only match is
             not a usable call).
     """
     # Preference rank by encoding (upper-cased): index in `supported`, lowest =
-    # most preferred. An encoding offered but somehow absent from `wanted` is
-    # filtered out first, so .index() below is always defined for survivors.
+    # most preferred. The membership filter below removes unsupported encodings
+    # before the rank lookup is used for local-preference ordering.
     rank = {name.upper(): i for i, name in enumerate(supported)}
     common = [c for c in offer.codecs if c.encoding.upper() in rank]
-    # Stable sort: ties (same encoding, so same rank) keep their offer order.
-    chosen = tuple(sorted(common, key=lambda c: rank[c.encoding.upper()]))
+    if prefer_local:
+        # Stable sort: ties (same encoding, so same rank) keep their offer order.
+        chosen = tuple(sorted(common, key=lambda c: rank[c.encoding.upper()]))
+    else:
+        chosen = tuple(common)
     has_voice = any(c.encoding.lower() != _TELEPHONE_EVENT for c in chosen)
     if not has_voice:
         msg = f"no common audio codec (offered {[c.encoding for c in offer.codecs]})"
@@ -1760,8 +1775,8 @@ def build_sip_dtls_answer(  # noqa: PLR0913 - SDP fields are independent; all ke
     For an SDES (``RTP/SAVP``) or plain (``RTP/AVP``) offer use
     :func:`build_audio_answer`; for a WebRTC (``UDP/TLS/RTP/SAVPF``) offer use
     :func:`build_webrtc_answer`. Codec negotiation (via :func:`negotiate_audio`)
-    follows the offer's preference order, and the direction mirrors the offer
-    (RFC 3264 §6.1).
+    orders the answer by our ``supported`` preference menu, and the direction mirrors
+    the offer (RFC 3264 §6.1).
 
     Args:
         offer: The parsed peer offer; its audio MUST be SIP DTLS-SRTP
@@ -1857,8 +1872,8 @@ def build_webrtc_answer(  # noqa: PLR0913 - WebRTC SDP fields are independent; a
     caller-supplied value — the answerer has no independent direction choice on
     a WebRTC answer).
 
-    Codec negotiation (via :func:`negotiate_audio`) follows the offer's
-    preference order, not ``supported``.
+    Codec negotiation (via :func:`negotiate_audio`) orders the answer by our
+    ``supported`` preference menu, not by the offer's codec order.
 
     Args:
         offer: The parsed peer WebRTC offer; must carry ``UDP/TLS/RTP/SAVPF``

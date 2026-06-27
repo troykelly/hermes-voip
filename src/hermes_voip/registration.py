@@ -55,6 +55,7 @@ _UNAUTHORIZED = 401
 _PROXY_AUTH_REQUIRED = 407
 _INTERVAL_TOO_BRIEF = 423
 _OK = 200
+_3XX = 300  # first non-2xx status code; used in the 2xx success range check
 _EXPIRES_PARAM = re.compile(r";\s*expires\s*=\s*(\d+)", re.IGNORECASE)
 # The addr-spec inside a Contact name-addr's angle brackets (``<sip:...>``).
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
@@ -318,7 +319,9 @@ class RegistrationFlow:
             raise RuntimeError(msg)
         self._check_cseq(response, txn)
         status = response.status_code
-        if status == _OK:
+        if _OK <= status < _3XX:
+            # Accept any 2xx as success (RFC 3261 §21.2 — 200 OK is the most common,
+            # but 202 Accepted is also a valid response to REGISTER on some gateways).
             self._registered = txn.requested_expires > 0
             self._txn = None
             return Registered(expires=self._granted_expires(response))
@@ -411,9 +414,16 @@ class RegistrationFlow:
         cseq = response.header("CSeq")
         if cseq is None:
             return  # a real registrar always echoes CSeq; nothing to correlate here
-        number = cseq.split()[0] if cseq.split() else ""
-        if not number.isdigit() or int(number) != txn.cseq:
-            msg = f"response CSeq {cseq!r} does not match outstanding {txn.cseq}"
+        parts = cseq.split()
+        number = parts[0] if parts else ""
+        method = parts[1] if len(parts) > 1 else ""
+        # RFC 3261 §8.1.3.5: the CSeq sequence number must match and the method
+        # must be REGISTER (a mismatched method is a protocol error — a response
+        # to a different transaction routed to this flow by mistake).
+        if not number.isdigit() or int(number) != txn.cseq or method != "REGISTER":
+            msg = (
+                f"response CSeq {cseq!r} does not match outstanding {txn.cseq} REGISTER"
+            )
             raise RuntimeError(msg)
 
     def _granted_expires(self, response: SipResponse) -> int:

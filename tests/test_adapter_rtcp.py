@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import socket
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Protocol
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -353,9 +354,19 @@ def _make_blocking_run(ev: asyncio.Event) -> Callable[[], Coroutine[None, None, 
     return _run
 
 
+class _KwargsCtor(Protocol):
+    """Typed protocol for a keyword-only callable returning object.
+
+    Avoids ``Callable[..., object]`` (disallowed under ``explicit-any``);
+    the inner ``_ctor`` in ``_make_port_injecting_ctor`` conforms here.
+    """
+
+    def __call__(self, **kwargs: object) -> object: ...
+
+
 def _make_port_injecting_ctor(
     rtp_port: int,
-) -> Callable[..., object]:
+) -> _KwargsCtor:
     """Return a ``RtpMediaTransport`` ctor wrapper that substitutes ``local_port``.
 
     The adapter always passes ``local_port=0``; this wrapper replaces it with
@@ -405,6 +416,16 @@ async def _until(
         waited += step
         if waited >= timeout:
             raise AssertionError("condition not met in time")
+
+
+def _has_call_loop(call_id: str, adapter: VoipAdapter) -> bool:
+    """Return True when ``call_id`` is registered in ``adapter._call_loops``.
+
+    Named helper (not a lambda with default args) so mypy can infer the full
+    signature; used with ``functools.partial`` to capture loop variables without
+    a B023 closure-in-loop violation.
+    """
+    return call_id in adapter._call_loops
 
 
 _FAKE_ENV = {
@@ -671,8 +692,8 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
                 adapter._on_inbound_invite(
                     NewCall(registration=_ext_config(), invite=invite)
                 )
-                # Default-arg binding captures current loop values (avoids B023).
-                await _until(lambda c=call_id, a=adapter: c in a._call_loops)
+                # functools.partial captures current loop values without a B023 closure.
+                await _until(functools.partial(_has_call_loop, call_id, adapter))
 
                 engine = _live_engine(adapter, call_id)
                 if engine._rtcp_local_port is None:
@@ -872,8 +893,8 @@ async def test_inbound_sdes_savp_call_activates_srtcp_when_opted_in() -> None:
                 adapter._on_inbound_invite(
                     NewCall(registration=_ext_config(), invite=invite)
                 )
-                # Default-arg binding captures current loop values (avoids B023).
-                await _until(lambda c=call_id, a=adapter: c in a._call_loops)
+                # functools.partial captures current loop values without a B023 closure.
+                await _until(functools.partial(_has_call_loop, call_id, adapter))
 
                 engine = _live_engine(adapter, call_id)
                 if engine._rtcp_local_port is None:

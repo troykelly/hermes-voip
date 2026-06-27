@@ -299,7 +299,9 @@ def test_jitter_reset_clears_buffer_and_sequence_state() -> None:
 
 
 def test_jitter_ssrc_change_auto_resets_sequence_anchor() -> None:
-    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    # With ssrc_hysteresis=1 the reset fires on the very first foreign-SSRC
+    # packet — preserving the pre-hysteresis behaviour for callers that opt in.
+    jb = JitterBuffer(target_depth=2, max_ahead=256, ssrc_hysteresis=1)
     old_ssrc = 0x11111111
     new_ssrc = 0x22222222
     for seq in (65000, 65001):

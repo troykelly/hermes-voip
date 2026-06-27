@@ -212,6 +212,24 @@ def test_negotiate_keeps_common_codecs_in_supported_order() -> None:
     assert [c.encoding for c in chosen] == ["PCMU", "telephone-event"]
 
 
+def test_negotiate_audio_rejects_te_clock_rate_mismatch() -> None:
+    offer = SessionDescription.parse(
+        "v=0\r\n"
+        "o=- 1 1 IN IP4 192.0.2.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0 101\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:101 telephone-event/16000\r\n"
+        "a=sendrecv\r\n"
+    )
+
+    assert offer.audio is not None
+    with pytest.raises(SdpError, match=r"telephone-event.*8000.*16000"):
+        negotiate_audio(offer.audio, supported=("PCMU", "telephone-event"))
+
+
 def test_negotiate_raises_when_no_common_audio_codec() -> None:
     sdp = SessionDescription.parse(_OFFER_AVP)
     assert sdp.audio is not None
@@ -475,14 +493,7 @@ def test_build_audio_offer_version_defaults_to_session_id() -> None:
     assert "o=- 42 42 IN IP4 192.0.2.10" in text
 
 
-def test_build_audio_offer_literal_sdp_structure() -> None:
-    """Literal substring assertions on build_audio_offer output.
-
-    Strengthens mutation coverage by asserting the exact SDP structure emitted:
-    starts with v=0, contains m=audio with RTP/AVP profile, the exact ptime line,
-    the exact direction line, and ends with CRLF. Guards against dropped lines
-    and mismatches between offer construction and parser round-trip.
-    """
+def test_build_audio_offer_literal_lines() -> None:
     codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
     text = build_audio_offer(
         local_address="192.0.2.10",
@@ -491,18 +502,81 @@ def test_build_audio_offer_literal_sdp_structure() -> None:
         direction="sendrecv",
         ptime=20,
     )
-    # Starts with v=0 CRLF.
-    assert text.startswith("v=0\r\n"), "SDP must start with v=0\\r\\n"
-    # Contains m=audio with RTP/AVP profile (not SAVP for plaintext offer).
-    assert "m=audio 41000 RTP/AVP 0" in text, (
-        "m=audio line must be present with RTP/AVP"
+
+    lines = text.split("\r\n")
+    assert lines[0] == "v=0"
+    assert lines.count("m=audio 41000 RTP/AVP 0") == 1
+    assert "a=ptime:20" in lines
+    assert "a=sendrecv" in lines
+    assert text.endswith("\r\n")
+    assert lines[-1] == ""
+
+
+@pytest.mark.parametrize(
+    ("direction", "mirrored_direction"),
+    [
+        ("sendrecv", "sendrecv"),
+        ("sendonly", "recvonly"),
+        ("recvonly", "sendonly"),
+        ("inactive", "inactive"),
+    ],
+)
+def test_direction_round_trips_for_valid_build_values(
+    direction: str, mirrored_direction: str
+) -> None:
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    offer_text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=codecs,
+        direction=direction,
     )
-    # Contains the exact ptime line.
-    assert "a=ptime:20\r\n" in text, "a=ptime:20\\r\\n must be present"
-    # Contains the exact direction line.
-    assert "a=sendrecv\r\n" in text, "a=sendrecv\\r\\n must be present"
-    # Ends with CRLF.
-    assert text.endswith("\r\n"), "SDP must end with \\r\\n"
+    parsed_offer = SessionDescription.parse(offer_text)
+    assert parsed_offer.audio is not None
+    assert parsed_offer.audio.direction == direction
+
+    answer_text = build_audio_answer(
+        parsed_offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+    )
+    parsed_answer = SessionDescription.parse(answer_text)
+    assert parsed_answer.audio is not None
+    assert parsed_answer.audio.direction == mirrored_direction
+
+
+@pytest.mark.parametrize("direction", ["bogus", "SENDRECV", " sendrecv", "recv_only"])
+def test_build_rejects_bad_direction(direction: str) -> None:
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+
+    with pytest.raises(ValueError, match="direction"):
+        build_audio_offer(
+            local_address="192.0.2.10",
+            port=41000,
+            codecs=codecs,
+            direction=direction,
+        )
+
+    invalid_offer = SessionDescription(
+        connection_address="192.0.2.1",
+        audio=AudioMedia(
+            port=40000,
+            protocol="RTP/AVP",
+            codecs=codecs,
+            crypto=(),
+            ptime=20,
+            direction=direction,
+            connection_address="192.0.2.1",
+        ),
+    )
+    with pytest.raises(ValueError, match="direction"):
+        build_audio_answer(
+            invalid_offer,
+            local_address="192.0.2.20",
+            port=42000,
+            supported=("PCMU",),
+        )
 
 
 def test_parse_without_audio_media_returns_none() -> None:

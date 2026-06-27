@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_voip.provider_error import is_provider_error, safe_error_reply
+from hermes_voip.provider_error import (
+    is_provider_error,
+    resolve_error_apology,
+    safe_error_reply,
+)
 
 # ---- the detector: real provider/runtime error shapes are recognised --------
 
@@ -104,3 +108,59 @@ def test_safe_error_reply_is_not_itself_classified_as_an_error() -> None:
     adapter could loop substituting it for itself.)
     """
     assert is_provider_error(safe_error_reply("en")) is False
+
+
+# ---- operator-overridable apology + per-language fallback (spec A) ----------
+#
+# resolve_error_apology(language, override) is the single seam used by the adapter.
+# • When override is non-empty, it is returned verbatim (operator-configured line).
+# • When override is absent/empty, the per-language line is returned if one exists.
+# • When no per-language line exists, English fallback is returned (never raises).
+# • For any language with a registered line (non-'en'), that line is returned.
+
+
+def test_resolve_error_apology_uses_override_when_set() -> None:
+    """A non-empty operator override is returned verbatim, regardless of language."""
+    custom = "Un instant, je vous prie."
+    assert resolve_error_apology("en", override=custom) == custom
+
+
+def test_resolve_error_apology_override_takes_priority_over_language_line() -> None:
+    """Override wins even when the language has a registered per-language line."""
+    custom = "Operator custom line."
+    # "fr" should have a language line (or fall back to en), but override always wins.
+    assert resolve_error_apology("fr", override=custom) == custom
+
+
+def test_resolve_error_apology_uses_per_language_line_when_no_override() -> None:
+    """A non-'en' language with a registered line returns that line, not English."""
+    # French is the canonical non-English test language.
+    fr_line = resolve_error_apology("fr", override=None)
+    en_line = resolve_error_apology("en", override=None)
+    # The French line must exist and differ from English.
+    assert fr_line.strip() != ""
+    assert fr_line != en_line
+
+
+def test_resolve_error_apology_falls_back_to_english_for_unknown_language() -> None:
+    """An unknown language with no line falls back to English, never raises."""
+    result = resolve_error_apology("zz-unknown", override=None)
+    assert result == resolve_error_apology("en", override=None)
+
+
+def test_resolve_error_apology_empty_override_uses_language_line() -> None:
+    """An empty-string override is treated as absent (uses language fallback)."""
+    en_line = resolve_error_apology("en", override=None)
+    assert resolve_error_apology("en", override="") == en_line
+
+
+def test_resolve_error_apology_result_is_not_itself_a_provider_error() -> None:
+    """The resolved apology line must never trigger is_provider_error (loop guard)."""
+    for lang in ("en", "fr", "de", "es"):
+        line = resolve_error_apology(lang, override=None)
+        assert not is_provider_error(line), (
+            f"resolve_error_apology({lang!r}) returned a line that triggers "
+            f"is_provider_error: {line!r}"
+        )
+    custom = "Un moment s'il vous plait."
+    assert not is_provider_error(resolve_error_apology("en", override=custom))

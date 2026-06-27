@@ -115,10 +115,14 @@ def is_provider_error(content: str) -> bool:
 #
 # Short, natural apologies keyed by language code (ADR-0054 mechanism). Each reads
 # cleanly on every TTS model (no bracket tag) and reveals nothing about the
-# backend. English-only for now; add a language by adding an entry (data-only),
-# mirroring _COMFORT_FILLER_PHRASES_BY_LANGUAGE in config.py.
+# backend. Add a language by adding an entry below (data-only change), mirroring
+# _COMFORT_FILLER_PHRASES_BY_LANGUAGE in config.py.
 _SAFE_ERROR_REPLY_BY_LANGUAGE: dict[str, str] = {
     "en": "Sorry, I'm having trouble right now. Please bear with me.",
+    "fr": "Désolé, j'ai un problème en ce moment. Merci de patienter.",
+    "de": "Entschuldigung, ich habe gerade ein technisches Problem. Bitte warten Sie.",
+    "es": "Lo siento, estoy teniendo problemas en este momento. Por favor, espere.",
+    "pt": "Desculpe, estou com um problema agora. Por favor, aguarde.",
 }
 
 #: The English line is the back-compatible default for an unknown language code.
@@ -135,3 +139,50 @@ def safe_error_reply(language: str) -> str:
     return _SAFE_ERROR_REPLY_BY_LANGUAGE.get(
         language, _SAFE_ERROR_REPLY_BY_LANGUAGE[_DEFAULT_LANGUAGE]
     )
+
+
+def classify_provider_error(content: str) -> str:
+    """Return a stable category token for the provider/runtime error in ``content``.
+
+    Used for structured log fields (runbook-0014 §Error handling) — a short,
+    stable token that lets a log pipeline count by category without exposing
+    raw error text or PII. Never returns an empty string (always at least
+    ``"provider_error"``). Assumes :func:`is_provider_error` has already
+    returned ``True`` for ``content``.
+
+    Categories (in match priority order):
+    - ``"traceback"`` — a Python stack trace header was found.
+    - ``"provider_token"`` — a provider/SDK error-class token was found.
+    - ``"http_error"`` — an HTTP 5xx/429 status in error context was found.
+    - ``"failure_phrase"`` — an explicit failure phrase was found.
+    - ``"provider_error"`` — matched by ``is_provider_error`` but no specific
+      sub-category (should not occur given the four detectors cover all cases).
+    """
+    if _TRACEBACK_RE.search(content):
+        return "traceback"
+    if _PROVIDER_TOKEN_RE.search(content):
+        return "provider_token"
+    if _HTTP_ERROR_RE.search(content):
+        return "http_error"
+    if _FAILURE_PHRASE_RE.search(content):
+        return "failure_phrase"
+    return "provider_error"
+
+
+def resolve_error_apology(language: str, *, override: str | None) -> str:
+    """Return the spoken apology line for a provider/runtime error (ADR-0063).
+
+    Resolution order:
+    1. ``override`` — when non-empty, the operator-configured line is returned
+       verbatim regardless of ``language`` (``HERMES_VOIP_ERROR_APOLOGY`` env var).
+    2. Per-language line — when a line exists for ``language`` in
+       ``_SAFE_ERROR_REPLY_BY_LANGUAGE``, it is returned.
+    3. English fallback — returned for any language with no registered line
+       (never raises — a missing translation must not break the call).
+
+    ``override`` must be a non-empty string to take effect; ``None`` and ``""``
+    both fall through to the language/English resolution path.
+    """
+    if override:
+        return override
+    return safe_error_reply(language)

@@ -2329,6 +2329,13 @@ def test_refuse_decline_phrases_blank_member_in_direct_construction_rejected() -
         dataclasses.replace(base, refuse_decline_phrases=("ok", "   "))
 
 
+def test_error_apology_blank_direct_construction_rejected() -> None:
+    """A directly-constructed MediaConfig rejects a blank operator apology line."""
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="error_apology"):
+        dataclasses.replace(base, error_apology="   ")
+
+
 def test_no_input_timeout_ms_must_be_positive() -> None:
     """HERMES_VOIP_NO_INPUT_TIMEOUT_MS=0 is rejected (must be positive)."""
     with pytest.raises(ConfigError):

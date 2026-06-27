@@ -315,9 +315,7 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
 
     # A cnonce is needed only on the qop=auth path (the only path reachable for
     # -sess after the guard above). The legacy MD5 no-qop path uses none.
-    client_nonce = (
-        (cnonce if cnonce is not None else secrets.token_hex(8)) if use_auth_qop else ""
-    )
+    client_nonce = (cnonce or secrets.token_hex(8)) if use_auth_qop else ""
 
     ha1 = _compute_ha1(
         algo_lower,

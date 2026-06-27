@@ -3179,3 +3179,42 @@ def test_build_webrtc_answer_ipv4_addrtype_in_origin() -> None:
     text = _make_webrtc_answer_text(_WEBRTC_IPV4_ADDR)
     assert f"IN IP4 {_WEBRTC_IPV4_ADDR}" in text
     assert "IN IP6" not in text
+
+
+# --- duplicate rtpmap rejection (fail-closed, not last-wins) ---
+
+
+def test_parse_rejects_duplicate_rtpmap_payload_type() -> None:
+    """Two a=rtpmap lines for the same PT in audio must raise SdpError (fail-closed)."""
+    with pytest.raises(SdpError, match=r"duplicate.*rtpmap.*payload type 0"):
+        SessionDescription.parse(
+            "v=0\r\n"
+            "o=- 1 1 IN IP4 192.0.2.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 192.0.2.1\r\n"
+            "t=0 0\r\n"
+            "m=audio 40000 RTP/AVP 0 8\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:0 PCMA/8000\r\n"  # conflicting duplicate for PT 0
+            "a=rtpmap:8 PCMA/8000\r\n"
+            "a=sendrecv\r\n"
+        )
+
+
+def test_parse_single_rtpmap_per_pt_is_accepted() -> None:
+    """A normal SDP with exactly one rtpmap per PT continues to parse unchanged."""
+    sdp = SessionDescription.parse(
+        "v=0\r\n"
+        "o=- 1 1 IN IP4 192.0.2.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0 8\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=sendrecv\r\n"
+    )
+    assert sdp.audio is not None
+    by_pt = {c.payload_type: c for c in sdp.audio.codecs}
+    assert by_pt[0].encoding == "PCMU"
+    assert by_pt[8].encoding == "PCMA"

@@ -106,3 +106,55 @@ def test_runbook_0013_restart_and_section3_align() -> None:
 
     # §Restart should mention ADR-0059
     assert "ADR-0059" in restart_section, "Restart §1 should cross-reference ADR-0059."
+
+
+def test_runbook_0013_wss_wired_claim_is_accurate() -> None:
+    """Verify runbook 0013 does not falsely claim WSS signalling is unwired.
+
+    ADR-0038 (Accepted) shipped WssSipTransport; adapter.py lines ~1135-1146 wire
+    it so inbound INVITEs over WSS reach _on_inbound_invite identically to TLS.
+    Any claim that 'WSS signalling is not yet wired' or that WebRTC inbound is 'in
+    the roadmap' is a rule-27 defect.
+    """
+    runbook_path = (
+        Path(__file__).parent.parent
+        / "docs"
+        / "runbooks"
+        / "0013-voip-incident-oncall.md"
+    )
+    content = runbook_path.read_text()
+
+    false_claim_unwired = "WSS signalling is not yet wired"
+    assert false_claim_unwired not in content, (
+        f"Runbook contains false claim: '{false_claim_unwired}'. "
+        "ADR-0038 shipped WssSipTransport and it is wired in adapter.py."
+    )
+
+    false_claim_roadmap = "WebRTC inbound calls are in the\n  roadmap"
+    assert false_claim_roadmap not in content, (
+        "Runbook falsely places WebRTC inbound calls 'in the roadmap'. "
+        "ADR-0038 shipped this; update to describe what IS."
+    )
+
+
+def test_runbook_0013_tts_fallback_token_is_hyphenated() -> None:
+    """Verify the TTS fallback env-var example uses 'sherpa-kokoro' (hyphen).
+
+    config.py _TTS_PROVIDERS uses 'sherpa-kokoro' (hyphen). The runbook previously
+    instructed operators to set HERMES_VOIP_TTS_FALLBACK=sherpa_kokoro (underscore),
+    which triggers a ConfigError at startup during a TTS outage.
+    """
+    runbook_path = (
+        Path(__file__).parent.parent
+        / "docs"
+        / "runbooks"
+        / "0013-voip-incident-oncall.md"
+    )
+    content = runbook_path.read_text()
+
+    bad_token = "HERMES_VOIP_TTS_FALLBACK=sherpa_kokoro"
+    assert bad_token not in content, (
+        f"Runbook contains invalid token '{bad_token}'. "
+        "config.py _TTS_PROVIDERS uses 'sherpa-kokoro' (hyphen, not underscore). "
+        "Following the runbook as written triggers ConfigError at startup."
+    )

@@ -1,5 +1,7 @@
 """Test that foundation modules export their public API via __all__."""
 
+import hermes_voip
+import hermes_voip.call_context
 import hermes_voip.dtmf
 import hermes_voip.message
 import hermes_voip.registration
@@ -50,3 +52,34 @@ def test_message_exports_sip_request() -> None:
     """SipRequest should be exported from hermes_voip.message.__all__."""
     assert "SipRequest" in hermes_voip.message.__all__
     assert hasattr(hermes_voip.message, "SipRequest")
+
+
+def test_top_level_exports_inbound_call_context() -> None:
+    """InboundCallContext should be exported from hermes_voip.__all__."""
+    assert "InboundCallContext" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "InboundCallContext")
+    assert hermes_voip.InboundCallContext is hermes_voip.call_context.InboundCallContext
+
+
+def test_top_level_exports_extract_call_context() -> None:
+    """extract_call_context should be exported from hermes_voip.__all__."""
+    assert "extract_call_context" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "extract_call_context")
+    assert (
+        hermes_voip.extract_call_context
+        is hermes_voip.call_context.extract_call_context
+    )
+
+
+def test_top_level_exports_diversion_hop() -> None:
+    """DiversionHop should be exported from hermes_voip.__all__."""
+    assert "DiversionHop" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "DiversionHop")
+    assert hermes_voip.DiversionHop is hermes_voip.call_context.DiversionHop
+
+
+def test_top_level_exports_history_info_entry() -> None:
+    """HistoryInfoEntry should be exported from hermes_voip.__all__."""
+    assert "HistoryInfoEntry" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "HistoryInfoEntry")
+    assert hermes_voip.HistoryInfoEntry is hermes_voip.call_context.HistoryInfoEntry

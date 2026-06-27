@@ -16,7 +16,7 @@ import base64
 
 import pytest
 
-from hermes_voip.call import CallError, CallSession, RefreshSucceeded
+from hermes_voip.call import CallError, CallSession
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.incall import LocalMediaSession
@@ -31,6 +31,7 @@ from hermes_voip.sdp import (
     build_audio_offer,
     generate_answer_crypto,
 )
+from hermes_voip.session_timer import RefreshSucceeded
 
 pytestmark = pytest.mark.asyncio
 

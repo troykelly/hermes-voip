@@ -429,6 +429,10 @@ def test_parse_unfolds_tab_continuation() -> None:
     The _parse_headers() unfolding logic checks ``line[:1] in (" ", "\t")`` to
     detect continuation lines. This test pins the HTAB case explicitly, separate
     from the existing SP-only test_parse_unfolds_continuation_lines().
+
+    The normalised value must be the two logical-line fragments joined with a
+    single SP (the HTAB is stripped and replaced with one space), producing the
+    exact single-line string asserted below.
     """
     raw = (
         "SIP/2.0 200 OK\r\n"
@@ -439,11 +443,10 @@ def test_parse_unfolds_tab_continuation() -> None:
     )
     resp = SipResponse.parse(raw)
     value = resp.header("WWW-Authenticate") or ""
-    assert "nonce=" in value
-    # Unfolded value should have the continuation merged with a single space.
-    assert "nonce=" in value
-    challenge = DigestChallenge.parse(value)
-    assert challenge.qop == ("auth",)
+    # Direct assertion: the reconstructed header value must be the exact
+    # single-line string produced by RFC 3261 §7.3.1 unfolding (HTAB stripped,
+    # continuation joined with one SP).
+    assert value == 'Digest realm="pbx.example.test", nonce="171/9c", qop="auth"'
 
 
 def test_parse_body_with_embedded_blank_line() -> None:

@@ -3369,3 +3369,233 @@ async def test_send_genuine_reply_not_treated_as_provider_error() -> None:
     result = await adapter.send(call_id, reply)
     assert result.success
     assert reply in spoken
+
+
+# ---------------------------------------------------------------------------
+# Operator-overridable apology + structured log fields (spec A+B)
+# ---------------------------------------------------------------------------
+#
+# (A) The spoken apology:
+#   1. Operator override (HERMES_VOIP_ERROR_APOLOGY env var) is used when set.
+#   2. Per-language line is used when language != 'en' and a line exists.
+#   3. English fallback when no per-language line.
+#
+# (B) The WARNING log carries structured extra={} fields per runbook-0014 §Error
+#     handling: event, call_id, error_category, language, override_applied.
+#     No PII, no raw exception text.
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_uses_operator_override_when_set() -> None:
+    """HERMES_VOIP_ERROR_APOLOGY override is spoken instead of the built-in line.
+
+    The operator can provide a custom apology in the env var; the adapter must
+    use it verbatim (redaction-safe: the override is not logged as a secret).
+    """
+    custom_line = "Please hold for one moment."
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({"HERMES_VOIP_ERROR_APOLOGY": custom_line})
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    assert spoken == [custom_line], f"expected [{custom_line!r}] but got {spoken!r}"
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_uses_per_language_line_for_non_en() -> None:
+    """Non-'en' language with a registered line speaks that language's apology."""
+    from hermes_voip.provider_error import resolve_error_apology  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    # Use French — must have a registered line (the impl provides it).
+    adapter._media_cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "fr"})
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    expected = resolve_error_apology("fr", override=None)
+    assert spoken == [expected], f"expected [{expected!r}] but got {spoken!r}"
+    # The French line must differ from English (ensures a real translation exists).
+    en_line = resolve_error_apology("en", override=None)
+    assert expected != en_line
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_falls_back_to_english_for_unknown_language() -> None:
+    """A language with no registered line speaks the English fallback."""
+    from hermes_voip.provider_error import resolve_error_apology  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "zz-unknown"})
+
+    call_id = new_call_id()
+    spoken: list[str] = []
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for chunk in text:
+                spoken.append(chunk)
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    en_line = resolve_error_apology("en", override=None)
+    assert spoken == [en_line], f"expected [{en_line!r}] but got {spoken!r}"
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_warning_log_carries_structured_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The WARNING log carries structured extra={} fields per runbook-0014.
+
+    Required fields: event, call_id, error_category, language, override_applied.
+    No PII, no raw provider message text in structured fields (only in the human
+    message body which is already redacted by _redact_secrets_for_log).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # Find the provider-error replacement record (must exist — not the speak() failure).
+    _ev = "provider_error_replaced"
+    replacement_records = [
+        r for r in warning_records if getattr(r, "event", None) == _ev
+    ]
+    seen_events = [getattr(r, "event", None) for r in warning_records]
+    assert replacement_records, (
+        f"no WARNING with event={_ev!r} found; events seen: {seen_events!r}"
+    )
+    rec = replacement_records[0]
+    # Mandatory structured fields.
+    assert getattr(rec, "call_id", None) == call_id
+    assert getattr(rec, "error_category", None) is not None  # non-empty category token
+    assert getattr(rec, "language", None) is not None  # language code logged
+    # override_applied must be a bool (False when no override configured).
+    assert getattr(rec, "override_applied", None) is False
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_structured_log_shows_override_applied_true(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When an operator override is active, override_applied=True in the log record."""
+    custom_line = "One moment please."
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({"HERMES_VOIP_ERROR_APOLOGY": custom_line})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    replacement_records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event", None) == "provider_error_replaced"
+    ]
+    assert replacement_records, "no provider_error_replaced log record emitted"
+    rec = replacement_records[0]
+    assert getattr(rec, "override_applied", None) is True
+
+
+@pytest.mark.asyncio
+async def test_send_provider_error_structured_log_no_pii_in_extra_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The structured extra={} fields must not carry PII or raw provider text.
+
+    The raw error text is placed only in the human-readable log message (already
+    redacted); the structured fields carry only safe category tokens, language
+    codes, and boolean flags — never raw exception strings or caller info.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config({})
+
+    call_id = new_call_id()
+
+    class _FakeLoop:
+        async def speak(self, text: AsyncIterator[str]) -> None:
+            async for _chunk in text:
+                pass
+
+    adapter._call_loops[call_id] = _FakeLoop()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        result = await adapter.send(call_id, _PROVIDER_ERROR_REPLY)
+
+    assert result.success
+    replacement_records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event", None) == "provider_error_replaced"
+    ]
+    assert replacement_records, "no provider_error_replaced log record emitted"
+    rec = replacement_records[0]
+    # The raw provider error text must NOT appear in any extra field value.
+    for key, value in rec.__dict__.items():
+        if key.startswith("_") or key in {"message", "msg", "args"}:
+            continue
+        str_val = str(value)
+        assert "502" not in str_val or key in {"call_id"} or "call_id" in key, (
+            f"extra field {key!r}={value!r} contains raw error detail '502'"
+        )
+        assert "overloaded_error" not in str_val, (
+            f"extra field {key!r}={value!r} contains raw provider token"
+        )

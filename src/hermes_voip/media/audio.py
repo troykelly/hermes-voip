@@ -6,7 +6,7 @@ both conversions so every provider boundary speaks one currency: PCM16 frames
 at a declared rate (ADR-0004).
 
 It wraps ``audioop`` (the ``audioop-lts`` backport, since stdlib ``audioop`` is
-removed in Python 3.13) — a typed, battle-tested C codec.
+removed in Python 3.13) — a stub-annotated C codec (via typeshed).
 
 :func:`generate_tone_frames` generates a pure-sine diagnostic tone directly at
 the G.711 wire rate (8 kHz), chunked into 20 ms :class:`PcmFrame` objects.
@@ -27,6 +27,22 @@ from typing import Final
 import audioop
 
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
+
+__all__ = [
+    "G711_SAMPLE_RATE",
+    "Resampler",
+    "alaw_to_frame",
+    "decode_alaw",
+    "decode_ulaw",
+    "encode_alaw",
+    "encode_ulaw",
+    "frame_to_alaw",
+    "frame_to_ulaw",
+    "generate_tone_frames",
+    "linear_fade_out",
+    "resample_frame",
+    "ulaw_to_frame",
+]
 
 # Capture audioop.error at import time so that ``except _AudioopError`` in
 # try/except blocks resolves correctly even when ``audioop`` is replaced by a
@@ -62,14 +78,15 @@ def encode_ulaw(pcm16: bytes) -> bytes:
 def decode_ulaw(ulaw: bytes) -> bytes:
     """Decode G.711 mu-law to PCM16-LE mono (two bytes per sample).
 
-    **No length validation is performed on the input** — this is deliberate. Each
-    G.711 byte maps to exactly one PCM16 sample regardless of context, so any
-    byte sequence is a valid decode input. An empty payload (comfort-noise RTP,
-    keep-alive, truncated packet) decodes to an empty PCM buffer ``b""``. The
-    caller (jitter buffer, call-loop) owns the policy for how to handle a
-    zero-duration frame (silence concealment, discard, log). Validating here
-    would require the codec to know framing semantics (expected ptime, packet
-    count) that live in higher-level layers — the wrong abstraction level.
+    Mono only. **No length validation is performed on the input** — this is
+    deliberate. Each G.711 byte maps to exactly one PCM16 sample regardless of
+    context, so any byte sequence is a valid decode input. An empty payload
+    (comfort-noise RTP, keep-alive, truncated packet) decodes to an empty PCM
+    buffer ``b""``. The caller (jitter buffer, call-loop) owns the policy for
+    how to handle a zero-duration frame (silence concealment, discard, log).
+    Validating here would require the codec to know framing semantics (expected
+    ptime, packet count) that live in higher-level layers — the wrong abstraction
+    level.
 
     This asymmetry with :func:`encode_ulaw` (which validates alignment) is
     intentional: encoding an odd-byte buffer is always a programming error because
@@ -101,7 +118,7 @@ def encode_alaw(pcm16: bytes) -> bytes:
 def decode_alaw(alaw: bytes) -> bytes:
     """Decode G.711 a-law to PCM16-LE mono (two bytes per sample).
 
-    No length validation is performed — same deliberate policy as
+    Mono only. No length validation is performed — same deliberate policy as
     :func:`decode_ulaw`. An empty or short a-law payload decodes to an empty
     or short PCM buffer; the transport/call-loop layer handles the
     zero-duration frame.
@@ -301,6 +318,9 @@ class Resampler:
     the clicks a stateless per-frame conversion would introduce at boundaries.
     One ``Resampler`` belongs to one direction of one call; ``reset()`` starts a
     fresh stream.
+
+    Not thread-safe: ``_state`` is mutable and shared across ``resample()`` calls.
+    One instance per stream; do not share across concurrent threads.
     """
 
     def __init__(self, from_rate: int, to_rate: int) -> None:

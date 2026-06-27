@@ -362,6 +362,27 @@ def test_parse_compound_sdes_utf8_cname_roundtrips() -> None:
     assert SourceDescription.parse(sdes.pack()) == sdes
 
 
+def test_parse_compound_sdes_malformed_utf8_cname_raises_rtcp_error() -> None:
+    """A malformed-UTF-8 SDES CNAME is wrapped as RtcpError, not leaked raw.
+
+    This packet is structurally valid RTCP/SDES (version 2, one chunk, one CNAME item,
+    null terminator, 32-bit padding), so parse_compound reaches _parse_sdes_chunk's
+    strict UTF-8 decode path. Without that try/except wrapper, the same input would leak
+    UnicodeDecodeError instead, and this assertion on RtcpError would fail.
+    """
+    invalid_cname_bytes = (
+        b"\x80"  # lone UTF-8 continuation byte: decode("utf-8") rejects
+    )
+    item = bytes([1, len(invalid_cname_bytes)]) + invalid_cname_bytes
+    raw = struct.pack("!I", 0xDEADC0DE) + item + b"\x00"
+    raw += b"\x00" * ((-len(raw)) % 4)
+    header = bytes([0x80 | 1, RTCP_PT_SDES]) + struct.pack("!H", len(raw) // 4)
+    wire = header + raw
+
+    with pytest.raises(RtcpError, match="SDES CNAME is not valid UTF-8"):
+        parse_compound(wire)
+
+
 def test_sdes_cname_over_255_utf8_bytes_is_error() -> None:
     """A CNAME whose UTF-8 encoding exceeds 255 octets is rejected (§6.5, 8-bit len).
 

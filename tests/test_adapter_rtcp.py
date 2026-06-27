@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING
+import functools
+import socket
+import time
+from collections.abc import AsyncIterator, Callable, Coroutine
+from typing import TYPE_CHECKING, Final, Protocol
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -282,6 +285,106 @@ def test_media_config_secured_rtcp_enabled_defaults_false() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Port-isolation helpers (flake-hardening, not test-weakening — rule 19).
+#
+# The non-muxed adapter path binds a sibling RTCP socket on RTP-port+1 (RFC 3550
+# §11). The adapter always passes ``local_port=0`` to ``RtpMediaTransport``, so the
+# OS picks the RTP port WITHOUT reserving port+1. Under full-suite ephemeral-port
+# churn another test's socket can steal RTP-port+1; the engine correctly degrades to
+# RTCP-off (leaving ``_rtcp_local_port`` None), making the
+# ``assert _rtcp_local_port == local_port+1`` assertion flake.
+#
+# The same fix PR #238 applied to ``test_media_engine_rtcp.py`` is applied here:
+# reserve a free consecutive (P, P+1) UDP pair, patch the adapter's
+# ``RtpMediaTransport`` constructor to use P instead of 0, then release P+1 just
+# before the adapter's ``start_rtcp`` call binds it. The irreducible residual race
+# (P+1 stolen between release and bind) is closed by a bounded retry over fresh
+# pairs against a real deadline; exhausting it RAISES (never a silent skip — rule
+# 19/37). No assertion is weakened: the ``== local_port+1`` check is preserved
+# verbatim; only the flaky setup is made deterministic.
+# ---------------------------------------------------------------------------
+
+_RTCP_SETUP_DEADLINE_SECS: Final[float] = 5.0
+
+
+def _reserve_consecutive_udp_pair(host: str) -> tuple[int, socket.socket]:
+    """Find a free ``(P, P+1)`` UDP pair on ``host``; return ``P`` + a held P+1 socket.
+
+    Binds an ephemeral probe to discover ``P``, then binds ``P+1``; on success the
+    probe is released (so the adapter/engine can bind ``P``) while the returned socket
+    KEEPS ``P+1`` reserved, shrinking the window in which a sibling test could steal
+    it. Retries with fresh ephemeral ports until a consecutive pair is free.
+
+    Raises:
+        OSError: If no consecutive pair can be reserved before the deadline (surfaces
+            a genuine inability to bind, never a silent skip — rule 19/37).
+    """
+    deadline = time.monotonic() + _RTCP_SETUP_DEADLINE_SECS
+    last_exc: OSError | None = None
+    while time.monotonic() < deadline:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind((host, 0))
+            rtp_port = probe.getsockname()[1]
+            sibling = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sibling.bind((host, rtp_port + 1))
+            except OSError as exc:  # P+1 already taken — try another ephemeral P.
+                last_exc = exc
+                sibling.close()
+                continue
+        finally:
+            probe.close()
+        # P is now free (probe released) and P+1 is held by ``sibling``.
+        return rtp_port, sibling
+    msg = "could not reserve a free consecutive UDP port pair before deadline"
+    raise OSError(msg) from last_exc
+
+
+def _make_blocking_run(ev: asyncio.Event) -> Callable[[], Coroutine[None, None, None]]:
+    """Return an async callable that blocks until ``ev`` is set.
+
+    Defined as a factory (not a closure inside a while loop) to avoid the B023
+    ruff lint: function-in-loop variable-capture warning.
+    """
+
+    async def _run() -> None:
+        await ev.wait()
+
+    return _run
+
+
+class _KwargsCtor(Protocol):
+    """Typed protocol for a keyword-only callable returning object.
+
+    Avoids ``Callable[..., object]`` (disallowed under ``explicit-any``);
+    the inner ``_ctor`` in ``_make_port_injecting_ctor`` conforms here.
+    """
+
+    def __call__(self, **kwargs: object) -> object: ...
+
+
+def _make_port_injecting_ctor(
+    rtp_port: int,
+) -> _KwargsCtor:
+    """Return a ``RtpMediaTransport`` ctor wrapper that substitutes ``local_port``.
+
+    The adapter always passes ``local_port=0``; this wrapper replaces it with
+    ``rtp_port`` (a known-free port from ``_reserve_consecutive_udp_pair``) so
+    the engine binds P and can then bind P+1 for its sibling RTCP socket.
+
+    Defined as a factory (not a closure inside a while loop) to avoid B023.
+    """
+    from hermes_voip.media.engine import RtpMediaTransport as _Real  # noqa: PLC0415
+
+    def _ctor(**kwargs: object) -> object:
+        kwargs["local_port"] = rtp_port
+        return _Real(**kwargs)  # type: ignore[arg-type]  # test seam; kwargs mirror the real constructor
+
+    return _ctor
+
+
+# ---------------------------------------------------------------------------
 # Integration: a real inbound plain-RTP INVITE activates RTCP on the live engine
 # ---------------------------------------------------------------------------
 
@@ -313,6 +416,16 @@ async def _until(
         waited += step
         if waited >= timeout:
             raise AssertionError("condition not met in time")
+
+
+def _has_call_loop(call_id: str, adapter: VoipAdapter) -> bool:
+    """Return True when ``call_id`` is registered in ``adapter._call_loops``.
+
+    Named helper (not a lambda with default args) so mypy can infer the full
+    signature; used with ``functools.partial`` to capture loop variables without
+    a B023 closure-in-loop violation.
+    """
+    return call_id in adapter._call_loops
 
 
 _FAKE_ENV = {
@@ -541,51 +654,80 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
     non-muxed path (the offer has no a=rtcp-mux), and the sibling RTCP socket is
     bound on RTP-port+1 — i.e. the live wiring, not just the planner. The
     conversational loop is stubbed so the call parks while we inspect the engine.
+
+    Port-isolation (PR #238 pattern): reserves a free consecutive (P, P+1) UDP pair
+    and patches the adapter's ``RtpMediaTransport`` constructor to bind P instead of
+    letting the OS pick freely — eliminating the full-suite flake where a sibling
+    test's ephemeral socket can occupy RTP-port+1 before ``start_rtcp`` binds it.
+    A bounded retry handles the residual sub-ms race. No assertion is weakened.
     """
-    transport = _FakeTransport()
-    adapter = await _build_adapter(transport)
-    call_id = new_call_id()
-    invite = SipRequest.parse(_make_invite(_PLAIN_INBOUND_OFFER, call_id))
+    deadline = time.monotonic() + _RTCP_SETUP_DEADLINE_SECS
+    while True:
+        rtp_port, sibling = _reserve_consecutive_udp_pair("127.0.0.1")
+        transport = _FakeTransport()
+        adapter = await _build_adapter(transport)
+        call_id = new_call_id()
+        invite = SipRequest.parse(_make_invite(_PLAIN_INBOUND_OFFER, call_id))
+        in_call = asyncio.Event()
 
-    in_call = asyncio.Event()
+        try:
+            with (
+                patch(
+                    "hermes_voip.adapter.RtpMediaTransport",
+                    _make_port_injecting_ctor(rtp_port),
+                ),
+                patch(
+                    "hermes_voip.adapter.CallLoop",
+                    return_value=MagicMock(run=_make_blocking_run(in_call)),
+                ),
+                patch(
+                    "hermes_voip.adapter.GuardSessionState", return_value=MagicMock()
+                ),
+                patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+                patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+            ):
+                # Release P+1 just before the adapter's start_rtcp binds it —
+                # minimising the window a sibling test could steal it.
+                sibling.close()
+                adapter._on_inbound_invite(
+                    NewCall(registration=_ext_config(), invite=invite)
+                )
+                # functools.partial captures current loop values without a B023 closure.
+                await _until(functools.partial(_has_call_loop, call_id, adapter))
 
-    async def _blocking_run() -> None:
-        await in_call.wait()
+                engine = _live_engine(adapter, call_id)
+                if engine._rtcp_local_port is None:
+                    # Residual race: P+1 was taken in the sub-ms window between
+                    # sibling.close() and the engine's bind. Retry on a fresh pair.
+                    if time.monotonic() >= deadline:
+                        msg = "could not activate non-muxed RTCP before deadline"
+                        raise OSError(msg)
+                    in_call.set()  # unblock _blocking_run so disconnect can proceed
+                    continue
 
-    try:
-        with (
-            patch(
-                "hermes_voip.adapter.CallLoop",
-                return_value=MagicMock(run=_blocking_run),
-            ),
-            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
-            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
-            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
-        ):
-            adapter._on_inbound_invite(
-                NewCall(registration=_ext_config(), invite=invite)
-            )
-            await _until(lambda: call_id in adapter._call_loops)
+                # RTCP activated on the isolated port pair — run the full assertions.
 
-            # The 200 OK is a plain RTP/AVP answer (no a=crypto) — the cleartext path.
-            oks = [
-                SipResponse.parse(m)
-                for m in transport.sent
-                if m.startswith("SIP/2.0 200")
-            ]
-            assert oks
-            assert "a=crypto" not in oks[-1].body
+                # The 200 OK is a plain RTP/AVP answer — no a=crypto (cleartext path).
+                oks = [
+                    SipResponse.parse(m)
+                    for m in transport.sent
+                    if m.startswith("SIP/2.0 200")
+                ]
+                assert oks
+                assert "a=crypto" not in oks[-1].body
 
-            # Reach the LIVE engine and assert RTCP was activated on it.
-            engine = _live_engine(adapter, call_id)
-            assert engine._rtcp_task is not None  # the run_rtcp loop is live
-            assert engine._rtcp_active is True  # inbound muxed-demux engaged
-            assert engine._rtcp_send is not None  # non-muxed: separate sink installed
-            assert engine._rtcp_local_port == engine.local_port + 1
-    finally:
-        in_call.set()
-        await adapter.disconnect()
-        await asyncio.sleep(0)
+                # Reach the LIVE engine and assert RTCP was activated on it.
+                assert engine._rtcp_task is not None  # the run_rtcp loop is live
+                assert engine._rtcp_active is True  # inbound muxed-demux engaged
+                assert (
+                    engine._rtcp_send is not None
+                )  # non-muxed: separate sink installed
+                assert engine._rtcp_local_port == rtp_port + 1
+                break
+        finally:
+            in_call.set()
+            await adapter.disconnect()
+            await asyncio.sleep(0)
 
 
 # ---------------------------------------------------------------------------
@@ -716,56 +858,75 @@ async def test_inbound_sdes_savp_call_activates_srtcp_when_opted_in() -> None:
     wired (``_srtcp_in``/``_srtcp_out`` set), and — the offer having no a=rtcp-mux — the
     sibling SRTCP socket bound on RTP-port+1 (RFC 3550 §11). The outbound RTCP is
     SRTCP-protected (never cleartext on the secured 5-tuple).
+
+    Port-isolation (PR #238 pattern): same approach as the plain-RTP test above.
     """
-    transport = _FakeTransport()
-    adapter = await _build_adapter(
-        transport, media_env={"HERMES_VOIP_SECURED_RTCP_ENABLED": "true"}
-    )
-    call_id = new_call_id()
-    invite = SipRequest.parse(_make_invite(_SDES_OFFER, call_id))
+    deadline = time.monotonic() + _RTCP_SETUP_DEADLINE_SECS
+    while True:
+        rtp_port, sibling = _reserve_consecutive_udp_pair("127.0.0.1")
+        transport = _FakeTransport()
+        adapter = await _build_adapter(
+            transport, media_env={"HERMES_VOIP_SECURED_RTCP_ENABLED": "true"}
+        )
+        call_id = new_call_id()
+        invite = SipRequest.parse(_make_invite(_SDES_OFFER, call_id))
+        in_call = asyncio.Event()
 
-    in_call = asyncio.Event()
+        try:
+            with (
+                patch(
+                    "hermes_voip.adapter.RtpMediaTransport",
+                    _make_port_injecting_ctor(rtp_port),
+                ),
+                patch(
+                    "hermes_voip.adapter.CallLoop",
+                    return_value=MagicMock(run=_make_blocking_run(in_call)),
+                ),
+                patch(
+                    "hermes_voip.adapter.GuardSessionState", return_value=MagicMock()
+                ),
+                patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+                patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+            ):
+                # Release P+1 just before the adapter's start_rtcp binds it.
+                sibling.close()
+                adapter._on_inbound_invite(
+                    NewCall(registration=_ext_config(), invite=invite)
+                )
+                # functools.partial captures current loop values without a B023 closure.
+                await _until(functools.partial(_has_call_loop, call_id, adapter))
 
-    async def _blocking_run() -> None:
-        await in_call.wait()
+                engine = _live_engine(adapter, call_id)
+                if engine._rtcp_local_port is None:
+                    # Residual race: retry on a fresh pair until the deadline.
+                    if time.monotonic() >= deadline:
+                        msg = "could not activate non-muxed SRTCP before deadline"
+                        raise OSError(msg)
+                    in_call.set()
+                    continue
 
-    try:
-        with (
-            patch(
-                "hermes_voip.adapter.CallLoop",
-                return_value=MagicMock(run=_blocking_run),
-            ),
-            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
-            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
-            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
-        ):
-            adapter._on_inbound_invite(
-                NewCall(registration=_ext_config(), invite=invite)
-            )
-            await _until(lambda: call_id in adapter._call_loops)
+                # The 200 OK is an SDES answer (a=crypto present) — the secured path.
+                oks = [
+                    SipResponse.parse(m)
+                    for m in transport.sent
+                    if m.startswith("SIP/2.0 200")
+                ]
+                assert oks
+                assert "a=crypto" in oks[-1].body
 
-            # The 200 OK is an SDES answer (a=crypto present) — the secured path.
-            oks = [
-                SipResponse.parse(m)
-                for m in transport.sent
-                if m.startswith("SIP/2.0 200")
-            ]
-            assert oks
-            assert "a=crypto" in oks[-1].body
-
-            # The LIVE engine has RTCP ACTIVE, wrapped in SRTCP (no cleartext leak).
-            engine = _live_engine(adapter, call_id)
-            assert engine._rtcp_task is not None  # the run_rtcp loop is live
-            assert engine._rtcp_active is True
-            assert engine._has_srtcp is True  # SRTCP in+out wired
-            assert engine._srtcp_in is not None
-            assert engine._srtcp_out is not None
-            # Non-muxed offer → sibling RTCP socket on RTP-port+1 (RFC 3550 §11).
-            assert engine._rtcp_local_port == engine.local_port + 1
-    finally:
-        in_call.set()
-        await adapter.disconnect()
-        await asyncio.sleep(0)
+                # The LIVE engine has RTCP ACTIVE, wrapped in SRTCP (no cleartext leak).
+                assert engine._rtcp_task is not None  # the run_rtcp loop is live
+                assert engine._rtcp_active is True
+                assert engine._has_srtcp is True  # SRTCP in+out wired
+                assert engine._srtcp_in is not None
+                assert engine._srtcp_out is not None
+                # Non-muxed offer → sibling RTCP socket on RTP-port+1 (RFC 3550 §11).
+                assert engine._rtcp_local_port == rtp_port + 1
+                break
+        finally:
+            in_call.set()
+            await adapter.disconnect()
+            await asyncio.sleep(0)
 
 
 class _FakeWebRtcSession:
@@ -910,3 +1071,24 @@ async def test_inbound_webrtc_savpf_call_activates_rtcp_via_srtcp() -> None:
     finally:
         in_call.set()
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Port-isolation smoke test (TDD red from the preceding commit, now green).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adapter_rtcp_plain_rtp_port_isolation_smoke() -> None:
+    """Port-isolation smoke: ``_reserve_consecutive_udp_pair`` returns a valid (P, P+1).
+
+    Proves the helper exists and produces a pair where the returned socket holds P+1
+    — a prerequisite for the hardened non-muxed integration tests above. Was the TDD
+    red commit (failed with NameError); passes once the helper is present (this commit).
+    """
+    rtp_port, sibling = _reserve_consecutive_udp_pair("127.0.0.1")
+    try:
+        assert rtp_port > 0
+        assert sibling.getsockname()[1] == rtp_port + 1
+    finally:
+        sibling.close()

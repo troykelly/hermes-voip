@@ -3012,3 +3012,93 @@ def test_build_audio_answer_ipv4_addrtype_unchanged() -> None:
     )
     assert "IN IP4 192.0.2.20" in text
     assert "IN IP6" not in text
+
+
+# ---------------------------------------------------------------------------
+# WebRTC (build_webrtc_offer / build_webrtc_answer) address-family coverage
+# ---------------------------------------------------------------------------
+# The WebRTC path omits the c= line (RFC 5763 §5), but still emits the o=
+# origin line, which MUST carry the correct addrtype (IP4 or IP6 — RFC 4566
+# §5.2).  The existing tests above cover the SDES/SIP-DTLS build functions;
+# these close the gap for the WebRTC build functions.
+#
+# Regression contract: if _build_webrtc_body ever reverts to a hardcoded
+# 'IN IP4', these tests fail immediately.
+# ---------------------------------------------------------------------------
+
+_WEBRTC_IPV4_ADDR = "198.51.100.7"
+_WEBRTC_IPV6_ADDR = "2001:db8::1"
+
+
+def _make_webrtc_offer_text(local_address: str) -> str:
+    """Build a WebRTC offer for the given local_address (test helper)."""
+    return build_webrtc_offer(
+        local_address=local_address,
+        port=9,
+        codecs=(Codec(payload_type=0, encoding="PCMU", clock_rate=8000),),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+        session_id=1,
+    )
+
+
+def _make_webrtc_answer_text(local_address: str) -> str:
+    """Build a WebRTC answer for the given local_address (test helper)."""
+    offer = SessionDescription.parse(_OFFER_SAVPF)
+    return build_webrtc_answer(
+        offer,
+        local_address=local_address,
+        port=42000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+        ice_ufrag=_FAKE_ANSWER_UFRAG,
+        ice_pwd=_FAKE_ANSWER_PWD,
+        ice_candidates=(_ANSWER_CANDIDATE,),
+        session_id=1,
+    )
+
+
+def test_build_webrtc_offer_ipv6_addrtype_in_origin() -> None:
+    """build_webrtc_offer with an IPv6 local_address emits 'IN IP6' in o= line."""
+    text = _make_webrtc_offer_text(_WEBRTC_IPV6_ADDR)
+    assert f"IN IP6 {_WEBRTC_IPV6_ADDR}" in text
+
+
+def test_build_webrtc_offer_ipv6_no_c_line_emitted() -> None:
+    """build_webrtc_offer with an IPv6 address must not emit a c= line (RFC 5763 §5)."""
+    text = _make_webrtc_offer_text(_WEBRTC_IPV6_ADDR)
+    assert "\r\nc=" not in text
+
+
+def test_build_webrtc_offer_ipv4_addrtype_in_origin() -> None:
+    """build_webrtc_offer with an IPv4 local_address emits 'IN IP4' in o= line."""
+    text = _make_webrtc_offer_text(_WEBRTC_IPV4_ADDR)
+    assert f"IN IP4 {_WEBRTC_IPV4_ADDR}" in text
+    assert "IN IP6" not in text
+
+
+def test_build_webrtc_answer_ipv6_addrtype_in_origin() -> None:
+    """build_webrtc_answer with an IPv6 local_address emits 'IN IP6' in o= line."""
+    text = _make_webrtc_answer_text(_WEBRTC_IPV6_ADDR)
+    assert f"IN IP6 {_WEBRTC_IPV6_ADDR}" in text
+
+
+def test_build_webrtc_answer_ipv6_no_c_line_emitted() -> None:
+    """build_webrtc_answer with an IPv6 address must not emit a c= line (RFC 5763 §5).
+
+    The WebRTC path omits the c= line regardless of address family — address
+    is conveyed by ICE candidates.
+    """
+    text = _make_webrtc_answer_text(_WEBRTC_IPV6_ADDR)
+    assert "\r\nc=" not in text
+
+
+def test_build_webrtc_answer_ipv4_addrtype_in_origin() -> None:
+    """build_webrtc_answer with an IPv4 local_address emits 'IN IP4' in o= line."""
+    text = _make_webrtc_answer_text(_WEBRTC_IPV4_ADDR)
+    assert f"IN IP4 {_WEBRTC_IPV4_ADDR}" in text
+    assert "IN IP6" not in text

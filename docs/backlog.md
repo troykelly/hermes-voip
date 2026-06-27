@@ -52,15 +52,15 @@ defect or a load-bearing test gap.
 - [x] **[low] robustness** — Empty `cnonce` (`cnonce=""`) is accepted and emitted (`is not None` check,
   line 167). Defeats the client-nonce purpose; some registrars reject it. Reject empty (or treat falsy
   as "generate") and document; add a test. — shipped #287
-- [ ] **[low] correctness** (partial — residual: no test asserting unknown/hyphenated params are silently ignored (no test with an unknown x-custom-param= in tests/test_digest.py).) — `_PARAM` key pattern `\w+` (line 24) cannot match hyphenated extension
+- [x] **[low] correctness** (partial — residual: no test asserting unknown/hyphenated params are silently ignored (no test with an unknown x-custom-param= in tests/test_digest.py).) — `_PARAM` key pattern `\w+` (line 24) cannot match hyphenated extension
   param names. No test asserts unknown/hyphenated params are ignored gracefully. Broaden to `[\w-]+`
-  for forward-compat or pin the silent-skip behaviour with a test.
+  for forward-compat or pin the silent-skip behaviour with a test. — shipped #293
 - [ ] **[low] robustness** — `algorithm` token rendered unquoted (line 163) after only a lowercase
   membership check (line 147). Safe today (only `md5` passes) but the render path trusts the gate.
   Route through the control-char guard or assert a token grammar; note the coupling in a comment.
-- [ ] **[low] robustness** — `realm` defaults to empty string silently when the challenge omits it
+- [x] **[low] robustness** — `realm` defaults to empty string silently when the challenge omits it
   (line 99), hashed into HA1 (line 154). Asymmetric with the missing-`nonce` case which *raises*
-  (lines 93-95). Either raise on missing/empty realm, or document why empty realm is tolerated; add a test.
+  (lines 93-95). Either raise on missing/empty realm, or document why empty realm is tolerated; add a test. — shipped #293
 - [ ] **[low] api** — Caller cannot supply a precomputed HA1; `DigestCredentials` holds plaintext
   password (line 112) and recomputes HA1 each call. RFC 2617 allows storing A1. Offer an HA1-based
   credential variant so security-conscious callers need not keep plaintext resident; record in the ADR.
@@ -452,12 +452,12 @@ defect or a load-bearing test gap.
   audioop has no in-place variant, but add a microbenchmark of per-frame encode+resample+decode latency
   and record it against the ADR-0005 budget; consider batching frames per `ratecv` call (state-carrying,
   correctness-preserving).
-- [ ] **[low] docs** — `ratecv` low-pass weights are left at defaults `(1, 0)` with no comment — a real
+- [x] **[low] docs** — `ratecv` low-pass weights are left at defaults `(1, 0)` with no comment — a real
   audio-quality decision for the STT path. Add a one-line comment (defaults adequate for narrowband
-  speech) or expose weights as params; record in ADR-0005.
-- [ ] **[low] test** (partial — residual: no assertion against a known-good G.711 reference value (e.g. `encode_ulaw(pcm16_of_0) == b'\xff'`); bare `decode_ulaw`/`decode_alaw` distin) — No test pins that `decode_ulaw`/`decode_alaw` are distinct codecs / that
+  speech) or expose weights as params; record in ADR-0005. — shipped #298
+- [x] **[low] test** (partial — residual: no assertion against a known-good G.711 reference value (e.g. `encode_ulaw(pcm16_of_0) == b'\xff'`); bare `decode_ulaw`/`decode_alaw` distin) — No test pins that `decode_ulaw`/`decode_alaw` are distinct codecs / that
   `ulaw_to_frame` uses mu-law specifically (the frame round-trip uses mu-law both ways, so a global
-  mu→a swap still passes). Assert against a known-good G.711 reference value.
+  mu→a swap still passes). Assert against a known-good G.711 reference value. — shipped #298
 - [ ] **[low] polish** — `Resampler` forbids equal rates but there's no symmetric guard catching
   resample-into-an-already-correct-rate, and the rate-label invariant is enforced only by `frame_to_ulaw`.
   Consider an `expect_rate(frame, hz)` validator centralised in this rate-authority module.
@@ -470,9 +470,9 @@ defect or a load-bearing test gap.
   that drops stubs is a deliberate decision, not a surprise `# type: ignore`.
 - [ ] **[low] polish** — No `__all__` (vs the root package's convention). Add one listing the public
   codec/resampler/frame-bridge symbols + `G711_SAMPLE_RATE`.
-- [ ] **[low] polish** — `_MONO` is private while `G711_SAMPLE_RATE` is public; the mono-only assumption
+- [x] **[low] polish** — `_MONO` is private while `G711_SAMPLE_RATE` is public; the mono-only assumption
   is silent (a stereo buffer has even length so `_validate_pcm16` passes and produces garbage). Document
-  the mono-only contract in the function docstrings (raw-bytes callers carry no channel metadata).
+  the mono-only contract in the function docstrings (raw-bytes callers carry no channel metadata). — shipped #298
 - [ ] **[low] docs** — `Resampler` carries mutable `_state` but the docstring doesn't state the
   concurrency contract; two coroutines sharing one would silently corrupt both streams. Add: not safe for
   concurrent use; one coroutine/thread per stream-direction-per-call.
@@ -513,21 +513,21 @@ defect or a load-bearing test gap.
 - [ ] **[low] api** — `policy.py` imports `GuardResult` only to read one bool in `record()` — more
   coupling than needed. Use `record(self, *, degraded: bool, …)` or a narrow `Protocol`; note the decision
   if guard/policy are intentionally one ADR-0009 unit.
-- [ ] **[low] api** — `ProviderRegistry` exposes no `__contains__`/`has`/`unregister`/get-factory, no
+- [x] **[low] api** — `ProviderRegistry` exposes no `__contains__`/`has`/`unregister`/get-factory, no
   memoisation (`make` always instantiates despite the "resolve at startup" intent), and `T` is unbounded.
   Add `__contains__`/`has`, consider a memoising `make` for the singleton case, optionally bound `T`;
-  document that `make()` instantiates fresh.
-- [ ] **[low] test** — Registry tests don't assert the factory is called lazily/exactly once; the
+  document that `make()` instantiates fresh. — shipped #296
+- [x] **[low] test** — Registry tests don't assert the factory is called lazily/exactly once; the
   duplicate-message assertion is a loose substring. Add a counter fake (0 after register, 1/2 after
-  make(s)); tighten the duplicate assertion to include kind + quoted name.
+  make(s)); tighten the duplicate assertion to include kind + quoted name. — shipped #296
 - [ ] **[low] efficiency** — `names()` re-sorts the dict each call (registry.py:49) — fine (startup/
   diagnostic), but add a one-line comment so a future caller doesn't reach for it per-turn.
-- [ ] **[low] api** (partial — residual: the six individual modules (asr.py, tts.py, guard.py, policy.py, transport.py, registry.py) still define no __all__, so deep-path imports ar) — `providers/__init__.py` exports nothing (no `__all__`, no re-exports); none of the
+- [x] **[low] api** (partial — residual: the six individual modules (asr.py, tts.py, guard.py, policy.py, transport.py, registry.py) still define no __all__, so deep-path imports ar) — `providers/__init__.py` exports nothing (no `__all__`, no re-exports); none of the
   seven modules define `__all__`. The most-imported contract (ADR-0004) forces deep-path imports. Re-export
-  the canonical public names from the package under one `__all__`.
-- [ ] **[low] api** — `GuardVerdict`/`ToolRisk` are documented "ascending severity" but derive from plain
+  the canonical public names from the package under one `__all__`. — shipped #294
+- [x] **[low] api** — `GuardVerdict`/`ToolRisk` are documented "ascending severity" but derive from plain
   `Enum` (uncomparable) — the claim implies a comparability that doesn't exist (rule 27). Make them
-  `IntEnum`/add a `severity` property if thresholding is needed, else soften the docstrings.
+  `IntEnum`/add a `severity` property if thresholding is needed, else soften the docstrings. — shipped #294
 - [ ] **[low] api** — `GuardVerdict`'s non-ALLOW members have no enforcement linkage to `ToolRisk` —
   `gate_tool_call` never consults the verdict, so a RESTRICT verdict doesn't itself clamp the toolset
   (the documented clamp is absent). Implement a verdict-aware clamp (CLARIFY blocks all tools this turn;
@@ -571,18 +571,18 @@ These span multiple modules or the repo as a whole.
 - [x] **[medium] polish/DRY** — **Duplicated control-character injection guard.** Identical constants +
   predicate in `message.py` and `digest.py`. A single shared helper prevents drift of a security
   invariant. (See message.py item.) message.py + digest.py deduped via _chars.contains_control (#277); refer.py migrated to _chars.contains_control — shipped #286
-- [ ] **[medium] polish/DRY** — **RFC 1982 serial-number arithmetic** is implemented in `rtp.py`
+- [x] **[medium] polish/DRY** — **RFC 1982 serial-number arithmetic** is implemented in `rtp.py`
   (`_seq_before`/`_seq_next`) and conceptually needed by `dtmf.py` (timestamp dedup) and future RTCP/RTP.
   Decide: promote to a shared public seqnum module, or keep private and document why each consumer's
   approach differs (rtp uses serial arithmetic; dtmf uses exact-equality + bounded window — both correct
-  for their case).
+  for their case). — shipped #297
 - [x] **[medium] api/consistency** — **`__all__` discipline is inconsistent.** The root `__init__`
   declares `__all__`; `media/audio.py`, `dtmf.py`, `message.py`, and every `providers/*` module do not.
   Adopt `__all__` uniformly so the public surface is explicit and private helpers stay out of
   star-imports/autodoc. media/audio.py (#279) + call_context/hermes_surface/notice_filter/provider_error (#281) now have `__all__`; media/dtls.py, media/srtp.py, media/srtcp.py — shipped #285
-- [ ] **[medium] api/consistency** — **`typing.Final` on module constants is inconsistent.**
+- [x] **[medium] api/consistency** — **`typing.Final` on module constants is inconsistent.**
   `media/audio.py` annotates public constants with `Final`; `dtmf.py`/`rtp.py` do not. Adopt `Final`
-  uniformly for mutation-resistance and consistency.
+  uniformly for mutation-resistance and consistency. — shipped #297
 - [ ] **[medium] correctness/consistency** (partial — residual: audioop.error not wrapped/documented as propagating.) — **Exception-type contract is inconsistent across the
   foundation.** Some guards raise `ValueError`/`SdpError`, others leak `AttributeError` (message.py
   reason-less status) or `audioop.error` (media/audio decode/resample). Define and document one coherent
@@ -657,6 +657,7 @@ These span multiple modules or the repo as a whole.
   `try/except`; a single malformed message tears down all calls simultaneously. The behaviour is documented as
   intentional but has zero regression tests for: (1) parse error → connection loss (not silent drop);
   (2) reconnect supervisor fires; (3) active calls terminate cleanly. Needs tests in `tests/test_adapter_reconnect.py`.
+- [ ] **[medium] robustness** — `WssSipTransport` inbound CANCEL falls through to unroutable in `ws_connection.py`. (Wave-3: ws_connection.py CANCEL handling implemented on branch fix/wss-inbound-cancel-2 but NOT merged — review found it is a partial-ship: also needs adapter.py to wire on_cancel into the WssSipTransport construction (mirror the TLS path) + fix the stale adapter.py:1148 comment. Complete the adapter wiring orchestrator-direct or in a fresh session, then merge.)
 
 ## src/hermes_voip/guard/_onnx_runtime.py
 
@@ -1053,7 +1054,7 @@ These span multiple modules or the repo as a whole.
 - [ ] **[low] efficiency** — Replace Python list + `struct.pack` splat in `linear_fade_out` with `bytearray` + `struct.pack_into`. `audio.py:162-170` calls `list(struct.unpack(f'<{total}h', pcm16))` — allocating a Python list of ~160 ints — then `struct.pack(f'<{total}h', *samples)` with a variadic splat; measured ~51,588 ns/call. A `bytearray`-based rewrite (`ba = bytearray(pcm16)` then `struct.pack_into('<h', ba, offset, val)`) avoids both the list allocation and the `*samples` splat via in-place writes. ADR-0028's barge-in contract requires the fade to complete within one frame, so this cannot be deferred (`src/hermes_voip/media/audio.py:162-170`).
 - [ ] **[medium] efficiency** — `RtpMediaTransport._next_datagram()` (engine.py:1841-1872) creates+cancels asyncio tasks for recv_queue.get()/stop_event.wait()/watchdog on EVERY receive iteration: ~100-150 task objects/sec/call on the event-loop hot path. Refactor to a no-per-packet-task wait that preserves stop/watchdog semantics. (perf gap-review Wave-1 2026-06-27)
 - [ ] **[medium] efficiency** — `send_audio()` (engine.py:1988-2004) appends to an immutable bytes `_tx_buffer` then front-slices while draining → O(n) reallocation per emitted frame on the outbound media hot path. Replace with a bytearray/cursor (ring-buffer shape) so reframing stays sample-continuous without copying the remainder. (perf gap-review Wave-1 2026-06-27)
-- [ ] **[low] efficiency** — STT worker counts fed samples via `len(item.tobytes()) // 4` (sherpa_onnx.py:294-295), materialising a ~1280-byte copy per 20ms frame (50/sec/call). Extend the FloatArray protocol (stt/resample.py) with a length/size surface and count without tobytes(). (perf gap-review Wave-1 2026-06-27)
+- [x] **[low] efficiency** — STT worker counts fed samples via `len(item.tobytes()) // 4` (sherpa_onnx.py:294-295), materialising a ~1280-byte copy per 20ms frame (50/sec/call). Extend the FloatArray protocol (stt/resample.py) with a length/size surface and count without tobytes(). (perf gap-review Wave-1 2026-06-27) — shipped #295
 
 ### Observability
 

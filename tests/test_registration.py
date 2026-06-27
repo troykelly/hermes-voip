@@ -651,3 +651,69 @@ def test_registration_public_api_is_importable_from_package() -> None:
     ):
         assert hasattr(hermes_voip, name), name
         assert name in hermes_voip.__all__
+
+
+# ---- transport Literal validation (bk236) -----------------------------------
+
+
+def test_config_rejects_unknown_transport() -> None:
+    # bk236: transport is a Literal["TLS","WSS","UDP","TCP"]. An unrecognised
+    # token such as "QUIC" would be injected verbatim into the Via header and
+    # silently produce a malformed request. Reject at construction instead.
+    with pytest.raises((ValueError, TypeError)):
+        RegistrationConfig(
+            aor="sip:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5060>",
+            local_sent_by="198.51.100.7:5060",
+            transport="QUIC",  # type: ignore[arg-type]  # intentionally wrong type
+        )
+
+
+# ---- expires non-negative validation (bk236) --------------------------------
+
+
+def test_config_rejects_negative_expires() -> None:
+    # bk236: a negative expires would produce "Expires: -1" on the wire, which
+    # confuses registrars and is semantically invalid (RFC 3261 §10.2). Reject
+    # at construction so the error surfaces early rather than mid-flow.
+    with pytest.raises(ValueError, match=r"expires"):
+        RegistrationConfig(
+            aor="sips:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+            local_sent_by="198.51.100.7:5061",
+            transport="TLS",
+            expires=-1,
+        )
+
+
+def test_config_rejects_large_negative_expires() -> None:
+    # Belt-and-braces: any negative value is rejected, not just -1.
+    with pytest.raises(ValueError, match=r"expires"):
+        RegistrationConfig(
+            aor="sips:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+            local_sent_by="198.51.100.7:5061",
+            transport="TLS",
+            expires=-300,
+        )
+
+
+def test_config_accepts_zero_expires() -> None:
+    # expires=0 is a legal de-registration request (RFC 3261 §10.2); it must
+    # not be rejected by the negative-expires guard.
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+        expires=0,
+    )
+    assert cfg.expires == 0

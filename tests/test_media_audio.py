@@ -611,3 +611,56 @@ def test_resampler_resample_audioop_error_preserves_cause_chain() -> None:
         with pytest.raises(ValueError, match="original ratecv cause") as exc_info:
             r.resample(pcm)
     assert exc_info.value.__cause__ is original
+
+
+# ---------------------------------------------------------------------------
+# __all__ export list — no private names leak via star-imports
+# ---------------------------------------------------------------------------
+
+
+def test_star_import_excludes_private_names() -> None:
+    """Star-import from hermes_voip.media.audio does NOT bind private names.
+
+    _MONO, _AudioopError, _validate_pcm16 and other module internals must not
+    appear in the namespace when using ``from hermes_voip.media.audio import *``.
+    This guards against accidental reexport of implementation details.
+    """
+    import hermes_voip.media.audio as audio_module  # noqa: PLC0415 — test isolation
+
+    # The module must have an __all__ attribute to control star-imports
+    assert hasattr(audio_module, "__all__"), (
+        "audio.py must define __all__ for proper star-import control"
+    )
+
+    public_names = set(audio_module.__all__)
+
+    # Verify that private names are NOT in __all__
+    assert "_MONO" not in public_names
+    assert "_AudioopError" not in public_names
+    assert "_validate_pcm16" not in public_names
+    assert "_require_8k" not in public_names
+    assert "_RateState" not in public_names
+    assert "_PTIME_MS" not in public_names
+    assert "_DEFAULT_TONE_FREQ_HZ" not in public_names
+    assert "_TONE_AMPLITUDE" not in public_names
+    assert "_FRAME_FORMAT" not in public_names
+
+    # Verify that public names ARE in __all__
+    expected_public = {
+        "G711_SAMPLE_RATE",
+        "encode_ulaw",
+        "decode_ulaw",
+        "encode_alaw",
+        "decode_alaw",
+        "ulaw_to_frame",
+        "alaw_to_frame",
+        "frame_to_ulaw",
+        "frame_to_alaw",
+        "linear_fade_out",
+        "resample_frame",
+        "Resampler",
+        "generate_tone_frames",
+    }
+    assert public_names == expected_public, (
+        f"__all__ mismatch: got {public_names}, expected {expected_public}"
+    )

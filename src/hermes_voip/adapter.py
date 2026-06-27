@@ -611,6 +611,12 @@ def _validate_dialable_target(target: str) -> None:
 def _make_tls_context(host: str) -> ssl.SSLContext:
     """Build a client TLS context that verifies the server certificate."""
     ctx = ssl.create_default_context()
+    # Floor the negotiated TLS version at 1.2 (ADR-0089). create_default_context
+    # leaves minimum_version at MINIMUM_SUPPORTED, so the host OpenSSL policy
+    # could otherwise downgrade this leg — which carries the SIP digest password
+    # and the SDES a=crypto inline key/salt — to TLS 1.0/1.1. This is
+    # downgrade-hardening only; check_hostname and CERT_REQUIRED stay inherited.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     # The gateway host name is used for SNI/verification.
     # We do not hard-code any certificate pinning here — gateway-agnostic.
     _ = host  # consumed by the transport's server_hostname

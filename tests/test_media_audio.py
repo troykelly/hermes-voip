@@ -420,26 +420,28 @@ def test_resample_frame_16k_to_8k_preserves_duration() -> None:
     )
 
 
-def test_resample_frame_ts_scaled_to_new_rate() -> None:
-    """resample_frame scales monotonic_ts_ns so frame timing stays monotonic.
+def test_resample_frame_preserves_monotonic_ts() -> None:
+    """resample_frame preserves monotonic_ts_ns unchanged across a rate change.
 
-    A frame at 8000 Hz with ts=20_000_000 ns (one 20ms frame in) becomes a frame
-    at 16000 Hz; the ts must be scaled by (target_rate / source_rate) = 2, so the
-    16kHz-domain timestamp is 40_000_000 ns — same wall-clock moment, expressed in
-    the 16kHz sample domain. This ensures consumers (VAD, endpointing) that
-    integrate durations from sample_rate + monotonic_ts_ns stay coherent.
+    monotonic_ts_ns is a rate-independent wall-clock nanosecond presentation
+    timestamp — the same contract that FrameUpsampler.upsample and
+    MediaEngine._to_wire_rate both follow.  Scaling it by target_rate/source_rate
+    would break the shared monotonic timebase used by VAD, endpointing, A/V-sync,
+    and barge-in (cross-review finding, corrected from the original scaled spec).
+
+    A frame at 8000 Hz with ts=20_000_000 ns resampled to 16000 Hz must carry
+    the same ts=20_000_000 ns — the wall-clock moment is rate-independent.
     """
     # One 20ms frame in at 8kHz: 160 samples @ 8000 Hz = 20ms = 20_000_000 ns
     pcm = _pcm16(*([1000] * 160))
     ts_in = 20_000_000
     frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=ts_in)
     out = resample_frame(frame, target_rate=16000)
-    expected_ts = int(ts_in * 16000 / 8000)
-    assert out.monotonic_ts_ns == expected_ts
+    assert out.monotonic_ts_ns == ts_in
 
 
 def test_resample_frame_ts_zero_stays_zero() -> None:
-    """resample_frame with ts=0 returns ts=0 at the new rate."""
+    """resample_frame with ts=0 preserves ts=0 (zero is a valid wall-clock ts)."""
     pcm = _pcm16(*([1000] * 160))
     frame = PcmFrame(samples=pcm, sample_rate=8000, monotonic_ts_ns=0)
     out = resample_frame(frame, target_rate=16000)

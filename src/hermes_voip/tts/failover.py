@@ -347,7 +347,7 @@ class _FailoverStream:
                 exc,
                 extra={
                     "event": "tts_primary_failover",
-                    "emitted_frames": self._emitted,
+                    "primary_emitted_audio": self._emitted,
                 },
             )
             return False
@@ -355,7 +355,10 @@ class _FailoverStream:
             "TTS primary synthesis failed before any audio; falling back to the "
             "self-host TTS for this call so the call still gets audio: %r",
             exc,
-            extra={"event": "tts_primary_failover", "emitted_frames": self._emitted},
+            extra={
+                "event": "tts_primary_failover",
+                "primary_emitted_audio": self._emitted,
+            },
         )
         fallback = self._owner._ensure_fallback()
         replay = _replay_text(self._recorded, self._source, self._tee.exhausted)

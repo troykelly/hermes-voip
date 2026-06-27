@@ -666,7 +666,7 @@ async def test_primary_failure_before_audio_logs_structured_failover_event(
 
     The failover event includes:
     - event: "tts_primary_failover"
-    - emitted_frames: whether any frame was emitted before the failure
+    - primary_emitted_audio: whether any frame was emitted before the failure
     """
 
     def _primary_stream(text: str, rate: int | None) -> TtsStream:
@@ -689,7 +689,7 @@ async def test_primary_failure_before_audio_logs_structured_failover_event(
     assert record.levelname == "WARNING"
     assert "TTS primary synthesis failed before any audio" in record.message
     assert record.__dict__.get("event") == "tts_primary_failover"
-    assert record.__dict__.get("emitted_frames") is False
+    assert record.__dict__.get("primary_emitted_audio") is False
 
 
 @pytest.mark.asyncio
@@ -700,7 +700,7 @@ async def test_primary_failure_after_audio_logs_structured_failover_event(
 
     The failover event includes:
     - event: "tts_primary_failover"
-    - emitted_frames: whether any frame was emitted before the failure (True here)
+    - primary_emitted_audio: whether audio was emitted before failure (True here)
     """
 
     def _primary_stream(text: str, rate: int | None) -> TtsStream:
@@ -723,7 +723,7 @@ async def test_primary_failure_after_audio_logs_structured_failover_event(
     assert record.levelname == "WARNING"
     assert "TTS primary failed mid-utterance after audio" in record.message
     assert record.__dict__.get("event") == "tts_primary_failover"
-    assert record.__dict__.get("emitted_frames") is True
+    assert record.__dict__.get("primary_emitted_audio") is True
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,11 @@ from pathlib import Path
 import yaml
 
 import hermes_voip
-from hermes_voip.config import _DEFAULT_MAX_CALLS, _DEFAULT_SHUTDOWN_DRAIN_SECS
+from hermes_voip.config import (
+    _DEFAULT_KEEPALIVE_INTERVAL,
+    _DEFAULT_MAX_CALLS,
+    _DEFAULT_SHUTDOWN_DRAIN_SECS,
+)
 
 # ---------------------------------------------------------------------------
 # Locations: the repo source tree (so the test runs from a checkout) + the
@@ -655,3 +659,56 @@ def test_docs_use_correct_tool_count() -> None:
                 f"{label} has a stale '{n_tools} tools, {n_hooks} hook' mention; "
                 f"the registered surface is '{expected}'"
             )
+
+
+# ---------------------------------------------------------------------------
+# (g) Operator-facing env vars: CALL_ON_CONNECT + KEEPALIVE_INTERVAL.
+# ---------------------------------------------------------------------------
+
+
+def test_optional_env_advertises_call_on_connect() -> None:
+    """HERMES_VOIP_CALL_ON_CONNECT in optional_env — must warn about allowlist bypass.
+
+    This env var fires a one-shot outbound dial on first registration and BYPASSES
+    the outbound allowlist (adapter.py ``_CALL_ON_CONNECT_KEY``). Without a manifest
+    entry an operator cannot discover it; without an explicit bypass warning in the
+    description the security implication is invisible. Both must be present.
+    """
+    entries = _optional_env_block()
+    names = {_entry_name(e): e for e in entries if isinstance(e, dict)}
+    assert "HERMES_VOIP_CALL_ON_CONNECT" in names, (
+        "optional_env must advertise HERMES_VOIP_CALL_ON_CONNECT — "
+        "operators need a manifest-visible signal this one-shot dial knob exists"
+    )
+    desc = names["HERMES_VOIP_CALL_ON_CONNECT"].get("description", "")
+    assert isinstance(desc, str)
+    # The description MUST warn that CALL_ON_CONNECT bypasses the outbound allowlist.
+    lowered = desc.lower()
+    assert "bypass" in lowered or "allowlist" in lowered or "allow list" in lowered, (
+        "HERMES_VOIP_CALL_ON_CONNECT description must explicitly warn about the "
+        "outbound-allowlist bypass (adapter.py ~920-921). Operators who set this "
+        "knob must understand it dials without allowlist gating."
+    )
+
+
+def test_optional_env_advertises_keepalive_interval_with_matching_default() -> None:
+    """HERMES_VOIP_KEEPALIVE_INTERVAL in optional_env; default matches config.py.
+
+    This env var controls the RFC 5626 double-CRLF keepalive interval. The manifest
+    default must match ``_DEFAULT_KEEPALIVE_INTERVAL`` in config.py so an operator
+    consulting the manifest sees the accurate default rather than a stale number.
+    """
+    entries = _optional_env_block()
+    defaults = {
+        _entry_name(e): e.get("default") for e in entries if isinstance(e, dict)
+    }
+    assert "HERMES_VOIP_KEEPALIVE_INTERVAL" in defaults, (
+        "optional_env must advertise HERMES_VOIP_KEEPALIVE_INTERVAL — "
+        "operators need a manifest-visible signal this RFC 5626 keepalive knob exists"
+    )
+    manifest_default = defaults["HERMES_VOIP_KEEPALIVE_INTERVAL"]
+    assert manifest_default == _DEFAULT_KEEPALIVE_INTERVAL, (
+        f"HERMES_VOIP_KEEPALIVE_INTERVAL default in plugin.yaml "
+        f"({manifest_default!r}) must match config.py "
+        f"_DEFAULT_KEEPALIVE_INTERVAL ({_DEFAULT_KEEPALIVE_INTERVAL!r})"
+    )

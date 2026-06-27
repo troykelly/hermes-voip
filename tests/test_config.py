@@ -2458,3 +2458,40 @@ def test_language_mixed_case_normalized_env_path() -> None:
     """HERMES_VOIP_LANGUAGE='PT-BR' (env path) must store 'pt-br' (already passing)."""
     cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "PT-BR"})
     assert cfg.language == "pt-br"
+
+
+# ---- keepalive interval (RFC 5626) -----------------------------------------
+
+
+def test_keepalive_interval_default() -> None:
+    """HERMES_VOIP_KEEPALIVE_INTERVAL defaults to 30.0 when unset."""
+    from hermes_voip.config import (  # noqa: PLC0415
+        _DEFAULT_KEEPALIVE_INTERVAL,
+        parse_keepalive_interval,
+    )
+
+    assert parse_keepalive_interval({}) == _DEFAULT_KEEPALIVE_INTERVAL
+
+
+def test_keepalive_interval_custom() -> None:
+    """HERMES_VOIP_KEEPALIVE_INTERVAL accepts a positive finite number."""
+    from hermes_voip.config import parse_keepalive_interval  # noqa: PLC0415
+
+    assert parse_keepalive_interval({"HERMES_VOIP_KEEPALIVE_INTERVAL": "45.0"}) == 45.0
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "0.0", "-0.5", "nan", "inf", "-inf", "abc"])
+def test_keepalive_interval_rejects_non_positive_or_malformed(bad: str) -> None:
+    """A non-positive, non-finite, or malformed keepalive interval raises ConfigError.
+
+    A zero or negative keepalive would disable the RFC 5626 double-CRLF keepalive
+    entirely, which would leave the TLS connection without a liveness signal and allow
+    NAT bindings to expire silently.  NaN/inf slip past a naive ``> 0`` check.  All
+    of these must fail loud at load/startup (rule 37) so a misconfigured interval is
+    surfaced before the first registration, not discovered mid-call when the TLS
+    session goes silent.
+    """
+    from hermes_voip.config import parse_keepalive_interval  # noqa: PLC0415
+
+    with pytest.raises(ConfigError, match="HERMES_VOIP_KEEPALIVE_INTERVAL"):
+        parse_keepalive_interval({"HERMES_VOIP_KEEPALIVE_INTERVAL": bad})

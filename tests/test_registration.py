@@ -304,6 +304,7 @@ def test_403_yields_failed() -> None:
     )
     assert isinstance(outcome, Failed)
     assert outcome.status == 403
+    assert outcome.reason == "Forbidden"
 
 
 def test_second_challenge_in_transaction_fails_no_loop() -> None:
@@ -313,6 +314,7 @@ def test_second_challenge_in_transaction_fails_no_loop() -> None:
     outcome = flow.handle(_challenge())  # still 401 after auth, same transaction
     assert isinstance(outcome, Failed)
     assert outcome.status == 401
+    assert outcome.reason == "Unauthorized"
 
 
 def test_refresh_after_registration_can_reauthenticate() -> None:

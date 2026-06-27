@@ -84,6 +84,14 @@ class GateDecision:
     allowed: bool
     reason: GateReason
 
+    def __post_init__(self) -> None:
+        """Reject inconsistent allow/block + reason pairs at construction."""
+        if self.allowed is not (self.reason is GateReason.ALLOWED):
+            msg = (
+                "GateDecision.allowed must be allowed iff reason is GateReason.ALLOWED"
+            )
+            raise ValueError(msg)
+
 
 class ToolRisk(Enum):
     """Action risk class for a registered tool (ascending)."""

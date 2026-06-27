@@ -83,6 +83,7 @@ class _FakeFluxSocket:
     def __init__(self, events: tuple[str, ...]) -> None:
         self._events = events
         self.sent: list[bytes] = []
+        self.sent_text_frames: list[str] = []
         self.closed = False
         self.opened = False
         self._close_event = asyncio.Event()
@@ -99,6 +100,7 @@ class _FakeFluxSocket:
         if isinstance(data, bytes):
             self.sent.append(data)
         else:
+            self.sent_text_frames.append(data)
             # A text control frame (e.g. CloseStream): signal that the server
             # should close the socket — mirroring real Deepgram behaviour where
             # CloseStream causes the server to flush + close its side.
@@ -173,6 +175,23 @@ async def test_deepgram_asr_closes_socket_when_audio_ends() -> None:
     asr = _asr_with(socket)
     [_ async for _ in asr.stream(_frames(_frame(0)))]
     assert socket.closed is True
+
+
+@pytest.mark.asyncio
+async def test_deepgram_asr_sends_exact_closestream_control_frame() -> None:
+    """Shutdown sends the real CloseStream sentinel, not an arbitrary text frame."""
+    socket = _FakeFluxSocket(())
+    asr = _asr_with(socket)
+
+    [_ async for _ in asr.stream(_frames(_frame(0)))]
+
+    # Hard-coded wire literal — NOT imported from production so a mutation to the
+    # production constant (e.g. wrong key name) makes the test fail (rule 19).
+    expected_close_stream = '{"type": "CloseStream"}'
+    assert socket.sent_text_frames == [expected_close_stream]
+    # Also assert the parsed JSON shape so whitespace variants of the same message
+    # are caught (a reformatted payload still encodes the wrong contract).
+    assert json.loads(socket.sent_text_frames[0]) == {"type": "CloseStream"}
 
 
 @pytest.mark.asyncio

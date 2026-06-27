@@ -350,6 +350,27 @@ def test_negotiate_prefers_opus_when_offer_lists_pcmu_first() -> None:
     assert [c.encoding.lower() for c in chosen] == ["opus", "pcmu", "telephone-event"]
 
 
+def test_negotiate_preserves_answerer_order_when_parsing_received_answer() -> None:
+    # Outbound call path: WE offered [opus, PCMU, telephone-event], but the peer
+    # answered [PCMU, opus, telephone-event]. As offerer parsing an answer, the peer
+    # is the answerer and its order is the selection signal; do not reorder to our
+    # offered menu or _first_voice_codec would send Opus against a PCMU-selected answer.
+    audio = SessionDescription.parse(_OFFER_PCMU_BEFORE_OPUS).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_WEBRTC_MENU, prefer_local=False)
+    assert [c.encoding.lower() for c in chosen] == ["pcmu", "opus", "telephone-event"]
+
+
+def test_negotiate_keeps_telephone_event_at_supported_menu_position() -> None:
+    # ADR-0078 property 5: telephone-event is sorted like every other supported
+    # encoding. If an embedding wants DTMF first, it stays first rather than being
+    # special-cased to the end.
+    audio = SessionDescription.parse(_OFFER_G711_ONLY).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=("telephone-event", "PCMU"))
+    assert [c.encoding.lower() for c in chosen] == ["telephone-event", "pcmu"]
+
+
 def test_negotiate_prefers_g722_when_offer_lists_pcmu_first() -> None:
     # Offer order is [PCMU, G722, DTMF] against the SDES menu (G722-preferred). The
     # answer must lead with G.722 (our preference), not the PCMU offered first —

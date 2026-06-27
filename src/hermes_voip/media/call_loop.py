@@ -882,7 +882,17 @@ class CallLoop:
         Delivery and the timer are async, so this schedules them as tracked tasks (the
         engine callback cannot await). :meth:`feed_dtmf_async` is the awaitable twin
         the tests use to drive delivery deterministically.
+
+        The RAW keypress is caller activity for the no-input watchdog (ADR-0057), so
+        :meth:`_mark_caller_active` runs FIRST — before any routing. Marking on the raw
+        event (not only on group DELIVERY in :meth:`_deliver_dtmf_group`) is what keeps
+        a caller pressing digits with inter-digit gaps — the group still buffered, the
+        inter-digit timeout not yet fired — from being treated as silent and reprompted
+        / hung up on mid-dialing (the keypad-only / accessibility path, cross-vendor
+        review). It also marks a confirmation-consumed digit, which never becomes a
+        delivered group at all: pressing the confirm key is still proof of life.
         """
+        self._mark_caller_active()
         if self._route_confirmation(digit):
             return
         if digit == _DTMF_TERMINATOR:
@@ -912,6 +922,19 @@ class CallLoop:
         else:
             self._dtmf_buffer.append(digit)
             self._arm_dtmf_flush_timer()
+
+    def _mark_caller_active(self) -> None:
+        """Mark caller activity for the no-input watchdog (ADR-0057): proof of life.
+
+        Sets ``_caller_active_in_window`` — EXACTLY the reset a finalised speech turn
+        (:meth:`_screen_and_deliver`) and a barge-in (:meth:`barge_in`) perform. The
+        watchdog reads-then-clears this flag once per silence window: a set flag stands
+        a pending reprompt down and restarts the reprompt cycle (its ``reprompts_sent``
+        local resets to 0 on the next wake — there is no instance-level reprompt count
+        to clear). Idempotent within a window (already-True stays True). Touched only
+        from the event loop, so no lock is needed.
+        """
+        self._caller_active_in_window = True
 
     def _route_confirmation(self, digit: str) -> bool:
         """Offer ``digit`` to a bound, armed confirmation; return whether consumed."""

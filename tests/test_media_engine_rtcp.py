@@ -18,6 +18,8 @@ import asyncio
 import contextlib
 import socket
 import struct
+import time
+from typing import Final
 
 import pytest
 
@@ -82,10 +84,11 @@ def _make_engine(
     rtcp_send: _RtcpSink | None = None,
     ntp_clock: object | None = None,
     pace_clock: object | None = None,
+    local_port: int = 0,
 ) -> RtpMediaTransport:
     kwargs: dict[str, object] = {
         "local_address": "127.0.0.1",
-        "local_port": 0,
+        "local_port": local_port,
         "remote_address": "127.0.0.1",
         "remote_port": 5004,
         "codec": Codec.PCMU,
@@ -100,6 +103,112 @@ def _make_engine(
     if pace_clock is not None:
         kwargs["pace_clock"] = pace_clock
     return RtpMediaTransport(**kwargs)  # type: ignore[arg-type]  # test seam: kwargs mirror the constructor
+
+
+# ---------------------------------------------------------------------------
+# Deterministic non-muxed RTCP setup (flake-hardening, not test-weakening).
+#
+# The non-muxed path binds a SIBLING RTCP socket on RTP-port+1 (RFC 3550 §11).
+# With the engine bound to port 0 the OS picks the RTP port but does NOT reserve
+# port+1, so under full-suite load another test's ephemeral socket can already
+# hold RTP-port+1; start_rtcp then catches the bind OSError and DEGRADES the call
+# to RTCP-off (rule 5), leaving ``_rtcp_local_port`` None — which made
+# ``assert rtcp_port is not None`` flake as ``assert None is not None`` in CI
+# (full-suite, main 4a9cadb). This is a port-isolation flake in the TEST, not a
+# production race: degrading on a real port collision is correct (and covered by
+# test_start_rtcp_non_muxed_socket_failure_degrades_call_stays_up).
+#
+# The fix removes the collision window WITHOUT weakening any assertion: probe a
+# FREE CONSECUTIVE (P, P+1) pair, bind the engine to P, then start_rtcp(mux=False)
+# so it binds the (just-confirmed-free) P+1 itself — exercising the real
+# production bind + reader. The residual race (P+1 taken between probe-release and
+# the engine's bind) is closed by a bounded retry over fresh pairs against a real
+# deadline; failure to bind within the deadline RAISES (never a silent skip).
+# ---------------------------------------------------------------------------
+
+_RTCP_SETUP_DEADLINE_SECS: Final[float] = 5.0
+
+
+def _reserve_consecutive_udp_pair(host: str) -> tuple[int, socket.socket]:
+    """Find a free ``(P, P+1)`` UDP pair on ``host``; return ``P`` + a held P+1 socket.
+
+    Binds an ephemeral probe to discover ``P``, then binds ``P+1``; on success the
+    probe is released (so the engine can bind ``P``) while the returned socket KEEPS
+    ``P+1`` reserved, shrinking the window in which a sibling test could steal it.
+    Retries with fresh ephemeral ports until a consecutive pair is free.
+
+    Raises:
+        OSError: If no consecutive pair can be reserved before the deadline (so a
+            genuine inability to bind surfaces, never a silent skip — rule 19/37).
+    """
+    deadline = time.monotonic() + _RTCP_SETUP_DEADLINE_SECS
+    last_exc: OSError | None = None
+    while time.monotonic() < deadline:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind((host, 0))
+            rtp_port = probe.getsockname()[1]
+            sibling = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sibling.bind((host, rtp_port + 1))
+            except OSError as exc:  # P+1 already taken — try another ephemeral P.
+                last_exc = exc
+                sibling.close()
+                continue
+        finally:
+            probe.close()
+        # P is now free (probe released) and P+1 is held by ``sibling``.
+        return rtp_port, sibling
+    msg = "could not reserve a free consecutive UDP port pair before deadline"
+    raise OSError(msg) from last_exc
+
+
+async def _connect_non_muxed_rtcp_engine(
+    *, remote_rtcp_addr: tuple[str, int] = ("127.0.0.1", 5005)
+) -> RtpMediaTransport:
+    """Connect an engine and activate non-muxed RTCP with its sibling socket LIVE.
+
+    Returns an engine on which ``start_rtcp(mux=False)`` genuinely bound the sibling
+    RTCP socket on RTP-port+1 and started its reader — i.e. ``_rtcp_local_port`` is
+    non-None. Deterministic under full-suite load: it reserves a free consecutive
+    port pair, binds the engine's RTP socket to ``P``, releases the ``P+1``
+    reservation, then starts RTCP (which binds ``P+1``). If that residual window is
+    lost to a sibling test the engine degrades to RTCP-off; this retries on a fresh
+    pair against a real deadline rather than returning a half-set-up engine.
+
+    Raises:
+        OSError: If RTCP could not be activated on a real sibling socket before the
+            deadline (surfacing a genuine bind failure, never weakening the caller's
+            ``assert _rtcp_local_port is not None`` into a pass — rule 19).
+    """
+    host = "127.0.0.1"
+    deadline = time.monotonic() + _RTCP_SETUP_DEADLINE_SECS
+    while True:
+        rtp_port, sibling = _reserve_consecutive_udp_pair(host)
+        engine = _make_engine(local_port=rtp_port)
+        try:
+            await engine.connect()
+        except OSError:
+            # The sub-ms window where P itself was stolen after the probe released it.
+            # Free the P+1 reservation and retry on a fresh pair (until the deadline).
+            sibling.close()
+            if time.monotonic() >= deadline:
+                raise
+            continue
+        # Release the P+1 reservation only now, immediately before start_rtcp binds
+        # it — minimising the window a sibling test could steal it.
+        sibling.close()
+        await engine.start_rtcp(
+            mux=False, rtp_payload_types=(), remote_rtcp_addr=remote_rtcp_addr
+        )
+        if engine._rtcp_local_port is not None:
+            return engine
+        # Residual race: P+1 was taken between release and the engine's bind, so RTCP
+        # degraded to off. Tear down and retry on a fresh pair until the deadline.
+        await engine.stop()
+        if time.monotonic() >= deadline:
+            msg = "could not activate non-muxed RTCP on a sibling socket in time"
+            raise OSError(msg)
 
 
 def _rtp_datagram(*, seq: int, ts: int, ssrc: int = _PEER_SSRC) -> bytes:
@@ -636,18 +745,13 @@ async def test_start_rtcp_non_muxed_opens_sibling_socket_on_rtp_port_plus_one() 
     the RTP port. The engine binds that sibling socket and routes outbound RTCP to
     the peer's RTCP address through it (so RTCP never lands on the RTP socket).
     """
-    engine = _make_engine()
-    await engine.connect()
-    rtp_port = engine.local_port
-    await engine.start_rtcp(
-        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
-    )
+    engine = await _connect_non_muxed_rtcp_engine()
     try:
         assert engine._rtcp_task is not None
         # A separate sink was installed (NOT muxed over the RTP transport).
         assert engine._rtcp_send is not None
         # The sibling RTCP socket is bound one above the RTP port (RFC 3550 §11).
-        assert engine._rtcp_local_port == rtp_port + 1
+        assert engine._rtcp_local_port == engine.local_port + 1
     finally:
         await engine.stop()
 
@@ -741,11 +845,7 @@ async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
     ingest_rtcp, so a peer report sent to RTP-port+1 updates call_quality. Sent over
     a real loopback UDP socket (the engine bound a real one) to prove the reader.
     """
-    engine = _make_engine()
-    await engine.connect()
-    await engine.start_rtcp(
-        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
-    )
+    engine = await _connect_non_muxed_rtcp_engine()
     try:
         rtcp_port = engine._rtcp_local_port
         assert rtcp_port is not None
@@ -754,7 +854,7 @@ async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
             sender.sendto(
                 _peer_rr_about_us(cumulative_lost=11), ("127.0.0.1", rtcp_port)
             )
-            # Give the event loop a few turns to read + ingest the datagram.
+            # Poll a bounded real deadline for the reader to ingest the datagram.
             for _ in range(50):
                 await asyncio.sleep(0.01)
                 if engine.call_quality.remote_cumulative_lost is not None:
@@ -842,11 +942,7 @@ async def test_non_muxed_active_call_does_not_demux_rtcp_typed_rtp_off_rtp_socke
     sit in the RTCP PT range (an RTP packet with a high PT + marker) must be processed
     as RTP, NOT swallowed by the muxed demux into ingest_rtcp.
     """
-    engine = _make_engine()
-    await engine.connect()
-    await engine.start_rtcp(
-        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
-    )
+    engine = await _connect_non_muxed_rtcp_engine()
     try:
         remote = ("127.0.0.1", 5004)
         # A genuine peer RR (2nd byte 201) delivered on the RTP socket. On a non-muxed
@@ -939,13 +1035,13 @@ async def test_start_rtcp_non_muxed_socket_failure_degrades_call_stays_up() -> N
     socket, leaves RTCP inactive, and returns so media continues. We genuinely OCCUPY
     RTP-port+1 with another bound UDP socket so the engine's real bind raises OSError.
     """
-    engine = _make_engine()
+    # Reserve a free consecutive pair: bind the engine's RTP socket to P and KEEP the
+    # P+1 reservation as the blocker so the engine's sibling-RTCP bind fails for real
+    # (no mock). Using a reserved pair (not bind-to-0-then-grab-P+1) keeps even THIS
+    # negative test deterministic under full-suite load — P+1 cannot have been stolen.
+    rtp_port, blocker = _reserve_consecutive_udp_pair("127.0.0.1")
+    engine = _make_engine(local_port=rtp_port)
     await engine.connect()
-    rtp_port = engine.local_port
-    # Occupy RTP-port+1 so the engine's sibling-RTCP bind fails for real (no mock).
-    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-    blocker.bind((engine._local_address, rtp_port + 1))
     try:
         # Must NOT raise — the call degrades to RTCP-off.
         await engine.start_rtcp(
@@ -974,11 +1070,7 @@ async def test_stop_awaits_and_clears_non_muxed_rtcp_reader() -> None:
     send-after-close, "task was destroyed but it is pending"). After stop() the
     reader handle is cleared and the awaited task is truly done.
     """
-    engine = _make_engine()
-    await engine.connect()
-    await engine.start_rtcp(
-        mux=False, rtp_payload_types=(), remote_rtcp_addr=("127.0.0.1", 5005)
-    )
+    engine = await _connect_non_muxed_rtcp_engine()
     reader = engine._rtcp_reader
     assert reader is not None
     assert not reader.done()

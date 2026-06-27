@@ -55,9 +55,15 @@ _REQUEST_PENDING = 491
 _UNAUTHORIZED = 401
 _PROXY_AUTH_REQUIRED = 407
 
-# A legacy RFC 2543 hold sets the connection address to the IPv4 black hole;
-# deprecated and never generated, but tolerated on receive (ADR-0011).
-_BLACKHOLE_ADDRESS = "0.0.0.0"  # noqa: S104 — detection sentinel, never a bind address
+# Legacy RFC 2543 hold sets the connection address to a black hole rather than
+# using direction attributes; deprecated and never generated, but tolerated on
+# receive (ADR-0011).  Both IPv4 (0.0.0.0) and IPv6 (::) variants are detected.
+_BLACKHOLE_ADDRESSES = frozenset(
+    {
+        "0.0.0.0",  # noqa: S104 — detection sentinel, never a bind address
+        "::",
+    }
+)
 
 # A hold/resume target is one of these two directions (ADR-0011 §2).
 _HOLD_DIRECTIONS = frozenset({"sendonly", "sendrecv"})
@@ -307,7 +313,7 @@ def classify_inbound_reinvite(
         raise IncallError(msg)
     held = (
         offer_direction in _HELD_OFFER_DIRECTIONS
-        or offer.audio.connection_address == _BLACKHOLE_ADDRESS
+        or offer.audio.connection_address in _BLACKHOLE_ADDRESSES
     )
     return MediaUpdate(
         offer=offer,

@@ -57,9 +57,6 @@ G711_SAMPLE_RATE: Final[int] = 8000
 # audioop.ratecv's resumable conversion state (or None to start a fresh stream).
 type _RateState = tuple[int, tuple[tuple[int, int], ...]] | None
 
-# ratecv uses its built-in filter weights here; we preserve the default neutral
-# response because this path is only changing sample rate, not applying EQ.
-
 
 def _validate_pcm16(pcm16: bytes) -> None:
     """Raise if ``pcm16`` is not a whole number of 16-bit samples."""
@@ -380,6 +377,8 @@ class Resampler:
         """
         _validate_pcm16(pcm16)
         try:
+            # ratecv uses its built-in filter weights here; we preserve the default
+            # neutral response because this path is only changing sample rate, not EQ.
             converted, self._state = audioop.ratecv(
                 pcm16, PCM16_BYTES_PER_SAMPLE, _MONO, self._from, self._to, self._state
             )

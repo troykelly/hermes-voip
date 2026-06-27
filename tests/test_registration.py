@@ -912,8 +912,9 @@ def test_missing_cseq_is_tolerated_and_yields_registered() -> None:
 
 def test_granted_expires_unicode_digit_contact_param_does_not_crash() -> None:
     # U+00B2 (²) passes str.isdigit() but raises ValueError from int(); a Contact
-    # expires param carrying this codepoint must be treated as absent/invalid and
-    # fall back gracefully — the handler must NOT raise.
+    # expires param carrying this codepoint must be treated as malformed (the same
+    # as any other non-ASCII-digit value such as "abc") — fail-closed to Failed —
+    # and the handler must NOT raise a bare ValueError.
     unicode_digit = chr(0xB2)
     flow = RegistrationFlow(_CONFIG)
     started = flow.start()
@@ -923,18 +924,19 @@ def test_granted_expires_unicode_digit_contact_param_does_not_crash() -> None:
         f"CSeq: {_cseq_num(started)} REGISTER\r\n"
         "Contact: <sip:1000@198.51.100.7:5061;transport=tls>"
         f";expires={unicode_digit}\r\n"
-        "Expires: 300\r\n"
         "Content-Length: 0\r\n\r\n"
     )
-    # Must not raise; falls back to the Expires header (300) → Registered
+    # Must not raise; malformed expires on our binding → fail-closed → Failed
     outcome = flow.handle(response)
-    assert isinstance(outcome, Registered)
-    assert outcome.expires == 300
+    assert isinstance(outcome, Failed)
+    assert outcome.status not in range(200, 300)
+    assert "expires" in outcome.reason.lower()
 
 
 def test_granted_expires_unicode_digit_expires_header_does_not_crash() -> None:
-    # U+00B2 (²) in the Expires header must also be treated as absent/invalid and
-    # fall back to the configured expires — the handler must NOT raise.
+    # U+00B2 (²) in the Expires header (no Contact expires param) must also be
+    # treated as absent/invalid — the handler must NOT raise a bare ValueError and
+    # must fall back to the configured expires, returning Registered.
     unicode_digit = chr(0xB2)
     flow = RegistrationFlow(_CONFIG)
     started = flow.start()
@@ -945,7 +947,7 @@ def test_granted_expires_unicode_digit_expires_header_does_not_crash() -> None:
         f"Expires: {unicode_digit}\r\n"
         "Content-Length: 0\r\n\r\n"
     )
-    # Must not raise; falls back to config expires (300) → Registered
+    # Must not raise; malformed Expires header → skipped → config expires (300)
     outcome = flow.handle(response)
     assert isinstance(outcome, Registered)
     assert outcome.expires == _CONFIG.expires
@@ -954,7 +956,7 @@ def test_granted_expires_unicode_digit_expires_header_does_not_crash() -> None:
 def test_min_expires_unicode_digit_does_not_crash() -> None:
     # U+00B2 (²) in a 423 Min-Expires header must be treated as absent/invalid —
     # _min_expires() must return None rather than raising ValueError, so the flow
-    # falls back to a safe Retry outcome.
+    # falls back to a safe Failed outcome (no valid retry interval can be computed).
     unicode_digit = chr(0xB2)
     flow = RegistrationFlow(_CONFIG)
     started = flow.start()

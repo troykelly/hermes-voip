@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+__all__ = ["ProviderRegistry"]
+
 
 class ProviderRegistry[T]:
     """A name -> factory map for one provider family, resolved at startup."""
@@ -19,6 +21,17 @@ class ProviderRegistry[T]:
         """Create an empty registry labelled ``kind`` (used in error messages)."""
         self._kind = kind
         self._factories: dict[str, Callable[[], T]] = {}
+
+    def __contains__(self, name: str) -> bool:
+        """Check if a provider name is registered.
+
+        Args:
+            name: The provider name to check.
+
+        Returns:
+            True if the name is registered, False otherwise.
+        """
+        return name in self._factories
 
     def register(self, name: str, factory: Callable[[], T]) -> None:
         """Register ``factory`` under ``name``.
@@ -33,6 +46,10 @@ class ProviderRegistry[T]:
 
     def make(self, name: str) -> T:
         """Instantiate the provider registered under ``name``.
+
+        Each call to make() instantiates a fresh instance by calling the factory.
+        The factory is called exactly once per invocation; the caller manages
+        instance lifetime and caching if needed.
 
         Raises:
             ValueError: If ``name`` is not registered.

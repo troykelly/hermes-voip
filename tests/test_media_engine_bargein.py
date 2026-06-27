@@ -131,7 +131,7 @@ async def test_flush_outbound_drops_pending_buffer() -> None:
     engine, recorder = await _new_engine(Codec.PCMU)
     # Stuff the carry buffer directly (no pacing drain yet): one big chunk of
     # 20 whole frames. send_audio would pace these out over 400 ms; we flush first.
-    engine._tx_buffer = _const_g711_frame(20, 12_000).samples
+    engine._tx_buffer = bytearray(_const_g711_frame(20, 12_000).samples)
 
     await engine.flush_outbound(fade_ms=30)
 
@@ -154,7 +154,7 @@ async def test_flush_outbound_emits_linear_fade_to_silence_g711() -> None:
     the fade and end at (essentially) silence — not a full-amplitude hard edge.
     """
     engine, recorder = await _new_engine(Codec.PCMU)
-    engine._tx_buffer = _const_g711_frame(10, 16_000).samples
+    engine._tx_buffer = bytearray(_const_g711_frame(10, 16_000).samples)
 
     await engine.flush_outbound(fade_ms=20)  # 20 ms = 160 samples = exactly 1 frame
 
@@ -182,7 +182,7 @@ async def test_flush_outbound_fade_is_monotone_in_linear_domain_g722() -> None:
     """
     engine, recorder = await _new_engine(Codec.G722)
     # 8 whole wideband frames of a constant signal in the carry buffer.
-    engine._tx_buffer = _const_g722_frame(8, 14_000).samples
+    engine._tx_buffer = bytearray(_const_g722_frame(8, 14_000).samples)
 
     await engine.flush_outbound(fade_ms=30)
 
@@ -207,7 +207,7 @@ async def test_flush_outbound_zero_fade_emits_no_audio() -> None:
     buffer is discarded and nothing is emitted.
     """
     engine, recorder = await _new_engine(Codec.PCMU)
-    engine._tx_buffer = _const_g711_frame(10, 12_000).samples
+    engine._tx_buffer = bytearray(_const_g711_frame(10, 12_000).samples)
 
     await engine.flush_outbound(fade_ms=0)
 
@@ -231,7 +231,7 @@ async def test_flush_outbound_advances_rtp_sequence() -> None:
     advance) so the gateway accepts them as the natural tail of the stream.
     """
     engine, recorder = await _new_engine(Codec.PCMU)
-    engine._tx_buffer = _const_g711_frame(6, 10_000).samples
+    engine._tx_buffer = bytearray(_const_g711_frame(6, 10_000).samples)
     await engine.flush_outbound(fade_ms=40)  # 40 ms => 2 frames
 
     seqs = [RtpPacket.parse(p).sequence_number for p in recorder.packets]
@@ -260,7 +260,7 @@ async def test_flush_outbound_drops_parked_inflight_frame() -> None:
         payload=encode_ulaw(inflight_pcm),
     )
     engine._inflight_wire = parked.pack()
-    engine._tx_buffer = _const_g711_frame(4, 16_000).samples
+    engine._tx_buffer = bytearray(_const_g711_frame(4, 16_000).samples)
 
     await engine.flush_outbound(fade_ms=20)
 
@@ -350,7 +350,7 @@ async def test_flush_outbound_while_held_emits_nothing() -> None:
     """
     engine, recorder = await _new_engine(Codec.PCMU)
     engine._inflight_wire = b"\x00" * 50
-    engine._tx_buffer = _const_g711_frame(4, 16_000).samples
+    engine._tx_buffer = bytearray(_const_g711_frame(4, 16_000).samples)
     engine.on_hold = True
 
     await engine.flush_outbound(fade_ms=30)

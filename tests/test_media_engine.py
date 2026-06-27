@@ -1532,6 +1532,65 @@ async def test_stop_tie_does_not_lose_dequeued_datagram() -> None:
     await engine.stop()
 
 
+@pytest.mark.asyncio
+async def test__next_datagram_stop_wins_over_queued_datum() -> None:
+    """Stop beats an ALREADY-QUEUED datum, and that datum is parked losslessly.
+
+    Pins the exact race semantics ``_next_datagram`` must preserve across the
+    per-packet-task-churn refactor (efficiency item, rule 22): when a datagram is
+    already sitting in the recv queue AND the stop flag is set, the stop flag wins
+    (``_next_datagram`` returns ``None`` — we never start draining a queue the
+    caller asked us to abandon) and the dequeued datagram is parked in
+    ``_pending`` (never re-queued, so a full queue cannot drop it) for the next
+    call.
+
+    Unlike ``test_stop_tie_does_not_lose_dequeued_datagram`` (which parks the call
+    on an EMPTY queue first, then ties an arrival with stop in the same loop step),
+    here the datum is enqueued and stop is set BEFORE ``_next_datagram`` is ever
+    awaited — the get and the stop are both immediately satisfiable, so this also
+    guards the single-iteration fast path of the refactored loop.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        clock=_dummy_clock,
+    )
+    await engine.connect()
+
+    datum: tuple[bytes, tuple[str, int]] = (
+        _make_rtp(11, 11 * _SAMPLES_PER_FRAME, _ulaw_silence()),
+        _FAKE_SRC,
+    )
+    # Datum is queued AND stop is set before the first await of _next_datagram.
+    engine._recv_queue.put_nowait(datum)
+    engine._stop_event.set()
+
+    result: tuple[bytes, tuple[str, int]] | None = await asyncio.wait_for(
+        engine._next_datagram(), timeout=2.0
+    )
+
+    # Stop wins: no datagram is handed back this call.
+    assert result is None
+    # The dequeued datum is parked losslessly (not dropped, not re-queued).
+    parked: tuple[bytes, tuple[str, int]] | None = engine._pending
+    assert parked == datum
+    assert engine._recv_queue.qsize() == 0
+
+    # And it is returned FIRST by the next call, ahead of the (still-set) stop —
+    # the parked-datum-before-stop ordering the refactor must keep.
+    nxt: tuple[bytes, tuple[str, int]] | None = await asyncio.wait_for(
+        engine._next_datagram(), timeout=2.0
+    )
+    assert nxt == datum
+    cleared: tuple[bytes, tuple[str, int]] | None = engine._pending
+    assert cleared is None
+
+    await engine.stop()
+
+
 # ---------------------------------------------------------------------------
 # (n) the stop/recv race leaks no pending task (RuntimeWarning-as-error)
 # ---------------------------------------------------------------------------

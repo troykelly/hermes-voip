@@ -244,48 +244,50 @@ def test_classification_result_is_frozen() -> None:
 
 def test_privilege_level_0_blocks_elevated() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=0)
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
 
 
 def test_privilege_level_0_blocks_irreversible_even_when_confirmed() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=0)
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
 
 
 def test_privilege_level_0_still_allows_safe() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=0)
-    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True
 
 
 def test_privilege_level_2_allows_elevated_when_not_degraded() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=2)
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
 
 
 def test_privilege_level_2_blocks_elevated_when_degraded() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=2, degraded=True)
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
 
 
 def test_privilege_level_2_blocks_irreversible_even_when_confirmed() -> None:
     """Level 2 ("trusted-but-limited") cannot execute irreversible actions."""
     state = GuardSessionState(call_id="c1", privilege_level=2)
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
 
 
 def test_privilege_level_3_allows_irreversible_when_confirmed_and_clean() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=3)
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is True
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is True
 
 
 def test_privilege_level_3_blocks_irreversible_when_degraded() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=3, degraded=True)
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
 
 
 def test_privilege_level_3_blocks_irreversible_without_confirmation() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=3)
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False) is False
+    assert (
+        gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False).allowed is False
+    )
 
 
 # Backward-compat: privileged bool property

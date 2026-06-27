@@ -112,7 +112,7 @@ _AUDIO_QUEUE_MAX: Final[int] = 32
 #: (finding #3): ASR back-pressures rather than buffering an unbounded backlog.
 _TRANSCRIPT_QUEUE_MAX: Final[int] = 32
 
-#: Default comfort-filler phrase set (ADR-0030, ADR-0054), used when a CallLoop is
+#: Default comfort-filler phrase set (ADR-0030, ADR-0085), used when a CallLoop is
 #: constructed without an explicit set. Each phrase reads naturally on every TTS model
 #: (no bracket tag), so the default never depends on v3 tag rendering; the set is
 #: intentionally varied so random (no-immediate-repeat) selection does not sound
@@ -131,7 +131,7 @@ _DEFAULT_COMFORT_FILLER_PHRASES: Final[tuple[str, ...]] = (
     "One moment.",
 )
 
-#: Default comfort-filler master switch (ADR-0054): ON. The adapter passes the
+#: Default comfort-filler master switch (ADR-0085): ON. The adapter passes the
 #: operator's ``MediaConfig.comfort_filler``; this is the bare-construction default.
 _DEFAULT_COMFORT_FILLER: Final[bool] = True
 
@@ -139,7 +139,7 @@ _DEFAULT_COMFORT_FILLER: Final[bool] = True
 _DEFAULT_COMFORT_FILLER_DELAY_MS: Final[int] = 900
 
 #: Default PERIODIC repeat interval (ms): on a sustained gap a fresh filler fires this
-#: often after the first, until the reply audio starts (ADR-0054). Defaults to the
+#: often after the first, until the reply audio starts (ADR-0085). Defaults to the
 #: dead-air delay (one cadence). The adapter passes ``comfort_filler_repeat_ms``.
 _DEFAULT_COMFORT_FILLER_REPEAT_MS: Final[int] = _DEFAULT_COMFORT_FILLER_DELAY_MS
 
@@ -163,7 +163,7 @@ _DEFAULT_NO_INPUT_MAX_REPROMPTS: Final[int] = 2
 #: explicit set. Each phrase reads naturally on every TTS model (no bracket tag), and is
 #: chosen at RANDOM per fire (no immediate repeat) so repeated reprompts on one call do
 #: not sound mechanical. Multi-language-ready: the adapter/config selects a language set
-#: the same way the comfort-filler phrases are selected (ADR-0054).
+#: the same way the comfort-filler phrases are selected (ADR-0085).
 _DEFAULT_NO_INPUT_REPROMPT_PHRASES: Final[tuple[str, ...]] = (
     "Are you still there?",
     "Hello, are you still there?",
@@ -190,7 +190,7 @@ _DEFAULT_GOODBYE_PHRASE: Final[str] = "Goodbye."
 #: coaching one (a deliberate caller is simply told it cannot be helped with that).
 #: Chosen at RANDOM per fire (no immediate repeat) so repeated refusals on one call do
 #: not sound mechanical. Multi-language-ready: the adapter/config selects a language set
-#: the same way as the comfort-filler / reprompt phrases (ADR-0054/0057).
+#: the same way as the comfort-filler / reprompt phrases (ADR-0085/0057).
 _DEFAULT_REFUSE_DECLINE_PHRASES: Final[tuple[str, ...]] = (
     "Sorry, I can't help with that. Is there anything else?",
     "I'm not able to do that. Is there something else I can help with?",
@@ -512,6 +512,11 @@ def gate_voip_tool(
     a non-degraded session; ``ELEVATED`` tools are blocked while degraded;
     ``SAFE`` tools always run.
 
+    **ADR-0085:** ``gate_tool_call`` returns a typed ``GateDecision``; this
+    re-export branches on ``.allowed`` (keeping its ``bool`` contract for existing
+    callers) and audits the structured ``.reason`` on a block so the operator sees
+    WHY the tool was refused.
+
     Args:
         risk: The action risk class of the tool.
         state: The per-session guard state for this call.
@@ -521,7 +526,15 @@ def gate_voip_tool(
     Returns:
         ``True`` if the tool may run, ``False`` if it must be blocked.
     """
-    return gate_tool_call(risk, state, confirmed=confirmed)
+    decision = gate_tool_call(risk, state, confirmed=confirmed)
+    if not decision.allowed:
+        _log.warning(
+            "gate_voip_tool BLOCK risk=%s call=%s reason=%s",
+            risk.value,
+            state.call_id,
+            decision.reason.value,
+        )
+    return decision.allowed
 
 
 class CallLoop:
@@ -584,7 +597,7 @@ class CallLoop:
             the final frames when a barge-in flushes the outbound audio (ADR-0028),
             so the clean stop is click-free. ``0`` is an instant hard cut. The
             adapter passes ``HERMES_VOIP_BARGE_IN_FADE_MS`` (default 30).
-        comfort_filler: Dead-air comfort filler master switch (ADR-0030, ADR-0054),
+        comfort_filler: Dead-air comfort filler master switch (ADR-0030, ADR-0085),
             ``True`` by default. When ``True``, after a caller turn is delivered the
             loop schedules a task that, once the gap exceeds ``comfort_filler_delay_ms``
             before the agent's reply audio starts, emits a short natural filler
@@ -596,7 +609,7 @@ class CallLoop:
         comfort_filler_delay_ms: Dead-air threshold (ms) before the FIRST filler fires.
             Must be positive (the adapter passes the validated config value).
         comfort_filler_repeat_ms: Periodic interval (ms) between subsequent fillers on
-            a sustained gap (ADR-0054). Must be positive.
+            a sustained gap (ADR-0085). Must be positive.
         comfort_filler_phrases: The filler phrase set; one is chosen at RANDOM per fire,
             never repeating the immediately-previous phrase. Each phrase reads naturally
             on every TTS model. Must be non-empty (defaults to the built-in set).
@@ -617,7 +630,7 @@ class CallLoop:
         no_input_reprompt_phrases: The reprompt phrase set; one is chosen at RANDOM per
             fire, never repeating the immediately-previous phrase. Each phrase reads
             naturally on every TTS model. Must be non-empty (defaults to the built-in
-            set). Multi-language-ready like the comfort-filler phrases (ADR-0054).
+            set). Multi-language-ready like the comfort-filler phrases (ADR-0085).
         goodbye: Spoken-goodbye master switch (ADR-0057), ``True`` by default. When
             ``True``, the loop-initiated graceful end (no-input limit exhausted) speaks
             ``goodbye_phrase`` and flushes it BEFORE :meth:`run` returns, so it has a
@@ -632,10 +645,10 @@ class CallLoop:
             never repeating the immediately-previous phrase; each reads naturally on
             every TTS model and declines without confirming/coaching an injection. The
             refused turn is STILL never delivered to the agent. Multi-language-ready
-            like the comfort-filler / reprompt phrases (ADR-0054/0057). An EMPTY set
+            like the comfort-filler / reprompt phrases (ADR-0085/0057). An EMPTY set
             disables the line (the prior pure-silence behaviour) — defaults to the set.
         rng: The random source for filler, reprompt AND refuse-decline phrase selection
-            (ADR-0054/0057). Defaults to a fresh :class:`random.Random`; tests
+            (ADR-0085/0057). Defaults to a fresh :class:`random.Random`; tests
             inject a seeded one for determinism. It is for variety only, never security.
         dtmf_interdigit_ms: Inter-digit gap (ms) after which a buffered DTMF menu
             group is delivered when no ``#`` terminator arrives (ADR-0010 §surfacing).
@@ -743,7 +756,7 @@ class CallLoop:
         # in-flight stream (cancels it, then takes the lock), so the greeting and
         # a following agent reply never interleave frames on the wire.
         self._playout_lock = asyncio.Lock()
-        # Dead-air comfort filler (ADR-0030, extended ADR-0054).
+        # Dead-air comfort filler (ADR-0030, extended ADR-0085).
         self._comfort_filler = comfort_filler
         # Delay (seconds) the filler gap awaits before the FIRST filler. The config
         # value is validated positive; stored in seconds for the asyncio sleep seam.
@@ -751,7 +764,7 @@ class CallLoop:
         # Periodic interval (seconds) between subsequent fillers on a sustained gap.
         self._comfort_filler_repeat_s = comfort_filler_repeat_ms / 1000.0
         self._comfort_filler_phrases = comfort_filler_phrases
-        # The random source for phrase selection (ADR-0054). Variety only, never
+        # The random source for phrase selection (ADR-0085). Variety only, never
         # security. A fresh ``random.Random`` unless a seeded one is injected (tests).
         self._comfort_rng = rng if rng is not None else random.Random()  # noqa: S311 — non-crypto; phrase variety
         self._sleep = sleep
@@ -761,7 +774,7 @@ class CallLoop:
         # done-callback nulls it on completion. Touched only from the event loop.
         self._comfort_filler_task: asyncio.Task[None] | None = None
         # The phrase chosen on the previous fire, so the random selector can avoid an
-        # immediate repeat (ADR-0054). ``None`` until the first fire. Touched only from
+        # immediate repeat (ADR-0085). ``None`` until the first fire. Touched only from
         # the loop.
         self._last_comfort_phrase: str | None = None
 
@@ -1566,7 +1579,7 @@ class CallLoop:
             task.cancel()
 
     def _next_comfort_phrase(self) -> str:
-        """Return a RANDOM filler phrase, never the immediately-previous one (ADR-0054).
+        """Return a RANDOM filler phrase, never the immediately-previous one (ADR-0085).
 
         Random (not round-robin) so a multi-fire / multi-gap call does not sound
         mechanically cyclic; the one guarantee is no back-to-back repeat. Selection is a
@@ -1594,7 +1607,7 @@ class CallLoop:
         Awaits the configured delay on the injected sleep seam, then — on GENUINE dead
         air only — emits a short random filler through the normal TTS/send path, and
         keeps re-emitting a fresh random phrase every ``comfort_filler_repeat_ms`` for
-        as long as the gap persists (ADR-0054). A single ~1 s phrase does not fill a
+        as long as the gap persists (ADR-0085). A single ~1 s phrase does not fill a
         10 s LLM wait; the periodic re-fire does, so a long wait never leaves a long
         silence. The loop runs until the real reply or a barge-in/teardown cancels it.
 
@@ -1730,7 +1743,7 @@ class CallLoop:
         """Return a RANDOM safe-decline phrase, never the immediately-previous one.
 
         Same selection discipline as the comfort filler and the no-input reprompt
-        (:meth:`_next_comfort_phrase` / :meth:`_next_reprompt_phrase`, ADR-0054/0057):
+        (:meth:`_next_comfort_phrase` / :meth:`_next_reprompt_phrase`, ADR-0085/0057):
         random for variety, with the one guarantee of no back-to-back repeat, and a
         direct choice among the distinct alternatives so it terminates even for a
         single-phrase or all-duplicate set. Uses the shared injected ``_comfort_rng``

@@ -18,14 +18,79 @@ maps to level 3/0 via the constructor keyword.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import assert_never
 
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 
+__all__ = [
+    "GateDecision",
+    "GateReason",
+    "GuardSessionState",
+    "ToolRisk",
+    "gate_tool_call",
+]
+
 # Minimum privilege level required to reach each non-SAFE risk class (ADR-0021).
 _MIN_LEVEL_ELEVATED = 2
 _MIN_LEVEL_IRREVERSIBLE = 3
+
+
+class GateReason(Enum):
+    """WHY :func:`gate_tool_call` allowed or blocked a tool (ADR-0085).
+
+    The discriminant of :class:`GateDecision`: a bare bool recorded only THAT a
+    tool was blocked, never WHY — exactly the audit trace an operator needs to
+    tell an unconfirmed caller apart from a degraded (fail-open) session apart
+    from a not-allowlisted/under-privileged one. The members are DERIVED from the
+    existing gate logic (no invented reasons): one allow reason plus the three
+    distinct block causes the gate already computes.
+
+    Members:
+        ALLOWED: The tool may run (the only non-block reason).
+        INSUFFICIENT_PRIVILEGE: The session's ``privilege_level`` is below the
+            tool's risk class (a confirmation can never lift a too-low level).
+        UNCONFIRMED: An ``IRREVERSIBLE`` tool lacked explicit caller confirmation
+            on an otherwise operator-level, non-degraded session.
+        DEGRADED: The session is in the sticky fail-open ``degraded`` state — the
+            ADR-0009 hard-block that fires regardless of privilege/confirmation.
+    """
+
+    ALLOWED = "allowed"
+    INSUFFICIENT_PRIVILEGE = "insufficient_privilege"
+    UNCONFIRMED = "unconfirmed"
+    DEGRADED = "degraded"
+
+
+@dataclass(frozen=True, slots=True)
+class GateDecision:
+    """An immutable, fully-typed gate outcome: the decision PLUS its reason.
+
+    Replaces ``gate_tool_call``'s bare ``bool`` so every block carries the
+    operator-visible :class:`GateReason` (the WHY a bool destroyed). The
+    allow/block ``allowed`` field reproduces the prior bool byte-for-byte; the
+    ``reason`` is purely ADDITIVE audit metadata.
+
+    Invariant: ``allowed`` is ``True`` iff ``reason is GateReason.ALLOWED`` — the
+    two fields are constructed together by :func:`gate_tool_call` and never drift.
+
+    Attributes:
+        allowed: Whether the tool may run (the prior bool decision).
+        reason: WHY — :attr:`GateReason.ALLOWED` on an allow, else the specific
+            block cause.
+    """
+
+    allowed: bool
+    reason: GateReason
+
+    def __post_init__(self) -> None:
+        """Reject inconsistent allow/block + reason pairs at construction."""
+        if self.allowed is not (self.reason is GateReason.ALLOWED):
+            msg = (
+                "GateDecision.allowed must be allowed iff reason is GateReason.ALLOWED"
+            )
+            raise ValueError(msg)
 
 
 class ToolRisk(Enum):
@@ -159,9 +224,13 @@ class GuardSessionState:
         )
 
 
+# Operator-friendly allow record, shared by every SAFE/allow path (no per-call alloc).
+_ALLOW = GateDecision(allowed=True, reason=GateReason.ALLOWED)
+
+
 def gate_tool_call(
     risk: ToolRisk, state: GuardSessionState, *, confirmed: bool
-) -> bool:
+) -> GateDecision:
     """Decide whether a tool may run (``pre_tool_call`` policy).
 
     **ADR-0021:** the gate now uses ``state.privilege_level`` (0/2/3) instead of
@@ -185,28 +254,63 @@ def gate_tool_call(
 
     This never silently allows (rule 37): the decision is total over ``ToolRisk``.
 
+    **ADR-0085 — typed decision.** Returns a :class:`GateDecision` (``allowed`` +
+    :class:`GateReason`) instead of a bare bool. The ``allowed`` field is the prior
+    bool byte-for-byte (the truth table is unchanged); the ``reason`` is the ADDED
+    audit WHY. When MULTIPLE block causes hold at once the reason follows a fixed,
+    security-ordered precedence — ``DEGRADED`` (the sticky fail-open, the most
+    security-significant signal) first, then ``INSUFFICIENT_PRIVILEGE`` (a level a
+    confirmation can never lift), then ``UNCONFIRMED`` (the residual cause on an
+    otherwise-eligible operator session). The precedence governs only WHICH reason
+    is reported on a block; it never changes whether the tool is blocked.
+
     Args:
         risk: The action risk class of the tool.
         state: The per-session guard state.
         confirmed: Whether the caller explicitly confirmed the action.
 
     Returns:
-        True if the tool may run, else False.
+        A :class:`GateDecision`: ``allowed`` (the prior bool) plus the
+        :class:`GateReason` explaining the outcome.
     """
     if risk is ToolRisk.SAFE:
         # Read-only tools always run, even for an untrusted/unprivileged session:
         # the caller is screened, never dropped.
-        return True
+        return _ALLOW
     if risk is ToolRisk.ELEVATED:
-        # Requires level >= 2 AND a non-degraded session.
-        return state.privilege_level >= _MIN_LEVEL_ELEVATED and not state.degraded
+        # SAFE+ELEVATED ceiling is level >= 2; no per-action confirmation needed, so
+        # confirmation is treated as satisfied (it is never consulted for ELEVATED).
+        return _gate_non_safe(
+            state, min_level=_MIN_LEVEL_ELEVATED, confirmation_ok=True
+        )
     if risk is ToolRisk.IRREVERSIBLE:
-        # Requires level >= 3 AND confirmed AND non-degraded.
-        return (
-            state.privilege_level >= _MIN_LEVEL_IRREVERSIBLE
-            and confirmed
-            and not state.degraded
+        # Operator ceiling (level >= 3) AND explicit confirmation.
+        return _gate_non_safe(
+            state, min_level=_MIN_LEVEL_IRREVERSIBLE, confirmation_ok=confirmed
         )
     assert_never(
         risk
     )  # exhaustive: a new ToolRisk member fails mypy here, not silently allows
+
+
+def _gate_non_safe(
+    state: GuardSessionState, *, min_level: int, confirmation_ok: bool
+) -> GateDecision:
+    """The ELEVATED/IRREVERSIBLE clamp, with the block-reason precedence (ADR-0085).
+
+    ``confirmation_ok`` is the *already-evaluated* confirmation status: ``True`` ⇒
+    confirmation satisfied or not required (ELEVATED never needs it); ``False`` ⇒
+    an IRREVERSIBLE tool still awaits its explicit caller confirmation. The
+    block-reason precedence is fixed: a ``degraded`` session (the load-bearing
+    fail-open hard-block) is reported first, then an insufficient ``privilege_level``
+    (a level no confirmation can lift), then the residual ``UNCONFIRMED`` cause.
+    Precedence governs only WHICH reason is reported; the allow/block decision is the
+    prior bool byte-for-byte.
+    """
+    if state.degraded:
+        return GateDecision(allowed=False, reason=GateReason.DEGRADED)
+    if state.privilege_level < min_level:
+        return GateDecision(allowed=False, reason=GateReason.INSUFFICIENT_PRIVILEGE)
+    if not confirmation_ok:
+        return GateDecision(allowed=False, reason=GateReason.UNCONFIRMED)
+    return _ALLOW

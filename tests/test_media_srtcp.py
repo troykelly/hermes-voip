@@ -724,3 +724,41 @@ class TestSrtcpInlineKeyDecodeGuard:
         crypto = _make_crypto()  # the normal validated path
         session = SrtcpSession(crypto)
         assert session.index == 0
+
+
+# ---------------------------------------------------------------------------
+# __all__ export
+# ---------------------------------------------------------------------------
+
+
+import hermes_voip.media.srtcp as _srtcp_mod  # noqa: E402
+
+
+class TestSrtcpModuleExports:
+    """Verify that srtcp.py defines __all__ with the correct public names."""
+
+    def test_module_defines_all(self) -> None:
+        """The srtcp module must define __all__."""
+        assert hasattr(_srtcp_mod, "__all__"), "srtcp module must define __all__"
+
+    def test_all_contains_correct_public_names(self) -> None:
+        """__all__ must list the exact public names intended for star-import."""
+        expected = {"SrtcpError", "SrtcpSession"}
+        assert set(_srtcp_mod.__all__) == expected  # type: ignore[attr-defined]
+
+    def test_all_names_are_importable(self) -> None:
+        """Every name in __all__ must be importable from the module."""
+        all_names = _srtcp_mod.__all__  # type: ignore[attr-defined]
+        for name in all_names:
+            assert hasattr(_srtcp_mod, name), (
+                f"{name} must be importable from srtcp module"
+            )
+            assert not name.startswith("_"), (
+                f"{name} must not be private (no leading _)"
+            )
+
+    def test_no_private_names_in_all(self) -> None:
+        """__all__ must not include any names starting with underscore."""
+        all_names = _srtcp_mod.__all__  # type: ignore[attr-defined]
+        private_names = [name for name in all_names if name.startswith("_")]
+        assert not private_names, f"Private names in __all__: {private_names}"

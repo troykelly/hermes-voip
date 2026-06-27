@@ -2223,6 +2223,19 @@ def test_no_input_defaults_match_call_loop_constants() -> None:
     assert cfg.no_input_reprompt_phrases == _DEFAULT_NO_INPUT_REPROMPT_PHRASES
     assert cfg.goodbye is True
     assert cfg.goodbye_phrase == _DEFAULT_GOODBYE_PHRASE
+    # Belt-and-braces (codex review): also pin the call_loop constants to their
+    # known-sane literal values, so a COORDINATED drift — call_loop AND config
+    # changed together to a bad value — is still caught. The equality bindings
+    # above only catch a one-sided divergence between the two modules.
+    assert _DEFAULT_NO_INPUT_REPROMPT is True
+    assert _DEFAULT_NO_INPUT_TIMEOUT_MS == 10_000
+    assert _DEFAULT_NO_INPUT_MAX_REPROMPTS == 2
+    assert _DEFAULT_GOODBYE_PHRASE == "Goodbye."
+    assert _DEFAULT_NO_INPUT_REPROMPT_PHRASES == (
+        "Are you still there?",
+        "Hello, are you still there?",
+        "Sorry, I can't hear anything. Are you still there?",
+    )
 
 
 def test_goodbye_phrase_env_override() -> None:

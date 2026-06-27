@@ -428,3 +428,125 @@ async def test_place_call_unlisted_number_no_failure_outcome(
     payload = json.loads(result)
     assert "error" in payload
     assert "failure_outcome" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Transport / media-init RuntimeError -> FAILED outcome (ADR-0084 Decision A)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_place_call_runtime_error_maps_to_failed_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport/media-init RuntimeError -> FAILED outcome (structured contract).
+
+    ADR-0084 classifies a non-SIP transport/media-init failure as the FAILED
+    outcome.  Such a failure surfaces as a ``RuntimeError`` from
+    ``place_call_with_objective`` (e.g. the RTP transport could not be opened).
+    It MUST carry the structured ``failure_outcome`` key like the SIP failures
+    do — not fall through to the generic boundary handler with no outcome.
+    """
+    host = _FakeHost(exc=RuntimeError("RTP transport init failed"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "origin-chat")
+
+    result = await place_call_handler({"number": "1000", "objective": "book a table"})
+
+    payload = json.loads(result)
+    assert "error" in payload
+    assert payload.get("failure_outcome") == PlaceCallOutcome.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_place_call_runtime_error_does_not_leak_gateway_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RuntimeError whose message embeds a (fake) gateway host MUST NOT leak it.
+
+    SECURITY / public-repo: ADR-0084 requires that NO gateway detail (host,
+    extension, port) leaks in the agent-facing result.  A transport/media-init
+    ``RuntimeError`` can carry a connection string in its message; the handler
+    must redact ``str(exc)`` exactly as the SIP path suppresses the reason
+    phrase — returning only the classified category, never the raw message.
+    """
+    leaky = RuntimeError(
+        "media transport to pbx.example.test:5061 failed: connection refused"
+    )
+    host = _FakeHost(exc=leaky)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "origin-chat")
+
+    result = await place_call_handler({"number": "1000", "objective": "book a table"})
+
+    payload = json.loads(result)
+    blob = json.dumps(payload)
+    # The structured outcome is still present...
+    assert payload.get("failure_outcome") == PlaceCallOutcome.FAILED.value
+    # ...but the raw exception message (with the fake host:port) is NOT echoed.
+    assert "pbx.example.test" not in blob
+    assert "5061" not in blob
+    assert "connection refused" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Ring timeout: positive infinity must be rejected (bounded-timeout policy)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ring_timeout_inf_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HERMES_VOIP_RING_TIMEOUT_SECS='inf' is rejected (defeats the bounded policy).
+
+    ``float('inf') > 0`` is True, so a bare ``value > 0`` check would accept
+    positive infinity — an unbounded timeout, which is exactly what the bounded
+    ring-timeout policy forbids.  ``inf`` must be treated as absent (None), so
+    the adapter's hard sink bound governs instead.
+    """
+    ring_log: list[float | None] = []
+    host = _FakeHost(call_id="call-rt-inf", ring_timeout_received=ring_log)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "origin-chat")
+    monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", "inf")
+
+    result = await place_call_handler(
+        {"number": "1000", "objective": "check availability"}
+    )
+
+    assert json.loads(result) == {"call_id": "call-rt-inf"}
+    # Positive infinity is NOT a valid bounded timeout — falls back to None.
+    assert ring_log == [None]
+
+
+def test_parse_ring_timeout_rejects_infinity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_parse_ring_timeout returns None for 'inf' / 'infinity' (non-finite values)."""
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    for raw in ("inf", "Infinity", "+inf", "-inf", "nan"):
+        monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", raw)
+        assert vt._parse_ring_timeout() is None, raw
+
+
+# ---------------------------------------------------------------------------
+# Stable API surface: ADR-0084 names PlaceCallOutcome + the ring-timeout env
+# var as __all__ exports.
+# ---------------------------------------------------------------------------
+
+
+def test_ring_timeout_env_symbol_is_exported() -> None:
+    """ADR-0084 Consequences: the ring-timeout env symbol is a stable __all__ export."""
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    assert "_RING_TIMEOUT_ENV" in vt.__all__
+    assert vt._RING_TIMEOUT_ENV == "HERMES_VOIP_RING_TIMEOUT_SECS"
+
+
+def test_place_call_outcome_is_exported() -> None:
+    """PlaceCallOutcome is part of the module's public API (__all__)."""
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    assert "PlaceCallOutcome" in vt.__all__

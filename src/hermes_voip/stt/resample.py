@@ -71,6 +71,17 @@ class FloatArray(Protocol):
         """Elementwise multiplication by a scalar (the PCM16 full-scale factor)."""
         ...
 
+    def __len__(self) -> int:
+        """Return the number of elements (samples) in the array.
+
+        Exposes the length surface so callers can count samples with ``len(arr)``
+        instead of ``len(arr.tobytes()) // 4``, avoiding a temporary bytes
+        allocation per frame (~1280 bytes per 20 ms/16 kHz frame, ~64 KB/s/call).
+        ``numpy.ndarray`` already implements ``__len__``, so no runtime shim is
+        needed; the addition is a Protocol-level annotation only.
+        """
+        ...
+
 
 class _NumpyModule(Protocol):
     """The ``numpy`` surface this module uses, bound to the lazily-imported module."""

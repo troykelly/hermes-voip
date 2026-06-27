@@ -292,7 +292,7 @@ class _Decoder[StreamT]:
                 yield from self._flush(stream, samples_fed=samples_fed)
                 return
             recognizer.accept_waveform(stream, RECOGNISER_SAMPLE_RATE, item)
-            samples_fed += len(item.tobytes()) // 4  # float32 = 4 bytes/sample
+            samples_fed += len(item)  # FloatArray.__len__ = number of samples
             while recognizer.is_ready(stream):
                 recognizer.decode_stream(stream)
             text = recognizer.get_result(stream)

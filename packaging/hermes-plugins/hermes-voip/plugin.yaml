@@ -140,8 +140,10 @@ optional_env:
     url: "https://console.deepgram.com/"
     secret: true
   - name: HERMES_SIP_MAX_CALLS
+    default: 8
     description: "Maximum concurrent active calls before new inbound INVITEs are rejected 486 Busy Here (default: 8)."
     prompt: "Max concurrent calls (default: 8)"
   - name: HERMES_SIP_SHUTDOWN_DRAIN_SECS
+    default: 5.0
     description: "Seconds to wait for in-flight calls to BYE-drain on shutdown before forcing teardown (default: 5.0)."
     prompt: "Shutdown drain timeout in seconds (default: 5.0)"

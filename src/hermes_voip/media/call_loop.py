@@ -913,7 +913,14 @@ class CallLoop:
         than scheduling it as a task — used by tests (and any awaiting caller) to
         observe the delivered turn deterministically. A non-terminator digit (re)arms
         the inter-digit timer exactly as :meth:`feed_dtmf` does.
+
+        The RAW keypress marks caller activity FIRST (:meth:`_mark_caller_active`), at
+        exact parity with :meth:`feed_dtmf` — a digit pressed via the awaitable path is
+        proof of life for the no-input watchdog (ADR-0057) even before its group is
+        delivered, so an awaiting caller dialing with inter-digit gaps is never treated
+        as silent and reprompted / hung up on mid-dialing.
         """
+        self._mark_caller_active()
         if self._route_confirmation(digit):
             return
         if digit == _DTMF_TERMINATOR:

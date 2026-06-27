@@ -8,7 +8,9 @@ PcmFrame integration.
 """
 
 import struct
+import unittest.mock
 
+import audioop
 import pytest
 
 from hermes_voip.media.audio import (
@@ -505,3 +507,89 @@ def test_resample_frame_does_not_mutate_input() -> None:
     assert frame.sample_rate == 8000
     # Output is a different PcmFrame.
     assert out is not frame or out.sample_rate != frame.sample_rate
+
+
+# ---------------------------------------------------------------------------
+# audioop.error wrapping — domain ValueError contract at codec/resample boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_decode_ulaw_wraps_audioop_error_as_value_error() -> None:
+    """decode_ulaw re-raises audioop.error as ValueError (domain exception contract).
+
+    audioop.error is a raw stdlib exception (not ValueError); leaking it to callers
+    breaks the module's coherent exception contract (all bad-input errors are
+    ValueError).  When the underlying audioop.ulaw2lin raises audioop.error the
+    function must catch it and re-raise as ``ValueError`` with ``from exc`` so the
+    original cause is preserved in the chain.
+
+    Raises:
+        ValueError: When audioop raises audioop.error internally.
+    """
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.ulaw2lin.side_effect = audioop.error("simulated ulaw decode error")
+        with pytest.raises(ValueError, match="simulated ulaw decode error"):
+            decode_ulaw(b"\xff\xff")
+
+
+def test_decode_alaw_wraps_audioop_error_as_value_error() -> None:
+    """decode_alaw re-raises audioop.error as ValueError (domain exception contract).
+
+    Same contract as decode_ulaw: audioop.alaw2lin errors are wrapped so callers
+    only ever see ValueError from this module's public API.
+
+    Raises:
+        ValueError: When audioop raises audioop.error internally.
+    """
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.alaw2lin.side_effect = audioop.error("simulated alaw decode error")
+        with pytest.raises(ValueError, match="simulated alaw decode error"):
+            decode_alaw(b"\xff\xff")
+
+
+def test_resampler_resample_wraps_audioop_error_as_value_error() -> None:
+    """Resampler.resample re-raises audioop.error as ValueError.
+
+    audioop.ratecv can raise audioop.error for edge-case inputs (e.g. an input
+    buffer whose byte count is not a whole number of frames for the given channel
+    width).  The Resampler pre-validates input with _validate_pcm16 to catch the
+    common case, but a defensive wrap ensures that any residual audioop.error from
+    audioop.ratecv propagates as ValueError — the module's coherent error type —
+    rather than leaking the raw C-layer exception to callers.
+
+    Raises:
+        ValueError: When audioop raises audioop.error during rate conversion.
+    """
+    r = Resampler(8000, 16000)
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.ratecv.side_effect = audioop.error("simulated ratecv error")
+        pcm = _pcm16(*([0] * 160))
+        with pytest.raises(ValueError, match="simulated ratecv error"):
+            r.resample(pcm)
+
+
+def test_decode_ulaw_audioop_error_preserves_cause_chain() -> None:
+    """Wrapped ValueError from decode_ulaw preserves the original audioop.error cause.
+
+    ``raise ValueError(...) from exc`` sets ``__cause__`` so debuggers and
+    tracebacks can still show the original audioop detail while callers see
+    only ValueError.
+    """
+    original = audioop.error("original cause")
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.ulaw2lin.side_effect = original
+        with pytest.raises(ValueError, match="original cause") as exc_info:
+            decode_ulaw(b"\x00")
+    assert exc_info.value.__cause__ is original
+
+
+def test_resampler_resample_audioop_error_preserves_cause_chain() -> None:
+    """Wrapped ValueError from Resampler.resample preserves audioop.error cause."""
+    original = audioop.error("original ratecv cause")
+    r = Resampler(8000, 16000)
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.ratecv.side_effect = original
+        pcm = _pcm16(*([0] * 160))
+        with pytest.raises(ValueError, match="original ratecv cause") as exc_info:
+            r.resample(pcm)
+    assert exc_info.value.__cause__ is original

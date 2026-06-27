@@ -225,3 +225,51 @@ def test_pong_between_messages_both_framed() -> None:
     assert len(messages) == 2
     assert "Call-ID: first" in messages[0]
     assert "Call-ID: second" in messages[1]
+
+
+# ---------------------------------------------------------------------------
+# RFC 3261 §20.14: exactly one Content-Length per message (duplicate = error)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_content_length_raises_framing_error() -> None:
+    """Two Content-Length header lines (both full form) must raise FramingError.
+
+    RFC 3261 §20.14 permits exactly one Content-Length per message.  A peer
+    that sends two values is malformed; first-wins would let an attacker
+    control the read boundary, so we fail-closed instead.
+    """
+    # First header has value 5 (the real body size); second has 999 (bogus).
+    # The framer must detect the duplicate before reading any body bytes.
+    framer = SipMessageFramer()
+    framer.feed(
+        b"SIP/2.0 200 OK\r\n"
+        b"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKdup\r\n"
+        b"Call-ID: dup-cl\r\n"
+        b"Content-Length: 5\r\n"
+        b"Content-Length: 999\r\n"
+        b"\r\n"
+        b"hello"
+    )
+    with pytest.raises(FramingError, match="duplicate Content-Length"):
+        list(framer)
+
+
+def test_duplicate_compact_and_full_content_length_raises_framing_error() -> None:
+    """A compact 'l' header followed by a full Content-Length must raise FramingError.
+
+    Both compact and full forms name the same header; a message carrying both is
+    equally malformed and must not be silently accepted.
+    """
+    framer = SipMessageFramer()
+    framer.feed(
+        b"SIP/2.0 200 OK\r\n"
+        b"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKdup2\r\n"
+        b"Call-ID: dup-cl-compact\r\n"
+        b"l: 5\r\n"
+        b"Content-Length: 999\r\n"
+        b"\r\n"
+        b"hello"
+    )
+    with pytest.raises(FramingError, match="duplicate Content-Length"):
+        list(framer)

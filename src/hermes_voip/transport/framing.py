@@ -121,9 +121,13 @@ def _content_length(head: str) -> int:
             unfolded[-1] = f"{unfolded[-1]} {line.strip()}"
         else:
             unfolded.append(line)
+    found: int | None = None
     for line in unfolded:
         name, sep, value = line.partition(":")
         if sep and name.strip().lower() in _CONTENT_LENGTH_NAMES:
+            if found is not None:
+                msg = "duplicate Content-Length header"
+                raise FramingError(msg)
             stripped = value.strip()
             # RFC 3261 Content-Length is ASCII 1*DIGIT. ``isascii() and
             # isdecimal()`` rejects superscripts/exotic Unicode digits (which
@@ -132,6 +136,8 @@ def _content_length(head: str) -> int:
             if not (stripped.isascii() and stripped.isdecimal()):
                 msg = f"non-numeric Content-Length: {stripped!r}"
                 raise FramingError(msg)
-            return int(stripped)
-    msg = "message head has no Content-Length"
-    raise FramingError(msg)
+            found = int(stripped)
+    if found is None:
+        msg = "message head has no Content-Length"
+        raise FramingError(msg)
+    return found

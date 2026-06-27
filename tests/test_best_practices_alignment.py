@@ -81,7 +81,13 @@ class _ExplodingHost:
     def list_registrations_text(self) -> str:
         raise _SyntheticHostError(_BOOM)
 
-    async def place_call_with_objective(self, number: str, objective: str) -> str:
+    async def place_call_with_objective(
+        self,
+        number: str,
+        objective: str,
+        *,
+        ring_timeout_secs: float | None = None,
+    ) -> str:
         raise _SyntheticHostError(_BOOM)
 
     def record_call_result(self, call_id: str, summary: str) -> bool:

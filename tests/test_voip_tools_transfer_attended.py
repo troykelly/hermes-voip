@@ -93,7 +93,13 @@ class _FakeHost:
     def list_registrations_text(self) -> str:
         return ""
 
-    async def place_call_with_objective(self, number: str, objective: str) -> str:
+    async def place_call_with_objective(
+        self,
+        number: str,
+        objective: str,
+        *,
+        ring_timeout_secs: float | None = None,
+    ) -> str:
         return ""
 
     def record_call_result(self, call_id: str, summary: str) -> bool:

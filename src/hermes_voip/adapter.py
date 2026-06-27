@@ -1504,8 +1504,14 @@ class VoipAdapter(BasePlatformAdapter):
     # Outbound call origination (ADR-0019 / ADR-0029)
     # -----------------------------------------------------------------------
 
-    async def place_call_with_objective(self, number: str, objective: str) -> str:
-        """Agent-triggered outbound call pursuing ``objective`` (ADR-0029).
+    async def place_call_with_objective(
+        self,
+        number: str,
+        objective: str,
+        *,
+        ring_timeout_secs: float | None = None,
+    ) -> str:
+        """Agent-triggered outbound call pursuing ``objective`` (ADR-0029/0084).
 
         The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
         ``place_call`` tool calls. Enforces the outbound allowlist (the HARD gate)
@@ -1522,6 +1528,10 @@ class VoipAdapter(BasePlatformAdapter):
         Args:
             number: The dial target (extension or SIP URI) — must be allowlisted.
             objective: The goal of the call, framed to the call agent.
+            ring_timeout_secs: When set, the maximum time to ring an unanswered
+                call before sending a CANCEL (ADR-0069); raises
+                :class:`~hermes_voip.originate.OutboundCallCancelled` on expiry.
+                ``None`` (the default) leaves only the hard sink bound.
 
         Returns:
             The SIP ``Call-ID`` of the established call.
@@ -1529,6 +1539,8 @@ class VoipAdapter(BasePlatformAdapter):
         Raises:
             OutboundCallNotAllowed: When ``number`` is not on
                 ``HERMES_VOIP_OUTBOUND_ALLOW`` (nothing is dialled).
+            OutboundCallCancelled: When ``ring_timeout_secs`` expires and the peer
+                returns ``487 Request Terminated``.
             OutboundCallFailed / RuntimeError: As :meth:`place_call`.
         """
         if not is_outbound_allowed(number, self._outbound_allow):
@@ -1541,7 +1553,12 @@ class VoipAdapter(BasePlatformAdapter):
             number,
             "present" if origin is not None else "none",
         )
-        return await self.place_call(number, objective=objective, origin=origin)
+        return await self.place_call(
+            number,
+            objective=objective,
+            origin=origin,
+            ring_timeout_secs=ring_timeout_secs,
+        )
 
     def _capture_origin_session(self) -> tuple[str, str] | None:
         """Capture the ORIGINATING session ``(platform, chat_id)`` (ADR-0029).

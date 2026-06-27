@@ -149,9 +149,14 @@ def _injection_label_index(config_path: Path) -> int:
         return 1
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         msg = f"corrupt config.json at {config_path}: {e}"
         raise ValueError(msg) from e
+    if not isinstance(raw, dict):
+        # Valid JSON but not an object (e.g. [], "x", 42) — treat as unrecognised
+        # config and fall back to the conventional INJECTION class index (same path
+        # as a missing or unrecognised config per the docstring).
+        return 1
     id2label = raw.get("id2label")
     if not isinstance(id2label, dict):
         return 1

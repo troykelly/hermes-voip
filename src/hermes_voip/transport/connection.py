@@ -32,10 +32,20 @@ It also keeps the UA alive: an out-of-dialog ``OPTIONS`` qualify ping is answere
 contact *qualified* and rings the extension rather than diverting inbound calls to
 voicemail — without one, a registrar marks the endpoint unreachable.
 
-Errors propagate (rule 37): an unparseable / unframable stream fails the reader
-task and is reported via ``on_connection_lost``; a stray response or unroutable
-request is surfaced via ``on_unroutable`` (a normal network event — it does not
-tear the connection down).
+Framing failure vs message-parse failure are distinguished (ADR-0081, rule 37). A
+**framing** failure — an unframable stream whose message boundaries can no longer
+be delimited (a corrupt ``Content-Length`` / CRLF framing, raised as
+:class:`~hermes_voip.transport.framing.FramingError` by the framer) — is
+unrecoverable: it ends the reader task and is reported via ``on_connection_lost``.
+But once framing **succeeds** and one complete message is extracted, a failure to
+*parse* that single message (a ``ValueError`` from
+:meth:`~hermes_voip.message.SipRequest.parse`) is **not** fatal: the stream is
+still synchronised, so the one bad message is logged loudly (a WARNING with a
+non-PII summary — the repo is PUBLIC, rule 34) and **skipped**, keeping the
+connection and every OTHER active call on it alive. This is surfaced, not swallowed
+(rule 37) — one malformed message is not a DoS against unrelated calls. A stray
+response or unroutable request is surfaced via ``on_unroutable`` (a normal network
+event — it does not tear the connection down).
 """
 
 from __future__ import annotations
@@ -581,13 +591,16 @@ class SipOverTlsTransport:
     # --- inbound reader + dispatch ------------------------------------------
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
-        """Read, frame, and dispatch until EOF or a stream error.
+        """Read, frame, and dispatch until EOF or an unrecoverable stream error.
 
-        A framing error (an unparseable Content-Length), an ``OSError`` (the
-        socket breaking), or a parse error all end the loop and propagate to the
+        A **framing** error (a corrupt ``Content-Length`` — the stream can no
+        longer be delimited, raised as ``FramingError`` from the framer iteration)
+        or an ``OSError`` (the socket breaking) ends the loop and propagates to the
         task, where :meth:`_on_reader_done` reports the cause via
-        ``on_connection_lost`` (rule 37: surfaced, never swallowed). A clean EOF
-        ends the loop with no error.
+        ``on_connection_lost`` (rule 37: surfaced, never swallowed). A failure to
+        *parse* a single, successfully-framed message is handled inside
+        :meth:`_dispatch` (logged and skipped — ADR-0081), NOT here, so it does not
+        end the loop. A clean EOF ends the loop with no error.
         """
         framer = SipMessageFramer()
         while True:
@@ -599,10 +612,36 @@ class SipOverTlsTransport:
                 await self._dispatch(raw)
 
     async def _dispatch(self, raw: str) -> None:
-        if raw.startswith(_RESPONSE_PREFIX):
-            await self._dispatch_response(SipResponse.parse(raw))
+        """Parse one already-framed message and route it; skip if it won't parse.
+
+        ``raw`` is a single complete message the framer has already delimited, so a
+        :class:`ValueError` from :meth:`~hermes_voip.message.SipResponse.parse` /
+        :meth:`~hermes_voip.message.SipRequest.parse` here is a *post-framing* parse
+        failure of THIS one message — the stream is still synchronised. It is logged
+        loudly and skipped (ADR-0081), keeping the connection and every other active
+        call alive; one malformed message must not be a DoS against unrelated calls.
+        A ``FramingError`` (an unframable stream) cannot reach this method — it is
+        raised by the framer in :meth:`_read_loop` and propagates there (rule 37).
+        """
+        is_response = raw.startswith(_RESPONSE_PREFIX)
+        try:
+            message: SipResponse | SipRequest = (
+                SipResponse.parse(raw) if is_response else SipRequest.parse(raw)
+            )
+        except ValueError as exc:
+            # A non-PII summary only — never the raw message (it may carry From/To/
+            # Call-ID/SDP; the repo is PUBLIC, rule 34). type(exc).__name__ + length
+            # is loud enough to alert without leaking wire content.
+            _log.warning(
+                "dropping an unparseable SIP message (%s, len=%d) — connection kept",
+                type(exc).__name__,
+                len(raw),
+            )
+            return
+        if isinstance(message, SipResponse):
+            await self._dispatch_response(message)
         else:
-            await self._dispatch_request(SipRequest.parse(raw))
+            await self._dispatch_request(message)
 
     async def _dispatch_response(self, response: SipResponse) -> None:
         # A 2xx racing a CANCEL we sent (RFC 3261 §9.1 glare) is consumed here: the

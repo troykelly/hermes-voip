@@ -36,7 +36,10 @@ extension for the process lifetime of this transport object.
 
 Errors propagate (rule 37): a failed ``recv`` or a closed connection reports
 via ``on_connection_lost``; a stray response or unroutable request surfaces via
-``on_unroutable`` (a normal network event — it does not tear the connection).
+``on_unroutable`` (a normal network event — it does not tear the connection). A
+single text frame that *parses* badly is the one exception that is recovered, not
+fatal: it is logged loudly and skipped (ADR-0081), so one malformed frame is not a
+DoS against the registration and every active call sharing the connection.
 
 The ``websockets`` library (BSD-3-Clause) is **lazy-imported** inside
 :meth:`connect` so that ``import hermes_voip`` is light when the ``webrtc``
@@ -48,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import logging
 import re
 import secrets
 import uuid
@@ -73,6 +77,8 @@ if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
 __all__ = ["WssSipTransport"]
+
+_log = logging.getLogger(__name__)
 
 _RESPONSE_PREFIX = "SIP/2.0 "
 # RFC 5626 §4.4.1 / RFC 7118 CRLF keepalive: a double-CRLF ping is answered with a
@@ -362,10 +368,38 @@ class WssSipTransport:
             # the media plane owns those on the media socket, not the signalling WS.
 
     async def _dispatch(self, raw: str) -> None:
-        if raw.startswith(_RESPONSE_PREFIX):
-            await self._dispatch_response(SipResponse.parse(raw))
+        """Parse one text frame (a whole message) and route it; skip if it won't parse.
+
+        Over WebSocket each text frame is exactly one complete SIP message (RFC 7118
+        §5), so there is no stream-framing problem here — but a frame can still fail
+        to *parse*. A :class:`ValueError` from
+        :meth:`~hermes_voip.message.SipResponse.parse` /
+        :meth:`~hermes_voip.message.SipRequest.parse` is a per-message parse failure
+        (ADR-0081): it is logged loudly (a WARNING with a non-PII summary — the repo
+        is PUBLIC, rule 34) and the one bad frame is **skipped**, keeping the
+        connection (and thus the registration and every active call) alive. One
+        malformed frame must not be a DoS against unrelated calls — surfaced, not
+        swallowed (rule 37). Whitespace-only keepalive frames never reach here (the
+        read loop handles them before dispatch).
+        """
+        is_response = raw.startswith(_RESPONSE_PREFIX)
+        try:
+            message: SipResponse | SipRequest = (
+                SipResponse.parse(raw) if is_response else SipRequest.parse(raw)
+            )
+        except ValueError as exc:
+            # A non-PII summary only — never the raw frame (it may carry From/To/
+            # Call-ID/SDP; the repo is PUBLIC, rule 34).
+            _log.warning(
+                "dropping an unparseable SIP frame (%s, len=%d) — connection kept",
+                type(exc).__name__,
+                len(raw),
+            )
+            return
+        if isinstance(message, SipResponse):
+            await self._dispatch_response(message)
         else:
-            await self._dispatch_request(SipRequest.parse(raw))
+            await self._dispatch_request(message)
 
     async def _dispatch_response(self, response: SipResponse) -> None:
         await self._auto_ack_non_2xx(response)

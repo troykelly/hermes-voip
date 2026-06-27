@@ -238,9 +238,15 @@ class RegistrationManager:
         knob.
 
         Raises:
-            ValueError: If ``min_refresh_delay`` is not strictly positive.
+            ValueError: If ``min_refresh_delay`` is not strictly positive. The check
+                is ``not (min_refresh_delay > 0)``, which fails closed on ``NaN`` too
+                (``nan > 0`` is False) — a NaN floor would otherwise slip a naive
+                ``<= 0`` test and poison ``max(nan, …)`` / ``asyncio.sleep(nan)``.
         """
-        if min_refresh_delay <= 0:
+        # ``not (… > 0)`` rather than ``<= 0`` so the check fails closed on NaN:
+        # ``nan <= 0`` is False (NaN would slip the floor) but ``nan > 0`` is also
+        # False, so ``not (nan > 0)`` is True and NaN is rejected with 0/negatives.
+        if not (min_refresh_delay > 0):
             msg = f"min_refresh_delay must be > 0 seconds, got {min_refresh_delay}"
             raise ValueError(msg)
         self._gateway = gateway

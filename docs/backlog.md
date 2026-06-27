@@ -177,7 +177,7 @@ defect or a load-bearing test gap.
 - [ ] **[low] robustness** — Duplicate rtpmap (last-wins) and duplicate payload-type in `m=` (dup
   `Codec`) resolved silently. Decide a policy (dedupe PTs preserving first; document last-wins for rtpmap)
   and pin with a test.
-- [ ] **[low] correctness** — telephone-event clock-rate vs voice clock-rate consistency not validated
+- [x] (#311) **[low] correctness** — telephone-event clock-rate vs voice clock-rate consistency not validated
   (RFC 4733). `telephone-event/16000` alongside `PCMU/8000` is accepted and would mis-time DTMF
   (ADR-0010). After negotiation, validate the TE clock_rate equals the selected voice rate; test the
   mismatch.
@@ -283,7 +283,7 @@ defect or a load-bearing test gap.
   `ValueError` path or validate config in `__post_init__`; test a control char in a config field.
 - [ ] **[low] test** — `test_403_yields_failed` asserts only status, not `reason` (mutation-weak); ditto
   the second-challenge test. Assert `outcome.reason`.
-- [ ] **[low] test** — No test that `deregister()` resets registered state / cannot be called twice. The
+- [x] (#314) **[low] test** — No test that `deregister()` resets registered state / cannot be called twice. The
   `_registered = txn.requested_expires > 0` logic is exercised only incidentally; a `> 0`→`>= 0` mutant
   survives. Add register → deregister → 200 → assert a second `deregister()` raises.
 - [ ] **[low] api** — `RegistrationOutcome` union has no exhaustiveness guard at call sites and no
@@ -1052,16 +1052,16 @@ These span multiple modules or the repo as a whole.
 - [ ] **[low] efficiency** — Replace per-frame Python list allocation in `InbandDtmfDetector._detect_frame` with `struct.unpack_from` tuple. `dtmf.py:430` allocates a new `list[float]` every inbound frame when in-band DTMF receive is enabled (`[float(v) for v in struct.unpack(f'<{n}h', pcm16)]`); measured ~22,848 ns/frame vs a cached format-string `struct.unpack_from`. Fix: use a module-level `_PCM16_FMT_8K` constant and `struct.unpack_from`, omit the `float()` coerce (inner loop arithmetic coerces); saves ~7 µs/frame at 50 fps. The existing backlog "Every encode/decode/resample returns a fresh bytes" item covers `audio.py`/`rtp.py` but not `dtmf.py` (`src/hermes_voip/dtmf.py:430`).
 - [x] **[medium] observability** — Add per-frame CPU microbenchmark for `call_progress.on_audio_frame` and record against ADR-0005 budget. — verified shipped on main 2026-06-27 (media/call_progress.py microbench + tests/test_call_progress_microbench.py) Rule 22 requires concrete per-frame latency numbers for every hot-path module; `CallProgressDetector.on_audio_frame` benchmarks at ~179 µs/frame (16 kHz, 10 Goertzel passes) — ~9 ms CPU/second — yet no microbenchmark, no ADR-0005 budget reference, and no per-frame comment exists. Add a benchmark in `tests/` or `benchmarks/` with `pytest-benchmark` or `timeit`; add the measured figure as a comment near `on_audio_frame` (call_progress.py:482) and the pump's feed site (call_loop.py:1151), following the pattern at engine.py:267 (`src/hermes_voip/media/call_progress.py:482`, `call_loop.py:1151`).
 - [ ] **[low] efficiency** — Replace Python list + `struct.pack` splat in `linear_fade_out` with `bytearray` + `struct.pack_into`. `audio.py:162-170` calls `list(struct.unpack(f'<{total}h', pcm16))` — allocating a Python list of ~160 ints — then `struct.pack(f'<{total}h', *samples)` with a variadic splat; measured ~51,588 ns/call. A `bytearray`-based rewrite (`ba = bytearray(pcm16)` then `struct.pack_into('<h', ba, offset, val)`) avoids both the list allocation and the `*samples` splat via in-place writes. ADR-0028's barge-in contract requires the fade to complete within one frame, so this cannot be deferred (`src/hermes_voip/media/audio.py:162-170`).
-- [ ] **[medium] efficiency** — `RtpMediaTransport._next_datagram()` (engine.py:1841-1872) creates+cancels asyncio tasks for recv_queue.get()/stop_event.wait()/watchdog on EVERY receive iteration: ~100-150 task objects/sec/call on the event-loop hot path. Refactor to a no-per-packet-task wait that preserves stop/watchdog semantics. (perf gap-review Wave-1 2026-06-27)
-- [ ] **[medium] efficiency** — `send_audio()` (engine.py:1988-2004) appends to an immutable bytes `_tx_buffer` then front-slices while draining → O(n) reallocation per emitted frame on the outbound media hot path. Replace with a bytearray/cursor (ring-buffer shape) so reframing stays sample-continuous without copying the remainder. (perf gap-review Wave-1 2026-06-27)
+- [x] (#310) **[medium] efficiency** — `RtpMediaTransport._next_datagram()` (engine.py:1841-1872) creates+cancels asyncio tasks for recv_queue.get()/stop_event.wait()/watchdog on EVERY receive iteration: ~100-150 task objects/sec/call on the event-loop hot path. Refactor to a no-per-packet-task wait that preserves stop/watchdog semantics. (perf gap-review Wave-1 2026-06-27)
+- [x] (#310) **[medium] efficiency** — `send_audio()` (engine.py:1988-2004) appends to an immutable bytes `_tx_buffer` then front-slices while draining → O(n) reallocation per emitted frame on the outbound media hot path. Replace with a bytearray/cursor (ring-buffer shape) so reframing stays sample-continuous without copying the remainder. (perf gap-review Wave-1 2026-06-27)
 - [x] **[low] efficiency** — STT worker counts fed samples via `len(item.tobytes()) // 4` (sherpa_onnx.py:294-295), materialising a ~1280-byte copy per 20ms frame (50/sec/call). Extend the FloatArray protocol (stt/resample.py) with a length/size surface and count without tobytes(). (perf gap-review Wave-1 2026-06-27) — shipped #295
 
 ### Observability
 
 - [x] **[medium] observability** — Add structured `extra={}` fields to spoken-error replacement log in `adapter.py`. — verified shipped on main 2026-06-27 (adapter.py provider_error_replaced + tests/test_adapter.py caplog) The runbook-0014 §Error handling lists `voip.errors.spoken_to_caller` as NOT YET INSTRUMENTED. The only code path that detects an error-spoken-to-caller event is `adapter.py:1390-1395` where `is_provider_error()` triggers a `WARNING` log with a plain `%`-format string and no `extra={}` kwargs. Fix: add `extra={'event': 'provider_error_spoken', 'call_id': chat_id}` to the existing `logging.warning` call; add a `caplog` test asserting the event fires (`src/hermes_voip/adapter.py:1390-1395`).
-- [ ] **[low] observability** — Thread `call_id` into call-progress event log and add structured `extra={}` fields. `call_loop.py:1016` logs `'call-progress: %s at %.2fs'` inside `_surface_call_progress()` with no `extra={}` fields and no `call_id`, so AMD/fax/progress detections (ADR-0064) cannot be correlated to a specific call in structured log queries. `CallLoop` stores `self._call_id` (line 688). Fix: add `extra={'event': 'call_progress', 'call_id': self._call_id, 'kind': event.kind.value, 'elapsed_s': event.elapsed_s}` to the INFO call (one-line change) (`src/hermes_voip/media/call_loop.py:1016`).
-- [ ] **[low] observability** — Add structured `extra={}` to registration lifecycle log events in `manager.py`. `manager.py:353-355` emits `'SIP registration established'` as plain `%`-format strings with the `expires` value embedded in message text, not as a typed `extra=` field, requiring automated log aggregators to regex-parse the numeric value. Fix: add `extra={'event': 'sip_registration_established', 'expires_s': outcome.expires}` to the INFO call and `extra={'event': 'sip_registration_refreshed', 'expires_s': outcome.expires}` to the DEBUG call (rule 34 respected — extension number is deliberately omitted per existing comment at manager.py:348-351) (`src/hermes_voip/manager.py:353-355`).
-- [ ] **[low] observability** — Emit structured event log on TTS failover to primary so failover rate is SLO-observable. `tts/failover.py:344` and `:350` emit WARNING log lines for pre-audio and mid-utterance primary failure with no `extra={}` fields, so TTS provider availability cannot be counted in structured log aggregation. Fix: add `extra={'event': 'tts_primary_failover', 'emitted_frames': self._emitted}` at both sites (two-line change; the provider interface is call-agnostic by design so no `call_id` is available) (`src/hermes_voip/tts/failover.py:344,350`).
+- [x] **[low] observability** (#276) — Thread `call_id` into call-progress event log and add structured `extra={}` fields. `call_loop.py:1016` logs `'call-progress: %s at %.2fs'` inside `_surface_call_progress()` with no `extra={}` fields and no `call_id`, so AMD/fax/progress detections (ADR-0064) cannot be correlated to a specific call in structured log queries. `CallLoop` stores `self._call_id` (line 688). Fix: add `extra={'event': 'call_progress', 'call_id': self._call_id, 'kind': event.kind.value, 'elapsed_s': event.elapsed_s}` to the INFO call (one-line change) (`src/hermes_voip/media/call_loop.py:1016`).
+- [x] **[low] observability** (#274) — Add structured `extra={}` to registration lifecycle log events in `manager.py`. `manager.py:353-355` emits `'SIP registration established'` as plain `%`-format strings with the `expires` value embedded in message text, not as a typed `extra=` field, requiring automated log aggregators to regex-parse the numeric value. Fix: add `extra={'event': 'sip_registration_established', 'expires_s': outcome.expires}` to the INFO call and `extra={'event': 'sip_registration_refreshed', 'expires_s': outcome.expires}` to the DEBUG call (rule 34 respected — extension number is deliberately omitted per existing comment at manager.py:348-351) (`src/hermes_voip/manager.py:353-355`).
+- [x] **[low] observability** (#275) — Emit structured event log on TTS failover to primary so failover rate is SLO-observable. `tts/failover.py:344` and `:350` emit WARNING log lines for pre-audio and mid-utterance primary failure with no `extra={}` fields, so TTS provider availability cannot be counted in structured log aggregation. Fix: add `extra={'event': 'tts_primary_failover', 'emitted_frames': self._emitted}` at both sites (two-line change; the provider interface is call-agnostic by design so no `call_id` is available) (`src/hermes_voip/tts/failover.py:344,350`).
 
 ### UX / conversational
 
@@ -1111,3 +1111,52 @@ below were not in the backlog before the issues were filed.
 - [ ] **[medium] obs** — Adapter call path: emit a structured `extra={event,…}` per-turn latency/timing log (local-only emission; observability, runbook-0014 SLOs). Note: this touches the hot serialized `adapter.py` — orchestrator-owned, single lane.
 - [ ] **[low] docs** — Reconcile drift in `docs/runbooks/0009` against current behaviour (rule 27/42).
 - [ ] **[low] docs/packaging** — Document the built-wheel / dist / PyPI trove classifiers + `py.typed` packaging story in README (follows #307).
+
+## Wave-7 gap-review (discovered 2026-06-27)
+
+Two self-referential backlog-hygiene items from the 37-candidate review were applied directly to existing lines instead of being re-added here. Six items are already in flight this wave and stay open until their PRs merge: RTCP UTF-8 CNAME parse, registration `isdigit()` parsing, `classify_provider_error()` tests, Deepgram `CloseStream`, duplicate `rtpmap`, and TLS minimum 1.2. Some of that in-flight set is tracked on pre-existing lines; newly discovered items are appended below.
+
+### Correctness / robustness / security
+
+- [ ] **[medium] correctness** — RTCP SDES UTF-8 CNAME parse raises `UnicodeEncodeError` instead of the contracted `RtcpError` on non-ASCII inbound names. (`src/hermes_voip/rtcp.py`)
+- [ ] **[low] correctness** — REGISTER binding matching uses raw string equality instead of RFC 3261 SIP-URI comparison, so equivalent echoed Contacts can refresh against the wrong binding expiry. (`src/hermes_voip/registration.py`)
+- [ ] **[medium] robustness** — `isdigit()` admits Unicode digits that `int()` cannot parse, crashing REGISTER 200-OK handling. (`src/hermes_voip/registration.py`)
+- [ ] **[low] robustness** — `_next_comfort_phrase()` / `_next_reprompt_phrase()` raise `IndexError` when the phrases tuple is empty. (`src/hermes_voip/media/call_loop.py`)
+- [ ] **[medium] security** — Pin the SIP-over-TLS/WSS client TLS minimum to 1.2 for downgrade defence-in-depth. (`src/hermes_voip/adapter.py`)
+- [ ] **[low] correctness** — `HERMES_VOIP_RING_TIMEOUT_SECS` is validated at tool-call time instead of startup, so config errors surface late. (`src/hermes_voip/voip_tools.py`)
+
+### Tests
+
+- [ ] **[high] test** — Held-call session refresh needs a regression test that a held call stays `sendonly`. (`tests/test_adapter_session_timers.py`)
+- [ ] **[medium] test** — Pin `classify_provider_error()` category tokens and precedence so structured error categories cannot drift. (`tests/test_provider_error.py`)
+- [ ] **[medium] test** — Deepgram shutdown should assert the exact `CloseStream` control frame, not just any text frame. (`tests/stt/test_deepgram.py`)
+
+### Docs drift
+
+- [ ] **[low] docs** — ADR-0019 still says "to be implemented" and shows the wrong `build_audio_offer` signature. (`docs/adr/0019-outbound-calling-uac-originate.md`)
+- [ ] **[low] docs** — ADR-0010 still claims the expected-length terminator is "not yet wired" with no tracked plan. (`docs/adr/0010-dtmf-handling.md`)
+- [ ] **[low] docs** — Runbook 0014 contains aspirational "NOT YET INSTRUMENTED" / "Metrics sink still TBD" language that violates rule 27. (`docs/runbooks/0014-voip-slo-metrics.md`)
+- [ ] **[medium] docs** — Runbook 0013 "registration down" diagnostics omit the ADR-0088 non-positive-expires failure log pattern. (`docs/runbooks/0013-voip-incident-oncall.md`)
+
+### API / ergonomics
+
+- [ ] **[medium] api** — The backlog false-closed `media/call_loop.py` `__all__`; the module still lacks an explicit public boundary. (`src/hermes_voip/media/call_loop.py`)
+- [ ] **[low] api** — `aio.py` lacks `__all__`, so internal threading scaffold classes leak on star-imports. (`src/hermes_voip/aio.py`)
+
+### Performance / efficiency
+
+- [ ] **[low] efficiency** — Replace `struct.unpack_from` + generator peak scan with `audioop.max` in `call_loop._play()`. (`src/hermes_voip/media/call_loop.py`)
+- [ ] **[low] efficiency** — Widen call-progress / Goertzel helpers to accept `Sequence[float]` so `on_audio_frame` can avoid a per-frame `list[float]` allocation. (`src/hermes_voip/media/call_progress.py`)
+- [ ] **[low] efficiency** — Remove the redundant `float()` coercion in `EchoCanceller.push_reference()`'s per-sample loop. (`src/hermes_voip/media/aec.py`)
+
+### Observability
+
+- [ ] **[high] observability** — Emit a structured log event on SIP registration failure so rejects and timeouts are queryable. (`src/hermes_voip/manager.py`)
+
+### UX / conversational
+
+- [ ] **[medium] ux** — A spoke-but-untranscribed caller should get a "didn't catch that" reprompt instead of silence followed by "Are you still there?". (`src/hermes_voip/media/call_loop.py`)
+
+### Product features
+
+- [ ] **[medium] feature** — Outbound agents cannot send DTMF through callee IVRs because `send_dtmf` is ELEVATED while the outbound persona is level 0. (`src/hermes_voip/caller_modes.py`)

@@ -13,19 +13,22 @@ INVITE.
 
 from __future__ import annotations
 
-from hermes_voip.transport.connection import SipOverTlsTransport
+from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
 from hermes_voip.transport.framing import FramingError, SipMessageFramer
 from hermes_voip.transport.transaction import (
     InviteClientTransaction,
     InviteServerTransaction,
     TransactionState,
 )
+from hermes_voip.transport.ws_connection import WssSipTransport
 
 __all__ = [
+    "CallResponseSink",
     "FramingError",
     "InviteClientTransaction",
     "InviteServerTransaction",
     "SipMessageFramer",
     "SipOverTlsTransport",
     "TransactionState",
+    "WssSipTransport",
 ]

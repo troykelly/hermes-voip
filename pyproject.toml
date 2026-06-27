@@ -1,6 +1,6 @@
 [project]
 name = "hermes-voip"
-version = "0.1.0"
+version = "0.1.1"
 description = "Hermes plugin for two-way voice over telephony, on any RFC-compliant SIP-over-TLS or WebRTC voice gateway."
 readme = "README.md"
 requires-python = ">=3.13"

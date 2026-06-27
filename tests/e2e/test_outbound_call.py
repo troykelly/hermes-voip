@@ -2003,7 +2003,10 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
             assert isinstance(adapter, VoipAdapter)
 
             def _negotiate_then_race(
-                offer: AudioMedia, supported: Sequence[str]
+                offer: AudioMedia,
+                supported: Sequence[str],
+                *,
+                prefer_local: bool = True,
             ) -> tuple[Codec, ...]:
                 # On the first (and only) acceptance, simulate an abort that landed
                 # in this same tick: the 2xx is already dequeued and ACKed, but the
@@ -2013,7 +2016,7 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
                     pending = next(iter(adapter._outbound_pending.values()))
                     pending.cancel_requested = True
                     pending.reason = "raced abort"
-                return negotiate_audio(offer, supported)
+                return negotiate_audio(offer, supported, prefer_local=prefer_local)
 
             with patch(
                 "hermes_voip.adapter.negotiate_audio",

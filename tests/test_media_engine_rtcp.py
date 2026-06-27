@@ -402,6 +402,55 @@ def test_ingest_updates_loss_and_jitter_quality_from_peer_report() -> None:
     assert q.remote_jitter_ms == pytest.approx(30.0, abs=0.01)
 
 
+def _raw_sdes_with_utf8_cname(ssrc: int, cname_bytes: bytes) -> bytes:
+    """Hand-build a structurally-valid SDES packet carrying a raw-byte CNAME.
+
+    Lets the test inject a multibyte UTF-8 CNAME on the wire without depending on the
+    packer's encoding, mirroring what a browser/Asterisk/FreeSWITCH sends (RFC 3550
+    §6.5: SDES item text is UTF-8).
+    """
+    item = bytes([1, len(cname_bytes)]) + cname_bytes  # type=CNAME(1), len, text
+    raw = struct.pack("!I", ssrc) + item + b"\x00"
+    raw += b"\x00" * ((-len(raw)) % 4)  # pad chunk to a 32-bit boundary
+    header = bytes([0x80 | 1, 202]) + struct.pack("!H", len(raw) // 4)  # PT 202 = SDES
+    return header + raw
+
+
+def test_ingest_compound_with_utf8_cname_still_absorbs_rr_stats() -> None:
+    """A compound RR + SDES(UTF-8 CNAME) must not abort: the RR loss/jitter still land.
+
+    RFC 3550 §6.5: SDES item text is UTF-8. A valid non-ASCII CNAME bundled with an
+    SR/RR must NOT crash compound parse and discard the SR/RR loss/RTT stats. This
+    fails before the fix (UnicodeEncodeError aborts the whole compound) and passes
+    after (the RR block updates call_quality despite the multibyte CNAME).
+    """
+    engine = _make_engine()
+    peer_rr = ReceiverReport(
+        ssrc=_PEER_SSRC,
+        report_blocks=(
+            ReportBlock(
+                ssrc=OUTBOUND_AUDIO_SSRC,
+                fraction_lost=128,  # half
+                cumulative_lost=42,
+                extended_highest_seq=1000,
+                jitter=240,  # 8 kHz clock units → 30 ms
+                lsr=0,
+                dlsr=0,
+            ),
+        ),
+    )
+    # "h" + U+00E9 (2-byte 0xC3 0xA9) + "y" — a valid multibyte UTF-8 CNAME.
+    sdes_raw = _raw_sdes_with_utf8_cname(_PEER_SSRC, b"h\xc3\xa9y")
+    datagram = peer_rr.pack() + sdes_raw
+
+    engine.ingest_rtcp(datagram)
+
+    q = engine.call_quality
+    assert q.remote_fraction_lost == pytest.approx(128 / 256)
+    assert q.remote_cumulative_lost == 42
+    assert q.remote_jitter_ms == pytest.approx(30.0, abs=0.01)
+
+
 def test_ingest_malformed_rtcp_raises() -> None:
     """A structurally broken RTCP datagram propagates an error (rule 37)."""
     engine = _make_engine()

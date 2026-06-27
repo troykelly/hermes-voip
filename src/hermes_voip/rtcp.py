@@ -541,7 +541,9 @@ class SdesChunk:
         if not 0 <= self.ssrc <= _U32:
             msg = f"ssrc out of range 0..2^32-1: {self.ssrc}"
             raise ValueError(msg)
-        encoded = self.cname.encode("ascii")
+        # RFC 3550 §6.5: SDES item text is UTF-8 and the 8-bit length field caps the
+        # item at 255 *octets* — measured on the UTF-8 byte length, not char count.
+        encoded = self.cname.encode("utf-8")
         if len(encoded) > _U8_MAX:
             msg = f"CNAME exceeds the 255-octet SDES item limit: {len(encoded)} octets"
             raise ValueError(msg)
@@ -598,7 +600,7 @@ class SourceDescription:
 
 def _pack_sdes_chunk(chunk: SdesChunk) -> bytes:
     """Pack one SDES chunk: SSRC + CNAME item + null terminator, padded to 4 bytes."""
-    cname = chunk.cname.encode("ascii")
+    cname = chunk.cname.encode("utf-8")  # RFC 3550 §6.5: SDES item text is UTF-8
     item = bytes([_SDES_ITEM_CNAME, len(cname)]) + cname
     # RFC 3550 §6.5: the item list is terminated by at least one null octet, then
     # padded with nulls to the next 32-bit boundary.
@@ -634,7 +636,14 @@ def _parse_sdes_chunk(data: bytes, offset: int) -> tuple[SdesChunk, int]:
             msg = "SDES item length runs past the packet"
             raise RtcpError(msg)
         if item_type == _SDES_ITEM_CNAME:
-            cname = data[start:end].decode("ascii", errors="replace")
+            # RFC 3550 §6.5: SDES item text is UTF-8. Decode strictly so a malformed
+            # byte sequence surfaces as an RtcpError (rule 37 — not silently mangled
+            # to U+FFFD), mirroring the BYE reason path.
+            try:
+                cname = data[start:end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                msg = "SDES CNAME is not valid UTF-8"
+                raise RtcpError(msg) from exc
         pos = end
     # Advance over the null padding to the next 32-bit boundary.
     pos += (-(pos - offset)) % _WORD

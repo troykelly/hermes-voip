@@ -335,6 +335,65 @@ def test_sdes_rejects_non_ascii_cname() -> None:
         SourceDescription(chunks=(SdesChunk(ssrc=1, cname="café" * 100),)).pack()
 
 
+def test_parse_compound_sdes_utf8_cname_roundtrips() -> None:
+    """A structurally-valid SDES CNAME carrying multibyte UTF-8 round-trips (§6.5).
+
+    RFC 3550 §6.5: SDES item text is UTF-8. Browsers/Asterisk/FreeSWITCH routinely
+    send a UTF-8 CNAME alongside the SR/RR in a compound. The CNAME path must be
+    UTF-8 end-to-end, so a valid non-ASCII CNAME must NOT raise UnicodeEncodeError
+    on construction nor be mangled to U+FFFD on parse.
+    """
+    # Build the on-wire CNAME bytes directly: "h" + U+00E9 (2-byte 0xC3 0xA9) + "y".
+    cname_bytes = b"h\xc3\xa9y"
+    cname_text = cname_bytes.decode("utf-8")
+    item = bytes([1, len(cname_bytes)]) + cname_bytes  # type=CNAME(1), len, text
+    raw = struct.pack("!I", 0xCAFEBABE) + item + b"\x00"
+    raw += b"\x00" * ((-len(raw)) % 4)  # pad chunk to a 32-bit boundary
+    header = bytes([0x80 | 1, RTCP_PT_SDES]) + struct.pack("!H", len(raw) // 4)
+    wire = header + raw
+
+    parsed = parse_compound(wire)
+    assert len(parsed) == 1
+    sdes = parsed[0]
+    assert isinstance(sdes, SourceDescription)
+    assert sdes.chunks[0].ssrc == 0xCAFEBABE
+    assert sdes.chunks[0].cname == cname_text
+    # And it survives a full re-pack/parse round-trip with the multibyte CNAME.
+    assert SourceDescription.parse(sdes.pack()) == sdes
+
+
+def test_parse_compound_sdes_malformed_utf8_cname_raises_rtcp_error() -> None:
+    """A malformed-UTF-8 SDES CNAME is wrapped as RtcpError, not leaked raw.
+
+    This packet is structurally valid RTCP/SDES (version 2, one chunk, one CNAME item,
+    null terminator, 32-bit padding), so parse_compound reaches _parse_sdes_chunk's
+    strict UTF-8 decode path. Without that try/except wrapper, the same input would leak
+    UnicodeDecodeError instead, and this assertion on RtcpError would fail.
+    """
+    invalid_cname_bytes = (
+        b"\x80"  # lone UTF-8 continuation byte: decode("utf-8") rejects
+    )
+    item = bytes([1, len(invalid_cname_bytes)]) + invalid_cname_bytes
+    raw = struct.pack("!I", 0xDEADC0DE) + item + b"\x00"
+    raw += b"\x00" * ((-len(raw)) % 4)
+    header = bytes([0x80 | 1, RTCP_PT_SDES]) + struct.pack("!H", len(raw) // 4)
+    wire = header + raw
+
+    with pytest.raises(RtcpError, match="SDES CNAME is not valid UTF-8"):
+        parse_compound(wire)
+
+
+def test_sdes_cname_over_255_utf8_bytes_is_error() -> None:
+    """A CNAME whose UTF-8 encoding exceeds 255 octets is rejected (§6.5, 8-bit len).
+
+    The 255-octet cap is on the UTF-8 BYTE length, not the character count: 86 copies
+    of U+00E9 (2 bytes each = 172 bytes) fit, but 128 copies (256 bytes) do not.
+    """
+    SdesChunk(ssrc=1, cname="é" * 86)  # 172 octets: within the 255-octet limit
+    with pytest.raises((ValueError, RtcpError)):
+        SdesChunk(ssrc=1, cname="é" * 128)  # 256 octets: over the limit
+
+
 # ---------------------------------------------------------------------------
 # BYE (RFC 3550 §6.6)
 # ---------------------------------------------------------------------------

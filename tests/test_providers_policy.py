@@ -150,3 +150,77 @@ def test_allowed_tools_is_stored_as_given() -> None:
     assert state.allowed_tools == frozenset({"open_entry"})
     # It does not perturb the other state.
     assert state.privilege_level == 2
+
+
+# ---------------------------------------------------------------------------
+# GuardVerdict ascending severity: ALLOW < CLARIFY < RESTRICT < REFUSE
+# ---------------------------------------------------------------------------
+
+
+def test_guard_verdict_severity_ordering() -> None:
+    """GuardVerdict members support rich comparison in documented ascending severity."""
+    # Documented order: ALLOW=least-severe, REFUSE=most-severe
+    assert GuardVerdict.REFUSE > GuardVerdict.ALLOW, (
+        "REFUSE must be strictly more severe than ALLOW"
+    )
+    assert GuardVerdict.REFUSE > GuardVerdict.CLARIFY, (
+        "REFUSE must be strictly more severe than CLARIFY"
+    )
+    assert GuardVerdict.REFUSE > GuardVerdict.RESTRICT, (
+        "REFUSE must be strictly more severe than RESTRICT"
+    )
+    assert GuardVerdict.RESTRICT > GuardVerdict.CLARIFY, (
+        "RESTRICT must be strictly more severe than CLARIFY"
+    )
+    assert GuardVerdict.RESTRICT > GuardVerdict.ALLOW, (
+        "RESTRICT must be strictly more severe than ALLOW"
+    )
+    assert GuardVerdict.CLARIFY > GuardVerdict.ALLOW, (
+        "CLARIFY must be strictly more severe than ALLOW"
+    )
+
+
+def test_guard_verdict_least_severe_is_allow() -> None:
+    """ALLOW is the minimum verdict by severity."""
+    assert min(GuardVerdict) == GuardVerdict.ALLOW, (
+        "ALLOW must be the minimum (least-severe) GuardVerdict"
+    )
+
+
+def test_guard_verdict_most_severe_is_refuse() -> None:
+    """REFUSE is the maximum verdict by severity."""
+    assert max(GuardVerdict) == GuardVerdict.REFUSE, (
+        "REFUSE must be the maximum (most-severe) GuardVerdict"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ToolRisk ascending severity (documented order: SAFE < ELEVATED < IRREVERSIBLE)
+# ---------------------------------------------------------------------------
+
+
+def test_tool_risk_severity_ordering() -> None:
+    """ToolRisk members support rich comparison in documented ascending severity."""
+    assert ToolRisk.IRREVERSIBLE > ToolRisk.SAFE, (
+        "IRREVERSIBLE must be strictly more severe than SAFE"
+    )
+    assert ToolRisk.IRREVERSIBLE > ToolRisk.ELEVATED, (
+        "IRREVERSIBLE must be strictly more severe than ELEVATED"
+    )
+    assert ToolRisk.ELEVATED > ToolRisk.SAFE, (
+        "ELEVATED must be strictly more severe than SAFE"
+    )
+
+
+def test_tool_risk_least_severe_is_safe() -> None:
+    """SAFE is the minimum risk level."""
+    assert min(ToolRisk) == ToolRisk.SAFE, (
+        "SAFE must be the minimum (least-severe) ToolRisk"
+    )
+
+
+def test_tool_risk_most_severe_is_irreversible() -> None:
+    """IRREVERSIBLE is the maximum risk level."""
+    assert max(ToolRisk) == ToolRisk.IRREVERSIBLE, (
+        "IRREVERSIBLE must be the maximum (most-severe) ToolRisk"
+    )

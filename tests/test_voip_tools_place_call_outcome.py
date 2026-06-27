@@ -429,7 +429,7 @@ def test_parse_ring_timeout_rejects_infinity(
 
 
 # ---------------------------------------------------------------------------
-# Ring timeout: positive infinity must be rejected (bounded-timeout policy)
+# Ring timeout: a value over the 3600s maximum is rejected before dialing
 # ---------------------------------------------------------------------------
 
 
@@ -459,7 +459,7 @@ async def test_ring_timeout_over_max_is_rejected_before_dial(
 
 
 # ---------------------------------------------------------------------------
-# Ring timeout: positive infinity must be rejected (bounded-timeout policy)
+# Ring timeout: expiry fires CANCEL and yields a NO_ANSWER outcome
 # ---------------------------------------------------------------------------
 
 
@@ -570,11 +570,6 @@ async def test_place_call_runtime_error_does_not_leak_gateway_detail(
     assert "pbx.example.test" not in blob
     assert "5061" not in blob
     assert "connection refused" not in blob
-
-
-# ---------------------------------------------------------------------------
-# Ring timeout: positive infinity must be rejected (bounded-timeout policy)
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

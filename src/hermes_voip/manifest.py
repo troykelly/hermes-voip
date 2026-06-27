@@ -31,7 +31,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import assert_never
 
 __all__ = [
@@ -174,6 +174,18 @@ class ModelFile:
         """Reject a file that is not a real pin (no name, bad digest, no licence)."""
         if not self.name:
             msg = "ModelFile.name must not be empty"
+            raise ValueError(msg)
+        # Validate, don't trust: reject absolute paths and parent-traversal segments
+        # so a malicious manifest cannot direct verify_model_files to hash a file
+        # outside the model directory.  Checked here (construction) so the invariant
+        # is enforced as early as possible — belt; verify_model_files re-checks as
+        # suspenders.
+        _name_pure = PurePosixPath(self.name)
+        if _name_pure.is_absolute() or ".." in _name_pure.parts:
+            msg = (
+                f"ModelFile.name must be a relative path with no path traversal, "
+                f"got {self.name!r}"
+            )
             raise ValueError(msg)
         if _SHA256_RE.fullmatch(self.sha256) is None:
             msg = (
@@ -397,10 +409,23 @@ def verify_model_files(manifest: ModelManifest, model_dir: str) -> None:
     """
     root = Path(model_dir)
     for file in manifest.files:
+        # Belt-and-suspenders: ModelFile.__post_init__ already rejects traversal
+        # names at construction, but we re-check here so that any hypothetical
+        # bypass (e.g. unpickling, object.__setattr__ on the frozen dataclass, or a
+        # future code path that skips construction) cannot reach the filesystem open.
+        _name_pure = PurePosixPath(file.name)
+        if _name_pure.is_absolute() or ".." in _name_pure.parts:
+            msg = (
+                f"{manifest.repo}@{manifest.revision}: pinned file {file.name!r} "
+                f"contains path traversal — refusing to hash a file outside the "
+                f"model directory"
+            )
+            raise ModelIntegrityError(msg)
         path = root / file.name
         if not path.is_file():
             msg = (
                 f"{manifest.repo}@{manifest.revision}: pinned file {file.name!r} "
+                f"(expected sha256 {file.sha256[:_DIGEST_PREFIX_LEN]}…) "
                 f"is missing from the model directory"
             )
             raise ModelIntegrityError(msg)

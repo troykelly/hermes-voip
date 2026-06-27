@@ -11,6 +11,8 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-27
+
 ### Added
 
 - **Automated publish on tag** — pushing a `vX.Y.Z` tag (including pre-releases
@@ -20,6 +22,68 @@ pinned equal by the test suite.
   to a GitHub Release; and an independent `pypi-publish` job publishes them to PyPI
   via OIDC Trusted Publishing with PEP 740 attestations and no stored token. See
   [docs/runbooks/0019-release-process.md](docs/runbooks/0019-release-process.md).
+  (#235)
+- **JitterBuffer accessors and SSRC-aware auto-reset** — `__len__`, `peek`, `flush`,
+  and `reset` methods on `JitterBuffer`; automatic per-SSRC state reset on SSRC
+  change so a re-invited call gets a clean buffer. (#221)
+- **Plugin manifest admission knobs** — `HERMES_SIP_MAX_CALLS` and
+  `HERMES_SIP_SHUTDOWN_DRAIN_SECS` declared in `plugin.yaml` `optional_env` so the
+  config wizard surfaces them. (#222)
+- **Manifest platform label and per-env prompt fields** — `label` and `prompt` fields
+  on all `requires_env` / `optional_env` entries, aligned with the `hermes config`
+  setup-wizard platform injector (ADR-0037). (#228)
+- **`resample_frame` preserves `monotonic_ts_ns`** — `resample_frame(PcmFrame)`
+  returns a `PcmFrame` with the original monotonic timestamp intact rather than
+  silently zeroing it. (#233)
+- **DTMF enum-tagged `feed()` result** — `DtmfDetector.feed()` now returns a typed
+  `DtmfPress | DtmfNoPress` discriminated union instead of an untagged optional,
+  collapsing the `_order` / `_seen` internal state into a single cleaner structure.
+  (#232)
+- **Provider input validation** — `PcmFrame`, `Transcript`, and `GuardResult`
+  constructors validate their fields and reject malformed input; odd-length PCM
+  chunks in the TTS send path are realigned before codec processing. (#225)
+- **Scheduled supply-chain audit** — `.github/workflows/supply-chain.yml` gains a
+  daily cron trigger and `workflow_dispatch` so the advisory audit runs automatically.
+  (#224)
+
+### Changed
+
+- ⚠ **Registration enforces `sips:` AOR on TLS/WSS transports** — a `sip:` AOR
+  supplied with a TLS or WSS transport now **raises `ConfigurationError` at config
+  load** (it previously silently accepted a potentially downgrade-vulnerable AOR).
+  The default AOR scheme is `sips:`. Deployers using an explicit `sip:` AOR on a
+  TLS/WSS transport must update their configuration to use `sips:` before upgrading.
+  Digest `nc`/`stale`/`qop` contract constraints are also pinned and tested.
+  (#230)
+- **SDP answerer-preference codec ordering** — the SDP answerer now preserves the
+  peer's codec order on received 2xx answers, while still applying local preference
+  when generating offers. (#234)
+
+### Fixed
+
+- **Non-audio re-INVITE returns 488** — a re-INVITE carrying a non-audio SDP (e.g.
+  video-only) is now correctly answered 488 Not Acceptable Here instead of being
+  misclassified as an offerless re-INVITE. (#229)
+- **Transport skips malformed SIP message** — a message that cannot be parsed (bad
+  framing, missing mandatory headers, etc.) is now skipped and logged; the transport
+  connection and all active calls continue rather than the connection being dropped.
+  (#231)
+- **Intercom control-character rejection** — control characters in intercom
+  configuration are rejected at config load; wrapped relay/webhook errors are
+  sanitised before surfacing. (#226)
+- **Docs reconciled** — stale `IMPLEMENTATION-PLAN` / `MULTIREG` plan documents
+  updated; outbound CANCEL runbook coverage added. (#227)
+- **DTMF mutation-hardening vectors** — encode() end-bit and volume edge cases, and
+  bounded-window eviction, are now covered by deterministic mutation tests. (#223)
+- **`Record-Route` header comma-splitting** — comma-combined `Record-Route` headers
+  are now split per RFC 3261 §7.3.1 so multi-hop dialog routing works correctly.
+  (#218)
+- **Content-Length line-folding** — line-folded `Content-Length` values in the SIP
+  stream framer are now unfolded before parsing. (#216)
+- **RTP padding rejection** — malformed RTP padding is rejected; jitter-buffer depth
+  semantics are pinned by tests. (#215)
+- **Digest nc range + control-char validation** — `nc` is validated within the
+  32-bit range and per-field control-character rejection is enforced. (#214)
 
 ## [0.1.0] - 2026-06-23
 
@@ -107,5 +171,6 @@ gateway.
   `plugin.yaml` manifest version equal, so a release is a single edit in
   `pyproject.toml`.
 
-[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/troykelly/hermes-voip/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/troykelly/hermes-voip/releases/tag/v0.1.0

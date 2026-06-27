@@ -23,13 +23,20 @@ applies :func:`gate_voip_tool` in its ``pre_tool_call`` hook.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 from hermes_voip.dialog import Dialog
 from hermes_voip.manager import RegistrationStatus
-from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_call
+from hermes_voip.providers.policy import (
+    GuardSessionState,
+    ToolRisk,
+    gate_tool_call,
+)
+
+_log: Final = logging.getLogger(__name__)
 
 # A bound call action (PEP 695 alias; ControllableCall is defined below — the
 # right-hand side is evaluated lazily).
@@ -133,17 +140,43 @@ def gate_voip_tool(
     """
     risk = TOOL_RISKS.get(tool_name)
     if risk is None:
+        _log.warning(
+            "gate_voip_tool BLOCK tool=%s call=%s reason=unknown_tool",
+            tool_name,
+            state.call_id,
+        )
         return False
     if tool_name in _GRANT_ONLY_TOOLS and tool_name not in state.allowed_tools:
         # Grant-only (physical-access) tool with no explicit grant: blocked even for
         # an operator and even when allowed_tools is empty. Only a group that lists
         # it (the intercom group) may reach it.
+        _log.warning(
+            "gate_voip_tool BLOCK tool=%s call=%s reason=not_granted",
+            tool_name,
+            state.call_id,
+        )
         return False
     if state.allowed_tools and tool_name not in state.allowed_tools:
         # Scoped session: this tool is outside the group's allow-list. Remove it
         # regardless of the level (the sub-ceiling never grants, only removes).
+        _log.warning(
+            "gate_voip_tool BLOCK tool=%s call=%s reason=not_allowlisted",
+            tool_name,
+            state.call_id,
+        )
         return False
-    return gate_tool_call(risk, state, confirmed=confirmed)
+    # ADR-0085: gate_tool_call returns a typed GateDecision. Branch on ``.allowed``
+    # (preserving this function's bool contract for the REFER chokepoints) and audit
+    # the structured ``.reason`` on a block so the operator sees WHY the gate refused.
+    decision = gate_tool_call(risk, state, confirmed=confirmed)
+    if not decision.allowed:
+        _log.warning(
+            "gate_voip_tool BLOCK tool=%s call=%s reason=%s",
+            tool_name,
+            state.call_id,
+            decision.reason.value,
+        )
+    return decision.allowed
 
 
 @dataclass(frozen=True, slots=True)

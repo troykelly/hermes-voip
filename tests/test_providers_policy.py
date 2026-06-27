@@ -6,7 +6,12 @@ or the action is unconfirmed. The truth table is asserted exhaustively.
 """
 
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
-from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_call
+from hermes_voip.providers.policy import (
+    GateDecision,
+    GuardSessionState,
+    ToolRisk,
+    gate_tool_call,
+)
 
 
 def _result(
@@ -34,36 +39,39 @@ def _flagged(verdict: GuardVerdict) -> GuardResult:
 
 def test_safe_tools_always_run() -> None:
     state = GuardSessionState(call_id="c1")
-    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True
     state.degraded = True
-    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True
 
 
 def test_gate_is_total_over_tool_risk() -> None:
-    # Every ToolRisk member yields a bool; none falls through to assert_never.
+    # Every ToolRisk member yields a GateDecision (ADR-0085: the gate returns a
+    # typed decision, not a bare bool); none falls through to assert_never.
     state = GuardSessionState(call_id="c1")
     for risk in ToolRisk:
-        assert isinstance(gate_tool_call(risk, state, confirmed=True), bool)
+        assert isinstance(gate_tool_call(risk, state, confirmed=True), GateDecision)
 
 
 def test_irreversible_requires_confirmation() -> None:
     state = GuardSessionState(call_id="c1")
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False) is False
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is True
+    assert (
+        gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False).allowed is False
+    )
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is True
 
 
 def test_irreversible_blocked_when_degraded_even_if_confirmed() -> None:
     # The ADR-0009 miss case: classifier may have ALLOWed, but a degraded guard
     # must still hard-block irreversible actions regardless of confirmation.
     state = GuardSessionState(call_id="c1", degraded=True)
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
 
 
 def test_elevated_blocked_only_when_degraded() -> None:
     state = GuardSessionState(call_id="c1")
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
     state.degraded = True
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
 
 
 def test_degraded_is_sticky_via_record() -> None:

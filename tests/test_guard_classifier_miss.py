@@ -61,7 +61,9 @@ async def test_missed_injection_still_blocked_unconfirmed_irreversible() -> None
 
     # ...yet the IRREVERSIBLE call-transfer the injection asked for is BLOCKED,
     # because it was never confirmed (human/DTMF). The gate is the control.
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False) is False
+    assert (
+        gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False).allowed is False
+    )
 
 
 @pytest.mark.asyncio
@@ -91,8 +93,8 @@ async def test_missed_injection_blocked_when_session_degraded_even_if_confirmed(
     # ...but the degraded clamp hard-blocks the irreversible action regardless of
     # the ALLOW verdict AND even if the caller "confirmed". This is the case the
     # classifier can never be trusted to catch.
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
     # An ELEVATED (reversible) tool is also clamped while degraded...
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=True).allowed is False
     # ...but a read-only SAFE tool still works (the caller is never dropped).
-    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True

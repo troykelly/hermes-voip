@@ -92,7 +92,7 @@ __all__ = [
     "TRANSFER_BLIND_TOOL_NAME",
     "TRANSFER_BLIND_TOOL_SCHEMA",
     "VOIP_TOOLSET",
-    "_RING_TIMEOUT_ENV",  # ADR-0084: stable public name of the ring-timeout env var
+    "_RING_TIMEOUT_ENV",  # ADR-0086: stable public name of the ring-timeout env var
     "AttendedTransferOutcome",
     "PlaceCallOutcome",
     "TransferOutcome",
@@ -215,7 +215,7 @@ class AttendedTransferOutcome(Enum):
 
 
 class PlaceCallOutcome(Enum):
-    """The structured outcome of a failed ``place_call`` (ADR-0084).
+    """The structured outcome of a failed ``place_call`` (ADR-0086).
 
     Maps distinct SIP failure classes to a typed outcome the agent can branch
     on, WITHOUT leaking the gateway host, extension, or any other PII:
@@ -1108,7 +1108,7 @@ async def place_call_handler(  # noqa: PLR0911 — each return is a distinct, cl
         except RuntimeError as exc:
             # A transport/media-initialisation failure (e.g. the RTP transport could
             # not be opened, or the WSS/WebRTC path is unsupported): NOT a SIP final
-            # response, but ADR-0084 classifies it as the FAILED outcome so the agent
+            # response, but ADR-0086 classifies it as the FAILED outcome so the agent
             # still receives the structured ``failure_outcome`` contract instead of a
             # generic, unstructured error. The exception message can embed gateway
             # connection details (host:port) — so, exactly like the SIP path above

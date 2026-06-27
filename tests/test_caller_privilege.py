@@ -52,29 +52,31 @@ def test_unprivileged_session_blocks_elevated_even_when_clean() -> None:
     state = GuardSessionState(call_id="c1", privileged=False)
     # Not degraded, no confirmation needed for ELEVATED normally — still blocked.
     assert state.degraded is False
-    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
 
 
 def test_unprivileged_session_blocks_irreversible_even_when_confirmed() -> None:
     state = GuardSessionState(call_id="c1", privileged=False)
     # Even a (spoofed) confirmation and a clean session cannot lift the clamp.
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True) is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
 
 
 def test_unprivileged_session_still_allows_safe_tools() -> None:
     # The caller is never dropped: read-only SAFE tools still run.
     state = GuardSessionState(call_id="c1", privileged=False)
-    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False) is True
+    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True
 
 
 def test_privileged_session_keeps_existing_behaviour() -> None:
     # privileged=True (the default) must change NOTHING about the ADR-0009 gate.
     clean = GuardSessionState(call_id="c1", privileged=True)
-    assert gate_tool_call(ToolRisk.ELEVATED, clean, confirmed=False) is True
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, clean, confirmed=True) is True
-    assert gate_tool_call(ToolRisk.IRREVERSIBLE, clean, confirmed=False) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, clean, confirmed=False).allowed is True
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, clean, confirmed=True).allowed is True
+    assert (
+        gate_tool_call(ToolRisk.IRREVERSIBLE, clean, confirmed=False).allowed is False
+    )
     degraded = GuardSessionState(call_id="c1", privileged=True, degraded=True)
-    assert gate_tool_call(ToolRisk.ELEVATED, degraded, confirmed=False) is False
+    assert gate_tool_call(ToolRisk.ELEVATED, degraded, confirmed=False).allowed is False
 
 
 def test_gate_voip_tool_honours_the_privilege_clamp() -> None:

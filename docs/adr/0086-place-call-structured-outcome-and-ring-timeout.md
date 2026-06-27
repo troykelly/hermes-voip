@@ -1,4 +1,4 @@
-# ADR-0084: `place_call` structured outbound failure outcome + bounded ring timeout
+# ADR-0086: `place_call` structured outbound failure outcome + bounded ring timeout
 
 - **Date:** 2026-06-27
 - **Status:** Accepted

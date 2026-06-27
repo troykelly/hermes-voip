@@ -1,4 +1,4 @@
-"""Tests for place_call outbound SIP failure classification + ring timeout (ADR-0084).
+"""Tests for place_call outbound SIP failure classification + ring timeout (ADR-0086).
 
 ``place_call`` previously collapsed all outbound failures into a single generic
 error, preventing the agent from branching on WHY a call failed.  This module
@@ -431,7 +431,7 @@ async def test_place_call_unlisted_number_no_failure_outcome(
 
 
 # ---------------------------------------------------------------------------
-# Transport / media-init RuntimeError -> FAILED outcome (ADR-0084 Decision A)
+# Transport / media-init RuntimeError -> FAILED outcome (ADR-0086 Decision A)
 # ---------------------------------------------------------------------------
 
 
@@ -441,7 +441,7 @@ async def test_place_call_runtime_error_maps_to_failed_outcome(
 ) -> None:
     """A transport/media-init RuntimeError -> FAILED outcome (structured contract).
 
-    ADR-0084 classifies a non-SIP transport/media-init failure as the FAILED
+    ADR-0086 classifies a non-SIP transport/media-init failure as the FAILED
     outcome.  Such a failure surfaces as a ``RuntimeError`` from
     ``place_call_with_objective`` (e.g. the RTP transport could not be opened).
     It MUST carry the structured ``failure_outcome`` key like the SIP failures
@@ -464,7 +464,7 @@ async def test_place_call_runtime_error_does_not_leak_gateway_detail(
 ) -> None:
     """A RuntimeError whose message embeds a (fake) gateway host MUST NOT leak it.
 
-    SECURITY / public-repo: ADR-0084 requires that NO gateway detail (host,
+    SECURITY / public-repo: ADR-0086 requires that NO gateway detail (host,
     extension, port) leaks in the agent-facing result.  A transport/media-init
     ``RuntimeError`` can carry a connection string in its message; the handler
     must redact ``str(exc)`` exactly as the SIP path suppresses the reason
@@ -532,13 +532,13 @@ def test_parse_ring_timeout_rejects_infinity(
 
 
 # ---------------------------------------------------------------------------
-# Stable API surface: ADR-0084 names PlaceCallOutcome + the ring-timeout env
+# Stable API surface: ADR-0086 names PlaceCallOutcome + the ring-timeout env
 # var as __all__ exports.
 # ---------------------------------------------------------------------------
 
 
 def test_ring_timeout_env_symbol_is_exported() -> None:
-    """ADR-0084 Consequences: the ring-timeout env symbol is a stable __all__ export."""
+    """ADR-0086 Consequences: the ring-timeout env symbol is a stable __all__ export."""
     import hermes_voip.voip_tools as vt  # noqa: PLC0415
 
     assert "_RING_TIMEOUT_ENV" in vt.__all__

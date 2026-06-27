@@ -24,6 +24,7 @@ from hermes_voip.registration import (
     RegistrationConfig,
     RegistrationFlow,
     Retry,
+    ViaTransport,
 )
 
 # The canonical fixture registers over TLS, so its AOR uses the mandated ``sips:``
@@ -476,7 +477,7 @@ def test_config_accepts_sips_aor() -> None:
 
 
 @pytest.mark.parametrize("transport", ["TLS", "WSS"])
-def test_config_rejects_sip_aor_on_secure_transport(transport: str) -> None:
+def test_config_rejects_sip_aor_on_secure_transport(transport: ViaTransport) -> None:
     # bk231 / ADR-0080: ADR-0005 mandates SIP-over-TLS (SIPS). A bare ``sip:`` AOR
     # on a TLS/WSS transport is internally inconsistent — the registrar request-URI
     # and digest uri would advertise an insecure scheme over a secure leg with no
@@ -494,8 +495,11 @@ def test_config_rejects_sip_aor_on_secure_transport(transport: str) -> None:
 
 
 def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
-    # The transport token is matched case-insensitively: a lower-case ``tls`` is the
-    # same secure transport as ``TLS`` and must reject a ``sip:`` AOR identically.
+    # The transport token is normalised to uppercase in __post_init__ before the
+    # secure-transport check runs: a lower-case ``tls`` input must trigger the
+    # sip:-AOR rejection identically to ``TLS``, proving normalisation fires before
+    # the check. The stored .transport normalisation itself is asserted separately
+    # in test_config_normalises_lowercase_transport_to_uppercase.
     with pytest.raises(ValueError, match=r"sips"):
         RegistrationConfig(
             aor="sip:1000@pbx.example.test",
@@ -503,12 +507,12 @@ def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
             password="s3cr3t",
             contact="<sips:1000@198.51.100.7:5061>",
             local_sent_by="198.51.100.7:5061",
-            transport="tls",
+            transport="tls",  # type: ignore[arg-type]  # intentional: passes lowercase to test normalisation
         )
 
 
 @pytest.mark.parametrize("transport", ["UDP", "TCP"])
-def test_config_accepts_sip_aor_on_insecure_transport(transport: str) -> None:
+def test_config_accepts_sip_aor_on_insecure_transport(transport: ViaTransport) -> None:
     # bk231 is TRANSPORT-GATED: UDP/TCP leave the AOR scheme to the deployer (the
     # SIPS mandate is an invariant only on the secure TLS/WSS transports). A ``sip:``
     # AOR on UDP/TCP is accepted and drives a ``sip:`` registrar request-URI.
@@ -651,3 +655,86 @@ def test_registration_public_api_is_importable_from_package() -> None:
     ):
         assert hasattr(hermes_voip, name), name
         assert name in hermes_voip.__all__
+
+
+# ---- transport Literal validation (bk236) -----------------------------------
+
+
+def test_config_rejects_unknown_transport() -> None:
+    # bk236: transport is a Literal["TLS","WSS","UDP","TCP"]. An unrecognised
+    # token such as "QUIC" would be injected verbatim into the Via header and
+    # silently produce a malformed request. Reject at construction instead.
+    with pytest.raises(ValueError, match="transport must be one of"):
+        RegistrationConfig(
+            aor="sip:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5060>",
+            local_sent_by="198.51.100.7:5060",
+            transport="QUIC",  # type: ignore[arg-type]  # intentionally wrong type
+        )
+
+
+def test_config_normalises_lowercase_transport_to_uppercase() -> None:
+    # bk236 / MUST-FIX 1: RegistrationConfig accepts lowercase transport tokens
+    # (e.g. "tls") by normalising them to the canonical uppercase ViaTransport
+    # Literal form in __post_init__. The stored .transport must be "TLS", not "tls",
+    # so the field always satisfies the Literal["TLS","WSS","UDP","TCP"] contract at
+    # runtime (not just at static-type-check time).
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="tls",  # type: ignore[arg-type]  # intentional: passes lowercase to test normalisation
+    )
+    assert cfg.transport == "TLS"
+
+
+# ---- expires non-negative validation (bk236) --------------------------------
+
+
+def test_config_rejects_negative_expires() -> None:
+    # bk236: a negative expires would produce "Expires: -1" on the wire, which
+    # confuses registrars and is semantically invalid (RFC 3261 §10.2). Reject
+    # at construction so the error surfaces early rather than mid-flow.
+    with pytest.raises(ValueError, match=r"expires"):
+        RegistrationConfig(
+            aor="sips:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+            local_sent_by="198.51.100.7:5061",
+            transport="TLS",
+            expires=-1,
+        )
+
+
+def test_config_rejects_large_negative_expires() -> None:
+    # Belt-and-braces: any negative value is rejected, not just -1.
+    with pytest.raises(ValueError, match=r"expires"):
+        RegistrationConfig(
+            aor="sips:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+            local_sent_by="198.51.100.7:5061",
+            transport="TLS",
+            expires=-300,
+        )
+
+
+def test_config_accepts_zero_expires() -> None:
+    # expires=0 is a legal de-registration request (RFC 3261 §10.2); it must
+    # not be rejected by the negative-expires guard.
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+        expires=0,
+    )
+    assert cfg.expires == 0

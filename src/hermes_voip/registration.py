@@ -20,10 +20,12 @@ __all__ = [
     "RegistrationFlow",
     "RegistrationOutcome",
     "Retry",
+    "ViaTransport",
 ]
 
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 from hermes_voip._header_list import split_header_list
 from hermes_voip.digest import (
@@ -39,6 +41,15 @@ from hermes_voip.message import (
     new_call_id,
     new_tag,
 )
+
+#: The set of Via transport tokens accepted by :class:`RegistrationConfig`.
+#: Extending this set requires a corresponding update to
+#: ``_require_secure_scheme`` and ``_SECURE_TRANSPORTS`` (ADR-0005/ADR-0080).
+type ViaTransport = Literal["TLS", "WSS", "UDP", "TCP"]
+
+# Runtime counterpart of the ViaTransport Literal — kept in sync by hand.
+# Used in __post_init__ to reject unknown transport tokens early (bk236).
+_VALID_TRANSPORTS: frozenset[str] = frozenset({"TLS", "WSS", "UDP", "TCP"})
 
 _UNAUTHORIZED = 401
 _PROXY_AUTH_REQUIRED = 407
@@ -150,24 +161,47 @@ class RegistrationConfig:
     password: str = field(repr=False)
     contact: str
     local_sent_by: str
-    transport: str = "TLS"
+    transport: ViaTransport = "TLS"
     expires: int = 300
     user_agent: str = "hermes-voip/0"
 
     def __post_init__(self) -> None:
         """Reject a malformed or insecure-scheme AOR at construction (fail fast).
 
-        Validates the AOR scheme/host (bk226), then enforces ADR-0005's
+        Validates the AOR scheme/host (bk226), enforces ADR-0005's
         SIP-over-TLS/SIPS mandate on the secure transports (bk231/ADR-0080): a
-        ``sip:`` AOR on TLS/WSS is rejected. Both checks fail fast at construction
-        rather than surfacing mid-flow as a confusing gateway rejection.
+        ``sip:`` AOR on TLS/WSS is rejected, and rejects a negative ``expires``
+        (bk236): ``expires < 0`` would produce ``Expires: -1`` on the wire,
+        which is semantically invalid (RFC 3261 §10.2). All checks fail fast at
+        construction rather than surfacing mid-flow as a confusing gateway
+        rejection.
+
+        ``transport`` is normalised to uppercase before validation so a caller
+        who passes a lowercase token (e.g. ``"tls"``) gets the canonical
+        ``ViaTransport`` Literal value stored (``"TLS"``). The dataclass is
+        frozen, so normalisation uses ``object.__setattr__`` (the only safe
+        mutation path for a frozen dataclass in ``__post_init__``).
 
         Raises:
             ValueError: If ``aor`` has no ``sip``/``sips`` scheme, an empty host,
-                or uses the ``sip`` scheme on a TLS/WSS transport.
+                uses the ``sip`` scheme on a TLS/WSS transport, or ``expires < 0``,
+                or ``transport`` is not a recognised token (bk236).
         """
+        # Normalise to uppercase first so the stored field always satisfies the
+        # Literal["TLS","WSS","UDP","TCP"] contract at runtime; must precede the
+        # membership check so the check and _require_secure_scheme both see the
+        # canonical form.
+        normalised = self.transport.upper()
+        object.__setattr__(self, "transport", normalised)
+        if normalised not in _VALID_TRANSPORTS:
+            allowed = ", ".join(sorted(_VALID_TRANSPORTS))
+            msg = f"transport must be one of {allowed}; got {self.transport!r}"
+            raise ValueError(msg)
         _split_aor(self.aor)
         _require_secure_scheme(self.aor, self.transport)
+        if self.expires < 0:
+            msg = f"expires must be >= 0, got {self.expires}"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)

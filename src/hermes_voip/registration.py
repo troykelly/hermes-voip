@@ -150,9 +150,14 @@ def _require_secure_scheme(aor: str, transport: str) -> None:
 def _min_expires(response: SipResponse) -> int | None:
     """Return the ``Min-Expires`` value from a 423, or ``None`` if absent/malformed."""
     raw = response.header("Min-Expires")
-    if raw is None or not raw.strip().isdigit():
+    if raw is None:
         return None
-    return int(raw.strip())
+    stripped = raw.strip()
+    # isascii()+isdecimal() rejects Unicode superscript digits (e.g. U+00B2)
+    # that isdigit() admits but int() cannot parse (framing.py precedent).
+    if not (stripped.isascii() and stripped.isdecimal()):
+        return None
+    return int(stripped)
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,12 +518,19 @@ class RegistrationFlow:
             token = _EXPIRES_TOKEN.search(chosen)
             if token is not None:
                 value = token.group(1)
-                # Present but not a run of digits (e.g. ``-1`` / ``abc``) is a
-                # malformed expires: fail closed, never the positive fallback.
-                return int(value) if value.isdigit() else None
+                # Present but not a run of ASCII digits (e.g. ``-1`` / ``abc``
+                # / U+00B2 ²) is a malformed expires: fail closed, never the
+                # positive fallback.  isascii()+isdecimal() rejects Unicode
+                # superscript digits that isdigit() admits but int() rejects
+                # (framing.py precedent; prevents ValueError on the read loop).
+                return int(value) if (value.isascii() and value.isdecimal()) else None
         expires = response.header("Expires")
-        if expires is not None and expires.strip().isdigit():
-            return int(expires.strip())
+        if expires is not None:
+            stripped = expires.strip()
+            # Same guard: isascii()+isdecimal() so a Unicode digit in the
+            # Expires header does not propagate a bare ValueError.
+            if stripped.isascii() and stripped.isdecimal():
+                return int(stripped)
         return self._cfg.expires
 
     def _build(self, *, expires: int, auth: tuple[str, str] | None) -> str:

@@ -608,3 +608,51 @@ def test_build_blind_refer_rejects_percent_encoded_close_angle() -> None:
     # ``%3E`` decodes to ``>`` — closes the ``Refer-To: <...>`` early.
     with pytest.raises(ValueError, match="transfer target"):
         build_blind_refer(_dialog(), "sip:3000@pbx.example.test%3Eevil")
+
+
+# ---- parse_refer injection guard (security) --------------------------------
+#
+# An attacker-influenced inbound REFER carries a hostile Refer-To target that
+# parse_refer must reject before building a ReferRequest.  The same guard
+# (_validate_transfer_target) used by build_blind_refer runs here.
+
+
+def test_parse_refer_rejects_foreign_host_in_refer_to() -> None:
+    # ``1001@evil.com`` is a host-hijack on a bare extension: not a dialable
+    # user-part and not a well-formed sip: URI, so parse_refer must raise ReferError.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", "<1001@evil.com>"),),
+        body="",
+    )
+    with pytest.raises(ReferError):
+        parse_refer(refer)
+
+
+def test_parse_refer_rejects_refer_to_with_replaces_header_form() -> None:
+    # A Refer-To carrying ``?Replaces=…`` would point the triggered INVITE at
+    # another dialog (dialog-seizing injection); parse_refer must raise ReferError.
+    _replaces_uri = "sip:1001@pbx.example.test?Replaces=abc%3Bto-tag%3Dx"
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", f"<{_replaces_uri}>"),),
+        body="",
+    )
+    with pytest.raises(ReferError):
+        parse_refer(refer)
+
+
+def test_parse_refer_accepts_valid_bare_extension() -> None:
+    # A valid bare extension (digits only) is a legitimate blind-transfer target
+    # and must parse without error, returning the extension as refer_to.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", "<1001>"),),
+        body="",
+    )
+    parsed = parse_refer(refer)
+    assert parsed.refer_to == "1001"
+    assert parsed.replaces is None

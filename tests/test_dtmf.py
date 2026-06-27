@@ -95,6 +95,9 @@ def test_dtmf_press_carries_digit() -> None:
     assert press.digit == "3"
     # immutable
     with pytest.raises((AttributeError, TypeError)):
+        # Justification for type: ignore[misc] below: mypy statically rejects
+        # assignment to a frozen dataclass field — that IS the behaviour under
+        # test; the assignment must raise FrozenInstanceError at runtime.
         press.digit = "5"  # type: ignore[misc]
 
 

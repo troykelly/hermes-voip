@@ -16,19 +16,25 @@ cleanly in the default no-ml gate. The ``FrameUpsampler`` rides on ``audioop-lts
 
 from __future__ import annotations
 
+import asyncio
 import struct
+from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
 from hermes_voip.media.audio import G711_SAMPLE_RATE, Resampler
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.stt.resample import (
+    FloatArray,
     FrameUpsampler,
     float32_to_pcm16,
     pcm16_to_float32,
 )
+from hermes_voip.stt.sherpa_onnx import SherpaOnnxASR
 
 _RECOGNISER_RATE = 16_000
+_N_SAMPLES_20MS = 320  # 20 ms at 16 kHz
 
 
 def _pcm16(*samples: int) -> bytes:
@@ -152,3 +158,165 @@ def test_frame_upsampler_rejects_wrong_source_rate() -> None:
     upsampler = FrameUpsampler()
     with pytest.raises(ValueError, match="8000"):
         upsampler.upsample(_frame(_pcm16(0, 0), rate=_RECOGNISER_RATE))
+
+
+# --- FloatArray.__len__: zero-copy sample count --------------------------------
+
+
+def test_float_array_protocol_has_len() -> None:
+    """``FloatArray`` declares ``__len__`` so callers can count samples without tobytes.
+
+    Before this fix, ``sherpa_onnx.py`` counted samples via
+    ``len(item.tobytes()) // 4``, allocating a ~1280-byte bytes copy per 20 ms frame
+    (~64 KB/s per active call) purely to count elements.  Adding ``__len__`` to the
+    Protocol removes that allocation; this test verifies the Protocol surface exists.
+
+    A numpy ndarray already implements ``__len__``, so no runtime shim is needed.
+    """
+    np = pytest.importorskip("numpy")
+    arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    # Runtime structural check: the concrete array must have __len__.
+    assert hasattr(arr, "__len__"), "numpy ndarray must have __len__"
+    # The Protocol itself must declare __len__ (checked by Protocol membership).
+    assert "__len__" in dir(FloatArray), (
+        "FloatArray Protocol must expose __len__ so mypy can type-check len(item)"
+    )
+    assert len(arr) == 3
+
+
+def test_float_array_len_matches_sample_count() -> None:
+    """``len(float_array)`` equals the number of float32 samples it contains.
+
+    This pins the semantics: for a 1-D float32 array produced by pcm16_to_float32,
+    ``len(arr)`` must equal the number of decoded samples (not bytes).  The
+    sherpa_onnx feed loop uses this to count samples fed without calling tobytes().
+    """
+    np = pytest.importorskip("numpy")
+    n_samples = 320  # 20 ms at 16 kHz
+    pcm = _pcm16(*([1000] * n_samples))
+    arr = pcm16_to_float32(pcm)
+    assert len(np.asarray(arr)) == n_samples
+
+
+class _NotobytesFakeArray:
+    """FloatArray fake: __len__ works, tobytes() raises (proves it's not called).
+
+    Used by test_float_array_sample_count_via_len_never_calls_tobytes to assert
+    that the sherpa run-loop does not call tobytes() for sample counting.
+    """
+
+    def __init__(self, n: int) -> None:
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def tobytes(self) -> bytes:
+        msg = "tobytes() must NOT be called for sample counting after #perf fix"
+        raise AssertionError(msg)
+
+    def astype(self, dtype: object) -> FloatArray:
+        return self  # type: ignore[return-value]  # structural fake, not a real ndarray
+
+    def __truediv__(self, other: float) -> FloatArray:
+        return self  # type: ignore[return-value]
+
+    def __mul__(self, other: float) -> FloatArray:
+        return self  # type: ignore[return-value]
+
+
+@dataclass
+class _LenFakeStream:
+    fed: list[FloatArray] = field(default_factory=list)
+    fed_rates: list[int] = field(default_factory=list)
+    finished: bool = False
+
+
+class _LenFakeRecognizer:
+    """Fake recogniser; pcm16_to_float32 is patched so item IS the no-tobytes fake."""
+
+    def __init__(self) -> None:
+        self._ready = False
+        self.last_stream: _LenFakeStream | None = None
+
+    def create_stream(self) -> _LenFakeStream:
+        self.last_stream = _LenFakeStream()
+        return self.last_stream
+
+    def accept_waveform(
+        self,
+        stream: _LenFakeStream,
+        sample_rate: int,
+        samples: FloatArray,
+    ) -> None:
+        stream.fed.append(samples)
+        stream.fed_rates.append(sample_rate)
+        self._ready = True
+
+    def is_ready(self, stream: _LenFakeStream) -> bool:
+        ready = self._ready
+        self._ready = False
+        return ready
+
+    def decode_stream(self, stream: _LenFakeStream) -> None:
+        pass
+
+    def get_result(self, stream: _LenFakeStream) -> str:
+        return ""
+
+    def is_endpoint(self, stream: _LenFakeStream) -> bool:
+        return False
+
+    def reset(self, stream: _LenFakeStream) -> None:
+        pass
+
+    def input_finished(self, stream: _LenFakeStream) -> None:
+        stream.finished = True
+
+
+def test_float_array_sample_count_via_len_never_calls_tobytes() -> None:
+    """The sherpa feed loop counts samples via ``len(item)``, not ``item.tobytes()``.
+
+    Regression test: ``sherpa_onnx._RunLoop.run()`` previously computed the
+    per-frame sample count as ``len(item.tobytes()) // 4``, allocating a temporary
+    bytes object per 20 ms frame.  After adding ``__len__`` to FloatArray and
+    replacing that expression with ``len(item)``, the sample-count path must NEVER
+    call ``tobytes()`` on the item fed to ``accept_waveform``.
+
+    This is verified by patching ``pcm16_to_float32`` in the sherpa_onnx module to
+    return a fake ``FloatArray`` whose ``tobytes()`` raises ``AssertionError``.
+    If the run-loop still calls ``tobytes()`` for sample counting the test fails
+    immediately; if it uses ``len()`` the test passes.
+    """
+    pytest.importorskip("numpy")
+
+    recognizer = _LenFakeRecognizer()
+    asr = SherpaOnnxASR.from_recognizer(recognizer)
+
+    def _frame_16k(n: int) -> PcmFrame:
+        return PcmFrame(
+            samples=struct.pack(f"<{n}h", *([1000] * n)),
+            sample_rate=_RECOGNISER_RATE,
+            monotonic_ts_ns=0,
+        )
+
+    async def _src() -> object:
+        yield _frame_16k(_N_SAMPLES_20MS)
+
+    # Patch pcm16_to_float32 in the sherpa_onnx module so every converted frame
+    # is the no-tobytes fake.  This guarantees the item variable in the run-loop is
+    # our fake; if the loop calls item.tobytes() it raises immediately.
+    fake_arr = _NotobytesFakeArray(_N_SAMPLES_20MS)
+
+    async def _run() -> list[object]:
+        with patch(
+            "hermes_voip.stt.sherpa_onnx.pcm16_to_float32",
+            return_value=fake_arr,
+        ):
+            result: list[object] = []
+            async for t in asr.stream(_src()):  # type: ignore[arg-type]
+                result.append(t)
+            return result
+
+    # Must complete without AssertionError from _NotobytesFakeArray.tobytes().
+    asyncio.run(_run())

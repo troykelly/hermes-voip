@@ -25,37 +25,61 @@ positive grant (e.g. 1–2 s) yields the same pathology at a sub-second cadence.
 
 Two independent guards, defence in depth:
 
-1. **Flow level (primary).** `RegistrationFlow._handle_success` returns
-   `Failed(0, "registrar granted non-positive expires (…); binding removed")`
-   when the request was a registration (`requested_expires > 0`) but the granted
-   lifetime is `<= 0`. A non-positive grant is a binding removal, not a live
-   registration, so it is surfaced as a failure outcome — never `Registered`. The
-   synthetic status `0` is outside the SIP 1xx–6xx range, so it cannot collide
-   with a real status and unambiguously marks this anomaly. A 2xx to a genuine
+1. **Flow level (primary).** `RegistrationFlow._handle_success` returns a
+   `Failed(0, …)` outcome when the request was a registration
+   (`requested_expires > 0`) but the granted lifetime for OUR binding is not a
+   usable positive value:
+   - a value parsed as `<= 0` (`"… a non-positive (0) expires for our binding; removed"`)
+     — the registrar removed the binding; or
+   - a **malformed** echo (`"… a malformed/negative expires for our binding; removed"`)
+     — a negative or non-numeric `expires` token on our Contact. RFC 3261
+     §10.2/§10.3 define Expires as a non-negative delta-seconds, so a value such as
+     `expires=-1` or `expires=abc` is invalid. `_granted_expires` parses the whole
+     `expires=` value token (via `_EXPIRES_TOKEN`) and returns `None` for a present
+     but malformed value, so the flow **fails closed** instead of silently
+     discarding the garbled token and falling back to the positive requested
+     lifetime (which would mask a registrar that did not grant our binding — codex
+     MUST-FIX 1). A binding with **no** `expires` parameter is not malformed: it
+     still falls through to the `Expires` header / requested-lifetime fallbacks.
+
+   Either case is surfaced as a failure outcome — never `Registered`. The synthetic
+   status `0` is outside the SIP 1xx–6xx range, so it cannot collide with a real
+   status and unambiguously marks this anomaly. A 2xx to a genuine
    **de-registration** (`requested_expires == 0`) keeps its existing meaning (a
-   clean unbind; not registered).
+   clean unbind; not registered) — a malformed expires there maps to `0` (there is
+   no live lifetime to arm anyway).
 
 2. **Manager level (defence in depth).** `_schedule_refresh` floors the delay at a
    positive minimum: `delay = max(self._min_refresh_delay, expires *
    refresh_fraction)`. `min_refresh_delay` is a keyword-only constructor knob
-   (default `1.0` s). Even if a tiny positive grant (or, defensively, a 0 that
-   slipped past guard 1) reaches the scheduler, no near-zero-delay refresh is ever
-   armed. Tests that deliberately drive an immediate refresh by hand pass
-   `min_refresh_delay=0.0`.
+   (default `1.0` s) that **must be strictly positive**: a `0` or negative floor
+   would defeat the very guard it provides, so `RegistrationManager.__init__`
+   rejects `min_refresh_delay <= 0` with `ValueError` — the public knob can never be
+   set to a guard-defeating value (codex MUST-FIX 2). Even if a tiny positive grant
+   (or, defensively, a 0 that slipped past guard 1) reaches the scheduler, no
+   near-zero-delay refresh is ever armed. Tests that deliberately drive an immediate
+   refresh by hand reach past the public knob via the private `_min_refresh_delay`
+   attribute (a test seam), never by passing a guard-defeating value to the
+   constructor.
 
-Because guard 1 routes a non-positive grant through `_on_registration_failed`, an
-**established** extension whose registrar later removes the binding is reported via
-`on_registration_error` and recovers on the existing bounded-backoff re-REGISTER
-ramp (never the 0-delay hot loop); a cold-start non-positive grant is reported and
-not retried (consistent with the existing cold-start failure handling).
+Because guard 1 routes a non-positive **or malformed** grant through
+`_on_registration_failed`, an **established** extension whose registrar later
+removes or garbles the binding is reported via `on_registration_error` and recovers
+on the existing bounded-backoff re-REGISTER ramp (never the 0-delay hot loop); a
+cold-start non-positive/malformed grant is reported and not retried (consistent with
+the existing cold-start failure handling).
 
 ## Consequences
 
-- A registrar that grants `expires=0` (or negative) can no longer drive a tight
-  re-REGISTER loop: the manager treats it as a failure, marks the extension down,
-  and surfaces the anomaly (rule 37), instead of busy-looping.
+- A registrar that grants `expires=0`, a negative `expires`, or a non-numeric
+  `expires` token on our binding can no longer drive a tight re-REGISTER loop (nor a
+  silent positive fallback that masks the anomaly): the manager treats it as a
+  failure, marks the extension down, and surfaces it (rule 37), instead of
+  busy-looping.
 - A tiny positive grant is clamped to a sane refresh cadence rather than a
-  sub-second hot loop.
+  sub-second hot loop; the floor (`min_refresh_delay`) is hard-enforced positive at
+  construction, so it cannot be disabled into a guard-defeating value through the
+  public API.
 - The change is behaviour-preserving for every healthy positive grant: the
   `Registered(expires=…)` path is unchanged for a normal lifetime, and the floor
   (1 s) is far below any realistic refresh window (`refresh_fraction` of a

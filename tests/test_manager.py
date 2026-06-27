@@ -18,6 +18,7 @@ import pytest
 
 from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import (
+    _MIN_REFRESH_DELAY,
     Cancel,
     InDialog,
     NewCall,
@@ -50,6 +51,21 @@ class _FakeConsumer:
 
     async def handle_request(self, request: SipRequest) -> None:
         self.received.append(request)
+
+
+def _disable_refresh_floor(manager: RegistrationManager) -> RegistrationManager:
+    """Private test seam: drop the production refresh floor for an immediate refresh.
+
+    The PUBLIC ``min_refresh_delay`` knob hard-enforces ``> 0`` (ADR-0087 / codex
+    MUST-FIX 2) — it can never be set to a guard-defeating ``0``. Tests that drive a
+    refresh by hand and want it to fire immediately (``refresh_fraction=0.0`` makes
+    the nominal delay ``0``, which the floor would otherwise lift to ``1 s``) reach
+    past the public knob via the private ``_min_refresh_delay`` attribute. This
+    preserves the original immediate-refresh intent of these tests without
+    re-opening the public bypass the floor exists to close.
+    """
+    manager._min_refresh_delay = 0.0
+    return manager
 
 
 def _gateway(**over: str) -> GatewayConfig:
@@ -211,11 +227,11 @@ async def test_on_response_refresh_does_not_re_log_at_info(
     # refresh_fraction=0.0 schedules the refresh REGISTER immediately after the
     # first registration, so we can answer that *new* REGISTER (a real refresh,
     # with its own CSeq) rather than replaying the first response.
-    # min_refresh_delay=0.0 keeps the production refresh floor from delaying this
-    # deliberately-immediate test refresh (the floor guards a tiny granted lifetime,
-    # not a test that drives the refresh by hand).
-    manager = RegistrationManager(
-        _gateway(), transport, refresh_fraction=0.0, min_refresh_delay=0.0
+    # _disable_refresh_floor drops the production floor so this deliberately-immediate
+    # test refresh is not lifted to 1 s (the floor guards a tiny granted lifetime, not
+    # a test that drives the refresh by hand) — the private seam, not the public knob.
+    manager = _disable_refresh_floor(
+        RegistrationManager(_gateway(), transport, refresh_fraction=0.0)
     )
     await manager.start()
     first_register = transport.sent[0]
@@ -417,10 +433,10 @@ async def test_remove_call_makes_in_dialog_unroutable() -> None:
 
 async def test_refresh_resends_register() -> None:
     transport = _FakeTransport()
-    # min_refresh_delay=0.0: see the note in test_on_response_refresh_does_not_re_log
+    # _disable_refresh_floor: see the note in test_on_response_refresh_does_not_re_log
     # — the production floor guards a tiny grant, not this hand-driven refresh.
-    manager = RegistrationManager(
-        _gateway(), transport, refresh_fraction=0.0, min_refresh_delay=0.0
+    manager = _disable_refresh_floor(
+        RegistrationManager(_gateway(), transport, refresh_fraction=0.0)
     )
     await manager.start()
     first_register = transport.sent[0]
@@ -455,12 +471,13 @@ async def test_refresh_failure_marks_down_and_is_reported() -> None:
     # background-task exception (codex HIGH).
     errors: list[tuple[str, BaseException]] = []
     transport = _FlakyTransport(fail_after=2)  # 2 initial REGISTERs ok; refresh fails
-    manager = RegistrationManager(
-        _gateway(),
-        transport,
-        refresh_fraction=0.0,
-        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
-        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
     )
     await manager.start()
     await manager.on_response(_ok_for(transport.sent[0]))
@@ -504,13 +521,14 @@ async def test_failed_refresh_reports_and_schedules_reregister() -> None:
     # binding recovers instead of dead-ending (the audit's terminal-silent gap).
     errors: list[tuple[str, BaseException]] = []
     transport = _FakeTransport()
-    manager = RegistrationManager(
-        _gateway(),
-        transport,
-        refresh_fraction=0.0,  # refresh fires immediately after registration
-        min_refresh_delay=0.0,  # bypass the production tiny-grant refresh floor
-        retry_backoff=0.0,  # and the recovery re-REGISTER fires immediately too
-        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,  # refresh fires immediately after registration
+            retry_backoff=0.0,  # and the recovery re-REGISTER fires immediately too
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
     )
     await manager.start()
     first_register = transport.sent[0]
@@ -552,12 +570,13 @@ async def test_failed_refresh_recovers_back_to_registered() -> None:
     # extension back up — end-to-end proof the dead-end is gone, not just that a
     # retry was emitted.
     transport = _FakeTransport()
-    manager = RegistrationManager(
-        _gateway(),
-        transport,
-        refresh_fraction=0.0,
-        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
-        retry_backoff=0.0,
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=0.0,
+        )
     )
     await manager.start()
     first_register = transport.sent[0]
@@ -602,12 +621,13 @@ async def test_is_up_false_after_sole_extensions_refresh_fails() -> None:
     # refresh is rejected, the manager is no longer up (codex review — guards a
     # future refactor that might back is_up by the one-shot connect() event).
     transport = _FakeTransport()
-    manager = RegistrationManager(
-        _single_gateway(),
-        transport,
-        refresh_fraction=0.0,
-        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
-        retry_backoff=10.0,  # keep the recovery from re-registering during the assert
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _single_gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=10.0,  # keep recovery from re-registering during the assert
+        )
     )
     await manager.start()
     first = transport.sent[0]
@@ -654,13 +674,14 @@ async def test_recovery_send_failure_reschedules_another_attempt() -> None:
     # recovery continued.
     errors: list[tuple[str, BaseException]] = []
     transport = _SendFailsOnceTransport(fail_on_index=3)
-    manager = RegistrationManager(
-        _single_gateway(),
-        transport,
-        refresh_fraction=0.0,
-        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
-        retry_backoff=0.0,
-        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _single_gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=0.0,
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
     )
     await manager.start()  # send #1 (initial REGISTER)
     first = transport.sent[0]
@@ -736,38 +757,48 @@ async def test_zero_granted_expires_does_not_arm_a_busyloop_refresh() -> None:
     await manager.aclose()
 
 
-async def test_tiny_positive_grant_refresh_is_clamped_to_a_positive_minimum() -> None:
+async def test_tiny_positive_grant_refresh_is_clamped_to_a_positive_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Defence-in-depth for _schedule_refresh: even a *positive* but tiny granted
     # lifetime (e.g. 1s) must not arm a sub-second refresh. The scheduler clamps the
-    # refresh delay to a sane positive minimum (>= ~1s), so a tiny grant does NOT
-    # produce a near-immediate re-REGISTER. The flow stays registered (a positive
-    # grant IS a registration); only the refresh cadence is floored.
+    # refresh delay to a sane positive minimum, so a tiny grant does NOT produce a
+    # near-immediate re-REGISTER. The flow stays registered (a positive grant IS a
+    # registration); only the refresh cadence is floored.
+    #
+    # codex MUST-FIX 3: assert the COMPUTED refresh delay directly rather than racing
+    # wall-clock time (the old test slept 0.7s hoping an unclamped 0.5s refresh would
+    # have fired — flaky under CI load). A capturing stub records the exact delay
+    # _schedule_refresh passes to _refresh_after; we assert it equals the production
+    # floor, deterministically and with no real sleeping.
+    captured: list[float] = []
+
+    async def _capture_delay(state: object, delay: float) -> None:
+        captured.append(delay)
+
     transport = _FakeTransport()
     manager = RegistrationManager(
         _single_gateway(),
         transport,
         refresh_fraction=0.5,  # 1s grant -> 0.5s nominal, below the positive floor
     )
+    # Replace the refresh body with the capturing stub (private seam): _schedule_refresh
+    # still computes and passes the clamped delay, but no REGISTER is sent and nothing
+    # sleeps, so the assertion is on the value, not the clock.
+    monkeypatch.setattr(manager, "_refresh_after", _capture_delay)
     await manager.start()
     first = transport.sent[0]
-    sent_after_initial = len(transport.sent)
     await manager.on_response(_ok_for(first, expires=1))
     up = next(s for s in manager.snapshot() if s.extension == "1000")
     assert up.registered is True, "a positive grant is a live registration"
-    # The nominal delay (1s * 0.5 = 0.5s) is below the clamp floor. Wait 0.7s — long
-    # enough that an UNCLAMPED 0.5s refresh would already have fired, but inside the
-    # clamped floor (>= 1s) so a correctly-floored refresh has not. Zero refreshes
-    # proves the delay was clamped up off the tiny grant.
-    await asyncio.sleep(0.7)
-    refreshes = [
-        m
-        for m in transport.sent[sent_after_initial:]
-        if SipRequest.parse(m).method == "REGISTER"
-    ]
-    assert not refreshes, (
-        "a tiny positive grant must be clamped to a positive refresh minimum, "
-        f"not fire a sub-second refresh; saw {len(refreshes)} refreshes in 0.7s"
+    await asyncio.sleep(0)  # let the scheduled (no-op) refresh task run
+    # 1s * 0.5 = 0.5s nominal is below the floor, so the scheduled delay is the floor
+    # itself — NOT the sub-second nominal value that would hot-loop the registrar.
+    assert captured == [_MIN_REFRESH_DELAY], (
+        "a tiny positive grant must be clamped to the positive refresh floor, "
+        f"not its sub-second nominal delay; scheduled {captured}"
     )
+    assert _MIN_REFRESH_DELAY > 0.5, "the floor must exceed the tiny nominal delay"
     await manager.aclose()
 
 
@@ -781,14 +812,15 @@ async def test_refresh_with_no_response_times_out_and_reregisters() -> None:
     # rather than trusting a binding that may already have lapsed at the registrar.
     errors: list[tuple[str, BaseException]] = []
     transport = _FakeTransport()
-    manager = RegistrationManager(
-        _gateway(),
-        transport,
-        refresh_fraction=0.0,  # refresh fires immediately
-        min_refresh_delay=0.0,  # bypass the production tiny-grant refresh floor
-        refresh_timeout=0.05,  # ... and times out fast (no response is fed)
-        retry_backoff=0.0,
-        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,  # refresh fires immediately
+            refresh_timeout=0.05,  # ... and times out fast (no response is fed)
+            retry_backoff=0.0,
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
     )
     await manager.start()
     first_register = transport.sent[0]
@@ -825,14 +857,15 @@ async def test_refresh_response_cancels_the_timeout() -> None:
     # error, still registered — proving a timely response disarms it.
     errors: list[tuple[str, BaseException]] = []
     transport = _FakeTransport()
-    manager = RegistrationManager(
-        _gateway(),
-        transport,
-        refresh_fraction=0.0,
-        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
-        refresh_timeout=0.05,
-        retry_backoff=0.0,
-        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    manager = _disable_refresh_floor(  # private seam: immediate hand-driven refresh
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            refresh_timeout=0.05,
+            retry_backoff=0.0,
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
     )
     await manager.start()
     first_register = transport.sent[0]

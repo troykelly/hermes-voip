@@ -230,9 +230,19 @@ class RegistrationManager:
 
         ``min_refresh_delay`` floors the scheduled refresh delay so a tiny granted
         lifetime cannot arm a near-zero-delay refresh that hot-loops the registrar
-        (the production default is a positive minimum; tests that want an immediate
-        refresh pass ``0.0``).
+        (ADR-0087). It MUST be a positive number of seconds: a ``0`` or negative
+        floor would defeat the very guard it exists to provide, so it is rejected at
+        construction (codex MUST-FIX 2) — the public knob can never be set to a
+        guard-defeating value. Tests that need an immediate hand-driven refresh
+        reach past it via the private ``_min_refresh_delay`` attribute, never this
+        knob.
+
+        Raises:
+            ValueError: If ``min_refresh_delay`` is not strictly positive.
         """
+        if min_refresh_delay <= 0:
+            msg = f"min_refresh_delay must be > 0 seconds, got {min_refresh_delay}"
+            raise ValueError(msg)
         self._gateway = gateway
         self._transport = transport
         self._refresh_fraction = refresh_fraction

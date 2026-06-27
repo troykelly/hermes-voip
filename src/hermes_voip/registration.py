@@ -56,15 +56,25 @@ _PROXY_AUTH_REQUIRED = 407
 _INTERVAL_TOO_BRIEF = 423
 _OK = 200
 _3XX = 300  # first non-2xx status code; used in the 2xx success range check
-# Synthetic (non-SIP) status for a 2xx that grants OUR binding a non-positive
-# lifetime: the registrar accepted the message but REMOVED the binding (expires=0
-# is a de-registration we did not request — RFC 3261 §10.3 lets a registrar grant
-# a shorter lifetime, including 0). It is reported as a Failed outcome so the
-# manager never treats a removed binding as a live registration (which would arm a
-# 0-delay refresh and busy-loop). 0 is outside the 1xx-6xx SIP range, so it never
-# collides with a real status and is unambiguously this anomaly.
+# Synthetic (non-SIP) status for a 2xx whose grant for OUR binding is not a usable
+# positive lifetime: the registrar accepted the message but REMOVED the binding
+# (``expires=0`` is a de-registration we did not request — RFC 3261 §10.3 lets a
+# registrar grant a shorter lifetime, including 0) OR echoed a MALFORMED expires
+# (negative or non-numeric, which §10.2/§10.3 forbid). Either way it is reported as
+# a Failed outcome so the manager never treats a removed/garbled binding as a live
+# registration (which would arm a 0-delay refresh and busy-loop). 0 is outside the
+# 1xx-6xx SIP range, so it never collides with a real status and unambiguously marks
+# this anomaly.
 _BINDING_REMOVED = 0
-_EXPIRES_PARAM = re.compile(r";\s*expires\s*=\s*(\d+)", re.IGNORECASE)
+# The whole ``expires=`` parameter VALUE token on a Contact binding — captured
+# verbatim (digits, a leading ``-``, or non-numeric garbage) so the flow can tell
+# "a usable non-negative lifetime" apart from "an expires param is present but
+# MALFORMED" apart from "no expires param at all". RFC 3261 §10.2/§10.3 define
+# Expires as a non-negative delta-seconds, so anything that is not a run of digits
+# is malformed and must fail closed rather than fall back to the requested lifetime
+# (codex MUST-FIX 1). The narrower ``\d+`` form alone silently dropped a malformed
+# token, hiding a registrar that did not actually grant our binding.
+_EXPIRES_TOKEN = re.compile(r";\s*expires\s*=\s*([^;,\s]+)", re.IGNORECASE)
 # The addr-spec inside a Contact name-addr's angle brackets (``<sip:...>``).
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
 # The SIP schemes an AOR may carry; sips is ADR-0005's SIP-over-TLS scheme.
@@ -348,27 +358,40 @@ class RegistrationFlow:
     def _handle_success(
         self, response: SipResponse, txn: _Transaction
     ) -> Registered | Failed:
-        """Turn a 2xx into a Registered or, on a non-positive grant, a Failed.
+        """Turn a 2xx into a Registered or, on a non-usable grant, a Failed.
 
         A registrar MAY grant a shorter lifetime than requested, including 0 (RFC
-        3261 §10.3). A 0 (or negative) grant for OUR binding to a *registration*
-        request (``requested_expires > 0``) means the registrar REMOVED the binding
-        — surfacing it as ``Registered`` would arm a 0-delay refresh that
-        immediately re-REGISTERs into a tight loop. It is returned as ``Failed`` so
-        the manager treats the anomaly as a registration failure, never a live
-        registration. A 2xx to a *de-registration* (``requested_expires == 0``)
-        keeps its existing meaning (a clean unbind, not registered).
+        3261 §10.3). For OUR binding to a *registration* request
+        (``requested_expires > 0``), a granted lifetime that is not a positive
+        delta-seconds means the registrar did not actually keep the binding alive:
+
+        * ``0`` (or a value parsed as ``<= 0``) is an unrequested de-registration —
+          it REMOVED the binding;
+        * a MALFORMED echo (negative or non-numeric ``expires`` on our Contact,
+          signalled by ``_granted_expires`` returning ``None``) is garbage the old
+          digits-only parse silently dropped, falling back to the positive requested
+          lifetime and hiding the anomaly (codex MUST-FIX 1).
+
+        Both are surfaced as ``Failed`` — never ``Registered`` — so the manager
+        treats them as a registration failure and never arms a refresh (a positive
+        fallback would re-REGISTER into a tight loop against a binding the registrar
+        is not honouring). A 2xx to a *de-registration* (``requested_expires == 0``)
+        keeps its existing meaning (a clean unbind, not registered); a malformed
+        expires there maps to ``0`` (there is no live lifetime to arm anyway).
         """
         granted = self._granted_expires(response)
         self._txn = None
-        if txn.requested_expires > 0 and granted <= 0:
+        if txn.requested_expires > 0 and (granted is None or granted <= 0):
             self._registered = False
+            detail = (
+                "malformed/negative" if granted is None else f"non-positive ({granted})"
+            )
             return Failed(
                 _BINDING_REMOVED,
-                f"registrar granted non-positive expires ({granted}); binding removed",
+                f"registrar granted a {detail} expires for our binding; removed",
             )
         self._registered = txn.requested_expires > 0
-        return Registered(expires=granted)
+        return Registered(expires=granted if granted is not None else 0)
 
     def _begin(self, requested_expires: int) -> str:
         self._cseq += 1
@@ -457,8 +480,8 @@ class RegistrationFlow:
             )
             raise RuntimeError(msg)
 
-    def _granted_expires(self, response: SipResponse) -> int:
-        """The granted lifetime for OUR binding (RFC 3261 §10.3).
+    def _granted_expires(self, response: SipResponse) -> int | None:
+        """The granted lifetime for OUR binding, or ``None`` if it is malformed.
 
         A 200 OK to REGISTER echoes EVERY binding the registrar holds for the
         AOR, each with its own ``expires`` — so the refresh window must be read
@@ -468,6 +491,16 @@ class RegistrationFlow:
         whose addr-spec matches our Contact URI supplies the value. Failing an
         exact match, the first binding's ``expires`` is the fallback, then the
         ``Expires`` header, then our requested lifetime.
+
+        When the chosen binding carries an ``expires`` parameter whose value is
+        present but MALFORMED — negative or non-numeric, which RFC 3261 §10.2/§10.3
+        forbid — this returns ``None`` (fail-closed) rather than discarding the
+        garbled token and falling back to the positive requested lifetime. The
+        caller (:meth:`_handle_success`) treats ``None`` the same as a non-positive
+        grant, so a registrar that does not actually grant our binding can never be
+        mistaken for a live registration (codex MUST-FIX 1). A binding with NO
+        ``expires`` parameter is not malformed: it falls through to the ``Expires``
+        header / requested-lifetime fallbacks unchanged.
         """
         bindings = [
             binding
@@ -477,9 +510,12 @@ class RegistrationFlow:
         ours = next((b for b in bindings if _binding_uri(b) == self._contact_uri), None)
         chosen = ours if ours is not None else (bindings[0] if bindings else None)
         if chosen is not None:
-            match = _EXPIRES_PARAM.search(chosen)
-            if match is not None:
-                return int(match.group(1))
+            token = _EXPIRES_TOKEN.search(chosen)
+            if token is not None:
+                value = token.group(1)
+                # Present but not a run of digits (e.g. ``-1`` / ``abc``) is a
+                # malformed expires: fail closed, never the positive fallback.
+                return int(value) if value.isdigit() else None
         expires = response.header("Expires")
         if expires is not None and expires.strip().isdigit():
             return int(expires.strip())

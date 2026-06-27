@@ -136,6 +136,16 @@ def test_runbook_0013_wss_wired_claim_is_accurate() -> None:
         "ADR-0038 shipped this; update to describe what IS."
     )
 
+    # PRESENCE assertion: the corrected WSS-wired statement must appear.
+    # Matches the actual corrected text in the runbook (§ "No inbound calls arriving",
+    # "Check transport mismatch" subsection) — guards against silent deletion or
+    # replacement with another false claim.
+    assert "WSS signalling IS wired (ADR-0038)" in content, (
+        "Runbook must CONTAIN the corrected WSS-wired statement "
+        "'WSS signalling IS wired (ADR-0038)'. "
+        "Absence means the section was deleted or rewritten into another false claim."
+    )
+
 
 def test_runbook_0013_tts_fallback_token_is_hyphenated() -> None:
     """Verify the TTS fallback env-var example uses 'sherpa-kokoro' (hyphen).
@@ -157,4 +167,13 @@ def test_runbook_0013_tts_fallback_token_is_hyphenated() -> None:
         f"Runbook contains invalid token '{bad_token}'. "
         "config.py _TTS_PROVIDERS uses 'sherpa-kokoro' (hyphen, not underscore). "
         "Following the runbook as written triggers ConfigError at startup."
+    )
+
+    # PRESENCE assertion: the corrected hyphenated token must appear.
+    # Guards against silent deletion or replacement with another wrong value.
+    good_token = "HERMES_VOIP_TTS_FALLBACK=sherpa-kokoro"
+    assert good_token in content, (
+        f"Runbook must CONTAIN the valid token '{good_token}' "
+        "(hyphen, matching config.py _TTS_PROVIDERS). "
+        "Absence means the guidance was deleted or replaced with another wrong value."
     )

@@ -29,6 +29,8 @@ import json
 
 import pytest
 
+import hermes_voip.voip_tools as vt
+from hermes_voip.config import ConfigError
 from hermes_voip.originate import (
     OutboundCallCancelled,
     OutboundCallFailed,
@@ -135,8 +137,6 @@ def _reset_active_adapter() -> object:
 
 
 def _set_chat(monkeypatch: pytest.MonkeyPatch, call_id: str | None) -> None:
-    import hermes_voip.voip_tools as vt  # noqa: PLC0415
-
     monkeypatch.setattr(vt, "_current_call_id", lambda: call_id)
 
 
@@ -423,9 +423,6 @@ def test_parse_ring_timeout_rejects_infinity(
     monkeypatch: pytest.MonkeyPatch, raw: str, fragment: str
 ) -> None:
     """_parse_ring_timeout rejects non-finite values with a typed config error."""
-    import hermes_voip.voip_tools as vt  # noqa: PLC0415
-    from hermes_voip.config import ConfigError  # noqa: PLC0415
-
     monkeypatch.setenv("HERMES_VOIP_RING_TIMEOUT_SECS", raw)
     with pytest.raises(ConfigError, match=fragment):
         vt._parse_ring_timeout()
@@ -588,14 +585,10 @@ async def test_place_call_runtime_error_does_not_leak_gateway_detail(
 
 def test_ring_timeout_env_symbol_is_exported() -> None:
     """ADR-0086 Consequences: the ring-timeout env symbol is a stable __all__ export."""
-    import hermes_voip.voip_tools as vt  # noqa: PLC0415
-
     assert "_RING_TIMEOUT_ENV" in vt.__all__
     assert vt._RING_TIMEOUT_ENV == "HERMES_VOIP_RING_TIMEOUT_SECS"
 
 
 def test_place_call_outcome_is_exported() -> None:
     """PlaceCallOutcome is part of the module's public API (__all__)."""
-    import hermes_voip.voip_tools as vt  # noqa: PLC0415
-
     assert "PlaceCallOutcome" in vt.__all__

@@ -1884,6 +1884,65 @@ async def test_connect_wires_on_cancel_and_it_aborts_the_call_task() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression: WSS transport must also wire on_cancel so inbound CANCEL over
+# WSS aborts the half-built call — identical to the TLS test above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wss_connect_wires_on_cancel_and_it_aborts_the_call_task() -> None:
+    """``_establish`` passes on_cancel to WssSipTransport; it cancels the task."""
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _ConnectOrderTransport()
+    config = _platform_config(
+        _FAKE_ENV | _FAKE_MEDIA_ENV | {"HERMES_SIP_TRANSPORT": "wss"}
+    )
+
+    captured: dict[str, object] = {}
+
+    def _capture_transport(*_args: object, **kwargs: object) -> _ConnectOrderTransport:
+        captured.update(kwargs)
+        return transport
+
+    with (
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.WssSipTransport", side_effect=_capture_transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=_FakeManager()),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+
+    on_cancel = captured.get("on_cancel")
+    assert on_cancel is not None, (
+        "the adapter must pass on_cancel to WssSipTransport so a CANCELled INVITE"
+        " over WSS is aborted"
+    )
+    assert callable(on_cancel)
+
+    # A long-running fake setup task tracked under a Call-ID; on_cancel must cancel
+    # it (the half-built media/CallLoop is torn down on the task's cancellation).
+    call_id = "wss-cancel-me-call"
+
+    async def _never() -> None:
+        await asyncio.Event().wait()  # blocks until cancelled
+
+    task: asyncio.Task[None] = asyncio.ensure_future(_never())
+    adapter._call_tasks.setdefault(call_id, set()).add(task)
+    await asyncio.sleep(0)  # let the task start
+
+    on_cancel(call_id)
+    await asyncio.sleep(0)  # let the cancellation propagate
+    assert task.cancelled() or task.cancelling() > 0, (
+        "on_cancel must cancel the WSS call's in-flight setup task"
+    )
+    # Drain the cancellation so the test leaves no pending task.
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+# ---------------------------------------------------------------------------
 # Regression (live inbound-call failure, 2026-06-16): the 200 OK answering an
 # inbound INVITE MUST carry our dialog To-tag, so the gateway's subsequent
 # in-dialog ACK/BYE route back to the established CallSession instead of going

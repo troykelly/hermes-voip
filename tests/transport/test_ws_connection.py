@@ -492,17 +492,16 @@ async def test_inbound_invite_routes_to_new_call() -> None:
         await server.stop()
 
 
-async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
-    """Over WSS a CANCEL surfaces via on_unroutable (TLS-only handling, follow-up).
+async def test_out_of_dialog_cancel_for_unknown_invite_is_481_wss() -> None:
+    """Over WSS a CANCEL with no matching pending INVITE is answered 481.
 
-    The shared :class:`~hermes_voip.manager.RegistrationManager` now classifies a
-    CANCEL as :class:`~hermes_voip.manager.Cancel`; the WSS transport does not yet
-    implement the §9.2 200/487 server-transaction handling (that lives on the TLS
-    transport), so a CANCEL falls through to the unroutable observer exactly as it
-    did before — this pins that behaviour so the typed routing change is covered.
+    The WSS transport now implements RFC 3261 §9.2 server-transaction tracking
+    (ported from SipOverTlsTransport).  A CANCEL that does not match any tracked
+    pending inbound INVITE is answered ``481 Call/Transaction Does Not Exist``
+    by the §9.2 handler; it is NOT routed to ``on_unroutable`` (the handler owns
+    this code path).  This supersedes the previous "fall-through to unroutable"
+    pinning test, which documented a known interim gap now closed.
     """
-    from hermes_voip.manager import Unroutable  # noqa: PLC0415
-
     unroutable: list[object] = []
 
     def responder(_frame: str) -> list[str]:
@@ -515,6 +514,7 @@ async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
         port=server.port,
         ws_path="/ws",
         connect_address="127.0.0.1",
+        on_cancel=lambda _cid: None,
         on_unroutable=unroutable.append,
     )
     manager = RegistrationManager(_gateway(), transport)
@@ -532,10 +532,13 @@ async def test_out_of_dialog_cancel_surfaces_unroutable() -> None:
             "Content-Length: 0\r\n\r\n"
         )
         await server.push(cancel)
-        await _until(lambda: len(unroutable) == 1, timeout=3.0)
-        reported = unroutable[0]
-        assert isinstance(reported, Unroutable)
-        assert reported.request.method == "CANCEL"
+        resp = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 481"), timeout=3.0
+        )
+        assert "CSeq: 1 CANCEL" in resp
+        # The §9.2 handler sends the 481; on_unroutable must NOT fire.
+        await asyncio.sleep(0.1)
+        assert unroutable == [], "an unmatched WSS CANCEL must not fire on_unroutable"
     finally:
         await manager.aclose()
         await transport.aclose()
@@ -948,6 +951,293 @@ async def test_remove_call_sink_identity_guard_matches_tls() -> None:
 # ---------------------------------------------------------------------------
 # caplog regression: malformed-SIP skip log must be non-PII (WSS, bk646)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Inbound CANCEL handling (RFC 3261 §9.2) — WSS server-transaction tracking
+# ---------------------------------------------------------------------------
+# These tests cover the ported §9.2 behaviour from SipOverTlsTransport:
+#   - a CANCEL matching a tracked pending inbound INVITE fires on_cancel, sends
+#     200 OK (to CANCEL) + 487 Request Terminated (to INVITE)
+#   - an unmatched CANCEL (no prior INVITE tracked) is answered 481
+# ---------------------------------------------------------------------------
+
+
+def _wss_inbound_invite_with(*, to_user: str, call_id: str, branch: str) -> str:
+    """A WSS inbound INVITE with an explicit branch for CANCEL matching."""
+    return (
+        f"INVITE sip:{to_user}@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/WSS gw.pbx.example.test;branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+        f"To: <sip:{to_user}@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Contact: <sip:caller@gw.pbx.example.test;transport=ws>\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _wss_cancel_for(*, to_user: str, call_id: str, branch: str) -> str:
+    """A CANCEL matching the branch/Call-ID of a prior WSS inbound INVITE."""
+    return (
+        f"CANCEL sip:{to_user}@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/WSS gw.pbx.example.test;branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:caller@pbx.example.test>;tag=remote\r\n"
+        f"To: <sip:{to_user}@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 CANCEL\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+_TO_TAG_RE = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
+
+
+def _to_tag_of(frame: str) -> str | None:
+    """The ``tag`` parameter of a response's ``To`` header (None if absent)."""
+    to_value = SipResponse.parse(frame).header("To")
+    if to_value is None:
+        return None
+    match = _TO_TAG_RE.search(to_value)
+    return match.group(1) if match is not None else None
+
+
+async def test_wss_inbound_cancel_487s_invite_and_200s_cancel_and_fires_on_cancel() -> (
+    None
+):
+    # RFC 3261 §9.2 on the WSS transport: a CANCEL matching a tracked pending
+    # inbound INVITE must answer the CANCEL 200 OK, the INVITE 487 Request
+    # Terminated, and fire the on_cancel hook (Call-ID) so the adapter tears
+    # down the half-built call. Mirrors the TLS equivalent in test_connection.py.
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKwscancel"
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        # Step 1: inbound INVITE arrives and is tracked.
+        await server.push(
+            _wss_inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1, timeout=3.0)
+        # Step 2: caller abandons — a CANCEL for the same transaction.
+        await server.push(
+            _wss_cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        )
+        # Transport must answer the CANCEL 200 OK ...
+        ok = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw,
+            timeout=3.0,
+        )
+        assert "CSeq: 1 CANCEL" in ok
+        # ... the pending INVITE 487 Request Terminated ...
+        terminated = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        assert "CSeq: 1 INVITE" in terminated
+        # ... and the abort hook must fire with this call's Call-ID.
+        await _until(lambda: cancelled == [call_id])
+        assert cancelled == [call_id]
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_wss_cancel_for_unknown_invite_is_481() -> None:
+    # RFC 3261 §9.2: a CANCEL matching no tracked INVITE server transaction
+    # on the WSS transport is answered 481 Call/Transaction Does Not Exist
+    # (not routed to on_unroutable — the §9.2 handler owns this code path).
+    # Mirrors test_cancel_for_unknown_invite_is_481 on the TLS transport.
+    unroutable: list[object] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=lambda _nc: None,
+        on_cancel=lambda _cid: None,
+        on_unroutable=unroutable.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(
+            _wss_cancel_for(
+                to_user="1000", call_id="wss-never-seen", branch="z9hG4bKwsghost"
+            )
+        )
+        resp = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 481"), timeout=3.0
+        )
+        assert "CSeq: 1 CANCEL" in resp
+        # The 481 is sent by the §9.2 handler; on_unroutable must NOT fire.
+        await asyncio.sleep(0.1)
+        assert unroutable == [], "an unmatched WSS CANCEL must not fire on_unroutable"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_wss_retransmitted_cancel_is_absorbed_no_second_487_or_abort() -> None:
+    # A retransmitted CANCEL on the WSS transport must be absorbed: the 200 OK
+    # to the CANCEL is re-sent, but the INVITE is NOT 487'd a second time and
+    # on_cancel fires only once (idempotent RFC 3261 §9.2).
+    # Mirrors test_retransmitted_cancel_is_absorbed_no_second_487_or_abort (TLS).
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKwsretx"
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(
+            _wss_inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1, timeout=3.0)
+        cancel = _wss_cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(cancel)
+        await _until(lambda: cancelled == [call_id])
+        await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        # The peer retransmits the CANCEL.
+        await server.push(cancel)
+        await asyncio.sleep(0.1)
+        # Exactly one 487 (the retransmit was absorbed).
+        terminated = [raw for raw in server.received if raw.startswith("SIP/2.0 487")]
+        assert len(terminated) == 1, (
+            "a retransmitted WSS CANCEL must not re-487 the INVITE"
+        )
+        assert cancelled == [call_id], "on_cancel must fire only once for a WSS CANCEL"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_wss_cancel_200_totag_matches_487_and_is_stable_across_retransmit() -> (
+    None
+):
+    # RFC 3261 §9.2: "The To tag of the response to the CANCEL and the To tag in
+    # the response to the original request SHOULD be the same." So the To tag on
+    # the 200 OK (to the CANCEL) MUST equal the To tag on the 487 (to the INVITE).
+    # And because a retransmitted CANCEL re-sends its 200 OK (§9.2 idempotency),
+    # every 200-to-CANCEL for the same transaction MUST carry that SAME stable To
+    # tag — a fresh tag per receipt would make CANCEL responses differ at the
+    # message level (non-idempotent). Both INVITE-487 and every CANCEL-200 carry
+    # the pending invite's one stable local_tag.
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKwstag"
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(
+            _wss_inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1, timeout=3.0)
+        cancel = _wss_cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(cancel)
+        # Collect the first 200-to-CANCEL and the 487-to-INVITE.
+        first_ok = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw,
+            timeout=3.0,
+        )
+        terminated = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        first_cancel_tag = _to_tag_of(first_ok)
+        invite_tag = _to_tag_of(terminated)
+        assert invite_tag is not None, "the 487 must carry a To tag"
+        assert first_cancel_tag is not None, "the 200-to-CANCEL must carry a To tag"
+        assert first_cancel_tag == invite_tag, (
+            "RFC 3261 §9.2: the 200-to-CANCEL To tag must equal the 487 To tag, "
+            f"got CANCEL-200={first_cancel_tag!r} vs INVITE-487={invite_tag!r}"
+        )
+        # The peer retransmits the CANCEL; its 200 OK must reuse the SAME To tag.
+        await server.push(cancel)
+        await _until(
+            lambda: (
+                sum(
+                    1
+                    for raw in server.received
+                    if raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw
+                )
+                >= 2
+            ),
+            timeout=3.0,
+        )
+        cancel_200_tags = {
+            _to_tag_of(raw)
+            for raw in server.received
+            if raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw
+        }
+        assert cancel_200_tags == {invite_tag}, (
+            "every 200-to-CANCEL (incl. the retransmit) must carry the one stable "
+            f"To tag {invite_tag!r}; got {cancel_200_tags!r}"
+        )
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
 
 
 async def test_malformed_frame_caplog_non_pii(

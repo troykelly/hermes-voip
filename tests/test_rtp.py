@@ -11,7 +11,7 @@ import struct
 
 import pytest
 
-from hermes_voip.rtp import JitterBuffer, Lost, RtpPacket, _seq_before
+from hermes_voip.rtp import _SEQ_HALF, JitterBuffer, Lost, RtpPacket, _seq_before
 
 
 def _pkt(
@@ -890,3 +890,140 @@ def test_lost_count_thirtynine_accepted() -> None:
     """Lost(count=39) is a valid coalesced far-ahead run."""
     lost = Lost(sequence=11, count=39)
     assert lost.count == 39
+
+
+# ---------------------------------------------------------------------------
+# max_ahead boundary edge, buffered-duplicate first-wins, and fidelity (backlog 330-341)
+# ---------------------------------------------------------------------------
+
+
+def test_max_ahead_boundary_inclusive_edge_packet_accepted() -> None:
+    """A packet at exactly next+max_ahead is accepted and buffered.
+
+    The playout window is [next, next+max_ahead] inclusive. A packet at the
+    boundary (diff == max_ahead) must pass the window check and be buffered.
+    After popping the anchor packet, the buffered boundary packet becomes available.
+    """
+    jb = JitterBuffer(target_depth=1, max_ahead=10)
+    jb.push(_pkt(100))  # anchor at 100
+    boundary_seq = 100 + 10  # exactly at the edge
+    jb.push(_pkt(boundary_seq))
+
+    # Anchor packet pops cleanly.
+    assert _packet(jb.pop()).sequence_number == 100
+
+    # Boundary packet must be present — next pop must not underflow/loss.
+    out = jb.pop()
+    assert isinstance(out, RtpPacket)
+    assert out.sequence_number == boundary_seq
+
+
+def test_max_ahead_boundary_exclusive_beyond_packet_dropped() -> None:
+    """A packet at next+max_ahead+1 is dropped and never reaches pop().
+
+    Packets beyond max_ahead are outside the playout window and discarded at
+    push time. A packet one step beyond the boundary (diff == max_ahead + 1)
+    must be dropped silently.
+    """
+    jb = JitterBuffer(target_depth=1, max_ahead=10)
+    jb.push(_pkt(100))  # anchor at 100
+    beyond_seq = 100 + 10 + 1  # beyond the edge
+    jb.push(_pkt(beyond_seq))
+
+    # Only the anchor should be buffered.
+    assert len(jb) == 1
+    assert _packet(jb.pop()).sequence_number == 100
+
+    # The beyond-boundary packet was dropped; no more packets.
+    assert jb.pop() is None
+
+
+def test_buffered_duplicate_first_payload_wins() -> None:
+    """A duplicate of a buffered packet keeps the FIRST arrival's payload.
+
+    The buffer uses setdefault(seq, packet): the first packet to arrive at a
+    sequence is buffered; later arrivals with the same sequence are silently
+    dropped. This guards against bit-corruption or retransmission overwriting
+    the original payload. Fidelity: the FIRST payload is preserved.
+    """
+    first_payload = b"FIRST_PAYLOAD"
+    second_payload = b"SECOND_PAYLOAD"
+
+    jb = JitterBuffer(target_depth=2)
+    jb.push(_pkt(100, payload=first_payload))
+    jb.push(_pkt(100, payload=second_payload))  # duplicate at same seq
+
+    # Pop must return the packet with the FIRST payload.
+    out = jb.pop()
+    assert isinstance(out, RtpPacket)
+    assert out.sequence_number == 100
+    assert out.payload == first_payload
+
+
+def test_payload_and_timestamp_fidelity_through_pop() -> None:
+    """Payload and timestamp values are preserved exactly through pop().
+
+    The jitter buffer reorders/buffers packets without modifying their payload
+    or timestamp. A packet arriving with specific payload bytes and a timestamp
+    must emerge from pop() byte-for-byte identical.
+    """
+    timestamps = [0, 160, 320, 480]  # e.g. 20ms ptime: 8kHz sample clock
+    payloads = [
+        b"PKT_A" * 32,  # 160 bytes
+        b"PKT_B" * 32,
+        b"PKT_C" * 32,
+        b"PKT_D" * 32,
+    ]
+
+    jb = JitterBuffer(target_depth=2)
+
+    # Push in reordered: 100, 102, 101, 103 with varying payloads/timestamps.
+    jb.push(_pkt(100, timestamp=timestamps[0], payload=payloads[0]))
+    jb.push(_pkt(102, timestamp=timestamps[2], payload=payloads[2]))
+    jb.push(_pkt(101, timestamp=timestamps[1], payload=payloads[1]))
+    jb.push(_pkt(103, timestamp=timestamps[3], payload=payloads[3]))
+
+    # Pop in order: must see all payloads and timestamps preserved.
+    out1 = _packet(jb.pop())
+    assert out1.sequence_number == 100
+    assert out1.timestamp == timestamps[0]
+    assert out1.payload == payloads[0]
+
+    out2 = _packet(jb.pop())
+    assert out2.sequence_number == 101
+    assert out2.timestamp == timestamps[1]
+    assert out2.payload == payloads[1]
+
+    out3 = _packet(jb.pop())
+    assert out3.sequence_number == 102
+    assert out3.timestamp == timestamps[2]
+    assert out3.payload == payloads[2]
+
+    out4 = _packet(jb.pop())
+    assert out4.sequence_number == 103
+    assert out4.timestamp == timestamps[3]
+    assert out4.payload == payloads[3]
+
+    # Underflow after all packets drained.
+    assert jb.pop() is None
+
+
+def test_max_ahead_guard_rejects_invalid_construction() -> None:
+    """JitterBuffer.__init__ asserts max_ahead < _SEQ_HALF to prevent overflow.
+
+    The serial-number arithmetic (RFC 1982) uses modulo 2^16. Reorder windows
+    larger than or equal to half the space (2^15 = 32768) break the comparison
+    logic and allow ambiguous sequence comparisons. The __init__ must assert
+    max_ahead < _SEQ_HALF to catch configuration errors early.
+    """
+    # max_ahead exactly at the half: must raise AssertionError.
+    with pytest.raises(AssertionError):
+        JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF)
+
+    # max_ahead beyond the half: must raise AssertionError.
+    with pytest.raises(AssertionError):
+        JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF + 1)
+
+    # max_ahead just below the half: must succeed.
+    jb = JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF - 1)
+    assert jb._max_ahead == _SEQ_HALF - 1

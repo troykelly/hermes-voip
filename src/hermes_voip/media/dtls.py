@@ -96,6 +96,13 @@ _PROFILE_TO_SUITE: dict[bytes, str] = {
     b"SRTP_AES128_CM_SHA1_32": _SUITE_32,
 }
 
+#: Strong SDP DTLS fingerprint hash algorithms accepted from peers (ADR-0087).
+_FINGERPRINT_HASH_ALGORITHMS: dict[str, str] = {
+    "sha-256": "sha256",
+    "sha-384": "sha384",
+    "sha-512": "sha512",
+}
+
 # ---------------------------------------------------------------------------
 # Public enums
 # ---------------------------------------------------------------------------
@@ -438,24 +445,61 @@ def _generate_self_signed(ossl: _PyOpenSSLImpl) -> tuple[_PKey, _X509]:
     return pkey, cert
 
 
-def _cert_fingerprint(ossl: _PyOpenSSLImpl, cert: _X509) -> str:
-    """Compute the SHA-256 fingerprint of *cert* in SDP ``a=fingerprint`` format.
+def _cert_fingerprint(
+    ossl: _PyOpenSSLImpl, cert: _X509, *, algorithm: str = "sha-256"
+) -> str:
+    """Compute *cert*'s fingerprint in SDP ``a=fingerprint`` format.
 
-    The fingerprint is the SHA-256 digest of the DER-encoded certificate
-    (RFC 4572 §5), formatted as ``sha-256 XX:XX:XX:…`` with uppercase hex
-    pairs separated by colons.
+    The fingerprint is the selected digest of the DER-encoded certificate (RFC
+    8122), formatted as ``<hash-func> XX:XX:XX:…`` with uppercase hex pairs
+    separated by colons.  Peer-advertised algorithms are limited to the strong
+    allowlist in :data:`_FINGERPRINT_HASH_ALGORITHMS` (ADR-0087).
 
     Args:
         ossl: The loaded :class:`_PyOpenSSLImpl` singleton.
         cert: The X.509 certificate to fingerprint.
+        algorithm: SDP hash-function token (``sha-256``, ``sha-384``, or ``sha-512``).
 
     Returns:
-        A string of the form ``"sha-256 XX:XX:XX:…"`` (32 uppercase hex pairs).
+        A string of the form ``"sha-256 XX:XX:XX:…"`` for the default algorithm.
+
+    Raises:
+        ValueError: If *algorithm* is weak, malformed, or unsupported.
     """
+    hash_name = _hashlib_name_for_fingerprint_algorithm(algorithm)
     der: bytes = ossl.dump_certificate(ossl.FILETYPE_ASN1, cert)
-    digest: str = hashlib.sha256(der).hexdigest().upper()
+    digest: str = hashlib.new(hash_name, der).hexdigest().upper()
     hex_pairs: str = ":".join(digest[i : i + 2] for i in range(0, len(digest), 2))
-    return f"sha-256 {hex_pairs}"
+    return f"{_normalise_fingerprint_algorithm(algorithm)} {hex_pairs}"
+
+
+def _normalise_fingerprint_algorithm(algorithm: str) -> str:
+    """Return the canonical lower-case SDP fingerprint hash-function token."""
+    return algorithm.strip().lower()
+
+
+def _hashlib_name_for_fingerprint_algorithm(algorithm: str) -> str:
+    """Map a supported SDP fingerprint hash-function token to ``hashlib`` name.
+
+    Raises:
+        ValueError: If *algorithm* is absent, weak (for example SHA-1/MD5), or not
+            in the explicit ADR-0087 allowlist.
+    """
+    normalised = _normalise_fingerprint_algorithm(algorithm)
+    try:
+        return _FINGERPRINT_HASH_ALGORITHMS[normalised]
+    except KeyError:
+        msg = f"unsupported DTLS fingerprint hash algorithm: {normalised!r}"
+        raise ValueError(msg) from None
+
+
+def _split_fingerprint(expected_fingerprint: str) -> tuple[str, str]:
+    """Split an SDP fingerprint value into ``(hash-func, hex-fingerprint)``."""
+    parts = expected_fingerprint.strip().split(maxsplit=1)
+    if len(parts) == 2:  # noqa: PLR2004 - split result length is the parse condition
+        return _normalise_fingerprint_algorithm(parts[0]), parts[1]
+    msg = "malformed DTLS fingerprint: expected '<hash-func> <fingerprint>'"
+    raise ValueError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -800,31 +844,31 @@ class DtlsEndpoint:
 
         Must be called after the handshake completes and BEFORE deriving SRTP
         sessions.  A mismatch means the peer is not who the SDP claims — abort
-        the call.
+        the call.  The SDP hash-function token is enforced fail-closed: only the
+        strong ADR-0087 allowlist (SHA-256/SHA-384/SHA-512) is accepted.
 
         Args:
-            expected_fingerprint: The ``a=fingerprint:sha-256 XX:XX:…`` value
-                from the peer's SDP (case-insensitive hex, with or without the
-                ``sha-256 `` prefix).
+            expected_fingerprint: The ``a=fingerprint`` body from the peer's SDP,
+                for example ``"sha-256 XX:XX:…"``.
 
         Raises:
             RuntimeError: If no peer certificate is available (handshake not
                 done, or anonymous peer).
-            ValueError: If the fingerprint does not match.
+            ValueError: If the hash algorithm is unsupported or the fingerprint
+                does not match.
         """
         peer_cert: _X509 | None = self._conn.get_peer_certificate()
         if peer_cert is None:
             msg = "no peer certificate — DTLS handshake may not be complete"
             raise RuntimeError(msg)
-        actual: str = _cert_fingerprint(self._ossl, peer_cert)
+        algorithm, expected_value = _split_fingerprint(expected_fingerprint)
+        actual: str = _cert_fingerprint(self._ossl, peer_cert, algorithm=algorithm)
+        _actual_algorithm, actual_value = _split_fingerprint(actual)
 
-        # Normalise: strip optional prefix, uppercase, compare.
-        def _normalise(fp: str) -> str:
-            if fp.lower().startswith("sha-256 "):
-                fp = fp[len("sha-256 ") :]
+        def _normalise_value(fp: str) -> str:
             return fp.upper().replace(" ", "")
 
-        if _normalise(actual) != _normalise(expected_fingerprint):
+        if _normalise_value(actual_value) != _normalise_value(expected_value):
             msg = "DTLS peer certificate fingerprint mismatch — call rejected"
             raise ValueError(msg)
         self._fingerprint_verified = True

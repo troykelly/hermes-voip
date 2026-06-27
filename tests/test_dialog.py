@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 
 from hermes_voip.dialog import (
+    _MAX_CSEQ,
     Dialog,
     DialogError,
     build_in_dialog_request,
@@ -471,3 +472,56 @@ def test_strict_router_first_route_rejected() -> None:
     )
     with pytest.raises(DialogError):
         build_in_dialog_request(d, "BYE")
+
+
+# ---- CSeq upper-bound guard in build_in_dialog_request ---------------------
+
+
+def test_build_in_dialog_request_raises_on_cseq_overflow() -> None:
+    # RFC 3261 §8.1.1.5: the CSeq sequence number must be below 2**31.
+    # build_in_dialog_request computes next_cseq = local_cseq + 1; when
+    # local_cseq == _MAX_CSEQ - 1, next_cseq == _MAX_CSEQ which would produce
+    # a CSeq value that the same module rejects on the parse path.  The build
+    # path must raise DialogError before emitting the overflowing value.
+    d = Dialog.from_invite_2xx(_invite(), _ok())
+    # Force local_cseq to _MAX_CSEQ - 1 (the last legal value we can hold).
+    d = d.__class__(
+        call_id=d.call_id,
+        local_uri=d.local_uri,
+        local_tag=d.local_tag,
+        remote_uri=d.remote_uri,
+        remote_tag=d.remote_tag,
+        remote_target=d.remote_target,
+        route_set=d.route_set,
+        local_contact=d.local_contact,
+        local_sent_by=d.local_sent_by,
+        transport=d.transport,
+        local_cseq=_MAX_CSEQ - 1,
+        sdp_version=d.sdp_version,
+        user_agent=d.user_agent,
+    )
+    with pytest.raises(DialogError, match="CSeq"):
+        build_in_dialog_request(d, "BYE")
+
+
+def test_build_in_dialog_request_normal_range_still_increments() -> None:
+    # A dialog just below the overflow boundary works normally.
+    d = Dialog.from_invite_2xx(_invite(), _ok())
+    # _MAX_CSEQ - 2 as local_cseq => next = _MAX_CSEQ - 1 (still legal).
+    d = d.__class__(
+        call_id=d.call_id,
+        local_uri=d.local_uri,
+        local_tag=d.local_tag,
+        remote_uri=d.remote_uri,
+        remote_tag=d.remote_tag,
+        remote_target=d.remote_target,
+        route_set=d.route_set,
+        local_contact=d.local_contact,
+        local_sent_by=d.local_sent_by,
+        transport=d.transport,
+        local_cseq=_MAX_CSEQ - 2,
+        sdp_version=d.sdp_version,
+        user_agent=d.user_agent,
+    )
+    result = build_in_dialog_request(d, "BYE")
+    assert result.dialog.local_cseq == _MAX_CSEQ - 1

@@ -2409,3 +2409,45 @@ def test_language_single_char_rejected() -> None:
     """A single-character code is not a valid BCP-47 primary subtag and is rejected."""
     with pytest.raises(ConfigError, match="HERMES_VOIP_LANGUAGE"):
         load_media_config({"HERMES_VOIP_LANGUAGE": "e"})
+
+
+def test_language_private_use_singleton_rejected_env() -> None:
+    """'x-foo' (single-letter primary subtag) is rejected via the env path.
+
+    ADR-0084 adopts the CONSERVATIVE boundary: the accepted grammar requires a
+    2-8 ASCII-alpha primary subtag.  Bare BCP-47 private-use singletons like
+    'x-foo' fall outside that grammar.  They are intentionally out of scope
+    because an arbitrary 'x-foo' has no provider meaning and would only move
+    failure from startup to call-time.  'zz' (a 2-letter code) remains valid.
+    """
+    with pytest.raises(ConfigError, match="HERMES_VOIP_LANGUAGE"):
+        load_media_config({"HERMES_VOIP_LANGUAGE": "x-foo"})
+
+
+def test_language_private_use_singleton_rejected_direct() -> None:
+    """'x-foo' is also rejected when constructing MediaConfig directly.
+
+    Guards the __post_init__ path (distinct from the env-parse path).
+    """
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="language"):
+        dataclasses.replace(base, language="x-foo")
+
+
+def test_language_mixed_case_normalized_on_direct_construction() -> None:
+    """MediaConfig(language='PT-BR') must construct and store the value lowercased.
+
+    Before this fix: the env path (via _value_lower) succeeds and stores 'pt-br',
+    but direct construction raises because _validate_comfort_filler matched
+    self.language against _LANGUAGE_RE without lowercasing first.  After the fix
+    both paths succeed and the stored value is always lowercased.
+    """
+    base = load_media_config({})
+    cfg = dataclasses.replace(base, language="PT-BR")
+    assert cfg.language == "pt-br"
+
+
+def test_language_mixed_case_normalized_env_path() -> None:
+    """HERMES_VOIP_LANGUAGE='PT-BR' (env path) must store 'pt-br' (already passing)."""
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "PT-BR"})
+    assert cfg.language == "pt-br"

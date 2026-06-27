@@ -744,11 +744,11 @@ class TestSrtcpModuleExports:
     def test_all_contains_correct_public_names(self) -> None:
         """__all__ must list the exact public names intended for star-import."""
         expected = {"SrtcpError", "SrtcpSession"}
-        assert set(_srtcp_mod.__all__) == expected  # type: ignore[attr-defined]
+        assert set(_srtcp_mod.__all__) == expected
 
     def test_all_names_are_importable(self) -> None:
         """Every name in __all__ must be importable from the module."""
-        all_names = _srtcp_mod.__all__  # type: ignore[attr-defined]
+        all_names = _srtcp_mod.__all__
         for name in all_names:
             assert hasattr(_srtcp_mod, name), (
                 f"{name} must be importable from srtcp module"
@@ -759,6 +759,6 @@ class TestSrtcpModuleExports:
 
     def test_no_private_names_in_all(self) -> None:
         """__all__ must not include any names starting with underscore."""
-        all_names = _srtcp_mod.__all__  # type: ignore[attr-defined]
+        all_names = _srtcp_mod.__all__
         private_names = [name for name in all_names if name.startswith("_")]
         assert not private_names, f"Private names in __all__: {private_names}"

@@ -1171,7 +1171,16 @@ class RtpMediaTransport:
         # is padded to a final frame exactly once, in stop()'s flush, so the last
         # utterance's tail is delivered not stranded; set_hold(True) drops it
         # (hold stops outbound media). Reset in connect()/stop().
-        self._tx_buffer: bytes = b""
+        #
+        # A bytearray (not immutable bytes) so the per-chunk send_audio drain
+        # mutates it in place (efficiency, rule 22): ``extend`` appends each chunk
+        # and ``del buf[:n]`` pops whole frames off the front WITHOUT the
+        # ``self._tx_buffer = self._tx_buffer + chunk`` / ``[n:]`` reallocation that
+        # immutable bytes forced on every append and every drained frame. Resets use
+        # ``.clear()`` (keeps the same object) except where a caller snapshots the
+        # tail, which copies to immutable ``bytes`` before clearing so the captured
+        # tail is not aliased to the (about-to-be-reused) buffer.
+        self._tx_buffer: bytearray = bytearray()
 
         # Barge-in flush generation (ADR-0028). ``flush_outbound`` increments this
         # to signal any send_audio drain loop currently parked on its pacing sleep
@@ -1220,6 +1229,16 @@ class RtpMediaTransport:
         # here (never re-queued, so it cannot be lost to a full queue) and
         # returned first by the next _next_datagram() call.
         self._pending: _Datagram | None = None
+
+        # Long-lived stop-wait racer reused across every _next_datagram() call
+        # (efficiency, rule 22). The inbound generator calls _next_datagram ~50x/s;
+        # the stop flag is set exactly once per call's lifetime, so re-creating a
+        # `_stop_event.wait()` Task on every receive is pure churn. We park ONE
+        # await on the event here and reuse the resulting Task — it is never
+        # cancelled by _next_datagram (only the per-call queue.get() racer is), and
+        # it is awaited+cleared in stop(). ``None`` until the first race that needs
+        # it; reset in connect()/stop() (the event object is replaced there too).
+        self._stop_wait_task: asyncio.Task[bool] | None = None
 
         # Outbound TX serialization (ADR-0031): send_audio (one re-framed TTS
         # chunk) and send_dtmf (one DTMF burst) are the two TX coroutines that
@@ -1339,6 +1358,17 @@ class RtpMediaTransport:
             if self._inband_dtmf_rx_enabled
             else None
         )
+        # Drop any stop-wait racer left parked on the PREVIOUS call's stop event
+        # (a reused engine replaces the event below). It cannot fire usefully on the
+        # new event; cancel AND await it so it does not leak (no "Task was destroyed
+        # but it is pending"). stop() normally clears this to None, so this only
+        # bites on connect-without-prior-stop (reconnect of a never-stopped engine).
+        stale_stop_wait = self._stop_wait_task
+        self._stop_wait_task = None
+        if stale_stop_wait is not None:
+            stale_stop_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stale_stop_wait
         self._stop_event = asyncio.Event()
         self._pending = None
         # Fresh TX lock so a reused engine never inherits a held lock (ADR-0031).
@@ -1374,8 +1404,9 @@ class RtpMediaTransport:
         # the outbound path re-sets ``_codec`` after connect() but before media, so
         # building it here (as PCMU) would pin the wrong rate for a G.722/Opus call.
         self._aec = None
-        # Drop any leftover outbound re-framing bytes from a previous call.
-        self._tx_buffer = b""
+        # Drop any leftover outbound re-framing bytes from a previous call (clear in
+        # place — the bytearray object is reused).
+        self._tx_buffer.clear()
         # A fresh call starts at flush generation 0 (no barge-in flush yet).
         self._flush_generation = 0
         # Re-anchor the pacing schedule on the first frame of this call (so a reused
@@ -1814,9 +1845,13 @@ class RtpMediaTransport:
         as a failure (MEDIA_TIMEOUT) — distinct from a clean BYE.
 
         ``asyncio.CancelledError`` from the awaited tasks propagates to the caller
-        (rule 37). Every race task is cancelled AND awaited before this method
-        returns or propagates, so no task is left pending (no "Task was destroyed
-        but it is pending" warning).
+        (rule 37). The per-call racers (the fresh ``queue.get()`` and, when armed,
+        the watchdog) are each cancelled AND awaited before this method returns or
+        propagates, so neither is left pending (no "Task was destroyed but it is
+        pending" warning). The stop-wait racer is created ONCE and REUSED across
+        calls (it is not re-created per receive — efficiency, rule 22); it is never
+        cancelled here, and is awaited+cleared in :meth:`stop` (and dropped in
+        :meth:`connect` for a reused engine), so it never leaks either.
 
         Rollback is lossless: if the stop flag wins a race in which a datagram had
         already been dequeued, that datagram is parked in :attr:`_pending` (never
@@ -1834,14 +1869,32 @@ class RtpMediaTransport:
             self._pending = None
             return data
 
-        # Fast path: already stopped.
-        if self._stop_event.is_set():
-            return None
+        # The stop-wait racer is created ONCE and reused across every call
+        # (efficiency, rule 22): the inbound generator calls this ~50x/s and the
+        # stop flag flips at most once per call, so re-creating a `wait()` Task per
+        # receive is pure churn. We park ONE await on the event and reuse the Task;
+        # it is never cancelled here (only the per-call get/watchdog racers are) and
+        # is awaited+cleared in stop(). A stop set BEFORE the first await still makes
+        # this Task resolve on the next loop step, so the stop precedence below
+        # applies uniformly — including the stop-with-queued-datum park (no separate
+        # is_set() fast path, which would have dropped the queued datum on stop).
+        #
+        # Measured task churn (rule 22; counted via asyncio.ensure_future over 100
+        # receive iterations): watchdog ARMED 3.00 -> 2.00 tasks/call, watchdog OFF
+        # 2.00 -> 1.00 tasks/call. The stop-wait Task is now amortised to ~0 per
+        # call (created once, reused), halving the per-receive task creation on the
+        # event-loop hot path at ~50 receives/s.
+        stop_task = self._stop_wait_task
+        if stop_task is None or (stop_task.done() and stop_task.cancelled()):
+            stop_task = asyncio.ensure_future(self._stop_event.wait())
+            self._stop_wait_task = stop_task
 
+        # One fresh queue.get() racer per call (a Future is single-shot). On a clean
+        # receive its result is the datagram; on a stop/watchdog win it is cancelled
+        # AND awaited below so nothing is left pending.
         get_task: asyncio.Task[_Datagram] = asyncio.ensure_future(
             self._recv_queue.get()
         )
-        stop_task: asyncio.Task[bool] = asyncio.ensure_future(self._stop_event.wait())
         # The inactivity-watchdog racer (ADR-0026), only when armed. A fresh task per
         # call re-arms the deadline on every datagram. ``None`` when the watchdog is
         # off (``_media_timeout_secs <= 0``) — the legacy stop/BYE-only behaviour.
@@ -1850,26 +1903,33 @@ class RtpMediaTransport:
             watchdog_task = asyncio.ensure_future(
                 self._watchdog_sleep(self._media_timeout_secs)
             )
-        race_tasks: tuple[asyncio.Task[object], ...] = (
-            (get_task, stop_task)
-            if watchdog_task is None
-            else (get_task, stop_task, watchdog_task)
+        # Only these per-call tasks are cancelled+awaited when they lose (the reused
+        # stop_task is NOT — it lives across calls). The tuple is typed at the
+        # ``object`` element so the heterogeneous tasks share one static type
+        # (tuples are covariant, so this widening is sound).
+        per_call_tasks: tuple[asyncio.Task[object], ...] = (
+            (get_task,) if watchdog_task is None else (get_task, watchdog_task)
         )
+        # The awaitables raced this call: the reused stop_task INCLUDED in the race
+        # but EXCLUDED from the per-call cleanup above.
+        race_tasks: tuple[asyncio.Task[object], ...] = (*per_call_tasks, stop_task)
         try:
             await asyncio.wait(
                 set(race_tasks),
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            # Cancel whichever tasks did not complete, then AWAIT all so their
-            # cancellation is fully processed before we return — nothing is left
-            # pending. return_exceptions=True absorbs the CancelledError of the
-            # losers; a cancellation of THIS coroutine still propagates out of the
-            # gather below (and thus out of _next_datagram) per rule 37.
-            for task in race_tasks:
+            # Cancel whichever PER-CALL tasks did not complete, then AWAIT all so
+            # their cancellation is fully processed before we return — nothing is
+            # left pending. The reused stop_task is deliberately NOT cancelled here
+            # (it is reused next call and retired in stop()). return_exceptions=True
+            # absorbs the losers' CancelledError; a cancellation of THIS coroutine
+            # still propagates out of the gather below (and thus out of
+            # _next_datagram) per rule 37.
+            for task in per_call_tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*race_tasks, return_exceptions=True)
+            await asyncio.gather(*per_call_tasks, return_exceptions=True)
 
         # Stop wins over a delivered datagram (abandon a full queue on stop).
         if stop_task.done() and not stop_task.cancelled():
@@ -1985,7 +2045,7 @@ class RtpMediaTransport:
         # shared _seq/_ts/_tx_buffer. The lock releases on every exit path
         # (including the early returns below) because it is an ``async with``.
         async with self._tx_lock:
-            self._tx_buffer += wire_rate_frame.samples
+            self._tx_buffer.extend(wire_rate_frame.samples)
             # Snapshot the flush generation for this drain: if a barge-in flush bumps
             # it mid-drain (ADR-0028), _transmit_frame suppresses the in-flight frame
             # and this loop stops, so the rest of the superseded utterance never goes
@@ -1996,11 +2056,12 @@ class RtpMediaTransport:
                 # which takes ownership: on a clean send the frame is on the wire; on a
                 # stop racing its pacing sleep the (already-encoded) frame lives in
                 # _inflight_wire for the flush. Either way it must NOT remain in
-                # _tx_buffer (that would re-encode/duplicate it).
-                chunk, self._tx_buffer = (
-                    self._tx_buffer[:chunk_bytes],
-                    self._tx_buffer[chunk_bytes:],
-                )
+                # _tx_buffer (that would re-encode/duplicate it). Copy the frame to
+                # immutable ``bytes`` (PcmFrame.samples is bytes, and the copy is
+                # detached from the buffer) then ``del`` it off the front in place —
+                # no whole-buffer realloc per drained frame.
+                chunk = bytes(self._tx_buffer[:chunk_bytes])
+                del self._tx_buffer[:chunk_bytes]
                 sent = await self._transmit_frame(
                     chunk,
                     wire_rate_frame.monotonic_ts_ns,
@@ -3160,7 +3221,7 @@ class RtpMediaTransport:
             on_hold: ``True`` to hold; ``False`` to resume.
         """
         if on_hold:
-            self._tx_buffer = b""
+            self._tx_buffer.clear()
         self.on_hold = on_hold
 
     async def rekey_srtp(
@@ -3247,8 +3308,10 @@ class RtpMediaTransport:
         # Supersede any in-flight send_audio drain: it bails when it wakes (so the
         # rest of the chunk it was pacing never goes out).
         self._flush_generation += 1
-        pending = self._tx_buffer
-        self._tx_buffer = b""
+        # Snapshot the buffered tail as immutable bytes (the fade path slices it and
+        # feeds linear_fade_out, which takes bytes), then clear the buffer in place.
+        pending = bytes(self._tx_buffer)
+        self._tx_buffer.clear()
         # DROP any frame the deadline pacer parked mid-flight. It is one ptime of
         # full-amplitude (pre-cut) audio; emitting it would add a full-volume packet
         # AFTER the barge-in, beyond the fade budget — exactly the "still talking
@@ -3307,7 +3370,7 @@ class RtpMediaTransport:
         transport = self._transport
         if transport is not None and not self.on_hold:
             self._flush_tx_tail(transport)
-        self._tx_buffer = b""
+        self._tx_buffer.clear()
         # Drop any in-flight frame the flush did not send (held call, or stop before
         # connect): hold/stop-without-socket emit nothing. _flush_tx_tail clears it
         # when it runs; this covers the paths where it does not.
@@ -3379,6 +3442,18 @@ class RtpMediaTransport:
         # Unlike a queued sentinel, this is independent of recv-queue capacity:
         # a full queue cannot drop the signal and strand the consumer.
         self._stop_event.set()
+        # Retire the reused stop-wait racer (efficiency, rule 22): the event is now
+        # set, so this task resolves on the next loop step. AWAIT it (it completes
+        # at once) so it is never left pending across teardown — mirroring the
+        # run_rtcp / reader cleanup above — then clear the slot so a reused engine's
+        # connect() starts fresh. CancelledError is not expected here (we do not
+        # cancel it — it wins cleanly on the set event) but is suppressed for the
+        # connect()-cancelled-it-then-reused-without-await edge, and re-raised by the
+        # task itself per rule 37 if it ever carries one.
+        stop_wait, self._stop_wait_task = self._stop_wait_task, None
+        if stop_wait is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_wait
 
     def _flush_tx_tail(self, transport: _DatagramSink) -> None:
         """Emit all buffered outbound audio as final RTP packets, in order.
@@ -3402,8 +3477,10 @@ class RtpMediaTransport:
         inflight, self._inflight_wire = self._inflight_wire, None
         if inflight is not None:
             transport.sendto(inflight, self._outbound_addr)
-        tail = self._tx_buffer
-        self._tx_buffer = b""
+        # Snapshot the buffered remainder as immutable bytes (it is zero-padded and
+        # handed to _emit_inline_frames below), then clear the buffer in place.
+        tail = bytes(self._tx_buffer)
+        self._tx_buffer.clear()
         if not tail:
             return
         wire_samples_per_frame = (self._wire_sample_rate * self._ptime) // 1000

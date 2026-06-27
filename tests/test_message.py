@@ -289,17 +289,22 @@ def test_build_request_rejects_invalid_header_name() -> None:
         build_request("REGISTER", "sip:pbx.example.test", [("Bad Name", "value")])
 
 
-def test_new_branch_has_rfc3261_magic_cookie_and_is_unique() -> None:
-    a, b = new_branch(), new_branch()
-    assert a.startswith("z9hG4bK")
-    assert b.startswith("z9hG4bK")
-    assert a != b
+def test_new_branch_has_exact_rfc3261_magic_cookie_and_hex_length() -> None:
+    assert re.fullmatch(r"z9hG4bK[0-9a-f]{16}", new_branch())
 
 
-def test_new_tag_and_call_id_are_unique() -> None:
+def test_new_branch_is_unique() -> None:
+    assert new_branch() != new_branch()
+
+
+def test_new_tag_has_exact_hex_length_and_is_unique() -> None:
+    assert re.fullmatch(r"[0-9a-f]{12}", new_tag())
     assert new_tag() != new_tag()
+
+
+def test_new_call_id_has_exact_hex_length_and_is_unique() -> None:
+    assert re.fullmatch(r"[0-9a-f]{24}", new_call_id())
     assert new_call_id() != new_call_id()
-    assert re.fullmatch(r"[0-9a-f]+", new_tag())
 
 
 # RFC 3261 token validation for the request-line method and request-URI

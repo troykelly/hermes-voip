@@ -405,17 +405,45 @@ class _FakeNumpy:
         return _FakeArray("sr")
 
 
+class _FakeNodeArg:
+    """A stand-in for ``onnxruntime.NodeArg`` exposing just ``.name`` and ``.shape``."""
+
+    def __init__(self, name: str, shape: list[int | None]) -> None:
+        self.name = name
+        self.shape = shape
+
+
 class _FakeSession:
     """An ``_OrtSession`` returning scripted probabilities and a fresh next-state.
 
     Records each call's ``state`` input and the full input feed so the test can
     assert the recurrent state is threaded and the inputs are well-formed.
+
+    ``state_shape`` configures what ``get_inputs()`` reports for the state input —
+    ``[2, 1, 128]`` for silero v5 (the default; passes the guard) and ``[2, 1, 64]``
+    for the incompatible silero v4 mirror (``deepghs/silero-vad-onnx``).
     """
 
-    def __init__(self, probabilities: list[float]) -> None:
+    def __init__(
+        self,
+        probabilities: list[float],
+        state_shape: list[int | None] | None = None,
+    ) -> None:
         self._probs = iter(probabilities)
         self.seen_states: list[object] = []
         self.feeds: list[dict[str, object]] = []
+        # Default to v5 shape so existing tests pass the new load-time guard.
+        self._state_shape: list[int | None] = (
+            [2, 1, 128] if state_shape is None else state_shape
+        )
+
+    def get_inputs(self) -> list[_FakeNodeArg]:
+        """Return the three silero ONNX inputs (input, state, sr)."""
+        return [
+            _FakeNodeArg("input", [1, None]),
+            _FakeNodeArg("state", self._state_shape),
+            _FakeNodeArg("sr", []),
+        ]
 
     def run(
         self, output_names: Sequence[str] | None, input_feed: dict[str, object], /
@@ -475,6 +503,43 @@ def test_silero_onnx_wrapper_reset_restores_zero_state() -> None:
     last_state = session.seen_states[-1]
     assert isinstance(last_state, _FakeArray)
     assert last_state.tag == "zero-state"
+
+
+# --- silero v5 shape guard (offline; no ml extra needed) -----------------
+#
+# An operator who grabs the ``deepghs/silero-vad-onnx`` HuggingFace mirror
+# gets a silero v4 model whose recurrent state is ``(2, 1, 64)`` rather than
+# the ``(2, 1, 128)`` that v5 needs.  Without a load-time guard the failure
+# surfaces as an opaque onnxruntime shape mismatch on the FIRST inference call
+# — too late and too cryptic to debug.  _SileroOnnxModel.__init__ must
+# validate ``session.get_inputs()`` immediately and raise a human-readable
+# ``ValueError`` so the operator can act before the call stack is live.
+
+
+def test_silero_v4_state_shape_raises_clear_error_at_model_init() -> None:
+    """A v4 ONNX model (state (2,1,64)) must fail at init with a clear ValueError.
+
+    A v4 model's state input has shape ``(2, 1, 64)``; v5 requires ``(2, 1, 128)``.
+    ``_SileroOnnxModel.__init__`` must detect this via ``session.get_inputs()`` and
+    raise a ``ValueError`` that names the loaded shape, the required shape, and
+    names the incompatible ``deepghs/silero-vad-onnx`` mirror so the operator
+    knows exactly what to do.  The error must appear at INIT time, not at the
+    first ``__call__``.
+    """
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v4_session = _FakeSession([], state_shape=[2, 1, 64])
+    with pytest.raises(ValueError, match=r"\(2, 1, 64\)"):
+        _SileroOnnxModel(v4_session, _FakeNumpy())
+
+
+def test_silero_v5_state_shape_constructs_without_error() -> None:
+    """A v5 ONNX model (state (2,1,128)) must construct without raising."""
+    from hermes_voip.media.vad import _SileroOnnxModel  # noqa: PLC0415
+
+    v5_session = _FakeSession([], state_shape=[2, 1, 128])
+    # must not raise
+    _SileroOnnxModel(v5_session, _FakeNumpy())
 
 
 # --- real-model smoke (skipped in the model-free gate) --------------------

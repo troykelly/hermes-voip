@@ -31,6 +31,12 @@ pip install "hermes-voip[ml,media,webrtc] @ git+https://github.com/troykelly/her
 # …or from a repo clone:  uv sync --frozen --all-extras
 ```
 
+> **WARNING: Hermes imports from the pip-installed copy, not the directory clone.**
+> The Hermes runtime loads `hermes_voip` from the pip-installed site-packages directory,
+> not from any git-cloned `~/.hermes/plugins/hermes-voip/` directory. If you apply a
+> local patch or debug change to the code, you must apply it to the site-packages copy
+> (or to both), not just the cloned directory — otherwise the runtime won't see it.
+
 > **Verified (rule 27): `hermes plugins install owner/repo` does NOT install this package.**
 > The real `hermes plugins install <identifier>` (hermes-agent 0.16.0; `identifier` = a Git URL
 > or `owner/repo` shorthand) **`git clone --depth 1`s** the repo into `~/.hermes/plugins/<name>/`
@@ -182,8 +188,13 @@ reverts the CLI affordance. Neither uninstalls the package (`uv` / `pip` owns th
 ## Why not fix the CLI instead?
 
 The `hermes plugins enable`/`list` filesystem-only behaviour is in the **Hermes runtime**
-(`hermes_cli`), not this plugin — we can't change it from here. The directory manifest is the
-supported way a pip plugin makes itself visible to that CLI. The plugin's own operator-facing
-hint (the `install_hint` passed to `register_platform` in
+(`hermes_cli`), not this plugin — we can't change it from here. The CLI is hardcoded to scan
+the filesystem plugin directories (bundled + `~/.hermes/plugins/` + project `./.hermes/plugins/`)
+and never consults `importlib.metadata` entry points, so a pip entry-point plugin like this one
+is invisible to it — this upstream limitation is tracked as [NousResearch/hermes-agent#23802](https://github.com/NousResearch/hermes-agent/issues/23802).
+Watch that issue for when the CLI gains entry-point awareness; at that point, the directory
+manifest copy-to-`~/.hermes/plugins` workaround can be retired. For now, the directory manifest
+is the supported way a pip plugin makes itself visible to that CLI. The plugin's own
+operator-facing hint (the `install_hint` passed to `register_platform` in
 [`src/hermes_voip/plugin.py`](../../src/hermes_voip/plugin.py)) therefore points at the
 `plugins.enabled` mechanism, which works in every case.

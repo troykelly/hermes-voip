@@ -430,3 +430,70 @@ def test_dtmf_event_rejects_duration_above_boundary_65536() -> None:
     """
     with pytest.raises(ValueError, match="duration out of range"):
         DtmfEvent(event=0, end=False, volume=10, duration=65536)
+
+
+# ---------------------------------------------------------------------------
+# New tests: feed non-digit / start-only paths + event_payloads step guard
+# ---------------------------------------------------------------------------
+
+
+def test_feed_non_digit_returns_none() -> None:
+    """Event code 16 (flash) is not a keypad digit; feed returns NON_DIGIT_EVENT.
+
+    Re-feeding the same timestamp returns DUPLICATE_END (the timestamp is still
+    recorded in the window even for non-digit ends, so the dedup fires correctly).
+    """
+    rx = DtmfReceiver(history=4)
+    flash = DtmfEvent(event=16, end=True, volume=10, duration=100)
+    result = rx.feed(flash, timestamp=100)
+    assert result is DtmfNoPress.NON_DIGIT_EVENT
+    # Re-feeding the same timestamp must be deduped, not re-surfaced.
+    result2 = rx.feed(flash, timestamp=100)
+    assert result2 is DtmfNoPress.DUPLICATE_END
+
+
+def test_start_only_press_never_emits() -> None:
+    """Non-end packets for digit '1' at ts 200 always return STILL_PRESSING.
+
+    The end bit is not set, so no press is ever emitted regardless of how many
+    packets arrive.
+    """
+    rx = DtmfReceiver(history=4)
+    for dur in (80, 160, 240):
+        pkt = DtmfEvent(event=1, end=False, volume=10, duration=dur)
+        assert rx.feed(pkt, timestamp=200) is DtmfNoPress.STILL_PRESSING
+
+
+def test_lone_end_packet_emits_once() -> None:
+    """A single end-bit packet for '1' at ts 300 emits DtmfPress('1') exactly once.
+
+    Re-feeding the same timestamp returns DUPLICATE_END.
+    """
+    rx = DtmfReceiver(history=4)
+    end_pkt = DtmfEvent(event=1, end=True, volume=10, duration=160)
+    result = rx.feed(end_pkt, timestamp=300)
+    assert result == DtmfPress(digit="1")
+    # Redundant end at same timestamp must be suppressed.
+    result2 = rx.feed(end_pkt, timestamp=300)
+    assert result2 is DtmfNoPress.DUPLICATE_END
+
+
+def test_event_payloads_step_exceeds_duration_clamps() -> None:
+    """event_payloads('1', step=1000, total_duration=160) must yield exactly 4 packets.
+
+    When step >= total_duration the function must not loop forever or skip the
+    final packet; instead it clamps and emits the single final-duration packet
+    followed by the three redundant end packets — four packets total.  The first
+    packet must carry duration=160 and end=False; each of the last three must carry
+    end=True and duration=160.
+    """
+    packets = list(event_payloads("1", step=1000, total_duration=160))
+    # One non-end packet + three redundant end packets.
+    assert len(packets) == 4
+    first = DtmfEvent.decode(packets[0])
+    assert first.end is False
+    assert first.duration == 160
+    for raw in packets[1:]:
+        ep = DtmfEvent.decode(raw)
+        assert ep.end is True
+        assert ep.duration == 160

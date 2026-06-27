@@ -4399,22 +4399,33 @@ async def test_no_input_resets_on_raw_dtmf_keypress_before_group_delivery() -> N
         no_input_timeout_ms=10_000,  # the watchdog window key released below (10 s)
     )
 
+    async def _pump_until(predicate: Callable[[], bool]) -> bool:
+        """Yield the loop until ``predicate`` holds; return whether it did.
+
+        Causal synchronisation, not a fixed turn count: the watchdog and the DTMF
+        flush are concurrent tasks whose number of cooperative turns to a given state
+        varies with whatever else the (full-suite) event loop is running, so a fixed
+        ``range(N)`` poll is load-racy. The bound is generous and exists ONLY to fail
+        loudly instead of hanging if a state is never reached.
+        """
+        for _ in range(1000):
+            if predicate():
+                return True
+            await asyncio.sleep(0)
+        return predicate()
+
     run_task = asyncio.create_task(loop.run())
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if 10.0 in sleep.calls:
-            break
-    assert 10.0 in sleep.calls, "the watchdog did not arm its 10 s silence-window wait"
+    assert await _pump_until(lambda: 10.0 in sleep.calls), (
+        "the watchdog did not arm its 10 s silence-window wait"
+    )
 
     # A SINGLE keypad digit, NO terminator: the raw inbound path (sync ``feed_dtmf``).
     # The inter-digit flush timer arms and parks on the 2 s sleep, which the keyed gate
     # NEVER releases — so the group stays buffered and is never delivered.
     loop.feed_dtmf("7")
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if 2.0 in sleep.calls:
-            break
-    assert 2.0 in sleep.calls, "the DTMF inter-digit flush timer did not arm"
+    assert await _pump_until(lambda: 2.0 in sleep.calls), (
+        "the DTMF inter-digit flush timer did not arm"
+    )
     assert delivered == [], (
         "the DTMF group was delivered; the test must isolate the RAW keypress "
         f"(group must stay buffered), got {delivered!r}"
@@ -4422,9 +4433,15 @@ async def test_no_input_resets_on_raw_dtmf_keypress_before_group_delivery() -> N
 
     # The watchdog window elapses while the digit is still buffered (group undelivered).
     # The raw keypress is caller activity, so the watchdog must re-arm — NOT reprompt.
+    # Wait CAUSALLY for the watchdog to settle: it either re-arms (a SECOND 10 s wait —
+    # positive proof it consumed the activity flag and looped WITHOUT reprompting) or it
+    # speaks a reprompt (sent_audio non-empty — the bug). Polling for one of these two
+    # definite transitions, not a fixed turn count, is what makes the assertion immune
+    # to event-loop load (the flake a fixed poll let through under the full suite).
     sleep.release(10.0)
-    for _ in range(20):
-        await asyncio.sleep(0)
+    assert await _pump_until(
+        lambda: sleep.calls.count(10.0) >= 2 or bool(transport.sent_audio)
+    ), "the watchdog neither re-armed nor reprompted after the silence window"
     assert transport.sent_audio == [], (
         "a reprompt fired after a raw DTMF keypress whose group had NOT yet been "
         "delivered (activity was marked only on group delivery, not on the keypress)"
@@ -4503,22 +4520,33 @@ async def test_no_input_resets_on_raw_async_dtmf_keypress_before_group_delivery(
         no_input_timeout_ms=10_000,  # the watchdog window key released below (10 s)
     )
 
+    async def _pump_until(predicate: Callable[[], bool]) -> bool:
+        """Yield the loop until ``predicate`` holds; return whether it did.
+
+        Causal synchronisation, not a fixed turn count: the watchdog and the DTMF
+        flush are concurrent tasks whose number of cooperative turns to a given state
+        varies with whatever else the (full-suite) event loop is running, so a fixed
+        ``range(N)`` poll is load-racy. The bound is generous and exists ONLY to fail
+        loudly instead of hanging if a state is never reached.
+        """
+        for _ in range(1000):
+            if predicate():
+                return True
+            await asyncio.sleep(0)
+        return predicate()
+
     run_task = asyncio.create_task(loop.run())
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if 10.0 in sleep.calls:
-            break
-    assert 10.0 in sleep.calls, "the watchdog did not arm its 10 s silence-window wait"
+    assert await _pump_until(lambda: 10.0 in sleep.calls), (
+        "the watchdog did not arm its 10 s silence-window wait"
+    )
 
     # A SINGLE keypad digit, NO terminator, via the AWAITABLE twin: the inter-digit
     # flush timer arms and parks on the 2 s sleep, which the keyed gate NEVER releases —
     # so the group stays buffered and is never delivered.
     await loop.feed_dtmf_async("7")
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if 2.0 in sleep.calls:
-            break
-    assert 2.0 in sleep.calls, "the DTMF inter-digit flush timer did not arm"
+    assert await _pump_until(lambda: 2.0 in sleep.calls), (
+        "the DTMF inter-digit flush timer did not arm"
+    )
     assert delivered == [], (
         "the DTMF group was delivered; the test must isolate the RAW keypress "
         f"(group must stay buffered), got {delivered!r}"
@@ -4526,10 +4554,13 @@ async def test_no_input_resets_on_raw_async_dtmf_keypress_before_group_delivery(
 
     # The watchdog window elapses while the digit is still buffered (group undelivered).
     # The raw keypress via the awaitable twin is caller activity, so the watchdog must
-    # re-arm — NOT reprompt.
+    # re-arm — NOT reprompt. Wait CAUSALLY for the watchdog to settle (re-arm proves the
+    # flag was consumed and the loop continued WITHOUT a reprompt; a reprompt would set
+    # sent_audio first) — a fixed turn count is load-racy under the full suite.
     sleep.release(10.0)
-    for _ in range(20):
-        await asyncio.sleep(0)
+    assert await _pump_until(
+        lambda: sleep.calls.count(10.0) >= 2 or bool(transport.sent_audio)
+    ), "the watchdog neither re-armed nor reprompted after the silence window"
     assert transport.sent_audio == [], (
         "a reprompt fired after a raw DTMF keypress via feed_dtmf_async whose group "
         "had NOT yet been delivered (the awaitable twin did not mark the raw keypress)"

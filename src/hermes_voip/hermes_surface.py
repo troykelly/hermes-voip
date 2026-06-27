@@ -23,6 +23,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
+__all__ = [
+    "BASE_ADAPTER_ABSTRACT_METHODS",
+    "REGISTER_PLATFORM_PARAMS",
+    "BasePlatformAdapterProtocol",
+    "MessageEventProtocol",
+    "PluginContextProtocol",
+    "SendResultProtocol",
+]
+
 #: The exact abstract methods a platform adapter must implement (verified).
 BASE_ADAPTER_ABSTRACT_METHODS: frozenset[str] = frozenset(
     {"connect", "disconnect", "send", "get_chat_info"}

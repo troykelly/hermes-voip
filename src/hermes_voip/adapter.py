@@ -1133,6 +1133,7 @@ class VoipAdapter(BasePlatformAdapter):
                 ws_path=gateway_cfg.ws_path,
                 ssl_context=tls_ctx,
                 on_new_call=self._on_inbound_invite,
+                on_cancel=self._on_cancel,
                 on_unroutable=self._on_unroutable,
                 on_connection_lost=self._on_connection_lost,
             )
@@ -1143,11 +1144,9 @@ class VoipAdapter(BasePlatformAdapter):
                 ssl_context=tls_ctx,
                 keepalive_interval=self._keepalive_interval,
                 on_new_call=self._on_inbound_invite,
-                # RFC 3261 §9.2: a CANCEL aborts a pending INVITE's setup. The TLS
-                # transport answers the 200/487 itself; this hook tears down the
-                # half-built call. (The WSS transport does not yet route CANCEL —
-                # tracked as a follow-up; over WSS a CANCEL still falls through to
-                # on_unroutable as before.)
+                # RFC 3261 §9.2: a CANCEL aborts a pending INVITE's setup. Both
+                # transports answer the 200/487 themselves; this hook tears down
+                # the half-built call.
                 on_cancel=self._on_cancel,
                 on_unroutable=self._on_unroutable,
                 on_connection_lost=self._on_connection_lost,

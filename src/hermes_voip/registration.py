@@ -39,6 +39,11 @@ _EXPIRES_PARAM = re.compile(r";\s*expires\s*=\s*(\d+)", re.IGNORECASE)
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
 # The SIP schemes an AOR may carry; sips is ADR-0005's SIP-over-TLS scheme.
 _AOR_SCHEMES = frozenset({"sip", "sips"})
+# The Via transports that carry signalling over an encrypted channel (lower-cased
+# for case-insensitive comparison). On these, ADR-0005's SIP-over-TLS/SIPS mandate
+# is an invariant, so a cleartext ``sip:`` AOR is rejected (ADR-0080). UDP/TCP are
+# absent: their AOR scheme is the deployer's responsibility, not this invariant's.
+_SECURE_TRANSPORTS = frozenset({"tls", "wss"})
 
 
 def _split_contacts(header_value: str) -> list[str]:
@@ -80,6 +85,28 @@ def _split_aor(aor: str) -> tuple[str, str]:
     return scheme, host
 
 
+def _require_secure_scheme(aor: str, transport: str) -> None:
+    """Reject a cleartext ``sip:`` AOR on a secure (TLS/WSS) transport (ADR-0080).
+
+    ADR-0005 mandates SIP-over-TLS (SIPS) on the encrypted transports, so a bare
+    ``sip:`` AOR there is internally inconsistent: the registrar request-URI and
+    the digest ``uri`` would advertise an insecure scheme over a secure leg with
+    no signal. The check is **transport-gated** — UDP/TCP leave the scheme to the
+    deployer — and a ``sips:`` AOR is accepted on any transport. The comparison is
+    case-insensitive (``tls`` and ``TLS`` are the same transport).
+
+    Raises:
+        ValueError: If ``aor`` uses the ``sip`` scheme on a TLS/WSS transport.
+    """
+    scheme, _ = _split_aor(aor)
+    if scheme.lower() == "sip" and transport.lower() in _SECURE_TRANSPORTS:
+        msg = (
+            f"aor must use the sips: scheme on a secure transport "
+            f"(transport={transport!r}, ADR-0005/ADR-0080): {aor!r}"
+        )
+        raise ValueError(msg)
+
+
 def _min_expires(response: SipResponse) -> int | None:
     """Return the ``Min-Expires`` value from a 423, or ``None`` if absent/malformed."""
     raw = response.header("Min-Expires")
@@ -93,7 +120,9 @@ class RegistrationConfig:
     """Inputs for a REGISTER flow (credentials sourced from ``HERMES_SIP_*``).
 
     Attributes:
-        aor: The address-of-record (``sip:user@domain``).
+        aor: The address-of-record (``sip:user@domain`` or ``sips:user@domain``).
+            On a TLS/WSS transport it must use ``sips:`` (ADR-0005/ADR-0080),
+            enforced in ``__post_init__``.
         username: The digest auth username.
         password: The digest auth password. A **secret** — repr-suppressed so it
             never reaches a log line (it carries the SIP or, on the WSS transport,
@@ -116,12 +145,19 @@ class RegistrationConfig:
     user_agent: str = "hermes-voip/0"
 
     def __post_init__(self) -> None:
-        """Reject a malformed AOR at construction (fail fast, not mid-flow).
+        """Reject a malformed or insecure-scheme AOR at construction (fail fast).
+
+        Validates the AOR scheme/host (bk226), then enforces ADR-0005's
+        SIP-over-TLS/SIPS mandate on the secure transports (bk231/ADR-0080): a
+        ``sip:`` AOR on TLS/WSS is rejected. Both checks fail fast at construction
+        rather than surfacing mid-flow as a confusing gateway rejection.
 
         Raises:
-            ValueError: If ``aor`` has no ``sip``/``sips`` scheme or empty host.
+            ValueError: If ``aor`` has no ``sip``/``sips`` scheme, an empty host,
+                or uses the ``sip`` scheme on a TLS/WSS transport.
         """
         _split_aor(self.aor)
+        _require_secure_scheme(self.aor, self.transport)
 
 
 @dataclass(frozen=True, slots=True)

@@ -26,8 +26,11 @@ from hermes_voip.registration import (
     Retry,
 )
 
+# The canonical fixture registers over TLS, so its AOR uses the mandated ``sips:``
+# scheme (ADR-0005/ADR-0080): a ``sip:`` AOR on TLS is now rejected at construction.
+# The Contact keeps its own scheme (the bk231 gate is AOR-vs-transport only).
 _CONFIG = RegistrationConfig(
-    aor="sip:1000@pbx.example.test",
+    aor="sips:1000@pbx.example.test",
     username="1000",
     password="s3cr3t",
     contact="<sip:1000@198.51.100.7:5061;transport=tls>",
@@ -65,6 +68,31 @@ def _too_brief(cseq: int, min_expires: str | None = "3600") -> SipResponse:
     )
 
 
+def _qopless_challenge(opaque: str | None = None) -> SipResponse:
+    """A 401 with NO qop (RFC 2069 legacy MD5), optionally carrying an opaque.
+
+    Every other fixture offers ``qop="auth"``; this exercises the registration↔
+    digest seam on the qop-less path (no nc/cnonce, 32-hex response).
+    """
+    opaque_param = f', opaque="{opaque}"' if opaque is not None else ""
+    return SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        f'WWW-Authenticate: Digest realm="pbx.example.test", nonce="abc123", '
+        f"algorithm=md5{opaque_param}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _stale_challenge(nonce: str) -> SipResponse:
+    """A second 401 advertising ``stale=true`` with a FRESH nonce (RFC 7616 §3.5)."""
+    return SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        f'WWW-Authenticate: Digest realm="pbx.example.test", nonce="{nonce}", '
+        'algorithm=md5, qop="auth", stale=true\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
 def _h(msg: str, name: str) -> str | None:
     for line in msg.split("\r\n"):
         if line.lower().startswith(name.lower() + ":"):
@@ -78,9 +106,18 @@ def _cseq_num(msg: str) -> int:
     return int(cseq.split()[0])
 
 
+def _via_branch(msg: str) -> str:
+    """Extract the ``branch`` token from the REGISTER's single Via header."""
+    via = _h(msg, "Via")
+    assert via is not None
+    match = re.search(r";branch=([^;]+)", via)
+    assert match is not None
+    return match.group(1)
+
+
 def test_start_builds_initial_register_with_explicit_via() -> None:
     req = RegistrationFlow(_CONFIG).start()
-    assert req.startswith("REGISTER sip:pbx.example.test SIP/2.0\r\n")
+    assert req.startswith("REGISTER sips:pbx.example.test SIP/2.0\r\n")
     assert "SIP/2.0/TLS 198.51.100.7:5061;branch=" in req
     assert _h(req, "CSeq") == "1 REGISTER"
     assert _h(req, "Expires") == "300"
@@ -164,7 +201,7 @@ def test_multiple_challenges_select_strongest_not_first() -> None:
         ),
         DigestCredentials("1000", "s3cr3t"),
         method="REGISTER",
-        uri="sip:pbx.example.test",
+        uri="sips:pbx.example.test",
         cnonce=cnonce,
     )
     expected_response = _auth_param(expected, "response")
@@ -434,6 +471,169 @@ def test_config_accepts_sips_aor() -> None:
     )
     req = RegistrationFlow(cfg).start()
     assert req.startswith("REGISTER sips:pbx.example.test SIP/2.0\r\n")
+
+
+@pytest.mark.parametrize("transport", ["TLS", "WSS"])
+def test_config_rejects_sip_aor_on_secure_transport(transport: str) -> None:
+    # bk231 / ADR-0080: ADR-0005 mandates SIP-over-TLS (SIPS). A bare ``sip:`` AOR
+    # on a TLS/WSS transport is internally inconsistent — the registrar request-URI
+    # and digest uri would advertise an insecure scheme over a secure leg with no
+    # signal. Fail fast at construction, mirroring the bk226 AOR validation, rather
+    # than surfacing later as a confusing gateway rejection.
+    with pytest.raises(ValueError, match=r"sips"):
+        RegistrationConfig(
+            aor="sip:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sips:1000@198.51.100.7:5061>",
+            local_sent_by="198.51.100.7:5061",
+            transport=transport,
+        )
+
+
+def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
+    # The transport token is matched case-insensitively: a lower-case ``tls`` is the
+    # same secure transport as ``TLS`` and must reject a ``sip:`` AOR identically.
+    with pytest.raises(ValueError, match=r"sips"):
+        RegistrationConfig(
+            aor="sip:1000@pbx.example.test",
+            username="1000",
+            password="s3cr3t",
+            contact="<sips:1000@198.51.100.7:5061>",
+            local_sent_by="198.51.100.7:5061",
+            transport="tls",
+        )
+
+
+@pytest.mark.parametrize("transport", ["UDP", "TCP"])
+def test_config_accepts_sip_aor_on_insecure_transport(transport: str) -> None:
+    # bk231 is TRANSPORT-GATED: UDP/TCP leave the AOR scheme to the deployer (the
+    # SIPS mandate is an invariant only on the secure TLS/WSS transports). A ``sip:``
+    # AOR on UDP/TCP is accepted and drives a ``sip:`` registrar request-URI.
+    cfg = RegistrationConfig(
+        aor="sip:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sip:1000@198.51.100.7:5060>",
+        local_sent_by="198.51.100.7:5060",
+        transport=transport,
+    )
+    assert (
+        RegistrationFlow(cfg)
+        .start()
+        .startswith("REGISTER sip:pbx.example.test SIP/2.0\r\n")
+    )
+
+
+def test_config_accepts_sips_aor_on_insecure_transport() -> None:
+    # The complement of the gate: a ``sips:`` AOR is accepted on ANY transport
+    # (upgrading the scheme is never the inconsistency bk231 guards against).
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sips:1000@198.51.100.7:5061>",
+        local_sent_by="198.51.100.7:5061",
+        transport="UDP",
+    )
+    assert (
+        RegistrationFlow(cfg)
+        .start()
+        .startswith("REGISTER sips:pbx.example.test SIP/2.0\r\n")
+    )
+
+
+def test_authed_register_pins_nc_00000001() -> None:
+    # bk239 / ADR-0080: each REGISTER is a fresh transaction answering the challenge
+    # it just received, with a fresh cnonce and nc=00000001 (RFC 7616 §3.4 — correct
+    # for a purely-reactive flow with no reused nonce to count against). Pin nc so a
+    # refactor cannot silently drift it; we deliberately do NOT thread an nc counter.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_challenge())
+    assert isinstance(outcome, Challenged)
+    auth = _h(outcome.request, "Authorization")
+    assert auth is not None
+    assert _auth_param(auth, "nc") == "00000001"
+
+
+def test_via_branch_changes_between_initial_and_authed_register() -> None:
+    # bk243 / RFC 3261 §8.1.1.7: the authed REGISTER is a new client transaction and
+    # MUST carry a new Via branch, while Call-ID and From-tag stay stable (same
+    # registration). ``_build`` calls new_branch() per send; pin it so a hoist into
+    # __init__ cannot silently break transaction matching.
+    flow = RegistrationFlow(_CONFIG)
+    first = flow.start()
+    authed = flow.handle(_challenge())
+    assert isinstance(authed, Challenged)
+    first_branch = _via_branch(first)
+    authed_branch = _via_branch(authed.request)
+    assert first_branch.startswith("z9hG4bK")
+    assert authed_branch.startswith("z9hG4bK")
+    assert first_branch != authed_branch
+    # Call-ID and From-tag are stable across the re-authentication (same dialog).
+    assert _h(first, "Call-ID") == _h(authed.request, "Call-ID")
+    assert _h(first, "From") == _h(authed.request, "From")
+
+
+def test_qop_less_rfc2069_digest_path_at_registration_level() -> None:
+    # bk247 / ADR-0080: registration-level coverage of the RFC 2069 legacy MD5 path
+    # (digest.py exists but was untested through the flow). A qop-less challenge must
+    # yield an Authorization with NO nc/cnonce and a 32-hex (MD5) response.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_qopless_challenge())
+    assert isinstance(outcome, Challenged)
+    auth = _h(outcome.request, "Authorization")
+    assert auth is not None
+    assert _auth_param(auth, "qop") is None
+    assert _auth_param(auth, "nc") is None
+    assert _auth_param(auth, "cnonce") is None
+    response = _auth_param(auth, "response")
+    assert response is not None
+    assert re.fullmatch(r"[0-9a-f]{32}", response)
+    # The digest must equal the independently-computed RFC 2069 legacy MD5 value.
+    expected = build_authorization(
+        DigestChallenge(realm="pbx.example.test", nonce="abc123", algorithm="md5"),
+        DigestCredentials("1000", "s3cr3t"),
+        method="REGISTER",
+        uri="sips:pbx.example.test",
+    )
+    expected_response = _auth_param(expected, "response")
+    assert expected_response is not None
+    assert response == expected_response
+
+
+def test_opaque_is_echoed_through_the_flow() -> None:
+    # bk247 / ADR-0080: an opaque sent in the challenge MUST be echoed back unchanged
+    # in the Authorization (RFC 7616 §3.4) — pin the registration↔digest seam.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_qopless_challenge(opaque="op4que-XYZ"))
+    assert isinstance(outcome, Challenged)
+    auth = _h(outcome.request, "Authorization")
+    assert auth is not None
+    assert _auth_param(auth, "opaque") == "op4que-XYZ"
+
+
+def test_stale_second_challenge_still_fails_recorded_limitation() -> None:
+    # bk250 / ADR-0080: INTENTIONAL, RECORDED LIMITATION. A second 401 in a
+    # transaction — even one advertising stale=true with a FRESH nonce — is treated
+    # as Failed; the flow does NOT perform an in-transaction stale-nonce retry.
+    # Recovery is the RegistrationManager's next refresh: a brand-new transaction
+    # that answers the fresh nonce. This test pins that we fail on the second 401
+    # even when it is stale, so the limitation cannot be silently "fixed" or broken.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    first = flow.handle(_challenge(header="WWW-Authenticate"))
+    assert isinstance(first, Challenged)  # answered the first challenge
+    second = flow.handle(_stale_challenge(nonce="fresh-nonce-2"))
+    assert isinstance(second, Failed)
+    assert second.status == 401
+    # And the documented recovery path works: a fresh refresh re-authenticates.
+    refresh = flow.start()
+    assert _cseq_num(refresh) > _cseq_num(first.request)
+    assert isinstance(flow.handle(_challenge()), Challenged)
 
 
 def test_registration_public_api_is_importable_from_package() -> None:

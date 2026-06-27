@@ -495,8 +495,10 @@ def test_config_rejects_sip_aor_on_secure_transport(transport: ViaTransport) -> 
 
 
 def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
-    # The transport token is matched case-insensitively: a lower-case ``tls`` is the
-    # same secure transport as ``TLS`` and must reject a ``sip:`` AOR identically.
+    # The transport token is normalised to uppercase in __post_init__ before the
+    # secure-transport check runs: a lower-case ``tls`` input must reject a ``sip:``
+    # AOR identically to ``TLS``, and the stored .transport must be the normalised
+    # uppercase form.
     with pytest.raises(ValueError, match=r"sips"):
         RegistrationConfig(
             aor="sip:1000@pbx.example.test",
@@ -504,7 +506,7 @@ def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
             password="s3cr3t",
             contact="<sips:1000@198.51.100.7:5061>",
             local_sent_by="198.51.100.7:5061",
-            transport="tls",  # type: ignore[arg-type]  # intentional: tests runtime case-fold
+            transport="tls",  # type: ignore[arg-type]  # intentional: passes lowercase to test normalisation
         )
 
 
@@ -661,7 +663,7 @@ def test_config_rejects_unknown_transport() -> None:
     # bk236: transport is a Literal["TLS","WSS","UDP","TCP"]. An unrecognised
     # token such as "QUIC" would be injected verbatim into the Via header and
     # silently produce a malformed request. Reject at construction instead.
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(ValueError, match="transport must be one of"):
         RegistrationConfig(
             aor="sip:1000@pbx.example.test",
             username="1000",
@@ -670,6 +672,23 @@ def test_config_rejects_unknown_transport() -> None:
             local_sent_by="198.51.100.7:5060",
             transport="QUIC",  # type: ignore[arg-type]  # intentionally wrong type
         )
+
+
+def test_config_normalises_lowercase_transport_to_uppercase() -> None:
+    # bk236 / MUST-FIX 1: RegistrationConfig accepts lowercase transport tokens
+    # (e.g. "tls") by normalising them to the canonical uppercase ViaTransport
+    # Literal form in __post_init__. The stored .transport must be "TLS", not "tls",
+    # so the field always satisfies the Literal["TLS","WSS","UDP","TCP"] contract at
+    # runtime (not just at static-type-check time).
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="tls",  # type: ignore[arg-type]  # intentional: passes lowercase to test normalisation
+    )
+    assert cfg.transport == "TLS"
 
 
 # ---- expires non-negative validation (bk236) --------------------------------

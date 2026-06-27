@@ -159,6 +159,44 @@ def test_build_request_sets_content_length_from_body_bytes() -> None:
     assert msg.endswith("\r\n\r\n" + body)
 
 
+def test_build_request_content_length_is_byte_length_not_char_count() -> None:
+    # Body contains multibyte UTF-8 characters (3 bytes each in UTF-8) so that
+    # len(body) (char-count) != len(body.encode('utf-8')) (byte-count).
+    # This pins the byte-length behaviour and kills any len(body) char-count mutant.
+    # U+00E9 (é) is 2 bytes; U+4E2D (中) is 3 bytes — both non-ASCII.
+    body = "café 中文"  # "café 中文" — 7 chars, 12 UTF-8 bytes
+    byte_len = len(body.encode("utf-8"))
+    char_len = len(body)
+    # pre-condition: char-count must differ from byte-count
+    assert byte_len != char_len
+    msg = build_request(
+        "MESSAGE",
+        "sip:1000@pbx.example.test",
+        [("Content-Type", "text/plain;charset=utf-8")],
+        body=body,
+    )
+    assert f"Content-Length: {byte_len}" in msg
+    assert f"Content-Length: {char_len}" not in msg
+
+
+def test_build_response_content_length_is_byte_length_not_char_count() -> None:
+    # Same mutant-kill for build_response: Content-Length must be byte length.
+    body = "café 中文"  # "café 中文" — 7 chars, 12 UTF-8 bytes
+    byte_len = len(body.encode("utf-8"))
+    char_len = len(body)
+    # pre-condition: char-count must differ from byte-count
+    assert byte_len != char_len
+    resp = build_response(
+        _inbound("INVITE"),
+        200,
+        "OK",
+        extra_headers=[("Content-Type", "text/plain;charset=utf-8")],
+        body=body,
+    )
+    assert f"Content-Length: {byte_len}" in resp
+    assert f"Content-Length: {char_len}" not in resp
+
+
 def test_parse_response_status_reason_and_body() -> None:
     raw = (
         "SIP/2.0 200 OK\r\n"

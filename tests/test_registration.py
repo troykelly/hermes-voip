@@ -24,6 +24,7 @@ from hermes_voip.registration import (
     RegistrationConfig,
     RegistrationFlow,
     Retry,
+    ViaTransport,
 )
 
 # The canonical fixture registers over TLS, so its AOR uses the mandated ``sips:``
@@ -476,7 +477,7 @@ def test_config_accepts_sips_aor() -> None:
 
 
 @pytest.mark.parametrize("transport", ["TLS", "WSS"])
-def test_config_rejects_sip_aor_on_secure_transport(transport: str) -> None:
+def test_config_rejects_sip_aor_on_secure_transport(transport: ViaTransport) -> None:
     # bk231 / ADR-0080: ADR-0005 mandates SIP-over-TLS (SIPS). A bare ``sip:`` AOR
     # on a TLS/WSS transport is internally inconsistent — the registrar request-URI
     # and digest uri would advertise an insecure scheme over a secure leg with no
@@ -503,12 +504,12 @@ def test_config_rejects_sip_aor_on_secure_transport_case_insensitive() -> None:
             password="s3cr3t",
             contact="<sips:1000@198.51.100.7:5061>",
             local_sent_by="198.51.100.7:5061",
-            transport="tls",
+            transport="tls",  # type: ignore[arg-type]  # intentional: tests runtime case-fold
         )
 
 
 @pytest.mark.parametrize("transport", ["UDP", "TCP"])
-def test_config_accepts_sip_aor_on_insecure_transport(transport: str) -> None:
+def test_config_accepts_sip_aor_on_insecure_transport(transport: ViaTransport) -> None:
     # bk231 is TRANSPORT-GATED: UDP/TCP leave the AOR scheme to the deployer (the
     # SIPS mandate is an invariant only on the secure TLS/WSS transports). A ``sip:``
     # AOR on UDP/TCP is accepted and drives a ``sip:`` registrar request-URI.

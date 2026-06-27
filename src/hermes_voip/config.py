@@ -34,7 +34,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from hermes_voip.registration import RegistrationConfig
+from hermes_voip.registration import RegistrationConfig, ViaTransport
 
 __all__ = [
     "DEFAULT_GREETING",
@@ -60,7 +60,7 @@ DEFAULT_GREETING = (
 
 # Scheme tokens accepted for HERMES_SIP_TRANSPORT, mapped to their Via transport
 # tokens (RFC 3261 §7.1 / RFC 7118). Only the two sanctioned transports.
-_VIA_TRANSPORT: dict[str, str] = {"tls": "TLS", "wss": "WSS"}
+_VIA_TRANSPORT: dict[str, ViaTransport] = {"tls": "TLS", "wss": "WSS"}
 _DEFAULT_PORT: dict[str, str] = {"tls": "5061", "wss": "443"}
 
 _DEFAULT_TRANSPORT = "tls"
@@ -756,7 +756,7 @@ class GatewayConfig:
             raise ConfigError(msg)
 
     @property
-    def via_transport(self) -> str:
+    def via_transport(self) -> ViaTransport:
         """The Via transport token (``TLS`` | ``WSS``) for this gateway."""
         return _VIA_TRANSPORT[self.transport]
 

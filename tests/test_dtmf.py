@@ -371,3 +371,62 @@ def test_receiver_has_no_separate_order_and_seen_attrs() -> None:
     assert not hasattr(rx, "_order"), "_order must be removed (bk354 consolidation)"
     assert not hasattr(rx, "_seen"), "_seen must be removed (bk354 consolidation)"
     assert hasattr(rx, "_window"), "_window must be the single dedup structure (bk354)"
+
+
+# ---------------------------------------------------------------------------
+# DtmfEvent.__post_init__ boundary validation (backlog ~393-410)
+# ---------------------------------------------------------------------------
+
+
+def test_dtmf_event_accepts_event_at_boundary_255() -> None:
+    """event=255 (0xFF, max valid) must be accepted without error.
+
+    Kills a mutant that uses > instead of <= in the boundary check.
+    """
+    event = DtmfEvent(event=255, end=False, volume=10, duration=100)
+    assert event.event == 255
+
+
+def test_dtmf_event_rejects_event_above_boundary_256() -> None:
+    """event=256 exceeds 0xFF and must raise ValueError.
+
+    Kills a mutant that uses >= instead of > in the rejection check.
+    """
+    with pytest.raises(ValueError, match="event out of range"):
+        DtmfEvent(event=256, end=False, volume=10, duration=100)
+
+
+def test_dtmf_event_accepts_volume_at_boundary_63() -> None:
+    """volume=63 (0x3F, max valid) must be accepted without error.
+
+    Kills a mutant that uses > instead of <= in the boundary check.
+    """
+    event = DtmfEvent(event=0, end=False, volume=63, duration=100)
+    assert event.volume == 63
+
+
+def test_dtmf_event_rejects_volume_above_boundary_64() -> None:
+    """volume=64 exceeds 0x3F and must raise ValueError.
+
+    Kills a mutant that uses >= instead of > in the rejection check.
+    """
+    with pytest.raises(ValueError, match="volume out of range"):
+        DtmfEvent(event=0, end=False, volume=64, duration=100)
+
+
+def test_dtmf_event_accepts_duration_at_boundary_65535() -> None:
+    """duration=65535 (0xFFFF, max valid) must be accepted without error.
+
+    Kills a mutant that uses > instead of <= in the boundary check.
+    """
+    event = DtmfEvent(event=0, end=False, volume=10, duration=65535)
+    assert event.duration == 65535
+
+
+def test_dtmf_event_rejects_duration_above_boundary_65536() -> None:
+    """duration=65536 exceeds 0xFFFF and must raise ValueError.
+
+    Kills a mutant that uses >= instead of > in the rejection check.
+    """
+    with pytest.raises(ValueError, match="duration out of range"):
+        DtmfEvent(event=0, end=False, volume=10, duration=65536)

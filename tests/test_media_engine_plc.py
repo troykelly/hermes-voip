@@ -21,7 +21,7 @@ import struct
 
 import pytest
 
-from hermes_voip.media.audio import G711_SAMPLE_RATE, encode_ulaw
+from hermes_voip.media.audio import G711_SAMPLE_RATE, Resampler, encode_ulaw
 from hermes_voip.media.engine import Codec, RtpMediaTransport
 from hermes_voip.media.g722 import G722_SAMPLE_RATE, G722Encoder
 from hermes_voip.providers.audio import PcmFrame
@@ -212,6 +212,7 @@ pytest.importorskip("opuslib", reason="webrtc extra (opuslib) not installed")
 from hermes_voip.media.opus import (  # noqa: E402 — after the importorskip guard
     OPUS_FRAME_SAMPLES,
     OPUS_SAMPLE_RATE,
+    OpusDecoder,
     OpusEncoder,
 )
 
@@ -316,3 +317,162 @@ async def test_opus_lone_loss_falls_back_to_plc() -> None:
     for idx in (2, 3):  # both concealment frames are full analysis-rate frames
         assert frames[idx].sample_rate == _OPUS_ANALYSIS_RATE
         assert len(frames[idx].samples) == samples_per_analysis_frame * 2
+
+
+# ---------------------------------------------------------------------------
+# Coalesced Lost(count=N): Opus PLC must match the pre-coalesce per-packet
+# semantics — only the slot immediately before the successor uses FEC; the
+# interpolated slots use PLC (finding #3, run-length-coalescing lane).
+# ---------------------------------------------------------------------------
+
+
+class _CountingOpusDecoder:
+    """A spy wrapping a real OpusDecoder, counting FEC/PLC calls (test seam).
+
+    Structurally assignable to the engine's ``_OpusDecode`` Protocol, so it can be
+    injected as ``engine._opus_decoder`` to observe exactly how the coalesced-Lost
+    concealment loop drives the decoder, without touching real audio behaviour.
+    """
+
+    def __init__(self) -> None:
+        self._inner = OpusDecoder()
+        self.decode_calls = 0
+        self.fec_calls = 0
+        self.plc_calls = 0
+        self.fec_payloads: list[bytes] = []
+
+    def decode(self, packet: bytes) -> bytes:
+        self.decode_calls += 1
+        return self._inner.decode(packet)
+
+    def decode_fec(self, next_packet: bytes) -> bytes:
+        self.fec_calls += 1
+        self.fec_payloads.append(next_packet)
+        return self._inner.decode_fec(next_packet)
+
+    def decode_plc(self) -> bytes:
+        self.plc_calls += 1
+        return self._inner.decode_plc()
+
+
+@pytest.mark.asyncio
+async def test_opus_coalesced_lost_uses_fec_once_plc_for_rest() -> None:
+    """A coalesced Lost(count=3) drives FEC exactly once, PLC for the other slots.
+
+    seqs 0,1 arrive then 5,6,7 (jitter_depth=3) -> the buffer coalesces the gap
+    into a single Lost(seq=2, count=3) with the successor (seq 5) already buffered.
+
+    Pre-coalesce this gap was three separate Lost events: Lost(2) and Lost(3) saw
+    an EMPTY anchor (PLC), and only Lost(4) — the slot immediately before the
+    successor — saw the buffered successor and recovered via FEC. Opus in-band FEC
+    only ever carries the ONE frame immediately preceding its packet, so the
+    correct behaviour conceals the 3 slots as PLC, PLC, FEC(packet 5).
+
+    The bug: the coalesced loop calls _conceal_opus() with the anchor ALREADY at
+    the successor, so peek_next() returns packet 5 on every iteration and
+    decode_fec(packet 5) runs 3 times (0 PLC) — redundant and semantically wrong
+    (it "recovers" frames 2 and 3 from a FEC copy that is only frame 4's).
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.OPUS,
+        payload_type=_OPUS_PT,
+        jitter_depth=3,
+        clock=_dummy_clock,
+        aec_enabled=False,
+    )
+    await engine.connect()
+
+    spy = _CountingOpusDecoder()
+    engine._opus_decoder = spy  # inject the counting decoder before any decode
+
+    enc = OpusEncoder(expected_packet_loss_pct=30)
+    payloads = [
+        enc.encode(
+            _tone_pcm16(OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, freq_hz=300.0 + 25.0 * i)
+        )
+        for i in range(8)
+    ]
+    # seqs 0,1 arrive; 2,3,4 lost; 5,6,7 arrive -> one Lost(seq=2, count=3).
+    for seq in (0, 1, 5, 6, 7):
+        engine._recv_queue.put_nowait(
+            (_make_rtp(seq, payloads[seq], pt=_OPUS_PT), _FAKE_SRC)
+        )
+
+    # 2 real (0,1) + 3 concealment (2,3,4) + 3 real (5,6,7) = 8 frames.
+    frames = await _collect_n(engine, 8)
+    await engine.stop()
+
+    assert len(frames) == 8  # every hole filled
+    # The crux: exactly ONE FEC decode (for the slot before the successor) and the
+    # other two concealed slots use PLC — NOT three FEC decodes of packet 5.
+    assert spy.fec_calls == 1, (
+        f"expected 1 FEC decode for the coalesced run, got {spy.fec_calls}"
+    )
+    assert spy.plc_calls == 2, (
+        f"expected 2 PLC decodes for the interpolated slots, got {spy.plc_calls}"
+    )
+    # The single FEC decode used the SUCCESSOR's payload (packet 5), not a repeat.
+    assert spy.fec_payloads == [payloads[5]]
+
+
+@pytest.mark.asyncio
+async def test_opus_coalesced_lost_matches_individual_lost_events() -> None:
+    """Lost(count=3) yields byte-identical concealment to three separate Losses.
+
+    Drive the SAME stream twice against two engines with identical state — one
+    where the gap coalesces into Lost(count=3), and a reference whose decoder is
+    driven through the exact pre-coalesce FEC/PLC pattern (PLC, PLC, FEC(succ)).
+    The three concealment frames must be byte-for-byte identical, proving the
+    coalesced loop reproduces the per-packet PLC semantics exactly (no extra FEC
+    decodes corrupting the predictor for the interpolated slots).
+    """
+    # Build the concealment frames the coalesced engine produces.
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.OPUS,
+        payload_type=_OPUS_PT,
+        jitter_depth=3,
+        clock=_dummy_clock,
+        aec_enabled=False,
+    )
+    await engine.connect()
+    enc = OpusEncoder(expected_packet_loss_pct=30)
+    payloads = [
+        enc.encode(
+            _tone_pcm16(OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, freq_hz=300.0 + 25.0 * i)
+        )
+        for i in range(8)
+    ]
+    for seq in (0, 1, 5, 6, 7):
+        engine._recv_queue.put_nowait(
+            (_make_rtp(seq, payloads[seq], pt=_OPUS_PT), _FAKE_SRC)
+        )
+    frames = await _collect_n(engine, 8)
+    await engine.stop()
+    coalesced_conceal = [f.samples for f in frames[2:5]]  # slots 2,3,4
+
+    # Reference: a fresh decoder driven through frames 0,1 then the pre-coalesce
+    # per-packet concealment pattern PLC, PLC, FEC(packet 5).
+    ref = OpusDecoder()
+    resampler = Resampler(OPUS_SAMPLE_RATE, _OPUS_ANALYSIS_RATE)
+    # Mirror the engine EXACTLY: it decodes the two real frames through the same
+    # state-carrying resampler it then uses for the concealment frames, so the
+    # decoder AND resampler state at the point of concealment must match for a
+    # byte-equal comparison. Drive frames 0,1 (decode + downsample), then the
+    # pre-coalesce per-packet concealment pattern PLC, PLC, FEC(packet 5).
+    resampler.resample(ref.decode(payloads[0]))
+    resampler.resample(ref.decode(payloads[1]))
+    expected_conceal = [
+        resampler.resample(ref.decode_plc()),
+        resampler.resample(ref.decode_plc()),
+        resampler.resample(ref.decode_fec(payloads[5])),
+    ]
+
+    assert coalesced_conceal == expected_conceal

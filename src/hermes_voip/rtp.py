@@ -152,9 +152,41 @@ class RtpPacket:
 
 @dataclass(frozen=True, slots=True)
 class Lost:
-    """A jitter-buffer signal that the packet for ``sequence`` is lost."""
+    """A jitter-buffer signal that one or more consecutive packets are lost.
+
+    Attributes:
+        sequence: The first (lowest) sequence number in the lost run.
+        count: How many consecutive packets starting at ``sequence`` are lost.
+            Defaults to ``1`` for backward-compatibility; callers that only
+            handle single-packet loss can ignore this field.  When ``count > 1``
+            the buffer has already advanced its anchor past the entire run, so
+            only one :class:`Lost` event is emitted for the whole gap.
+    """
 
     sequence: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        """Validate ``count`` is a whole packet count (>= 1).
+
+        A zero or negative run is meaningless and silently breaks the consumer's
+        per-slot concealment loop (``for _ in range(count)`` emits nothing for 0
+        and raises for a negative), so it is rejected at construction. ``bool`` is
+        an ``int`` subclass in Python so it is checked first; a non-int ``count``
+        (e.g. a ``float`` from an untyped caller) is a type error — matching the
+        runtime-and-type-check validation style used elsewhere in this module.
+        """
+        count_raw: object = self.count
+        if isinstance(count_raw, bool):
+            msg = "Lost.count must be a positive int, not bool"
+            raise TypeError(msg)
+        if not isinstance(count_raw, int):
+            kind = type(count_raw).__name__
+            msg = f"Lost.count must be a positive int, got {kind}"
+            raise TypeError(msg)
+        if self.count < 1:
+            msg = f"Lost.count must be >= 1, got {self.count}"
+            raise ValueError(msg)
 
 
 type JitterOutput = RtpPacket | Lost
@@ -436,10 +468,29 @@ class JitterBuffer:
         # drains past a permanent gap instead of stalling.
         if len(self._packets) >= self._depth:
             self._emitted = True
-            self._next = _seq_next(expected)
             if self._adapt:
                 self._clean_run = 0  # a declared loss breaks the clean run
-            return Lost(expected)
+            # Run-length coalescing: scan forward from ``expected`` to find the
+            # first sequence that IS buffered.  Emit a single Lost(count=N)
+            # instead of N separate Lost events — O(1) allocations + iterations
+            # per gap regardless of gap size (amortized O(1) per packet).
+            # The scan is bounded by _max_ahead so it terminates even for a
+            # permanent gap. The gap is capped at EXACTLY _max_ahead: the strict
+            # ``<`` stops the loop once ``scan`` reaches ``expected + _max_ahead``
+            # (the window edge), so ``gap`` never exceeds _max_ahead and the anchor
+            # cannot over-advance past a packet that later arrives at that edge.
+            # The loop visits at most _max_ahead steps.
+            gap = 1
+            scan = _seq_next(expected)
+            while (
+                scan not in self._packets
+                and (scan - expected) % _SEQ_MOD < self._max_ahead
+            ):
+                gap += 1
+                scan = _seq_next(scan)
+            # Advance the anchor past all gap slots in one step.
+            self._next = (expected + gap) % _SEQ_MOD
+            return Lost(expected, count=gap)
         return None
 
     def peek(self) -> JitterOutput | None:

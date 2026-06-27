@@ -1711,20 +1711,38 @@ class RtpMediaTransport:
                     break
                 ts_ns = self._clock()
                 if isinstance(output, Lost):
-                    # Packet-loss concealment (ADR-0056): fill the hole with a
-                    # concealment frame instead of skipping it, so the VAD/STT see a
-                    # continuous stream. For Opus this recovers the frame from the
-                    # NEXT packet's in-band FEC when that successor is already
-                    # buffered (peeked, not consumed), else uses Opus PLC; for
-                    # G.711/G.722 it repeats the last good frame, attenuated.
-                    _log.debug("JitterBuffer: lost packet seq=%d", output.sequence)
-                    frame = self._conceal_frame(ts_ns)
-                else:
-                    # Decode the wire payload to an analysis-rate PcmFrame and
-                    # remember it as the basis for concealing a future loss.
-                    frame = self._decode(output.payload, ts_ns)
-                    self._last_good_samples = frame.samples
-                    self._consecutive_lost = 0
+                    # Packet-loss concealment (ADR-0056): fill each hole with a
+                    # concealment frame so the VAD/STT see a continuous stream.
+                    # Lost.count > 1 signals a coalesced run (a far-ahead gap
+                    # compressed to one event); iterate count times so the stream
+                    # produced here is frame-accurate regardless of gap size.
+                    #
+                    # The run's anchor (peek_next) is already at the real
+                    # successor for the WHOLE run, so only the LAST slot — the one
+                    # immediately before the successor — may use the successor's
+                    # in-band Opus FEC (which carries exactly that one preceding
+                    # frame). The earlier interpolated slots conceal with PLC,
+                    # reproducing the pre-coalesce per-packet semantics (one Lost
+                    # per pop) instead of redundantly FEC-decoding the same
+                    # successor for every slot.
+                    _log.debug(
+                        "JitterBuffer: lost seq=%d count=%d",
+                        output.sequence,
+                        output.count,
+                    )
+                    last_index = output.count - 1
+                    for index in range(output.count):
+                        ts_ns = self._clock()
+                        frame = self._conceal_frame(ts_ns, is_last=index == last_index)
+                        frame = self._cancel_echo(frame)
+                        self._detect_inband_dtmf(frame)
+                        yield frame
+                    continue
+                # Decode the wire payload to an analysis-rate PcmFrame and
+                # remember it as the basis for concealing a future loss.
+                frame = self._decode(output.payload, ts_ns)
+                self._last_good_samples = frame.samples
+                self._consecutive_lost = 0
                 # Acoustic echo cancellation (ADR-0033): subtract the KNOWN outbound
                 # TTS reference (tapped in the TX path) from this inbound frame
                 # BEFORE the VAD/ASR see it, so the gateway's reflected echo cannot
@@ -3607,7 +3625,7 @@ class RtpMediaTransport:
             self._rx_resampler = Resampler(decoded_rate, analysis_rate)
         return self._rx_resampler.resample(pcm)
 
-    def _conceal_frame(self, ts_ns: int) -> PcmFrame:
+    def _conceal_frame(self, ts_ns: int, *, is_last: bool = True) -> PcmFrame:
         """Build one concealment frame for a lost packet (ADR-0056, items 2+3).
 
         Returns an analysis-rate :class:`~hermes_voip.providers.audio.PcmFrame` —
@@ -3628,13 +3646,20 @@ class RtpMediaTransport:
           rather than droning). Identical for both codecs, so G.722 loss handling
           is no worse than G.711's.
 
+        ``is_last`` marks the final slot of a (possibly coalesced) loss run — the
+        slot sitting immediately before the buffered successor. Only that slot may
+        consult the successor's Opus in-band FEC (it carries exactly that one
+        preceding frame); the interpolated slots of a coalesced run pass
+        ``is_last=False`` and conceal with PLC, matching the pre-coalesce
+        per-packet behaviour. A lone ``Lost`` defaults to ``is_last=True``.
+
         ``_consecutive_lost`` is incremented here (a run of losses) and reset by
         the next real decode; a future RTCP lane can read it as a loss count.
         """
         run = self._consecutive_lost
         self._consecutive_lost = run + 1
         if self._codec is Codec.OPUS:
-            samples = self._conceal_opus()
+            samples = self._conceal_opus(use_successor_fec=is_last)
             # Track the recovered/concealed estimate as the basis for a subsequent
             # G.711-style repeat should this become a non-Opus run (defensive; the
             # codec does not change mid-call, so this only keeps state coherent).
@@ -3651,17 +3676,22 @@ class RtpMediaTransport:
             monotonic_ts_ns=ts_ns,
         )
 
-    def _conceal_opus(self) -> bytes:
+    def _conceal_opus(self, *, use_successor_fec: bool = True) -> bytes:
         """Recover/conceal one lost Opus frame at the analysis rate (ADR-0056).
 
-        Uses the next buffered packet's in-band FEC when available, else native
-        Opus PLC; both keep the decoder predictor coherent. The decoder is created
-        lazily (as in :meth:`_decode`) so a connect-as-PCMU-then-Opus call works
-        and the default no-webrtc path never imports opuslib.
+        When ``use_successor_fec`` is set (the default, and the final slot of a
+        coalesced run), the next buffered packet's in-band FEC is used if present —
+        it carries exactly the frame immediately before it. When it is unset (an
+        interpolated slot of a coalesced run, whose true predecessor is NOT the
+        buffered successor), native Opus PLC is used instead; FEC-decoding the
+        successor for such a slot would "recover" the wrong frame. Both keep the
+        decoder predictor coherent. The decoder is created lazily (as in
+        :meth:`_decode`) so a connect-as-PCMU-then-Opus call works and the default
+        no-webrtc path never imports opuslib.
         """
         if self._opus_decoder is None:
             self._opus_decoder = _new_opus_decoder()
-        successor = self._jitter.peek_next()
+        successor = self._jitter.peek_next() if use_successor_fec else None
         if successor is not None and successor.payload_type == self._payload_type:
             decoded = self._opus_decoder.decode_fec(successor.payload)
         else:

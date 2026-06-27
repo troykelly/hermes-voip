@@ -27,7 +27,12 @@ from typing import Final
 
 import pytest
 
-from hermes_voip.media.call_loop import BargeInMode, CallLoop, gate_voip_tool
+from hermes_voip.media.call_loop import (
+    _DTMF_TURN_PREFIX,
+    BargeInMode,
+    CallLoop,
+    gate_voip_tool,
+)
 from hermes_voip.media.call_progress import CallProgressEvent, FaxCng
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import VoiceActivityDetector
@@ -4225,6 +4230,99 @@ async def test_no_input_reprompt_stands_down_on_barge_in() -> None:
         await asyncio.sleep(0)
     assert transport.sent_audio == [], (
         "a reprompt fired after a barge-in (the watchdog did not stand down)"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_no_input_reprompt_resets_when_caller_sends_dtmf() -> None:
+    """Inbound DTMF is caller activity: keypad-only navigation never trips the watchdog.
+
+    The accessibility gap (ADR-0057): a caller navigating purely by keypad — a
+    hearing/speech-impaired caller for whom DTMF is the access path, or anyone pausing
+    between menu digits longer than the no-input window — sent NO speech, so the
+    speech/refuse path that marks ``_caller_active_in_window`` never ran and the
+    watchdog treated them as silent: reprompted, then hung up. A delivered DTMF group
+    must reset the watchdog EXACTLY like a finalised speech turn.
+
+    Two silence windows, each preceded by a delivered DTMF group (no speech anywhere):
+    the watchdog must observe the activity and re-arm both times — never reprompting,
+    never ending the call. The speech-only equivalent
+    (:func:`test_no_input_reprompt_resets_when_caller_speaks`) already passes, so this
+    test isolates the DTMF gap.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=2)  # two windows; DTMF in each must reset the watchdog
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),  # the caller NEVER speaks (pure silence on the STT path)
+        tts,
+        sleep=sleep,
+        deliver_turn=capture,
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the watchdog did not arm"
+
+    # A keypad menu digit arrives during the first window (terminator delivers the
+    # group synchronously — not via the inter-digit sleep seam the watchdog owns here).
+    await loop.feed_dtmf_async("5")
+    await loop.feed_dtmf_async("#")
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if delivered:
+            break
+    assert delivered == [f"{_DTMF_TURN_PREFIX}5"], (
+        f"the DTMF menu group was not delivered as a turn; got {delivered!r}"
+    )
+
+    # First window elapses: DTMF WAS delivered during it, so the watchdog must reset
+    # (re-arm) rather than reprompt — DTMF is caller activity, like a speech turn.
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "a reprompt fired even though the caller had pressed a key "
+        "(DTMF was not counted as caller activity)"
+    )
+    assert not run_task.done(), "the watchdog ended the call after DTMF input"
+
+    # A second keypad digit during the second window: must again reset the watchdog so a
+    # caller pausing longer than the window between menu digits is never hung up on.
+    await loop.feed_dtmf_async("2")
+    await loop.feed_dtmf_async("#")
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(delivered) >= 2:
+            break
+    assert delivered == [f"{_DTMF_TURN_PREFIX}5", f"{_DTMF_TURN_PREFIX}2"], (
+        f"the second DTMF menu group was not delivered; got {delivered!r}"
+    )
+
+    sleep.step()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "a reprompt fired on the second window despite DTMF activity "
+        "(keypad-only navigation must never trip the no-input watchdog)"
+    )
+    assert not run_task.done(), (
+        "the call ended on a DTMF-navigating caller (the no-input watchdog hung up)"
     )
 
     transport.close_inbound()

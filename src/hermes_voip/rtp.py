@@ -10,6 +10,13 @@ shape.
 
 from __future__ import annotations
 
+__all__ = [
+    "JitterBuffer",
+    "JitterOutput",
+    "Lost",
+    "RtpPacket",
+]
+
 import struct
 from dataclasses import dataclass
 

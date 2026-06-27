@@ -5,6 +5,10 @@ decision lives here. This is a minimal real unit so the toolchain gate has a
 typed, tested target from day one.
 """
 
+__all__ = [
+    "sip_address_of_record",
+]
+
 
 def sip_address_of_record(extension: str, host: str) -> str:
     """Build a SIP Address-of-Record (AOR) URI for an extension on a gateway.

@@ -1013,9 +1013,23 @@ class CallLoop:
         (never a fake STT transcript), so a normal turn can act on keypad menu input.
         The buffer was already taken by :meth:`_take_dtmf_group` at the firing instant,
         so this method holds no shared state a concurrent feed could race.
+
+        A delivered DTMF group is also caller activity for the no-input watchdog
+        (ADR-0057), exactly equivalent to a finalised speech turn (see
+        :meth:`_screen_and_deliver`): pressing a key proves the caller is present and
+        engaged, so the silence window resets — a pending reprompt stands down and the
+        reprompt count clears on the watchdog's next wake. Without this a caller
+        navigating purely by keypad — INCLUDING a hearing/speech-impaired caller for
+        whom DTMF is the accessibility path, or anyone pausing longer than the no-input
+        window between menu digits — is treated as silent and eventually hung up on. Set
+        only once the group is non-empty (a real delivered turn), mirroring the speech
+        path's marking on an actual finalised turn.
         """
         if not digits:
             return
+        # The caller pressed a key (a delivered menu turn): reset the no-input silence
+        # window, equivalent to a finalised speech turn (ADR-0057).
+        self._caller_active_in_window = True
         text = f"{_DTMF_TURN_PREFIX}{digits}"
         _log.info("dtmf: delivering menu group %r", text)
         await self._deliver_turn(text)

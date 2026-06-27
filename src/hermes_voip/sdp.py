@@ -716,9 +716,9 @@ class _VideoAccumulator:
         tag, _, rest = value.partition(":")
         try:
             self._add_attribute(tag, rest, value)
+        except SdpError:
+            raise
         except ValueError as exc:
-            if isinstance(exc, SdpError):
-                raise
             msg = f"malformed a={value!r}"
             raise SdpError(msg) from exc
 
@@ -831,9 +831,9 @@ class _AudioAccumulator:
         tag, _, rest = value.partition(":")
         try:
             self._add_attribute(tag, rest, value)
+        except SdpError:
+            raise
         except ValueError as exc:
-            if isinstance(exc, SdpError):
-                raise
             msg = f"malformed a={value!r}"
             raise SdpError(msg) from exc
 
@@ -1085,6 +1085,8 @@ def negotiate_audio(
     Raises:
         ValueError: If no actual voice codec is shared (a DTMF-only match is
             not a usable call).
+        SdpError: If the negotiated ``telephone-event`` clock rate matches none
+            of the negotiated voice codecs' clock rates.
     """
     # Preference rank by encoding (upper-cased): index in `supported`, lowest =
     # most preferred. The membership filter below removes unsupported encodings
@@ -1096,11 +1098,33 @@ def negotiate_audio(
         chosen = tuple(sorted(common, key=lambda c: rank[c.encoding.upper()]))
     else:
         chosen = tuple(common)
-    has_voice = any(c.encoding.lower() != _TELEPHONE_EVENT for c in chosen)
-    if not has_voice:
+    voice = [c for c in chosen if c.encoding.lower() != _TELEPHONE_EVENT]
+    if not voice:
         msg = f"no common audio codec (offered {[c.encoding for c in offer.codecs]})"
         raise ValueError(msg)
+    telephone_event = next(
+        (codec for codec in chosen if codec.encoding.lower() == _TELEPHONE_EVENT), None
+    )
+    if telephone_event is not None:
+        voice_rates = {codec.clock_rate for codec in voice}
+        if telephone_event.clock_rate not in voice_rates:
+            selected_rate = voice[0].clock_rate
+            msg = (
+                "telephone-event clock rate "
+                f"{selected_rate} does not match selected voice codec clock rate "
+                f"{telephone_event.clock_rate}"
+            )
+            raise SdpError(msg)
     return chosen
+
+
+def _mirror_direction(direction: str) -> str:
+    """Return the RFC 3264 answer direction for an offered direction token."""
+    try:
+        return _ANSWER_DIRECTION[direction]
+    except KeyError as exc:
+        msg = f"invalid SDP direction: {direction!r}"
+        raise ValueError(msg) from exc
 
 
 def negotiate_ptime(
@@ -1712,7 +1736,7 @@ def build_audio_answer(  # noqa: PLR0913 - SDP fields are independent; all keywo
         local_address=local_address,
         port=port,
         codecs=chosen,
-        direction=_ANSWER_DIRECTION[audio.direction],
+        direction=_mirror_direction(audio.direction),
         ptime=ptime,
         session_id=session_id,
         sess_version=sess_version,

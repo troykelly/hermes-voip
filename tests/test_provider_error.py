@@ -164,3 +164,92 @@ def test_resolve_error_apology_result_is_not_itself_a_provider_error() -> None:
         )
     custom = "Un moment s'il vous plait."
     assert not is_provider_error(resolve_error_apology("en", override=custom))
+
+
+# ---- classify_provider_error: exact category tokens + precedence ----------------
+#
+# classify_provider_error() returns one of five stable log-pipeline tokens. Each
+# test below pins a DIFFERENT representative input to its EXACT expected token so
+# that a constant-return mutant fails at least four of the five category tests, and
+# the precedence test ensures a precedence-swap mutant fails.
+
+
+from hermes_voip.provider_error import classify_provider_error  # noqa: E402
+
+
+def test_classify_provider_error_traceback_token() -> None:
+    """A Python stack-trace header returns exactly "traceback"."""
+    text = "Traceback (most recent call last):\n  File 'x.py', line 1\nValueError: boom"
+    assert classify_provider_error(text) == "traceback"
+
+
+def test_classify_provider_error_provider_token_token() -> None:
+    """A provider SDK error-class repr returns exactly "provider_token"."""
+    # "RuntimeError:" matches _PROVIDER_TOKEN_RE (\b\w*error\b\s*:) and does NOT
+    # match _TRACEBACK_RE, so the second detector fires.
+    text = "RuntimeError: connection reset by peer"
+    assert classify_provider_error(text) == "provider_token"
+
+
+def test_classify_provider_error_http_error_token() -> None:
+    """An HTTP 5xx/429 status in error context returns exactly "http_error"."""
+    # "HTTP 502" matches _HTTP_ERROR_RE keyword branch; none of the higher detectors
+    # fire on this plain status string (no traceback, no provider token, no phrase).
+    text = "HTTP 502"
+    assert classify_provider_error(text) == "http_error"
+
+
+def test_classify_provider_error_failure_phrase_token() -> None:
+    """An explicit failure phrase returns exactly "failure_phrase"."""
+    # "API call failed" matches _FAILURE_PHRASE_RE; no higher detector fires.
+    text = "API call failed"
+    assert classify_provider_error(text) == "failure_phrase"
+
+
+def test_classify_provider_error_fallback_token() -> None:
+    """A string with no sub-detector match returns "provider_error" (fallback)."""
+    # The docstring says "should not occur" in practice, but the fallback branch is
+    # real code. Call directly with a string that clears all four detectors to pin the
+    # final return value. The function guarantees never returning an empty string.
+    # (The caller is expected to have confirmed is_provider_error first; this call
+    # exercises the fallback regardless of that precondition.)
+    result = classify_provider_error("some unmatched string with no error markers")
+    assert result == "provider_error"
+
+
+def test_classify_provider_error_traceback_wins_over_provider_token() -> None:
+    """When input matches both traceback AND provider_token, "traceback" is returned.
+
+    Pins the detector ORDER: traceback > provider_token. A mutant that swaps these
+    two detectors would return "provider_token" instead and fail this test.
+    """
+    # "Traceback (most recent call last):" matches _TRACEBACK_RE.
+    # "ValueError:" matches _PROVIDER_TOKEN_RE (\b\w*error\b\s*:).
+    # Both detectors fire; the higher-priority one (traceback) must win.
+    text = "Traceback (most recent call last):\nValueError: something went wrong"
+    assert classify_provider_error(text) == "traceback"
+
+
+def test_classify_provider_error_provider_token_wins_over_http_error() -> None:
+    """When input matches both provider_token AND http_error, "provider_token" wins.
+
+    Pins the detector ORDER: provider_token > http_error. A mutant that swaps these
+    two detectors would return "http_error" instead and fail this test.
+    """
+    # "InternalServerError: HTTP 502" — "InternalServerError:" fires _PROVIDER_TOKEN_RE
+    # and "HTTP 502" fires _HTTP_ERROR_RE; provider_token must take priority.
+    text = "InternalServerError: HTTP 502 Bad Gateway"
+    assert classify_provider_error(text) == "provider_token"
+
+
+def test_classify_provider_error_http_error_wins_over_failure_phrase() -> None:
+    """When input matches both http_error AND failure_phrase, "http_error" is returned.
+
+    Pins the detector ORDER: http_error > failure_phrase. A mutant that swaps these
+    two detectors would return "failure_phrase" instead and fail this test.
+    """
+    # "API call failed: HTTP 502" — "API call failed" matches _FAILURE_PHRASE_RE and
+    # "HTTP 502" matches _HTTP_ERROR_RE; _PROVIDER_TOKEN_RE does NOT fire (no
+    # "error:" token, no structured token, no "status code" substring); http_error wins.
+    text = "API call failed: HTTP 502"
+    assert classify_provider_error(text) == "http_error"

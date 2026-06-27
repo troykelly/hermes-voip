@@ -417,6 +417,24 @@ def test_deregister_before_registration_raises() -> None:
         RegistrationFlow(_CONFIG).deregister()
 
 
+def test_deregister_resets_registered_state() -> None:
+    # After a successful registration, deregister() -> 200 OK sets _registered=False.
+    # A second deregister() call must then raise RuntimeError (not registered),
+    # distinct from test_deregister_before_registration_raises which tests the
+    # initial state. This guards the idempotency guard: once unregistered, the
+    # flow cannot be de-registered again without a fresh registration.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    flow.handle(_ok(_cseq_num(started)))  # -> Registered, sets _registered=True
+    dereg = flow.deregister()  # -> 200 OK, should clear _registered
+    flow.handle(_ok(_cseq_num(dereg)))  # accept the de-registration
+    # Direct assertion: _registered must be False after the 200 OK is accepted.
+    assert flow._registered is False
+    # Indirect guard: a second deregister() must raise (idempotency guard).
+    with pytest.raises(RuntimeError, match="not registered"):
+        flow.deregister()
+
+
 def test_call_id_matches_the_wire_and_is_stable() -> None:
     # The manager demuxes REGISTER responses by Call-ID (ADR-0011), so the
     # property must equal the Call-ID actually used on the wire.

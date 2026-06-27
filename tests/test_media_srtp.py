@@ -887,3 +887,41 @@ class TestPacketIvKnownAnswers:
         k_s = bytes(range(14))  # 000102030405060708090A0B0C0D
         iv = _packet_iv(k_s, ssrc=0x12345678, roc=2, seq=3)
         assert iv == bytes.fromhex("000102031631507F08090A090C0E0000")
+
+
+# ---------------------------------------------------------------------------
+# __all__ export
+# ---------------------------------------------------------------------------
+
+
+import hermes_voip.media.srtp as _srtp_mod  # noqa: E402
+
+
+class TestSrtpModuleExports:
+    """Verify that srtp.py defines __all__ with the correct public names."""
+
+    def test_module_defines_all(self) -> None:
+        """The srtp module must define __all__."""
+        assert hasattr(_srtp_mod, "__all__"), "srtp module must define __all__"
+
+    def test_all_contains_correct_public_names(self) -> None:
+        """__all__ must list the exact public names intended for star-import."""
+        expected = {"SrtpError", "SrtpSession", "crypto_suite_strength"}
+        assert set(_srtp_mod.__all__) == expected
+
+    def test_all_names_are_importable(self) -> None:
+        """Every name in __all__ must be importable from the module."""
+        all_names = _srtp_mod.__all__
+        for name in all_names:
+            assert hasattr(_srtp_mod, name), (
+                f"{name} must be importable from srtp module"
+            )
+            assert not name.startswith("_"), (
+                f"{name} must not be private (no leading _)"
+            )
+
+    def test_no_private_names_in_all(self) -> None:
+        """__all__ must not include any names starting with underscore."""
+        all_names = _srtp_mod.__all__
+        private_names = [name for name in all_names if name.startswith("_")]
+        assert not private_names, f"Private names in __all__: {private_names}"

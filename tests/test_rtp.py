@@ -463,3 +463,157 @@ def test_adaptive_floor_is_target_depth() -> None:
 def test_adaptive_constructor_validates_max_depth() -> None:
     with pytest.raises(ValueError, match="max_depth"):
         JitterBuffer(target_depth=4, max_depth=2, adapt=True)  # max < floor
+
+
+# ---------------------------------------------------------------------------
+# SSRC auto-reset hysteresis (backlog ~1089-e).
+#
+# A single stray/misrouted foreign-SSRC packet must NOT flush buffered audio.
+# Only N CONSECUTIVE packets sharing the same foreign SSRC trigger a reset.
+# Default N is 3; a constructor param ``ssrc_hysteresis`` overrides it.
+# ---------------------------------------------------------------------------
+
+
+def test_ssrc_hysteresis_default_is_3() -> None:
+    """JitterBuffer exposes ssrc_hysteresis defaulting to 3."""
+    jb = JitterBuffer()
+    assert jb.ssrc_hysteresis == 3
+
+
+def test_ssrc_hysteresis_constructor_validates_positive_int() -> None:
+    """ssrc_hysteresis rejects zero, negatives, booleans, and non-ints."""
+    with pytest.raises(ValueError, match="ssrc_hysteresis"):
+        JitterBuffer(ssrc_hysteresis=0)
+    with pytest.raises(ValueError, match="ssrc_hysteresis"):
+        JitterBuffer(ssrc_hysteresis=-1)
+    with pytest.raises((ValueError, TypeError), match="ssrc_hysteresis"):
+        # bool is a subclass of int — must be rejected
+        JitterBuffer(ssrc_hysteresis=True)
+    with pytest.raises((ValueError, TypeError), match="ssrc_hysteresis"):
+        JitterBuffer(ssrc_hysteresis=1.5)  # type: ignore[arg-type]  # float not valid
+
+
+def test_ssrc_hysteresis_one_foreign_packet_does_not_reset() -> None:
+    """A single foreign-SSRC packet leaves the buffer intact."""
+    home_ssrc = 0x11111111
+    foreign_ssrc = 0x22222222
+    jb = JitterBuffer(target_depth=3, ssrc_hysteresis=3)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    # One foreign packet — should NOT trigger a reset.
+    jb.push(_pkt(20, ssrc=foreign_ssrc))
+    # Buffer still has the home packets.
+    assert len(jb) == 3
+    assert _packet(jb.pop()).sequence_number == 10
+
+
+def test_ssrc_hysteresis_n_minus_1_consecutive_foreign_do_not_reset() -> None:
+    """N-1 consecutive foreign-SSRC packets do not trigger a reset."""
+    home_ssrc = 0x11111111
+    foreign_ssrc = 0x22222222
+    jb = JitterBuffer(target_depth=4, ssrc_hysteresis=3)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    buffered_before = len(jb)
+    # Push N-1 = 2 consecutive foreign packets.
+    for seq in (100, 101):
+        jb.push(_pkt(seq, ssrc=foreign_ssrc))
+    # Reset must NOT have fired; original buffer intact.
+    assert len(jb) == buffered_before
+    assert _packet(jb.pop()).sequence_number == 10
+
+
+def test_ssrc_hysteresis_nth_consecutive_foreign_resets() -> None:
+    """Exactly N consecutive foreign-SSRC packets trigger a reset and SSRC adoption."""
+    home_ssrc = 0x11111111
+    foreign_ssrc = 0x22222222
+    jb = JitterBuffer(target_depth=4, ssrc_hysteresis=3)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    # Push N consecutive foreign packets; the Nth should fire the reset.
+    for seq in (100, 101, 102):
+        jb.push(_pkt(seq, ssrc=foreign_ssrc))
+    # The reset must have cleared the old packets and adopted the foreign SSRC.
+    assert len(jb) <= 3  # at most the three foreign packets survive
+    # The anchor is now on the foreign stream; the Nth foreign packet itself
+    # was pushed into the new buffer.
+    out = jb.pop()
+    assert out is not None
+    assert isinstance(out, RtpPacket)
+    assert out.ssrc == foreign_ssrc
+
+
+def test_ssrc_hysteresis_home_packet_interleaved_resets_candidate() -> None:
+    """A home-SSRC packet mid-run resets the candidate; the run must restart."""
+    home_ssrc = 0x11111111
+    foreign_ssrc = 0x22222222
+    # N=3: two foreign, then one home, then two more foreign → still no reset.
+    jb = JitterBuffer(target_depth=4, ssrc_hysteresis=3)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    buffered_before = len(jb)
+    # Two foreign packets (N-1).
+    jb.push(_pkt(100, ssrc=foreign_ssrc))
+    jb.push(_pkt(101, ssrc=foreign_ssrc))
+    # Home packet interrupts — must reset the candidate count.
+    jb.push(_pkt(13, ssrc=home_ssrc))
+    # Two more foreign — total run restarts at 2, still < N=3, no reset.
+    jb.push(_pkt(102, ssrc=foreign_ssrc))
+    jb.push(_pkt(103, ssrc=foreign_ssrc))
+    # Home packets still in buffer.
+    assert len(jb) >= buffered_before
+    assert _packet(jb.pop()).sequence_number == 10
+
+
+def test_ssrc_hysteresis_different_foreign_ssrc_mid_run_restarts_count() -> None:
+    """A DIFFERENT foreign SSRC mid-run restarts the candidate at 1, not reset."""
+    home_ssrc = 0x11111111
+    foreign_ssrc_a = 0x22222222
+    foreign_ssrc_b = 0x33333333
+    jb = JitterBuffer(target_depth=4, ssrc_hysteresis=3)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    buffered_before = len(jb)
+    # Two packets from foreign_a (count=2, N-1).
+    jb.push(_pkt(100, ssrc=foreign_ssrc_a))
+    jb.push(_pkt(101, ssrc=foreign_ssrc_a))
+    # One packet from foreign_b → candidate switches to foreign_b, count=1.
+    jb.push(_pkt(200, ssrc=foreign_ssrc_b))
+    # One more from foreign_b (count=2, still < 3): no reset.
+    jb.push(_pkt(201, ssrc=foreign_ssrc_b))
+    # Original home buffer must be intact.
+    assert len(jb) >= buffered_before
+    assert _packet(jb.pop()).sequence_number == 10
+
+
+def test_ssrc_hysteresis_1_resets_immediately() -> None:
+    """ssrc_hysteresis=1 degrades to the pre-hysteresis: reset on first foreign."""
+    home_ssrc = 0x11111111
+    foreign_ssrc = 0x22222222
+    jb = JitterBuffer(target_depth=3, ssrc_hysteresis=1)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    jb.push(_pkt(100, ssrc=foreign_ssrc))
+    # Must have reset immediately on the first foreign packet.
+    assert len(jb) <= 1  # only the foreign packet in buffer (possibly)
+    out = jb.pop()
+    assert out is not None
+    assert isinstance(out, RtpPacket)
+    assert out.ssrc == foreign_ssrc
+
+
+def test_ssrc_hysteresis_reset_clears_candidate_state() -> None:
+    """reset() clears the SSRC candidate/count so a subsequent push starts fresh."""
+    home_ssrc = 0x11111111
+    foreign_ssrc = 0x22222222
+    jb = JitterBuffer(target_depth=3, ssrc_hysteresis=3)
+    for seq in (10, 11, 12):
+        jb.push(_pkt(seq, ssrc=home_ssrc))
+    # Accumulate a partial candidate run without firing.
+    jb.push(_pkt(100, ssrc=foreign_ssrc))
+    jb.push(_pkt(101, ssrc=foreign_ssrc))
+    # Explicit reset.
+    jb.reset()
+    # After reset, a single home packet should anchor cleanly.
+    jb.push(_pkt(1, ssrc=home_ssrc))
+    assert _packet(jb.pop()).sequence_number == 1

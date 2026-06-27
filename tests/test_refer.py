@@ -374,6 +374,17 @@ def test_parse_notify_sipfrag_rejects_missing_subscription_state() -> None:
 
 
 def test_attended_refer_appends_replaces_when_target_has_uri_header() -> None:
+    # This test checks build_attended_refer's ``&`` separator logic only: when the
+    # consultation dialog's remote_target already carries a ``?``-headed URI (an
+    # unusual but syntactically valid SIP Contact), the outbound REFER must join
+    # the ``Replaces=`` with ``&``, never produce a malformed second ``?``.
+    #
+    # NOTE: parse_refer is NOT called here because a Refer-To carrying
+    # ``?Subject=consult&Replaces=...`` would be rejected by the inbound query
+    # guard (_validate_refer_to_query rejects any non-Replaces embedded header key).
+    # The build-side test and the parse-side security boundary are intentionally
+    # separate concerns: a transferee receiving such a REFER with an extra header
+    # MUST reject it (see test_parse_refer_rejects_non_replaces_embedded_header).
     consult = _consult()
     with_header = Dialog(
         call_id=consult.call_id,
@@ -394,9 +405,6 @@ def test_attended_refer_appends_replaces_when_target_has_uri_header() -> None:
     # A second URI header is joined with '&', never a malformed second '?'.
     assert refer_to.count("?") == 1
     assert "&Replaces=" in refer_to
-    parsed = parse_refer(refer)
-    assert parsed.replaces is not None
-    assert parsed.replaces.to_tag == "c-tag"
 
 
 def test_build_blind_refer_carries_auth_header() -> None:
@@ -630,17 +638,20 @@ def test_parse_refer_rejects_foreign_host_in_refer_to() -> None:
         parse_refer(refer)
 
 
-def test_parse_refer_rejects_refer_to_with_replaces_header_form() -> None:
-    # A Refer-To carrying ``?Replaces=…`` would point the triggered INVITE at
-    # another dialog (dialog-seizing injection); parse_refer must raise ReferError.
-    _replaces_uri = "sip:1001@pbx.example.test?Replaces=abc%3Bto-tag%3Dx"
+def test_parse_refer_rejects_refer_to_with_non_replaces_header_form() -> None:
+    # A Refer-To carrying any embedded header key other than ``Replaces`` is a
+    # header-injection vector; parse_refer must raise ReferError.
+    # NOTE: ``?Replaces=<dialog-id>`` on a valid host IS accepted for attended
+    # transfer (see test_parse_attended_refer_extracts_replaces); this test covers
+    # the non-Replaces injection case with an otherwise-valid host and target.
+    _uri = "sip:1001@pbx.example.test?Subject=evil"
     refer = SipRequest(
         method="REFER",
         request_uri="sip:1000@198.51.100.7:5061",
-        headers=(("Refer-To", f"<{_replaces_uri}>"),),
+        headers=(("Refer-To", f"<{_uri}>"),),
         body="",
     )
-    with pytest.raises(ReferError):
+    with pytest.raises(ReferError, match="embedded header"):
         parse_refer(refer)
 
 

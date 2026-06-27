@@ -178,6 +178,8 @@ async def test_on_response_logs_registration_established(
     message = records[0].getMessage()
     # The expiry IS surfaced (it is not a secret) — operators read the refresh window.
     assert "299" in message
+    assert records[0].__dict__["event"] == "sip_registration_established"
+    assert records[0].__dict__["expires_s"] == 299
     # rule 34: the message must NOT leak any HERMES_SIP_* value. The fakes here are
     # the host, the extension/username, and the digest password from ``_gateway()``.
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2", "sip:"):
@@ -226,6 +228,8 @@ async def test_on_response_refresh_does_not_re_log_at_info(
     ]
     assert len(info) == 1, "only the initial registration logs at INFO, not refreshes"
     assert len(debug) == 1, "the refresh is logged at DEBUG"
+    assert debug[0].__dict__["event"] == "sip_registration_refreshed"
+    assert debug[0].__dict__["expires_s"] == 300
 
 
 async def test_on_response_challenge_resends_authenticated() -> None:

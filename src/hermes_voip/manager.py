@@ -349,10 +349,21 @@ class RegistrationManager:
             # the non-sensitive expiry. With N extensions a per-line identifier
             # would be the (PII) extension number, so it is deliberately omitted;
             # the count of these lines is how many extensions came up.
+            extra = {
+                "expires_s": outcome.expires,
+            }
             if was_registered:
-                _log.debug("SIP registration refreshed (expires %ss)", outcome.expires)
+                _log.debug(
+                    "SIP registration refreshed (expires %ss)",
+                    outcome.expires,
+                    extra={"event": "sip_registration_refreshed", **extra},
+                )
             else:
-                _log.info("SIP registration established (expires %ss)", outcome.expires)
+                _log.info(
+                    "SIP registration established (expires %ss)",
+                    outcome.expires,
+                    extra={"event": "sip_registration_established", **extra},
+                )
         elif isinstance(outcome, Failed):
             self._on_registration_failed(
                 state,

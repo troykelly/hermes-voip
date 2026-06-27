@@ -452,6 +452,70 @@ class TestRolloverCounter:
         assert tx.roc == 1
         assert rx.roc == 1
 
+    def test_roc_wrap_up_is_32bit_masked(self) -> None:
+        """_estimate_roc wrap-UP at ROC=0xFFFFFFFF must return 0, not 0x100000000.
+
+        RFC 3711 §3.3.1: the rollover counter is a 32-bit value; incrementing past
+        0xFFFFFFFF must wrap to 0x00000000.  Without the modulus the result would be
+        a 33-bit integer (0x100000000), which diverges from the RFC and from the
+        symmetric wrap-DOWN branch that already applies % _ROC_MOD.
+        """
+        crypto = _make_crypto()
+        # Build a receiver already at ROC = 0xFFFFFFFF and seq_top in the lower half
+        # so that the next packet (seq in the upper half, using a large seq value as
+        # a back-reference across the boundary) can exercise the wrap-UP estimation.
+        # We reach this state by directly manipulating roc; no 2^48-packet marathon.
+        rx = SrtpSession(crypto)
+        tx = SrtpSession(crypto)
+
+        # Prime both sessions with a single packet so _seq_top is initialised.
+        seed = _make_packet(seq=1)
+        rx.unprotect(tx.protect(seed))
+        assert tx.roc == 0
+        assert rx.roc == 0
+
+        # Force both sessions to the penultimate ROC.
+        tx.roc = 0xFFFFFFFF
+        rx.roc = 0xFFFFFFFF
+
+        # Set seq_top to a small value so the estimation algorithm sees a seq in
+        # the upper half (s_l < _SEQ_HALF, seq - s_l > _SEQ_HALF) — that triggers
+        # the wrap-DOWN branch (roc - 1), NOT the wrap-UP branch we are testing.
+        # We want s_l in the upper half and seq in the lower half to reach wrap-UP:
+        #   s_l >= _SEQ_HALF AND s_l - seq > _SEQ_HALF  => v = roc + 1
+        # Use s_l = 0xC000, seq = 0x0001 so s_l - seq = 0xBFFF > 0x7FFF = _SEQ_HALF.
+        rx._seq_top = 0xC000  # type: ignore[attr-defined]  # test-only state injection
+
+        # _estimate_roc must return 0 (== (0xFFFFFFFF + 1) % 2**32), not 0x100000000.
+        # Access the private method directly to test just the estimation logic in
+        # isolation without needing a valid SRTP packet at ROC=0xFFFFFFFF.
+        estimated_roc = rx._estimate_roc(0x0001)  # type: ignore[attr-defined]
+        assert estimated_roc == 0, (
+            f"_estimate_roc wrap-UP at ROC=0xFFFFFFFF must yield 0 (32-bit wrap), "
+            f"got {estimated_roc:#x}"
+        )
+
+    def test_sender_roc_increment_is_32bit_masked(self) -> None:
+        """Sender ROC must wrap to 0x00000000 after 0xFFFFFFFF, not overflow.
+
+        RFC 3711 §3.3.1: the ROC is a 32-bit integer; the sender-side increment on
+        sequence-number wraparound must apply modulo 2**32 so that roc never escapes
+        the 32-bit domain.
+        """
+        crypto = _make_crypto()
+        tx = SrtpSession(crypto)
+        # Manually place the sender at ROC = 0xFFFFFFFF and seq_top = 0xFFFF.
+        tx.roc = 0xFFFFFFFF
+        tx._seq_top = 0xFFFF  # type: ignore[attr-defined]  # test-only state injection
+
+        # protect() with seq=0 triggers the wraparound branch (seq_top==SEQ_MAX, seq==0)
+        # so roc += 1 fires; it must wrap to 0, not become 0x100000000.
+        pkt = _make_packet(seq=0)
+        tx.protect(pkt)
+        assert tx.roc == 0, (
+            f"Sender ROC must wrap to 0 after 0xFFFFFFFF, got {tx.roc:#x}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Key-size / suite validation

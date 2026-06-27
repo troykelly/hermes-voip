@@ -174,7 +174,7 @@ defect or a load-bearing test gap.
 - [x] (done #209) **[low] robustness** — Direction attribute matching is exact-case only; `a=SENDONLY` is silently
   ignored (defaults to `sendrecv`, lines 146-147) → wrong media direction (e.g. a hold treated as
   sendrecv). Lower-case before the membership test; add a mixed-case test.
-- [ ] **[low] robustness** — Duplicate rtpmap (last-wins) and duplicate payload-type in `m=` (dup
+- [x] (#320) **[low] robustness** — Duplicate rtpmap (last-wins) and duplicate payload-type in `m=` (dup
   `Codec`) resolved silently. Decide a policy (dedupe PTs preserving first; document last-wins for rtpmap)
   and pin with a test.
 - [x] (#311) **[low] correctness** — telephone-event clock-rate vs voice clock-rate consistency not validated
@@ -1118,18 +1118,18 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 ### Correctness / robustness / security
 
-- [ ] **[medium] correctness** — RTCP SDES UTF-8 CNAME parse raises `UnicodeEncodeError` instead of the contracted `RtcpError` on non-ASCII inbound names. (`src/hermes_voip/rtcp.py`)
+- [x] (#321) **[medium] correctness** — RTCP SDES UTF-8 CNAME parse raises `UnicodeEncodeError` instead of the contracted `RtcpError` on non-ASCII inbound names. (`src/hermes_voip/rtcp.py`)
 - [ ] **[low] correctness** — REGISTER binding matching uses raw string equality instead of RFC 3261 SIP-URI comparison, so equivalent echoed Contacts can refresh against the wrong binding expiry. (`src/hermes_voip/registration.py`)
-- [ ] **[medium] robustness** — `isdigit()` admits Unicode digits that `int()` cannot parse, crashing REGISTER 200-OK handling. (`src/hermes_voip/registration.py`)
+- [x] (#316) **[medium] robustness** — `isdigit()` admits Unicode digits that `int()` cannot parse, crashing REGISTER 200-OK handling. (`src/hermes_voip/registration.py`)
 - [ ] **[low] robustness** — `_next_comfort_phrase()` / `_next_reprompt_phrase()` raise `IndexError` when the phrases tuple is empty. (`src/hermes_voip/media/call_loop.py`)
-- [ ] **[medium] security** — Pin the SIP-over-TLS/WSS client TLS minimum to 1.2 for downgrade defence-in-depth. (`src/hermes_voip/adapter.py`)
+- [x] (#318) **[medium] security** — Pin the SIP-over-TLS/WSS client TLS minimum to 1.2 for downgrade defence-in-depth. (`src/hermes_voip/adapter.py`)
 - [ ] **[low] correctness** — `HERMES_VOIP_RING_TIMEOUT_SECS` is validated at tool-call time instead of startup, so config errors surface late. (`src/hermes_voip/voip_tools.py`)
 
 ### Tests
 
 - [ ] **[high] test** — Held-call session refresh needs a regression test that a held call stays `sendonly`. (`tests/test_adapter_session_timers.py`)
-- [ ] **[medium] test** — Pin `classify_provider_error()` category tokens and precedence so structured error categories cannot drift. (`tests/test_provider_error.py`)
-- [ ] **[medium] test** — Deepgram shutdown should assert the exact `CloseStream` control frame, not just any text frame. (`tests/stt/test_deepgram.py`)
+- [x] (#317) **[medium] test** — Pin `classify_provider_error()` category tokens and precedence so structured error categories cannot drift. (`tests/test_provider_error.py`)
+- [x] (#319) **[medium] test** — Deepgram shutdown should assert the exact `CloseStream` control frame, not just any text frame. (`tests/stt/test_deepgram.py`)
 
 ### Docs drift
 
@@ -1160,3 +1160,21 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 ### Product features
 
 - [ ] **[medium] feature** — Outbound agents cannot send DTMF through callee IVRs because `send_dtmf` is ELEVATED while the outbound persona is level 0. (`src/hermes_voip/caller_modes.py`)
+
+## Wave-8 gap-review (discovered 2026-06-27, batch 2)
+
+- [ ] **[medium] correctness** — In-dialog NOTIFY handler treats every NOTIFY as `Event: refer` transfer progress without checking the `Event` header; an `Event: message-summary` NOTIFY triggers `parse_notify_sipfrag` and returns 400 Bad Request instead of a plain 200 OK ack. (src/hermes_voip/call.py, src/hermes_voip/refer.py)
+- [ ] **[high] security** — Pinned model-file sha256 is recorded in the manifest but never compared to on-disk bytes at provider build/load time; a tampered or wrong-revision model directory (including the GUARD model) loads silently. (src/hermes_voip/providers/build.py, src/hermes_voip/manifest.py)
+- [ ] **[medium] test** — Async integration test: REFUSE turn resets no-input watchdog — no end-to-end test combining a REFUSE guard verdict with `_SteppedSleep`/`_HoldOpenTransport`/`_no_input_loop` to kill the two mutation-surviving paths at lines 2095 and 2115. (tests/test_call_loop.py)
+- [ ] **[medium] docs** — runbook-0013:131 falsely states WSS signalling is not yet wired (ADR-0016 roadmap language); ADR-0038 shipped `WssSipTransport` and it is wired in adapter.py:1124-1146. (docs/runbooks/0013-voip-incident-oncall.md)
+- [ ] **[medium] docs** — runbook-0015:26-34 says the adapter "does not yet pass" no-input kwargs and "there is no `HERMES_VOIP_*` env var for these knobs"; PR #188 shipped all six `HERMES_VOIP_NO_INPUT_*` / `HERMES_VOIP_GOODBYE*` vars and wired them in adapter.py. (docs/runbooks/0015-voip-silence-reprompt-and-goodbye.md)
+- [ ] **[medium] api** — `hermes_voip.transport.__all__` exports `SipOverTlsTransport` but omits `WssSipTransport` and `CallResponseSink`; `from hermes_voip.transport import WssSipTransport` raises `AttributeError`. (src/hermes_voip/transport/__init__.py)
+- [ ] **[medium] observability** — Outbound call lifecycle has no structured log events; only `call_loop_started` is emitted for outbound — `outbound_invite_sent`, `outbound_call_connected`, and `outbound_call_failed` are absent, blocking outbound SLO queries. (src/hermes_voip/adapter.py)
+- [ ] **[medium] observability** — `_teardown_call` reads `CallQuality` for the `rtcp_call_quality` event but performs no one-way/no-audio inference and emits no `one_way_audio` or `media_degraded` structured event. (src/hermes_voip/adapter.py, src/hermes_voip/media/engine.py)
+- [ ] **[high] ux** — DTMF input does not count as caller activity for the no-input watchdog; `feed_dtmf` / `_deliver_dtmf_group` never set `_caller_active_in_window`, so a keypad-only or hearing-impaired caller is reprompted then hung up on mid-navigation. (src/hermes_voip/media/call_loop.py)
+- [ ] **[medium] ux** — `hang_up_call` sends BYE immediately with no TTS drain; a farewell spoken in the same turn is clipped mid-word, unlike the loop-initiated goodbye which flushes before `run()` returns. (src/hermes_voip/adapter.py, src/hermes_voip/voip_tools.py)
+- [ ] **[high] docs** — runbook-0013 §6 and runbook-0014 §Error-handling falsely state provider-error-spoken-verbatim is unfixed ("NOT FIXED", "known leak — Task #26"); ADR-0063 shipped the fix in `provider_error.py` + adapter.py:1429-1448. (docs/runbooks/0013-voip-incident-oncall.md, docs/runbooks/0014-voip-slo-metrics.md)
+- [ ] **[high] docs** — runbook-0013 §5 TTS fallback recovery step instructs `HERMES_VOIP_TTS_FALLBACK=sherpa_kokoro` (underscore) but config.py validates only `sherpa-kokoro` (hyphen); following the runbook during an outage triggers `ConfigError` at startup. (docs/runbooks/0013-voip-incident-oncall.md)
+- [ ] **[medium] docs** — runbook-0007 "The knobs" table omits `HERMES_VOIP_RING_TIMEOUT_SECS` and the `failure_outcome` structured result added by ADR-0086 (commits 881b6a9, 786b2c6, 2026-06-27); rule 42 violation. (docs/runbooks/0007-voip-outbound-calling.md)
+- [ ] **[medium] feature** — `HERMES_VOIP_DENY_MODE=decline` (polite spoken-decline before BYE, ADR-0020 §6) was designed as Phase 2 but never built; `grep 'DENY_MODE\|deny_mode' src/` returns zero hits; the ADR config table entry is aspirational (rule 27). (src/hermes_voip/adapter.py, src/hermes_voip/config.py, docs/adr/0020-voip-caller-modes.md)
+- [ ] **[low] docs** — Rename test `test_sdes_rejects_non_ascii_cname` to an octet-based name; its café×100 input is now rejected by the 255-UTF-8-octet cap, not by ASCII-encodability (post #321). (tests/test_rtcp.py)

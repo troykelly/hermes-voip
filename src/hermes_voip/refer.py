@@ -352,7 +352,11 @@ def parse_refer(request: SipRequest) -> ReferRequest:
     """Parse an inbound REFER into its target, ``Replaces``, and ``Referred-By``.
 
     Raises:
-        ReferError: if the REFER does not carry exactly one ``Refer-To`` header.
+        ReferError: if the REFER does not carry exactly one ``Refer-To`` header,
+            or if the ``Refer-To`` target fails the injection guard
+            (:func:`_validate_transfer_target`) — e.g. a bare-extension host
+            hijack (``1001@evil.com``), a ``?``-header form (``?Replaces=…``),
+            or any other shape rejected by the outbound guard.
     """
     refer_to_values = request.headers_all("Refer-To")
     if len(refer_to_values) != 1:
@@ -360,6 +364,18 @@ def parse_refer(request: SipRequest) -> ReferRequest:
         raise ReferError(msg)
     addr = _bracketed_uri(refer_to_values[0])
     target, _, query = addr.partition("?")
+    # Apply the same injection guard as build_blind_refer BEFORE constructing the
+    # ReferRequest: an attacker-influenced inbound Refer-To may carry a foreign
+    # host, an embedded ?-header (e.g. ?Replaces=), or other injection vectors
+    # that must be rejected before they can influence the triggered INVITE.
+    # _validate_transfer_target raises ValueError on a bad target; wrap it as
+    # ReferError (the consistent exception type for this module) via ``from exc``
+    # to preserve the cause-chain (rule 37), without echoing any secret value.
+    try:
+        _validate_transfer_target(target.strip())
+    except ValueError as exc:
+        msg = f"REFER Refer-To target rejected by injection guard: {exc}"
+        raise ReferError(msg) from exc
     replaces = _replaces_from_uri_query(query)
     referred_by_raw = request.header("Referred-By")
     referred_by = _bracketed_uri(referred_by_raw) if referred_by_raw else None

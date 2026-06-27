@@ -376,13 +376,15 @@ def parse_refer(request: SipRequest) -> ReferRequest:
     addr = _bracketed_uri(refer_to_values[0])
     target, _, query = addr.partition("?")
     # Guard 1: validate the pre-``?`` target (extension or sip: URI shape).
-    # _validate_transfer_target raises ValueError; wrap as ReferError via
-    # ``from exc`` to preserve the cause-chain (rule 37). The error message
-    # echoes only the ValueError reason text, never the raw target value.
+    # _validate_transfer_target raises ValueError; wrap as ReferError with a
+    # FIXED message and ``from exc`` to preserve the cause-chain for debugging
+    # (rule 37/34). The user-facing message never interpolates the exception text
+    # or the raw target, so even a future leaky validator message cannot escape
+    # here — the no-echo contract holds at this boundary regardless.
     try:
         _validate_transfer_target(target.strip())
     except ValueError as exc:
-        msg = f"REFER Refer-To target rejected by injection guard: {exc}"
+        msg = "REFER Refer-To target rejected by injection guard"
         raise ReferError(msg) from exc
     # Guard 2: if a ``?``-query is present, only ``?Replaces=`` is accepted.
     # Any other embedded header key (``?Route=``, ``?Header=``, …) or duplicate

@@ -638,6 +638,26 @@ def test_parse_refer_rejects_foreign_host_in_refer_to() -> None:
         parse_refer(refer)
 
 
+def test_parse_refer_target_rejection_message_does_not_echo_cause() -> None:
+    # Defense-in-depth (rule 34): the ReferError raised when the pre-``?`` target
+    # fails _validate_transfer_target carries a FIXED message that never
+    # interpolates the underlying ValueError or the raw attacker-supplied target,
+    # so a future validator message that echoed the raw value could not leak
+    # through this boundary. Pins the no-echo contract at parse_refer. (An earlier
+    # form interpolated ``: {exc}`` and would fail this exact-message assertion.)
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", "<1001@evil.com>"),),
+        body="",
+    )
+    with pytest.raises(ReferError) as excinfo:
+        parse_refer(refer)
+    assert str(excinfo.value) == "REFER Refer-To target rejected by injection guard"
+    # The underlying ValueError cause is still preserved for debugging (rule 37).
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
 def test_parse_refer_rejects_refer_to_with_non_replaces_header_form() -> None:
     # A Refer-To carrying any embedded header key other than ``Replaces`` is a
     # header-injection vector; parse_refer must raise ReferError.

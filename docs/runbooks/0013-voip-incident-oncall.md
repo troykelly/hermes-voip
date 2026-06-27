@@ -128,8 +128,11 @@ uv run python -c \
   - If the gateway has per-transport call routing and routes calls to a **different** transport,
     the call will not arrive at the plugin.
 
-- **WebRTC (WSS):** WSS signalling is not yet wired (ADR-0016); WebRTC inbound calls are in the
-  roadmap.
+- **WebRTC (WSS):** WSS signalling IS wired (ADR-0038). `WssSipTransport` is selected in
+  `adapter.py` when `gateway_cfg.transport == "wss"`, and inbound INVITEs over WSS reach
+  `_on_inbound_invite` identically to TLS (the `is_webrtc` branch handles the WebRTC-specific
+  media path). If WSS inbound calls are not arriving, verify the gateway routes the INVITE to
+  the WSS Contact registered by the plugin.
 
 **Check what the gateway sees:** log in to the gateway and inspect the extension's transport
 registration on the SIP/TLS edge. It must show the plugin's Contact address (the IP and port it
@@ -449,7 +452,7 @@ ls -la "$HERMES_VOIP_TTS_MODEL"
 **Fallback:**
 - **TTS has a fallback.** ElevenLabs Cloud primary is configured to fall back to self-hosted
   Kokoro on failure. If Kokoro is not configured, the agent stays silent.
-  - Ensure `HERMES_VOIP_TTS_FALLBACK=sherpa_kokoro` and `HERMES_VOIP_TTS_FALLBACK_MODEL` is set to
+  - Ensure `HERMES_VOIP_TTS_FALLBACK=sherpa-kokoro` and `HERMES_VOIP_TTS_FALLBACK_MODEL` is set to
     the Kokoro model root.
 - **LLM has no fallback.** A provider outage is an outage.
 - **STT has no fallback** (currently). If Deepgram is down, calls cannot transcribe speech.

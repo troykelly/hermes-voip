@@ -865,9 +865,13 @@ def test_lost_count_negative_rejected() -> None:
 
 
 def test_lost_count_bool_rejected() -> None:
-    """Lost(count=True) is rejected — bool is an int subclass but not a count."""
+    """Lost(count=True) is rejected at runtime.
+
+    ``bool`` is an ``int`` subtype to the type checker (so there is no static
+    error), but it is not a valid packet count.
+    """
     with pytest.raises(TypeError, match="count"):
-        Lost(sequence=10, count=True)  # type: ignore[arg-type]
+        Lost(sequence=10, count=True)
 
 
 def test_lost_count_float_rejected() -> None:

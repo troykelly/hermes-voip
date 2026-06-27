@@ -166,6 +166,28 @@ class Lost:
     sequence: int
     count: int = 1
 
+    def __post_init__(self) -> None:
+        """Validate ``count`` is a whole packet count (>= 1).
+
+        A zero or negative run is meaningless and silently breaks the consumer's
+        per-slot concealment loop (``for _ in range(count)`` emits nothing for 0
+        and raises for a negative), so it is rejected at construction. ``bool`` is
+        an ``int`` subclass in Python so it is checked first; a non-int ``count``
+        (e.g. a ``float`` from an untyped caller) is a type error — matching the
+        runtime-and-type-check validation style used elsewhere in this module.
+        """
+        count_raw: object = self.count
+        if isinstance(count_raw, bool):
+            msg = "Lost.count must be a positive int, not bool"
+            raise TypeError(msg)
+        if not isinstance(count_raw, int):
+            kind = type(count_raw).__name__
+            msg = f"Lost.count must be a positive int, got {kind}"
+            raise TypeError(msg)
+        if self.count < 1:
+            msg = f"Lost.count must be >= 1, got {self.count}"
+            raise ValueError(msg)
+
 
 type JitterOutput = RtpPacket | Lost
 
@@ -453,12 +475,16 @@ class JitterBuffer:
             # instead of N separate Lost events — O(1) allocations + iterations
             # per gap regardless of gap size (amortized O(1) per packet).
             # The scan is bounded by _max_ahead so it terminates even for a
-            # permanent gap; the loop visits at most min(gap, _max_ahead) steps.
+            # permanent gap. The gap is capped at EXACTLY _max_ahead: the strict
+            # ``<`` stops the loop once ``scan`` reaches ``expected + _max_ahead``
+            # (the window edge), so ``gap`` never exceeds _max_ahead and the anchor
+            # cannot over-advance past a packet that later arrives at that edge.
+            # The loop visits at most _max_ahead steps.
             gap = 1
             scan = _seq_next(expected)
             while (
                 scan not in self._packets
-                and (scan - expected) % _SEQ_MOD <= self._max_ahead
+                and (scan - expected) % _SEQ_MOD < self._max_ahead
             ):
                 gap += 1
                 scan = _seq_next(scan)

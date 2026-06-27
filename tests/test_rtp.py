@@ -1015,19 +1015,20 @@ def test_payload_and_timestamp_fidelity_through_pop() -> None:
 
 
 def test_max_ahead_guard_rejects_invalid_construction() -> None:
-    """JitterBuffer.__init__ asserts max_ahead < _SEQ_HALF to prevent overflow.
+    """JitterBuffer.__init__ raises ValueError when max_ahead >= _SEQ_HALF.
 
     The serial-number arithmetic (RFC 1982) uses modulo 2^16. Reorder windows
     larger than or equal to half the space (2^15 = 32768) break the comparison
-    logic and allow ambiguous sequence comparisons. The __init__ must assert
-    max_ahead < _SEQ_HALF to catch configuration errors early.
+    logic and allow ambiguous sequence comparisons. The __init__ must raise
+    ValueError (not assert, which is stripped under -O) to catch configuration
+    errors early and unconditionally (rule 37: errors propagate).
     """
-    # max_ahead exactly at the half: must raise AssertionError.
-    with pytest.raises(AssertionError):
+    # max_ahead exactly at the half: must raise ValueError.
+    with pytest.raises(ValueError, match="max_ahead"):
         JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF)
 
-    # max_ahead beyond the half: must raise AssertionError.
-    with pytest.raises(AssertionError):
+    # max_ahead beyond the half: must raise ValueError.
+    with pytest.raises(ValueError, match="max_ahead"):
         JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF + 1)
 
     # max_ahead just below the half: must succeed.

@@ -1,4 +1,4 @@
-# ADR-0082 — Relax over-pinned extras to compatible ranges for Hermes/plugin coexistence
+# ADR-0083 — Relax over-pinned extras to compatible ranges for Hermes/plugin coexistence
 
 **Status:** Accepted  
 **Date:** 2026-06-27  

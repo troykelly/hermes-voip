@@ -992,6 +992,18 @@ def _wss_cancel_for(*, to_user: str, call_id: str, branch: str) -> str:
     )
 
 
+_TO_TAG_RE = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
+
+
+def _to_tag_of(frame: str) -> str | None:
+    """The ``tag`` parameter of a response's ``To`` header (None if absent)."""
+    to_value = SipResponse.parse(frame).header("To")
+    if to_value is None:
+        return None
+    match = _TO_TAG_RE.search(to_value)
+    return match.group(1) if match is not None else None
+
+
 async def test_wss_inbound_cancel_487s_invite_and_200s_cancel_and_fires_on_cancel() -> (
     None
 ):
@@ -1139,6 +1151,89 @@ async def test_wss_retransmitted_cancel_is_absorbed_no_second_487_or_abort() -> 
             "a retransmitted WSS CANCEL must not re-487 the INVITE"
         )
         assert cancelled == [call_id], "on_cancel must fire only once for a WSS CANCEL"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_wss_cancel_200_totag_matches_487_and_is_stable_across_retransmit() -> (
+    None
+):
+    # RFC 3261 §9.2: "The To tag of the response to the CANCEL and the To tag in
+    # the response to the original request SHOULD be the same." So the To tag on
+    # the 200 OK (to the CANCEL) MUST equal the To tag on the 487 (to the INVITE).
+    # And because a retransmitted CANCEL re-sends its 200 OK (§9.2 idempotency),
+    # every 200-to-CANCEL for the same transaction MUST carry that SAME stable To
+    # tag — a fresh tag per receipt would make CANCEL responses differ at the
+    # message level (non-idempotent). Both INVITE-487 and every CANCEL-200 carry
+    # the pending invite's one stable local_tag.
+    new_calls: list[NewCall] = []
+    cancelled: list[str] = []
+    call_id = new_call_id()
+    branch = "z9hG4bKwstag"
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancelled.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(
+            _wss_inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1, timeout=3.0)
+        cancel = _wss_cancel_for(to_user="1000", call_id=call_id, branch=branch)
+        await server.push(cancel)
+        # Collect the first 200-to-CANCEL and the 487-to-INVITE.
+        first_ok = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw,
+            timeout=3.0,
+        )
+        terminated = await server.wait_for_received(
+            lambda raw: raw.startswith("SIP/2.0 487"), timeout=3.0
+        )
+        first_cancel_tag = _to_tag_of(first_ok)
+        invite_tag = _to_tag_of(terminated)
+        assert invite_tag is not None, "the 487 must carry a To tag"
+        assert first_cancel_tag is not None, "the 200-to-CANCEL must carry a To tag"
+        assert first_cancel_tag == invite_tag, (
+            "RFC 3261 §9.2: the 200-to-CANCEL To tag must equal the 487 To tag, "
+            f"got CANCEL-200={first_cancel_tag!r} vs INVITE-487={invite_tag!r}"
+        )
+        # The peer retransmits the CANCEL; its 200 OK must reuse the SAME To tag.
+        await server.push(cancel)
+        await _until(
+            lambda: (
+                sum(
+                    1
+                    for raw in server.received
+                    if raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw
+                )
+                >= 2
+            ),
+            timeout=3.0,
+        )
+        cancel_200_tags = {
+            _to_tag_of(raw)
+            for raw in server.received
+            if raw.startswith("SIP/2.0 200") and "CSeq: 1 CANCEL" in raw
+        }
+        assert cancel_200_tags == {invite_tag}, (
+            "every 200-to-CANCEL (incl. the retransmit) must carry the one stable "
+            f"To tag {invite_tag!r}; got {cancel_200_tags!r}"
+        )
     finally:
         await manager.aclose()
         await transport.aclose()

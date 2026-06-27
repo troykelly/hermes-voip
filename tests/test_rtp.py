@@ -11,6 +11,7 @@ import struct
 
 import pytest
 
+import hermes_voip.rtp as rtp_module
 from hermes_voip.rtp import _SEQ_HALF, JitterBuffer, Lost, RtpPacket, _seq_before
 
 
@@ -1034,3 +1035,43 @@ def test_max_ahead_guard_rejects_invalid_construction() -> None:
     # max_ahead just below the half: must succeed.
     jb = JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF - 1)
     assert jb._max_ahead == _SEQ_HALF - 1
+
+
+def test_module_constants_pinned_values() -> None:
+    """Pin the documented numeric contract between module constants.
+
+    ``typing.Final`` is enforced statically by mypy --strict (not at runtime);
+    these assertions are value-typo regression guards, not behavioural tests.
+    They catch a transcription error in any constant (e.g. _SEQ_MOD = 1 << 15)
+    and pin the cross-constant relationships that the code relies on.
+    """
+    # Header-layout arithmetic: a minimal RTP header is 12 bytes; extension
+    # headers carry a 4-byte profile+length word before the body.
+    assert rtp_module._HEADER_LEN == 3 * rtp_module._CSRC_WORD  # 3 x 32-bit words
+    assert rtp_module._EXT_HEADER_LEN == rtp_module._CSRC_WORD  # one 32-bit word
+
+    # Bit-field positions within the first two header bytes.
+    assert rtp_module._MARKER_BIT == 0x80  # M is bit 7 of byte 1
+    assert rtp_module._PADDING_BIT == 0x20  # P is bit 5 of byte 0
+    assert rtp_module._EXTENSION_BIT == 0x10  # X is bit 4 of byte 0
+    assert rtp_module._CSRC_MASK == 0x0F  # CC is low 4 bits of byte 0
+    assert rtp_module._MAX_PAYLOAD_TYPE == 0x7F  # PT is 7 bits
+    assert rtp_module._RTP_VERSION == 2  # V=2 per RFC 3550
+
+    # 16-bit serial-number space (RFC 1982): modulus, half-window, and max seq
+    # must satisfy: _SEQ_HALF == _SEQ_MOD // 2 and _MAX_SEQ == _SEQ_MOD - 1.
+    assert rtp_module._SEQ_MOD == 1 << 16
+    assert rtp_module._SEQ_HALF == rtp_module._SEQ_MOD // 2  # half-window = 2^15
+    assert rtp_module._MAX_SEQ == rtp_module._SEQ_MOD - 1  # 0xFFFF
+
+    # 32-bit mask used for timestamp/SSRC field arithmetic.
+    assert (
+        rtp_module._U32 == rtp_module._SEQ_MOD * rtp_module._SEQ_MOD - 1
+    )  # (2^16)^2 - 1
+
+    # Adaptive-jitter defaults: max_depth and shrink-after are positive and
+    # in a sensible order (shrink threshold fits below max_depth packets x ptime).
+    assert rtp_module._DEFAULT_MAX_DEPTH > 0
+    assert rtp_module._SHRINK_AFTER > rtp_module._DEFAULT_MAX_DEPTH
+    assert rtp_module._DEFAULT_MAX_AHEAD > 0
+    assert rtp_module._DEFAULT_MAX_AHEAD < rtp_module._SEQ_HALF  # must fit in window

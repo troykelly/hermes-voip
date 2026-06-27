@@ -19,32 +19,33 @@ __all__ = [
 
 import struct
 from dataclasses import dataclass
+from typing import Final
 
-_RTP_VERSION = 2
-_HEADER_LEN = 12
-_EXT_HEADER_LEN = 4
-_MAX_PAYLOAD_TYPE = 0x7F
-_MARKER_BIT = 0x80
-_PADDING_BIT = 0x20
-_EXTENSION_BIT = 0x10
-_CSRC_MASK = 0x0F
-_CSRC_WORD = 4
-_SEQ_MOD = 1 << 16
-_SEQ_HALF = 1 << 15
-_MAX_SEQ = 0xFFFF
-_U32 = 0xFFFFFFFF
-_DEFAULT_MAX_AHEAD = 256
+_RTP_VERSION: Final[int] = 2
+_HEADER_LEN: Final[int] = 12
+_EXT_HEADER_LEN: Final[int] = 4
+_MAX_PAYLOAD_TYPE: Final[int] = 0x7F
+_MARKER_BIT: Final[int] = 0x80
+_PADDING_BIT: Final[int] = 0x20
+_EXTENSION_BIT: Final[int] = 0x10
+_CSRC_MASK: Final[int] = 0x0F
+_CSRC_WORD: Final[int] = 4
+_SEQ_MOD: Final[int] = 1 << 16
+_SEQ_HALF: Final[int] = 1 << 15
+_MAX_SEQ: Final[int] = 0xFFFF
+_U32: Final[int] = 0xFFFFFFFF
+_DEFAULT_MAX_AHEAD: Final[int] = 256
 
 # Adaptive jitter depth (ADR-0056). The ceiling used when adaptation is enabled
 # but no explicit ``max_depth`` is given: 10 packets = 200 ms at the standard
 # 20 ms ptime — generous reorder tolerance without an unbounded latency tax.
-_DEFAULT_MAX_DEPTH = 10
+_DEFAULT_MAX_DEPTH: Final[int] = 10
 # Consecutive clean pops (a real in-order packet, no loss and no late drop)
 # before the adaptive depth shrinks one step back toward the floor. A run, not a
 # single pop, so a calm patch between bursts does not thrash the depth down and
 # straight back up; one full window's worth of clean packets is a reasonable
 # "the link has settled" signal.
-_SHRINK_AFTER = 50
+_SHRINK_AFTER: Final[int] = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +198,19 @@ class Lost:
 
 
 type JitterOutput = RtpPacket | Lost
+
+
+# RFC 1982 serial-number arithmetic: the following functions implement the
+# 16-bit sequence-number comparison and increment semantics from RFC 1982 §3.2
+# so that sequence-number wraparound (at 2^16 = 65536) is handled correctly.
+# Used by the JitterBuffer for reordering detection and jitter compensation.
+# _seq_before(a, b) is True iff a precedes b in 16-bit serial space, using the
+# modular test (b - a) % 65536 < 32768. This is the RFC 1982 §3.2 predicate —
+# i1 < i2 when either both are ordered normally with a gap below the half-window,
+# or they straddle the wrap point with the reverse gap above the half-window —
+# collapsed to a single expression. The half-window is 2^15 = 32768:
+# forward distances are 1..32767; backward distances are 32769..65535;
+# distance 32768 is undefined (ambiguous) per the RFC.
 
 
 def _seq_before(a: int, b: int) -> bool:

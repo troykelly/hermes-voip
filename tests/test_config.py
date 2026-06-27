@@ -2334,3 +2334,73 @@ def test_goodbye_phrase_empty_string_keeps_default() -> None:
     """A blank HERMES_VOIP_GOODBYE_PHRASE keeps the default (same as unset)."""
     cfg = load_media_config({"HERMES_VOIP_GOODBYE_PHRASE": "  "})
     assert cfg.goodbye_phrase == "Goodbye."
+
+
+# ---------------------------------------------------------------------------
+# Multi-language accept policy (ADR-0084)
+# ---------------------------------------------------------------------------
+
+
+def test_language_es_constructs_without_comfort_filler_phrases() -> None:
+    """HERMES_VOIP_LANGUAGE=es must construct without ConfigError.
+
+    Before ADR-0084 this raised ConfigError because ``_SUPPORTED_LANGUAGES``
+    was derived solely from ``_COMFORT_FILLER_PHRASES_BY_LANGUAGE``.
+    """
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "es"})
+    assert cfg.language == "es"
+
+
+def test_language_fr_constructs_without_comfort_filler_phrases() -> None:
+    """HERMES_VOIP_LANGUAGE=fr must construct (same as 'es' — no phrase set)."""
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "fr"})
+    assert cfg.language == "fr"
+
+
+def test_language_without_phrase_set_falls_back_to_english_filler() -> None:
+    """A language with no built-in phrase set falls back to English phrases.
+
+    ``comfort_filler_phrases`` is always non-empty and well-defined.
+    """
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "es"})
+    assert cfg.comfort_filler_phrases  # non-empty
+    assert all(p.strip() for p in cfg.comfort_filler_phrases)  # no blank phrases
+    # The fallback is the English set; spot-check one phrase.
+    assert "One moment please." in cfg.comfort_filler_phrases
+
+
+def test_language_without_phrase_set_explicit_phrases_still_win() -> None:
+    """Even for a language with no built-in set, an explicit phrase override wins."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_LANGUAGE": "es",
+            "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES": "un momento|espera",
+        }
+    )
+    assert cfg.comfort_filler_phrases == ("un momento", "espera")
+
+
+def test_language_direct_construction_es_accepted() -> None:
+    """Directly constructing MediaConfig with language='es' must not raise.
+
+    This guards the ``__post_init__`` validation path (distinct from env-parse).
+    """
+    base = load_media_config({})
+    cfg = dataclasses.replace(base, language="es")
+    assert cfg.language == "es"
+
+
+def test_language_malformed_code_still_rejected() -> None:
+    """A structurally malformed language code is still rejected at startup.
+
+    Valid BCP-47 primary subtags are 2-8 ASCII letters; a code containing
+    digits or only one letter is malformed.
+    """
+    with pytest.raises(ConfigError, match="HERMES_VOIP_LANGUAGE"):
+        load_media_config({"HERMES_VOIP_LANGUAGE": "12"})  # digits, not alpha
+
+
+def test_language_single_char_rejected() -> None:
+    """A single-character code is not a valid BCP-47 primary subtag and is rejected."""
+    with pytest.raises(ConfigError, match="HERMES_VOIP_LANGUAGE"):
+        load_media_config({"HERMES_VOIP_LANGUAGE": "e"})

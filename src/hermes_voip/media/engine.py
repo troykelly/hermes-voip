@@ -2951,10 +2951,12 @@ class RtpMediaTransport:
         a programming error (the same posture as a malformed RTP datagram above). The
         ``ValueError`` guard spans BOTH the 4-byte ``decode`` AND the receiver ``feed``
         (cross-vendor review #5): a well-formed payload whose event code is not a keypad
-        digit (e.g. flash, event 16) is already surfaced as ``None`` by the receiver,
-        but wrapping ``feed`` too means any future value-domain error in the digit
-        mapping is contained to a single dropped packet, not a torn-down call. Any
-        non-``ValueError`` exception still propagates (rule 37).
+        digit (e.g. flash, event 16) is surfaced as ``DtmfNoPress.NON_DIGIT_EVENT`` by
+        the receiver and silently dropped here (the ``isinstance(result, DtmfPress)``
+        check below rejects it), but wrapping ``feed`` too means any future
+        value-domain error in the digit mapping is contained to a single dropped packet,
+        not a torn-down call. Any non-``ValueError`` exception still propagates
+        (rule 37).
         """
         if self._on_dtmf is None:
             return  # inbound DTMF ignored; the packet is still kept off the audio path

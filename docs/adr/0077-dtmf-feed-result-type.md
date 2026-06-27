@@ -4,7 +4,7 @@
 |-----------|---------------------------------|
 | Status    | Accepted                        |
 | Date      | 2026-06-26                      |
-| Deciders  | Agent (Claude Sonnet 4.6)       |
+| Deciders  | agent session (dtmf-feed-result-dedup lane) |
 | Backlog   | bk354, bk366                    |
 
 ## Context

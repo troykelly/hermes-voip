@@ -49,9 +49,9 @@ defect or a load-bearing test gap.
   quoted param. `_quoted`'s guard is shared, but only `nonce` is covered (`test_rejects_crlf_in_auth_param_value`).
   `uri` is both hashed and rendered; `username`, `opaque`, `realm`, `cnonce` are rendered too. Add
   per-field CRLF-rejection tests — the per-field coverage is what mutation testing rewards.
-- [ ] **[low] robustness** — Empty `cnonce` (`cnonce=""`) is accepted and emitted (`is not None` check,
+- [x] **[low] robustness** — Empty `cnonce` (`cnonce=""`) is accepted and emitted (`is not None` check,
   line 167). Defeats the client-nonce purpose; some registrars reject it. Reject empty (or treat falsy
-  as "generate") and document; add a test.
+  as "generate") and document; add a test. — shipped #287
 - [ ] **[low] correctness** (partial — residual: no test asserting unknown/hyphenated params are silently ignored (no test with an unknown x-custom-param= in tests/test_digest.py).) — `_PARAM` key pattern `\w+` (line 24) cannot match hyphenated extension
   param names. No test asserts unknown/hyphenated params are ignored gracefully. Broaden to `[\w-]+`
   for forward-compat or pin the silent-skip behaviour with a test.
@@ -71,14 +71,14 @@ defect or a load-bearing test gap.
   separately maps 401→Authorization / 407→Proxy-Authorization, duplicating knowledge the challenge origin
   already has. Carry `proxy: bool` on `DigestChallenge` (set by parse) or return a `(name, value)` pair;
   record in the digest/registration ADR.
-- [ ] **[low] test** — No assertion that `algorithm`/`qop`/`nc` render UNQUOTED (`algorithm=MD5`, not
+- [x] **[low] test** — No assertion that `algorithm`/`qop`/`nc` render UNQUOTED (`algorithm=MD5`, not
   `="MD5"`). `_param` helper strips quotes, so a quote-everything mutation survives. Assert raw header
-  substrings (`'algorithm=MD5,' in header`, `'qop=auth,' in header`).
-- [ ] **[low] test** — No test that `opaque` is ABSENT when the challenge omits it (negative case,
-  line 181). A mutation always emitting `opaque=""` survives. Assert `_param(header,"opaque") is None`.
-- [ ] **[low] test** — No test pinning the quoting table (username/realm/nonce/uri/cnonce/response/opaque
+  substrings (`'algorithm=MD5,' in header`, `'qop=auth,' in header`). — shipped #287
+- [x] **[low] test** — No test that `opaque` is ABSENT when the challenge omits it (negative case,
+  line 181). A mutation always emitting `opaque=""` survives. Assert `_param(header,"opaque") is None`. — shipped #287
+- [x] **[low] test** — No test pinning the quoting table (username/realm/nonce/uri/cnonce/response/opaque
   quoted vs algorithm/qop/nc unquoted, lines 158-182). Add raw-substring assertions for at least one
-  quoted and one unquoted param to lock the boolean-flip mutants.
+  quoted and one unquoted param to lock the boolean-flip mutants. — shipped #287
 - [ ] **[low] docs** — `DigestCredentials.password` is repr-suppressed (`field(repr=False)`, line 112)
   but the docstring doesn't say it is still plaintext in memory and must never be logged/interpolated.
   Add the note (public-repo / AGENTS 34); optionally a test that the secret isn't in `repr(creds)`.
@@ -184,11 +184,11 @@ defect or a load-bearing test gap.
 - [ ] **[low] efficiency** — `SessionDescription.parse` does `text.replace(_CRLF,'\n').split('\n')`
   (line 189), allocating two transient buffers. SDP is NOT the 50pkt/s path. Use `splitlines()` (drops
   the copy, handles bare CR) — micro-optimisation; correctness of bare-CR handling is the better reason.
-- [ ] **[low] polish** (partial — residual: addrtype is still hardcoded to IP4 at sdp.py:1330, 1332, 1464, 1689, 1691 — "derive addrtype from the address family" is unimplemented.) — `o=` line collapses three distinct RFC 4566 fields. `o=- {session_id}
+- [x] **[low] polish** — `o=` line collapses three distinct RFC 4566 fields. `o=- {session_id}
   {session_id} IN IP4 {local_address}` (line 285) forces sess-id == sess-version (a re-INVITE must keep
   sess-id and increment only sess-version — the docstring's re-INVITE claim at 260-261 is aspirational,
   rule 27), hard-codes username `-`, and hard-codes `IP4` so an IPv6 local_address emits a wrong addrtype.
-  Split `session_id`/`session_version`; derive addrtype from the address family.
+  Split `session_id`/`session_version`; derive addrtype from the address family. — shipped #291
 - [ ] **[low] polish** — `add_attribute` exception funnel double-wraps; the `isinstance(exc, SdpError)`
   re-raise branch (lines 116-129) is dead (nothing in `_add_attribute` raises `SdpError`). Simplify to
   `except SdpError: raise` then `except ValueError: …`, or remove the dead branch.
@@ -259,15 +259,15 @@ defect or a load-bearing test gap.
   observed to rely on in-transaction recovery, add a `DigestChallenge.stale` field + a single re-answer
   within the same transaction when the second 401 carries `stale=true` (bounded, reversible). Deferred now
   (rule 6 — no scaffolding for an unproven need).
-- [ ] **[low] correctness** — A 2xx other than 200 (e.g. 202) is mishandled — `status == _OK` exact
+- [x] **[low] correctness** — A 2xx other than 200 (e.g. 202) is mishandled — `status == _OK` exact
   compare (line 141) falls through to `Failed`; 1xx provisionals also treated as `Failed`. Treat
   `200 ≤ status < 300` as success (or document 200-only) and ignore 1xx; tests for 1xx-then-200 and
-  non-200 2xx.
-- [ ] **[low] efficiency** — `_check_cseq` calls `cseq.split()` twice (line 183) and never validates the
+  non-200 2xx. — shipped #288
+- [x] **[low] efficiency** — `_check_cseq` calls `cseq.split()` twice (line 183) and never validates the
   CSeq *method*; a response whose number coincides but whose method is `INVITE` is accepted. Split once,
-  validate `parts[1].upper() == 'REGISTER'`; test a method mismatch.
-- [ ] **[low] robustness** — Missing/garbled CSeq is silently accepted (lines 181-182), bypassing the
-  only correlation check. Reconsider raising; if leniency is deliberate, pin it with a test.
+  validate `parts[1].upper() == 'REGISTER'`; test a method mismatch. — shipped #288
+- [x] **[low] robustness** — Missing/garbled CSeq is silently accepted (lines 181-182), bypassing the
+  only correlation check. Reconsider raising; if leniency is deliberate, pin it with a test. — shipped #288
 - [ ] **[low] robustness** (partial — residual: registration.py:358-384 — multi-Contact parsing via `_split_contacts`/`_binding_uri` is implemented and our-binding matching exists. Tests f) — `_granted_expires` falls back to the *requested* Expires when the 200 omits
   expiry (lines 188-197), masking a shorter grant → silent registration drop. It also doesn't match the
   Contact against ours. Log/flag the missing-expiry case; tests for multi-Contact/Expires-only/neither.
@@ -327,18 +327,18 @@ defect or a load-bearing test gap.
 - [ ] **[low] robustness** — No length cap on payload/packet size; `pack()` builds multi-kB datagrams and
   the buffer stores them; per-buffered-packet byte size is unbounded. Consider an optional generous
   telephony ceiling, or document the deliberate absence (transport's responsibility).
-- [ ] **[low] test** — `max_ahead` window boundary is inclusive but untested at the exact edge (line 185;
+- [x] **[low] test** — `max_ahead` window boundary is inclusive but untested at the exact edge (line 185;
   verified next=10/max_ahead=256 keeps 266, drops 267). A `>`→`>=` mutant survives. Document inclusive;
-  add `next+max_ahead` (kept) / `+1` (dropped) tests.
+  add `next+max_ahead` (kept) / `+1` (dropped) tests. — shipped #290
 - [ ] **[low] docs** — The `_seq_before` (32768) vs `max_ahead` (256) interaction creates an undocumented
   effective window `[next .. next+256]` and a wraparound ambiguity if `max_ahead` nears 32768. Add a
   comment; assert `max_ahead < _SEQ_HALF` in `__init__`.
-- [ ] **[low] test** — No test for a duplicate of a packet still buffered (only an already-popped
+- [x] **[low] test** — No test for a duplicate of a packet still buffered (only an already-popped
   duplicate is tested). A `setdefault`→assignment (last-wins) mutant survives. Push two copies of the same
-  buffered seq with distinct payloads; assert first-arrival payload wins.
-- [ ] **[low] test** — Jitter-buffer tests assert only `.sequence_number`, never payload/timestamp/ssrc
+  buffered seq with distinct payloads; assert first-arrival payload wins. — shipped #290
+- [x] **[low] test** — Jitter-buffer tests assert only `.sequence_number`, never payload/timestamp/ssrc
   fidelity through the buffer (the property that matters for STT). Give packets unique payloads/timestamps
-  and assert correct payload+timestamp per sequence.
+  and assert correct payload+timestamp per sequence. — shipped #290
 - [ ] **[low] api** — `_seq_before` is underscore-private but imported by tests (blurring the public
   surface). Either promote the RFC 1982 helpers (`seq_before`/`seq_next`/`seq_distance`) to a shared public
   seqnum module (RTCP/DTMF/RTP all need them) or keep private and test only via the buffer.
@@ -568,18 +568,18 @@ These span multiple modules or the repo as a whole.
   as written (no `pytest-asyncio`/`anyio`, no `asyncio_mode`). This blocks behavioural coverage of every
   streaming/transport/guard contract. Add + pin the runner, set `asyncio_mode`, regenerate `uv.lock`.
   (Listed per-module under providers too; called out here because it gates the whole async surface.)
-- [ ] **[medium] polish/DRY** — **Duplicated control-character injection guard.** Identical constants +
+- [x] **[medium] polish/DRY** — **Duplicated control-character injection guard.** Identical constants +
   predicate in `message.py` and `digest.py`. A single shared helper prevents drift of a security
-  invariant. (See message.py item.) message.py + digest.py deduped via _chars.contains_control (#277); RESIDUAL: refer.py:119-177 still holds a verbatim copy (next contains_control call site) and its comment 'mirrors message._C0_END / message._DEL' is now stale (rule 27).
+  invariant. (See message.py item.) message.py + digest.py deduped via _chars.contains_control (#277); refer.py migrated to _chars.contains_control — shipped #286
 - [ ] **[medium] polish/DRY** — **RFC 1982 serial-number arithmetic** is implemented in `rtp.py`
   (`_seq_before`/`_seq_next`) and conceptually needed by `dtmf.py` (timestamp dedup) and future RTCP/RTP.
   Decide: promote to a shared public seqnum module, or keep private and document why each consumer's
   approach differs (rtp uses serial arithmetic; dtmf uses exact-equality + bounded window — both correct
   for their case).
-- [ ] **[medium] api/consistency** — **`__all__` discipline is inconsistent.** The root `__init__`
+- [x] **[medium] api/consistency** — **`__all__` discipline is inconsistent.** The root `__init__`
   declares `__all__`; `media/audio.py`, `dtmf.py`, `message.py`, and every `providers/*` module do not.
   Adopt `__all__` uniformly so the public surface is explicit and private helpers stay out of
-  star-imports/autodoc. media/audio.py (#279) + call_context/hermes_surface/notice_filter/provider_error (#281) now have `__all__`; RESIDUAL: media/dtls.py, media/srtp.py, media/srtcp.py still lack `__all__`.
+  star-imports/autodoc. media/audio.py (#279) + call_context/hermes_surface/notice_filter/provider_error (#281) now have `__all__`; media/dtls.py, media/srtp.py, media/srtcp.py — shipped #285
 - [ ] **[medium] api/consistency** — **`typing.Final` on module constants is inconsistent.**
   `media/audio.py` annotates public constants with `Final`; `dtmf.py`/`rtp.py` do not. Adopt `Final`
   uniformly for mutation-resistance and consistency.
@@ -660,10 +660,10 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/guard/_onnx_runtime.py
 
-- [ ] **[low] robustness** — `_injection_label_index` (line 146): `json.loads(config_path.read_text(...))` has
+- [x] **[low] robustness** — `_injection_label_index` (line 146): `json.loads(config_path.read_text(...))` has
   no `try/except`. A corrupt `config.json` (partial write, truncated model download) raises a bare
   `json.JSONDecodeError` with no context about which file or why. Wrap with
-  `ValueError(f"corrupt config.json at {config_path}: {e}") from e` for actionable diagnostics.
+  `ValueError(f"corrupt config.json at {config_path}: {e}") from e` for actionable diagnostics. — shipped #289
 
 ## src/hermes_voip/registration.py (Wave-1 additions)
 
@@ -893,10 +893,10 @@ These span multiple modules or the repo as a whole.
   Fix: remove `HttpByteStream`/`HttpCancellation`/`ElevenLabsRequest` from `tts/__init__.__all__`; rename
   `Synthesizer` to `SherpaKokoroBackend` or keep it in `sherpa_kokoro.py` only
   (`src/hermes_voip/tts/__init__.py`, `tts/elevenlabs.py`, `tts/sherpa_kokoro.py`).
-- [ ] **[medium] api** — `__all__` missing from modules added after the original backlog audit: `call_context.py`,
+- [x] **[medium] api** — `__all__` missing from modules added after the original backlog audit: `call_context.py`,
   `hermes_surface.py`, `notice_filter.py`, `provider_error.py`, `media/call_loop.py`, `media/dtls.py`,
   `media/srtp.py`, `media/srtcp.py`. All expose implementation-private symbols to star-imports and autodoc.
-  The existing backlog item (line 566) enumerates the original modules; this covers the new ones. 4 non-media modules done (#281); RESIDUAL: media/dtls.py, media/srtp.py, media/srtcp.py.
+  The existing backlog item (line 566) enumerates the original modules; this covers the new ones. 4 non-media modules done (#281); media/dtls.py, media/srtp.py, media/srtcp.py — shipped #285
 
 ## Packaging / release
 
@@ -1042,7 +1042,7 @@ These span multiple modules or the repo as a whole.
 
 - [x] **[medium] api** — Add `__all__` to core foundation modules missing from both existing `__all__`-sweep backlog items. — verified shipped on main 2026-06-27 (tests/test_init_exports.py) The two consolidated `__all__`-sweep items in the backlog (line 571: dtmf.py/message.py/media/audio.py/providers/*; line 888: call_context.py/hermes_surface.py/notice_filter.py/provider_error.py/media/{call_loop,dtls,srtp,srtcp}.py) both omit the five core SIP/RTP/RTCP/SDP foundation modules that define the plugin's central typed surfaces: `rtcp.py` (14 public names including RtcpPacket, SenderReport, ReceiverReport, build_compound, parse_compound), `rtp.py` (RtpPacket, JitterBuffer), `sdp.py` (9+ public names including SessionDescription, AudioStream, build_audio_offer), `sip.py` (sip_address_of_record, build_request, build_response, SipResponse, SipRequest), and `registration.py` (RegistrationFlow, RegistrationConfig, outcomes). Fix: add `__all__` to all five modules listing only the intended public surface; add a package-boundary star-import test (`src/hermes_voip/rtcp.py`, `rtp.py`, `sdp.py`, `sip.py`, `registration.py`).
 - [x] **[medium] api** — Promote `InboundCallContext` to `hermes_voip` top-level `__all__`. — shipped #278 `InboundCallContext` (call_context.py:298) is the structured per-call datum injected into every answered-call turn (`adapter.py:73,5954`), carrying caller identity, diversion chain, asserted-identity, and call-context text — the central type a plugin author or test author needs to inspect. The existing backlog item at line 863 promotes `MediaConfig`/`GatewayConfig`/`ConfigError`/`Providers`/`PcmFrame`/`StreamingASR`/`StreamingTTS`/`InjectionGuard` but omits `InboundCallContext`, `DiversionHop`, `HistoryInfoEntry`, and `extract_call_context`, which would remain deep-import-only after that fix. Fix: add `InboundCallContext` (and `extract_call_context`) to `hermes_voip/__init__.__all__`; add a public-boundary import test (`src/hermes_voip/__init__.py`, `call_context.py:298`).
-- [ ] **[low] polish/DRY** — Migrate refer.py:119-177 control-char guard to `hermes_voip._chars.contains_control` (the remaining duplicate after #277) and fix its now-stale comment "mirrors message._C0_END / message._DEL". (review residual #277)
+- [x] **[low] polish/DRY** — Migrate refer.py:119-177 control-char guard to `hermes_voip._chars.contains_control` (the remaining duplicate after #277) and fix its now-stale comment "mirrors message._C0_END / message._DEL". (review residual #277) — shipped #286
 
 ### Performance / efficiency
 

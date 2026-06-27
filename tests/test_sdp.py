@@ -2896,3 +2896,119 @@ def test_negotiate_answer_crypto_picks_strongest_directly() -> None:
     )
     assert accepted.suite == _SUITE_80
     assert accepted.tag == 2
+
+
+# ---------------------------------------------------------------------------
+# IPv6 address-family correctness (backlog 187-191, RFC 4566 §5.2/5.7)
+# ---------------------------------------------------------------------------
+# addrtype in o= and c= MUST match the address family.  Before the fix every
+# build function hardcoded 'IN IP4', producing malformed SDP for IPv6 callers.
+# ---------------------------------------------------------------------------
+
+_IPV6_ADDR = "2001:db8::1"
+_IPV6_CONN_EXPECTED = f"IN IP6 {_IPV6_ADDR}"
+
+
+def test_build_audio_offer_ipv6_addrtype_in_origin() -> None:
+    """build_audio_offer with an IPv6 local_address emits 'IN IP6' in o= line."""
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    text = build_audio_offer(
+        local_address=_IPV6_ADDR,
+        port=41000,
+        codecs=codecs,
+        session_id=1,
+    )
+    assert f"o=- 1 1 {_IPV6_CONN_EXPECTED}" in text
+
+
+def test_build_audio_offer_ipv6_addrtype_in_connection() -> None:
+    """build_audio_offer with an IPv6 local_address emits 'IN IP6' in c= line."""
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    text = build_audio_offer(
+        local_address=_IPV6_ADDR,
+        port=41000,
+        codecs=codecs,
+        session_id=1,
+    )
+    assert f"c={_IPV6_CONN_EXPECTED}" in text
+
+
+def test_build_audio_answer_ipv6_addrtype_in_origin() -> None:
+    """build_audio_answer with an IPv6 local_address emits 'IN IP6' in o= line."""
+    offer = SessionDescription.parse(_OFFER_AVP)
+    text = build_audio_answer(
+        offer,
+        local_address=_IPV6_ADDR,
+        port=42000,
+        supported=("PCMU",),
+    )
+    assert "o=- " in text
+    # The origin line must use IP6, not IP4
+    assert f"IN IP6 {_IPV6_ADDR}" in text
+    assert "IN IP4" not in text.split("s=-")[0]  # only check before s= line
+
+
+def test_build_audio_answer_ipv6_addrtype_in_connection() -> None:
+    """build_audio_answer with an IPv6 local_address emits 'IN IP6' in c= line."""
+    offer = SessionDescription.parse(_OFFER_AVP)
+    text = build_audio_answer(
+        offer,
+        local_address=_IPV6_ADDR,
+        port=42000,
+        supported=("PCMU",),
+    )
+    assert f"c={_IPV6_CONN_EXPECTED}" in text
+
+
+def test_build_sip_dtls_answer_ipv6_addrtype_in_origin() -> None:
+    """build_sip_dtls_answer with an IPv6 local_address emits 'IN IP6' in o= line."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address=_IPV6_ADDR,
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert f"IN IP6 {_IPV6_ADDR}" in text
+
+
+def test_build_sip_dtls_answer_ipv6_addrtype_in_connection() -> None:
+    """build_sip_dtls_answer with an IPv6 local_address emits 'IN IP6' in c= line."""
+    offer = SessionDescription.parse(_OFFER_SIP_DTLS)
+    text = build_sip_dtls_answer(
+        offer,
+        local_address=_IPV6_ADDR,
+        port=43000,
+        supported=("PCMU", "telephone-event"),
+        fingerprint=Fingerprint.parse(f"sha-256 {_FAKE_FINGERPRINT_ANSWER}"),
+        setup=SetupRole.parse("active"),
+    )
+    assert f"c={_IPV6_CONN_EXPECTED}" in text
+
+
+def test_build_audio_offer_ipv4_addrtype_unchanged() -> None:
+    """build_audio_offer with an IPv4 address still emits 'IN IP4' (no regression)."""
+    codecs = (Codec(payload_type=0, encoding="PCMU", clock_rate=8000),)
+    text = build_audio_offer(
+        local_address="192.0.2.10",
+        port=41000,
+        codecs=codecs,
+        session_id=1,
+    )
+    assert "IN IP4 192.0.2.10" in text
+    assert "IN IP6" not in text
+
+
+def test_build_audio_answer_ipv4_addrtype_unchanged() -> None:
+    """build_audio_answer with an IPv4 address still emits 'IN IP4' (no regression)."""
+    offer = SessionDescription.parse(_OFFER_AVP)
+    text = build_audio_answer(
+        offer,
+        local_address="192.0.2.20",
+        port=42000,
+        supported=("PCMU",),
+    )
+    assert "IN IP4 192.0.2.20" in text
+    assert "IN IP6" not in text

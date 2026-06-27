@@ -729,7 +729,11 @@ class _VideoAccumulator:
             rate_str, _, ch_str = after.partition("/")
             rate = int(rate_str) if rate_str else VIDEO_DEFAULT_CLOCK_RATE
             channels = int(ch_str) if ch_str else 1
-            self.rtpmaps[int(pt_str)] = (encoding, rate, channels)
+            pt = int(pt_str)
+            if pt in self.rtpmaps:
+                msg = f"duplicate rtpmap for payload type {pt}"
+                raise SdpError(msg)
+            self.rtpmaps[pt] = (encoding, rate, channels)
         elif tag == "fmtp":
             pt_str, _, params = rest.partition(" ")
             self.fmtps[int(pt_str)] = params.strip()
@@ -846,7 +850,11 @@ class _AudioAccumulator:
             rate_str, _, ch_str = after.partition("/")
             rate = int(rate_str) if rate_str else _DEFAULT_CLOCK_RATE
             channels = int(ch_str) if ch_str else 1
-            self.rtpmaps[int(pt_str)] = (encoding, rate, channels)
+            pt = int(pt_str)
+            if pt in self.rtpmaps:
+                msg = f"duplicate rtpmap for payload type {pt}"
+                raise SdpError(msg)
+            self.rtpmaps[pt] = (encoding, rate, channels)
         elif tag == "fmtp":
             pt_str, _, params = rest.partition(" ")
             self.fmtps[int(pt_str)] = params.strip()

@@ -31,6 +31,7 @@ from hermes_voip.sdp import (
     build_audio_offer,
     generate_answer_crypto,
 )
+from hermes_voip.session_timer import RefreshSucceeded
 
 pytestmark = pytest.mark.asyncio
 
@@ -1024,3 +1025,55 @@ async def test_inbound_notify_malformed_answers_400_does_not_propagate() -> None
 async def test_dialog_id_routes_inbound() -> None:
     session = _session(_FakeSignaling(), _FakeMedia())
     assert session.dialog_id == ("call-1", "ours", "theirs")
+
+
+# ---- outbound: refresh_session hold/unhold direction -------------------------
+
+
+async def test_refresh_session_while_held_offers_sendonly() -> None:
+    """refresh_session with on_hold=True must offer a=sendonly in the re-INVITE body.
+
+    Killing the ``not self.on_hold`` mutant at call.py line 439: if the branch were
+    inverted the refresh re-INVITE would offer ``sendrecv`` while the call is held,
+    silently un-holding it at the SDP layer while ``on_hold`` and the media engine
+    hold-gate stayed set (media/signalling split).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    session.on_hold = True
+    extra_headers = [
+        ("Session-Expires", "600;refresher=uas"),
+        ("Supported", "timer"),
+    ]
+    task = asyncio.create_task(session.refresh_session(extra_headers))
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    assert "a=sendonly" in reinvite.body
+    assert "a=sendrecv" not in reinvite.body
+    await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))
+    outcome = await task
+    assert isinstance(outcome, RefreshSucceeded)
+
+
+async def test_refresh_session_while_not_held_offers_sendrecv() -> None:
+    """refresh_session with on_hold=False must offer a=sendrecv in the re-INVITE body.
+
+    Companion to test_refresh_session_while_held_offers_sendonly: verifies the
+    non-held branch picks ``sendrecv``.  A ``always sendonly`` mutant at line 439
+    would fail this test.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    assert session.on_hold is False
+    extra_headers = [
+        ("Session-Expires", "600;refresher=uas"),
+        ("Supported", "timer"),
+    ]
+    task = asyncio.create_task(session.refresh_session(extra_headers))
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+    assert "a=sendrecv" in reinvite.body
+    assert "a=sendonly" not in reinvite.body
+    await session.on_response(SipResponse.parse(_answer_to(reinvite, "sendrecv")))
+    outcome = await task
+    assert isinstance(outcome, RefreshSucceeded)

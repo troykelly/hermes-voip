@@ -828,6 +828,46 @@ async def test_inbound_notify_records_progress_and_answers_200() -> None:
     assert session.transfer_progress.terminated is True
 
 
+async def test_inbound_notify_non_refer_event_answers_200_leaves_progress() -> None:
+    """A non-``Event:refer`` NOTIFY is a plain 200 OK and never touches progress.
+
+    ``_on_notify`` is the dispatch target for EVERY in-dialog NOTIFY, but only an
+    ``Event: refer`` NOTIFY carries a ``message/sipfrag`` transfer-progress body
+    (RFC 6665/3515). A NOTIFY for any other Event package (here ``message-summary``
+    MWI) must NOT be fed to ``parse_notify_sipfrag``: its body has no ``SIP/2.0``
+    status-line, so the old unconditional dispatch answered the peer's legitimate
+    NOTIFY ``400 Bad Request``. The correct behaviour is a plain ``200 OK`` with
+    ``transfer_progress`` left untouched.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    notify = SipRequest(
+        method="NOTIFY",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-n"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirs"),
+            ("To", "<sip:1000@pbx.example.test>;tag=ours"),
+            ("Call-ID", "call-1"),
+            ("CSeq", "12 NOTIFY"),
+            ("Event", "message-summary"),
+            ("Subscription-State", "active"),
+            ("Content-Type", "application/simple-message-summary"),
+        ),
+        # A real MWI body — no SIP/2.0 status-line. parse_notify_sipfrag would raise.
+        body="Messages-Waiting: yes\r\nVoice-Message: 2/0 (0/0)",
+    )
+
+    await session.handle_request(notify)
+
+    responses = [t for t in signaling.sent if t.startswith("SIP/2.0 ")]
+    assert len(responses) == 1
+    assert SipResponse.parse(responses[-1]).status_code == 200
+    # The transfer-progress field is for Event:refer only — never touched here.
+    assert session.transfer_progress is None
+    assert session.ended is False
+
+
 async def test_inbound_refer_accepts_and_invokes_handler() -> None:
     signaling, media = _FakeSignaling(), _FakeMedia()
     seen: list[ReferRequest] = []

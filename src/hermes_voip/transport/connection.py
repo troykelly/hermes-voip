@@ -746,8 +746,11 @@ class SipOverTlsTransport:
         already_cancelled = pending.cancelled
         pending.cancelled = True
         # 200 OK to the CANCEL itself (its own transaction). Always re-sent, so a
-        # retransmitted CANCEL is absorbed.
-        await self.send(build_response(cancel, 200, "OK", to_tag=new_tag()))
+        # retransmitted CANCEL is absorbed. RFC 3261 §9.2: the To-tag on the 200
+        # to the CANCEL MUST equal the To-tag on the 487 to the INVITE — both use
+        # the pending invite's stable local_tag (never a fresh tag per receipt,
+        # which would make retransmitted CANCEL responses non-idempotent).
+        await self.send(build_response(cancel, 200, "OK", to_tag=pending.local_tag))
         if already_cancelled:
             return  # the 487 + abort already happened on the first CANCEL
         # 487 the INVITE: a dialog-forming final carrying our stable local tag.

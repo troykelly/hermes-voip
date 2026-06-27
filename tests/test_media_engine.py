@@ -69,6 +69,21 @@ def _silence_frame(ts_ns: int = 0) -> PcmFrame:
     )
 
 
+def _tone_frame(amplitude: int = 1000, ts_ns: int = 0) -> PcmFrame:
+    """Generate a PCM frame with a constant amplitude tone.
+
+    Args:
+        amplitude: Sample value (e.g., 1000 for audible mid-range tone).
+        ts_ns: Monotonic timestamp in nanoseconds.
+    """
+    samples = struct.pack(f"<{_SAMPLES_PER_FRAME}h", *[amplitude] * _SAMPLES_PER_FRAME)
+    return PcmFrame(
+        samples=samples,
+        sample_rate=G711_SAMPLE_RATE,
+        monotonic_ts_ns=ts_ns,
+    )
+
+
 def _make_rtp(seq: int, ts: int, payload: bytes, ssrc: int = _FAKE_SSRC) -> bytes:
     """Pack a minimal plain-RTP datagram."""
     return RtpPacket(
@@ -2238,3 +2253,118 @@ def test_ptime_setter_rejects_non_positive() -> None:
         engine.ptime = 0
     with pytest.raises(ValueError, match="ptime"):
         engine.ptime = -5
+
+
+# ---------------------------------------------------------------------------
+# TX amplitude logging — verify peak amplitude is logged correctly
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_audio_logs_tx_amplitude_for_non_silent_chunk(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """send_audio logs a non-zero peak_amplitude for a non-silent frame.
+
+    The TX amplitude is logged once per _TX_AMPLITUDE_LOG_PERIOD (50) packets
+    at 20 ms ptime (1 second). This test verifies that a non-silent frame
+    produces a non-zero peak amplitude in the log.
+    """
+    capture_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    capture_sock.bind(("127.0.0.1", 0))
+    capture_sock.setblocking(False)
+    remote_port = capture_sock.getsockname()[1]
+
+    async def _fake_sleep(secs: float) -> None:
+        """Stub sleep to avoid real delays."""
+        pass
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=remote_port,
+        codec=Codec.PCMU,
+        sleep=_fake_sleep,
+    )
+    await engine.connect()
+
+    # Send 50 frames (one period) with a non-silent tone.
+    tone_frame = _tone_frame(amplitude=1000)
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.engine"):
+        for _ in range(50):
+            await engine.send_audio(tone_frame)
+
+    # Verify that the TX amplitude log line was emitted with a non-zero peak.
+    log_messages = [rec.getMessage() for rec in caplog.records]
+    peak_log = [
+        msg for msg in log_messages if "rtp tx:" in msg and "peak_amplitude" in msg
+    ]
+    assert peak_log, f"Expected a peak_amplitude log line, got: {log_messages}"
+
+    # The peak should be non-zero for a non-silent frame.
+    peak_msg = peak_log[0]
+    assert "peak_amplitude=" in peak_msg
+    # Extract the peak_amplitude value; should not be zero.
+    parts = peak_msg.split("peak_amplitude=")
+    assert len(parts) == 2, f"Could not parse peak_amplitude from: {peak_msg}"
+    peak_str = parts[1].split()[0]  # get the number before the next word
+    peak_val = int(peak_str)
+    assert peak_val > 0, f"Expected non-zero peak amplitude, got {peak_val}"
+
+    capture_sock.close()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_audio_logs_tx_amplitude_near_zero_for_silence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """send_audio logs near-zero peak_amplitude for a silent frame.
+
+    Silence (all zeros) should produce a zero or near-zero peak amplitude.
+    """
+    capture_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    capture_sock.bind(("127.0.0.1", 0))
+    capture_sock.setblocking(False)
+    remote_port = capture_sock.getsockname()[1]
+
+    async def _fake_sleep(secs: float) -> None:
+        """Stub sleep to avoid real delays."""
+        pass
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=remote_port,
+        codec=Codec.PCMU,
+        sleep=_fake_sleep,
+    )
+    await engine.connect()
+
+    # Send 50 frames (one period) of silence.
+    silence_frame = _silence_frame()
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.engine"):
+        for _ in range(50):
+            await engine.send_audio(silence_frame)
+
+    # Verify that the TX amplitude log line was emitted with a zero or near-zero peak.
+    log_messages = [rec.getMessage() for rec in caplog.records]
+    peak_log = [
+        msg for msg in log_messages if "rtp tx:" in msg and "peak_amplitude" in msg
+    ]
+    assert peak_log, f"Expected a peak_amplitude log line, got: {log_messages}"
+
+    # The peak should be zero for silence.
+    peak_msg = peak_log[0]
+    assert "peak_amplitude=" in peak_msg
+    # Extract the peak_amplitude value; should be zero for silence.
+    parts = peak_msg.split("peak_amplitude=")
+    assert len(parts) == 2, f"Could not parse peak_amplitude from: {peak_msg}"
+    peak_str = parts[1].split()[0]  # get the number before the next word
+    peak_val = int(peak_str)
+    assert peak_val == 0, f"Expected zero peak amplitude for silence, got {peak_val}"
+
+    capture_sock.close()
+    await engine.stop()

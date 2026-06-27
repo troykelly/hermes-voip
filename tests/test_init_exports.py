@@ -10,6 +10,7 @@ import hermes_voip.rtp
 import hermes_voip.sdp
 import hermes_voip.sip
 import hermes_voip.stt
+import hermes_voip.transport
 import hermes_voip.tts
 
 
@@ -109,3 +110,57 @@ def test_top_level_exports_history_info_entry() -> None:
     assert "HistoryInfoEntry" in hermes_voip.__all__
     assert hasattr(hermes_voip, "HistoryInfoEntry")
     assert hermes_voip.HistoryInfoEntry is hermes_voip.call_context.HistoryInfoEntry
+
+
+# ── (A) transport.__all__ gaps ────────────────────────────────────────────────
+
+
+def test_transport_all_exports_wss_sip_transport() -> None:
+    """WssSipTransport must appear in hermes_voip.transport.__all__."""
+    assert "WssSipTransport" in hermes_voip.transport.__all__
+    assert hasattr(hermes_voip.transport, "WssSipTransport")
+
+
+def test_transport_all_exports_call_response_sink() -> None:
+    """CallResponseSink must appear in hermes_voip.transport.__all__."""
+    assert "CallResponseSink" in hermes_voip.transport.__all__
+    assert hasattr(hermes_voip.transport, "CallResponseSink")
+
+
+# ── (B) top-level __all__ gaps ────────────────────────────────────────────────
+
+
+def test_top_level_exports_media_config() -> None:
+    """MediaConfig must appear in hermes_voip.__all__ and be importable."""
+    assert "MediaConfig" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "MediaConfig")
+
+
+def test_top_level_exports_gateway_config() -> None:
+    """GatewayConfig must appear in hermes_voip.__all__ and be importable."""
+    assert "GatewayConfig" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "GatewayConfig")
+
+
+def test_top_level_exports_config_error() -> None:
+    """ConfigError must appear in hermes_voip.__all__ and be importable."""
+    assert "ConfigError" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "ConfigError")
+
+
+def test_top_level_exports_providers() -> None:
+    """Providers must appear in hermes_voip.__all__ and be importable."""
+    assert "Providers" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "Providers")
+
+
+def test_top_level_exports_build_providers() -> None:
+    """build_providers must appear in hermes_voip.__all__ and be importable."""
+    assert "build_providers" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "build_providers")
+
+
+def test_top_level_exports_pcm_frame() -> None:
+    """PcmFrame must appear in hermes_voip.__all__ and be importable."""
+    assert "PcmFrame" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "PcmFrame")

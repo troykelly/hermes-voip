@@ -714,3 +714,22 @@ def test_parse_refer_accepts_valid_bare_extension() -> None:
     parsed = parse_refer(refer)
     assert parsed.refer_to == "1001"
     assert parsed.replaces is None
+
+
+# ---- _validate_transfer_target: control-character rejection ----------------
+#
+# NUL (\x00), CR (\r), and DEL (\x7f) are all ASCII C0/DEL control characters
+# that must be rejected by _validate_transfer_target (and therefore by
+# build_blind_refer which calls it). This test pins that behaviour so the
+# _chars.contains_control migration in refer.py is verified non-tautologically:
+# the test was shown to FAIL when the guard was skipped (see commit message).
+
+
+def test_validate_transfer_target_rejects_nul_cr_del() -> None:
+    # NUL, CR, and DEL are C0/DEL control characters that must be rejected
+    # by _validate_transfer_target via contains_control from hermes_voip._chars.
+    for bad_char in ("\x00", "\r", "\x7f"):
+        with pytest.raises(
+            ValueError, match="transfer target contains a control character"
+        ):
+            build_blind_refer(_dialog(), f"sip:1000@pbx.example.test{bad_char}")

@@ -36,7 +36,7 @@ import pytest
 from hermes_voip.media.audio import G711_SAMPLE_RATE, encode_ulaw
 from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
-from hermes_voip.stt.deepgram import DeepgramASR
+from hermes_voip.stt.deepgram import _CLOSE_STREAM, DeepgramASR
 
 
 def _frame(*samples: int, ts: int = 0) -> PcmFrame:
@@ -173,6 +173,17 @@ async def test_deepgram_asr_closes_socket_when_audio_ends() -> None:
     asr = _asr_with(socket)
     [_ async for _ in asr.stream(_frames(_frame(0)))]
     assert socket.closed is True
+
+
+@pytest.mark.asyncio
+async def test_deepgram_asr_sends_exact_closestream_control_frame() -> None:
+    """Shutdown sends the real CloseStream sentinel, not an arbitrary text frame."""
+    socket = _FakeFluxSocket(())
+    asr = _asr_with(socket)
+
+    [_ async for _ in asr.stream(_frames(_frame(0)))]
+
+    assert socket.sent_text_frames == [_CLOSE_STREAM]
 
 
 @pytest.mark.asyncio

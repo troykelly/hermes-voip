@@ -432,7 +432,9 @@ def test_registration_config_builder() -> None:
         contact="<sip:1000@198.51.100.7:5061;transport=tls>",
         local_sent_by="198.51.100.7:5061",
     )
-    assert rc.aor == "sip:1000@pbx.example.test"
+    # ADR-0005/ADR-0080: the AOR carries the ``sips:`` scheme on the TLS transport
+    # (a ``sip:`` AOR on TLS/WSS is rejected at RegistrationConfig construction).
+    assert rc.aor == "sips:1000@pbx.example.test"
     assert rc.username == "1000"
     assert rc.password == "secret"
     assert rc.transport == "TLS"

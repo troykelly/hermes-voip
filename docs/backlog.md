@@ -228,29 +228,37 @@ defect or a load-bearing test gap.
   AOR corrupts the request-URI and digest uri and surfaces much later as a confusing gateway rejection.
   Validate scheme + non-empty host in `RegistrationConfig.__post_init__`/`_registrar_uri`, raise
   `ValueError`; tests for empty/no-scheme/no-user.
-- [ ] **[medium] correctness** — AOR scheme not constrained to `sips`, contradicting ADR-0005's
+- [x] **[medium] correctness** (done — ADR-0080) — AOR scheme not constrained to `sips`, contradicting ADR-0005's
   SIP-over-TLS mandate. `_registrar_uri` echoes whatever scheme the AOR carries; a `sip:` AOR over a TLS
-  transport is internally inconsistent with no signal. Either document scheme as the transport's
-  responsibility, or add a `transport in {TLS,WSS} ⇒ sips:` consistency check; record the stance.
+  transport is internally inconsistent with no signal. ENFORCED: `RegistrationConfig.__post_init__` rejects
+  a `sip:` AOR on a TLS/WSS transport (`_require_secure_scheme`, transport-gated, case-insensitive); UDP/TCP
+  leave the scheme to the deployer; `sips:` is accepted on any transport.
 - [ ] **[medium] robustness** (attempted Wave 4 — BLOCKED: a `transport` Literal on RegistrationConfig conflicts with `GatewayConfig.via_transport` dict typing at config.py:684; reconcile both files in one lane) — `RegistrationConfig.transport` and `expires` are unvalidated. `transport`
   is a free str injected into the Via line (line 201); `expires` accepts negatives (`Expires: -1`). Make
   `transport` a `Literal['TLS','WSS','UDP','TCP']`, reject negative `expires` in `__post_init__`
   (AGENTS 17 prefer types). Test an unknown-transport rejection.
-- [ ] **[medium] correctness** — Auth re-send does not increment `nc` on a refresh reusing the same
-  nonce. `_reauthenticate` (lines 158-177) always uses `nc=1` with a fresh cnonce; a registrar expecting
-  monotonic nc within a nonce lifetime is unsupported. Document the fresh-nonce assumption OR thread an nc
-  counter; at minimum assert `nc=00000001` appears so the assumption is pinned.
-- [ ] **[medium] test** — No test that the Via branch changes between the initial and authed REGISTER
+- [x] **[medium] correctness** (done — ADR-0080: PINNED, fresh-nonce assumption documented; no nc counter added — rule 6) — Auth re-send does not increment `nc` on a refresh reusing the same
+  nonce. `_reauthenticate` always uses `nc=1` with a fresh cnonce. This is CORRECT (RFC 7616 §3.4) for a
+  purely-reactive flow: each REGISTER is a fresh transaction answering a freshly-received nonce, so there is
+  no reused nonce to count against; a persistent monotonic nc would be state with no reachable consumer.
+  Pinned with a test asserting the authed REGISTER carries `nc=00000001`.
+- [x] **[medium] test** (done — ADR-0080) — No test that the Via branch changes between the initial and authed REGISTER
   (RFC 3261 §8.1.1.7 requires a new branch). `_build` does call `new_branch()` each time, but nothing
-  pins it; a hoist-to-`__init__` refactor would silently break transaction matching. Extract and assert
-  the branches differ (both `z9hG4bK…`); assert Call-ID/From-tag stay equal.
-- [ ] **[medium] test** — No registration-level test for the qop-less (RFC 2069) digest path or the
-  opaque echo. Every challenge fixture offers `qop="auth"` and no opaque. Add a qop-less challenge test
-  (no nc/cnonce, 32-hex response) and an opaque-echo test — guards the registration↔digest seam.
-- [ ] **[medium] test** — No test that a fresh nonce in a second 401 (`stale=true`) is used. The flow
-  treats any second 401 in a transaction as `Failed` (lines 146-148), so it cannot honour stale-nonce
-  rotation; there is no `DigestChallenge.stale` field. Decide scope: parse `stale` + retry, or pin
-  "we fail on the second 401 even if stale" with a test.
+  pins it; a hoist-to-`__init__` refactor would silently break transaction matching. PINNED: a test asserts
+  the branches differ (both `z9hG4bK…`) while Call-ID/From-tag stay equal.
+- [x] **[medium] test** (done — ADR-0080) — No registration-level test for the qop-less (RFC 2069) digest path or the
+  opaque echo. Every challenge fixture offers `qop="auth"` and no opaque. ADDED: a qop-less challenge test
+  (no nc/cnonce, 32-hex response, independently recomputed) and an opaque-echo test — guards the registration↔digest seam.
+- [x] **[medium] test** (done — ADR-0080: PINNED the "fail on second 401 even if stale" limitation) — No test that a fresh nonce in a second 401 (`stale=true`) is used. The flow
+  treats any second 401 in a transaction as `Failed`, so it cannot honour in-transaction stale-nonce
+  rotation; there is no `DigestChallenge.stale` field. PINNED as an intentional, recorded limitation:
+  recovery is the RegistrationManager's next refresh (a brand-new transaction with the fresh nonce). A test
+  asserts a second 401 with `stale=true` is still `Failed` and that the next refresh re-authenticates.
+- [ ] **[low] robustness** (follow-up from ADR-0080 / bk250) — Optional in-transaction `stale=true` retry.
+  Today recovery from a stale-nonce 401 is the next refresh (a new transaction). If a gateway is ever
+  observed to rely on in-transaction recovery, add a `DigestChallenge.stale` field + a single re-answer
+  within the same transaction when the second 401 carries `stale=true` (bounded, reversible). Deferred now
+  (rule 6 — no scaffolding for an unproven need).
 - [ ] **[low] correctness** — A 2xx other than 200 (e.g. 202) is mishandled — `status == _OK` exact
   compare (line 141) falls through to `Failed`; 1xx provisionals also treated as `Failed`. Treat
   `200 ≤ status < 300` as success (or document 200-only) and ignore 1xx; tests for 1xx-then-200 and

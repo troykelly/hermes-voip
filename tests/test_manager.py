@@ -135,8 +135,9 @@ async def test_start_sends_one_register_per_extension() -> None:
     await manager.start()
     assert len(transport.sent) == 2
     aors = "".join(transport.sent)
-    assert "sip:1000@pbx.example.test" in aors
-    assert "sip:1001@pbx.example.test" in aors
+    # ADR-0080: the AOR uses the mandated ``sips:`` scheme on the TLS transport.
+    assert "sips:1000@pbx.example.test" in aors
+    assert "sips:1001@pbx.example.test" in aors
 
 
 async def test_on_response_registers_and_marks_up() -> None:

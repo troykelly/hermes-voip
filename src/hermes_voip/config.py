@@ -772,8 +772,14 @@ class GatewayConfig:
         password = ext.password
         if self.transport == "wss" and self.ws_password is not None:
             password = self.ws_password
+        # ADR-0005/ADR-0080: the AOR scheme is ``sips:`` on a secure transport.
+        # ``self.transport`` is validated to ``_VIA_TRANSPORT`` = {tls, wss} (see
+        # ``_parse_transport``), both TLS-protected, so the scheme is always
+        # ``sips:`` here — a ``sip:`` AOR on TLS/WSS is rejected by
+        # RegistrationConfig. If a cleartext transport is ever added to that set,
+        # this must become transport-derived rather than the ``sips:`` constant.
         return RegistrationConfig(
-            aor=f"sip:{ext.extension}@{self.host}",
+            aor=f"sips:{ext.extension}@{self.host}",
             username=ext.username,
             password=password,
             contact=contact,

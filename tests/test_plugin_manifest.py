@@ -32,6 +32,7 @@ from collections.abc import Sequence
 from importlib.metadata import version as _dist_version
 from pathlib import Path
 
+import pytest
 import yaml
 
 import hermes_voip
@@ -47,8 +48,10 @@ from hermes_voip.config import (
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_SOURCE_MANIFEST = _REPO_ROOT / "src" / "hermes_voip" / "plugin.yaml"
 _PACKAGING_DIR = _REPO_ROOT / "packaging" / "hermes-plugins" / "hermes-voip"
 _PACKAGING_MANIFEST = _PACKAGING_DIR / "plugin.yaml"
+_MANIFEST_PATHS = (_SOURCE_MANIFEST, _PACKAGING_MANIFEST)
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 
 
@@ -333,9 +336,11 @@ def _requires_env_block() -> list[dict[str, object]]:
     return _normalise_env(_load_manifest(_PACKAGING_MANIFEST).get("requires_env"))
 
 
-def _optional_env_block() -> list[dict[str, object]]:
+def _optional_env_block(
+    manifest_path: Path = _PACKAGING_MANIFEST,
+) -> list[dict[str, object]]:
     """The manifest's ``optional_env`` normalised to rich dicts (``[]`` if absent)."""
-    optional = _load_manifest(_PACKAGING_MANIFEST).get("optional_env")
+    optional = _load_manifest(manifest_path).get("optional_env")
     return _normalise_env(optional) if optional is not None else []
 
 
@@ -666,49 +671,57 @@ def test_docs_use_correct_tool_count() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_optional_env_advertises_call_on_connect() -> None:
-    """HERMES_VOIP_CALL_ON_CONNECT in optional_env — must warn about allowlist bypass.
+@pytest.mark.parametrize("manifest_path", _MANIFEST_PATHS)
+def test_optional_env_advertises_call_on_connect(manifest_path: Path) -> None:
+    """Both manifests advertise CALL_ON_CONNECT and warn about the allowlist bypass.
 
     This env var fires a one-shot outbound dial on first registration and BYPASSES
     the outbound allowlist (adapter.py ``_CALL_ON_CONNECT_KEY``). Without a manifest
     entry an operator cannot discover it; without an explicit bypass warning in the
-    description the security implication is invisible. Both must be present.
+    description the security implication is invisible. Both canonical manifest copies
+    must carry the same warning so neither install path can drift.
     """
-    entries = _optional_env_block()
+    entries = _optional_env_block(manifest_path)
     names = {_entry_name(e): e for e in entries if isinstance(e, dict)}
     assert "HERMES_VOIP_CALL_ON_CONNECT" in names, (
-        "optional_env must advertise HERMES_VOIP_CALL_ON_CONNECT — "
+        f"{manifest_path} optional_env must advertise HERMES_VOIP_CALL_ON_CONNECT — "
         "operators need a manifest-visible signal this one-shot dial knob exists"
     )
     desc = names["HERMES_VOIP_CALL_ON_CONNECT"].get("description", "")
     assert isinstance(desc, str)
-    # The description MUST warn that CALL_ON_CONNECT bypasses the outbound allowlist.
     lowered = desc.lower()
-    assert "bypass" in lowered or "allowlist" in lowered or "allow list" in lowered, (
-        "HERMES_VOIP_CALL_ON_CONNECT description must explicitly warn about the "
-        "outbound-allowlist bypass (adapter.py ~920-921). Operators who set this "
-        "knob must understand it dials without allowlist gating."
+    assert "allowlist" in lowered or "allow list" in lowered, (
+        f"{manifest_path} HERMES_VOIP_CALL_ON_CONNECT description must name the "
+        "outbound allowlist it bypasses"
+    )
+    assert "bypass" in lowered, (
+        f"{manifest_path} HERMES_VOIP_CALL_ON_CONNECT description must explicitly "
+        "warn about the outbound-allowlist bypass (adapter.py ~920-921). Operators "
+        "who set this knob must understand it dials without allowlist gating."
     )
 
 
-def test_optional_env_advertises_keepalive_interval_with_matching_default() -> None:
-    """HERMES_VOIP_KEEPALIVE_INTERVAL in optional_env; default matches config.py.
+@pytest.mark.parametrize("manifest_path", _MANIFEST_PATHS)
+def test_optional_env_advertises_keepalive_interval_with_matching_default(
+    manifest_path: Path,
+) -> None:
+    """Both manifests advertise KEEPALIVE_INTERVAL with config.py's default.
 
-    This env var controls the RFC 5626 double-CRLF keepalive interval. The manifest
-    default must match ``_DEFAULT_KEEPALIVE_INTERVAL`` in config.py so an operator
-    consulting the manifest sees the accurate default rather than a stale number.
+    This env var controls the RFC 5626 double-CRLF keepalive interval. Each manifest
+    copy must match ``_DEFAULT_KEEPALIVE_INTERVAL`` in config.py so either install path
+    shows the accurate default rather than a stale number.
     """
-    entries = _optional_env_block()
+    entries = _optional_env_block(manifest_path)
     defaults = {
         _entry_name(e): e.get("default") for e in entries if isinstance(e, dict)
     }
     assert "HERMES_VOIP_KEEPALIVE_INTERVAL" in defaults, (
-        "optional_env must advertise HERMES_VOIP_KEEPALIVE_INTERVAL — "
+        f"{manifest_path} optional_env must advertise HERMES_VOIP_KEEPALIVE_INTERVAL — "
         "operators need a manifest-visible signal this RFC 5626 keepalive knob exists"
     )
     manifest_default = defaults["HERMES_VOIP_KEEPALIVE_INTERVAL"]
     assert manifest_default == _DEFAULT_KEEPALIVE_INTERVAL, (
-        f"HERMES_VOIP_KEEPALIVE_INTERVAL default in plugin.yaml "
+        f"HERMES_VOIP_KEEPALIVE_INTERVAL default in {manifest_path} "
         f"({manifest_default!r}) must match config.py "
         f"_DEFAULT_KEEPALIVE_INTERVAL ({_DEFAULT_KEEPALIVE_INTERVAL!r})"
     )

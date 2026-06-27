@@ -738,3 +738,90 @@ def test_config_accepts_zero_expires() -> None:
         expires=0,
     )
     assert cfg.expires == 0
+
+
+# ---- 2xx success range (backlog 262) ----------------------------------------
+
+
+def _2xx(cseq: int, code: int, reason: str = "Accepted") -> SipResponse:
+    """A non-200 2xx response (e.g. 202 Accepted) to a REGISTER."""
+    return SipResponse.parse(
+        f"SIP/2.0 {code} {reason}\r\n"
+        f"CSeq: {cseq} REGISTER\r\n"
+        f"Contact: <sip:1000@198.51.100.7:5061;transport=tls>;expires=300\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def test_202_accepted_yields_registered() -> None:
+    # backlog 262: any 2xx (200 <= status < 300) must be treated as success.
+    # A 202 Accepted from some RFC-compliant registrar implementations must not
+    # be mishandled as a failure (the old code compared status == 200 exactly).
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_2xx(_cseq_num(started), 202))
+    assert isinstance(outcome, Registered)
+
+
+def test_204_no_content_yields_registered() -> None:
+    # backlog 262: 204 is another non-200 2xx that must also yield Registered.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    outcome = flow.handle(_2xx(_cseq_num(started), 204, "No Content"))
+    assert isinstance(outcome, Registered)
+
+
+# ---- CSeq method validation (backlog 266) ------------------------------------
+
+
+def _ok_with_cseq_method(cseq: int, method: str) -> SipResponse:
+    """A 200 OK whose CSeq uses the given method (not necessarily REGISTER)."""
+    return SipResponse.parse(
+        f"SIP/2.0 200 OK\r\n"
+        f"CSeq: {cseq} {method}\r\n"
+        f"Contact: <sip:1000@198.51.100.7:5061;transport=tls>;expires=300\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def test_cseq_method_invite_raises() -> None:
+    # backlog 266: a response whose CSeq number matches but whose method is NOT
+    # REGISTER is a protocol error and must raise RuntimeError.  The old code
+    # only checked the sequence number and silently accepted an INVITE/BYE/etc.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    cseq_num = _cseq_num(started)
+    with pytest.raises(RuntimeError, match="CSeq"):
+        flow.handle(_ok_with_cseq_method(cseq_num, "INVITE"))
+
+
+def test_cseq_method_bye_raises() -> None:
+    # backlog 266: same guard for BYE — any non-REGISTER method is rejected.
+    flow = RegistrationFlow(_CONFIG)
+    started = flow.start()
+    cseq_num = _cseq_num(started)
+    with pytest.raises(RuntimeError, match="CSeq"):
+        flow.handle(_ok_with_cseq_method(cseq_num, "BYE"))
+
+
+# ---- missing/garbled CSeq behaviour (backlog 269) ---------------------------
+
+
+def _ok_without_cseq(expires: int = 300) -> SipResponse:
+    """A 200 OK with NO CSeq header (malformed/absent, as some broken proxies emit)."""
+    return SipResponse.parse(
+        f"SIP/2.0 200 OK\r\n"
+        f"Contact: <sip:1000@198.51.100.7:5061;transport=tls>;expires={expires}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def test_missing_cseq_is_tolerated_and_yields_registered() -> None:
+    # backlog 269: a response with NO CSeq header cannot be correlated by sequence
+    # number, but we tolerate the omission (a real registrar always echoes CSeq; a
+    # broken proxy may strip it).  Current behaviour: silently accept and return
+    # Registered.  This test PINS that leniency so it cannot change unintentionally.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_ok_without_cseq())
+    assert isinstance(outcome, Registered)

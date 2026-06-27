@@ -408,14 +408,76 @@ class _NumpyModule(Protocol):
 
 
 @runtime_checkable
+class _NodeArg(Protocol):
+    """Narrow slice of ``onnxruntime.NodeArg`` used for load-time shape validation.
+
+    ``onnxruntime.InferenceSession.get_inputs()`` returns a list of ``NodeArg``
+    objects; we need only ``name`` (to find the state input) and ``shape`` (to
+    validate the v5 recurrent-state dimensions). Both are regular attributes.
+    """
+
+    #: Input tensor name (e.g. ``"state"`` for the silero recurrent state).
+    name: str
+    #: Symbolic shape as a list; may contain ``None`` for dynamic dimensions.
+    shape: list[int | None]
+
+
+@runtime_checkable
 class _OrtSession(Protocol):
     """The slice of ``onnxruntime.InferenceSession`` the live path calls."""
+
+    def get_inputs(self) -> list[_NodeArg]:
+        """Return the session's input metadata (one NodeArg per input)."""
+        ...
 
     def run(
         self, output_names: Sequence[str] | None, input_feed: dict[str, object], /
     ) -> Sequence[_NdArray]:
         """Run the graph; output 0 = speech probability, output 1 = next state."""
         ...
+
+
+def _validate_silero_v5_state_shape(session: _OrtSession) -> None:
+    """Raise ``ValueError`` if the loaded ONNX is not a silero v5 model.
+
+    silero v5 carries an LSTM state of shape ``(2, 1, 128)`` between windows.
+    The ``deepghs/silero-vad-onnx`` HuggingFace mirror is silero v4, whose
+    state is ``(2, 1, 64)`` — incompatible with the v5 inference harness here.
+    Without this guard the failure surfaces as an opaque onnxruntime shape
+    mismatch on the first inference call; with it the operator sees a clear
+    message immediately on model load.
+
+    Args:
+        session: The freshly-loaded ``InferenceSession`` to validate.
+
+    Raises:
+        ValueError: If the ``"state"`` input's shape does not match
+            :data:`_SILERO_STATE_SHAPE` ``(2, 1, 128)``.
+    """
+    inputs = session.get_inputs()
+    state_input = next((inp for inp in inputs if inp.name == "state"), None)
+    if state_input is None:
+        # No "state" input at all — not a recognisable silero model.
+        msg = (
+            "silero VAD v5 required: the loaded ONNX has no 'state' input; "
+            "expected a silero v5 model with state shape "
+            f"{_SILERO_STATE_SHAPE} — see runbook 0002"
+        )
+        raise ValueError(msg)
+    loaded_shape = tuple(state_input.shape)
+    if loaded_shape != _SILERO_STATE_SHAPE:
+        msg = (
+            f"silero VAD v5 required (state shape {_SILERO_STATE_SHAPE}); "
+            f"the loaded model expects {loaded_shape} — "
+            "this is silero v4 (e.g. the deepghs/silero-vad-onnx mirror, "
+            "which is incompatible with this plugin); "
+            "download the official v5 model: "
+            "huggingface_hub.hf_hub_download("
+            "repo_id='snakers4/silero-vad', "
+            "filename='src/silero_vad/data/silero_vad.onnx', "
+            "repo_type='model', revision='v5.1.2') — see runbook 0002"
+        )
+        raise ValueError(msg)
 
 
 class _SileroOnnxModel:
@@ -434,6 +496,7 @@ class _SileroOnnxModel:
     """
 
     def __init__(self, session: _OrtSession, numpy_module: _NumpyModule) -> None:
+        _validate_silero_v5_state_shape(session)
         self._session = session
         self._np = numpy_module
         self._state: _NdArray = self._zero_state()

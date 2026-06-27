@@ -79,11 +79,45 @@ fixed):
 | 2026-06-14 (previous) | `csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26` | `672fbf1b30579d6585301139bb363f42a0ad4a24` | LibriSpeech only | original ADR-0006 default; degraded on noisy telephony audio |
 
 Download script (reads the pins from `manifest.py`; verifies each pinned sha256 and aborts on
-mismatch -- see the project history for the exact `huggingface_hub.hf_hub_download` +
-`snapshot_download` invocation used). The silero VAD is fetched from the official tagged
-release and is *not* manifest-pinned (it is the VAD, not a licence-bearing conversational
-model); record its sha256 when you cache it. After downloading, prove the stack actually
-loads (not just that the files exist):
+mismatch). The silero VAD is fetched from the official tagged release below and is *not*
+manifest-pinned (it is the VAD, not a licence-bearing conversational model); record its
+sha256 when you cache it.
+
+> **WARNING — mirror incompatibility:** the `deepghs/silero-vad-onnx` HuggingFace mirror
+> is silero **v4**. Its recurrent-state tensor has shape `(2, 1, 64)`, which is **not
+> compatible** with this plugin's v5 inference harness (expected state shape `(2, 1, 128)`,
+> see `vad.py _SILERO_STATE_SHAPE`). Do **not** use that mirror. The plugin detects this at
+> model load and raises a clear `ValueError` naming the loaded shape, but the fix is to
+> download from `snakers4/silero-vad` at `v5.1.2` as shown below.
+
+**Silero VAD v5.1.2 — pinned download (run once per workspace):**
+
+```python
+# Requires: pip install huggingface_hub   (already present via the ml extra)
+from pathlib import Path
+from huggingface_hub import hf_hub_download
+import hashlib, os, shutil
+
+vad_dir = Path(os.environ["VOIP_MODELS_ROOT"]) / "vad"
+vad_dir.mkdir(parents=True, exist_ok=True)
+
+# Download the v5.1.2-tagged file from the OFFICIAL repo (not the deepghs mirror).
+# revision pins the exact git tag; filename is the path inside the repo tree.
+tmp = hf_hub_download(
+    repo_id="snakers4/silero-vad",
+    filename="src/silero_vad/data/silero_vad.onnx",
+    repo_type="model",
+    revision="v5.1.2",
+)
+dest = vad_dir / "silero_vad.onnx"
+shutil.copy(tmp, dest)
+
+sha256 = hashlib.sha256(dest.read_bytes()).hexdigest()
+print(f"silero_vad.onnx  sha256={sha256}")
+# Record the sha256 printed here; re-run to verify: the printed value must match.
+```
+
+After downloading, prove the stack actually loads (not just that the files exist):
 
 ```bash
 export HERMES_VOIP_STT_MODEL_DIR="$VOIP_MODELS_ROOT/stt"

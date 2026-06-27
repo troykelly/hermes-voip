@@ -22,6 +22,7 @@ from hermes_voip.media.vad import (
     SpeechEdge,
     VadEvent,
     VoiceActivityDetector,
+    _NodeArg,  # private symbol; test-only
     load_silero_model,
 )
 from hermes_voip.providers.audio import PcmFrame
@@ -406,11 +407,15 @@ class _FakeNumpy:
 
 
 class _FakeNodeArg:
-    """A stand-in for ``onnxruntime.NodeArg`` exposing just ``.name`` and ``.shape``."""
+    """A stand-in for ``onnxruntime.NodeArg`` exposing just ``.name`` and ``.shape``.
+
+    Satisfies the ``_NodeArg`` Protocol from ``hermes_voip.media.vad`` so
+    ``_FakeSession.get_inputs()`` can be typed as ``list[_NodeArg]``.
+    """
 
     def __init__(self, name: str, shape: list[int | None]) -> None:
-        self.name = name
-        self.shape = shape
+        self.name: str = name
+        self.shape: list[int | None] = shape
 
 
 class _FakeSession:
@@ -437,8 +442,9 @@ class _FakeSession:
             [2, 1, 128] if state_shape is None else state_shape
         )
 
-    def get_inputs(self) -> list[_FakeNodeArg]:
+    def get_inputs(self) -> list[_NodeArg]:
         """Return the three silero ONNX inputs (input, state, sr)."""
+        # _FakeNodeArg satisfies the _NodeArg Protocol (name/shape attributes).
         return [
             _FakeNodeArg("input", [1, None]),
             _FakeNodeArg("state", self._state_shape),

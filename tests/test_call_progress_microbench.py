@@ -21,8 +21,7 @@ Worst-case frame:
     simultaneously dominate a single frame; that is physically impossible for pure
     tones at distinct frequencies, so 7 is the correct tight upper bound.
 
-Frame shape:
-  * 8 kHz / 20 ms -> 160 samples (one RTP G.711 frame)
+Frame shape used in all tests:
   * 16 kHz / 20 ms -> 320 samples (resampled conversational path, ADR-0017)
 """
 
@@ -49,12 +48,10 @@ from hermes_voip.providers.audio import PcmFrame
 # Frame constants
 # ---------------------------------------------------------------------------
 
-_RATE_8K: Final[int] = 8_000
 _RATE_16K: Final[int] = 16_000
 _FRAME_MS: Final[int] = 20  # standard RTP packetisation
 
 # 20 ms x sample rate -> sample count per frame
-_SAMPLES_8K: Final[int] = _RATE_8K * _FRAME_MS // 1000  # 160
 _SAMPLES_16K: Final[int] = _RATE_16K * _FRAME_MS // 1000  # 320
 
 # ---------------------------------------------------------------------------
@@ -94,12 +91,6 @@ _MAX_GOERTZEL_PASSES_WORST_CASE: Final[int] = 7
 # ---------------------------------------------------------------------------
 # Frame builders
 # ---------------------------------------------------------------------------
-
-
-def _silence_frame(rate: int, ts_ns: int = 0) -> PcmFrame:
-    """Return a 20 ms all-zeros PCM16 frame at ``rate`` Hz."""
-    n = rate * _FRAME_MS // 1000
-    return PcmFrame(samples=b"\x00\x00" * n, sample_rate=rate, monotonic_ts_ns=ts_ns)
 
 
 def _sine_frame(
@@ -166,24 +157,33 @@ def test_on_audio_frame_cost_constant_exists() -> None:
 #
 # This is the authoritative efficiency gate.  It counts the number of
 # ``_goertzel_power`` calls made on the documented worst-case path and asserts
-# that the count does not exceed _MAX_GOERTZEL_PASSES_WORST_CASE.  No wall
+# the count == _MAX_GOERTZEL_PASSES_WORST_CASE (exact, not <=).  An exact
+# assertion catches both regressions (new tone check or guard bin) AND silent
+# setup errors that bypass the beep path and produce fewer calls.  No wall
 # clock; no OS jitter; fully deterministic.
 # ---------------------------------------------------------------------------
 
 
 def test_on_audio_frame_goertzel_pass_count_worst_case() -> None:
-    """on_audio_frame makes <= _MAX_GOERTZEL_PASSES_WORST_CASE Goertzel calls.
+    """on_audio_frame makes exactly _MAX_GOERTZEL_PASSES_WORST_CASE Goertzel calls.
 
     Exercises the documented worst-case path: outbound call, machine classified,
     beep check active, frame dominated by a pure 1000 Hz tone.  All 4 BEEP guard
-    bins run; CNG and CED fraction-checks fail after 1 call each.  Total: 7 passes.
+    bins run; CNG and CED fraction-checks fail after 1 target call each.
+    Exact count: 1 (CNG) + 1 (CED) + 5 (BEEP target + 4 guards) = 7 passes.
 
-    This is the primary regression gate for on_audio_frame compute cost.  A change
-    that adds a new tone check, a new guard bin, or restructures the early-exit
-    logic will fail this assertion deterministically, with no dependence on timing.
+    The assertion is == (exact), not <=, so a setup error that silently bypasses
+    the beep path and produces fewer calls also fails loudly.  A pre-flight check
+    confirms the detector is genuinely in the beep-path-active state before
+    counting begins.
+
+    This is the primary regression gate for on_audio_frame compute cost.  Any
+    change that adds a tone check, a guard bin, or restructures early-exit logic
+    will fail this test deterministically with no timing dependency.
     """
     det = _worst_case_detector()
-    # 1000 Hz pure tone: triggers full BEEP guard-bin evaluation.
+    # 1000 Hz pure tone: CNG/CED fraction-checks fail (1 call each); BEEP
+    # fraction passes then all 4 guard bins run = 5 calls.  Total: 7.
     beep_frame = _sine_frame(float(_BEEP_HZ), _RATE_16K)
 
     # Warm up so all Python caches and JIT-equivalent state settle.
@@ -201,80 +201,105 @@ def test_on_audio_frame_goertzel_pass_count_worst_case() -> None:
         call_count += 1
         return _real_goertzel(samples, freq, rate)
 
-    # Reset state and run exactly one worst-case call under the counting proxy.
+    # Reset to the exact worst-case state: outbound, machine decided, beep active.
     det._ready_emitted = False
     det._cng_emitted = False
     det._ced_emitted = False
+
+    # Pre-flight: verify the detector is in the beep-path-active state so that a
+    # broken _worst_case_detector() that omits the machine classification cannot
+    # silently produce 2 passes instead of 7 and still pass a <= guard.
+    assert det._amd._decided_machine, (
+        "pre-flight: detector must have AMD in decided_machine=True state "
+        "for the worst-case beep path to be active; check _worst_case_detector()"
+    )
+    assert not det._ready_emitted, (
+        "pre-flight: _ready_emitted must be False so the beep check runs"
+    )
 
     with patch.object(_cp_mod, "_goertzel_power", side_effect=counting_goertzel):
         det.on_audio_frame(beep_frame)
 
     expected = 2 + 1 + len(_GUARD_OFFSETS_HZ)  # 1 CNG + 1 CED + 5 BEEP
-    assert call_count <= _MAX_GOERTZEL_PASSES_WORST_CASE, (
+    assert call_count == _MAX_GOERTZEL_PASSES_WORST_CASE, (
         f"on_audio_frame made {call_count} Goertzel calls on the worst-case path "
-        f"(budget <= {_MAX_GOERTZEL_PASSES_WORST_CASE}); "
-        "check for a new tone check or guard-bin addition on this path. "
-        f"Expected breakdown: 1 (CNG) + 1 (CED) + "
-        f"{1 + len(_GUARD_OFFSETS_HZ)} (BEEP target+guards) = {expected} passes"
+        f"(expected exactly {_MAX_GOERTZEL_PASSES_WORST_CASE}). "
+        f"Breakdown must be: 1 (CNG target) + 1 (CED target) + "
+        f"{1 + len(_GUARD_OFFSETS_HZ)} (BEEP target+{len(_GUARD_OFFSETS_HZ)} guards)"
+        f" = {expected}. "
+        "If count < expected, the beep path was not reached (check setup). "
+        "If count > expected, a new tone check or guard bin was added."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3 -- Allocation growth (deterministic regression guard)
+# Test 3 -- Transient allocation peak (deterministic regression guard)
+#
+# Justification for this approach (rule 19): the previous version used
+# tracemalloc snapshot-diff (compare_to), which only sees LIVE blocks at
+# snapshot time.  The per-call samples list and float objects are freed before
+# the snapshot, so count_diff was ~0 regardless of transient regressions --
+# a non-gating assertion that cannot fail is worse than none (rule 19).
+#
+# tracemalloc.get_traced_memory() returns (current, peak) where peak is the
+# high-water mark DURING the tracing window, capturing the maximum live-set
+# even after those allocations are freed.  Sequential worst-case calls each
+# produce the same transient heap footprint (list + n floats + misc); they do
+# not accumulate across calls, so peak ≈ one call's transient high-water.
+# Measured on this machine: ~22 KB peak for 320 float samples.  The 50 KB
+# ceiling is ~2.3x the measured peak, tight enough to catch a regression (e.g.
+# an extra full list copy per call would roughly double the peak to ~44 KB) yet
+# loose enough that Python version differences in object overhead cannot flip it.
 # ---------------------------------------------------------------------------
 
+# Measured transient peak on this machine for a single worst-case call at 16 kHz:
+# ~22 KB (list[float] of 320 floats + misc per-call temporaries).
+# 50 KB ≈ 2.3x the measured value; catches an extra full-list-copy regression.
+_ALLOC_PEAK_BYTES_CEILING: Final[int] = 50_000  # 50 KB
 
-def test_on_audio_frame_allocation_growth_within_budget_16k() -> None:
-    """on_audio_frame has bounded per-iteration heap-object growth on the worst path.
 
-    Uses tracemalloc snapshot diff over N iterations to measure per-iteration
-    heap-object growth in call_progress.py.  A pure allocation-free path grows by
-    0 objects/call; the current implementation allocates a list[float] plus n float
-    objects per call (the samples list comprehension), giving ~n+1 objects per call.
-    The ceiling of 2*n+10 is generous; a regression (e.g. an extra list copy or a
-    dict allocation per call) would exceed it without any timing dependency.
+def test_on_audio_frame_transient_alloc_peak_worst_case_16k() -> None:
+    """on_audio_frame transient heap peak is < 50 KB on the worst-case path.
 
-    At 16 kHz worst-case: n=320, ceiling = 2*320+10 = 650 objects per call.
-    We run 10 iterations and assert total growth <= 10 * 650 = 6 500 objects.
+    Uses tracemalloc.get_traced_memory() peak (high-water mark during the window)
+    to capture transient per-call allocations even though they are freed between
+    calls.  The snapshot-diff approach is NOT used here because compare_to() only
+    sees live blocks at snapshot time; freed transients are invisible, making it
+    non-gating.
+
+    Measured peak on this machine: ~22 KB (320 floats + list + misc).  The 50 KB
+    ceiling catches an extra-list-copy regression (~44 KB) without depending on
+    timing or precise object sizes.
     """
     det = _worst_case_detector()
     beep_frame = _sine_frame(float(_BEEP_HZ), _RATE_16K)
 
-    # Warm up so Python caches and lazy state settle before we snapshot.
-    for _ in range(50):
+    # Warm up so Python caches and lazy state settle before measuring.
+    for _ in range(100):
         det._ready_emitted = False
         det._cng_emitted = False
         det._ced_emitted = False
         det.on_audio_frame(beep_frame)
 
-    n_iters = 10
-    max_allocs_per_call = 2 * _SAMPLES_16K + 10  # 650 objects
-
     tracemalloc.start()
     try:
-        snap_before = tracemalloc.take_snapshot()
-        for _ in range(n_iters):
+        # reset_peak so the high-water mark reflects only the calls below.
+        tracemalloc.reset_peak()
+        for _ in range(10):
             det._ready_emitted = False
             det._cng_emitted = False
             det._ced_emitted = False
             det.on_audio_frame(beep_frame)
-        snap_after = tracemalloc.take_snapshot()
+        _cur, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
 
-    # Diff the two snapshots: only count net-positive growth in call_progress.py.
-    stats = snap_after.compare_to(snap_before, "lineno")
-    cp_growth = sum(
-        s.count_diff
-        for s in stats
-        if "call_progress" in s.traceback[0].filename and s.count_diff > 0
-    )
-
-    max_total = n_iters * max_allocs_per_call  # 6 500 objects across 10 calls
-    assert cp_growth <= max_total, (
-        f"on_audio_frame grew call_progress.py heap by {cp_growth} objects over "
-        f"{n_iters} calls (budget <= {max_total}, i.e. {max_allocs_per_call}/call); "
-        "check for accidental per-call list copies or extra per-sample allocations"
+    assert peak < _ALLOC_PEAK_BYTES_CEILING, (
+        f"on_audio_frame transient heap peak was {peak} bytes on worst-case path "
+        f"(ceiling {_ALLOC_PEAK_BYTES_CEILING} bytes / 50 KB); "
+        "check for an extra per-call list copy or large temporary allocation. "
+        f"Measured baseline on this machine: ~22 KB "
+        f"(320 floats + list + misc per-call temporaries)."
     )
 
 

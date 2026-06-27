@@ -84,9 +84,10 @@ _MS_PER_SECOND: Final[int] = 1000
 # energy at 1000/1100/2100 Hz, which pure telephony tones never produce.
 #
 # The 20 ms frame period is the outer budget wall; 131 µs = 0.66 % of that period.
-# Three Goertzel passes (CNG + CED + optional BEEP) each walk n samples in O(n) —
-# the same order as one ``InbandDtmfDetector`` low/high pass already on the hot
-# path (ADR-0064). No FFT, no allocation beyond the per-frame float list.
+# Up to 7 Goertzel passes per frame on the worst-case path (1 CNG target + 1 CED
+# target + 5 BEEP target+guards); each pass walks n samples in O(n) — the same
+# order as one ``InbandDtmfDetector`` low/high pass already on the hot path
+# (ADR-0064). No FFT, no allocation beyond the per-frame float list.
 #
 # The per-frame test gate in ``tests/test_call_progress_microbench.py`` uses a
 # deterministic Goertzel-pass count as the primary gate and a generous 5 ms wall-

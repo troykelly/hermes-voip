@@ -366,6 +366,49 @@ def test_classify_legacy_blackhole_hold_is_held() -> None:
     assert out.held_by_peer is True
 
 
+def test_classify_ipv6_blackhole_hold_is_held() -> None:
+    # IPv6 equivalent of the RFC 2543 black-hole hold: c=IN IP6 :: with sendrecv.
+    # Some gateways send :: instead of 0.0.0.0 when placing a call on hold.
+    # Must be detected as held even though sendrecv is not in _HELD_OFFER_DIRECTIONS.
+    legacy_v6 = build_audio_offer(
+        local_address="::",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendrecv",
+        session_id=9,
+    )
+    req = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@pbx.example.test",
+        headers=(("Content-Type", "application/sdp"),),
+        body=legacy_v6,
+    )
+    out = classify_inbound_reinvite(req, pending_local_offer=False)
+    assert isinstance(out, MediaUpdate)
+    assert out.held_by_peer is True
+
+
+def test_classify_ipv6_blackhole_recvonly_is_held() -> None:
+    # c=IN IP6 :: with recvonly: the peer is also not sending to us (black hole).
+    # Must also be classified as held regardless of direction.
+    legacy_v6 = build_audio_offer(
+        local_address="::",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="recvonly",
+        session_id=9,
+    )
+    req = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@pbx.example.test",
+        headers=(("Content-Type", "application/sdp"),),
+        body=legacy_v6,
+    )
+    out = classify_inbound_reinvite(req, pending_local_offer=False)
+    assert isinstance(out, MediaUpdate)
+    assert out.held_by_peer is True
+
+
 def test_classify_offerless_reinvite() -> None:
     req = SipRequest(
         method="INVITE",

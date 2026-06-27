@@ -1348,7 +1348,13 @@ def _coerce_crypto(crypto: CryptoAttribute | str | None) -> CryptoAttribute | No
 
 
 def _addrtype(addr: str) -> str:
-    """Return 'IP6' if *addr* is an IPv6 address, else 'IP4' (RFC 4566 §5.2/5.7)."""
+    """Return 'IP6' if *addr* is an IPv6 address, else 'IP4' (RFC 4566 §5.2/5.7).
+
+    Caller contract: *addr* MUST be a bare IP literal — no brackets, no port
+    suffix, no zone-id.  All callers receive ``local_address`` from
+    ``_host_of()`` in adapter.py, which strips brackets before returning,
+    guaranteeing a bare literal reaches here.
+    """
     return "IP6" if ":" in addr else "IP4"
 
 

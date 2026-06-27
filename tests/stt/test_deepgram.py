@@ -83,6 +83,7 @@ class _FakeFluxSocket:
     def __init__(self, events: tuple[str, ...]) -> None:
         self._events = events
         self.sent: list[bytes] = []
+        self.sent_text_frames: list[str] = []
         self.closed = False
         self.opened = False
         self._close_event = asyncio.Event()
@@ -99,6 +100,7 @@ class _FakeFluxSocket:
         if isinstance(data, bytes):
             self.sent.append(data)
         else:
+            self.sent_text_frames.append(data)
             # A text control frame (e.g. CloseStream): signal that the server
             # should close the socket — mirroring real Deepgram behaviour where
             # CloseStream causes the server to flush + close its side.

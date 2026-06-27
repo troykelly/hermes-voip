@@ -191,6 +191,77 @@ def linear_fade_out(pcm16: bytes, *, fade_samples: int) -> bytes:
     return struct.pack(f"<{total}h", *samples)
 
 
+def resample_frame(frame: PcmFrame, *, target_rate: int) -> PcmFrame:
+    """Convert a :class:`PcmFrame` to ``target_rate`` Hz, returning a new frame.
+
+    Wraps the existing :class:`Resampler` so the same validated DSP and the same
+    ``ValueError``/``TypeError`` contracts apply at the PcmFrame level.  The input
+    frame is never mutated (it is frozen).
+
+    Timestamp contract: ``monotonic_ts_ns`` is a rate-independent wall-clock
+    nanosecond presentation timestamp that is PRESERVED UNCHANGED across a rate
+    change.  Scaling it would break the shared monotonic timebase used by VAD,
+    endpointing, A/V-sync, and barge-in — the same contract that
+    :meth:`~hermes_voip.media.engine.MediaEngine._to_wire_rate` and
+    :class:`~hermes_voip.stt.resample.FrameUpsampler` both follow: the presentation
+    clock is unaffected by the rate change.
+
+    Identity: when ``target_rate == frame.sample_rate`` the function returns a
+    :class:`PcmFrame` with the same ``samples``, ``sample_rate``, and
+    ``monotonic_ts_ns`` — no DSP is applied and the :class:`Resampler` (which
+    rejects equal rates) is not constructed.
+
+    Args:
+        frame: The source :class:`PcmFrame` to convert.
+        target_rate: The desired output sample rate in Hz. Must be a plain ``int``
+            (not ``bool``) and must be positive — the same constraints that
+            :class:`Resampler` enforces on ``to_rate``.
+
+    Returns:
+        A new :class:`PcmFrame` at ``target_rate`` with ``monotonic_ts_ns``
+        preserved unchanged from the input frame.
+
+    Raises:
+        ValueError: If ``target_rate`` is a ``bool``, not an ``int``, not positive,
+            or equal to ``frame.sample_rate`` … the last case is unreachable because
+            the identity fast-path returns early; all other ``ValueError`` s are
+            propagated unchanged from :class:`Resampler`.
+    """
+    # Validate target_rate up front using the same rules Resampler enforces.  We
+    # do this even in the identity case so bool/float/negative target rates are
+    # rejected consistently regardless of frame.sample_rate.
+    if isinstance(target_rate, bool) or not isinstance(target_rate, int):
+        msg = (
+            f"sample rates must be a plain integer, got to_rate={target_rate!r}"
+            f" ({type(target_rate).__name__})"
+        )
+        raise ValueError(msg)  # noqa: TRY004 — module contract is ValueError throughout
+    if target_rate <= 0:
+        msg = f"sample rates must be positive, got {frame.sample_rate} -> {target_rate}"
+        raise ValueError(msg)
+
+    if target_rate == frame.sample_rate:
+        # Identity: no DSP, no allocation beyond constructing the return frame.
+        # dataclasses.replace would work too, but the constructor is explicit.
+        return PcmFrame(
+            samples=frame.samples,
+            sample_rate=frame.sample_rate,
+            monotonic_ts_ns=frame.monotonic_ts_ns,
+        )
+
+    resampler = Resampler(frame.sample_rate, target_rate)
+    new_samples = resampler.resample(frame.samples)
+
+    # monotonic_ts_ns is a wall-clock nanosecond presentation timestamp; it is
+    # rate-independent and must be preserved unchanged across the rate change
+    # (same contract as FrameUpsampler.upsample and MediaEngine._to_wire_rate).
+    return PcmFrame(
+        samples=new_samples,
+        sample_rate=target_rate,
+        monotonic_ts_ns=frame.monotonic_ts_ns,
+    )
+
+
 class Resampler:
     """Stateful PCM16 sample-rate converter for one continuous stream.
 

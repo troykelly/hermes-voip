@@ -75,6 +75,19 @@ def test_make_calls_factory_exactly_once_per_call() -> None:
     assert call_count == 2
 
 
+def test_make_returns_distinct_instances_per_call() -> None:
+    """make() must return a fresh instance on every call (no memoisation/caching).
+
+    This test would fail if make() ever cached the factory result and returned
+    the same object identity on subsequent calls.
+    """
+    reg: ProviderRegistry[_Fake] = ProviderRegistry("thing")
+    reg.register("x", _Fake)
+    first = reg.make("x")
+    second = reg.make("x")
+    assert first is not second
+
+
 def test_register_duplicate_error_includes_kind_and_name() -> None:
     reg: ProviderRegistry[_Fake] = ProviderRegistry("special-thing")
     reg.register("x", _Fake)

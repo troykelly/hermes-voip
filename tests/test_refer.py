@@ -644,6 +644,33 @@ def test_parse_refer_rejects_refer_to_with_replaces_header_form() -> None:
         parse_refer(refer)
 
 
+def test_parse_refer_rejects_non_replaces_embedded_header() -> None:
+    # A Refer-To URI carrying an embedded header other than ``Replaces=`` is a
+    # header-injection vector (e.g. ``?Route=`` would source-route the triggered
+    # INVITE; ``?Header=evil`` is arbitrary injection). Only ``?Replaces=`` is a
+    # legitimate embedded header in an attended-transfer Refer-To; anything else
+    # must raise ReferError even when the pre-``?`` target host is valid.
+    #
+    # This is the fail-open the security review found: ``_replaces_from_uri_query``
+    # silently ignores non-Replaces pairs, so without an explicit query allowlist
+    # check, ``?Header=evil`` passes right through and produces a ReferRequest
+    # with ``replaces=None``.
+    for injected_query in (
+        "Header=evil",
+        "Route=%3Csip%3Aevil%40attacker.example%3E",
+        "Replaces=abc%40x%3Bto-tag%3D1%3Bfrom-tag%3D2&Route=%3Csip%3Aevil%3E",
+    ):
+        uri = f"sip:1001@pbx.example.test?{injected_query}"
+        refer = SipRequest(
+            method="REFER",
+            request_uri="sip:1000@198.51.100.7:5061",
+            headers=(("Refer-To", f"<{uri}>"),),
+            body="",
+        )
+        with pytest.raises(ReferError, match="embedded header"):
+            parse_refer(refer)
+
+
 def test_parse_refer_accepts_valid_bare_extension() -> None:
     # A valid bare extension (digits only) is a legitimate blind-transfer target
     # and must parse without error, returning the extension as refer_to.

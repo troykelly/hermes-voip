@@ -301,8 +301,48 @@ async def _one_chunk(text: str) -> AsyncIterator[str]:
 
 
 @pytest.mark.asyncio
-async def test_finalised_turn_delivers_exactly_once() -> None:
-    """A single end-of-turn transcript fires deliver_turn exactly once."""
+async def test_empty_finalised_turn_is_discarded() -> None:
+    """An empty final ASR turn is silently discarded."""
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    loop = _build_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([("", True, True)]),
+        _FakeTTS([]),
+        _FakeGuard([_allow_result()]),
+        capture,
+    )
+    await loop.run()
+
+    assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_finalised_turn_is_discarded() -> None:
+    """A whitespace-only final ASR turn is silently discarded."""
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    loop = _build_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([("   ", True, True)]),
+        _FakeTTS([]),
+        _FakeGuard([_allow_result()]),
+        capture,
+    )
+    await loop.run()
+
+    assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_non_empty_finalised_turn_delivers_exactly_once() -> None:
+    """A non-empty final ASR turn fires deliver_turn exactly once."""
     delivered: list[str] = []
 
     async def capture(text: str) -> None:

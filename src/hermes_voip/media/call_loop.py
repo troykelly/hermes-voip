@@ -1341,7 +1341,8 @@ class CallLoop:
                             eot_from_endpointer,
                             transcript.end_of_turn,
                         )
-                        await transcript_q.put(transcript.text)
+                        if transcript.text.strip():
+                            await transcript_q.put(transcript.text)
             await transcript_q.put(_END_OF_STREAM)
 
         async def _delivery() -> None:

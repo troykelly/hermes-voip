@@ -1347,6 +1347,17 @@ def _coerce_crypto(crypto: CryptoAttribute | str | None) -> CryptoAttribute | No
     return CryptoAttribute.parse(body)
 
 
+def _addrtype(addr: str) -> str:
+    """Return 'IP6' if *addr* is an IPv6 address, else 'IP4' (RFC 4566 §5.2/5.7).
+
+    Caller contract: *addr* MUST be a bare IP literal — no brackets, no port
+    suffix, no zone-id.  All callers receive ``local_address`` from
+    ``_host_of()`` in adapter.py, which strips brackets before returning,
+    guaranteeing a bare literal reaches here.
+    """
+    return "IP6" if ":" in addr else "IP4"
+
+
 def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keyword-only
     *,
     local_address: str,
@@ -1387,11 +1398,12 @@ def _build_audio_body(  # noqa: PLR0913 - SDP fields are independent; all keywor
         raise ValueError(msg)
     profile = _SECURE_PROFILE if crypto is not None else _PLAIN_PROFILE
     payloads = " ".join(str(c.payload_type) for c in codecs)
+    addrtype = _addrtype(local_address)
     lines = [
         "v=0",
-        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
+        f"o=- {session_id} {sess_version} IN {addrtype} {local_address}",
         "s=-",
-        f"c=IN IP4 {local_address}",
+        f"c=IN {addrtype} {local_address}",
         "t=0 0",
         f"m=audio {port} {profile} {payloads}",
     ]
@@ -1521,9 +1533,10 @@ def _build_webrtc_body(  # noqa: PLR0913 - WebRTC SDP fields are independent; al
     payloads = " ".join(str(c.payload_type) for c in codecs)
     # RFC 5763 §5: no c= line on a DTLS-SRTP m-line (connection address is
     # conveyed by ICE candidates, not a c= attribute).
+    _at = _addrtype(local_address)
     lines = [
         "v=0",
-        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
+        f"o=- {session_id} {sess_version} IN {_at} {local_address}",
         "s=-",
         "t=0 0",
     ]
@@ -1747,11 +1760,12 @@ def _build_sip_dtls_body(  # noqa: PLR0913 - SDP fields are independent; all key
         msg = f"ptime must be positive, got {ptime}"
         raise ValueError(msg)
     payloads = " ".join(str(c.payload_type) for c in codecs)
+    addrtype = _addrtype(local_address)
     lines = [
         "v=0",
-        f"o=- {session_id} {sess_version} IN IP4 {local_address}",
+        f"o=- {session_id} {sess_version} IN {addrtype} {local_address}",
         "s=-",
-        f"c=IN IP4 {local_address}",
+        f"c=IN {addrtype} {local_address}",
         "t=0 0",
         f"m=audio {port} {_SIP_DTLS_PROFILE} {payloads}",
     ]

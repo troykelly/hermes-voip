@@ -27,9 +27,11 @@ can never validate for its family even if it is one this code never enumerated.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path, PurePosixPath
 from typing import assert_never
 
 __all__ = [
@@ -42,10 +44,20 @@ __all__ = [
     "LicenceError",
     "ModelFamily",
     "ModelFile",
+    "ModelIntegrityError",
     "ModelManifest",
     "licence_ok",
     "validate_manifest",
+    "verify_model_files",
 ]
+
+# Streaming hash chunk size: hash a large weight file without loading it whole
+# into memory (an ONNX model is hundreds of MB; the guard's DeBERTa is ~700 MB).
+_HASH_CHUNK_BYTES = 1 << 20  # 1 MiB
+# How many leading hex chars of a digest the mismatch error reports — enough to
+# make "this is a different artifact" obvious in an audit log, while never echoing
+# the full digest or any file bytes.
+_DIGEST_PREFIX_LEN = 12
 
 # A model file's content digest: exactly 64 lowercase hex chars (SHA-256). A pin
 # that is not a full digest is not a pin, so construction rejects it.
@@ -66,6 +78,22 @@ class LicenceError(ValueError):
     Raised by :func:`validate_manifest`. The message names the offending file
     and its licence so the CI licence-gate log (and the audit trail) records
     exactly which artifact failed and why (rule 35).
+    """
+
+
+class ModelIntegrityError(ValueError):
+    """A materialised model file's on-disk bytes do not match its pinned sha256.
+
+    Raised by :func:`verify_model_files` when a pinned file is missing from the
+    model directory, or when its streamed SHA-256 differs from the digest the
+    manifest pins. This is the content half of the pin (rule 35): the licence gate
+    asserts the *declared* SPDX, while this asserts the *actual bytes* are the
+    audited artifact — most critically the prompt-injection GUARD model (ADR-0009),
+    whose silent substitution would neuter the injection defence.
+
+    The message names the offending file and a short digest prefix only; it never
+    echoes file bytes, so an audit log records which artifact failed without
+    leaking model content.
     """
 
 
@@ -146,6 +174,18 @@ class ModelFile:
         """Reject a file that is not a real pin (no name, bad digest, no licence)."""
         if not self.name:
             msg = "ModelFile.name must not be empty"
+            raise ValueError(msg)
+        # Validate, don't trust: reject absolute paths and parent-traversal segments
+        # so a malicious manifest cannot direct verify_model_files to hash a file
+        # outside the model directory.  Checked here (construction) so the invariant
+        # is enforced as early as possible — belt; verify_model_files re-checks as
+        # suspenders.
+        _name_pure = PurePosixPath(self.name)
+        if _name_pure.is_absolute() or ".." in _name_pure.parts:
+            msg = (
+                f"ModelFile.name must be a relative path with no path traversal, "
+                f"got {self.name!r}"
+            )
             raise ValueError(msg)
         if _SHA256_RE.fullmatch(self.sha256) is None:
             msg = (
@@ -327,3 +367,74 @@ def validate_manifest(manifest: ModelManifest, family: ModelFamily) -> None:
                 f"{', '.join(sorted(_allowed_spdx(family)))})"
             )
             raise LicenceError(msg)
+
+
+def _sha256_file(path: Path) -> str:
+    """Stream ``path`` through SHA-256 in fixed chunks and return the hex digest.
+
+    Chunked so a multi-hundred-MB ONNX weight never loads whole into memory
+    (efficiency, rule 22). The file is read in binary; no bytes are returned or
+    logged — only the digest leaves this function.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(_HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_model_files(manifest: ModelManifest, model_dir: str) -> None:
+    """Assert each pinned file under ``model_dir`` hashes to its pinned sha256.
+
+    The content half of the pin (rule 35), complementing :func:`validate_manifest`
+    (which checks only the declared SPDX): for every :class:`ModelFile` in
+    ``manifest``, resolve ``model_dir / file.name`` (the name may carry a
+    subdirectory, e.g. ``onnx/model.onnx``), stream it through SHA-256, and compare
+    to the pin. A missing file or a digest mismatch means the on-disk artifact is
+    NOT the audited one — most critically a swapped prompt-injection GUARD model
+    (ADR-0009) — so it raises rather than loading suspect weights.
+
+    Errors propagate (rule 37): the first offending file raises
+    :class:`ModelIntegrityError`, naming the file and a short digest prefix only —
+    never echoing file bytes, so the audit log records the failure without leaking
+    model content.
+
+    Args:
+        manifest: The pinned model artifact whose files to verify.
+        model_dir: The directory the model files were materialised into.
+
+    Raises:
+        ModelIntegrityError: If a pinned file is missing from ``model_dir`` or its
+            on-disk SHA-256 does not match the manifest's pinned digest.
+    """
+    root = Path(model_dir)
+    for file in manifest.files:
+        # Belt-and-suspenders: ModelFile.__post_init__ already rejects traversal
+        # names at construction, but we re-check here so that any hypothetical
+        # bypass (e.g. unpickling, object.__setattr__ on the frozen dataclass, or a
+        # future code path that skips construction) cannot reach the filesystem open.
+        _name_pure = PurePosixPath(file.name)
+        if _name_pure.is_absolute() or ".." in _name_pure.parts:
+            msg = (
+                f"{manifest.repo}@{manifest.revision}: pinned file {file.name!r} "
+                f"contains path traversal — refusing to hash a file outside the "
+                f"model directory"
+            )
+            raise ModelIntegrityError(msg)
+        path = root / file.name
+        if not path.is_file():
+            msg = (
+                f"{manifest.repo}@{manifest.revision}: pinned file {file.name!r} "
+                f"(expected sha256 {file.sha256[:_DIGEST_PREFIX_LEN]}…) "
+                f"is missing from the model directory"
+            )
+            raise ModelIntegrityError(msg)
+        actual = _sha256_file(path)
+        if actual != file.sha256:
+            msg = (
+                f"{manifest.repo}@{manifest.revision}: pinned file {file.name!r} "
+                f"sha256 mismatch (expected {file.sha256[:_DIGEST_PREFIX_LEN]}…, "
+                f"got {actual[:_DIGEST_PREFIX_LEN]}…) — on-disk bytes are not the "
+                f"audited artifact"
+            )
+            raise ModelIntegrityError(msg)

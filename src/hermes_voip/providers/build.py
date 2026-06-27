@@ -33,14 +33,19 @@ Design invariants
 - **Fail-fast on misconfiguration**: a self-host provider whose required model dir
   is ``None`` raises :class:`~hermes_voip.config.ConfigError` naming the missing
   env var, inside the factory, before any model load.
-- **Licence gate (rule 35 / ADR-0006/0007/0009)**: every *self-host default* model
-  factory runs :func:`~hermes_voip.manifest.validate_manifest` against the family's
-  pinned :class:`~hermes_voip.manifest.ModelManifest` before constructing the
-  provider — STT (:data:`~hermes_voip.manifest.STT_MODEL_MANIFEST`), TTS
+- **Licence + integrity gate (rule 35 / ADR-0006/0007/0009)**: every *self-host
+  default* model factory runs :func:`~hermes_voip.manifest.validate_manifest`
+  (declared-SPDX check) AND :func:`~hermes_voip.manifest.verify_model_files`
+  (on-disk SHA-256 check) against the family's pinned
+  :class:`~hermes_voip.manifest.ModelManifest` before constructing the provider —
+  STT (:data:`~hermes_voip.manifest.STT_MODEL_MANIFEST`), TTS
   (:data:`~hermes_voip.manifest.TTS_MODEL_MANIFEST`), and the ONNX guard
-  (:data:`~hermes_voip.manifest.GUARD_MODEL_MANIFEST`). Cloud providers
-  (Deepgram, ElevenLabs) carry no committed model artifact and skip the gate.
-  :class:`~hermes_voip.manifest.LicenceError` propagates uncaught (rule 37).
+  (:data:`~hermes_voip.manifest.GUARD_MODEL_MANIFEST`). The integrity check hashes
+  the materialised ``model_dir`` so a swapped or truncated weight (most critically
+  a neutered prompt-injection guard, ADR-0009) is caught before any model load.
+  Cloud providers (Deepgram, ElevenLabs) carry no committed model artifact and skip
+  both gates. :class:`~hermes_voip.manifest.LicenceError` /
+  :class:`~hermes_voip.manifest.ModelIntegrityError` propagate uncaught (rule 37).
 - **ML-free import**: importing this module never loads sherpa-onnx, onnxruntime,
   tokenizers, or websockets. Each factory lazy-imports the concrete class only when
   invoked.
@@ -65,6 +70,7 @@ from hermes_voip.manifest import (
     TTS_MODEL_MANIFEST,
     ModelFamily,
     validate_manifest,
+    verify_model_files,
 )
 from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.guard import InjectionGuard
@@ -129,6 +135,9 @@ def _make_sherpa_onnx_asr(config: MediaConfig) -> StreamingASR:
     # Licence gate (rule 35): the pinned default STT model must declare an
     # STT-family-allowed SPDX before we construct the provider.
     validate_manifest(STT_MODEL_MANIFEST, ModelFamily.STT)
+    # Integrity gate (rule 35): the on-disk weights under model_dir must hash to
+    # the pinned sha256 — the audited bytes, not a swapped artifact.
+    verify_model_files(STT_MODEL_MANIFEST, model_dir)
     from hermes_voip.stt.sherpa_onnx import SherpaOnnxASR  # noqa: PLC0415
 
     return SherpaOnnxASR(model_dir)
@@ -153,6 +162,9 @@ def _make_sherpa_kokoro_tts(config: MediaConfig) -> StreamingTTS:
     # Licence gate (rule 35): the pinned default TTS model must declare a
     # TTS-family-allowed SPDX before we construct the provider.
     validate_manifest(TTS_MODEL_MANIFEST, ModelFamily.TTS)
+    # Integrity gate (rule 35): the on-disk weights under model_dir must hash to
+    # the pinned sha256 — the audited bytes, not a swapped artifact.
+    verify_model_files(TTS_MODEL_MANIFEST, model_dir)
     voice = config.tts_voice or ""
     from hermes_voip.tts.sherpa_kokoro import SherpaKokoroTTS  # noqa: PLC0415
 
@@ -230,6 +242,10 @@ def _make_onnx_guard(config: MediaConfig) -> InjectionGuard:
         raise ConfigError(msg)
     # Licence gate (rule 35 / ADR-0009): runs before any model load.
     validate_manifest(GUARD_MODEL_MANIFEST, ModelFamily.GUARD)
+    # Integrity gate (rule 35 / ADR-0009): the on-disk guard weights must hash to
+    # the pinned sha256. A silently-swapped guard neuters ADR-0009's injection
+    # defence, so this verifies the audited bytes before any model load.
+    verify_model_files(GUARD_MODEL_MANIFEST, model_dir)
     from hermes_voip.guard.onnx import (  # noqa: PLC0415
         OnnxInjectionGuard,
         build_onnx_classifier,
@@ -305,6 +321,8 @@ def build_providers(
         ConfigError: If a self-host provider requires a model dir that is ``None``.
         LicenceError: If a self-host default model's pinned manifest fails its
             family licence gate.
+        ModelIntegrityError: If a self-host default model's on-disk files do not
+            match their pinned sha256 (a swapped, truncated, or missing artifact).
     """
     asr = _dispatch("asr", asr_factories, config.stt_provider, config)
     tts = _resolve_tts(tts_factories, config)

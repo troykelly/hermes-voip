@@ -10,7 +10,12 @@ barge-in. Sentence/clause segmentation of the agent's token stream lives in
 
 from __future__ import annotations
 
-from hermes_voip.tts.elevenlabs import ElevenLabsTTS
+from hermes_voip.tts.elevenlabs import (
+    ElevenLabsRequest,  # noqa: F401 -- kept importable for back-compat; intentionally excluded from __all__
+    ElevenLabsTTS,
+    HttpByteStream,  # noqa: F401 -- kept importable for back-compat; intentionally excluded from __all__
+    HttpCancellation,  # noqa: F401 -- kept importable for back-compat; intentionally excluded from __all__
+)
 from hermes_voip.tts.failover import (
     FailoverTTS,
     SupportsCallReset,

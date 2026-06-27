@@ -408,6 +408,31 @@ def test_is_connected_false_when_sip_env_absent() -> None:
     assert fn(probe) is False
 
 
+def test_validate_config_raises_on_missing_selected_provider_key() -> None:
+    """validate_voip_config must fail-fast on full VoIP env misconfiguration.
+
+    Selecting a cloud media provider without its required credential must be
+    rejected in plugin preflight, not later inside adapter setup. The error must
+    name the missing setting, never the secret value.
+    """
+    from hermes_voip.config import ConfigError  # noqa: PLC0415
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    cfg = MagicMock()
+    cfg.extra = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "fake-password",
+        "HERMES_VOIP_STT_PROVIDER": "deepgram",
+    }
+
+    with pytest.raises(ConfigError, match="DEEPGRAM_API_KEY") as exc_info:
+        validate_voip_config(cfg)
+
+    assert "deepgram" in str(exc_info.value)
+    assert "fake-password" not in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # (f) _env_enablement copies DEEPGRAM_API_KEY / ELEVENLABS_API_KEY so that
 #     load_media_config(extra) succeeds when a cloud provider is selected.

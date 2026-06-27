@@ -59,6 +59,46 @@ __all__ = [
 
 _MS_PER_SECOND: Final[int] = 1000
 
+# ---------------------------------------------------------------------------
+# Efficiency documentation (rule 22)
+# ---------------------------------------------------------------------------
+# Measured per-frame cost of ``CallProgressDetector.on_audio_frame`` on a
+# devcontainer core (Python 3.13, 10 000 iterations via ``timeit``):
+#
+#   * 16 kHz / 320-sample frame, silence (energy below floor, early exit):
+#     ~34-44 µs/frame
+#   * 16 kHz / 320-sample frame, 1100 Hz CNG tone (energy above floor,
+#     5 guard bins evaluated for CNG, 1 each for CED/BEEP): ~106-132 µs/frame
+#   * 16 kHz / 320-sample frame, worst-case (outbound + machine decided + beep
+#     path active, 1000 Hz tone — 7 Goertzel passes total): ~127-138 µs/frame
+#
+# Worst-case Goertzel pass breakdown (outbound + machine classified + beep active,
+# 1000 Hz frame dominating the beep check):
+#   CNG check  (1100 Hz): 1 target call → fraction fails → 0 guards  = 1 pass
+#   CED check  (2100 Hz): 1 target call → fraction fails → 0 guards  = 1 pass
+#   BEEP check (1000 Hz): 1 target call → fraction passes → 4 guards = 5 passes
+#   Total: 7 Goertzel passes per frame (deterministic upper bound).
+#
+# A single frame can only be dominated by one pure tone at a time; the theoretical
+# 15-pass scenario (each of 3 tones passing its fraction test) requires simultaneous
+# energy at 1000/1100/2100 Hz, which pure telephony tones never produce.
+#
+# The 20 ms frame period is the outer budget wall; 131 µs = 0.66 % of that period.
+# Up to 7 Goertzel passes per frame on the worst-case path (1 CNG target + 1 CED
+# target + 5 BEEP target+guards); each pass walks n samples in O(n) — the same
+# order as one ``InbandDtmfDetector`` low/high pass already on the hot path
+# (ADR-0064). No FFT, no allocation beyond the per-frame float list.
+#
+# The per-frame test gate in ``tests/test_call_progress_microbench.py`` uses a
+# deterministic Goertzel-pass count as the primary gate and a generous 5 ms wall-
+# clock ceiling (~38 x the worst-case measured cost) as a coarse safety net.
+#
+#: Documented worst-case per-frame cost in µs at 16 kHz (320 samples) on the beep
+#: path (outbound + machine classified + 1000 Hz tone, 7 Goertzel passes) —
+#: the value most relevant to the resampled conversational pipeline (ADR-0017).
+#: Re-measure and update if the implementation changes (rule 22).
+_ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K: Final[float] = 131.0
+
 
 # ---------------------------------------------------------------------------
 # Event model — a tagged, frozen discriminated union (rule 17: exhaustive match,
@@ -486,6 +526,18 @@ class CallProgressDetector:
         been classified, the record-beep detector AND the tick-driven no-beep
         fallback. ``elapsed_s`` is the running sample count divided by the rate, so
         it stays exact under variable or zero-length frames with no wall clock.
+
+        **Per-frame cost (rule 22):** O(n) in the frame sample count.  Measured on a
+        devcontainer core (Python 3.13, ``timeit`` 10 000 iterations):
+
+        * 16 kHz / 320 samples, silence (energy below floor, early exit): ~34-44 µs
+        * 16 kHz / 320 samples, 1100 Hz tone (5 guard bins for CNG): ~106-132 µs
+        * 16 kHz / 320 samples, worst-case (outbound + machine classified + beep
+          active, 1000 Hz tone — 7 Goertzel passes total): ~127-138 µs
+
+        The 20 ms frame period is the outer budget wall; 131 µs = 0.66 % of that
+        budget.  See :data:`_ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K` and
+        ``tests/test_call_progress_microbench.py`` for the gating test.
 
         Args:
             frame: PCM16-LE mono audio at this detector's ``sample_rate``.

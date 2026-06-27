@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -91,6 +92,7 @@ __all__ = [
     "TRANSFER_BLIND_TOOL_NAME",
     "TRANSFER_BLIND_TOOL_SCHEMA",
     "VOIP_TOOLSET",
+    "_RING_TIMEOUT_ENV",  # ADR-0084: stable public name of the ring-timeout env var
     "AttendedTransferOutcome",
     "PlaceCallOutcome",
     "TransferOutcome",
@@ -247,18 +249,25 @@ _NO_ANSWER_STATUSES: frozenset[int] = frozenset({408, 487})
 _DECLINED_STATUSES: frozenset[int] = frozenset({603})
 
 #: Environment variable for the bounded ring timeout (seconds). When set to a
-#: positive float, ``place_call_handler`` forwards it as ``ring_timeout_secs``
+#: finite positive float, ``place_call_handler`` forwards it as ``ring_timeout_secs``
 #: to :meth:`VoipToolHost.place_call_with_objective`, which arms the ADR-0069
-#: outbound CANCEL timer. Unset / non-numeric / zero-or-negative => ``None``
-#: (the adapter's hard sink timeout governs instead). Default: unset.
+#: outbound CANCEL timer. Unset / non-numeric / non-finite (``inf`` / ``nan``) /
+#: zero-or-negative => ``None`` (the adapter's hard sink timeout governs instead).
+#: Default: unset.
 _RING_TIMEOUT_ENV = "HERMES_VOIP_RING_TIMEOUT_SECS"
 
 
 def _parse_ring_timeout() -> float | None:
     """Read ``HERMES_VOIP_RING_TIMEOUT_SECS`` and return it as a positive float.
 
-    Returns ``None`` when the variable is unset, blank, non-numeric, or
-    non-positive (<=0). Never raises — a bad value is treated as absent.
+    Returns ``None`` when the variable is unset, blank, non-numeric, non-positive
+    (<=0), or non-finite. Never raises — a bad value is treated as absent.
+
+    ``float("inf")`` / ``"nan"`` parse cleanly and ``inf > 0`` is ``True``, so a
+    bare positivity check would accept a positive-infinity timeout — an *unbounded*
+    ring, which defeats the whole point of a bounded ring-timeout policy. The
+    ``math.isfinite`` guard rejects ±inf and NaN so only a real, finite positive
+    bound is honoured.
     """
     raw = os.environ.get(_RING_TIMEOUT_ENV, "")
     if not raw:
@@ -266,6 +275,8 @@ def _parse_ring_timeout() -> float | None:
     try:
         value = float(raw)
     except ValueError:
+        return None
+    if not math.isfinite(value):
         return None
     return value if value > 0 else None
 
@@ -1092,6 +1103,30 @@ async def place_call_handler(  # noqa: PLR0911 — each return is a distinct, cl
                 {
                     "error": f"outbound call failed: {outcome.value}",
                     "failure_outcome": outcome.value,
+                }
+            )
+        except RuntimeError as exc:
+            # A transport/media-initialisation failure (e.g. the RTP transport could
+            # not be opened, or the WSS/WebRTC path is unsupported): NOT a SIP final
+            # response, but ADR-0084 classifies it as the FAILED outcome so the agent
+            # still receives the structured ``failure_outcome`` contract instead of a
+            # generic, unstructured error. The exception message can embed gateway
+            # connection details (host:port) — so, exactly like the SIP path above
+            # suppresses the reason phrase, ``str(exc)`` is NEVER echoed in the
+            # agent-facing result (rule 34 / public-repo invariant). The failure is
+            # still surfaced to the operator's logs (rule 37), but with only the
+            # exception TYPE name (no message, no traceback) so a host/port embedded
+            # in the message cannot leak into logs either.
+            _log.error(
+                "VoIP tool %r: outbound call failed at transport/media init "
+                "with a %s (detail redacted)",
+                PLACE_CALL_TOOL_NAME,
+                type(exc).__name__,
+            )
+            return json.dumps(
+                {
+                    "error": f"outbound call failed: {PlaceCallOutcome.FAILED.value}",
+                    "failure_outcome": PlaceCallOutcome.FAILED.value,
                 }
             )
         return json.dumps({"call_id": call_id})

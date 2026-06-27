@@ -40,15 +40,25 @@ typed outcome values the agent can branch on:
 | `DECLINED` | 603 | Callee explicitly rejected the call |
 | `FAILED` | anything else | Any other non-2xx, or transport/init failure |
 
-The `place_call_handler` catches `OutboundCallFailed` and `OutboundCallCancelled`
-specifically (BEFORE the outer `except Exception` boundary) and returns:
+The `place_call_handler` catches `OutboundCallFailed`, `OutboundCallCancelled`, **and
+`RuntimeError`** specifically (BEFORE the outer `except Exception` boundary) and returns:
 
 ```json
 {"error": "outbound call failed: <outcome.value>", "failure_outcome": "<outcome.value>"}
 ```
 
 The SIP `reason` phrase is **never** echoed in the agent-facing result (only the classified
-category). The `OutboundCallNotAllowed` (allowlist refusal before any dial) stays as a plain
+category). A transport/media-initialisation `RuntimeError` (e.g. the RTP transport could not
+be opened, or the WSS/WebRTC outbound path raises `NotImplementedError` — a `RuntimeError`
+subclass) is caught here and mapped to `PlaceCallOutcome.FAILED`, so a non-SIP failure still
+carries the structured `failure_outcome` contract instead of falling through to the generic
+boundary handler. Its `str(exc)` is **redacted exactly like the SIP reason phrase** — the
+message can embed gateway connection details (host:port), so only the classified `FAILED`
+category is surfaced, never the raw exception text (rule 34). The failure is still logged for
+the operator (rule 37), but with only the exception **type name** (no message, no traceback)
+so a host/port in the message cannot leak into logs either.
+
+The `OutboundCallNotAllowed` (allowlist refusal before any dial) stays as a plain
 `{"error": ...}` with **no** `failure_outcome` key — this is a policy gate, not a SIP
 failure.
 
@@ -58,10 +68,15 @@ The `failure_outcome` value is the stable JSON API surface for the agent; it mat
 
 ### (B) Ring timeout via `HERMES_VOIP_RING_TIMEOUT_SECS`
 
-A new env var `HERMES_VOIP_RING_TIMEOUT_SECS` (positive float, default unset) is read by
-`place_call_handler` at call time via `_parse_ring_timeout()` and forwarded as
+A new env var `HERMES_VOIP_RING_TIMEOUT_SECS` (finite positive float, default unset) is read
+by `place_call_handler` at call time via `_parse_ring_timeout()` and forwarded as
 `ring_timeout_secs` to `VoipToolHost.place_call_with_objective`. The adapter wires it to
 `place_call(..., ring_timeout_secs=...)` which arms the existing ADR-0069 timer.
+
+`_parse_ring_timeout()` rejects (returns `None`, i.e. treats as absent) any value that is
+unset, blank, non-numeric, non-positive, **or non-finite** — `math.isfinite()` guards
+against `inf`/`nan`, because `float("inf") > 0` is `True` and a positive-infinity timeout is
+an *unbounded* ring, which defeats the bounded-timeout policy this section establishes.
 
 On expiry the adapter raises `OutboundCallCancelled`, which the handler maps to
 `PlaceCallOutcome.NO_ANSWER` — "we stopped waiting, no one answered".

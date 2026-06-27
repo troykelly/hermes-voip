@@ -775,17 +775,36 @@ class CallSession:
         await self._media.stop()
 
     async def _on_notify(self, request: SipRequest) -> None:
-        """Answer an inbound transfer-progress NOTIFY; a malformed one gets 400.
+        """Dispatch an inbound NOTIFY by its Event package (RFC 6665 §8.2.1).
 
-        ``parse_notify_sipfrag`` raises :class:`ReferError` on a NOTIFY that is
-        missing ``Subscription-State`` or whose body has no ``SIP/2.0`` status-line.
-        That is a malformed PEER message, not our bug — answer it ``400 Bad Request``
-        and return, never letting the error propagate. Propagation would reach the
-        transport read loop and tear down the ENTIRE signalling connection (and its
-        registration), dropping every concurrent call on it: a one-message DoS. The
-        progress field is left unchanged on a malformed NOTIFY (rule 37 nuance: a
-        malformed inbound message is answered, not fatal).
+        ``_on_notify`` is the target for EVERY in-dialog NOTIFY, but only an
+        ``Event: refer`` NOTIFY carries a ``message/sipfrag`` transfer-progress body
+        (RFC 3515). A NOTIFY for any other Event package (dialog/presence, or a
+        misrouted ``message-summary`` MWI) — or one with no ``Event`` header — is NOT
+        a transfer-progress notification: it gets a plain ``200 OK`` and
+        ``transfer_progress`` is left untouched. Feeding such a body to
+        ``parse_notify_sipfrag`` would (mis)answer the peer's legitimate NOTIFY
+        ``400 Bad Request`` when its body lacks a ``SIP/2.0`` status-line, or
+        silently corrupt ``transfer_progress`` if the first line happened to look
+        like one.
+
+        The Event-type token is the part before any ``;`` parameters, compared
+        case-insensitively (RFC 6665 §8.2.1: event-type is case-insensitive).
+
+        Only the ``refer`` package reaches ``parse_notify_sipfrag``, which raises
+        :class:`ReferError` on a NOTIFY missing ``Subscription-State`` or whose body
+        has no ``SIP/2.0`` status-line. That is a malformed PEER message, not our
+        bug — it is answered ``400 Bad Request`` and the error never propagates.
+        Propagation would reach the transport read loop and tear down the ENTIRE
+        signalling connection (and its registration), dropping every concurrent call
+        on it: a one-message DoS (rule 37 nuance: a malformed inbound message is
+        answered, not fatal).
         """
+        event = request.header("Event")
+        package = event.split(";", 1)[0].strip().lower() if event is not None else ""
+        if package != "refer":
+            await self._signaling.send(build_response(request, 200, "OK"))
+            return
         try:
             progress = parse_notify_sipfrag(request)
         except ReferError:

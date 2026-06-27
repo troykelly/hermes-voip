@@ -763,6 +763,32 @@ def test_sha256_sess_without_qop_raises() -> None:
         )
 
 
+def test_parse_rejects_challenge_without_realm() -> None:
+    # A challenge omitting realm= is malformed; hashing an empty realm silently
+    # corrupts HA1.  Symmetric with the missing-nonce path that already raises.
+    with pytest.raises(ValueError, match="realm"):
+        DigestChallenge.parse('Digest nonce="n", qop="auth"')
+
+
+def test_parse_rejects_challenge_with_empty_realm() -> None:
+    # An explicitly empty realm="" is equally malformed and must also raise.
+    with pytest.raises(ValueError, match="realm"):
+        DigestChallenge.parse('Digest realm="", nonce="n", qop="auth"')
+
+
+def test_parse_ignores_unknown_hyphenated_extension_param() -> None:
+    # The _PARAM regex (\w[\w-]*) accepts hyphenated param names as tokens.
+    # Unknown extension params (x-custom-param, x-foo-bar) must be silently
+    # ignored — they must not raise and must not corrupt the known fields.
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n", qop="auth", '
+        'x-custom-param=foo, x-foo-bar="baz qux"'
+    )
+    assert challenge.realm == "pbx.example.test"
+    assert challenge.nonce == "n"
+    assert challenge.qop == ("auth",)
+
+
 def test_plain_md5_no_qop_still_uses_legacy_rfc2069() -> None:
     # Regression guard: plain MD5 with no qop MUST keep the RFC 2069 legacy
     # form response = MD5(HA1:nonce:HA2), with no qop/nc/cnonce in the header.

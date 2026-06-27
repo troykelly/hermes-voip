@@ -374,6 +374,17 @@ def test_parse_notify_sipfrag_rejects_missing_subscription_state() -> None:
 
 
 def test_attended_refer_appends_replaces_when_target_has_uri_header() -> None:
+    # This test checks build_attended_refer's ``&`` separator logic only: when the
+    # consultation dialog's remote_target already carries a ``?``-headed URI (an
+    # unusual but syntactically valid SIP Contact), the outbound REFER must join
+    # the ``Replaces=`` with ``&``, never produce a malformed second ``?``.
+    #
+    # NOTE: parse_refer is NOT called here because a Refer-To carrying
+    # ``?Subject=consult&Replaces=...`` would be rejected by the inbound query
+    # guard (_validate_refer_to_query rejects any non-Replaces embedded header key).
+    # The build-side test and the parse-side security boundary are intentionally
+    # separate concerns: a transferee receiving such a REFER with an extra header
+    # MUST reject it (see test_parse_refer_rejects_non_replaces_embedded_header).
     consult = _consult()
     with_header = Dialog(
         call_id=consult.call_id,
@@ -394,9 +405,6 @@ def test_attended_refer_appends_replaces_when_target_has_uri_header() -> None:
     # A second URI header is joined with '&', never a malformed second '?'.
     assert refer_to.count("?") == 1
     assert "&Replaces=" in refer_to
-    parsed = parse_refer(refer)
-    assert parsed.replaces is not None
-    assert parsed.replaces.to_tag == "c-tag"
 
 
 def test_build_blind_refer_carries_auth_header() -> None:
@@ -608,3 +616,101 @@ def test_build_blind_refer_rejects_percent_encoded_close_angle() -> None:
     # ``%3E`` decodes to ``>`` — closes the ``Refer-To: <...>`` early.
     with pytest.raises(ValueError, match="transfer target"):
         build_blind_refer(_dialog(), "sip:3000@pbx.example.test%3Eevil")
+
+
+# ---- parse_refer injection guard (security) --------------------------------
+#
+# An attacker-influenced inbound REFER carries a hostile Refer-To target that
+# parse_refer must reject before building a ReferRequest.  The same guard
+# (_validate_transfer_target) used by build_blind_refer runs here.
+
+
+def test_parse_refer_rejects_foreign_host_in_refer_to() -> None:
+    # ``1001@evil.com`` is a host-hijack on a bare extension: not a dialable
+    # user-part and not a well-formed sip: URI, so parse_refer must raise ReferError.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", "<1001@evil.com>"),),
+        body="",
+    )
+    with pytest.raises(ReferError):
+        parse_refer(refer)
+
+
+def test_parse_refer_target_rejection_message_does_not_echo_cause() -> None:
+    # Defense-in-depth (rule 34): the ReferError raised when the pre-``?`` target
+    # fails _validate_transfer_target carries a FIXED message that never
+    # interpolates the underlying ValueError or the raw attacker-supplied target,
+    # so a future validator message that echoed the raw value could not leak
+    # through this boundary. Pins the no-echo contract at parse_refer. (An earlier
+    # form interpolated ``: {exc}`` and would fail this exact-message assertion.)
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", "<1001@evil.com>"),),
+        body="",
+    )
+    with pytest.raises(ReferError) as excinfo:
+        parse_refer(refer)
+    assert str(excinfo.value) == "REFER Refer-To target rejected by injection guard"
+    # The underlying ValueError cause is still preserved for debugging (rule 37).
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_parse_refer_rejects_refer_to_with_non_replaces_header_form() -> None:
+    # A Refer-To carrying any embedded header key other than ``Replaces`` is a
+    # header-injection vector; parse_refer must raise ReferError.
+    # NOTE: ``?Replaces=<dialog-id>`` on a valid host IS accepted for attended
+    # transfer (see test_parse_attended_refer_extracts_replaces); this test covers
+    # the non-Replaces injection case with an otherwise-valid host and target.
+    _uri = "sip:1001@pbx.example.test?Subject=evil"
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", f"<{_uri}>"),),
+        body="",
+    )
+    with pytest.raises(ReferError, match="embedded header"):
+        parse_refer(refer)
+
+
+def test_parse_refer_rejects_non_replaces_embedded_header() -> None:
+    # A Refer-To URI carrying an embedded header other than ``Replaces=`` is a
+    # header-injection vector (e.g. ``?Route=`` would source-route the triggered
+    # INVITE; ``?Header=evil`` is arbitrary injection). Only ``?Replaces=`` is a
+    # legitimate embedded header in an attended-transfer Refer-To; anything else
+    # must raise ReferError even when the pre-``?`` target host is valid.
+    #
+    # This is the fail-open the security review found: ``_replaces_from_uri_query``
+    # silently ignores non-Replaces pairs, so without an explicit query allowlist
+    # check, ``?Header=evil`` passes right through and produces a ReferRequest
+    # with ``replaces=None``.
+    for injected_query in (
+        "Header=evil",
+        "Route=%3Csip%3Aevil%40attacker.example%3E",
+        "Replaces=abc%40x%3Bto-tag%3D1%3Bfrom-tag%3D2&Route=%3Csip%3Aevil%3E",
+    ):
+        uri = f"sip:1001@pbx.example.test?{injected_query}"
+        refer = SipRequest(
+            method="REFER",
+            request_uri="sip:1000@198.51.100.7:5061",
+            headers=(("Refer-To", f"<{uri}>"),),
+            body="",
+        )
+        with pytest.raises(ReferError, match="embedded header"):
+            parse_refer(refer)
+
+
+def test_parse_refer_accepts_valid_bare_extension() -> None:
+    # A valid bare extension (digits only) is a legitimate blind-transfer target
+    # and must parse without error, returning the extension as refer_to.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", "<1001>"),),
+        body="",
+    )
+    parsed = parse_refer(refer)
+    assert parsed.refer_to == "1001"
+    assert parsed.replaces is None

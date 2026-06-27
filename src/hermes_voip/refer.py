@@ -351,8 +351,23 @@ def build_attended_refer(
 def parse_refer(request: SipRequest) -> ReferRequest:
     """Parse an inbound REFER into its target, ``Replaces``, and ``Referred-By``.
 
+    Two injection guards run in order before a :class:`ReferRequest` is built:
+
+    1. **Target guard** (:func:`_validate_transfer_target`) — validates the
+       pre-``?`` URI part (extension or ``sip:``/``sips:`` URI shape); rejects
+       foreign-host hijacks, control chars, angle brackets, etc.
+    2. **Query guard** (:func:`_validate_refer_to_query`) — if the URI carries a
+       ``?``-query, it must contain ONLY a single ``Replaces=`` key
+       (case-insensitive). Any other embedded header key (``?Route=``,
+       ``?Header=``, etc.) or a duplicate ``Replaces`` is rejected as a
+       header-injection vector, even when the pre-``?`` host is valid. A bare
+       ``?Replaces=<dialog-id>`` is the legitimate attended-transfer case (RFC
+       3515/3891) and is accepted.
+
     Raises:
-        ReferError: if the REFER does not carry exactly one ``Refer-To`` header.
+        ReferError: if the REFER does not carry exactly one ``Refer-To`` header,
+            or if the pre-``?`` target fails the injection guard, or if the
+            ``?``-query carries any embedded header key other than ``Replaces``.
     """
     refer_to_values = request.headers_all("Refer-To")
     if len(refer_to_values) != 1:
@@ -360,6 +375,22 @@ def parse_refer(request: SipRequest) -> ReferRequest:
         raise ReferError(msg)
     addr = _bracketed_uri(refer_to_values[0])
     target, _, query = addr.partition("?")
+    # Guard 1: validate the pre-``?`` target (extension or sip: URI shape).
+    # _validate_transfer_target raises ValueError; wrap as ReferError with a
+    # FIXED message and ``from exc`` to preserve the cause-chain for debugging
+    # (rule 37/34). The user-facing message never interpolates the exception text
+    # or the raw target, so even a future leaky validator message cannot escape
+    # here — the no-echo contract holds at this boundary regardless.
+    try:
+        _validate_transfer_target(target.strip())
+    except ValueError as exc:
+        msg = "REFER Refer-To target rejected by injection guard"
+        raise ReferError(msg) from exc
+    # Guard 2: if a ``?``-query is present, only ``?Replaces=`` is accepted.
+    # Any other embedded header key (``?Route=``, ``?Header=``, …) or duplicate
+    # ``Replaces`` is a header-injection vector; _validate_refer_to_query raises
+    # ReferError directly with a sanitised message (no attacker-supplied content).
+    _validate_refer_to_query(query)
     replaces = _replaces_from_uri_query(query)
     referred_by_raw = request.header("Referred-By")
     referred_by = _bracketed_uri(referred_by_raw) if referred_by_raw else None
@@ -486,8 +517,52 @@ def _bracketed_uri(value: str) -> str:
     return match.group(1).strip() if match is not None else value.strip()
 
 
+def _validate_refer_to_query(query: str) -> None:
+    """Reject a Refer-To URI ``?``-query that carries any non-``Replaces`` header.
+
+    An inbound ``Refer-To`` URI may legitimately carry ``?Replaces=<dialog-id>``
+    for an attended transfer (RFC 3891 via RFC 3515), and ONLY that. Any other
+    embedded header key — ``?Route=``, ``?Header=``, or any extra ``&``-joined
+    header alongside a ``Replaces`` — is a header-injection vector and MUST be
+    rejected before the query is parsed. Duplicate ``Replaces`` keys are equally
+    rejected (ambiguous / attack-surface).
+
+    Args:
+        query: The raw ``?``-query string from the Refer-To URI (after
+            ``partition("?")``, so without the leading ``?``).
+
+    Raises:
+        ReferError: If the query contains any key other than ``replaces``
+            (case-insensitive), or more than one ``replaces`` key.
+    """
+    if not query:
+        return
+    replaces_count = 0
+    for pair in query.split("&"):
+        name, _sep, _val = pair.partition("=")
+        key = name.strip().lower()
+        if key != "replaces":
+            # Do NOT echo the key — it is attacker-supplied.
+            msg = (
+                "Refer-To URI carries an embedded header other than 'Replaces' "
+                "(header-injection vector rejected)"
+            )
+            raise ReferError(msg)
+        replaces_count += 1
+    if replaces_count > 1:
+        msg = "Refer-To URI carries duplicate 'Replaces' embedded headers"
+        raise ReferError(msg)
+
+
 def _replaces_from_uri_query(query: str) -> ReplacesSpec | None:
-    """Extract a ``Replaces`` from a Refer-To URI header query, if present."""
+    """Extract a ``Replaces`` from a Refer-To URI header query, if present.
+
+    Callers MUST invoke :func:`_validate_refer_to_query` first to ensure the
+    query contains only an optional single ``Replaces=`` key; this function
+    then parses that key. It returns ``None`` when the query is empty or carries
+    no ``Replaces`` pair (which cannot happen after a valid-query guard, but is
+    kept defensively for the no-``?`` case).
+    """
     if not query:
         return None
     for pair in query.split("&"):

@@ -410,9 +410,41 @@ def test_ingest_malformed_rtcp_raises() -> None:
 
 
 def test_ingest_ignores_bye_without_error() -> None:
-    """An inbound BYE is parsed without raising (it is a clean control packet)."""
+    """An inbound BYE is parsed without raising (it is a clean control packet).
+
+    Strengthened: first ingest an SR/RR to establish call_quality state, snapshot it,
+    ingest the BYE, and assert call_quality is UNCHANGED. This catches mutations that
+    reset/zero call_quality on BYE (rule 25: failing-then-passing test detects the fix).
+    """
     engine = _make_engine()
+    # Establish call_quality state with a peer RR about our outbound stream.
+    peer_rr = ReceiverReport(
+        ssrc=_PEER_SSRC,
+        report_blocks=(
+            ReportBlock(
+                ssrc=OUTBOUND_AUDIO_SSRC,
+                fraction_lost=128,  # half
+                cumulative_lost=42,
+                extended_highest_seq=1000,
+                jitter=240,  # 8 kHz clock units → 30 ms
+                lsr=0,
+                dlsr=0,
+            ),
+        ),
+    )
+    engine.ingest_rtcp(build_compound((peer_rr,)))
+    # Snapshot the quality state after ingesting the RR.
+    quality_before = engine.call_quality
+    assert quality_before.remote_fraction_lost is not None
+    assert quality_before.remote_cumulative_lost == 42
+    # Ingest the BYE without raising.
     engine.ingest_rtcp(build_compound((Bye(ssrcs=(_PEER_SSRC,), reason="bye"),)))
+    # Assert call_quality is UNCHANGED after BYE (mutation zeroing it must FAIL).
+    quality_after = engine.call_quality
+    assert quality_after.remote_fraction_lost == quality_before.remote_fraction_lost
+    assert quality_after.remote_cumulative_lost == quality_before.remote_cumulative_lost
+    assert quality_after.remote_jitter_ms == quality_before.remote_jitter_ms
+    assert quality_after.rtt_seconds == quality_before.rtt_seconds
 
 
 # ---------------------------------------------------------------------------

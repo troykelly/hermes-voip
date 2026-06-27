@@ -342,9 +342,24 @@ _handle_inbound_invite(invite):
   no RTP is opened, the engine is never built. `486 Busy Here` and `403 Forbidden` are
   available via the same `build_response` call if an operator prefers a different posture;
   `603` is the default. A **configurable polite-decline** alternative — answer (`200 OK`),
-  speak one TTS line ("Sorry, I can't take this call"), then `BYE` — is a Phase-2 option
-  (`HERMES_VOIP_DENY_MODE=reject|decline`), useful where a hard `603` trains a spammer to
-  retry from a new number. Phase 1 ships `reject` (`603`).
+  speak one TTS line ("Sorry, I cannot take this call"), then `BYE` — is selectable via
+  `HERMES_VOIP_DENY_MODE=reject|decline`, useful where a hard `603` trains a spammer to
+  retry from a new number. The default is `reject` (`603`).
+
+  > **Implemented (Phase 2, 2026-06-27).** `HERMES_VOIP_DENY_MODE=decline` **is built**.
+  > `GatewayConfig.deny_mode` (a `Literal["reject", "decline"]`, default `reject`) carries
+  > the policy; `MediaConfig.decline_phrase` (default `"Sorry, I cannot take this call."`,
+  > `HERMES_VOIP_DECLINE_PHRASE`) carries the spoken line. At the declined-at-SIP
+  > chokepoint in `adapter._handle_inbound_invite`, `reject` keeps the pre-200-OK `603`
+  > path unchanged; `decline` instead proceeds through the **normal** SDP negotiation +
+  > `200 OK` answer + `CallSession`, then — in place of building the conversational
+  > `CallLoop` — calls `adapter._speak_decline_then_bye`, which synthesises the
+  > `decline_phrase` through the **existing** TTS provider (`Providers.tts`), drains the
+  > frames to `engine.send_audio`, and ends the dialog via the existing
+  > `CallSession.hang_up` (in-dialog `BYE` + media stop). It is bounded by construction:
+  > one phrase, no STT/VAD/agent turn/barge-in, no new transport or pipeline. The declined
+  > caller still never reaches the agent (no context first-turn, no `CallLoop`). Synthesis
+  > is best-effort: a TTS failure is logged and the call is **still** BYE'd (rule 37).
 - **Decision point:** entirely inside the adapter's inbound handler, on the call's own
   task — `build_response`/`transport.send` is the same call path already used for `488`,
   so no transport change is needed. Outbound is never deny-classified (§3).
@@ -367,7 +382,8 @@ New `HERMES_VOIP_*` env vars (parsed by `load_caller_modes`; documented with fak
 | `HERMES_VOIP_CALLER_GREY_FILE` | Path to grey-list JSON (optional explicit pins) | unset => empty |
 | `HERMES_VOIP_CALLER_DEFAULT_MODE` | Mode for an unmatched caller: `grey` only (the safe receptionist default) | `grey` |
 | `HERMES_VOIP_CALLER_NORMALIZATION` | `e164`/`strip-plus`/`none` | `e164` |
-| `HERMES_VOIP_DENY_MODE` | `reject` (603) / `decline` (answer+TTS+BYE) | `reject` (Phase 2 adds `decline`) |
+| `HERMES_VOIP_DENY_MODE` | `reject` (603) / `decline` (answer+TTS+BYE) | `reject` (`decline` implemented, Phase 2) |
+| `HERMES_VOIP_DECLINE_PHRASE` | The one short line spoken on a `decline`-mode declined caller | `Sorry, I cannot take this call.` |
 
 **Default with nothing configured:** no allow entries, no deny entries => **every caller
 is GREY (receptionist)**. This is the safe default — an operator who installs the plugin
@@ -445,6 +461,9 @@ enumerate trusted numbers), consistent with the forgeable-caller-ID posture (§1
 
 *Phase 2 (follow-on PR — hardening, behind the same module):*
 5. `HERMES_VOIP_DENY_MODE=decline` polite-decline path (answer + one TTS line + BYE).
+   **Implemented (2026-06-27)** — see the §5 "Implemented (Phase 2)" note above for the
+   wiring (`GatewayConfig.deny_mode`, `MediaConfig.decline_phrase`,
+   `adapter._speak_decline_then_bye`).
 6. Prefer **P-Asserted-Identity** over `From` when the gateway asserts it over a trusted
    TLS peer (still not an auth boundary; closes the easiest spoof — §7), behind a config
    flag, recorded as its own ADR if it changes the trust model materially.

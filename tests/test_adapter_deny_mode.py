@@ -161,7 +161,8 @@ class _FakeASR:
     async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
         async for _ in audio:
             pass
-        for chunk in ():  # always empty — forces the async-gen shape
+        empty: tuple[object, ...] = ()
+        for chunk in empty:  # always empty — forces the async-gen shape
             yield chunk
 
 

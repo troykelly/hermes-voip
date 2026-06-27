@@ -11,6 +11,16 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+### Added
+
+- **Automated publish on tag** — pushing a `vX.Y.Z` tag (including pre-releases
+  like `v1.2.3-rc1`) runs `.github/workflows/publish.yml`: a `build` job guards the
+  tag against `pyproject.toml [project].version`, builds + wheel-smokes the wheel +
+  sdist, and uploads them; a `github-release` job attaches them (plus `SHA256SUMS`)
+  to a GitHub Release; and an independent `pypi-publish` job publishes them to PyPI
+  via OIDC Trusted Publishing with PEP 740 attestations and no stored token. See
+  [docs/runbooks/0019-release-process.md](docs/runbooks/0019-release-process.md).
+
 ## [0.1.0] - 2026-06-23
 
 First tagged release of the `hermes-voip` Hermes plugin: two-way voice over

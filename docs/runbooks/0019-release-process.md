@@ -2,10 +2,12 @@
 
 **What it is.** The procedure to cut a versioned release of the `hermes-voip`
 Hermes plugin: bump the single-sourced version, prove the version-sync gate green,
-update the changelog, tag the commit, build and verify the wheel, and make the
-release available. This is the operational HOW; the WHY of the single-source
-decision is recorded inline in `src/hermes_voip/__init__.py` and the version-sync
-tests in `tests/test_plugin_manifest.py`.
+update the changelog, tag the commit, and push the tag — at which point the
+`publish.yml` GitHub Actions workflow builds + verifies the artifacts, creates the
+GitHub Release, and publishes to PyPI (see "Automated publish on tag" below). This
+is the operational HOW; the WHY of the single-source decision is recorded inline in
+`src/hermes_voip/__init__.py` and the version-sync tests in
+`tests/test_plugin_manifest.py`.
 
 > Public repo — no hosts/tokens/PII here. The version is a public package number.
 
@@ -45,17 +47,18 @@ follows the install metadata automatically with no source edit.
 `hermes_agent.plugins`, declared in `pyproject.toml` as
 `[project.entry-points."hermes_agent.plugins"] hermes-voip = "hermes_voip"`). The
 Hermes runtime scans that group at startup and calls `hermes_voip.register(ctx)`.
-There is **no published package registry** for this project today: installation is
-**from the Git checkout** via `uv sync` (see README Step 1), not `pip install
-hermes-voip` from PyPI. Activation also needs the one-time manifest-directory copy
-under `~/.hermes/plugins/hermes-voip/` so `hermes plugins enable hermes-voip` sees
-it — see [0011-voip-enable-plugin.md](0011-voip-enable-plugin.md).
+The current documented consumer install path is **from the Git checkout** via
+`uv sync` (see README Step 1) — that is the install model the README and ADR-0037
+describe. As of the automated publish flow below, pushing a `vX.Y.Z` tag ALSO
+publishes the wheel + sdist to the **PyPI** project `hermes-voip` (so once the
+first tag fires, `uv add hermes-voip` / `pip install hermes-voip` resolve it too).
+Activation also needs the one-time manifest-directory copy under
+`~/.hermes/plugins/hermes-voip/` so `hermes plugins enable hermes-voip` sees it —
+see [0011-voip-enable-plugin.md](0011-voip-enable-plugin.md).
 
-So a "release" here is a **tagged, buildable Git commit** plus a verified wheel
-artifact — consumers install that tag. Publishing the wheel to an external index
-(PyPI) is **not** part of this process and is propose-only (see "Automated publish"
-below); standing up that account/token is operator-gated infra (AGENTS.md rules
-40/41).
+So a "release" is a **tagged, buildable Git commit** whose tag push drives the
+`publish.yml` workflow: build + verify the artifacts, attach them to a GitHub
+Release, and publish them to PyPI via OIDC Trusted Publishing (no stored token).
 
 ## Cut a release (step by step)
 
@@ -102,89 +105,194 @@ Replace `X.Y.Z` with the target version (e.g. `0.1.0`).
 5. **Commit** (Conventional Commit + the AI co-author trailer) on a worktree-lane
    branch, open a PR, run the full local gate (AGENTS.md rule 15), and merge.
 
-6. **Tag the merged commit** `vX.Y.Z` and push the tag:
-
-   ```bash
-   git tag -a vX.Y.Z -m "hermes-voip X.Y.Z"
-   git push origin vX.Y.Z
-   ```
-
-   (Use an annotated tag. The semver tag is what consumers pin.)
-
-7. **Build the distribution artifacts** from the tagged commit, into a
-   worktree-local `dist/` (AGENTS.md rule 10 — never `/tmp`):
+6. **(Optional) Verify the build locally** before tagging — the workflow runs the
+   identical checks, but this catches a bad build without spending a tag. Build into
+   a worktree-local `dist/` (AGENTS.md rule 10 — never `/tmp`) and smoke-install:
 
    ```bash
    uv build --out-dir dist
-   # → Successfully built dist/hermes_voip-X.Y.Z.tar.gz
-   #   Successfully built dist/hermes_voip-X.Y.Z-py3-none-any.whl
-   ```
-
-8. **Verify the wheel** carries the right version, installs cleanly, imports, and
-   ships the manifest as package data:
-
-   ```bash
-   uv venv /tmp/relcheck && WHL=$(ls dist/*.whl)
-   uv pip install --python /tmp/relcheck/bin/python "$WHL"
-   /tmp/relcheck/bin/python -c "
+   uv venv dist/.relcheck && WHL=$(ls dist/*.whl)
+   uv pip install --python dist/.relcheck/bin/python "$WHL"
+   dist/.relcheck/bin/python -c "
    import hermes_voip
    from importlib.resources import files
    print('version:', hermes_voip.__version__)               # → X.Y.Z (from wheel metadata)
    print('register:', callable(hermes_voip.register))       # → True
    print('manifest packaged:', files('hermes_voip').joinpath('plugin.yaml').is_file())  # → True
    "
-   rm -rf /tmp/relcheck dist   # clean scratch (AGENTS.md rule 10)
+   rm -rf dist   # clean scratch (AGENTS.md rule 10)
    ```
 
-   `version: X.Y.Z` here proves the single-source works for a REAL wheel install
-   (not just the editable dev install): the wheel's `METADATA` `Version:` is read
-   by `importlib.metadata`, with no source edit to `__init__.py`. `manifest
-   packaged: True` proves `plugin.yaml` is in the wheel (hatchling `artifacts`
-   declaration, ADR-0037).
+   `version: X.Y.Z` proves the single-source works for a REAL wheel install (the
+   wheel's `METADATA` `Version:` read by `importlib.metadata`); `manifest packaged:
+   True` proves `plugin.yaml` is in the wheel (hatchling `artifacts`, ADR-0037).
+   These are the same three assertions the `publish.yml` build job runs.
 
-9. **Make the release available.** Consumers install from the tag:
+7. **Tag the merged commit** `vX.Y.Z` and push the tag — this is what triggers the
+   automated publish:
 
    ```bash
-   uv add "hermes-voip @ git+https://github.com/troykelly/hermes-voip.git@vX.Y.Z"
+   git tag -a vX.Y.Z -m "hermes-voip X.Y.Z"
+   git push origin vX.Y.Z
    ```
 
-   Optionally attach the built wheel + sdist to a GitHub Release for the tag
-   (`gh release create vX.Y.Z dist/*` — does not require any external registry or
-   token beyond the repo's own `gh` auth). Then follow the activation steps in
-   [0011-voip-enable-plugin.md](0011-voip-enable-plugin.md).
+   Use an annotated tag. The semver tag is what consumers pin AND the
+   `publish.yml` trigger (`on.push.tags: v[0-9]+.[0-9]+.[0-9]+`, plus a `-*`
+   suffix pattern for pre-releases like `v1.2.3-rc1`). The tag's version (minus the
+   leading `v`) MUST equal `pyproject.toml [project].version` or the build job's
+   guard fails the run (see below). For a pre-release, append a `-<suffix>` so the
+   GitHub Release is marked `--prerelease`.
 
-## Verify a cut release
+8. **Watch the publish run** to green (`gh run watch` or the Actions tab). The
+   three jobs are detailed in "Automated publish on tag" below; "Verify a publish"
+   confirms the GitHub Release + PyPI artifact landed.
+
+## Automated publish on tag
+
+The workflow `.github/workflows/publish.yml` runs on every pushed tag matching
+`v[0-9]+.[0-9]+.[0-9]+` (and the `-*` pre-release variant). It uses **no stored
+secrets**: the GitHub Release uses the automatic `GITHUB_TOKEN`; PyPI uses GitHub
+**OIDC Trusted Publishing** (no token at all). A `concurrency` group
+(`publish-${{ github.ref }}`, no cancel-in-progress) serializes two tag pushes so
+they cannot race the publish steps. Top-level permissions are read-only; each job
+elevates only what it needs.
+
+Three jobs:
+
+1. **`build`** (`ubuntu-latest`, default read-only token):
+   - checks out the pushed tag, installs `uv` (pinned) + Python from
+     `.python-version`, `uv sync --frozen`;
+   - **tag↔version guard:** strips the leading `v` and asserts it EXACTLY equals
+     `pyproject.toml [project].version` — a mismatch fails the run with a clear
+     message (you cannot publish a tag that disagrees with the source version);
+   - `uv build --out-dir dist` (wheel + sdist);
+   - **wheel-smoke** (mirrors the `wheel-smoke` job in `gate.yml`): installs the
+     freshly built wheel into a clean venv and asserts `hermes_voip.__version__` ==
+     pyproject version and != `0+unknown`, that `plugin.yaml` is inside the wheel,
+     and that the `hermes_agent.plugins` entry point resolves to a callable
+     `register`;
+   - generates `dist/SHA256SUMS` over the wheel + sdist, extracts this version's
+     `## [X.Y.Z]` section from `CHANGELOG.md` into `dist/RELEASE_NOTES.md`, and
+     uploads `dist/` as the `dist` artifact.
+2. **`github-release`** (`needs: build`; `permissions: contents: write`):
+   downloads the artifact and runs
+   `gh release create <tag> <wheel> <sdist> dist/SHA256SUMS --title <tag>
+   --notes-file dist/RELEASE_NOTES.md`, adding `--prerelease` when the tag contains
+   a `-` (e.g. `v1.2.3-rc1`). Authenticated by the automatic `GITHUB_TOKEN`.
+3. **`pypi-publish`** (`needs: build`; `environment: pypi`;
+   `permissions: id-token: write`): downloads the artifact, moves ONLY the wheel +
+   sdist into a clean dir (so `SHA256SUMS`/`RELEASE_NOTES.md` are never uploaded),
+   and publishes via `pypa/gh-action-pypi-publish` with `attestations: true` and
+   **no `password:`** — the action mints a short-lived credential from the GitHub
+   OIDC identity. This job is INDEPENDENT of `github-release` (both only
+   `needs: build`), so a not-yet-configured PyPI Trusted Publisher fails ONLY this
+   job and still leaves the GitHub Release published.
+
+**Why `pypa/gh-action-pypi-publish` and not `uv publish`?** `uv publish` does
+support OIDC Trusted Publishing, but it does **not** generate PEP 740 build-
+provenance attestations; the PyPA action generates and uploads them by default
+(`attestations: true` makes it explicit). We keep `uv` as the only *builder*
+(`uv build` in the `build` job — AGENTS.md rule 38) and use the PyPA action solely
+to *upload* the artifacts with attestations. Revisit if/when `uv publish` gains
+attestation generation.
+
+### Tag↔version guard (the exact assertion)
+
+```bash
+TAG_VERSION="${TAG#v}"   # TAG = github.ref_name, e.g. v0.1.0 → 0.1.0
+PYPROJECT_VERSION=$(uv run python -c \
+  "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+[ "$TAG_VERSION" = "$PYPROJECT_VERSION" ] || { echo "FAIL: tag != pyproject"; exit 1; }
+```
+
+## PyPI Trusted Publisher (one-time setup)
+
+Trusted Publishing binds the GitHub repo + workflow + environment to the PyPI
+project, so CI uploads with a short-lived OIDC credential and **no API token ever
+exists** (rules 34/35: nothing to store, leak, or rotate). The operator has
+configured this on PyPI with the EXACT values below — they MUST match the workflow
+or PyPI rejects the upload:
+
+| Field             | Value          |
+| ----------------- | -------------- |
+| PyPI project name | `hermes-voip`  |
+| Owner             | `troykelly`    |
+| Repository        | `hermes-voip`  |
+| Workflow filename | `publish.yml`  |
+| Environment name  | `pypi`         |
+
+Because the PyPI project does not exist yet (nothing has been published), this was
+registered as a **pending publisher** (PyPI → *Your projects* → *Publishing* →
+*Add a pending publisher*, or *Manage* → *Publishing* on an existing project). The
+first successful `pypi-publish` run **creates** the `hermes-voip` project on PyPI
+and converts the pending publisher into the project's permanent Trusted Publisher.
+No secrets are added to the GitHub repo or the `pypi` environment — the only
+GitHub-side requirement is the `pypi` environment existing (the workflow's
+`environment: pypi` plus the operator-side Trusted Publisher binding); the
+`id-token: write` permission is granted in the workflow, not configured on GitHub.
+
+If any of the five values above changes (e.g. the workflow is renamed or the
+environment changes), the Trusted Publisher entry on PyPI must be updated to match,
+or publishing fails with an OIDC trust error.
+
+## Verify a publish
 
 ```bash
 git tag --list 'v*'                       # the new vX.Y.Z is present
 git show vX.Y.Z --stat | head             # points at the bumped commit
-# in a clean venv with the wheel installed (step 8):
-python -c "import hermes_voip; assert hermes_voip.__version__ == 'X.Y.Z'"
+gh run list --workflow publish.yml -L 5   # the tag's run is green (all 3 jobs)
+
+# GitHub Release exists with the three assets + (for an rc tag) prerelease flag:
+gh release view vX.Y.Z --json tagName,isPrerelease,assets \
+  --jq '{tag:.tagName, prerelease:.isPrerelease, assets:[.assets[].name]}'
+# → assets include hermes_voip-X.Y.Z-py3-none-any.whl, .tar.gz, SHA256SUMS
+
+# PyPI has the version (once pypi-publish is green):
+curl -fsSL https://pypi.org/pypi/hermes-voip/X.Y.Z/json | \
+  python -c "import sys,json; d=json.load(sys.stdin); print(d['info']['version'])"
+# → X.Y.Z
+
+# A clean install from PyPI imports and reports the right version:
+uv venv dist/.verify && uv pip install --python dist/.verify/bin/python "hermes-voip==X.Y.Z"
+dist/.verify/bin/python -c "import hermes_voip; assert hermes_voip.__version__ == 'X.Y.Z'"
+rm -rf dist
 ```
 
 ## Roll back / re-cut
 
-A release is a tag + an artifact; nothing is provisioned. To roll back, do NOT
-move a published tag (consumers may have pinned it) — instead cut a new patch
-release (`X.Y.Z+1`) with the fix and a changelog entry. If a tag was pushed in
-error and provably unconsumed, delete it locally and on the remote
-(`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) and re-cut. Build
-artifacts under `dist/` are disposable — rebuild from the tag at any time with
-`uv build`.
+A release is a tag + a GitHub Release + a PyPI artifact. **PyPI is immutable** — a
+published version can NEVER be re-uploaded or un-published, only **yanked** (it
+stays installable by exact pin but is hidden from new resolutions). So the primary
+roll-back is forward: cut a new patch release (`X.Y.Z+1`) with the fix and a
+changelog entry, and `pip`-yank the bad version if it is actively harmful:
 
-## Automated publish (PROPOSE-ONLY — not built)
+```bash
+# Yank a bad PyPI release (reversible: `--unyank` restores it). PyPI has no CLI for
+# this; do it in the project's *Manage* → *Releases* UI, or:
+uvx twine yank hermes-voip X.Y.Z       # if twine is available; else use the PyPI UI
+```
 
-Publishing the wheel to **PyPI** (or any external index) on tag would need an
-external account and a scoped API token — infrastructure this repo does not stand
-up without explicit operator approval recorded in an ADR (AGENTS.md rules 40/41).
-It is therefore **not** part of this process today. If the operator wants it:
+To delete a GitHub Release + its tag (e.g. a tag pushed in error, before anyone
+pinned it):
 
-1. Record a Proposed ADR (`docs/adr/`) choosing the index (PyPI), the trusted-
-   publishing mechanism (GitHub OIDC → PyPI, so no long-lived token in CI), and the
-   scope.
-2. On approval, add a tag-triggered GitHub Actions job that runs `uv build` and
-   `uv publish` (or `pypa/gh-action-pypi-publish` via OIDC), and a runbook for the
-   PyPI project + trusted-publisher binding (rule 42).
+```bash
+gh release delete vX.Y.Z --yes --cleanup-tag     # removes the Release AND the tag
+# or, if the Release was not created: git push origin :refs/tags/vX.Y.Z
+```
 
-Until then, the manual steps above are the release process, and the backlog item
-"automate release publish (PyPI trusted publishing)" tracks the proposal.
+Deleting the GitHub Release does **not** remove the PyPI artifact — if the
+`pypi-publish` job already ran, yank it on PyPI as above. Build artifacts under
+`dist/` are disposable; the workflow rebuilds them from the tag on any re-push of a
+*new* tag (a tag already consumed by a green run will refuse to re-publish to PyPI
+because the version already exists — which is the correct, safe behaviour).
+
+## Re-running / recovering a failed publish
+
+- **`build` failed (guard or wheel-smoke):** fix the cause on `main`, then move the
+  tag is NOT allowed (consumers may have pinned it). Instead bump to the next
+  version and tag that.
+- **`github-release` failed but `pypi-publish` succeeded (or vice versa):** the
+  jobs are independent. Re-run just the failed job from the Actions UI
+  (`gh run rerun <run-id> --job <job-id>`). `pypi-publish` is idempotent in the
+  safe direction — it errors if the version is already on PyPI, so a re-run after a
+  successful PyPI upload is a no-op failure, not a double-publish.

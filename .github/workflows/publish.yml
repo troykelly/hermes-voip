@@ -1,0 +1,274 @@
+# Tag-triggered PUBLISH workflow for hermes-voip.
+#
+# WHAT IT IS. Pushing a semver tag `vX.Y.Z` (optionally a pre-release like
+# `v1.2.3-rc1`) runs three jobs:
+#   1. build         — checks out the tag, builds the wheel + sdist with `uv`,
+#                      asserts the tag matches pyproject's version, mirrors the
+#                      `wheel-smoke` checks from gate.yml against the freshly
+#                      built wheel, generates SHA256SUMS, extracts the changelog
+#                      section, and uploads `dist/` as an artifact.
+#   2. github-release — downloads the artifact and creates a GitHub Release for
+#                      the tag with the wheel, sdist, and SHA256SUMS attached
+#                      (`--prerelease` for pre-release tags). Uses the automatic
+#                      `GITHUB_TOKEN`; no stored secret.
+#   3. pypi-publish  — downloads the artifact and publishes ONLY the wheel + sdist
+#                      to PyPI via OIDC Trusted Publishing (NO token), in the
+#                      `pypi` environment, with PEP 740 attestations.
+#
+# github-release and pypi-publish each `needs: build` only (they do NOT depend on
+# each other) so a not-yet-configured PyPI Trusted Publisher cannot block the
+# GitHub Release, and vice versa.
+#
+# SECRETS. This workflow uses NO stored secrets. `GITHUB_TOKEN` is auto-provided
+# for the GitHub Release; PyPI uses GitHub OIDC Trusted Publishing (the
+# `pypi-publish` job requests an OIDC token via `id-token: write` and PyPI
+# exchanges it for a short-lived upload credential — see
+# docs/runbooks/0019-release-process.md).
+#
+# SUPPLY CHAIN (AGENTS.md rule 35). Every third-party action is pinned to a full
+# 40-char commit SHA with a trailing `# vX.Y.Z` comment. Only official actions are
+# used: actions/*, astral-sh/setup-uv, pypa/gh-action-pypi-publish.
+name: publish
+
+on:
+  push:
+    tags:
+      # Semver release tags, including pre-releases (handled in the build job:
+      # a tag containing '-' is marked --prerelease on the GitHub Release).
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# Top-level permissions are read-only (AGENTS.md). Each job elevates only what it
+# needs: github-release adds `contents: write`; pypi-publish adds `id-token: write`.
+permissions:
+  contents: read
+
+# Serialize concurrent tag pushes so two releases cannot race the same publish
+# steps. We do NOT cancel in-progress runs — a publish mid-flight must finish.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Default read-only token (inherits the top-level read-only permissions).
+    steps:
+      # Check out exactly the pushed tag (github.ref_name == the tag, e.g. v0.1.0).
+      - name: Checkout the pushed tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.ref_name }}
+
+      # uv reads .python-version and provisions that interpreter; the pinned uv
+      # version matches gate.yml.
+      - name: Install uv + Python
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.11.21" # pin uv (AGENTS.md rule 33)
+
+      - name: Install dependencies (frozen)
+        run: uv sync --frozen
+
+      # GUARD: strip the leading `v` from the tag and assert it EXACTLY equals
+      # pyproject.toml [project].version. Publishing a tag that disagrees with the
+      # source version would ship a mislabelled artifact — fail loudly instead.
+      - name: Assert tag matches pyproject version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          TAG_VERSION="${TAG#v}"
+          PYPROJECT_VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag                    : $TAG"
+          echo "tag version (no 'v')   : $TAG_VERSION"
+          echo "pyproject.toml version : $PYPROJECT_VERSION"
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "FAIL: tag version ($TAG_VERSION) != pyproject.toml [project].version ($PYPROJECT_VERSION)"
+            echo "Bump pyproject.toml (and the plugin.yaml copies) to match the tag, or tag the correct commit."
+            exit 1
+          fi
+          echo "PASS: tag $TAG matches pyproject.toml version $PYPROJECT_VERSION"
+
+      # Build wheel + sdist into a worktree-local dist/ (uv build uses an isolated
+      # build env; no editable install — same as gate.yml's wheel-smoke job).
+      - name: Build wheel + sdist
+        run: uv build --out-dir dist
+
+      # WHEEL-SMOKE (mirrors the `wheel-smoke` job in .github/workflows/gate.yml).
+      # Install the freshly built wheel into a CLEAN venv and assert the three
+      # release-blocker properties. A wheel that fails any of these would load
+      # broken in the real Hermes runtime, so the release is blocked here.
+      - name: Wheel-smoke — install built wheel into a clean venv
+        run: |
+          uv venv dist/.smoke-venv
+          uv pip install --python dist/.smoke-venv/bin/python dist/*.whl
+
+      # Assertion 1: hermes_voip.__version__ resolves from installed distribution
+      # metadata (not the "0+unknown" fallback) and matches pyproject.toml.
+      - name: Wheel-smoke — assert version metadata
+        run: |
+          PYPROJECT_VER=$(uv run python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); print(d['project']['version'])")
+          INSTALLED_VER=$(dist/.smoke-venv/bin/python -c "import hermes_voip; print(hermes_voip.__version__)")
+          echo "pyproject.toml version : $PYPROJECT_VER"
+          echo "installed __version__  : $INSTALLED_VER"
+          test "$INSTALLED_VER" != "0+unknown" || { echo "FAIL: __version__ is 0+unknown — no distribution metadata in wheel"; exit 1; }
+          test "$INSTALLED_VER" = "$PYPROJECT_VER" || { echo "FAIL: __version__ ($INSTALLED_VER) != pyproject.toml ($PYPROJECT_VER)"; exit 1; }
+          echo "PASS: version $INSTALLED_VER matches pyproject.toml"
+
+      # Assertion 2: plugin.yaml is packaged inside the wheel zipfile.
+      - name: Wheel-smoke — assert plugin.yaml in wheel
+        run: |
+          dist/.smoke-venv/bin/python -c "
+          import zipfile, glob, sys
+          wheels = glob.glob('dist/*.whl')
+          assert wheels, 'no wheel found in dist/'
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if not any(n.endswith('plugin.yaml') for n in names):
+              print('FAIL: plugin.yaml NOT in wheel', wheels[0])
+              print('Contents:', [n for n in names if 'plugin' in n or 'yaml' in n])
+              sys.exit(1)
+          print('PASS: plugin.yaml found in wheel', wheels[0])
+          "
+
+      # Assertion 3: the hermes_agent.plugins entry point resolves to hermes_voip
+      # with a `register` callable (the Hermes runtime entry point).
+      - name: Wheel-smoke — assert entry point resolves
+        run: |
+          dist/.smoke-venv/bin/python -c "
+          from importlib.metadata import entry_points
+          import sys
+          eps = list(entry_points(group='hermes_agent.plugins'))
+          voip = next((ep for ep in eps if ep.name == 'hermes-voip'), None)
+          if voip is None:
+              print('FAIL: no hermes-voip in hermes_agent.plugins entry points:', eps)
+              sys.exit(1)
+          module = voip.load()
+          if not hasattr(module, 'register') or not callable(module.register):
+              print('FAIL: hermes_voip.register not found or not callable')
+              sys.exit(1)
+          print('PASS: entry point hermes-voip ->', voip.value, '| register:', module.register)
+          "
+
+      # Generate dist/SHA256SUMS over the wheel + sdist only (exclude the smoke
+      # venv). Paths are relative to dist/ so `sha256sum -c` works from there.
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.whl *.tar.gz > SHA256SUMS
+          echo "--- dist/SHA256SUMS ---"
+          cat SHA256SUMS
+
+      # Extract this version's section from CHANGELOG.md (the `## [X.Y.Z]` block,
+      # up to the next `## ` heading) into dist/RELEASE_NOTES.md for the GitHub
+      # Release body. Falls back to a one-line note if the section is absent.
+      - name: Extract changelog section
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          uv run python - "$VERSION" <<'PY'
+          import pathlib, re, sys
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Match the heading `## [X.Y.Z]` (with optional `- DATE`) and capture the
+          # body up to (but not including) the next top-level `## ` heading, the
+          # link-reference-definition footer block (lines like `[Unreleased]: http`),
+          # or end of file. Stopping at the footer matters for the OLDEST section,
+          # which would otherwise swallow the `[X.Y.Z]:` link defs at the file end.
+          pattern = re.compile(
+              r"^##\s+\[" + re.escape(version) + r"\].*?$(.*?)(?=^##\s|^\[[^\]]+\]:\s|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = pattern.search(text)
+          notes = match.group(1).strip() if match else ""
+          if not notes:
+              notes = f"Release {version}. See CHANGELOG.md for details."
+          out = pathlib.Path("dist/RELEASE_NOTES.md")
+          out.write_text(notes + "\n", encoding="utf-8")
+          print(f"--- dist/RELEASE_NOTES.md ({len(notes)} chars) ---")
+          print(notes)
+          PY
+
+      # Remove the smoke venv before uploading so the artifact carries only the
+      # release assets (wheel, sdist, SHA256SUMS, RELEASE_NOTES.md).
+      - name: Prune smoke venv from dist
+        run: rm -rf dist/.smoke-venv
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload assets via gh
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      # Create the GitHub Release for the tag with the built assets attached.
+      # A tag containing '-' (e.g. v1.2.3-rc1) is a pre-release. Uses the built-in
+      # gh CLI authenticated by the automatic GITHUB_TOKEN — no stored secret.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          PRERELEASE_FLAG=""
+          case "$TAG" in
+            *-*) PRERELEASE_FLAG="--prerelease" ;;
+          esac
+          WHEEL=$(ls dist/*.whl)
+          SDIST=$(ls dist/*.tar.gz)
+          echo "Creating release $TAG (prerelease flag: '${PRERELEASE_FLAG:-none}')"
+          gh release create "$TAG" \
+            "$WHEEL" "$SDIST" dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file dist/RELEASE_NOTES.md \
+            $PRERELEASE_FLAG
+
+  pypi-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # The `pypi` environment name must match the PyPI Trusted Publisher config
+    # exactly (operator-configured — see runbook 0019). This job is INDEPENDENT of
+    # github-release (both only `needs: build`).
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for PyPI Trusted Publishing (no stored secret)
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
+      # The artifact also carries SHA256SUMS + RELEASE_NOTES.md, which must NOT be
+      # uploaded to PyPI. Move only the wheel + sdist into a clean upload dir.
+      - name: Stage only wheel + sdist for upload
+        run: |
+          mkdir -p upload
+          mv dist/*.whl dist/*.tar.gz upload/
+          echo "--- files to publish to PyPI ---"
+          ls -1 upload
+
+      # Publish to PyPI via OIDC Trusted Publishing (NO token). We use the official
+      # PyPA action rather than `uv publish` for ONE reason: `uv publish` supports
+      # trusted publishing but does NOT yet generate PEP 740 attestations, whereas
+      # this action generates + uploads them by default (attestations: true makes
+      # that explicit). The artifacts are still built by `uv build` in the `build`
+      # job (AGENTS.md rule 38 — uv is the only builder); this step only uploads
+      # them. No `password:` is set, so the action uses the ambient OIDC identity.
+      - name: Publish to PyPI (Trusted Publishing + attestations)
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: upload
+          attestations: true

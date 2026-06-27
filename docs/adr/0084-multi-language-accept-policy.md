@@ -37,10 +37,16 @@ Rationale for format rather than registry lookup:
 - The downstream consumers (`stt`, `tts`, `call_loop`) already resolve per-provider
   language support; rejecting here for a language that a provider supports is
   user-hostile.
-- Private-use and experimental codes (`"x-foo"`, `"zz"`) are intentionally included by
-  BCP-47 for experimentation; we should not block them.
+- `"zz"` and other 2–8-letter experimental codes are accepted by this grammar.
 - A structurally malformed value (digits, empty, single char) signals a typo and is
   caught immediately.
+
+**Accepted grammar boundary:** the primary subtag must be 2–8 ASCII alpha characters.
+BCP-47 bare private-use singletons (`"x-foo"`, where `"x"` is the single-character
+primary subtag) are **intentionally outside this scope**: an arbitrary `x-*` tag has no
+defined meaning for STT/TTS providers and would only shift failure from startup to
+call-time.  Operators who require a non-standard provider tag should supply it via
+the provider-specific config rather than the language field.
 
 The existing test for `"zz"` (previously expected to fail as "unknown") is updated in
 this commit: `"zz"` is a well-formed 2-letter code and is now accepted.  The rejection

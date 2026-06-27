@@ -1143,6 +1143,13 @@ class MediaConfig:
         it validates the bounded/enumerated fields itself rather than trusting
         :func:`load_media_config` to have done so.
         """
+        # Normalise the language tag to lowercase so both the direct-construction
+        # path and the env path (which lowercases via _value_lower) behave
+        # identically.  _validate_comfort_filler then matches against _LANGUAGE_RE
+        # on the already-lowercased value.  object.__setattr__ is required because
+        # MediaConfig is a frozen dataclass; this is the standard pattern for
+        # normalising frozen-dataclass fields in __post_init__.
+        object.__setattr__(self, "language", self.language.lower())
         if not _finite_in_range(
             self.vad_threshold, _MIN_VAD_THRESHOLD, _MAX_VAD_THRESHOLD
         ):

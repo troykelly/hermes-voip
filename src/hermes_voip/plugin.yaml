@@ -156,6 +156,13 @@ optional_env:
       and the TLS connection to go silent mid-call. Validated at startup; has no
       effect on the WSS/WebRTC path.
     prompt: "SIP-over-TLS keepalive interval in seconds (default: 30.0)"
+  - name: HERMES_VOIP_RING_TIMEOUT_SECS
+    description: >-
+      Maximum time, in seconds, that an outbound `place_call` may ring unanswered
+      before Hermes sends CANCEL and reports `failure_outcome=no_answer` (default:
+      unset, so only the adapter's hard sink timeout applies). Must be a finite
+      number greater than 0 and no more than 3600. Validated at tool-call time.
+    prompt: "Outbound ring timeout in seconds (optional; range >0 and <=3600)"
   - name: HERMES_VOIP_CALL_ON_CONNECT
     description: >-
       Extension or SIP URI to dial once, immediately after the first successful

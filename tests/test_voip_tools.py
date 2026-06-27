@@ -597,7 +597,7 @@ async def test_place_call_handler_rejects_invalid_ring_timeout_before_dial(
     assert json.loads(result) == {
         "error": (
             "place_call failed: HERMES_VOIP_RING_TIMEOUT_SECS must be > 0 "
-            "and <= 3600 seconds; got 0.0"
+            "seconds; got 0.0"
         )
     }
 

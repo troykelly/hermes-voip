@@ -62,6 +62,7 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.call import CallError
+from hermes_voip.config import ConfigError
 from hermes_voip.originate import (
     OutboundCallCancelled,
     OutboundCallFailed,
@@ -249,36 +250,45 @@ _NO_ANSWER_STATUSES: frozenset[int] = frozenset({408, 487})
 _DECLINED_STATUSES: frozenset[int] = frozenset({603})
 
 #: Environment variable for the bounded ring timeout (seconds). When set to a
-#: finite positive float, ``place_call_handler`` forwards it as ``ring_timeout_secs``
-#: to :meth:`VoipToolHost.place_call_with_objective`, which arms the ADR-0069
-#: outbound CANCEL timer. Unset / non-numeric / non-finite (``inf`` / ``nan``) /
-#: zero-or-negative => ``None`` (the adapter's hard sink timeout governs instead).
+#: finite positive float no greater than ``_MAX_RING_TIMEOUT_SECS``,
+#: ``place_call_handler`` forwards it as ``ring_timeout_secs`` to
+#: :meth:`VoipToolHost.place_call_with_objective`, which arms the ADR-0069
+#: outbound CANCEL timer. Unset / blank => ``None`` (the adapter's hard sink
+#: timeout governs instead). Invalid values raise :class:`ConfigError`.
 #: Default: unset.
 _RING_TIMEOUT_ENV = "HERMES_VOIP_RING_TIMEOUT_SECS"
+_DEFAULT_RING_TIMEOUT_SECS: float | None = None
+_MAX_RING_TIMEOUT_SECS = 3600.0
 
 
 def _parse_ring_timeout() -> float | None:
-    """Read ``HERMES_VOIP_RING_TIMEOUT_SECS`` and return it as a positive float.
+    """Read ``HERMES_VOIP_RING_TIMEOUT_SECS`` and return a validated timeout.
 
-    Returns ``None`` when the variable is unset, blank, non-numeric, non-positive
-    (<=0), or non-finite. Never raises — a bad value is treated as absent.
-
-    ``float("inf")`` / ``"nan"`` parse cleanly and ``inf > 0`` is ``True``, so a
-    bare positivity check would accept a positive-infinity timeout — an *unbounded*
-    ring, which defeats the whole point of a bounded ring-timeout policy. The
-    ``math.isfinite`` guard rejects ±inf and NaN so only a real, finite positive
-    bound is honoured.
+    Returns ``None`` when the variable is unset or blank. Raises
+    :class:`ConfigError` when the value is non-numeric, non-finite, non-positive,
+    or greater than ``_MAX_RING_TIMEOUT_SECS``.
     """
-    raw = os.environ.get(_RING_TIMEOUT_ENV, "")
+    raw = os.environ.get(_RING_TIMEOUT_ENV, "").strip()
     if not raw:
-        return None
+        return _DEFAULT_RING_TIMEOUT_SECS
     try:
         value = float(raw)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        msg = f"{_RING_TIMEOUT_ENV} must be a number of seconds, got {raw!r}"
+        raise ConfigError(msg) from exc
     if not math.isfinite(value):
-        return None
-    return value if value > 0 else None
+        msg = f"{_RING_TIMEOUT_ENV} must be finite, got {raw!r}"
+        raise ConfigError(msg)
+    if value <= 0:
+        msg = f"{_RING_TIMEOUT_ENV} must be > 0 seconds; got {value}"
+        raise ConfigError(msg)
+    if value > _MAX_RING_TIMEOUT_SECS:
+        msg = (
+            f"{_RING_TIMEOUT_ENV} must be <= {_MAX_RING_TIMEOUT_SECS:.0f} "
+            f"seconds; got {value}"
+        )
+        raise ConfigError(msg)
+    return value
 
 
 def _classify_outbound_failure(exc: OutboundCallFailed) -> PlaceCallOutcome:

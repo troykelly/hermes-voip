@@ -68,6 +68,7 @@ def load_deberta_classifier(model_dir: str) -> Classifier:
     Raises:
         ImportError: The ``ml`` extra (onnxruntime / tokenizers) is not installed.
         FileNotFoundError: A required pinned artifact file is absent.
+        ValueError: If config.json exists but is corrupt/unparseable.
     """
     onnxruntime = _require("onnxruntime")
     tokenizers = _require("tokenizers")
@@ -140,10 +141,17 @@ def _injection_label_index(config_path: Path) -> int:
     label whose name marks the positive/unsafe class. If the config is absent or
     unrecognised we default to index 1 (the conventional positive class for these
     2-class injection detectors).
+
+    Raises:
+        ValueError: If config.json exists but is corrupt/unparseable.
     """
     if not config_path.is_file():
         return 1
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        msg = f"corrupt config.json at {config_path}: {e}"
+        raise ValueError(msg) from e
     id2label = raw.get("id2label")
     if not isinstance(id2label, dict):
         return 1

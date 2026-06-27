@@ -152,9 +152,19 @@ class RtpPacket:
 
 @dataclass(frozen=True, slots=True)
 class Lost:
-    """A jitter-buffer signal that the packet for ``sequence`` is lost."""
+    """A jitter-buffer signal that one or more consecutive packets are lost.
+
+    Attributes:
+        sequence: The first (lowest) sequence number in the lost run.
+        count: How many consecutive packets starting at ``sequence`` are lost.
+            Defaults to ``1`` for backward-compatibility; callers that only
+            handle single-packet loss can ignore this field.  When ``count > 1``
+            the buffer has already advanced its anchor past the entire run, so
+            only one :class:`Lost` event is emitted for the whole gap.
+    """
 
     sequence: int
+    count: int = 1
 
 
 type JitterOutput = RtpPacket | Lost
@@ -436,10 +446,25 @@ class JitterBuffer:
         # drains past a permanent gap instead of stalling.
         if len(self._packets) >= self._depth:
             self._emitted = True
-            self._next = _seq_next(expected)
             if self._adapt:
                 self._clean_run = 0  # a declared loss breaks the clean run
-            return Lost(expected)
+            # Run-length coalescing: scan forward from ``expected`` to find the
+            # first sequence that IS buffered.  Emit a single Lost(count=N)
+            # instead of N separate Lost events — O(1) allocations + iterations
+            # per gap regardless of gap size (amortized O(1) per packet).
+            # The scan is bounded by _max_ahead so it terminates even for a
+            # permanent gap; the loop visits at most min(gap, _max_ahead) steps.
+            gap = 1
+            scan = _seq_next(expected)
+            while (
+                scan not in self._packets
+                and (scan - expected) % _SEQ_MOD <= self._max_ahead
+            ):
+                gap += 1
+                scan = _seq_next(scan)
+            # Advance the anchor past all gap slots in one step.
+            self._next = (expected + gap) % _SEQ_MOD
+            return Lost(expected, count=gap)
         return None
 
     def peek(self) -> JitterOutput | None:

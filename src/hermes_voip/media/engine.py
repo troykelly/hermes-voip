@@ -1711,20 +1711,28 @@ class RtpMediaTransport:
                     break
                 ts_ns = self._clock()
                 if isinstance(output, Lost):
-                    # Packet-loss concealment (ADR-0056): fill the hole with a
-                    # concealment frame instead of skipping it, so the VAD/STT see a
-                    # continuous stream. For Opus this recovers the frame from the
-                    # NEXT packet's in-band FEC when that successor is already
-                    # buffered (peeked, not consumed), else uses Opus PLC; for
-                    # G.711/G.722 it repeats the last good frame, attenuated.
-                    _log.debug("JitterBuffer: lost packet seq=%d", output.sequence)
-                    frame = self._conceal_frame(ts_ns)
-                else:
-                    # Decode the wire payload to an analysis-rate PcmFrame and
-                    # remember it as the basis for concealing a future loss.
-                    frame = self._decode(output.payload, ts_ns)
-                    self._last_good_samples = frame.samples
-                    self._consecutive_lost = 0
+                    # Packet-loss concealment (ADR-0056): fill each hole with a
+                    # concealment frame so the VAD/STT see a continuous stream.
+                    # Lost.count > 1 signals a coalesced run (a far-ahead gap
+                    # compressed to one event); iterate count times so the stream
+                    # produced here is frame-accurate regardless of gap size.
+                    _log.debug(
+                        "JitterBuffer: lost seq=%d count=%d",
+                        output.sequence,
+                        output.count,
+                    )
+                    for _ in range(output.count):
+                        ts_ns = self._clock()
+                        frame = self._conceal_frame(ts_ns)
+                        frame = self._cancel_echo(frame)
+                        self._detect_inband_dtmf(frame)
+                        yield frame
+                    continue
+                # Decode the wire payload to an analysis-rate PcmFrame and
+                # remember it as the basis for concealing a future loss.
+                frame = self._decode(output.payload, ts_ns)
+                self._last_good_samples = frame.samples
+                self._consecutive_lost = 0
                 # Acoustic echo cancellation (ADR-0033): subtract the KNOWN outbound
                 # TTS reference (tapped in the TX path) from this inbound frame
                 # BEFORE the VAD/ASR see it, so the gateway's reflected echo cannot

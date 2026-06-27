@@ -16,6 +16,7 @@ import struct
 
 import pytest
 
+import hermes_voip.rtcp as rtcp_module
 from hermes_voip.rtcp import (
     RTCP_PT_BYE,
     RTCP_PT_RR,
@@ -770,3 +771,54 @@ def test_stray_out_of_range_packet_does_not_poison_jitter() -> None:
     clean_block = clean.report_block(source_ssrc=1, lsr=0, dlsr=0)
     stray_block = stray.report_block(source_ssrc=1, lsr=0, dlsr=0)
     assert stray_block.jitter == clean_block.jitter == 0
+
+
+def test_module_constants_pinned_values() -> None:
+    """Verify that module constants have the documented, invariant values.
+
+    Module-level constants should be annotated with typing.Final to signal that
+    they are immutable configuration/protocol values, never reassignable. This
+    test pins their documented values so a typo in any constant is caught
+    deterministically (e.g. a transcription error in _NTP_UNIX_EPOCH_DELTA or
+    _SEQ_MOD).
+    """
+    # RTCP packet types (RFC 3550 §12.1 / IANA)
+    assert rtcp_module.RTCP_PT_SR == 200
+    assert rtcp_module.RTCP_PT_RR == 201
+    assert rtcp_module.RTCP_PT_SDES == 202
+    assert rtcp_module.RTCP_PT_BYE == 203
+    assert rtcp_module.RTCP_PT_APP == 204
+    # SDES item type for canonical name
+    assert rtcp_module._SDES_ITEM_CNAME == 1
+    # Version and header bitfields
+    assert rtcp_module._RTP_VERSION == 2
+    assert rtcp_module._VERSION_SHIFT == 6
+    assert rtcp_module._COUNT_MASK == 0x1F
+    assert rtcp_module._PADDING_BIT == 0x20
+    # Field widths
+    assert rtcp_module._U8_MAX == 0xFF
+    assert rtcp_module._U32 == 0xFFFFFFFF
+    assert rtcp_module._U64 == (1 << 64) - 1
+    assert rtcp_module._S24_MIN == -(1 << 23)
+    assert rtcp_module._S24_MAX == (1 << 23) - 1
+    assert rtcp_module._MAX_COUNT == 0x1F
+    # Length constants
+    assert rtcp_module._WORD == 4
+    assert rtcp_module._SSRC_LEN == 4
+    assert rtcp_module._SDES_ITEM_HEADER_LEN == 2
+    assert rtcp_module._COMMON_HEADER_LEN == 4
+    assert rtcp_module._REPORT_BLOCK_LEN == 24
+    assert rtcp_module._SENDER_INFO_LEN == 20
+    # NTP conversion constants
+    assert rtcp_module._NTP_UNIX_EPOCH_DELTA == 2_208_988_800
+    assert rtcp_module._FRAC_SCALE == 1 << 32
+    assert rtcp_module._COMPACT_FRAC_SCALE == 1 << 16
+    # RFC 3550 timing constants
+    assert rtcp_module._RTCP_MIN_TIME == 5.0
+    assert rtcp_module._RTCP_SENDER_BW_FRACTION == 0.25
+    assert rtcp_module._COMPENSATION == 1.21828
+    # Sequence validity constants
+    assert rtcp_module._MAX_DROPOUT == 3000
+    assert rtcp_module._MAX_MISORDER == 100
+    assert rtcp_module._SEQ_MOD == 1 << 16
+    assert rtcp_module._RTP_SEQ_NONE == rtcp_module._SEQ_MOD + 1

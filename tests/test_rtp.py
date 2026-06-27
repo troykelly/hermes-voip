@@ -11,6 +11,7 @@ import struct
 
 import pytest
 
+import hermes_voip.rtp as rtp_module
 from hermes_voip.rtp import _SEQ_HALF, JitterBuffer, Lost, RtpPacket, _seq_before
 
 
@@ -1034,3 +1035,30 @@ def test_max_ahead_guard_rejects_invalid_construction() -> None:
     # max_ahead just below the half: must succeed.
     jb = JitterBuffer(target_depth=1, max_ahead=_SEQ_HALF - 1)
     assert jb._max_ahead == _SEQ_HALF - 1
+
+
+def test_module_constants_pinned_values() -> None:
+    """Verify that module constants have the documented, invariant values.
+
+    Module-level constants should be annotated with typing.Final to signal that
+    they are immutable configuration/protocol values, never reassignable. This
+    test pins their documented values so a typo in any constant is caught
+    deterministically (e.g. a transcription error in _SEQ_MOD = 1 << 16).
+    """
+    # RTP version and header structure
+    assert rtp_module._RTP_VERSION == 2
+    assert rtp_module._HEADER_LEN == 12
+    assert rtp_module._EXT_HEADER_LEN == 4
+    assert rtp_module._MAX_PAYLOAD_TYPE == 0x7F
+    assert rtp_module._MARKER_BIT == 0x80
+    assert rtp_module._PADDING_BIT == 0x20
+    assert rtp_module._EXTENSION_BIT == 0x10
+    assert rtp_module._CSRC_MASK == 0x0F
+    assert rtp_module._CSRC_WORD == 4
+    assert rtp_module._SEQ_MOD == 1 << 16
+    assert rtp_module._SEQ_HALF == 1 << 15
+    assert rtp_module._MAX_SEQ == 0xFFFF
+    assert rtp_module._U32 == 0xFFFFFFFF
+    assert rtp_module._DEFAULT_MAX_AHEAD == 256
+    assert rtp_module._DEFAULT_MAX_DEPTH == 10
+    assert rtp_module._SHRINK_AFTER == 50

@@ -1232,12 +1232,17 @@ def test_media_comfort_filler_repeat_ms_override_and_validation() -> None:
 
 
 def test_media_language_selects_phrase_set_and_is_validated() -> None:
-    """HERMES_VOIP_LANGUAGE selects the phrase set; an unknown code fails (ADR-0054)."""
+    """HERMES_VOIP_LANGUAGE selects the phrase set; a malformed code fails (ADR-0084).
+
+    Since ADR-0084 the gate is BCP-47 format (2-8 alpha chars), not phrase-set
+    membership.  'zz' is a valid 2-letter primary subtag (accepted); '12' is all
+    digits and is structurally malformed (rejected).
+    """
     cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "EN"})  # case-insensitive
     assert cfg.language == "en"
     assert "One moment please." in cfg.comfort_filler_phrases
     with pytest.raises(ConfigError, match="HERMES_VOIP_LANGUAGE"):
-        load_media_config({"HERMES_VOIP_LANGUAGE": "zz"})
+        load_media_config({"HERMES_VOIP_LANGUAGE": "12"})  # digits — malformed
 
 
 def test_media_comfort_filler_explicit_phrases_override_language_default() -> None:

@@ -900,12 +900,13 @@ These span multiple modules or the repo as a whole.
 
 ## Packaging / release
 
-- [ ] **[high] operability** (partial — manual release process documented in runbook 0019 / version single-sourced #187; automated CI-publish is PROPOSE-ONLY pending the operator's publish-target decision, rule 40/41) — No automated version bumping mechanism or release workflow. The version is
-  hardcoded to `'0.0.0'` in three places (`pyproject.toml:3`, `src/hermes_voip/__init__.py:49`,
-  `packaging/hermes-plugins/hermes-voip/plugin.yaml:27`) with no automation to keep them synchronized. A
-  release requires manual synchronization of all three, inviting drift. The test at
-  `tests/test_plugin_manifest.py:159-164` guards `pyproject.toml` ↔ `plugin.yaml` drift but there is no
-  guard for `__init__.__version__`, and no documented release process.
+- [x] **[high] operability** (resolved by this PR — tag-triggered `.github/workflows/publish.yml` (build → github-release → pypi-publish) + runbook 0019 "Automated publish on tag"; version single-sourced earlier in #187/#181) — No automated version bumping mechanism or release workflow. The version is
+  no longer hardcoded in three places: it is single-sourced from `pyproject.toml [project].version`
+  (`hermes_voip.__version__` derives from install metadata; `plugin.yaml` ×2 are pinned equal by the suite —
+  #187), and pushing a `vX.Y.Z` tag now runs `publish.yml`, which guards tag↔`pyproject` version equality,
+  builds + wheel-smokes the artifacts, creates the GitHub Release, and publishes to PyPI via OIDC Trusted
+  Publishing (no stored token). The drift guards live in `tests/test_plugin_manifest.py` (all four version-sync
+  tests), so a release is a single `pyproject.toml` edit + the two `plugin.yaml` copies.
 - [x] **[high] test** (#181) — No test for `__version__` equality with `pyproject.toml`. `test_plugin_manifest.py`
   asserts `plugin.yaml` version matches `pyproject.toml` (line 159) but there is no corresponding test for
   `src/hermes_voip/__init__.py.__version__` (line 49) — a release bump could easily leave it out of sync

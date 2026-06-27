@@ -621,7 +621,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/dialog.py
 
-- [ ] **[low] correctness** — `build_in_dialog_request` can emit a CSeq >= 2**31, the exact value its own
+- [x] (#250) **[low] correctness** — `build_in_dialog_request` can emit a CSeq >= 2**31, the exact value its own
   parser rejects (RFC 3261 §8.1.1.5). `dialog.py:230` computes `next_cseq = dialog.local_cseq + 1` with no
   upper-bound guard, while the parse path (`_cseq`, lines ~339-345) explicitly raises `DialogError` when
   `sequence >= _MAX_CSEQ (2**31)`. A dialog at `local_cseq = 2**31 - 1` produces `CSeq: 2147483648 BYE`
@@ -1031,7 +1031,7 @@ These span multiple modules or the repo as a whole.
 
 ### Tests
 
-- [ ] **[low] test** — RTCP BYE ingest test is assertion-free: `call_quality` unchanged after BYE is unverified. `tests/test_media_engine_rtcp.py:303` `test_ingest_ignores_bye_without_error` only calls `engine.ingest_rtcp(build_compound((Bye(...),)))` with no assertion — only "must not raise". The BYE handler (engine.py:2313-2316) only logs; a mutation adding a state reset to the BYE branch would pass the suite. Fix: snapshot `engine.call_quality` before ingest and assert it equals the state after (`tests/test_media_engine_rtcp.py:303`, `src/hermes_voip/media/engine.py:2313`).
+- [x] (#251) **[low] test** — RTCP BYE ingest test is assertion-free: `call_quality` unchanged after BYE is unverified. `tests/test_media_engine_rtcp.py:303` `test_ingest_ignores_bye_without_error` only calls `engine.ingest_rtcp(build_compound((Bye(...),)))` with no assertion — only "must not raise". The BYE handler (engine.py:2313-2316) only logs; a mutation adding a state reset to the BYE branch would pass the suite. Fix: snapshot `engine.call_quality` before ingest and assert it equals the state after (`tests/test_media_engine_rtcp.py:303`, `src/hermes_voip/media/engine.py:2313`).
 
 ### Docs / drift
 
@@ -1045,7 +1045,7 @@ These span multiple modules or the repo as a whole.
 
 ### Performance / efficiency
 
-- [ ] **[low] efficiency** — Replace `struct.unpack_from` + generator peak scan with `audioop.max` in TX amplitude logging. `engine.py:2147-2150` calls `struct.unpack_from(f'<{n_samp}h', chunk)` then `max(abs(s) for s in pcm_vals)` on every outbound frame (50/s) to compute the rolling peak for the 1-second amplitude log; measured cost is ~13,342 ns/frame vs `audioop.max(chunk, 2)` at ~259 ns/frame — a 51x speedup. `audioop` is already imported at engine.py:61. Fix: replace with `audioop.max(chunk, 2)` (one line); no dependencies added (`src/hermes_voip/media/engine.py:2147-2150`).
+- [x] (#252) **[low] efficiency** — Replace `struct.unpack_from` + generator peak scan with `audioop.max` in TX amplitude logging. `engine.py:2147-2150` calls `struct.unpack_from(f'<{n_samp}h', chunk)` then `max(abs(s) for s in pcm_vals)` on every outbound frame (50/s) to compute the rolling peak for the 1-second amplitude log; measured cost is ~13,342 ns/frame vs `audioop.max(chunk, 2)` at ~259 ns/frame — a 51x speedup. `audioop` is already imported at engine.py:61. Fix: replace with `audioop.max(chunk, 2)` (one line); no dependencies added (`src/hermes_voip/media/engine.py:2147-2150`).
 - [ ] **[medium] efficiency** — Measure and document `CallProgressDetector.on_audio_frame` per-frame cost; gate or move off event-loop hot path. `call_loop.py:1151` calls `_feed_call_progress(frame, frame_events)` unconditionally on every decoded inbound frame (50/s) when call-progress is enabled; `call_progress.py:520` unpacks the PCM16 frame into a Python `list[float]` then runs 10+ Goertzel passes — measured ~179 µs/frame at 16 kHz, roughly 9 ms CPU/second against the 20 ms frame budget, running synchronously in the pump asyncio task. No measurement or budget note exists; not in the backlog (the generic efficiency item at line 604 covers `media/audio.py` and `rtp.py`, not `call_progress.py`). Fix options: move to the VAD worker thread; run at VAD-window rate (~31/s) rather than RTP-frame rate (50/s); run every Nth frame. Rule 22 requires a concrete number before merging (`src/hermes_voip/media/call_progress.py:520`, `call_loop.py:1151`).
 - [ ] **[low] efficiency** — Replace per-frame Python list allocation in `InbandDtmfDetector._detect_frame` with `struct.unpack_from` tuple. `dtmf.py:430` allocates a new `list[float]` every inbound frame when in-band DTMF receive is enabled (`[float(v) for v in struct.unpack(f'<{n}h', pcm16)]`); measured ~22,848 ns/frame vs a cached format-string `struct.unpack_from`. Fix: use a module-level `_PCM16_FMT_8K` constant and `struct.unpack_from`, omit the `float()` coerce (inner loop arithmetic coerces); saves ~7 µs/frame at 50 fps. The existing backlog "Every encode/decode/resample returns a fresh bytes" item covers `audio.py`/`rtp.py` but not `dtmf.py` (`src/hermes_voip/dtmf.py:430`).
 - [ ] **[medium] observability** — Add per-frame CPU microbenchmark for `call_progress.on_audio_frame` and record against ADR-0005 budget. Rule 22 requires concrete per-frame latency numbers for every hot-path module; `CallProgressDetector.on_audio_frame` benchmarks at ~179 µs/frame (16 kHz, 10 Goertzel passes) — ~9 ms CPU/second — yet no microbenchmark, no ADR-0005 budget reference, and no per-frame comment exists. Add a benchmark in `tests/` or `benchmarks/` with `pytest-benchmark` or `timeit`; add the measured figure as a comment near `on_audio_frame` (call_progress.py:482) and the pump's feed site (call_loop.py:1151), following the pattern at engine.py:267 (`src/hermes_voip/media/call_progress.py:482`, `call_loop.py:1151`).
@@ -1083,8 +1083,20 @@ These span multiple modules or the repo as a whole.
 ## Review follow-ups (Wave 6 release-blocker reviews, 2026-06-27)
 
 - [ ] **[low] correctness** — sdp: the SIP 2xx-answer parse site (`adapter.py` ~:2034) recomputes `_sip_supported_encodings()` instead of threading the stored offered codecs like the WebRTC site (~:2689); harmonize (pre-existing; #234 review).
-- [ ] **[low] test** — transport: add a `caplog` test asserting the malformed-message skip log carries only exception type + length (non-PII), catching a regression that logs raw SIP content (#231).
+- [x] (#247) **[low] test** — transport: add a `caplog` test asserting the malformed-message skip log carries only exception type + length (non-PII), catching a regression that logs raw SIP content (#231).
 - [ ] **[low] feature** — registration: optional in-transaction `stale=true` nonce retry (deferred by ADR-0080).
-- [ ] **[low] security** — CI: pin `gate.yml`/`gitleaks.yml`/`supply-chain.yml` third-party action `uses:` to commit SHAs, matching `publish.yml` (#235).
-- [ ] **[medium] test** — rtp: JitterBuffer SSRC auto-reset has no hysteresis — one foreign-SSRC packet flushes buffered audio (safe only because SRTP auth is above); consider N-consecutive-packet confirmation (#221).
-- [ ] **[low] test** — manifest: the `plugin.yaml` admission-knob test asserts presence only, not default-value parity with `config.py` (`MAX_CALLS=8`, `SHUTDOWN_DRAIN_SECS=5.0`); add a cross-check (#222).
+- [x] (#246) **[low] security** — CI: pin `gate.yml`/`gitleaks.yml`/`supply-chain.yml` third-party action `uses:` to commit SHAs, matching `publish.yml` (#235).
+- [x] (#248) **[medium] test** — rtp: JitterBuffer SSRC auto-reset has no hysteresis — one foreign-SSRC packet flushes buffered audio (safe only because SRTP auth is above); consider N-consecutive-packet confirmation (#221).
+- [x] (#249) **[low] test** — manifest: the `plugin.yaml` admission-knob test asserts presence only, not default-value parity with `config.py` (`MAX_CALLS=8`, `SHUTDOWN_DRAIN_SECS=5.0`); add a cross-check (#222).
+
+## Operator-filed issues (Wave 7, 2026-06-27)
+
+Tracked as GitHub issues #239–#244; resolved in PRs #253–#254.  The items
+below were not in the backlog before the issues were filed.
+
+- [x] (#254) **[medium] packaging** — `[webrtc]` extra pins `websockets==16.0`, conflicting with Hermes's own pin of 15.0.1 (issue #240). Relax to `websockets>=15.0,<17` so Hermes and hermes-voip can co-install; note the stable API surface used (connect/subprotocols/max_size/ping_interval). ADR-0083 records the constraint policy (`pyproject.toml`, `uv.lock`, `docs/adr/0083-extra-dependency-constraint-policy.md`).
+- [x] (#254) **[medium] packaging** — `[media]` extra pins `cryptography==48.0.1`, conflicting with co-installed packages that require `<47` (issue #241). Relax to `cryptography>=46.0.7,<49` (floor = CVE-2026-39892/-34073 patch; ceiling keeps pyopenssl 26.2.0 satisfiable); only AES-CTR hazmat is used (`pyproject.toml`, ADR-0083).
+- [x] (#254) **[medium] packaging** — `[ml]` extra pins `onnxruntime==1.24.4` which has no macOS py3.13 wheel (issue #239). Add `; sys_platform != 'darwin'` marker so macOS users relying on sherpa-onnx's self-bundled onnxruntime are not broken (`pyproject.toml`, ADR-0083).
+- [x] (#253) **[low] docs** — `docs/runbooks/0011-voip-enable-plugin.md` did not explain that `hermes plugins enable/list` uses filesystem discovery only and never consults `importlib.metadata` entry-points (issue #244, upstream NousResearch/hermes-agent#23802). Cross-reference added.
+- [x] (#253) **[low] docs** — `docs/runbooks/0011-voip-enable-plugin.md` did not warn that the Hermes runtime imports `hermes_voip` from the pip-installed site-packages copy, not a git-cloned `~/.hermes/plugins/hermes-voip/` directory (issue #243). Warning added so operators applying local patches target the right location.
+- [x] (#245) **[low] test** — Non-muxed RTCP adapter tests were flaky: `start_rtcp(mux=False)` binds an RTP-port+1 sibling socket; tests using `local_port=0` did not reserve the consecutive pair, so under ephemeral-port churn a sibling test could hold port+1 causing the engine to degrade the call to RTCP-off and `assert rtcp_port is not None` to fail. Fix: new `reserve_consecutive_udp_pair` helper reserves the (P, P+1) pair before binding the engine to P, closing the sub-ms steal window. Reproduced at 7/200 under 800 held loopback sockets.

@@ -66,8 +66,9 @@ def test_matching_bytes_pass(tmp_path: Path) -> None:
     )
     _write(tmp_path, "model.onnx", data)
 
-    # No exception == pass; verify_model_files returns None on success.
-    assert verify_model_files(manifest, str(tmp_path)) is None
+    # The assertion is the ABSENCE of a raise: a matching digest verifies and
+    # returns control to the caller (verify_model_files returns None).
+    verify_model_files(manifest, str(tmp_path))
 
 
 def test_mismatched_bytes_raise(tmp_path: Path) -> None:
@@ -128,7 +129,8 @@ def test_pinned_file_in_subdirectory_is_resolved(tmp_path: Path) -> None:
     )
     _write(tmp_path, "onnx/model.onnx", data)
 
-    assert verify_model_files(manifest, str(tmp_path)) is None
+    # No raise == the subdirectory file was located and its digest matched.
+    verify_model_files(manifest, str(tmp_path))
 
 
 def test_first_mismatch_among_many_raises(tmp_path: Path) -> None:

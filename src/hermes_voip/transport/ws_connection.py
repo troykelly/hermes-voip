@@ -102,9 +102,10 @@ class _PendingInvite:
     Tracked from the moment the INVITE is handed to ``on_new_call`` until we
     send its final response (or a CANCEL terminates it), so a CANCEL can be
     matched to it (RFC 3261 §9.2) and a 200 OK racing a CANCEL is suppressed.
-    ``local_tag`` is the To-tag for any response *we* generate for this
-    transaction (the CANCEL-driven 487), stable so a retransmitted 487 reuses
-    it (§8.2.6.2).
+    ``local_tag`` is the one stable To-tag for *every* response *we* generate
+    for this CANCEL exchange — both the 487 to the INVITE and the 200 OK to the
+    CANCEL — so they share a To-tag (§9.2) and a retransmitted 487/200 reuses it
+    (§8.2.6.2).
     """
 
     invite: SipRequest
@@ -574,9 +575,13 @@ class WssSipTransport:
             return
         already_cancelled = pending.cancelled
         pending.cancelled = True
-        # 200 OK to the CANCEL itself. Always re-sent so a retransmitted CANCEL
-        # is absorbed.
-        await self.send(build_response(cancel, 200, "OK", to_tag=new_tag()))
+        # 200 OK to the CANCEL itself. It carries the pending invite's stable
+        # local_tag — the SAME To tag as the 487 below — per RFC 3261 §9.2: "The
+        # To tag of the response to the CANCEL and the To tag in the response to
+        # the original request SHOULD be the same." Reusing local_tag (never a
+        # fresh new_tag()) also makes the 200 idempotent at the message level: a
+        # retransmitted CANCEL is always re-answered with the identical To tag.
+        await self.send(build_response(cancel, 200, "OK", to_tag=pending.local_tag))
         if already_cancelled:
             return  # the 487 + abort already happened on the first CANCEL
         # 487 the INVITE: a dialog-forming final carrying our stable local tag.

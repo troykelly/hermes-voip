@@ -14,6 +14,7 @@ classifiers = [
     "Topic :: Communications :: Telephony",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
+    "Typing :: Typed",
 ]
 dependencies = [
     "audioop-lts==0.2.2",

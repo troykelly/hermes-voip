@@ -1340,6 +1340,9 @@ class MediaConfig:
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
             raise ConfigError(msg)
+        if self.error_apology and not self.error_apology.strip():
+            msg = "error_apology must not be blank when set"
+            raise ConfigError(msg)
         # An EMPTY refuse_decline_phrases tuple is allowed (the operator opting OUT of
         # the spoken decline, back to the prior pure-silence behaviour); a tuple WITH a
         # blank member is a misconfiguration — the loop would synthesise empty speech.

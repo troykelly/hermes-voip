@@ -1,8 +1,14 @@
 # ADR-0022: G.722 wideband — negotiate-best-available, vendored public-domain codec
 
 - **Date:** 2026-06-17
-- **Status:** Accepted
+- **Status:** Accepted (codec-order selection superseded in part by ADR-0078)
 - **Deciders:** agent session (G.722 wideband lane)
+
+> **Superseded in part (ADR-0078, 2026-06-26):** where this ADR states the offer/answer
+> machinery "honours the offer's preference order", that no longer holds —
+> `negotiate_audio` now orders the answer by OUR menu preference (the answerer's
+> preference, RFC 3264 §6.1). The G.722-preferred menu and the G.711 fallback are
+> unchanged; only the ordering of the negotiated result changed. See ADR-0078.
 
 ## Context
 

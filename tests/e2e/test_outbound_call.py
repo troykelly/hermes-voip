@@ -666,6 +666,102 @@ async def test_outbound_call_runs_unprivileged_with_callee_identity() -> None:
         await gateway.stop()
 
 
+async def test_outbound_answer_order_selects_peer_preferred_pcmu_over_opus() -> None:
+    """A received 2xx answer keeps the answerer's codec order.
+
+    The plugin is the offerer on outbound calls. If it offered Opus before PCMU but
+    the 2xx answer lists PCMU before Opus, the answerer selected PCMU and the engine
+    must send PCMU. Reordering the received answer back to our offer menu would make
+    us send Opus against a PCMU-preferred answer.
+    """
+
+    class _PcmuBeforeOpusGateway(OutboundGateway):
+        """Gateway whose 2xx answer prefers PCMU even though Opus is also accepted."""
+
+        def _sdp_answer(self) -> str:
+            rtp_port = self.rtp.port
+            return (
+                "v=0\r\n"
+                "o=- 8000 8000 IN IP4 127.0.0.1\r\n"
+                "s=-\r\n"
+                "c=IN IP4 127.0.0.1\r\n"
+                "t=0 0\r\n"
+                f"m=audio {rtp_port} RTP/AVP 0 111 101\r\n"
+                "a=rtpmap:0 PCMU/8000\r\n"
+                "a=rtpmap:111 opus/48000/2\r\n"
+                "a=fmtp:111 minptime=10;useinbandfec=1\r\n"
+                "a=rtpmap:101 telephone-event/8000\r\n"
+                "a=fmtp:101 0-16\r\n"
+                "a=ptime:20\r\n"
+                "a=sendrecv\r\n"
+            )
+
+    from hermes_voip.media.engine import Codec  # noqa: PLC0415
+
+    gateway = _PcmuBeforeOpusGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(
+        asr=_FakeASR(),
+        tts=_FakeTTS(),
+        guard=_FakeGuard(),
+    )
+
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            with patch("hermes_voip.adapter._opus_sip_available", return_value=True):
+                place_task = asyncio.create_task(adapter.place_call(_TARGET_EXT))
+
+                await gateway.await_invite_from_plugin(timeout=5.0)
+                await gateway.await_invite_from_plugin(timeout=5.0)
+                await gateway.await_ack_from_plugin(timeout=5.0)
+
+                returned_call_id = await asyncio.wait_for(place_task, timeout=5.0)
+
+            await _until(
+                lambda: returned_call_id in adapter._call_sessions, timeout=5.0
+            )
+            session = adapter._call_sessions[returned_call_id]
+            engine = session._media
+            assert isinstance(engine, RtpMediaTransport), (
+                f"expected RtpMediaTransport, got {type(engine)}"
+            )
+            assert engine._codec is Codec.PCMU, (
+                f"engine codec is {engine._codec!r} "
+                f"(payload type {engine._codec.value}); expected Codec.PCMU because "
+                "the received 2xx answer listed PCMU first."
+            )
+
+            dialog = session.dialog
+            bye = build_request(
+                "BYE",
+                f"sip:{_TO_USER}@127.0.0.1:{gateway.sip_port};transport=tls",
+                [
+                    (
+                        "Via",
+                        f"SIP/2.0/TLS 127.0.0.1:{gateway.sip_port}"
+                        f";branch={new_branch()};rport",
+                    ),
+                    ("Max-Forwards", "70"),
+                    ("From", f"<{dialog.remote_uri}>;tag={dialog.remote_tag}"),
+                    ("To", f"<{dialog.local_uri}>;tag={dialog.local_tag}"),
+                    ("Call-ID", returned_call_id),
+                    ("CSeq", "2 BYE"),
+                ],
+            )
+            await gateway._server.push(bye)
+            await _until(
+                lambda: returned_call_id not in adapter._call_sessions, timeout=5.0
+            )
+    finally:
+        await gateway.stop()
+
+
 async def test_outbound_call_486_busy() -> None:
     """Plugin sends INVITE, gateway responds 486 Busy Here -> OutboundCallFailed.
 
@@ -1907,7 +2003,10 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
             assert isinstance(adapter, VoipAdapter)
 
             def _negotiate_then_race(
-                offer: AudioMedia, supported: Sequence[str]
+                offer: AudioMedia,
+                supported: Sequence[str],
+                *,
+                prefer_local: bool = True,
             ) -> tuple[Codec, ...]:
                 # On the first (and only) acceptance, simulate an abort that landed
                 # in this same tick: the 2xx is already dequeued and ACKed, but the
@@ -1917,7 +2016,7 @@ async def test_abort_racing_the_2xx_same_tick_aborts_instead_of_proceeding() -> 
                     pending = next(iter(adapter._outbound_pending.values()))
                     pending.cancel_requested = True
                     pending.reason = "raced abort"
-                return negotiate_audio(offer, supported)
+                return negotiate_audio(offer, supported, prefer_local=prefer_local)
 
             with patch(
                 "hermes_voip.adapter.negotiate_audio",

@@ -204,11 +204,11 @@ def test_is_srtp_detects_savp_and_crypto() -> None:
     assert savp.audio.crypto[0].startswith("1 AES_CM_128_HMAC_SHA1_80")
 
 
-def test_negotiate_keeps_common_codecs_in_offer_order() -> None:
+def test_negotiate_keeps_common_codecs_in_supported_order() -> None:
     sdp = SessionDescription.parse(_OFFER_AVP)
     assert sdp.audio is not None
     chosen = negotiate_audio(sdp.audio, supported=("PCMU", "telephone-event"))
-    # PCMA is dropped (unsupported); order follows the offer (PCMU then 101)
+    # PCMA is dropped (unsupported); order follows our supported menu.
     assert [c.encoding for c in chosen] == ["PCMU", "telephone-event"]
 
 
@@ -272,7 +272,7 @@ def test_g722_static_payload_9_parses_without_rtpmap() -> None:
 
 
 def test_negotiate_prefers_g722_when_offered() -> None:
-    # Offer [G722, PCMU, PCMA, DTMF] against our menu -> G722 wins (offer order
+    # Offer [G722, PCMU, PCMA, DTMF] against our menu -> G722 wins (our menu
     # promotes it first), and the chosen voice codec is carriable by the engine.
     from hermes_voip.media.engine import Codec as EngineCodec  # noqa: PLC0415
     from hermes_voip.media.engine import codec_for_encoding  # noqa: PLC0415
@@ -300,6 +300,137 @@ def test_negotiate_falls_back_to_g711_when_g722_absent() -> None:
     assert codec_for_encoding(voice[0].encoding, voice[0].clock_rate) is (
         EngineCodec.PCMU
     )
+
+
+# ---------------------------------------------------------------------------
+# RFC 3264 §6.1 (ADR-0078): negotiate_audio orders the answer by OUR preference
+# (the `supported` menu, first = most preferred), NOT by the offer's order. A
+# gateway that lists a narrowband codec before our preferred wideband one must
+# still be answered with the wideband codec we advertise. A stable sort by
+# preference rank keeps already-preference-ordered offers byte-for-byte unchanged
+# and keeps the relative offer order of two codecs sharing one rank.
+# ---------------------------------------------------------------------------
+
+_WEBRTC_MENU = ("opus", "PCMU", "PCMA", "telephone-event")
+
+_OFFER_PCMU_BEFORE_OPUS = (
+    "v=0\r\n"
+    "o=- 9 9 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 40008 RTP/AVP 0 111 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+_OFFER_PCMU_BEFORE_G722 = (
+    "v=0\r\n"
+    "o=- 9 9 IN IP4 192.0.2.3\r\n"
+    "s=-\r\n"
+    "c=IN IP4 192.0.2.3\r\n"
+    "t=0 0\r\n"
+    "m=audio 40010 RTP/AVP 0 9 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:9 G722/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def test_negotiate_prefers_opus_when_offer_lists_pcmu_first() -> None:
+    # Offer order is [PCMU, opus, DTMF] but OUR menu prefers opus first. The answer
+    # must lead with opus (RFC 3264 §6.1: the answerer's preference wins), not the
+    # narrowband PCMU the offer happened to list first.
+    audio = SessionDescription.parse(_OFFER_PCMU_BEFORE_OPUS).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_WEBRTC_MENU)
+    assert [c.encoding.lower() for c in chosen] == ["opus", "pcmu", "telephone-event"]
+
+
+def test_negotiate_preserves_answerer_order_when_parsing_received_answer() -> None:
+    # Outbound call path: WE offered [opus, PCMU, telephone-event], but the peer
+    # answered [PCMU, opus, telephone-event]. As offerer parsing an answer, the peer
+    # is the answerer and its order is the selection signal; do not reorder to our
+    # offered menu or _first_voice_codec would send Opus against a PCMU-selected answer.
+    audio = SessionDescription.parse(_OFFER_PCMU_BEFORE_OPUS).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_WEBRTC_MENU, prefer_local=False)
+    assert [c.encoding.lower() for c in chosen] == ["pcmu", "opus", "telephone-event"]
+
+
+def test_negotiate_keeps_telephone_event_at_supported_menu_position() -> None:
+    # ADR-0078 property 5: telephone-event is sorted like every other supported
+    # encoding. If an embedding wants DTMF first, it stays first rather than being
+    # special-cased to the end.
+    audio = SessionDescription.parse(_OFFER_G711_ONLY).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=("telephone-event", "PCMU"))
+    assert [c.encoding.lower() for c in chosen] == ["telephone-event", "pcmu"]
+
+
+def test_negotiate_prefers_g722_when_offer_lists_pcmu_first() -> None:
+    # Offer order is [PCMU, G722, DTMF] against the SDES menu (G722-preferred). The
+    # answer must lead with G.722 (our preference), not the PCMU offered first —
+    # otherwise a wideband-capable peer is silently answered narrowband.
+    audio = SessionDescription.parse(_OFFER_PCMU_BEFORE_G722).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_SUPPORTED)
+    assert [c.encoding.upper() for c in chosen] == ["G722", "PCMU", "TELEPHONE-EVENT"]
+
+
+def test_negotiate_unchanged_when_offer_already_preference_ordered() -> None:
+    # When the offer already matches our preference order the result is unchanged
+    # (byte-for-byte: same Codec objects in the same order) — the reorder is a
+    # stable no-op, so existing offer-order behaviour is preserved in that case.
+    audio = SessionDescription.parse(_OFFER_G722_AND_G711).audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=_SUPPORTED)
+    # Offer is [G722, PCMU, PCMA, DTMF]; our menu is (G722, PCMU, PCMA, DTMF) — the
+    # reorder is a stable no-op, so the chosen Codec objects equal the offered ones
+    # in the offered order (no copy, no shuffle).
+    assert list(chosen) == list(audio.codecs)
+    assert [c.encoding.upper() for c in chosen] == [
+        "G722",
+        "PCMU",
+        "PCMA",
+        "TELEPHONE-EVENT",
+    ]
+
+
+def test_negotiate_stable_within_same_preference_rank() -> None:
+    # Two offered codecs that map to the SAME preference rank (here both PCMU,
+    # offered under two payload types) keep their relative OFFER order — the sort
+    # is stable, so the first-offered stays first.
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0 96 101\r\n"
+        "a=rtpmap:0 PCMU/8000\r\na=rtpmap:96 PCMU/8000\r\n"
+        "a=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n"
+    )
+    audio = offer.audio
+    assert audio is not None
+    chosen = negotiate_audio(audio, supported=("PCMU", "telephone-event"))
+    # Both PCMU entries share rank 0; the first-offered (PT 0) precedes PT 96.
+    pcmu = [c for c in chosen if c.encoding.upper() == "PCMU"]
+    assert [c.payload_type for c in pcmu] == [0, 96]
+
+
+def test_answer_orders_codecs_by_our_preference_not_offer() -> None:
+    # End-to-end through build_audio_answer: offer lists PCMA before PCMU; our menu
+    # prefers PCMU first, so the answer's m= line must list PCMU (0) before PCMA (8)
+    # — RFC 3264 §6.1, the answerer expresses ITS preference.
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
+        "m=audio 40000 RTP/AVP 8 0\r\na=rtpmap:8 PCMA/8000\r\n"
+        "a=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+    )
+    text = build_audio_answer(
+        offer, local_address="192.0.2.20", port=42000, supported=("PCMU", "PCMA")
+    )
+    assert "m=audio 42000 RTP/AVP 0 8" in text
 
 
 def test_build_audio_offer_round_trips() -> None:
@@ -537,7 +668,7 @@ def test_answer_negotiates_codecs_and_mirrors_sendrecv() -> None:
         supported=("PCMU", "telephone-event"),
     )
     parsed = _audio(SessionDescription.parse(text))
-    # PCMA dropped (unsupported); PCMU + telephone-event kept in offer order.
+    # PCMA dropped (unsupported); PCMU + telephone-event follow our supported menu.
     assert [c.encoding for c in parsed.codecs] == ["PCMU", "telephone-event"]
     assert parsed.port == 42000
     assert parsed.connection_address == "192.0.2.20"
@@ -629,9 +760,13 @@ def test_answer_requires_audio_in_offer() -> None:
         )
 
 
-def test_answer_preserves_offer_codec_order_not_supported_order() -> None:
-    # Offer lists PCMA before PCMU; answer must follow the OFFER order, not the
-    # order of `supported` (RFC 3264: answer uses the offerer's preference).
+def test_answer_orders_codecs_by_supported_not_offer_order() -> None:
+    # Offer lists PCMA before PCMU; the answer must follow OUR `supported` order
+    # (PCMU before PCMA), not the offer's (ADR-0078, RFC 3264 §6.1: the answer
+    # expresses the ANSWERER's preference). This is the same end-to-end behaviour
+    # asserted by test_answer_orders_codecs_by_our_preference_not_offer above; kept
+    # here under the W3 build_audio_answer suite as the regression anchor for the
+    # superseded offer-order contract.
     offer = SessionDescription.parse(
         "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"
         "m=audio 40000 RTP/AVP 8 0\r\na=rtpmap:8 PCMA/8000\r\n"
@@ -640,7 +775,7 @@ def test_answer_preserves_offer_codec_order_not_supported_order() -> None:
     text = build_audio_answer(
         offer, local_address="192.0.2.20", port=42000, supported=("PCMU", "PCMA")
     )
-    assert "m=audio 42000 RTP/AVP 8 0" in text
+    assert "m=audio 42000 RTP/AVP 0 8" in text
 
 
 # --- W3 (review): typed a=crypto parse + validation + negotiation (RFC 4568) ---

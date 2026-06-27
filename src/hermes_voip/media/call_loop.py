@@ -1057,7 +1057,17 @@ class CallLoop:
         callback = self._call_progress_callback
         if callback is None:
             return
-        _log.info("call-progress: %s at %.2fs", event.kind, event.elapsed_s)
+        _log.info(
+            "call-progress: %s at %.2fs",
+            event.kind,
+            event.elapsed_s,
+            extra={
+                "event": "call_progress",
+                "call_id": self._call_id,
+                "kind": event.kind,
+                "elapsed_s": round(event.elapsed_s, 3),
+            },
+        )
 
         async def _runner() -> None:
             await callback(event)

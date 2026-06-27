@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import random
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
@@ -27,6 +28,7 @@ from typing import Final
 import pytest
 
 from hermes_voip.media.call_loop import BargeInMode, CallLoop, gate_voip_tool
+from hermes_voip.media.call_progress import CallProgressEvent, FaxCng
 from hermes_voip.media.endpoint import Endpointer
 from hermes_voip.media.vad import VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR, Transcript
@@ -293,6 +295,39 @@ async def _noop(text: str) -> None:
 async def _one_chunk(text: str) -> AsyncIterator[str]:
     """A single-chunk agent-text iterator for speak()."""
     yield text
+
+
+@pytest.mark.asyncio
+async def test_surface_call_progress_logs_structured_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_surface_call_progress emits the call-progress INFO with structured extra fields.
+
+    The structured ``extra`` (event/call_id/kind/elapsed_s) lets operators query
+    call-progress (fax/AMD/beep) outcomes from logs per call (ADR-0064 / runbook
+    0014) without scraping the human message. No caller PII: call_id is the internal
+    session id, kind a fixed verdict token, elapsed_s a float.
+    """
+    seen: list[CallProgressEvent] = []
+
+    async def _cb(ev: CallProgressEvent) -> None:
+        seen.append(ev)
+
+    loop = _build_loop(
+        _FakeTransport([]), _FakeASR([]), _FakeTTS([]), _FakeGuard([]), _noop
+    )
+    loop._call_progress_callback = _cb  # test-only wiring of the optional callback
+    event = FaxCng(elapsed_s=1.5)
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.call_loop"):
+        loop._surface_call_progress(event)
+        await asyncio.gather(*loop._call_progress_tasks)
+    record = next(
+        r for r in caplog.records if r.__dict__.get("event") == "call_progress"
+    )
+    assert record.__dict__["call_id"] == _CALL_ID
+    assert record.__dict__["kind"] == "fax_cng"
+    assert record.__dict__["elapsed_s"] == 1.5
+    assert seen == [event]
 
 
 # ---------------------------------------------------------------------------

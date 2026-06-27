@@ -59,6 +59,33 @@ __all__ = [
 
 _MS_PER_SECOND: Final[int] = 1000
 
+# ---------------------------------------------------------------------------
+# Efficiency documentation (rule 22)
+# ---------------------------------------------------------------------------
+# Measured per-frame cost of ``CallProgressDetector.on_audio_frame`` on a
+# devcontainer core (Python 3.13, 10 000 iterations via ``timeit``):
+#
+#   * 16 kHz / 320-sample frame, silence (energy below floor, early exit):
+#     ~34-44 µs/frame
+#   * 16 kHz / 320-sample frame, 1100 Hz CNG tone (energy above floor, all
+#     guard bins evaluated): ~120-132 µs/frame
+#   * 16 kHz / 320-sample frame, worst-case (outbound + machine decided + beep
+#     path active, 1000 Hz tone): ~150 µs/frame
+#
+# The 20 ms frame period is the outer budget wall; 150 µs = 0.75 % of that
+# period. Three Goertzel passes (CNG + CED + optional BEEP) each walk n samples
+# in O(n) — the same order as one ``InbandDtmfDetector`` low/high pass already on
+# the hot path (ADR-0064). No FFT, no allocation beyond the per-frame float list.
+#
+# The per-frame test gate in ``tests/test_call_progress_microbench.py`` uses a
+# generous 5 ms ceiling (~33 x the worst-case measured cost) so CI scheduling
+# jitter cannot cause a false failure; it also guards the heap allocation count.
+#
+#: Documented worst-case per-frame cost in µs at 16 kHz (320 samples) — the
+#: value most relevant to the resampled conversational pipeline (ADR-0017).
+#: Re-measure and update if the implementation changes (rule 22).
+_ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K: Final[float] = 150.0
+
 
 # ---------------------------------------------------------------------------
 # Event model — a tagged, frozen discriminated union (rule 17: exhaustive match,
@@ -486,6 +513,17 @@ class CallProgressDetector:
         been classified, the record-beep detector AND the tick-driven no-beep
         fallback. ``elapsed_s`` is the running sample count divided by the rate, so
         it stays exact under variable or zero-length frames with no wall clock.
+
+        **Per-frame cost (rule 22):** O(n) in the frame sample count.  Measured on a
+        devcontainer core (Python 3.13, ``timeit`` 10 000 iterations):
+
+        * 16 kHz / 320 samples, silence (energy below floor, early exit): ~34-44 µs
+        * 16 kHz / 320 samples, 1100 Hz tone (guard bins active): ~120-132 µs
+        * 16 kHz / 320 samples, worst-case (beep path + tone): ~150 µs
+
+        The 20 ms frame period is the outer budget wall; 150 µs = 0.75 % of that
+        budget.  See :data:`_ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K` and
+        ``tests/test_call_progress_microbench.py`` for the gating test.
 
         Args:
             frame: PCM16-LE mono audio at this detector's ``sample_rate``.

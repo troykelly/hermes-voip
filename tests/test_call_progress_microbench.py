@@ -127,7 +127,7 @@ def test_on_audio_frame_cost_constant_exists() -> None:
         "on_audio_frame must document its measured per-frame cost in a module-level "
         "constant _ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K (rule 22)"
     )
-    measured = _cp_mod._ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K  # type: ignore[attr-defined]
+    measured = _cp_mod._ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K
     assert isinstance(measured, (int, float)), (
         "_ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K must be a numeric constant (µs)"
     )
@@ -211,7 +211,7 @@ def test_on_audio_frame_wall_clock_within_5ms_ceiling_16k() -> None:
     us_per_frame = elapsed_s / n_iters * 1_000_000
 
     # Document the measured number -- this is what rule 22 requires.
-    measured = _cp_mod._ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K  # type: ignore[attr-defined]
+    measured = _cp_mod._ON_AUDIO_FRAME_MEASURED_US_PER_FRAME_16K
 
     # The gating assertion: CI must not regress beyond the generous ceiling.
     assert us_per_frame < _WALL_CLOCK_CEILING_US, (

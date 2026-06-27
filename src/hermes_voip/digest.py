@@ -29,6 +29,8 @@ import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from hermes_voip._chars import contains_control
+
 # An auth-param is ``name=token`` or ``name="quoted-string"``. The quoted
 # alternative is escape-aware (RFC 2617 quoted-pair): ``\"`` is a literal quote
 # and ``\\`` a literal backslash, so the value spans to the matching unescaped
@@ -52,10 +54,6 @@ _ALGORITHM_PREFERENCE: tuple[str, ...] = (
     "md5-sess",
     "md5",
 )
-
-# Forbidden control characters: the ASCII C0 range (code points below this) and DEL.
-_C0_END = 0x20
-_DEL = 0x7F
 
 # RFC 2617/7616 nonce-count is exactly 8 lowercase hex digits on the wire.
 _NC_MIN = 1
@@ -91,7 +89,7 @@ def _quoted(value: str) -> str:
     Raises:
         ValueError: If ``value`` contains a control character.
     """
-    if any(ord(char) < _C0_END or ord(char) == _DEL for char in value):
+    if contains_control(value):
         msg = "auth-param value contains a control character"
         raise ValueError(msg)
     return value.replace("\\", "\\\\").replace('"', '\\"')

@@ -16,6 +16,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
+from hermes_voip._chars import contains_control
+
 __all__ = [
     "SipRequest",
     "SipResponse",
@@ -51,14 +53,10 @@ _CONTENT_LENGTH: Final[str] = "Content-Length"
 _MIN_STATUS: Final[int] = 100
 _MAX_STATUS: Final[int] = 699
 
-# Forbidden control characters: the ASCII C0 range (code points below this) and DEL.
-_C0_END: Final[int] = 0x20
-_DEL: Final[int] = 0x7F
-
 
 def _reject_controls(value: str, what: str) -> None:
     """Raise if ``value`` carries a control character (CR/LF/NUL injection guard)."""
-    if any(ord(char) < _C0_END or ord(char) == _DEL for char in value):
+    if contains_control(value):
         msg = f"{what} contains a control character"
         raise ValueError(msg)
 

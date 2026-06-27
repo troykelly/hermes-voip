@@ -106,6 +106,130 @@ def _binding_uri(binding: str) -> str:
     return binding.split(";", 1)[0].strip()
 
 
+#: The default port for each SIP scheme (RFC 3261 §19.1.2): an omitted port is
+#: equivalent to the scheme default in §19.1.4 SIP-URI comparison. Used as the
+#: scheme-keyed fallback when the caller supplies no transport-derived default.
+_DEFAULT_PORT: dict[str, int] = {"sip": 5060, "sips": 5061}
+
+#: The default signalling port keyed by the active Via transport (ADR-0090). On a
+#: secure leg (TLS/WSS, which carry SIP-over-TLS per ADR-0005) the wire default is
+#: 5061, so a registrar that echoes our portless Contact with an explicit ``:5061``
+#: — even on a ``sip:`` addr-spec whose ``transport=tls`` param ``_binding_uri``
+#: strips — is binding the same endpoint. UDP/TCP keep the cleartext 5060 default.
+_TRANSPORT_DEFAULT_PORT: dict[str, int] = {
+    "TLS": 5061,
+    "WSS": 5061,
+    "UDP": 5060,
+    "TCP": 5060,
+}
+
+
+def _split_host_port(hostport: str) -> tuple[str, str] | None:
+    """Split a ``host[:port]`` (or bracketed IPv6 ``[..]:port``) into ``(host, port)``.
+
+    Returns the host and the raw port token (``""`` when the port is omitted), or
+    ``None`` for a malformed reference. An IPv6 literal is bracketed
+    (``[2001:db8::1]:5061``), so the port-delimiting colon is only the one OUTSIDE
+    the brackets — a plain ``rpartition(':')`` would wrongly split inside the
+    address.
+    """
+    if hostport.startswith("["):
+        close = hostport.find("]")
+        if close == -1:
+            return None
+        host = hostport[: close + 1]
+        remainder = hostport[close + 1 :]
+        if remainder == "":
+            return host, ""
+        if remainder.startswith(":"):
+            return host, remainder[1:]
+        return None
+    host, _, port_str = hostport.partition(":")
+    return host, port_str
+
+
+def _split_sip_uri(uri: str) -> tuple[str, str, str, int | None] | None:
+    """Decompose a SIP addr-spec into ``(scheme, userinfo, host, port)`` for §19.1.4.
+
+    Operates on a Contact addr-spec (``scheme:[user@]host[:port]`` optionally
+    followed by ``;uri-params``). ``_binding_uri`` strips the angle brackets but
+    leaves any ``;transport=...`` URI parameters attached, so they are dropped
+    here at the first top-level ``;`` before the host/port is read. The port is
+    ``None`` when omitted (the §19.1.4 default-port elision is applied by the
+    comparator, not here). Returns ``None`` for anything that is not a
+    ``scheme:[user@]host[:port]`` shape so the caller falls back to plain string
+    equality rather than mis-parsing.
+    """
+    scheme, sep, rest = uri.partition(":")
+    if not sep or not scheme or not rest:
+        return None
+    # Drop any ``;uri-params`` (e.g. ``;transport=tls``) — they are not part of
+    # the scheme+userinfo+host+port prefix §19.1.4 compares, and a left-over
+    # ``;...`` on the port token would otherwise make the URI unparseable.
+    rest = rest.split(";", 1)[0]
+    if not rest:
+        return None
+    userinfo, at, hostport = rest.rpartition("@")
+    if not at:
+        userinfo, hostport = "", rest
+    split = _split_host_port(hostport)
+    if split is None:
+        return None
+    host, port_str = split
+    if not host:
+        return None
+    if port_str == "":
+        port: int | None = None
+    elif port_str.isascii() and port_str.isdecimal():
+        port = int(port_str)
+    else:
+        return None
+    return scheme, userinfo, host, port
+
+
+def _sip_uri_equal(a: str, b: str, *, default_port: int | None = None) -> bool:
+    """Whether two SIP addr-specs are equivalent under RFC 3261 §19.1.4.
+
+    Two SIP-URIs are equivalent when the scheme matches case-insensitively, the
+    userinfo matches case-sensitively, the host matches case-insensitively, and
+    the port matches with default-port elision (an omitted port equals the
+    default). This is the subset of §19.1.4 that matters for matching OUR Contact
+    binding in a 200 OK echo: a registrar that echoes
+    ``sip:1000@PBX.EXAMPLE.TEST:5061`` for our portless
+    ``sip:1000@pbx.example.test`` is binding the same AOR and must not be missed.
+
+    ``default_port`` is the elided port — the active transport's signalling
+    default (ADR-0090): on a TLS/WSS leg every binding is reached over 5061, so an
+    explicit ``:5061`` echoed against our omitted port is the same endpoint even
+    when the addr-spec scheme is bare ``sip`` (its ``transport=tls`` param is
+    stripped before comparison). When ``None`` the per-scheme RFC 3261 §19.1.2
+    default is used (5060 ``sip`` / 5061 ``sips``) — both sides must share the
+    same scheme, so a single scheme-keyed default is unambiguous.
+
+    Only the ``scheme + userinfo + host + port`` prefix is compared (URI
+    parameters and headers are not — :func:`_binding_uri` has already stripped
+    them). If either side is not a parseable SIP addr-spec, falls back to exact
+    string equality so a malformed echo can never spuriously match.
+    """
+    if a == b:
+        return True
+    parsed_a = _split_sip_uri(a)
+    parsed_b = _split_sip_uri(b)
+    if parsed_a is None or parsed_b is None:
+        return False
+    scheme_a, user_a, host_a, port_a = parsed_a
+    scheme_b, user_b, host_b, port_b = parsed_b
+    scheme_a, scheme_b = scheme_a.lower(), scheme_b.lower()
+    if scheme_a != scheme_b or user_a != user_b:
+        return False
+    if host_a.lower() != host_b.lower():
+        return False
+    elided = default_port if default_port is not None else _DEFAULT_PORT.get(scheme_a)
+    effective_a = port_a if port_a is not None else elided
+    effective_b = port_b if port_b is not None else elided
+    return effective_a == effective_b
+
+
 def _split_aor(aor: str) -> tuple[str, str]:
     """Split an AOR into its ``(scheme, host)`` for the registrar request-URI.
 
@@ -493,8 +617,12 @@ class RegistrationFlow:
         from OUR Contact, not whichever binding comes first (another device's
         lifetime would arm the wrong timer and let our binding lapse). All
         ``Contact`` headers are flattened into individual bindings; the one
-        whose addr-spec matches our Contact URI supplies the value. Failing an
-        exact match, the first binding's ``expires`` is the fallback, then the
+        whose addr-spec is equivalent to our Contact URI under RFC 3261 §19.1.4
+        SIP-URI comparison (scheme/host case-insensitive, userinfo
+        case-sensitive, default-port elision) supplies the value — not a raw
+        byte-for-byte string match, which would miss a registrar that echoes our
+        binding with a differing host case or an explicit default port. Failing a
+        §19.1.4 match, the first binding's ``expires`` is the fallback, then the
         ``Expires`` header, then our requested lifetime.
 
         When the chosen binding carries an ``expires`` parameter whose value is
@@ -512,7 +640,19 @@ class RegistrationFlow:
             for header in response.headers_all("Contact")
             for binding in _split_contacts(header)
         ]
-        ours = next((b for b in bindings if _binding_uri(b) == self._contact_uri), None)
+        # The elided default port is the active transport's signalling default
+        # (5061 on the secure TLS/WSS legs, 5060 on UDP/TCP) — ADR-0090.
+        default_port = _TRANSPORT_DEFAULT_PORT[self._cfg.transport]
+        ours = next(
+            (
+                b
+                for b in bindings
+                if _sip_uri_equal(
+                    _binding_uri(b), self._contact_uri, default_port=default_port
+                )
+            ),
+            None,
+        )
         chosen = ours if ours is not None else (bindings[0] if bindings else None)
         if chosen is not None:
             token = _EXPIRES_TOKEN.search(chosen)

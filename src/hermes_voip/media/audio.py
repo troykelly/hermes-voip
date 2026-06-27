@@ -28,6 +28,11 @@ import audioop
 
 from hermes_voip.providers.audio import PCM16_BYTES_PER_SAMPLE, PcmFrame
 
+# Capture audioop.error at import time so that ``except _AudioopError`` in
+# try/except blocks resolves correctly even when ``audioop`` is replaced by a
+# mock in tests (mock.patch replaces the module reference, not the class).
+_AudioopError = audioop.error
+
 _MONO: int = 1
 
 #: The fixed sample rate of telephony G.711 (mu-law/a-law) narrowband audio.
@@ -47,7 +52,11 @@ def _validate_pcm16(pcm16: bytes) -> None:
 def encode_ulaw(pcm16: bytes) -> bytes:
     """Encode PCM16-LE mono to G.711 mu-law (one byte per sample)."""
     _validate_pcm16(pcm16)
-    return audioop.lin2ulaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    try:
+        return audioop.lin2ulaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    except _AudioopError as exc:
+        msg = str(exc)
+        raise ValueError(msg) from exc
 
 
 def decode_ulaw(ulaw: bytes) -> bytes:
@@ -66,14 +75,27 @@ def decode_ulaw(ulaw: bytes) -> bytes:
     intentional: encoding an odd-byte buffer is always a programming error because
     PCM16 samples are two bytes; decoding a short or empty G.711 payload is a
     normal wire event that must propagate upward, not be rejected in the codec.
+
+    Raises:
+        ValueError: If the underlying audioop codec raises ``audioop.error``
+            (e.g. due to an internal implementation constraint).  The original
+            error is preserved as the ``__cause__`` of the ``ValueError``.
     """
-    return audioop.ulaw2lin(ulaw, PCM16_BYTES_PER_SAMPLE)
+    try:
+        return audioop.ulaw2lin(ulaw, PCM16_BYTES_PER_SAMPLE)
+    except _AudioopError as exc:
+        msg = str(exc)
+        raise ValueError(msg) from exc
 
 
 def encode_alaw(pcm16: bytes) -> bytes:
     """Encode PCM16-LE mono to G.711 a-law (one byte per sample)."""
     _validate_pcm16(pcm16)
-    return audioop.lin2alaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    try:
+        return audioop.lin2alaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    except _AudioopError as exc:
+        msg = str(exc)
+        raise ValueError(msg) from exc
 
 
 def decode_alaw(alaw: bytes) -> bytes:
@@ -83,8 +105,17 @@ def decode_alaw(alaw: bytes) -> bytes:
     :func:`decode_ulaw`. An empty or short a-law payload decodes to an empty
     or short PCM buffer; the transport/call-loop layer handles the
     zero-duration frame.
+
+    Raises:
+        ValueError: If the underlying audioop codec raises ``audioop.error``
+            (e.g. due to an internal implementation constraint).  The original
+            error is preserved as the ``__cause__`` of the ``ValueError``.
     """
-    return audioop.alaw2lin(alaw, PCM16_BYTES_PER_SAMPLE)
+    try:
+        return audioop.alaw2lin(alaw, PCM16_BYTES_PER_SAMPLE)
+    except _AudioopError as exc:
+        msg = str(exc)
+        raise ValueError(msg) from exc
 
 
 def ulaw_to_frame(ulaw: bytes, *, monotonic_ts_ns: int) -> PcmFrame:
@@ -313,11 +344,23 @@ class Resampler:
         self._state: _RateState = None
 
     def resample(self, pcm16: bytes) -> bytes:
-        """Convert one chunk of PCM16-LE mono, carrying stream state forward."""
+        """Convert one chunk of PCM16-LE mono, carrying stream state forward.
+
+        Raises:
+            ValueError: If ``pcm16`` is not a whole number of 16-bit samples,
+                or if the underlying ``audioop.ratecv`` raises ``audioop.error``
+                (e.g. a residual frame-alignment edge case not caught by the
+                pre-validation).  The original error is preserved as the
+                ``__cause__`` of the ``ValueError``.
+        """
         _validate_pcm16(pcm16)
-        converted, self._state = audioop.ratecv(
-            pcm16, PCM16_BYTES_PER_SAMPLE, _MONO, self._from, self._to, self._state
-        )
+        try:
+            converted, self._state = audioop.ratecv(
+                pcm16, PCM16_BYTES_PER_SAMPLE, _MONO, self._from, self._to, self._state
+            )
+        except _AudioopError as exc:
+            msg = str(exc)
+            raise ValueError(msg) from exc
         return converted
 
     def reset(self) -> None:

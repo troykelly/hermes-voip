@@ -49,6 +49,11 @@ from __future__ import annotations
 
 import re
 
+__all__ = [
+    "is_internal_system_notice",
+    "is_interruption_ack",
+]
+
 # The "no home channel …" announcement shared verbatim by the whole proactive
 # family in hermes-agent 0.16.0:
 #   * ``gateway.run._handle_message``      — "No home channel is set for {P}."

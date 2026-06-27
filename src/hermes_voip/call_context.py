@@ -30,6 +30,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+__all__ = [
+    "DiversionHop",
+    "HistoryInfoEntry",
+    "InboundCallContext",
+    "extract_call_context",
+    "render_call_context_block",
+]
+
 from hermes_voip.message import SipRequest
 
 # The ADR-0009 spotlight delimiters a caller could try to forge in any header value.

@@ -28,6 +28,13 @@ from __future__ import annotations
 
 import re
 
+__all__ = [
+    "classify_provider_error",
+    "is_provider_error",
+    "resolve_error_apology",
+    "safe_error_reply",
+]
+
 # --- error detectors --------------------------------------------------------
 #
 # Each pattern is a STRONG error signal — an HTTP server-error status *in an error

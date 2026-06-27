@@ -453,14 +453,9 @@ def test_optional_env_advertises_admission_control_knobs() -> None:
         assert manifest_default == config_default, (
             f"{expected} default in plugin.yaml must match config.py"
         )
-        if expected == "HERMES_SIP_MAX_CALLS":
-            assert isinstance(manifest_default, int), (
-                f"{expected} default should be a YAML number"
-            )
-        else:
-            assert isinstance(manifest_default, float), (
-                f"{expected} default should be a YAML number"
-            )
+        assert isinstance(manifest_default, type(config_default)), (
+            f"{expected} default should be a YAML {type(config_default).__name__}"
+        )
 
 
 # ---------------------------------------------------------------------------

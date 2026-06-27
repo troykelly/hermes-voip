@@ -34,7 +34,7 @@ from hermes_voip.caller_modes import (
     channel_for_group,
     group_for_mode,
 )
-from hermes_voip.config import load_gateway_config
+from hermes_voip.config import load_gateway_config, load_media_config
 
 if TYPE_CHECKING:
     from hermes_voip.hermes_surface import (
@@ -168,14 +168,15 @@ def channel_env_enablement() -> dict[str, str]:
 def validate_voip_config(config: object) -> bool:
     """Validate the Hermes ``PlatformConfig`` for the VoIP adapter.
 
-    Calls :func:`~hermes_voip.config.load_gateway_config` against the config's
-    ``extra`` mapping. Returns ``True`` when the SIP configuration is complete
-    and well-formed.
+    Calls :func:`~hermes_voip.config.load_gateway_config` and
+    :func:`~hermes_voip.config.load_media_config` against the config's ``extra``
+    mapping. Returns ``True`` when the full VoIP configuration is complete and
+    well-formed.
 
     The Hermes gateway's ``PlatformRegistry.create_adapter`` treats a **falsey**
     return as a validation failure and refuses to build the adapter, so this
     deliberately returns ``True`` on success (never ``None``). A missing or
-    malformed SIP env raises :class:`~hermes_voip.config.ConfigError`; the
+    malformed SIP/media env raises :class:`~hermes_voip.config.ConfigError`; the
     registry catches that and treats it as a rejection as well.
 
     Args:
@@ -183,13 +184,14 @@ def validate_voip_config(config: object) -> bool:
             attribute (``Mapping[str, str]``).
 
     Returns:
-        ``True`` if the SIP configuration is valid.
+        ``True`` if the SIP and media configuration is valid.
 
     Raises:
-        ConfigError: If a required SIP env var is absent or invalid.
+        ConfigError: If a required VoIP env var is absent or invalid.
     """
     extra = getattr(config, "extra", {})
     load_gateway_config(extra)
+    load_media_config(extra)
     return True
 
 

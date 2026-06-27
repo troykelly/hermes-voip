@@ -344,7 +344,96 @@ def test_alaw_round_trip_is_near_lossless_for_midrange() -> None:
 
 
 # ---------------------------------------------------------------------------
-# encode_ulaw vs encode_alaw discrimination
+# G.711 golden-vector regression — ITU-correct byte values, empirically pinned
+# ---------------------------------------------------------------------------
+
+
+def test_ulaw_golden_vector_zero_sample() -> None:
+    """encode_ulaw(PCM16 zero) == 0xFF — mu-law silence codeword per ITU G.711.
+
+    ITU-T G.711 (1988) Section 2.4.2: the mu-law encoder adds a bias of 33 to
+    the 14-bit magnitude before segment lookup; a zero PCM sample maps to the
+    highest segment (7), producing the all-ones codeword 0xFF.  This is the
+    canonical mu-law silence byte; any deviation indicates a wrong codec table
+    or a mu/a-law swap.
+
+    Byte verified empirically against audioop.lin2ulaw on Python 3.13
+    (audioop-lts 0.2.1) and matches the ITU reference table.
+    """
+    ulaw = encode_ulaw(_pcm16(0))
+    assert len(ulaw) == 1, "one PCM16 sample must encode to exactly one G.711 byte"
+    assert ulaw == b"\xff", (
+        f"mu-law silence codeword must be 0xFF per ITU G.711, got 0x{ulaw[0]:02x}"
+    )
+
+
+def test_alaw_golden_vector_zero_sample() -> None:
+    """encode_alaw(PCM16 zero) == 0xD5 — a-law silence codeword per ITU G.711.
+
+    ITU-T G.711 (1988) Table 1: the a-law encoder maps a zero PCM sample to
+    the lowest amplitude segment with the standard even-bit XOR mask applied,
+    yielding 0xD5.  Any deviation indicates a wrong codec table or a swap with
+    mu-law.
+
+    Byte verified empirically against audioop.lin2alaw on Python 3.13
+    (audioop-lts 0.2.1) and matches the ITU reference table.
+    """
+    alaw = encode_alaw(_pcm16(0))
+    assert len(alaw) == 1, "one PCM16 sample must encode to exactly one G.711 byte"
+    assert alaw == b"\xd5", (
+        f"a-law silence codeword must be 0xD5 per ITU G.711, got 0x{alaw[0]:02x}"
+    )
+
+
+def test_ulaw_golden_vector_multi_sample_frame() -> None:
+    """encode_ulaw pins the exact mu-law codewords for a known 5-sample PCM frame.
+
+    Samples [0, 1000, -1000, 8000, -8000] span the silence point, a mid-range
+    positive, a mid-range negative, a high positive, and a high negative.
+    The expected bytes are the reference output of audioop.lin2ulaw on
+    Python 3.13 (audioop-lts 0.2.1):
+
+      0   -> 0xFF  (silence, max segment bias)
+      1000 -> 0xCE  (mid-range positive)
+     -1000 -> 0x4E  (mid-range negative; sign bit flipped from 0xCE)
+      8000 -> 0xA0  (high positive, lower segment)
+     -8000 -> 0x20  (high negative)
+
+    Any regression in the codec table or sign handling fails this test.
+    """
+    pcm = _pcm16(0, 1000, -1000, 8000, -8000)
+    expected = bytes([0xFF, 0xCE, 0x4E, 0xA0, 0x20])
+    result = encode_ulaw(pcm)
+    assert result == expected, (
+        f"mu-law golden vector mismatch: expected {expected.hex()}, got {result.hex()}"
+    )
+
+
+def test_alaw_golden_vector_multi_sample_frame() -> None:
+    """encode_alaw pins the exact a-law codewords for a known 5-sample PCM frame.
+
+    Same input as the mu-law golden test [0, 1000, -1000, 8000, -8000].
+    The expected bytes are the reference output of audioop.lin2alaw on
+    Python 3.13 (audioop-lts 0.2.1):
+
+      0   -> 0xD5  (a-law silence)
+      1000 -> 0xFA  (mid-range positive)
+     -1000 -> 0x7A  (mid-range negative)
+      8000 -> 0x8A  (high positive, higher segment)
+     -8000 -> 0x0A  (high negative)
+
+    Any regression in the codec table or sign handling fails this test.
+    """
+    pcm = _pcm16(0, 1000, -1000, 8000, -8000)
+    expected = bytes([0xD5, 0xFA, 0x7A, 0x8A, 0x0A])
+    result = encode_alaw(pcm)
+    assert result == expected, (
+        f"a-law golden vector mismatch: expected {expected.hex()}, got {result.hex()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codec identity — mu-law and a-law must produce distinct wire bytes
 # ---------------------------------------------------------------------------
 
 
@@ -358,6 +447,39 @@ def test_encode_ulaw_differs_from_encode_alaw() -> None:
     """
     pcm = _pcm16(1000, -1000, 8000, -8000, 16000)
     assert encode_ulaw(pcm) != encode_alaw(pcm)
+
+
+def test_frame_to_ulaw_differs_from_frame_to_alaw() -> None:
+    """frame_to_ulaw and frame_to_alaw produce distinct payloads for non-silent audio.
+
+    Guards a mu<->a-law swap or wrong-table bug in the PcmFrame-level bridges.
+    If frame_to_ulaw incorrectly delegates to lin2alaw (or vice-versa), the
+    wire payloads will be identical when they must differ.
+    """
+    frame = PcmFrame(
+        samples=_pcm16(1000, -1000, 8000), sample_rate=8000, monotonic_ts_ns=0
+    )
+    assert frame_to_ulaw(frame) != frame_to_alaw(frame)
+
+
+def test_ulaw_to_frame_differs_from_alaw_to_frame() -> None:
+    """Decoding the SAME bytes via ulaw_to_frame vs alaw_to_frame yields different PCM.
+
+    Guards a mu<->a-law swap in the RX (decode) path.  The same G.711 wire bytes
+    represent different PCM values under mu-law vs a-law tables; identical decoded
+    PCM would indicate one decoder is calling the other's audioop function.
+
+    We use the mu-law encoding of a non-silent frame as the shared wire bytes so
+    both decoders start from a realistic payload.
+    """
+    pcm = _pcm16(1000, -1000, 8000)
+    wire = encode_ulaw(pcm)  # realistic mu-law wire bytes
+    frame_u = ulaw_to_frame(wire, monotonic_ts_ns=0)
+    frame_a = alaw_to_frame(wire, monotonic_ts_ns=0)
+    assert frame_u.samples != frame_a.samples, (
+        "Decoding the same wire bytes as mu-law vs a-law must yield different PCM; "
+        "identical samples indicate a codec swap in the decode bridges."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -49,7 +49,7 @@ __all__ = [
 # mock in tests (mock.patch replaces the module reference, not the class).
 _AudioopError = audioop.error
 
-_MONO: int = 1
+_MONO: int = 1  # audioop.ratecv only converts the single telephony channel here.
 
 #: The fixed sample rate of telephony G.711 (mu-law/a-law) narrowband audio.
 G711_SAMPLE_RATE: Final[int] = 8000
@@ -98,6 +98,7 @@ def decode_ulaw(ulaw: bytes) -> bytes:
             (e.g. due to an internal implementation constraint).  The original
             error is preserved as the ``__cause__`` of the ``ValueError``.
     """
+    # Mono-only by construction: G.711 carries one telephony channel per byte.
     try:
         return audioop.ulaw2lin(ulaw, PCM16_BYTES_PER_SAMPLE)
     except _AudioopError as exc:
@@ -128,6 +129,7 @@ def decode_alaw(alaw: bytes) -> bytes:
             (e.g. due to an internal implementation constraint).  The original
             error is preserved as the ``__cause__`` of the ``ValueError``.
     """
+    # Mono-only by construction: G.711 carries one telephony channel per byte.
     try:
         return audioop.alaw2lin(alaw, PCM16_BYTES_PER_SAMPLE)
     except _AudioopError as exc:
@@ -375,6 +377,8 @@ class Resampler:
         """
         _validate_pcm16(pcm16)
         try:
+            # ratecv uses its built-in filter weights here; we preserve the default
+            # neutral response because this path is only changing sample rate, not EQ.
             converted, self._state = audioop.ratecv(
                 pcm16, PCM16_BYTES_PER_SAMPLE, _MONO, self._from, self._to, self._state
             )

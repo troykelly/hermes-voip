@@ -202,6 +202,7 @@ class JitterBuffer:
         *,
         max_depth: int | None = None,
         adapt: bool = False,
+        ssrc_hysteresis: int = 3,
     ) -> None:
         """Create the buffer.
 
@@ -230,6 +231,12 @@ class JitterBuffer:
             adapt: Enable adaptive reorder tolerance. ``False`` (the default)
                 keeps the depth fixed at ``target_depth`` — byte-for-byte the
                 legacy behaviour, so existing call sites are unaffected.
+            ssrc_hysteresis: How many CONSECUTIVE packets bearing the same
+                foreign SSRC must arrive before the buffer auto-resets and
+                adopts that SSRC as the new home. Must be a positive ``int``
+                (not ``bool``). Default 3 (ADR-0082). Set to ``1`` to restore
+                the pre-hysteresis behaviour (reset on the very first foreign
+                packet).
         """
         if target_depth < 1:
             msg = f"target_depth must be >= 1, got {target_depth}"
@@ -244,11 +251,27 @@ class JitterBuffer:
                 f"got max_depth={ceiling} < target_depth={target_depth}"
             )
             raise ValueError(msg)
+        # Validate at runtime as well as at type-check time: bool is a subclass
+        # of int in Python so it must be checked first; non-int objects (e.g.
+        # float from an untyped caller) are also rejected so the contract is
+        # enforced regardless of whether the caller uses mypy.
+        _hysteresis_raw: object = ssrc_hysteresis
+        if isinstance(_hysteresis_raw, bool):
+            msg = "ssrc_hysteresis must be a positive int, not bool"
+            raise TypeError(msg)
+        if not isinstance(_hysteresis_raw, int):
+            kind = type(_hysteresis_raw).__name__
+            msg = f"ssrc_hysteresis must be a positive int, got {kind}"
+            raise TypeError(msg)
+        if ssrc_hysteresis < 1:
+            msg = f"ssrc_hysteresis must be >= 1, got {ssrc_hysteresis}"
+            raise ValueError(msg)
         self._adapt = adapt
         self._floor = target_depth
         self._ceiling = ceiling
         self._depth = target_depth
         self._max_ahead = max_ahead
+        self._ssrc_hysteresis = ssrc_hysteresis
         self._packets: dict[int, RtpPacket] = {}
         self._next: int | None = None
         self._ssrc: int | None = None
@@ -259,10 +282,21 @@ class JitterBuffer:
         # Consecutive clean pops (real in-order packet, no loss/late-drop) since
         # the last grow or shrink. Drives the shrink-toward-floor decision.
         self._clean_run = 0
+        # SSRC hysteresis tracking (ADR-0082). A foreign-SSRC packet starts or
+        # continues a candidate run; the home SSRC or a DIFFERENT foreign SSRC
+        # resets it. Reset fires only when _ssrc_candidate_count reaches
+        # _ssrc_hysteresis.
+        self._ssrc_candidate: int | None = None
+        self._ssrc_candidate_count: int = 0
 
     def __len__(self) -> int:
         """Return the current buffered packet count."""
         return len(self._packets)
+
+    @property
+    def ssrc_hysteresis(self) -> int:
+        """Consecutive foreign-SSRC packets required before an SSRC auto-reset fires."""
+        return self._ssrc_hysteresis
 
     @property
     def current_depth(self) -> int:
@@ -282,12 +316,46 @@ class JitterBuffer:
         self._highest = None
         self._clean_run = 0
         self._depth = self._floor
+        self._ssrc_candidate = None
+        self._ssrc_candidate_count = 0
 
     def _grow(self) -> None:
         """Widen the reorder tolerance by one, bounded by the ceiling (adaptive)."""
         if self._depth < self._ceiling:
             self._depth += 1
         self._clean_run = 0
+
+    def _check_ssrc(self, packet: RtpPacket) -> bool:
+        """Apply SSRC hysteresis and return True when the packet may be enqueued.
+
+        Updates the candidate-run state and fires :meth:`reset` (adopting the
+        new SSRC) once ``ssrc_hysteresis`` consecutive foreign-SSRC packets have
+        been observed.  Returns ``False`` when the foreign packet is silently
+        dropped because the hysteresis window is not yet satisfied.
+        """
+        if self._ssrc is None:
+            # First packet ever: learn the home SSRC.
+            self._ssrc = packet.ssrc
+            self._ssrc_candidate = None
+            self._ssrc_candidate_count = 0
+            return True
+        if packet.ssrc == self._ssrc:
+            # Home SSRC: clear any in-progress foreign candidate run.
+            self._ssrc_candidate = None
+            self._ssrc_candidate_count = 0
+            return True
+        # Foreign SSRC: accumulate the consecutive-run counter.
+        if packet.ssrc == self._ssrc_candidate:
+            self._ssrc_candidate_count += 1
+        else:
+            self._ssrc_candidate = packet.ssrc
+            self._ssrc_candidate_count = 1
+        if self._ssrc_candidate_count < self._ssrc_hysteresis:
+            return False  # hysteresis window not yet satisfied — drop silently
+        # N consecutive foreign packets confirmed: reset and adopt new SSRC.
+        self.reset()
+        self._ssrc = packet.ssrc
+        return True
 
     def push(self, packet: RtpPacket) -> None:
         """Add a packet; duplicate, late, and too-far-ahead packets are dropped.
@@ -306,11 +374,8 @@ class JitterBuffer:
         the reorder tolerance — both are evidence the buffer was too eager.
         """
         seq = packet.sequence_number
-        if self._ssrc is None:
-            self._ssrc = packet.ssrc
-        elif packet.ssrc != self._ssrc:
-            self.reset()
-            self._ssrc = packet.ssrc
+        if not self._check_ssrc(packet):
+            return
         if self._next is not None:
             if _seq_before(seq, self._next):
                 if self._emitted:

@@ -62,59 +62,60 @@ __all__ = [
 import random
 import struct
 from dataclasses import dataclass, field
+from typing import Final
 
 # RTCP packet types (RFC 3550 §12.1 / IANA).
-RTCP_PT_SR: int = 200
-RTCP_PT_RR: int = 201
-RTCP_PT_SDES: int = 202
-RTCP_PT_BYE: int = 203
-RTCP_PT_APP: int = 204
+RTCP_PT_SR: Final[int] = 200
+RTCP_PT_RR: Final[int] = 201
+RTCP_PT_SDES: Final[int] = 202
+RTCP_PT_BYE: Final[int] = 203
+RTCP_PT_APP: Final[int] = 204
 
 # SDES item type for the canonical name (RFC 3550 §6.5.1).
-_SDES_ITEM_CNAME: int = 1
+_SDES_ITEM_CNAME: Final[int] = 1
 
-_RTP_VERSION: int = 2
-_VERSION_SHIFT: int = 6
-_COUNT_MASK: int = 0x1F  # the low-5 RC / SC count in the first byte
-_PADDING_BIT: int = 0x20
+_RTP_VERSION: Final[int] = 2
+_VERSION_SHIFT: Final[int] = 6
+_COUNT_MASK: Final[int] = 0x1F  # the low-5 RC / SC count in the first byte
+_PADDING_BIT: Final[int] = 0x20
 
-_U8_MAX: int = 0xFF
-_U32: int = 0xFFFFFFFF
-_U64: int = (1 << 64) - 1
-_S24_MIN: int = -(1 << 23)
-_S24_MAX: int = (1 << 23) - 1
-_MAX_COUNT: int = 0x1F  # RC/SC is a 5-bit field
+_U8_MAX: Final[int] = 0xFF
+_U32: Final[int] = 0xFFFFFFFF
+_U64: Final[int] = (1 << 64) - 1
+_S24_MIN: Final[int] = -(1 << 23)
+_S24_MAX: Final[int] = (1 << 23) - 1
+_MAX_COUNT: Final[int] = 0x1F  # RC/SC is a 5-bit field
 
-_WORD: int = 4  # bytes per 32-bit RTCP length unit
-_SSRC_LEN: int = 4  # an SSRC/CSRC identifier is one 32-bit word
-_SDES_ITEM_HEADER_LEN: int = 2  # an SDES item's type + length octets
-_COMMON_HEADER_LEN: int = 4
-_REPORT_BLOCK_LEN: int = 24
-_SENDER_INFO_LEN: int = 20  # SSRC(4) + NTP(8) + RTP ts(4) + pkt(4) ... see below
+_WORD: Final[int] = 4  # bytes per 32-bit RTCP length unit
+_SSRC_LEN: Final[int] = 4  # an SSRC/CSRC identifier is one 32-bit word
+_SDES_ITEM_HEADER_LEN: Final[int] = 2  # an SDES item's type + length octets
+_COMMON_HEADER_LEN: Final[int] = 4
+_REPORT_BLOCK_LEN: Final[int] = 24
+_SENDER_INFO_LEN: Final[int] = 20  # SSRC(4) + NTP(8) + RTP ts(4) + pkt(4) ... see below
 # Sender info per §6.4.1 is NTP(8) + RTP ts(4) + packet count(4) + octet count(4)
 # = 20 bytes, AFTER the 4-byte sender SSRC that follows the common header.
 
 # Seconds between the NTP epoch (1900-01-01 00:00) and the Unix epoch (1970-01-01).
-_NTP_UNIX_EPOCH_DELTA: int = 2_208_988_800
-_FRAC_SCALE: int = 1 << 32  # 32-bit NTP fraction resolution
-_COMPACT_FRAC_SCALE: int = 1 << 16  # LSR/DLSR are NTP middle-32 (16.16 s) units
+_NTP_UNIX_EPOCH_DELTA: Final[int] = 2_208_988_800
+_FRAC_SCALE: Final[int] = 1 << 32  # 32-bit NTP fraction resolution
+_COMPACT_FRAC_SCALE: Final[int] = 1 << 16  # LSR/DLSR are NTP middle-32 (16.16 s) units
 
 # RFC 3550 §6.2 / Appendix A.7 transmission-interval constants.
-_RTCP_MIN_TIME: float = 5.0  # seconds — the minimum deterministic interval
-_RTCP_SENDER_BW_FRACTION: float = 0.25  # senders share 25% of the RTCP bandwidth
+_RTCP_MIN_TIME: Final[float] = 5.0  # seconds — the minimum deterministic interval
+_RTCP_SENDER_BW_FRACTION: Final[float] = 0.25  # senders share 25% of the RTCP bandwidth
 # §6.3.1 compensation for the [0.5, 1.5] uniform randomisation (e - 3/2).
-_COMPENSATION: float = 1.21828
+_COMPENSATION: Final[float] = 1.21828
 
 # RFC 3550 Appendix A.1 sequence-validity constants. A forward jump larger than
 # _MAX_DROPOUT, or a backward jump larger than _MAX_MISORDER, is not normal
 # loss/reorder: it is a possible source restart, validated by a second in-sequence
 # packet from the new base (the bad_seq mechanism) before the baseline is re-based.
-_MAX_DROPOUT: int = 3000
-_MAX_MISORDER: int = 100
-_SEQ_MOD: int = 1 << 16
+_MAX_DROPOUT: Final[int] = 3000
+_MAX_MISORDER: Final[int] = 100
+_SEQ_MOD: Final[int] = 1 << 16
 # The "impossible" sentinel A.1 seeds bad_seq with (one past the 16-bit space) so the
 # first out-of-range packet cannot accidentally match it.
-_RTP_SEQ_NONE: int = _SEQ_MOD + 1
+_RTP_SEQ_NONE: Final[int] = _SEQ_MOD + 1
 
 
 class RtcpError(Exception):

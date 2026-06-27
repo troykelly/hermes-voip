@@ -460,3 +460,25 @@ def test_build_answer_rejects_unsupported_video_with_port_zero() -> None:
     # m-line correspondence: the rejected video keeps its mid.
     video_block = text.split("m=video", 1)[1]
     assert "a=mid:1" in video_block
+
+
+# --- duplicate rtpmap rejection in video path (fail-closed, not last-wins) ---
+
+
+def test_parse_rejects_duplicate_rtpmap_payload_type_in_video() -> None:
+    """Two a=rtpmap lines for the same PT in video must raise SdpError (fail-closed)."""
+    with pytest.raises(SdpError, match=r"duplicate.*rtpmap.*payload type 96"):
+        SessionDescription.parse(
+            "v=0\r\n"
+            "o=- 1 1 IN IP4 192.0.2.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 192.0.2.1\r\n"
+            "t=0 0\r\n"
+            "m=audio 40000 RTP/AVP 0\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "m=video 41000 RTP/AVP 96 97\r\n"
+            "a=rtpmap:96 H264/90000\r\n"
+            "a=rtpmap:96 VP8/90000\r\n"  # conflicting duplicate for PT 96
+            "a=rtpmap:97 VP9/90000\r\n"
+            "a=sendrecv\r\n"
+        )

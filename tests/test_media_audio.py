@@ -514,6 +514,24 @@ def test_resample_frame_does_not_mutate_input() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_encode_ulaw_wraps_audioop_error_as_value_error() -> None:
+    """encode_ulaw re-raises audioop.error as ValueError (domain exception contract)."""
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.lin2ulaw.side_effect = audioop.error("simulated ulaw encode error")
+        with pytest.raises(ValueError, match="simulated ulaw encode error") as exc_info:
+            encode_ulaw(_pcm16(0, 1))
+    assert isinstance(exc_info.value.__cause__, audioop.error)
+
+
+def test_encode_alaw_wraps_audioop_error_as_value_error() -> None:
+    """encode_alaw re-raises audioop.error as ValueError (domain exception contract)."""
+    with unittest.mock.patch("hermes_voip.media.audio.audioop") as mock_audioop:
+        mock_audioop.lin2alaw.side_effect = audioop.error("simulated alaw encode error")
+        with pytest.raises(ValueError, match="simulated alaw encode error") as exc_info:
+            encode_alaw(_pcm16(0, 1))
+    assert isinstance(exc_info.value.__cause__, audioop.error)
+
+
 def test_decode_ulaw_wraps_audioop_error_as_value_error() -> None:
     """decode_ulaw re-raises audioop.error as ValueError (domain exception contract).
 

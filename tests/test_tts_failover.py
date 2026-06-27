@@ -20,6 +20,7 @@ These tests pin the contract with fakes only (no network, no ml weights):
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
@@ -650,6 +651,79 @@ def test_failover_preserves_audio_tags_mirrors_primary() -> None:
         fallback_factory=lambda: _FakeTTS(lambda t, r: _ListStream([], spoken=[])),
     )
     assert tts.preserves_audio_tags is True
+
+
+# ---------------------------------------------------------------------------
+# (7) TTS primary failover WARNING logs include structured extra fields.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_primary_failure_before_audio_logs_structured_failover_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pre-audio primary failure logs a WARNING with structured extra fields.
+
+    The failover event includes:
+    - event: "tts_primary_failover"
+    - primary_emitted_audio: whether any frame was emitted before the failure
+    """
+
+    def _primary_stream(text: str, rate: int | None) -> TtsStream:
+        return _RaisingStream(_http_400())
+
+    def _fallback_stream(text: str, rate: int | None) -> TtsStream:
+        return _ListStream([_frame(rate or _G711_RATE)], spoken=[])
+
+    tts = FailoverTTS(
+        primary=_FakeTTS(_primary_stream),
+        fallback_factory=lambda: _FakeTTS(_fallback_stream),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.tts.failover"):
+        frames = await _drain(tts.synthesize(_text("Hello there. "), voice="v"))
+
+    assert frames, "the fallback must produce frames"
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelname == "WARNING"
+    assert "TTS primary synthesis failed before any audio" in record.message
+    assert record.__dict__.get("event") == "tts_primary_failover"
+    assert record.__dict__.get("primary_emitted_audio") is False
+
+
+@pytest.mark.asyncio
+async def test_primary_failure_after_audio_logs_structured_failover_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mid-utterance primary failure logs a WARNING with structured extra fields.
+
+    The failover event includes:
+    - event: "tts_primary_failover"
+    - primary_emitted_audio: whether audio was emitted before failure (True here)
+    """
+
+    def _primary_stream(text: str, rate: int | None) -> TtsStream:
+        return _RaisingStream(_http_400(), frames_before=[_frame(rate or _G711_RATE)])
+
+    def _fallback_stream(text: str, rate: int | None) -> TtsStream:
+        return _ListStream([_frame(rate or _G711_RATE)], spoken=[])
+
+    tts = FailoverTTS(
+        primary=_FakeTTS(_primary_stream),
+        fallback_factory=lambda: _FakeTTS(_fallback_stream),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.tts.failover"):
+        frames = await _drain(tts.synthesize(_text("Partly spoken. "), voice="v"))
+
+    assert frames, "must yield the emitted frame"
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelname == "WARNING"
+    assert "TTS primary failed mid-utterance after audio" in record.message
+    assert record.__dict__.get("event") == "tts_primary_failover"
+    assert record.__dict__.get("primary_emitted_audio") is True
 
 
 # ---------------------------------------------------------------------------

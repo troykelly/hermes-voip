@@ -482,3 +482,31 @@ def test_parse_rejects_duplicate_rtpmap_payload_type_in_video() -> None:
             "a=rtpmap:97 VP9/90000\r\n"
             "a=sendrecv\r\n"
         )
+
+
+def test_parse_accepts_single_rtpmap_per_pt_video() -> None:
+    """A video m= section with exactly one rtpmap per PT must parse without error.
+
+    Symmetry with test_parse_single_rtpmap_per_pt_is_accepted (audio). A mutant
+    that makes the video accumulation path reject ALL rtpmaps (not just duplicates)
+    would fail here.
+    """
+    sdp = SessionDescription.parse(
+        "v=0\r\n"
+        "o=- 1 1 IN IP4 192.0.2.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "m=video 41000 RTP/AVP 96 97\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=rtpmap:97 VP8/90000\r\n"
+        "a=sendrecv\r\n"
+    )
+    assert sdp.video is not None
+    by_pt = {c.payload_type: c for c in sdp.video.codecs}
+    assert by_pt[96].encoding == "H264"
+    assert by_pt[96].clock_rate == 90000
+    assert by_pt[97].encoding == "VP8"
+    assert by_pt[97].clock_rate == 90000

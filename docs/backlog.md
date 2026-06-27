@@ -155,7 +155,7 @@ defect or a load-bearing test gap.
   `generate_answer_crypto` / `_negotiate_answer_crypto` and is wired into `adapter.py` for an
   `RTP/SAVP` offer (a plain `RTP/AVP` offer is still answered plain). Round-trip + adapter tests
   cover `is_srtp` / `crypto` survival.
-- [ ] **[medium] correctness** — Opus / preference-ordered offer is unreachable through the builder.
+- [x] (#234) **[medium] correctness** — Opus / preference-ordered offer is unreachable through the builder.
   `negotiate_audio` selects in *offer* order (lines 220-240) with no notion of *our* preference, so a
   gateway offering PCMU-then-Opus keeps PCMU first, violating ADR-0005's "prefer Opus when offered".
   Order the result by the caller's `supported` order, or add `prefer: Sequence[str]`; document which wins
@@ -317,7 +317,7 @@ defect or a load-bearing test gap.
   payload, the guard (lines 114-117) fails and the raw payload (incl. the bogus pad byte) is returned with
   no error — inconsistent with the other parse paths that raise. Verified: P=1, payload `b'\x05'` →
   `b'\x05'`. Raise `ValueError` when `pad > len(payload)`; decide/document `pad==0`-with-P. Tests both.
-- [ ] **[medium] api** (partial — residual: `__len__`, `flush()`, `reset()` are absent; no SSRC-awareness or auto-reset on SSRC change.) — `JitterBuffer` exposes no `__len__`/peek/flush/reset. The media loop needs depth
+- [x] (#221) **[medium] api** (partial — residual: `__len__`, `flush()`, `reset()` are absent; no SSRC-awareness or auto-reset on SSRC change.) — `JitterBuffer` exposes no `__len__`/peek/flush/reset. The media loop needs depth
   (metrics/adaptive), drain-on-BYE (trailing audio), and reset-on-SSRC-change (re-INVITE/source resync) —
   none exist, and an SSRC change mis-classifies the new stream against the stale anchor. Add
   `__len__`/peek/`flush()`/`reset()`; have the buffer know the SSRC and auto-reset on change.
@@ -359,7 +359,7 @@ defect or a load-bearing test gap.
   growing `_seen`, an unbounded leak on a long call, silently breaking the bounded-window contract.
   `history<0` raises a raw `ValueError` from deque. Validate `if history < 1: raise ValueError(...)`
   mirroring `JitterBuffer`; document the minimum.
-- [ ] **[medium] polish** — `_order`/`_seen` are two structures kept in sync by hand (lines 175-178) — the
+- [x] (#232) **[medium] polish** — `_order`/`_seen` are two structures kept in sync by hand (lines 175-178) — the
   source of the `history=0` desync and a mutation-fragile pattern. Replace with a single insertion-ordered
   `dict`/`OrderedDict` (membership + FIFO eviction via `popitem(last=False)`), or add a
   `len(_order)==len(_seen)` invariant assertion/test.
@@ -371,14 +371,14 @@ defect or a load-bearing test gap.
   seam (rich digit with symbol/duration_ms/source/received_at; async `digits()`/`mode()`); `feed` returns
   a bare `str|None` and requires the caller to pass the RTP timestamp by hand. Wrap `DtmfReceiver` behind
   the detector protocol when that layer is built; track explicitly so primitive and seam don't drift.
-- [ ] **[medium] api** — `feed()` conflates "still pressing" / "duplicate end" / "non-digit event" into a
+- [x] (#232) **[medium] api** — `feed()` conflates "still pressing" / "duplicate end" / "non-digit event" into a
   single `None` (lines 170-172). A controller may need to distinguish a completed flash/non-digit from
   "nothing happened". Return a small result type (enum-tagged / `DtmfPress | None`) or expose whether a new
   end-timestamp was recorded.
-- [ ] **[medium] test** — `encode()`'s end-bit/volume byte construction is mutation-weak — one pinned
+- [x] (#223) **[medium] test** — `encode()`'s end-bit/volume byte construction is mutation-weak — one pinned
   vector (`end=True, volume=10` → `0x8A`); no `end=False` (`0x0A`), no `volume=0`/`0x3F`. A `|`→`&` or
   dropped-`_END_BIT` mutant partly survives. Add end=False, volume=0 (`0x80`), volume=0x3F assertions.
-- [ ] **[medium] test** — Bounded-window eviction (an evicted timestamp re-emits) is a deliberate tradeoff
+- [x] (#223) **[medium] test** — Bounded-window eviction (an evicted timestamp re-emits) is a deliberate tradeoff
   with no test (verified with `history=2`). Fill the window, confirm the oldest is evicted, assert a
   re-feed of the evicted timestamp re-emits — pins the window size semantics.
 - [ ] **[low] robustness** — `event_payloads` has no minimum-packet / step-vs-total guard; `step >=
@@ -431,7 +431,7 @@ defect or a load-bearing test gap.
   transport must hand-roll frame construction + the 8kHz guard that `frame_to_ulaw` centralises. Add the
   a-law pair, OR better a codec-parameterised `frame_to_g711(frame, codec)` / `g711_to_frame(...)`; mirror
   a-law frame-bridge tests.
-- [ ] **[medium] api** — Resample path is byte-oriented; nothing returns/consumes `PcmFrame`, forcing the
+- [x] (#233) **[medium] api** — Resample path is byte-oriented; nothing returns/consumes `PcmFrame`, forcing the
   hot-path loop to unwrap frames and re-stamp `sample_rate`/`monotonic_ts_ns` by hand (the error-prone
   part — a forgotten rate update makes the frame lie). Add `resample_frame(frame) -> PcmFrame` that sets
   the new rate and propagates ts; document the ts policy. Keep the byte-level primitives.
@@ -489,12 +489,12 @@ defect or a load-bearing test gap.
   `pytest-asyncio`/`anyio` and no `asyncio_mode`; plain pytest can't run `async def test_…`, which is why
   the async contract is untested. Add and pin `pytest-asyncio` (or `anyio`), set `asyncio_mode = "auto"`,
   regenerate `uv.lock`, convert the conformance tests to await the async members.
-- [ ] **[medium] robustness** — `PcmFrame` performs no validation (no `__post_init__`). An odd-length
+- [x] (#225) **[medium] robustness** — `PcmFrame` performs no validation (no `__post_init__`). An odd-length
   `samples` truncates silently (`len // 2`, line 36); `sample_rate=0`/negative passes downstream. The
   canonical 50pkt/s currency type bypasses `media/audio._validate_pcm16`. Add `__post_init__` asserting
   whole-sample length and `sample_rate > 0` (propagate per rule 37); if the per-frame cost is a concern,
   use a `PcmFrame.validated(...)` factory and document the choice.
-- [ ] **[medium] robustness** — `Transcript.confidence` and `GuardResult.score` advertise 0.0..1.0 but
+- [x] (#225) **[medium] robustness** — `Transcript.confidence` and `GuardResult.score` advertise 0.0..1.0 but
   never enforce it (asr.py:20, guard.py:35). For `score` this is security-adjacent (ADR-0009 thresholds
   on it). Validate in `__post_init__` (reject out-of-range/NaN) or introduce a branded `Probability`
   newtype; tests for the range.
@@ -631,7 +631,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/incall.py
 
-- [ ] **[medium] correctness** — An offer-carrying re-INVITE with no `m=audio` line is misclassified as
+- [x] (#229) **[medium] correctness** — An offer-carrying re-INVITE with no `m=audio` line is misclassified as
   `OfferlessReinvite` and answered with a fresh OFFER, violating RFC 3264 offer/answer. `classify_inbound_reinvite`
   returns `OfferlessReinvite()` whenever `offer.audio is None` (`incall.py`) — conflating "no SDP body at all"
   with "an SDP body that parses but carries no m=audio". `call.py:729-732` (`_on_reinvite`) then treats
@@ -651,7 +651,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/transport/
 
-- [ ] **[medium] robustness / test** — SIP parse error in TLS/WSS `_dispatch` kills the entire connection and
+- [x] (#231) **[medium] robustness / test** — SIP parse error in TLS/WSS `_dispatch` kills the entire connection and
   drops all active calls with no regression test. `transport/connection.py:601-605` and
   `transport/ws_connection.py:364-368` call `SipRequest.parse()` / `SipResponse.parse()` with no
   `try/except`; a single malformed message tears down all calls simultaneously. The behaviour is documented as
@@ -771,7 +771,7 @@ These span multiple modules or the repo as a whole.
 
 ## .github/workflows/
 
-- [ ] **[medium] security** — Supply-chain advisory audit only fires on dependency-file changes — no scheduled
+- [x] (#224) **[medium] security** — Supply-chain advisory audit only fires on dependency-file changes — no scheduled
   run, so a newly-disclosed CVE against an unchanged pinned dep is invisible to CI. `.github/workflows/supply-chain.yml`
   triggers ONLY on `pull_request`/`push` filtered to paths `[pyproject.toml, uv.lock, supply-chain.yml]`;
   `grep -rn 'schedule|cron' .github/workflows/` returns nothing. pip-audit / OSV databases update
@@ -791,7 +791,7 @@ These span multiple modules or the repo as a whole.
   `docs/runbooks/0018-voip-acoustic-echo-cancellation.md` had three stale references to the old 16 ms default
   for `HERMES_VOIP_AEC_FILTER_MS`: the knobs table (line 26), and the two verify-output examples (lines 99-100).
   `config.py:256` `_DEFAULT_AEC_FILTER_MS = 64` (verified). Fixed: updated table and both example outputs to 64 ms.
-- [ ] **[medium] docs** — Add outbound SIP CANCEL coverage to runbook 0007. ADR-0069 (outbound SIP CANCEL,
+- [x] (#227) **[medium] docs** — Add outbound SIP CANCEL coverage to runbook 0007. ADR-0069 (outbound SIP CANCEL,
   RFC 3261 §9.1) is Accepted and fully implemented (`transport/connection.py:418` `send_cancel`,
   `adapter.py:2309` `abort_call`, `adapter.py:2347` `_ring_timeout`). `docs/runbooks/0007-voip-outbound-calling.md`
   has zero CANCEL coverage: no mention of what happens when an outbound ringing call is aborted, no log line
@@ -833,7 +833,7 @@ These span multiple modules or the repo as a whole.
 
 ## docs/plan/IMPLEMENTATION-PLAN.md
 
-- [ ] **[medium] docs** — `IMPLEMENTATION-PLAN.md` is massively stale: describes the entire plugin as
+- [x] (#227) **[medium] docs** — `IMPLEMENTATION-PLAN.md` is massively stale: describes the entire plugin as
   not-started. Line 25 marks ADR-0002 as not-started and says "No `register(ctx)`, no `plugin.yaml`, no
   `VoipAdapter`". In reality: `plugin.py` has `register()`, `plugin.yaml` is shipped, `adapter.py` has
   `class VoipAdapter(BasePlatformAdapter)`, `media/vad.py` exists (the plan's ADR-0008 entry says "no
@@ -1021,8 +1021,8 @@ These span multiple modules or the repo as a whole.
 
 ### Robustness
 
-- [ ] **[medium] robustness** — `intercom` relay_token: CRLF/control chars accepted at load, misfires at door-open time. `load_intercom_config` (intercom.py:245) only calls `.strip()` on the relay bearer token; a value containing embedded CRLF or NUL bytes is silently accepted, then raises a bare `ValueError` inside `_open_blocking`'s `asyncio.to_thread` call that bypasses the `(urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError)` except chain (intercom.py:150-157), violating the `open_entry_handler` docstring's `IntercomRelayError` contract. Fix: add control-char rejection in `load_intercom_config` at intercom.py:245 with a `ConfigError`; add a `ValueError` catch in `_open_blocking` re-raised as `IntercomRelayError` (`src/hermes_voip/intercom.py:150-157,245`, `voip_tools.py`).
-- [ ] **[medium] robustness** — `multi_intercom` webhook header names/values: CRLF not validated at load, `ValueError` leaks at fire time. `_parse_headers` (multi_intercom.py:410-428) validates only `isinstance(value, str)` — not control characters (CRLF, NUL) — so a misconfigured intercom JSON with a CRLF-injected header is silently accepted; when `fire_webhook_opening` is called, `http.client` raises `ValueError('Invalid header value …')` that is NOT in the except chain at lines 504-515 (only HTTPError, URLError, TimeoutError, OSError), propagating uncaught through `asyncio.to_thread` and violating the `WebhookError` exception contract. Fix: add `_reject_controls` to `_parse_headers`; add `ValueError` catch in `_fire_webhook_blocking` re-raised as `WebhookError` (`src/hermes_voip/multi_intercom.py:410-428,484-515`).
+- [x] (#226) **[medium] robustness** — `intercom` relay_token: CRLF/control chars accepted at load, misfires at door-open time. `load_intercom_config` (intercom.py:245) only calls `.strip()` on the relay bearer token; a value containing embedded CRLF or NUL bytes is silently accepted, then raises a bare `ValueError` inside `_open_blocking`'s `asyncio.to_thread` call that bypasses the `(urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError)` except chain (intercom.py:150-157), violating the `open_entry_handler` docstring's `IntercomRelayError` contract. Fix: add control-char rejection in `load_intercom_config` at intercom.py:245 with a `ConfigError`; add a `ValueError` catch in `_open_blocking` re-raised as `IntercomRelayError` (`src/hermes_voip/intercom.py:150-157,245`, `voip_tools.py`).
+- [x] (#226) **[medium] robustness** — `multi_intercom` webhook header names/values: CRLF not validated at load, `ValueError` leaks at fire time. `_parse_headers` (multi_intercom.py:410-428) validates only `isinstance(value, str)` — not control characters (CRLF, NUL) — so a misconfigured intercom JSON with a CRLF-injected header is silently accepted; when `fire_webhook_opening` is called, `http.client` raises `ValueError('Invalid header value …')` that is NOT in the except chain at lines 504-515 (only HTTPError, URLError, TimeoutError, OSError), propagating uncaught through `asyncio.to_thread` and violating the `WebhookError` exception contract. Fix: add `_reject_controls` to `_parse_headers`; add `ValueError` catch in `_fire_webhook_blocking` re-raised as `WebhookError` (`src/hermes_voip/multi_intercom.py:410-428,484-515`).
 
 ### Security
 
@@ -1035,7 +1035,7 @@ These span multiple modules or the repo as a whole.
 
 ### Docs / drift
 
-- [ ] **[medium] docs** — `MULTIREG-CALLCONTROL-PLAN.md` is stale: PR7–PR9 marked blocked but all shipped. `docs/plan/MULTIREG-CALLCONTROL-PLAN.md:15` says "Blocked on the live transport (P2/P3): PR7–PR9 — manager.py, call.py, tools.py + adapter wiring". All three modules are fully shipped and wired end-to-end. A future agent reading the plan would skip or duplicate work. Update the plan to reflect current status (note: `docs/plan/IMPLEMENTATION-PLAN.md` staleness is separately tracked at backlog line 828).
+- [x] (#227) **[medium] docs** — `MULTIREG-CALLCONTROL-PLAN.md` is stale: PR7–PR9 marked blocked but all shipped. `docs/plan/MULTIREG-CALLCONTROL-PLAN.md:15` says "Blocked on the live transport (P2/P3): PR7–PR9 — manager.py, call.py, tools.py + adapter wiring". All three modules are fully shipped and wired end-to-end. A future agent reading the plan would skip or duplicate work. Update the plan to reflect current status (note: `docs/plan/IMPLEMENTATION-PLAN.md` staleness is separately tracked at backlog line 828).
 - [ ] **[low] docs** — ADR-0066 Decision text claims engine SRTCP wiring is "a separate named follow-on" but it is already done. `docs/adr/0066-srtcp-transform.md:35-36` states the engine wiring "is not built here" and is "a separate, named follow-on". However `adapter.py:623-649` defines `_srtcp_inbound_from_offer`/`_srtcp_outbound_from_answer` and passes them into the engine on every secured call (adapter.py:3467-3468, :3798-3834); ADR-0061's amendment (docs/adr/0061-rtcp-sr-rr-rtcp-mux.md:136-167) explicitly documents the completion. Rule 27: the ADR-0066 Decision section never acknowledges this. Fix: add a Refinement subsection to ADR-0066 noting the engine wiring was completed and referencing the ADR-0061 amendment (`docs/adr/0066-srtcp-transform.md:35-36`).
 
 ### API / ergonomics
@@ -1067,7 +1067,7 @@ These span multiple modules or the repo as a whole.
 ### Operability
 
 - [x] (done #206) **[high] docs** — Runbook 0013 §3 falsely states graceful shutdown is unimplemented — contradicts §Restart in the same file. `docs/runbooks/0013-voip-incident-oncall.md` lines 496-511 say "The plugin does not currently implement graceful shutdown … A hard kill: kill -9" — but ADR-0059 shipped a full BYE-drain `disconnect()` (adapter.py:1175-1240), and the same runbook's Restart §1 (lines 523-536) already correctly documents `kill -TERM` + drain with the expected log line. An on-call engineer reading §3 will hard-kill a running gateway, dropping live callers, when a graceful SIGTERM is available. Fix: update §3 to match §Restart; align both sections to describe the shipped ADR-0059 behaviour (rule 27) (`docs/runbooks/0013-voip-incident-oncall.md:496-511`).
-- [ ] **[medium] docs** — Admission-control and shutdown-drain knobs (`HERMES_SIP_MAX_CALLS`, `HERMES_SIP_SHUTDOWN_DRAIN_SECS`) absent from `plugin.yaml` `optional_env`. Both env vars are declared and validated in `config.py` (lines 104-107, 661-717) and operational (runbook-0013 lines 151-156, 526), but neither appears in `src/hermes_voip/plugin.yaml` `optional_env` (verified: grep returns no output). An operator tuning capacity or adjusting how long live callers are given to finish on restart has no manifest-visible signal these knobs exist. Fix: add both to `plugin.yaml optional_env` with description and default (rule 42) (`src/hermes_voip/plugin.yaml`, `config.py`).
+- [x] (#222) **[medium] docs** — Admission-control and shutdown-drain knobs (`HERMES_SIP_MAX_CALLS`, `HERMES_SIP_SHUTDOWN_DRAIN_SECS`) absent from `plugin.yaml` `optional_env`. Both env vars are declared and validated in `config.py` (lines 104-107, 661-717) and operational (runbook-0013 lines 151-156, 526), but neither appears in `src/hermes_voip/plugin.yaml` `optional_env` (verified: grep returns no output). An operator tuning capacity or adjusting how long live callers are given to finish on restart has no manifest-visible signal these knobs exist. Fix: add both to `plugin.yaml optional_env` with description and default (rule 42) (`src/hermes_voip/plugin.yaml`, `config.py`).
 
 ### Packaging
 
@@ -1079,3 +1079,12 @@ These span multiple modules or the repo as a whole.
 
 - [ ] **[medium] ux** — `place_call` tool flattens SIP outbound failure (busy / no-answer / declined) into a generic redacted error instead of a structured outcome. `place_call_handler` (voip_tools.py:868-907) catches only `OutboundCallNotAllowed`; an `OutboundCallFailed` (busy 486, no-answer 480/408, declined 603, congestion 503, secure-media 488) falls through to the generic `except Exception` → `_tool_failure` (voip_tools.py:125-128), so the placing agent sees an opaque `'place_call failed: <exc>'` with no SIP status and cannot distinguish "line was busy, retry later" from "caller declined" or "internal error". The `transfer_attended` consult path already handles this correctly (voip_tools.py:1160-1167). Fix: catch `OutboundCallFailed` in `place_call_handler` and return a structured `{"error": ...}` naming the outcome class (busy / no-answer / declined / unreachable) derived from the SIP status, mirroring the consult handler (`src/hermes_voip/voip_tools.py:868-907`, `originate.py:35-44`).
 - [ ] **[medium] ux** — Agent `place_call` has no bounded ring timeout — an unanswered outbound call blocks on the gateway INVITE timeout. `place_call_with_objective` (adapter.py:1474-1512) calls `place_call` without `ring_timeout_secs`, and there is no ring/dial-timeout config at all (`rg ring_timeout|dial_timeout|RING_TIMEOUT config.py` returns nothing); when a callee rings-but-never-answers the agent's tool call awaits for however long the gateway's INVITE timeout runs (commonly 30-180 s), tying up the concurrent-outbound slot and the agent. The plumbing already exists: `place_call` accepts `ring_timeout_secs` and arms an abort/CANCEL timer (adapter.py:782, 1538-1599 ADR-0069 outbound CANCEL), but the agent tool path never sets it. Backlog line 788-790 references `ring_timeout_secs` only in a runbook-docs context, not as the missing default on the agent tool path. Fix: add `HERMES_VOIP_RING_TIMEOUT` config (sensible default e.g. 45 s) and thread it through `place_call_with_objective` → `place_call` so an unanswered outbound dial is auto-CANCELled and surfaced as a "no answer" structured outcome (composes with the structured-outcome fix above) (`src/hermes_voip/adapter.py:1474-1512`, `config.py`, `voip_tools.py`).
+
+## Review follow-ups (Wave 6 release-blocker reviews, 2026-06-27)
+
+- [ ] **[low] correctness** — sdp: the SIP 2xx-answer parse site (`adapter.py` ~:2034) recomputes `_sip_supported_encodings()` instead of threading the stored offered codecs like the WebRTC site (~:2689); harmonize (pre-existing; #234 review).
+- [ ] **[low] test** — transport: add a `caplog` test asserting the malformed-message skip log carries only exception type + length (non-PII), catching a regression that logs raw SIP content (#231).
+- [ ] **[low] feature** — registration: optional in-transaction `stale=true` nonce retry (deferred by ADR-0080).
+- [ ] **[low] security** — CI: pin `gate.yml`/`gitleaks.yml`/`supply-chain.yml` third-party action `uses:` to commit SHAs, matching `publish.yml` (#235).
+- [ ] **[medium] test** — rtp: JitterBuffer SSRC auto-reset has no hysteresis — one foreign-SSRC packet flushes buffered audio (safe only because SRTP auth is above); consider N-consecutive-packet confirmation (#221).
+- [ ] **[low] test** — manifest: the `plugin.yaml` admission-knob test asserts presence only, not default-value parity with `config.py` (`MAX_CALLS=8`, `SHUTDOWN_DRAIN_SECS=5.0`); add a cross-check (#222).

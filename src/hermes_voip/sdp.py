@@ -1109,10 +1109,10 @@ def negotiate_audio(
         voice_rates = {codec.clock_rate for codec in voice}
         if telephone_event.clock_rate not in voice_rates:
             selected_rate = voice[0].clock_rate
+            te_rate = telephone_event.clock_rate
             msg = (
-                "telephone-event clock rate "
-                f"{selected_rate} does not match selected voice codec clock rate "
-                f"{telephone_event.clock_rate}"
+                f"telephone-event clock rate {te_rate} does not match"
+                f" selected voice codec clock rate {selected_rate}"
             )
             raise SdpError(msg)
     return chosen

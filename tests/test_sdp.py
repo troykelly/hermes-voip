@@ -226,8 +226,11 @@ def test_negotiate_audio_rejects_te_clock_rate_mismatch() -> None:
     )
 
     assert offer.audio is not None
-    with pytest.raises(SdpError, match=r"telephone-event.*8000.*16000"):
+    with pytest.raises(SdpError) as exc_info:
         negotiate_audio(offer.audio, supported=("PCMU", "telephone-event"))
+    msg = str(exc_info.value)
+    assert "telephone-event clock rate 16000" in msg, msg
+    assert "voice codec clock rate 8000" in msg, msg
 
 
 def test_negotiate_raises_when_no_common_audio_codec() -> None:

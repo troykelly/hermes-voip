@@ -296,15 +296,13 @@ def test_granted_expiry_falls_back_to_first_contact_when_ours_absent() -> None:
 
 
 def test_granted_expiry_matches_contact_differing_host_case_and_default_port() -> None:
-    # RFC 3261 §19.1.4: two SIP-URIs are equivalent when scheme matches
-    # case-insensitively, userinfo case-sensitively, host case-insensitively, and
-    # an omitted port equals the scheme default (5060 sip / 5061 sips). A registrar
-    # that echoes our binding with an UPPER-CASE host AND an explicit default port
-    # (``sip:1000@PBX.EXAMPLE.TEST:5061``) when our Contact omitted the port and
-    # lower-cased the host (``sip:1000@pbx.example.test``) is still OUR binding. With
-    # raw string equality the match misses and the flow falls back to the FIRST
-    # (other device's) binding — arming the wrong refresh timer and letting our
-    # binding silently lapse. The selected lifetime must be OUR 120, not the 600.
+    # Pragmatic Contact-binding canonicalisation for registrar echoes: scheme/host
+    # case, userinfo case-sensitivity, and the active transport's signalling default
+    # port identify OUR binding even though strict RFC 3261 §19.1.4 would not equate
+    # an omitted port with an explicitly present default. With raw string equality
+    # the match misses and the flow falls back to the FIRST (other device's) binding
+    # — arming the wrong refresh timer and letting our binding silently lapse. The
+    # selected lifetime must be OUR 120, not the 600.
     cfg = RegistrationConfig(
         aor="sips:1000@pbx.example.test",
         username="1000",
@@ -327,13 +325,40 @@ def test_granted_expiry_matches_contact_differing_host_case_and_default_port() -
     assert isinstance(outcome, Registered)
     assert (
         outcome.expires == 120
-    )  # OUR binding by §19.1.4 equality, not the 600 fallback
+    )  # OUR binding by pragmatic canonicalisation, not the 600 fallback
+
+
+def test_granted_expiry_matches_semicolon_bearing_userinfo_contact() -> None:
+    """Pragmatic matching parses userinfo before stripping host URI parameters."""
+    cfg = RegistrationConfig(
+        aor="sips:1000@pbx.example.test",
+        username="1000",
+        password="s3cr3t",
+        contact="<sip:1000;day=tuesday@pbx.example.test;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+        expires=300,
+    )
+    flow = RegistrationFlow(cfg)
+    started = flow.start()
+    echoed = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"CSeq: {_cseq_num(started)} REGISTER\r\n"
+        "Contact: <sip:1000@198.51.100.9:5061;transport=tls>;expires=600\r\n"
+        "Contact: <sip:1000;day=tuesday@PBX.EXAMPLE.TEST:5061;transport=tls>"
+        ";expires=120\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(echoed)
+    assert isinstance(outcome, Registered)
+    assert outcome.expires == 120
 
 
 def test_granted_expiry_matches_sips_contact_with_explicit_default_port_5061() -> None:
-    # §19.1.4 companion for the sips: scheme — default port 5061. Our Contact uses a
-    # sips: addr-spec with no explicit port; the registrar echoes it with the explicit
-    # default ``:5061``. The two URIs are equivalent, so OUR 90 is selected over the
+    # Pragmatic Contact-binding canonicalisation companion for the sips: scheme.
+    # Our Contact uses a sips: addr-spec with no explicit port; the registrar echoes
+    # it with the explicit active-transport default ``:5061``. Strict §19.1.4 would
+    # not equate those forms, but this bounded OUR-AOR match selects OUR 90 over the
     # leading other-device binding's 600.
     cfg = RegistrationConfig(
         aor="sips:1000@pbx.example.test",
@@ -355,7 +380,7 @@ def test_granted_expiry_matches_sips_contact_with_explicit_default_port_5061() -
     )
     outcome = flow.handle(echoed)
     assert isinstance(outcome, Registered)
-    assert outcome.expires == 90  # OUR sips binding by §19.1.4 equality, not the 600
+    assert outcome.expires == 90  # OUR sips binding, not the 600 fallback
 
 
 def test_200_granting_zero_expires_to_a_registration_is_failed_not_registered() -> None:

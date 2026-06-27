@@ -106,9 +106,11 @@ def _binding_uri(binding: str) -> str:
     return binding.split(";", 1)[0].strip()
 
 
-#: The default port for each SIP scheme (RFC 3261 §19.1.2): an omitted port is
-#: equivalent to the scheme default in §19.1.4 SIP-URI comparison. Used as the
-#: scheme-keyed fallback when the caller supplies no transport-derived default.
+#: The default port for each SIP scheme (RFC 3261 §19.1.2). Used only as a
+#: scheme-keyed fallback for pragmatic Contact-binding canonicalisation when the
+#: caller supplies no transport-derived default. This is not strict RFC 3261
+#: §19.1.4 URI equality: §19.1.4 treats an omitted port as different from an
+#: explicitly present default port.
 _DEFAULT_PORT: dict[str, int] = {"sip": 5060, "sips": 5061}
 
 #: The default signalling port keyed by the active Via transport (ADR-0090). On a
@@ -148,30 +150,32 @@ def _split_host_port(hostport: str) -> tuple[str, str] | None:
     return host, port_str
 
 
-def _split_sip_uri(uri: str) -> tuple[str, str, str, int | None] | None:
-    """Decompose a SIP addr-spec into ``(scheme, userinfo, host, port)`` for §19.1.4.
+def _split_contact_binding_uri(uri: str) -> tuple[str, str, str, int | None] | None:
+    """Decompose a Contact addr-spec for pragmatic binding canonicalisation.
 
     Operates on a Contact addr-spec (``scheme:[user@]host[:port]`` optionally
     followed by ``;uri-params``). ``_binding_uri`` strips the angle brackets but
-    leaves any ``;transport=...`` URI parameters attached, so they are dropped
-    here at the first top-level ``;`` before the host/port is read. The port is
-    ``None`` when omitted (the §19.1.4 default-port elision is applied by the
-    comparator, not here). Returns ``None`` for anything that is not a
-    ``scheme:[user@]host[:port]`` shape so the caller falls back to plain string
-    equality rather than mis-parsing.
+    leaves ``;uri-params`` inside name-addrs; they are intentionally out of scope
+    for this OUR-AOR binding match, so this parser splits userinfo at the LAST
+    ``@`` first and then strips ``;uri-params`` from the HOSTPORT portion only.
+    This preserves legal semicolons in userinfo, such as
+    ``sip:alice;day=tuesday@host``. Returns ``None`` for anything that is not a
+    ``scheme:[user@]host[:port]`` shape so the caller falls back to no match
+    rather than mis-parsing.
     """
     scheme, sep, rest = uri.partition(":")
     if not sep or not scheme or not rest:
         return None
-    # Drop any ``;uri-params`` (e.g. ``;transport=tls``) — they are not part of
-    # the scheme+userinfo+host+port prefix §19.1.4 compares, and a left-over
-    # ``;...`` on the port token would otherwise make the URI unparseable.
-    rest = rest.split(";", 1)[0]
-    if not rest:
-        return None
-    userinfo, at, hostport = rest.rpartition("@")
+    userinfo, at, hostport_with_params = rest.rpartition("@")
     if not at:
-        userinfo, hostport = "", rest
+        userinfo, hostport_with_params = "", rest
+    # URI/header parameters are out of scope for this bounded comparison because
+    # ``_binding_uri`` already trims params from bare Contact forms, and this
+    # helper is used only to choose among Contact bindings echoed for our own AOR.
+    # Strip them after userinfo parsing so semicolons inside userinfo survive.
+    hostport = hostport_with_params.split(";", 1)[0]
+    if not hostport:
+        return None
     split = _split_host_port(hostport)
     if split is None:
         return None
@@ -187,34 +191,39 @@ def _split_sip_uri(uri: str) -> tuple[str, str, str, int | None] | None:
     return scheme, userinfo, host, port
 
 
-def _sip_uri_equal(a: str, b: str, *, default_port: int | None = None) -> bool:
-    """Whether two SIP addr-specs are equivalent under RFC 3261 §19.1.4.
+def _contact_binding_matches(
+    a: str, b: str, *, default_port: int | None = None
+) -> bool:
+    """Whether two Contact addr-specs identify the same pragmatic binding.
 
-    Two SIP-URIs are equivalent when the scheme matches case-insensitively, the
-    userinfo matches case-sensitively, the host matches case-insensitively, and
-    the port matches with default-port elision (an omitted port equals the
-    default). This is the subset of §19.1.4 that matters for matching OUR Contact
-    binding in a 200 OK echo: a registrar that echoes
-    ``sip:1000@PBX.EXAMPLE.TEST:5061`` for our portless
-    ``sip:1000@pbx.example.test`` is binding the same AOR and must not be missed.
+    This is a deliberate, bounded canonicalisation for matching a registrar's
+    200-OK echo of OUR OWN Contact, not generic RFC 3261 §19.1.4 SIP-URI
+    equality. Strict §19.1.4 does not equate an omitted port with an explicitly
+    present default port and also has parameter/percent-encoding rules this
+    helper does not implement. For this flow, the useful canonicalisations are:
+    scheme case-folding, host case-folding, case-sensitive userinfo, and eliding
+    an omitted port to the active transport's signalling default. That recognises
+    a registrar echo such as ``sip:1000@PBX.EXAMPLE.TEST:5061`` for our portless
+    ``sip:1000@pbx.example.test`` while remaining scoped to Contact bindings for
+    our own AOR.
 
     ``default_port`` is the elided port — the active transport's signalling
     default (ADR-0090): on a TLS/WSS leg every binding is reached over 5061, so an
-    explicit ``:5061`` echoed against our omitted port is the same endpoint even
-    when the addr-spec scheme is bare ``sip`` (its ``transport=tls`` param is
-    stripped before comparison). When ``None`` the per-scheme RFC 3261 §19.1.2
-    default is used (5060 ``sip`` / 5061 ``sips``) — both sides must share the
-    same scheme, so a single scheme-keyed default is unambiguous.
+    explicit ``:5061`` echoed against our omitted port is treated as the same
+    binding even when the addr-spec scheme is bare ``sip`` (its
+    ``transport=tls`` param is stripped before comparison). When ``None`` the
+    per-scheme RFC 3261 §19.1.2 default is used (5060 ``sip`` / 5061 ``sips``).
 
-    Only the ``scheme + userinfo + host + port`` prefix is compared (URI
-    parameters and headers are not — :func:`_binding_uri` has already stripped
-    them). If either side is not a parseable SIP addr-spec, falls back to exact
-    string equality so a malformed echo can never spuriously match.
+    URI parameters, headers, and percent-encoding equivalence are out of scope:
+    our minted Contact carries no percent-encoding, and :func:`_binding_uri`
+    already strips parameters from bare Contact forms before this OUR-AOR-scoped
+    comparison. If either side is not a parseable SIP addr-spec, this returns
+    ``False`` so a malformed echo can never spuriously match.
     """
     if a == b:
         return True
-    parsed_a = _split_sip_uri(a)
-    parsed_b = _split_sip_uri(b)
+    parsed_a = _split_contact_binding_uri(a)
+    parsed_b = _split_contact_binding_uri(b)
     if parsed_a is None or parsed_b is None:
         return False
     scheme_a, user_a, host_a, port_a = parsed_a
@@ -617,13 +626,14 @@ class RegistrationFlow:
         from OUR Contact, not whichever binding comes first (another device's
         lifetime would arm the wrong timer and let our binding lapse). All
         ``Contact`` headers are flattened into individual bindings; the one
-        whose addr-spec is equivalent to our Contact URI under RFC 3261 §19.1.4
-        SIP-URI comparison (scheme/host case-insensitive, userinfo
-        case-sensitive, default-port elision) supplies the value — not a raw
-        byte-for-byte string match, which would miss a registrar that echoes our
-        binding with a differing host case or an explicit default port. Failing a
-        §19.1.4 match, the first binding's ``expires`` is the fallback, then the
-        ``Expires`` header, then our requested lifetime.
+        whose addr-spec pragmatically canonicalises to our Contact URI supplies
+        the value: scheme/host are case-insensitive, userinfo is case-sensitive,
+        and an omitted port elides to the active transport's signalling default
+        (ADR-0090). This is deliberately not strict RFC 3261 §19.1.4 URI
+        equality, which would miss a registrar that echoes our portless binding
+        with a differing host case or an explicit default port. Failing that
+        bounded OUR-AOR match, the first binding's ``expires`` is the fallback,
+        then the ``Expires`` header, then our requested lifetime.
 
         When the chosen binding carries an ``expires`` parameter whose value is
         present but MALFORMED — negative or non-numeric, which RFC 3261 §10.2/§10.3
@@ -647,7 +657,7 @@ class RegistrationFlow:
             (
                 b
                 for b in bindings
-                if _sip_uri_equal(
+                if _contact_binding_matches(
                     _binding_uri(b), self._contact_uri, default_port=default_port
                 )
             ),

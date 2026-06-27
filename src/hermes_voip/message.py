@@ -14,33 +14,46 @@ import re
 import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Final
+
+__all__ = [
+    "SipRequest",
+    "SipResponse",
+    "build_request",
+    "build_response",
+    "new_branch",
+    "new_call_id",
+    "new_tag",
+]
 
 # RFC 3261 §8.1.1.7: a branch value MUST begin with this magic cookie.
-_MAGIC_COOKIE = "z9hG4bK"
-_CRLF = "\r\n"
+_MAGIC_COOKIE: Final[str] = "z9hG4bK"
+_CRLF: Final[str] = "\r\n"
 # A status-line is "SIP/2.0 <code> <reason>" with a mandatory single SP before
 # the (possibly empty) reason phrase: "SIP/2.0 200OK" (no SP) and "SIP/2.0 200"
 # (no reason SP at all) are both rejected as malformed framing, while
 # "SIP/2.0 200 " parses with an empty reason. build_response always emits the
 # SP, so parse and build agree on the wire shape.
-_STATUS_LINE = re.compile(r"SIP/2\.0 (\d{3}) (.*)")
+_STATUS_LINE: Final[re.Pattern[str]] = re.compile(r"SIP/2\.0 (\d{3}) (.*)")
 # A request-line is "METHOD request-uri SIP/2.0"; method is an RFC 3261 token
 # (covers extension methods, not just the alphabetic standard ones).
-_REQUEST_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0")
+_REQUEST_LINE: Final[re.Pattern[str]] = re.compile(
+    r"([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) SIP/2\.0"
+)
 # A header field name is an RFC 3261 token: no whitespace, colon, or controls.
-_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_HEADER_NAME: Final[re.Pattern[str]] = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 # A To/From header already carrying a dialog tag parameter.
-_TAG_PRESENT = re.compile(r";\s*tag=", re.IGNORECASE)
+_TAG_PRESENT: Final[re.Pattern[str]] = re.compile(r";\s*tag=", re.IGNORECASE)
 # The header this module computes itself; callers must not also supply it.
-_CONTENT_LENGTH = "Content-Length"
+_CONTENT_LENGTH: Final[str] = "Content-Length"
 
 # A SIP status code is in the 1xx..6xx range.
-_MIN_STATUS = 100
-_MAX_STATUS = 699
+_MIN_STATUS: Final[int] = 100
+_MAX_STATUS: Final[int] = 699
 
 # Forbidden control characters: the ASCII C0 range (code points below this) and DEL.
-_C0_END = 0x20
-_DEL = 0x7F
+_C0_END: Final[int] = 0x20
+_DEL: Final[int] = 0x7F
 
 
 def _reject_controls(value: str, what: str) -> None:

@@ -44,6 +44,7 @@ __all__ = [
     "ReinviteProgress",
     "ReinviteRejected",
     "ReinviteResponse",
+    "UnsupportedReinviteOffer",
     "build_hold_reinvite",
     "classify_inbound_reinvite",
     "handle_reinvite_response",
@@ -268,7 +269,14 @@ class OfferlessReinvite:
     """A re-INVITE with no SDP offer; we must offer in the 2xx."""
 
 
-type InboundReinvite = Glare | MediaUpdate | OfferlessReinvite
+@dataclass(frozen=True, slots=True)
+class UnsupportedReinviteOffer:
+    """A re-INVITE carried an SDP offer with no usable audio media."""
+
+
+type InboundReinvite = (
+    Glare | MediaUpdate | OfferlessReinvite | UnsupportedReinviteOffer
+)
 
 
 def classify_inbound_reinvite(
@@ -279,7 +287,8 @@ def classify_inbound_reinvite(
     Glare takes priority: if we already have an unanswered re-INVITE outstanding,
     the result is :class:`Glare` (answer 491) regardless of the offer. Otherwise
     an offer present yields a :class:`MediaUpdate` with the mirrored answer
-    direction; an absent offer yields :class:`OfferlessReinvite`.
+    direction; an absent offer yields :class:`OfferlessReinvite`; a present
+    offer with no usable audio media yields :class:`UnsupportedReinviteOffer`.
 
     Raises:
         IncallError: if the offer carries an unknown media direction.
@@ -290,7 +299,7 @@ def classify_inbound_reinvite(
         return OfferlessReinvite()
     offer = SessionDescription.parse(request.body)
     if offer.audio is None:
-        return OfferlessReinvite()
+        return UnsupportedReinviteOffer()
     offer_direction = offer.audio.direction
     answer_direction = _ANSWER_MIRROR.get(offer_direction)
     if answer_direction is None:

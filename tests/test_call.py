@@ -755,6 +755,34 @@ async def test_inbound_reinvite_hold_answers_recvonly_and_holds() -> None:
     assert media.holds == [True]
 
 
+_VIDEO_ONLY_OFFER = "\r\n".join(
+    (
+        "v=0",
+        "o=- 7 1 IN IP4 198.51.100.99",
+        "s=-",
+        "c=IN IP4 198.51.100.99",
+        "t=0 0",
+        "m=video 42002 RTP/AVP 96",
+        "a=rtpmap:96 H264/90000",
+        "a=sendrecv",
+        "",
+    )
+)
+
+
+async def test_inbound_reinvite_video_only_offer_is_rejected_not_answered() -> None:
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+
+    await session.handle_request(_inbound("INVITE", body=_VIDEO_ONLY_OFFER))
+
+    response = SipResponse.parse(signaling.sent[-1])
+    assert response.status_code == 488
+    assert response.body == ""
+    assert session.on_hold is False
+    assert media.holds == []
+
+
 async def test_inbound_reinvite_during_local_offer_is_491_glare() -> None:
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media)

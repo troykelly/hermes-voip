@@ -25,6 +25,7 @@ from hermes_voip.incall import (
     ReinviteChallenged,
     ReinviteProgress,
     ReinviteRejected,
+    UnsupportedReinviteOffer,
     build_hold_reinvite,
     classify_inbound_reinvite,
     handle_reinvite_response,
@@ -374,6 +375,32 @@ def test_classify_offerless_reinvite() -> None:
     )
     out = classify_inbound_reinvite(req, pending_local_offer=False)
     assert isinstance(out, OfferlessReinvite)
+
+
+_VIDEO_ONLY_OFFER = "\r\n".join(
+    (
+        "v=0",
+        "o=- 7 1 IN IP4 198.51.100.99",
+        "s=-",
+        "c=IN IP4 198.51.100.99",
+        "t=0 0",
+        "m=video 42002 RTP/AVP 96",
+        "a=rtpmap:96 H264/90000",
+        "a=sendrecv",
+        "",
+    )
+)
+
+
+def test_classify_non_empty_sdp_without_audio_is_unsupported_offer() -> None:
+    req = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@pbx.example.test",
+        headers=(("Content-Type", "application/sdp"),),
+        body=_VIDEO_ONLY_OFFER,
+    )
+    out = classify_inbound_reinvite(req, pending_local_offer=False)
+    assert isinstance(out, UnsupportedReinviteOffer)
 
 
 def test_classify_glare_takes_priority_over_offer() -> None:

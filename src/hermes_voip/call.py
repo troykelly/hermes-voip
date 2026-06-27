@@ -38,6 +38,7 @@ from hermes_voip.incall import (
     LocalMediaSession,
     MediaUpdate,
     ReinviteRejected,
+    UnsupportedReinviteOffer,
     build_hold_reinvite,
     classify_inbound_reinvite,
     handle_reinvite_response,
@@ -710,6 +711,11 @@ class CallSession:
         )
         if isinstance(routing, Glare):
             await self._signaling.send(build_response(request, 491, "Request Pending"))
+            return
+        if isinstance(routing, UnsupportedReinviteOffer):
+            await self._signaling.send(
+                build_response(request, 488, "Not Acceptable Here")
+            )
             return
         if isinstance(routing, MediaUpdate):
             # Downgrade resistance (ADR-0053): a secured call never answers a plain

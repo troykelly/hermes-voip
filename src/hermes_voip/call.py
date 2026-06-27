@@ -53,6 +53,7 @@ from hermes_voip.message import (
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.refer import (
     NotifyProgress,
+    ReferError,
     ReferRequest,
     build_attended_refer,
     build_blind_refer,
@@ -83,6 +84,7 @@ _PROVISIONAL_CEILING = 200  # a status below this is a 1xx provisional response
 _UNAUTHORIZED = 401
 _PROXY_AUTH_REQUIRED = 407
 _FIRST_ERROR_STATUS = 300
+_BAD_REQUEST = 400
 _MAX_FORWARDS = "70"
 _DEFAULT_RESPONSE_TIMEOUT = 32.0
 
@@ -773,11 +775,47 @@ class CallSession:
         await self._media.stop()
 
     async def _on_notify(self, request: SipRequest) -> None:
-        self.transfer_progress = parse_notify_sipfrag(request)
+        """Answer an inbound transfer-progress NOTIFY; a malformed one gets 400.
+
+        ``parse_notify_sipfrag`` raises :class:`ReferError` on a NOTIFY that is
+        missing ``Subscription-State`` or whose body has no ``SIP/2.0`` status-line.
+        That is a malformed PEER message, not our bug — answer it ``400 Bad Request``
+        and return, never letting the error propagate. Propagation would reach the
+        transport read loop and tear down the ENTIRE signalling connection (and its
+        registration), dropping every concurrent call on it: a one-message DoS. The
+        progress field is left unchanged on a malformed NOTIFY (rule 37 nuance: a
+        malformed inbound message is answered, not fatal).
+        """
+        try:
+            progress = parse_notify_sipfrag(request)
+        except ReferError:
+            await self._signaling.send(
+                build_response(request, _BAD_REQUEST, "Bad Request")
+            )
+            return
+        self.transfer_progress = progress
         await self._signaling.send(build_response(request, 200, "OK"))
 
     async def _on_refer(self, request: SipRequest) -> None:
-        refer = parse_refer(request)
+        """Answer an inbound REFER; 202 only once it parses, else a 4xx.
+
+        ``parse_refer`` raises :class:`ReferError` when the REFER lacks exactly one
+        ``Refer-To`` or its target fails the injection guard (foreign-host hijack,
+        ``?``-header form, control char, …). A malformed/hostile REFER is answered
+        ``400 Bad Request`` and the handler never runs — propagating the error would
+        reach the transport read loop and drop the WHOLE signalling connection (a
+        one-message DoS). Crucially, the ``202 Accepted`` is sent ONLY AFTER a
+        successful parse: a REFER whose injection guard fails is rejected outright,
+        never accepted-then-abandoned (rule 37 nuance: a malformed inbound message
+        is answered, not fatal).
+        """
+        try:
+            refer = parse_refer(request)
+        except ReferError:
+            await self._signaling.send(
+                build_response(request, _BAD_REQUEST, "Bad Request")
+            )
+            return
         await self._signaling.send(build_response(request, 202, "Accepted"))
         if self._refer_handler is not None:
             await self._refer_handler(refer)

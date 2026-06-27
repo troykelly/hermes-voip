@@ -855,6 +855,127 @@ async def test_inbound_refer_accepts_and_invokes_handler() -> None:
     assert seen[0].refer_to == "sip:4000@pbx.example.test"
 
 
+async def test_inbound_refer_no_refer_to_answers_4xx_does_not_propagate() -> None:
+    """A malformed REFER (no Refer-To) is answered 4xx, not fatal to the connection.
+
+    ``parse_refer`` raises ``ReferError`` (a ``ValueError``) on a REFER with no
+    ``Refer-To``. If that propagated out of ``handle_request`` it would mark the
+    transport reader task failed and tear down the ENTIRE TLS/WSS signalling
+    connection — a one-message DoS dropping every concurrent call. The malformed
+    peer message must be ANSWERED (4xx), never crash the dialog: ``handle_request``
+    returns normally and emits a single 4xx, no 202 and no handler invocation.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    seen: list[ReferRequest] = []
+
+    async def _handler(refer: ReferRequest) -> None:
+        seen.append(refer)
+
+    session = _session(signaling, media, on_refer=_handler)
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-r"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirs"),
+            ("To", "<sip:1000@pbx.example.test>;tag=ours"),
+            ("Call-ID", "call-1"),
+            ("CSeq", "13 REFER"),
+            # no Refer-To header — parse_refer raises ReferError
+        ),
+        body="",
+    )
+
+    # Must NOT raise — propagation would tear down the whole connection.
+    await session.handle_request(refer)
+
+    responses = [t for t in signaling.sent if t.startswith("SIP/2.0 ")]
+    assert len(responses) == 1, "exactly one response to the malformed REFER"
+    status = SipResponse.parse(responses[-1]).status_code
+    assert 400 <= status < 500, f"a malformed REFER is answered 4xx, got {status}"
+    # No 202 Accepted was sent and the handler was never invoked.
+    assert SipResponse.parse(responses[-1]).status_code != 202
+    assert seen == []
+    # The session is untouched — the dialog stays alive for other calls.
+    assert session.ended is False
+
+
+async def test_inbound_refer_hostile_refer_to_answers_4xx_not_202() -> None:
+    """A REFER whose Refer-To fails the injection guard gets a 4xx and NO 202.
+
+    Response ordering security fix: a 202 Accepted must only be sent once the
+    REFER parses (target injection guard passes). A control-char / hostile
+    ``Refer-To`` makes ``parse_refer`` raise ``ReferError``, so the answer is a
+    4xx — never an accepted-then-rejected sequence — and the handler never runs.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    seen: list[ReferRequest] = []
+
+    async def _handler(refer: ReferRequest) -> None:
+        seen.append(refer)
+
+    session = _session(signaling, media, on_refer=_handler)
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-r"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirs"),
+            ("To", "<sip:1000@pbx.example.test>;tag=ours"),
+            ("Call-ID", "call-1"),
+            ("CSeq", "13 REFER"),
+            # CR injection vector in the target — rejected by the injection guard.
+            ("Refer-To", "<sip:4000@pbx.example.test%0d%0aEvil: x>"),
+        ),
+        body="",
+    )
+
+    await session.handle_request(refer)
+
+    responses = [t for t in signaling.sent if t.startswith("SIP/2.0 ")]
+    statuses = [SipResponse.parse(r).status_code for r in responses]
+    assert 202 not in statuses, "a rejected REFER must never be Accepted (202)"
+    assert len(responses) == 1
+    assert 400 <= statuses[-1] < 500, f"hostile REFER answered 4xx, got {statuses[-1]}"
+    assert seen == []
+
+
+async def test_inbound_notify_malformed_answers_400_does_not_propagate() -> None:
+    """A malformed NOTIFY (no Subscription-State) is answered 400, not fatal.
+
+    ``parse_notify_sipfrag`` raises ``ReferError`` on a NOTIFY missing
+    ``Subscription-State`` (or with a non-``SIP/2.0`` body). If that propagated
+    out of ``handle_request`` it would tear down the whole signalling connection.
+    The malformed message must be ANSWERED 400 and the connection left alive.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    notify = SipRequest(
+        method="NOTIFY",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-n"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirs"),
+            ("To", "<sip:1000@pbx.example.test>;tag=ours"),
+            ("Call-ID", "call-1"),
+            ("CSeq", "12 NOTIFY"),
+            ("Content-Type", "message/sipfrag"),
+            # no Subscription-State header — parse_notify_sipfrag raises ReferError
+        ),
+        body="SIP/2.0 200 OK",
+    )
+
+    # Must NOT raise — propagation would tear down the whole connection.
+    await session.handle_request(notify)
+
+    responses = [t for t in signaling.sent if t.startswith("SIP/2.0 ")]
+    assert len(responses) == 1
+    assert SipResponse.parse(responses[-1]).status_code == 400
+    # The progress field is left unchanged and the session stays alive.
+    assert session.transfer_progress is None
+    assert session.ended is False
+
+
 async def test_dialog_id_routes_inbound() -> None:
     session = _session(_FakeSignaling(), _FakeMedia())
     assert session.dialog_id == ("call-1", "ours", "theirs")

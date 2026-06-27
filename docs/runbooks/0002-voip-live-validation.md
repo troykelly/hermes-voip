@@ -80,23 +80,41 @@ fixed):
 
 Download script (reads the pins from `manifest.py`; verifies each pinned sha256 and aborts on
 mismatch). The silero VAD is fetched from the official tagged release below and is *not*
-manifest-pinned (it is the VAD, not a licence-bearing conversational model); record its
-sha256 when you cache it.
+manifest-pinned (it is the VAD, not a licence-bearing conversational model); its **known-good
+sha256 is pinned in this runbook** (below) and the download is verified against it.
 
 > **WARNING — mirror incompatibility:** the `deepghs/silero-vad-onnx` HuggingFace mirror
-> is silero **v4**. Its recurrent-state tensor has shape `(2, 1, 64)`, which is **not
-> compatible** with this plugin's v5 inference harness (expected state shape `(2, 1, 128)`,
-> see `vad.py _SILERO_STATE_SHAPE`). Do **not** use that mirror. The plugin detects this at
-> model load and raises a clear `ValueError` naming the loaded shape, but the fix is to
-> download from `snakers4/silero-vad` at `v5.1.2` as shown below.
+> is silero **v4**. Its recurrent-state tensor's hidden dim is `64` (state shape
+> `[2, <dynamic batch>, 64]`), which is **not compatible** with this plugin's v5 inference
+> harness. silero **v5** reports its `state` input shape as `[2, None, 128]` — dim0 (`2`)
+> and the hidden dim (`128`) are fixed, and the **batch dim is dynamic** (onnxruntime
+> reports it as `None` or a symbolic name, never a fixed `1`). The plugin's load-time guard
+> (`vad.py _validate_silero_v5_state_shape`) compares only those two fixed dims, so it
+> accepts the genuine v5 model and rejects the v4 mirror (hidden dim `64`) with a clear
+> `ValueError`. Do **not** use that mirror; download from `snakers4/silero-vad` at `v5.1.2`
+> as shown below.
 
-**Silero VAD v5.1.2 — pinned download (run once per workspace):**
+**Silero VAD v5.1.2 — pinned download + digest verification (run once per workspace):**
 
-```python
-# Requires: pip install huggingface_hub   (already present via the ml extra)
+`uv` is the only package manager (rule 38) — never `pip install`. `huggingface_hub` is
+already present via the `--extra ml` sync (step 1); if you run this in a bare shell, use
+`uv run --with huggingface_hub python - <<'PY' … PY` so the dependency is resolved by `uv`,
+not bare pip. The script aborts non-zero on a digest mismatch (a moved tag or corrupted
+artifact is caught, not silently accepted — rule 23):
+
+```bash
+# `--with huggingface_hub` makes uv resolve the dep (no bare pip). Inside an
+# already-synced `--extra ml` venv, plain `uv run python - <<'PY' … PY` also works.
+uv run --with huggingface_hub python - <<'PY'
 from pathlib import Path
 from huggingface_hub import hf_hub_download
-import hashlib, os, shutil
+import hashlib, os, shutil, sys
+
+# Pinned known-good digest of the v5.1.2 silero_vad.onnx (verify the download
+# against THIS, ex-ante — a moved tag / corrupted artifact must fail, not be
+# recorded after the fact). 2 327 524 bytes; corroborated against an independent
+# public mirror of the same v5 ONNX (FluidInference/silero-vad-coreml).
+EXPECTED_SHA256 = "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
 
 vad_dir = Path(os.environ["VOIP_MODELS_ROOT"]) / "vad"
 vad_dir.mkdir(parents=True, exist_ok=True)
@@ -109,13 +127,25 @@ tmp = hf_hub_download(
     repo_type="model",
     revision="v5.1.2",
 )
+sha256 = hashlib.sha256(Path(tmp).read_bytes()).hexdigest()
+if sha256 != EXPECTED_SHA256:
+    sys.exit(
+        f"ABORT: silero_vad.onnx sha256 {sha256} != expected {EXPECTED_SHA256} "
+        "— the v5.1.2 tag may have moved or the download is corrupt; do NOT use it."
+    )
+
 dest = vad_dir / "silero_vad.onnx"
 shutil.copy(tmp, dest)
-
-sha256 = hashlib.sha256(dest.read_bytes()).hexdigest()
-print(f"silero_vad.onnx  sha256={sha256}")
-# Record the sha256 printed here; re-run to verify: the printed value must match.
+print(f"OK: silero_vad.onnx verified sha256={sha256} -> {dest}")
+PY
 ```
+
+> **Pinned digest:** `silero_vad.onnx` (v5.1.2) sha256 =
+> `2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f` (2 327 524 bytes).
+> To re-verify an already-cached copy without re-downloading:
+> `uv run python -c "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('$VOIP_MODELS_ROOT/vad/silero_vad.onnx').read_bytes()).hexdigest())"`
+> — the output must equal the pinned digest above. If silero ever re-publishes the v5 ONNX
+> under a new tag, update this pin in the same commit that bumps the `revision`.
 
 After downloading, prove the stack actually loads (not just that the files exist):
 

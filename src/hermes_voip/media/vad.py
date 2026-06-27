@@ -343,9 +343,25 @@ _SILERO_MODEL_FILENAME: Final[str] = "silero_vad.onnx"
 _SILERO_MODEL_DIR_ENV: Final[str] = "HERMES_VOIP_VAD_MODEL_DIR"
 
 
-#: silero v5's recurrent state shape: a single (2, 1, 128) float32 tensor carried
-#: between windows. Reset to zeros starts a fresh utterance.
+#: silero v5's recurrent state ALLOCATION shape: a single (2, 1, 128) float32
+#: tensor carried between windows. We feed exactly one window per inference, so
+#: the batch dim is the concrete ``1`` here — this shape sizes the zero tensor we
+#: pass in (``np.zeros``), NOT the shape we validate the loaded model against (the
+#: model reports the batch dim as DYNAMIC; see ``_SILERO_STATE_*`` below).
 _SILERO_STATE_SHAPE: Final[tuple[int, int, int]] = (2, 1, 128)
+
+#: The LOAD-BEARING fixed dimensions of the silero v5 ``state`` input, used to
+#: validate the loaded ONNX. onnxruntime reports the v5 state shape as
+#: ``[2, None, 128]`` — dim0 and dim2 are fixed ints; the **batch dim (index 1) is
+#: DYNAMIC** (reported as ``None`` or a symbolic ``str``, never a fixed ``1``). So
+#: the guard compares ONLY these two dims and treats dim1 as dynamic; an exact
+#: match against ``(2, 1, 128)`` would wrongly reject the genuine v5 model.
+_SILERO_STATE_RANK: Final[int] = 3
+_SILERO_STATE_DIM0: Final[int] = 2
+_SILERO_STATE_HIDDEN_DIM: Final[int] = 128
+#: silero **v4**'s hidden dim — the value that marks the incompatible v4 model
+#: (e.g. the ``deepghs/silero-vad-onnx`` mirror), whose state is ``[2, ?, 64]``.
+_SILERO_V4_HIDDEN_DIM: Final[int] = 64
 
 #: Full-scale divisor mapping PCM16 to the float32 [-1.0, 1.0) range silero wants.
 _PCM16_FULL_SCALE: Final[float] = 32768.0
@@ -418,8 +434,10 @@ class _NodeArg(Protocol):
 
     #: Input tensor name (e.g. ``"state"`` for the silero recurrent state).
     name: str
-    #: Symbolic shape as a list; may contain ``None`` for dynamic dimensions.
-    shape: list[int | None]
+    #: Symbolic shape as a list. Each element is an ``int`` (a fixed dimension),
+    #: ``None`` (an unnamed dynamic dimension), or a ``str`` (a named/symbolic
+    #: dynamic dimension) — exactly what ``onnxruntime.NodeArg.shape`` yields.
+    shape: list[int | str | None]
 
 
 @runtime_checkable
@@ -440,19 +458,26 @@ class _OrtSession(Protocol):
 def _validate_silero_v5_state_shape(session: _OrtSession) -> None:
     """Raise ``ValueError`` if the loaded ONNX is not a silero v5 model.
 
-    silero v5 carries an LSTM state of shape ``(2, 1, 128)`` between windows.
-    The ``deepghs/silero-vad-onnx`` HuggingFace mirror is silero v4, whose
-    state is ``(2, 1, 64)`` — incompatible with the v5 inference harness here.
-    Without this guard the failure surfaces as an opaque onnxruntime shape
-    mismatch on the first inference call; with it the operator sees a clear
-    message immediately on model load.
+    silero v5 carries an LSTM state between windows whose ONNX input shape
+    onnxruntime reports as ``[2, None, 128]``: dim0 (``2``) and dim2 (``128``,
+    the hidden size) are **fixed**, while the batch dim (index 1) is **DYNAMIC**
+    — reported as ``None`` or a symbolic ``str``, never a fixed ``1``. The
+    ``deepghs/silero-vad-onnx`` HuggingFace mirror is silero v4, whose hidden dim
+    is ``64`` (``[2, ?, 64]``) — incompatible with the v5 inference harness here.
+
+    The guard therefore compares only the two LOAD-BEARING fixed dims
+    (``dim0 == 2`` and ``dim2 == 128``) and treats the batch dim as dynamic. A
+    naive exact match against ``(2, 1, 128)`` would WRONGLY REJECT the genuine v5
+    model, because the real model never reports a fixed batch dim. Without this
+    guard a v4 model would fail with an opaque onnxruntime shape mismatch on the
+    first inference call; with it the operator sees a clear message on model load.
 
     Args:
         session: The freshly-loaded ``InferenceSession`` to validate.
 
     Raises:
-        ValueError: If the ``"state"`` input's shape does not match
-            :data:`_SILERO_STATE_SHAPE` ``(2, 1, 128)``.
+        ValueError: If there is no ``"state"`` input, its shape is not rank-3, or
+            its fixed hidden dim is not ``128`` (notably ``64`` for silero v4).
     """
     inputs = session.get_inputs()
     state_input = next((inp for inp in inputs if inp.name == "state"), None)
@@ -460,24 +485,41 @@ def _validate_silero_v5_state_shape(session: _OrtSession) -> None:
         # No "state" input at all — not a recognisable silero model.
         msg = (
             "silero VAD v5 required: the loaded ONNX has no 'state' input; "
-            "expected a silero v5 model with state shape "
-            f"{_SILERO_STATE_SHAPE} — see runbook 0002"
+            f"expected a silero v5 model with state shape {_SILERO_STATE_SHAPE} "
+            "(reported by onnxruntime as [2, <dynamic>, 128]) — see runbook 0002"
         )
         raise ValueError(msg)
-    loaded_shape = tuple(state_input.shape)
-    if loaded_shape != _SILERO_STATE_SHAPE:
-        msg = (
-            f"silero VAD v5 required (state shape {_SILERO_STATE_SHAPE}); "
-            f"the loaded model expects {loaded_shape} — "
-            "this is silero v4 (e.g. the deepghs/silero-vad-onnx mirror, "
-            "which is incompatible with this plugin); "
-            "download the official v5 model: "
-            "huggingface_hub.hf_hub_download("
-            "repo_id='snakers4/silero-vad', "
-            "filename='src/silero_vad/data/silero_vad.onnx', "
-            "repo_type='model', revision='v5.1.2') — see runbook 0002"
-        )
-        raise ValueError(msg)
+    loaded_shape = list(state_input.shape)
+    # Only a rank-3 shape can be a silero v5 state; unpacking the three dims
+    # avoids bare index literals. The middle (batch) dim is intentionally bound to
+    # ``_`` and NOT checked — onnxruntime reports it dynamic (None or a symbolic
+    # str), so any value there (dynamic or a fixed 1) is accepted; only dim0 and
+    # the hidden dim are the fixed, load-bearing version markers.
+    if len(loaded_shape) == _SILERO_STATE_RANK:
+        dim0, _batch, hidden_dim = loaded_shape
+        if dim0 == _SILERO_STATE_DIM0 and hidden_dim == _SILERO_STATE_HIDDEN_DIM:
+            return
+    else:
+        hidden_dim = None
+    is_v4 = hidden_dim == _SILERO_V4_HIDDEN_DIM
+    v4_note = (
+        "this is silero v4 (e.g. the deepghs/silero-vad-onnx mirror, "
+        "which is incompatible with this plugin); "
+        if is_v4
+        else "this does not look like a silero v5 model; "
+    )
+    msg = (
+        "silero VAD v5 required (state shape [2, <dynamic batch>, 128], "
+        f"i.e. hidden dim {_SILERO_STATE_HIDDEN_DIM}); the loaded model's "
+        f"'state' input shape is {loaded_shape} — "
+        f"{v4_note}"
+        "download the official v5 model: "
+        "huggingface_hub.hf_hub_download("
+        "repo_id='snakers4/silero-vad', "
+        "filename='src/silero_vad/data/silero_vad.onnx', "
+        "repo_type='model', revision='v5.1.2') — see runbook 0002"
+    )
+    raise ValueError(msg)
 
 
 class _SileroOnnxModel:

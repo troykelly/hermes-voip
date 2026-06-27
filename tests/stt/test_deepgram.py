@@ -36,7 +36,7 @@ import pytest
 from hermes_voip.media.audio import G711_SAMPLE_RATE, encode_ulaw
 from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
-from hermes_voip.stt.deepgram import _CLOSE_STREAM, DeepgramASR
+from hermes_voip.stt.deepgram import DeepgramASR
 
 
 def _frame(*samples: int, ts: int = 0) -> PcmFrame:
@@ -185,7 +185,13 @@ async def test_deepgram_asr_sends_exact_closestream_control_frame() -> None:
 
     [_ async for _ in asr.stream(_frames(_frame(0)))]
 
-    assert socket.sent_text_frames == [_CLOSE_STREAM]
+    # Hard-coded wire literal — NOT imported from production so a mutation to the
+    # production constant (e.g. wrong key name) makes the test fail (rule 19).
+    expected_close_stream = '{"type": "CloseStream"}'
+    assert socket.sent_text_frames == [expected_close_stream]
+    # Also assert the parsed JSON shape so whitespace variants of the same message
+    # are caught (a reformatted payload still encodes the wrong contract).
+    assert json.loads(socket.sent_text_frames[0]) == {"type": "CloseStream"}
 
 
 @pytest.mark.asyncio

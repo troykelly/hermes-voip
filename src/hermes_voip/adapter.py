@@ -91,6 +91,7 @@ from hermes_voip.config import (
     MediaConfig,
     load_gateway_config,
     load_media_config,
+    parse_keepalive_interval,
 )
 from hermes_voip.dialog import Dialog, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
@@ -1081,9 +1082,10 @@ class VoipAdapter(BasePlatformAdapter):
         # fails LOUD at startup, never at door-open time (rule 37).
         self._multi_intercom = load_multi_intercom_config(extra)
         self._tls_ctx = _make_tls_context(gateway_cfg.host)
-        self._keepalive_interval = float(
-            extra.get("HERMES_VOIP_KEEPALIVE_INTERVAL", "30.0")
-        )
+        # parse_keepalive_interval validates the interval is strictly-positive finite
+        # at connect() time so a misconfigured value fails loud before the first
+        # registration, not mid-call when the TLS session goes silent (rule 37).
+        self._keepalive_interval = parse_keepalive_interval(extra)
 
         up = await self._establish()
 

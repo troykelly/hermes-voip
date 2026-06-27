@@ -45,6 +45,7 @@ __all__ = [
     "MediaConfig",
     "load_gateway_config",
     "load_media_config",
+    "parse_keepalive_interval",
 ]
 
 #: The opening line the agent speaks the instant an inbound call is answered,
@@ -497,6 +498,16 @@ _DEFAULT_JITTER_MAX_DEPTH = 10
 # floor would raise at engine construction (crashing the call), so the minimum valid
 # ceiling is the floor itself — validated here, not deferred to a runtime crash.
 _MIN_JITTER_MAX_DEPTH = 2
+
+# RFC 5626 double-CRLF keepalive (SIP-over-TLS path). The interval (seconds) between
+# the double-CRLF pings that keep the TLS connection alive through NAT/firewall
+# bindings. Must be strictly positive and finite — a zero/negative value disables the
+# keepalive entirely (NAT bindings expire; mid-call silence = dropped connection), and
+# NaN/inf slip past a naive ``> 0`` test. Validated at connect() via
+# parse_keepalive_interval so a misconfiguration surfaces at startup, not mid-call
+# (rule 37). Has no effect on the WSS/WebRTC path.
+_KEEPALIVE_INTERVAL_KEY = "HERMES_VOIP_KEEPALIVE_INTERVAL"
+_DEFAULT_KEEPALIVE_INTERVAL: float = 30.0
 
 # WebRTC ICE STUN servers (ADR-0032/0016, default revised ADR-0043). A comma-separated
 # list of ``stun:`` URLs used to gather server-reflexive (srflx) ICE candidates for the
@@ -1806,6 +1817,28 @@ def _parse_positive_float(env: Mapping[str, str], key: str, default: float) -> f
         msg = f"{key} must be a positive finite number, got {raw!r}"
         raise ConfigError(msg)
     return value
+
+
+def parse_keepalive_interval(env: Mapping[str, str]) -> float:
+    """Parse ``HERMES_VOIP_KEEPALIVE_INTERVAL`` as a strictly-positive finite float.
+
+    Returns the default (30.0 s) when the key is unset or blank. Rejects zero,
+    negative, NaN, and infinite values fail-fast (rule 37) so a misconfigured
+    keepalive surfaces at connect()/startup rather than mid-call when the TLS
+    session goes silent unexpectedly.
+
+    Args:
+        env: The process/platform env mapping (e.g. ``PlatformConfig.extra``).
+
+    Returns:
+        The validated keepalive interval in seconds.
+
+    Raises:
+        ConfigError: If the value is non-numeric, NaN/inf, or ``<= 0``.
+    """
+    return _parse_positive_float(
+        env, _KEEPALIVE_INTERVAL_KEY, _DEFAULT_KEEPALIVE_INTERVAL
+    )
 
 
 # --- media / feature field parsing ------------------------------------------

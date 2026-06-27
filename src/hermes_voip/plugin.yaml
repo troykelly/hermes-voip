@@ -147,3 +147,21 @@ optional_env:
     default: 5.0
     description: "Seconds to wait for in-flight calls to BYE-drain on shutdown before forcing teardown (default: 5.0)."
     prompt: "Shutdown drain timeout in seconds (default: 5.0)"
+  - name: HERMES_VOIP_KEEPALIVE_INTERVAL
+    default: 30.0
+    description: >-
+      RFC 5626 double-CRLF keepalive interval in seconds for the SIP-over-TLS
+      connection (default: 30.0). Must be strictly positive and finite — a zero or
+      negative value disables the keepalive entirely, allowing NAT bindings to expire
+      and the TLS connection to go silent mid-call. Validated at startup; has no
+      effect on the WSS/WebRTC path.
+    prompt: "SIP-over-TLS keepalive interval in seconds (default: 30.0)"
+  - name: HERMES_VOIP_CALL_ON_CONNECT
+    description: >-
+      Extension or SIP URI to dial once, immediately after the first successful
+      registration (e.g. for an AFK test or a scheduled one-shot call). SECURITY
+      WARNING: this env-triggered dial BYPASSES the outbound allowlist
+      (HERMES_VOIP_OUTBOUND_ALLOW) — it is the operator's own explicit dial, so the
+      allowlist gate is intentionally skipped. Do NOT set this unless you understand
+      and accept the allowlist bypass. Unset (the default) — no dial-on-connect.
+    prompt: "Extension/URI to dial on first registration (allowlist bypass — see runbook 0007)"

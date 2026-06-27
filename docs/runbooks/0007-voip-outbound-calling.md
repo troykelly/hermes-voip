@@ -24,6 +24,15 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 
 | Item | Value |
 | --- | --- |
+| Env var | `HERMES_VOIP_CALL_ON_CONNECT` (optional) |
+| Type | extension number or SIP URI string |
+| Default | unset → no dial-on-connect |
+| Read by | `VoipAdapter._establish` (after first successful registration) |
+| **Security** | **BYPASSES the `HERMES_VOIP_OUTBOUND_ALLOW` allowlist** — this is the operator's own explicit one-shot dial, so the allowlist gate is intentionally skipped. Only set this if you understand and accept the bypass. |
+| Re-trigger | the flag is permanent once set; reconnects do NOT re-fire the dial. |
+
+| Item | Value |
+| --- | --- |
 | Env var | `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` (optional) |
 | Type | a single `platform:chat_id` target (split on the FIRST `:`) |
 | Default | unset → a no-origin call's outcome is **logged only** |

@@ -145,7 +145,7 @@ async def test_builds_one_flow_per_extension() -> None:
     assert manager.is_up is False
 
 
-@pytest.mark.parametrize("bad_floor", [0.0, -0.5, -1.0])
+@pytest.mark.parametrize("bad_floor", [0.0, -0.5, -1.0, float("nan")])
 async def test_min_refresh_delay_must_be_positive(bad_floor: float) -> None:
     # codex MUST-FIX 2: the refresh floor is the guard that stops a tiny/zero granted
     # lifetime arming a near-zero-delay refresh that hot-loops the registrar
@@ -153,6 +153,12 @@ async def test_min_refresh_delay_must_be_positive(bad_floor: float) -> None:
     # public knob must hard-enforce ``> 0`` at construction — it can never be set to
     # a guard-defeating value. Tests that want an immediate hand-driven refresh use a
     # PRIVATE seam (``_disable_refresh_floor``), not this public knob.
+    #
+    # codex follow-up: NaN must ALSO be rejected. ``nan <= 0`` is False, so a naive
+    # ``<= 0`` check would let NaN slip the positive-floor contract and later poison
+    # ``max(nan, x)`` / ``asyncio.sleep(nan)`` in the scheduler. The validation is
+    # fail-closed (``not (min_refresh_delay > 0)``), which catches NaN, 0, and
+    # negatives alike (``nan > 0`` is False).
     with pytest.raises(ValueError, match=r"min_refresh_delay"):
         RegistrationManager(_gateway(), _FakeTransport(), min_refresh_delay=bad_floor)
 

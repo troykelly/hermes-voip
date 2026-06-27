@@ -107,9 +107,15 @@ class _FakeHost:
         self.listed += 1
         return self._registrations
 
-    async def place_call_with_objective(self, number: str, objective: str) -> str:
-        # ADR-0029 VoipToolHost member (unused by this module's tests; satisfies the
-        # protocol so set_active_adapter type-checks).
+    async def place_call_with_objective(
+        self,
+        number: str,
+        objective: str,
+        *,
+        ring_timeout_secs: float | None = None,
+    ) -> str:
+        # ADR-0029/0084 VoipToolHost member (unused by this module's tests; satisfies
+        # the protocol so set_active_adapter type-checks).
         self.placed.append((number, objective))
         return "call-out"
 

@@ -60,7 +60,13 @@ class _FakeHost:
     def guard_state_for(self, call_id: str) -> GuardSessionState | None:
         return self._guard
 
-    async def place_call_with_objective(self, number: str, objective: str) -> str:
+    async def place_call_with_objective(
+        self,
+        number: str,
+        objective: str,
+        *,
+        ring_timeout_secs: float | None = None,
+    ) -> str:
         if not self._allowed:
             raise OutboundCallNotAllowed(number)
         self.placed.append((number, objective))

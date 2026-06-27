@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -61,7 +62,11 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.call import CallError
-from hermes_voip.originate import OutboundCallFailed, OutboundCallNotAllowed
+from hermes_voip.originate import (
+    OutboundCallCancelled,
+    OutboundCallFailed,
+    OutboundCallNotAllowed,
+)
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.tools import gate_voip_tool
 
@@ -87,7 +92,9 @@ __all__ = [
     "TRANSFER_BLIND_TOOL_NAME",
     "TRANSFER_BLIND_TOOL_SCHEMA",
     "VOIP_TOOLSET",
+    "_RING_TIMEOUT_ENV",  # ADR-0084: stable public name of the ring-timeout env var
     "AttendedTransferOutcome",
+    "PlaceCallOutcome",
     "TransferOutcome",
     "VoipToolHost",
     "active_voip_adapter",
@@ -205,6 +212,84 @@ class AttendedTransferOutcome(Enum):
     NO_CONSULT = "no_consult"
     NO_CALL = "no_call"
     BLOCKED = "blocked"
+
+
+class PlaceCallOutcome(Enum):
+    """The structured outcome of a failed ``place_call`` (ADR-0084).
+
+    Maps distinct SIP failure classes to a typed outcome the agent can branch
+    on, WITHOUT leaking the gateway host, extension, or any other PII:
+
+    * ``BUSY`` — the callee is busy (SIP 486 Busy Here / 600 Busy Everywhere).
+    * ``NO_ANSWER`` — the call was not answered: either the gateway timed out on
+      its own (SIP 408 / 487 before we sent a CANCEL), or the outbound INVITE
+      was actively CANCELled by our own ring-timeout (the ADR-0069 CANCEL path,
+      which raises :class:`~hermes_voip.originate.OutboundCallCancelled`).
+    * ``DECLINED`` — the callee explicitly rejected the call (SIP 603 Decline).
+    * ``FAILED`` — any other final non-2xx response (4xx / 5xx / 6xx other than
+      the above), or a transport/media initialisation failure (``RuntimeError``
+      from :meth:`VoipToolHost.place_call_with_objective`).
+
+    These values are the **stable JSON API surface** embedded in the agent-facing
+    tool result as ``{"failure_outcome": <value>, "error": <message>}``; the
+    model branches on the value string, not the enum member name.
+    """
+
+    BUSY = "busy"
+    NO_ANSWER = "no_answer"
+    DECLINED = "declined"
+    FAILED = "failed"
+
+
+#: SIP 4xx/5xx/6xx status codes that map to ``PlaceCallOutcome.BUSY``.
+_BUSY_STATUSES: frozenset[int] = frozenset({486, 600})
+#: SIP status codes that map to ``PlaceCallOutcome.NO_ANSWER`` (peer-initiated).
+_NO_ANSWER_STATUSES: frozenset[int] = frozenset({408, 487})
+#: SIP status codes that map to ``PlaceCallOutcome.DECLINED``.
+_DECLINED_STATUSES: frozenset[int] = frozenset({603})
+
+#: Environment variable for the bounded ring timeout (seconds). When set to a
+#: finite positive float, ``place_call_handler`` forwards it as ``ring_timeout_secs``
+#: to :meth:`VoipToolHost.place_call_with_objective`, which arms the ADR-0069
+#: outbound CANCEL timer. Unset / non-numeric / non-finite (``inf`` / ``nan``) /
+#: zero-or-negative => ``None`` (the adapter's hard sink timeout governs instead).
+#: Default: unset.
+_RING_TIMEOUT_ENV = "HERMES_VOIP_RING_TIMEOUT_SECS"
+
+
+def _parse_ring_timeout() -> float | None:
+    """Read ``HERMES_VOIP_RING_TIMEOUT_SECS`` and return it as a positive float.
+
+    Returns ``None`` when the variable is unset, blank, non-numeric, non-positive
+    (<=0), or non-finite. Never raises — a bad value is treated as absent.
+
+    ``float("inf")`` / ``"nan"`` parse cleanly and ``inf > 0`` is ``True``, so a
+    bare positivity check would accept a positive-infinity timeout — an *unbounded*
+    ring, which defeats the whole point of a bounded ring-timeout policy. The
+    ``math.isfinite`` guard rejects ±inf and NaN so only a real, finite positive
+    bound is honoured.
+    """
+    raw = os.environ.get(_RING_TIMEOUT_ENV, "")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value):
+        return None
+    return value if value > 0 else None
+
+
+def _classify_outbound_failure(exc: OutboundCallFailed) -> PlaceCallOutcome:
+    """Map an ``OutboundCallFailed`` SIP status code to a ``PlaceCallOutcome``."""
+    if exc.status in _BUSY_STATUSES:
+        return PlaceCallOutcome.BUSY
+    if exc.status in _NO_ANSWER_STATUSES:
+        return PlaceCallOutcome.NO_ANSWER
+    if exc.status in _DECLINED_STATUSES:
+        return PlaceCallOutcome.DECLINED
+    return PlaceCallOutcome.FAILED
 
 
 #: The Hermes ``chat_id`` (== SIP Call-ID) session-context variable name.
@@ -574,7 +659,13 @@ class VoipToolHost(Protocol):
         """Return a human-readable snapshot of the gateway registrations."""
         ...
 
-    async def place_call_with_objective(self, number: str, objective: str) -> str:
+    async def place_call_with_objective(
+        self,
+        number: str,
+        objective: str,
+        *,
+        ring_timeout_secs: float | None = None,
+    ) -> str:
         """Place an outbound call pursuing ``objective``; return the new Call-ID.
 
         Captures the originating session (for result reporting) and enforces the
@@ -583,6 +674,14 @@ class VoipToolHost(Protocol):
         permitted (so the handler reports a clear refusal and nothing is dialled).
         Returns immediately once the call loop is running (the call proceeds in the
         background) — it does NOT await the whole call.
+
+        Args:
+            number: The dial target (extension or SIP URI) — must be allowlisted.
+            objective: The goal of the call, framed to the call agent.
+            ring_timeout_secs: When set, the maximum time to ring an unanswered
+                call before sending a CANCEL (ADR-0069); raises
+                :class:`~hermes_voip.originate.OutboundCallCancelled` on expiry.
+                ``None`` (the default) leaves only the adapter's hard sink bound.
         """
         ...
 
@@ -932,7 +1031,7 @@ def _str_arg(args: Mapping[str, object] | None, key: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-async def place_call_handler(
+async def place_call_handler(  # noqa: PLR0911 — each return is a distinct, clear branch (no adapter / no number / no objective / not-allowed / busy / declined / no-answer / failed / success); collapsing them would hide which outcome the agent sees
     args: Mapping[str, object] | None = None,
     **_kwargs: object,
 ) -> str:
@@ -940,14 +1039,28 @@ async def place_call_handler(
 
     Reads ``number`` + ``objective`` from the tool args, then calls the live
     adapter's :meth:`VoipToolHost.place_call_with_objective`. Returns the JSON
-    tool-result contract: ``{"call_id": …}`` IMMEDIATELY on success (ASYNC — it does
-    NOT await the whole call; the call runs as its own background conversation), or
-    ``{"error": …}`` when no adapter is in scope, an argument is missing, or the
-    target is not on the allowlist (the dial is then never made).
+    tool-result contract:
+
+    * ``{"call_id": …}`` IMMEDIATELY on success (ASYNC — the call runs as its own
+      background conversation; this does NOT await the whole call).
+    * ``{"error": …}`` when no adapter is in scope, an argument is missing, or the
+      target is not on the allowlist (dial never made — no ``failure_outcome``).
+    * ``{"error": …, "failure_outcome": <outcome>}`` when the outbound call fails
+      after dialling: the ``failure_outcome`` key carries a
+      :class:`PlaceCallOutcome` value string (``"busy"`` / ``"no_answer"`` /
+      ``"declined"`` / ``"failed"``) so the agent can branch on WHY the call
+      failed. The SIP reason phrase is **never** echoed (it may embed gateway
+      host/extension details — rule 34).
 
     The ``pre_tool_call`` gate has already enforced the operator-level (3) +
     non-degraded privilege clamp before this runs; the allowlist (enforced inside
     ``place_call_with_objective``) is the hard irreversibility gate.
+
+    ``HERMES_VOIP_RING_TIMEOUT_SECS``, when set to a positive float, is forwarded
+    as ``ring_timeout_secs`` to arm the ADR-0069 outbound CANCEL timer: if the
+    call rings unanswered beyond that bound, the INVITE is CANCELled and the
+    adapter raises :class:`~hermes_voip.originate.OutboundCallCancelled`, which
+    the handler maps to ``NO_ANSWER``.
     """
     try:
         adapter = _ACTIVE_ADAPTER
@@ -961,12 +1074,61 @@ async def place_call_handler(
             return json.dumps(
                 {"error": "place_call requires an 'objective' for the call"}
             )
+        ring_timeout = _parse_ring_timeout()
         try:
-            call_id = await adapter.place_call_with_objective(number, objective)
+            call_id = await adapter.place_call_with_objective(
+                number, objective, ring_timeout_secs=ring_timeout
+            )
         except OutboundCallNotAllowed as exc:
             # The hard gate refused the target — surface a clear, non-fatal error; the
             # number was NOT dialled. (The error message names the rejected target.)
+            # No ``failure_outcome``: this is a policy refusal before any dial.
             return json.dumps({"error": str(exc)})
+        except OutboundCallCancelled:
+            # Our own ring-timeout fired (ADR-0069): we sent the CANCEL and the peer
+            # returned 487 Request Terminated. This is "no one answered because we
+            # stopped waiting", so the outcome is NO_ANSWER. The exception carries the
+            # Call-ID and a reason string that is internal (never forwarded — rule 34).
+            return json.dumps(
+                {
+                    "error": "outbound call was not answered (ring timeout)",
+                    "failure_outcome": PlaceCallOutcome.NO_ANSWER.value,
+                }
+            )
+        except OutboundCallFailed as exc:
+            # A final non-2xx SIP response: classify by status code into a structured
+            # outcome the agent can branch on WITHOUT the gateway reason phrase (PII).
+            outcome = _classify_outbound_failure(exc)
+            return json.dumps(
+                {
+                    "error": f"outbound call failed: {outcome.value}",
+                    "failure_outcome": outcome.value,
+                }
+            )
+        except RuntimeError as exc:
+            # A transport/media-initialisation failure (e.g. the RTP transport could
+            # not be opened, or the WSS/WebRTC path is unsupported): NOT a SIP final
+            # response, but ADR-0084 classifies it as the FAILED outcome so the agent
+            # still receives the structured ``failure_outcome`` contract instead of a
+            # generic, unstructured error. The exception message can embed gateway
+            # connection details (host:port) — so, exactly like the SIP path above
+            # suppresses the reason phrase, ``str(exc)`` is NEVER echoed in the
+            # agent-facing result (rule 34 / public-repo invariant). The failure is
+            # still surfaced to the operator's logs (rule 37), but with only the
+            # exception TYPE name (no message, no traceback) so a host/port embedded
+            # in the message cannot leak into logs either.
+            _log.error(
+                "VoIP tool %r: outbound call failed at transport/media init "
+                "with a %s (detail redacted)",
+                PLACE_CALL_TOOL_NAME,
+                type(exc).__name__,
+            )
+            return json.dumps(
+                {
+                    "error": f"outbound call failed: {PlaceCallOutcome.FAILED.value}",
+                    "failure_outcome": PlaceCallOutcome.FAILED.value,
+                }
+            )
         return json.dumps({"call_id": call_id})
     except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
         return _tool_failure(PLACE_CALL_TOOL_NAME, exc)

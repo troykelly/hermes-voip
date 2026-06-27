@@ -19,6 +19,7 @@ real pyOpenSSL over an in-memory datagram pair, not a mock).
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 
 import pytest
@@ -664,6 +665,44 @@ class TestFingerprintBeforeKeying:
         # Should still block derive_srtp_sessions since verification failed.
         with pytest.raises(RuntimeError, match="verify_peer_fingerprint"):
             client.derive_srtp_sessions()
+
+    def test_verify_peer_fingerprint_rejects_unsupported_hash_algorithm(
+        self,
+    ) -> None:
+        """Unsupported SDP fingerprint hash algorithms fail closed, not as SHA-256."""
+        client = DtlsEndpoint(role=DtlsRole.CLIENT)
+        server = DtlsEndpoint(role=DtlsRole.SERVER)
+        _pump_handshake(client, server)
+
+        # This value is byte-for-byte the peer's SHA-256 fingerprint.  Labelling it
+        # with an unsupported SDP hash algorithm must not silently strip the token and
+        # compare it as SHA-256.
+        sha256_value = server.fingerprint().split(" ", 1)[1]
+        with pytest.raises(
+            ValueError, match="unsupported DTLS fingerprint hash algorithm"
+        ):
+            client.verify_peer_fingerprint(f"sha-1 {sha256_value}")
+
+        with pytest.raises(RuntimeError, match="verify_peer_fingerprint"):
+            client.derive_srtp_sessions()
+
+    def test_verify_peer_fingerprint_accepts_sha512_hash_algorithm(self) -> None:
+        """A supported non-default SDP hash algorithm is computed over the peer cert."""
+        client = DtlsEndpoint(role=DtlsRole.CLIENT)
+        server = DtlsEndpoint(role=DtlsRole.SERVER)
+        _pump_handshake(client, server)
+
+        ossl = server._ossl
+        der = ossl.dump_certificate(ossl.FILETYPE_ASN1, server._cert)
+        sha512_hex = hashlib.sha512(der).hexdigest().upper()
+        sha512_fingerprint = ":".join(
+            sha512_hex[index : index + 2] for index in range(0, len(sha512_hex), 2)
+        )
+
+        client.verify_peer_fingerprint(f"sha-512 {sha512_fingerprint}")
+        inbound, outbound = client.derive_srtp_sessions()
+        assert isinstance(inbound, SrtpSession)
+        assert isinstance(outbound, SrtpSession)
 
 
 # ---------------------------------------------------------------------------

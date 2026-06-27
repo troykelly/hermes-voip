@@ -421,3 +421,48 @@ def test_parse_response_accepts_valid_folded_continuation_line() -> None:
     )
     resp = SipResponse.parse(raw)
     assert "transport=tls" in (resp.header("Contact") or "")
+
+
+def test_parse_unfolds_tab_continuation() -> None:
+    r"""RFC 3261 §7.3.1 allows header continuation with HTAB (\t), not just SP.
+
+    The _parse_headers() unfolding logic checks ``line[:1] in (" ", "\t")`` to
+    detect continuation lines. This test pins the HTAB case explicitly, separate
+    from the existing SP-only test_parse_unfolds_continuation_lines().
+
+    The normalised value must be the two logical-line fragments joined with a
+    single SP (the HTAB is stripped and replaced with one space), producing the
+    exact single-line string asserted below.
+    """
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        'WWW-Authenticate: Digest realm="pbx.example.test",\r\n'
+        '\tnonce="171/9c", qop="auth"\r\n'  # continuation starts with HTAB, not SP
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    resp = SipResponse.parse(raw)
+    value = resp.header("WWW-Authenticate") or ""
+    # Direct assertion: the reconstructed header value must be the exact
+    # single-line string produced by RFC 3261 §7.3.1 unfolding (HTAB stripped,
+    # continuation joined with one SP).
+    assert value == 'Digest realm="pbx.example.test", nonce="171/9c", qop="auth"'
+
+
+def test_parse_body_with_embedded_blank_line() -> None:
+    r"""A body containing an embedded blank line (\r\n\r\n) is preserved intact.
+
+    parse() uses partition(CRLFCRLF) to split headers from body, so the body
+    retains any embedded CRLFCRLF sequences. This test pins that behaviour
+    against a potential regression to split()-style parsing.
+    """
+    body_with_blank = "line1\r\n\r\nline2\r\nline3"
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS host.invalid;branch=z9hG4bKxyz\r\n"
+        f"Content-Length: {len(body_with_blank)}\r\n"
+        "\r\n" + body_with_blank
+    )
+    resp = SipResponse.parse(raw)
+    assert resp.body == body_with_blank
+    assert resp.body == "line1\r\n\r\nline2\r\nline3"

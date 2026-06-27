@@ -199,7 +199,12 @@ async def test_on_response_refresh_does_not_re_log_at_info(
     # refresh_fraction=0.0 schedules the refresh REGISTER immediately after the
     # first registration, so we can answer that *new* REGISTER (a real refresh,
     # with its own CSeq) rather than replaying the first response.
-    manager = RegistrationManager(_gateway(), transport, refresh_fraction=0.0)
+    # min_refresh_delay=0.0 keeps the production refresh floor from delaying this
+    # deliberately-immediate test refresh (the floor guards a tiny granted lifetime,
+    # not a test that drives the refresh by hand).
+    manager = RegistrationManager(
+        _gateway(), transport, refresh_fraction=0.0, min_refresh_delay=0.0
+    )
     await manager.start()
     first_register = transport.sent[0]
     call_id = SipRequest.parse(first_register).header("Call-ID")
@@ -400,7 +405,11 @@ async def test_remove_call_makes_in_dialog_unroutable() -> None:
 
 async def test_refresh_resends_register() -> None:
     transport = _FakeTransport()
-    manager = RegistrationManager(_gateway(), transport, refresh_fraction=0.0)
+    # min_refresh_delay=0.0: see the note in test_on_response_refresh_does_not_re_log
+    # — the production floor guards a tiny grant, not this hand-driven refresh.
+    manager = RegistrationManager(
+        _gateway(), transport, refresh_fraction=0.0, min_refresh_delay=0.0
+    )
     await manager.start()
     first_register = transport.sent[0]
     call_id = SipRequest.parse(first_register).header("Call-ID")
@@ -438,6 +447,7 @@ async def test_refresh_failure_marks_down_and_is_reported() -> None:
         _gateway(),
         transport,
         refresh_fraction=0.0,
+        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
         on_registration_error=lambda ext, exc: errors.append((ext, exc)),
     )
     await manager.start()
@@ -486,6 +496,7 @@ async def test_failed_refresh_reports_and_schedules_reregister() -> None:
         _gateway(),
         transport,
         refresh_fraction=0.0,  # refresh fires immediately after registration
+        min_refresh_delay=0.0,  # bypass the production tiny-grant refresh floor
         retry_backoff=0.0,  # and the recovery re-REGISTER fires immediately too
         on_registration_error=lambda ext, exc: errors.append((ext, exc)),
     )
@@ -533,6 +544,7 @@ async def test_failed_refresh_recovers_back_to_registered() -> None:
         _gateway(),
         transport,
         refresh_fraction=0.0,
+        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
         retry_backoff=0.0,
     )
     await manager.start()
@@ -582,6 +594,7 @@ async def test_is_up_false_after_sole_extensions_refresh_fails() -> None:
         _single_gateway(),
         transport,
         refresh_fraction=0.0,
+        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
         retry_backoff=10.0,  # keep the recovery from re-registering during the assert
     )
     await manager.start()
@@ -633,6 +646,7 @@ async def test_recovery_send_failure_reschedules_another_attempt() -> None:
         _single_gateway(),
         transport,
         refresh_fraction=0.0,
+        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
         retry_backoff=0.0,
         on_registration_error=lambda ext, exc: errors.append((ext, exc)),
     )
@@ -759,6 +773,7 @@ async def test_refresh_with_no_response_times_out_and_reregisters() -> None:
         _gateway(),
         transport,
         refresh_fraction=0.0,  # refresh fires immediately
+        min_refresh_delay=0.0,  # bypass the production tiny-grant refresh floor
         refresh_timeout=0.05,  # ... and times out fast (no response is fed)
         retry_backoff=0.0,
         on_registration_error=lambda ext, exc: errors.append((ext, exc)),
@@ -802,6 +817,7 @@ async def test_refresh_response_cancels_the_timeout() -> None:
         _gateway(),
         transport,
         refresh_fraction=0.0,
+        min_refresh_delay=0.0,  # bypass the tiny-grant refresh floor
         refresh_timeout=0.05,
         retry_backoff=0.0,
         on_registration_error=lambda ext, exc: errors.append((ext, exc)),

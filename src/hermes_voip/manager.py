@@ -81,6 +81,13 @@ class RegistrationTimeoutError(RegistrationError):
 
 
 _DEFAULT_REFRESH_FRACTION = 0.5
+# The smallest refresh delay we will ever arm. A registrar may grant a tiny (but
+# positive) lifetime; ``expires * refresh_fraction`` could then be sub-second (or,
+# for a 0 grant that slipped past the registration-flow guard, 0), arming a refresh
+# task that re-REGISTERs almost immediately and hot-loops the gateway. Flooring the
+# delay here guarantees no near-zero-delay refresh is ever scheduled (defence in
+# depth alongside the flow-level non-positive-grant rejection).
+_MIN_REFRESH_DELAY = 1.0
 # RFC 3261 Timer-F/B analogue: how long to wait for a response to a REGISTER
 # before treating it as failed. Over reliable TLS there are no retransmissions,
 # so this is a single overall response deadline (the §17.1.1.2 32 s default).
@@ -207,6 +214,7 @@ class RegistrationManager:
         refresh_fraction: float = _DEFAULT_REFRESH_FRACTION,
         refresh_timeout: float = _DEFAULT_REFRESH_TIMEOUT,
         retry_backoff: float = _DEFAULT_RETRY_BACKOFF,
+        min_refresh_delay: float = _MIN_REFRESH_DELAY,
         on_registration_error: Callable[[str, BaseException], None] | None = None,
     ) -> None:
         """Build one flow per configured extension (no IO until :meth:`start`).
@@ -219,12 +227,18 @@ class RegistrationManager:
         failed rather than left ``registered`` forever. ``retry_backoff`` is the
         initial recovery delay for a re-REGISTER after a failed refresh
         (exponential, capped at 30 s, with ±20% jitter).
+
+        ``min_refresh_delay`` floors the scheduled refresh delay so a tiny granted
+        lifetime cannot arm a near-zero-delay refresh that hot-loops the registrar
+        (the production default is a positive minimum; tests that want an immediate
+        refresh pass ``0.0``).
         """
         self._gateway = gateway
         self._transport = transport
         self._refresh_fraction = refresh_fraction
         self._refresh_timeout = refresh_timeout
         self._retry_backoff = retry_backoff
+        self._min_refresh_delay = min_refresh_delay
         self._on_error = on_registration_error
         self._flows: dict[str, _FlowState] = {}
         self._by_extension: dict[str, _FlowState] = {}
@@ -379,7 +393,12 @@ class RegistrationManager:
     def _schedule_refresh(self, state: _FlowState, expires: int) -> None:
         if state.refresh_task is not None:
             state.refresh_task.cancel()
-        delay = max(0.0, expires * self._refresh_fraction)
+        # Floor the delay to a positive minimum so a tiny (or, defensively, a
+        # non-positive) granted lifetime never arms a near-zero-delay refresh that
+        # hot-loops the registrar (a non-positive grant is already rejected upstream
+        # as a Failed outcome, so a refresh is normally only scheduled for a positive
+        # grant; this guards the remaining tiny-positive case and any future caller).
+        delay = max(self._min_refresh_delay, expires * self._refresh_fraction)
         task = asyncio.create_task(self._refresh_after(state, delay))
         state.refresh_task = task
         task.add_done_callback(lambda done: self._on_refresh_done(state, done))

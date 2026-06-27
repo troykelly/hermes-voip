@@ -56,6 +56,14 @@ _PROXY_AUTH_REQUIRED = 407
 _INTERVAL_TOO_BRIEF = 423
 _OK = 200
 _3XX = 300  # first non-2xx status code; used in the 2xx success range check
+# Synthetic (non-SIP) status for a 2xx that grants OUR binding a non-positive
+# lifetime: the registrar accepted the message but REMOVED the binding (expires=0
+# is a de-registration we did not request — RFC 3261 §10.3 lets a registrar grant
+# a shorter lifetime, including 0). It is reported as a Failed outcome so the
+# manager never treats a removed binding as a live registration (which would arm a
+# 0-delay refresh and busy-loop). 0 is outside the 1xx-6xx SIP range, so it never
+# collides with a real status and is unambiguously this anomaly.
+_BINDING_REMOVED = 0
 _EXPIRES_PARAM = re.compile(r";\s*expires\s*=\s*(\d+)", re.IGNORECASE)
 # The addr-spec inside a Contact name-addr's angle brackets (``<sip:...>``).
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
@@ -322,9 +330,7 @@ class RegistrationFlow:
         if _OK <= status < _3XX:
             # Accept any 2xx as success (RFC 3261 §21.2 — 200 OK is the most common,
             # but 202 Accepted is also a valid response to REGISTER on some gateways).
-            self._registered = txn.requested_expires > 0
-            self._txn = None
-            return Registered(expires=self._granted_expires(response))
+            return self._handle_success(response, txn)
         if status in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
             if txn.challenged:
                 self._txn = None  # already answered once; the credential is wrong
@@ -338,6 +344,31 @@ class RegistrationFlow:
             return Failed(status, response.reason)
         self._txn = None
         return Failed(status, response.reason)
+
+    def _handle_success(
+        self, response: SipResponse, txn: _Transaction
+    ) -> Registered | Failed:
+        """Turn a 2xx into a Registered or, on a non-positive grant, a Failed.
+
+        A registrar MAY grant a shorter lifetime than requested, including 0 (RFC
+        3261 §10.3). A 0 (or negative) grant for OUR binding to a *registration*
+        request (``requested_expires > 0``) means the registrar REMOVED the binding
+        — surfacing it as ``Registered`` would arm a 0-delay refresh that
+        immediately re-REGISTERs into a tight loop. It is returned as ``Failed`` so
+        the manager treats the anomaly as a registration failure, never a live
+        registration. A 2xx to a *de-registration* (``requested_expires == 0``)
+        keeps its existing meaning (a clean unbind, not registered).
+        """
+        granted = self._granted_expires(response)
+        self._txn = None
+        if txn.requested_expires > 0 and granted <= 0:
+            self._registered = False
+            return Failed(
+                _BINDING_REMOVED,
+                f"registrar granted non-positive expires ({granted}); binding removed",
+            )
+        self._registered = txn.requested_expires > 0
+        return Registered(expires=granted)
 
     def _begin(self, requested_expires: int) -> str:
         self._cseq += 1

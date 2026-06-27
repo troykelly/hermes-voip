@@ -52,7 +52,11 @@ def _validate_pcm16(pcm16: bytes) -> None:
 def encode_ulaw(pcm16: bytes) -> bytes:
     """Encode PCM16-LE mono to G.711 mu-law (one byte per sample)."""
     _validate_pcm16(pcm16)
-    return audioop.lin2ulaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    try:
+        return audioop.lin2ulaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    except _AudioopError as exc:
+        msg = str(exc)
+        raise ValueError(msg) from exc
 
 
 def decode_ulaw(ulaw: bytes) -> bytes:
@@ -87,7 +91,11 @@ def decode_ulaw(ulaw: bytes) -> bytes:
 def encode_alaw(pcm16: bytes) -> bytes:
     """Encode PCM16-LE mono to G.711 a-law (one byte per sample)."""
     _validate_pcm16(pcm16)
-    return audioop.lin2alaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    try:
+        return audioop.lin2alaw(pcm16, PCM16_BYTES_PER_SAMPLE)
+    except _AudioopError as exc:
+        msg = str(exc)
+        raise ValueError(msg) from exc
 
 
 def decode_alaw(alaw: bytes) -> bytes:

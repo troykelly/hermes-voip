@@ -14,6 +14,7 @@ classifiers = [
     "Topic :: Communications :: Telephony",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
+    "Typing :: Typed",
 ]
 dependencies = [
     "audioop-lts==0.2.2",
@@ -123,6 +124,7 @@ packages = ["src/hermes_voip"]
 # self-describing: importlib.resources.files("hermes_voip")/"plugin.yaml" resolves it.
 # Non-.py files under the package dir are not included by hatchling unless declared.
 artifacts = [
+  "src/hermes_voip/py.typed",
   "src/hermes_voip/plugin.yaml",
   # Bundled call-scenario skills (ADR-0047): skills/<name>/SKILL.md shipped as
   # importable package data so register() can resolve each via

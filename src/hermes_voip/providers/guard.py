@@ -11,17 +11,29 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from enum import Enum
+from enum import IntEnum
 from typing import Protocol, runtime_checkable
 
+__all__ = [
+    "GuardResult",
+    "GuardVerdict",
+    "InjectionGuard",
+]
 
-class GuardVerdict(Enum):
-    """Graded screening outcome (ascending severity)."""
 
-    ALLOW = "allow"  # benign turn; proceed normally
-    CLARIFY = "clarify"  # ambiguous; ask a clarifying question, no tools this turn
-    RESTRICT = "restrict"  # weak/medium signal; proceed least-privilege (read-only)
-    REFUSE = "refuse"  # strong signal; refuse the instruction, flag, escalate
+class GuardVerdict(IntEnum):
+    """Graded screening outcome (ascending severity).
+
+    The integer values encode severity order: the least-severe outcome is 0
+    and the most-severe is 3, enabling direct ``>``/``<`` comparisons such as
+    ``verdict >= GuardVerdict.RESTRICT``.  The documented ascending order is
+    ``ALLOW < CLARIFY < RESTRICT < REFUSE``.
+    """
+
+    ALLOW = 0  # benign turn; proceed normally
+    CLARIFY = 1  # ambiguous; ask a clarifying question, no tools this turn
+    RESTRICT = 2  # weak/medium signal; proceed least-privilege (read-only)
+    REFUSE = 3  # strong signal; refuse the instruction, flag, escalate
 
 
 @dataclass(frozen=True, slots=True)

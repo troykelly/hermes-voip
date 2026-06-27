@@ -7,6 +7,8 @@ from typing import Protocol, runtime_checkable
 
 from hermes_voip.providers.audio import PcmFrame
 
+__all__ = ["MediaTransport"]
+
 
 @runtime_checkable
 class MediaTransport(Protocol):

@@ -13,19 +13,9 @@ glue (PCM16<->float32, 8 kHz->16 kHz upsampling) lives in
 from __future__ import annotations
 
 from hermes_voip.stt.deepgram import DeepgramASR
-from hermes_voip.stt.resample import (
-    RECOGNISER_SAMPLE_RATE,
-    FrameUpsampler,
-    float32_to_pcm16,
-    pcm16_to_float32,
-)
 from hermes_voip.stt.sherpa_onnx import SherpaOnnxASR
 
 __all__ = [
-    "RECOGNISER_SAMPLE_RATE",
     "DeepgramASR",
-    "FrameUpsampler",
     "SherpaOnnxASR",
-    "float32_to_pcm16",
-    "pcm16_to_float32",
 ]

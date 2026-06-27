@@ -4330,6 +4330,115 @@ async def test_no_input_reprompt_resets_when_caller_sends_dtmf() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_input_resets_on_raw_dtmf_keypress_before_group_delivery() -> None:
+    """A RAW inbound DTMF keypress is caller activity — even before the group delivers.
+
+    The gap the terminator-delivered test (above) does NOT cover: a caller pressing
+    digits with inter-digit gaps. While the group is still buffered — the inter-digit
+    timeout has NOT yet fired, so ``_deliver_dtmf_group`` (which marks activity) has NOT
+    run — the no-input window can elapse. If activity is marked only on group DELIVERY,
+    such a mid-dialing caller still looks silent and is reprompted / hung up on. The
+    spec (ADR-0057) requires marking activity on the inbound-DTMF path itself, so a
+    single keypress with no terminator resets the watchdog exactly like a speech turn.
+
+    Determinism: the watchdog window (10 s) and the DTMF inter-digit flush (2 s) share
+    the loop's one ``sleep`` seam. A delay-KEYED gate releases ONLY the watchdog window
+    and leaves the inter-digit flush parked forever, so the buffered group is NEVER
+    delivered — isolating the raw-keypress marking as the ONLY thing that could reset
+    the watchdog. ``feed_dtmf`` (the synchronous engine entry, NOT the awaitable twin)
+    is the exact real inbound path the defect is about.
+    """
+
+    class _DelayKeyedSleep:
+        """``sleep`` seam that releases ONE waiter per requested DELAY value.
+
+        Per-delay semaphore (like ``_SteppedSleep``, but keyed): each
+        ``release(delay)`` frees exactly ONE ``await keyed(delay)`` of that delay, so a
+        re-armed wait of the same delay parks again (a sticky ``Event`` would instead
+        free every subsequent same-delay wait at once, letting the watchdog burn its
+        whole reprompt budget on one release). This lets the test advance the
+        watchdog's 10 s window EXACTLY once while the DTMF inter-digit's 2 s flush — for
+        which no permit is ever issued — stays parked, so the group is never delivered.
+        """
+
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+            self._sems: dict[float, asyncio.Semaphore] = {}
+
+        def _sem_for(self, delay: float) -> asyncio.Semaphore:
+            sem = self._sems.get(delay)
+            if sem is None:
+                sem = asyncio.Semaphore(0)
+                self._sems[delay] = sem
+            return sem
+
+        def release(self, delay: float) -> None:
+            self._sem_for(delay).release()
+
+        async def __call__(self, delay: float) -> None:
+            self.calls.append(delay)
+            await self._sem_for(delay).acquire()
+
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _DelayKeyedSleep()
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _FakeASR([]),  # the caller NEVER speaks (pure silence on the STT path)
+        tts,
+        sleep=sleep,
+        deliver_turn=capture,
+        no_input_timeout_ms=10_000,  # the watchdog window key released below (10 s)
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if 10.0 in sleep.calls:
+            break
+    assert 10.0 in sleep.calls, "the watchdog did not arm its 10 s silence-window wait"
+
+    # A SINGLE keypad digit, NO terminator: the raw inbound path (sync ``feed_dtmf``).
+    # The inter-digit flush timer arms and parks on the 2 s sleep, which the keyed gate
+    # NEVER releases — so the group stays buffered and is never delivered.
+    loop.feed_dtmf("7")
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if 2.0 in sleep.calls:
+            break
+    assert 2.0 in sleep.calls, "the DTMF inter-digit flush timer did not arm"
+    assert delivered == [], (
+        "the DTMF group was delivered; the test must isolate the RAW keypress "
+        f"(group must stay buffered), got {delivered!r}"
+    )
+
+    # The watchdog window elapses while the digit is still buffered (group undelivered).
+    # The raw keypress is caller activity, so the watchdog must re-arm — NOT reprompt.
+    sleep.release(10.0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.sent_audio == [], (
+        "a reprompt fired after a raw DTMF keypress whose group had NOT yet been "
+        "delivered (activity was marked only on group delivery, not on the keypress)"
+    )
+    assert not run_task.done(), (
+        "the no-input watchdog ended the call mid-dialing — a caller pressing digits "
+        "with inter-digit gaps was treated as silent"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
 async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     """After N unanswered reprompts the watchdog ends the call gracefully (run returns).
 

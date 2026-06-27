@@ -172,7 +172,8 @@ class DigestChallenge:
             The parsed challenge.
 
         Raises:
-            ValueError: If the challenge carries no ``nonce`` (auth is impossible).
+            ValueError: If the challenge carries no ``nonce`` or no ``realm``
+                (both are required; auth is impossible without either).
         """
         params: dict[str, str] = {}
         for match in _PARAM.finditer(header_value):
@@ -184,10 +185,14 @@ class DigestChallenge:
         if not nonce:
             msg = "digest challenge is missing a nonce"
             raise ValueError(msg)
+        realm = params.get("realm")
+        if not realm:
+            msg = "digest challenge is missing a realm"
+            raise ValueError(msg)
         qop_raw = params.get("qop", "")
         qop = tuple(token.strip() for token in qop_raw.split(",") if token.strip())
         return cls(
-            realm=params.get("realm", ""),
+            realm=realm,
             nonce=nonce,
             algorithm=params.get("algorithm", "MD5"),
             qop=qop,

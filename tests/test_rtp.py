@@ -898,24 +898,30 @@ def test_lost_count_thirtynine_accepted() -> None:
 
 
 def test_max_ahead_boundary_inclusive_edge_packet_accepted() -> None:
-    """A packet at exactly next+max_ahead is accepted and buffered.
+    """A packet at exactly next+max_ahead is accepted and buffered, not dropped.
 
     The playout window is [next, next+max_ahead] inclusive. A packet at the
-    boundary (diff == max_ahead) must pass the window check and be buffered.
-    After popping the anchor packet, the buffered boundary packet becomes available.
+    boundary (diff == max_ahead from anchor) must pass the push-side window check
+    (the line checking `> max_ahead`). This test verifies that the boundary packet
+    is NOT dropped at push time; it survives in the buffer for retrieval.
     """
-    jb = JitterBuffer(target_depth=1, max_ahead=10)
+    max_ahead = 10
+    jb = JitterBuffer(target_depth=1, max_ahead=max_ahead)
     jb.push(_pkt(100))  # anchor at 100
-    boundary_seq = 100 + 10  # exactly at the edge
-    jb.push(_pkt(boundary_seq))
+    boundary_seq = 100 + max_ahead  # exactly at the edge (diff = 10)
+    jb.push(_pkt(boundary_seq))  # must not be dropped by push()
 
-    # Anchor packet pops cleanly.
+    # Verify the boundary packet is in the buffer (not dropped).
+    assert len(jb) == 2  # both 100 and 110 buffered
+    assert 110 in jb._packets  # boundary packet is actually there
+
+    # Pop the anchor and then the boundary — the boundary must be retrievable.
     assert _packet(jb.pop()).sequence_number == 100
-
-    # Boundary packet must be present — next pop must not underflow/loss.
-    out = jb.pop()
-    assert isinstance(out, RtpPacket)
-    assert out.sequence_number == boundary_seq
+    # Now declare the gap as Lost (occupancy 1 >= depth 1).
+    lost = jb.pop()
+    assert isinstance(lost, Lost)
+    # After the loss, the boundary packet is now available at the new anchor.
+    assert _packet(jb.pop()).sequence_number == boundary_seq
 
 
 def test_max_ahead_boundary_exclusive_beyond_packet_dropped() -> None:

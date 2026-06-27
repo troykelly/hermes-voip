@@ -283,6 +283,12 @@ class JitterBuffer:
         if max_ahead < 1:
             msg = f"max_ahead must be >= 1, got {max_ahead}"
             raise ValueError(msg)
+        assert max_ahead < _SEQ_HALF, (  # noqa: S101
+            f"max_ahead must be < _SEQ_HALF ({_SEQ_HALF}): got {max_ahead}. "
+            "A window >= half the 16-bit sequence space breaks RFC 1982 "
+            "serial-number comparison logic (defensive invariant that should "
+            "never fire in production; configuration error, not runtime error)."
+        )
         ceiling = _DEFAULT_MAX_DEPTH if max_depth is None else max_depth
         if adapt and ceiling < target_depth:
             msg = (

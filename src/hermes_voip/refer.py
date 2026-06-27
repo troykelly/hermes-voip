@@ -32,6 +32,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import quote, unquote
 
+from hermes_voip._chars import contains_control
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.message import (
     SipRequest,
@@ -115,10 +116,6 @@ _ALLOWED_URI_PARAMS = frozenset({"transport", "user", "method", "ttl", "maddr", 
 # few DTMF digits, or a sip URI with a host and a couple of params, but short
 # enough to refuse an absurd value before it reaches the wire.
 _MAX_TRANSFER_TARGET_LEN = 256
-# Forbidden control characters: the ASCII C0 range (below this) and DEL — the
-# CR/LF/NUL header-injection bytes (mirrors ``message._C0_END`` / ``message._DEL``).
-_C0_END = 0x20
-_DEL = 0x7F
 
 
 def _validate_transfer_target(target: str) -> None:
@@ -174,7 +171,7 @@ def _validate_transfer_target(target: str) -> None:
     # raises and leaves non-escapes intact, so this catches both forms. Do NOT
     # echo the raw value (it may carry injection bytes); name the violated rule.
     for candidate in (target, unquote(target)):
-        if any(ord(char) < _C0_END or ord(char) == _DEL for char in candidate):
+        if contains_control(candidate):
             msg = "transfer target contains a control character"
             raise ValueError(msg)
         if any(char.isspace() for char in candidate):

@@ -24,17 +24,31 @@ import math
 import struct
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Final
+
+__all__ = [
+    "DtmfEvent",
+    "DtmfNoPress",
+    "DtmfPress",
+    "DtmfReceiver",
+    "DtmfSendMode",
+    "InbandDtmfDetector",
+    "digit_to_event",
+    "event_payloads",
+    "event_to_digit",
+    "inband_tone_pcm",
+]
 
 # Event codes 0..15 map to the keypad; 16 is flash. Index == event code.
-_DIGITS = "0123456789*#ABCD"
-_PAYLOAD_LEN = 4
-_END_BIT = 0x80
-_VOLUME_MASK = 0x3F
-_MAX_EVENT = 0xFF
-_MAX_VOLUME = 0x3F
-_MAX_DURATION = 0xFFFF
-_REDUNDANT_END_COUNT = 3
-_RECEIVER_HISTORY = 32
+_DIGITS: Final[str] = "0123456789*#ABCD"
+_PAYLOAD_LEN: Final[int] = 4
+_END_BIT: Final[int] = 0x80
+_VOLUME_MASK: Final[int] = 0x3F
+_MAX_EVENT: Final[int] = 0xFF
+_MAX_VOLUME: Final[int] = 0x3F
+_MAX_DURATION: Final[int] = 0xFFFF
+_REDUNDANT_END_COUNT: Final[int] = 3
+_RECEIVER_HISTORY: Final[int] = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,17 +293,19 @@ class DtmfReceiver:
 # ---------------------------------------------------------------------------
 
 # The eight DTMF tones (Hz). A keypad symbol is one low (row) + one high (column).
-_DTMF_LOW: tuple[int, ...] = (697, 770, 852, 941)
-_DTMF_HIGH: tuple[int, ...] = (1209, 1336, 1477, 1633)
+_DTMF_LOW: Final[tuple[int, ...]] = (697, 770, 852, 941)
+_DTMF_HIGH: Final[tuple[int, ...]] = (1209, 1336, 1477, 1633)
 # Row x column -> keypad symbol (standard 4x4 incl. A-D on the 1633 Hz column).
-_DTMF_KEYPAD: tuple[tuple[str, ...], ...] = (
+_DTMF_KEYPAD: Final[tuple[tuple[str, ...], ...]] = (
     ("1", "2", "3", "A"),
     ("4", "5", "6", "B"),
     ("7", "8", "9", "C"),
     ("*", "0", "#", "D"),
 )
 
-_INBAND_MAX_AMPLITUDE = 0x3FFF  # per-tone amplitude (sum stays < int16 full-scale)
+_INBAND_MAX_AMPLITUDE: Final[int] = (
+    0x3FFF  # per-tone amplitude (sum stays < int16 full-scale)
+)
 
 # Detection thresholds (tuned on 8 kHz clean G.711; ADR-0036 re-measures live).
 # Goertzel power is N-normalised (x 2/N) so a pure full-amplitude tone scores ~the
@@ -298,10 +314,10 @@ _INBAND_MAX_AMPLITUDE = 0x3FFF  # per-tone amplitude (sum stays < int16 full-sca
 #
 # A frame must carry real energy before any tone test runs (rejects silence/comfort
 # noise without a divide-by-zero). Units: sum of squared int16 samples per frame.
-_INBAND_MIN_FRAME_ENERGY = 5.0e5
+_INBAND_MIN_FRAME_ENERGY: Final[float] = 5.0e5
 # The winning low + high tone must EACH hold at least this fraction of the frame's
 # energy (each genuine DTMF tone is ~0.5).
-_INBAND_MIN_TONE_FRACTION = 0.33
+_INBAND_MIN_TONE_FRACTION: Final[float] = 0.33
 # ...and their COMBINED energy must be at least this fraction of the frame's energy.
 # This is the PRIMARY speech rejecter: a clean DTMF pair scores ~1.0 (all energy in
 # two bins), whereas voiced speech spreads energy across its full harmonic series and
@@ -310,24 +326,24 @@ _INBAND_MIN_TONE_FRACTION = 0.33
 # rejected by the energy it carries in its OTHER harmonics. (A signal that is spectrally
 # ONLY two pure DTMF tones is, by definition, indistinguishable from a real keypress —
 # the fundamental limit that makes in-band the LAST resort, ADR-0010/0034.)
-_INBAND_MIN_COMBINED_FRACTION = 0.80
+_INBAND_MIN_COMBINED_FRACTION: Final[float] = 0.80
 # Forward/reverse twist: the louder tone may exceed the quieter by at most this ratio
 # (~8 dB). A wildly mismatched "pair" is not a keypress.
-_INBAND_MAX_TWIST = 6.3
+_INBAND_MAX_TWIST: Final[float] = 6.3
 # A detected tone's energy must dominate the others IN ITS OWN group by this factor
 # (rejects a single tone that merely happens to clear the fraction floor — its
 # group runner-up would be comparable for broadband noise).
-_INBAND_GROUP_DOMINANCE = 4.0
+_INBAND_GROUP_DOMINANCE: Final[float] = 4.0
 # Harmonic-corroboration rejecter: a voiced source that lands two harmonics on a DTMF
 # pair ALSO carries energy at the OTHER harmonics it implies — most tellingly the second
 # harmonic of each detected tone (2x low, 2x high) and the difference frequency (the
 # would-be fundamental). A real DTMF generator emits ONLY the two tones, so those bins
 # are ~empty. Reject when their combined energy rivals the weaker detected tone by this
 # fraction. This catches the harmonic-speech case the bare second-harmonic test missed.
-_INBAND_MAX_HARMONIC_CORROBORATION = 0.25
+_INBAND_MAX_HARMONIC_CORROBORATION: Final[float] = 0.25
 # Debounce: a digit must persist this many consecutive validated frames before it
 # emits (one 20 ms frame is enough to flag a glitch; ~2 frames = a real press).
-_INBAND_MIN_PRESS_FRAMES = 2
+_INBAND_MIN_PRESS_FRAMES: Final[int] = 2
 
 
 def inband_tone_pcm(

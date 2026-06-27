@@ -1,5 +1,7 @@
 """Test that foundation modules export their public API via __all__."""
 
+import hermes_voip.dtmf
+import hermes_voip.message
 import hermes_voip.registration
 import hermes_voip.rtcp
 import hermes_voip.rtp
@@ -36,3 +38,15 @@ def test_registration_exports_registration_flow() -> None:
     """RegistrationFlow should be exported from hermes_voip.registration.__all__."""
     assert "RegistrationFlow" in hermes_voip.registration.__all__
     assert hasattr(hermes_voip.registration, "RegistrationFlow")
+
+
+def test_dtmf_exports_dtmf_press() -> None:
+    """DtmfPress should be exported from hermes_voip.dtmf.__all__."""
+    assert "DtmfPress" in hermes_voip.dtmf.__all__
+    assert hasattr(hermes_voip.dtmf, "DtmfPress")
+
+
+def test_message_exports_sip_request() -> None:
+    """SipRequest should be exported from hermes_voip.message.__all__."""
+    assert "SipRequest" in hermes_voip.message.__all__
+    assert hasattr(hermes_voip.message, "SipRequest")

@@ -249,11 +249,16 @@ jq -c 'select(.event=="rtcp_call_quality")
   /path/to/hermes/log.jsonl
 ```
 
-**Secured paths (SDES / WebRTC) do NOT run RTCP yet.** The engine emits/parses CLEARTEXT
-RTCP only and has no SRTCP (RFC 3711 §3.4) transform, so RTCP on an RTP/SAVP or SAVPF
-5-tuple would violate the secured profile and leak the SSRC/CNAME/timing in cleartext.
-RTCP therefore stays dormant on encrypted calls until the SRTCP capability lands — tracked
-as the SRTCP follow-up. NOTE: the live test gateway uses SDES-SRTP, so RTCP is dormant there.
+**Secured paths (SDES / WebRTC): RTCP is dormant by default (opt-in via ADR-0066).**
+ADR-0066 shipped `src/hermes_voip/media/srtcp.py` and wired it in `adapter.py`. However,
+a live finding (2026-06-21) showed that sending SRTCP to a real gateway that had not
+negotiated `a=rtcp-mux` muted the audio entirely. Secured-path RTCP is therefore
+**opt-in, default off**: by default a SDES/WebRTC call stays **RTCP-dormant** (no sibling
+SRTCP socket, no RTCP on the wire), which is the audio-working posture.
+
+Set `HERMES_VOIP_SECURED_RTCP_ENABLED=true` (together with the master
+`HERMES_VOIP_RTCP_ENABLED=true`) to activate SRTCP on a gateway validated to tolerate it.
+See runbook 0002 §9c for the full opt-in procedure and pass criteria.
 
 **Still TODO:** the teardown snapshot is logged, not yet pushed to a metrics sink (the
 `voip.rtp.*` gauges below); wiring a metrics emitter is the remaining observability step.
@@ -389,43 +394,43 @@ ss -tn | grep -c "5061\|5000" # SIP and RTP connections
 
 ## Error handling
 
-**What it measures.** Frequency that provider errors (API failures, 502 responses) are spoken
-to the caller verbatim (a current known leak — Task #26).
+**What it measures.** Frequency that provider errors (API failures, 502 responses)
+reach the caller. ADR-0063 shipped an intercept so raw errors are **not** spoken;
+this SLO now measures residual leakage (should be 0%) and the instrumentation gap
+(counters not yet wired to a metrics sink).
 
-**Target:** < 5% of turns (or 0% if fixed).
+**Target:** 0% of turns (callers hear only the safe apology phrase, never a raw
+error string).
+
+**Shipped behaviour (ADR-0063):** when `is_provider_error()` detects a raw error in
+the LLM reply, `adapter._deliver_content` replaces it with `resolve_error_apology()`
+before calling `loop.speak()`. The raw error is logged at WARNING with structured
+`event=provider_error_replaced` and `error_category`.
 
 **How to observe:**
+
+**Log inspection — intercepted errors (should be the ONLY form of error events):**
+
+```bash
+# Count intercepted provider errors (caller heard safe apology, not raw error):
+jq 'select(.event=="provider_error_replaced") | .error_category' \
+  /path/to/hermes/log.jsonl | sort | uniq -c
+# Count total turns:
+grep "asr: delivering turn" /path/to/hermes/log | wc -l
+```
 
 **Manual spot check:**
 
 ```bash
-# Make test calls and have the agent speak for multiple turns.
-# Listen for error messages like:
-# - "API call failed"
+# Make test calls with a deliberately overloaded/down backend.
+# The caller should hear a friendly apology phrase, NOT a raw error string such as:
 # - "502 Bad Gateway"
 # - "overloaded_error"
-# If you hear these, the error is being spoken (current behavior).
+# If you hear raw errors, check provider_error.py patterns and adapter.py ~line 1435.
 ```
 
-**Log inspection:**
-
-```bash
-# Count error-speech events:
-grep -E "502|overloaded|API call failed|provider.*error" /path/to/hermes/log | wc -l
-# Count total turns:
-grep "asr: delivering turn" /path/to/hermes/log | wc -l
-# Error pct ≈ (errors / turns) * 100
-```
-
-**Current status:** NOT FIXED. A future code lane will:
-1. Detect provider errors in the `send()` / `speak()` path.
-2. Synthesize a safe, friendly fallback response (e.g., "One moment…" or silence).
-3. Log the raw error (for debugging) without speaking it.
-
-See ADR backlog Task #26 and the `llm-502-spoken-error-finding-verified` memory entry.
-
-**NOT YET INSTRUMENTED:**
-- `voip.errors.spoken_to_caller` — counter (LLM/STT/TTS failures spoken).
+**NOT YET INSTRUMENTED (remaining gap):**
+- `voip.errors.intercepted` — counter (provider errors intercepted; caller heard apology).
 - `voip.turns.total` — counter.
 - `voip.turns.with_error` — counter.
 

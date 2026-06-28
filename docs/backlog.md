@@ -1211,8 +1211,8 @@ Privacy/vendor-identifier scrub of operator gateway identifiers from tracked fil
 
 ### Security
 
-- [ ] **[high] security** (`docs/adr/0042-*`, `docs/runbooks/0009-*`) — A SIP realm label persists in tracked files, outside the scope of the vendor/model/brand scrub (PR #343). Verify whether it is sensitive (an internal realm/hostname per the public-repo invariant) and scrub to a fake if so. Describe generically — do NOT write the value.
-- [ ] **[high] security/ops** (repo-wide) — Git HISTORY still contains the operator gateway identifiers that PR #343 scrubbed from the working tree (and they were already public). Decide remediation: a history purge (`git filter-repo` / force-rewrite of public history — OPERATOR decision, disruptive) and/or formally treat the identifiers as known-disclosed. Tracked as an operator decision.
+- [x] (#346) **[high] security** (`docs/adr/0042-*`, `docs/runbooks/0009-*`, `tests/test_no_vendor_identifiers.py`) — Investigated the remaining SIP realm label as sensitive because it appeared in live-gateway ADR/runbook evidence, scrubbed the tracked occurrences to a sanctioned fake realm, and extended the tracked-tree guard to fail on reintroduction without embedding the contiguous live token.
+- [x] (#346) **[high] security/ops** (accepted 2026-06-28) (repo-wide) — Git HISTORY still contains the operator gateway identifiers that PR #343 scrubbed from the working tree. Operator decision: retain public history as known-disclosed; no history rewrite/purge.
 
 ### Robustness / CI
 

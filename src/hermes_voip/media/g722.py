@@ -60,6 +60,18 @@ G722_SAMPLE_RATE: Final[int] = 16_000
 #: rate (160 per 20 ms frame), not at the 16 kHz audio sample rate.
 G722_RTP_CLOCK_RATE: Final[int] = 8_000
 
+# Rule 22 / ADR-0094: measured hot-path cost for ONE 20 ms / 16 kHz frame
+# (320 PCM16 samples -> 160 G.722 octets on encode; inverse on decode), recorded
+# in source so the CPU budget is explicit and reviewable. Measured 2026-06-28 on
+# CPython 3.13.5 in the project devcontainer via repeated
+# G722Encoder().encode(frame) / G722Decoder().decode(frame) calls over 2000-3000
+# iterations on the stateful continuous-stream path. The budget gate in
+# tests/test_media_g722_budget.py asserts these constants exist and stay below one
+# 20 ms frame in aggregate; its 15 ms wall-clock ceiling is the secondary safety
+# net for catastrophic regressions only.
+_G722_ENCODE_MEASURED_US_PER_FRAME_16K: Final[float] = 3_400.0
+_G722_DECODE_MEASURED_US_PER_FRAME_16K: Final[float] = 3_300.0
+
 _INT16_MAX: Final[int] = 32_767
 _INT16_MIN: Final[int] = -32_768
 

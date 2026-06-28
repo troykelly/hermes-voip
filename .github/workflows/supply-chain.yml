@@ -114,7 +114,16 @@ jobs:
           for package in sorted(set(selected)):
               print(package)
           PY
-          if [ -s optional-runtime-pkgs.txt ]; then
+          # Fail-loud guard (rule 37). The decision — run the licence check, skip
+          # because no optional-extra package is declared, or FAIL because extras
+          # ARE declared but the parser produced an empty list (a false green from
+          # a changed '# via hermes-voip' provenance comment) — lives in the
+          # unit-tested tools.check_optional_extras_guard module, NOT inline shell.
+          # It prints RUN or SKIP on stdout and exits non-zero (diagnostic on
+          # stderr) on the false-green condition, which `set -e` propagates.
+          decision="$(uv run python -m tools.check_optional_extras_guard \
+            --pyproject pyproject.toml --packages optional-runtime-pkgs.txt)"
+          if [ "$decision" = "RUN" ]; then
             echo "Licence-checking optional runtime extras deps:"; cat optional-runtime-pkgs.txt
             # --allow-only exits non-zero on any disallowed licence (no extra flag needed).
             # Exact composite strings below are current permissive-only metadata for

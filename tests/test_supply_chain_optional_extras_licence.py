@@ -191,3 +191,23 @@ def test_optional_extras_parser_keeps_direct_extra_packages(
         "hermes-agent",
         "sherpa-onnx",
     ]
+
+
+def test_optional_extras_step_delegates_guard_to_extracted_module() -> None:
+    """The fail-loud guard lives in a unit-tested module, not inline YAML shell.
+
+    The empty-parse branch must call ``tools.check_optional_extras_guard`` rather
+    than an inline ``python3 -c`` one-liner, so the skip/fail/run decision is
+    exercised by ``tests/test_supply_chain_optional_extras_guard.py``.  Asserting
+    the workflow delegates keeps the two in lock-step.
+    """
+    run_cmd = _optional_extras_run()
+
+    assert "tools.check_optional_extras_guard" in run_cmd, (
+        "The optional-extras step must delegate its skip/fail-loud decision to the "
+        "tools.check_optional_extras_guard module (see "
+        "tests/test_supply_chain_optional_extras_guard.py)."
+    )
+    # The brittle inline ``python3 -c`` guard must be gone — it was untestable and
+    # checked value-truthiness rather than counting declared packages.
+    assert "python3 -c" not in run_cmd

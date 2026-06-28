@@ -231,11 +231,11 @@ def _locked_version(package: str) -> str:
     return m.group(1)
 
 
-def test_lockfile_resolves_websockets_16_0() -> None:
-    """uv.lock must resolve websockets to 16.0 (drift detection)."""
+def test_lockfile_resolves_websockets_15_0_1() -> None:
+    """uv.lock must resolve websockets to 15.0.1 (drift detection)."""
     version = _locked_version("websockets")
-    assert version == "16.0", (
-        f"uv.lock resolved websockets to {version!r}, expected 16.0. "
+    assert version == "15.0.1", (
+        f"uv.lock resolved websockets to {version!r}, expected 15.0.1. "
         "If intentional, update this test alongside the lockfile bump."
     )
 

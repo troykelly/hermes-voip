@@ -1034,18 +1034,31 @@ class VoipAdapter(BasePlatformAdapter):
     # BasePlatformAdapter abstract methods
     # -----------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Load config, open TLS, register extensions, start reconnect supervisor.
 
         Returns True when at least one extension is up. Degraded-up (one out
         of N extensions registered) counts as up — the manager's ``is_up``
         property already implements this rule.
 
+        Args:
+            is_reconnect: Reconnect-aware Hermes gateway builds may pass this
+                keyword on a connect path (``False`` on first connect, ``True``
+                on a supervised reconnect) so an adapter can replay a
+                server-side message backlog. VoIP has no such queue to preserve
+                — SIP/RTP are live media with no durable backlog — so we
+                accept-but-ignore it; the adapter's own RFC 5626 reconnect
+                supervisor (``_supervise``/``_establish``) already restores
+                registration and re-attaches in-flight calls. The parameter
+                exists for gateway call-signature tolerance (ref issue #350).
+
         Returns:
             ``True`` if at least one extension registered successfully,
             ``False`` otherwise (never raises on partial failure — the caller
             decides whether to retry).
         """
+        # Gateway-base parity; VoIP has no server-side backlog to replay (#350).
+        _ = is_reconnect
         extra = self.config.extra
         self._extra = extra
         gateway_cfg = load_gateway_config(extra)

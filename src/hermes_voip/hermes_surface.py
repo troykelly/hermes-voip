@@ -81,8 +81,12 @@ class BasePlatformAdapterProtocol(Protocol):
     typed contract.
     """
 
-    async def connect(self) -> bool:
-        """Bring the platform up; return success."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Bring the platform up; return success.
+
+        ``is_reconnect`` keeps this typed boundary tolerant of reconnect-aware
+        Hermes gateway calls that pass the flag keyword-only (#350).
+        """
         ...
 
     async def disconnect(self) -> None:

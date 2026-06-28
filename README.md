@@ -219,10 +219,11 @@ That's it. **Dial your extension from any phone** and your agent answers.
 hermes plugins list
 ```
 
-If you installed the manifest directory from Step 3, `hermes-voip` appears in the table with
-its description and version. (This is a **filesystem listing** — it shows the plugin but does
-not load it. The in-session `/plugins` command, once the gateway is running, shows it loaded
-with its tool count — `10 tools, 1 hook`.)
+If you installed the manifest directory from Step 3, `hermes-voip` appears in the table as a
+filesystem listing entry. `hermes plugins list` reads the directory manifest, so it shows the
+plugin with the manifest-backed description and version from the shipped plugin metadata. It
+does not load the plugin. The in-session `/plugins` command, once the gateway is running,
+shows the loaded view with its tool count — `10 tools, 1 hook`.
 
 To see what Hermes actually **discovers and loads** at startup, set `HERMES_PLUGINS_DEBUG=1`
 when you start the gateway (not on `plugins list`):

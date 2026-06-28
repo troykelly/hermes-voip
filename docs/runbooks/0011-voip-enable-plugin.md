@@ -58,7 +58,7 @@ The repo ships the **complete plugin manifest** at
 [`__init__.py`](../../packaging/hermes-plugins/hermes-voip/__init__.py) that re-exports the
 package's `register`. Copying this directory into the Hermes user-plugins directory makes the
 CLI recognise the plugin, so the natural `hermes plugins enable` command works and the plugin
-shows up in `hermes plugins list` with its version + description.
+shows up in `hermes plugins list` with its manifest-backed version + description from the shipped plugin metadata.
 
 ```bash
 # 1. Install the directory manifest (one time):
@@ -83,11 +83,11 @@ tools + 1 hook, no duplicate). The directory copy's job is purely the CLI afford
 edit `plugins.enabled` in `config.yaml`.
 
 > **`hermes plugins list` vs `/plugins` — a runtime nuance.** `hermes plugins list` reads this
-> directory `plugin.yaml`, so it shows `hermes-voip … 0.0.0 … <description> … user`. The
-> in-session `/plugins` *loaded* view, however, shows the version from the manifest that **won
-> the load dedup — the entry point's — which is empty**. Its tool/hook count (10 tools, 1 hook)
-> is computed from the real registration, not from `provides_tools`. Both views are correct;
-> they read different sources. (`hermes plugins list` has no tool-count column at all.)
+> directory `plugin.yaml`, so it shows `hermes-voip` with the directory manifest version + description
+> from the shipped plugin metadata. The in-session `/plugins` *loaded* view, however, shows the
+> entry point empty version. Its tool/hook count (10 tools, 1 hook) is
+> computed from the real registration, not from `provides_tools`. Both views are correct; they
+> read different sources. (`hermes plugins list` has no tool-count column at all.)
 
 The manifest is the single source of truth: its `provides_tools` / `provides_hooks` are pinned
 by `tests/test_plugin_manifest.py` to the tools/hooks the plugin actually registers, and its
@@ -131,15 +131,15 @@ cp packaging/hermes-plugins/hermes-voip/__init__.py "$HERMES_HOME/plugins/hermes
 
 ```bash
 hermes plugins list --plain | grep hermes-voip      # read-only
-# → not enabled  user  0.0.0  hermes-voip
+# → not enabled  user  <version>  hermes-voip
 hermes plugins enable hermes-voip                    # WRITES plugins.enabled to config.yaml
 # → ✓ Plugin hermes-voip enabled. Takes effect on next session.
 hermes plugins list --plain | grep hermes-voip       # read-only
-# → enabled      user  0.0.0  hermes-voip
+# → enabled      user  <version>  hermes-voip
 ```
 
 `hermes plugins list` is a **filesystem listing** — it reads the directory `plugin.yaml`
-(so the **version + description** come from the manifest) but does **not** load the plugin
+(so the **version + description** come from the shipped plugin manifest) but does **not** load the plugin
 or run `register()`, and it does **not** consult `HERMES_PLUGINS_DEBUG`. To see actual
 discovery/load detail set `HERMES_PLUGINS_DEBUG=1` when you start the **gateway**
 (`hermes gateway run`) — that is the path that loads plugins. The load-bearing checks below

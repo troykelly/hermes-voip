@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
 import random
 import re
@@ -48,6 +49,7 @@ __all__ = [
     "InDialog",
     "NewCall",
     "RegistrationError",
+    "RegistrationFailureCategory",
     "RegistrationManager",
     "RegistrationRejectedError",
     "RegistrationStatus",
@@ -55,6 +57,7 @@ __all__ = [
     "RequestRouting",
     "SipTransport",
     "Unroutable",
+    "registration_failure_category",
 ]
 
 
@@ -78,6 +81,69 @@ class RegistrationTimeoutError(RegistrationError):
     def __init__(self) -> None:
         """A response-deadline timeout (the registrar never answered)."""
         super().__init__("registration refresh timed out with no response")
+
+
+class RegistrationFailureCategory(enum.Enum):
+    """A sanitized, typed category for a registration failure.
+
+    Use this enum — returned by :func:`registration_failure_category` — to
+    classify an error received via the ``on_registration_error`` callback
+    **without calling** ``str()`` or ``repr()`` on the exception.
+
+    .. warning:: Secret-safety contract for ``on_registration_error`` consumers
+
+        The ``on_registration_error(extension, error)`` callback passes the raw
+        :class:`BaseException` directly to operator-supplied code.  Callers
+        MUST observe the following constraints before logging or forwarding the
+        arguments:
+
+        * **``extension``** is the SIP extension number — sensitive PII.  Never
+          log it directly.  It is provided solely so the consumer can look up
+          additional context in a way the consumer controls.
+        * **``error``** may be a :class:`RegistrationRejectedError` whose
+          ``__str__`` embeds the registrar-controlled free-text ``reason`` field
+          (e.g. ``"403 Forbidden"``).  Logging ``str(error)`` or ``repr(error)``
+          therefore risks forwarding attacker-influenced text to a telemetry
+          sink.  Use :func:`registration_failure_category` (or ``isinstance``
+          checks) to classify the failure without touching the string
+          representation.
+    """
+
+    REJECTED = "rejected"
+    """A refresh REGISTER was rejected with a 4xx/5xx/6xx final response."""
+
+    TIMEOUT = "timeout"
+    """A refresh REGISTER got no response within the Timer-F/B deadline."""
+
+    TRANSPORT_FAILED = "transport_failed"
+    """The REGISTER could not be sent (transport/socket error)."""
+
+
+def registration_failure_category(error: BaseException) -> RegistrationFailureCategory:
+    """Return the sanitized :class:`RegistrationFailureCategory` for *error*.
+
+    Classifies the exception received by an ``on_registration_error`` callback
+    **without calling** ``str()`` or ``repr()`` on it — safe for use in a
+    logging or telemetry consumer that must not forward registrar-controlled
+    free text.
+
+    Args:
+        error: The ``BaseException`` passed to the ``on_registration_error``
+            callback by :class:`RegistrationManager`.
+
+    Returns:
+        :attr:`RegistrationFailureCategory.REJECTED` if *error* is a
+        :class:`RegistrationRejectedError` (registrar returned a 4xx/5xx/6xx);
+        :attr:`RegistrationFailureCategory.TIMEOUT` if *error* is a
+        :class:`RegistrationTimeoutError` (Timer-F/B expiry); or
+        :attr:`RegistrationFailureCategory.TRANSPORT_FAILED` for any other
+        error (transport/socket send failure or unexpected task exception).
+    """
+    if isinstance(error, RegistrationRejectedError):
+        return RegistrationFailureCategory.REJECTED
+    if isinstance(error, RegistrationTimeoutError):
+        return RegistrationFailureCategory.TIMEOUT
+    return RegistrationFailureCategory.TRANSPORT_FAILED
 
 
 _DEFAULT_REFRESH_FRACTION = 0.5
@@ -219,8 +285,13 @@ class RegistrationManager:
     ) -> None:
         """Build one flow per configured extension (no IO until :meth:`start`).
 
-        ``on_registration_error`` is invoked (extension, error) when a background
-        refresh fails, so a flapping registration is observed, never swallowed.
+        ``on_registration_error`` is invoked ``(extension, error)`` when a
+        background refresh fails, so a flapping registration is observed, never
+        swallowed.  See :class:`RegistrationFailureCategory` for the full
+        secret-safety contract: consumers MUST NOT log ``extension`` (sensitive
+        PII) or ``str(error)`` (may contain registrar-controlled free text)
+        directly.  Use :func:`registration_failure_category` to classify the
+        error without touching its string representation.
 
         ``refresh_timeout`` is the per-REGISTER response deadline (RFC 3261 Timer
         F/B analogue): a refresh that gets no response within it is treated as

@@ -1138,3 +1138,76 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
         "structured field 'attempt' must be >= 1 on the first failure"
     )
     _assert_failure_log_is_secret_safe(rec)
+
+
+# Distinctive registrar-controlled free text. A real registrar (or an attacker who
+# influences it) can put ARBITRARY bytes in the SIP response reason-phrase; this
+# sentinel stands in for that text. It must NEVER reach an on_registration_error
+# consumer via the *default* string form of the error, because operators commonly
+# wire that callback straight to a logger/telemetry sink (a path the #348
+# structured-log guard does not cover).
+_REGISTRAR_REASON_SENTINEL = "ATTACKER-CONTROLLED-REASON-7f3a91"
+
+
+async def test_on_registration_error_callback_error_str_omits_registrar_reason() -> None:
+    # SECURITY (codex #351 follow-up): the on_registration_error callback receives
+    # the raw exception. RegistrationRejectedError historically baked the
+    # registrar-controlled reason-phrase into its Exception message, so a consumer
+    # logging str(error)/repr(error) forwarded attacker-influenced free text to its
+    # sink. The default string form of the error handed to the callback MUST be
+    # safe — it may carry the SIP status code and a sanitized category, but NOT the
+    # registrar reason text.
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=0.0,
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))
+    await asyncio.sleep(0.05)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    # The registrar rejects the refresh with attacker-influenced reason text.
+    await manager.on_response(
+        _failed_for(refresh, status=403, reason=_REGISTRAR_REASON_SENTINEL)
+    )
+    assert errors, "a rejected refresh must be reported via on_registration_error"
+    _ext, exc = errors[0]
+    rendered_str = str(exc)
+    rendered_repr = repr(exc)
+    # THE LEAK: the registrar-controlled text must not appear in the default
+    # string/repr a consumer would log.
+    assert _REGISTRAR_REASON_SENTINEL not in rendered_str, (
+        "registrar-controlled reason leaked via str(error) to the "
+        f"on_registration_error consumer: {rendered_str!r}"
+    )
+    assert _REGISTRAR_REASON_SENTINEL not in rendered_repr, (
+        "registrar-controlled reason leaked via repr(error) to the "
+        f"on_registration_error consumer: {rendered_repr!r}"
+    )
+    # str(exc.args) is the other casually-logged form (logging renders args): it
+    # must be clean too, so the reason cannot live in the exception args tuple.
+    assert _REGISTRAR_REASON_SENTINEL not in str(exc.args), (
+        "registrar-controlled reason leaked via exc.args to the "
+        f"on_registration_error consumer: {exc.args!r}"
+    )
+    # The default form is still useful: the SIP status code remains visible, and
+    # the error exposes a typed status for status-aware consumers.
+    assert "403" in rendered_str, (
+        "the sanitized error string should still carry the SIP status code"
+    )
+    assert getattr(exc, "status", None) == 403, (
+        "RegistrationRejectedError must expose the SIP status for consumers"
+    )
+    await manager.aclose()

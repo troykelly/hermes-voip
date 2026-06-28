@@ -3464,7 +3464,7 @@ async def test_gated_sustained_turn_after_tts_finished_is_delivered() -> None:
 async def test_sustained_self_echo_during_playout_delivers_no_turn() -> None:
     """A SUSTAINED reflected-TTS echo during the agent's playout delivers no turn.
 
-    The live self-echo regression (call 2026-06-21, Yealink T48G HANDSET so NO
+    The live self-echo regression (call 2026-06-21, SIP HANDSET so NO
     acoustic echo): the gateway reflects the agent's own ~1 s comfort filler back
     on the inbound leg while the agent is STILL speaking. The reflected filler is a
     SUSTAINED continuous voiced run that EXCEEDS the sustained barge-in threshold,

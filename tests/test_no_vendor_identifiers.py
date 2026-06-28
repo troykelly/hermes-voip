@@ -1,13 +1,13 @@
 """Privacy invariant guard against gateway vendor/model/brand identifiers.
 
 CLAUDE.md hard invariant + AGENTS.md rule 34 ban device/vendor identifiers in
-ANY tracked file of this PUBLIC repo. The operator's real test-gateway VENDOR,
-MODEL and BRAND (plus the WAVE product name) leaked across the tree once before
-(a regression of the PR-103 scrub). This test scans the actual git-tracked tree
-so any re-introduction fails CI immediately.
+ANY tracked file of this PUBLIC repo. The operator's real test-gateway vendor,
+model, brand, and product name leaked across the tree once before (a regression
+of the PR-103 scrub). This test scans the actual git-tracked tree so any
+re-introduction fails CI immediately.
 
-The references are kept vendor-neutral (e.g. "a real RFC-compliant SIP/UCM-class
-gateway") so the interop WHY of each is preserved without naming the device.
+The references are kept vendor-neutral (e.g. "a real RFC-compliant SIP gateway")
+so the interop WHY of each is preserved without naming the device.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # explicitly excludes this file from the tracked-tree walk.
 _BANNED_CASE_INSENSITIVE: tuple[str, ...] = (
     "grand" + "stream",
-    "ucm" + "6304",
+    "u" + "cm6304",
     "gd" + "ms",
 )
 # Word-boundary token (the vendor product name) — matched case-sensitively as a

@@ -2,7 +2,7 @@
 
 A registrar that gets no ``200 OK`` to its qualify ``OPTIONS`` marks the endpoint
 UNREACHABLE and routes inbound calls to voicemail without ever sending an INVITE
-(observed live against a real RFC-compliant SIP/UCM gateway). The
+(observed live against a real RFC-compliant SIP gateway). The
 :class:`~hermes_voip.transport.connection.SipOverTlsTransport` therefore answers
 an out-of-dialog ``OPTIONS`` with ``200 OK`` (RFC 3261 §11) and acknowledges an
 unsolicited MWI ``NOTIFY`` with ``200 OK``, *before* falling through to the

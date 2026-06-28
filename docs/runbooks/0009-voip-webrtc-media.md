@@ -158,7 +158,7 @@ The knob applies **only** to an `a=setup:actpass` offer. A peer that pins itself
 would create two clients or two servers and deadlock). An unknown value is rejected at
 config load.
 
-**Why the default flipped (ADR-0050).** A real Asterisk/UCM-class gateway offers
+**Why the default flipped (ADR-0050).** A real Asterisk/appliance-class gateway offers
 `a=setup:actpass` but behaves as the DTLS **server**, expecting the answerer to be the
 client. The previous `actpass → passive` mapping left both ends as servers, so the DTLS
 handshake never started. RFC 8842 §5.3's active answerer (`auto`) is the standards-based
@@ -386,9 +386,9 @@ PLC attenuation curve or fade length, edit `_PLC_ATTENUATION_PER_FRAME` /
   keyed (setup=…)`, `WebRTC media engine connected over ICE`, then `rtp tx/rx` lines. Two-way
   audio confirms the path.
 
-## Live validation status — real Asterisk/UCM gateway (2026-06-18, ADR-0042)
+## Live validation status — real Asterisk/SIP gateway (2026-06-18, ADR-0042)
 
-First inbound WebRTC call from the live gateway (a UCM-class gateway whose WebRTC edge is an
+First inbound WebRTC call from the live gateway (an appliance-class gateway whose WebRTC edge is an
 embedded Asterisk). What was **proven on the wire**, in order:
 
 1. **WSS REGISTER → `200 OK`** (expires ~299 s) on port `8090`, path `/ws`, subprotocol

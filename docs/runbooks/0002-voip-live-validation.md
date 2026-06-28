@@ -735,7 +735,7 @@ Pass criteria:
 ### 9c. Secured-path RTCP over SRTCP (ADR-0066/0061) — DEFAULT-OFF after a live finding
 
 **Live finding (2026-06-21):** when secured-path RTCP was activated unconditionally
-(`HERMES_VOIP_SECURED_RTCP_ENABLED` did not yet exist), a real UCM-class gateway that did
+(`HERMES_VOIP_SECURED_RTCP_ENABLED` did not yet exist), a real production gateway that did
 **not** negotiate `a=rtcp-mux` **MUTED the media** on a secured SDES call — the unexpected
 SRTCP on the sibling RTP-port+1 socket broke the session (no two-way audio). Setting
 `HERMES_VOIP_RTCP_ENABLED=false` restored audio. So secured-path RTCP is now **opt-in,

@@ -1,4 +1,4 @@
-# ADR-0042: Inbound WebRTC against a real Asterisk/UCM gateway — SDP + keepalive fixes
+# ADR-0042: Inbound WebRTC against a real Asterisk/SIP gateway — SDP + keepalive fixes
 
 - **Date:** 2026-06-18
 - **Status:** Accepted (amends ADR-0032 §SDP parsing, ADR-0038 §3; precedes a
@@ -10,7 +10,7 @@
 ADR-0032 wired the WebRTC media plane (ICE + DTLS-SRTP + Opus) and ADR-0038
 selected the WSS signalling transport. Both passed their unit/e2e suites against
 **our own fixtures**. The first **live** inbound WebRTC call from the test
-gateway (a real RFC-compliant UCM-class gateway whose WebRTC edge is an embedded
+gateway (a real RFC-compliant appliance-class gateway whose WebRTC edge is an embedded
 **Asterisk**) exposed three gaps the fixtures did not model — the
 unit-test-vs-real-gateway seam the operator had flagged. Each was captured on the
 wire (secrets redacted) and fixed under TDD.

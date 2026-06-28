@@ -487,7 +487,7 @@ class FakeWebRtcGateway:
         """
         # The peer is the DTLS SERVER (ADR-0050). The offer carries `a=setup:actpass`,
         # and under RFC 8842 §5.3 the adapter answers `active` (the DTLS client). So
-        # this peer — modelling a real Asterisk/UCM gateway that offers actpass yet
+        # this peer — modelling a real Asterisk/SIP gateway that offers actpass yet
         # behaves as the DTLS server — must be passive/server. WebRtcMediaSession
         # derives its own role from `offer_setup`: an `active` offer makes this side
         # passive/server (the complement of the adapter's active answer).

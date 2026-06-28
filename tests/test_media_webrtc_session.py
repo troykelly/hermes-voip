@@ -120,8 +120,9 @@ def test_answer_setup_for_offer_picks_active_for_actpass() -> None:
     """The RFC 8842 default: an actpass offer makes us active (ADR-0050).
 
     RFC 8842 §5.3: the answerer SHOULD be ``active`` (the DTLS client, sending the
-    ClientHello). A real Asterisk/UCM gateway offers ``actpass`` but behaves as the
-    DTLS server, so an answerer that picks ``passive`` deadlocks (both servers). The
+    ClientHello). A real Asterisk or appliance-class gateway offers ``actpass`` but
+    behaves as the DTLS server, so an answerer that picks ``passive`` deadlocks (both
+    servers). The
     ``auto`` default therefore answers ``active`` to an ``actpass`` offer. The forced
     roles in the offer are still honoured: an ``active`` offer pins us ``passive``;
     a ``passive`` offer pins us ``active`` (RFC 5763 §5).

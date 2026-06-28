@@ -1183,15 +1183,15 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 Two candidates were already/partially tracked and were not duplicated here: `_granted_expires` multi-Contact fallback (existing registration item) and provider seam `__all__` (partially covered by the existing provider export residual). Newly discovered local-only items follow.
 
-- [ ] **[low] robustness** — RTCP BYE reason should decode UTF-8 strictly and raise `RtcpError` on malformed bytes, matching SDES CNAME handling and rule 37. (`src/hermes_voip/rtcp.py`)
+- [x] (#338) **[low] robustness** — RTCP BYE reason should decode UTF-8 strictly and raise `RtcpError` on malformed bytes, matching SDES CNAME handling and rule 37. (`src/hermes_voip/rtcp.py`)
 - [ ] **[medium] robustness** — Drop malformed RTP codec payloads with a log instead of letting codec decode exceptions tear down the whole call. (`src/hermes_voip/media/engine.py`, `src/hermes_voip/media/call_loop.py`)
 - [ ] **[medium] robustness** — Fail malformed final-INVITE response CSeqs loudly instead of silently skipping ACK/transaction cleanup. (`src/hermes_voip/transport/connection.py`, `src/hermes_voip/transport/ws_connection.py`)
 - [ ] **[medium] security** — Move outbound dial allowlist values out of inline env into a file-backed setting so real numbers/SIP URIs are not stored in shell-visible env. (`src/hermes_voip/outbound_allow.py`, `docs/runbooks/0007-voip-outbound-calling.md`, `docs/adr/0020-voip-caller-modes.md`)
-- [ ] **[low] packaging** — Licence-check all declared optional runtime extras, not just default deps, so a bad extra licence fails CI. (`.github/workflows/supply-chain.yml`, `docs/runbooks/0003-supply-chain-audit.md`, `pyproject.toml`)
+- [x] (#339) **[low] packaging** — Licence-check all declared optional runtime extras, not just default deps, so a bad extra licence fails CI. (`.github/workflows/supply-chain.yml`, `docs/runbooks/0003-supply-chain-audit.md`, `pyproject.toml`)
 - [ ] **[medium] test** — Reconnect test should assert the registration manager reattaches active dialogs, not only the new transport sink. (`tests/test_adapter_reconnect.py`, `src/hermes_voip/adapter.py`)
 - [ ] **[medium] test** — Reconnect success test should assert degraded-health state clears after a successful reconnect. (`tests/test_adapter_reconnect.py`, `src/hermes_voip/adapter.py`)
-- [ ] **[medium] test** — Add a multi-file manifest licence test where a later file fails, proving validation checks every pinned file. (`tests/providers/test_build.py`, `src/hermes_voip/manifest.py`)
-- [ ] **[medium] docs** — Reconcile `hermes plugins list` version expectations so README/runbook agree on whether healthy output shows the shipped plugin version or `0.0.0`. (`README.md`, `docs/runbooks/0011-voip-enable-plugin.md`, `packaging/hermes-plugins/hermes-voip/plugin.yaml`, `src/hermes_voip/plugin.yaml`)
+- [x] (#340) **[medium] test** — Add a multi-file manifest licence test where a later file fails, proving validation checks every pinned file. (`tests/providers/test_build.py`, `src/hermes_voip/manifest.py`)
+- [x] (#341) **[medium] docs** — Reconcile `hermes plugins list` version expectations so README/runbook agree on whether healthy output shows the shipped plugin version or `0.0.0`. (`README.md`, `docs/runbooks/0011-voip-enable-plugin.md`, `packaging/hermes-plugins/hermes-voip/plugin.yaml`, `src/hermes_voip/plugin.yaml`)
 - [ ] **[low] docs** — Refresh stale file-line anchors in the IMPLEMENTATION-PLAN evidence table so present-tense proof points land on current definitions. (`docs/plan/IMPLEMENTATION-PLAN.md`)
 - [ ] **[low] api** — Trim `hermes_voip.providers.build.__all__` to the real builder API and stop exporting internal default wiring/maps/constants. (`src/hermes_voip/providers/build.py`, `src/hermes_voip/manifest.py`)
 - [ ] **[high] efficiency** — Gate G.722 hot-path CPU cost with a benchmark/budget or stop preferring it by default while the pure-Python codec remains expensive. (`src/hermes_voip/adapter.py`, `src/hermes_voip/media/engine.py`, `src/hermes_voip/media/g722.py`)
@@ -1199,8 +1199,25 @@ Two candidates were already/partially tracked and were not duplicated here: `_gr
 - [ ] **[medium] observability** — Emit structured SIP transport loss/retry/recovery events so uptime and flap windows are queryable without regex. (`src/hermes_voip/adapter.py`, `docs/runbooks/0014-voip-slo-metrics.md`)
 - [ ] **[medium] ux** — Add language-keyed default polite-decline phrases so `HERMES_VOIP_DENY_MODE=decline` is not English-only by default. (`src/hermes_voip/config.py`, `src/hermes_voip/adapter.py`)
 - [ ] **[low] ux** — Sanitize custom polite-decline text before TTS so markdown/URLs/emoji are not spoken raw in deny-mode decline. (`src/hermes_voip/adapter.py`, `src/hermes_voip/media/call_loop.py`)
-- [ ] **[medium] operability** — Expose `HERMES_VOIP_CARTESIA_API_KEY` in the plugin manifest so supported Cartesia configuration is discoverable and verifiable. (`src/hermes_voip/plugin.yaml`, `src/hermes_voip/config.py`)
+- [x] (#342) **[medium] operability** — Expose `HERMES_VOIP_CARTESIA_API_KEY` in the plugin manifest so supported Cartesia configuration is discoverable and verifiable. (`src/hermes_voip/plugin.yaml`, `src/hermes_voip/config.py`)
 - [ ] **[low] operability** — Document the `HERMES_VOIP_TEST_TONE` diagnostic knob in manifest/runbooks for no-audio incident triage. (`src/hermes_voip/plugin.yaml`, `docs/runbooks/0002-voip-live-validation.md`, `docs/runbooks/0013-voip-incident-oncall.md`)
 - [ ] **[medium] operability** — Reject inert `HERMES_VOIP_DUPLEX_MODE=full` at config load so operators cannot believe full-duplex is active when runtime ignores it. (`src/hermes_voip/config.py`)
 - [ ] **[medium] feature** — Deliver inbound `take-message` results to an operator-visible channel; today inbound capture reports success to the agent but not to the operator. (`src/hermes_voip/adapter.py`, `docs/adr/0047-bundled-call-skills.md`, `src/hermes_voip/skills/take-message/SKILL.md`)
 - [ ] **[medium] feature** — Surface terminal REFER/NOTIFY transfer outcome to the agent/operator instead of treating REFER acceptance as final success. (`src/hermes_voip/call.py`, `src/hermes_voip/adapter.py`, `src/hermes_voip/voip_tools.py`)
+
+## Wave-10 gap-review items (discovered 2026-06-28)
+
+Privacy/vendor-identifier scrub of operator gateway identifiers from tracked files is shipping as PR #343 (currently in CI).
+
+### Security
+
+- [ ] **[high] security** (`docs/adr/0042-*`, `docs/runbooks/0009-*`) — A SIP realm label persists in tracked files, outside the scope of the vendor/model/brand scrub (PR #343). Verify whether it is sensitive (an internal realm/hostname per the public-repo invariant) and scrub to a fake if so. Describe generically — do NOT write the value.
+- [ ] **[high] security/ops** (repo-wide) — Git HISTORY still contains the operator gateway identifiers that PR #343 scrubbed from the working tree (and they were already public). Decide remediation: a history purge (`git filter-repo` / force-rewrite of public history — OPERATOR decision, disruptive) and/or formally treat the identifiers as known-disclosed. Tracked as an operator decision.
+
+### Robustness / CI
+
+- [ ] **[medium] robustness/ci** (`.github/workflows/supply-chain.yml`) — The optional-extras licence gate can silently FALSE-GREEN: if `uv export` ever drops or renames the `# via hermes-voip` provenance comment its parser relies on, the package list parses empty, the `[ -s ]` guard takes the else branch, and the gate passes vacuously while extras are actually declared. Add a loud-fail guard: if optional extras are declared in `pyproject.toml` but the parsed package list is empty, FAIL (rule 37), don't skip.
+
+### Security / test
+
+- [ ] **[low] security/test** (`tests/test_no_vendor_identifiers.py`) — The product-word sub-check in the vendor-identifier guard is case-sensitive by necessity (the token is an English homograph), so it only matches the brand's canonical all-caps form; a future reintroduction of the brand in non-canonical case could slip past that one sub-check (the distinctive vendor/model/abbreviation fragments remain case-insensitive). Consider a context-aware check.

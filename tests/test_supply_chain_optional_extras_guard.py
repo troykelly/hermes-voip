@@ -13,7 +13,7 @@ Three cases must be unambiguous:
 * (a) no ``[project.optional-dependencies]`` section, OR every declared extra is
   empty -> legitimate SKIP (``decide`` -> ``SKIP``).
 * (b) at least one declared extra contains at least one package BUT the parsed
-  package list is empty -> FAIL LOUD (``decide`` raises ``GuardFailure``).
+  package list is empty -> FAIL LOUD (``decide`` raises ``GuardFailureError``).
 * (c) declared extras with packages AND the parsed list is non-empty -> RUN the
   licence gate normally (``decide`` -> ``RUN``).
 """
@@ -27,7 +27,7 @@ import sys
 import pytest
 from tools.check_optional_extras_guard import (
     Decision,
-    GuardFailure,
+    GuardFailureError,
     count_declared_extra_packages,
     decide,
     main,
@@ -112,7 +112,7 @@ def test_decide_fails_loud_when_declared_but_parse_empty(
     tmp_path: pathlib.Path,
 ) -> None:
     pyproject_path, packages_path = _write(tmp_path, _PYPROJECT_WITH_PACKAGES, "")
-    with pytest.raises(GuardFailure):
+    with pytest.raises(GuardFailureError):
         decide(pyproject_path, packages_path)
 
 
@@ -124,7 +124,7 @@ def test_decide_fails_loud_when_parse_file_only_blank_lines(
     pyproject_path, packages_path = _write(
         tmp_path, _PYPROJECT_WITH_PACKAGES, "\n   \n\n"
     )
-    with pytest.raises(GuardFailure):
+    with pytest.raises(GuardFailureError):
         decide(pyproject_path, packages_path)
 
 
@@ -134,7 +134,7 @@ def test_decide_fails_loud_when_parse_file_missing(
     pyproject_path = tmp_path / "pyproject.toml"
     pyproject_path.write_text(_PYPROJECT_WITH_PACKAGES)
     missing_packages = tmp_path / "does-not-exist.txt"
-    with pytest.raises(GuardFailure):
+    with pytest.raises(GuardFailureError):
         decide(pyproject_path, missing_packages)
 
 

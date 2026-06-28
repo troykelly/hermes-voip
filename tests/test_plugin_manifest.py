@@ -417,6 +417,7 @@ def test_optional_env_advertises_transport_and_provider_keys() -> None:
         "HERMES_SIP_PORT",
         "HERMES_SIP_TRANSPORT",
         "ELEVENLABS_API_KEY",
+        "HERMES_VOIP_CARTESIA_API_KEY",
         "DEEPGRAM_API_KEY",
     ):
         assert expected in names, f"optional_env should mention {expected}"
@@ -424,6 +425,7 @@ def test_optional_env_advertises_transport_and_provider_keys() -> None:
     for entry in optional:
         if isinstance(entry, dict) and entry.get("name") in {
             "ELEVENLABS_API_KEY",
+            "HERMES_VOIP_CARTESIA_API_KEY",
             "DEEPGRAM_API_KEY",
         }:
             assert entry.get("secret") is True, (

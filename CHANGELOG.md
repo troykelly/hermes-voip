@@ -11,6 +11,124 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-28
+
+### Added
+
+- **`HERMES_VOIP_DENY_MODE=decline`** — new deny mode that answers with 200 OK,
+  delivers a spoken decline message, then sends BYE; per ADR-0020 Phase 2. (#332)
+- **Model-file sha256 verification** — the provider build step verifies pinned
+  model-file checksums with a path-traversal guard, so a tampered or corrupted
+  model file is rejected at load time rather than at inference. (#326)
+- **`WssSipTransport` / `CallResponseSink` in top-level `__all__`** — and all
+  top-level `config` / `provider` types, so consumers can import them without
+  reaching into private sub-modules. (#324)
+- **Outbound ring-timeout config knob** — `HERMES_VOIP_RING_TIMEOUT_SECS` with
+  validation and documentation in `voip_tools`. (#308)
+- **Preflight VoIP env validation** — plugin validates the full set of required
+  environment variables at startup and fails fast with a secret-safe error. (#306)
+- **BCP-47 language-tag acceptance** — `HERMES_VOIP_LANGUAGE` now accepts any
+  well-formed BCP-47 tag, decoupled from comfort-filler availability. (#257)
+- **`HERMES_VOIP_CALL_ON_CONNECT` and `KEEPALIVE_INTERVAL` config** — documented
+  and validated in the config layer. (#267)
+- **Structured extra fields on observability logs** — `call-progress`, TTS
+  failover, and SIP registration log events carry typed `extra={}` dicts for
+  structured log consumers. (#276, #275, #274)
+- **`ProviderRegistry` introspection** — `__contains__` and `__all__` + fresh-
+  instance identity pin so callers can test registry membership and iterate
+  registered providers. (#296)
+- **`__all__` exports** across DTLS/SRTP/SRTCP crypto modules, audio codec
+  module, and the foundation RTP/RTCP/SDP/SIP/registration modules. (#285, #279,
+  #268, #281, #271)
+- **`InboundCallContext` and helpers promoted** to top-level `hermes_voip`
+  exports. (#278)
+- **CI: pinned third-party workflow action SHAs** with an enforcement test. (#246)
+- **JitterBuffer SSRC auto-reset hysteresis** — N-consecutive-confirmation before
+  accepting an SSRC change (ADR-0082). (#248)
+
+### Changed
+
+- **`GuardVerdict` / `ToolRisk` are `IntEnum`** — enables documented severity
+  comparison semantics and documented `__all__`. (#294)
+- **Control-character guard extracted** to shared `_chars.py` used by the
+  message, digest, and refer layers. (#277, #286)
+- **`py.typed` marker and `Typing::Typed` classifier** shipped in the built
+  wheel so downstream type-checkers pick up inline type information. (#307)
+- **Dependency extras relaxed** to compatible ranges for Hermes/plugin
+  coexistence without pinned upper bounds causing install conflicts. (#254)
+- **REGISTER expires validation tightened** — non-positive or malformed granted
+  expires is a hard failure, not a 0-second refresh loop (ADR-0087). (#305)
+- **`place_call` outbound-failure outcomes structured** — failures now carry
+  typed outcome codes and bounded ring timeout. (#259, #308)
+- **`provider_error` apology configurable** — localized error apology text and
+  structured provider-error logs. (#263)
+- **`GateDecision` reasons typed** — `tool-policy` gate returns typed
+  `GateDecision` reasons rather than bare strings. (#261)
+- **`JitterBuffer` packet-loss coalesced** — far-ahead packet bursts emit one
+  `Lost(count)` event instead of per-packet events. (#260)
+- **Media engine per-datagram task overhead removed** — asyncio task churn per
+  datagram dropped; TX path uses a `bytearray` buffer. (#310)
+- **STT sample-count via `FloatArray.__len__`** — drops the per-frame
+  `.tobytes()` copy. (#295)
+- **Engine TX amplitude log via `audioop.max`** — ~51x faster than previous
+  path. (#252)
+
+### Fixed
+
+- **IPv6 black-hole hold detection** — `c=IN IP6 ::` in a re-INVITE SDP is
+  now correctly classified as a held call. (#328)
+- **Duplicate `Content-Length` header rejected** — fail-closed; the first value
+  is not silently used. (#329)
+- **`NOTIFY` dispatched by `Event` package** — in-dialog NOTIFY is routed by
+  the `Event:` header value; only `Event: refer` carries sipfrag body. (#323)
+- **SDP duplicate `rtpmap` rejected** — per payload type, fail-closed, for both
+  audio and video. (#320)
+- **TLS 1.2 floor on WSS/TLS client context** (ADR-0089). (#318)
+- **Registration `isascii()+isdecimal()` guards** — a Unicode-digit `expires`
+  field can no longer crash REGISTER handling. (#316)
+- **Contact-binding canonicalisation** — pragmatic canonicalisation for
+  registrar echoes (ADR-0090). (#331)
+- **RTCP SDES CNAME UTF-8 end-to-end** — a valid non-ASCII CNAME no longer
+  aborts compound RTCP parse. (#321)
+- **SDP `telephone-event` clock-rate validated** per RFC 4733. (#311)
+- **API `__all__` trimmed** — leaked `tts`/`stt` seams removed; still importable
+  for back-compat. (#313)
+- **SDP `addrtype` derived from address family** — IPv6 addresses now produce
+  `IN IP6` SDP lines. (#291)
+- **CSeq overflow guard** — `build_in_dialog_request` rejects CSeq >= 2**31
+  per RFC 3261. (#250)
+- **Registration `accept 2xx`** — any 2xx (not just 200) is treated as success;
+  CSeq method validated. (#288)
+- **Digest `cnonce` / `nc` validation** — empty cnonce rejected; `nc` validated
+  within 32-bit range; unquoted `algorithm`/`qop`/`nc` render pinned. (#287)
+- **Digest `realm` / `nonce` validation** — raise on missing or empty realm,
+  symmetric with nonce. (#293)
+- **Inbound CANCEL on `WssSipTransport`** — end-to-end handling per RFC 3261
+  §9.2; TLS CANCEL-200 reuses the stable `To`-tag. (#300, #302)
+- **Malformed REFER/NOTIFY answered 4xx** instead of dropping the SIP
+  connection. (#301)
+- **Guard `config.json` corruption** — corrupt or invalid `config.json` is
+  wrapped cleanly and does not leak path information. (#289)
+- **SRTP ROC increment masked** to 32-bit modulus per RFC 3711. (#304)
+- **DTLS fingerprint hash algorithm validated** at SDP answer time (fail-
+  closed). (#303)
+- **DTMF counts as no-input watchdog activity** — inbound DTMF digits reset
+  the caller-silence reprompt timer. (#327)
+- **VAD silero v5 dynamic-batch state shape** accepted; pinned v5 model
+  download. (#255)
+- **`Refer-To` target injection guard** — inbound `Refer-To` URI validated in
+  `parse_refer`. (#266)
+- **Empty/whitespace-only ASR finals dropped** — no phantom agent turns from
+  silent utterances. (#269)
+- **Runbook-0013 doc drift fixed** — false WSS-unwired claim corrected;
+  `sherpa_kokoro` → `sherpa-kokoro` package token updated, with drift tests.
+  (#325)
+- **`audioop.error` wrapped** in the media-layer exception contract. (#262)
+- **Registration negative `expires` rejected** — Literal transport type
+  enforced. (#282)
+- **`call_loop` empty ASR final guard** — drops whitespace-only transcript
+  finals before routing to the agent. (#269)
+
 ## [0.1.1] - 2026-06-27
 
 ### Added
@@ -171,6 +289,7 @@ gateway.
   `plugin.yaml` manifest version equal, so a release is a single edit in
   `pyproject.toml`.
 
-[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/troykelly/hermes-voip/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/troykelly/hermes-voip/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/troykelly/hermes-voip/releases/tag/v0.1.0

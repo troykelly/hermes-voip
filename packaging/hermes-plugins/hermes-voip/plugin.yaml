@@ -27,7 +27,7 @@ name: hermes-voip
 # Human-readable platform label — the canonical kind:platform field (mirrors the
 # label passed to ctx.register_platform and the shape in plugins/platforms/irc/).
 label: VoIP (SIP/WebRTC telephony)
-version: "0.1.1"
+version: "0.1.2"
 description: >-
   Two-way voice over telephony for a Hermes agent — answer and place phone calls on
   any RFC-compliant SIP-over-TLS or WebRTC voice gateway, with streaming STT/TTS, a

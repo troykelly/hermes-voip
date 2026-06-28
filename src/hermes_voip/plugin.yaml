@@ -131,6 +131,11 @@ optional_env:
     prompt: "ElevenLabs API key"
     url: "https://elevenlabs.io/app/settings/api-keys"
     secret: true
+  - name: HERMES_VOIP_CARTESIA_API_KEY
+    description: "Cartesia API key — required only when HERMES_VOIP_TTS_PROVIDER=cartesia."
+    prompt: "Cartesia API key"
+    url: "https://cartesia.ai/"
+    secret: true
   - name: HERMES_VOIP_STT_PROVIDER
     description: "STT backend: sherpa-onnx (default) or deepgram."
     prompt: "STT provider"

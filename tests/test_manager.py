@@ -1028,6 +1028,58 @@ async def test_rejected_refresh_emits_structured_failure_log_event(
     _assert_failure_log_is_secret_safe(rec)
 
 
+async def test_refresh_send_failure_emits_transport_failed_log_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refresh transport failure is logged distinctly from timeout/rejection.
+
+    Operators need to distinguish a registrar response from a local transport send
+    failure, but the log must remain secret-safe.
+    """
+    transport = _FlakyTransport(fail_after=2)
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=10.0,
+        )
+    )
+    await manager.start()
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(transport.sent[0]))
+        await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager"
+        and getattr(r, "event", None) == "sip_registration_failed"
+    ]
+    assert records, (
+        "a refresh transport-send failure must emit a structured log record with "
+        "event='sip_registration_failed'"
+    )
+    rec = records[0]
+    assert rec.levelno == logging.WARNING, (
+        "registration transport failure must log at WARNING level"
+    )
+    assert getattr(rec, "outcome", None) == "transport_failed", (
+        "structured field 'outcome' must distinguish transport-send failures"
+    )
+    assert getattr(rec, "status_code", object()) is None, (
+        "structured field 'status_code' must be None when no response exists"
+    )
+    assert isinstance(getattr(rec, "attempt", None), int), (
+        "structured field 'attempt' must be an integer"
+    )
+    assert getattr(rec, "attempt", 0) >= 1, (
+        "structured field 'attempt' must be >= 1 on the first failure"
+    )
+    _assert_failure_log_is_secret_safe(rec)
+
+
 async def test_timeout_refresh_emits_structured_failure_log_event(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

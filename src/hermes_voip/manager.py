@@ -465,12 +465,13 @@ class RegistrationManager:
         retried here (those are ``connect()``'s / a clean teardown's concern).
 
         Emits a structured WARNING log event ``sip_registration_failed`` on every
-        failure so operators can query registration rejects/timeouts without
-        parsing free-text logs. The event carries only non-sensitive fields:
-        ``outcome`` (``"rejected"`` | ``"timeout"``), ``status_code`` (the SIP
-        integer for a rejection, ``None`` for a timeout), and ``attempt`` (the
-        1-based recovery attempt counter). NEVER logs the SIP host, realm,
-        extension, username, or password (rule 34).
+        failure so operators can query registration rejects, timeouts, and
+        transport send failures without parsing free-text logs. The event carries
+        only non-sensitive fields: ``outcome`` (``"rejected"`` | ``"timeout"`` |
+        ``"transport_failed"``), ``status_code`` (the SIP integer for a
+        rejection, ``None`` otherwise), and ``attempt`` (the 1-based recovery
+        attempt counter). NEVER logs the SIP host, realm, extension, username,
+        or password (rule 34).
         """
         state.registered = False
         state.last_error = error
@@ -480,12 +481,14 @@ class RegistrationManager:
         if isinstance(error, RegistrationRejectedError):
             outcome = "rejected"
             status_code = error.status
-        else:
-            # RegistrationTimeoutError or any transport-send failure (RuntimeError
-            # etc.) all collapse to a "timeout" outcome for the structured event —
-            # the distinction that matters for ops is "registrar said no" vs "we
-            # never got an answer / couldn't reach it".
+        elif isinstance(error, RegistrationTimeoutError):
             outcome = "timeout"
+            status_code = None
+        else:
+            # Transport or task-execution failures mean the REGISTER never made it
+            # onto the wire or recovery could not keep running. Report only the
+            # failure category, never transport/host detail.
+            outcome = "transport_failed"
             status_code = None
         # recovery_attempt is incremented in _schedule_recovery (called below for
         # established flows), so it is 0 on the very first failure of a cold-start

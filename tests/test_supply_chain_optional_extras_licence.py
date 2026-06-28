@@ -9,18 +9,57 @@ OSS allowlist report entirely.
 from __future__ import annotations
 
 import pathlib
+import re
+import subprocess
+import sys
+import textwrap
 
 import yaml
 
 _WORKFLOW_PATH = (
     pathlib.Path(__file__).parent.parent / ".github" / "workflows" / "supply-chain.yml"
 )
+_OPTIONAL_EXTRAS_STEP_NAME = "Licence allowlist (optional runtime extras)"
 
 
 def _load_workflow() -> dict[str, object]:
     with _WORKFLOW_PATH.open() as fh:
         result: dict[str, object] = yaml.safe_load(fh)
     return result
+
+
+def _audit_steps() -> list[dict[str, object]]:
+    workflow = _load_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict), "No `jobs` mapping found in supply-chain.yml"
+    assert "audit" in jobs, "No `audit` job found in supply-chain.yml"
+    audit_job = jobs["audit"]
+    assert isinstance(audit_job, dict), "`audit` job must be a mapping"
+
+    steps = audit_job.get("steps", [])
+    assert isinstance(steps, list), "`steps` in `audit` job must be a list"
+    return [step for step in steps if isinstance(step, dict)]
+
+
+def _optional_extras_run() -> str:
+    for step in _audit_steps():
+        if step.get("name") != _OPTIONAL_EXTRAS_STEP_NAME:
+            continue
+        run_cmd = step.get("run")
+        assert isinstance(run_cmd, str), (
+            "Optional-extras step must define a shell script"
+        )
+        return run_cmd
+    raise AssertionError(
+        "supply-chain.yml is missing the optional runtime extras licence step"
+    )
+
+
+def _optional_extras_python_script() -> str:
+    run_cmd = _optional_extras_run()
+    match = re.search(r"<<'PY'\n(?P<script>.*)\n\s*PY", run_cmd, flags=re.DOTALL)
+    assert match is not None, "Optional-extras step must embed a Python parser script"
+    return textwrap.dedent(match.group("script"))
 
 
 def test_optional_extras_licence_step_exports_all_extras_runtime_surface() -> None:
@@ -32,21 +71,10 @@ def test_optional_extras_licence_step_exports_all_extras_runtime_surface() -> No
     licence report from ``uv export --all-extras --no-dev --no-emit-project
     --no-hashes``.
     """
-    workflow = _load_workflow()
-    jobs = workflow.get("jobs")
-    assert isinstance(jobs, dict), "No `jobs` mapping found in supply-chain.yml"
-    assert "audit" in jobs, "No `audit` job found in supply-chain.yml"
-    audit_job = jobs["audit"]
-    assert isinstance(audit_job, dict), "`audit` job must be a mapping"
-
-    steps = audit_job.get("steps", [])
-    assert isinstance(steps, list), "`steps` in `audit` job must be a list"
-
     matching_runs = [
         step.get("run", "")
-        for step in steps
-        if isinstance(step, dict)
-        and isinstance(step.get("run"), str)
+        for step in _audit_steps()
+        if isinstance(step.get("run"), str)
         and "uv export" in step["run"]
         and "--all-extras" in step["run"]
         and "--no-dev" in step["run"]
@@ -68,20 +96,9 @@ def test_production_and_optional_extras_licence_reports_are_separate() -> None:
     exact default shipped surface. The optional-extras report is additive, not a
     replacement.
     """
-    workflow = _load_workflow()
-    jobs = workflow.get("jobs")
-    assert isinstance(jobs, dict), "No `jobs` mapping found in supply-chain.yml"
-    audit_job = jobs["audit"]
-    assert isinstance(audit_job, dict), "`audit` job must be a mapping"
-
-    steps = audit_job.get("steps", [])
-    assert isinstance(steps, list), "`steps` in `audit` job must be a list"
-
     production_steps = 0
     optional_extras_steps = 0
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
+    for step in _audit_steps():
         run_cmd = step.get("run")
         if not isinstance(run_cmd, str) or "pip-licenses" not in run_cmd:
             continue
@@ -105,3 +122,65 @@ def test_production_and_optional_extras_licence_reports_are_separate() -> None:
         "Expected a separate optional-extras licence report in addition to the "
         "production-only gate"
     )
+
+
+def test_optional_extras_licence_step_reads_named_export_file() -> None:
+    """The parser must read a named export file, not a discarded pipe.
+
+    ``python - <<'PY'`` consumes stdin for the script body itself, so piping
+    ``uv export`` into that form silently drops the exported requirements and leaves
+    the package list empty. The workflow must materialize the export first and pass
+    the file path into the parser.
+    """
+    run_cmd = _optional_extras_run()
+
+    assert "optional-runtime-export.txt" in run_cmd
+    assert "sys.argv[1]" in run_cmd
+    assert "| uv run python - <<'PY'" not in run_cmd
+
+
+def test_optional_extras_parser_keeps_direct_extra_packages(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The embedded parser keeps every direct hermes-voip optional package.
+
+    A representative ``uv export --all-extras`` stream must yield the direct package
+    names declared by ``hermes-voip`` rather than an empty file.
+    """
+    export_path = tmp_path / "optional-runtime-export.txt"
+    export_path.write_text(
+        textwrap.dedent(
+            """\
+            # This file was autogenerated by uv via the following command:
+            aioice==0.10.1
+                # via hermes-voip
+            audioop-lts==0.2.2
+                # via hermes-voip
+            cffi==1.17.1
+                # via cryptography
+            hermes-agent==0.16.0
+                # via
+                #   hermes-voip
+            sherpa-onnx==1.10.59 ; sys_platform == 'linux'
+                # via hermes-voip
+            websockets==15.0.1
+                # via aioice
+            """
+        )
+    )
+
+    result = subprocess.run(  # noqa: S603 - test runs the embedded workflow parser via the current interpreter.
+        [sys.executable, "-", str(export_path)],
+        input=_optional_extras_python_script(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "aioice",
+        "audioop-lts",
+        "hermes-agent",
+        "sherpa-onnx",
+    ]

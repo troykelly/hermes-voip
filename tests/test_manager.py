@@ -23,8 +23,12 @@ from hermes_voip.manager import (
     Cancel,
     InDialog,
     NewCall,
+    RegistrationFailureCategory,
     RegistrationManager,
+    RegistrationRejectedError,
+    RegistrationTimeoutError,
     Unroutable,
+    registration_failure_category,
 )
 from hermes_voip.message import SipRequest, SipResponse
 
@@ -1149,7 +1153,7 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
 _REGISTRAR_REASON_SENTINEL = "ATTACKER-CONTROLLED-REASON-7f3a91"
 
 
-async def test_on_registration_error_callback_error_str_omits_registrar_reason() -> None:
+async def test_callback_error_str_omits_registrar_reason() -> None:
     # SECURITY (codex #351 follow-up): the on_registration_error callback receives
     # the raw exception. RegistrationRejectedError historically baked the
     # registrar-controlled reason-phrase into its Exception message, so a consumer
@@ -1211,3 +1215,41 @@ async def test_on_registration_error_callback_error_str_omits_registrar_reason()
         "RegistrationRejectedError must expose the SIP status for consumers"
     )
     await manager.aclose()
+
+
+async def test_registration_failure_category_classifies_without_string_form() -> None:
+    # The sanitized category is the safe discriminator for an on_registration_error
+    # consumer: it exposes no registrar text and no SIP host/extension.
+    rejected = RegistrationRejectedError(403, _REGISTRAR_REASON_SENTINEL)
+    timeout = RegistrationTimeoutError()
+    other = RuntimeError("transport went away")
+    assert registration_failure_category(rejected) is (
+        RegistrationFailureCategory.REJECTED
+    )
+    assert registration_failure_category(timeout) is (
+        RegistrationFailureCategory.TIMEOUT
+    )
+    # A non-RegistrationError (e.g. an unexpected transport/task failure) is
+    # classified as TRANSPORT_FAILED, never crashing the consumer.
+    assert registration_failure_category(other) is (
+        RegistrationFailureCategory.TRANSPORT_FAILED
+    )
+    # The error answers its own category too.
+    assert rejected.category is RegistrationFailureCategory.REJECTED
+    assert timeout.category is RegistrationFailureCategory.TIMEOUT
+    # No category value carries registrar text or an identifier.
+    for member in RegistrationFailureCategory:
+        assert _REGISTRAR_REASON_SENTINEL not in member.value
+        assert "1000" not in member.value
+
+
+async def test_registration_rejected_raw_reason_is_explicit_opt_in() -> None:
+    # The registrar reason is reachable ONLY via the explicit, documented-untrusted
+    # raw_reason opt-in — never via the default string/repr/args form.
+    rejected = RegistrationRejectedError(403, _REGISTRAR_REASON_SENTINEL)
+    assert rejected.raw_reason == _REGISTRAR_REASON_SENTINEL, (
+        "a consumer that explicitly opts in must still be able to read the reason"
+    )
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in repr(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected.args)

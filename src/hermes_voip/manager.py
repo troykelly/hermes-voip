@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
 import random
 import re
@@ -48,6 +49,7 @@ __all__ = [
     "InDialog",
     "NewCall",
     "RegistrationError",
+    "RegistrationFailureCategory",
     "RegistrationManager",
     "RegistrationRejectedError",
     "RegistrationStatus",
@@ -55,21 +57,99 @@ __all__ = [
     "RequestRouting",
     "SipTransport",
     "Unroutable",
+    "registration_failure_category",
 ]
 
 
+class RegistrationFailureCategory(enum.Enum):
+    """A sanitized, typed category for a registration-keep-alive failure.
+
+    This is the **safe** way to discriminate the error an
+    ``on_registration_error`` consumer receives: it carries no registrar text
+    and no SIP host/extension/secret, so it is always safe to log or forward to
+    telemetry. Read it via :attr:`RegistrationError.category` (every
+    :class:`RegistrationError` exposes one) or :func:`registration_failure_category`.
+    """
+
+    REJECTED = "rejected"
+    """A refresh REGISTER was rejected with a 4xx/5xx/6xx final response."""
+
+    TIMEOUT = "timeout"
+    """A refresh REGISTER got no response within the Timer-F/B deadline."""
+
+    TRANSPORT_FAILED = "transport_failed"
+    """The REGISTER could not be sent / recovery could not run (transport error)."""
+
+
 class RegistrationError(Exception):
-    """Base class for a recoverable registration-keep-alive failure."""
+    """Base class for a recoverable registration-keep-alive failure.
+
+    .. warning:: Secret-safety contract for ``on_registration_error`` consumers
+
+        The exception subclasses are handed **raw** to the operator-supplied
+        ``on_registration_error(extension, error)`` callback. Their default
+        string forms (``str(error)``, ``repr(error)``, ``error.args``) are
+        sanitized: they carry the SIP status code and the sanitized
+        :class:`RegistrationFailureCategory`, but **never** the registrar's
+        free-text reason-phrase (which is registrar-controlled and may be
+        attacker-influenced) and never the SIP host/extension/secret. Logging
+        the default string form is therefore safe.
+
+        The registrar reason is available **only** by explicit opt-in via
+        :attr:`RegistrationRejectedError.raw_reason`. A consumer that forwards
+        ``raw_reason`` to a logging/telemetry sink owns the sanitization of that
+        untrusted text itself.
+    """
+
+    @property
+    def category(self) -> RegistrationFailureCategory:
+        """The sanitized :class:`RegistrationFailureCategory` for this failure."""
+        return RegistrationFailureCategory.TRANSPORT_FAILED
 
 
 class RegistrationRejectedError(RegistrationError):
-    """A refresh REGISTER was rejected with a final 4xx/5xx/6xx status."""
+    """A refresh REGISTER was rejected with a final 4xx/5xx/6xx status.
+
+    The default string form is sanitized (status + category only). The
+    registrar-controlled reason-phrase is kept off ``args`` and is exposed
+    solely via :attr:`raw_reason` for a consumer that explicitly opts in (and
+    then owns sanitizing that untrusted text). See :class:`RegistrationError`.
+    """
 
     def __init__(self, status: int, reason: str) -> None:
-        """Carry the rejecting status/reason (no SIP host/extension/secret)."""
-        super().__init__(f"registration refresh rejected: {status} {reason}")
+        """Carry the rejecting status (the reason is held off ``args``).
+
+        ``status`` is the SIP final-response code and is safe to surface.
+        ``reason`` is the registrar's free-text reason-phrase — untrusted and
+        possibly attacker-influenced — so it is stored privately and excluded
+        from the sanitized message/``args`` that a consumer might log.
+        """
+        # The Exception message (and therefore ``args`` and the default
+        # ``str``/``repr``) carries only the status and the sanitized category,
+        # never the registrar reason (rule 34; codex #351 follow-up).
+        super().__init__(
+            f"registration refresh rejected: "
+            f"{status} ({RegistrationFailureCategory.REJECTED.value})"
+        )
         self.status = status
-        self.reason = reason
+        # Private: the untrusted registrar reason. Kept off ``args`` so it cannot
+        # leak through casual ``str``/``repr``/logging of the exception.
+        self._reason = reason
+
+    @property
+    def category(self) -> RegistrationFailureCategory:
+        """Always :attr:`RegistrationFailureCategory.REJECTED`."""
+        return RegistrationFailureCategory.REJECTED
+
+    @property
+    def raw_reason(self) -> str:
+        """The registrar's free-text reason-phrase (UNTRUSTED — opt-in only).
+
+        This is registrar-controlled and may be attacker-influenced. It is NOT
+        part of the sanitized default string form; a consumer that reads it owns
+        validating/escaping it before logging or forwarding to telemetry.
+        """
+        return self._reason
 
 
 class RegistrationTimeoutError(RegistrationError):
@@ -78,6 +158,28 @@ class RegistrationTimeoutError(RegistrationError):
     def __init__(self) -> None:
         """A response-deadline timeout (the registrar never answered)."""
         super().__init__("registration refresh timed out with no response")
+
+    @property
+    def category(self) -> RegistrationFailureCategory:
+        """Always :attr:`RegistrationFailureCategory.TIMEOUT`."""
+        return RegistrationFailureCategory.TIMEOUT
+
+
+def registration_failure_category(
+    error: BaseException,
+) -> RegistrationFailureCategory:
+    """Return the sanitized :class:`RegistrationFailureCategory` for *error*.
+
+    Classifies the exception an ``on_registration_error`` callback receives
+    **without** calling ``str()``/``repr()`` on it — though, post-#351, those
+    forms are themselves sanitized. A :class:`RegistrationError` answers from its
+    own :attr:`~RegistrationError.category`; any other exception (an unexpected
+    transport/task failure) classifies as
+    :attr:`~RegistrationFailureCategory.TRANSPORT_FAILED`.
+    """
+    if isinstance(error, RegistrationError):
+        return error.category
+    return RegistrationFailureCategory.TRANSPORT_FAILED
 
 
 _DEFAULT_REFRESH_FRACTION = 0.5
@@ -221,6 +323,13 @@ class RegistrationManager:
 
         ``on_registration_error`` is invoked (extension, error) when a background
         refresh fails, so a flapping registration is observed, never swallowed.
+        ``extension`` is sensitive PII; ``error`` is a :class:`RegistrationError`
+        whose default string form is sanitized (status + a sanitized
+        :class:`RegistrationFailureCategory`, never the registrar reason). Read
+        :func:`registration_failure_category` to classify it; the registrar's
+        free-text reason is available only via the explicit, untrusted
+        :attr:`RegistrationRejectedError.raw_reason` opt-in. See
+        :class:`RegistrationError` for the full secret-safety contract.
 
         ``refresh_timeout`` is the per-REGISTER response deadline (RFC 3261 Timer
         F/B analogue): a refresh that gets no response within it is treated as

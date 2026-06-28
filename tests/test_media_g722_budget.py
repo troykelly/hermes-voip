@@ -1,34 +1,32 @@
 """G.722 hot-path CPU-budget gate (backlog [high] efficiency, ADR-0094).
 
 Rule 22 requires every hot-path module to have a concrete per-frame cost
-measurement documented in source and gated in a test.  The G.722 pure-Python
+measurement documented in source and gated in a test. The G.722 pure-Python
 encode and decode paths run on every RTP packet at 50 pps (20 ms ptime):
 G722Encoder.encode on the outbound send_audio path, G722Decoder.decode on the
-inbound receive path.  This test gates both.
+inbound receive path. Because G.722 remains preferred by default, CI must enforce
+the COMBINED encode+decode cost against the 20 ms packet-period budget.
 
-Design (mirrors test_call_progress_microbench.py):
-  - The PRIMARY gate is that documented constants exist in media/g722.py and are
-    within plausible bounds.  The constants commit the measured numbers to source
-    so rule 22 is satisfied and a future refactor that doubles the cost is caught
-    by a CI human reading the diff -- not just by wall-clock timing.
-  - The SECONDARY gate is a wall-clock ceiling (15 ms = 75 % of the 20 ms frame
-    period).  This is intentionally very generous so CI scheduling jitter cannot
-    cause false failures; it catches only catastrophic regressions (e.g. an
-    accidental O(n^2) path or importing a model on every call).
-  - There is NO tight wall-clock budget gate: the actual cost varies across CPython
-    versions and CI hardware.  The documented constant is the record; the ceiling
-    guards against the extreme regression tail.
+Design:
+  - media/g722.py records measured encode and decode baselines plus the combined
+    packet-period budget. Those constants are not review-only: this test measures
+    the hot path and verifies the measured values remain within a generous,
+    documented tolerance of the constants.
+  - The primary budget gate measures encode+decode together and asserts the
+    combined per-frame cost stays below the 20 ms G.722 packet period. A
+    regression to ~14 ms encode + ~14 ms decode fails even though each side would
+    be below a separate 15 ms ceiling.
+  - The benchmark is CI-friendly: no sleeps, no network, no benchmark dependency,
+    warm-up before timing, several repeated batches, and the best batch is used to
+    reduce scheduler-noise sensitivity. The budget is deliberately coarse (20 ms),
+    not a precision performance score.
 
-Measured numbers (2026-06-28, CPython 3.13.5, devcontainer):
-  Encode: ~3 400 us / 20 ms frame (one 320-sample pair pass through QMF + ADPCM)
-  Decode: ~3 300 us / 20 ms frame (inverse QMF + ADPCM reconstruction)
+Measured numbers recorded 2026-06-28 on CPython 3.13.5 in the devcontainer:
+  Encode: ~3 400 us / 20 ms frame (320 PCM16 samples -> 160 G.722 octets)
+  Decode: ~3 300 us / 20 ms frame (160 G.722 octets -> 320 PCM16 samples)
   Combined: ~6 700 us / frame (~33 % of the 20 ms ptime)
 
-The 15 ms ceiling is 4-5x the observed cost -- wide enough for a heavily loaded
-CI runner but tight enough to catch an accidental O(n^2) regression.
-
-No networking, no wall-clock sleeps, no real gateway addresses.  Runs in the
-DEFAULT gate (pure-Python G.722, no extras required).
+No real gateway addresses, extension numbers, or device identifiers appear here.
 """
 
 from __future__ import annotations
@@ -36,6 +34,8 @@ from __future__ import annotations
 import math
 import struct
 import timeit
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Final
 
 import hermes_voip.media.g722 as _g722_mod
@@ -47,22 +47,38 @@ from hermes_voip.media.g722 import G722Decoder, G722Encoder
 
 _RATE: Final[int] = 16_000  # G.722 audio sample rate
 _PTIME_MS: Final[int] = 20  # standard RTP packetisation
+_FRAME_PERIOD_US: Final[float] = float(_PTIME_MS * 1000)  # 20 000 us
 _SAMPLES_PER_FRAME: Final[int] = _RATE * _PTIME_MS // 1000  # 320
-_BYTES_PER_FRAME: Final[int] = _SAMPLES_PER_FRAME // 2  # 160 G.722 octets
 
 # ---------------------------------------------------------------------------
-# Budget ceiling (rule 22 / ADR-0094)
+# Benchmark stability knobs (rule 22 / ADR-0094)
 # ---------------------------------------------------------------------------
-# Primary gate: the documented constants in g722.py (see Test 1).
-# Secondary gate: this very generous wall-clock ceiling.
-# 15 ms = 75 % of the 20 ms frame period.  A pure-Python encode at ~3.4 ms
-# has roughly 4x headroom here; only a catastrophic regression (accidental
-# O(n^2), model load, full-frame copy loop) will breach the ceiling.
-_WALL_CLOCK_CEILING_US: Final[float] = 15_000.0  # 15 ms
+
+# Baseline constants are measured on one devcontainer host. CI hosts and transient
+# scheduler load vary, so tolerate up to 3x the recorded per-side baseline while
+# still enforcing the real combined packet-period budget below. A regression to
+# ~14 ms encode or decode fails this tolerance; a combined regression over 20 ms
+# fails regardless of the per-side split.
+_MEASURED_CONSTANT_TOLERANCE_MULTIPLIER: Final[float] = 3.0
+
+# Keep the test cheap while averaging over enough frames to avoid per-call timer
+# noise. At the recorded cost, the whole benchmark file completes in a few seconds.
+_BENCHMARK_REPEATS: Final[int] = 5
+_BENCHMARK_FRAMES_PER_REPEAT: Final[int] = 20
+_WARMUP_FRAMES: Final[int] = 20
+
+
+@dataclass(frozen=True, slots=True)
+class _MeasuredCost:
+    """Measured per-20 ms-frame costs in microseconds."""
+
+    encode_us: float
+    decode_us: float
+    combined_us: float
 
 
 # ---------------------------------------------------------------------------
-# Frame builders
+# Frame builders / timing helpers
 # ---------------------------------------------------------------------------
 
 
@@ -78,154 +94,127 @@ def _pcm_frame(n_samples: int = _SAMPLES_PER_FRAME, freq_hz: float = 3000.0) -> 
     )
 
 
-def _g722_frame() -> bytes:
-    """Return one encoded 20 ms G.722 frame (160 bytes) for decode tests."""
-    return G722Encoder().encode(_pcm_frame())
+def _warm_up(fn: Callable[[], object]) -> None:
+    """Run ``fn`` enough times to settle interpreter/cache noise before timing."""
+    for _ in range(_WARMUP_FRAMES):
+        fn()
 
 
-# ---------------------------------------------------------------------------
-# Test 1 -- documented cost constants must exist in g722.py (deterministic)
-#
-# This test FAILS before _G722_ENCODE_MEASURED_US_PER_FRAME_16K and
-# _G722_DECODE_MEASURED_US_PER_FRAME_16K are added to media/g722.py.
-# ---------------------------------------------------------------------------
+def _best_us_per_frame(fn: Callable[[], object]) -> float:
+    """Return best repeated-batch time for one 20 ms frame in microseconds.
 
-
-def test_g722_encode_cost_constant_exists() -> None:
-    """G722Encoder.encode must document its measured cost in a module constant.
-
-    _G722_ENCODE_MEASURED_US_PER_FRAME_16K records the per-frame encode cost
-    (us) at 16 kHz (320 samples -> 160 G.722 octets).  The constant satisfies
-    rule 22 (efficiency is documented, not left implicit) and makes the ADR
-    claim verifiable from source.  Any future change that significantly moves
-    the cost must update the constant, making the regression visible in a diff.
+    The best of several batches is the least scheduler-contaminated estimate. We
+    are enforcing a coarse 20 ms safety budget, not reporting a precision score.
     """
-    assert hasattr(_g722_mod, "_G722_ENCODE_MEASURED_US_PER_FRAME_16K"), (
-        "G722Encoder.encode must document its measured per-frame cost in a "
-        "module-level constant _G722_ENCODE_MEASURED_US_PER_FRAME_16K (rule 22 "
-        "/ ADR-0094).  Add it to src/hermes_voip/media/g722.py."
+    _warm_up(fn)
+    seconds = min(
+        timeit.repeat(
+            fn,
+            repeat=_BENCHMARK_REPEATS,
+            number=_BENCHMARK_FRAMES_PER_REPEAT,
+        )
     )
-    measured = _g722_mod._G722_ENCODE_MEASURED_US_PER_FRAME_16K
-    assert isinstance(measured, (int, float)), (
-        "_G722_ENCODE_MEASURED_US_PER_FRAME_16K must be a numeric constant (us)"
-    )
-    assert 0 < measured < 20_000, (
-        f"_G722_ENCODE_MEASURED_US_PER_FRAME_16K={measured} us is out of the "
-        "plausible (0, 20000) range; update the constant to the actual measurement"
-    )
+    return seconds / _BENCHMARK_FRAMES_PER_REPEAT * 1_000_000.0
 
 
-def test_g722_decode_cost_constant_exists() -> None:
-    """G722Decoder.decode must document its measured cost in a module constant.
-
-    _G722_DECODE_MEASURED_US_PER_FRAME_16K records the per-frame decode cost
-    (us) at 16 kHz (160 G.722 octets -> 320 PCM16 samples).  Same rule 22
-    rationale as the encode constant.
-    """
-    assert hasattr(_g722_mod, "_G722_DECODE_MEASURED_US_PER_FRAME_16K"), (
-        "G722Decoder.decode must document its measured per-frame cost in a "
-        "module-level constant _G722_DECODE_MEASURED_US_PER_FRAME_16K (rule 22 "
-        "/ ADR-0094).  Add it to src/hermes_voip/media/g722.py."
-    )
-    measured = _g722_mod._G722_DECODE_MEASURED_US_PER_FRAME_16K
-    assert isinstance(measured, (int, float)), (
-        "_G722_DECODE_MEASURED_US_PER_FRAME_16K must be a numeric constant (us)"
-    )
-    assert 0 < measured < 20_000, (
-        f"_G722_DECODE_MEASURED_US_PER_FRAME_16K={measured} us is out of the "
-        "plausible (0, 20000) range; update the constant to the actual measurement"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 2 -- wall-clock ceiling for G.722 encode (secondary safety net)
-#
-# The ceiling is very generous (15 ms).  The primary gate is the documented
-# constant in Test 1.  A tight wall-clock budget would be CI-flaky; this only
-# catches catastrophic regressions.
-# ---------------------------------------------------------------------------
-
-
-def test_g722_encode_stays_within_wall_clock_ceiling() -> None:
-    """G722Encoder.encode for one 20 ms frame must complete within 15 ms.
-
-    This is a SECONDARY gate -- the ceiling is 4-5x the measured cost so CI
-    scheduling jitter cannot produce false failures.  The PRIMARY gate is the
-    documented constant (Test 1).  Only an O(n^2) regression, an accidental
-    model load, or a catastrophic algorithmic change would breach 15 ms.
-
-    Uses a stateful encoder (one instance per call direction) to match the
-    production path: G722Encoder is constructed once per call and reused.
-    """
+def _measure_hot_path() -> _MeasuredCost:
+    """Measure stateful encode, decode, and combined encode+decode hot paths."""
     pcm = _pcm_frame()
-    encoder = G722Encoder()
-    # Warm up the encoder's Python state and JIT-equivalent caches.
-    for _ in range(50):
-        encoder.encode(pcm)
+    decode_payload = G722Encoder().encode(pcm)
 
-    # Re-construct to start from a clean state matching the ADR-0022 description
-    # ("construct a fresh encoder per call"), but keep it stateful for the timing
-    # loop (the real path feeds frames continuously into one encoder).
-    encoder = G722Encoder()
-    reps = 200
-    elapsed_us = timeit.timeit(lambda: encoder.encode(pcm), number=reps) / reps * 1e6
+    encode_encoder = G722Encoder()
+    decode_decoder = G722Decoder()
+    combined_encoder = G722Encoder()
+    combined_decoder = G722Decoder()
 
-    assert elapsed_us < _WALL_CLOCK_CEILING_US, (
-        f"G722Encoder.encode for one 20 ms frame took {elapsed_us:.1f} us, "
-        f"exceeding the {_WALL_CLOCK_CEILING_US:.0f} us ceiling (15 ms = 75 % "
-        "of the 20 ms ptime).  This is a catastrophic regression -- check for an "
-        "accidental O(n^2) path, a model load inside encode(), or a structural "
-        "change to the ADPCM loop.  See ADR-0094."
+    def encode_one_frame() -> bytes:
+        return encode_encoder.encode(pcm)
+
+    def decode_one_frame() -> bytes:
+        return decode_decoder.decode(decode_payload)
+
+    def encode_then_decode_one_frame() -> bytes:
+        return combined_decoder.decode(combined_encoder.encode(pcm))
+
+    return _MeasuredCost(
+        encode_us=_best_us_per_frame(encode_one_frame),
+        decode_us=_best_us_per_frame(decode_one_frame),
+        combined_us=_best_us_per_frame(encode_then_decode_one_frame),
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3 -- wall-clock ceiling for G.722 decode (secondary safety net)
-# ---------------------------------------------------------------------------
-
-
-def test_g722_decode_stays_within_wall_clock_ceiling() -> None:
-    """G722Decoder.decode for one 20 ms frame must complete within 15 ms.
-
-    Same rationale and ceiling as Test 2 for encode.
-    """
-    g722 = _g722_frame()
-    decoder = G722Decoder()
-    # Warm up.
-    for _ in range(50):
-        decoder.decode(g722)
-
-    decoder = G722Decoder()
-    reps = 200
-    elapsed_us = timeit.timeit(lambda: decoder.decode(g722), number=reps) / reps * 1e6
-
-    assert elapsed_us < _WALL_CLOCK_CEILING_US, (
-        f"G722Decoder.decode for one 20 ms frame took {elapsed_us:.1f} us, "
-        f"exceeding the {_WALL_CLOCK_CEILING_US:.0f} us ceiling (15 ms = 75 % "
-        "of the 20 ms ptime).  See ADR-0094."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 4 -- combined encode + decode budget is documented
+# Documented constants: existence/range checks (deterministic)
 #
-# Asserts that the two constants together produce a sane combined budget, so
-# the ADR's claim "well within the 20 ms frame period" is machine-checked.
+# This test now FAILS until g722.py defines the combined packet-period budget
+# constant, proving the previous separate 15 ms thresholds are no longer enough.
 # ---------------------------------------------------------------------------
 
 
-def test_g722_combined_budget_is_within_frame_period() -> None:
-    """The documented encode + decode cost is less than one 20 ms frame.
+def test_g722_cost_and_budget_constants_exist() -> None:
+    """Measured G.722 costs and combined budget are documented in g722.py."""
+    assert hasattr(_g722_mod, "_G722_ENCODE_MEASURED_US_PER_FRAME_16K"), (
+        "G722Encoder.encode must document its measured per-frame cost in "
+        "_G722_ENCODE_MEASURED_US_PER_FRAME_16K (rule 22 / ADR-0094)."
+    )
+    assert hasattr(_g722_mod, "_G722_DECODE_MEASURED_US_PER_FRAME_16K"), (
+        "G722Decoder.decode must document its measured per-frame cost in "
+        "_G722_DECODE_MEASURED_US_PER_FRAME_16K (rule 22 / ADR-0094)."
+    )
+    assert hasattr(_g722_mod, "_G722_COMBINED_BUDGET_US_PER_FRAME_16K"), (
+        "G.722 must document the combined encode+decode per-frame CPU budget in "
+        "_G722_COMBINED_BUDGET_US_PER_FRAME_16K so CI can enforce the 20 ms packet "
+        "period while G.722 remains preferred by default."
+    )
 
-    This catches a future update that raises one constant past 20 ms (which
-    would make the ADR claim false).  The actual margin is large (~3 x),
-    so the documented numbers would have to be wildly wrong to trigger this.
-    """
     encode_us: float = _g722_mod._G722_ENCODE_MEASURED_US_PER_FRAME_16K
     decode_us: float = _g722_mod._G722_DECODE_MEASURED_US_PER_FRAME_16K
-    frame_us = _PTIME_MS * 1000  # 20 000 us
-    assert encode_us + decode_us < frame_us, (
-        f"Documented G.722 encode ({encode_us} us) + decode ({decode_us} us) = "
-        f"{encode_us + decode_us} us >= one 20 ms frame ({frame_us} us).  "
-        "Update ADR-0094 and the constants to reflect the actual measured cost."
+    budget_us: float = _g722_mod._G722_COMBINED_BUDGET_US_PER_FRAME_16K
+
+    assert 0 < encode_us < _FRAME_PERIOD_US
+    assert 0 < decode_us < _FRAME_PERIOD_US
+    assert 0 < encode_us + decode_us < budget_us <= _FRAME_PERIOD_US
+
+
+# ---------------------------------------------------------------------------
+# Real CI budget gate: measured constants are tied to measured benchmark output,
+# and combined encode+decode must stay below the packet-period budget.
+# ---------------------------------------------------------------------------
+
+
+def test_g722_measured_hot_path_stays_within_combined_budget() -> None:
+    """Measure encode+decode together and enforce the real 20 ms packet budget.
+
+    This is the MUSTFIX gate: a regression to 14 ms encode + 14 ms decode fails
+    because ``combined_us`` exceeds the single-frame budget. The per-side checks
+    tie the documented measured constants to real benchmark output, so stale
+    constants cannot hide a CPU regression.
+    """
+    measured = _measure_hot_path()
+
+    documented_encode_us: float = _g722_mod._G722_ENCODE_MEASURED_US_PER_FRAME_16K
+    documented_decode_us: float = _g722_mod._G722_DECODE_MEASURED_US_PER_FRAME_16K
+    combined_budget_us: float = _g722_mod._G722_COMBINED_BUDGET_US_PER_FRAME_16K
+
+    assert measured.encode_us <= (
+        documented_encode_us * _MEASURED_CONSTANT_TOLERANCE_MULTIPLIER
+    ), (
+        f"Measured G.722 encode cost {measured.encode_us:.1f} us/frame exceeds "
+        f"the documented {documented_encode_us:.1f} us baseline by more than "
+        f"{_MEASURED_CONSTANT_TOLERANCE_MULTIPLIER:g}x. Update the implementation "
+        "or ADR-0094/g722.py with a new measured budget."
+    )
+    assert measured.decode_us <= (
+        documented_decode_us * _MEASURED_CONSTANT_TOLERANCE_MULTIPLIER
+    ), (
+        f"Measured G.722 decode cost {measured.decode_us:.1f} us/frame exceeds "
+        f"the documented {documented_decode_us:.1f} us baseline by more than "
+        f"{_MEASURED_CONSTANT_TOLERANCE_MULTIPLIER:g}x. Update the implementation "
+        "or ADR-0094/g722.py with a new measured budget."
+    )
+    assert measured.combined_us < combined_budget_us, (
+        f"Measured combined G.722 encode+decode cost {measured.combined_us:.1f} "
+        f"us/frame exceeds the {combined_budget_us:.0f} us combined packet-period "
+        "budget while G.722 remains preferred by default. Demote G.722 or reduce "
+        "the codec cost before shipping."
     )

@@ -17,14 +17,19 @@ import logging
 
 import pytest
 
+import hermes_voip.manager as _manager_module
 from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import (
     _MIN_REFRESH_DELAY,
     Cancel,
     InDialog,
     NewCall,
+    RegistrationFailureCategory,
     RegistrationManager,
+    RegistrationRejectedError,
+    RegistrationTimeoutError,
     Unroutable,
+    registration_failure_category,
 )
 from hermes_voip.message import SipRequest, SipResponse
 
@@ -1138,3 +1143,128 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
         "structured field 'attempt' must be >= 1 on the first failure"
     )
     _assert_failure_log_is_secret_safe(rec)
+
+
+# ---- _on_error callback contract: secret leakage guard (PR #348 follow-up) --
+
+
+async def test_on_error_callback_receives_typed_exception() -> None:
+    """``_on_error`` callback receives the TYPED exception, never a string.
+
+    The ``on_registration_error(extension, error)`` callback passes the raw
+    ``BaseException`` to the operator-supplied callable.  Consumers MUST NOT
+    call ``str(error)`` or log ``error`` directly — ``RegistrationRejectedError``
+    embeds registrar-controlled free text (the ``reason`` field) and its
+    ``__str__`` includes the SIP status.
+
+    This test pins the contract: the callback ALWAYS receives the concrete typed
+    subclass so consumers can use :func:`registration_failure_category` (or
+    ``isinstance``) to classify failures without touching the error's string
+    representation.
+    """
+    received: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=10.0,
+            on_registration_error=lambda ext, exc: received.append((ext, exc)),
+        )
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))
+    await asyncio.sleep(0.05)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    await manager.on_response(_failed_for(refresh, status=403, reason="Forbidden"))
+    await manager.aclose()
+
+    assert received, "on_error callback must be invoked on a rejected refresh"
+    _ext, error = received[0]
+    # The callback receives a TYPED exception — not a plain string or generic Exception.
+    assert isinstance(error, RegistrationRejectedError), (
+        f"callback received {type(error).__name__!r}, "
+        "expected RegistrationRejectedError"
+    )
+    # Consumers can classify without calling str(error):
+    category = registration_failure_category(error)
+    assert category is RegistrationFailureCategory.REJECTED, (
+        f"registration_failure_category returned {category!r}, expected REJECTED"
+    )
+
+
+async def test_on_error_timeout_category() -> None:
+    """``registration_failure_category`` returns TIMEOUT for response-timeout errors."""
+    received: list[BaseException] = []
+    transport = _FakeTransport()
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            refresh_timeout=0.05,
+            retry_backoff=10.0,
+            on_registration_error=lambda ext, exc: received.append(exc),
+        )
+    )
+    await manager.start()
+    await manager.on_response(_ok_for(transport.sent[0]))
+    await asyncio.sleep(0.2)
+    await manager.aclose()
+
+    assert received, "on_error callback must fire on response-timeout"
+    error = received[0]
+    assert isinstance(error, RegistrationTimeoutError), (
+        f"expected RegistrationTimeoutError, got {type(error).__name__!r}"
+    )
+    category = registration_failure_category(error)
+    assert category is RegistrationFailureCategory.TIMEOUT, (
+        f"registration_failure_category returned {category!r}, expected TIMEOUT"
+    )
+
+
+async def test_on_error_transport_failed_category() -> None:
+    """``registration_failure_category`` returns TRANSPORT_FAILED for send errors."""
+    received: list[BaseException] = []
+    transport = _FlakyTransport(fail_after=2)
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=10.0,
+            on_registration_error=lambda ext, exc: received.append(exc),
+        )
+    )
+    await manager.start()
+    await manager.on_response(_ok_for(transport.sent[0]))
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert received, "on_error callback must fire when send raises"
+    error = received[0]
+    # A generic transport error is NOT a RegistrationError subclass; the category
+    # helper must still classify it without str()ing the exception.
+    assert not isinstance(error, (RegistrationRejectedError, RegistrationTimeoutError))
+    category = registration_failure_category(error)
+    assert category is RegistrationFailureCategory.TRANSPORT_FAILED, (
+        f"registration_failure_category returned {category!r}, "
+        "expected TRANSPORT_FAILED"
+    )
+
+
+def test_registration_failure_category_is_exported() -> None:
+    """``RegistrationFailureCategory`` and helper must be in ``__all__``."""
+    assert "RegistrationFailureCategory" in _manager_module.__all__, (
+        "RegistrationFailureCategory must be in __all__ so consumers can import it"
+    )
+    assert "registration_failure_category" in _manager_module.__all__, (
+        "registration_failure_category must be in __all__ so consumers can import it"
+    )

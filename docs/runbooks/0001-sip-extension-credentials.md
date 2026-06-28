@@ -17,8 +17,8 @@ and password are **sensitive**: they live ONLY in the gitignored repo-root `.env
 
 > **Which password is the SIP secret.** The SIP-extension 1Password item holds **two**
 > passwords. `HERMES_SIP_PASSWORD` must be the item's **VoIP-section `Password`** field (the
-> SIP-TLS digest secret) — **not** the item's **top-level portal `password`** (the GDMS/WAVE
-> web-app login). A live REGISTER returns `401` if the portal password is used on either the
+> SIP-TLS digest secret) — **not** the item's **top-level portal `password`** (the operator
+> web-app portal login). A live REGISTER returns `401` if the portal password is used on either the
 > SIP-TLS or the Secure-WebSocket edge. The WSS/WebRTC edge authenticates with the **same**
 > VoIP-section `Password`, so `HERMES_SIP_WS_PASSWORD` is left unset for this gateway (it falls
 > back to `HERMES_SIP_PASSWORD`). This matches

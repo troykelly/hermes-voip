@@ -1336,8 +1336,8 @@ _OFFER_SAVPF = (
 )
 
 
-# A realistic WebRTC offer as sent by an Asterisk-based gateway (e.g. the
-# Grandstream UCM's embedded Asterisk WebRTC edge): a BUNDLE group with the
+# A realistic WebRTC offer as sent by an Asterisk-based gateway (e.g. a
+# UCM-class gateway's embedded Asterisk WebRTC edge): a BUNDLE group with the
 # DTLS-SRTP + ICE credentials at the **session level** (before the first m=
 # line), shared across all bundled m-lines. RFC 8122 §5 (fingerprint) and RFC
 # 8839 §4.2 (ice-ufrag/ice-pwd) both permit session-level placement; a

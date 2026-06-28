@@ -53,7 +53,7 @@ A new `MediaConfig.sip_sdes_offer` (env `HERMES_VOIP_SIP_SDES_OFFER`, default
 
 - **`false` (default):** the outbound INVITE offers plain `RTP/AVP` — **today's
   behaviour, unchanged**. This preserves the live-validated default (the merged Stage 1
-  live call ran against a Grandstream that offered plain RTP; ADR-0053) and avoids
+  live call ran against the operator test gateway that offered plain RTP; ADR-0053) and avoids
   regressing any deployment whose gateway/extension is not SRTP-capable on the
   terminating leg.
 - **`true`:** the outbound INVITE offers `RTP/SAVP` with one `a=crypto`

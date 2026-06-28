@@ -10,7 +10,7 @@
 ADR-0032 wired the WebRTC media plane (ICE + DTLS-SRTP + Opus) and ADR-0038
 selected the WSS signalling transport. Both passed their unit/e2e suites against
 **our own fixtures**. The first **live** inbound WebRTC call from the test
-gateway (a Grandstream UCM6304 whose WebRTC/WAVE edge is an embedded
+gateway (a real RFC-compliant UCM-class gateway whose WebRTC edge is an embedded
 **Asterisk**) exposed three gaps the fixtures did not model — the
 unit-test-vs-real-gateway seam the operator had flagged. Each was captured on the
 wire (secrets redacted) and fixed under TDD.
@@ -41,14 +41,14 @@ then routed to **voicemail** until the next re-REGISTER. (The TLS transport neve
 hit this: its `SipMessageFramer._skip_keepalive_crlf` already drops inter-message
 CRLFs; the per-frame WSS path had no equivalent.)
 
-### 3. The WSS/WAVE edge authenticates with the **SIP** password, not a separate one
+### 3. The WSS/WebRTC-client edge authenticates with the **SIP** password, not a separate one
 
 ADR-0038 §3 assumed the gateway's Secure-WebSocket edge uses a *different* digest
 password than the SIP-TLS edge, and added an optional `HERMES_SIP_WS_PASSWORD`
 override on that premise. A live RFC 7118 REGISTER credential matrix disproved it
 for this gateway: the WSS edge (port 8090, path `/ws`, subprotocol `sip`, realm
 `voip002`, MD5 `qop=auth`) returns **`200 OK`** with the **SIP-TLS digest
-password** and **`401`** with the gateway's other ("portal/WAVE-app login")
+password** and **`401`** with the gateway's other ("portal/web-app login")
 password. So the WSS edge **shares** the SIP credential here, and the documented
 fallback (`HERMES_SIP_WS_PASSWORD` unset → reuse `HERMES_SIP_PASSWORD`) is the
 correct zero-config path.
@@ -67,8 +67,8 @@ correct zero-config path.
 3. **Correct the ADR-0038 credential premise.** `HERMES_SIP_WS_PASSWORD` stays as
    a valid **optional** override for gateways that genuinely differ, but it is
    **not** required for this gateway; the runbook documents that the WSS edge
-   shares the SIP password and that the item's top-level password is the GDMS/WAVE
-   portal login (not a SIP credential). Runbook 0002's "portal password (unused)"
+   shares the SIP password and that the item's top-level password is the operator
+   web-app portal login (not a SIP credential). Runbook 0002's "portal password (unused)"
    annotation is corrected accordingly.
 
 All three are gateway-agnostic standards behaviour (RFC 8122/8839/5763 session

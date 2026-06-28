@@ -744,7 +744,7 @@ async def test_inbound_plain_rtp_call_activates_rtcp_on_live_engine() -> None:
 # Test change (rule 19): the pre-existing
 # test_inbound_sdes_savp_call_activates_rtcp_via_srtcp_on_live_engine asserted the
 # SDES path ALWAYS activates RTCP — that expectation broke a real call (unexpected
-# SRTCP muted the media on a non-mux Grandstream). It is INVERTED here to the
+# SRTCP muted the media on a non-mux gateway). It is INVERTED here to the
 # now-correct default (dormant), with an explicit opt-in test proving the capability
 # still works when chosen. The WebRTC SAVPF path always rtcp-muxes onto its single
 # ICE/DTLS 5-tuple (no sibling socket) and is unchanged by this gate.

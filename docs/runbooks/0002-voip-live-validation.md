@@ -26,7 +26,7 @@ ADR-0005 SIP/RTP, ADR-0006/0007/0008/0009 the conversational providers, ADR-0013
     (the extension number / SIP username), the **VoIP-section `Password`** (the SIP-TLS
     digest secret — *not* the top-level portal `password`), and the `website` URL (the SIP
     host). It also holds a `Voicemail PIN` (unused here). The item's **top-level
-    `password`** is the **GDMS/WAVE web-app portal login**, NOT a SIP credential: a live
+    `password`** is the **operator web-app portal login**, NOT a SIP credential: a live
     RFC 7118 REGISTER returns `401` with it on both the SIP-TLS and the Secure-WebSocket
     edges. The **WSS/WebRTC edge authenticates with the SAME VoIP-section `Password`** as
     SIP-TLS (verified 2026-06-18, ADR-0042), so `HERMES_SIP_WS_PASSWORD` is left **unset**
@@ -735,7 +735,7 @@ Pass criteria:
 ### 9c. Secured-path RTCP over SRTCP (ADR-0066/0061) — DEFAULT-OFF after a live finding
 
 **Live finding (2026-06-21):** when secured-path RTCP was activated unconditionally
-(`HERMES_VOIP_SECURED_RTCP_ENABLED` did not yet exist), a real Grandstream UCM that did
+(`HERMES_VOIP_SECURED_RTCP_ENABLED` did not yet exist), a real UCM-class gateway that did
 **not** negotiate `a=rtcp-mux` **MUTED the media** on a secured SDES call — the unexpected
 SRTCP on the sibling RTP-port+1 socket broke the session (no two-way audio). Setting
 `HERMES_VOIP_RTCP_ENABLED=false` restored audio. So secured-path RTCP is now **opt-in,

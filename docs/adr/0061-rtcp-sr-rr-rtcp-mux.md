@@ -163,7 +163,7 @@ on every secured path (SDES, SIP-DTLS, WebRTC) instead of staying dormant.
 ### Secured-path RTCP is OPT-IN, default off (live finding, 2026-06-21)
 
 The "activate on every secured path" posture of the 2026-06-20 refinement broke a **real
-call**. On a live inbound SDES (RTP/SAVP) call to a Grandstream UCM that did **not** negotiate
+call**. On a live inbound SDES (RTP/SAVP) call to a UCM-class gateway that did **not** negotiate
 `a=rtcp-mux`, `_plan_secured_rtcp_activation` (then gated by the kill-switch only) activated
 RTCP, so the engine opened the sibling SRTCP socket on RTP-port+1 and emitted SRTCP on the
 wire. The gateway **muted the media session** in response — no two-way audio. Setting

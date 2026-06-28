@@ -3659,7 +3659,7 @@ class VoipAdapter(BasePlatformAdapter):
         # transform (wired above), so RTCP is encrypted+authenticated and may ride the
         # secured 5-tuple — it is activated via the secured planner, which is
         # FAIL-CLOSED by default: it stays dormant unless the
-        # HERMES_VOIP_SECURED_RTCP_ENABLED opt-in is set (a live non-mux Grandstream
+        # HERMES_VOIP_SECURED_RTCP_ENABLED opt-in is set (a live non-mux gateway
         # muted the media on unexpected SRTCP), gated additionally by the master
         # rtcp_enabled kill-switch. On the cleartext plain-RTP path the fail-closed
         # cleartext planner applies (it gates on the answered profile == RTP/AVP). Done

@@ -17,7 +17,7 @@ SAVPF / UDP-TLS-RTP-SAVP profile the call negotiated. The codex review of the RT
 activation lane locked this in as a fail-closed gate (`_plan_rtcp_activation`
 refuses to activate unless the answered profile is exactly `RTP/AVP`).
 
-The live Grandstream test gateway uses SDES-SRTP, so in production RTCP is dormant
+The live operator test gateway uses SDES-SRTP, so in production RTCP is dormant
 until SRTCP lands. RFC 3711 §3.4 defines the missing piece: the SRTCP transform
 that protects (encrypt + authenticate) a compound RTCP packet, mirroring how SRTP
 (ADR-0013) protects an RTP packet.

@@ -575,7 +575,7 @@ async def test_out_of_dialog_options_is_answered_200_ok() -> None:
 async def test_crlf_keepalive_ping_does_not_drop_connection() -> None:
     """An RFC 5626 §4.4 / RFC 7118 CRLF keepalive frame must not crash the reader.
 
-    Regression: a real Asterisk/Grandstream-UCM WebRTC edge sends bare CRLF keepalive
+    Regression: a real Asterisk/UCM-class WebRTC edge sends bare CRLF keepalive
     frames over the WSS signalling channel. The reader fed each text frame straight to
     ``SipRequest.parse``, which raised ``not a SIP request-line: ''`` on the empty
     request-line, ending the reader task and dropping the registration — inbound calls

@@ -725,7 +725,11 @@ class Bye:
             if end > len(body):
                 msg = "BYE reason length runs past the packet"
                 raise RtcpError(msg)
-            reason = body[start:end].decode("utf-8", errors="replace")
+            try:
+                reason = body[start:end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                msg = "BYE reason is not valid UTF-8"
+                raise RtcpError(msg) from exc
         return cls(ssrcs=ssrcs, reason=reason)
 
 

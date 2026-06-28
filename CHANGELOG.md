@@ -11,6 +11,8 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-28
+
 ### Fixed
 
 - **`VoipAdapter.connect` now accepts the keyword-only `is_reconnect` param the
@@ -315,7 +317,8 @@ gateway.
   `plugin.yaml` manifest version equal, so a release is a single edit in
   `pyproject.toml`.
 
-[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/troykelly/hermes-voip/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/troykelly/hermes-voip/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/troykelly/hermes-voip/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/troykelly/hermes-voip/releases/tag/v0.1.0

@@ -399,6 +399,14 @@ _DEFAULT_GOODBYE_PHRASE = "Goodbye."
 # ``reject`` mode (no media path there). ``HERMES_VOIP_DECLINE_PHRASE``.
 _DECLINE_PHRASE_KEY = "HERMES_VOIP_DECLINE_PHRASE"
 _DEFAULT_DECLINE_PHRASE = "Sorry, I cannot take this call."
+# ADR-0020 §5/§6 require ONE SHORT line: the decline phrase is spoken once over the
+# answered media path before the BYE, not a multi-line block. So a value containing a
+# line break is rejected, and the length is capped to this sane maximum (≈ a long
+# sentence; well above the default's 31 chars, well below an unbounded paragraph that
+# would answer a declined caller into a wall of synthesised speech). Enforced in
+# MediaConfig.__post_init__ so a direct construction is self-validating, not only the
+# env parser.
+_MAX_DECLINE_PHRASE_LEN = 200
 
 # Safe-decline line spoken on a guard REFUSE (ADR-0076). When the injection guard
 # refuses a turn it is never forwarded to the agent; without a spoken line a caller the
@@ -1189,10 +1197,12 @@ class MediaConfig:
     goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE
     # Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020
     # §5/§6 Phase 2). When the gateway's deny_mode is ``decline``, a declined-group
-    # caller is ANSWERED (200 OK) and hears this one short line over the real media path
+    # caller is ANSWERED (200 OK) and hears this ONE short line over the real media path
     # before the call is BYE'd — a polite decline that trains a spammer less than a hard
-    # 603. Must be non-blank (a blank line would answer-then-immediately-BYE with dead
-    # air). ``HERMES_VOIP_DECLINE_PHRASE``; blank/unset → the built-in default.
+    # 603. Must be ONE short line: non-blank (a blank line would answer then immediately
+    # BYE with dead air), with no line break, and at most ``_MAX_DECLINE_PHRASE_LEN``
+    # chars (spoken once, not a multi-line block) — all enforced in __post_init__.
+    # ``HERMES_VOIP_DECLINE_PHRASE``; blank/unset → the built-in default.
     decline_phrase: str = _DEFAULT_DECLINE_PHRASE
     # Safe-decline line spoken on a guard REFUSE (ADR-0076): one phrase chosen at
     # random per refusal (no immediate repeat) so a false-positived caller hears a
@@ -1401,8 +1411,28 @@ class MediaConfig:
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
             raise ConfigError(msg)
+        # ADR-0020 §5/§6: the polite-decline line is ONE short spoken line. A blank
+        # value would answer-then-immediately-BYE with dead air; a value with a line
+        # break is a multi-line block, not one line; an over-long value answers a
+        # declined caller into an unbounded wall of speech. All three fail loud here
+        # (the env parser defaults a blank, so a blank can only reach here via a direct
+        # construction). The newline/length messages name the env var so an operator
+        # who set HERMES_VOIP_DECLINE_PHRASE wrongly sees the key.
         if not self.decline_phrase.strip():
             msg = "decline_phrase must not be blank"
+            raise ConfigError(msg)
+        if "\n" in self.decline_phrase or "\r" in self.decline_phrase:
+            msg = (
+                f"{_DECLINE_PHRASE_KEY} must be a single line "
+                "(no line break) — it is spoken as ONE short decline line"
+            )
+            raise ConfigError(msg)
+        if len(self.decline_phrase) > _MAX_DECLINE_PHRASE_LEN:
+            msg = (
+                f"{_DECLINE_PHRASE_KEY} must be at most "
+                f"{_MAX_DECLINE_PHRASE_LEN} characters "
+                f"(got {len(self.decline_phrase)}) — it is ONE short decline line"
+            )
             raise ConfigError(msg)
         if self.error_apology and not self.error_apology.strip():
             msg = "error_apology must not be blank when set"

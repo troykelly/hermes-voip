@@ -172,8 +172,11 @@ the inbound INVITE. Independent of which list scheme you use.
   real media, then we hang up (`BYE`). No STT/agent/VAD runs — the declined caller still
   **never reaches the agent**. Use where a polite "we can't take this call" trains a
   spammer less than a hard 603. An invalid `HERMES_VOIP_DENY_MODE` value fails loud
-  (`ConfigError` naming the var) at startup; a blank `HERMES_VOIP_DECLINE_PHRASE` is
-  rejected (answering only to play dead air is a misconfiguration).
+  (`ConfigError` naming the var) at startup. A **blank/unset** `HERMES_VOIP_DECLINE_PHRASE`
+  uses the built-in default `Sorry, I cannot take this call.` (it is never answered as
+  dead air — a blank value defaults). The phrase must be **ONE short line**: a value with
+  an embedded line break, or longer than 200 characters, is rejected at startup
+  (`ConfigError` naming the var) — it is spoken once, not as a multi-line block.
 
 **Verify** `decline`: place a call from a deny-listed caller-ID with
 `HERMES_VOIP_DENY_MODE=decline` set; the call connects (200 OK), you hear the decline

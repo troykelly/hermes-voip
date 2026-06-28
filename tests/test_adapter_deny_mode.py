@@ -26,17 +26,24 @@ pytest.importorskip("gateway.config")
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
+from hermes_voip.call import CallMedia, CallSession
 from hermes_voip.caller_modes import (
     CallerMode,
     CallerModeConfig,
     Normalization,
 )
 from hermes_voip.config import ExtensionConfig
+from hermes_voip.dialog import Dialog
+from hermes_voip.digest import DigestCredentials
+from hermes_voip.incall import LocalMediaSession
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
+from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
+from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.sdp import Codec
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -117,13 +124,38 @@ class _FakeManager:
 
 
 class _FakeTtsStream:
-    """One PCM frame so the decline phrase actually plays out to ``send_audio``."""
+    """A genuine ``AsyncIterator[PcmFrame]`` that records its text on the awaited path.
 
-    def __aiter__(self) -> AsyncIterator[PcmFrame]:
-        return self._gen()
+    Implements the ``TtsStream`` protocol structurally — ``__aiter__`` returns ``self``
+    and ``__anext__`` is defined — so no ``# type: ignore[return-value]`` is needed
+    when ``_RecordingTTS.synthesize`` returns it (must-fix 1).
 
-    async def _gen(self) -> AsyncIterator[PcmFrame]:
-        yield PcmFrame(samples=b"\x00\x00", sample_rate=8000, monotonic_ts_ns=0)
+    The text iterator handed to ``synthesize`` is drained on the FIRST ``__anext__``
+    (the awaited iteration the adapter performs via ``async for frame in stream``), and
+    the joined phrase is appended to the shared ``phrases`` list. That replaces the
+    previous fire-and-forget ``asyncio.ensure_future`` recorder, whose exceptions were
+    swallowed (must-fix 2): the drain now runs on the consumer's own awaited task, so a
+    failure propagates through the ``async for`` instead of vanishing into an orphan
+    task. Exactly one PCM frame is then emitted so the phrase actually plays out to
+    ``engine.send_audio`` before ``StopAsyncIteration``.
+    """
+
+    def __init__(self, text: AsyncIterator[str], phrases: list[str]) -> None:
+        self._text = text
+        self._phrases = phrases
+        self._emitted = False
+
+    def __aiter__(self) -> _FakeTtsStream:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        if self._emitted:
+            raise StopAsyncIteration
+        # Drain + record the text on this awaited pull (errors propagate to the caller).
+        parts = [chunk async for chunk in self._text]
+        self._phrases.append("".join(parts))
+        self._emitted = True
+        return PcmFrame(samples=b"\x00\x00", sample_rate=8000, monotonic_ts_ns=0)
 
     async def flush(self) -> None: ...
 
@@ -133,10 +165,19 @@ class _FakeTtsStream:
 
 
 class _RecordingTTS:
-    """Records the (joined) text passed to ``synthesize`` so the test can assert it."""
+    """Records the joined text AND the voice passed to ``synthesize`` for assertions.
+
+    Typed to satisfy ``StreamingTTS`` structurally (``output_sample_rate`` +
+    ``synthesize``) so ``Providers(...)`` needs no ``# type: ignore`` (must-fix 1).
+    """
 
     def __init__(self) -> None:
         self.phrases: list[str] = []
+        self.voices: list[str] = []
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 8000
 
     def synthesize(
         self,
@@ -145,25 +186,34 @@ class _RecordingTTS:
         *,
         sample_rate: int | None = None,
     ) -> TtsStream:
-        async def _collect() -> None:
-            parts: list[str] = []
-            async for chunk in text:
-                parts.append(chunk)
-            self.phrases.append("".join(parts))
-
-        # The synthesiser consumes the text iterator; do it eagerly on the loop so the
-        # recorded phrase is available right after playout completes.
-        asyncio.ensure_future(_collect())  # noqa: RUF006 — fire-and-forget recorder
-        return _FakeTtsStream()  # type: ignore[return-value]
+        # Record the per-call voice synchronously (must-fix 5: assert the configured
+        # voice reaches synthesize). The text is recorded by the returned stream as it
+        # is iterated — no orphan task, no swallowed errors (must-fix 2).
+        self.voices.append(voice)
+        return _FakeTtsStream(text, self.phrases)
 
 
 class _FakeASR:
-    async def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[object]:
-        async for _ in audio:
-            pass
-        empty: tuple[object, ...] = ()
-        for chunk in empty:  # always empty — forces the async-gen shape
-            yield chunk
+    """StreamingASR fake: never iterated here (a declined caller builds no CallLoop).
+
+    Typed to satisfy ``StreamingASR`` structurally (``input_sample_rate`` +
+    ``stream`` returning ``AsyncIterator[Transcript]``) so ``Providers(...)`` needs no
+    ``# type: ignore`` escape hatch (must-fix 1).
+    """
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _ in audio:
+                pass
+            empty: tuple[Transcript, ...] = ()
+            for transcript in empty:  # always empty — gives the async-gen its shape
+                yield transcript
+
+        return _gen()
 
 
 class _FakeGuard:
@@ -230,7 +280,7 @@ def _deny_caller(caller: str) -> CallerModeConfig:
     )
 
 
-async def _build_adapter(  # noqa: PLR0913 — keyword-only test wiring: transport + manager + caller_modes + tts + the two deny-mode knobs are all real dependencies
+async def _build_adapter(  # noqa: PLR0913 — keyword-only test wiring: transport + manager + caller_modes + tts + the deny-mode knobs + the configured voice are all real dependencies
     transport: _FakeTransport,
     manager: _FakeManager,
     *,
@@ -238,11 +288,15 @@ async def _build_adapter(  # noqa: PLR0913 — keyword-only test wiring: transpo
     tts: _RecordingTTS,
     deny_mode: str,
     decline_phrase: str,
+    tts_voice: str | None = None,
 ) -> VoipAdapter:
     from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
 
     config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV))
-    providers = Providers(asr=_FakeASR(), tts=tts, guard=_FakeGuard())  # type: ignore[arg-type]
+    # The fakes satisfy the ASR/TTS/Guard Protocols structurally; Providers accepts them
+    # via its keyword constructor (no type: ignore needed — the params are typed to the
+    # Protocols, which these duck-type).
+    providers = Providers(asr=_FakeASR(), tts=tts, guard=_FakeGuard())
     with (
         patch(
             "hermes_voip.adapter.load_gateway_config",
@@ -269,6 +323,10 @@ async def _build_adapter(  # noqa: PLR0913 — keyword-only test wiring: transpo
                 session_expires=600,
                 min_se=90,
                 decline_phrase=decline_phrase,
+                # The configured TTS voice the decline synthesis must use (must-fix 5);
+                # an explicit value (not a MagicMock attr) so `tts_voice or ""` resolves
+                # to a real str the recorder can assert.
+                tts_voice=tts_voice,
             ),
         ),
         patch("hermes_voip.adapter.load_caller_modes", return_value=caller_modes),
@@ -282,20 +340,76 @@ async def _build_adapter(  # noqa: PLR0913 — keyword-only test wiring: transpo
         return adapter
 
 
+def _real_call_session(
+    *,
+    signaling: _FakeTransport,
+    media: CallMedia,
+    call_id: str,
+    caller: str,
+) -> CallSession:
+    """A REAL :class:`CallSession` over the adapter's transport (must-fix 4).
+
+    The decline test must exercise the ACTUAL teardown path, not a hand-rolled mock BYE.
+    The adapter builds the session with ``signaling=transport`` and ``media=engine``
+    (see ``adapter._handle_inbound_invite``); this mirrors that wiring with a REAL
+    ``CallSession``, so ``CallSession.hang_up`` builds a genuine in-dialog ``BYE`` via
+    ``build_in_dialog_request`` and sends it on the SAME transport the ``200 OK`` went
+    out on. The test then asserts the real BYE wire text (a parseable ``BYE`` request
+    with a proper ``CSeq: <n> BYE``), proving the real BYE-producing call ran — not
+    that the adapter merely invoked a mock.
+
+    ``media`` is the adapter's engine mock; ``hang_up`` only calls ``media.stop()``.
+    Fakes only — ``pbx.example.test`` / ext ``1000`` (PUBLIC-repo invariant).
+    """
+    dialog = Dialog(
+        call_id=call_id,
+        local_uri="sip:1000@pbx.example.test",
+        local_tag="ours",
+        remote_uri=f"sip:{caller}@pbx.example.test",
+        remote_tag="theirs",
+        remote_target=f"sip:{caller}@198.51.100.99:5061;transport=tls",
+        route_set=(),
+        local_contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+        local_cseq=1,
+        sdp_version=0,
+    )
+    return CallSession(
+        dialog=dialog,
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id=call_id),
+        local_media=LocalMediaSession(
+            local_address="198.51.100.7",
+            port=40000,
+            codecs=(Codec(payload_type=0, encoding="PCMU", clock_rate=8000),),
+            session_id=55555,
+        ),
+        credentials=DigestCredentials("1000", "fake"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_deny_mode_decline_answers_200_speaks_then_byes() -> None:
-    """Decline mode: answer 200 (NOT 603), speak one phrase, then BYE — no agent.
+    """Decline mode: answer 200 (NOT 603), speak one phrase, then a REAL BYE — no agent.
 
     The caller "9999" is on the deny list, and ``deny_mode=decline``. Instead of the
     Phase-1 hard ``603 Decline``, the adapter answers the call (a ``200 OK`` reaches
     the transport), synthesises the configured decline phrase through the EXISTING TTS
-    provider, plays it, then ends the dialog with a ``BYE``. No CallLoop is built (the
-    agent never sees the caller).
+    provider IN THE CONFIGURED VOICE, plays it, then ends the dialog with a ``BYE``. No
+    CallLoop is built (the agent never sees the caller).
+
+    A REAL :class:`CallSession` drives the teardown (must-fix 4): the BYE asserted on
+    the wire is the genuine in-dialog request the real ``hang_up`` builds and sends —
+    not a mock-synthesised line. The configured ``tts_voice`` is asserted to reach
+    ``synthesize`` (must-fix 5).
     """
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     tts = _RecordingTTS()
     phrase = "Sorry, I cannot take this call"
+    voice = "operator-voice-7"
     adapter = await _build_adapter(
         transport,
         manager,
@@ -303,6 +417,7 @@ async def test_deny_mode_decline_answers_200_speaks_then_byes() -> None:
         tts=tts,
         deny_mode="decline",
         decline_phrase=phrase,
+        tts_voice=voice,
     )
 
     call_id = new_call_id()
@@ -313,21 +428,16 @@ async def test_deny_mode_decline_answers_200_speaks_then_byes() -> None:
         stop=AsyncMock(return_value=None),
         start_rtcp=AsyncMock(return_value=None),
         send_audio=AsyncMock(return_value=None),
+        set_hold=AsyncMock(return_value=None),
         _rtcp_active=False,
         local_port=20002,
         inbound_sample_rate=8000,
     )
 
-    async def _fake_hang_up() -> None:
-        # The real CallSession.hang_up sends an in-dialog BYE + stops media; model
-        # that here so the test asserts the BYE reached the transport.
-        await transport.send("BYE sip:9999@pbx.example.test SIP/2.0\r\n")
-        await engine.stop()
-
-    session = MagicMock(
-        dialog_id=("c", "l", "r"),
-        ended=False,
-        hang_up=AsyncMock(side_effect=_fake_hang_up),
+    # A REAL CallSession over the adapter's transport: its real hang_up emits a real
+    # in-dialog BYE on `transport`, the same seam the 200 OK uses (must-fix 4).
+    session = _real_call_session(
+        signaling=transport, media=engine, call_id=call_id, caller="9999"
     )
 
     with (
@@ -344,14 +454,35 @@ async def test_deny_mode_decline_answers_200_speaks_then_byes() -> None:
     # A 200 OK was sent (the call was ANSWERED) and NO 603 Decline.
     assert any("200 OK" in m for m in transport.sent), transport.sent
     assert not any("603 Decline" in m for m in transport.sent), transport.sent
-    # A BYE followed the answer (the call was torn down after the decline line).
-    assert any(m.startswith("BYE") for m in transport.sent), transport.sent
+    # A REAL BYE followed the answer: parse the wire text and confirm it is a genuine
+    # in-dialog BYE request (method + CSeq), not a hand-rolled mock line. The real
+    # CallSession.hang_up built it via build_in_dialog_request, sent on `transport`.
+    bye_texts = [
+        m for m in transport.sent if m.startswith("BYE") and not m.startswith("SIP/2.0")
+    ]
+    assert bye_texts, transport.sent
+    bye = SipRequest.parse(bye_texts[0])
+    assert bye.method == "BYE"
+    cseq = bye.header("CSeq") or ""
+    assert cseq.endswith("BYE"), cseq
+    # The BYE targets this dialog's Call-ID (it is the SAME dialog the 200 OK answered).
+    assert bye.header("Call-ID") == call_id
+    # Ordering: the answer (200 OK) preceded the BYE.
     answer_idx = next(i for i, m in enumerate(transport.sent) if "200 OK" in m)
-    bye_idx = next(i for i, m in enumerate(transport.sent) if m.startswith("BYE"))
+    bye_idx = next(
+        i
+        for i, m in enumerate(transport.sent)
+        if m.startswith("BYE") and not m.startswith("SIP/2.0")
+    )
     assert answer_idx < bye_idx, transport.sent
+    # The real hang_up marked the session ended and stopped media (the real teardown).
+    assert session.ended
+    engine.stop.assert_awaited()
     # The decline phrase was synthesised through the real TTS provider (non-empty).
     assert tts.phrases, "the decline phrase was never synthesised"
     assert tts.phrases[0].strip()
     assert phrase in tts.phrases[0]
+    # The CONFIGURED TTS voice reached synthesize (must-fix 5): not an empty voice.
+    assert tts.voices == [voice], tts.voices
     # No CallLoop / CallSession-driven agent path was started for the declined caller.
     assert call_id not in adapter._call_loops

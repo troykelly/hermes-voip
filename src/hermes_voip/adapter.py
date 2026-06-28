@@ -5061,7 +5061,11 @@ class VoipAdapter(BasePlatformAdapter):
             endpointer=endpointer,
             guard_state=guard_state,
             deliver_turn=_deliver,
-            voice="",
+            # The configured TTS voice (``MediaConfig.tts_voice``); ``None`` resolves to
+            # ``""`` (the provider's default voice). The decline path
+            # (``_speak_decline_then_bye``) resolves the SAME way, so a declined caller
+            # hears the operator's chosen voice exactly as a normal caller does.
+            voice=media_cfg.tts_voice or "",
             call_id=call_id,
             # Speak the configured opening line on answer so RTP flows out first
             # — the caller hears it and a NAT'd gateway latches (ADR-0002).
@@ -5171,6 +5175,11 @@ class VoipAdapter(BasePlatformAdapter):
             msg = f"INVITE {call_id}: providers not initialised"
             raise RuntimeError(msg)
         phrase = media_cfg.decline_phrase
+        # Use the SAME configured TTS voice the normal conversational path uses
+        # (``MediaConfig.tts_voice``); ``None`` resolves to ``""`` (the provider's
+        # default voice), exactly as the CallLoop voice seam does — so the decline line
+        # is spoken in the operator's chosen voice, not an empty/unset one.
+        voice = media_cfg.tts_voice or ""
 
         async def _single_chunk() -> AsyncIterator[str]:
             yield phrase
@@ -5179,7 +5188,7 @@ class VoipAdapter(BasePlatformAdapter):
         try:
             stream = providers.tts.synthesize(
                 _single_chunk(),
-                "",
+                voice,
                 sample_rate=engine.inbound_sample_rate,
             )
             async with contextlib.aclosing(stream):

@@ -2366,6 +2366,92 @@ def test_goodbye_phrase_empty_string_keeps_default() -> None:
     assert cfg.goodbye_phrase == "Goodbye."
 
 
+def test_decline_phrase_default_when_unset() -> None:
+    """HERMES_VOIP_DECLINE_PHRASE unset → the built-in default (ADR-0020 §5/§6)."""
+    cfg = load_media_config({})
+    assert cfg.decline_phrase == "Sorry, I cannot take this call."
+
+
+def test_decline_phrase_blank_keeps_default() -> None:
+    """A blank HERMES_VOIP_DECLINE_PHRASE falls back to the built-in default.
+
+    Reconciled behaviour (ADR-0020 §5/§6): blank/unset → the built-in default phrase
+    (NOT a rejection). The .env.example and runbook-0010 both state this, and the code
+    must agree — answering a declined caller only to play dead air is impossible because
+    a blank value never reaches the wire, it defaults.
+    """
+    cfg = load_media_config({"HERMES_VOIP_DECLINE_PHRASE": "   "})
+    assert cfg.decline_phrase == "Sorry, I cannot take this call."
+
+
+def test_decline_phrase_custom_value_used() -> None:
+    """A non-blank HERMES_VOIP_DECLINE_PHRASE is used verbatim (trimmed)."""
+    cfg = load_media_config({"HERMES_VOIP_DECLINE_PHRASE": "  We can't take this. "})
+    assert cfg.decline_phrase == "We can't take this."
+
+
+def test_decline_phrase_multiline_rejected() -> None:
+    """A multiline HERMES_VOIP_DECLINE_PHRASE is rejected (ADR-0020 §5/§6: ONE line).
+
+    The decline phrase is ONE short spoken line; an embedded newline (a multi-line
+    block) is a misconfiguration and fails loud at load, naming the env var (rule 37).
+    """
+    with pytest.raises(ConfigError, match="HERMES_VOIP_DECLINE_PHRASE"):
+        load_media_config({"HERMES_VOIP_DECLINE_PHRASE": "Sorry.\nGo away."})
+
+
+def test_decline_phrase_carriage_return_rejected() -> None:
+    """A bare carriage-return in the decline phrase is rejected (any line break)."""
+    with pytest.raises(ConfigError, match="HERMES_VOIP_DECLINE_PHRASE"):
+        load_media_config({"HERMES_VOIP_DECLINE_PHRASE": "Sorry.\rGo away."})
+
+
+def test_decline_phrase_over_long_rejected() -> None:
+    """An over-long HERMES_VOIP_DECLINE_PHRASE is rejected (ADR-0020 §5/§6: SHORT).
+
+    The phrase is capped to a sane maximum so unbounded content cannot be answered into
+    a declined call; over the cap fails loud at load, naming the env var.
+    """
+    with pytest.raises(ConfigError, match="HERMES_VOIP_DECLINE_PHRASE"):
+        load_media_config({"HERMES_VOIP_DECLINE_PHRASE": "x" * 201})
+
+
+def test_decline_phrase_at_max_length_accepted() -> None:
+    """A decline phrase exactly at the cap is accepted (boundary is inclusive)."""
+    phrase = "x" * 200
+    cfg = load_media_config({"HERMES_VOIP_DECLINE_PHRASE": phrase})
+    assert cfg.decline_phrase == phrase
+
+
+def test_decline_phrase_multiline_direct_construction_rejected() -> None:
+    """A directly-constructed MediaConfig with a multiline decline phrase is rejected.
+
+    MediaConfig is public (a caller can construct one directly), so the newline/length
+    invariant lives on ``__post_init__``, not only the env parser — naming the env var.
+    """
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="HERMES_VOIP_DECLINE_PHRASE"):
+        dataclasses.replace(base, decline_phrase="Sorry.\nGo away.")
+
+
+def test_decline_phrase_over_long_direct_construction_rejected() -> None:
+    """A directly-constructed MediaConfig with an over-long decline phrase fails."""
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="HERMES_VOIP_DECLINE_PHRASE"):
+        dataclasses.replace(base, decline_phrase="x" * 201)
+
+
+def test_decline_phrase_blank_direct_construction_rejected() -> None:
+    """A directly-constructed MediaConfig with a blank decline phrase is rejected.
+
+    The env parser defaults a blank value, so this can only arise from a direct
+    construction; a blank line would answer-then-immediately-BYE with dead air.
+    """
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="decline_phrase"):
+        dataclasses.replace(base, decline_phrase="   ")
+
+
 # ---------------------------------------------------------------------------
 # Multi-language accept policy (ADR-0084)
 # ---------------------------------------------------------------------------

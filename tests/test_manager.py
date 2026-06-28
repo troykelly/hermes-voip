@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 
 import pytest
 
@@ -23,8 +24,13 @@ from hermes_voip.manager import (
     Cancel,
     InDialog,
     NewCall,
+    RegistrationError,
+    RegistrationFailureCategory,
     RegistrationManager,
+    RegistrationRejectedError,
+    RegistrationTimeoutError,
     Unroutable,
+    registration_failure_category,
 )
 from hermes_voip.message import SipRequest, SipResponse
 
@@ -1138,3 +1144,195 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
         "structured field 'attempt' must be >= 1 on the first failure"
     )
     _assert_failure_log_is_secret_safe(rec)
+
+
+# Distinctive registrar-controlled free text. A real registrar (or an attacker who
+# influences it) can put ARBITRARY bytes in the SIP response reason-phrase; this
+# sentinel stands in for that text. It must NEVER reach an on_registration_error
+# consumer via the *default* string form of the error, because operators commonly
+# wire that callback straight to a logger/telemetry sink (a path the #348
+# structured-log guard does not cover).
+_REGISTRAR_REASON_SENTINEL = "ATTACKER-CONTROLLED-REASON-7f3a91"
+
+
+async def test_callback_error_str_omits_registrar_reason() -> None:
+    # SECURITY (codex #351 follow-up): the on_registration_error callback receives
+    # the raw exception. RegistrationRejectedError historically baked the
+    # registrar-controlled reason-phrase into its Exception message, so a consumer
+    # logging str(error)/repr(error) forwarded attacker-influenced free text to its
+    # sink. The default string form of the error handed to the callback MUST be
+    # safe — it may carry the SIP status code and a sanitized category, but NOT the
+    # registrar reason text.
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=0.0,
+            on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+        )
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    await manager.on_response(_ok_for(first_register))
+    await asyncio.sleep(0.05)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    # The registrar rejects the refresh with attacker-influenced reason text.
+    await manager.on_response(
+        _failed_for(refresh, status=403, reason=_REGISTRAR_REASON_SENTINEL)
+    )
+    assert errors, "a rejected refresh must be reported via on_registration_error"
+    _ext, exc = errors[0]
+    rendered_str = str(exc)
+    rendered_repr = repr(exc)
+    # THE LEAK: the registrar-controlled text must not appear in the default
+    # string/repr a consumer would log.
+    assert _REGISTRAR_REASON_SENTINEL not in rendered_str, (
+        "registrar-controlled reason leaked via str(error) to the "
+        f"on_registration_error consumer: {rendered_str!r}"
+    )
+    assert _REGISTRAR_REASON_SENTINEL not in rendered_repr, (
+        "registrar-controlled reason leaked via repr(error) to the "
+        f"on_registration_error consumer: {rendered_repr!r}"
+    )
+    # str(exc.args) is the other casually-logged form (logging renders args): it
+    # must be clean too, so the reason cannot live in the exception args tuple.
+    assert _REGISTRAR_REASON_SENTINEL not in str(exc.args), (
+        "registrar-controlled reason leaked via exc.args to the "
+        f"on_registration_error consumer: {exc.args!r}"
+    )
+    # The default form is still useful: the SIP status code remains visible, and
+    # the error exposes a typed status for status-aware consumers.
+    assert "403" in rendered_str, (
+        "the sanitized error string should still carry the SIP status code"
+    )
+    assert getattr(exc, "status", None) == 403, (
+        "RegistrationRejectedError must expose the SIP status for consumers"
+    )
+    await manager.aclose()
+
+
+async def test_registration_failure_category_classifies_without_string_form() -> None:
+    # The sanitized category is the safe discriminator for an on_registration_error
+    # consumer: it exposes no registrar text and no SIP host/extension.
+    rejected = RegistrationRejectedError(403, _REGISTRAR_REASON_SENTINEL)
+    timeout = RegistrationTimeoutError()
+    other = RuntimeError("transport went away")
+    assert registration_failure_category(rejected) is (
+        RegistrationFailureCategory.REJECTED
+    )
+    assert registration_failure_category(timeout) is (
+        RegistrationFailureCategory.TIMEOUT
+    )
+    # A non-RegistrationError (e.g. an unexpected transport/task failure) is
+    # classified as TRANSPORT_FAILED, never crashing the consumer.
+    assert registration_failure_category(other) is (
+        RegistrationFailureCategory.TRANSPORT_FAILED
+    )
+    # The error answers its own category too.
+    assert rejected.category is RegistrationFailureCategory.REJECTED
+    assert timeout.category is RegistrationFailureCategory.TIMEOUT
+    # No category value carries registrar text or an identifier.
+    for member in RegistrationFailureCategory:
+        assert _REGISTRAR_REASON_SENTINEL not in member.value
+        assert "1000" not in member.value
+
+
+async def test_registration_rejected_raw_reason_is_explicit_opt_in() -> None:
+    # The registrar reason is reachable ONLY via the explicit, documented-untrusted
+    # raw_reason opt-in — never via the default string/repr/args form.
+    rejected = RegistrationRejectedError(403, _REGISTRAR_REASON_SENTINEL)
+    assert rejected.raw_reason == _REGISTRAR_REASON_SENTINEL, (
+        "a consumer that explicitly opts in must still be able to read the reason"
+    )
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in repr(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected.args)
+
+
+async def test_registration_rejected_reason_attribute_retained_for_compat() -> None:
+    # COMPAT (codex #351 follow-up BLOCK): original main exposed a PUBLIC
+    # ``RegistrationRejectedError.reason`` attribute. An external operator callback
+    # wired to ``on_registration_error`` may read ``error.reason`` directly. The
+    # sanitization fix must NOT drop that public accessor (that would break such a
+    # caller) — ``.reason`` must keep returning the registrar reason verbatim, the
+    # same untrusted opt-in contract as ``raw_reason``. This makes the change
+    # genuinely non-breaking: ``error.reason`` keeps working exactly as before.
+    rejected = RegistrationRejectedError(403, _REGISTRAR_REASON_SENTINEL)
+    # The pre-existing public read accessor still works (the compat guarantee).
+    assert rejected.reason == _REGISTRAR_REASON_SENTINEL, (
+        "RegistrationRejectedError.reason must remain a public accessor so an "
+        "external operator callback reading error.reason does not break"
+    )
+    # ``.reason`` is the explicit, opt-in untrusted accessor — it is excluded from
+    # the sanitized default rendering, so a consumer that merely logs the exception
+    # still cannot leak the registrar text via str/repr/args.
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in repr(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected.args)
+
+
+# A factory per CONCRETE RegistrationError subclass, each constructed with a
+# reason-like string argument (the sentinel) wherever the subclass takes registrar
+# text. A subclass that carries no reason (e.g. the timeout) simply ignores it; the
+# point is that EVERY concrete subclass is exercised. The completeness assertion
+# below pins this map to the actual subclass set, so a future subclass is forced to
+# register here AND prove its sanitization — a subclass that forwarded the registrar
+# reason into its message/args would then trip the leak assertion.
+_REGISTRATION_ERROR_FACTORIES: dict[
+    type[RegistrationError], Callable[[str], RegistrationError]
+] = {
+    RegistrationRejectedError: lambda reason: RegistrationRejectedError(403, reason),
+    RegistrationTimeoutError: lambda _reason: RegistrationTimeoutError(),
+}
+
+
+def _concrete_registration_error_subclasses() -> set[type[RegistrationError]]:
+    """Every concrete (non-abstract) ``RegistrationError`` subclass, recursively."""
+    discovered: set[type[RegistrationError]] = set()
+    pending: list[type[RegistrationError]] = list(RegistrationError.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        discovered.add(cls)
+        pending.extend(cls.__subclasses__())
+    return discovered
+
+
+async def test_registration_error_subclasses_never_leak_reason_in_default_form() -> (
+    None
+):
+    """INVARIANT: no concrete ``RegistrationError`` subclass renders registrar text.
+
+    Locks the secret-safety contract against a future-subclass regression (a
+    reviewer's substantive risk): for every concrete subclass constructible with a
+    reason-like string, a passed-in sentinel must NOT appear in ``str(e)``,
+    ``repr(e)``, or ``str(e.args)``. Passes today (the current subclasses are
+    safe); the moment a new subclass forwards registrar/gateway free text into its
+    message or ``args`` it trips this test.
+    """
+    concrete = _concrete_registration_error_subclasses()
+    # Completeness: the factory map must cover exactly the concrete subclass set, so
+    # a newly-added subclass cannot silently escape this invariant.
+    assert concrete == set(_REGISTRATION_ERROR_FACTORIES), (
+        "every concrete RegistrationError subclass must be registered in "
+        "_REGISTRATION_ERROR_FACTORIES so the no-leak invariant covers it; "
+        f"uncovered={concrete - set(_REGISTRATION_ERROR_FACTORIES)}, "
+        f"stale={set(_REGISTRATION_ERROR_FACTORIES) - concrete}"
+    )
+    for cls, make in _REGISTRATION_ERROR_FACTORIES.items():
+        error = make(_REGISTRAR_REASON_SENTINEL)
+        for rendered, form in (
+            (str(error), "str"),
+            (repr(error), "repr"),
+            (str(error.args), "args"),
+        ):
+            assert _REGISTRAR_REASON_SENTINEL not in rendered, (
+                f"{cls.__name__} leaked registrar reason via {form}(): {rendered!r}"
+            )

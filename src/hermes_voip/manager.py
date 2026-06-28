@@ -463,9 +463,47 @@ class RegistrationManager:
         was actually established — a refresh/keep-alive outage. A cold-start
         REGISTER that never succeeded, or a deliberate de-registration, is NOT
         retried here (those are ``connect()``'s / a clean teardown's concern).
+
+        Emits a structured WARNING log event ``sip_registration_failed`` on every
+        failure so operators can query registration rejects/timeouts without
+        parsing free-text logs. The event carries only non-sensitive fields:
+        ``outcome`` (``"rejected"`` | ``"timeout"``), ``status_code`` (the SIP
+        integer for a rejection, ``None`` for a timeout), and ``attempt`` (the
+        1-based recovery attempt counter). NEVER logs the SIP host, realm,
+        extension, username, or password (rule 34).
         """
         state.registered = False
         state.last_error = error
+        # Classify the failure for the structured event before bumping the counter.
+        outcome: str
+        status_code: int | None
+        if isinstance(error, RegistrationRejectedError):
+            outcome = "rejected"
+            status_code = error.status
+        else:
+            # RegistrationTimeoutError or any transport-send failure (RuntimeError
+            # etc.) all collapse to a "timeout" outcome for the structured event —
+            # the distinction that matters for ops is "registrar said no" vs "we
+            # never got an answer / couldn't reach it".
+            outcome = "timeout"
+            status_code = None
+        # recovery_attempt is incremented in _schedule_recovery (called below for
+        # established flows), so it is 0 on the very first failure of a cold-start
+        # flow. We add 1 here to produce a 1-based attempt count that is meaningful
+        # whether or not recovery is scheduled.
+        attempt = state.recovery_attempt + 1
+        _log.warning(
+            "SIP registration failed: %s (status=%s, attempt=%d)",
+            outcome,
+            status_code,
+            attempt,
+            extra={
+                "event": "sip_registration_failed",
+                "outcome": outcome,
+                "status_code": status_code,
+                "attempt": attempt,
+            },
+        )
         if self._on_error is not None:
             self._on_error(state.extension.extension, error)
         if state.established and not state.deregistering:

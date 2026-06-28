@@ -328,6 +328,34 @@ def test_validate_manifest_bad_spdx_raises_licence_error() -> None:
         validate_manifest(bad_manifest, ModelFamily.GUARD)
 
 
+def test_validate_manifest_reports_later_bad_file_in_multi_file_manifest() -> None:
+    """validate_manifest keeps checking pinned files until a later failure."""
+    bad_manifest = ModelManifest(
+        repo="example/model",
+        revision="0" * 40,
+        files=(
+            ModelFile(
+                name="encoder.onnx",
+                sha256="1" * 64,
+                spdx="Apache-2.0",
+            ),
+            ModelFile(
+                name="decoder.onnx",
+                sha256="2" * 64,
+                spdx="Apache-2.0",
+            ),
+            ModelFile(
+                name="joiner.onnx",
+                sha256="3" * 64,
+                spdx="GPL-3.0",
+            ),
+        ),
+    )
+    expected = re.escape("file 'joiner.onnx' declares licence 'GPL-3.0'")
+    with pytest.raises(LicenceError, match=expected):
+        validate_manifest(bad_manifest, ModelFamily.GUARD)
+
+
 def test_build_providers_licence_gate_blocks_bad_guard_manifest() -> None:
     """build_providers surfaces a LicenceError raised inside a guard factory."""
     bad_manifest = ModelManifest(

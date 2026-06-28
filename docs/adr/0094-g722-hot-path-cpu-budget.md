@@ -32,17 +32,23 @@ CPU budget gate instead of demoting it.
 
 Concrete shape:
 
-1. `src/hermes_voip/media/g722.py` records the measured per-frame hot-path costs in two
-   module-level constants:
+1. `src/hermes_voip/media/g722.py` records the measured per-frame hot-path costs and the
+   combined budget in module-level constants:
    - `_G722_ENCODE_MEASURED_US_PER_FRAME_16K = 3400.0`
    - `_G722_DECODE_MEASURED_US_PER_FRAME_16K = 3300.0`
-2. `tests/test_media_g722_budget.py` gates the hot path with the same pattern already used
-   by `tests/test_call_progress_microbench.py`:
+   - `_G722_COMBINED_BUDGET_US_PER_FRAME_16K = 20000.0`
+2. `tests/test_media_g722_budget.py` gates the hot path directly:
    - deterministic existence/range checks for the documented constants;
-   - a machine-checked assertion that encode + decode stays below one 20 ms frame period;
-   - a **very generous** 15 ms wall-clock ceiling for encode and decode individually, used
-     only as a catastrophic-regression safety net.
-3. The measurement method is the project devcontainer on CPython 3.13.5, running repeated
+   - a measured encode check that must stay within 3x the documented encode baseline;
+   - a measured decode check that must stay within 3x the documented decode baseline;
+   - a measured **combined encode+decode** check that must stay below the 20 ms packet
+     period while G.722 remains preferred by default.
+3. The benchmark avoids precision-performance flake while still being real CI evidence:
+   no sleeps, no network, no benchmark dependency, warm-up before timing, five repeated
+   batches of 20 frames, and the best batch is used to reduce scheduler-noise sensitivity.
+   The budget is coarse (20 ms), so the test fails on meaningful CPU regressions rather
+   than normal host variance.
+4. The measurement method is the project devcontainer on CPython 3.13.5, running repeated
    `G722Encoder().encode(frame)` / `G722Decoder().decode(frame)` loops on a 20 ms, 16 kHz,
    320-sample synthetic PCM frame (2000-3000 repetitions). The stateful continuous-stream
    path is the reference because production constructs one codec object per call direction
@@ -62,11 +68,12 @@ be an unnecessary quality loss today.
 - The SIP/SDES answerer preference remains wideband-first (`G722`, then G.711 fallback),
   so a peer that can carry G.722 still gets wideband audio by default.
 - The CPU trade-off is no longer implicit. A future change that materially increases the
-  codec cost must update the constants and will trip the budget test if it becomes
-  catastrophic.
-- The wall-clock gate is intentionally loose; it is NOT a precision benchmark. The exact
-  number of record remains the documented constants plus this ADR. This avoids CI flake
-  while still catching “something is badly wrong” regressions.
+  codec cost cannot pass by leaving stale constants unchanged: CI measures encode and
+  decode against the documented baselines with tolerance, and measures combined
+  encode+decode against the 20 ms packet-period budget.
+- The benchmark is intentionally coarse; it is NOT a precision performance score. The
+  3x per-side tolerance plus best-of-repeated-batches design avoids CI flake while still
+  failing meaningful regressions and any combined over-budget path.
 - We are now committed to revisiting this ADR if host measurements or production evidence
   show the pure-Python path approaching the 20 ms packet budget. The engine seam from
   ADR-0022 still allows a later switch to a compiled base dependency if CPU, not licence or
@@ -77,6 +84,7 @@ be an unnecessary quality loss today.
 | Alternative | Rejected because |
 | ----------- | ---------------- |
 | Stop preferring G.722 by default until a budget exists | Once measured, the pure-Python cost is still comfortably within the 20 ms frame period (~6.7 ms combined encode+decode), so demoting G.722 would knowingly discard wideband quality without an actual budget breach. |
+| Keep separate 15 ms encode and decode ceilings | Rejected after review: 14 ms encode + 14 ms decode would pass separately while exceeding the single 20 ms packet-period budget with G.722 still preferred. |
 | Add a tight wall-clock benchmark threshold (for example 4 ms exact) | Too CI-flaky across hardware, scheduler load, and interpreter versions. Rule 22 needs an honest budget gate, not a noisy one. |
-| Add a heavy benchmarking dependency (pytest-benchmark / perf harness) | Unnecessary for this repository’s needs; a small deterministic test plus recorded constants captures the safety goal without expanding the dependency surface. |
+| Add a heavy benchmarking dependency (pytest-benchmark / perf harness) | Unnecessary for this repository’s needs; a small real benchmark plus recorded constants captures the safety goal without expanding the dependency surface. |
 | Leave ADR-0022’s “heavier than C” statement as-is | Fails rule 22 because the cost stays qualitative and ungated; future regressions would have no concrete number to compare against. |

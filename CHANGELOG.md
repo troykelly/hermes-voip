@@ -45,6 +45,8 @@ pinned equal by the test suite.
 - **CI: pinned third-party workflow action SHAs** with an enforcement test. (#246)
 - **JitterBuffer SSRC auto-reset hysteresis** — N-consecutive-confirmation before
   accepting an SSRC change (ADR-0082). (#248)
+- **`HERMES_VOIP_CARTESIA_API_KEY` credential** — Cartesia API-key declared in the
+  plugin manifest so the Hermes config wizard surfaces it. (#342)
 
 ### Changed
 
@@ -72,6 +74,9 @@ pinned equal by the test suite.
   `.tobytes()` copy. (#295)
 - **Engine TX amplitude log via `audioop.max`** — ~51x faster than previous
   path. (#252)
+- **Plugin-list version wording reconciled** — `plugin.yaml` version expectations
+  aligned with the pinned test suite; a docs-drift guard prevents future divergence.
+  (#341)
 
 ### Fixed
 
@@ -128,6 +133,17 @@ pinned equal by the test suite.
   enforced. (#282)
 - **`call_loop` empty ASR final guard** — drops whitespace-only transcript
   finals before routing to the agent. (#269)
+- **Malformed (non-UTF-8) RTCP BYE reason strings rejected** — non-decodable
+  BYE reason payloads are now refused rather than silently discarded or
+  mis-decoded. (#338)
+
+### Security
+
+- **Removed operator-specific gateway identifiers from tracked files** — a CI
+  guard scanning the whole tracked tree now prevents reintroduction. (#343)
+- **Supply-chain audit gates declared optional extras** — a banned-SPDX optional
+  dependency now fails CI; closes the licence-gate gap for optional dependency
+  groups (ADR-0091). (#339)
 
 ## [0.1.1] - 2026-06-27
 

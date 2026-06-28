@@ -1253,3 +1253,25 @@ async def test_registration_rejected_raw_reason_is_explicit_opt_in() -> None:
     assert _REGISTRAR_REASON_SENTINEL not in str(rejected)
     assert _REGISTRAR_REASON_SENTINEL not in repr(rejected)
     assert _REGISTRAR_REASON_SENTINEL not in str(rejected.args)
+
+
+async def test_registration_rejected_reason_attribute_retained_for_compat() -> None:
+    # COMPAT (codex #351 follow-up BLOCK): original main exposed a PUBLIC
+    # ``RegistrationRejectedError.reason`` attribute. An external operator callback
+    # wired to ``on_registration_error`` may read ``error.reason`` directly. The
+    # sanitization fix must NOT drop that public accessor (that would break such a
+    # caller) — ``.reason`` must keep returning the registrar reason verbatim, the
+    # same untrusted opt-in contract as ``raw_reason``. This makes the change
+    # genuinely non-breaking: ``error.reason`` keeps working exactly as before.
+    rejected = RegistrationRejectedError(403, _REGISTRAR_REASON_SENTINEL)
+    # The pre-existing public read accessor still works (the compat guarantee).
+    assert rejected.reason == _REGISTRAR_REASON_SENTINEL, (
+        "RegistrationRejectedError.reason must remain a public accessor so an "
+        "external operator callback reading error.reason does not break"
+    )
+    # ``.reason`` is the explicit, opt-in untrusted accessor — it is excluded from
+    # the sanitized default rendering, so a consumer that merely logs the exception
+    # still cannot leak the registrar text via str/repr/args.
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in repr(rejected)
+    assert _REGISTRAR_REASON_SENTINEL not in str(rejected.args)

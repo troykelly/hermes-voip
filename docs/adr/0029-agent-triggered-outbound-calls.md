@@ -107,7 +107,9 @@ the operator opts numbers in.
   API `hang_up` uses for the Call-ID) and stores it as
   `_call_info[cid]["origin"]` (a `(platform, chat_id)` pair). The `HERMES_VOIP_
   CALL_ON_CONNECT` / cron path has no origin (no session in scope) — captured as
-  `None`.
+  `None`. When a later no-origin fallback channel is configured as a wildcard pattern
+  (for example `telegram:*`), delivery is derived from a **matching** origin only;
+  with no origin in scope the fallback fails closed to log-only.
 
 - **`report_call_result(summary: str)` tool** for the call agent (session B) to
   record the outcome before hangup → `_call_info[cid]["result"]`. SAFE (a session
@@ -143,14 +145,19 @@ the operator opts numbers in.
 - **No-origin fallback.** When there is no origin (the env-trigger / cron path), VoIP
   has no home channel of its own, so a proactive notification *into* voip is impossible
   (it always fails "No home channel set for voip"). The fallback uses
-  `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` (a `platform:chat_id` target) when set,
-  delivered by the SAME foreign-session injection the origin report uses (a
-  `MessageEvent` whose `source` names the configured channel — the path the built-in
-  `send_message` tool would also take). The `tools.send_message_tool` symbol is *not*
-  imported, because a sibling module in the hermes-agent `tools` package has a syntax
-  error mypy cannot parse under `follow_untyped_imports`; reusing the
-  `gateway.*`-only foreign-session injection keeps the type-check clean. With neither
-  origin nor a configured channel the outcome is logged only.
+  `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` when set, delivered by the SAME
+  foreign-session injection the origin report uses (a `MessageEvent` whose `source`
+  names the configured channel — the path the built-in `send_message` tool would also
+  take). Exact entries (no wildcard) preserve the original behaviour: a fixed
+  `platform:chat_id` destination. Wildcard entries (for example `telegram:*`) are
+  matched against a captured origin `platform:chat_id`; on a match the destination is
+  DERIVED from that origin (so the report lands back in the originating Telegram chat),
+  and with no matching origin the fallback fails closed to log-only. The
+  `tools.send_message_tool` symbol is *not* imported, because a sibling module in the
+  hermes-agent `tools` package has a syntax error mypy cannot parse under
+  `follow_untyped_imports`; reusing the `gateway.*`-only foreign-session injection keeps
+  the type-check clean. With neither origin nor a configured channel the outcome is
+  logged only.
 
 ### Hermes gaps recorded (so a future session does not re-derive them)
 
@@ -164,10 +171,12 @@ the operator opts numbers in.
 
 - The agent can place calls *autonomously* once the operator opts a number in — a new
   irreversible capability. It is contained by: (1) the empty-by-default allowlist (no
-  dialling at all until configured), (2) the level-3 + non-degraded privilege clamp
-  (an untrusted inbound caller can never trigger it), and (3) least privilege on the
-  resulting call (the callee is untrusted; the call agent gets the OUTBOUND persona
-  with `privilege_level=0`, so it cannot itself place a further call or transfer).
+  dialling at all until configured), (2) exact-match semantics for entries that contain
+  no wildcard characters, plus explicit per-entry wildcard opt-in where broader matching
+  is genuinely desired, (3) the level-3 + non-degraded privilege clamp (an untrusted
+  inbound caller can never trigger it), and (4) least privilege on the resulting call
+  (the callee is untrusted; the call agent gets the OUTBOUND persona with
+  `privilege_level=0`, so it cannot itself place a further call or transfer).
 
 - **The objective brief must not contain secrets.** It is spoken to / pursued with an
   untrusted callee; the operator's prompt and the call agent's persona are framed so

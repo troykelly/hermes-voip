@@ -915,7 +915,17 @@ def _proactive_place_call_allowed(tool_name: str) -> bool:
     if not platform or not chat_id:
         return False
     needle = f"{platform}:{chat_id}"
-    return needle in {entry.strip() for entry in allowed.split(",") if entry.strip()}
+    entries = {entry.strip() for entry in allowed.split(",") if entry.strip()}
+    if needle in entries:
+        return True
+    # Wildcard opt-in (issue #355): entries containing ``*`` are matched with
+    # fnmatch so operators can write ``telegram:*`` to allow any Telegram origin
+    # without enumerating every chat id. Non-wildcard entries continue to use the
+    # exact set above. The fail-closed contract is unchanged: any unresolved origin
+    # still returns False; only a positively-matching pattern grants.
+    import fnmatch  # noqa: PLC0415 -- lazy; stdlib, negligible cost
+
+    return any(fnmatch.fnmatchcase(needle, entry) for entry in entries if "*" in entry)
 
 
 async def hang_up_handler(

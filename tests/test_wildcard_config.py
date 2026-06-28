@@ -141,6 +141,20 @@ def _inject_session(
     monkeypatch.setitem(sys.modules, "gateway.session_context", module)
 
 
+def _set_chat(monkeypatch: pytest.MonkeyPatch, call_id: str | None) -> None:
+    """Monkeypatch ``_current_call_id`` so proactive tests can model no live call.
+
+    In a NON-VoIP proactive session, the session-context ``HERMES_SESSION_CHAT_ID``
+    is the ORIGIN chat id (e.g. ``telegram:chat-1000``), not a SIP Call-ID. The
+    gate's no-live-call branch is keyed off :func:`_current_call_id`, so tests must
+    override that helper directly to ``None`` while still exposing the origin via the
+    fake ``gateway.session_context`` module above.
+    """
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    monkeypatch.setattr(vt, "_current_call_id", lambda: call_id)
+
+
 class TestProactiveCallFromWildcard:
     """Wildcard pattern entries in ``HERMES_VOIP_PROACTIVE_CALL_FROM``."""
 
@@ -156,6 +170,7 @@ class TestProactiveCallFromWildcard:
 
         monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
         set_active_adapter(None)
+        _set_chat(monkeypatch, None)
         _inject_session(monkeypatch, "telegram", "chat-1000")
 
         result = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -173,6 +188,7 @@ class TestProactiveCallFromWildcard:
 
         monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
         set_active_adapter(None)
+        _set_chat(monkeypatch, None)
         _inject_session(monkeypatch, "telegram", "chat-9999")
 
         result = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -190,6 +206,7 @@ class TestProactiveCallFromWildcard:
 
         monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
         set_active_adapter(None)
+        _set_chat(monkeypatch, None)
         _inject_session(monkeypatch, "slack", "chat-1000")
 
         verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -206,6 +223,7 @@ class TestProactiveCallFromWildcard:
 
         monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:chat-1000")
         set_active_adapter(None)
+        _set_chat(monkeypatch, None)
         _inject_session(monkeypatch, "telegram", "chat-1000")
 
         result = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -223,6 +241,7 @@ class TestProactiveCallFromWildcard:
 
         monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:chat-1000")
         set_active_adapter(None)
+        _set_chat(monkeypatch, None)
         _inject_session(monkeypatch, "telegram", "chat-9999")
 
         verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -239,6 +258,7 @@ class TestProactiveCallFromWildcard:
 
         monkeypatch.delenv("HERMES_VOIP_PROACTIVE_CALL_FROM", raising=False)
         set_active_adapter(None)
+        _set_chat(monkeypatch, None)
         _inject_session(monkeypatch, "telegram", "chat-1000")
 
         verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -256,60 +276,60 @@ class TestResultChannelWildcard:
 
     def test_exact_channel_resolves_as_fixed_destination(self) -> None:
         """Exact ``telegram:chat-1000`` resolves to fixed ``(telegram, chat-1000)``."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        dest = _resolve_result_channel("telegram:chat-1000", None)
+        dest = resolve_result_channel("telegram:chat-1000", None)
         assert dest == ("telegram", "chat-1000")
 
     def test_exact_channel_with_origin_uses_fixed_destination(self) -> None:
         """Exact entry is always the fixed destination regardless of origin."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        dest = _resolve_result_channel("telegram:chat-1000", ("telegram", "chat-9999"))
+        dest = resolve_result_channel("telegram:chat-1000", ("telegram", "chat-9999"))
         assert dest == ("telegram", "chat-1000")
 
     def test_wildcard_channel_with_matching_origin_derives_destination(self) -> None:
         """Wildcard ``telegram:*`` + matching origin => origin is the destination."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        dest = _resolve_result_channel("telegram:*", ("telegram", "chat-1000"))
+        dest = resolve_result_channel("telegram:*", ("telegram", "chat-1000"))
         assert dest == ("telegram", "chat-1000")
 
     def test_wildcard_channel_with_non_matching_origin_returns_none(self) -> None:
         """Wildcard ``telegram:*`` with a ``slack`` origin does NOT match => None."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        dest = _resolve_result_channel("telegram:*", ("slack", "chat-1000"))
+        dest = resolve_result_channel("telegram:*", ("slack", "chat-1000"))
         assert dest is None
 
     def test_wildcard_channel_with_no_origin_returns_none(self) -> None:
         """Wildcard ``telegram:*`` with no origin (cron path) => None (log-only)."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        dest = _resolve_result_channel("telegram:*", None)
+        dest = resolve_result_channel("telegram:*", None)
         assert dest is None
 
     def test_none_channel_returns_none(self) -> None:
         """None channel string => None (unset => log-only, unchanged)."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        assert _resolve_result_channel(None, ("telegram", "chat-1000")) is None
+        assert resolve_result_channel(None, ("telegram", "chat-1000")) is None
 
     def test_blank_channel_returns_none(self) -> None:
         """Blank/empty channel string => None."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        assert _resolve_result_channel("", None) is None
-        assert _resolve_result_channel("  ", None) is None
+        assert resolve_result_channel("", None) is None
+        assert resolve_result_channel("  ", None) is None
 
     def test_wildcard_channel_matches_any_telegram_chat(self) -> None:
         """``telegram:*`` matches any telegram chat_id -- pattern is per-origin."""
-        from hermes_voip.adapter import _resolve_result_channel  # noqa: PLC0415
+        from hermes_voip.outbound_allow import resolve_result_channel  # noqa: PLC0415
 
-        assert _resolve_result_channel("telegram:*", ("telegram", "chat-9999")) == (
+        assert resolve_result_channel("telegram:*", ("telegram", "chat-9999")) == (
             "telegram",
             "chat-9999",
         )
-        assert _resolve_result_channel(
+        assert resolve_result_channel(
             "telegram:*", ("telegram", "chat-1234567890")
         ) == ("telegram", "chat-1234567890")

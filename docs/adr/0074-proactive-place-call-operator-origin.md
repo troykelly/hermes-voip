@@ -32,11 +32,14 @@ never reach `place_call`. The relaxation must be surgical — proactive, operato
 ## Decision
 
 Add one opt-in env gate, `HERMES_VOIP_PROACTIVE_CALL_FROM` — a comma-separated list of
-`platform:chat_id` origins. In the **no-live-call** branch of `voip_pre_tool_call` **only**,
-when the originating `(platform, chat_id)` (read from `gateway.session_context`) matches a
-configured entry **and** the tool is **exactly** `place_call`, the gate resolves
-`privilege_level=3` instead of 0; otherwise it resolves 0 as before. The decision lives in a
-single pure helper, `voip_tools._proactive_place_call_allowed(tool_name) -> bool`.
+`platform:chat_id` origins. Matching is **exact by default** and **pattern-based only when the
+operator opts in explicitly**: entries without wildcard characters stay exact, while entries
+containing `*` are matched as glob patterns (for example `telegram:*` to trust any Telegram
+chat id). In the **no-live-call** branch of `voip_pre_tool_call` **only**, when the
+originating `(platform, chat_id)` (read from `gateway.session_context`) matches a configured
+entry **and** the tool is **exactly** `place_call`, the gate resolves `privilege_level=3`
+instead of 0; otherwise it resolves 0 as before. The decision lives in a single pure helper,
+`voip_tools._proactive_place_call_allowed(tool_name) -> bool`.
 
 Deliberate constraints, each a security property:
 
@@ -49,7 +52,9 @@ Deliberate constraints, each a security property:
   call). A live call still resolves its real caller-group privilege above this branch, so a
   spoofed/injected caller is unaffected.
 - **Scoped, not blanket.** Permission is tied to explicitly-configured `(platform, chat_id)`
-  pairs (exact match after trimming), not "any chat on the platform".
+  entries. An entry without wildcards is exact after trimming; an entry with `*` is an
+  explicit operator-authored glob pattern (for example `telegram:*`). This is still not a
+  blanket trust of all non-VoIP sessions — the operator names the platform scope deliberately.
 - **Defense in depth preserved.** The static `HERMES_VOIP_OUTBOUND_ALLOW` allowlist (ADR-0029)
   still refuses any unlisted dial target at the chokepoint, so even a compromised/misconfigured
   operator chat can only reach pre-approved numbers.
@@ -63,9 +68,10 @@ is absent).
 
 ## Consequences
 
-- An operator can drive a proactive outbound call from a configured chat: the gate grants
-  operator privilege for that `place_call`, the allowlist gates the number, and the outcome is
-  reported back via the originating session / `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`.
+- An operator can drive a proactive outbound call from a configured chat OR an explicit
+  wildcard-scoped chat family (for example any Telegram chat via `telegram:*`): the gate
+  grants operator privilege for that `place_call`, the allowlist gates the number, and the
+  outcome is reported back via the originating session / `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`.
 - With the env unset, nothing changes — the privilege spine and every existing inbound
   fail-safe test stay green unchanged.
 - Two env vars must now align for proactive outbound: the **origin** (`…PROACTIVE_CALL_FROM`)

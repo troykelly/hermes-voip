@@ -160,7 +160,12 @@ from hermes_voip.originate import (
     build_outbound_invite,
     build_srtp_crypto_attrs,
 )
-from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowlist
+from hermes_voip.outbound_allow import (
+    OutboundAllowlist,
+    is_outbound_allowed,
+    load_outbound_allowlist,
+    resolve_result_channel,
+)
 from hermes_voip.provider_error import (
     classify_provider_error,
     is_provider_error,
@@ -1018,7 +1023,9 @@ class VoipAdapter(BasePlatformAdapter):
         # opts numbers in). The dial chokepoint (place_call_with_objective) enforces
         # it before any INVITE; the env-trigger CALL_ON_CONNECT path bypasses it (it
         # is the operator's own explicit dial, like the gate-bypassing test trigger).
-        self._outbound_allow: frozenset[str] = frozenset()
+        self._outbound_allow: OutboundAllowlist = OutboundAllowlist(
+            _exact=frozenset(), _patterns=()
+        )
         # _attended_consults (ADR-0048): the in-flight attended-transfer pairings,
         # mapping an ORIGINAL call's Call-ID -> its CONSULTATION leg's Call-ID. Set by
         # start_attended_consult, read by complete_attended_transfer (to find the
@@ -6398,7 +6405,12 @@ class VoipAdapter(BasePlatformAdapter):
                 exc,
             )
 
-    async def _report_to_fallback_channel(self, call_id: str, report: str) -> None:
+    async def _report_to_fallback_channel(
+        self,
+        call_id: str,
+        report: str,
+        origin: tuple[str, str] | None = None,
+    ) -> None:
         """No-origin fallback: deliver the outcome to a configured channel (ADR-0029).
 
         The CALL_ON_CONNECT / cron path has no originating session, and voip has no
@@ -6409,10 +6421,16 @@ class VoipAdapter(BasePlatformAdapter):
         lands in the configured channel's conversation, exactly the delivery path the
         built-in ``send_message`` tool would take). When unset (or malformed) the
         outcome is logged only. Best-effort: failures are logged, not raised.
+
+        The ``origin`` parameter supports the wildcard result-channel path
+        (issue #355): when ``HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`` contains ``*``,
+        :func:`resolve_result_channel` matches the pattern against ``origin``; a
+        match derives the delivery target from the origin itself. An exact channel
+        entry ignores ``origin`` (fixed destination, current behaviour unchanged).
         """
         extra = self._extra
         channel = extra.get(_OUTBOUND_RESULT_CHANNEL_KEY) if extra is not None else None
-        target = _parse_channel_target(channel)
+        target = resolve_result_channel(channel, origin)
         if target is None:
             _log.info(
                 "call %s ended (outbound, no origin, no result channel): %s",
@@ -7659,24 +7677,6 @@ def _coerce_origin(value: object) -> tuple[str, str] | None:
         platform, chat_id = value
         return (platform, chat_id)
     return None
-
-
-def _parse_channel_target(channel: str | None) -> tuple[str, str] | None:
-    """Parse a ``platform:chat_id`` channel string into a pair, or None (ADR-0029).
-
-    The no-origin fallback target ``HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`` is a
-    ``platform:chat_id`` string (split on the FIRST ``:`` so a chat_id may itself
-    contain colons). An absent, blank, or shapeless value yields ``None`` so the
-    fallback logs only rather than mis-routing.
-    """
-    if not channel or ":" not in channel:
-        return None
-    platform, chat_id = channel.split(":", 1)
-    platform = platform.strip()
-    chat_id = chat_id.strip()
-    if not platform or not chat_id:
-        return None
-    return (platform, chat_id)
 
 
 def ensure_channel_registered(channel: str) -> None:

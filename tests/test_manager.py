@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 
 import pytest
 
@@ -23,6 +24,7 @@ from hermes_voip.manager import (
     Cancel,
     InDialog,
     NewCall,
+    RegistrationError,
     RegistrationFailureCategory,
     RegistrationManager,
     RegistrationRejectedError,
@@ -1275,3 +1277,62 @@ async def test_registration_rejected_reason_attribute_retained_for_compat() -> N
     assert _REGISTRAR_REASON_SENTINEL not in str(rejected)
     assert _REGISTRAR_REASON_SENTINEL not in repr(rejected)
     assert _REGISTRAR_REASON_SENTINEL not in str(rejected.args)
+
+
+# A factory per CONCRETE RegistrationError subclass, each constructed with a
+# reason-like string argument (the sentinel) wherever the subclass takes registrar
+# text. A subclass that carries no reason (e.g. the timeout) simply ignores it; the
+# point is that EVERY concrete subclass is exercised. The completeness assertion
+# below pins this map to the actual subclass set, so a future subclass is forced to
+# register here AND prove its sanitization — a subclass that forwarded the registrar
+# reason into its message/args would then trip the leak assertion.
+_REGISTRATION_ERROR_FACTORIES: dict[
+    type[RegistrationError], Callable[[str], RegistrationError]
+] = {
+    RegistrationRejectedError: lambda reason: RegistrationRejectedError(403, reason),
+    RegistrationTimeoutError: lambda _reason: RegistrationTimeoutError(),
+}
+
+
+def _concrete_registration_error_subclasses() -> set[type[RegistrationError]]:
+    """Every concrete (non-abstract) ``RegistrationError`` subclass, recursively."""
+    discovered: set[type[RegistrationError]] = set()
+    pending: list[type[RegistrationError]] = list(RegistrationError.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        discovered.add(cls)
+        pending.extend(cls.__subclasses__())
+    return discovered
+
+
+async def test_registration_error_subclasses_never_leak_reason_in_default_form() -> (
+    None
+):
+    """INVARIANT: no concrete ``RegistrationError`` subclass renders registrar text.
+
+    Locks the secret-safety contract against a future-subclass regression (a
+    reviewer's substantive risk): for every concrete subclass constructible with a
+    reason-like string, a passed-in sentinel must NOT appear in ``str(e)``,
+    ``repr(e)``, or ``str(e.args)``. Passes today (the current subclasses are
+    safe); the moment a new subclass forwards registrar/gateway free text into its
+    message or ``args`` it trips this test.
+    """
+    concrete = _concrete_registration_error_subclasses()
+    # Completeness: the factory map must cover exactly the concrete subclass set, so
+    # a newly-added subclass cannot silently escape this invariant.
+    assert concrete == set(_REGISTRATION_ERROR_FACTORIES), (
+        "every concrete RegistrationError subclass must be registered in "
+        "_REGISTRATION_ERROR_FACTORIES so the no-leak invariant covers it; "
+        f"uncovered={concrete - set(_REGISTRATION_ERROR_FACTORIES)}, "
+        f"stale={set(_REGISTRATION_ERROR_FACTORIES) - concrete}"
+    )
+    for cls, make in _REGISTRATION_ERROR_FACTORIES.items():
+        error = make(_REGISTRAR_REASON_SENTINEL)
+        for rendered, form in (
+            (str(error), "str"),
+            (repr(error), "repr"),
+            (str(error.args), "args"),
+        ):
+            assert _REGISTRAR_REASON_SENTINEL not in rendered, (
+                f"{cls.__name__} leaked registrar reason via {form}(): {rendered!r}"
+            )

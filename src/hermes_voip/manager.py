@@ -96,9 +96,10 @@ class RegistrationError(Exception):
         the default string form is therefore safe.
 
         The registrar reason is available **only** by explicit opt-in via
-        :attr:`RegistrationRejectedError.raw_reason`. A consumer that forwards
-        ``raw_reason`` to a logging/telemetry sink owns the sanitization of that
-        untrusted text itself.
+        :attr:`RegistrationRejectedError.reason` (the back-compat accessor) or its
+        explicit-intent alias :attr:`RegistrationRejectedError.raw_reason`. A
+        consumer that forwards either to a logging/telemetry sink owns the
+        sanitization of that untrusted text itself.
     """
 
     @property
@@ -112,8 +113,9 @@ class RegistrationRejectedError(RegistrationError):
 
     The default string form is sanitized (status + category only). The
     registrar-controlled reason-phrase is kept off ``args`` and is exposed
-    solely via :attr:`raw_reason` for a consumer that explicitly opts in (and
-    then owns sanitizing that untrusted text). See :class:`RegistrationError`.
+    solely via the back-compat :attr:`reason` accessor (or its explicit-intent
+    alias :attr:`raw_reason`) for a consumer that explicitly opts in (and then
+    owns sanitizing that untrusted text). See :class:`RegistrationError`.
     """
 
     def __init__(self, status: int, reason: str) -> None:
@@ -142,12 +144,32 @@ class RegistrationRejectedError(RegistrationError):
         return RegistrationFailureCategory.REJECTED
 
     @property
+    def reason(self) -> str:
+        """The registrar's free-text reason-phrase (UNTRUSTED — opt-in only).
+
+        This is the **backwards-compatible** public accessor: original ``main``
+        exposed ``RegistrationRejectedError.reason`` as a public attribute, so an
+        external operator callback that reads ``error.reason`` keeps working
+        unchanged. :attr:`raw_reason` is its explicit-intent alias; both return
+        this same value.
+
+        Like :attr:`raw_reason`, the value is registrar-controlled and may be
+        attacker-influenced, and it is **excluded** from the sanitized default
+        string form (``str``/``repr``/``args``). Reading it is an explicit opt-in:
+        a consumer that forwards it to a log/telemetry sink owns validating or
+        escaping it first.
+        """
+        return self._reason
+
+    @property
     def raw_reason(self) -> str:
         """The registrar's free-text reason-phrase (UNTRUSTED — opt-in only).
 
-        This is registrar-controlled and may be attacker-influenced. It is NOT
-        part of the sanitized default string form; a consumer that reads it owns
-        validating/escaping it before logging or forwarding to telemetry.
+        The explicit-intent alias of the back-compat :attr:`reason` accessor —
+        both return the same registrar-controlled (possibly attacker-influenced)
+        text, and both are **excluded** from the sanitized default string form. A
+        consumer that reads either owns validating/escaping it before logging or
+        forwarding to telemetry.
         """
         return self._reason
 

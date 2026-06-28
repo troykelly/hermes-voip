@@ -1151,7 +1151,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 ### Observability
 
-- [ ] **[high] observability** — Emit a structured log event on SIP registration failure so rejects and timeouts are queryable. (`src/hermes_voip/manager.py`)
+- [x] (#348) **[high] observability** — Emit a structured log event on SIP registration failure so rejects and timeouts are queryable. (`src/hermes_voip/manager.py`) — shipped #348 (secret-safe structured WARNING distinguishing rejected/timeout/transport_failed outcomes)
 
 ### UX / conversational
 
@@ -1173,8 +1173,8 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 - [ ] **[medium] observability** — `_teardown_call` reads `CallQuality` for the `rtcp_call_quality` event but performs no one-way/no-audio inference and emits no `one_way_audio` or `media_degraded` structured event. (src/hermes_voip/adapter.py, src/hermes_voip/media/engine.py)
 - [x] (#327) **[high] ux** — DTMF input does not count as caller activity for the no-input watchdog; `feed_dtmf` / `_deliver_dtmf_group` never set `_caller_active_in_window`, so a keypad-only or hearing-impaired caller is reprompted then hung up on mid-navigation. (src/hermes_voip/media/call_loop.py)
 - [ ] **[medium] ux** — `hang_up_call` sends BYE immediately with no TTS drain; a farewell spoken in the same turn is clipped mid-word, unlike the loop-initiated goodbye which flushes before `run()` returns. (src/hermes_voip/adapter.py, src/hermes_voip/voip_tools.py)
-- [ ] **[high] docs** — runbook-0013 §6 and runbook-0014 §Error-handling falsely state provider-error-spoken-verbatim is unfixed ("NOT FIXED", "known leak — Task #26"); ADR-0063 shipped the fix in `provider_error.py` + adapter.py:1429-1448. (docs/runbooks/0013-voip-incident-oncall.md, docs/runbooks/0014-voip-slo-metrics.md)
-- [ ] **[high] docs** — runbook-0013 §5 TTS fallback recovery step instructs `HERMES_VOIP_TTS_FALLBACK=sherpa_kokoro` (underscore) but config.py validates only `sherpa-kokoro` (hyphen); following the runbook during an outage triggers `ConfigError` at startup. (docs/runbooks/0013-voip-incident-oncall.md)
+- [x] (#333) **[high] docs** — runbook-0013 §6 and runbook-0014 §Error-handling falsely state provider-error-spoken-verbatim is unfixed ("NOT FIXED", "known leak — Task #26"); ADR-0063 shipped the fix in `provider_error.py` + adapter.py:1429-1448. (docs/runbooks/0013-voip-incident-oncall.md, docs/runbooks/0014-voip-slo-metrics.md) — verified correct on main; fixed in commit de2e4f5 (both runbooks now reference ADR-0063 shipped intercept)
+- [x] (#333) **[high] docs** — runbook-0013 §5 TTS fallback recovery step instructs `HERMES_VOIP_TTS_FALLBACK=sherpa_kokoro` (underscore) but config.py validates only `sherpa-kokoro` (hyphen); following the runbook during an outage triggers `ConfigError` at startup. (docs/runbooks/0013-voip-incident-oncall.md) — verified correct on main (runbook reads `sherpa-kokoro` with hyphen); fixed in commit de2e4f5 (PR #333)
 - [ ] **[medium] docs** — runbook-0007 "The knobs" table omits `HERMES_VOIP_RING_TIMEOUT_SECS` and the `failure_outcome` structured result added by ADR-0086 (commits 881b6a9, 786b2c6, 2026-06-27); rule 42 violation. (docs/runbooks/0007-voip-outbound-calling.md)
 - [x] (#332) **[medium] feature** — `HERMES_VOIP_DENY_MODE=decline` (polite spoken-decline before BYE, ADR-0020 §6) was designed as Phase 2 but never built; `grep 'DENY_MODE\|deny_mode' src/` returns zero hits; the ADR config table entry is aspirational (rule 27). (src/hermes_voip/adapter.py, src/hermes_voip/config.py, docs/adr/0020-voip-caller-modes.md)
 - [ ] **[low] docs** — Rename test `test_sdes_rejects_non_ascii_cname` to an octet-based name; its café×100 input is now rejected by the 255-UTF-8-octet cap, not by ASCII-encodability (post #321). (tests/test_rtcp.py)
@@ -1216,8 +1216,12 @@ Privacy/vendor-identifier scrub of operator gateway identifiers from tracked fil
 
 ### Robustness / CI
 
-- [ ] **[medium] robustness/ci** (`.github/workflows/supply-chain.yml`) — The optional-extras licence gate can silently FALSE-GREEN: if `uv export` ever drops or renames the `# via hermes-voip` provenance comment its parser relies on, the package list parses empty, the `[ -s ]` guard takes the else branch, and the gate passes vacuously while extras are actually declared. Add a loud-fail guard: if optional extras are declared in `pyproject.toml` but the parsed package list is empty, FAIL (rule 37), don't skip.
+- [x] (#347) **[medium] robustness/ci** (`.github/workflows/supply-chain.yml`) — The optional-extras licence gate can silently FALSE-GREEN: if `uv export` ever drops or renames the `# via hermes-voip` provenance comment its parser relies on, the package list parses empty, the `[ -s ]` guard takes the else branch, and the gate passes vacuously while extras are actually declared. Add a loud-fail guard: if optional extras are declared in `pyproject.toml` but the parsed package list is empty, FAIL (rule 37), don't skip. — shipped #347 (`tools/check_optional_extras_guard.py` + supply-chain.yml delegation)
 
 ### Security / test
 
 - [ ] **[low] security/test** (`tests/test_no_vendor_identifiers.py`) — The product-word sub-check in the vendor-identifier guard is case-sensitive by necessity (the token is an English homograph), so it only matches the brand's canonical all-caps form; a future reintroduction of the brand in non-canonical case could slip past that one sub-check (the distinctive vendor/model/abbreviation fragments remain case-insensitive). Consider a context-aware check.
+
+## Review follow-ups (PR #348 opus review, 2026-06-28)
+
+- [ ] **[medium] security/robustness** (`src/hermes_voip/manager.py`) — `_on_registration_failed()` passes the raw `error` to the operator-supplied `_on_error(extension, error)` callback; `RegistrationRejectedError.__str__` embeds the registrar-controlled free-text `reason`. If an operator wires that callback to a logger or telemetry sink, the registrar-influenced `reason` (plus the extension passed alongside) could reach logs through a path the new structured-log secret-safety guard (PR #348) does NOT cover. Add a docstring warning on the `_on_error` callback contract (the `error` argument may carry registrar-controlled text; callers must not log it verbatim alongside sensitive context) and/or pass a sanitized error category instead of the raw exception. Discovered in the PR #348 opus review.

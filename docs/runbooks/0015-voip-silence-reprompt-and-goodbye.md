@@ -22,16 +22,13 @@ see below). This runbook is the operational HOW.
 ## Current wiring (what IS, AGENTS rule 27)
 
 Both behaviours are implemented in `src/hermes_voip/media/call_loop.py` as `CallLoop`
-constructor kwargs with built-in English defaults. The adapter (`adapter._run_call_loop`)
-constructs `CallLoop` with explicit kwargs and does **not yet pass** these new ones, so the
-**`CallLoop` defaults are what runs in production** — i.e. the feature is **live on every call
-right now** (reprompt on, goodbye on, built-in phrases), with no env knob required.
+constructor kwargs with built-in English defaults. The adapter (`adapter._run_call_loop`,
+~line 5104) **passes all six kwargs explicitly** from `MediaConfig`, and `config.py`
+(~lines 343–374, PR #188) exposes each as a `HERMES_VOIP_*` env var. All six knobs are
+fully wired end-to-end: env var → `MediaConfig` field → `_run_call_loop` kwarg → `CallLoop`.
 
-Threading operator env vars / language-selected phrase sets through `MediaConfig`
-(`config.py`) — the way `HERMES_VOIP_TTS_COMFORT_FILLER*` / `HERMES_VOIP_LANGUAGE` are
-threaded for the comfort filler (runbook 0006) — is a **planned follow-on in the `config.py`
-lane**. Until that lands there is **no `HERMES_VOIP_*` env var** for these knobs; tuning is via
-the `CallLoop` kwargs below (e.g. for a custom embedding, or once the adapter plumbs them).
+The feature is **live on every call** with the defaults shown below; set the env vars to
+override (see the env-var table after the kwarg table).
 
 ## The knobs (`CallLoop` kwargs)
 
@@ -46,6 +43,19 @@ the `CallLoop` kwargs below (e.g. for a custom embedding, or once the adapter pl
 
 The silence window and reprompt phrasing reuse the comfort-filler RNG and the same injected
 `sleep` seam, so the loop has one deterministic time source for tests.
+
+## Env vars (all six knobs are wired via `MediaConfig`)
+
+| Env var | Maps to kwarg | Default | Notes |
+| --- | --- | --- | --- |
+| `HERMES_VOIP_NO_INPUT_REPROMPT` | `no_input_reprompt` | `true` | `false` disables the watchdog entirely. |
+| `HERMES_VOIP_NO_INPUT_TIMEOUT_MS` | `no_input_timeout_ms` | `10000` | Must be `> 0`. |
+| `HERMES_VOIP_NO_INPUT_MAX_REPROMPTS` | `no_input_max_reprompts` | `2` | `>= 0`; `0` goes straight to goodbye. |
+| `HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES` | `no_input_reprompt_phrases` | (built-in English set) | Newline-separated list; must be non-empty. |
+| `HERMES_VOIP_GOODBYE` | `goodbye` | `true` | `false` → call ends silently. |
+| `HERMES_VOIP_GOODBYE_PHRASE` | `goodbye_phrase` | `"Goodbye."` | The closing line spoken pre-BYE. |
+
+All six are read at `connect()` time and validated by `MediaConfig._validate_no_input()`.
 
 ## How it behaves (the guarantees)
 

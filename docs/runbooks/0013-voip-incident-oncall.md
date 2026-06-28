@@ -435,7 +435,7 @@ curl -sS -I "https://api.deepgram.com/v1/listen" \
 ```bash
 # ElevenLabs Cloud:
 curl -sS -I "https://api.elevenlabs.io/v1/text-to-speech" \
-  -H "xi-api-key: ${HERMES_VOIP_ELEVENLABS_API_KEY:?not set}"
+  -H "xi-api-key: ${ELEVENLABS_API_KEY:?not set}"
 # Expect: 405 (POST required) or 200.
 # If: 502, 429 (rate limit), timeout → ElevenLabs is down or key is invalid.
 
@@ -457,14 +457,31 @@ ls -la "$HERMES_VOIP_TTS_MODEL"
 - **LLM has no fallback.** A provider outage is an outage.
 - **STT has no fallback** (currently). If Deepgram is down, calls cannot transcribe speech.
 
-### 6. Provider error spoken to caller (current behavior)
+### 6. Provider error handling — ADR-0063 (shipped)
 
-**Important:** transient provider errors (e.g., `502 Bad Gateway`, `overloaded_error`) are
-currently spoken verbatim to the caller. This is a known leak (Task #26 / ADR backlog — marked
-CORE priority).
-- The error does not contain secrets (just the HTTP status / vendor error message).
-- **Temporary mitigation:** if a provider outage is happening, disable the platform entirely
-  (`HERMES_VOIP=` or remove from `plugins.enabled`) to avoid speaking errors to callers.
+**Current behaviour:** transient provider errors (e.g., `502 Bad Gateway`,
+`overloaded_error`) are **NOT spoken to the caller**. ADR-0063 shipped
+`src/hermes_voip/provider_error.py` and an intercept in `adapter.py`
+(`_deliver_content`, ~line 1435): when `is_provider_error()` matches the LLM
+reply, the adapter replaces it with a safe apology phrase
+(`resolve_error_apology()`) before calling `loop.speak()`. The raw error is
+logged at WARNING with structured `event=provider_error_replaced` (visible in
+the log pipeline) but the caller hears only the apology.
+
+The apology phrase is operator-overridable via `HERMES_VOIP_ERROR_APOLOGY`; a
+per-language fallback is applied for non-English calls when a native phrase is
+registered.
+
+**To observe interception in logs:**
+
+```bash
+jq 'select(.event=="provider_error_replaced") | {call_id, error_category, language}' \
+  /path/to/hermes/log.jsonl
+```
+
+**If you still see raw errors in calls** (should not happen): check that the
+`provider_error.py` patterns cover the vendor error format. Widen `is_provider_error`
+or set `HERMES_VOIP_ERROR_APOLOGY` to a fixed safe phrase and redeploy.
 
 ---
 

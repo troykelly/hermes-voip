@@ -47,6 +47,14 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 | Read by | `hermes_voip.voip_tools._proactive_place_call_allowed` (at the `pre_tool_call` gate) |
 | Effect | a `place_call` (ONLY) from a listed origin, with **no live SIP call** in scope, resolves operator privilege (level 3) instead of the fail-safe level 0 |
 
+| Item | Value |
+| --- | --- |
+| Env var | `HERMES_VOIP_RING_TIMEOUT_SECS` (optional, ADR-0086) |
+| Type | positive float (seconds); max 3600 |
+| Default | **unset** → no automatic ring-timeout (the adapter's hard sink timeout governs) |
+| Read by | `hermes_voip.voip_tools._parse_ring_timeout` (at `place_call` invocation) |
+| Effect | when set, arms `VoipAdapter._ring_timeout` which cancels an unanswered outbound INVITE after this many seconds; **TLS transport only** — raises `NotImplementedError` immediately on a WSS gateway (see §Aborting below) |
+
 A call triggered by an **agent turn** always reports its outcome back to that originating
 session (captured from `gateway.session_context` at trigger time) — the result channel is the
 fallback ONLY for the env-trigger/cron path, because voip has no home channel of its own and a

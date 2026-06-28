@@ -47,7 +47,7 @@ ADR-0038 §3 assumed the gateway's Secure-WebSocket edge uses a *different* dige
 password than the SIP-TLS edge, and added an optional `HERMES_SIP_WS_PASSWORD`
 override on that premise. A live RFC 7118 REGISTER credential matrix disproved it
 for this gateway: the WSS edge (port 8090, path `/ws`, subprotocol `sip`, realm
-`voip002`, MD5 `qop=auth`) returns **`200 OK`** with the **SIP-TLS digest
+`example`, MD5 `qop=auth`) returns **`200 OK`** with the **SIP-TLS digest
 password** and **`401`** with the gateway's other ("portal/web-app login")
 password. So the WSS edge **shares** the SIP credential here, and the documented
 fallback (`HERMES_SIP_WS_PASSWORD` unset → reuse `HERMES_SIP_PASSWORD`) is the

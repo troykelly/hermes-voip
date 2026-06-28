@@ -1,10 +1,10 @@
-"""Privacy invariant guard against gateway vendor/model/brand identifiers.
+"""Privacy invariant guard against sensitive gateway identifiers.
 
-CLAUDE.md hard invariant + AGENTS.md rule 34 ban device/vendor identifiers in
-ANY tracked file of this PUBLIC repo. The operator's real test-gateway vendor,
-model, brand, and product name leaked across the tree once before (a regression
-of the PR-103 scrub). This test scans the actual git-tracked tree so any
-re-introduction fails CI immediately.
+CLAUDE.md hard invariant + AGENTS.md rule 34 ban device/vendor identifiers and
+other operator-specific gateway labels in ANY tracked file of this PUBLIC repo.
+The operator's real test-gateway vendor, model, brand, product name, and a live
+SIP realm label leaked across the tree once before. This test scans the actual
+git-tracked tree so any re-introduction fails CI immediately.
 
 The references are kept vendor-neutral (e.g. "a real RFC-compliant SIP gateway")
 so the interop WHY of each is preserved without naming the device.
@@ -27,6 +27,7 @@ _BANNED_CASE_INSENSITIVE: tuple[str, ...] = (
     "grand" + "stream",
     "u" + "cm6304",
     "gd" + "ms",
+    "voi" + "p002",
 )
 # Word-boundary token (the vendor product name) — matched case-sensitively as a
 # whole word so the unrelated orchestration "wave" concept is not flagged.

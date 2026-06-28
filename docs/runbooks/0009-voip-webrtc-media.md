@@ -392,7 +392,7 @@ First inbound WebRTC call from the live gateway (an appliance-class gateway whos
 embedded Asterisk). What was **proven on the wire**, in order:
 
 1. **WSS REGISTER → `200 OK`** (expires ~299 s) on port `8090`, path `/ws`, subprotocol
-   `sip`, realm `voip002`, MD5 `qop=auth` — using the **VoIP-section `Password`** (the SIP
+   `sip`, realm `example`, MD5 `qop=auth` — using the **VoIP-section `Password`** (the SIP
    digest). `HERMES_SIP_WS_PASSWORD` is left **unset**; the item's top-level `password` is
    the operator web-app portal login and `401`s here (see runbook 0002).
 2. **Inbound INVITE** classified to the `operator` group (needs `HERMES_VOIP_CALLER_ALLOW_FILE`

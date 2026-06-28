@@ -12,6 +12,7 @@ Fakes only (``pbx.example.test``, ext ``1000``/``1001``, ``198.51.100.x``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import pytest
@@ -89,6 +90,51 @@ def _ok_for(register_text: str, *, expires: int = 300) -> SipResponse:
         f"Contact: {reg.header('Contact')};expires={expires}\r\n"
         "Content-Length: 0\r\n\r\n"
     )
+
+
+def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
+    structured_fields = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key
+        not in {
+            "name",
+            "msg",
+            "args",
+            "levelname",
+            "levelno",
+            "pathname",
+            "filename",
+            "module",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "lineno",
+            "funcName",
+            "created",
+            "msecs",
+            "relativeCreated",
+            "thread",
+            "threadName",
+            "processName",
+            "process",
+            "taskName",
+            "message",
+        }
+    }
+    serialized_fields = json.dumps(structured_fields, sort_keys=True, default=repr)
+    serialized_record = json.dumps(record.__dict__, sort_keys=True, default=repr)
+    rendered_message = record.getMessage()
+    for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
+        assert secret not in serialized_fields, (
+            f"structured failure log leaked secret {secret!r} in extra fields"
+        )
+        assert secret not in serialized_record, (
+            f"structured failure log leaked secret {secret!r} in serialized record"
+        )
+        assert secret not in rendered_message, (
+            f"structured failure log leaked secret {secret!r} in rendered message"
+        )
 
 
 def _challenge_for(register_text: str) -> SipResponse:
@@ -922,8 +968,9 @@ async def test_rejected_refresh_emits_structured_failure_log_event(
 
     SECRET-SAFE: the emitted LogRecord must NOT contain the fake SIP host
     (``pbx.example.test``), extension/username (``1000``/``1001``), or password
-    (``p1``/``p2``) in its formatted message — rule 34 applies to structured log
-    events the same as to free-text log lines.
+    (``p1``/``p2``) in any serialized structured field or in the formatted
+    message — rule 34 applies to structured log events the same as to free-text
+    log lines.
     """
     transport = _FakeTransport()
     manager = _disable_refresh_floor(
@@ -937,8 +984,9 @@ async def test_rejected_refresh_emits_structured_failure_log_event(
     await manager.start()
     first_register = transport.sent[0]
     call_id = SipRequest.parse(first_register).header("Call-ID")
-    await manager.on_response(_ok_for(first_register))  # extension 1000 now up
-    await asyncio.sleep(0.05)
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(first_register))  # extension 1000 now up
+        await asyncio.sleep(0.05)
     refresh = next(
         m
         for m in transport.sent[1:]
@@ -976,10 +1024,8 @@ async def test_rejected_refresh_emits_structured_failure_log_event(
     assert getattr(rec, "attempt", 0) >= 1, (
         "structured field 'attempt' must be >= 1 on the first failure"
     )
-    # rule 34: never log secrets in the structured event
-    msg = rec.getMessage()
-    for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
-        assert secret not in msg, f"structured failure log leaked secret {secret!r}"
+    # rule 34: never log secrets in the structured event or any structured fields
+    _assert_failure_log_is_secret_safe(rec)
 
 
 async def test_timeout_refresh_emits_structured_failure_log_event(
@@ -992,7 +1038,8 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
     - ``status_code`` — ``None`` (no SIP response was received)
     - ``attempt`` — the integer recovery attempt count (>= 1 on first failure)
 
-    SECRET-SAFE: same rule-34 constraints as the rejection variant.
+    SECRET-SAFE: same rule-34 constraints as the rejection variant, including
+    every serialized structured field.
     """
     transport = _FakeTransport()
     manager = _disable_refresh_floor(
@@ -1006,9 +1053,9 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
     )
     await manager.start()
     first_register = transport.sent[0]
-    await manager.on_response(_ok_for(first_register))  # extension 1000 now up
-    # Deliberately do NOT feed a response to the refresh — the Timer-F/B fires.
     with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(first_register))  # extension 1000 now up
+        # Deliberately do NOT feed a response to the refresh — the Timer-F/B fires.
         await asyncio.sleep(0.2)
     await manager.aclose()
 
@@ -1038,6 +1085,4 @@ async def test_timeout_refresh_emits_structured_failure_log_event(
     assert getattr(rec, "attempt", 0) >= 1, (
         "structured field 'attempt' must be >= 1 on the first failure"
     )
-    msg = rec.getMessage()
-    for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
-        assert secret not in msg, f"structured timeout log leaked secret {secret!r}"
+    _assert_failure_log_is_secret_safe(rec)

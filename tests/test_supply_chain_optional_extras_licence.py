@@ -57,7 +57,11 @@ def _optional_extras_run() -> str:
 
 def _optional_extras_python_script() -> str:
     run_cmd = _optional_extras_run()
-    match = re.search(r"<<'PY'\n(?P<script>.*)\n\s*PY", run_cmd, flags=re.DOTALL)
+    match = re.search(
+        r"<<'PY'[^\n]*\n(?P<script>.*)\n\s*PY",
+        run_cmd,
+        flags=re.DOTALL,
+    )
     assert match is not None, "Optional-extras step must embed a Python parser script"
     return textwrap.dedent(match.group("script"))
 
@@ -71,15 +75,18 @@ def test_optional_extras_licence_step_exports_all_extras_runtime_surface() -> No
     licence report from ``uv export --all-extras --no-dev --no-emit-project
     --no-hashes``.
     """
-    matching_runs = [
-        step.get("run", "")
-        for step in _audit_steps()
-        if isinstance(step.get("run"), str)
-        and "uv export" in step["run"]
-        and "--all-extras" in step["run"]
-        and "--no-dev" in step["run"]
-        and "pip-licenses" in step["run"]
-    ]
+    matching_runs: list[str] = []
+    for step in _audit_steps():
+        run_cmd = step.get("run")
+        if not isinstance(run_cmd, str):
+            continue
+        if (
+            "uv export" in run_cmd
+            and "--all-extras" in run_cmd
+            and "--no-dev" in run_cmd
+            and "pip-licenses" in run_cmd
+        ):
+            matching_runs.append(run_cmd)
 
     assert matching_runs, (
         "supply-chain.yml does not have a licence-report step for optional runtime "

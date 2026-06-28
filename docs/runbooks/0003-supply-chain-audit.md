@@ -3,9 +3,10 @@
 **What it is.** The CI advisory + licence gate for this plugin's dependencies
 (AGENTS.md rule 35), in the `audit` job of
 `.github/workflows/supply-chain.yml`. It (1) installs the dependency surface and
-runs `pip-audit` (PyPI Advisory DB / OSV — free/OSS), and (2) licence-checks the
-production deps with `pip-licenses` against a permissive-OSS allowlist. The WHY is
-ADR-0024. This runbook is the HOW.
+runs `pip-audit` (PyPI Advisory DB / OSV — free/OSS), (2) licence-checks the
+default production deps with `pip-licenses` against a permissive-OSS allowlist,
+and (3) separately reports the optional runtime extras surface with the same
+allowlist. The WHY is ADR-0024. This runbook is the HOW.
 
 > Public repo — no hosts/tokens/PII here; this gate touches only package metadata.
 
@@ -14,15 +15,26 @@ ADR-0024. This runbook is the HOW.
 ```yaml
 - run: uv sync --frozen --all-extras        # install hermes+ml+media+webrtc too
 - run: uv run pip-audit                     # audit the FULL installed surface, no suppression
-# licence gate (unchanged): scoped to PRODUCTION deps via `uv export --no-dev`
+- name: Licence allowlist (production deps) # default shipped surface only
+- name: Licence allowlist (optional runtime extras) # additive extra-surface report
 ```
 
-`--all-extras` matters: `pip-audit` audits the *installed* environment, so a bare
-`uv sync --frozen` (no extras → only `audioop-lts` installed) leaves every
-extra-only transitive dependency uninstalled and reports a **false green**. The
-licence gate is unaffected — it reads the lock via `uv export --frozen --no-dev`,
-which ignores extras, so it stays scoped to production deps (today: just
-`audioop-lts`).
+`--all-extras` matters twice. First, `pip-audit` audits the *installed*
+environment, so a bare `uv sync --frozen` (no extras → only `audioop-lts`
+installed) leaves every extra-only transitive dependency uninstalled and
+reports a **false green**. Second, `uv export --frozen --no-dev` still lists only
+the default production dependency set, so the licence gate now keeps that base
+report and adds a separate `uv export --frozen --all-extras --no-dev
+--no-emit-project --no-hashes` report for the optional runtime extras closure.
+That additive report filters to the packages marked `# via hermes-voip` in the
+export, i.e. the direct packages this repo declares in `[project.optional-
+dependencies]`, so extra-only runtime packages cannot bypass the allowlist audit
+while host/runtime transitive metadata stays outside this repo's declaration
+boundary.
+
+Today the base production export is still just `audioop-lts`; the optional
+runtime-extras export is the direct hermes/ml/media/webrtc package set declared
+by `hermes-voip`.
 
 ## pyjwt history — fully resolved (ADR-0062)
 
@@ -66,15 +78,104 @@ uv run pip-audit
 # expect: "No known vulnerabilities found"  +  exit 0
 ```
 
-Licence gate (must stay scoped to production deps):
+Licence gates (the base production report stays separate from the additive
+optional-runtime-extras report):
 
 ```bash
 uv export --frozen --no-dev --no-emit-project --no-hashes | sed 's/[<>=!~; ].*//' \
   | grep -vE '^$|^#|^-e'        # expect: audioop-lts  (extras NOT listed)
+
+uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes
+# expect: a full requirements export whose direct hermes-voip declarations are
+# the entries marked with `# via hermes-voip`
 ```
 
-The local project (`hermes-voip`) is skipped by pip-audit ("not found on PyPI") —
-that is expected, not a failure.
+Both exports feed `pip-licenses --allow-only` in CI, but the second report first
+extracts only the `# via hermes-voip` package names from the all-extras export.
+That keeps the scope aligned with the backlog item: all declared optional runtime
+extras are licence-gated, while transitive host/runtime dependencies are still
+covered by `pip-audit` rather than a fragile string allowlist. The local project
+(`hermes-voip`) is skipped by pip-audit ("not found on PyPI") — that is
+expected, not a failure.
+
+To mirror the two licence reports locally:
+
+```bash
+uv run pip-licenses --packages $(uv export --frozen --no-dev --no-emit-project --no-hashes \
+  | sed 's/[<>=!~; ].*//' | grep -vE '^$|^#|^-e' | tr '\n' ' ') \
+  --allow-only="MIT;MIT License;BSD License;BSD-2-Clause;BSD-3-Clause;Apache-2.0;Apache Software License;ISC;ISC License (ISCL);Python Software Foundation License;PSF-2.0;0BSD;BlueOak-1.0.0"
+
+uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes \
+  | uv run python - <<'PY'
+import sys
+
+package_name: str | None = None
+include_package = False
+selected: list[str] = []
+
+
+def flush() -> None:
+    global package_name, include_package
+    if package_name is not None and include_package:
+        selected.append(package_name)
+
+
+for raw_line in sys.stdin:
+    line = raw_line.rstrip("\n")
+    stripped = line.strip()
+    if not stripped or stripped.startswith("# This file was autogenerated"):
+        continue
+    if not line.startswith(" "):
+        flush()
+        package_name = stripped
+        include_package = False
+        for separator in ("<", ">", "=", "!", "~", ";", " "):
+            if separator in package_name:
+                package_name = package_name.split(separator, 1)[0]
+                break
+        continue
+    if "hermes-voip" in stripped:
+        include_package = True
+
+flush()
+for package in sorted(set(selected)):
+    print(package)
+PY
+# expect: aioice audioop-lts cryptography hermes-agent numpy onnxruntime opuslib
+#         pyopenssl sherpa-onnx tokenizers websockets
+
+uv run pip-licenses --packages aioice audioop-lts cryptography hermes-agent numpy \
+  onnxruntime opuslib pyopenssl sherpa-onnx tokenizers websockets \
+  --allow-only="MIT;MIT License;BSD License;BSD-2-Clause;BSD-3-Clause;Apache-2.0;Apache Software License;ISC;ISC License (ISCL);Python Software Foundation License;PSF-2.0;0BSD;BlueOak-1.0.0;Apache-2.0 OR BSD-3-Clause;BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0;Apache licensed, as found in the LICENSE file"
+```
+
+The second report is intentionally additive: it proves every direct optional
+runtime extra declaration also satisfies the allowlist.
+
+Current direct optional-runtime package set (verified from the all-extras export):
+
+- `aioice`
+- `audioop-lts`
+- `cryptography`
+- `hermes-agent`
+- `numpy`
+- `onnxruntime`
+- `opuslib`
+- `pyopenssl`
+- `sherpa-onnx`
+- `tokenizers`
+- `websockets`
+
+Current extra-report-only allowlist strings (all permissive metadata for the
+packages above):
+
+- `Apache-2.0 OR BSD-3-Clause`
+- `BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0`
+- `Apache licensed, as found in the LICENSE file`
+
+If a dependency update changes any of those exact strings, re-run the local
+mirror command above and update the workflow allowlist in the same change after
+verifying the new string is still permissive-only.
 
 ## Trigger
 

@@ -548,8 +548,9 @@ OPEN_ENTRY_TOOL_SCHEMA: dict[str, object] = {
 #: whose new untrusted outbound leg has no human in the loop): the operator-level party
 #: on the live call confirming the keypad press IS the per-call, per-target
 #: authorization (ADR-0031 alternatives — a destination allowlist is a recorded future
-#: hardening, not shipped). ``transfer_attended`` is deliberately NOT exposed — it needs
-#: a consult-leg Dialog the agent cannot originate (deferred, ADR-0031 §4).
+#: hardening, not shipped). ``transfer_attended`` is fully exposed and wired
+#: (plugin.yaml, adapter.py); ADR-0048 (closed 2026-06-18) delivered the
+#: consultative-transfer implementation end-to-end.
 TRANSFER_BLIND_TOOL_NAME = "transfer_blind"
 
 #: ``transfer_blind`` schema. ``target`` is the destination (an extension or SIP URI)

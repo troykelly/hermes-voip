@@ -417,6 +417,28 @@ def test_bye_round_trip_with_reason() -> None:
     assert Bye.parse(packed) == bye
 
 
+def test_bye_valid_utf8_reason_round_trips() -> None:
+    """A BYE reason carrying multibyte UTF-8 decodes back to the same text."""
+    reason_bytes = b"h\xc3\xa9y"
+    reason_text = reason_bytes.decode("utf-8")
+    body = struct.pack("!I", 0xCAFEBABE) + bytes([len(reason_bytes)]) + reason_bytes
+    body += b"\x00" * ((-(1 + len(reason_bytes))) % 4)
+    wire = bytes([0x80 | 1, RTCP_PT_BYE]) + struct.pack("!H", len(body) // 4) + body
+
+    assert Bye.parse(wire) == Bye(ssrcs=(0xCAFEBABE,), reason=reason_text)
+
+
+def test_bye_malformed_utf8_reason_raises_rtcp_error() -> None:
+    """A malformed-UTF-8 BYE reason is rejected as RtcpError, not mangled."""
+    reason_bytes = b"\x80"
+    body = struct.pack("!I", 0xDEADC0DE) + bytes([len(reason_bytes)]) + reason_bytes
+    body += b"\x00" * ((-(1 + len(reason_bytes))) % 4)
+    wire = bytes([0x80 | 1, RTCP_PT_BYE]) + struct.pack("!H", len(body) // 4) + body
+
+    with pytest.raises(RtcpError, match="BYE reason is not valid UTF-8"):
+        Bye.parse(wire)
+
+
 # ---------------------------------------------------------------------------
 # Compound packets (RFC 3550 §6.1)
 # ---------------------------------------------------------------------------

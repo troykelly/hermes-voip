@@ -193,108 +193,21 @@ def test_optional_extras_parser_keeps_direct_extra_packages(
     ]
 
 
-def _extract_shell_guard_segment(run_cmd: str) -> str:
-    """Return the portion of the shell script that runs after the Python parser.
+def test_optional_extras_step_delegates_guard_to_extracted_module() -> None:
+    """The fail-loud guard lives in a unit-tested module, not inline YAML shell.
 
-    The fail-loud guard lives between ``PY`` (end of the heredoc) and the
-    ``rm -f`` cleanup block.
+    The empty-parse branch must call ``tools.check_optional_extras_guard`` rather
+    than an inline ``python3 -c`` one-liner, so the skip/fail/run decision is
+    exercised by ``tests/test_supply_chain_optional_extras_guard.py``.  Asserting
+    the workflow delegates keeps the two in lock-step.
     """
-    # Strip the heredoc body; keep only the shell wrapper
-    return run_cmd.split("PY", 2)[-1]  # text after the closing ``PY``
-
-
-def test_optional_extras_guard_fails_loud_when_extras_declared_but_parse_empty(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Fail loudly when optional-extras are declared but the parser returns nothing.
-
-    If the ``uv export`` comment format changes and the parser yields an empty
-    ``optional-runtime-pkgs.txt`` while ``pyproject.toml`` still declares
-    ``[project.optional-dependencies]``, the CI step MUST exit non-zero with a
-    clear message — never silently pass (rule 37 / spec: fail-loud guard).
-
-    The guard is embedded in the shell ``run:`` block of the
-    ``Licence allowlist (optional runtime extras)`` step immediately after the
-    ``PY`` heredoc closes. This test exercises it by:
-
-    * Writing a fake ``pyproject.toml`` that declares one extra.
-    * Writing an empty ``optional-runtime-pkgs.txt`` (simulates a broken parser).
-    * Extracting and running the shell portion of the step inside ``tmp_path``.
-    * Asserting exit code is non-zero and stderr/stdout carries a diagnostic.
-    """
-    # Fake pyproject.toml with a declared optional dependency
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent(
-            """\
-            [project]
-            name = "hermes-voip"
-            version = "0.0.0"
-
-            [project.optional-dependencies]
-            webrtc = ["aioice==0.10.2"]
-            """
-        )
-    )
-    # Empty parsed package list (simulates broken/missing provenance comment)
-    (tmp_path / "optional-runtime-pkgs.txt").write_text("")
-
     run_cmd = _optional_extras_run()
-    shell_after_py = _extract_shell_guard_segment(run_cmd)
 
-    result = subprocess.run(  # noqa: S603
-        ["bash", "-euo", "pipefail", "-c", shell_after_py],  # noqa: S607 - bash is a known system shell.
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
+    assert "tools.check_optional_extras_guard" in run_cmd, (
+        "The optional-extras step must delegate its skip/fail-loud decision to the "
+        "tools.check_optional_extras_guard module (see "
+        "tests/test_supply_chain_optional_extras_guard.py)."
     )
-
-    assert result.returncode != 0, (
-        "Expected the gate to fail when optional-extras are declared in "
-        "pyproject.toml but the parsed package list is empty. "
-        f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    )
-    combined = result.stdout + result.stderr
-    assert combined, (
-        "Expected a diagnostic message explaining why the gate failed, got empty output"
-    )
-
-
-def test_optional_extras_guard_skips_when_genuinely_no_extras(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The guard must still allow skipping when no extras are declared.
-
-    A project with an empty ``[project.optional-dependencies]`` section (or no
-    section at all) has a genuinely empty optional package set.  The gate should
-    print the existing "no extras" message and exit 0 — the skip path is
-    legitimate and must not be broken by the fail-loud guard.
-    """
-    # pyproject.toml with NO optional-dependencies section
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent(
-            """\
-            [project]
-            name = "hermes-voip"
-            version = "0.0.0"
-            """
-        )
-    )
-    # Empty parsed package list (correct: no extras → nothing to parse)
-    (tmp_path / "optional-runtime-pkgs.txt").write_text("")
-
-    run_cmd = _optional_extras_run()
-    shell_after_py = _extract_shell_guard_segment(run_cmd)
-
-    result = subprocess.run(  # noqa: S603
-        ["bash", "-euo", "pipefail", "-c", shell_after_py],  # noqa: S607 - bash is a known system shell.
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, (
-        "Expected the gate to succeed (skip) when no optional-extras are declared. "
-        f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    )
+    # The brittle inline ``python3 -c`` guard must be gone — it was untestable and
+    # checked value-truthiness rather than counting declared packages.
+    assert "python3 -c" not in run_cmd

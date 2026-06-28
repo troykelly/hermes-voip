@@ -156,6 +156,33 @@ Patterns: exact value or `*`-suffixed literal prefix. The default group **must**
 
 List-file format: `{ "patterns": ["+15555550100", "1000", "+15550*"] }`.
 
+### Deny enforcement style — `HERMES_VOIP_DENY_MODE` (ADR-0020 §5/§6)
+
+How a **declined** caller (a `declined_at_sip` group / a deny-list match) is handled at
+the inbound INVITE. Independent of which list scheme you use.
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `HERMES_VOIP_DENY_MODE` | `reject` → hard `603 Decline` (pre-200-OK; no media, no agent). `decline` → ANSWER (`200 OK`), speak one short line, then `BYE`. | `reject` |
+| `HERMES_VOIP_DECLINE_PHRASE` | the one line spoken in `decline` mode (blank/unset → the built-in default) | `Sorry, I cannot take this call.` |
+
+- **`reject` (default):** cheapest and gives the caller zero agent surface. A persistent
+  spammer may learn the number is blocked and retry from a fresh number.
+- **`decline`:** the call is answered, the caller hears one short configured line over
+  real media, then we hang up (`BYE`). No STT/agent/VAD runs — the declined caller still
+  **never reaches the agent**. Use where a polite "we can't take this call" trains a
+  spammer less than a hard 603. An invalid `HERMES_VOIP_DENY_MODE` value fails loud
+  (`ConfigError` naming the var) at startup. A **blank/unset** `HERMES_VOIP_DECLINE_PHRASE`
+  uses the built-in default `Sorry, I cannot take this call.` (it is never answered as
+  dead air — a blank value defaults). The phrase must be **ONE short line**: a value with
+  an embedded line break, or longer than 200 characters, is rejected at startup
+  (`ConfigError` naming the var) — it is spoken once, not as a multi-line block.
+
+**Verify** `decline`: place a call from a deny-listed caller-ID with
+`HERMES_VOIP_DENY_MODE=decline` set; the call connects (200 OK), you hear the decline
+phrase, then the call drops (BYE). With `reject` (or unset) the same call is rejected
+immediately (`603`) with no audio.
+
 > **Privileged default is refused (fail-loud).** Only `grey` is a valid
 > `HERMES_VOIP_CALLER_DEFAULT_MODE`. `allow` is **rejected at startup with a
 > `ConfigError`**: it would put every unmatched (unknown, forgeable) caller in the

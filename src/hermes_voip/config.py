@@ -33,13 +33,20 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 from hermes_voip.registration import RegistrationConfig, ViaTransport
+
+#: Deny enforcement style for a declined-group caller (ADR-0020 §5/§6). ``reject``
+#: sends a hard ``603 Decline`` (Phase 1); ``decline`` answers + speaks one TTS line
+#: + BYEs (Phase 2). The runtime counterpart is ``_DENY_MODES``, kept in sync by hand.
+type DenyMode = Literal["reject", "decline"]
 
 __all__ = [
     "DEFAULT_GREETING",
     "DEFAULT_ICE_STUN_URLS",
     "ConfigError",
+    "DenyMode",
     "ExtensionConfig",
     "GatewayConfig",
     "MediaConfig",
@@ -106,6 +113,17 @@ _MAX_CALLS_KEY = "HERMES_SIP_MAX_CALLS"
 _DEFAULT_MAX_CALLS = 8
 _SHUTDOWN_DRAIN_SECS_KEY = "HERMES_SIP_SHUTDOWN_DRAIN_SECS"
 _DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+# Deny enforcement style for a declined-group caller (ADR-0020 §5/§6). ``reject``
+# (the default, Phase 1) sends a hard ``603 Decline`` in the pre-200-OK window —
+# cheapest, gives the caller no agent surface. ``decline`` (Phase 2) instead ANSWERS
+# the call (200 OK), speaks one short TTS line (``decline_phrase``), then BYEs — a
+# polite decline that trains a spammer less than a hard 603. The mode lives on the
+# gateway scheme (``HERMES_VOIP_DENY_MODE``) because it governs the SIP-level
+# inbound-call disposition; the phrase it speaks lives on MediaConfig with the other
+# spoken-UX lines (greeting/goodbye).
+_DENY_MODE_KEY = "HERMES_VOIP_DENY_MODE"
+_DENY_MODES = frozenset({"reject", "decline"})
+_DEFAULT_DENY_MODE: DenyMode = "reject"
 
 _BARE_EXTENSION = "HERMES_SIP_EXTENSION"
 _BARE_PASSWORD = "HERMES_SIP_PASSWORD"  # noqa: S105 — env var name, not a secret
@@ -373,6 +391,22 @@ _DEFAULT_GOODBYE = True
 # The goodbye phrase — MUST exactly match _DEFAULT_GOODBYE_PHRASE in call_loop.py.
 _GOODBYE_PHRASE_KEY = "HERMES_VOIP_GOODBYE_PHRASE"
 _DEFAULT_GOODBYE_PHRASE = "Goodbye."
+
+# Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020 §5).
+# When the gateway's deny_mode is ``decline``, a declined-group caller is ANSWERED and
+# hears this one short line before the call is BYE'd (instead of a hard 603). Operator-
+# overridable; blank/whitespace → the built-in default. NOT spoken on the default
+# ``reject`` mode (no media path there). ``HERMES_VOIP_DECLINE_PHRASE``.
+_DECLINE_PHRASE_KEY = "HERMES_VOIP_DECLINE_PHRASE"
+_DEFAULT_DECLINE_PHRASE = "Sorry, I cannot take this call."
+# ADR-0020 §5/§6 require ONE SHORT line: the decline phrase is spoken once over the
+# answered media path before the BYE, not a multi-line block. So a value containing a
+# line break is rejected, and the length is capped to this sane maximum (≈ a long
+# sentence; well above the default's 31 chars, well below an unbounded paragraph that
+# would answer a declined caller into a wall of synthesised speech). Enforced in
+# MediaConfig.__post_init__ so a direct construction is self-validating, not only the
+# env parser.
+_MAX_DECLINE_PHRASE_LEN = 200
 
 # Safe-decline line spoken on a guard REFUSE (ADR-0076). When the injection guard
 # refuses a turn it is never forwarded to the agent; without a spoken line a caller the
@@ -707,6 +741,12 @@ class GatewayConfig:
             BYE to every live call and waits up to this long for the drain before
             forcing teardown, so a restart no longer hard-drops live callers. Strictly
             positive and finite (default 5.0). ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``.
+        deny_mode: How a declined-group caller is handled at the inbound INVITE
+            (ADR-0020 §5/§6). ``reject`` (the default, Phase 1) sends a hard
+            ``603 Decline`` in the pre-200-OK window — no dialog, no media, no agent
+            surface. ``decline`` (Phase 2) ANSWERS the call (200 OK), speaks one short
+            TTS line (:attr:`MediaConfig.decline_phrase`), then BYEs — a polite decline
+            that trains a spammer less than a hard 603. ``HERMES_VOIP_DENY_MODE``.
     """
 
     host: str
@@ -720,6 +760,7 @@ class GatewayConfig:
     ws_password: str | None = field(default=None, repr=False)
     max_calls: int = _DEFAULT_MAX_CALLS
     shutdown_drain_secs: float = _DEFAULT_SHUTDOWN_DRAIN_SECS
+    deny_mode: DenyMode = _DEFAULT_DENY_MODE
 
     def __post_init__(self) -> None:
         """Enforce the invariants the type promises, not just the parser.
@@ -752,6 +793,16 @@ class GatewayConfig:
             msg = (
                 "shutdown_drain_secs must be a positive finite number, "
                 f"got {self.shutdown_drain_secs!r}"
+            )
+            raise ConfigError(msg)
+        # deny_mode is a Literal, but a direct (non-parser) construction could pass an
+        # off-Literal string at runtime; validate against the runtime counterpart so a
+        # bad value fails LOUD here (naming the env var) rather than silently slipping
+        # past the type into the inbound handler.
+        if self.deny_mode not in _DENY_MODES:
+            choices = ", ".join(sorted(_DENY_MODES))
+            msg = (
+                f"{_DENY_MODE_KEY} must be one of {{{choices}}}, got {self.deny_mode!r}"
             )
             raise ConfigError(msg)
 
@@ -1144,6 +1195,15 @@ class MediaConfig:
     # ``HERMES_VOIP_GOODBYE`` / ``HERMES_VOIP_GOODBYE_PHRASE``.
     goodbye: bool = _DEFAULT_GOODBYE
     goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE
+    # Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020
+    # §5/§6 Phase 2). When the gateway's deny_mode is ``decline``, a declined-group
+    # caller is ANSWERED (200 OK) and hears this ONE short line over the real media path
+    # before the call is BYE'd — a polite decline that trains a spammer less than a hard
+    # 603. Must be ONE short line: non-blank (a blank line would answer then immediately
+    # BYE with dead air), with no line break, and at most ``_MAX_DECLINE_PHRASE_LEN``
+    # chars (spoken once, not a multi-line block) — all enforced in __post_init__.
+    # ``HERMES_VOIP_DECLINE_PHRASE``; blank/unset → the built-in default.
+    decline_phrase: str = _DEFAULT_DECLINE_PHRASE
     # Safe-decline line spoken on a guard REFUSE (ADR-0076): one phrase chosen at
     # random per refusal (no immediate repeat) so a false-positived caller hears a
     # short line instead of dead air. The refused turn is STILL never delivered to the
@@ -1350,6 +1410,29 @@ class MediaConfig:
             raise ConfigError(msg)
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
+            raise ConfigError(msg)
+        # ADR-0020 §5/§6: the polite-decline line is ONE short spoken line. A blank
+        # value would answer-then-immediately-BYE with dead air; a value with a line
+        # break is a multi-line block, not one line; an over-long value answers a
+        # declined caller into an unbounded wall of speech. All three fail loud here
+        # (the env parser defaults a blank, so a blank can only reach here via a direct
+        # construction). The newline/length messages name the env var so an operator
+        # who set HERMES_VOIP_DECLINE_PHRASE wrongly sees the key.
+        if not self.decline_phrase.strip():
+            msg = "decline_phrase must not be blank"
+            raise ConfigError(msg)
+        if "\n" in self.decline_phrase or "\r" in self.decline_phrase:
+            msg = (
+                f"{_DECLINE_PHRASE_KEY} must be a single line "
+                "(no line break) — it is spoken as ONE short decline line"
+            )
+            raise ConfigError(msg)
+        if len(self.decline_phrase) > _MAX_DECLINE_PHRASE_LEN:
+            msg = (
+                f"{_DECLINE_PHRASE_KEY} must be at most "
+                f"{_MAX_DECLINE_PHRASE_LEN} characters "
+                f"(got {len(self.decline_phrase)}) — it is ONE short decline line"
+            )
             raise ConfigError(msg)
         if self.error_apology and not self.error_apology.strip():
             msg = "error_apology must not be blank when set"
@@ -1652,6 +1735,8 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         no_input_reprompt_phrases=_parse_no_input_reprompt_phrases(env),
         goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),
         goodbye_phrase=_parse_goodbye_phrase(env),
+        # ADR-0020 §5/§6: the polite-decline line for deny_mode=decline.
+        decline_phrase=_parse_decline_phrase(env),
         refuse_decline_phrases=_parse_refuse_decline_phrases(env, language),
         error_apology=_value(env, _ERROR_APOLOGY_KEY) or "",
     )
@@ -1692,6 +1777,8 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
         shutdown_drain_secs=_parse_positive_float(
             env, _SHUTDOWN_DRAIN_SECS_KEY, _DEFAULT_SHUTDOWN_DRAIN_SECS
         ),
+        # ADR-0020 §5/§6: declined-caller disposition (reject 603 | decline+TTS+BYE).
+        deny_mode=_parse_deny_mode(env),
     )
 
 
@@ -1872,6 +1959,24 @@ def _parse_enum(
         msg = f"{key} must be one of {{{choices}}}, got {token!r}"
         raise ConfigError(msg)
     return token
+
+
+def _parse_deny_mode(env: Mapping[str, str]) -> DenyMode:
+    """Parse ``HERMES_VOIP_DENY_MODE`` into the validated :data:`DenyMode` Literal.
+
+    Unset → the Phase-1 default ``reject`` (hard 603). An invalid value raises
+    :class:`ConfigError` naming the env var (rule 37 — a misconfigured deny policy
+    fails loud, never silently defaults). The value is narrowed to the Literal here
+    so the typed config field carries no off-Literal value.
+    """
+    mode = _value_lower(env, _DENY_MODE_KEY) or _DEFAULT_DENY_MODE
+    if mode == "reject":
+        return "reject"
+    if mode == "decline":
+        return "decline"
+    choices = ", ".join(sorted(_DENY_MODES))
+    msg = f"{_DENY_MODE_KEY} must be one of {{{choices}}}, got {mode!r}"
+    raise ConfigError(msg)
 
 
 def _parse_positive_int(env: Mapping[str, str], key: str, default: int) -> int:
@@ -2149,6 +2254,19 @@ def _parse_goodbye_phrase(env: Mapping[str, str]) -> str:
     """
     raw = _value(env, _GOODBYE_PHRASE_KEY)
     return raw or _DEFAULT_GOODBYE_PHRASE
+
+
+def _parse_decline_phrase(env: Mapping[str, str]) -> str:
+    """Parse ``HERMES_VOIP_DECLINE_PHRASE``, defaulting when unset or blank.
+
+    The polite-decline line spoken on a ``deny_mode=decline`` declined caller
+    (ADR-0020 §5/§6). A blank/whitespace value falls back to the built-in default —
+    answering a declined caller only to play dead air is a misconfiguration, so the
+    spoken line is always non-trivially short. The operator keeps the hard-603 posture
+    via ``HERMES_VOIP_DENY_MODE=reject`` (the default), not by blanking this phrase.
+    """
+    raw = _value(env, _DECLINE_PHRASE_KEY)
+    return raw or _DEFAULT_DECLINE_PHRASE
 
 
 def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:

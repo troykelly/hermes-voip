@@ -3031,6 +3031,15 @@ class VoipAdapter(BasePlatformAdapter):
             raise RuntimeError(msg)
         classification = classify_caller_group(caller_number, caller_groups)
         group = classification.group
+        # ADR-0020 §5/§6: a declined-group caller's disposition is governed by
+        # ``deny_mode``. ``reject`` (the default, Phase 1) sends a hard 603 Decline
+        # HERE, in the pre-200-OK window — no dialog, no media, no agent surface.
+        # ``decline`` (Phase 2) instead ANSWERS the call and speaks one short line
+        # before BYEing: it does NOT 603 here but proceeds through the normal SDP
+        # negotiation + answer path with ``decline_after_answer`` set, and the
+        # CallLoop tail below plays the decline phrase + BYEs instead of building the
+        # conversational loop. Either way the agent never reaches the declined caller.
+        decline_after_answer = False
         if group.declined_at_sip:
             # Audit the deny WITHOUT writing PII to logs: the full caller number,
             # the verbatim From, and the matched deny pattern are all PII, so we
@@ -3038,17 +3047,28 @@ class VoipAdapter(BasePlatformAdapter):
             # (last 2 digits) — enough to correlate a spoof report by call_id and a
             # partial number without dumping the number itself. Caller *content* is
             # never logged here.
+            if gateway_cfg.deny_mode == "reject":
+                _log.info(
+                    "INVITE %s: caller DECLINED (group=%s source=%s) — 603 Decline"
+                    "; number=%s",
+                    call_id,
+                    group.name,
+                    classification.source,
+                    _redact_number(caller_number),
+                    extra=_rejected_extra(call_id, 603, "caller_declined"),
+                )
+                await transport.send(build_response(invite, 603, "Decline"))
+                return
+            # deny_mode == "decline": answer, speak one line, then BYE (below).
+            decline_after_answer = True
             _log.info(
-                "INVITE %s: caller DECLINED (group=%s source=%s) — 603 Decline"
-                "; number=%s",
+                "INVITE %s: caller DECLINED (group=%s source=%s) — polite decline "
+                "(answer + TTS + BYE); number=%s",
                 call_id,
                 group.name,
                 classification.source,
                 _redact_number(caller_number),
-                extra=_rejected_extra(call_id, 603, "caller_declined"),
             )
-            await transport.send(build_response(invite, 603, "Decline"))
-            return
         _log.info(
             "INVITE %s: caller group=%s privilege_level=%d (source=%s)",
             call_id,
@@ -3445,6 +3465,32 @@ class VoipAdapter(BasePlatformAdapter):
             # open_entry(name) is scoped to ONLY these openings (and surface the NAMES,
             # never the secret codes/urls, to the agent below).
             self._call_info[call_id]["intercom_entry"] = intercom_entry
+
+        # --- Polite decline (ADR-0020 §5/§6, deny_mode=decline) -------------
+        # A declined caller answered under ``decline`` mode never reaches the agent:
+        # speak ONE short line over the now-live media path, then BYE — reusing the
+        # SAME answer-200/TTS/BYE machinery (no new transport/infra), skipping the
+        # context injection + conversational CallLoop entirely. Leak-safe: the engine
+        # + dialog routes are torn down in the ``finally`` exactly as the normal path.
+        if decline_after_answer:
+            try:
+                await self._speak_decline_then_bye(
+                    call_id=call_id,
+                    engine=engine,
+                    session=session,
+                    media_cfg=media_cfg,
+                )
+            finally:
+                await self._teardown_call(
+                    call_id=call_id,
+                    engine=engine,
+                    transport=transport,
+                    dialog_id=session.dialog_id,
+                    session=session,
+                    call_loop=None,
+                    reason=CallEndReason.AGENT_HANGUP,
+                )
+            return
 
         # --- Seed the agent's first turn with the rich call context (ADR-0052) ---
         # Inject the labelled, untrusted call-context block as the call's first system
@@ -5015,7 +5061,11 @@ class VoipAdapter(BasePlatformAdapter):
             endpointer=endpointer,
             guard_state=guard_state,
             deliver_turn=_deliver,
-            voice="",
+            # The configured TTS voice (``MediaConfig.tts_voice``); ``None`` resolves to
+            # ``""`` (the provider's default voice). The decline path
+            # (``_speak_decline_then_bye``) resolves the SAME way, so a declined caller
+            # hears the operator's chosen voice exactly as a normal caller does.
+            voice=media_cfg.tts_voice or "",
             call_id=call_id,
             # Speak the configured opening line on answer so RTP flows out first
             # — the caller hears it and a NAT'd gateway latches (ADR-0002).
@@ -5094,6 +5144,65 @@ class VoipAdapter(BasePlatformAdapter):
         )
         await call_loop.run()
         return call_loop
+
+    async def _speak_decline_then_bye(
+        self,
+        *,
+        call_id: str,
+        engine: RtpMediaTransport,
+        session: CallSession,
+        media_cfg: MediaConfig,
+    ) -> None:
+        """Speak the polite-decline line over the live media path, then BYE (ADR-0020).
+
+        The ``deny_mode=decline`` body (ADR-0020 §5/§6 Phase 2): the call has just
+        been ANSWERED (200 OK sent, engine connected) for a declined-group caller who
+        must never reach the agent. This plays ONE short configured line
+        (:attr:`MediaConfig.decline_phrase`) and then ends the dialog with a ``BYE`` —
+        reusing the EXISTING TTS provider (``self._providers.tts``) and the existing
+        :meth:`CallSession.hang_up` (in-dialog BYE + media stop), with no new transport
+        or pipeline.
+
+        Bounded by construction: one phrase synthesised + drained to ``send_audio``,
+        then teardown — there is no STT, VAD, agent turn, or barge-in. The phrase is
+        synthesised at the engine's negotiated wire rate (the engine reconciles any
+        off-rate frames). Synthesis/send is best-effort: a TTS hiccup must not strand
+        the teardown, so a failure is logged and we STILL BYE (rule 37 — the error is
+        logged, never silently swallowed, and never blocks the hang-up).
+        """
+        providers = self._providers
+        if providers is None:  # connect() populates this before any INVITE
+            msg = f"INVITE {call_id}: providers not initialised"
+            raise RuntimeError(msg)
+        phrase = media_cfg.decline_phrase
+        # Use the SAME configured TTS voice the normal conversational path uses
+        # (``MediaConfig.tts_voice``); ``None`` resolves to ``""`` (the provider's
+        # default voice), exactly as the CallLoop voice seam does — so the decline line
+        # is spoken in the operator's chosen voice, not an empty/unset one.
+        voice = media_cfg.tts_voice or ""
+
+        async def _single_chunk() -> AsyncIterator[str]:
+            yield phrase
+
+        _log.info("INVITE %s: speaking polite-decline line, then BYE", call_id)
+        try:
+            stream = providers.tts.synthesize(
+                _single_chunk(),
+                voice,
+                sample_rate=engine.inbound_sample_rate,
+            )
+            async with contextlib.aclosing(stream):
+                async for frame in stream:
+                    await engine.send_audio(frame)
+        except Exception:  # noqa: BLE001 — best-effort decline speech; logged, then we still BYE (rule 37)
+            _log.warning(
+                "INVITE %s: decline-phrase synthesis/send failed; BYEing anyway",
+                call_id,
+                exc_info=True,
+            )
+        # End the dialog: in-dialog BYE + media stop (idempotent — _teardown_call's own
+        # hang_up is then a no-op). Reuses the existing UAC BYE machinery (ADR-0026).
+        await session.hang_up()
 
     async def _handle_call_progress(
         self,

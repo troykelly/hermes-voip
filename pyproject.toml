@@ -25,7 +25,7 @@ dependencies = [
 # optional extra so its large transitive tree stays out of the default install,
 # the production licence gate, and the default pip-audit env. The typed boundary
 # is hermes_voip.hermes_surface; the contract test verifies the real surface.
-hermes = ["hermes-agent==0.16.0"]
+hermes = ["hermes-agent==0.17.0"]
 # Local-inference ML stack for the conversational providers (ADR-0006/0007/0008/
 # 0009): onnxruntime for VAD (silero) + the injection guard (DeBERTa), sherpa-onnx
 # for streaming STT/TTS, tokenizers for the DeBERTa guard's SentencePiece tokenizer
@@ -292,29 +292,10 @@ addopts = "-q"
 testpaths = ["tests"]
 asyncio_mode = "strict"  # async tests carry an explicit @pytest.mark.asyncio
 
-# ---------------------------------------------------------------------------
-# uv resolver overrides (AGENTS.md rule 35 — supply-chain hygiene).
-#
-# hermes-agent==0.16.0 hard-pins `PyJWT[crypto]==2.12.1` in its Requires-Dist,
-# which blocks uv from resolving pyjwt>=2.13.0 through ordinary constraint
-# solving.  The HIGH severity CVE (public-key JWK accepted as HMAC secret →
-# forged HS256 tokens; PYSEC-2026-175..179, fix: pyjwt 2.13.0) can be patched
-# HERE via a uv resolver override, which replaces the hermes-agent pin at the
-# resolution layer without changing hermes-agent itself.  The override was
-# fully verified before commit (see ADR-0062):
-#
-#   • `uv lock` resolves cleanly with pyjwt==2.13.0 in the lock.
-#   • `uv sync --frozen --extra hermes --extra ml --extra media` installs without error.
-#   • hermes-contract gate (mypy + full pytest) passes green.
-#   • `pip-audit` reports no advisories — the 5 PYSEC-2026-175..179 suppression
-#     lines in supply-chain.yml are removed in the same commit.
-#   • Import smoke: `import jwt; import gateway.config; import gateway.platforms.base`
-#     all succeed with pyjwt 2.13.0 installed.
-#
-# REVERT THIS SECTION the moment hermes-agent ships a version that allows
-# pyjwt>=2.13.0 natively — at that point the override is no longer needed and
-# `uv lock` will pick up the new constraint automatically.  See ADR-0062 and
-# docs/runbooks/0003-supply-chain-audit.md.
+# Pins a CVE-safe pyjwt floor (PYSEC-2026-175..179, fix: 2.13.0; ref ADR-0062).
+# hermes-agent==0.17.0 already requires pyjwt[crypto]==2.13.0, so this is a
+# defence-in-depth floor that keeps the resolution safe against any future
+# hermes-agent change that would relax the pin below the patched version.
 [tool.uv]
 override-dependencies = ["pyjwt[crypto]>=2.13.0"]
 

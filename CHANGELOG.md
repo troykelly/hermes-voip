@@ -11,6 +11,16 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`VoipAdapter.connect` now accepts the keyword-only `is_reconnect` param the
+  Hermes 0.17.0 gateway may pass** (`connect(*, is_reconnect: bool = False)`),
+  so a gateway build that forwards the reconnect flag no longer hits
+  `TypeError` on every connect (the VoIP platform never coming up). VoIP has no
+  server-side message backlog to replay, so the flag is accepted-but-ignored;
+  the adapter's own RFC 5626 reconnect supervisor already restores
+  registration. `hermes-agent` pin moved `0.16.0` → `0.17.0`. (#350)
+
 ## [0.1.2] - 2026-06-28
 
 ### Added

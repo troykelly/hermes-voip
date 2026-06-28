@@ -370,8 +370,8 @@ def test_sustained_run_beginning_in_tail_barges_in_but_is_suppressed_in_tail() -
 
 
 # ---------------------------------------------------------------------------
-# TRUE HALF-DUPLEX (live self-echo regression, call 2026-06-21 Yealink T48G
-# HANDSET so NO acoustic echo): the gateway (UCM6304) reflects the agent's own
+# TRUE HALF-DUPLEX (live self-echo regression, call 2026-06-21, SIP HANDSET so
+# NO acoustic echo): the operator test gateway reflects the agent's own
 # outbound TTS back on the inbound leg under the gateway's SSRC. A ~1 s comfort
 # filler ("One moment please.") is a SUSTAINED continuous voiced run that EXCEEDS
 # the sustained barge-in threshold, so ``should_barge_in`` FIRES on the agent's

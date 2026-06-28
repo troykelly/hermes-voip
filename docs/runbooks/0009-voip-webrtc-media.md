@@ -158,7 +158,7 @@ The knob applies **only** to an `a=setup:actpass` offer. A peer that pins itself
 would create two clients or two servers and deadlock). An unknown value is rejected at
 config load.
 
-**Why the default flipped (ADR-0050).** A real Asterisk/UCM-class gateway offers
+**Why the default flipped (ADR-0050).** A real Asterisk/appliance-class gateway offers
 `a=setup:actpass` but behaves as the DTLS **server**, expecting the answerer to be the
 client. The previous `actpass → passive` mapping left both ends as servers, so the DTLS
 handshake never started. RFC 8842 §5.3's active answerer (`auto`) is the standards-based
@@ -386,15 +386,15 @@ PLC attenuation curve or fade length, edit `_PLC_ATTENUATION_PER_FRAME` /
   keyed (setup=…)`, `WebRTC media engine connected over ICE`, then `rtp tx/rx` lines. Two-way
   audio confirms the path.
 
-## Live validation status — real Asterisk/UCM gateway (2026-06-18, ADR-0042)
+## Live validation status — real Asterisk/SIP gateway (2026-06-18, ADR-0042)
 
-First inbound WebRTC call from the live gateway (a Grandstream UCM whose WebRTC edge is an
+First inbound WebRTC call from the live gateway (an appliance-class gateway whose WebRTC edge is an
 embedded Asterisk). What was **proven on the wire**, in order:
 
 1. **WSS REGISTER → `200 OK`** (expires ~299 s) on port `8090`, path `/ws`, subprotocol
    `sip`, realm `voip002`, MD5 `qop=auth` — using the **VoIP-section `Password`** (the SIP
    digest). `HERMES_SIP_WS_PASSWORD` is left **unset**; the item's top-level `password` is
-   the GDMS/WAVE portal login and `401`s here (see runbook 0002).
+   the operator web-app portal login and `401`s here (see runbook 0002).
 2. **Inbound INVITE** classified to the `operator` group (needs `HERMES_VOIP_CALLER_ALLOW_FILE`
    set, else the default group declines with `603`).
 3. **WebRTC SDP answer built** (`setup=passive`, Opus) + **`200 OK` sent** — the gateway's
@@ -414,7 +414,7 @@ Tracked as the next lane (a dedicated IPv6-first-ICE ADR).
 
 To reproduce the validation so far: run the gateway with `HERMES_SIP_TRANSPORT=wss`,
 `HERMES_SIP_PORT=8090`, `HERMES_SIP_WS_PATH=/ws`, the SIP `HERMES_SIP_*` creds, the model
-dirs, and `HERMES_VOIP_CALLER_ALLOW_FILE`; dial the extension from a WAVE client; watch the
+dirs, and `HERMES_VOIP_CALLER_ALLOW_FILE`; dial the extension from a WebRTC client; watch the
 log for the four lines above.
 
 ## Outbound WebRTC video (ADR-0044)

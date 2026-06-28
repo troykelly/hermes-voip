@@ -15,7 +15,7 @@ sends a `ClientHello` and the handshake **deadlocks** until the call setup times
 ADR-0032 shipped `answer_setup_for_offer` following RFC 5763 §5's letter literally:
 an `actpass` **or** `active` offer made us `passive` (the DTLS server); only a
 `passive` offer made us `active`. That is safe against a strict offerer, but a real
-Asterisk / UCM-class gateway offers `a=setup:actpass` while **behaving as the DTLS
+Asterisk / appliance-class gateway offers `a=setup:actpass` while **behaving as the DTLS
 server** — it expects the answerer to be the client. Our `passive` answer then leaves
 **both** ends waiting (gateway-server + us-server), so the handshake never starts and
 the live call fails to key SRTP.
@@ -59,7 +59,7 @@ The DTLS role drives `DtlsEndpoint(role=CLIENT|SERVER)` exactly as before; only 
 
 ## Consequences
 
-- Against an Asterisk/UCM-class gateway that offers `actpass` and acts as the DTLS
+- Against an Asterisk/appliance-class gateway that offers `actpass` and acts as the DTLS
   server, the handshake now starts (we send the `ClientHello`) instead of
   dead-locking — the concrete live-gateway-confidence win this lane targets.
 - The e2e fake gateway peer is now the DTLS **server** (it offers `actpass`, so the

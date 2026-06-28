@@ -63,7 +63,7 @@ Known-answer test vectors:
 ## Consequences
 
 - REGISTER now succeeds against any gateway that challenges with MD5, MD5-sess,
-  SHA-256, or SHA-256-sess — covering the current Grandstream UCM (MD5) and
+  SHA-256, or SHA-256-sess — covering the current operator test gateway (MD5) and
   hardened SBCs/carriers (SHA-256 preferred).
 - `pick_best_challenge` is available for the registration state machine to prefer
   SHA-256 when the gateway offers a choice.

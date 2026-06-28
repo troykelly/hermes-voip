@@ -229,9 +229,10 @@ def test_canonical_host_wins_over_server_host_alias() -> None:
 def test_tls_port_alias_wins_over_canonical_port_on_tls() -> None:
     """On the (default) tls transport, HERMES_SIP_TLS_PORT wins over HERMES_SIP_PORT.
 
-    Corrected from the original "canonical always wins" assertion: a live GDMS
-    provisioner exports both PORT=5060 (cleartext) and TLS_PORT=5061, and the tls
-    handshake must target the TLS port. HERMES_SIP_TLS_PORT is a TLS-only alias, so
+    Corrected from the original "canonical always wins" assertion: a live
+    appliance-class gateway provisioner exports both PORT=5060 (cleartext) and
+    TLS_PORT=5061, and the tls handshake must target the TLS port.
+    HERMES_SIP_TLS_PORT is a TLS-only alias, so
     on tls it takes precedence over the canonical (often cleartext) HERMES_SIP_PORT.
     """
     cfg = load_gateway_config(
@@ -296,7 +297,7 @@ def test_tls_port_alias_out_of_range_rejected() -> None:
 
 # ---- transport-aware TLS port precedence (live gateway bug) -----------------
 #
-# A real GDMS/Grandstream provisioner exports BOTH the plain/UDP SIP port
+# A real SIP gateway provisioner exports BOTH the plain/UDP SIP port
 # (HERMES_SIP_PORT=5060) AND the SIP-TLS port (HERMES_SIP_TLS_PORT=5061). On the
 # tls transport the TLS port is the one a TLS handshake must target; resolving the
 # cleartext 5060 makes the handshake hit the plain port -> ConnectionReset/Timeout

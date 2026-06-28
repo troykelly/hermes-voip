@@ -462,7 +462,7 @@ _DEFAULT_RTCP_ENABLED = True
 # Secured-path RTCP over SRTCP (RFC 3711 §3.4, ADR-0066) — gated OFF by default.
 # When a secured (SDES RTP/SAVP) inbound call has no a=rtcp-mux, activating RTCP
 # opens a sibling SRTCP socket on RTP-port+1 and emits SRTCP on the wire. A live
-# Grandstream UCM that did NOT negotiate rtcp-mux MUTED the media session on that
+# production gateway that did NOT negotiate rtcp-mux MUTED the media session on that
 # unexpected SRTCP (no two-way audio). So secured-path RTCP is OPT-IN: by default a
 # secured call stays RTCP-dormant (the pre-#160 behaviour, audio works), and the
 # SRTCP capability is retained behind this flag for a gateway-validated rollout. The
@@ -1163,7 +1163,7 @@ class MediaConfig:
     rtcp_enabled: bool = _DEFAULT_RTCP_ENABLED
     # Secured-path RTCP over SRTCP (RFC 3711 §3.4, ADR-0066): when True the adapter
     # ALSO activates RTCP (wrapped in SRTCP) on the secured SDES (RTP/SAVP) path.
-    # Default FALSE — a live non-mux Grandstream muted the media on the unexpected
+    # Default FALSE — a live non-mux gateway muted the media on the unexpected
     # SRTCP, so secured RTCP is opt-in pending real-gateway validation; by default the
     # secured path stays RTCP-dormant (the pre-#160 behaviour). Gated additionally by
     # ``rtcp_enabled`` (the master kill-switch).
@@ -1837,7 +1837,7 @@ def _parse_transport(env: Mapping[str, str]) -> str:
 def _parse_port(env: Mapping[str, str], transport: str) -> int:
     # Port resolution is transport-aware. HERMES_SIP_TLS_PORT is the provisioner's
     # SIP-TLS port and applies ONLY on the tls transport (there is no symmetric wss
-    # alias). A real GDMS/Grandstream provisioner exports BOTH HERMES_SIP_PORT=5060
+    # alias). A real SIP gateway provisioner exports BOTH HERMES_SIP_PORT=5060
     # (the plain/UDP SIP port) and HERMES_SIP_TLS_PORT=5061 (the SIP-TLS port); on tls
     # the TLS handshake must target the TLS port, so for tls the precedence is
     # HERMES_SIP_TLS_PORT > HERMES_SIP_PORT > default(5061). (Preferring the canonical

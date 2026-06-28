@@ -1336,8 +1336,8 @@ _OFFER_SAVPF = (
 )
 
 
-# A realistic WebRTC offer as sent by an Asterisk-based gateway (e.g. the
-# Grandstream UCM's embedded Asterisk WebRTC edge): a BUNDLE group with the
+# A realistic WebRTC offer as sent by an Asterisk-based gateway (e.g. a
+# A production gateway's embedded Asterisk WebRTC edge): a BUNDLE group with the
 # DTLS-SRTP + ICE credentials at the **session level** (before the first m=
 # line), shared across all bundled m-lines. RFC 8122 §5 (fingerprint) and RFC
 # 8839 §4.2 (ice-ufrag/ice-pwd) both permit session-level placement; a
@@ -1606,7 +1606,7 @@ def test_parse_webrtc_offer_has_no_sdes_crypto() -> None:
 def test_parse_webrtc_session_level_fingerprint() -> None:
     """Session-level a=fingerprint applies to the bundled audio (RFC 8122 §5).
 
-    Regression: an Asterisk/UCM BUNDLE offer puts the DTLS fingerprint at the
+    Regression: an Asterisk/SIP-gateway BUNDLE offer puts the DTLS fingerprint at the
     session level; the parser must surface it on the audio media (it was being
     dropped, producing a spurious 488 'missing fingerprint' on the live gateway).
     """

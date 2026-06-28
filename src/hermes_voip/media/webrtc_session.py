@@ -195,9 +195,10 @@ def answer_setup_for_offer(
     * **actpass offer ⇒ ``forced`` decides.** For an ``actpass`` offer (or a missing
       ``a=setup``, which RFC 5763 §5 treats as ``actpass``) we are free to pick. The
       ``auto`` default applies RFC 8842 §5.3: the answerer SHOULD be ``active`` (the
-      DTLS client, sending the ClientHello). Many gateways (e.g. Asterisk/UCM) offer
-      ``actpass`` yet behave as the DTLS server, so a ``passive`` answer deadlocks
-      (both servers wait). ``forced="passive"`` overrides this for a gateway that
+      DTLS client, sending the ClientHello). Many gateways (e.g. Asterisk and
+      appliance-class PBXes) offer ``actpass`` yet behave as the DTLS server, so a
+      ``passive`` answer deadlocks (both servers wait). ``forced="passive"``
+      overrides this for a gateway that
       insists on being the client; ``forced="active"`` is the explicit form of the
       default.
 

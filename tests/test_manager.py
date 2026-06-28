@@ -12,6 +12,7 @@ Fakes only (``pbx.example.test``, ext ``1000``/``1001``, ``198.51.100.x``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import pytest
@@ -89,6 +90,51 @@ def _ok_for(register_text: str, *, expires: int = 300) -> SipResponse:
         f"Contact: {reg.header('Contact')};expires={expires}\r\n"
         "Content-Length: 0\r\n\r\n"
     )
+
+
+def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
+    structured_fields = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key
+        not in {
+            "name",
+            "msg",
+            "args",
+            "levelname",
+            "levelno",
+            "pathname",
+            "filename",
+            "module",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "lineno",
+            "funcName",
+            "created",
+            "msecs",
+            "relativeCreated",
+            "thread",
+            "threadName",
+            "processName",
+            "process",
+            "taskName",
+            "message",
+        }
+    }
+    serialized_fields = json.dumps(structured_fields, sort_keys=True, default=repr)
+    serialized_record = json.dumps(record.__dict__, sort_keys=True, default=repr)
+    rendered_message = record.getMessage()
+    for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
+        assert secret not in serialized_fields, (
+            f"structured failure log leaked secret {secret!r} in extra fields"
+        )
+        assert secret not in serialized_record, (
+            f"structured failure log leaked secret {secret!r} in serialized record"
+        )
+        assert secret not in rendered_message, (
+            f"structured failure log leaked secret {secret!r} in rendered message"
+        )
 
 
 def _challenge_for(register_text: str) -> SipResponse:
@@ -905,3 +951,190 @@ async def test_refresh_response_cancels_the_timeout() -> None:
     up = next(s for s in manager.snapshot() if s.extension == "1000")
     assert up.registered is True
     await manager.aclose()
+
+
+# ---- structured log events on registration failure (observability) ----------
+
+
+async def test_rejected_refresh_emits_structured_failure_log_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 4xx/5xx REGISTER rejection emits a structured WARNING with typed extra fields.
+
+    The event ``sip_registration_failed`` must carry:
+    - ``outcome`` — the string ``"rejected"``
+    - ``status_code`` — the integer HTTP/SIP status (e.g. 503)
+    - ``attempt`` — the integer recovery attempt count (>= 1 on first failure)
+
+    SECRET-SAFE: the emitted LogRecord must NOT contain the fake SIP host
+    (``pbx.example.test``), extension/username (``1000``/``1001``), or password
+    (``p1``/``p2``) in any serialized structured field or in the formatted
+    message — rule 34 applies to structured log events the same as to free-text
+    log lines.
+    """
+    transport = _FakeTransport()
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=10.0,  # suppress recovery send to keep the test focused
+        )
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    call_id = SipRequest.parse(first_register).header("Call-ID")
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(first_register))  # extension 1000 now up
+        await asyncio.sleep(0.05)
+    refresh = next(
+        m
+        for m in transport.sent[1:]
+        if SipRequest.parse(m).header("Call-ID") == call_id
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(
+            _failed_for(refresh, status=503, reason="Service Unavailable")
+        )
+    await manager.aclose()
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager"
+        and getattr(r, "event", None) == "sip_registration_failed"
+    ]
+    assert records, (
+        "a rejected REGISTER refresh must emit a structured log record with "
+        "event='sip_registration_failed'"
+    )
+    rec = records[0]
+    assert rec.levelno == logging.WARNING, (
+        "registration failure must log at WARNING level"
+    )
+    assert getattr(rec, "outcome", None) == "rejected", (
+        "structured field 'outcome' must be 'rejected' for a 4xx/5xx response"
+    )
+    assert getattr(rec, "status_code", None) == 503, (
+        "structured field 'status_code' must be the SIP status integer"
+    )
+    assert isinstance(getattr(rec, "attempt", None), int), (
+        "structured field 'attempt' must be an integer"
+    )
+    assert getattr(rec, "attempt", 0) >= 1, (
+        "structured field 'attempt' must be >= 1 on the first failure"
+    )
+    # rule 34: never log secrets in the structured event or any structured fields
+    _assert_failure_log_is_secret_safe(rec)
+
+
+async def test_refresh_send_failure_emits_transport_failed_log_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refresh transport failure is logged distinctly from timeout/rejection.
+
+    Operators need to distinguish a registrar response from a local transport send
+    failure, but the log must remain secret-safe.
+    """
+    transport = _FlakyTransport(fail_after=2)
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            retry_backoff=10.0,
+        )
+    )
+    await manager.start()
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(transport.sent[0]))
+        await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager"
+        and getattr(r, "event", None) == "sip_registration_failed"
+    ]
+    assert records, (
+        "a refresh transport-send failure must emit a structured log record with "
+        "event='sip_registration_failed'"
+    )
+    rec = records[0]
+    assert rec.levelno == logging.WARNING, (
+        "registration transport failure must log at WARNING level"
+    )
+    assert getattr(rec, "outcome", None) == "transport_failed", (
+        "structured field 'outcome' must distinguish transport-send failures"
+    )
+    assert getattr(rec, "status_code", object()) is None, (
+        "structured field 'status_code' must be None when no response exists"
+    )
+    assert isinstance(getattr(rec, "attempt", None), int), (
+        "structured field 'attempt' must be an integer"
+    )
+    assert getattr(rec, "attempt", 0) >= 1, (
+        "structured field 'attempt' must be >= 1 on the first failure"
+    )
+    _assert_failure_log_is_secret_safe(rec)
+
+
+async def test_timeout_refresh_emits_structured_failure_log_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A response-timeout on a refresh emits a structured WARNING with typed fields.
+
+    The event ``sip_registration_failed`` must carry:
+    - ``outcome`` — the string ``"timeout"``
+    - ``status_code`` — ``None`` (no SIP response was received)
+    - ``attempt`` — the integer recovery attempt count (>= 1 on first failure)
+
+    SECRET-SAFE: same rule-34 constraints as the rejection variant, including
+    every serialized structured field.
+    """
+    transport = _FakeTransport()
+    manager = _disable_refresh_floor(
+        RegistrationManager(
+            _gateway(),
+            transport,
+            refresh_fraction=0.0,
+            refresh_timeout=0.05,  # short enough that no-response fires fast
+            retry_backoff=10.0,  # suppress recovery send to keep the test focused
+        )
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.manager"):
+        await manager.on_response(_ok_for(first_register))  # extension 1000 now up
+        # Deliberately do NOT feed a response to the refresh — the Timer-F/B fires.
+        await asyncio.sleep(0.2)
+    await manager.aclose()
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "hermes_voip.manager"
+        and getattr(r, "event", None) == "sip_registration_failed"
+    ]
+    assert records, (
+        "a refresh response-timeout must emit a structured log record with "
+        "event='sip_registration_failed'"
+    )
+    rec = records[0]
+    assert rec.levelno == logging.WARNING, (
+        "registration timeout failure must log at WARNING level"
+    )
+    assert getattr(rec, "outcome", None) == "timeout", (
+        "structured field 'outcome' must be 'timeout' for a Timer-F/B expiry"
+    )
+    assert getattr(rec, "status_code", object()) is None, (
+        "structured field 'status_code' must be None when no response was received"
+    )
+    assert isinstance(getattr(rec, "attempt", None), int), (
+        "structured field 'attempt' must be an integer"
+    )
+    assert getattr(rec, "attempt", 0) >= 1, (
+        "structured field 'attempt' must be >= 1 on the first failure"
+    )
+    _assert_failure_log_is_secret_safe(rec)

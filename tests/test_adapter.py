@@ -3647,12 +3647,47 @@ async def test_send_provider_error_structured_log_no_pii_in_extra_fields(
     ]
     assert replacement_records, "no provider_error_replaced log record emitted"
     rec = replacement_records[0]
-    # The raw provider error text must NOT appear in any extra field value.
+    # DENYLIST scan (preserves the #348-style broad coverage): iterate EVERY field
+    # on the record — including any future structured ``extra={}`` payload — and
+    # assert the raw provider-error text never leaks. We exclude only the standard
+    # built-in ``logging.LogRecord`` attributes, which the stdlib sets itself and
+    # which can coincidentally contain digit substrings like "502" (e.g. numeric
+    # thread/process ids, ``msecs``); they are outside the adapter's structured
+    # event payload. Scanning the message body (``msg``/``message``/``args``) is
+    # also out of scope here — the raw text is intentionally placed there, already
+    # redacted, and asserted elsewhere; this test guards the structured fields.
+    builtin_logrecord_attrs = {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "taskName",
+        "asctime",
+        "message",
+    }
     for key, value in rec.__dict__.items():
-        if key.startswith("_") or key in {"message", "msg", "args"}:
+        if key in builtin_logrecord_attrs:
             continue
         str_val = str(value)
-        assert "502" not in str_val or key in {"call_id"} or "call_id" in key, (
+        # ``call_id`` is a synthetic non-PII correlation token and is allowed to
+        # contain arbitrary digit runs; every other structured field must be clean.
+        assert "502" not in str_val or key == "call_id", (
             f"extra field {key!r}={value!r} contains raw error detail '502'"
         )
         assert "overloaded_error" not in str_val, (

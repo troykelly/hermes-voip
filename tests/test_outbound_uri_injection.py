@@ -34,6 +34,7 @@ from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_voip.adapter import VoipAdapter, _validate_dialable_target
+from hermes_voip.outbound_allow import load_outbound_allowlist
 
 
 @pytest.fixture
@@ -140,3 +141,24 @@ async def test_place_call_rejects_injection_before_dialing(target: str) -> None:
     adapter = VoipAdapter(PlatformConfig(enabled=True, extra={}))
     with pytest.raises(ValueError, match="dial target"):
         await adapter.place_call(target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_register_voip_platform")
+async def test_wildcard_allow_entry_cannot_bypass_dial_target_shape_guard() -> None:
+    """An allowlisted wildcard URI-shaped target still fails the dial chokepoint.
+
+    The outbound allowlist answers WHETHER a configured target is permitted. It must
+    not disable the independent Request-URI shape guard that rejects injection-bearing
+    targets before the adapter interpolates them into ``sip:{target}@host``.
+    """
+    adapter = VoipAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._outbound_allow = load_outbound_allowlist(
+        {"HERMES_VOIP_OUTBOUND_ALLOW": "10*@evil.example.test"}
+    )
+
+    with pytest.raises(ValueError, match="dial target"):
+        await adapter.place_call_with_objective(
+            "1001@evil.example.test",
+            "fake objective",
+        )

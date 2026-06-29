@@ -6356,7 +6356,18 @@ class VoipAdapter(BasePlatformAdapter):
         report = _outbound_result_text(callee, reason, summary)
         origin_obj = info.get("origin")
         origin = _coerce_origin(origin_obj)
+        extra = self._extra
+        result_channel = (
+            extra.get(_OUTBOUND_RESULT_CHANNEL_KEY) if extra is not None else None
+        )
         if origin is not None:
+            if result_channel is not None and "*" in result_channel:
+                # Issue #355: a wildcard result-channel is an origin-derived routing
+                # pattern, not a fixed destination. Wire the captured origin through
+                # the real fallback resolver so ``telegram:*`` routes to the matching
+                # originating telegram chat and fails closed for non-matching origins.
+                await self._report_to_fallback_channel(call_id, report, origin)
+                return
             await self._report_to_origin_session(call_id, origin, report)
             return
         await self._report_to_fallback_channel(call_id, report)

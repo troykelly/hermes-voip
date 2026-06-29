@@ -915,6 +915,73 @@ async def test_no_objective_first_turn_when_objective_absent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_end_result_channel_wildcard_routes_to_matching_origin() -> None:
+    """``OUTBOUND_RESULT_CHANNEL=telegram:*`` routes via the real result-channel path.
+
+    This proves the call-end reporter passes the captured origin into the fallback
+    result-channel resolver. Without that wiring, the wildcard channel fails closed
+    even though the outbound call captured a matching ``telegram:chat-1000`` origin.
+    """
+    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    adapter._extra = {
+        **_FAKE_ENV,
+        "HERMES_VOIP_OUTBOUND_RESULT_CHANNEL": "telegram:*",
+    }
+
+    captured: list[object] = []
+
+    async def _handler(event: object) -> None:
+        captured.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    fallback_origins: list[tuple[str, str] | None] = []
+    original_fallback = adapter._report_to_fallback_channel
+
+    async def _recording_fallback(
+        call_id: str,
+        report: str,
+        origin: tuple[str, str] | None = None,
+    ) -> None:
+        fallback_origins.append(origin)
+        await original_fallback(call_id, report, origin)
+
+    adapter._report_to_fallback_channel = _recording_fallback
+
+    call_id = new_call_id()
+    info = _outbound_info(
+        objective="book a table for two at 7pm",
+        origin=("telegram", "chat-1000"),
+    )
+    info["result"] = "Booked: table for two at 7pm."
+    adapter._call_info[call_id] = info
+
+    await adapter._signal_call_end(call_id, CallEndReason.REMOTE_BYE)
+    for _ in range(50):
+        if any(
+            getattr(getattr(event, "source", None), "chat_id", None) == "chat-1000"
+            for event in captured
+        ):
+            break
+        await asyncio.sleep(0.02)
+
+    assert fallback_origins == [("telegram", "chat-1000")]
+    origin_events = [
+        event
+        for event in captured
+        if getattr(getattr(event, "source", None), "chat_id", None) == "chat-1000"
+    ]
+    assert origin_events, f"no result reached wildcard-derived origin: {captured!r}"
+    origin_source = getattr(origin_events[0], "source", None)
+    assert origin_source is not None
+    assert getattr(origin_source.platform, "value", None) == "telegram"
+
+
+@pytest.mark.asyncio
 async def test_call_end_reports_result_into_origin_session() -> None:
     """A finished outbound call reports its outcome into the ORIGINATING session.
 

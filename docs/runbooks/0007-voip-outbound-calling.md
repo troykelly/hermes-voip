@@ -70,11 +70,12 @@ proactive notification cannot be delivered into voip.
   confirmation an IRREVERSIBLE tool would otherwise require: a static, operator-curated
   allowlist is **more** spoof-resistant than an in-band DTMF tone the remote party shares the
   channel with. Matching is **exact by default** (after trimming) — a listed `1000` does NOT also permit
-  `10000`. Wildcards are **opt-in per entry** only: `*` is a glob wildcard, and `x` is a
-  digit wildcard for simple extension patterns (for example `10xx` => `1000`..`1099`).
-  SIP URIs keep literal `x` characters, so `sip:ext@pbx.example.test` remains exact unless
-  the operator explicitly uses `*`. This keeps the ADR-0021 escalation lesson intact for
-  exact entries while still allowing concise, deliberate operator patterns.
+  `10000`. Wildcards are **opt-in per entry** only. In simple dial masks, `*` and `x` each
+  mean exactly one digit: `10**` and `10xx` both allow `1000`..`1099`, and reject `10`,
+  `100`, `10000`, and `10ab`. SIP URI / non-mask patterns keep literal `x` characters and
+  use `*` as the explicit glob, so `sip:ext@pbx.example.test` remains exact unless the
+  operator explicitly adds `*`. This keeps the ADR-0021 escalation lesson intact for exact
+  entries while still allowing concise, deliberate operator patterns.
 - The callee is **untrusted**: the resulting call runs unprivileged (the OUTBOUND persona,
   `privilege_level=0`), so the call agent cannot itself place a further call or transfer, and
   the **objective must not contain operator secrets** (it is pursued with the untrusted callee).
@@ -151,7 +152,7 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
    ```
 
    Prints `False True True False` because the allowlist now contains one exact entry and one
-   pattern entry (`10xx`). An empty/absent value still prints a falsey/empty allowlist and
+   pattern entry (`10xx`; `10**` has the same fixed-length digit-mask semantics). An empty/absent value still prints a falsey/empty allowlist and
    denies everything (inert, fail-closed).
 
 2. **Gate + tool behaviour (covered by the test suite):**

@@ -90,10 +90,14 @@ the operator opts numbers in.
   dial targets (extensions and/or SIP URIs). **The default is empty = no outbound
   call is permitted** — the feature is inert until the operator opts numbers in. The
   handler rejects any `number` not on the allowlist with a clear error and never
-  dials an unlisted target. Extensions-only is the assumed shape; a PSTN target is
-  just an allowlist entry if the gateway routes it. The allowlist value lives only in
-  the gitignored `.env` (a real number is potentially PII; extensions are not, but
-  the rule is uniform).
+  dials an unlisted target. Matching is **exact by default** and **pattern-based only
+  when the operator opts a wildcard entry in explicitly**: entries with no wildcard
+  characters stay exact members; simple dial masks treat `*` and `x` as one decimal
+  digit each (`10**` and `10xx` both mean exactly `1000`..`1099`); SIP URI / non-mask
+  patterns keep `x` literal and allow `*` as the explicit glob. Extensions-only is
+  the assumed shape; a PSTN target is just an allowlist entry if the gateway routes
+  it. The allowlist value lives only in the gitignored `.env` (a real number is
+  potentially PII; extensions are not, but the rule is uniform).
 
 - We deliberately do **not** rely on a `confirmed: bool` tool argument as a guard
   (a model under prompt injection would set it). The allowlist is the hard gate; the

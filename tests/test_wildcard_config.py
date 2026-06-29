@@ -13,8 +13,10 @@ Semantics (per the corrected orchestrator brief):
 
 * Wildcard is **opt-in per entry**: an entry WITHOUT ``*`` or ``x`` stays
   exact-match -- backwards compatible.
-* ``x`` in a pattern for ``OUTBOUND_ALLOW`` is a digit wildcard (one digit 0-9).
-* ``*`` in any pattern matches any character sequence (fnmatch convention).
+* In ``OUTBOUND_ALLOW`` simple dial masks, ``x`` and ``*`` each match one digit
+  (``10xx`` and ``10**`` both mean exactly 1000..1099).
+* ``*`` remains glob-like for non-mask patterns (and for the origin/result-channel
+  ``platform:chat_id`` patterns).
 * **Fail-closed**: empty/unset still means deny-all for ``PROACTIVE_CALL_FROM``
   and ``OUTBOUND_ALLOW``.
 * For ``OUTBOUND_RESULT_CHANNEL``: an exact entry is a fixed destination (current
@@ -42,10 +44,10 @@ from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowl
 class TestOutboundAllowWildcard:
     """Wildcard pattern entries in ``HERMES_VOIP_OUTBOUND_ALLOW``."""
 
-    # --- 10** pattern (glob-style: * = any sequence) ---
+    # --- 10** pattern (dial-mask style: * = one digit here) ---
 
     def test_double_star_matches_4digit_10xx_extension(self) -> None:
-        """``10**`` matches 1000..1099 (10 + any two chars)."""
+        """``10**`` matches 1000..1099 (10 + exactly two digits)."""
         allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10**"})
         assert is_outbound_allowed("1000", allow) is True
         assert is_outbound_allowed("1099", allow) is True
@@ -56,6 +58,12 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("1100", allow) is False
         assert is_outbound_allowed("2000", allow) is False
         assert is_outbound_allowed("", allow) is False
+
+    @pytest.mark.parametrize("target", ["10", "100", "10000", "10ab", "1100"])
+    def test_double_star_is_fixed_length_digit_mask(self, target: str) -> None:
+        """``10**`` is a 4-digit 10xx mask, not an arbitrary ``10...`` glob."""
+        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10**"})
+        assert is_outbound_allowed(target, allow) is False
 
     # --- 10xx pattern (x = digit wildcard, 0-9) ---
 

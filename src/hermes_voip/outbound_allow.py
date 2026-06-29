@@ -17,11 +17,13 @@ git and out of logs).
 Matching is **exact** for entries that contain no wildcard characters, and
 **pattern-based** (opt-in per entry) for entries that contain ``*`` or ``x``:
 
-* ``*`` matches any sequence of characters (fnmatch / glob convention).
-* ``x`` matches exactly ONE decimal digit (0-9) -- the standard telecom digit
-  placeholder. Example: ``10xx`` permits any four-digit number beginning with
-  ``10`` (1000-1099), while ``*`` permits any suffix. Patterns are anchored:
-  ``10xx`` does NOT match ``10000`` (too long) or ``10ab`` (non-digit).
+* In simple dial masks (digits plus ``+`` / ``#`` / ``*`` / ``x``), ``*`` and
+  ``x`` each match exactly ONE decimal digit. Example: ``10**`` and ``10xx`` both
+  permit only four-digit numbers beginning with ``10`` (1000-1099), not arbitrary
+  ``10...`` prefixes.
+* In SIP URI / non-mask patterns, ``*`` remains glob-like (any character
+  sequence), while ``x`` is literal so values like ``sip:ext@pbx.example.test``
+  stay exact unless the operator explicitly adds ``*``.
 
 Wildcard matching is **opt-in**: an entry without ``*`` or ``x`` stays
 exact-match, so a listed ``"1000"`` never accidentally also permits ``"10000"``
@@ -65,28 +67,41 @@ def _is_sip_uri(entry: str) -> bool:
     return "@" in entry or entry.lower().startswith("sip:")
 
 
+def _is_extension_mask(entry: str) -> bool:
+    """Return True iff ``entry`` is a simple dial-mask pattern.
+
+    Dial masks are extension/feature-code-shaped entries made only from digits,
+    ``+``, ``#``, ``*``, and ``x``/``X``. In this context both ``*`` and ``x`` mean
+    exactly ONE decimal digit, so issue examples ``10**`` and ``10xx`` are the same
+    fixed-length 10xx mask (1000-1099) rather than a broad ``10...`` prefix glob.
+    SIP URIs and other non-mask strings keep glob-style ``*`` semantics instead.
+    """
+    return all(ch.isdigit() or ch in "+#*xX" for ch in entry) and (
+        "*" in entry or "x" in entry or "X" in entry
+    )
+
+
 def _entry_to_regex(entry: str) -> re.Pattern[str] | None:
     """Compile ``entry`` to an anchored regex if it contains wildcards, else None.
 
     An entry without wildcards is exact (returns ``None``); the caller uses set
     membership for those. When wildcards ARE present, the character set depends
-    on whether the entry is a SIP URI:
+    on whether the entry is a simple extension/dial mask or a SIP URI/string pattern:
 
-    **Simple extension** (no ``@``, no ``sip:`` prefix):
+    **Simple extension mask** (only digits, ``+``, ``#``, ``*``, and ``x``/``X``):
 
-    * ``x`` -> ``[0-9]`` (exactly one decimal digit -- telecom digit placeholder).
-    * ``*`` -> ``.*`` (any sequence of characters).
+    * ``x`` / ``X`` -> ``[0-9]`` (exactly one decimal digit).
+    * ``*`` -> ``[0-9]`` (also exactly one decimal digit for dial-mask syntax).
 
-    **SIP URI** (contains ``@`` or ``sip:`` prefix):
+    **SIP URI / other pattern**:
 
     * ``x`` is literal (SIP URIs legitimately contain ``x`` in words like
       ``ext`` or ``example`` -- treating it as a wildcard would match nothing).
     * ``*`` -> ``.*`` (glob any sequence, useful for e.g. ``sip:10*@pbx.example.test``).
 
     All other characters are regex-escaped so they match literally. The pattern
-    is anchored (``^...$``) so ``10xx`` cannot match ``10000`` (the suffix must
-    be exactly two digits, no more) and ``10**`` cannot match ``1100`` (the
-    prefix must be ``10``).
+    is anchored (``^...$``) so ``10xx`` and ``10**`` both match exactly four digits
+    beginning with ``10``; neither matches ``10``, ``100``, ``10000``, or ``10ab``.
 
     Args:
         entry: A single allowlist entry (already trimmed).
@@ -95,18 +110,21 @@ def _entry_to_regex(entry: str) -> re.Pattern[str] | None:
         A compiled :class:`re.Pattern` when the entry contains wildcards, else
         ``None`` (exact-match entry).
     """
+    is_mask = _is_extension_mask(entry)
     is_uri = _is_sip_uri(entry)
-    has_wildcard = "*" in entry or ("x" in entry and not is_uri)
+    has_wildcard = "*" in entry or (("x" in entry or "X" in entry) and not is_uri)
     if not has_wildcard:
         return None
     # Build an anchored regex from the pattern.  Walk char-by-char so each
     # literal character is properly escaped while wildcard chars are expanded.
     parts: list[str] = []
     for ch in entry:
-        if ch == "*":
+        if ch == "*" and is_mask:
+            parts.append("[0-9]")
+        elif ch == "*":
             parts.append(".*")
-        elif ch == "x" and not is_uri:
-            # Digit wildcard: valid only in simple extension patterns (not SIP URIs).
+        elif ch in {"x", "X"} and not is_uri:
+            # Digit wildcard: valid only outside SIP URIs.
             parts.append("[0-9]")
         else:
             parts.append(re.escape(ch))
@@ -197,7 +215,9 @@ def load_outbound_allowlist(extra: Mapping[str, str]) -> OutboundAllowlist:
     )
 
 
-def is_outbound_allowed(number: str, allowlist: OutboundAllowlist) -> bool:
+def is_outbound_allowed(
+    number: str, allowlist: OutboundAllowlist | frozenset[str]
+) -> bool:
     """Return whether ``number`` is a permitted dial target.
 
     Exact entries are checked via O(1) set membership; pattern entries are
@@ -208,7 +228,8 @@ def is_outbound_allowed(number: str, allowlist: OutboundAllowlist) -> bool:
 
     Args:
         number: The dial target requested by the agent (extension or SIP URI).
-        allowlist: The permitted set from :func:`load_outbound_allowlist`.
+        allowlist: The permitted allowlist from :func:`load_outbound_allowlist`;
+            a legacy exact-only ``frozenset[str]`` is also accepted for compatibility.
 
     Returns:
         ``True`` iff the trimmed ``number`` is permitted by an exact entry or a
@@ -217,6 +238,11 @@ def is_outbound_allowed(number: str, allowlist: OutboundAllowlist) -> bool:
     candidate = number.strip()
     if not candidate:
         return False
+    if isinstance(allowlist, frozenset):
+        # Backwards compatibility for exact-only callers/tests that still hold the
+        # pre-issue-355 representation. Pattern matching requires the typed
+        # OutboundAllowlist returned by load_outbound_allowlist.
+        return candidate in allowlist
     if candidate in allowlist._exact:
         return True
     return any(pat.fullmatch(candidate) is not None for pat in allowlist._patterns)

@@ -33,8 +33,11 @@ from hermes_voip.call_context import (
 )
 from hermes_voip.config import ConfigError, GatewayConfig, MediaConfig
 from hermes_voip.plugin import register
+from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers, build_providers
+from hermes_voip.providers.guard import InjectionGuard
+from hermes_voip.providers.tts import StreamingTTS
 from hermes_voip.registration import (
     Challenged,
     Failed,
@@ -54,6 +57,7 @@ __all__ = [
     "GatewayConfig",
     "HistoryInfoEntry",
     "InboundCallContext",
+    "InjectionGuard",
     "MediaConfig",
     "PcmFrame",
     "Providers",
@@ -62,6 +66,8 @@ __all__ = [
     "RegistrationFlow",
     "RegistrationOutcome",
     "Retry",
+    "StreamingASR",
+    "StreamingTTS",
     "__version__",
     "build_providers",
     "extract_call_context",

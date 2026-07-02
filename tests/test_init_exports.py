@@ -4,6 +4,9 @@ import hermes_voip
 import hermes_voip.call_context
 import hermes_voip.dtmf
 import hermes_voip.message
+import hermes_voip.providers.asr
+import hermes_voip.providers.guard
+import hermes_voip.providers.tts
 import hermes_voip.registration
 import hermes_voip.rtcp
 import hermes_voip.rtp
@@ -164,3 +167,44 @@ def test_top_level_exports_pcm_frame() -> None:
     """PcmFrame must appear in hermes_voip.__all__ and be importable."""
     assert "PcmFrame" in hermes_voip.__all__
     assert hasattr(hermes_voip, "PcmFrame")
+
+
+# ── (C) top-level provider-protocol export gaps (bk872) ──────────────────────
+# StreamingASR / StreamingTTS / InjectionGuard are the canonical ADR-0004
+# provider seams — already re-exported at hermes_voip.providers.__all__ — but
+# #324 did not promote them to the hermes_voip top level alongside the other
+# provider-wiring names (Providers, build_providers, PcmFrame).
+
+
+def test_top_level_exports_streaming_asr() -> None:
+    """StreamingASR must appear in hermes_voip.__all__ and be importable."""
+    assert "StreamingASR" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "StreamingASR")
+    assert hermes_voip.StreamingASR is hermes_voip.providers.asr.StreamingASR
+
+
+def test_top_level_exports_streaming_tts() -> None:
+    """StreamingTTS must appear in hermes_voip.__all__ and be importable."""
+    assert "StreamingTTS" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "StreamingTTS")
+    assert hermes_voip.StreamingTTS is hermes_voip.providers.tts.StreamingTTS
+
+
+def test_top_level_exports_injection_guard() -> None:
+    """InjectionGuard must appear in hermes_voip.__all__ and be importable."""
+    assert "InjectionGuard" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "InjectionGuard")
+    assert hermes_voip.InjectionGuard is hermes_voip.providers.guard.InjectionGuard
+
+
+# ── (D) top-level submodule-attribute access (bk872) ──────────────────────────
+# The submodules pulled in (directly/transitively) by hermes_voip/__init__.py
+# stay reachable as ``hermes_voip.<name>`` — this is intentional, standard
+# Python: it is exactly what the ``import hermes_voip.sub; hermes_voip.sub.X``
+# idiom relies on, and this file's own tests above use it (hermes_voip.sip/.stt/
+# .tts/.message ... attribute access). ``__all__`` — not the attribute surface —
+# is the documented ``from hermes_voip import *`` public API, and #324 + the new
+# StreamingASR/StreamingTTS/InjectionGuard exports keep it correct. So there is
+# nothing to "de-leak": deleting those attributes would break the deep-import
+# idiom (verified: after ``del``, ``import hermes_voip.config`` then
+# ``hermes_voip.config.X`` raises AttributeError on the cache-hit import).

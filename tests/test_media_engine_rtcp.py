@@ -919,6 +919,32 @@ async def test_inbound_malformed_muxed_rtcp_is_dropped_not_fatal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inbound_zero_ssrc_bye_is_dropped_not_fatal() -> None:
+    """A crafted 4-byte BYE with source-count 0 is dropped, not fatal.
+
+    Regression: ``Bye._from_body`` used to raise a bare ``ValueError`` (not
+    ``RtcpError``) for an SC=0 BYE, which ``_ingest_rtcp_datagram`` does not catch
+    — so a single ``80 cb 00 00`` datagram to a live call's muxed RTP/RTCP address
+    propagated out of the SAME inbound generator that decodes audio. With the
+    parse-path guard it is dropped like any malformed datagram and the next audio
+    packet still flows.
+    """
+    engine = _make_engine()
+    await engine.connect()
+    engine._transport = _CaptureTransport()
+    await engine.start_rtcp(mux=True, rtp_payload_types=())
+    try:
+        remote = ("127.0.0.1", 5004)
+        engine._recv_queue.put_nowait((b"\x80\xcb\x00\x00", remote))  # SC=0 BYE
+        engine._recv_queue.put_nowait((_rtp_datagram(seq=501, ts=0), remote))
+        gen = engine.inbound_audio()
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        assert frame.sample_rate == _G711_RATE
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_non_muxed_inbound_rtcp_socket_feeds_ingest() -> None:
     """The sibling RTCP socket pumps inbound RTCP into ingest_rtcp (non-muxed path).
 

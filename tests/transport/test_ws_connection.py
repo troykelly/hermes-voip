@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -972,6 +973,199 @@ async def test_malformed_response_frame_is_skipped_active_call_survives() -> Non
     finally:
         await transport.aclose()
         await server.stop()
+
+
+async def test_superscript_cseq_number_on_invite_final_survives_connection() -> None:
+    # F1 (HIGH, ADR-0081, WSS mirror): a crafted INVITE-final frame with a
+    # non-decimal CSeq NUMBER — the superscript "²": ``"²".isdigit()`` is True but
+    # ``int("²")`` raises — reaches ``_txn_key`` (method token is a valid "INVITE")
+    # and crashes in ``int()`` BEFORE any transaction lookup, so no correlated call
+    # is needed. Unguarded it escaped the reader and dropped every active call.
+    # Assert an UNRELATED active call survives and on_connection_lost never fires.
+    active_call_id = new_call_id()
+    active_branch = new_branch()
+    responses: list[SipResponse] = []
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    class _Sink:
+        async def on_response(self, response: SipResponse) -> None:
+            responses.append(response)
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    try:
+        await transport.connect()
+        transport.add_call(active_call_id, _Sink())
+        active_invite = _outbound_invite(active_branch, call_id=active_call_id)
+        await transport.send(active_invite)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        # The crafted frame carries its OWN (untracked) Call-ID; it correlates to no
+        # transaction, and would crash in _txn_key before that even mattered.
+        unrelated = SipRequest.parse(
+            _outbound_invite(new_branch(), call_id=new_call_id())
+        )
+        await server.push(_final_with_cseq(unrelated, 486, "Busy Here", "² INVITE"))
+        # RED before the fix: the reader crashes and fires on_connection_lost.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+        assert lost == [], "a non-decimal CSeq must not fire on_connection_lost"
+        # The unrelated active call's own 200 OK is still routed to its sink.
+        parsed_active = SipRequest.parse(active_invite)
+        cseq = parsed_active.header("CSeq")
+        assert cseq is not None
+        await server.push(_final_with_cseq(parsed_active, 200, "OK", cseq))
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in responses))
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_overlong_cseq_number_on_invite_final_survives_connection() -> None:
+    # F1 residual (codex adversarial review), WSS mirror: a CSeq number that is
+    # all-ASCII-decimal but longer than CPython's int-from-string digit limit
+    # (sys.get_int_max_str_digits(), default 4300) passes ``isascii() and
+    # isdecimal()`` yet still makes ``int()`` raise ValueError. A crafted
+    # "CSeq: <thousands of digits> INVITE" frame must be dropped like "²" is.
+    overlong = "9" * (sys.get_int_max_str_digits() + 1)
+    active_call_id = new_call_id()
+    active_branch = new_branch()
+    responses: list[SipResponse] = []
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    class _Sink:
+        async def on_response(self, response: SipResponse) -> None:
+            responses.append(response)
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    try:
+        await transport.connect()
+        transport.add_call(active_call_id, _Sink())
+        active_invite = _outbound_invite(active_branch, call_id=active_call_id)
+        await transport.send(active_invite)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        unrelated = SipRequest.parse(
+            _outbound_invite(new_branch(), call_id=new_call_id())
+        )
+        await server.push(
+            _final_with_cseq(unrelated, 486, "Busy Here", f"{overlong} INVITE")
+        )
+        # RED before the try/except: the reader crashes and fires on_connection_lost.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+        assert lost == [], "an over-long CSeq number must not fire on_connection_lost"
+        parsed_active = SipRequest.parse(active_invite)
+        cseq = parsed_active.header("CSeq")
+        assert cseq is not None
+        await server.push(_final_with_cseq(parsed_active, 200, "OK", cseq))
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in responses))
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+def _final_missing_to(invite: SipRequest, status: int, reason: str) -> str:
+    """A non-2xx final correlated to ``invite`` but carrying NO ``To`` header.
+
+    Same Via/branch, Call-ID and CSeq number as ``invite`` (so it matches the
+    outstanding INVITE client transaction), but no ``To``. parse() does not require
+    ``To`` (it frames + parses cleanly), so this reaches _auto_ack_non_2xx and
+    _build_ack's ``_require(response, "To")`` raises ValueError.
+    """
+    return (
+        f"SIP/2.0 {status} {reason}\r\n"
+        f"Via: {invite.header('Via')}\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"Call-ID: {invite.header('Call-ID')}\r\n"
+        f"CSeq: {invite.header('CSeq')}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_correlated_non_2xx_final_missing_to_survives_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # F3 (MEDIUM, ADR-0081, WSS mirror): a non-2xx final that CORRELATES to an
+    # INVITE we sent (so a client transaction IS found) but lacks a To header makes
+    # _build_ack's _require(response, "To") raise ValueError. Unguarded it escaped
+    # the reader and tore the connection down. Assert the connection survives, no
+    # ACK is sent, and a non-PII WARNING is logged.
+    branch = new_branch()
+    call_id = new_call_id()
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.ws_connection"):
+        try:
+            await transport.connect()
+            invite = _outbound_invite(branch, call_id=call_id)
+            await transport.send(invite)
+            await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+            await server.push(
+                _final_missing_to(SipRequest.parse(invite), 486, "Busy Here")
+            )
+            # RED before the fix: the reader crashes and fires on_connection_lost.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+            assert lost == [], (
+                "a To-less correlated final must not tear the reader down"
+            )
+            # The auto-ACK could not be built, so none was sent.
+            assert not any(raw.startswith("ACK ") for raw in server.received)
+        finally:
+            await transport.aclose()
+            await server.stop()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("auto-ACK" in r.getMessage() for r in warnings), (
+        "dropping an unbuildable auto-ACK must be logged as a WARNING"
+    )
 
 
 async def test_in_dialog_request_routes_to_consumer() -> None:

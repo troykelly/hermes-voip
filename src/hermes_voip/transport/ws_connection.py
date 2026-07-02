@@ -530,7 +530,23 @@ class WssSipTransport:
         txn = self._client_txns.get(key)
         if txn is None:
             return
-        ack = txn.ack_for_response(response)
+        # Building the §17.1.1.3 ACK copies the response's To (and echoes other
+        # headers) into a fresh request, so a correlated non-2xx final that is missing
+        # To — or carries a control char in an echoed header — makes the builder raise
+        # ValueError; unguarded that escapes the reader and tears down the whole
+        # connection (ADR-0081). Catch ONLY the builder's ValueError and drop the
+        # auto-ACK: no ACK was built, so the transaction is untouched and is cleaned up
+        # with the call. The send stays OUTSIDE the try so a genuine transport error
+        # from real IO loss still propagates (rule 37).
+        try:
+            ack = txn.ack_for_response(response)
+        except ValueError as exc:
+            _log.warning(
+                "dropping the auto-ACK for a non-2xx INVITE final that cannot build"
+                " an ACK (%s) — connection kept",
+                type(exc).__name__,
+            )
+            return
         if ack is not None:
             await self.send(ack)
         if txn.state is TransactionState.TERMINATED:
@@ -760,6 +776,20 @@ def _txn_key(call_id: str | None, cseq: str | None) -> tuple[str, int] | None:
     if call_id is None or cseq is None:
         return None
     parts = cseq.split()
-    if not parts or not parts[0].isdigit():
+    # Guard int() with ``isascii() and isdecimal()`` (the house pattern — see
+    # framing.py / sdp.py / registration.py), NOT ``isdigit()``: ``str.isdigit()`` is
+    # True for non-decimal digit characters such as the superscript "²" that ``int()``
+    # cannot parse, so an inbound ``CSeq: ² INVITE`` would raise ValueError here and
+    # escape the reader, tearing down the whole connection (ADR-0081).
+    if not parts or not (parts[0].isascii() and parts[0].isdecimal()):
         return None
-    return (call_id, int(parts[0]))
+    try:
+        number = int(parts[0])
+    except ValueError:
+        # An all-ASCII-decimal token can still overflow CPython's int-from-string
+        # digit limit (sys.get_int_max_str_digits(), default 4300): a crafted
+        # ``CSeq: <thousands of digits> INVITE`` reaches here and int() raises. Fail
+        # closed on that residual too — no transaction match, so the caller drops the
+        # auto-ACK rather than crashing.
+        return None
+    return (call_id, number)

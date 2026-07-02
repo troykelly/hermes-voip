@@ -197,42 +197,14 @@ def test_top_level_exports_injection_guard() -> None:
     assert hermes_voip.InjectionGuard is hermes_voip.providers.guard.InjectionGuard
 
 
-# ── (D) top-level submodule-attribute leak (bk872) ────────────────────────────
-# #324's __all__ correctly excludes these internal submodules (so
-# ``from hermes_voip import *`` already excludes them), but plain
-# ``import hermes_voip`` still left them resolvable as ``hermes_voip.<name>``
-# attributes — Python's import machinery binds every submodule pulled in,
-# directly or transitively, by hermes_voip/__init__.py onto the package. The
-# attribute surface must agree with __all__, not just the star-import surface.
-#
-# Only 4 of the 7 leaked names are covered here (not sip/registration/message):
-# those three are load-bearing for existing tests ABOVE in this same file
-# (test_sip_exports_sip_address_of_record, test_registration_exports_
-# registration_flow, test_message_exports_sip_request all reach the module via
-# hermes_voip.sip/.registration/.message attribute access) — deleting them
-# would raise AttributeError there. caller_modes/config/digest/plugin have no
-# such dependency anywhere in tests/ or src/, so they can be fully closed.
-
-
-def test_top_level_does_not_leak_caller_modes_submodule() -> None:
-    """hermes_voip.caller_modes must not resolve as a top-level attribute."""
-    assert "caller_modes" not in hermes_voip.__all__
-    assert not hasattr(hermes_voip, "caller_modes")
-
-
-def test_top_level_does_not_leak_config_submodule() -> None:
-    """hermes_voip.config must not resolve as a top-level attribute."""
-    assert "config" not in hermes_voip.__all__
-    assert not hasattr(hermes_voip, "config")
-
-
-def test_top_level_does_not_leak_digest_submodule() -> None:
-    """hermes_voip.digest must not resolve as a top-level attribute."""
-    assert "digest" not in hermes_voip.__all__
-    assert not hasattr(hermes_voip, "digest")
-
-
-def test_top_level_does_not_leak_plugin_submodule() -> None:
-    """hermes_voip.plugin must not resolve as a top-level attribute."""
-    assert "plugin" not in hermes_voip.__all__
-    assert not hasattr(hermes_voip, "plugin")
+# ── (D) top-level submodule-attribute access (bk872) ──────────────────────────
+# The submodules pulled in (directly/transitively) by hermes_voip/__init__.py
+# stay reachable as ``hermes_voip.<name>`` — this is intentional, standard
+# Python: it is exactly what the ``import hermes_voip.sub; hermes_voip.sub.X``
+# idiom relies on, and this file's own tests above use it (hermes_voip.sip/.stt/
+# .tts/.message ... attribute access). ``__all__`` — not the attribute surface —
+# is the documented ``from hermes_voip import *`` public API, and #324 + the new
+# StreamingASR/StreamingTTS/InjectionGuard exports keep it correct. So there is
+# nothing to "de-leak": deleting those attributes would break the deep-import
+# idiom (verified: after ``del``, ``import hermes_voip.config`` then
+# ``hermes_voip.config.X`` raises AttributeError on the cache-hit import).

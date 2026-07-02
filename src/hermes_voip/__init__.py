@@ -75,29 +75,6 @@ __all__ = [
     "sip_address_of_record",
 ]
 
-# ``hermes_voip.providers``/``.stt``/``.tts``/``.transport``/``.call_context``
-# etc. are intentional deep-import subpackages — each audited by its own
-# __all__ (tests/test_init_exports.py) — and stay reachable as
-# ``hermes_voip.<name>``. ``caller_modes``/``config``/``digest``/``plugin`` are
-# pure implementation-detail submodules that Python's import machinery binds
-# onto this package as a side effect of the imports above (nobody is meant to
-# write ``hermes_voip.plugin.register`` — they use the ``register`` promoted
-# above); ``del`` below closes that gap so the attribute surface agrees with
-# __all__, not just the star-import surface. Deep imports keep working
-# (``from hermes_voip.config import X``, ``import hermes_voip.config``): the
-# module stays cached in ``sys.modules``, and CPython's import fast path does
-# not re-set a parent attribute for an already-cached module
-# (``importlib._bootstrap._find_and_load`` short-circuits on the cache hit),
-# so the attribute never reappears.
-#
-# sip/registration/message leak the same way but are deliberately NOT deleted
-# here: existing tests reach them via this exact attribute chain
-# (tests/test_init_exports.py's sip/registration/message __all__ checks), so
-# removing them would break those tests.
-from . import caller_modes, config, digest, plugin
-
-del caller_modes, config, digest, plugin
-
 
 def _resolve_version() -> str:
     """Single-source the package version from installed distribution metadata.

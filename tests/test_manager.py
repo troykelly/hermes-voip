@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 
 import pytest
@@ -98,68 +99,81 @@ def _ok_for(register_text: str, *, expires: int = 300) -> SipResponse:
     )
 
 
-def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
-    structured_fields = {
-        key: value
-        for key, value in record.__dict__.items()
-        if key
-        not in {
-            "name",
-            "msg",
-            "args",
-            "levelname",
-            "levelno",
-            "pathname",
-            "filename",
-            "module",
-            "exc_info",
-            "exc_text",
-            "stack_info",
-            "lineno",
-            "funcName",
-            "created",
-            "msecs",
-            "relativeCreated",
-            "thread",
-            "threadName",
-            "processName",
-            "process",
-            "taskName",
-            "message",
-        }
-    }
-    serialized_fields = json.dumps(structured_fields, sort_keys=True, default=repr)
-    # LogRecord *numeric* runtime metadata (timestamps, thread/process ids) is
-    # framework-set and never secret-bearing, but its values vary per run and can
-    # coincidentally contain a short secret digit like "1000" (e.g. relativeCreated
-    # mid-suite, or a thread/process id), which flakes this check -- so it is excluded
-    # below. Every secret-bearing surface is still scanned: the code-attached extra
-    # fields, the message args, the rendered message, and `taskName` (asyncio task
-    # names are application-set and CAN carry a dial target, so they stay scanned).
-    runtime_metadata = {
+# Standard LogRecord attributes (Python 3.13): framework-populated metadata plus the raw
+# message template/args. A secret reaches the log ONLY via a code-controlled surface --
+# the rendered message, ``%`` args, a code-attached ``extra`` field, or a CUSTOM task
+# name -- so those are the only surfaces the scan below covers. Everything else here is
+# framework metadata (timestamps, thread/process ids, source location, the default
+# "Task-<n>" counter) that never carries a secret and whose nondeterministic numeric
+# values would only false-trip a short-digit scan.
+_STANDARD_LOGRECORD_ATTRS = frozenset(
+    {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
         "created",
         "msecs",
         "relativeCreated",
         "thread",
+        "threadName",
+        "processName",
         "process",
+        "taskName",
+        "message",
     }
-    scannable_record = {
+)
+
+#: asyncio's framework-DEFAULT task name, ``Task-<n>`` (a monotonic counter that climbs
+#: past "1000"/"1001" across a suite). A ``taskName`` that does NOT match this is
+#: application-set and MAY carry a dial target, so it is scanned; the default is not.
+_DEFAULT_ASYNCIO_TASK_NAME = re.compile(r"Task-\d+")
+
+
+def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
+    """Assert no fake secret leaks into any CODE-CONTROLLED surface of ``record``.
+
+    Deterministic: scans only the surfaces a logging call populates -- code-attached
+    ``extra`` fields, the rendered message, the ``%`` args, and a CUSTOM asyncio task
+    name -- never the framework metadata (timestamps / thread & process ids / source
+    location / the default ``Task-<n>`` counter), whose nondeterministic values would
+    otherwise coincidentally match a short secret digit like "1000" and flake. A CUSTOM
+    task name (e.g. ``create_task(name=f"dial-{ext}")``) IS scanned, so a secret leaked
+    only via a named task is still caught; ``taskName`` may be ``None`` (no loop)
+    -- that carries nothing.
+    """
+    extra_fields = {
         key: value
         for key, value in record.__dict__.items()
-        if key not in runtime_metadata
+        if key not in _STANDARD_LOGRECORD_ATTRS
     }
-    serialized_record = json.dumps(scannable_record, sort_keys=True, default=repr)
-    rendered_message = record.getMessage()
+    task_name = record.__dict__.get("taskName")
+    custom_task_name = (
+        task_name
+        if isinstance(task_name, str)
+        and _DEFAULT_ASYNCIO_TASK_NAME.fullmatch(task_name) is None
+        else ""
+    )
+    scanned_surfaces = {
+        "extra fields": json.dumps(extra_fields, sort_keys=True, default=repr),
+        "rendered message": record.getMessage(),
+        "message args": json.dumps(record.args, default=repr) if record.args else "",
+        "custom task name": custom_task_name,
+    }
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
-        assert secret not in serialized_fields, (
-            f"structured failure log leaked secret {secret!r} in extra fields"
-        )
-        assert secret not in serialized_record, (
-            f"structured failure log leaked secret {secret!r} in serialized record"
-        )
-        assert secret not in rendered_message, (
-            f"structured failure log leaked secret {secret!r} in rendered message"
-        )
+        for surface_name, surface in scanned_surfaces.items():
+            assert secret not in surface, (
+                f"structured failure log leaked secret {secret!r} in {surface_name}"
+            )
 
 
 def _make_clean_record(**overrides: object) -> logging.LogRecord:

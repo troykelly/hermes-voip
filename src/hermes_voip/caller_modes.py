@@ -68,6 +68,7 @@ __all__ = [
     "channel_for_group",
     "classify_caller",
     "classify_caller_group",
+    "default_caller_classification",
     "group_for_mode",
     "load_caller_groups",
     "load_caller_modes",
@@ -544,6 +545,34 @@ def _matched_pattern(candidate: str, raw: str, patterns: tuple[str, ...]) -> str
 # ---------------------------------------------------------------------------
 
 
+def default_caller_classification(cfg: CallerGroupConfig) -> CallerClassification:
+    """The classification an UNRESOLVED / unmatched caller-ID gets: the default group.
+
+    The default group is the operator-configured catch-all — validated at load to have
+    ``privilege_level == 0`` (least privilege, :meth:`CallerGroupConfig.__post_init__`).
+    This is the ONLY correct outcome for a caller-ID that could not be resolved (a
+    ``tel:`` URI, a malformed ``From`` with no ``sip:user@``): the call site must force
+    the default HERE rather than route a placeholder string through
+    :func:`classify_caller_group`, because a placeholder in the caller-ID namespace is
+    NOT a guardrail — an operator pattern (exact or ``*``-prefix) could match it and
+    force an elevated group, a crafted-``From`` privilege escalation. Pure; returns the
+    same default group an unmatched caller falls into.
+    """
+    by_name: dict[str, CallerGroup] = {g.name: g for g in cfg.groups}
+    default_group = by_name.get(cfg.default_group)
+    if default_group is None:
+        # Should not happen — validated at load; fall back to a safe receptionist.
+        default_group = CallerGroup(
+            name="receptionist",
+            privilege_level=0,
+            persona="receptionist",
+            declined_at_sip=False,
+        )
+    return CallerClassification(
+        group=default_group, source="default", matched_pattern=""
+    )
+
+
 def classify_caller_group(
     raw_caller: str, cfg: CallerGroupConfig
 ) -> CallerClassification:
@@ -580,20 +609,7 @@ def classify_caller_group(
                 group=group, source=group_name, matched_pattern=pat
             )
 
-    default_group = by_name.get(cfg.default_group)
-    if default_group is None:
-        # Should not happen — validated at load; fall back to a safe receptionist.
-        safe = CallerGroup(
-            name="receptionist",
-            privilege_level=0,
-            persona="receptionist",
-            declined_at_sip=False,
-        )
-        return CallerClassification(group=safe, source="default", matched_pattern="")
-
-    return CallerClassification(
-        group=default_group, source="default", matched_pattern=""
-    )
+    return default_caller_classification(cfg)
 
 
 # ---------------------------------------------------------------------------

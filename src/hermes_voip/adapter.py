@@ -71,16 +71,19 @@ from gateway.session import SessionSource
 from hermes_voip.call import CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
+    _addr_spec,
     extract_call_context,
     render_call_context_block,
 )
 from hermes_voip.call_end import CallEndReason, injection_text_for_reason
 from hermes_voip.caller_modes import (
+    CallerClassification,
     CallerGroup,
     CallerGroupConfig,
     CallerMode,
     channel_for_group,
     classify_caller_group,
+    default_caller_classification,
     group_for_mode,
     load_caller_groups,
     load_caller_modes,
@@ -3044,12 +3047,17 @@ class VoipAdapter(BasePlatformAdapter):
         # proceed; the group's privilege_level sets guard_state and the per-turn
         # persona later.
         from_header = invite.header("From") or ""
-        caller_number = _caller_number(from_header)
         caller_groups = self._caller_groups
         if caller_groups is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: caller-group config not initialised"
             raise RuntimeError(msg)
-        classification = classify_caller_group(caller_number, caller_groups)
+        caller_number, classification = _classify_caller(from_header, caller_groups)
+        # DISPLAY value for the (forgeable) caller identity: the resolved SIP user-part,
+        # or a fixed placeholder when unresolved (a tel:/malformed From). This is a
+        # DISPLAY/log token ONLY — it is never fed back into classification/intercom
+        # matching, so an unresolved caller cannot be matched into an elevated group by
+        # an operator pattern (the classification above forces the default group).
+        caller_display = caller_number if caller_number is not None else _UNKNOWN_CALLER
         group = classification.group
         # ADR-0020 §5/§6: a declined-group caller's disposition is governed by
         # ``deny_mode``. ``reject`` (the default, Phase 1) sends a hard 603 Decline
@@ -3074,7 +3082,7 @@ class VoipAdapter(BasePlatformAdapter):
                     call_id,
                     group.name,
                     classification.source,
-                    _redact_number(caller_number),
+                    _redact_number(caller_display),
                     extra=_rejected_extra(call_id, 603, "caller_declined"),
                 )
                 await transport.send(build_response(invite, 603, "Decline"))
@@ -3087,7 +3095,7 @@ class VoipAdapter(BasePlatformAdapter):
                 call_id,
                 group.name,
                 classification.source,
-                _redact_number(caller_number),
+                _redact_number(caller_display),
             )
         _log.info(
             "INVITE %s: caller group=%s privilege_level=%d (source=%s)",
@@ -3465,9 +3473,15 @@ class VoipAdapter(BasePlatformAdapter):
         # binds this call to that intercom's NAMED opening set, scoping open_entry(name)
         # to ONLY those openings. Caller-ID is forgeable (never auth) — the per-opening
         # secret + the ELEVATED/allowed_tools gate are the protection, not the match.
-        intercom_entry = self._multi_intercom.match(caller_number)
+        # An unresolved caller-ID (None) matches NO intercom — same guardrail as the
+        # classification above: a placeholder string is never routed through pattern
+        # matching, so a crafted/malformed From cannot bind a call to an intercom's
+        # opening set by matching an intercom caller-ID pattern.
+        intercom_entry = (
+            None if caller_number is None else self._multi_intercom.match(caller_number)
+        )
         self._call_info[call_id] = {
-            "name": caller_number,
+            "name": caller_display,
             "remote_uri": from_header,
             "type": "dm",
             "ended": False,
@@ -6657,13 +6671,21 @@ class VoipAdapter(BasePlatformAdapter):
         targets the *originating* foreign session instead and does NOT use this helper.
         """
         channel = channel_for_group(self._group_for_call(call_id))
+        # The caller-/callee-derived identity fields are FORGEABLE and presentation-only
+        # (never authorization — ADR-0020/0052). Defang them HERE, the single chokepoint
+        # every own-session injection routes through, so no agent-visible identity field
+        # can carry the spotlight-fence sentinel or a multi-line-injection payload —
+        # consistent with the transcript + ADR-0052 context-block treatment. ``chat_id``
+        # is the routing key (our own Call-ID, not caller-supplied) and is left exact;
+        # the system-turn ``user_id``/``user_name=="system"`` values are already clean,
+        # so the defang is a no-op there.
         return SessionSource(
             platform=self._channel_platform(channel),
             chat_id=call_id,
-            chat_name=chat_name,
+            chat_name=_defang_identity(chat_name),
             chat_type="dm",
-            user_id=user_id,
-            user_name=user_name,
+            user_id=_defang_identity(user_id),
+            user_name=_defang_identity(user_name),
         )
 
     def _channel_platform(self, channel: str) -> Platform:
@@ -7385,13 +7407,68 @@ def _host_of(sent_by: str) -> str:
     return host if sep else sent_by
 
 
-def _caller_number(from_header: str) -> str:
-    """Extract the user part of the From AOR, or return the header verbatim."""
-    # From: <sip:NUMBER@host>;tag=…  or  sip:NUMBER@host
+# DISPLAY placeholder for an UNRESOLVED caller-ID (a ``tel:`` URI, or a malformed From
+# with no ``sip:user@``). Used ONLY as the agent-visible ``MessageEvent`` name and the
+# redacted deny-audit log token — NEVER for classification / intercom matching (an
+# unresolved caller forces the default group directly, see :func:`_classify_caller`). A
+# fixed low-entropy token is defang-safe and carries no attacker bytes.
+_UNKNOWN_CALLER = "unknown"
+
+
+def _caller_number(from_header: str) -> str | None:
+    """Extract the ``sip:`` user-part of the From AOR, or ``None`` when unresolved.
+
+    Parses the ACTUAL From addr-spec (the URI inside ``<...>``, or the bare URI when
+    there is no display-name wrapper) via the shared SIP addr-spec parser
+    (:func:`~hermes_voip.call_context._addr_spec`), so a ``sip:...@`` substring embedded
+    in the DISPLAY NAME or a header parameter is NEVER mistaken for the caller-ID (which
+    a whole-header regex would do — a crafted-``From`` classification/intercom bypass).
+    Only a ``sip:`` / ``sips:`` AOR with a non-empty, whitespace-free user-part resolves
+    (a real SIP/E.164 user-part carries no whitespace — RFC 3261 §19.1.1); a ``tel:``
+    URI, any other scheme, or a malformed value is UNRESOLVED and returns ``None``.
+
+    ``None`` is an explicit "unresolved" state — NEVER the whole raw header (which would
+    leak an attacker-controlled string) and NEVER a placeholder STRING (which the
+    caller-group / intercom matchers would treat as an ordinary caller-ID, where an
+    operator pattern could match it and escalate the caller). :func:`_classify_caller`
+    maps ``None`` to the default group directly. A matched user-part stays forgeable and
+    is defanged at the agent-visible seam (:func:`_defang_identity`); caller-ID is never
+    authorization (ADR-0020/0052).
+    """
     import re  # noqa: PLC0415
 
-    match = re.search(r"sip:([^@>]+)@", from_header)
-    return match.group(1) if match else from_header
+    addr = _addr_spec(from_header)
+    scheme, sep, rest = addr.partition(":")
+    if not sep or scheme.lower() not in ("sip", "sips"):
+        return None
+    # A valid AOR is EXACTLY ``user@host`` where each part is non-empty, whitespace-free
+    # and ``@``-free (a SIP host cannot contain an unescaped ``@``). An anchored match
+    # rejects every malformed shape in one pass — host-less, empty user/host, a
+    # multi-``@`` host, or embedded whitespace — so a crafted From never yields a
+    # caller-ID that could enter caller-group / intercom pattern matching.
+    match = re.fullmatch(r"([^\s@]+)@[^\s@]+", rest)
+    return match.group(1) if match else None
+
+
+def _classify_caller(
+    from_header: str, caller_groups: CallerGroupConfig
+) -> tuple[str | None, CallerClassification]:
+    """Resolve the caller-ID from a ``From`` header and classify it.
+
+    Returns ``(caller_number, classification)``. An UNRESOLVED caller-ID (``None`` — a
+    ``tel:`` URI, a malformed header) FORCES the default (least-privilege) group
+    directly via :func:`default_caller_classification`; it is NEVER routed through
+    :func:`classify_caller_group` as a placeholder string, because a placeholder in the
+    caller-ID namespace is not a guardrail — an operator pattern (exact or ``*``-prefix)
+    could match it and force an elevated group, a crafted-``From`` privilege escalation.
+    A resolved caller-ID classifies normally. Caller-ID is forgeable and never
+    authorization (ADR-0020/0052); classification only selects a persona / privilege
+    tier.
+    """
+    caller_number = _caller_number(from_header)
+    if caller_number is None:
+        return None, default_caller_classification(caller_groups)
+    return caller_number, classify_caller_group(caller_number, caller_groups)
 
 
 def _redact_number(number: str) -> str:
@@ -7596,6 +7673,26 @@ def _defang_fence(text: str) -> str:
     return text.replace("<<<", "< < <").replace(">>>", "> > >")
 
 
+def _defang_identity(value: str) -> str:
+    """Neutralise an UNTRUSTED caller/callee identity for an agent-visible field.
+
+    The caller-ID is forgeable and presentation-only — never an authorization input
+    (ADR-0020/0052). A hostile ``From`` header can carry the spotlight-fence sentinel
+    and prompt-injection markup into the ``MessageEvent`` identity fields
+    (``user_name``/``chat_name``/``user_id``) and the outbound framing, which a Hermes
+    runtime may render into the agent's context (e.g. "you are speaking with
+    {user_name}"). This applies the SAME discipline the transcript and the ADR-0052
+    context block use for caller-ID: collapse every whitespace run (newlines/tabs/CR
+    included) to a single space — so the value stays ONE line and cannot introduce a
+    forged instruction line — and defang the ``<<<``/``>>>`` fence sentinel
+    (:func:`_defang_fence`). The result is a single, fence-safe line that can never
+    break out of an untrusted framing. Presentation only; the privilege clamp is the
+    real boundary. Idempotent, and a no-op on an already-clean identity (e.g. our own
+    Call-ID used as ``user_id`` on a system turn).
+    """
+    return _defang_fence(" ".join(value.split()))
+
+
 # Human-readable phrasing of each call-end reason for an outbound OUTCOME report to
 # the originating conversation (ADR-0029). NOT the same as the call's own-session
 # signal text (that is ``/stop`` or the disconnected note, ADR-0026) — this is a
@@ -7781,8 +7878,12 @@ def _spotlight_turn(
     preamble = persona_preamble_for_group(group)
     framing = ""
     if group.persona == "outbound":
+        # The callee identity is forgeable/attacker-influenceable, so defang it before
+        # it rides in the TRUSTED framing (consistent with the objective on the next
+        # line, which is likewise defanged): no fence sentinel, single line.
         framing = (
-            f"\nThis is an outbound call that the operator placed to '{caller_name}'. "
+            "\nThis is an outbound call that the operator placed to "
+            f"'{_defang_identity(caller_name)}'. "
             "Open the conversation as the operator's assistant pursuing the "
             "operator's task with this callee.\n"
         )

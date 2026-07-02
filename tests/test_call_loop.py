@@ -27,6 +27,7 @@ from typing import Final
 
 import pytest
 
+import hermes_voip.media.call_loop as _call_loop_mod
 from hermes_voip.media.call_loop import (
     _DTMF_TURN_PREFIX,
     BargeInMode,
@@ -5131,3 +5132,49 @@ async def test_reply_streams_first_sentence_before_later_synthesised() -> None:
     second_segment_gate.set()
     await asyncio.wait_for(speak_task, timeout=5.0)
     assert len(transport.sent_audio) == 2, "the second sentence's audio was not sent"
+
+
+# ---------------------------------------------------------------------------
+# __all__ export
+# ---------------------------------------------------------------------------
+
+
+class TestCallLoopModuleExports:
+    """Verify that call_loop.py defines __all__ with the correct public names.
+
+    call_loop.py was the one outlier among the ``media/`` package's modules with no
+    explicit ``__all__`` (15/17 siblings define one) — a star-import would leak every
+    private helper (``_DtmfConfirmationSink``, ``_ToneStream``, ``_sanitize_iter``, the
+    module-level ``_DEFAULT_*`` config constants, ...). The expected set below is
+    exactly the module's real external surface: ``CallLoop`` and ``gate_voip_tool``
+    (imported directly by the adapter and by tests), plus ``BargeInMode`` and
+    ``BargeInGate`` (imported by the barge-in gate tests and the adapter).
+    """
+
+    def test_module_defines_all(self) -> None:
+        """The call_loop module must define __all__."""
+        assert hasattr(_call_loop_mod, "__all__"), (
+            "call_loop module must define __all__"
+        )
+
+    def test_all_contains_correct_public_names(self) -> None:
+        """__all__ must list the exact public names intended for star-import."""
+        expected = {"BargeInGate", "BargeInMode", "CallLoop", "gate_voip_tool"}
+        assert set(_call_loop_mod.__all__) == expected
+
+    def test_all_names_are_importable(self) -> None:
+        """Every name in __all__ must be a real, resolvable attribute of the module."""
+        all_names = _call_loop_mod.__all__
+        for name in all_names:
+            assert hasattr(_call_loop_mod, name), (
+                f"{name} must be importable from the call_loop module"
+            )
+            assert not name.startswith("_"), (
+                f"{name} must not be private (no leading _)"
+            )
+
+    def test_no_private_names_in_all(self) -> None:
+        """__all__ must not include any names starting with underscore."""
+        all_names = _call_loop_mod.__all__
+        private_names = [name for name in all_names if name.startswith("_")]
+        assert not private_names, f"Private names in __all__: {private_names}"

@@ -50,6 +50,14 @@ class _FakeSignaling:
         self.sent.append(message)
 
 
+class _RaisingSignaling(_FakeSignaling):
+    """A signalling seam whose ``send`` always fails (a dropped transport)."""
+
+    async def send(self, message: str) -> None:
+        msg = "peer transport is gone"
+        raise ConnectionError(msg)
+
+
 class _FakeMedia:
     def __init__(self) -> None:
         self.holds: list[bool] = []
@@ -736,6 +744,25 @@ async def test_hang_up_is_idempotent() -> None:
 
     assert byes_after_first == 1
     assert byes_after_second == 1, "a second hang_up must not send another BYE"
+
+
+async def test_hang_up_completes_teardown_despite_bye_send_failure() -> None:
+    """A BYE-send failure (dropped transport) must not abort local teardown.
+
+    ADR-0026: we do not wait for the BYE's response because the call is over the
+    moment we send it — a peer that never receives the BYE is the normal
+    lost-packet case its own dialog timers already handle. That same rationale
+    extends to the send itself raising (a TLS/WS/transport fault): the local
+    session must still be marked ended and the media engine stopped, or the
+    conversational loop never ends and the call is left half-torn-down.
+    """
+    signaling, media = _RaisingSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+
+    await session.hang_up()  # must not raise
+
+    assert session.ended is True
+    assert media.stopped is True
 
 
 async def test_inbound_reinvite_hold_answers_recvonly_and_holds() -> None:

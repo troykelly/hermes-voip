@@ -199,19 +199,43 @@ defect or a load-bearing test gap.
   (the resolved media-level-or-session-fallback). A caller reaching for the session field when they meant
   the media's effective address gets the wrong value. Document that `audio.connection_address` is the
   effective address.
-- [ ] **[low] docs** (partial — residual: No "Scope and leniency" paragraph was added to the module docstring (sdp.py:1-20); it still only describes the two keying paths. DONE (reque) — No module-level statement of scope/leniency (video ignored is stated; 2nd+ audio
+- [x] **[low] docs** — No module-level statement of scope/leniency (video ignored is stated; 2nd+ audio
   sections ignored, unknown `a=` dropped, dup rtpmap last-wins, no DTLS fingerprint, port 0 not special
   are NOT). Add a "Scope and leniency" paragraph; consider modelling `a=fingerprint`/`a=setup` so the
-  ADR-0005 DTLS-SRTP profile is representable.
-- [ ] **[low] test** — Build-side under-asserted (mutation-weak round-trip): no literal-line assertions
+  ADR-0005 DTLS-SRTP profile is representable. — done: a "Scope and leniency" paragraph is added to the
+  `sdp.py` module docstring (tolerated cosmetic quirks vs fail-closed semantic errors, and the CRLF/LF
+  line-splitting boundary); `a=fingerprint`/`a=setup` are already modelled (`Fingerprint` dataclass + the
+  DTLS-SRTP build path).
+- [x] **[low] test** — Build-side under-asserted (mutation-weak round-trip): no literal-line assertions
   (`v=0` first, single `m=audio … RTP/AVP`, `a=ptime:20`, `a=sendrecv`, trailing CRLF). A dropped `v=0`
-  round-trips through our own lenient parser. Assert key literal lines.
-- [ ] **[low] test** (partial — residual: test_build_rejects_bad_direction (specifically named in the item) does not exist — no test asserts that build_audio_offer/build_audio_answer) — Direction round-trip untested for sendonly/recvonly/inactive (every assertion is
+  round-trips through our own lenient parser. Assert key literal lines. — done: the build round-trip test
+  asserts `lines[0] == "v=0"`, a single `m=audio …` line, `a=ptime:20`, `a=sendrecv`, and the trailing
+  CRLF (`text.endswith("\r\n")` and `lines[-1] == ""`).
+- [x] **[low] test** — Direction round-trip untested for sendonly/recvonly/inactive (every assertion is
   `sendrecv`); build-side direction validation (lines 270-272) and `session_id`-into-`o=` are untested.
   Parameterise over all four directions for parse+build; add `test_build_rejects_bad_direction` and a
-  session-id-in-o= test.
-- [ ] **[low] test** — Parser robustness paths untested (negative/zero port, negative ptime, blank lines,
+  session-id-in-o= test. — done: `test_direction_round_trips_for_valid_build_values` parametrises all four
+  directions (parse + build + RFC 3264 answer-mirror); `test_build_rejects_bad_direction` rejects bad
+  directions on both offer and answer; `test_build_audio_offer_distinct_session_id_and_version` covers
+  `session_id`→`o=`.
+- [x] **[low] test** — Parser robustness paths untested (negative/zero port, negative ptime, blank lines,
   lone CR, trailing whitespace, duplicate rtpmap). Add once the parser is hardened (assert `SdpError`).
+  — done: semantic errors are rejected (`test_parse_rejects_negative_port` / `_port_above_65535` /
+  `_accepts_port_zero` / `_rejects_negative_ptime` / `_rejects_ptime_zero` /
+  `_rejects_duplicate_rtpmap_payload_type`); the cosmetic-leniency contract and the bare-CR
+  line-splitting security boundary are pinned this PR (`test_parse_tolerates_trailing_whitespace_without_phantom_payload`
+  / `_lf_only_line_endings` / `_embedded_blank_line` / `test_parse_lone_cr_cannot_inject_attribute` /
+  `test_parse_rejects_lone_cr_splicing_the_m_line`).
+- [ ] **[low] robustness/security** (surfaced by codex on the leniency PR) — A media-direction
+  attribute corrupted by an embedded bare CR (`a=recvonly\ra=inactive`) is currently dropped as
+  unrecognised, so the direction silently falls back to the default `sendrecv` — broadening media flow
+  versus the `recvonly`/`inactive` the gateway intended (a hold/one-way case becomes two-way). This is
+  NOT a line-injection hole (the forged value never wins; pinned by `test_parse_lone_cr_cannot_inject_attribute`),
+  and transport TLS integrity is the primary control against byte tampering, so it is defence-in-depth,
+  not a live vulnerability. Decide the policy: keep lenient-default, or fail closed (reject a known
+  direction attribute whose value is present-but-corrupt, distinct from a genuinely unknown `a=`). Needs
+  a small design note before changing parser behaviour (the current "unknown `a=` ignored" leniency must
+  not regress).
 
 ## src/hermes_voip/registration.py
 

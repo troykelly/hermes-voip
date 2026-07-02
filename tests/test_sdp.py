@@ -3218,3 +3218,143 @@ def test_parse_single_rtpmap_per_pt_is_accepted() -> None:
     by_pt = {c.payload_type: c for c in sdp.audio.codecs}
     assert by_pt[0].encoding == "PCMU"
     assert by_pt[8].encoding == "PCMA"
+
+
+# ---------------------------------------------------------------------------
+# Line-terminator / whitespace LENIENCY contract (Postel, gateway-agnostic).
+#
+# The parser deliberately TOLERATES cosmetic wire quirks that real-world
+# gateways emit — trailing whitespace, LF-only line endings, embedded blank
+# lines — parsing them to exactly the same result as the clean form. This is a
+# core interop requirement (the plugin must register on ANY RFC-compliant
+# gateway), so these are regression tests: they lock the leniency in so a future
+# "strict parsing" refactor cannot silently break a quirky-but-valid gateway.
+#
+# CRUCIALLY, leniency stops at line SPLITTING: the parser splits only on real
+# terminators (CRLF / LF), NEVER on a bare CR. A lone CR therefore cannot forge
+# a new SDP line, so it cannot inject an attribute (e.g. downgrade the media
+# direction or add a codec) the gateway never sent. A bare CR is absorbed into
+# its line: in free-text it is inert; a mangled a= attribute is dropped as
+# unrecognised (its value lost to the parser default); a mangled strict line
+# such as m= is rejected fail-closed. The two security tests below pin that
+# boundary.
+#
+# The clean baseline every variant must match: one audio stream on port 40000,
+# a=sendrecv, a single PCMU/0 codec. (Semantic-error rejection — bad port/ptime,
+# duplicate rtpmap — is covered by the fail-closed tests above.)
+# ---------------------------------------------------------------------------
+
+
+def _assert_matches_leniency_baseline(sdp: SessionDescription) -> None:
+    """Assert a parsed SDP is the exact clean baseline (kills phantom-token mutants)."""
+    assert sdp.audio is not None
+    assert sdp.audio.port == 40000
+    assert sdp.audio.direction == "sendrecv"
+    codecs = tuple((c.payload_type, c.encoding) for c in sdp.audio.codecs)
+    assert codecs == ((0, "PCMU"),)
+
+
+def test_parse_tolerates_trailing_whitespace_without_phantom_payload() -> None:
+    """Trailing SP on lines is tolerated.
+
+    A trailing SP after the ``m=`` payload list must NOT be read as an extra
+    (empty) payload type.
+    """
+    sdp = SessionDescription.parse(
+        "v=0\r\n"
+        "o=- 7 7 IN IP4 192.0.2.1   \r\n"  # trailing spaces on o=
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0 \r\n"  # trailing SP after the payload list
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=sendrecv\r\n"
+    )
+    _assert_matches_leniency_baseline(sdp)
+
+
+def test_parse_tolerates_lf_only_line_endings() -> None:
+    """Bare-LF line endings (no CR) parse identically to CRLF.
+
+    RFC 4566 uses CRLF, but real gateways emit LF-only; leniency keeps interop.
+    """
+    sdp = SessionDescription.parse(
+        "v=0\n"
+        "o=- 7 7 IN IP4 192.0.2.1\n"
+        "s=-\n"
+        "c=IN IP4 192.0.2.1\n"
+        "t=0 0\n"
+        "m=audio 40000 RTP/AVP 0\n"
+        "a=rtpmap:0 PCMU/8000\n"
+        "a=sendrecv\n"
+    )
+    _assert_matches_leniency_baseline(sdp)
+
+
+def test_parse_tolerates_embedded_blank_line() -> None:
+    """A blank line between SDP lines is skipped, not treated as end-of-message."""
+    sdp = SessionDescription.parse(
+        "v=0\r\n"
+        "o=- 7 7 IN IP4 192.0.2.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "\r\n"  # stray blank line mid-description
+        "m=audio 40000 RTP/AVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=sendrecv\r\n"
+    )
+    _assert_matches_leniency_baseline(sdp)
+
+
+def test_parse_lone_cr_cannot_inject_attribute() -> None:
+    """SECURITY: a bare CR cannot forge an attribute line that takes effect.
+
+    The real attribute is the NON-default ``a=recvonly`` (the parser defaults an
+    absent direction to ``sendrecv``), so the outcome is unambiguous. Splicing a
+    bare CR then ``a=inactive`` after it does NOT inject the forged
+    ``a=inactive``: were the bare CR a line separator, the two media direction
+    lines would resolve last-wins to ``inactive`` (verified: the identical bytes
+    with a real CRLF yield ``inactive``). Instead the CR is absorbed, the whole
+    CR-mangled ``recvonly`` token is an unrecognised direction, and the corrupted
+    line is dropped — so the direction is NEITHER the injected ``inactive`` NOR
+    the (now-lost) ``recvonly``, but the default ``sendrecv``. The security
+    property is that the forged ``inactive`` never wins.
+    """
+    sdp = SessionDescription.parse(
+        "v=0\r\n"
+        "o=- 7 7 IN IP4 192.0.2.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 40000 RTP/AVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=recvonly\ra=inactive\r\n"  # bare CR + forged last-wins direction
+    )
+    assert sdp.audio is not None
+    # The forged a=inactive did NOT win (no CR line-split injection) ...
+    assert sdp.audio.direction != "inactive"
+    # ... and the CR-corrupted a=recvonly is dropped -> parser default sendrecv
+    # (proving the CR was absorbed, not treated as a separator).
+    assert sdp.audio.direction == "sendrecv"
+    codecs = tuple((c.payload_type, c.encoding) for c in sdp.audio.codecs)
+    assert codecs == ((0, "PCMU"),)
+
+
+def test_parse_rejects_lone_cr_splicing_the_m_line() -> None:
+    """SECURITY: a bare CR spliced into the m= line does not start a new line.
+
+    It stays part of the ``m=`` field, making it malformed, so it is rejected
+    fail-closed rather than silently admitting a forged trailing attribute.
+    """
+    with pytest.raises(SdpError, match=r"m=audio"):
+        SessionDescription.parse(
+            "v=0\r\n"
+            "o=- 7 7 IN IP4 192.0.2.1\r\n"
+            "s=-\r\n"
+            "c=IN IP4 192.0.2.1\r\n"
+            "t=0 0\r\n"
+            "m=audio 40000 RTP/AVP 0\ra=rtpmap:0 PCMA/8000\r\n"  # bare-CR splice
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=sendrecv\r\n"
+        )

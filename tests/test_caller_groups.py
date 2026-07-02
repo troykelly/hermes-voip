@@ -30,6 +30,7 @@ from hermes_voip.caller_modes import (
     Normalization,
     channel_for_group,
     classify_caller_group,
+    default_caller_classification,
     load_caller_groups,
     load_caller_modes,
     persona_preamble,
@@ -138,6 +139,22 @@ def test_unmatched_caller_gets_default_group() -> None:
     cfg = _default_config()
     cls = classify_caller_group(_UNKNOWN_NUMBER, cfg)
     assert cls.group.name == "receptionist"
+    assert cls.source == "default"
+    assert cls.matched_pattern == ""
+
+
+def test_default_caller_classification_forces_default_without_matching() -> None:
+    """``default_caller_classification`` returns the default group without matching.
+
+    This is the classification an UNRESOLVED caller-ID (a ``tel:`` / malformed From) is
+    forced into. It never consults ``group_lists``, so a placeholder can never be
+    pattern-matched into an elevated group — the least-privilege default holds
+    regardless of any configured pattern. Equivalent to the unmatched-caller default.
+    """
+    cfg = _default_config()
+    cls = default_caller_classification(cfg)
+    assert cls.group.name == "receptionist"
+    assert cls.group.privilege_level == 0
     assert cls.source == "default"
     assert cls.matched_pattern == ""
 

@@ -82,6 +82,7 @@ from hermes_voip.caller_modes import (
     CallerMode,
     channel_for_group,
     classify_caller_group,
+    default_caller_classification,
     group_for_mode,
     load_caller_groups,
     load_caller_modes,
@@ -7405,37 +7406,35 @@ def _host_of(sent_by: str) -> str:
     return host if sep else sent_by
 
 
-# Placeholder caller-ID for a From header with no extractable ``sip:user@`` AOR (a
-# ``tel:`` URI, or a malformed header). The forgeable, whole ``From`` header must
-# NEVER become the caller identity: it is agent-visible (it seeds the
-# ``MessageEvent`` ``user_name``/``chat_name`` fields) and would hand an entire
-# attacker-controlled string to the agent. A fixed low-entropy token is safe and
-# classifies as the default (receptionist, least-privilege) group, exactly as an
-# unrecognised caller already does.
+# DISPLAY placeholder for an UNRESOLVED caller-ID (a ``tel:`` URI, or a malformed From
+# with no ``sip:user@``). Used ONLY as the agent-visible ``MessageEvent`` name and the
+# redacted deny-audit log token — NEVER for classification / intercom matching (an
+# unresolved caller forces the default group directly, see :func:`_classify_caller`). A
+# fixed low-entropy token is defang-safe and carries no attacker bytes.
 _UNKNOWN_CALLER = "unknown"
 
 
-def _caller_number(from_header: str) -> str:
-    """Extract the ``sip:`` user-part of the From AOR, or a safe placeholder.
+def _caller_number(from_header: str) -> str | None:
+    """Extract the ``sip:`` user-part of the From AOR, or ``None`` when unresolved.
 
-    The user-part is the (forgeable, presentation-only) caller identity: it seeds
-    both the caller-group classification AND the agent-visible ``MessageEvent``
-    identity fields, so the pattern is deliberately narrow. A real SIP/E.164
-    user-part carries no whitespace (RFC 3261 §19.1.1), so the class excludes ``@``,
-    ``>`` and whitespace: a well-formed AOR matches, while a space-bearing
-    (hostile/malformed) user-part does not, and falls through. On no match (a
-    ``tel:`` URI, or a header with no ``sip:user@``) return the fixed
-    :data:`_UNKNOWN_CALLER` placeholder, NEVER the whole raw ``From`` header, which
-    would leak an entire attacker-controlled string into the identity fields.
-    Caller-ID is never authorization (ADR-0020/0052); an unresolved identity
-    classifies as the default group. Even a matched user-part stays forgeable, so it
-    is defanged again at the agent-visible seam (:func:`_defang_identity`).
+    The user-part is the (forgeable, presentation-only) caller identity. A real
+    SIP/E.164 user-part carries no whitespace (RFC 3261 §19.1.1), so the class excludes
+    ``@``, ``>`` and whitespace: a well-formed AOR matches, while a space-bearing
+    (hostile/malformed) user-part does not, and falls through. On no match (a ``tel:``
+    URI, or a header with no ``sip:user@``) return ``None`` — an explicit "unresolved"
+    state, NEVER the whole raw ``From`` header (which would leak an entire
+    attacker-controlled string) and NEVER a placeholder STRING (which the caller-group /
+    intercom matchers would treat as an ordinary caller-ID, where an operator pattern
+    could match it and escalate the caller). :func:`_classify_caller` maps ``None`` to
+    the default group directly. A matched user-part stays forgeable and is defanged at
+    the agent-visible seam (:func:`_defang_identity`); caller-ID is never authorization
+    (ADR-0020/0052).
     """
     # From: <sip:NUMBER@host>;tag=…  or  sip:NUMBER@host
     import re  # noqa: PLC0415
 
     match = re.search(r"sip:([^@>\s]+)@", from_header)
-    return match.group(1) if match else _UNKNOWN_CALLER
+    return match.group(1) if match else None
 
 
 def _classify_caller(
@@ -7443,13 +7442,19 @@ def _classify_caller(
 ) -> tuple[str | None, CallerClassification]:
     """Resolve the caller-ID from a ``From`` header and classify it.
 
-    Returns ``(caller_number, classification)`` — the resolved SIP user-part and the
-    caller-group outcome. Extracted from the inbound-INVITE handler as the single seam
-    that resolves + classifies the caller-ID, so the mapping is unit-testable in
-    isolation. The caller-ID is forgeable and never authorization (ADR-0020/0052);
-    classification only selects a persona / privilege tier.
+    Returns ``(caller_number, classification)``. An UNRESOLVED caller-ID (``None`` — a
+    ``tel:`` URI, a malformed header) FORCES the default (least-privilege) group
+    directly via :func:`default_caller_classification`; it is NEVER routed through
+    :func:`classify_caller_group` as a placeholder string, because a placeholder in the
+    caller-ID namespace is not a guardrail — an operator pattern (exact or ``*``-prefix)
+    could match it and force an elevated group, a crafted-``From`` privilege escalation.
+    A resolved caller-ID classifies normally. Caller-ID is forgeable and never
+    authorization (ADR-0020/0052); classification only selects a persona / privilege
+    tier.
     """
     caller_number = _caller_number(from_header)
+    if caller_number is None:
+        return None, default_caller_classification(caller_groups)
     return caller_number, classify_caller_group(caller_number, caller_groups)
 
 

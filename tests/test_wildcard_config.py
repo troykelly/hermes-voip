@@ -5,18 +5,20 @@ so operators can express intent concisely without enumerating every individual
 origin, target, or result channel:
 
 - ``HERMES_VOIP_PROACTIVE_CALL_FROM=telegram:*`` -- allow all Telegram origins
-- ``HERMES_VOIP_OUTBOUND_ALLOW=10**`` or ``10xx`` -- allow all 10xx extensions
+- ``HERMES_VOIP_OUTBOUND_ALLOW=10xx`` -- allow all 10xx extensions (1000..1099)
 - ``HERMES_VOIP_OUTBOUND_RESULT_CHANNEL=telegram:*`` -- route results to the
   originating telegram chat
 
-Semantics (per the corrected orchestrator brief):
+Semantics (per ADR-0029; ``*`` is LITERAL in the dial allowlist):
 
-* Wildcard is **opt-in per entry**: an entry WITHOUT ``*`` or ``x`` stays
-  exact-match -- backwards compatible.
-* In ``OUTBOUND_ALLOW`` simple dial masks, ``x`` and ``*`` each match one digit
-  (``10xx`` and ``10**`` both mean exactly 1000..1099).
-* ``*`` remains glob-like for non-mask patterns (and for the origin/result-channel
-  ``platform:chat_id`` patterns).
+* ``OUTBOUND_ALLOW`` opt-in wildcard is ``x``/``X`` ONLY, and ONLY inside a simple
+  extension mask -- each ``x`` matches exactly one digit (``10xx`` == 1000..1099).
+  ``*`` is a LITERAL dial character here, so ``*67`` is an exact star-code (never a
+  wildcard) and the ``10**`` spelling is a literal string, not a mask alias. SIP URIs
+  and every other entry are exact-only -- no entry ever compiles to a ``.*`` glob.
+* ``*`` remains glob-like ONLY for the origin/result-channel ``platform:chat_id``
+  patterns (``PROACTIVE_CALL_FROM`` / ``OUTBOUND_RESULT_CHANNEL``, via ``fnmatch``) --
+  an intentional divergence from the dial gate, which must never over-match a target.
 * **Fail-closed**: empty/unset still means deny-all for ``PROACTIVE_CALL_FROM``
   and ``OUTBOUND_ALLOW``.
 * For ``OUTBOUND_RESULT_CHANNEL``: an exact entry is a fixed destination (current
@@ -44,26 +46,32 @@ from hermes_voip.outbound_allow import is_outbound_allowed, load_outbound_allowl
 class TestOutboundAllowWildcard:
     """Wildcard pattern entries in ``HERMES_VOIP_OUTBOUND_ALLOW``."""
 
-    # --- 10** pattern (dial-mask style: * = one digit here) ---
+    # --- `10**` is a LITERAL string, NOT a digit mask (`*` literal; use `10xx`) ---
 
-    def test_double_star_matches_4digit_10xx_extension(self) -> None:
-        """``10**`` matches 1000..1099 (10 + exactly two digits)."""
+    def test_double_star_is_literal_not_a_digit_mask(self) -> None:
+        """``10**`` matches only the literal ``10**`` -- it is NOT the 1000..1099 mask.
+
+        With ``*`` literal, the ``10**`` spelling from issue #355 no longer expands;
+        operators use ``10xx`` for the range. Pin that ``10**`` neither denies itself
+        nor over-matches any four-digit number.
+        """
         allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10**"})
-        assert is_outbound_allowed("1000", allow) is True
-        assert is_outbound_allowed("1099", allow) is True
+        assert is_outbound_allowed("10**", allow) is True
+        assert is_outbound_allowed("1000", allow) is False
+        assert is_outbound_allowed("1099", allow) is False
 
-    def test_double_star_does_not_match_outside_prefix(self) -> None:
-        """``10**`` does not match 1100, 2000, or empty."""
+    @pytest.mark.parametrize("target", ["10", "100", "10000", "10ab", "1100", "1042"])
+    def test_double_star_matches_no_bare_digit_sequence(self, target: str) -> None:
+        """The literal ``10**`` matches no bare digit sequence (no ``*`` expansion)."""
+        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10**"})
+        assert is_outbound_allowed(target, allow) is False
+
+    def test_double_star_literal_denies_wrong_and_empty_targets(self) -> None:
+        """``10**`` (literal) denies 1100/2000/empty like any exact entry."""
         allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10**"})
         assert is_outbound_allowed("1100", allow) is False
         assert is_outbound_allowed("2000", allow) is False
         assert is_outbound_allowed("", allow) is False
-
-    @pytest.mark.parametrize("target", ["10", "100", "10000", "10ab", "1100"])
-    def test_double_star_is_fixed_length_digit_mask(self, target: str) -> None:
-        """``10**`` is a 4-digit 10xx mask, not an arbitrary ``10...`` glob."""
-        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10**"})
-        assert is_outbound_allowed(target, allow) is False
 
     # --- 10xx pattern (x = digit wildcard, 0-9) ---
 
@@ -92,6 +100,18 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("100", allow) is False
         assert is_outbound_allowed("10000", allow) is False
 
+    def test_10xx_mask_regression_guard(self) -> None:
+        """Regression guard: the ``10xx`` digit mask is UNCHANGED by the fix.
+
+        Characterisation (passes before AND after the ``*``-literal fix): the primary
+        issue-#355 example must keep working -- ``10xx`` matches 1000..1099 (one digit
+        per ``x``) and nothing shorter.
+        """
+        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "10xx"})
+        assert is_outbound_allowed("1042", allow) is True
+        assert is_outbound_allowed("1000", allow) is True
+        assert is_outbound_allowed("10", allow) is False
+
     # --- exact entries remain exact ---
 
     def test_exact_entry_not_affected_by_wildcard_support(self) -> None:
@@ -112,10 +132,11 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("sip:ext@pbx.example.test", allow) is True
         assert is_outbound_allowed("1001", allow) is False
 
-    def test_non_mask_pattern_keeps_x_literal(self) -> None:
-        """In a non-mask pattern, ``x`` is literal while ``*`` remains glob-like."""
+    def test_non_mask_entry_is_exact_star_and_x_literal(self) -> None:
+        """A non-mask entry is EXACT -- both ``*`` and ``x`` are literal characters."""
         allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "fax*"})
-        assert is_outbound_allowed("fax123", allow) is True
+        assert is_outbound_allowed("fax*", allow) is True
+        assert is_outbound_allowed("fax123", allow) is False
         assert is_outbound_allowed("fa9", allow) is False
 
     def test_literal_x_entry_stays_exact_no_overmatch(self) -> None:
@@ -157,18 +178,18 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("282", allow) is False
         assert is_outbound_allowed("098", allow) is False
 
-    def test_sip_uri_pattern_keeps_x_literal(self) -> None:
-        """SIP URI / non-mask patterns preserve literal ``x`` characters.
+    def test_sip_uri_entry_is_exact_only(self) -> None:
+        """SIP URI entries are EXACT-only: ``*`` is literal, so no ``.*`` host swallow.
 
-        Regression guard (characterisation): SIP URIs already treated ``x`` as
-        literal before this refinement; assert the ``is_mask`` discriminator keeps
-        that behaviour so a ``*`` glob in a URI never silently digit-matches ``x``.
+        Security: a URI entry never compiles to a ``.*`` glob, so a listed
+        ``sip:fax*@pbx.example.test`` cannot match a different user/host and there is
+        no ReDoS surface. The entry matches only itself, verbatim.
         """
         allow = load_outbound_allowlist(
             {"HERMES_VOIP_OUTBOUND_ALLOW": "sip:fax*@pbx.example.test"}
         )
-        assert is_outbound_allowed("sip:fax123@pbx.example.test", allow) is True
-        assert is_outbound_allowed("sip:fa9123@pbx.example.test", allow) is False
+        assert is_outbound_allowed("sip:fax*@pbx.example.test", allow) is True
+        assert is_outbound_allowed("sip:fax123@pbx.example.test", allow) is False
 
     # --- fail-closed / empty ---
 

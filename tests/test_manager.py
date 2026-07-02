@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 
 import pytest
@@ -98,68 +99,258 @@ def _ok_for(register_text: str, *, expires: int = 300) -> SipResponse:
     )
 
 
-def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
-    structured_fields = {
-        key: value
-        for key, value in record.__dict__.items()
-        if key
-        not in {
-            "name",
-            "msg",
-            "args",
-            "levelname",
-            "levelno",
-            "pathname",
-            "filename",
-            "module",
-            "exc_info",
-            "exc_text",
-            "stack_info",
-            "lineno",
-            "funcName",
-            "created",
-            "msecs",
-            "relativeCreated",
-            "thread",
-            "threadName",
-            "processName",
-            "process",
-            "taskName",
-            "message",
-        }
-    }
-    serialized_fields = json.dumps(structured_fields, sort_keys=True, default=repr)
-    # LogRecord *numeric* runtime metadata (timestamps, thread/process ids) is
-    # framework-set and never secret-bearing, but its values vary per run and can
-    # coincidentally contain a short secret digit like "1000" (e.g. relativeCreated
-    # mid-suite, or a thread/process id), which flakes this check -- so it is excluded
-    # below. Every secret-bearing surface is still scanned: the code-attached extra
-    # fields, the message args, the rendered message, and `taskName` (asyncio task
-    # names are application-set and CAN carry a dial target, so they stay scanned).
-    runtime_metadata = {
+# Standard LogRecord attributes (Python 3.13). Subtracting this set from
+# ``record.__dict__`` isolates the code-attached ``extra`` fields. A secret reaches the
+# log ONLY via a code-controlled surface -- the rendered message, the ``%`` args, an
+# ``extra`` field, a logged exception (``exc_text`` or the raw ``exc_info`` value), a
+# captured traceback (``stack_info``), or a CUSTOM task name -- the scan covers those.
+# The rest is framework metadata (timestamps, thread/process ids, source location, the
+# default "Task-<n>" counter) that never carries a secret and whose nondeterministic
+# numeric values would only false-trip a short-digit scan.
+_STANDARD_LOGRECORD_ATTRS = frozenset(
+    {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
         "created",
         "msecs",
         "relativeCreated",
         "thread",
+        "threadName",
+        "processName",
         "process",
+        "taskName",
+        "message",
     }
-    scannable_record = {
+)
+
+#: FRAMEWORK-DEFAULT auto-names for asyncio tasks / threads / processes: fixed labels
+#: (``MainThread``/``MainProcess``) or monotonic counters (``Task-<n>``/``Thread-<n>``)
+#: that carry no user data but can coincidentally contain a short secret digit like
+#: "1000". A ``taskName``/``threadName``/``processName`` that does NOT match is
+#: application-set (e.g. ``create_task(name=f"dial-{ext}")``) and MAY carry a target.
+_FRAMEWORK_AUTO_NAME = re.compile(
+    r"MainThread|MainProcess"
+    r"|(Task|Thread|Process|SpawnProcess|ForkProcess|SpawnPoolWorker"
+    r"|ForkPoolWorker|ThreadPoolExecutor|Dummy|asyncio)[-_].*"
+)
+
+
+def _custom_auto_name(value: object) -> str:
+    """The value of a LogRecord auto-name, scanned only when NOT a framework default.
+
+    A custom task/thread/process name can carry a dial target; the framework default
+    is a fixed label or a counter that would false-trip a short-digit scan.
+    """
+    return (
+        value
+        if isinstance(value, str) and _FRAMEWORK_AUTO_NAME.fullmatch(value) is None
+        else ""
+    )
+
+
+def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
+    """Assert no fake secret leaks into any CODE-CONTROLLED surface of ``record``.
+
+    Deterministic: scans only the surfaces a logging call populates -- code-attached
+    ``extra`` fields, the rendered message, the ``%`` args, a logged exception rendered
+    via ``formatException`` (``exc_text``/``exc_info``, incl. its ``__cause__`` chain)
+    with its ``stack_info``, and any CUSTOM asyncio-task/thread/process name. It never
+    scans framework metadata: numeric ids/timestamps, the source location, or the
+    framework-DEFAULT auto-names (``MainThread`` / ``Task-<n>`` ...), whose fixed or
+    counter values would coincidentally match a short digit like "1000" and flake. This
+    package logs from the default main thread/process and unnamed tasks, never naming a
+    thread/process with caller data; the one auto-name that CAN be user-set is scanned
+    when custom, so such a leak is still caught. ``None`` auto-names carry nothing.
+    """
+    extra_fields = {
         key: value
         for key, value in record.__dict__.items()
-        if key not in runtime_metadata
+        if key not in _STANDARD_LOGRECORD_ATTRS
     }
-    serialized_record = json.dumps(scannable_record, sort_keys=True, default=repr)
-    rendered_message = record.getMessage()
+    # ``exc_text`` is populated only once a Formatter runs; on a raw captured record a
+    # log with ``exc_info=True`` leaves ``exc_text`` None. Render ``exc_info`` and scan
+    # it -- ``formatException`` follows the full ``__cause__`` / ``__context__`` /
+    # ``ExceptionGroup`` chain (the real log output), so a secret in a chained or
+    # wrapped exception is caught too, with no timestamps/counters to false-trip.
+    formatted_exc = (
+        logging.Formatter().formatException(record.exc_info)
+        if isinstance(record.exc_info, tuple) and record.exc_info[1] is not None
+        else ""
+    )
+    scanned_surfaces = {
+        "extra fields": json.dumps(extra_fields, sort_keys=True, default=repr),
+        "rendered message": record.getMessage(),
+        "message args": json.dumps(record.args, default=repr) if record.args else "",
+        "custom task name": _custom_auto_name(record.__dict__.get("taskName")),
+        "custom thread name": _custom_auto_name(record.__dict__.get("threadName")),
+        "custom process name": _custom_auto_name(record.__dict__.get("processName")),
+        "exception text": record.exc_text or "",
+        "exception value": formatted_exc,
+        "stack info": record.stack_info or "",
+    }
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
-        assert secret not in serialized_fields, (
-            f"structured failure log leaked secret {secret!r} in extra fields"
-        )
-        assert secret not in serialized_record, (
-            f"structured failure log leaked secret {secret!r} in serialized record"
-        )
-        assert secret not in rendered_message, (
-            f"structured failure log leaked secret {secret!r} in rendered message"
-        )
+        for surface_name, surface in scanned_surfaces.items():
+            assert secret not in surface, (
+                f"structured failure log leaked secret {secret!r} in {surface_name}"
+            )
+
+
+def _make_clean_record(**overrides: object) -> logging.LogRecord:
+    """A WARNING failure LogRecord with NO secret in any surface, plus per-test knobs.
+
+    ``overrides`` are written into ``record.__dict__`` (how logging attaches ``extra``
+    fields and framework metadata), so a test can set ``taskName`` / ``relativeCreated``
+    / an extra field without tripping attribute typing. Framework metadata is pinned to
+    a deterministic baseline first, so async auto-population can't slip a real name in.
+    """
+    record = logging.LogRecord(
+        name="hermes_voip.manager",
+        level=logging.WARNING,
+        pathname="manager.py",
+        lineno=1,
+        msg="SIP registration failed: rejected (status=503, attempt=1)",
+        args=None,
+        exc_info=None,
+    )
+    record.__dict__.update({"taskName": None, "relativeCreated": 0.0, **overrides})
+    return record
+
+
+async def test_secret_scan_ignores_framework_metadata() -> None:
+    """No false-trip on framework metadata that coincidentally contains "1000".
+
+    The framework-DEFAULT task/thread/process auto-names (``Task-<n>``/``Thread-<n>``/
+    ``...PoolWorker-<n>``) are monotonic counters that climb past ``1000``/``1001``
+    mid-suite, and numeric fields (``relativeCreated`` etc.) vary per run -- all are
+    framework-set, never secrets, so none may trip the scan.
+    """
+    record = _make_clean_record(
+        taskName="Task-1000",
+        threadName="Thread-1000 (worker)",
+        processName="SpawnPoolWorker-1001",
+        relativeCreated=21000.5,
+    )
+    _assert_failure_log_is_secret_safe(record)  # must NOT raise
+
+
+async def test_secret_scan_catches_leak_in_rendered_message() -> None:
+    """A secret rendered into the message (via ``%`` args) is still caught."""
+    record = _make_clean_record(msg="dialing %s failed", args=("1000",))
+    with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_extra_field() -> None:
+    """A secret in a code-attached ``extra`` field is still caught."""
+    record = _make_clean_record(extension="1000")
+    with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_custom_task_name() -> None:
+    """A secret leaked ONLY via a CUSTOM asyncio task name is caught (codex concern)."""
+    record = _make_clean_record(taskName="dial-1000")
+    with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_custom_thread_or_process_name() -> None:
+    """A secret in a CUSTOM thread or process name is caught (codex must-fix).
+
+    ``threadName``/``processName`` are application-settable (``Thread(name=...)`` /
+    ``multiprocessing`` process names) just like ``taskName``; a custom value carrying a
+    dial target must be caught while the framework defaults stay excluded.
+    """
+    with pytest.raises(
+        AssertionError, match=r"leaked secret '1000' in custom thread name"
+    ):
+        _assert_failure_log_is_secret_safe(_make_clean_record(threadName="dial-1000"))
+    with pytest.raises(
+        AssertionError, match=r"leaked secret '1001' in custom process name"
+    ):
+        _assert_failure_log_is_secret_safe(_make_clean_record(processName="dial-1001"))
+
+
+async def test_secret_scan_catches_leak_in_exception_text() -> None:
+    """A secret in a logged exception's rendered text is caught (codex must-fix).
+
+    A failure log that adds ``exc_info=True`` renders the exception into
+    ``record.exc_text``; a registrar- or dial-target string captured there is a
+    genuine leak, so it must be scanned like the message, args, and extra fields.
+    """
+    record = _make_clean_record(
+        exc_text="Traceback: ConnectionError contacting pbx.example.test:5061",
+    )
+    with pytest.raises(
+        AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception text"
+    ):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_stack_info() -> None:
+    """A secret captured in ``stack_info`` (``stack_info=True``) is caught."""
+    record = _make_clean_record(
+        stack_info='Stack (most recent call last):\n  dialing "1001"',
+    )
+    with pytest.raises(AssertionError, match=r"leaked secret '1001' in stack info"):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_unformatted_exception() -> None:
+    """A logged exception's message is caught even before ``exc_text`` is formatted.
+
+    ``caplog`` captures RAW records: with ``exc_info=True`` the record carries an
+    ``exc_info`` tuple but ``exc_text`` stays ``None`` until a Formatter runs, so an
+    ``exc_text``-only scan would miss it. The exception is rendered via
+    ``Formatter().formatException`` and scanned too.
+    """
+    exc = ConnectionError("cannot reach pbx.example.test:5061")
+    record = _make_clean_record(exc_info=(type(exc), exc, exc.__traceback__))
+    assert record.exc_text is None  # precondition: exception not yet formatted
+    with pytest.raises(
+        AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception value"
+    ):
+        _assert_failure_log_is_secret_safe(record)
+
+
+def _chained_secret_exception() -> RuntimeError:
+    """A ``RuntimeError('registration failed')`` whose ``__cause__`` carries a secret.
+
+    Equivalent to ``raise RuntimeError(...) from ConnectionError('...secret...')`` but
+    built without a live ``raise`` -- the wrapper's own message is sanitized, so only a
+    scan that follows ``__cause__`` sees the secret.
+    """
+    wrapper = RuntimeError("registration failed")
+    wrapper.__cause__ = ConnectionError("cannot reach pbx.example.test:5061")
+    return wrapper
+
+
+async def test_secret_scan_catches_leak_in_chained_exception() -> None:
+    """A secret in a CHAINED exception's cause is caught (codex must-fix).
+
+    A sanitized wrapper logged with ``exc_info=True`` still renders its ``__cause__``
+    into the formatted traceback, so a secret in the cause is a genuine leak. Scanning
+    only the top-level exception value would miss it; ``Formatter().formatException``
+    follows the ``__cause__`` chain, matching the real log output.
+    """
+    exc = _chained_secret_exception()
+    assert "pbx.example.test" not in str(exc)  # the wrapper itself is sanitized
+    record = _make_clean_record(exc_info=(type(exc), exc, exc.__traceback__))
+    with pytest.raises(
+        AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception value"
+    ):
+        _assert_failure_log_is_secret_safe(record)
 
 
 def _challenge_for(register_text: str) -> SipResponse:

@@ -655,7 +655,16 @@ class RegistrationFlow:
         # RFC 3261 §8.1.3.5: the CSeq sequence number must match and the method
         # must be REGISTER (a mismatched method is a protocol error — a response
         # to a different transaction routed to this flow by mistake).
-        if not number.isdigit() or int(number) != txn.cseq or method != "REGISTER":
+        # isascii()+isdecimal() rejects Unicode superscript digits (e.g. U+00B2 ²)
+        # that isdigit() admits but int() cannot parse (framing.py precedent): a
+        # non-decimal CSeq number falls into this RuntimeError mismatch path (which
+        # on_response catches and ignores) instead of raising a bare ValueError that
+        # would escape to the reader loop and tear the connection down (ADR-0081).
+        if (
+            not (number.isascii() and number.isdecimal())
+            or int(number) != txn.cseq
+            or method != "REGISTER"
+        ):
             msg = (
                 f"response CSeq {cseq!r} does not match outstanding {txn.cseq} REGISTER"
             )

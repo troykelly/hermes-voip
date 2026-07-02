@@ -991,11 +991,14 @@ def test_missing_cseq_is_tolerated_and_yields_registered() -> None:
 # ---- Unicode-digit crash guard (isdigit → isascii+isdecimal) -----------------
 #
 # str.isdigit() returns True for Unicode superscript digits such as U+00B2 (²)
-# but int(chr(0xB2)) raises ValueError.  The three isdigit() guards in
-# registration.py must use isascii()+isdecimal() (the framing.py precedent) so
-# a malformed expires carrying a Unicode digit does NOT propagate a bare
-# ValueError through _granted_expires → _handle_success → handle, which would
-# tear down the SIP connection on the transport async read loop.
+# but int(chr(0xB2)) raises ValueError.  The four isdigit() guards in
+# registration.py must use isascii()+isdecimal() (the framing.py precedent) so a
+# malformed numeric token carrying a Unicode digit does NOT propagate a bare
+# ValueError that would tear down the SIP connection on the transport async read
+# loop.  Three treat the token as absent/malformed and fall back (a malformed
+# expires via _granted_expires → _handle_success, or a 423 Min-Expires via
+# _min_expires → _retry_interval); the fourth, _check_cseq → handle, turns a
+# non-decimal CSeq number into the caught RuntimeError mismatch instead.
 
 
 def test_granted_expires_unicode_digit_contact_param_does_not_crash() -> None:
@@ -1058,6 +1061,30 @@ def test_min_expires_unicode_digit_does_not_crash() -> None:
     # valid Min-Expires as Failed (no valid retry interval can be computed).
     outcome = flow.handle(response)
     assert not isinstance(outcome, Registered)
+
+
+def test_cseq_unicode_digit_number_raises_runtimeerror_not_valueerror() -> None:
+    # The FOURTH isdigit() guard: _check_cseq runs at the TOP of handle() on EVERY
+    # response while a REGISTER is outstanding — the first 401 to the initial
+    # REGISTER triggers it.  U+00B2 (²) passes str.isdigit() but int("²") raises
+    # ValueError, so a CSeq whose number token is this codepoint must be treated as
+    # an uncorrelated response: the documented RuntimeError "does not match" contract
+    # (exactly like a mismatched sequence number or a non-REGISTER method), which
+    # RegistrationManager.on_response catches with `except RuntimeError` and IGNORES.
+    # A BARE ValueError would NOT be caught by that guard and runs OUTSIDE the reader
+    # loop's parse-only `except ValueError`, so it would unwind _read_loop and tear
+    # down the whole shared SIP connection — every active call and every registration
+    # (ADR-0081).  Mirrors test_cseq_method_invite_raises' RuntimeError/CSeq contract.
+    unicode_digit = chr(0xB2)
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()  # CSeq 1 outstanding
+    response = SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        f"CSeq: {unicode_digit} REGISTER\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    with pytest.raises(RuntimeError, match="CSeq"):
+        flow.handle(response)
 
 
 # --- an UNANSWERABLE first 401/407 must fail CLOSED, never raise (ADR-0081) ------

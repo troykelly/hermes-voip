@@ -110,6 +110,29 @@ defect or a load-bearing test gap.
   `DigestChallenge.parse` carries a cold-path comment stating the full-dict materialisation is
   intentional (per-registration, never per-RTP-packet) and must not be micro-optimised into a
   single-pass early-exit scan.
+- [ ] **[low] correctness / security** — `DigestChallenge.parse` / `_strongest_challenge` mis-parse
+  two comma-separated `Digest …` challenges packed into a SINGLE `WWW-Authenticate` /
+  `Proxy-Authenticate` line (RFC 7616 §3.7 permits the `1#challenge` comma list; real SIP registrars
+  use separate header lines). `_strongest_challenge` (registration.py:603) separates challenges only
+  by `headers_all` — i.e. per header LINE — then parses each with `DigestChallenge.parse`, whose
+  `_PARAM.finditer` (digest.py:47/193) folds every param on the line into ONE dict with duplicate keys
+  OVERWRITTEN last-wins (the bare `Digest` scheme token is not a `name=value` pair, so it is skipped,
+  not treated as a delimiter). So a single comma-joined line collapses into ONE challenge built from
+  whichever `realm`/`nonce`/`algorithm` appear LAST. No crash-escape — the result is still a valid
+  `DigestChallenge`, so this is a wrong/mixed auth, never a bare exception on the shared reader loop.
+  Two outcome sub-cases: (a) when the last-appearing params come from different challenges, the mixed
+  realm/nonce yields a `response` the registrar rejects → second challenge → fail CLOSED to `Failed`
+  (registration.py:526-528), or an unsupported mixed algorithm raises `ValueError` caught in
+  `_handle_challenge` (registration.py:531) → `Failed`; BUT (b) when a stronger challenge is followed
+  by a COMPLETE MD5 `Digest` challenge with the SAME realm, last-wins folds to a COHERENT MD5
+  challenge (realm+nonce+algorithm all from the MD5 half), `pick_best_challenge` returns it, and the
+  client SILENTLY authenticates with MD5 — a downgrade that hides the stronger challenge. Sub-case (b)
+  is why this is not purely cosmetic; it stays LOW because it affects ONLY the non-standard
+  comma-joined encoding an on-path attacker would coalesce (two separate lines merged with MD5 ordered
+  last) or an unusual gateway emits — separate-line challenges (SIP practice, and the header-reorder
+  threat model in `_strongest_challenge`'s docstring) stay fully downgrade-protected. Fix (if ever):
+  split a comma-joined challenge value into its constituent `Digest` challenges (respecting quoted
+  commas) before `DigestChallenge.parse`, so `pick_best_challenge` sees each challenge whole.
 
 ## src/hermes_voip/message.py
 

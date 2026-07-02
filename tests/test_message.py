@@ -7,6 +7,8 @@ case-insensitive, repeatable header access), and the token generators
 """
 
 import re
+from collections.abc import Callable
+from typing import Final
 
 import pytest
 
@@ -466,3 +468,215 @@ def test_parse_body_with_embedded_blank_line() -> None:
     resp = SipResponse.parse(raw)
     assert resp.body == body_with_blank
     assert resp.body == "line1\r\n\r\nline2\r\nline3"
+
+
+# ---------------------------------------------------------------------------
+# Wave-13 ingress hardening: ASCII-only status digits (LOW-1), status-code
+# range check on parse (LOW-2), redacted length-only parse-error messages
+# (LOW-4), and the ADR-0081 exception-escape invariant locked against
+# regression (G3), plus the previously-uncovered orphan-continuation (G1) and
+# malformed-request-line (G2) rejections.
+# ---------------------------------------------------------------------------
+
+
+# The ADR-0081 invariant the transport read loop rests on: SipRequest.parse and
+# SipResponse.parse are TOTAL over str — every input either parses or raises
+# ValueError, never any other exception type. A KeyError / IndexError /
+# AttributeError / TypeError / StopIteration / struct.error escaping parse would
+# propagate past the read loop's ``except ValueError``, end the reader task, and
+# tear down the ENTIRE signalling connection (registration + every concurrent
+# call) over one hostile inbound message. hypothesis is not a dev dependency, so
+# this is a hand-built table of adversarial inputs, not a property test.
+_ADVERSARIAL_PARSE_INPUTS: Final[tuple[str, ...]] = (
+    "",  # empty string
+    "\r\n",  # a lone CRLF
+    "\r\n\r\n",  # only the head/body separator
+    "\n",  # bare LF, no CRLF
+    "\r",  # bare CR
+    " ",  # a lone space (continuation-shaped)
+    "\t",  # a lone HTAB
+    "   \r\n",  # whitespace-only first line
+    "\tHeader: v\r\n\r\n",  # continuation line, no preceding header (HTAB)
+    " leading-space\r\n\r\n",  # continuation-first header (SP)
+    "SIP/2.0",  # truncated status-line, no code
+    "SIP/2.0 ",  # code position empty
+    "SIP/2.0 2\r\n\r\n",  # one-digit code
+    "SIP/2.0 20\r\n\r\n",  # two-digit code
+    "SIP/2.0 2000 OK\r\n\r\n",  # four-digit code
+    "SIP/2.0 -20 OK\r\n\r\n",  # negative-looking code
+    "SIP/2.0 xyz OK\r\n\r\n",  # non-numeric code
+    "SIP/2.0 \u0662\u0660\u0660 OK\r\n\r\n",  # Arabic-Indic digits (fold to 200)
+    "SIP/2.0 \uff12\uff10\uff10 OK\r\n\r\n",  # fullwidth digits (fold to 200)
+    "SIP/2.0 000 X\r\n\r\n",  # below-range code
+    "SIP/2.0 999 X\r\n\r\n",  # above-range code
+    "SIP/2.0 200 OK",  # no CRLF anywhere
+    "SIP/2.0 200 OK\r\nno-colon-here\r\n\r\n",  # colon-less header line
+    "SIP/2.0 200 OK\r\n\x00\x01\x02\r\n\r\n",  # control chars where a header goes
+    "SIP/2.0 200 OK\r\n: emptyname\r\n\r\n",  # empty header name
+    "SIP/2.0 200 OK\r\n\t\r\n\r\n",  # lone-HTAB continuation, no preceding header
+    "INVITE",  # truncated request-line
+    "INVITE sip:x",  # request-line missing SIP-version
+    "INVITE  SIP/2.0\r\n\r\n",  # empty request-URI (double space)
+    "INVITE sip:x SIP/2.0\r\n leading\r\n\r\n",  # continuation-first header (request)
+    "\x00\x00\x00",  # raw NULs, no structure
+    "SIP/2.0 200 OK\r\nX: " + "a" * 100_000 + "\r\n\r\n",  # very long header value
+    "SIP/2.0 200 " + "R" * 100_000 + "\r\n\r\n",  # very long reason phrase
+    "SIP/2.0\r200 OK\r\n\r\n",  # bare CR inside the status-line
+    "a\r\n" * 1000,  # very many short lines
+)
+
+
+def _parse_input_id(raw: str) -> str:
+    """A length-based parametrize id so hostile/huge inputs never render in output."""
+    return f"{len(raw)}chars"
+
+
+def _assert_parse_raises_only_value_error(
+    parse: Callable[[str], object], raw: str
+) -> None:
+    """Assert ``parse(raw)`` either returns or raises ``ValueError`` — no other type.
+
+    A non-``ValueError`` escape is the exact ADR-0081 regression this guards: it
+    would propagate past the transport read loop's ``except ValueError`` and DoS
+    the whole connection. The failure message is length-only (never the raw
+    input) to keep the same redaction discipline this lane enforces on the parser.
+    """
+    try:
+        parse(raw)
+    except ValueError:
+        return  # the ONLY permitted failure mode
+    except Exception as exc:  # noqa: BLE001 — asserting NO non-ValueError type escapes parse
+        pytest.fail(
+            f"parse raised {type(exc).__name__}, not ValueError, on a "
+            f"{len(raw)}-char input — ADR-0081 exception-escape regression"
+        )
+
+
+@pytest.mark.parametrize("raw", _ADVERSARIAL_PARSE_INPUTS, ids=_parse_input_id)
+def test_response_parse_raises_only_value_error_on_hostile_input(raw: str) -> None:
+    """SipResponse.parse parses or raises ValueError on any str (ADR-0081)."""
+    _assert_parse_raises_only_value_error(SipResponse.parse, raw)
+
+
+@pytest.mark.parametrize("raw", _ADVERSARIAL_PARSE_INPUTS, ids=_parse_input_id)
+def test_request_parse_raises_only_value_error_on_hostile_input(raw: str) -> None:
+    """SipRequest.parse parses or raises ValueError on any str (ADR-0081)."""
+    _assert_parse_raises_only_value_error(SipRequest.parse, raw)
+
+
+def test_parse_response_rejects_continuation_first_header_line() -> None:
+    """A first header line starting with SP has no preceding header to continue.
+
+    Exercises the ``if not unfolded: raise`` branch (uncovered before this test):
+    _parse_headers must raise ValueError, never an IndexError from ``unfolded[-1]``
+    on an empty list.
+    """
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        " orphan-continuation\r\n"  # SP-led first header line — nothing precedes it
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    with pytest.raises(ValueError, match="continuation"):
+        SipResponse.parse(raw)
+
+
+def test_parse_request_rejects_htab_continuation_first_header_line() -> None:
+    """Orphan-continuation guard holds via SipRequest.parse with a HTAB lead."""
+    raw = (
+        "REGISTER sip:pbx.example.test SIP/2.0\r\n"
+        "\torphan-continuation\r\n"  # HTAB-led first header line — nothing precedes it
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    with pytest.raises(ValueError, match="continuation"):
+        SipRequest.parse(raw)
+
+
+def test_parse_request_rejects_malformed_request_line() -> None:
+    """A first line that is not a valid request-line must raise ValueError.
+
+    Only the response status-line had a malformed-first-line test; this pins the
+    symmetric SipRequest guard (never an AttributeError from a None regex match).
+    """
+    with pytest.raises(ValueError, match="request-line"):
+        SipRequest.parse("NOT A REQUEST LINE\r\nContent-Length: 0\r\n\r\n")
+
+
+def test_parse_rejects_non_ascii_digit_status_code() -> None:
+    r"""Non-ASCII decimal digits in the status code are rejected (RFC 3261 ABNF).
+
+    RFC 3261 requires three ASCII DIGITs (%x30-39). Arabic-Indic (U+0660-0669)
+    and fullwidth (U+FF10-FF19) digits are Unicode Nd that ``\d`` matched and
+    ``int()`` folds to 200 — a parser differential (two distinct wire strings
+    decode to the same status). The status-line regex uses ``[0-9]`` so both are
+    rejected as a malformed status-line rather than silently normalised.
+    """
+    # Arabic-Indic and fullwidth "200" (Unicode Nd that int() folds to ASCII 200).
+    for status in ("\u0662\u0660\u0660", "\uff12\uff10\uff10"):
+        raw = f"SIP/2.0 {status} OK\r\nContent-Length: 0\r\n\r\n"
+        with pytest.raises(ValueError, match="status-line"):
+            SipResponse.parse(raw)
+
+
+def test_parse_rejects_out_of_range_status_code() -> None:
+    """A well-formed but out-of-ABNF-range status code is rejected on parse.
+
+    build_response enforces 100..699; parse must be symmetric so a hostile
+    000/099/700/999 status-line cannot yield a SipResponse the builder would
+    never emit.
+    """
+    for code in ("000", "099", "700", "999"):
+        raw = f"SIP/2.0 {code} X\r\nContent-Length: 0\r\n\r\n"
+        with pytest.raises(ValueError, match="range"):
+            SipResponse.parse(raw)
+
+
+def test_parse_accepts_status_codes_at_the_inclusive_range_boundaries() -> None:
+    """100 and 699 are the inclusive RFC 3261 boundaries — both still parse.
+
+    Pins the boundaries against an off-by-one regression in the range check (a
+    ``< 100``/``> 699`` mutant would wrongly reject exactly 100 or 699).
+    """
+    for code in (100, 699):
+        raw = f"SIP/2.0 {code} X\r\nContent-Length: 0\r\n\r\n"
+        assert SipResponse.parse(raw).status_code == code
+
+
+def test_parse_error_does_not_embed_raw_status_line() -> None:
+    """A malformed status-line's ValueError is length-only, not the raw wire text.
+
+    The sole catcher today (_dispatch) logs type+len, never str(exc), but a
+    request start-line carries the callee URI and a stray header line could be a
+    From/To — parse errors stay length-only to match the egress-log redaction
+    discipline (rule 34) and to be safe if any future caller logs str(exc).
+    """
+    with pytest.raises(ValueError, match="status-line") as excinfo:
+        SipResponse.parse(
+            "SIP/2.0 zz sip:secret-callee@internal.example\r\nContent-Length: 0\r\n\r\n"
+        )
+    message = str(excinfo.value)
+    assert "secret-callee" not in message
+    assert "internal.example" not in message
+
+
+def test_parse_error_does_not_embed_raw_request_line() -> None:
+    """A malformed request-line carries the callee URI; its error stays length-only."""
+    with pytest.raises(ValueError, match="request-line") as excinfo:
+        SipRequest.parse("BOGUS sip:secret-callee@internal.example\r\n\r\n")
+    message = str(excinfo.value)
+    assert "secret-callee" not in message
+    assert "internal.example" not in message
+
+
+def test_parse_error_does_not_embed_raw_header_line() -> None:
+    """A colon-less header line could carry routing/PII; its error stays length-only."""
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "secret-caller-token-no-colon\r\n"  # no colon -> malformed header line
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    with pytest.raises(ValueError, match="malformed header") as excinfo:
+        SipResponse.parse(raw)
+    assert "secret-caller-token-no-colon" not in str(excinfo.value)

@@ -760,6 +760,13 @@ def _txn_key(call_id: str | None, cseq: str | None) -> tuple[str, int] | None:
     if call_id is None or cseq is None:
         return None
     parts = cseq.split()
-    if not parts or not parts[0].isdigit():
+    # Guard int() with ``isascii() and isdecimal()`` (the house pattern — see
+    # framing.py / sdp.py / registration.py), NOT ``isdigit()``: ``str.isdigit()`` is
+    # True for non-decimal digit characters such as the superscript "²" that ``int()``
+    # cannot parse, so an inbound ``CSeq: ² INVITE`` would raise ValueError here and
+    # escape the reader, tearing down the whole connection (ADR-0081). A non-decimal
+    # CSeq number now yields None (no transaction match), so the caller drops the
+    # auto-ACK rather than crashing.
+    if not parts or not (parts[0].isascii() and parts[0].isdecimal()):
         return None
     return (call_id, int(parts[0]))

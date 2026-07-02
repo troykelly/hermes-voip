@@ -25,6 +25,7 @@ Verifies the adapter-activation wave (ADR-0053 §6) end-to-end:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1384,6 +1385,100 @@ async def test_answered_guard_ack_without_trailing_bye_confirms_after_grace() ->
     with patch("hermes_voip.adapter._ACK_BYE_SETTLE_S", 0.01):
         await guard.handle_request(ack)
         assert await guard.wait_outcome(timeout=30.0) is _DialogOutcome.ACK_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_answered_guard_drops_a_header_incomplete_in_dialog_bye(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A header-incomplete in-dialog BYE must not crash the answer-handshake guard.
+
+    ADR-0081 class (build side): the guard's handle_request runs INLINE in the transport
+    reader task (the InDialog branch awaits it directly). A peer BYE that PARSES but
+    lacks a mandatory echo header (no Via) makes build_response(request, 200, ...)
+    raise ValueError (RFC 3261 §8.2.6). Before the fix that escaped the reader and
+    tore down the whole connection — a DoS against every other active call. The BYE
+    must be dropped fail-closed: no raise, no (broken) 200 sent, the dialog
+    still marked peer-ended, and a non-PII WARNING logged.
+    """
+    from hermes_voip.adapter import _AnsweredDialogGuard  # noqa: PLC0415
+    from hermes_voip.dialog import Dialog  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+    local_tag = new_tag()
+    dialog = Dialog.from_inbound_invite(
+        invite,
+        local_tag=local_tag,
+        local_contact="<sip:1000@127.0.0.1:5061;transport=tls>",
+        local_sent_by="127.0.0.1:5061",
+        transport="TLS",
+    )
+    guard = _AnsweredDialogGuard(dialog=dialog, transport=transport, call_id=call_id)
+    # A peer BYE that parses but carries NO Via — build_response(200) has none to echo.
+    bye_no_via = SipRequest.parse(
+        "BYE sip:1000@127.0.0.1:5061 SIP/2.0\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag={local_tag}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 2 BYE\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.adapter"):
+        # Must NOT raise (before the fix this propagated ValueError out of the reader).
+        await guard.handle_request(bye_no_via)
+
+    assert transport.sent == [], (
+        "an un-answerable BYE must not send a (broken) 200 — it is dropped fail-closed"
+    )
+    assert guard.peer_ended, (
+        "the peer BYE still marks the dialog peer-ended even when its 200 can't build"
+    )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "dropping the un-answerable BYE must emit a WARNING (rule 37)"
+    assert "ValueError" in warnings[0].getMessage()
+    # Non-PII (rule 34): the request's identity must not leak into the log.
+    assert call_id not in caplog.text, "Call-ID must not appear in the log (PII guard)"
+    assert "sip:2000@" not in caplog.text, "caller URI must not appear in the log"
+
+
+@pytest.mark.asyncio
+async def test_answered_guard_answers_a_well_formed_bye() -> None:
+    """Positive control: a well-formed in-dialog BYE is still answered 200 OK.
+
+    The fail-closed guard must not change the happy path — a BYE carrying its Via (and
+    the other echo headers) is answered 200 OK exactly as before.
+    """
+    from hermes_voip.adapter import _AnsweredDialogGuard  # noqa: PLC0415
+    from hermes_voip.dialog import Dialog  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(_SIP_DTLS_OFFER, call_id))
+    dialog = Dialog.from_inbound_invite(
+        invite,
+        local_tag=new_tag(),
+        local_contact="<sip:1000@127.0.0.1:5061;transport=tls>",
+        local_sent_by="127.0.0.1:5061",
+        transport="TLS",
+    )
+    guard = _AnsweredDialogGuard(dialog=dialog, transport=transport, call_id=call_id)
+    ok = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 203.0.113.7:5061;branch=z9hG4bKdlg\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag={new_tag()}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    bye = _in_dialog_request("BYE", ok, call_id=call_id)
+    await guard.handle_request(bye)
+    assert any(m.startswith("SIP/2.0 200") and "BYE" in m for m in transport.sent), (
+        "a well-formed BYE must still be answered 200 OK"
+    )
+    assert guard.peer_ended
 
 
 @pytest.mark.asyncio

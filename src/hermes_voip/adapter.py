@@ -378,7 +378,10 @@ class _AnsweredDialogGuard:
         established-then-terminated; the abort must not send its own BYE). An in-window
         re-``INVITE`` is rejected ``491 Request Pending`` (media is not up yet, so we
         cannot service a re-offer). Anything else is acknowledged where a final response
-        is required and otherwise benignly absorbed — never crashing the window.
+        is required and otherwise benignly absorbed — never crashing the window. A
+        request that PARSES but lacks a mandatory header to echo cannot be answered and
+        is dropped fail-closed via :meth:`_answer_or_drop` (its builder ``ValueError``
+        never reaches the reader — ADR-0081).
         """
         method = request.method
         if method == "ACK":
@@ -390,12 +393,36 @@ class _AnsweredDialogGuard:
             # success-path peer_ended check both rely on this.
             self._peer_bye.set()
             self._confirmed.set()
-            await self._transport.send(build_response(request, 200, "OK"))
+            await self._answer_or_drop(lambda: build_response(request, 200, "OK"))
         elif method == "INVITE":
-            await self._transport.send(build_response(request, 491, "Request Pending"))
+            await self._answer_or_drop(
+                lambda: build_response(request, 491, "Request Pending")
+            )
         elif method in ("INFO", "NOTIFY", "OPTIONS"):
-            await self._transport.send(build_response(request, 200, "OK"))
+            await self._answer_or_drop(lambda: build_response(request, 200, "OK"))
         # Any other in-dialog method in this brief window is ignored (no media yet).
+
+    async def _answer_or_drop(self, build: Callable[[], str]) -> None:
+        """Build a response to the in-dialog request; drop it if it cannot be built.
+
+        ``build_response`` raises ``ValueError`` when the request lacks a mandatory
+        header to echo (Via / From / To / Call-ID / CSeq). This guard's
+        :meth:`handle_request` runs INLINE in the reader task (the ``InDialog`` dispatch
+        branch awaits it), so an escaping ``ValueError`` would end the reader and tear
+        down the whole connection — a DoS against every other active call (ADR-0081).
+        Fail closed: log a non-PII WARNING (the exception type only, rule 34) and skip
+        the response, keeping the connection alive.
+        """
+        try:
+            response = build()
+        except ValueError as exc:
+            _log.warning(
+                "dropping a header-incomplete in-dialog request in the answer"
+                " handshake window (%s) — connection kept",
+                type(exc).__name__,
+            )
+            return
+        await self._transport.send(response)
 
     async def on_response(self, response: SipResponse) -> None:
         """Absorb a stray response (the guard sends no request that awaits one).

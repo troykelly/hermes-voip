@@ -809,6 +809,120 @@ async def test_malformed_frame_is_skipped_connection_survives_next_frames() -> N
         await server.stop()
 
 
+# --------------------------------------------------------------------------
+# ADR-0081 class, BUILD side (WSS): a header-incomplete inbound request that
+# PARSES but whose auto-response cannot be built must not tear down the reader.
+# --------------------------------------------------------------------------
+
+
+def _cancel_missing_via() -> str:
+    """A CANCEL frame that PARSES but carries NO Via — its 481 auto-response has none.
+
+    Routes to _handle_cancel (no To-tag, method CANCEL), matches no pending INVITE (no
+    Via branch), and reaches build_response(cancel, 481, ...) — which RAISES ValueError
+    on the absent Via (RFC 3261 §8.2.6). The build runs INLINE, so before the fix the
+    escape ended the reader and dropped the registration + every active call.
+    """
+    return (
+        "CANCEL sip:1000@pbx.example.test SIP/2.0\r\n"
+        "From: <sip:2000@pbx.example.test>;tag=cancel-nohdr-ft\r\n"
+        "To: <sip:1000@pbx.example.test>\r\n"
+        "Call-ID: cancel-no-via-tripwire\r\n"
+        "CSeq: 1 CANCEL\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _options_missing_via() -> str:
+    """An out-of-dialog OPTIONS frame that PARSES but has NO Via for its 200."""
+    return (
+        "OPTIONS sip:1000@pbx.example.test SIP/2.0\r\n"
+        "From: <sip:qualify@pbx.example.test>;tag=opt-nohdr-ft\r\n"
+        "To: <sip:1000@pbx.example.test>\r\n"
+        "Call-ID: options-no-via-tripwire\r\n"
+        "CSeq: 1 OPTIONS\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_header_incomplete_cancel_frame_does_not_tear_down_reader_wss() -> None:
+    # ADR-0081 class (build side, WSS): a CANCEL that PARSES but lacks Via routes to
+    # _handle_cancel, whose build_response(481) raises ValueError INLINE in the reader.
+    # The escape must be contained: the bad CANCEL is dropped (logged) and a SUBSEQUENT
+    # well-formed OPTIONS on the same connection is still answered 200 OK — the reader
+    # (and thus the registration + every active call) survives.
+    lost: list[BaseException | None] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(_cancel_missing_via())
+        await server.push(_inbound_options(to_user="1000"))
+        response_frame = await server.wait_for_received(
+            lambda f: f.startswith("SIP/2.0 200 "), timeout=3.0
+        )
+        assert "200 OK" in response_frame
+        assert lost == [], (
+            "a header-incomplete CANCEL frame must not fire on_connection_lost"
+        )
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_header_incomplete_keepalive_options_does_not_tear_down_reader_wss() -> (
+    None
+):
+    # ADR-0081 class (build side, WSS), keepalive: an out-of-dialog OPTIONS missing Via
+    # is auto-answered via build_options_ok → build_response, which raises. The bad
+    # OPTIONS is dropped and a SUBSEQUENT well-formed OPTIONS is still answered 200 OK.
+    lost: list[BaseException | None] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push(_options_missing_via())
+        await server.push(_inbound_options(to_user="1000"))
+        response_frame = await server.wait_for_received(
+            lambda f: f.startswith("SIP/2.0 200 "), timeout=3.0
+        )
+        assert "200 OK" in response_frame
+        assert lost == [], (
+            "a header-incomplete keepalive OPTIONS must not fire on_connection_lost"
+        )
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 async def test_malformed_response_frame_is_skipped_active_call_survives() -> None:
     # bk646 (the DoS angle, WSS): an established call's response routing must survive a
     # malformed frame on the shared WS connection. A response sink is registered for an

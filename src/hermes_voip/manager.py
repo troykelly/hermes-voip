@@ -476,6 +476,12 @@ class RegistrationManager:
         A response for a flow disarms that flow's in-flight response timeout
         (RFC 3261 Timer F/B) — the registrar answered, so the deadline is moot.
 
+        A response the flow cannot correlate to an outstanding REGISTER — a
+        duplicate/late or superseded final for which ``handle()`` raises
+        ``RuntimeError`` — is IGNORED with a WARNING, never propagated: this method
+        runs OUTSIDE the reader loop's parse-only guard, so an escaping exception
+        would tear down the whole shared signalling connection (ADR-0081).
+
         Raises:
             KeyError: if no flow owns the response's Call-ID (the transport must
                 route only registration responses here; call responses go to the
@@ -486,9 +492,40 @@ class RegistrationManager:
             msg = f"no registration flow for Call-ID {call_id!r}"
             raise KeyError(msg)
         state = self._flows[call_id]
-        # The registrar responded: cancel the Timer-F/B deadline for this REGISTER.
+        try:
+            outcome = state.flow.handle(response)
+        except RuntimeError as exc:
+            # handle() raises RuntimeError (its documented contract) for a response
+            # it cannot correlate to an outstanding REGISTER: a DUPLICATE/late 200 OK
+            # (the transaction already closed, so the flow's _txn is None) or a
+            # SUPERSEDED final whose CSeq no longer matches the in-flight REGISTER.
+            # The registration Call-ID is stable for the flow's life, so such a stray
+            # final routes back here. IGNORE it — it is a retransmit/stale echo, not a
+            # failure: routing it to _on_registration_failed would flap a live
+            # registration DOWN (and alarm the operator) for a harmless duplicate.
+            # This RuntimeError must NEVER propagate out of on_response, which runs
+            # OUTSIDE the reader loop's parse-only `except ValueError`; an escape would
+            # unwind _read_loop and tear down the whole shared signalling connection —
+            # every call and every registration (ADR-0081's DoS invariant). Surfaced
+            # (not swallowed, rule 37) as a non-PII WARNING: exception TYPE only, never
+            # the response or Call-ID (rule 34). CRUCIALLY, we return WITHOUT disarming
+            # the Timer-F/B deadline below: an uncorrelated final did NOT answer the
+            # outstanding REGISTER, so cancelling its deadline would strand the live
+            # transaction with no timeout-driven recovery (a fail-stuck registration).
+            _log.warning(
+                "ignoring an uncorrelated REGISTER response (%s) — connection kept",
+                type(exc).__name__,
+                extra={"event": "sip_registration_response_uncorrelated"},
+            )
+            return
+
+        # The registrar answered THIS REGISTER (a correlated outcome): the Timer-F/B
+        # deadline is now moot, so disarm it. A Challenged/Retry follow-up re-arms it
+        # in _send_register below; Registered/Failed leave it cancelled. Disarming
+        # AFTER correlation (not before handle()) is what keeps an ignored stale/
+        # duplicate final from cancelling the live transaction's deadline.
         self._cancel_response_timeout(state)
-        outcome = state.flow.handle(response)
+
         # Challenged (401/407) and Retry (423 Interval Too Brief) both carry a
         # ready-to-send follow-up REGISTER; the rest update registration state.
         if isinstance(outcome, Challenged | Retry):

@@ -90,14 +90,49 @@ the operator opts numbers in.
   dial targets (extensions and/or SIP URIs). **The default is empty = no outbound
   call is permitted** — the feature is inert until the operator opts numbers in. The
   handler rejects any `number` not on the allowlist with a clear error and never
-  dials an unlisted target. Extensions-only is the assumed shape; a PSTN target is
+  dials an unlisted target. Matching is **exact by default**; the ONLY wildcard is
+  `x`/`X` inside a simple extension mask (an entry of digits, `+`, `#`, `*` and at
+  least one `x`/`X`), where each `x`/`X` matches exactly one decimal digit
+  (`10xx` = `1000`..`1099`). **`*` is a LITERAL dial character, never a wildcard** — so
+  a star/service feature code like `*67` is an EXACT entry (matching only `*67`) and the
+  `10**` spelling from issue #355 is a literal string, not a mask alias (use `10xx`).
+  SIP URIs and any other non-mask entry are exact-only; no entry ever compiles to a
+  `.*` glob (see §2a for why). Extensions-only is the assumed shape; a PSTN target is
   just an allowlist entry if the gateway routes it. The allowlist value lives only in
-  the gitignored `.env` (a real number is potentially PII; extensions are not, but
-  the rule is uniform).
+  the gitignored `.env` (a real number is potentially PII; extensions are not, but the
+  rule is uniform).
 
 - We deliberately do **not** rely on a `confirmed: bool` tool argument as a guard
   (a model under prompt injection would set it). The allowlist is the hard gate; the
   IRREVERSIBLE level-3 + non-degraded clamp and the empty default are the safeguards.
+
+### 2a. `OUTBOUND_ALLOW` pattern semantics — `*` is literal; `x`/`X` is the sole mask wildcard (amended 2026-07-02)
+
+Issue #355 added opt-in patterns to `OUTBOUND_ALLOW`. A first cut treated `*` as a
+one-digit mask character (and as a `.*` glob in non-mask / URI entries). Cross-tier
+review proved that over-matches the DIAL GATE — a security defect:
+
+- `HERMES_VOIP_OUTBOUND_ALLOW="*67"` compiled to `^[0-9]67$`, so it **denied** the
+  listed `*67` yet **authorised** `067`..`967` — ten targets the operator never listed
+  (all valid dial strings that reach `place_call`). Star/service codes (`*67`, `*82`,
+  `*98`) are exactly the digit-shaped entries this misfired on, silently.
+- a URI entry like `sip:10*@host` compiled to `^sip:10.*@host$`, which a value such as
+  `sip:10@evil.example@host` satisfies (host-swallow); and every `.*` is a ReDoS surface.
+
+**Decision (adjudicated):** in `OUTBOUND_ALLOW`, `*` is a **literal** dial character and
+`x`/`X` is the SOLE digit-wildcard, valid ONLY inside a simple extension mask. A mask
+compiles to an anchored regex where `x`/`X` → one digit and every other character
+(`*` included) is escaped; a non-mask entry (star code, SIP URI, label) is exact-only.
+No compiled pattern contains `.*`, so the gate cannot over-match a target or a host and
+has no ReDoS surface. The issue's primary `10xx` example is unchanged; the `10**` alias
+is dropped (now literal — operators use `10xx`).
+
+**Intentional cross-config divergence:** `PROACTIVE_CALL_FROM` and
+`OUTBOUND_RESULT_CHANNEL` keep `fnmatch` glob semantics (`*` = any sequence), because
+they select trigger origins / result routing over `platform:chat_id`, not dial targets.
+`*` is therefore literal in the dial allowlist but a glob in the trigger/routing configs
+— the gate that grants the right to *dial a target* must never over-match, while the
+origin/routing configs remain bounded by that same dial gate at the chokepoint.
 
 ### 3. Async cross-session result reporting
 
@@ -107,7 +142,9 @@ the operator opts numbers in.
   API `hang_up` uses for the Call-ID) and stores it as
   `_call_info[cid]["origin"]` (a `(platform, chat_id)` pair). The `HERMES_VOIP_
   CALL_ON_CONNECT` / cron path has no origin (no session in scope) — captured as
-  `None`.
+  `None`. When a later no-origin fallback channel is configured as a wildcard pattern
+  (for example `telegram:*`), delivery is derived from a **matching** origin only;
+  with no origin in scope the fallback fails closed to log-only.
 
 - **`report_call_result(summary: str)` tool** for the call agent (session B) to
   record the outcome before hangup → `_call_info[cid]["result"]`. SAFE (a session
@@ -143,14 +180,19 @@ the operator opts numbers in.
 - **No-origin fallback.** When there is no origin (the env-trigger / cron path), VoIP
   has no home channel of its own, so a proactive notification *into* voip is impossible
   (it always fails "No home channel set for voip"). The fallback uses
-  `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` (a `platform:chat_id` target) when set,
-  delivered by the SAME foreign-session injection the origin report uses (a
-  `MessageEvent` whose `source` names the configured channel — the path the built-in
-  `send_message` tool would also take). The `tools.send_message_tool` symbol is *not*
-  imported, because a sibling module in the hermes-agent `tools` package has a syntax
-  error mypy cannot parse under `follow_untyped_imports`; reusing the
-  `gateway.*`-only foreign-session injection keeps the type-check clean. With neither
-  origin nor a configured channel the outcome is logged only.
+  `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` when set, delivered by the SAME
+  foreign-session injection the origin report uses (a `MessageEvent` whose `source`
+  names the configured channel — the path the built-in `send_message` tool would also
+  take). Exact entries (no wildcard) preserve the original behaviour: a fixed
+  `platform:chat_id` destination. Wildcard entries (for example `telegram:*`) are
+  matched against a captured origin `platform:chat_id`; on a match the destination is
+  DERIVED from that origin (so the report lands back in the originating Telegram chat),
+  and with no matching origin the fallback fails closed to log-only. The
+  `tools.send_message_tool` symbol is *not* imported, because a sibling module in the
+  hermes-agent `tools` package has a syntax error mypy cannot parse under
+  `follow_untyped_imports`; reusing the `gateway.*`-only foreign-session injection keeps
+  the type-check clean. With neither origin nor a configured channel the outcome is
+  logged only.
 
 ### Hermes gaps recorded (so a future session does not re-derive them)
 
@@ -164,10 +206,12 @@ the operator opts numbers in.
 
 - The agent can place calls *autonomously* once the operator opts a number in — a new
   irreversible capability. It is contained by: (1) the empty-by-default allowlist (no
-  dialling at all until configured), (2) the level-3 + non-degraded privilege clamp
-  (an untrusted inbound caller can never trigger it), and (3) least privilege on the
-  resulting call (the callee is untrusted; the call agent gets the OUTBOUND persona
-  with `privilege_level=0`, so it cannot itself place a further call or transfer).
+  dialling at all until configured), (2) exact-match semantics for every entry except a
+  simple `x`/`X` extension mask — `*` is literal, so no entry ever over-matches a target
+  or compiles to a `.*` glob (§2a), (3) the level-3 + non-degraded privilege clamp (an untrusted
+  inbound caller can never trigger it), and (4) least privilege on the resulting call
+  (the callee is untrusted; the call agent gets the OUTBOUND persona with
+  `privilege_level=0`, so it cannot itself place a further call or transfer).
 
 - **The objective brief must not contain secrets.** It is spoken to / pursued with an
   untrusted callee; the operator's prompt and the call agent's persona are framed so

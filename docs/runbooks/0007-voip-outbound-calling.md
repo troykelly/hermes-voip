@@ -16,7 +16,7 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 | Item | Value |
 | --- | --- |
 | Env var | `HERMES_VOIP_OUTBOUND_ALLOW` |
-| Type | comma-separated list of dial targets (extensions and/or SIP URIs) |
+| Type | comma-separated list of dial targets (extensions and/or SIP URIs); exact by default. The ONLY wildcard is `x`/`X` (one digit) inside a simple extension mask, e.g. `10xx` = 1000–1099. `*` is a **literal** dial char (so `*67` is exact; `10**` is literal — use `10xx`); SIP URIs match verbatim. No `.*` glob is compiled (no host-swallow, no ReDoS). |
 | Default | **empty** → no outbound call is permitted (the feature is **inert**) |
 | Read by | `hermes_voip.outbound_allow.load_outbound_allowlist` (called at `connect()`) |
 | Enforced at | `VoipAdapter.place_call_with_objective` — the dial chokepoint, BEFORE any INVITE |
@@ -34,7 +34,7 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 | Item | Value |
 | --- | --- |
 | Env var | `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` (optional) |
-| Type | a single `platform:chat_id` target (split on the FIRST `:`) |
+| Type | exact `platform:chat_id` fixed target, or a wildcard pattern like `telegram:*` that derives the destination from a matching origin |
 | Default | unset → a no-origin call's outcome is **logged only** |
 | Read by | `VoipAdapter._report_to_fallback_channel` (at call end) |
 | Used when | the call had **no originating session** (the `HERMES_VOIP_CALL_ON_CONNECT` / cron path) |
@@ -42,7 +42,7 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 | Item | Value |
 | --- | --- |
 | Env var | `HERMES_VOIP_PROACTIVE_CALL_FROM` (optional, issue #202) |
-| Type | comma-separated list of `platform:chat_id` operator origins (exact match after trimming) |
+| Type | comma-separated list of `platform:chat_id` operator origins; exact by default, `*` glob opt-in (for example `telegram:*`) |
 | Default | **unset** → proactive `place_call` from a non-VoIP session is **blocked** (fully fail-safe) |
 | Read by | `hermes_voip.voip_tools._proactive_place_call_allowed` (at the `pre_tool_call` gate) |
 | Effect | a `place_call` (ONLY) from a listed origin, with **no live SIP call** in scope, resolves operator privilege (level 3) instead of the fail-safe level 0 |
@@ -69,16 +69,27 @@ proactive notification cannot be delivered into voip.
 - The **hard** gate is `HERMES_VOIP_OUTBOUND_ALLOW`. It stands in for the ADR-0010 DTMF
   confirmation an IRREVERSIBLE tool would otherwise require: a static, operator-curated
   allowlist is **more** spoof-resistant than an in-band DTMF tone the remote party shares the
-  channel with. Matching is **exact** (after trimming) — a listed `1000` does NOT also permit
-  `10000`; there are no prefix wildcards on this trust-granting list (ADR-0021 lesson).
+  channel with. Matching is **exact by default** (after trimming) — a listed `1000` does NOT also permit
+  `10000`. The ONLY wildcard is `x`/`X` inside a simple extension mask, **opt-in per
+  entry**: each `x`/`X` matches exactly one digit, so `10xx` allows `1000`..`1099` and
+  rejects `10`, `100`, `10000`, and `10ab`. `*` is a **literal** dial character, NOT a
+  wildcard — so a star/service code like `*67` is an exact entry (it matches only `*67`,
+  never `067`..`967`), and the `10**` spelling is a literal string, not a mask alias (use
+  `10xx` for the range). SIP URIs and any other non-mask entry are exact-only; no entry
+  ever compiles to a `.*` glob, so a URI entry cannot over-match a different host and there
+  is no ReDoS surface. This keeps the ADR-0021 escalation lesson intact for exact entries
+  while still allowing concise, deliberate `x`-masks (ADR-0029 §2a). NOTE: `*` is a glob
+  ONLY in `PROACTIVE_CALL_FROM` / `OUTBOUND_RESULT_CHANNEL` (those use `fnmatch` — see
+  below); in this dial allowlist `*` is always literal.
 - The callee is **untrusted**: the resulting call runs unprivileged (the OUTBOUND persona,
   `privilege_level=0`), so the call agent cannot itself place a further call or transfer, and
   the **objective must not contain operator secrets** (it is pursued with the untrusted callee).
 - **Proactive `place_call` from an operator chat** (`HERMES_VOIP_PROACTIVE_CALL_FROM`, issue
   #202): by default `place_call` is unreachable from a **non-VoIP** session (e.g. a Telegram
   turn), because with no live SIP call in scope the gate fails safe to level 0. This opt-in
-  env relaxes that **only** for a place_call whose **originating** `(platform, chat_id)` is on
-  the list — and **only** `place_call` (transfer/dtmf/open_entry stay blocked, being
+  env relaxes that **only** for a place_call whose **originating** `(platform, chat_id)`
+  matches an explicit list entry or wildcard pattern — and **only** `place_call`
+  (transfer/dtmf/open_entry stay blocked, being
   meaningless without a live call). It does **not** touch the **inbound** fail-safe: a live
   call still resolves its real caller-group privilege, so a spoofed/prompt-injected caller is
   unaffected. The `HERMES_VOIP_OUTBOUND_ALLOW` allowlist above **still** gates the dial target
@@ -92,11 +103,15 @@ Hermes runtime loads, or the process environment for `hermes gateway run`). Exam
 (gitignored `.env`; fakes only — substitute the operator's real approved targets):
 
 ```
-# Permit outbound calls to two approved extensions and one SIP URI:
-HERMES_VOIP_OUTBOUND_ALLOW=1000,1001,sip:reception@pbx.example.test
+# Permit outbound calls to two approved extensions, any 10xx internal extension,
+# and one SIP URI:
+HERMES_VOIP_OUTBOUND_ALLOW=1000,1001,10xx,sip:reception@pbx.example.test
 
 # (Optional) where env-trigger/cron call outcomes are reported:
+# exact fixed destination:
 HERMES_VOIP_OUTBOUND_RESULT_CHANNEL=telegram:123456789
+# OR wildcard-derived destination from a matching origin:
+# HERMES_VOIP_OUTBOUND_RESULT_CHANNEL=telegram:*
 ```
 
 Then redeploy/restart the gateway so the plugin re-reads its config (the allowlist is read at
@@ -110,15 +125,20 @@ you need all three knobs together — the dial allowlist, the trusted origin, an
 outcome lands back) the result channel (fakes only; substitute the operator's real values):
 
 ```
-# The number(s) the proactive call may dial (the chokepoint gate — unchanged):
-HERMES_VOIP_OUTBOUND_ALLOW=1000,sip:reception@pbx.example.test
+# The number(s) the proactive call may dial (the chokepoint gate):
+HERMES_VOIP_OUTBOUND_ALLOW=1000,10xx,sip:reception@pbx.example.test
 
 # The operator chat(s) allowed to TRIGGER a proactive place_call (platform:chat_id):
+# exact:
 HERMES_VOIP_PROACTIVE_CALL_FROM=telegram:123456789
+# or wildcard-scope any Telegram chat explicitly:
+# HERMES_VOIP_PROACTIVE_CALL_FROM=telegram:*
 
-# Where the call outcome is reported (the proactive path captures THIS origin, so it
-# normally reports back to the chat directly; set this as the fallback):
+# Where the call outcome is reported when there is no direct origin capture:
+# exact fixed destination:
 HERMES_VOIP_OUTBOUND_RESULT_CHANNEL=telegram:123456789
+# or wildcard-derived destination when the origin matches:
+# HERMES_VOIP_OUTBOUND_RESULT_CHANNEL=telegram:*
 ```
 
 `HERMES_VOIP_PROACTIVE_CALL_FROM` is the **only** new knob; it is read at the `pre_tool_call`
@@ -132,19 +152,24 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
 
    ```
    uv run python -c "from hermes_voip.outbound_allow import load_outbound_allowlist, is_outbound_allowed; \
-     a = load_outbound_allowlist({'HERMES_VOIP_OUTBOUND_ALLOW':'1000, 1001'}); \
-     print(sorted(a), is_outbound_allowed('1000', a), is_outbound_allowed('9999', a))"
+     a = load_outbound_allowlist({'HERMES_VOIP_OUTBOUND_ALLOW':'1000,10xx'}); \
+     print(a == frozenset({'1000'}), is_outbound_allowed('1000', a), is_outbound_allowed('1055', a), is_outbound_allowed('1100', a))"
    ```
 
-   Prints `['1000', '1001'] True False`. An empty/absent value prints `[] False False` (inert).
+   Prints `False True True False` because the allowlist now contains one exact entry and one
+   pattern entry (`10xx`, an `x`-digit mask; `*` is literal, so `10**` would be an exact
+   literal entry — use `10xx` for the range). An empty/absent value still prints a
+   falsey/empty allowlist and denies everything (inert, fail-closed).
 
 2. **Gate + tool behaviour (covered by the test suite):**
-   - `uv run pytest tests/test_outbound_allow.py` — the allowlist parser + default-empty.
-   - `uv run pytest tests/test_voip_tools_place_call.py` — the `place_call` / `report_call_result`
-     tools, the IRREVERSIBLE gate (level-0/2/degraded blocked, operator level-3 allowed), the
-     unlisted-number refusal, the immediate `{call_id}` return, AND the proactive-origin gate
-     (`test_voip_tools_gate_proactive_*`: matching origin allowed; transfer/dtmf/open_entry
-     still blocked; off-by-default; wrong-origin blocked).
+   - `uv run pytest tests/test_outbound_allow.py tests/test_wildcard_config.py` — the exact
+     allowlist parser, `x`-digit mask entries (`10xx`) and literal `*` entries (`*67`,
+     `10**`), fixed vs wildcard result channel resolution, and fail-closed defaults.
+   - `uv run pytest tests/test_voip_tools_place_call.py tests/test_wildcard_config.py` — the
+     `place_call` / `report_call_result` tools, the IRREVERSIBLE gate (level-0/2/degraded
+     blocked, operator level-3 allowed), the unlisted-number refusal, the immediate `{call_id}`
+     return, AND the proactive-origin gate (matching origin allowed; wildcard `telegram:*`
+     allowed; transfer/dtmf/open_entry still blocked; off-by-default; wrong-origin blocked).
    - `uv run --extra hermes pytest tests/test_adapter_caller_modes.py -k "objective or origin or first_turn or report"`
      — the objective in the outbound preamble + injected as the call's first turn, and the
      outcome reported into the ORIGIN session (success + failure-fallback; no-origin path).

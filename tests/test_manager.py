@@ -129,7 +129,26 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
         }
     }
     serialized_fields = json.dumps(structured_fields, sort_keys=True, default=repr)
-    serialized_record = json.dumps(record.__dict__, sort_keys=True, default=repr)
+    # LogRecord *numeric* runtime metadata (timestamps, thread/process ids) is
+    # framework-set and never secret-bearing, but its values vary per run and can
+    # coincidentally contain a short secret digit like "1000" (e.g. relativeCreated
+    # mid-suite, or a thread/process id), which flakes this check -- so it is excluded
+    # below. Every secret-bearing surface is still scanned: the code-attached extra
+    # fields, the message args, the rendered message, and `taskName` (asyncio task
+    # names are application-set and CAN carry a dial target, so they stay scanned).
+    runtime_metadata = {
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "process",
+    }
+    scannable_record = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key not in runtime_metadata
+    }
+    serialized_record = json.dumps(scannable_record, sort_keys=True, default=repr)
     rendered_message = record.getMessage()
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
         assert secret not in serialized_fields, (

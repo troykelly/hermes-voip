@@ -14,10 +14,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import sys
 
 import pytest
 
-from hermes_voip.call import CallError, CallSession
+from hermes_voip.call import CallError, CallSession, _cseq_number
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.incall import LocalMediaSession
@@ -1235,3 +1236,141 @@ async def test_header_incomplete_in_dialog_drop_is_logged_non_pii(
     assert "theirs" not in blob
     assert "call-1" not in blob
     assert "pbx.example.test" not in blob
+
+
+# ---- fail-closed: an inbound RESPONSE whose CSeq number is a unicode "digit"
+# ---- must not tear down the whole signalling connection (ADR-0081 class,
+# ---- response-correlation side; sibling of the handle_request fix above) -----
+
+
+def _response_with_cseq(cseq: str) -> SipResponse:
+    """A ``200 OK`` routed to this call by Call-ID, carrying an arbitrary ``CSeq``.
+
+    The transport routes a response to a :class:`CallSession` by Call-ID (``call-1``)
+    and calls ``on_response``, whose ONLY use of the message is to parse the CSeq
+    NUMBER (via ``_cseq_number``) to correlate the response to the outstanding verb.
+    A raw ``cseq`` string forges a number ``int()`` cannot parse without tripping the
+    parser — ``SipResponse.parse`` stores the ``CSeq`` header verbatim.
+    """
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bK-resp\r\n"
+        "From: <sip:2000@pbx.example.test>;tag=theirs\r\n"
+        "To: <sip:1000@pbx.example.test>;tag=ours\r\n"
+        "Call-ID: call-1\r\n"
+        f"CSeq: {cseq}\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    return SipResponse.parse(raw)
+
+
+async def test_established_call_survives_a_unicode_digit_cseq_response() -> None:
+    """An inbound response with a unicode-digit CSeq is ignored, not a teardown.
+
+    The transport routes a response to a :class:`CallSession` by Call-ID and calls
+    ``on_response``, which parses the CSeq number via ``_cseq_number`` to correlate
+    it to the outstanding verb. ``_cseq_number`` guarded ``int(parts[0])`` with
+    ``str.isdigit()`` — ``True`` for the superscript ``²`` (U+00B2) — yet
+    ``int("²")`` raises a bare :class:`ValueError`. ``on_response`` runs in the
+    transport reader task OUTSIDE its parse-only ``except ValueError``, so an inbound
+    ``CSeq: ² BYE`` response whose Call-ID matches an active call escaped
+    ``on_response`` -> ``_read_loop`` -> ``on_connection_lost``, tearing down every
+    call and the registration on the shared SIP-over-TLS/WSS connection over one
+    packet (the ADR-0081 DoS class, response-correlation side — the sibling of the
+    ``handle_request`` fix above).
+
+    Fail closed: a non-decimal CSeq number takes the SAME path as any other
+    uncorrelatable CSeq — ``_cseq_number`` returns ``None`` and ``on_response`` drops
+    the response — so ``int()`` is never reached and the reader survives. Proven by
+    keeping a legitimate re-INVITE outstanding (the "unrelated" traffic on the shared
+    connection): the ``²`` response must neither raise nor disturb it, and the
+    well-formed answer that follows must still correlate and complete the hold (no
+    wedge, no over-drop).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    # A real verb is outstanding on this session: hold() sends a re-INVITE and awaits
+    # its final response (registering the re-INVITE's CSeq in _pending).
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+
+    # The forged response arrives on the same connection. Must NOT raise: a
+    # ValueError propagating out of on_response IS the reader unwind (a whole-
+    # connection teardown). ² = U+00B2 — isdigit()-True but int()-unparseable.
+    await session.on_response(_response_with_cseq("² BYE"))
+
+    # Not wedged / no over-drop: the outstanding re-INVITE's correlation is intact,
+    # so its well-formed 200 answer still completes the hold.
+    await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))
+    await task
+    assert session.on_hold is True
+    assert media.holds == [True]
+
+
+async def test_established_call_survives_an_oversized_ascii_cseq_response() -> None:
+    """An inbound response with an over-long ASCII-decimal CSeq is dropped, not fatal.
+
+    Gating ``int()`` on ``isascii()+isdecimal()`` closes the non-decimal unicode-digit
+    escape but is NOT sufficient on its own: an all-ASCII-decimal CSeq number longer
+    than Python's (configurable, >= 640) integer-string-conversion limit still makes
+    ``int(parts[0])`` raise a bare :class:`ValueError` (``Exceeds the limit ... for
+    integer string conversion``) — the SAME escape, via the SAME ``on_response`` ->
+    reader path that tears down the shared SIP-over-TLS/WSS connection.
+
+    ``_cseq_number`` calls ``int()`` on the ASCII-decimal token inside a
+    ``try``/``except ValueError`` and classifies the digit-limit overflow as
+    uncorrelatable (``None``) instead of letting it escape. Proven, as for the unicode
+    case, with a legitimate re-INVITE kept outstanding: the oversized response must
+    neither raise nor disturb it, and the well-formed answer that follows still
+    completes the hold.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+
+    # A CSeq number far longer than CPython's integer-string conversion limit (default
+    # 4300; 0 disables it), yet every character is isascii()+isdecimal(). Pre-fix this
+    # made int() raise and escape; now int() runs inside try/except so the overflow (or,
+    # if the limit is disabled, the resulting out-of-range value) maps to None.
+    limit = sys.get_int_max_str_digits()
+    oversized = "9" * (limit + 1 if limit else 5000)
+    await session.on_response(_response_with_cseq(f"{oversized} BYE"))  # must NOT raise
+
+    await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))
+    await task
+    assert session.on_hold is True
+    assert media.holds == [True]
+
+
+async def test_cseq_number_rejects_a_number_at_or_above_2_31() -> None:
+    """_cseq_number drops a CSeq value outside the valid SIP range (RFC 3261 §8.1.1.5).
+
+    A SIP CSeq sequence number is ``< 2**31``. The largest valid value (``2**31 - 1``)
+    still parses; ``2**31`` and any larger value (e.g. ``9999999999``) is out of range
+    and returns ``None`` — dropped as uncorrelatable, never mistaken for a real sequence
+    number. Range enforcement is not observable through ``on_response`` (whose
+    ``_pending`` only ever holds our own small CSeqs), so the boundary is pinned here
+    directly.
+    """
+    assert _cseq_number("2147483647 BYE") == 2**31 - 1  # largest valid CSeq
+    assert _cseq_number("2147483648 BYE") is None  # 2**31: out of range
+    assert _cseq_number("9999999999 BYE") is None  # 10 digits but >= 2**31
+
+
+async def test_cseq_number_accepts_a_leading_zero_padded_cseq() -> None:
+    """Leading zeros are valid in a SIP CSeq number; its VALUE is what counts.
+
+    RFC 3261's CSeq sequence-number grammar is `1*DIGIT`, which permits leading
+    zeros, so ``00000000001`` is a valid encoding of sequence number 1 and MUST
+    correlate as 1 — never dropped for its digit count. ``_cseq_number`` normalizes
+    via ``int()`` (``int("00000000001") == 1``) and range-checks the VALUE, not the
+    length; a bounded-length guard would wrongly drop a legitimately padded CSeq an
+    RFC-compliant peer may send (a real over-drop, not a fail-closed non-numeric case).
+    """
+    assert _cseq_number("00000000001 BYE") == 1  # 11 digits, value 1: not over-dropped
+    # A heavily padded largest-valid CSeq still normalizes and is accepted here.
+    assert _cseq_number("0000000000002147483647 INVITE") == 2**31 - 1

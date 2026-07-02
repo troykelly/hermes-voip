@@ -34,9 +34,12 @@ is deliberately lenient about COSMETIC wire form and strict about SEMANTICS:
   one payload type.
 
 Leniency stops at line SPLITTING: lines are split only on CRLF or LF, NEVER on a
-bare CR. A lone CR cannot forge a new SDP line, so it cannot inject an attribute
-(direction downgrade, extra codec) the gateway never sent — in free-text it is
-inert, in a structured line it makes the line malformed and is rejected.
+bare CR. A lone CR is absorbed into the current line's field, so it can never
+forge a new line and cannot inject an attribute (direction downgrade, extra
+codec) the gateway never sent. A field corrupted this way is dropped as
+unrecognised — an ``a=`` attribute so mangled loses its value and falls back to
+the parser default — or, in a strictly-parsed line such as ``m=``, makes it
+malformed and is rejected fail-closed.
 """
 
 from __future__ import annotations

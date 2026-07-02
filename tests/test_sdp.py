@@ -3233,9 +3233,11 @@ def test_parse_single_rtpmap_per_pt_is_accepted() -> None:
 # CRUCIALLY, leniency stops at line SPLITTING: the parser splits only on real
 # terminators (CRLF / LF), NEVER on a bare CR. A lone CR therefore cannot forge
 # a new SDP line, so it cannot inject an attribute (e.g. downgrade the media
-# direction or add a codec) the gateway never sent. In free-text fields a bare
-# CR is inert; in a structured line it makes the line malformed and is rejected
-# fail-closed. The two security tests below pin that boundary.
+# direction or add a codec) the gateway never sent. A bare CR is absorbed into
+# its line: in free-text it is inert; a mangled a= attribute is dropped as
+# unrecognised (its value lost to the parser default); a mangled strict line
+# such as m= is rejected fail-closed. The two security tests below pin that
+# boundary.
 #
 # The clean baseline every variant must match: one audio stream on port 40000,
 # a=sendrecv, a single PCMU/0 codec. (Semantic-error rejection — bad port/ptime,
@@ -3306,15 +3308,18 @@ def test_parse_tolerates_embedded_blank_line() -> None:
 
 
 def test_parse_lone_cr_cannot_inject_attribute() -> None:
-    """SECURITY: a bare CR is not a line separator; a forged attribute cannot splice in.
+    """SECURITY: a bare CR cannot forge an attribute line that takes effect.
 
-    The splice targets the MEDIA-level direction, where a *successful* injection
-    would be observable: two media-level direction lines resolve last-wins, so a
-    forged ``a=inactive`` after the real ``a=sendrecv`` WOULD flip the negotiated
-    direction to ``inactive`` if the bare CR started a new line (verified: the
-    same bytes with a real CRLF yield ``inactive``). Because the CR is inert, the
-    forged attribute is swallowed into the ``a=sendrecv`` field and the direction
-    stays the ``sendrecv`` the gateway actually sent.
+    The real attribute is the NON-default ``a=recvonly`` (the parser defaults an
+    absent direction to ``sendrecv``), so the outcome is unambiguous. Splicing a
+    bare CR then ``a=inactive`` after it does NOT inject the forged
+    ``a=inactive``: were the bare CR a line separator, the two media direction
+    lines would resolve last-wins to ``inactive`` (verified: the identical bytes
+    with a real CRLF yield ``inactive``). Instead the CR is absorbed, the whole
+    CR-mangled ``recvonly`` token is an unrecognised direction, and the corrupted
+    line is dropped — so the direction is NEITHER the injected ``inactive`` NOR
+    the (now-lost) ``recvonly``, but the default ``sendrecv``. The security
+    property is that the forged ``inactive`` never wins.
     """
     sdp = SessionDescription.parse(
         "v=0\r\n"
@@ -3324,10 +3329,16 @@ def test_parse_lone_cr_cannot_inject_attribute() -> None:
         "t=0 0\r\n"
         "m=audio 40000 RTP/AVP 0\r\n"
         "a=rtpmap:0 PCMU/8000\r\n"
-        "a=sendrecv\ra=inactive\r\n"  # bare CR + forged last-wins direction
+        "a=recvonly\ra=inactive\r\n"  # bare CR + forged last-wins direction
     )
-    # The forged a=inactive did NOT win: direction is the real a=sendrecv.
-    _assert_matches_leniency_baseline(sdp)
+    assert sdp.audio is not None
+    # The forged a=inactive did NOT win (no CR line-split injection) ...
+    assert sdp.audio.direction != "inactive"
+    # ... and the CR-corrupted a=recvonly is dropped -> parser default sendrecv
+    # (proving the CR was absorbed, not treated as a separator).
+    assert sdp.audio.direction == "sendrecv"
+    codecs = tuple((c.payload_type, c.encoding) for c in sdp.audio.codecs)
+    assert codecs == ((0, "PCMU"),)
 
 
 def test_parse_rejects_lone_cr_splicing_the_m_line() -> None:

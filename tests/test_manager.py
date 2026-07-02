@@ -162,6 +162,59 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
         )
 
 
+def _make_clean_record(**overrides: object) -> logging.LogRecord:
+    """A WARNING failure LogRecord with NO secret in any surface, plus per-test knobs.
+
+    ``overrides`` are written into ``record.__dict__`` (how logging attaches ``extra``
+    fields and framework metadata), so a test can set ``taskName`` / ``relativeCreated``
+    / an extra field without tripping attribute typing. Framework metadata is pinned to
+    a deterministic baseline first, so async auto-population can't slip a real name in.
+    """
+    record = logging.LogRecord(
+        name="hermes_voip.manager",
+        level=logging.WARNING,
+        pathname="manager.py",
+        lineno=1,
+        msg="SIP registration failed: rejected (status=503, attempt=1)",
+        args=None,
+        exc_info=None,
+    )
+    record.__dict__.update({"taskName": None, "relativeCreated": 0.0, **overrides})
+    return record
+
+
+async def test_secret_scan_ignores_framework_metadata() -> None:
+    """No false-trip on framework metadata that coincidentally contains "1000".
+
+    The asyncio DEFAULT task name ``Task-<n>`` is a monotonic counter that climbs past
+    ``1000``/``1001`` mid-suite, and numeric fields (``relativeCreated`` etc.) vary per
+    run -- both are framework-set, never secrets, so neither may trip the scan.
+    """
+    record = _make_clean_record(taskName="Task-1000", relativeCreated=21000.5)
+    _assert_failure_log_is_secret_safe(record)  # must NOT raise
+
+
+async def test_secret_scan_catches_leak_in_rendered_message() -> None:
+    """A secret rendered into the message (via ``%`` args) is still caught."""
+    record = _make_clean_record(msg="dialing %s failed", args=("1000",))
+    with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_extra_field() -> None:
+    """A secret in a code-attached ``extra`` field is still caught."""
+    record = _make_clean_record(extension="1000")
+    with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_custom_task_name() -> None:
+    """A secret leaked ONLY via a CUSTOM asyncio task name is caught (codex concern)."""
+    record = _make_clean_record(taskName="dial-1000")
+    with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
+        _assert_failure_log_is_secret_safe(record)
+
+
 def _challenge_for(register_text: str) -> SipResponse:
     reg = SipRequest.parse(register_text)
     return SipResponse.parse(

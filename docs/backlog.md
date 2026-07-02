@@ -55,18 +55,25 @@ defect or a load-bearing test gap.
 - [x] **[low] correctness** (partial — residual: no test asserting unknown/hyphenated params are silently ignored (no test with an unknown x-custom-param= in tests/test_digest.py).) — `_PARAM` key pattern `\w+` (line 24) cannot match hyphenated extension
   param names. No test asserts unknown/hyphenated params are ignored gracefully. Broaden to `[\w-]+`
   for forward-compat or pin the silent-skip behaviour with a test. — shipped #293
-- [ ] **[low] robustness** — `algorithm` token rendered unquoted (line 163) after only a lowercase
+- [x] **[low] robustness** — `algorithm` token rendered unquoted (line 163) after only a lowercase
   membership check (line 147). Safe today (only `md5` passes) but the render path trusts the gate.
   Route through the control-char guard or assert a token grammar; note the coupling in a comment.
+  — done: a comment at the `build_authorization` params list documents the coupling — the unquoted
+  algorithm/qop/nc are safe because `algorithm` is validated to `_SUPPORTED_ALGORITHMS` (a fixed
+  `[a-z0-9-]` set) before the render, `qop` is the literal `"auth"`, and `nc` is 8 hex digits — with a
+  pointer to route through `_quoted` if that gate is ever loosened.
 - [x] **[low] robustness** — `realm` defaults to empty string silently when the challenge omits it
   (line 99), hashed into HA1 (line 154). Asymmetric with the missing-`nonce` case which *raises*
   (lines 93-95). Either raise on missing/empty realm, or document why empty realm is tolerated; add a test. — shipped #293
 - [ ] **[low] api** — Caller cannot supply a precomputed HA1; `DigestCredentials` holds plaintext
   password (line 112) and recomputes HA1 each call. RFC 2617 allows storing A1. Offer an HA1-based
   credential variant so security-conscious callers need not keep plaintext resident; record in the ADR.
-- [ ] **[low] api** (partial — residual: the build_authorization docstring does not explicitly state that auth-int-only is the rejection path or scope this as SIP REGISTER / empty b) — `qop` selection silently drops `auth-int`; auth-int unimplemented. Correct/in-scope
+- [x] **[low] api** — `qop` selection silently drops `auth-int`; auth-int unimplemented. Correct/in-scope
   for SIP REGISTER (empty body) but the docstring doesn't call out that auth-int-only is the rejection
-  path. State the scope in the docstring/ADR; keep the auth-int-only rejection test.
+  path. State the scope in the docstring/ADR; keep the auth-int-only rejection test. — done: the
+  `build_authorization` docstring now states `qop=auth-int` is unimplemented (unnecessary for SIP
+  REGISTER's empty body) and that a challenge offering only `auth-int` is the rejection path;
+  `test_rejects_qop_present_without_auth` pins it.
 - [ ] **[low] api** — `build_authorization` returns a bare value string; `registration.py` (lines 161-164)
   separately maps 401→Authorization / 407→Proxy-Authorization, duplicating knowledge the challenge origin
   already has. Carry `proxy: bool` on `DigestChallenge` (set by parse) or return a `(name, value)` pair;
@@ -79,18 +86,30 @@ defect or a load-bearing test gap.
 - [x] **[low] test** — No test pinning the quoting table (username/realm/nonce/uri/cnonce/response/opaque
   quoted vs algorithm/qop/nc unquoted, lines 158-182). Add raw-substring assertions for at least one
   quoted and one unquoted param to lock the boolean-flip mutants. — shipped #287
-- [ ] **[low] docs** — `DigestCredentials.password` is repr-suppressed (`field(repr=False)`, line 112)
+- [x] **[low] docs** — `DigestCredentials.password` is repr-suppressed (`field(repr=False)`, line 112)
   but the docstring doesn't say it is still plaintext in memory and must never be logged/interpolated.
   Add the note (public-repo / AGENTS 34); optionally a test that the secret isn't in `repr(creds)`.
-- [ ] **[low] docs** — `_md5_hex` always encodes UTF-8 (line 37); a `charset` param (RFC 7616) is
+  — done: the `DigestCredentials` docstring warns the password is still the plaintext secret in memory
+  and must never be logged/interpolated (rule 34); `test_credentials_repr_does_not_leak_password` proves
+  the secret (and the field name) are absent from `repr(creds)`.
+- [x] **[low] docs** — `_md5_hex` always encodes UTF-8 (line 37); a `charset` param (RFC 7616) is
   ignored. Latin-1 gateways with accented credentials would mismatch HA1. Document the UTF-8 assumption;
-  add a non-ASCII-realm test pinning the behaviour.
-- [ ] **[low] docs** — Algorithm round-trip subtlety: case-insensitive gate (line 147), case-preserving
+  add a non-ASCII-realm test pinning the behaviour. — done: the module docstring documents the UTF-8
+  encoding assumption (the RFC 7616 §4 `charset` param is not consulted);
+  `test_non_ascii_realm_is_utf8_encoded_in_ha1` is a KAT proving HA1 uses UTF-8 (and differs from
+  ISO-8859-1) for a realm containing U+00E9.
+- [x] **[low] docs** — Algorithm round-trip subtlety: case-insensitive gate (line 147), case-preserving
   echo (line 163). Correct and intended but unexplained. Add one docstring sentence; add an uppercase
-  `algorithm=MD5` accepted+echoed test to complete coverage.
-- [ ] **[low] efficiency / docs** — `parse` materialises a full param dict even though only ~5 keys are
+  `algorithm=MD5` accepted+echoed test to complete coverage. — done: the `DigestChallenge.algorithm`
+  attribute doc explains the case-insensitive match + verbatim case-preserving echo;
+  `test_uppercase_algorithm_accepted_and_echoed_verbatim` covers an uppercase `algorithm=MD5` accepted
+  and echoed unquoted.
+- [x] **[low] efficiency / docs** — `parse` materialises a full param dict even though only ~5 keys are
   read. Cold path (per-registration, not per-RTP-packet) — **no action on perf grounds**; note in review
-  that digest parsing is cold-path so a future agent doesn't "optimise" clarity away.
+  that digest parsing is cold-path so a future agent doesn't "optimise" clarity away. — done:
+  `DigestChallenge.parse` carries a cold-path comment stating the full-dict materialisation is
+  intentional (per-registration, never per-RTP-packet) and must not be micro-optimised into a
+  single-pass early-exit scan.
 
 ## src/hermes_voip/message.py
 

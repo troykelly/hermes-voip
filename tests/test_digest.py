@@ -816,3 +816,87 @@ def test_plain_md5_no_qop_still_uses_legacy_rfc2069() -> None:
     assert _param(header, "qop") is None
     assert _param(header, "nc") is None
     assert _param(header, "cnonce") is None
+
+
+# ── digest.py hardening: mutation-hardening + security regression tests ────────
+# These lock in already-correct behaviour (regression/characterisation) that a
+# mutation or a naive "simplification" would silently break: the plaintext secret
+# must never enter repr(); credential/challenge fields are UTF-8 encoded before
+# hashing; and the algorithm token is matched case-insensitively but echoed back
+# to the server verbatim.
+
+
+def test_credentials_repr_does_not_leak_password() -> None:
+    """SECURITY: the plaintext password must never appear in repr() (rule 34).
+
+    ``DigestCredentials.password`` is ``field(repr=False)``; a mutation dropping
+    that flag would surface the secret in every traceback/log that stringifies a
+    containing object.
+    """
+    creds = DigestCredentials(username="1000", password="sup3r-s3cret-pw")
+    rendered = repr(creds)
+    assert "sup3r-s3cret-pw" not in rendered
+    assert "password" not in rendered  # the field name is suppressed too
+    assert "username='1000'" in rendered  # username is still shown
+
+
+def test_non_ascii_realm_is_utf8_encoded_in_ha1() -> None:
+    """HA1 UTF-8-encodes non-ASCII realm/credential bytes (RFC 7616 §4 charset).
+
+    Independently-computed KAT: the response equals the digest of the UTF-8-encoded
+    inputs and DIFFERS from the ISO-8859-1 encoding, so a mutation switching the
+    encoding (or a legacy latin-1 gateway) would fail this vector.
+    """
+    realm = "réalm.example.test"  # contains U+00E9 (e-acute): UTF-8 != latin-1
+    nonce = "nonce-utf8"
+    challenge = DigestChallenge(realm=realm, nonce=nonce, qop=("auth",))
+    creds = DigestCredentials(username="1000", password="s3cr3t")
+    header = build_authorization(
+        challenge,
+        creds,
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="fixedcnonce",
+        nc=1,
+    )
+
+    def md5_utf8(value: str) -> str:
+        return hashlib.md5(value.encode("utf-8")).hexdigest()  # noqa: S324 - test KAT
+
+    def md5_latin1(value: str) -> str:
+        return hashlib.md5(value.encode("latin-1")).hexdigest()  # noqa: S324 - test KAT
+
+    ha2 = md5_utf8("REGISTER:sip:pbx.example.test")
+    ha1_utf8 = md5_utf8(f"1000:{realm}:s3cr3t")
+    expected_utf8 = md5_utf8(f"{ha1_utf8}:{nonce}:00000001:fixedcnonce:auth:{ha2}")
+    ha1_latin1 = md5_latin1(f"1000:{realm}:s3cr3t")
+    expected_latin1 = md5_latin1(
+        f"{ha1_latin1}:{nonce}:00000001:fixedcnonce:auth:{ha2}"
+    )
+
+    assert _param(header, "response") == expected_utf8
+    # Discriminating: latin-1 would yield a different response for this realm.
+    assert expected_utf8 != expected_latin1
+
+
+def test_uppercase_algorithm_accepted_and_echoed_verbatim() -> None:
+    """An uppercase algorithm token is matched case-insensitively but echoed back.
+
+    ``algorithm=MD5`` (uppercase) is accepted (case-insensitive gate) and echoed
+    in the server's original case, rendered UNQUOTED (``algorithm=MD5``).
+    """
+    challenge = DigestChallenge.parse(
+        'Digest realm="pbx.example.test", nonce="n1", algorithm=MD5, qop="auth"'
+    )
+    assert challenge.algorithm == "MD5"  # stored verbatim (case preserved)
+    header = build_authorization(
+        challenge,
+        DigestCredentials(username="1000", password="pw"),
+        method="REGISTER",
+        uri="sip:pbx.example.test",
+        cnonce="c",
+        nc=1,
+    )
+    assert _param(header, "algorithm") == "MD5"  # echoed in the server's case
+    assert "algorithm=MD5" in header  # unquoted
+    assert 'algorithm="MD5"' not in header  # not quoted

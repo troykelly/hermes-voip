@@ -1270,6 +1270,75 @@ async def test_header_incomplete_cancel_drop_is_logged_non_pii(
     assert lost == [], "the header-incomplete CANCEL must not fire on_connection_lost"
 
 
+def _matched_cancel_missing_cseq(*, branch: str, call_id: str) -> str:
+    """A CANCEL that MATCHES a pending INVITE (branch + Call-ID) but omits CSeq.
+
+    It carries the pending INVITE's top Via branch and its Call-ID, so ``_match_cancel``
+    finds the transaction — but with no ``CSeq``, ``build_response(cancel, 200, ...)``
+    raises, so the 200 OK to the CANCEL cannot be built. A CANCEL we cannot answer must
+    have NO effect on the transaction (no 487, no ``on_cancel``).
+    """
+    return (
+        "CANCEL sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 203.0.113.5:5061;branch={branch};rport\r\n"
+        "From: <sip:2000@pbx.example.test>;tag=match-nocseq-ft\r\n"
+        "To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_matched_header_incomplete_cancel_does_not_cancel_the_invite() -> None:
+    # codex review follow-up: a CANCEL that MATCHES a pending INVITE by Via-branch +
+    # Call-ID but is header-incomplete (here: no CSeq) cannot have its 200 OK built. A
+    # CANCEL we cannot answer must have NO effect — it must not half-drive the
+    # transaction (no 487 to the peer, no on_cancel abort). It is dropped whole, the
+    # pending INVITE is left intact, and the connection survives.
+    new_calls: list[NewCall] = []
+    cancels: list[str] = []
+    lost: list[BaseException | None] = []
+    branch = new_branch()
+    call_id = new_call_id()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_cancel=cancels.append,
+        on_connection_lost=lost.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        # A well-formed inbound INVITE is tracked as a pending server transaction.
+        await server.push(
+            _inbound_invite_with(to_user="1000", call_id=call_id, branch=branch)
+        )
+        await _until(lambda: len(new_calls) == 1)
+        # A matched-but-header-incomplete CANCEL: routes to _handle_cancel, matches the
+        # pending INVITE, but its 200 OK cannot be built.
+        await server.push(_matched_cancel_missing_cseq(branch=branch, call_id=call_id))
+        # Let the reader process the CANCEL (in the buggy version this fired on_cancel).
+        await asyncio.sleep(0.2)
+        assert cancels == [], (
+            "a header-incomplete CANCEL we cannot answer must not cancel the INVITE"
+        )
+        assert lost == [], "the connection must survive the header-incomplete CANCEL"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 def _nonutf8_body_but_framable() -> bytes:
     """A message that FRAMES cleanly but whose BODY is not valid UTF-8.
 

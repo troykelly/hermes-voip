@@ -465,9 +465,18 @@ class RegistrationFlow:
     def handle(self, response: SipResponse) -> RegistrationOutcome:
         """Consume the response to the outstanding request.
 
+        An UNANSWERABLE 401/407 challenge (only an unsupported algorithm, ``qop``
+        without ``auth``, a missing/absent nonce or realm) fails CLOSED to a
+        :class:`Failed` outcome rather than raising: the digest layer's
+        ``ValueError`` is consumed here so it can never propagate out to the shared
+        signalling reader loop and tear down unrelated calls (ADR-0081).
+
         Raises:
             RuntimeError: If there is no outstanding request, or the response's
-                CSeq does not match it.
+                CSeq does not match it (a duplicate/late/superseded final routed
+                back by the stable registration Call-ID). The
+                :class:`RegistrationManager` consumer treats this as an ignorable
+                stray response — it, too, never propagates to the reader loop.
         """
         txn = self._txn
         if txn is None:
@@ -480,10 +489,7 @@ class RegistrationFlow:
             # but 202 Accepted is also a valid response to REGISTER on some gateways).
             return self._handle_success(response, txn)
         if status in (_UNAUTHORIZED, _PROXY_AUTH_REQUIRED):
-            if txn.challenged:
-                self._txn = None  # already answered once; the credential is wrong
-                return Failed(status, response.reason)
-            return Challenged(request=self._reauthenticate(response, status, txn))
+            return self._handle_challenge(response, status, txn)
         if status == _INTERVAL_TOO_BRIEF:
             retry = self._retry_interval(response, txn)
             if retry is not None:
@@ -492,6 +498,43 @@ class RegistrationFlow:
             return Failed(status, response.reason)
         self._txn = None
         return Failed(status, response.reason)
+
+    def _handle_challenge(
+        self, response: SipResponse, status: int, txn: _Transaction
+    ) -> Challenged | Failed:
+        """Answer a 401/407 challenge, or fail CLOSED if it is unanswerable.
+
+        A SECOND challenge in the same transaction is Failed (the credential is
+        wrong; recovery is the manager's next refresh — ADR-0080). A FIRST challenge
+        the digest layer cannot answer raises ``ValueError`` out of
+        ``_reauthenticate`` — from ``pick_best_challenge`` (only an unsupported
+        algorithm, e.g. a legitimate RFC 8760 SHA-512-256), ``build_authorization``
+        (``qop`` without ``auth``, e.g. auth-int), or ``DigestChallenge.parse`` (a
+        missing/garbled nonce or realm, including a 401/407 with NO challenge header,
+        where ``_strongest_challenge`` parses ``""``). That ``ValueError`` is
+        CONSUMED here and mapped to :class:`Failed` — exactly like the second-challenge
+        path and every other non-answerable branch of :meth:`handle` — so the manager
+        reports it and recovers via a fresh REGISTER (bounded backoff).
+
+        It must NEVER propagate: ``on_response`` has no guard and runs OUTSIDE the
+        signalling reader loop's parse-only ``except ValueError``, so an escaping
+        ``ValueError`` would unwind ``_read_loop`` and tear down the whole shared
+        connection — every active call and every registration (ADR-0081: one
+        malformed message must not be a DoS against unrelated calls). The digest layer
+        keeps its raising contract; registration fails closed on it.
+        """
+        if txn.challenged:
+            self._txn = None  # already answered once; the credential is wrong
+            return Failed(status, response.reason)
+        try:
+            request = self._reauthenticate(response, status, txn)
+        except ValueError:
+            # Unanswerable challenge (see the method docstring): the digest layer's
+            # ValueError is consumed and mapped to a fail-closed Failed, never raised
+            # out to on_response / the shared reader loop (ADR-0081 DoS invariant).
+            self._txn = None
+            return Failed(status, response.reason)
+        return Challenged(request=request)
 
     def _handle_success(
         self, response: SipResponse, txn: _Transaction

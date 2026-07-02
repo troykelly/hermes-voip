@@ -1653,3 +1653,35 @@ async def test_on_response_stale_cseq_does_not_propagate() -> None:
     assert manager.is_up is False  # the stale final did not spuriously register us
     assert not errors
     await manager.aclose()
+
+
+async def test_on_response_stale_cseq_preserves_outstanding_response_timeout() -> None:
+    # Ignoring an uncorrelated (stale-CSeq) final must NOT disarm the LIVE REGISTER's
+    # Timer-F/B deadline. on_response used to cancel the response timeout BEFORE
+    # handle(), so a stale/superseded final left the outstanding REGISTER with no
+    # timeout-driven recovery — a fail-stuck registration (the same registration-layer
+    # DoS, merely shifted from the shared-connection teardown this fix closes). The
+    # deadline must be disarmed ONLY for a response the registrar actually answered
+    # THIS REGISTER with (a correlated outcome).
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway(), transport)  # default refresh_timeout > 0
+    await manager.start()
+    # Answer the initial REGISTER with a 401 → the authed REGISTER (CSeq 2) is sent and
+    # its Timer-F/B response timeout is armed while we await the authed 200.
+    await manager.on_response(_challenge_for(transport.sent[0]))
+    state = manager._by_extension["1000"]
+    assert state.response_timeout_task is not None  # armed, awaiting the authed 200
+
+    reg = SipRequest.parse(transport.sent[0])
+    stale = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"Call-ID: {reg.header('Call-ID')}\r\n"
+        "CSeq: 1 REGISTER\r\n"  # stale: the outstanding REGISTER is CSeq 2 (authed)
+        f"Contact: {reg.header('Contact')};expires=300\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    await manager.on_response(stale)  # MUST NOT raise, MUST NOT disarm the live timeout
+    assert state.response_timeout_task is not None, (
+        "a stale/uncorrelated final must not cancel the outstanding REGISTER's timeout"
+    )
+    await manager.aclose()

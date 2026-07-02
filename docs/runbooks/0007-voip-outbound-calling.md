@@ -70,12 +70,17 @@ proactive notification cannot be delivered into voip.
   confirmation an IRREVERSIBLE tool would otherwise require: a static, operator-curated
   allowlist is **more** spoof-resistant than an in-band DTMF tone the remote party shares the
   channel with. Matching is **exact by default** (after trimming) — a listed `1000` does NOT also permit
-  `10000`. Wildcards are **opt-in per entry** only. In simple dial masks, `*` and `x` each
-  mean exactly one digit: `10**` and `10xx` both allow `1000`..`1099`, and reject `10`,
-  `100`, `10000`, and `10ab`. SIP URI / non-mask patterns keep literal `x` characters and
-  use `*` as the explicit glob, so `sip:ext@pbx.example.test` remains exact unless the
-  operator explicitly adds `*`. This keeps the ADR-0021 escalation lesson intact for exact
-  entries while still allowing concise, deliberate operator patterns.
+  `10000`. The ONLY wildcard is `x`/`X` inside a simple extension mask, **opt-in per
+  entry**: each `x`/`X` matches exactly one digit, so `10xx` allows `1000`..`1099` and
+  rejects `10`, `100`, `10000`, and `10ab`. `*` is a **literal** dial character, NOT a
+  wildcard — so a star/service code like `*67` is an exact entry (it matches only `*67`,
+  never `067`..`967`), and the `10**` spelling is a literal string, not a mask alias (use
+  `10xx` for the range). SIP URIs and any other non-mask entry are exact-only; no entry
+  ever compiles to a `.*` glob, so a URI entry cannot over-match a different host and there
+  is no ReDoS surface. This keeps the ADR-0021 escalation lesson intact for exact entries
+  while still allowing concise, deliberate `x`-masks (ADR-0029 §2a). NOTE: `*` is a glob
+  ONLY in `PROACTIVE_CALL_FROM` / `OUTBOUND_RESULT_CHANNEL` (those use `fnmatch` — see
+  below); in this dial allowlist `*` is always literal.
 - The callee is **untrusted**: the resulting call runs unprivileged (the OUTBOUND persona,
   `privilege_level=0`), so the call agent cannot itself place a further call or transfer, and
   the **objective must not contain operator secrets** (it is pursued with the untrusted callee).
@@ -152,13 +157,14 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
    ```
 
    Prints `False True True False` because the allowlist now contains one exact entry and one
-   pattern entry (`10xx`; `10**` has the same fixed-length digit-mask semantics). An empty/absent value still prints a falsey/empty allowlist and
-   denies everything (inert, fail-closed).
+   pattern entry (`10xx`, an `x`-digit mask; `*` is literal, so `10**` would be an exact
+   literal entry — use `10xx` for the range). An empty/absent value still prints a
+   falsey/empty allowlist and denies everything (inert, fail-closed).
 
 2. **Gate + tool behaviour (covered by the test suite):**
    - `uv run pytest tests/test_outbound_allow.py tests/test_wildcard_config.py` — the exact
-     allowlist parser, wildcard allowlist entries (`10**`, `10xx`), fixed vs wildcard result
-     channel resolution, and fail-closed defaults.
+     allowlist parser, `x`-digit mask entries (`10xx`) and literal `*` entries (`*67`,
+     `10**`), fixed vs wildcard result channel resolution, and fail-closed defaults.
    - `uv run pytest tests/test_voip_tools_place_call.py tests/test_wildcard_config.py` — the
      `place_call` / `report_call_result` tools, the IRREVERSIBLE gate (level-0/2/degraded
      blocked, operator level-3 allowed), the unlisted-number refusal, the immediate `{call_id}`

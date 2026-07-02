@@ -69,16 +69,25 @@ class DtmfNoPress(enum.Enum):
     Replaces the bare ``None`` that previously conflated all non-press cases,
     letting callers branch on the exact reason without extra bookkeeping:
 
-    * ``STILL_PRESSING``  - the end bit is not set; the tone is still in progress.
-    * ``DUPLICATE_END``   - the end bit is set but this RTP timestamp was already
-      recorded as a completed press (RFC 4733 redundant end or a reordered
-      duplicate).
-    * ``NON_DIGIT_EVENT`` - the end bit is set and the timestamp is new, but the
-      telephone-event code is not a keypad digit (e.g. flash = event 16).
+    * ``STILL_PRESSING``    - the end bit is not set; the tone is still in
+      progress.
+    * ``DUPLICATE_END``     - the end bit is set and this RTP timestamp was
+      already recorded with the SAME event code (RFC 4733 redundant end or a
+      reordered duplicate of the same key-press).
+    * ``CONFLICTING_EVENT`` - the end bit is set and this RTP timestamp was
+      already recorded, but with a DIFFERENT event code. This is never
+      surfaced as a press and never conflated with ``DUPLICATE_END``: DTMF is
+      the ADR-0009 spoof-resistant confirmation channel (ADR-0010), so a
+      forged or otherwise mismatching telephone-event packet racing the
+      genuine one at the same timestamp must not be able to substitute a
+      different digit for the one the real key-press produced.
+    * ``NON_DIGIT_EVENT``   - the end bit is set and the timestamp is new, but
+      the telephone-event code is not a keypad digit (e.g. flash = event 16).
     """
 
     STILL_PRESSING = "still_pressing"
     DUPLICATE_END = "duplicate_end"
+    CONFLICTING_EVENT = "conflicting_event"
     NON_DIGIT_EVENT = "non_digit_event"
 
 
@@ -232,11 +241,25 @@ class DtmfReceiver:
     packets were all lost is still surfaced (favouring not missing a digit), and
     a non-digit event (e.g. flash) is not surfaced as a digit.
 
-    ``_window`` is an insertion-ordered ``dict[int, None]`` that acts as a
-    bounded ordered set: the keys are the remembered timestamps in oldest-to-
-    newest order, and the ``None`` values carry no information. This replaces
-    the previous ``_order: deque[int]`` + ``_seen: set[int]`` pair, which
-    required manual synchronisation on every write (bk354).
+    ``_window`` is an insertion-ordered ``dict[int, int]`` mapping each
+    remembered RTP timestamp (oldest-to-newest) to the event code first
+    recorded for it. Recording the event code, not just the timestamp, lets
+    :meth:`feed` distinguish an ordinary agreeing duplicate (``DUPLICATE_END``)
+    from a same-timestamp packet whose event code disagrees
+    (``CONFLICTING_EVENT``) — a forged or otherwise mismatching packet that
+    must never be able to substitute a different digit for the one already
+    decided. This replaces the previous ``_order: deque[int]`` + ``_seen:
+    set[int]`` pair, which required manual synchronisation on every write
+    (bk354), and the later ``dict[int, None]`` form, which recorded a
+    timestamp had been seen but not what digit it had decided (the
+    digit-substitution gap fixed here).
+
+    Residual scope: this closes substitution AFTER a timestamp's outcome is
+    decided (the first end packet at a timestamp wins and is compared against
+    by every later one). It does not — and, without transport-layer
+    authentication such as SRTP, cannot — decide which of two same-timestamp
+    packets was "genuine" if a forged one simply wins the race to arrive
+    first; that is out of scope for this receiver.
     """
 
     def __init__(self, history: int = _RECEIVER_HISTORY) -> None:
@@ -256,10 +279,12 @@ class DtmfReceiver:
             raise ValueError(msg)
         self._history = history
         # Single insertion-ordered structure: keys are remembered timestamps
-        # in insertion order; eviction pops the oldest (first) key when the
-        # window is full.  Acts as an ordered set with O(1) membership tests
-        # and O(1) oldest-key access (next(iter(d))).
-        self._window: dict[int, None] = {}
+        # in insertion order, values are the event code first recorded at
+        # that timestamp; eviction pops the oldest (first) key when the
+        # window is full.  O(1) membership tests, O(1) oldest-key access
+        # (next(iter(d))), and O(1) lookup of the recorded event code to
+        # detect a same-timestamp conflict.
+        self._window: dict[int, int] = {}
 
     def feed(self, event: DtmfEvent, *, timestamp: int) -> DtmfPress | DtmfNoPress:
         """Process one decoded event at its RTP ``timestamp``.
@@ -268,22 +293,31 @@ class DtmfReceiver:
             :class:`DtmfPress` carrying the pressed digit when a new key-press
             ends.  One of the :class:`DtmfNoPress` variants otherwise:
 
-            * ``STILL_PRESSING``  — the end bit is not set.
-            * ``DUPLICATE_END``   — the end bit is set but this timestamp is
-              already in the bounded window (RFC 4733 redundant end or reordered
-              duplicate).
-            * ``NON_DIGIT_EVENT`` — the end bit is set and the timestamp is new,
-              but the event code is not a keypad digit (e.g. flash = 16).
+            * ``STILL_PRESSING``    — the end bit is not set.
+            * ``DUPLICATE_END``     — the end bit is set and this timestamp is
+              already in the bounded window with the SAME event code (RFC 4733
+              redundant end or reordered duplicate of the same key-press).
+            * ``CONFLICTING_EVENT`` — the end bit is set and this timestamp is
+              already in the bounded window, but with a DIFFERENT event code.
+              Never treated as a press and never conflated with
+              ``DUPLICATE_END``: a forged or otherwise mismatching packet
+              racing the genuine one must not substitute a different digit
+              for the one already decided for this timestamp.
+            * ``NON_DIGIT_EVENT``   — the end bit is set and the timestamp is
+              new, but the event code is not a keypad digit (e.g. flash = 16).
         """
         if not event.end:
             return DtmfNoPress.STILL_PRESSING
-        if timestamp in self._window:
+        recorded_event = self._window.get(timestamp)
+        if recorded_event is not None:
+            if recorded_event != event.event:
+                return DtmfNoPress.CONFLICTING_EVENT
             return DtmfNoPress.DUPLICATE_END
         # Evict the oldest entry if the window is full.
         if len(self._window) >= self._history:
             oldest = next(iter(self._window))
             del self._window[oldest]
-        self._window[timestamp] = None
+        self._window[timestamp] = event.event
         if 0 <= event.event < len(_DIGITS):
             return DtmfPress(digit=_DIGITS[event.event])
         return DtmfNoPress.NON_DIGIT_EVENT

@@ -61,6 +61,7 @@ import audioop  # audioop-lts (rule 38) — used for PLC attenuation of a held f
 
 from hermes_voip.dtmf import (
     DtmfEvent,
+    DtmfNoPress,
     DtmfPress,
     DtmfReceiver,
     DtmfSendMode,
@@ -3035,6 +3036,14 @@ class RtpMediaTransport:
         value-domain error in the digit mapping is contained to a single dropped packet,
         not a torn-down call. Any non-``ValueError`` exception still propagates
         (rule 37).
+
+        A same-timestamp packet whose event code disagrees with the one already
+        recorded for that timestamp is surfaced as ``DtmfNoPress.CONFLICTING_EVENT`` —
+        a forged or otherwise mismatching duplicate that must never substitute a
+        different digit for the one already decided (DTMF is the ADR-0009
+        spoof-resistant confirmation channel; see ``DtmfReceiver.feed``). It is never
+        treated as a press, and is logged at DEBUG below, distinctly from an ordinary
+        ``DUPLICATE_END``, for diagnostic visibility into attempted substitution.
         """
         if self._on_dtmf is None:
             return  # inbound DTMF ignored; the packet is still kept off the audio path
@@ -3047,6 +3056,18 @@ class RtpMediaTransport:
         if isinstance(result, DtmfPress):
             _log.info("dtmf rx: digit %r", result.digit)
             self._on_dtmf(result.digit)
+        elif result is DtmfNoPress.CONFLICTING_EVENT:
+            # A same-timestamp packet disagreed with the event code already
+            # recorded for it (a forged or otherwise mismatching duplicate,
+            # never a press — see DtmfReceiver.feed). Logged at the same
+            # severity as the SRTP auth/replay and malformed-datagram drops
+            # above: the receiver already defended against it, so this is
+            # diagnostic noise, not a call-affecting failure.
+            _log.debug(
+                "dtmf rx: conflicting telephone-event at timestamp %d — dropped "
+                "(mismatched duplicate, not treated as a press)",
+                packet.timestamp,
+            )
 
     @property
     def on_dtmf(self) -> Callable[[str], None] | None:

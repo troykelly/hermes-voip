@@ -258,6 +258,23 @@ async def test_secret_scan_catches_leak_in_stack_info() -> None:
         _assert_failure_log_is_secret_safe(record)
 
 
+async def test_secret_scan_catches_leak_in_unformatted_exception() -> None:
+    """A logged exception's message is caught even before ``exc_text`` is formatted.
+
+    ``caplog`` captures RAW records: with ``exc_info=True`` the record carries an
+    ``exc_info`` tuple but ``exc_text`` stays ``None`` until a Formatter runs, so an
+    ``exc_text``-only scan would miss the message. The unformatted exception value
+    (``str(exc_info[1])``) is scanned too.
+    """
+    exc = ConnectionError("cannot reach pbx.example.test:5061")
+    record = _make_clean_record(exc_info=(type(exc), exc, exc.__traceback__))
+    assert record.exc_text is None  # precondition: exception not yet formatted
+    with pytest.raises(
+        AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception value"
+    ):
+        _assert_failure_log_is_secret_safe(record)
+
+
 def _challenge_for(register_text: str) -> SipResponse:
     reg = SipRequest.parse(register_text)
     return SipResponse.parse(

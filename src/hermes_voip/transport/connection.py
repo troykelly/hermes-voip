@@ -982,12 +982,19 @@ def _txn_key(call_id: str | None, cseq: str | None) -> tuple[str, int] | None:
     # framing.py / sdp.py / registration.py), NOT ``isdigit()``: ``str.isdigit()`` is
     # True for non-decimal digit characters such as the superscript "²" that ``int()``
     # cannot parse, so an inbound ``CSeq: ² INVITE`` would raise ValueError here and
-    # escape the reader, tearing down the whole connection (ADR-0081). A non-decimal
-    # CSeq number now yields None (no transaction match), so the caller drops the
-    # auto-ACK rather than crashing.
+    # escape the reader, tearing down the whole connection (ADR-0081).
     if not parts or not (parts[0].isascii() and parts[0].isdecimal()):
         return None
-    return (call_id, int(parts[0]))
+    try:
+        number = int(parts[0])
+    except ValueError:
+        # An all-ASCII-decimal token can still overflow CPython's int-from-string
+        # digit limit (sys.get_int_max_str_digits(), default 4300): a crafted
+        # ``CSeq: <thousands of digits> INVITE`` reaches here and int() raises. Fail
+        # closed on that residual too — no transaction match, so the caller drops the
+        # auto-ACK rather than crashing.
+        return None
+    return (call_id, number)
 
 
 def _build_cancel(outbound: _OutboundInvite) -> str:

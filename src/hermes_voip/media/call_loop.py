@@ -67,13 +67,6 @@ cancellation is immediate relative to any subsequent ``send_audio`` calls.
 own coroutine while ``run()`` is live; it is independently cancellable via
 ``barge_in()``. ``_active_tts_stream`` is touched only from the event loop, so
 no locking is needed.
-
-Tool gating
------------
-``gate_voip_tool`` is a thin re-export of ``gate_tool_call`` from
-``hermes_voip.providers.policy``.  The adapter calls it before executing any
-tool action so the guard-session state (``degraded``, ``flagged_turns``) is
-honoured without the call loop needing to know tool semantics.
 """
 
 from __future__ import annotations
@@ -95,7 +88,7 @@ from hermes_voip.media.vad import SpeechEdge, VadEvent, VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardVerdict, InjectionGuard
-from hermes_voip.providers.policy import GuardSessionState, ToolRisk, gate_tool_call
+from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.spoken_text import sanitize_for_speech
@@ -105,7 +98,6 @@ __all__ = [
     "BargeInGate",
     "BargeInMode",
     "CallLoop",
-    "gate_voip_tool",
 ]
 
 _log: Final = logging.getLogger(__name__)
@@ -502,46 +494,6 @@ async def _sanitize_iter(text: AsyncIterator[str]) -> AsyncIterator[str]:
         clean = sanitize_for_speech(chunk)
         if clean:
             yield clean
-
-
-def gate_voip_tool(
-    risk: ToolRisk,
-    state: GuardSessionState,
-    *,
-    confirmed: bool,
-) -> bool:
-    """Gate a tool invocation through the session guard state.
-
-    A thin re-export of ``gate_tool_call`` (``hermes_voip.providers.policy``):
-    the adapter calls this for every tool action so the guard-session state
-    (``degraded`` flag, cumulative risk) is honoured regardless of the
-    classifier outcome. ``IRREVERSIBLE`` tools require explicit confirmation AND
-    a non-degraded session; ``ELEVATED`` tools are blocked while degraded;
-    ``SAFE`` tools always run.
-
-    **ADR-0085:** ``gate_tool_call`` returns a typed ``GateDecision``; this
-    re-export branches on ``.allowed`` (keeping its ``bool`` contract for existing
-    callers) and audits the structured ``.reason`` on a block so the operator sees
-    WHY the tool was refused.
-
-    Args:
-        risk: The action risk class of the tool.
-        state: The per-session guard state for this call.
-        confirmed: Whether the caller explicitly confirmed the action
-            (e.g. via DTMF — ADR-0010).
-
-    Returns:
-        ``True`` if the tool may run, ``False`` if it must be blocked.
-    """
-    decision = gate_tool_call(risk, state, confirmed=confirmed)
-    if not decision.allowed:
-        _log.warning(
-            "gate_voip_tool BLOCK risk=%s call=%s reason=%s",
-            risk.value,
-            state.call_id,
-            decision.reason.value,
-        )
-    return decision.allowed
 
 
 class CallLoop:

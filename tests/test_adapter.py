@@ -907,8 +907,12 @@ def test_caller_number_unresolved_from_returns_none_not_raw_header() -> None:
         is None
     )
 
+    # (5) A malformed / host-less ``sip:`` URI with NO ``@`` is not a valid AOR — it has
+    #     no user@host, so it is unresolved (None), never the bare token before the
+    #     missing ``@`` (which would still enter caller-group / intercom matching).
+    assert _caller_number("<sip:operator>;tag=x") is None
 
-@pytest.mark.asyncio
+
 async def test_deliver_turn_defangs_hostile_caller_identity_fields() -> None:
     """A hostile caller name must not reach the MessageEvent identity fields RAW.
 

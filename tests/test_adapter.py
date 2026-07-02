@@ -912,6 +912,13 @@ def test_caller_number_unresolved_from_returns_none_not_raw_header() -> None:
     #     missing ``@`` (which would still enter caller-group / intercom matching).
     assert _caller_number("<sip:operator>;tag=x") is None
 
+    # (6) A ``sip:`` URI with an EMPTY host after ``@`` is not a valid AOR either — the
+    #     user part alone (no host) must NOT resolve to a caller-ID.
+    assert _caller_number("<sip:operator@>;tag=x") is None
+
+    # (7) An EMPTY user part (``sip:@host``) is unresolved too.
+    assert _caller_number("<sip:@pbx.example.test>") is None
+
 
 @pytest.mark.asyncio
 async def test_deliver_turn_defangs_hostile_caller_identity_fields() -> None:

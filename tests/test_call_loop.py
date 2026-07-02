@@ -4729,6 +4729,56 @@ async def test_dtmf_group_delivery_failure_warning_does_not_log_raw_digits(
 
 
 @pytest.mark.asyncio
+async def test_dtmf_delivery_failure_does_not_log_digit_bearing_exception_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The delivery-failure log carries NO exception-derived content (rule 34).
+
+    ``deliver_turn`` is opaque, so even the exception TYPE is a data-derived field read
+    across that boundary: a downstream callback could raise a dynamically-named
+    exception class whose ``__name__`` embeds the raw digit text, which ``type(exc)``
+    (or its repr) would then leak. The failure log therefore emits a CONSTANT message
+    with no exception-derived field — the failure is still surfaced (rule 37), yet no
+    digit content can reach any log record (message or args).
+    """
+    secret = "1234567890"
+
+    async def boom(text: str) -> None:
+        _ = text  # the leak vector under test is the class NAME, not the turn text
+        # Worst case for an opaque callback: a dynamically-named exception class whose
+        # __name__ embeds the raw digits, so type(exc).__name__ would carry the secret.
+        exc_type = type(f"Rejected{secret}Error", (RuntimeError,), {})
+        raise exc_type("delivery rejected")
+
+    loop = _build_loop(
+        _FakeTransport([]), _FakeASR([]), _FakeTTS([]), _FakeGuard([]), boom
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.media.call_loop"):
+        for digit in secret:
+            loop.feed_dtmf(digit)
+        loop.feed_dtmf("#")
+        for _ in range(50):
+            await asyncio.sleep(0)
+    assert not loop._dtmf_delivery_tasks, "the DTMF delivery task never completed"
+
+    # The failure IS logged (rule 37: errors propagate, never swallowed) ...
+    assert [
+        r for r in caplog.records if "DTMF group delivery failed" in r.getMessage()
+    ], "the DTMF delivery-failure warning was not emitted"
+
+    # ... but the digit-bearing exception CLASS NAME reaches no log record.
+    for record in caplog.records:
+        assert secret not in record.getMessage(), (
+            f"digit-bearing exception name leaked in a log message: "
+            f"{record.getMessage()!r}"
+        )
+        assert secret not in str(record.args), (
+            f"digit-bearing exception name leaked in a log record's args: "
+            f"{record.args!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     """After N unanswered reprompts the watchdog ends the call gracefully (run returns).
 

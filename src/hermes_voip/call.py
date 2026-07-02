@@ -994,18 +994,29 @@ class CallSession:
             await self._refer_handler(refer)
 
 
+# RFC 3261 §8.1.1.5: a CSeq sequence number is < 2**31 — at most 10 decimal digits.
+# Bounding the token length also keeps int() below Python's (configurable, >= 640)
+# integer-string-conversion limit, so the conversion in _cseq_number cannot raise.
+_MAX_CSEQ_DIGITS = 10
+
+
 def _cseq_number(cseq: str | None) -> int | None:
     if cseq is None:
         return None
     parts = cseq.split()
-    # Fail closed (ADR-0081): a SIP CSeq number is ASCII `1*DIGIT` (RFC 3261), but
-    # str.isdigit() is True for non-decimal unicode digits (e.g. superscript "²"
-    # U+00B2) that int() rejects with a bare ValueError. on_response/_send_ack run
-    # OUTSIDE the reader's parse-only `except ValueError`, so that escape would tear
-    # down the whole connection. Require isascii()+isdecimal() — exactly the ASCII
-    # 0-9 SIP allows — so a non-conformant CSeq takes the SAME uncorrelatable-CSeq
-    # path (None) a non-numeric one already does; int() then never sees a value it
-    # rejects.
-    if not parts or not (parts[0].isascii() and parts[0].isdecimal()):
+    # Fail closed (ADR-0081): a SIP CSeq number is ASCII `1*DIGIT` and < 2**31
+    # (RFC 3261 §8.1.1.5) — at most _MAX_CSEQ_DIGITS digits. str.isdigit() is True
+    # for non-decimal unicode digits (e.g. superscript "²" U+00B2) that int()
+    # rejects with a bare ValueError, and int() also raises on an over-long ASCII
+    # run (Python's integer-string-conversion limit). on_response/_send_ack run
+    # OUTSIDE the reader's parse-only `except ValueError`, so either escape would
+    # tear down the whole connection. Require isascii()+isdecimal() AND a bounded
+    # length, so a non-conformant CSeq takes the SAME uncorrelatable-CSeq path
+    # (None) a non-numeric one already does and int() below cannot raise.
+    if (
+        not parts
+        or not (parts[0].isascii() and parts[0].isdecimal())
+        or len(parts[0]) > _MAX_CSEQ_DIGITS
+    ):
         return None
     return int(parts[0])

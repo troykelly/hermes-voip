@@ -45,7 +45,13 @@ from hermes_voip.media.srtp import (  # noqa: E402
     _packet_iv,
 )
 from hermes_voip.rtp import RtpPacket  # noqa: E402
-from hermes_voip.sdp import CryptoAttribute, SdpError  # noqa: E402
+from hermes_voip.sdp import (  # noqa: E402
+    CryptoAttribute,
+    SdpError,
+    SessionDescription,
+    _negotiate_answer_crypto,
+    generate_answer_crypto,
+)
 
 # ---------------------------------------------------------------------------
 # RFC 3711 §B.2 — AES-CM keystream known-answer test vector
@@ -253,6 +259,42 @@ def _make_packet(
         ssrc=ssrc,
         payload=payload,
     )
+
+
+def test_sdes_weak_first_offer_media_flows_to_wire_answer_peer() -> None:
+    """A weak-first SDES offer must key media a wire-answer peer can decrypt.
+
+    End-to-end reproduction (real SRTP protect/unprotect) of the SDES
+    wire-suite/installed-key divergence. The adapter keys OUR outbound session
+    from ``generate_answer_crypto(audio.crypto_attrs[0])`` (offer order), while the
+    wire answer re-selects the STRONGEST suite (``_negotiate_answer_crypto``). A
+    conforming peer keys its receive decryptor from that wire answer. If the two
+    suites diverge (auth-tag length 4 vs 10) the peer cannot authenticate our
+    packets — no audio. Both sessions share the SAME minted key here, so the ONLY
+    variable is the suite: the round trip succeeds iff wire-suite == installed-suite.
+    Fake key||salt are ``bytes(range(N))`` — obviously synthetic, never real keys.
+    """
+    weak_key = base64.b64encode(bytes(range(30))).decode()
+    strong_key = base64.b64encode(bytes(range(50, 80))).decode()
+    offer = SessionDescription.parse(
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\ns=-\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:1 AES_CM_128_HMAC_SHA1_32 inline:{weak_key}\r\n"
+        f"a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{strong_key}\r\n"
+        "a=sendrecv\r\n"
+    )
+    audio = offer.audio
+    assert audio is not None
+    # OUR outbound session, keyed exactly as the adapter keys it (crypto_attrs[0]).
+    answer_crypto = generate_answer_crypto(audio.crypto_attrs[0])
+    our_outbound = SrtpSession(answer_crypto)
+    # The peer keys its receive decryptor from the suite WE advertise on the wire.
+    wire_crypto = _negotiate_answer_crypto(audio, answer_crypto)
+    peer_receive = SrtpSession(wire_crypto)
+    packet = _make_packet(payload=bytes(range(160)))
+    protected = our_outbound.protect(packet)
+    recovered = peer_receive.unprotect(protected)
+    assert recovered.payload == packet.payload
 
 
 class TestSrtpSessionRoundTrip:

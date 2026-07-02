@@ -2975,6 +2975,32 @@ def test_negotiate_answer_crypto_picks_strongest_directly() -> None:
     assert accepted.tag == 2
 
 
+def test_wire_answer_suite_equals_installed_keying_suite() -> None:
+    """The wire answer's suite MUST equal the suite the SRTP sessions are keyed with.
+
+    ``build_audio_answer`` selects the STRONGEST offered suite for the wire
+    (anti-downgrade, via :func:`_negotiate_answer_crypto`'s ``max``), but the
+    adapter keys every SRTP/SRTCP session from ``crypto_attrs[0]`` (offer order):
+    ``SrtpSession(audio.crypto_attrs[0])`` inbound and
+    ``generate_answer_crypto(audio.crypto_attrs[0])`` outbound. For a spec-compliant
+    weak-first offer the two suites MUST agree, or the peer keys a different SRTP
+    auth-tag length than we run and the secured call has no audio in either
+    direction — while the anti-downgrade control is silently defeated (we actually
+    run the weaker suite the wire claims to have rejected). This pins the invariant
+    that ``crypto_attrs[0]`` is the SAME accepted suite the wire advertises.
+    """
+    offer = SessionDescription.parse(_savp_offer_two_crypto(_SUITE_32, _SUITE_80))
+    audio = offer.audio
+    assert audio is not None
+    # What the adapter installs: it keys every SrtpSession from crypto_attrs[0].
+    installed = audio.crypto_attrs[0]
+    # What the wire answer advertises: the strongest suite (anti-downgrade).
+    wire = _negotiate_answer_crypto(audio, f"{_SUITE_80} inline:{_FAKE_ANSWER_KEY}")
+    assert installed.suite == wire.suite
+    # Both are the strong suite — selection is by strength, never offer order.
+    assert installed.suite == _SUITE_80
+
+
 # ---------------------------------------------------------------------------
 # IPv6 address-family correctness (backlog 187-191, RFC 4566 §5.2/5.7)
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ import pytest
 
 from hermes_voip.transport.framing import FramingError, SipMessageFramer
 
-_CRLF = "\r\n"
+_CRLF = b"\r\n"
 
 
 def _register(call_id: str = "reg-1") -> bytes:
@@ -29,7 +29,7 @@ def _register(call_id: str = "reg-1") -> bytes:
     ).encode()
 
 
-def _with_body() -> tuple[bytes, str]:
+def _with_body() -> tuple[bytes, bytes]:
     body = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"
     head = (
         "SIP/2.0 200 OK\r\n"
@@ -39,7 +39,9 @@ def _with_body() -> tuple[bytes, str]:
         "Content-Type: application/sdp\r\n"
         f"Content-Length: {len(body.encode())}\r\n\r\n"
     )
-    return (head + body).encode(), head + body
+    raw = (head + body).encode()
+    # The framer yields the whole message as raw bytes; expected == the fed bytes.
+    return raw, raw
 
 
 def test_single_complete_message_in_one_feed() -> None:
@@ -47,7 +49,7 @@ def test_single_complete_message_in_one_feed() -> None:
     framer.feed(_register())
     messages = list(framer)
     assert len(messages) == 1
-    assert messages[0].startswith("REGISTER sip:pbx.example.test SIP/2.0")
+    assert messages[0].startswith(b"REGISTER sip:pbx.example.test SIP/2.0")
     assert messages[0].endswith(_CRLF + _CRLF)
     # The buffer is drained; a second drain yields nothing.
     assert list(framer) == []
@@ -62,7 +64,7 @@ def test_message_split_across_two_feeds_at_header_boundary() -> None:
     framer.feed(whole[cut:])
     messages = list(framer)
     assert len(messages) == 1
-    assert messages[0] == whole.decode()
+    assert messages[0] == whole
 
 
 def test_message_split_inside_the_body() -> None:
@@ -83,8 +85,8 @@ def test_coalesced_messages_in_one_feed() -> None:
     framer.feed(_register("a") + _register("b"))
     messages = list(framer)
     assert len(messages) == 2
-    assert "Call-ID: a" in messages[0]
-    assert "Call-ID: b" in messages[1]
+    assert b"Call-ID: a" in messages[0]
+    assert b"Call-ID: b" in messages[1]
 
 
 def test_pipelined_message_with_body_then_another() -> None:
@@ -94,7 +96,7 @@ def test_pipelined_message_with_body_then_another() -> None:
     messages = list(framer)
     assert len(messages) == 2
     assert messages[0] == expected
-    assert "Call-ID: after" in messages[1]
+    assert b"Call-ID: after" in messages[1]
 
 
 def test_byte_at_a_time_delivery_reassembles() -> None:
@@ -104,6 +106,30 @@ def test_byte_at_a_time_delivery_reassembles() -> None:
         framer.feed(raw[i : i + 1])
     messages = list(framer)
     assert messages == [expected]
+
+
+def test_nonutf8_body_is_yielded_as_bytes_not_decoded() -> None:
+    """A well-framed message with a non-UTF-8 BODY is yielded as raw bytes, not raised.
+
+    The framer delimits by byte count and does NOT decode: the strict UTF-8 decode is
+    the parse layer's job (ADR-0081). A body carrying an invalid UTF-8 byte (``0xFF``,
+    e.g. a binary ``application/ISUP`` / ``octet-stream`` payload) is handed on intact
+    for the recoverable post-framing path — it must NEVER raise ``UnicodeDecodeError``
+    from the framer (that used to escape the reader loop and tear the connection down).
+    """
+    framer = SipMessageFramer()
+    message = (
+        b"MESSAGE sip:1000@pbx.example.test SIP/2.0\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Length: 1\r\n\r\n"
+        b"\xff"
+    )
+    framer.feed(message)
+    messages = list(framer)
+    assert messages == [message]
+    assert isinstance(messages[0], bytes)
+    # The buffer is fully consumed — the stream is synchronised for the next message.
+    assert list(framer) == []
 
 
 def test_body_consumes_exactly_content_length_not_more() -> None:
@@ -131,7 +157,7 @@ def test_folded_content_length_header_is_unfolded_before_framing() -> None:
         f"Content-Length:\r\n\t{len(body.encode())}\r\n\r\n{body}"
     )
     framer.feed(message.encode())
-    assert list(framer) == [message]
+    assert list(framer) == [message.encode()]
 
 
 def test_leading_crlf_keepalive_ping_is_skipped_before_a_message() -> None:
@@ -140,7 +166,7 @@ def test_leading_crlf_keepalive_ping_is_skipped_before_a_message() -> None:
     framer.feed(b"\r\n" + b"\r\n\r\n" + _register("a"))
     messages = list(framer)
     assert len(messages) == 1
-    assert "Call-ID: a" in messages[0]
+    assert b"Call-ID: a" in messages[0]
 
 
 def test_keepalive_only_feed_yields_no_message_and_does_not_fault() -> None:
@@ -151,7 +177,7 @@ def test_keepalive_only_feed_yields_no_message_and_does_not_fault() -> None:
     framer.feed(_register("b"))
     messages = list(framer)
     assert len(messages) == 1
-    assert "Call-ID: b" in messages[0]
+    assert b"Call-ID: b" in messages[0]
 
 
 def test_missing_content_length_is_a_framing_error() -> None:
@@ -214,7 +240,7 @@ def test_leading_crlf_skipped() -> None:
     framer.feed(b"\r\n" + _register("ping-skip"))
     messages = list(framer)
     assert len(messages) == 1
-    assert "Call-ID: ping-skip" in messages[0]
+    assert b"Call-ID: ping-skip" in messages[0]
 
 
 def test_pong_between_messages_both_framed() -> None:
@@ -223,8 +249,8 @@ def test_pong_between_messages_both_framed() -> None:
     framer.feed(_register("first") + b"\r\n\r\n" + _register("second"))
     messages = list(framer)
     assert len(messages) == 2
-    assert "Call-ID: first" in messages[0]
-    assert "Call-ID: second" in messages[1]
+    assert b"Call-ID: first" in messages[0]
+    assert b"Call-ID: second" in messages[1]
 
 
 # ---------------------------------------------------------------------------

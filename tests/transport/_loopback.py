@@ -141,11 +141,14 @@ class LoopbackSipServer:
                     return
                 framer.feed(data)
                 for raw in framer:
-                    self.received.append(raw)
+                    # The framer yields raw bytes; this fixture only ever frames the
+                    # well-formed UTF-8 the client sends, so a strict decode is safe.
+                    text = raw.decode("utf-8")
+                    self.received.append(text)
                     self._received_event.set()
-                    if raw.startswith("SIP/2.0 "):
+                    if text.startswith("SIP/2.0 "):
                         continue  # a response from the client; nothing to reply
-                    request = SipRequest.parse(raw)
+                    request = SipRequest.parse(text)
                     for reply in await self._responder(request):
                         writer.write(reply.encode())
                     await writer.drain()
@@ -159,6 +162,21 @@ class LoopbackSipServer:
             msg = "no client connected"
             raise RuntimeError(msg)
         self._writer.write(message.encode())
+        await self._writer.drain()
+
+    async def push_bytes(self, data: bytes, *, timeout: float = 3.0) -> None:
+        """Send RAW bytes to the connected client (may be non-UTF-8).
+
+        :meth:`push` encodes a ``str``; a well-framed SIP message whose BODY is
+        binary and not valid UTF-8 (an ``application/ISUP`` / ``octet-stream`` /
+        Latin-1 payload) cannot be expressed as ``str``, so this writes the exact
+        bytes onto the wire to exercise the framer's non-UTF-8-body handling.
+        """
+        await asyncio.wait_for(self._connected.wait(), timeout)
+        if self._writer is None:  # pragma: no cover - guarded by the event
+            msg = "no client connected"
+            raise RuntimeError(msg)
+        self._writer.write(data)
         await self._writer.drain()
 
     async def wait_for_received(

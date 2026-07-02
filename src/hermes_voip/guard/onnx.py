@@ -181,12 +181,21 @@ class OnnxInjectionGuard:
         normalized = normalize(text)
         try:
             raw = await asyncio.to_thread(self._classify, normalized.screened_text)
+            # ``_is_valid_probability`` runs INSIDE this try (not after it): the
+            # ``Classifier`` alias is only a *static* str -> float contract (it is
+            # dependency-injected, per the module docstring) — a buggy or
+            # alternate implementation can violate it at runtime and return a
+            # non-numeric value. ``math.isfinite`` raises ``TypeError`` on such a
+            # value; catching it here means a runtime contract violation fails
+            # open exactly like any other classifier malfunction, instead of
+            # escaping ``screen()`` as an uncaught exception.
+            valid = _is_valid_probability(raw)
         except Exception as exc:  # noqa: BLE001 -- fail-open is the policy (ADR-0009)
             # The error is handled + reported (not swallowed): degrade the session
             # so policy clamps the action surface, and NEVER silently ALLOW.
             return self._fail_open(normalized, reason=f"classifier-error: {exc}")
 
-        if not _is_valid_probability(raw):
+        if not valid:
             return self._fail_open(
                 normalized, reason=f"classifier-invalid-score: {raw!r}"
             )

@@ -166,17 +166,23 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
         and _DEFAULT_ASYNCIO_TASK_NAME.fullmatch(task_name) is None
         else ""
     )
-    # ``exc_text`` is populated only once a Formatter runs; on a raw captured record
-    # (caplog) an ``exc_info=True`` log leaves ``exc_text`` None while the exception
-    # value still carries the message, so scan ``str(exc_info[1])`` as well.
-    exc_value = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    # ``exc_text`` is populated only once a Formatter runs; on a raw captured record a
+    # log with ``exc_info=True`` leaves ``exc_text`` None. Render ``exc_info`` and scan
+    # it -- ``formatException`` follows the full ``__cause__`` / ``__context__`` /
+    # ``ExceptionGroup`` chain (the real log output), so a secret in a chained or
+    # wrapped exception is caught too, with no timestamps/counters to false-trip.
+    formatted_exc = (
+        logging.Formatter().formatException(record.exc_info)
+        if isinstance(record.exc_info, tuple) and record.exc_info[1] is not None
+        else ""
+    )
     scanned_surfaces = {
         "extra fields": json.dumps(extra_fields, sort_keys=True, default=repr),
         "rendered message": record.getMessage(),
         "message args": json.dumps(record.args, default=repr) if record.args else "",
         "custom task name": custom_task_name,
         "exception text": record.exc_text or "",
-        "exception value": str(exc_value) if exc_value is not None else "",
+        "exception value": formatted_exc,
         "stack info": record.stack_info or "",
     }
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
@@ -269,12 +275,41 @@ async def test_secret_scan_catches_leak_in_unformatted_exception() -> None:
 
     ``caplog`` captures RAW records: with ``exc_info=True`` the record carries an
     ``exc_info`` tuple but ``exc_text`` stays ``None`` until a Formatter runs, so an
-    ``exc_text``-only scan would miss the message. The unformatted exception value
-    (``str(exc_info[1])``) is scanned too.
+    ``exc_text``-only scan would miss it. The exception is rendered via
+    ``Formatter().formatException`` and scanned too.
     """
     exc = ConnectionError("cannot reach pbx.example.test:5061")
     record = _make_clean_record(exc_info=(type(exc), exc, exc.__traceback__))
     assert record.exc_text is None  # precondition: exception not yet formatted
+    with pytest.raises(
+        AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception value"
+    ):
+        _assert_failure_log_is_secret_safe(record)
+
+
+def _chained_secret_exception() -> RuntimeError:
+    """A ``RuntimeError('registration failed')`` whose ``__cause__`` carries a secret.
+
+    Equivalent to ``raise RuntimeError(...) from ConnectionError('...secret...')`` but
+    built without a live ``raise`` -- the wrapper's own message is sanitized, so only a
+    scan that follows ``__cause__`` sees the secret.
+    """
+    wrapper = RuntimeError("registration failed")
+    wrapper.__cause__ = ConnectionError("cannot reach pbx.example.test:5061")
+    return wrapper
+
+
+async def test_secret_scan_catches_leak_in_chained_exception() -> None:
+    """A secret in a CHAINED exception's cause is caught (codex must-fix).
+
+    A sanitized wrapper logged with ``exc_info=True`` still renders its ``__cause__``
+    into the formatted traceback, so a secret in the cause is a genuine leak. Scanning
+    only the top-level exception value would miss it; ``Formatter().formatException``
+    follows the ``__cause__`` chain, matching the real log output.
+    """
+    exc = _chained_secret_exception()
+    assert "pbx.example.test" not in str(exc)  # the wrapper itself is sanitized
+    record = _make_clean_record(exc_info=(type(exc), exc, exc.__traceback__))
     with pytest.raises(
         AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception value"
     ):

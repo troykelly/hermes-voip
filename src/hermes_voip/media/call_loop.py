@@ -981,13 +981,12 @@ class CallLoop:
             return
         exc = task.exception()
         if exc is not None:
-            # Log the exception TYPE only, never its repr: the delivery routes the
-            # digit-bearing turn text through ``deliver_turn`` (the agent runtime),
-            # whose error can echo that text, so ``%r`` would leak the secret digits
-            # (rule 34). The failure class is enough to diagnose; the payload is not.
-            _log.warning(
-                "DTMF group delivery failed (call continues): %s", type(exc).__name__
-            )
+            # Log a CONSTANT message with NO exception-derived content: ``deliver_turn``
+            # is an opaque callback, so even ``type(exc).__name__`` is data-derived and
+            # could embed the secret digits (a dynamically-named exception class). The
+            # failure is still surfaced (rule 37); no digit content reaches a log
+            # (rule 34).
+            _log.warning("DTMF group delivery failed (call continues)")
 
     async def _dtmf_flush_after_gap(self) -> None:
         """Wait the inter-digit gap, then dispatch the buffered group as a menu turn.

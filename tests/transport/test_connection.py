@@ -1080,6 +1080,70 @@ async def test_active_call_survives_a_malformed_message_on_the_connection() -> N
 
 
 # --------------------------------------------------------------------------
+# ADR-0081 class, RESPONSE side (F1): a NON-DECIMAL CSeq number on an INVITE
+# final must not tear the connection down via _txn_key's int().
+# --------------------------------------------------------------------------
+
+
+async def test_superscript_cseq_number_on_invite_final_survives_connection() -> None:
+    # F1 (HIGH, ADR-0081): a crafted INVITE-final response with a non-decimal CSeq
+    # NUMBER — the superscript "²": ``"²".isdigit()`` is True but
+    # ``int("²")`` raises — reaches ``_txn_key`` (the method token is a valid
+    # "INVITE", so ``_method_of`` passes the gate) and crashes in ``int()`` BEFORE
+    # any transaction lookup. So NO correlated call is needed: a single response
+    # escaped the reader and dropped every active call. Assert an UNRELATED active
+    # call survives (its own 200 OK is still routed) and on_connection_lost never
+    # fires.
+    active_call_id = new_call_id()
+    active_branch = new_branch()
+    sink = _RecordingSink()
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    await transport.connect()
+    transport.add_call(active_call_id, sink)
+    try:
+        active_invite = _outbound_invite(active_branch, call_id=active_call_id)
+        await transport.send(active_invite)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        # The crafted response carries its OWN (untracked) Call-ID; it correlates to
+        # no transaction, and would crash in _txn_key before that even mattered.
+        unrelated = SipRequest.parse(
+            _outbound_invite(new_branch(), call_id=new_call_id())
+        )
+        await server.push(_final_with_cseq(unrelated, 486, "Busy Here", "² INVITE"))
+        # RED before the fix: the reader crashes and fires on_connection_lost.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+        assert lost == [], "a non-decimal CSeq must not fire on_connection_lost"
+        # The unrelated active call's own 200 OK is still routed to its sink.
+        await server.push(_final_2xx_with_contact(SipRequest.parse(active_invite)))
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in sink.responses))
+        # No ACK is attempted for the crafted response (it matches no transaction).
+        assert not any(raw.startswith("ACK ") for raw in server.received)
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+# --------------------------------------------------------------------------
 # ADR-0081 class, BUILD side: a header-incomplete inbound request that PARSES
 # but whose auto-response cannot be built must not tear down the connection.
 # --------------------------------------------------------------------------

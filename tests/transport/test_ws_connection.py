@@ -251,6 +251,45 @@ def _inbound_options(*, to_user: str) -> str:
     )
 
 
+def _outbound_invite(branch: str, *, call_id: str | None = None, cseq: int = 1) -> str:
+    """A client-originated INVITE this transport sends (WSS Via, ``.invalid`` host)."""
+    return build_request(
+        "INVITE",
+        "sip:2000@pbx.example.test",
+        [
+            ("Via", f"SIP/2.0/WSS abc123.invalid;branch={branch};rport"),
+            ("Max-Forwards", "70"),
+            ("From", f"<sip:1000@pbx.example.test>;tag={new_tag()}"),
+            ("To", "<sip:2000@pbx.example.test>"),
+            ("Call-ID", call_id if call_id is not None else new_call_id()),
+            ("CSeq", f"{cseq} INVITE"),
+            ("Contact", "<sip:1000@abc123.invalid;transport=ws>"),
+        ],
+    )
+
+
+def _final_with_cseq(
+    invite: SipRequest, status: int, reason: str, cseq_header: str | None
+) -> str:
+    """A final response to ``invite`` with a caller-supplied ``CSeq`` value.
+
+    ``cseq_header`` is the raw header value to send (e.g. ``"INVITE"`` — a method
+    with no sequence number — or ``"abc INVITE"`` — a non-numeric sequence
+    number); ``None`` omits the ``CSeq`` header entirely. Used to regression-guard
+    the loud-failure path when a final's CSeq cannot be parsed (bk1188).
+    """
+    cseq_line = f"CSeq: {cseq_header}\r\n" if cseq_header is not None else ""
+    return (
+        f"SIP/2.0 {status} {reason}\r\n"
+        f"Via: {invite.header('Via')}\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag=busy-srv\r\n"
+        f"Call-ID: {invite.header('Call-ID')}\r\n"
+        f"{cseq_line}"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
 def _in_dialog_bye(*, call_id: str, local_tag: str, remote_tag: str) -> str:
     return (
         f"BYE sip:1000@pbx.example.test SIP/2.0\r\n"
@@ -464,6 +503,61 @@ async def test_register_round_trips_via_manager() -> None:
         await manager.aclose()
         await transport.aclose()
         await server.stop()
+
+
+async def test_malformed_cseq_on_invite_final_logs_warning_wss(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A final non-2xx with an unparseable CSeq is logged, not silently dropped.
+
+    Mirrors the TLS-transport regression test: before the fix,
+    ``_auto_ack_non_2xx`` gives up via a bare ``return`` when the CSeq method
+    isn't ``INVITE`` or ``_txn_key`` can't parse the sequence number — silently
+    skipping both the mandatory ACK (RFC 3261 §17.1.1.3) and the client-
+    transaction cleanup, with NO log at all. This exercises all three malformed
+    shapes (omitted CSeq, CSeq with no number, CSeq with a non-numeric number)
+    and asserts each is logged as a WARNING naming the Call-ID.
+    """
+    call_id = new_call_id()
+
+    def responder(_frame: str) -> list[str]:
+        return []  # the malformed finals are pushed directly below
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = _make_transport(server.port)
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.ws_connection"):
+        try:
+            await transport.connect()
+            invite_text = _outbound_invite(new_branch(), call_id=call_id)
+            await transport.send(invite_text)
+            await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+            invite = SipRequest.parse(invite_text)
+
+            for cseq_header in (None, "INVITE", "abc INVITE"):
+                await server.push(
+                    _final_with_cseq(invite, 486, "Busy Here", cseq_header)
+                )
+
+            await _until(
+                lambda: (
+                    len([r for r in caplog.records if r.levelno == logging.WARNING])
+                    >= 3
+                ),
+                timeout=3.0,
+            )
+        finally:
+            await transport.aclose()
+            await server.stop()
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) >= 3, (
+        f"expected one WARNING per malformed-CSeq shape (3), got {len(warning_records)}"
+    )
+    for record in warning_records:
+        assert call_id in record.getMessage(), (
+            f"WARNING must name the Call-ID, got: {record.getMessage()!r}"
+        )
 
 
 async def test_inbound_invite_routes_to_new_call() -> None:

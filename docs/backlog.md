@@ -413,10 +413,12 @@ defect or a load-bearing test gap.
 
 - [ ] **[low] robustness** — `SourceDescription._from_body` (line 586) and `Bye._from_body`
   (line 708) both stop once the declared `count` chunks/SSRCs (+ BYE's optional reason) are
-  consumed, but neither checks the body's remaining bytes are zero — verified: neither has an
-  `offset == len(body)` / `end == len(body)` guard, so trailing garbage after the declared
-  content parses silently instead of raising. Add the same full-consumption check to both;
-  test a trailing extra byte on each.
+  consumed, but neither checks that parsing fully consumed the declared body — verified:
+  neither has an `offset == len(body)` / `end == len(body)` guard, so any trailing bytes left
+  over after the declared content (there is no legitimate padding-after-content case per RFC
+  3550 §6.5/§6.6 — each SDES chunk already self-pads to its own 4-byte boundary) parse
+  silently instead of raising. Add the same full-consumption check to both; test a trailing
+  extra byte on each.
 - [ ] **[low] robustness** — `rtt_from_report_block` (line 1038) clamps the *lower* bound
   (`rtt_units < 0 → 0.0`) but not the upper: `delay = (now - lsr) & _U32` wraps to up to
   2^32-1 compact-NTP units (~18.2 h) when `lsr` is stale/replayed or the clock jumps, and that

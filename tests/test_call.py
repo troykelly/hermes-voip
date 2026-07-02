@@ -1374,3 +1374,67 @@ async def test_cseq_number_accepts_a_leading_zero_padded_cseq() -> None:
     assert _cseq_number("00000000001 BYE") == 1  # 11 digits, value 1: not over-dropped
     # A heavily padded largest-valid CSeq still normalizes and is accepted here.
     assert _cseq_number("0000000000002147483647 INVITE") == 2**31 - 1
+
+
+# ---- fail-closed: a malformed in-dialog re-INVITE SDP OFFER must not tear down the
+# ---- whole signalling connection (ADR-0081 class, offer-parse side; uncovered by #391
+# ---- which guarded only the build_response/answer sites) --------------------
+
+
+async def test_established_call_survives_a_malformed_sdp_reinvite() -> None:
+    """A re-INVITE with an unparseable SDP offer is rejected 400, not a teardown.
+
+    An established call classifies an inbound re-INVITE's offer INLINE in the transport
+    reader task (handle_request -> _on_reinvite -> classify_inbound_reinvite ->
+    SessionDescription.parse). A non-empty but malformed offer body — here a non-numeric
+    ``m=`` port — makes SessionDescription.parse raise ``SdpError`` (a ``ValueError``
+    subclass). Unguarded, that SdpError escapes _on_reinvite -> handle_request and
+    unwinds the reader -> on_connection_lost, dropping every OTHER live call and the
+    registration on the shared connection over one packet. This is the ADR-0081 class on
+    the offer-PARSE side (#391 guarded only the build_response answer sites, not this
+    classify/parse site). Fail closed: _on_reinvite REJECTS the malformed re-INVITE
+    ``400`` and does NOT raise (reader + other calls survive); classify runs first, so
+    no call/dialog state is mutated.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    # Must not raise: an SdpError propagating out of here IS the reader unwind.
+    await session.handle_request(_inbound("INVITE", body="m=audio x RTP/AVP 0"))
+    assert SipResponse.parse(signaling.sent[-1]).status_code == 400  # offer rejected
+    # Drop-whole: the malformed re-INVITE flipped no hold/media state.
+    assert session.on_hold is False
+    assert media.holds == []
+    # Not wedged: a subsequent WELL-FORMED re-INVITE is still answered 200.
+    good_offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendonly",
+        session_id=7,
+    )
+    await session.handle_request(_inbound("INVITE", body=good_offer))
+    assert SipResponse.parse(signaling.sent[-1]).status_code == 200
+
+
+async def test_malformed_sdp_reinvite_reject_is_logged_non_pii(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rejecting a malformed re-INVITE offer logs a WARNING with no wire content.
+
+    The log carries only the exception TYPE — never the offer body or any dialog
+    identifier (the repo is PUBLIC, rule 34). Before the fix no WARNING is emitted (the
+    SdpError escapes instead of being caught, rejected 400, and logged).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.call"):
+        await session.handle_request(_inbound("INVITE", body="m=audio x RTP/AVP 0"))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "a rejected malformed re-INVITE offer must log a WARNING"
+    blob = " ".join(r.getMessage() for r in warnings)
+    assert "SdpError" in blob  # the exception type is surfaced for diagnosis
+    # No wire content / PII: neither the offer body nor any dialog identifier leaks.
+    assert "m=audio" not in blob
+    assert "theirs" not in blob
+    assert "call-1" not in blob
+    assert "pbx.example.test" not in blob

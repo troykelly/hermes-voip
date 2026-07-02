@@ -805,9 +805,30 @@ class CallSession:
             self.on_dtmf(digit)
 
     async def _on_reinvite(self, request: SipRequest) -> None:
-        routing = classify_inbound_reinvite(
-            request, pending_local_offer=self._local_offer_pending
-        )
+        try:
+            routing = classify_inbound_reinvite(
+                request, pending_local_offer=self._local_offer_pending
+            )
+        except ValueError as exc:
+            # A malformed re-INVITE SDP offer makes SessionDescription.parse raise
+            # SdpError (a ValueError subclass — non-numeric m= port / rtpmap / fmtp /
+            # ptime); an unclassifiable direction raises IncallError (also ValueError).
+            # classify runs INLINE in the reader (handle_request is awaited bare), so an
+            # escaping ValueError would unwind it and tear down the whole shared
+            # signalling connection (ADR-0081, offer-parse side; the build_response
+            # answer sites below are already guarded). Fail closed: reject 400 and drop
+            # WHOLE — classify is the first statement, so no state changed — logging
+            # non-PII (the exception TYPE only, never the offer body, rule 34).
+            _log.warning(
+                "rejecting an in-dialog re-INVITE with an unparseable offer (%s) —"
+                " call and connection kept",
+                type(exc).__name__,
+            )
+            await self._answer_or_drop(
+                lambda: build_response(request, _BAD_REQUEST, "Bad Request"),
+                kind="INVITE",
+            )
+            return
         if isinstance(routing, Glare):
             await self._answer_or_drop(
                 lambda: build_response(request, 491, "Request Pending"), kind="INVITE"

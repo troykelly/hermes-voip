@@ -107,6 +107,43 @@ uv run python -c \
 # If ConfigError is raised → a required key is missing or malformed.
 ```
 
+### 6. Registrar granted a non-positive or malformed `Expires` (ADR-0088)
+
+**Current behaviour:** RFC 3261 §10.3 lets a registrar grant a *shorter* lifetime than
+requested, including `0` (an unrequested de-registration), and a malformed/negative
+`Expires` on our echoed `Contact` is also possible. `RegistrationFlow._handle_success`
+(`src/hermes_voip/registration.py:496`) treats either case as a registration **failure** —
+never a silent `Registered(expires=0)` — so `RegistrationManager` never arms a 0-delay
+refresh that would hot-loop the registrar. The failure routes through
+`_on_registration_failed` (`src/hermes_voip/manager.py:590`), which emits the same
+structured WARNING as any other registration failure — `event=sip_registration_failed`,
+`outcome="rejected"`, `attempt=<1-based counter>` — but with a **synthetic**
+`status_code=0` that can never collide with a real SIP status (1xx–6xx), unambiguously
+marking this specific anomaly.
+
+**To observe in logs:**
+
+```bash
+jq 'select(.event=="sip_registration_failed" and .status_code==0) | {outcome, attempt}' \
+  /path/to/hermes/log.jsonl
+# Plain-text log (no jq): the WARNING line reads
+#   "SIP registration failed: rejected (status=0, attempt=N)"
+```
+
+**What it means:** the registrar answered our REGISTER with a `2xx` but the `Expires` on
+OUR `Contact` binding was non-positive or unparseable — it did not actually keep the
+binding alive, even though it did not send a real rejection status. This is a
+**registrar-side** signal (a gateway/ACL/binding-policy issue), not a plugin defect; the
+plugin never logs the registrar's free-text reason for this event (rule 34), so
+cross-reference the gateway's own registration logs by timestamp, not by message text.
+
+**Operator action:** if the extension was previously **established**, the existing
+bounded-backoff re-REGISTER ramp (same recovery path as step 3 above) retries
+automatically and usually self-heals once the registrar starts granting a positive
+lifetime again. A **cold-start** non-positive/malformed grant is reported but not
+auto-retried — fix the gateway-side binding/ACL issue for this extension, then restart
+(see **Restart** below).
+
 ---
 
 ## Symptom: No inbound calls arriving

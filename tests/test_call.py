@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from hermes_voip.call import CallError, CallSession
+from hermes_voip.call import CallError, CallSession, _cseq_number
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.incall import LocalMediaSession
@@ -1340,3 +1340,18 @@ async def test_established_call_survives_an_oversized_ascii_cseq_response() -> N
     await task
     assert session.on_hold is True
     assert media.holds == [True]
+
+
+async def test_cseq_number_rejects_a_number_at_or_above_2_31() -> None:
+    """_cseq_number drops a CSeq value outside the valid SIP range (RFC 3261 §8.1.1.5).
+
+    A SIP CSeq sequence number is ``< 2**31``. The largest valid value (``2**31 - 1``)
+    still parses; ``2**31`` and any larger in-length run (e.g. ``9999999999``, ten ASCII
+    digits that pass the length bound) is out of range and returns ``None`` — dropped as
+    uncorrelatable, never mistaken for a real sequence number. Range enforcement is not
+    observable through ``on_response`` (whose ``_pending`` only ever holds our own small
+    CSeqs), so the boundary is pinned here directly.
+    """
+    assert _cseq_number("2147483647 BYE") == 2**31 - 1  # largest valid CSeq
+    assert _cseq_number("2147483648 BYE") is None  # 2**31: out of range
+    assert _cseq_number("9999999999 BYE") is None  # 10 digits but >= 2**31

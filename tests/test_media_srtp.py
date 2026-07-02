@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import os
+import struct
 
 import pytest
 
@@ -360,6 +361,39 @@ class TestAuthTagRejection:
         srtp_bytes[1] ^= 0x01
         with pytest.raises(SrtpError, match="auth"):
             rx.unprotect(bytes(srtp_bytes))
+
+
+# ---------------------------------------------------------------------------
+# Post-decrypt RTP-parse rejection (must be SrtpError, not a bare ValueError)
+# ---------------------------------------------------------------------------
+
+
+class TestUnprotectMalformedPlaintext:
+    def test_malformed_padding_in_authenticated_plaintext_raises_srtperror(
+        self,
+    ) -> None:
+        """Malformed padding in an authenticated packet's plaintext raises SrtpError.
+
+        The bad RFC 3550 §5.1 padding makes RtpPacket.parse raise a bare
+        ValueError, but ``SrtpError`` subclasses ``ValueError`` so the media
+        engine's ``except SrtpError`` (which drops one packet, "not fatal") CANNOT
+        catch parse's parent ``ValueError``: it would escape ``_inbound_gen`` (the
+        coroutine that also decodes live audio) and tear the whole call down. Same
+        exception-type-contract class as the rtcp BYE SC=0 bug (#370).
+        """
+        crypto = _make_crypto()
+        tx = SrtpSession(crypto)
+        rx = SrtpSession(crypto)
+        ssrc = 0xDEADBEEF
+        # Plaintext RTP wire: V=2 with the P (padding) bit set and a 1-byte
+        # payload whose value 0 is the pad count — malformed, since the count
+        # octet counts itself so a valid count is 1..len(payload). protect_wire
+        # encrypts only the payload, so the decrypted plaintext still carries the
+        # P bit + bad pad count and fails RtpPacket.parse AFTER auth passes.
+        header = bytes([0x80 | 0x20, 0x00]) + struct.pack("!HII", 1, 0, ssrc)
+        protected = tx.protect_wire(header + b"\x00")
+        with pytest.raises(SrtpError, match="not a valid RTP"):
+            rx.unprotect(protected)
 
 
 # ---------------------------------------------------------------------------

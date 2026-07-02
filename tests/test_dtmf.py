@@ -102,23 +102,30 @@ def test_dtmf_press_carries_digit() -> None:
 
 
 def test_dtmf_no_press_variants_exist() -> None:
-    """DtmfNoPress has the three distinguishable no-press cases (ADR-0077).
+    """DtmfNoPress has four distinguishable no-press cases (ADR-0077).
 
     Callers who previously tested 'result is None' must now pick the right variant:
-      STILL_PRESSING  — end bit not set; tone still in progress
-      DUPLICATE_END   — end bit set but this timestamp was already recorded
-      NON_DIGIT_EVENT — end bit set, new timestamp, but the event is not a keypad digit
+      STILL_PRESSING    — end bit not set; tone still in progress
+      DUPLICATE_END     — end bit set but this timestamp was already recorded
+                          with the SAME event code (ordinary RFC 4733 redundancy)
+      CONFLICTING_EVENT — end bit set but this timestamp was already recorded
+                          with a DIFFERENT event code (a forged/mismatching
+                          packet racing the genuine one — never a press)
+      NON_DIGIT_EVENT   — end bit set, new timestamp, but the event is not a
+                          keypad digit
     """
     assert DtmfNoPress.STILL_PRESSING is DtmfNoPress.STILL_PRESSING
     assert DtmfNoPress.DUPLICATE_END is DtmfNoPress.DUPLICATE_END
+    assert DtmfNoPress.CONFLICTING_EVENT is DtmfNoPress.CONFLICTING_EVENT
     assert DtmfNoPress.NON_DIGIT_EVENT is DtmfNoPress.NON_DIGIT_EVENT
-    # All three must be distinct
+    # All four must be distinct
     variants = {
         DtmfNoPress.STILL_PRESSING,
         DtmfNoPress.DUPLICATE_END,
+        DtmfNoPress.CONFLICTING_EVENT,
         DtmfNoPress.NON_DIGIT_EVENT,
     }
-    assert len(variants) == 3
+    assert len(variants) == 4
 
 
 def test_receiver_emits_press_once_and_suppresses_duplicates() -> None:
@@ -200,6 +207,69 @@ def test_receiver_dedups_reordered_end_packets() -> None:
     # a late duplicate of the first press must NOT double-emit
     assert (
         rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.DUPLICATE_END
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security: conflicting-event (digit-substitution) rejection
+#
+# DTMF is the ADR-0009 spoof-resistant confirmation channel (ADR-0010): a
+# forged or otherwise mismatching telephone-event packet arriving at the SAME
+# RTP timestamp as a genuine key-press must never be able to substitute a
+# different digit for the one the real press produced, and the anomaly must
+# be distinguishable from ordinary RFC 4733 redundancy (agreeing duplicate end
+# packets), which must keep collapsing to a single press exactly as before.
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_rejects_conflicting_event_at_same_timestamp() -> None:
+    """A same-timestamp mismatching event must never substitute a digit.
+
+    It must also never be silently conflated with the digit already reported
+    for that timestamp.
+    """
+    rx = DtmfReceiver()
+    genuine = rx.feed(
+        DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert genuine == DtmfPress(digit="5")
+    # A later packet at the SAME timestamp but a DIFFERENT event code (a
+    # forged telephone-event payload, or two overlapping senders) must never
+    # substitute the digit already reported, and must not be silently
+    # conflated with an ordinary agreeing-event redundant duplicate.
+    forged = rx.feed(
+        DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert not isinstance(forged, DtmfPress), (
+        "a mismatching event at an already-decided timestamp must never "
+        "produce a DtmfPress — that would substitute the wrong digit"
+    )
+    assert forged is not DtmfNoPress.DUPLICATE_END, (
+        "a conflicting event must be distinguishable from an ordinary "
+        "agreeing-event redundant duplicate"
+    )
+    assert forged is DtmfNoPress.CONFLICTING_EVENT
+
+
+def test_receiver_still_dedups_agreeing_duplicate_after_conflict_probe() -> None:
+    """A conflicting probe must not corrupt dedup of the original digit.
+
+    The original digit's own genuine redundant end packets arriving
+    afterwards must still be recognised as ordinary duplicates.
+    """
+    rx = DtmfReceiver()
+    assert rx.feed(
+        DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000
+    ) == DtmfPress(digit="5")
+    assert (
+        rx.feed(DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.CONFLICTING_EVENT
+    )
+    # The genuine digit's own redundant end packet (matching event=5) must
+    # still be recognised as an ordinary duplicate, not another conflict.
+    assert (
+        rx.feed(DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000)
         is DtmfNoPress.DUPLICATE_END
     )
 

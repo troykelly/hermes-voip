@@ -500,12 +500,35 @@ class WssSipTransport:
         Identical logic to the TLS transport: the client transaction generates
         the ACK (same branch), not the TU.  Over a reliable transport (WS) there
         are no retransmission timers, but the ACK absorbs retransmitted finals.
+
+        A response whose CSeq names a method other than ``INVITE`` (e.g. the 200
+        OK to a BYE/REGISTER/OPTIONS) is the ordinary, high-volume case and is
+        skipped without comment. A CSeq that cannot be parsed AT ALL — missing
+        entirely, or present with no method token — is a *different*, malformed
+        condition: :func:`_method_of` returns ``None`` for both, so it is
+        distinguished here and logged loudly (never silently), because it means
+        this layer gives up on the mandatory auto-ACK with no other signal.
         """
-        if _method_of(response.header("CSeq")) != "INVITE":
+        cseq = response.header("CSeq")
+        method = _method_of(cseq)
+        if method != "INVITE":
+            if method is None:
+                _log.warning(
+                    "INVITE-final response with an unparseable CSeq (Call-ID"
+                    " %s) — cannot auto-ACK or clean up the transaction",
+                    response.header("Call-ID"),
+                )
             return
-        key = _txn_key(response.header("Call-ID"), response.header("CSeq"))
-        txn = self._client_txns.get(key) if key is not None else None
-        if txn is None or key is None:
+        key = _txn_key(response.header("Call-ID"), cseq)
+        if key is None:
+            _log.warning(
+                "INVITE-final response with an unparseable CSeq (Call-ID %s) —"
+                " cannot auto-ACK or clean up the transaction",
+                response.header("Call-ID"),
+            )
+            return
+        txn = self._client_txns.get(key)
+        if txn is None:
             return
         ack = txn.ack_for_response(response)
         if ack is not None:

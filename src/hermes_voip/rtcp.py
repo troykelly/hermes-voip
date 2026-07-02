@@ -100,6 +100,15 @@ _NTP_UNIX_EPOCH_DELTA: Final[int] = 2_208_988_800
 _FRAC_SCALE: Final[int] = 1 << 32  # 32-bit NTP fraction resolution
 _COMPACT_FRAC_SCALE: Final[int] = 1 << 16  # LSR/DLSR are NTP middle-32 (16.16 s) units
 
+# RFC 1982 serial-number arithmetic, applied to the wrap-safe LSR/DLSR subtraction
+# in rtt_from_report_block (mirrors rtp.py's _seq_before for 16-bit RTP sequence
+# numbers, scaled up to the 32-bit compact-NTP space): a raw delay is only an
+# unambiguous forward elapsed time below half the modulus. At or above half, the
+# subtraction has wrapped from lsr being stale/replayed or from a backward clock
+# jump, not from ~9h+ genuinely elapsing since our last SR — ambiguous per the
+# RFC, so treated as no valid RTT rather than a bogus multi-hour reading.
+_COMPACT_NTP_HALF: Final[int] = 1 << 31
+
 # RFC 3550 §6.2 / Appendix A.7 transmission-interval constants.
 _RTCP_MIN_TIME: Final[float] = 5.0  # seconds — the minimum deterministic interval
 _RTCP_SENDER_BW_FRACTION: Final[float] = 0.25  # senders share 25% of the RTCP bandwidth
@@ -595,6 +604,18 @@ class SourceDescription:
         if not chunks:
             msg = "SDES packet declared zero chunks"
             raise RtcpError(msg)
+        # Each chunk's own padding already advances offset to a 32-bit boundary
+        # (_parse_sdes_chunk), so a well-formed packet's SC declared chunks
+        # consume the body exactly. Anything left over is trailing garbage the
+        # SC field doesn't account for — mirrors _parse_report_blocks's exact-
+        # consumption check (ADR-0061), not silently ignored (rule 37).
+        if offset != len(body):
+            msg = (
+                f"SDES chunk region consumed {offset} bytes, expected exactly "
+                f"{len(body)} for {header.count} declared chunk(s) "
+                f"(trailing bytes present)"
+            )
+            raise RtcpError(msg)
         return cls(chunks=tuple(chunks))
 
 
@@ -741,6 +762,19 @@ class Bye:
             except UnicodeDecodeError as exc:
                 msg = "BYE reason is not valid UTF-8"
                 raise RtcpError(msg) from exc
+            # As with an SDES item, the length-prefixed reason (1 + rlen bytes)
+            # is padded to the next 32-bit boundary (mirrors pack()). A
+            # well-formed packet's reason-plus-padding consumes the rest of the
+            # body exactly; anything left over is trailing garbage the length
+            # prefix doesn't account for (rule 37 — not silently ignored).
+            raw_len = 1 + rlen
+            padded_end = needed + raw_len + (-raw_len) % _WORD
+            if padded_end != len(body):
+                msg = (
+                    f"BYE reason region (padded) ends at byte {padded_end}, "
+                    f"expected exactly {len(body)} (trailing bytes present)"
+                )
+                raise RtcpError(msg)
         return cls(ssrcs=ssrcs, reason=reason)
 
 
@@ -1041,12 +1075,15 @@ def rtt_from_report_block(*, now_compact_ntp: int, lsr: int, dlsr: int) -> float
         dlsr: The ``dlsr`` field from the inbound report block.
 
     Returns:
-        The RTT in seconds, or ``None`` when ``lsr`` is 0 — the peer has not yet
-        timed any SR of ours, so no RTT can be computed.
+        The RTT in seconds, or ``None`` when ``lsr`` is 0 (the peer has not yet
+        timed any SR of ours) or the delay is an implausible ambiguous-wraparound
+        value (see ``_COMPACT_NTP_HALF``) — either way, no RTT can be computed.
     """
     if lsr == 0:
         return None
     delay = (now_compact_ntp - lsr) & _U32  # wrap-safe 32-bit subtraction
+    if delay >= _COMPACT_NTP_HALF:
+        return None
     rtt_units = delay - dlsr
     if rtt_units < 0:
         return 0.0

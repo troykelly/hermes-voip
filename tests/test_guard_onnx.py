@@ -214,6 +214,26 @@ async def test_out_of_range_score_fails_open_not_allow() -> None:
     assert result.verdict is not GuardVerdict.ALLOW
 
 
+@pytest.mark.asyncio
+async def test_non_numeric_classifier_return_fails_open_not_escapes() -> None:
+    # ``Classifier`` is only *typed* as ``str -> float`` (it is a dependency-
+    # injected callable, per the module docstring, so a future/alternate
+    # implementation swapped into this interface is not guaranteed to be as
+    # carefully type-coerced as the pinned ONNX backend). A runtime contract
+    # violation — a classifier returning a non-numeric value — must fail open
+    # exactly like any other classifier malfunction (ADR-0009), never escape
+    # ``screen()`` as an uncaught TypeError (``math.isfinite`` raises on a
+    # non-real value).
+    def _wrong_type(_text: str) -> object:
+        return "not-a-float"
+
+    guard = _guard(_wrong_type)
+    result = await _screen(guard, "hello", call_id="c1")
+    assert result.degraded is True
+    assert result.verdict is not GuardVerdict.ALLOW
+    assert any("error" in r.lower() for r in result.reasons)
+
+
 # --- stateful escalation: cumulative + sliding window ------------------------
 
 

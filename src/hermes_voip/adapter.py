@@ -6657,13 +6657,21 @@ class VoipAdapter(BasePlatformAdapter):
         targets the *originating* foreign session instead and does NOT use this helper.
         """
         channel = channel_for_group(self._group_for_call(call_id))
+        # The caller-/callee-derived identity fields are FORGEABLE and presentation-only
+        # (never authorization — ADR-0020/0052). Defang them HERE, the single chokepoint
+        # every own-session injection routes through, so no agent-visible identity field
+        # can carry the spotlight-fence sentinel or a multi-line-injection payload —
+        # consistent with the transcript + ADR-0052 context-block treatment. ``chat_id``
+        # is the routing key (our own Call-ID, not caller-supplied) and is left exact;
+        # the system-turn ``user_id``/``user_name=="system"`` values are already clean,
+        # so the defang is a no-op there.
         return SessionSource(
             platform=self._channel_platform(channel),
             chat_id=call_id,
-            chat_name=chat_name,
+            chat_name=_defang_identity(chat_name),
             chat_type="dm",
-            user_id=user_id,
-            user_name=user_name,
+            user_id=_defang_identity(user_id),
+            user_name=_defang_identity(user_name),
         )
 
     def _channel_platform(self, channel: str) -> Platform:
@@ -7385,13 +7393,37 @@ def _host_of(sent_by: str) -> str:
     return host if sep else sent_by
 
 
+# Placeholder caller-ID for a From header with no extractable ``sip:user@`` AOR (a
+# ``tel:`` URI, or a malformed header). The forgeable, whole ``From`` header must
+# NEVER become the caller identity: it is agent-visible (it seeds the
+# ``MessageEvent`` ``user_name``/``chat_name`` fields) and would hand an entire
+# attacker-controlled string to the agent. A fixed low-entropy token is safe and
+# classifies as the default (receptionist, least-privilege) group, exactly as an
+# unrecognised caller already does.
+_UNKNOWN_CALLER = "unknown"
+
+
 def _caller_number(from_header: str) -> str:
-    """Extract the user part of the From AOR, or return the header verbatim."""
+    """Extract the ``sip:`` user-part of the From AOR, or a safe placeholder.
+
+    The user-part is the (forgeable, presentation-only) caller identity: it seeds
+    both the caller-group classification AND the agent-visible ``MessageEvent``
+    identity fields, so the pattern is deliberately narrow. A real SIP/E.164
+    user-part carries no whitespace (RFC 3261 §19.1.1), so the class excludes ``@``,
+    ``>`` and whitespace: a well-formed AOR matches, while a space-bearing
+    (hostile/malformed) user-part does not, and falls through. On no match (a
+    ``tel:`` URI, or a header with no ``sip:user@``) return the fixed
+    :data:`_UNKNOWN_CALLER` placeholder, NEVER the whole raw ``From`` header, which
+    would leak an entire attacker-controlled string into the identity fields.
+    Caller-ID is never authorization (ADR-0020/0052); an unresolved identity
+    classifies as the default group. Even a matched user-part stays forgeable, so it
+    is defanged again at the agent-visible seam (:func:`_defang_identity`).
+    """
     # From: <sip:NUMBER@host>;tag=…  or  sip:NUMBER@host
     import re  # noqa: PLC0415
 
-    match = re.search(r"sip:([^@>]+)@", from_header)
-    return match.group(1) if match else from_header
+    match = re.search(r"sip:([^@>\s]+)@", from_header)
+    return match.group(1) if match else _UNKNOWN_CALLER
 
 
 def _redact_number(number: str) -> str:
@@ -7596,6 +7628,26 @@ def _defang_fence(text: str) -> str:
     return text.replace("<<<", "< < <").replace(">>>", "> > >")
 
 
+def _defang_identity(value: str) -> str:
+    """Neutralise an UNTRUSTED caller/callee identity for an agent-visible field.
+
+    The caller-ID is forgeable and presentation-only — never an authorization input
+    (ADR-0020/0052). A hostile ``From`` header can carry the spotlight-fence sentinel
+    and prompt-injection markup into the ``MessageEvent`` identity fields
+    (``user_name``/``chat_name``/``user_id``) and the outbound framing, which a Hermes
+    runtime may render into the agent's context (e.g. "you are speaking with
+    {user_name}"). This applies the SAME discipline the transcript and the ADR-0052
+    context block use for caller-ID: collapse every whitespace run (newlines/tabs/CR
+    included) to a single space — so the value stays ONE line and cannot introduce a
+    forged instruction line — and defang the ``<<<``/``>>>`` fence sentinel
+    (:func:`_defang_fence`). The result is a single, fence-safe line that can never
+    break out of an untrusted framing. Presentation only; the privilege clamp is the
+    real boundary. Idempotent, and a no-op on an already-clean identity (e.g. our own
+    Call-ID used as ``user_id`` on a system turn).
+    """
+    return _defang_fence(" ".join(value.split()))
+
+
 # Human-readable phrasing of each call-end reason for an outbound OUTCOME report to
 # the originating conversation (ADR-0029). NOT the same as the call's own-session
 # signal text (that is ``/stop`` or the disconnected note, ADR-0026) — this is a
@@ -7781,8 +7833,12 @@ def _spotlight_turn(
     preamble = persona_preamble_for_group(group)
     framing = ""
     if group.persona == "outbound":
+        # The callee identity is forgeable/attacker-influenceable, so defang it before
+        # it rides in the TRUSTED framing (consistent with the objective on the next
+        # line, which is likewise defanged): no fence sentinel, single line.
         framing = (
-            f"\nThis is an outbound call that the operator placed to '{caller_name}'. "
+            "\nThis is an outbound call that the operator placed to "
+            f"'{_defang_identity(caller_name)}'. "
             "Open the conversation as the operator's assistant pursuing the "
             "operator's task with this callee.\n"
         )

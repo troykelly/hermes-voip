@@ -22,6 +22,7 @@ from hermes_voip.media.opus import (
     OPUS_FRAME_SAMPLES,
     OPUS_RTP_CLOCK_RATE,
     OPUS_SAMPLE_RATE,
+    OpusDecodeError,
     OpusDecoder,
     OpusEncoder,
     ensure_opus_available,
@@ -210,3 +211,59 @@ def test_normal_encode_decode_still_works_with_fec_on() -> None:
     dec = OpusDecoder()
     out = dec.decode(enc.encode(_sine_pcm16(OPUS_FRAME_SAMPLES)))
     assert len(out) == OPUS_FRAME_SAMPLES * _BYTES_PER_SAMPLE
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-payload handling: opuslib raises its own untyped ``OpusError`` (e.g.
+# ``b'corrupted stream'``) straight from the C library on malformed input. Every
+# decode-family method must translate it to the one hermes_voip-owned
+# :class:`OpusDecodeError` so callers (media/engine.py) depend on a single,
+# documented, typed exception rather than a vendor internal — never a silent
+# swallow (rule 37: the original is chained via ``from exc``).
+#
+# ``\xff`` bytes are a genuine malformed Opus packet: verified empirically
+# against opuslib 3.0.1 (code -4, "corrupted stream"), not merely assumed.
+# ---------------------------------------------------------------------------
+
+_CORRUPT_OPUS_PAYLOAD = b"\xff" * 20
+
+
+def test_decode_raises_opus_decode_error_on_corrupt_payload() -> None:
+    """A corrupt Opus packet raises OpusDecodeError, not the raw opuslib error.
+
+    Before this fix, ``OpusDecoder.decode`` let opuslib's own ``OpusError``
+    (neither ``ValueError`` nor any hermes_voip type) escape uncaught — a
+    caller catching only documented, typed exceptions could not tell a corrupt
+    frame from a programming bug.
+    """
+    dec = OpusDecoder()
+    with pytest.raises(OpusDecodeError) as exc_info:
+        dec.decode(_CORRUPT_OPUS_PAYLOAD)
+    # Chained, not swallowed (rule 37): the original opuslib error is preserved
+    # as the cause for anyone who needs the low-level detail.
+    assert exc_info.value.__cause__ is not None
+
+
+def test_decode_fec_raises_opus_decode_error_on_corrupt_successor_payload() -> None:
+    """decode_fec on a corrupt successor packet raises OpusDecodeError.
+
+    The FEC recovery path takes the NEXT packet's bytes as input — a corrupt
+    successor (e.g. a second bad packet arriving right after a genuine loss)
+    must fail the same documented way as a corrupt primary decode.
+    """
+    dec = OpusDecoder()
+    with pytest.raises(OpusDecodeError) as exc_info:
+        dec.decode_fec(_CORRUPT_OPUS_PAYLOAD)
+    assert exc_info.value.__cause__ is not None
+
+
+def test_decode_plc_does_not_raise_opus_decode_error() -> None:
+    """decode_plc (no packet input) has no corrupt-payload attack surface.
+
+    Sanity check that the translation added for decode/decode_fec did not
+    change decode_plc's contract — it takes no wire bytes, so it keeps
+    succeeding exactly as before.
+    """
+    dec = OpusDecoder()
+    concealed = dec.decode_plc()
+    assert len(concealed) == OPUS_FRAME_SAMPLES * _BYTES_PER_SAMPLE

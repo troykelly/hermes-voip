@@ -44,6 +44,7 @@ __all__ = [
     "OPUS_FRAME_SAMPLES",
     "OPUS_RTP_CLOCK_RATE",
     "OPUS_SAMPLE_RATE",
+    "OpusDecodeError",
     "OpusDecoder",
     "OpusEncoder",
     "ensure_opus_available",
@@ -84,6 +85,24 @@ _DEFAULT_EXPECTED_PACKET_LOSS_PCT: Final[int] = 10
 #: Inclusive bounds for a packet-loss percentage hint.
 _MIN_LOSS_PCT: Final[int] = 0
 _MAX_LOSS_PCT: Final[int] = 100
+
+
+class OpusDecodeError(Exception):
+    """Opus decode-family call failed (e.g. a corrupt/malformed payload).
+
+    Wraps opuslib's own ``OpusError`` (an untyped, undocumented C-library error
+    — ships no ``py.typed``, is neither ``ValueError`` nor any hermes_voip
+    type) so every caller of :class:`OpusDecoder` depends on exactly one
+    stable, documented exception for a decode-layer fault, never the vendor
+    internal. The original is always chained (``raise ... from exc``) —
+    reported, never swallowed (AGENTS.md rule 37).
+
+    A caller decoding untrusted wire bytes (the engine's inbound RTP path)
+    catches this and treats the frame as concealable loss rather than fatal —
+    the corrupt input never carries a secret, so the chained cause is safe to
+    log in full (contrast the DTMF/registration paths, which must not chain a
+    credential-bearing cause).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +229,12 @@ class _OpuslibModule(Protocol):
     Encoder: _EncoderCtor
     Decoder: _DecoderCtor
     api: _OpusApiModule
+    #: The vendor's own decode-failure exception class (e.g. raised as
+    #: ``OpusError(-4)`` / ``str() == "corrupted stream"`` on malformed input).
+    #: Declared here (rather than a module-scope ``import opuslib``) so
+    #: :class:`OpusDecoder` can catch it by reference without forcing opuslib
+    #: to be a hard import-time dependency of this module.
+    OpusError: type[Exception]
 
 
 def _get_opuslib() -> _OpuslibModule:
@@ -384,6 +409,9 @@ class OpusDecoder:
         opuslib = _get_opuslib()
         self._api = opuslib.api
         self._dec: _RawDecoder = opuslib.Decoder(OPUS_SAMPLE_RATE, _CHANNELS)
+        # Captured once so decode/decode_fec/decode_plc can catch the vendor's
+        # exception BY REFERENCE without a module-scope ``import opuslib``.
+        self._error_cls: type[Exception] = opuslib.OpusError
 
     def decode(self, packet: bytes) -> bytes:
         """Decode one Opus packet to a 20 ms 48 kHz PCM16 frame.
@@ -394,8 +422,16 @@ class OpusDecoder:
 
         Returns:
             One 20 ms 48 kHz PCM16-LE mono frame (960 samples / 1920 bytes).
+
+        Raises:
+            OpusDecodeError: If ``packet`` is not decodable Opus data (e.g. a
+                corrupt or malformed payload — opuslib: ``"corrupted stream"``).
         """
-        return self._dec.decode(packet, OPUS_FRAME_SAMPLES)
+        try:
+            return self._dec.decode(packet, OPUS_FRAME_SAMPLES)
+        except self._error_cls as exc:
+            msg = f"Opus decode failed: {exc}"
+            raise OpusDecodeError(msg) from exc
 
     def decode_fec(self, next_packet: bytes) -> bytes:
         """Recover a lost frame from the in-band FEC in the NEXT received packet.
@@ -411,8 +447,16 @@ class OpusDecoder:
 
         Returns:
             The reconstructed lost frame as one 20 ms 48 kHz PCM16-LE mono frame.
+
+        Raises:
+            OpusDecodeError: If ``next_packet`` is not decodable Opus data (e.g. a
+                corrupt or malformed successor payload).
         """
-        return self._dec.decode(next_packet, OPUS_FRAME_SAMPLES, decode_fec=True)
+        try:
+            return self._dec.decode(next_packet, OPUS_FRAME_SAMPLES, decode_fec=True)
+        except self._error_cls as exc:
+            msg = f"Opus FEC decode failed: {exc}"
+            raise OpusDecodeError(msg) from exc
 
     def decode_plc(self) -> bytes:
         """Conceal one lost frame with no packet (Opus packet-loss concealment).
@@ -425,12 +469,22 @@ class OpusDecoder:
 
         Returns:
             A concealment frame as one 20 ms 48 kHz PCM16-LE mono frame.
+
+        Raises:
+            OpusDecodeError: If libopus fails to extrapolate a concealment frame.
+                No packet input reaches this path, so this is not attacker-
+                reachable — the translation exists only for a uniform contract
+                across all three decode-family methods.
         """
-        return self._api.decoder.decode(
-            self._dec.decoder_state,
-            None,
-            0,
-            OPUS_FRAME_SAMPLES,
-            False,
-            channels=_CHANNELS,
-        )
+        try:
+            return self._api.decoder.decode(
+                self._dec.decoder_state,
+                None,
+                0,
+                OPUS_FRAME_SAMPLES,
+                False,
+                channels=_CHANNELS,
+            )
+        except self._error_cls as exc:
+            msg = f"Opus PLC concealment failed: {exc}"
+            raise OpusDecodeError(msg) from exc

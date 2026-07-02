@@ -320,6 +320,147 @@ async def test_opus_lone_loss_falls_back_to_plc() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Corrupt (not lost) Opus payload: an authenticated packet that ARRIVES
+# in-order but whose bytes are malformed Opus data. opuslib raises its own
+# untyped ``OpusError`` on this (verified empirically: code -4, "corrupted
+# stream") — neither a sequence gap the jitter buffer flags as ``Lost`` nor a
+# ``ValueError``/``SrtpError`` the transport/SRTP guards already catch. Before
+# the fix this propagated out of ``_decode`` -> ``_inbound_gen``, ending
+# ``inbound_audio()`` on a single corrupt packet (in the real call loop, a
+# one-packet call teardown — the same systemic class as the RTCP/transport/
+# registration/SRTP fixes, ADR-0081). The fix conceals it exactly like a
+# genuine loss so the stream — and the call — survives.
+# ---------------------------------------------------------------------------
+
+_CORRUPT_OPUS_PAYLOAD = (
+    b"\xff" * 20
+)  # genuine malformed Opus (opuslib: "corrupted stream")
+
+
+@pytest.mark.asyncio
+async def test_opus_corrupt_payload_is_concealed_and_call_survives() -> None:
+    """A corrupt (but authenticated, in-order) Opus payload is concealed, not fatal.
+
+    seq 1 carries genuinely malformed Opus bytes — NOT a sequence-number gap;
+    the packet arrives normally. This must not raise out of inbound_audio():
+    the corrupt slot is concealed (a full analysis-rate frame), AND the packet
+    AFTER it (seq 2) still decodes to real, non-silent audio — proving the
+    decoder's predictor state stayed coherent and the stream kept flowing,
+    which is the actual security property (not merely a different exception
+    type). Before the fix, _collect_n would time out here: only frame 0 is
+    ever emitted before the uncaught OpusDecodeError kills the generator.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.OPUS,
+        payload_type=_OPUS_PT,
+        jitter_depth=1,
+        clock=_dummy_clock,
+        aec_enabled=False,
+    )
+    await engine.connect()
+
+    enc = OpusEncoder()
+    good = [
+        enc.encode(
+            _tone_pcm16(OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, freq_hz=300.0 + 25.0 * i)
+        )
+        for i in range(2)
+    ]
+    engine._recv_queue.put_nowait((_make_rtp(0, good[0], pt=_OPUS_PT), _FAKE_SRC))
+    engine._recv_queue.put_nowait(
+        (_make_rtp(1, _CORRUPT_OPUS_PAYLOAD, pt=_OPUS_PT), _FAKE_SRC)
+    )
+    engine._recv_queue.put_nowait((_make_rtp(2, good[1], pt=_OPUS_PT), _FAKE_SRC))
+
+    frames = await _collect_n(engine, 3)
+    await engine.stop()
+
+    assert len(frames) == 3  # the corrupt packet is concealed, not fatal
+    assert frames[0].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[0].samples) > 0.0  # seq 0 decodes normally
+
+    samples_per_analysis_frame = (
+        OPUS_FRAME_SAMPLES * _OPUS_ANALYSIS_RATE // OPUS_SAMPLE_RATE
+    )
+    assert frames[1].sample_rate == _OPUS_ANALYSIS_RATE
+    assert (
+        len(frames[1].samples) == samples_per_analysis_frame * 2
+    )  # full concealment frame
+
+    # THE call survives: the packet AFTER the corrupt one still decodes to
+    # real, non-silent audio, proving the stream (and decoder predictor state)
+    # stayed healthy — not just that an exception type changed.
+    assert frames[2].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[2].samples) > 0.0
+
+
+@pytest.mark.asyncio
+async def test_opus_corrupt_successor_payload_falls_back_to_plc() -> None:
+    """A genuine loss whose FEC-bearing successor is ALSO corrupt still conceals.
+
+    seq 1 is truly lost (sequence gap, jitter_depth=1 -> Lost(1)); its would-be
+    FEC source, seq 2, carries corrupt bytes instead of real Opus data. FEC
+    recovery of frame 1 from packet 2 is therefore impossible — the engine must
+    fall back to native PLC rather than let decode_fec's OpusDecodeError escape.
+    seq 2 itself is also undecodable as a normal frame (the same corrupt
+    bytes), so it is concealed too — two adjacent bad slots in a row. The
+    stream must still continue afterward: seq 3, a real later packet, is
+    collected and asserted to decode to real, non-silent audio, proving the
+    decoder recovered from BOTH corruption events rather than merely that an
+    exception type changed.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.OPUS,
+        payload_type=_OPUS_PT,
+        jitter_depth=1,
+        clock=_dummy_clock,
+        aec_enabled=False,
+    )
+    await engine.connect()
+
+    enc = OpusEncoder()
+    seq0 = enc.encode(_tone_pcm16(OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, freq_hz=300.0))
+    seq3 = enc.encode(_tone_pcm16(OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, freq_hz=400.0))
+    engine._recv_queue.put_nowait((_make_rtp(0, seq0, pt=_OPUS_PT), _FAKE_SRC))
+    # seq 1 is never sent (a genuine loss); seq 2's payload is corrupt (would-be
+    # FEC source for frame 1); seq 3 is a real, later packet.
+    engine._recv_queue.put_nowait(
+        (_make_rtp(2, _CORRUPT_OPUS_PAYLOAD, pt=_OPUS_PT), _FAKE_SRC)
+    )
+    engine._recv_queue.put_nowait((_make_rtp(3, seq3, pt=_OPUS_PT), _FAKE_SRC))
+
+    frames = await _collect_n(engine, 4)
+    await engine.stop()
+
+    assert len(frames) == 4  # Lost(1) concealed via PLC fallback, not fatal
+    assert frames[0].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[0].samples) > 0.0  # seq 0 decodes normally
+
+    samples_per_analysis_frame = (
+        OPUS_FRAME_SAMPLES * _OPUS_ANALYSIS_RATE // OPUS_SAMPLE_RATE
+    )
+    assert len(frames[1].samples) == samples_per_analysis_frame * 2
+
+    # Frame 2 (the corrupt packet itself, seq 2) is ALSO concealed rather than
+    # propagating — the same protection applies to a corrupt "current" packet
+    # as to a corrupt FEC-source successor.
+    assert len(frames[2].samples) == samples_per_analysis_frame * 2
+
+    # THE call survives BOTH corruption events: seq 3 — the real packet after
+    # them — still decodes to real, non-silent audio.
+    assert frames[3].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[3].samples) > 0.0
+
+
+# ---------------------------------------------------------------------------
 # Coalesced Lost(count=N): Opus PLC must match the pre-coalesce per-packet
 # semantics — only the slot immediately before the successor uses FEC; the
 # interpolated slots use PLC (finding #3, run-length-coalescing lane).

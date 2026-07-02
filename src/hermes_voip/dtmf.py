@@ -69,23 +69,38 @@ class DtmfNoPress(enum.Enum):
     Replaces the bare ``None`` that previously conflated all non-press cases,
     letting callers branch on the exact reason without extra bookkeeping:
 
-    * ``STILL_PRESSING``    - the end bit is not set; the tone is still in
+    * ``STILL_PRESSING``       - the end bit is not set; the tone is still in
       progress.
-    * ``DUPLICATE_END``     - the end bit is set and this RTP timestamp was
-      already recorded with the SAME event code (RFC 4733 redundant end or a
-      reordered duplicate of the same key-press).
-    * ``CONFLICTING_EVENT`` - the end bit is set and this RTP timestamp was
-      already recorded, but with a DIFFERENT event code. This is never
-      surfaced as a press and never conflated with ``DUPLICATE_END``: DTMF is
-      the ADR-0009 spoof-resistant confirmation channel (ADR-0010), so a
-      forged or otherwise mismatching telephone-event packet racing the
-      genuine one at the same timestamp must not be able to substitute a
-      different digit for the one the real key-press produced.
-    * ``NON_DIGIT_EVENT``   - the end bit is set and the timestamp is new, but
-      the telephone-event code is not a keypad digit (e.g. flash = event 16).
+    * ``AWAITING_CORROBORATION`` - the end bit is set and this is the FIRST
+      end packet ever seen for this RTP timestamp. DTMF is the ADR-0009
+      spoof-resistant confirmation channel (ADR-0010), so a single packet is
+      never trusted outright — that is exactly what a forged packet racing
+      the genuine one looks like. The digit is trusted only once a SECOND
+      end packet agreeing with the first is seen (see ``DtmfReceiver.feed``).
+    * ``DUPLICATE_END``        - the end bit is set and this RTP timestamp
+      already has an EMITTED digit recorded with the SAME event code (a
+      further RFC 4733 redundant end or a reordered duplicate) — including
+      one that arrives after an unrelated ``CONFLICTING_EVENT`` for a
+      DIFFERENT code, since the digit was already safely corroborated by two
+      agreeing packets before that conflict was ever seen.
+    * ``CONFLICTING_EVENT``    - the end bit is set and this RTP timestamp
+      has a DIFFERENT event code recorded for it than this packet carries.
+      Before a digit has been emitted for the timestamp this is permanent:
+      the timestamp is contested and neither code can be told apart from a
+      forgery without transport-layer authentication (SRTP), so no press is
+      ever emitted for it, no matter which code a later packet carries —
+      including one that matches the code first recorded, since that first
+      code might itself have been the forged one. After a digit HAS already
+      been emitted (via two packets that agreed before any conflict was
+      seen), a later disagreeing packet is flagged this way too, for
+      visibility, but cannot un-emit the digit already returned.
+    * ``NON_DIGIT_EVENT``      - a second, corroborating end packet agreed
+      with the first, but the event code is not a keypad digit (e.g. flash =
+      event 16).
     """
 
     STILL_PRESSING = "still_pressing"
+    AWAITING_CORROBORATION = "awaiting_corroboration"
     DUPLICATE_END = "duplicate_end"
     CONFLICTING_EVENT = "conflicting_event"
     NON_DIGIT_EVENT = "non_digit_event"
@@ -230,36 +245,80 @@ def event_payloads(
         ).encode()
 
 
+@dataclass(slots=True)
+class _PendingTimestamp:
+    """Mutable per-timestamp state for :class:`DtmfReceiver`'s corroboration gate.
+
+    Attributes:
+        event: The event code first recorded for this timestamp (compared
+            against every later packet at the same timestamp).
+        emitted: Whether a :class:`DtmfPress` has already been returned for
+            this timestamp (set on the second, corroborating packet).
+        poisoned: Whether a disagreeing event code was seen for this
+            timestamp BEFORE a digit was emitted. While ``emitted`` is still
+            ``False``, ``poisoned=True`` is permanent: no further packet for
+            this timestamp is ever emitted as a press, even one that matches
+            ``event`` — a pre-emission disagreement proves this timestamp is
+            contested and there is no way to tell which sender was genuine.
+            Once ``emitted`` is ``True``, ``poisoned`` is never consulted
+            again: the digit was already safely corroborated by two
+            agreeing packets before any conflict was seen, so it cannot be
+            un-emitted by a conflict arriving afterwards.
+    """
+
+    event: int
+    emitted: bool = False
+    poisoned: bool = False
+
+
 class DtmfReceiver:
     """Collapses RFC 4733 events into one digit per key-press.
 
-    A key-press ends with redundant end packets at one RTP timestamp; the
-    receiver emits on the first and suppresses duplicates, including ones that
-    arrive reordered (after a later press), by remembering a bounded window of
-    recently-emitted timestamps. A later press carries a new RTP timestamp and
-    is emitted again. The end packet is the trigger: a press whose start/update
-    packets were all lost is still surfaced (favouring not missing a digit), and
-    a non-digit event (e.g. flash) is not surfaced as a digit.
+    A key-press ends with ``_REDUNDANT_END_COUNT`` (3) redundant end packets at
+    one RTP timestamp, all carrying the same event code. The receiver never
+    trusts a single, uncorroborated end packet: DTMF is the ADR-0009
+    spoof-resistant confirmation channel (ADR-0010), and a lone packet is
+    exactly what a forged packet racing the genuine one looks like. The FIRST
+    end packet seen for a new timestamp returns ``AWAITING_CORROBORATION``
+    (recorded, not yet trusted); only a SECOND end packet that AGREES with the
+    first is emitted as :class:`DtmfPress` — collapsing the remaining
+    redundant copies to ``DUPLICATE_END``. A disagreeing packet seen BEFORE a
+    digit has been emitted permanently poisons that timestamp
+    (``CONFLICTING_EVENT``): no press is ever emitted for it, not even one
+    that matches an event code seen earlier, because the disagreement proves
+    the timestamp is contested and there is no cryptographic way to tell
+    which sender was genuine — the receiver fails safe (no digit) rather
+    than fail open (the wrong digit accepted). A disagreement seen AFTER a
+    digit has already been emitted cannot un-emit it (the digit was already
+    safely corroborated by two agreeing packets first); it is still reported
+    as ``CONFLICTING_EVENT`` for visibility, while further packets that agree
+    with the emitted digit keep collapsing to ordinary ``DUPLICATE_END``. A
+    later press carries a new RTP timestamp and is judged fresh. A non-digit
+    event (e.g. flash) that corroborates is not surfaced as a digit
+    (``NON_DIGIT_EVENT``).
 
-    ``_window`` is an insertion-ordered ``dict[int, int]`` mapping each
-    remembered RTP timestamp (oldest-to-newest) to the event code first
-    recorded for it. Recording the event code, not just the timestamp, lets
-    :meth:`feed` distinguish an ordinary agreeing duplicate (``DUPLICATE_END``)
-    from a same-timestamp packet whose event code disagrees
-    (``CONFLICTING_EVENT``) — a forged or otherwise mismatching packet that
-    must never be able to substitute a different digit for the one already
-    decided. This replaces the previous ``_order: deque[int]`` + ``_seen:
-    set[int]`` pair, which required manual synchronisation on every write
-    (bk354), and the later ``dict[int, None]`` form, which recorded a
-    timestamp had been seen but not what digit it had decided (the
-    digit-substitution gap fixed here).
+    ``_window`` is an insertion-ordered ``dict[int, _PendingTimestamp]``
+    mapping each remembered RTP timestamp (oldest-to-newest) to its
+    corroboration state; eviction pops the oldest (first) key when the window
+    is full. This replaces the previous ``_order: deque[int]`` + ``_seen:
+    set[int]`` pair (bk354), the later ``dict[int, None]`` form that recorded
+    a timestamp had been seen but not what digit it had decided, and the
+    ``dict[int, int]`` form that recorded the event code but trusted it
+    immediately on first sight (the digit-substitution gap fixed here: see
+    ADR-0077 and backlog — a receiver that emits on the FIRST packet it ever
+    sees for a timestamp can never detect a disagreement before that packet
+    has already been acted on, no matter how a LATER disagreeing packet is
+    classified).
 
-    Residual scope: this closes substitution AFTER a timestamp's outcome is
-    decided (the first end packet at a timestamp wins and is compared against
-    by every later one). It does not — and, without transport-layer
-    authentication such as SRTP, cannot — decide which of two same-timestamp
-    packets was "genuine" if a forged one simply wins the race to arrive
-    first; that is out of scope for this receiver.
+    Residual scope: corroboration requires two end packets to AGREE, not two
+    end packets from the SAME sender — two colluding forged copies are
+    indistinguishable from a genuine corroborated pair without
+    transport-layer authentication (SRTP). An attacker who wins the arrival
+    race on BOTH of the first two end packets for a timestamp (not merely
+    one) still has a forged digit accepted. This raises the bar from a
+    single-packet race to a same-outcome two-packet race; it does not
+    eliminate spoofing on an unauthenticated media path, and no receiver-side
+    heuristic can without SRTP.
     """
 
     def __init__(self, history: int = _RECEIVER_HISTORY) -> None:
@@ -279,47 +338,79 @@ class DtmfReceiver:
             raise ValueError(msg)
         self._history = history
         # Single insertion-ordered structure: keys are remembered timestamps
-        # in insertion order, values are the event code first recorded at
-        # that timestamp; eviction pops the oldest (first) key when the
-        # window is full.  O(1) membership tests, O(1) oldest-key access
-        # (next(iter(d))), and O(1) lookup of the recorded event code to
-        # detect a same-timestamp conflict.
-        self._window: dict[int, int] = {}
+        # in insertion order, values are each timestamp's corroboration state;
+        # eviction pops the oldest (first) key when the window is full.  O(1)
+        # membership tests, O(1) oldest-key access (next(iter(d))), and O(1)
+        # lookup to detect a same-timestamp conflict or complete corroboration.
+        self._window: dict[int, _PendingTimestamp] = {}
 
     def feed(self, event: DtmfEvent, *, timestamp: int) -> DtmfPress | DtmfNoPress:
         """Process one decoded event at its RTP ``timestamp``.
 
         Returns:
-            :class:`DtmfPress` carrying the pressed digit when a new key-press
-            ends.  One of the :class:`DtmfNoPress` variants otherwise:
+            :class:`DtmfPress` carrying the pressed digit when a SECOND,
+            corroborating end packet agrees with the first one seen for this
+            timestamp.  One of the :class:`DtmfNoPress` variants otherwise:
 
-            * ``STILL_PRESSING``    — the end bit is not set.
-            * ``DUPLICATE_END``     — the end bit is set and this timestamp is
-              already in the bounded window with the SAME event code (RFC 4733
-              redundant end or reordered duplicate of the same key-press).
-            * ``CONFLICTING_EVENT`` — the end bit is set and this timestamp is
-              already in the bounded window, but with a DIFFERENT event code.
-              Never treated as a press and never conflated with
-              ``DUPLICATE_END``: a forged or otherwise mismatching packet
-              racing the genuine one must not substitute a different digit
-              for the one already decided for this timestamp.
-            * ``NON_DIGIT_EVENT``   — the end bit is set and the timestamp is
-              new, but the event code is not a keypad digit (e.g. flash = 16).
+            * ``STILL_PRESSING``          — the end bit is not set.
+            * ``AWAITING_CORROBORATION``  — the end bit is set and this is
+              the FIRST end packet seen for this timestamp. Not yet trusted;
+              recorded so a second packet can be compared against it.
+            * ``CONFLICTING_EVENT``       — the end bit is set and this
+              timestamp already has a DIFFERENT event code recorded for it.
+              Before a digit has been emitted for it, this is permanent —
+              never treated as a press again, even by a packet that matches
+              an event code seen earlier, since a forged or otherwise
+              mismatching packet racing the genuine one must not substitute
+              a different digit for it, and once contested pre-emission
+              neither side can be told apart from a forgery. After a digit
+              HAS been emitted, a later disagreeing packet is still flagged
+              this way for visibility, but cannot un-emit it.
+            * ``DUPLICATE_END``           — the end bit is set and this
+              timestamp's digit was already emitted with the SAME event code
+              (a further RFC 4733 redundant end or reordered duplicate),
+              including one arriving after an unrelated post-emission
+              conflict.
+            * ``NON_DIGIT_EVENT``         — a corroborating end packet agreed
+              with the first, but the event code is not a keypad digit (e.g.
+              flash = 16).
         """
         if not event.end:
             return DtmfNoPress.STILL_PRESSING
-        recorded_event = self._window.get(timestamp)
-        if recorded_event is not None:
-            if recorded_event != event.event:
-                return DtmfNoPress.CONFLICTING_EVENT
+        state = self._window.get(timestamp)
+        if state is None:
+            # Evict the oldest entry if the window is full.
+            if len(self._window) >= self._history:
+                oldest = next(iter(self._window))
+                del self._window[oldest]
+            self._window[timestamp] = _PendingTimestamp(event=event.event)
+            return DtmfNoPress.AWAITING_CORROBORATION
+        disagrees = state.event != event.event
+        if disagrees:
+            # A disagreement always poisons the timestamp. Pre-emission this
+            # is permanent (no press is ever emitted for it again, no matter
+            # which code a later packet carries). Post-emission it cannot
+            # un-emit the digit already returned; it only flags the anomaly.
+            state.poisoned = True
+        if disagrees or (state.poisoned and not state.emitted):
+            # Either this packet itself disagrees, or an EARLIER packet did
+            # and no digit has been emitted yet — either way, a pre-emission
+            # conflict proves the timestamp contested (there is no way to
+            # tell which sender was genuine), so refuse to emit even for a
+            # packet that happens to match the code first recorded.
+            return DtmfNoPress.CONFLICTING_EVENT
+        if state.emitted:
+            # Agrees with the recorded code and a digit was already emitted:
+            # an ordinary further redundant/reordered copy, harmless even if
+            # an unrelated conflict was flagged in between — the emission
+            # already happened safely, on two packets that agreed before any
+            # conflict was seen.
             return DtmfNoPress.DUPLICATE_END
-        # Evict the oldest entry if the window is full.
-        if len(self._window) >= self._history:
-            oldest = next(iter(self._window))
-            del self._window[oldest]
-        self._window[timestamp] = event.event
-        if 0 <= event.event < len(_DIGITS):
-            return DtmfPress(digit=_DIGITS[event.event])
+        # Second (corroborating) end packet agreeing with the first, with no
+        # conflict seen before it: only now is the digit trusted.
+        state.emitted = True
+        if 0 <= state.event < len(_DIGITS):
+            return DtmfPress(digit=_DIGITS[state.event])
         return DtmfNoPress.NON_DIGIT_EVENT
 
 

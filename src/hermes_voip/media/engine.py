@@ -3021,9 +3021,11 @@ class RtpMediaTransport:
         Called by the inbound generator for every packet at the negotiated
         telephone-event PT (ADR-0010). The 4-byte named-event payload is decoded and
         fed to the per-call :class:`~hermes_voip.dtmf.DtmfReceiver` at the packet's RTP
-        timestamp; the receiver returns the digit only on the FIRST end packet of a
-        press (collapsing RFC 4733's redundant end packets and de-duplicating reordered
-        ones), so ``on_dtmf`` fires exactly once per key-press.
+        timestamp; the receiver never trusts a single end packet outright (DTMF is the
+        ADR-0009 spoof-resistant confirmation channel) — it returns the digit only once
+        a SECOND end packet corroborates the first, collapsing the remaining redundant
+        RFC 4733 end packets to duplicates, so ``on_dtmf`` fires exactly once per
+        key-press (see ``DtmfReceiver.feed`` for the full corroboration contract).
 
         A malformed named-event packet is DROPPED with a DEBUG log rather than crashing
         the inbound generator — a corrupt inbound packet is an environmental event, not
@@ -3039,11 +3041,13 @@ class RtpMediaTransport:
 
         A same-timestamp packet whose event code disagrees with the one already
         recorded for that timestamp is surfaced as ``DtmfNoPress.CONFLICTING_EVENT`` —
-        a forged or otherwise mismatching duplicate that must never substitute a
-        different digit for the one already decided (DTMF is the ADR-0009
-        spoof-resistant confirmation channel; see ``DtmfReceiver.feed``). It is never
-        treated as a press, and is logged at DEBUG below, distinctly from an ordinary
-        ``DUPLICATE_END``, for diagnostic visibility into attempted substitution.
+        this permanently withholds a press for that timestamp, whether the conflict is
+        seen BEFORE any digit was trusted (the dangerous ordering: a forged packet
+        arrives first, and the disagreeing genuine one that follows can never rescue
+        it either) or after (a conflicting straggler arriving too late to undo an
+        already-emitted press). Either way it is never treated as a (new) press, and is
+        logged at DEBUG below, distinctly from an ordinary ``DUPLICATE_END``, for
+        diagnostic visibility into attempted substitution.
         """
         if self._on_dtmf is None:
             return  # inbound DTMF ignored; the packet is still kept off the audio path

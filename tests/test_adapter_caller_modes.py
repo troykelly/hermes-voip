@@ -47,6 +47,7 @@ from hermes_voip.intercom import IntercomConfig, IntercomOpenMode
 from hermes_voip.manager import NewCall
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 from hermes_voip.multi_intercom import IntercomEntry, Opening, OpeningType
+from hermes_voip.outbound_allow import load_outbound_allowlist
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
@@ -915,7 +916,9 @@ async def test_no_objective_first_turn_when_objective_absent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_end_result_channel_wildcard_routes_to_matching_origin() -> None:
+async def test_call_end_result_channel_wildcard_routes_to_matching_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``OUTBOUND_RESULT_CHANNEL=telegram:*`` routes via the real result-channel path.
 
     This proves the call-end reporter passes the captured origin into the fallback
@@ -950,7 +953,7 @@ async def test_call_end_result_channel_wildcard_routes_to_matching_origin() -> N
         fallback_origins.append(origin)
         await original_fallback(call_id, report, origin)
 
-    adapter._report_to_fallback_channel = _recording_fallback
+    monkeypatch.setattr(adapter, "_report_to_fallback_channel", _recording_fallback)
 
     call_id = new_call_id()
     info = _outbound_info(
@@ -2169,7 +2172,9 @@ async def test_start_attended_consult_dials_allowlisted_target() -> None:
     original = _FakeAttendedOriginalSession()
     call_id = new_call_id()
     adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
-    adapter._outbound_allow = frozenset({"1000"})
+    adapter._outbound_allow = load_outbound_allowlist(
+        {"HERMES_VOIP_OUTBOUND_ALLOW": "1000"}
+    )
 
     dialled: list[str] = []
 
@@ -2203,7 +2208,9 @@ async def test_start_attended_consult_rejects_unlisted_target() -> None:
     original = _FakeAttendedOriginalSession()
     call_id = new_call_id()
     adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
-    adapter._outbound_allow = frozenset({"1000"})  # 9999 not listed
+    adapter._outbound_allow = load_outbound_allowlist(
+        {"HERMES_VOIP_OUTBOUND_ALLOW": "1000"}
+    )  # 9999 not listed
 
     dialled: list[str] = []
 
@@ -2237,7 +2244,9 @@ async def test_start_attended_consult_blocks_non_operator() -> None:
     )
     call_id = new_call_id()
     adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
-    adapter._outbound_allow = frozenset({"1000"})
+    adapter._outbound_allow = load_outbound_allowlist(
+        {"HERMES_VOIP_OUTBOUND_ALLOW": "1000"}
+    )
 
     dialled: list[str] = []
 

@@ -14,18 +14,20 @@ from a provided env mapping; tests pass fakes (ext ``1000``/``1001``). Extension
 are not PII, but the value is treated uniformly as sensitive config (kept out of
 git and out of logs).
 
-Matching is **exact** for entries that contain no wildcard characters, and
-**pattern-based** (opt-in per entry) for entries that contain ``*`` or ``x``:
+Matching is **exact** for entries with no active wildcard, and **pattern-based**
+(opt-in per entry) for entries that contain ``*`` -- or contain ``x``/``X`` inside a
+simple extension mask:
 
 * In simple dial masks (digits plus ``+`` / ``#`` / ``*`` / ``x``), ``*`` and
   ``x`` each match exactly ONE decimal digit. Example: ``10**`` and ``10xx`` both
   permit only four-digit numbers beginning with ``10`` (1000-1099), not arbitrary
   ``10...`` prefixes.
-* In SIP URI / non-mask patterns, ``*`` remains glob-like (any character
-  sequence), while ``x`` is literal so values like ``sip:ext@pbx.example.test``
-  stay exact unless the operator explicitly adds ``*``.
+* In any non-mask entry (a SIP URI, or a label like ``fax``), ``x``/``X`` is a
+  LITERAL character and only ``*`` stays glob-like -- so ``fax`` matches exactly
+  ``fax`` (never ``fa0``..``fa9``) and ``sip:ext@pbx.example.test`` is matched
+  verbatim unless the operator explicitly adds ``*``.
 
-Wildcard matching is **opt-in**: an entry without ``*`` or ``x`` stays
+Wildcard matching is **opt-in**: an entry with no active wildcard stays
 exact-match, so a listed ``"1000"`` never accidentally also permits ``"10000"``
 (the caller-groups escalation lesson from ADR-0021). An allowlist that *grants the
 right to dial* must therefore be an exact-match set for exact entries; the pattern
@@ -55,18 +57,6 @@ __all__ = [
 OUTBOUND_ALLOW_ENV = "HERMES_VOIP_OUTBOUND_ALLOW"
 
 
-def _is_sip_uri(entry: str) -> bool:
-    """Return True iff ``entry`` looks like a SIP URI (has ``@`` or ``sip:`` prefix).
-
-    SIP URIs legitimately contain alphabetic characters (``ext``, ``pbx``,
-    ``example``) that would collide with the ``x`` digit-wildcard convention.
-    In a SIP URI, ``x`` is ALWAYS a literal character -- only ``*`` triggers
-    glob matching. A simple extension (digits + wildcard chars only, no URI
-    structure) is the context where ``x`` means "any digit".
-    """
-    return "@" in entry or entry.lower().startswith("sip:")
-
-
 def _is_extension_mask(entry: str) -> bool:
     """Return True iff ``entry`` is a simple dial-mask pattern.
 
@@ -85,18 +75,21 @@ def _entry_to_regex(entry: str) -> re.Pattern[str] | None:
     """Compile ``entry`` to an anchored regex if it contains wildcards, else None.
 
     An entry without wildcards is exact (returns ``None``); the caller uses set
-    membership for those. When wildcards ARE present, the character set depends
-    on whether the entry is a simple extension/dial mask or a SIP URI/string pattern:
+    membership for those. When wildcards ARE present, the character set depends on
+    whether the entry is a simple extension/dial mask (:func:`_is_extension_mask`)
+    or any other (non-mask) pattern:
 
     **Simple extension mask** (only digits, ``+``, ``#``, ``*``, and ``x``/``X``):
 
     * ``x`` / ``X`` -> ``[0-9]`` (exactly one decimal digit).
     * ``*`` -> ``[0-9]`` (also exactly one decimal digit for dial-mask syntax).
 
-    **SIP URI / other pattern**:
+    **Non-mask pattern** (a SIP URI, or any other string):
 
-    * ``x`` is literal (SIP URIs legitimately contain ``x`` in words like
-      ``ext`` or ``example`` -- treating it as a wildcard would match nothing).
+    * ``x`` / ``X`` is LITERAL. Only a real mask means "any digit"; elsewhere ``x``
+      is an ordinary character -- SIP URIs legitimately contain ``x`` in words like
+      ``ext``/``example``, and a literal label like ``fax`` must stay exact rather
+      than silently become a digit pattern that over-matches ``fa0``..``fa9``.
     * ``*`` -> ``.*`` (glob any sequence, useful for e.g. ``sip:10*@pbx.example.test``).
 
     All other characters are regex-escaped so they match literally. The pattern
@@ -111,8 +104,7 @@ def _entry_to_regex(entry: str) -> re.Pattern[str] | None:
         ``None`` (exact-match entry).
     """
     is_mask = _is_extension_mask(entry)
-    is_uri = _is_sip_uri(entry)
-    has_wildcard = "*" in entry or (("x" in entry or "X" in entry) and not is_uri)
+    has_wildcard = "*" in entry or (("x" in entry or "X" in entry) and is_mask)
     if not has_wildcard:
         return None
     # Build an anchored regex from the pattern.  Walk char-by-char so each
@@ -123,8 +115,8 @@ def _entry_to_regex(entry: str) -> re.Pattern[str] | None:
             parts.append("[0-9]")
         elif ch == "*":
             parts.append(".*")
-        elif ch in {"x", "X"} and not is_uri:
-            # Digit wildcard: valid only outside SIP URIs.
+        elif ch in {"x", "X"} and is_mask:
+            # Digit wildcard: valid only in simple extension masks.
             parts.append("[0-9]")
         else:
             parts.append(re.escape(ch))
@@ -188,8 +180,9 @@ def load_outbound_allowlist(extra: Mapping[str, str]) -> OutboundAllowlist:
     blank value yields the **empty** allowlist -- the feature is inert (no target
     may be dialled) until the operator opts numbers in.
 
-    Entries containing ``*`` or ``x`` are compiled to anchored regex patterns (opt-in
-    per entry); all other entries are exact-match members.
+    Entries containing ``*`` -- or ``x``/``X`` inside a simple extension mask -- are
+    compiled to anchored regex patterns (opt-in per entry); all other entries
+    (including a literal label like ``fax``) are exact-match members.
 
     Args:
         extra: The plugin's env-config mapping (``config.extra``).

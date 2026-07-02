@@ -129,6 +129,19 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("fax", allow) is True
         assert is_outbound_allowed("fa5", allow) is False
 
+    def test_sip_uri_pattern_keeps_x_literal(self) -> None:
+        """SIP URI / non-mask patterns preserve literal ``x`` characters.
+
+        Regression guard (characterisation): SIP URIs already treated ``x`` as
+        literal before this refinement; assert the ``is_mask`` discriminator keeps
+        that behaviour so a ``*`` glob in a URI never silently digit-matches ``x``.
+        """
+        allow = load_outbound_allowlist(
+            {"HERMES_VOIP_OUTBOUND_ALLOW": "sip:fax*@pbx.example.test"}
+        )
+        assert is_outbound_allowed("sip:fax123@pbx.example.test", allow) is True
+        assert is_outbound_allowed("sip:fa9123@pbx.example.test", allow) is False
+
     # --- fail-closed / empty ---
 
     def test_empty_allow_still_denies_all(self) -> None:

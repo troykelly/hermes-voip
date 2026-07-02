@@ -994,31 +994,32 @@ class CallSession:
             await self._refer_handler(refer)
 
 
-# RFC 3261 §8.1.1.5: a CSeq sequence number is < 2**31 — at most 10 decimal digits.
-# The digit cap keeps int()'s input below Python's (configurable, >= 640) integer-
-# string-conversion limit, so the conversion in _cseq_number cannot raise.
+# RFC 3261 §8.1.1.5: a CSeq sequence number is < 2**31. Leading zeros are valid
+# (`1*DIGIT`), so the digit COUNT is not bounded — int() normalizes the value.
 _MAX_CSEQ = 2**31
-_MAX_CSEQ_DIGITS = 10
 
 
 def _cseq_number(cseq: str | None) -> int | None:
     if cseq is None:
         return None
     parts = cseq.split()
-    # Fail closed (ADR-0081): a valid SIP CSeq number is a short ASCII-decimal run
-    # (`1*DIGIT` < 2**31, RFC 3261 §8.1.1.5). str.isdigit() is True for non-decimal
-    # unicode digits (e.g. superscript "²" U+00B2) that int() rejects with a bare
-    # ValueError, and int() also raises on an over-long ASCII run (Python's integer
-    # string-conversion limit). on_response/_send_ack run OUTSIDE the reader's
-    # parse-only `except ValueError`, so either escape would tear down the whole
-    # connection. Gate on isascii()+isdecimal() AND length so int() cannot raise, then
-    # range-check the value; a non-conformant CSeq takes the SAME uncorrelatable path
-    # (None) any other unparseable one does.
-    if (
-        not parts
-        or not (parts[0].isascii() and parts[0].isdecimal())
-        or len(parts[0]) > _MAX_CSEQ_DIGITS
-    ):
+    if not parts:
         return None
-    number = int(parts[0])
-    return number if number < _MAX_CSEQ else None
+    token = parts[0]
+    # Fail closed (ADR-0081): a valid SIP CSeq number is ASCII `1*DIGIT` < 2**31
+    # (RFC 3261 §8.1.1.5). str.isdigit() is True for non-decimal unicode digits
+    # (e.g. superscript "²" U+00B2) that int() rejects, so require isascii() and
+    # isdecimal(). int() still raises on an ASCII run longer than CPython's integer
+    # string limit, so that is caught too. on_response/_send_ack run OUTSIDE the
+    # reader's parse-only `except ValueError`, so an escape would tear down the whole
+    # connection — every non-conformant token instead returns None (the uncorrelatable
+    # path a non-numeric CSeq already takes).
+    if not (token.isascii() and token.isdecimal()):
+        return None
+    try:
+        value = int(token)
+    except ValueError:
+        # An ASCII-decimal token longer than CPython's int-from-string limit: not a
+        # valid CSeq; drop it (fail closed) rather than let it unwind the reader.
+        return None
+    return value if value < _MAX_CSEQ else None

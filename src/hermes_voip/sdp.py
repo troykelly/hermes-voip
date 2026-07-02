@@ -439,7 +439,16 @@ class IceCandidate:
                 len(tokens) > _ICE_CAND_RPORT_VAL_IDX
                 and tokens[_ICE_CAND_RPORT_KW_IDX] == "rport"
             ):
-                rport = int(tokens[_ICE_CAND_RPORT_VAL_IDX])
+                try:
+                    rport = int(tokens[_ICE_CAND_RPORT_VAL_IDX])
+                except ValueError as exc:
+                    # Same ValueError->SdpError guard as the mandatory numeric
+                    # fields above: rport is attacker-controlled too, and a bare
+                    # ValueError would bypass the a=candidate site's
+                    # suppress(SdpError) and fail the whole offer parse instead of
+                    # skipping this one candidate (ADR-0081 read-loop-escape class).
+                    msg = "malformed a=candidate: non-integer rport"
+                    raise SdpError(msg) from exc
         return cls(
             foundation=foundation,
             component=component,

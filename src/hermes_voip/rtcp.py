@@ -717,6 +717,17 @@ class Bye:
             struct.unpack("!I", body[i * _WORD : (i + 1) * _WORD])[0]
             for i in range(header.count)
         )
+        # A wire BYE with source-count 0 is malformed (RFC 3550 §6.6: a BYE
+        # carries at least one SSRC). Fail closed as RtcpError HERE — the
+        # wire-parse contract — rather than letting the empty tuple reach the
+        # ``Bye(...)`` constructor, whose ``__post_init__`` raises ValueError (the
+        # constructor contract). ``_ingest_rtcp_datagram`` catches only
+        # RtcpError/SrtcpError, so this keeps a crafted 4-byte SC=0 datagram
+        # "dropped, not fatal" instead of propagating out of the live inbound
+        # generator. Mirrors ``SourceDescription._from_body``'s zero-chunk guard.
+        if not ssrcs:
+            msg = "BYE packet declared zero SSRCs"
+            raise RtcpError(msg)
         reason: str | None = None
         if len(body) > needed:
             rlen = body[needed]

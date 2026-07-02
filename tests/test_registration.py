@@ -991,11 +991,14 @@ def test_missing_cseq_is_tolerated_and_yields_registered() -> None:
 # ---- Unicode-digit crash guard (isdigit → isascii+isdecimal) -----------------
 #
 # str.isdigit() returns True for Unicode superscript digits such as U+00B2 (²)
-# but int(chr(0xB2)) raises ValueError.  The three isdigit() guards in
-# registration.py must use isascii()+isdecimal() (the framing.py precedent) so
-# a malformed expires carrying a Unicode digit does NOT propagate a bare
-# ValueError through _granted_expires → _handle_success → handle, which would
-# tear down the SIP connection on the transport async read loop.
+# but int(chr(0xB2)) raises ValueError.  The four isdigit() guards in
+# registration.py must use isascii()+isdecimal() (the framing.py precedent) so a
+# malformed numeric token carrying a Unicode digit does NOT propagate a bare
+# ValueError that would tear down the SIP connection on the transport async read
+# loop.  Three treat the token as absent/malformed and fall back (a malformed
+# expires via _granted_expires → _handle_success, or a 423 Min-Expires via
+# _min_expires → _retry_interval); the fourth, _check_cseq → handle, turns a
+# non-decimal CSeq number into the caught RuntimeError mismatch instead.
 
 
 def test_granted_expires_unicode_digit_contact_param_does_not_crash() -> None:

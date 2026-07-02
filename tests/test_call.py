@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 
 import pytest
 
@@ -1104,3 +1105,131 @@ async def test_refresh_session_while_not_held_offers_sendrecv() -> None:
     await session.on_response(SipResponse.parse(_answer_to(reinvite, "sendrecv")))
     outcome = await task
     assert isinstance(outcome, RefreshSucceeded)
+
+
+# ---- fail-closed: a header-incomplete in-dialog request must not tear down the
+# ---- whole signalling connection (ADR-0081 class, response-build side) ------
+
+
+def _header_incomplete(
+    method: str, *, omit: str, body: str = "", cseq: int = 9
+) -> SipRequest:
+    """An in-dialog request routed to this call but missing one mandatory echo header.
+
+    ``manager._route_in_dialog`` keys an in-dialog request on its To-tag, From-tag and
+    Call-ID ONLY — never Via or CSeq — so a request that carries those three (here the
+    dialog's ``ours``/``theirs`` tags + ``call-1``) but ``omit``s a mandatory echo
+    header (Via / From / To / Call-ID / CSeq, RFC 3261 §8.2.6) still routes ``InDialog``
+    to the established :class:`CallSession` and reaches an inline ``build_response`` —
+    which raises :class:`ValueError` because it cannot echo the missing header.
+    """
+    headers = [
+        ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-in"),
+        ("From", "<sip:2000@pbx.example.test>;tag=theirs"),
+        ("To", "<sip:1000@pbx.example.test>;tag=ours"),
+        ("Call-ID", "call-1"),
+        ("CSeq", f"{cseq} {method}"),
+    ]
+    if body:
+        headers.append(("Content-Type", "application/sdp"))
+    return SipRequest(
+        method=method,
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=tuple((name, value) for name, value in headers if name != omit),
+        body=body,
+    )
+
+
+async def test_established_call_survives_a_header_incomplete_bye() -> None:
+    """A header-incomplete in-dialog BYE is dropped WHOLE, not a connection teardown.
+
+    An established call answers an inbound BYE ``200 OK`` inline in the transport
+    reader task (``handle_request`` -> ``_on_bye`` -> ``build_response``). A BYE that
+    routes here (To/From tags + Call-ID) but omits its ``Via`` cannot be answered:
+    ``build_response`` raises :class:`ValueError`. Unguarded, that ``ValueError``
+    escapes ``handle_request``, unwinds the reader (``_dispatch_request`` ->
+    ``_read_loop``) and fires ``on_connection_lost`` — dropping every OTHER live call
+    and the registration on the shared signalling connection over one packet (the
+    ADR-0081 DoS class, response-build side). Fail closed: ``handle_request`` must DROP
+    the malformed BYE whole — send no ``200`` and (a request we cannot answer must have
+    no effect) leave the call NOT ended and its media NOT stopped — and must NOT raise,
+    so the reader and every other call on the connection stay alive.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    # Must not raise: a ``ValueError`` propagating out of here IS the reader unwind.
+    await session.handle_request(_header_incomplete("BYE", omit="Via"))
+    assert signaling.sent == []  # unanswerable -> no 200 built or sent
+    assert session.ended is False  # drop-whole: the malformed BYE did not end the call
+    assert media.stopped is False
+    # The session is not wedged: a subsequent WELL-FORMED BYE is still answered 200
+    # (the reader-survival analogue — the dispatcher keeps serving in-dialog requests).
+    await session.handle_request(_inbound("BYE"))
+    assert SipResponse.parse(signaling.sent[-1]).status_code == 200
+    assert session.ended is True
+    assert media.stopped is True
+
+
+async def test_established_srtp_call_survives_header_incomplete_reinvite_no_rekey() -> (
+    None
+):
+    """A header-incomplete secured re-INVITE is dropped WHOLE — no partial SRTP re-key.
+
+    Answering a peer re-INVITE on an SRTP call re-keys the media engine (via
+    ``_answer_reinvite`` -> ``_reanswer_crypto``) and bumps the SDP version BEFORE the
+    ``200`` is built. A re-INVITE carrying a usable ``a=crypto`` (so it reaches the
+    re-key path) but omitting its ``Via`` cannot be answered: ``build_response`` raises.
+    Unguarded, the engine is left re-keyed to a key the peer never saw us confirm, AND
+    the ``ValueError`` unwinds the reader. Fail closed: answerability is checked BEFORE
+    the irreversible re-key, so an unanswerable re-INVITE re-keys NOTHING, sends no
+    ``200``, and does not raise.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=media,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_srtp_media(),
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+    offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=42000,
+        codecs=(_PCMU,),
+        direction="sendonly",
+        session_id=7,
+        crypto=_srtp_crypto(),
+    )
+    await session.handle_request(_header_incomplete("INVITE", omit="Via", body=offer))
+    assert signaling.sent == []  # unanswerable -> no 200
+    assert media.rekeys == []  # drop-whole: the SRTP context was NOT re-keyed
+    # Not wedged: a subsequent well-formed secured re-INVITE is still answered + rekeys.
+    await session.handle_request(_inbound("INVITE", body=offer))
+    assert SipResponse.parse(signaling.sent[-1]).status_code == 200
+    assert media.rekeys, "a well-formed secured re-INVITE must still re-key the engine"
+
+
+async def test_header_incomplete_in_dialog_drop_is_logged_non_pii(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fail-closed drop emits a WARNING carrying no wire content (rule 34).
+
+    The dropped request is logged at WARNING with only the method kind and the
+    exception TYPE name — never the request's From/To/Call-ID or any host (the repo is
+    PUBLIC). Before the fix no WARNING is emitted at all (the ``ValueError`` escapes
+    instead of being caught and logged).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.call"):
+        await session.handle_request(_header_incomplete("BYE", omit="CSeq"))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "a header-incomplete in-dialog drop must log a WARNING"
+    blob = " ".join(r.getMessage() for r in warnings)
+    assert "ValueError" in blob  # the exception type is surfaced for diagnosis
+    # No PII / wire content: none of the request's tags, Call-ID or host leaks.
+    assert "theirs" not in blob
+    assert "call-1" not in blob
+    assert "pbx.example.test" not in blob

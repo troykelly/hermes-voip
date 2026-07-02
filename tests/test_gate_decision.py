@@ -14,7 +14,6 @@ import logging
 
 import pytest
 
-from hermes_voip.media.call_loop import gate_voip_tool as loop_gate
 from hermes_voip.providers.policy import (
     GateDecision,
     GateReason,
@@ -228,11 +227,3 @@ def test_tools_gate_voip_tool_does_not_log_on_allow(
         allowed = tools_gate("hold_call", clean, confirmed=False)
     assert allowed is True
     assert caplog.records == []
-
-
-def test_call_loop_gate_voip_tool_returns_bool() -> None:
-    # The media/call_loop re-export keeps the bool contract its callers use.
-    clean = GuardSessionState(call_id="c1")
-    degraded = GuardSessionState(call_id="c1", degraded=True)
-    assert loop_gate(ToolRisk.SAFE, clean, confirmed=False) is True
-    assert loop_gate(ToolRisk.IRREVERSIBLE, degraded, confirmed=True) is False

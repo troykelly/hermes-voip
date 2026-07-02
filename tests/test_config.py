@@ -1740,8 +1740,13 @@ def test_media_duplex_mode_full_rejected_as_inert() -> None:
     fail loud, never silently no-op). Only ``half`` is a valid value until a
     follow-up ADR ships Phase 2.
     """
-    with pytest.raises(ConfigError, match="not implemented"):
+    with pytest.raises(ConfigError, match="not implemented") as excinfo:
         load_media_config({"HERMES_VOIP_DUPLEX_MODE": "full"})
+    # The error must name the specific inert knob + value (actionable), not just a
+    # generic "not implemented" that could drift away from the real guidance.
+    message = str(excinfo.value)
+    assert "HERMES_VOIP_DUPLEX_MODE" in message
+    assert "full" in message
 
 
 def test_media_unknown_dtmf_mode_rejected() -> None:

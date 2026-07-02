@@ -155,11 +155,11 @@ class DigestChallenge:
     Attributes:
         realm: The protection realm the server hashes the credential against.
         nonce: The server-issued nonce (single-use on many gateways).
-        algorithm: The digest algorithm token. Matching is case-insensitive
+        algorithm: The digest algorithm token. Local matching is case-insensitive
             (RFC 7616 §3.3), but the token is stored — and echoed back in the
-            ``Authorization`` header — VERBATIM in the server's original case:
-            the wire permits either case and echoing the server's own form is
-            always accepted. Defaults to ``MD5`` when the challenge omits it.
+            ``Authorization`` header — VERBATIM in the server's original case (the
+            wire permits either case). Defaults to ``MD5`` when the challenge omits
+            it.
         qop: The offered quality-of-protection tokens (e.g. ``("auth",)``).
         opaque: An opaque value to echo back unchanged, if the server sent one.
     """
@@ -218,12 +218,14 @@ class DigestChallenge:
 class DigestCredentials:
     """The shared-secret credential used to answer a digest challenge.
 
-    ``password`` is ``repr``-suppressed (``field(repr=False)``) so it cannot leak
-    into a traceback, log line, or the ``repr()`` of a containing object — but it
-    is STILL the plaintext secret, resident in memory for this object's lifetime.
-    Never log it, interpolate it into an error message, or persist it; it exists
-    only to compute HA1 (AGENTS.md rule 34 — secrets never touch logs/git; the
-    repo is public).
+    ``password`` is ``repr``-suppressed (``field(repr=False)``) so it is not
+    surfaced by ``repr(credentials)`` — nor by a containing object's repr that
+    delegates to it — which reduces accidental leaks via tracebacks/logs that
+    stringify the object. That is NOT a general secret-handling control: the field
+    is STILL the plaintext secret, resident in memory for this object's lifetime,
+    and ``credentials.password`` is fully readable. Never log it, interpolate it
+    into an error message, or persist it; it exists only to compute HA1 (AGENTS.md
+    rule 34 — secrets never touch logs/git; the repo is public).
     """
 
     username: str
@@ -365,10 +367,11 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
     # characters and escapes the quoted-pair specials — that is the header-
     # injection guard for the attacker-controlled challenge fields. The UNQUOTED
     # values (algorithm/qop/nc) bypass that guard and are safe only because their
-    # content is already constrained: ``algorithm`` was validated above to be one
-    # of _SUPPORTED_ALGORITHMS (a fixed ``[a-z0-9-]`` token set, so no separator
-    # or control char can appear), ``qop`` is the literal "auth", and ``nc`` is 8
-    # hex digits from ``f"{nc:08x}"``. If that algorithm gate is ever loosened,
+    # content is already constrained: ``algorithm.lower()`` was validated above to
+    # be one of _SUPPORTED_ALGORITHMS, so the echoed token can differ only by ASCII
+    # case from a supported name (``[A-Za-z0-9-]`` — no separator or control char
+    # can appear), ``qop`` is the literal "auth", and ``nc`` is 8 hex digits from
+    # ``f"{nc:08x}"``. If that algorithm gate is ever loosened,
     # route it through _quoted (or a token-grammar check) before this render.
     params: list[tuple[str, str, bool]] = [
         ("username", credentials.username, True),

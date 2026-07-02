@@ -995,8 +995,9 @@ class CallSession:
 
 
 # RFC 3261 §8.1.1.5: a CSeq sequence number is < 2**31 — at most 10 decimal digits.
-# Bounding the token length also keeps int() below Python's (configurable, >= 640)
-# integer-string-conversion limit, so the conversion in _cseq_number cannot raise.
+# The digit cap keeps int()'s input below Python's (configurable, >= 640) integer-
+# string-conversion limit, so the conversion in _cseq_number cannot raise.
+_MAX_CSEQ = 2**31
 _MAX_CSEQ_DIGITS = 10
 
 
@@ -1004,19 +1005,20 @@ def _cseq_number(cseq: str | None) -> int | None:
     if cseq is None:
         return None
     parts = cseq.split()
-    # Fail closed (ADR-0081): a SIP CSeq number is ASCII `1*DIGIT` and < 2**31
-    # (RFC 3261 §8.1.1.5) — at most _MAX_CSEQ_DIGITS digits. str.isdigit() is True
-    # for non-decimal unicode digits (e.g. superscript "²" U+00B2) that int()
-    # rejects with a bare ValueError, and int() also raises on an over-long ASCII
-    # run (Python's integer-string-conversion limit). on_response/_send_ack run
-    # OUTSIDE the reader's parse-only `except ValueError`, so either escape would
-    # tear down the whole connection. Require isascii()+isdecimal() AND a bounded
-    # length, so a non-conformant CSeq takes the SAME uncorrelatable-CSeq path
-    # (None) a non-numeric one already does and int() below cannot raise.
+    # Fail closed (ADR-0081): a valid SIP CSeq number is a short ASCII-decimal run
+    # (`1*DIGIT` < 2**31, RFC 3261 §8.1.1.5). str.isdigit() is True for non-decimal
+    # unicode digits (e.g. superscript "²" U+00B2) that int() rejects with a bare
+    # ValueError, and int() also raises on an over-long ASCII run (Python's integer
+    # string-conversion limit). on_response/_send_ack run OUTSIDE the reader's
+    # parse-only `except ValueError`, so either escape would tear down the whole
+    # connection. Gate on isascii()+isdecimal() AND length so int() cannot raise, then
+    # range-check the value; a non-conformant CSeq takes the SAME uncorrelatable path
+    # (None) any other unparseable one does.
     if (
         not parts
         or not (parts[0].isascii() and parts[0].isdecimal())
         or len(parts[0]) > _MAX_CSEQ_DIGITS
     ):
         return None
-    return int(parts[0])
+    number = int(parts[0])
+    return number if number < _MAX_CSEQ else None

@@ -355,5 +355,16 @@ class CallControlTools:
 
 
 def _ambient_state(call: ControllableCall | None) -> GuardSessionState:
-    """The guard state for a call-independent SAFE tool (clean when no call)."""
-    return call.guard if call is not None else GuardSessionState(call_id="")
+    """The guard state for a call-independent tool invocation (no active call).
+
+    The only caller today is the ``ELEVATED`` ``list_registrations`` when
+    invoked with no active call (``self._call is None`` — see its docstring).
+    ``privilege_level=3`` is explicit (ADR-0097 made the bare constructor
+    default least-privilege): with no active call there is no caller at all to
+    defend against, so this is the one legitimate operator-only ambient case.
+    """
+    return (
+        call.guard
+        if call is not None
+        else GuardSessionState(call_id="", privilege_level=3)
+    )

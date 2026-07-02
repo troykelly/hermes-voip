@@ -24,7 +24,14 @@ from hermes_voip.tools import (
 
 class _FakeCall:
     def __init__(self, *, degraded: bool = False) -> None:
-        self.guard = GuardSessionState(call_id="call-1", degraded=degraded)
+        # This fixture models the PRIVILEGED (operator) call across this file —
+        # the confirmed/degraded axis is what this module tests (see its
+        # docstring); the privilege axis is `test_caller_privilege.py`'s job.
+        # ADR-0097 made bare ``GuardSessionState`` construction level-0, so the
+        # privileged default is now stated explicitly here rather than inherited.
+        self.guard = GuardSessionState(
+            call_id="call-1", privilege_level=3, degraded=degraded
+        )
         self.held = 0
         self.resumed = 0
         self.hung_up = 0
@@ -131,8 +138,10 @@ def test_gate_voip_tool_unknown_tool_denied() -> None:
 
 
 def test_gate_voip_tool_maps_to_gate_tool_call() -> None:
-    clean = GuardSessionState(call_id="call-1")
-    degraded = GuardSessionState(call_id="call-1", degraded=True)
+    # ADR-0097: bare construction is level 0 now; both scenarios here are about
+    # the confirmed/degraded axis on an already-privileged session.
+    clean = GuardSessionState(call_id="call-1", privilege_level=3)
+    degraded = GuardSessionState(call_id="call-1", privilege_level=3, degraded=True)
     # list_registrations is ELEVATED: allowed on a clean privileged call, blocked
     # while degraded (and — see test_caller_privilege — for an unprivileged call).
     assert gate_voip_tool("list_registrations", clean, confirmed=False) is True
@@ -153,8 +162,10 @@ def test_gate_voip_tool_maps_to_gate_tool_call() -> None:
 
 def test_allowed_tools_empty_is_level_only_backcompat() -> None:
     # The default empty allow-list does not change any existing decision: an
-    # ELEVATED tool on a clean operator session still runs.
-    clean = GuardSessionState(call_id="call-1")
+    # ELEVATED tool on a clean operator session still runs. ADR-0097: bare
+    # construction is level 0 now, so state the operator level explicitly —
+    # the allow-list backcompat is what this test is actually about.
+    clean = GuardSessionState(call_id="call-1", privilege_level=3)
     assert clean.allowed_tools == frozenset()
     assert gate_voip_tool("hold_call", clean, confirmed=False) is True
     assert gate_voip_tool("list_registrations", clean, confirmed=False) is True

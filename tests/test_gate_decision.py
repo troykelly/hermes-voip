@@ -66,14 +66,17 @@ def test_safe_is_allowed_even_when_degraded_and_unprivileged() -> None:
 
 
 def test_elevated_allowed_for_privileged_clean_session() -> None:
-    state = GuardSessionState(call_id="c1")  # default level 3, clean
+    # ADR-0097: bare construction is level 0 now; state level 3 explicitly to
+    # target the privileged/clean scenario this test is about.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
     decision = gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False)
     assert decision.allowed is True
     assert decision.reason is GateReason.ALLOWED
 
 
 def test_irreversible_allowed_for_confirmed_privileged_clean_session() -> None:
-    state = GuardSessionState(call_id="c1")  # default level 3, clean
+    # ADR-0097: bare construction is level 0 now — state level 3 explicitly.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
     decision = gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True)
     assert decision.allowed is True
     assert decision.reason is GateReason.ALLOWED
@@ -106,8 +109,9 @@ def test_irreversible_block_for_level2_confirmed_is_insufficient_privilege() -> 
 
 def test_irreversible_blocked_when_unconfirmed_is_unconfirmed() -> None:
     # Operator level, clean session, but no confirmation: the block reason is the
-    # missing confirmation, distinct from privilege/degrade.
-    state = GuardSessionState(call_id="c1")  # level 3, clean
+    # missing confirmation, distinct from privilege/degrade. ADR-0097: bare
+    # construction is level 0 now, so operator level must be explicit.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
     decision = gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False)
     assert decision.allowed is False
     assert decision.reason is GateReason.UNCONFIRMED
@@ -117,7 +121,9 @@ def test_irreversible_blocked_when_unconfirmed_is_unconfirmed() -> None:
 
 
 def test_elevated_blocked_when_degraded_is_degraded() -> None:
-    state = GuardSessionState(call_id="c1", degraded=True)  # level 3, degraded
+    # Level is irrelevant here (ADR-0097: bare construction is level 0) — the
+    # DEGRADED block fires regardless of privilege level.
+    state = GuardSessionState(call_id="c1", degraded=True)
     decision = gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False)
     assert decision.allowed is False
     assert decision.reason is GateReason.DEGRADED
@@ -222,7 +228,9 @@ def test_tools_gate_voip_tool_logs_degraded_reason(
 def test_tools_gate_voip_tool_does_not_log_on_allow(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    clean = GuardSessionState(call_id="c1")  # level 3, clean
+    # ADR-0097: bare construction is level 0 now — state the operator level
+    # explicitly so `hold_call` (ELEVATED) is actually allowed here.
+    clean = GuardSessionState(call_id="c1", privilege_level=3)
     with caplog.at_level(logging.WARNING, logger="hermes_voip.tools"):
         allowed = tools_gate("hold_call", clean, confirmed=False)
     assert allowed is True

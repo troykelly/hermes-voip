@@ -53,7 +53,9 @@ def test_gate_is_total_over_tool_risk() -> None:
 
 
 def test_irreversible_requires_confirmation() -> None:
-    state = GuardSessionState(call_id="c1")
+    # ADR-0097: bare construction is level 0 now; this test is about the
+    # confirmation gate on an already-privileged session, so state the level.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
     assert (
         gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=False).allowed is False
     )
@@ -68,7 +70,9 @@ def test_irreversible_blocked_when_degraded_even_if_confirmed() -> None:
 
 
 def test_elevated_blocked_only_when_degraded() -> None:
-    state = GuardSessionState(call_id="c1")
+    # ADR-0097: bare construction is level 0 now; this test is about the
+    # degraded-flag gate on an already-privileged session, so state the level.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
     assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
     state.degraded = True
     assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False

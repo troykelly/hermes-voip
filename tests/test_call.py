@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import sys
 
 import pytest
 
@@ -1302,6 +1303,39 @@ async def test_established_call_survives_a_unicode_digit_cseq_response() -> None
 
     # Not wedged / no over-drop: the outstanding re-INVITE's correlation is intact,
     # so its well-formed 200 answer still completes the hold.
+    await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))
+    await task
+    assert session.on_hold is True
+    assert media.holds == [True]
+
+
+async def test_established_call_survives_an_oversized_ascii_cseq_response() -> None:
+    """An inbound response with an over-long ASCII-decimal CSeq is dropped, not fatal.
+
+    Gating ``int()`` on ``isascii()+isdecimal()`` closes the non-decimal unicode-digit
+    escape but is NOT sufficient on its own: an all-ASCII-decimal CSeq number longer
+    than Python's (configurable, >= 640) integer-string-conversion limit still makes
+    ``int(parts[0])`` raise a bare :class:`ValueError` (``Exceeds the limit ... for
+    integer string conversion``) — the SAME escape, via the SAME ``on_response`` ->
+    reader path that tears down the shared SIP-over-TLS/WSS connection.
+
+    A valid SIP CSeq number is ``< 2**31`` (RFC 3261 §8.1.1.5) — at most 10 decimal
+    digits — so ``_cseq_number`` also drops an over-length token as uncorrelatable
+    (``None``) and never calls ``int()`` on it. Proven, as for the unicode case, with a
+    legitimate re-INVITE kept outstanding: the oversized response must neither raise nor
+    disturb it, and the well-formed answer that follows still completes the hold.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+
+    # More ASCII digits than int() will convert (the limit is >= 640 on any host), yet
+    # every character is isascii()+isdecimal() — so only a length bound closes this.
+    oversized = "9" * (sys.get_int_max_str_digits() + 1)
+    await session.on_response(_response_with_cseq(f"{oversized} BYE"))  # must NOT raise
+
     await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))
     await task
     assert session.on_hold is True

@@ -394,6 +394,37 @@ defect or a load-bearing test gap.
 - [ ] **[low] efficiency / docs** — `payload = data[offset:]` copies (correct: jitter-buffered packets
   don't pin the transport's receive buffers). Add a comment so a future zero-copy/memoryview refactor
   doesn't silently reintroduce retention.
+- [ ] **[low] robustness** — `RtpPacket.__post_init__` (line 71) range-checks
+  `payload_type`/`sequence_number`/`timestamp`/`ssrc` with `0 <= x <= MAX` but never
+  `isinstance(x, int)` — a `float` (e.g. `timestamp=1000.5`) satisfies every comparison and
+  constructs cleanly, then fails later and lower in the stack: `pack()`'s
+  `struct.pack('!...I', 1000.5, ...)` raises `struct.error`, not the module's advertised
+  `ValueError`. Add an `isinstance(x, int)` guard (or accept `SupportsInt` and coerce) so the
+  failure is immediate, typed, and at construction.
+- [ ] **[low] correctness** — `peek()` (line 524) returns `Lost(expected)` with the default
+  `count=1`, never the coalesced run-length `pop()` computes (lines 501-521) for the same gap
+  — verified: `pop()` at the same anchor can return `Lost(expected, count=N>1)` while a
+  `peek()` just before it reports count=1. Latent (no caller currently branches on `peek()`'s
+  count), but a future caller trusting `peek()` to preview `pop()` would under-report loss.
+  Share the run-length scan (or document `peek()`'s count as advisory-only); test the
+  mismatch.
+
+## src/hermes_voip/rtcp.py
+
+- [ ] **[low] robustness** — `SourceDescription._from_body` (line 586) and `Bye._from_body`
+  (line 708) both stop once the declared `count` chunks/SSRCs (+ BYE's optional reason) are
+  consumed, but neither checks that parsing fully consumed the declared body — verified:
+  neither has an `offset == len(body)` / `end == len(body)` guard, so any trailing bytes left
+  over after the declared content (there is no legitimate padding-after-content case per RFC
+  3550 §6.5/§6.6 — each SDES chunk already self-pads to its own 4-byte boundary) parse
+  silently instead of raising. Add the same full-consumption check to both; test a trailing
+  extra byte on each.
+- [ ] **[low] robustness** — `rtt_from_report_block` (line 1038) clamps the *lower* bound
+  (`rtt_units < 0 → 0.0`) but not the upper: `delay = (now - lsr) & _U32` wraps to up to
+  2^32-1 compact-NTP units (~18.2 h) when `lsr` is stale/replayed or the clock jumps, and that
+  whole span can surface as a bogus multi-hour "RTT" with no ceiling. Clamp to a documented
+  sane maximum (or reject values above it) so a stale/replayed report block can't poison
+  RTT-based SLO metrics; test the wraparound-to-huge-RTT case.
 
 ## src/hermes_voip/dtmf.py
 
@@ -457,6 +488,24 @@ defect or a load-bearing test gap.
   marker-bit / first-packet semantics (RFC 4733 §2.5.1.2 wants marker on the first packet; `rtp.py`'s
   `RtpPacket.marker` exists). Document that marker handling is the transport's job + which index is "first";
   consider making the end-count a keyword arg.
+- [ ] **[medium] correctness** — `InbandDtmfDetector.feed` (lines 464-490) treats any
+  non-validated frame as a full press-end: a gap frame resets `_emitted`/`_candidate`/`_run`
+  together (lines 473-479), so a single silent/lost frame in the MIDDLE of one physical
+  keypress (packet loss, a brief dip below `_INBAND_MIN_FRAME_ENERGY`) makes the tone's
+  resumption debounce as a brand-new press and emit the SAME digit a second time — one
+  keypress, two `DtmfDigit`s. This is a security-relevant control (ADR-0009/0010 confirmation
+  channel); a duplicated digit could double an irreversible confirmation or desync a
+  multi-digit PIN/menu flow. Add hold-over tolerance (require N consecutive gap frames, not
+  one, before resetting) or track "still within one press" separately from "candidate
+  validated"; test one dropped frame mid-press emits exactly once.
+- [ ] **[low] robustness** — `InbandDtmfDetector._detect_frame` (line 494) computes
+  `n = len(pcm16) // 2` but calls `struct.unpack(f"<{n}h", pcm16)` on the FULL buffer, not
+  `pcm16[:2 * n]` — verified an odd-length buffer (e.g. 5 bytes) raises `struct.error: unpack
+  requires a buffer of 4 bytes`, not a `ValueError`, from a `feed()` whose docstring promises
+  `str | None`. Reachability from a real G.711 caller is unverified (frames should always be
+  even-length), but it's an uncaught-crash path on malformed input. Slice to
+  `pcm16[:2 * n]` before unpacking (silently drop the trailing odd byte) or raise a typed
+  `ValueError` up front; test an odd-length frame.
 
 ## src/hermes_voip/media/audio.py
 

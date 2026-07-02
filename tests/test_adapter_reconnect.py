@@ -418,3 +418,141 @@ async def test_active_call_sink_reattached_on_reconnect() -> None:
         )
 
     await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Test 6 (bk1191): active call DIALOG re-attached to the registration manager
+# on reconnect — distinct from Test 5's transport-sink re-attach.
+# ---------------------------------------------------------------------------
+
+
+async def test_active_call_dialog_reattached_to_manager_on_reconnect() -> None:
+    """A dialog registered before the drop is re-added to the NEW manager.
+
+    Test 5 only proves the new *transport* re-learns the call-id sink. RFC 3261
+    dialog matching (in-dialog requests routed by Call-ID + tags) happens at the
+    :class:`RegistrationManager` layer via ``add_call(dialog_id, consumer)`` — a
+    reconnect that re-attaches the transport sink but forgets to re-attach the
+    dialog on the new manager would silently misroute in-dialog requests
+    (re-INVITE, BYE) for calls that survived the reconnect. A single shared fake
+    manager instance (as Test 5 uses) cannot distinguish "already there from the
+    first connect" from "re-attached on reconnect", so this test gives the
+    manager its own per-connect-attempt factory, mirroring the transport
+    factory pattern above.
+    """
+    transport = _FakeReconnectTransport()
+    managers: list[_FakeManager] = []
+
+    def _manager_factory(*args: object, **kwargs: object) -> _FakeManager:
+        m = _FakeManager()
+        managers.append(m)
+        return m
+
+    fake_sink = MagicMock()
+    fake_sink.dialog_id = ("call-id-1", "local-tag-1", "remote-tag-1")
+
+    with (
+        patch(
+            "hermes_voip.adapter.SipOverTlsTransport",
+            side_effect=lambda **kw: _capture_cb(transport, kw),
+        ),
+        patch("hermes_voip.adapter.RegistrationManager", side_effect=_manager_factory),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.build_providers", return_value=MagicMock()),
+        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+    ):
+        adapter = VoipAdapter(_platform_config())
+        await adapter.connect()
+
+        # Directly register a fake call session, keyed by call-id, in the
+        # adapter's tracking dict (mirrors how a live inbound/outbound call
+        # would have registered itself before the connection dropped).
+        adapter._call_sessions["call-id-1"] = fake_sink
+
+        # Trigger reconnect.
+        adapter._on_connection_lost(None)
+
+        # Wait for a second (fresh) manager to be constructed by _establish().
+        await _until(lambda: len(managers) >= 2, timeout=3.0)
+
+        second_manager = managers[1]
+        # The dialog must be re-registered on the NEW manager, not just left
+        # dangling on the old (torn-down) one.
+        await _until(
+            lambda: fake_sink.dialog_id in second_manager._calls,
+            timeout=3.0,
+        )
+        assert second_manager._calls[fake_sink.dialog_id] is fake_sink, (
+            "reconnect re-attached the wrong consumer for the dialog"
+        )
+
+    await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Test 7 (bk1192): degraded flow health clears after a successful reconnect
+# ---------------------------------------------------------------------------
+
+
+async def test_degraded_health_clears_after_successful_reconnect() -> None:
+    """Degraded health clears after a later reconnect attempt succeeds.
+
+    ``is_flow_healthy`` goes False while reconnecting fails, then True again
+    once a reconnect attempt actually succeeds — the degraded state must not be
+    sticky past recovery.
+    """
+    call_count = 0
+
+    def _factory(**kw: object) -> _FakeReconnectTransport:
+        nonlocal call_count
+        call_count += 1
+        # Only the SECOND transport (the first reconnect attempt) fails; the
+        # initial connect and the third transport (second reconnect attempt)
+        # both succeed.
+        fail = call_count == 2
+        t = _FakeReconnectTransport(fail_connect=fail)
+        if call_count == 1:
+            t._on_connection_lost_cb = kw.get("on_connection_lost")
+        return t
+
+    manager = _FakeManager()
+
+    with (
+        patch("hermes_voip.adapter.SipOverTlsTransport", side_effect=_factory),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.build_providers", return_value=MagicMock()),
+        patch("hermes_voip.adapter.load_media_config", return_value=MagicMock()),
+        # A real (small but non-zero) backoff window so the "degraded between
+        # attempts" state is actually observable by the poll below, rather
+        # than the failed attempt and the successful retry both completing
+        # within the same event-loop tick.
+        patch("hermes_voip.adapter._RECONNECT_BACKOFF_INITIAL", 0.1),
+        patch("hermes_voip.adapter._RECONNECT_BACKOFF_CAP", 0.1),
+    ):
+        adapter = VoipAdapter(_platform_config())
+        await adapter.connect()
+        assert adapter.is_flow_healthy is True, "must start out healthy"
+
+        # Trigger connection loss; the first reconnect attempt is made to fail.
+        adapter._on_connection_lost(None)
+
+        # While the failed attempt is backing off before its retry, flow
+        # health must report degraded (not healthy).
+        await _until(lambda: not adapter.is_flow_healthy, timeout=3.0)
+
+        # The retry succeeds; degraded health must clear back to healthy.
+        await _until(lambda: adapter.is_flow_healthy, timeout=3.0)
+        # Prove the clear was CAUSED by a genuine successful reconnect, not a
+        # spurious flip: the failed attempt (transport #2) AND the succeeding
+        # retry (transport #3) must both have been constructed by now, so the
+        # health cleared strictly *after* a real reconnect completed.
+        assert call_count >= 3, (
+            f"expected a failed attempt + a successful retry (>=3 transports built), "
+            f"got {call_count} — cannot conclude health cleared after a real reconnect"
+        )
+        assert adapter.is_flow_healthy is True, (
+            "degraded health did not clear after a successful reconnect"
+        )
+
+    await adapter.disconnect()

@@ -919,6 +919,16 @@ def test_caller_number_unresolved_from_returns_none_not_raw_header() -> None:
     # (7) An EMPTY user part (``sip:@host``) is unresolved too.
     assert _caller_number("<sip:@pbx.example.test>") is None
 
+    # (8) A SIP host cannot contain an unescaped ``@``; a multi-``@`` AOR is malformed
+    #     and must NOT resolve to the leading token (which would enter caller-group /
+    #     intercom matching as an ordinary caller-ID).
+    assert _caller_number("<sip:operator@pbx.example.test@evil.example>;tag=x") is None
+    assert _caller_number("<sip:operator@@evil.example>;tag=x") is None
+
+    # (9) A well-formed AOR with a port / IPv6 host / uri-params still resolves.
+    assert _caller_number("<sip:1000@[2001:db8::1]:5060>") == "1000"
+    assert _caller_number("<sip:1000@pbx.example.test:5060;transport=tls>") == "1000"
+
 
 @pytest.mark.asyncio
 async def test_deliver_turn_defangs_hostile_caller_identity_fields() -> None:

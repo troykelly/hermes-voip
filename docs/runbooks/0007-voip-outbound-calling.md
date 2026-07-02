@@ -60,6 +60,33 @@ session (captured from `gateway.session_context` at trigger time) — the result
 fallback ONLY for the env-trigger/cron path, because voip has no home channel of its own and a
 proactive notification cannot be delivered into voip.
 
+## The `place_call` structured result contract (ADR-0086)
+
+`place_call`'s JSON tool result is a **stable contract** the calling agent branches on
+(`hermes_voip.voip_tools.place_call_handler`, `PlaceCallOutcome`):
+
+| Result shape | When |
+| --- | --- |
+| `{"call_id": …}` | Returned **immediately** on a successful dial. The call runs as its own background conversation — this does NOT wait for the call to finish. |
+| `{"error": …}` (no `failure_outcome` key) | Refused **before** any INVITE was sent: no adapter in scope, a missing `number`/`objective` argument, or the target is not on `HERMES_VOIP_OUTBOUND_ALLOW` (`OutboundCallNotAllowed`). |
+| `{"error": …, "failure_outcome": <value>}` | The INVITE was sent but the call did not connect. `<value>` is a `PlaceCallOutcome` string the agent can branch on. |
+
+`failure_outcome` values (`hermes_voip.voip_tools.PlaceCallOutcome`):
+
+| Value | Meaning | Trigger |
+| --- | --- | --- |
+| `busy` | Callee is busy | SIP `486 Busy Here` / `600 Busy Everywhere` |
+| `no_answer` | Not answered | SIP `408` / `487` timeout, **or** our own `HERMES_VOIP_RING_TIMEOUT_SECS` CANCEL (ADR-0069, §Aborting above) — a self-inflicted ring timeout is reported the same as a peer no-answer |
+| `declined` | Callee explicitly rejected | SIP `603 Decline` |
+| `failed` | Any other final non-2xx response, or a transport/media-init error | e.g. unclassified `4xx`/`5xx`/`6xx`, or the RTP transport failed to open (`RuntimeError`) |
+
+The gateway-controlled SIP reason phrase and any transport error message are **never** echoed
+into the tool result or the agent-facing error string — only the typed `failure_outcome` value
+and a generic message — so a registrar/gateway host, extension, or other PII embedded in a
+reason phrase cannot reach the model or a downstream log the agent can read (rule 34). A
+transport/media-init failure is still logged to the **operator's own** logs, but only the
+exception's type name, never its message (`voip_tools.py` `place_call_handler`).
+
 ## Security model (why the allowlist is the gate)
 
 - `place_call` is **`ToolRisk.IRREVERSIBLE`** and clamped by the `pre_tool_call` gate to an

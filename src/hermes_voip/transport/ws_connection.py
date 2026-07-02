@@ -461,6 +461,14 @@ class WssSipTransport:
         malformed frame must not be a DoS against unrelated calls — surfaced, not
         swallowed (rule 37). Whitespace-only keepalive frames never reach here (the
         read loop handles them before dispatch).
+
+        Routing (:meth:`_dispatch_response` / :meth:`_dispatch_request` and the
+        handlers they await) runs OUTSIDE that parse-only ``try``; a scoped
+        ``except Exception`` fail-safe backstop (ADR-0098, amending ADR-0081)
+        contains any exception a handler raises to this one frame, so it cannot
+        end the reader and tear down the OTHER calls + registration on the shared
+        connection. ``asyncio.CancelledError`` is a ``BaseException``, not an
+        ``Exception``, and still propagates (rule 37).
         """
         is_response = raw.startswith(_RESPONSE_PREFIX)
         try:
@@ -476,10 +484,34 @@ class WssSipTransport:
                 len(raw),
             )
             return
-        if isinstance(message, SipResponse):
-            await self._dispatch_response(message)
-        else:
-            await self._dispatch_request(message)
+        # ADR-0098 (amends ADR-0081) reader dispatch-boundary fail-safe backstop.
+        # The per-site ADR-0081 guards — the parse-only ``except ValueError``
+        # above, plus build_response, the _txn_key/_build_ack auto-ACK, the
+        # registration/call CSeq int() guards, the re-INVITE SDP parse, … — each
+        # catch the ONE ValueError their site was known to raise, and REMAIN as
+        # first-line defense-in-depth. This is the last line for the SAME failure
+        # class the per-site campaign keeps finding new siblings of (including the
+        # latent over-long int() residual at every isascii()+isdecimal() site):
+        # ANY exception a handler raises here is contained to this one frame, so
+        # it can never end the reader (_on_reader_done -> on_connection_lost) and
+        # DoS the other calls + registration on the shared connection. It is scoped
+        # to the dispatch boundary, NOT a _read_loop catch-all (which ADR-0081
+        # rejected, correctly), and catches Exception, NOT BaseException, so
+        # asyncio.CancelledError / SystemExit / KeyboardInterrupt STILL propagate
+        # (rule 37 — the precise concern ADR-0081 raised about a broad catch). The
+        # loud WARNING keeps a masked logic bug surfaced, so this is fail-soft, not
+        # silent suppression (rule 20 / rule 37).
+        try:
+            if isinstance(message, SipResponse):
+                await self._dispatch_response(message)
+            else:
+                await self._dispatch_request(message)
+        except Exception as exc:  # noqa: BLE001 — ADR-0098 reader fail-safe backstop
+            _log.warning(
+                "a SIP frame handler raised (%s) — dropping the one frame,"
+                " connection kept (ADR-0098 reader fail-safe backstop)",
+                type(exc).__name__,
+            )
 
     async def _dispatch_response(self, response: SipResponse) -> None:
         await self._auto_ack_non_2xx(response)

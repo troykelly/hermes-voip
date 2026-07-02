@@ -102,31 +102,52 @@ def test_dtmf_press_carries_digit() -> None:
 
 
 def test_dtmf_no_press_variants_exist() -> None:
-    """DtmfNoPress has the three distinguishable no-press cases (ADR-0077).
+    """DtmfNoPress has five distinguishable no-press cases.
 
-    Callers who previously tested 'result is None' must now pick the right variant:
-      STILL_PRESSING  — end bit not set; tone still in progress
-      DUPLICATE_END   — end bit set but this timestamp was already recorded
-      NON_DIGIT_EVENT — end bit set, new timestamp, but the event is not a keypad digit
+    The original three (bk366, ADR-0077) were STILL_PRESSING, DUPLICATE_END,
+    and NON_DIGIT_EVENT; AWAITING_CORROBORATION and CONFLICTING_EVENT were
+    added later by the corroboration gate (ADR-0096). Callers who previously
+    tested 'result is None' must now pick the right variant:
+      STILL_PRESSING         — end bit not set; tone still in progress
+      AWAITING_CORROBORATION — end bit set, but this is the FIRST end packet
+                               ever seen for this timestamp — not yet trusted
+                               (the digit-substitution fix: a lone packet is
+                               exactly what a forged one racing the genuine
+                               one looks like)
+      DUPLICATE_END          — end bit set but this timestamp's digit was
+                               already emitted with the SAME event code
+                               (ordinary RFC 4733 redundancy)
+      CONFLICTING_EVENT      — end bit set but this timestamp already has a
+                               DIFFERENT event code recorded for it (a
+                               forged/mismatching packet racing the genuine
+                               one — never a press)
+      NON_DIGIT_EVENT        — end bit set, corroborated, but the event is
+                               not a keypad digit
     """
     assert DtmfNoPress.STILL_PRESSING is DtmfNoPress.STILL_PRESSING
+    assert DtmfNoPress.AWAITING_CORROBORATION is DtmfNoPress.AWAITING_CORROBORATION
     assert DtmfNoPress.DUPLICATE_END is DtmfNoPress.DUPLICATE_END
+    assert DtmfNoPress.CONFLICTING_EVENT is DtmfNoPress.CONFLICTING_EVENT
     assert DtmfNoPress.NON_DIGIT_EVENT is DtmfNoPress.NON_DIGIT_EVENT
-    # All three must be distinct
+    # All five must be distinct
     variants = {
         DtmfNoPress.STILL_PRESSING,
+        DtmfNoPress.AWAITING_CORROBORATION,
         DtmfNoPress.DUPLICATE_END,
+        DtmfNoPress.CONFLICTING_EVENT,
         DtmfNoPress.NON_DIGIT_EVENT,
     }
-    assert len(variants) == 3
+    assert len(variants) == 5
 
 
 def test_receiver_emits_press_once_and_suppresses_duplicates() -> None:
-    """feed() returns DtmfPress on first end packet and DtmfNoPress for others.
+    """feed() returns DtmfPress on the SECOND (corroborating) end packet.
 
-    Replaces test_receiver_emits_digit_once_per_press with the new API (bk366).
-    The two start/update packets yield STILL_PRESSING; the first end packet yields
-    DtmfPress('3'); the two redundant end packets yield DUPLICATE_END.
+    Replaces test_receiver_emits_digit_once_per_press with the new API (bk366,
+    ADR-0077). The two start/update packets yield STILL_PRESSING; the first of
+    the three RFC 4733 redundant end packets yields AWAITING_CORROBORATION (not
+    yet trusted — the corroboration gate, ADR-0096); the second, agreeing, end
+    packet yields DtmfPress('3'); the third yields DUPLICATE_END.
     """
     rx = DtmfReceiver()
     # two start/update packets — not end, must be STILL_PRESSING
@@ -138,16 +159,17 @@ def test_receiver_emits_press_once_and_suppresses_duplicates() -> None:
         DtmfEvent(event=3, end=False, volume=10, duration=320), timestamp=1000
     )
     assert result is DtmfNoPress.STILL_PRESSING
-    # first end packet — new timestamp, keypad digit → DtmfPress
+    # first end packet — new timestamp, not yet corroborated
+    result = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert result is DtmfNoPress.AWAITING_CORROBORATION
+    # second (corroborating) end packet, agreeing — NOW trusted as a press
     result = rx.feed(
         DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
     )
     assert result == DtmfPress(digit="3")
-    # redundant end packets — same timestamp already seen → DUPLICATE_END
-    result = rx.feed(
-        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
-    )
-    assert result is DtmfNoPress.DUPLICATE_END
+    # third (further redundant) end packet — already emitted → DUPLICATE_END
     result = rx.feed(
         DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
     )
@@ -157,26 +179,41 @@ def test_receiver_emits_press_once_and_suppresses_duplicates() -> None:
 def test_receiver_distinguishes_repeated_digit_by_timestamp() -> None:
     """Two presses of the same digit with different timestamps each yield DtmfPress.
 
-    New timestamp = new press, regardless of the digit character (bk366).
+    New timestamp = new press, regardless of the digit character (bk366). Each
+    press needs its own corroborating second end packet (ADR-0096).
     """
     rx = DtmfReceiver()
+    assert (
+        rx.feed(DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
     assert rx.feed(
         DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=1000
     ) == DtmfPress(digit="7")
     # same digit pressed again -> new RTP timestamp -> a distinct DtmfPress
+    assert (
+        rx.feed(DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=2000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
     assert rx.feed(
         DtmfEvent(event=7, end=True, volume=10, duration=480), timestamp=2000
     ) == DtmfPress(digit="7")
 
 
 def test_receiver_non_digit_event_yields_non_digit_variant() -> None:
-    """A flash event (event=16) on a new end packet yields NON_DIGIT_EVENT (bk366).
+    """A flash event (event=16), once corroborated, yields NON_DIGIT_EVENT (bk366).
 
     Previously both a duplicate end AND a non-digit event were indistinguishable None.
-    Now NON_DIGIT_EVENT lets callers handle them explicitly.
+    Now NON_DIGIT_EVENT lets callers handle them explicitly. The first end packet at a
+    new timestamp is never trusted outright (ADR-0096), so a second, agreeing packet
+    is required before the outcome (digit or non-digit) is decided.
     """
     rx = DtmfReceiver()
     # event=16 is flash — valid telephone-event, but NOT a keypad digit
+    result = rx.feed(
+        DtmfEvent(event=16, end=True, volume=10, duration=480), timestamp=5000
+    )
+    assert result is DtmfNoPress.AWAITING_CORROBORATION
     result = rx.feed(
         DtmfEvent(event=16, end=True, volume=10, duration=480), timestamp=5000
     )
@@ -187,13 +224,21 @@ def test_receiver_dedups_reordered_end_packets() -> None:
     """Late duplicate end packet after the window is suppressed as DUPLICATE_END.
 
     Tests the old test_receiver_dedups_reordered_end_packets semantics with the
-    new API: a re-ordered end packet for an already-recorded timestamp is
-    DUPLICATE_END, not a new DtmfPress (bk366).
+    new API: a re-ordered end packet for an already-recorded (and already
+    corroborated) timestamp is DUPLICATE_END, not a new DtmfPress (bk366).
     """
     rx = DtmfReceiver()
+    assert (
+        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
     assert rx.feed(
         DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
     ) == DtmfPress(digit="3")
+    assert (
+        rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=2000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
     assert rx.feed(
         DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=2000
     ) == DtmfPress(digit="3")
@@ -202,6 +247,166 @@ def test_receiver_dedups_reordered_end_packets() -> None:
         rx.feed(DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000)
         is DtmfNoPress.DUPLICATE_END
     )
+
+
+# ---------------------------------------------------------------------------
+# Security: conflicting-event (digit-substitution) rejection
+#
+# DTMF is the ADR-0009 spoof-resistant confirmation channel (ADR-0010): a
+# forged or otherwise mismatching telephone-event packet arriving at the SAME
+# RTP timestamp as a genuine key-press must never be able to substitute a
+# different digit for the one the real press produced, and the anomaly must
+# be distinguishable from ordinary RFC 4733 redundancy (agreeing duplicate end
+# packets), which must keep collapsing to a single press exactly as before.
+#
+# THE property is about the DANGEROUS ordering (forged arrives FIRST, before
+# the genuine packet) -- not the safe ordering (genuine first, forged second).
+# A same-timestamp conflict can only ever be DETECTED on the packet that
+# disagrees with whatever was seen already, so a design that trusts the very
+# FIRST end packet it ever sees for a timestamp (unconditionally, before any
+# chance of a disagreeing packet arriving) cannot close this gap no matter how
+# the SECOND packet is classified. The test below is the one that actually
+# proves the property; it fails against a receiver that trusts on first sight.
+# ---------------------------------------------------------------------------
+
+
+def test_receiver_never_accepts_forged_digit_that_arrives_first() -> None:
+    """A forged end-event racing ahead of the genuine one must never win.
+
+    This is THE security property, and this is the dangerous ordering the
+    substitution vulnerability actually
+    depends on. Trusting whichever end packet arrives FIRST for a timestamp
+    (unconditionally) leaves this ordering wide open even if a later,
+    disagreeing packet at the same timestamp is correctly labelled a
+    conflict: relabelling the second, already-too-late packet does nothing to
+    stop the first (forged) one from having already been accepted as the
+    digit the system acts on. Proving this property requires the dangerous
+    order specifically -- forged, then genuine -- not the safe order (genuine
+    then forged).
+    """
+    rx = DtmfReceiver()
+    # The attacker's forged end(9) wins the race and arrives FIRST.
+    forged_first = rx.feed(
+        DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert not isinstance(forged_first, DtmfPress), (
+        "a single, uncorroborated end packet must never be trusted as a "
+        "press outright -- that is exactly what a forged packet racing the "
+        "genuine one looks like from the receiver's point of view, since "
+        "the receiver cannot yet know whether a disagreeing packet is about "
+        "to arrive at the same timestamp"
+    )
+    # The genuine end(3) arrives second, at the same timestamp, disagreeing.
+    genuine_second = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert genuine_second != DtmfPress(digit="9"), (
+        "the forged digit must never be substituted for the real one"
+    )
+    assert not isinstance(genuine_second, DtmfPress), (
+        "once a same-timestamp conflict is seen, NEITHER side can be "
+        "trusted -- there is no way to know which packet was genuine, so "
+        "the receiver must fail safe (no digit emitted) rather than fail "
+        "open (the wrong digit accepted)"
+    )
+
+
+def test_receiver_rejects_conflicting_event_at_same_timestamp() -> None:
+    """A same-timestamp mismatching event must never substitute a digit.
+
+    It must also never be silently conflated with the digit already reported
+    for that timestamp. The genuine digit is corroborated first (ADR-0096,
+    two agreeing end packets) before the conflicting probe arrives.
+    """
+    rx = DtmfReceiver()
+    assert (
+        rx.feed(DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
+    genuine = rx.feed(
+        DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert genuine == DtmfPress(digit="5")
+    # A later packet at the SAME timestamp but a DIFFERENT event code (a
+    # forged telephone-event payload, or two overlapping senders) must never
+    # substitute the digit already reported, and must not be silently
+    # conflated with an ordinary agreeing-event redundant duplicate.
+    forged = rx.feed(
+        DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert not isinstance(forged, DtmfPress), (
+        "a mismatching event at an already-decided timestamp must never "
+        "produce a DtmfPress — that would substitute the wrong digit"
+    )
+    assert forged is not DtmfNoPress.DUPLICATE_END, (
+        "a conflicting event must be distinguishable from an ordinary "
+        "agreeing-event redundant duplicate"
+    )
+    assert forged is DtmfNoPress.CONFLICTING_EVENT
+
+
+def test_receiver_still_dedups_agreeing_duplicate_after_conflict_probe() -> None:
+    """A conflicting probe must not corrupt dedup of the original digit.
+
+    The original digit's own genuine redundant end packets arriving
+    afterwards must still be recognised as ordinary duplicates — because the
+    digit was already safely corroborated by two agreeing packets BEFORE the
+    conflicting probe ever arrived (ADR-0096); a disagreement that shows up
+    only after emission cannot un-emit the digit, so it does not turn every
+    later agreeing packet into a fresh alarm either.
+    """
+    rx = DtmfReceiver()
+    assert (
+        rx.feed(DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
+    assert rx.feed(
+        DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000
+    ) == DtmfPress(digit="5")
+    assert (
+        rx.feed(DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.CONFLICTING_EVENT
+    )
+    # The genuine digit's own redundant end packet (matching event=5) must
+    # still be recognised as an ordinary duplicate, not another conflict.
+    assert (
+        rx.feed(DtmfEvent(event=5, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.DUPLICATE_END
+    )
+
+
+def test_residual_two_colluding_forged_packets_still_win() -> None:
+    """Honest residual: an attacker winning BOTH of the first two races still wins.
+
+    Corroboration (ADR-0096) raises the bar from a single-packet race to a
+    same-outcome TWO-packet race — it does not eliminate spoofing on an
+    unauthenticated media path. Two colluding forged packets that both arrive
+    before the genuine one, and agree with each other, are indistinguishable
+    from a genuine corroborated pair: the receiver has no cryptographic way
+    to tell them apart without SRTP. This test pins that residual precisely,
+    as a real currently-accepted limitation rather than a hypothetical, so it
+    is never silently forgotten or overclaimed away (rule 27).
+    """
+    rx = DtmfReceiver()
+    # Two colluding forged end(9) packets win the race, both arriving before
+    # the genuine end(3).
+    assert (
+        rx.feed(DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000)
+        is DtmfNoPress.AWAITING_CORROBORATION
+    )
+    forged_pair_result = rx.feed(
+        DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000
+    )
+    # The forged pair corroborates each other — indistinguishable, without
+    # SRTP, from a genuine agreeing pair — so the (wrong) digit IS accepted.
+    # This is the documented residual, not a regression.
+    assert forged_pair_result == DtmfPress(digit="9")
+    # The genuine end(3), arriving too late, can no longer do anything: the
+    # timestamp is already decided, and is now poisoned (flagged) too.
+    genuine_too_late = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert genuine_too_late is DtmfNoPress.CONFLICTING_EVENT
 
 
 # --- hardening per cross-vendor review ---
@@ -307,13 +512,19 @@ def test_encode_end_false_volume_max() -> None:
 def test_receiver_bounded_window_evicts_oldest_timestamp() -> None:
     """With history=2 the window holds exactly 2 timestamps; the third evicts the first.
 
-    Sequence:
-      1. Press ts=1000 -> DtmfPress('3').  _window={1000: None}.
-      2. Press ts=2000 -> DtmfPress('3').  _window={1000: None, 2000: None}.
-      3. Press ts=3000 -> DtmfPress('3').  Window is full; ts=1000 is evicted before
-         ts=3000 is added.  _window={2000: None, 3000: None}.
-      4. Late duplicate of ts=1000 arrives.  Because 1000 was evicted from _window,
-         the receiver treats it as a NEW press and returns DtmfPress('3') again.
+    Sequence (each press needs 2 agreeing end packets to corroborate, ADR-0096):
+      1. Press ts=1000 -> AWAITING_CORROBORATION, then DtmfPress('3').
+         _window={1000}.
+      2. Press ts=2000 -> AWAITING_CORROBORATION, then DtmfPress('3').
+         _window={1000, 2000}.
+      3. Press ts=3000's FIRST packet: window is full, so ts=1000 is evicted
+         before ts=3000 is inserted (AWAITING_CORROBORATION); the second,
+         agreeing packet emits DtmfPress('3').  _window={2000, 3000}.
+      4. Late duplicate of ts=1000 arrives.  Because 1000 was evicted from
+         _window, its first packet is a brand new, uncorroborated timestamp
+         again (AWAITING_CORROBORATION) — which itself evicts ts=2000 (now the
+         oldest) to make room — and its second, agreeing packet re-emits
+         DtmfPress('3').
 
     This pins the eviction-on-overflow behaviour: a mutant that never discards
     from the window would return DUPLICATE_END at step 4 instead of re-emitting.
@@ -323,24 +534,36 @@ def test_receiver_bounded_window_evicts_oldest_timestamp() -> None:
     rx = DtmfReceiver(history=2)
     ev = DtmfEvent(event=3, end=True, volume=10, duration=480)
 
-    # press 1: ts=1000
+    # press 1: ts=1000 (2 agreeing packets to corroborate)
+    assert rx.feed(ev, timestamp=1000) is DtmfNoPress.AWAITING_CORROBORATION
     assert rx.feed(ev, timestamp=1000) == DtmfPress(digit="3")
     # press 2: ts=2000 — window now full
+    assert rx.feed(ev, timestamp=2000) is DtmfNoPress.AWAITING_CORROBORATION
     assert rx.feed(ev, timestamp=2000) == DtmfPress(digit="3")
     # press 3: ts=3000 — evicts ts=1000 from _window
+    assert rx.feed(ev, timestamp=3000) is DtmfNoPress.AWAITING_CORROBORATION
     assert rx.feed(ev, timestamp=3000) == DtmfPress(digit="3")
-    # late duplicate of ts=1000: evicted, so re-emits as a new press
+    # late duplicate of ts=1000: evicted, so its first packet is a fresh,
+    # uncorroborated timestamp again (evicting ts=2000 in turn); its second,
+    # agreeing packet re-emits as a new press
+    assert rx.feed(ev, timestamp=1000) is DtmfNoPress.AWAITING_CORROBORATION, (
+        "evicted timestamp must be treated as brand new, not resume mid-window state"
+    )
     assert rx.feed(ev, timestamp=1000) == DtmfPress(digit="3"), (
-        "evicted timestamp must re-emit as DtmfPress; _window must not retain it "
-        "past the bounded window"
+        "evicted timestamp must re-emit as DtmfPress once re-corroborated; "
+        "_window must not retain it past the bounded window"
     )
 
 
 def test_receiver_bounded_window_retains_recent_timestamps() -> None:
     """Timestamps still within the window yield DUPLICATE_END (dedup still works).
 
-    With history=2 and three presses (ts 1000, 2000, 3000), ts=2000 and ts=3000
-    remain in the window.  A duplicate of either must return DUPLICATE_END.
+    With history=2 and three presses (ts 1000, 2000, 3000, each corroborated
+    with 2 agreeing end packets per ADR-0096), ts=2000 and ts=3000 remain in
+    the window (ts=1000 is evicted). A THIRD packet for either must return
+    DUPLICATE_END — not AWAITING_CORROBORATION (which would mean the window
+    forgot it had already been corroborated) and not a fresh DtmfPress (which
+    would mean a double emission).
 
     Kills a mutant that evicts too aggressively (e.g. evicts all entries instead
     of just the oldest).
@@ -348,10 +571,14 @@ def test_receiver_bounded_window_retains_recent_timestamps() -> None:
     rx = DtmfReceiver(history=2)
     ev = DtmfEvent(event=3, end=True, volume=10, duration=480)
     rx.feed(ev, timestamp=1000)
+    rx.feed(ev, timestamp=1000)
+    rx.feed(ev, timestamp=2000)
     rx.feed(ev, timestamp=2000)
     rx.feed(ev, timestamp=3000)
+    rx.feed(ev, timestamp=3000)
 
-    # ts=2000 and ts=3000 are still in the window — must be DUPLICATE_END
+    # ts=2000 and ts=3000 are still in the window — a third packet for either
+    # must be DUPLICATE_END
     assert rx.feed(ev, timestamp=2000) is DtmfNoPress.DUPLICATE_END
     assert rx.feed(ev, timestamp=3000) is DtmfNoPress.DUPLICATE_END
 
@@ -440,16 +667,20 @@ def test_dtmf_event_rejects_duration_above_boundary_65536() -> None:
 def test_feed_non_digit_returns_none() -> None:
     """Event code 16 (flash) is not a keypad digit; feed returns NON_DIGIT_EVENT.
 
-    Re-feeding the same timestamp returns DUPLICATE_END (the timestamp is still
-    recorded in the window even for non-digit ends, so the dedup fires correctly).
+    The first end packet is never trusted outright (ADR-0096): it returns
+    AWAITING_CORROBORATION. The second, agreeing packet corroborates it and
+    surfaces NON_DIGIT_EVENT rather than a DtmfPress. A third, further
+    redundant packet is deduped as DUPLICATE_END.
     """
     rx = DtmfReceiver(history=4)
     flash = DtmfEvent(event=16, end=True, volume=10, duration=100)
     result = rx.feed(flash, timestamp=100)
-    assert result is DtmfNoPress.NON_DIGIT_EVENT
-    # Re-feeding the same timestamp must be deduped, not re-surfaced.
+    assert result is DtmfNoPress.AWAITING_CORROBORATION
     result2 = rx.feed(flash, timestamp=100)
-    assert result2 is DtmfNoPress.DUPLICATE_END
+    assert result2 is DtmfNoPress.NON_DIGIT_EVENT
+    # Re-feeding the same timestamp again must be deduped, not re-surfaced.
+    result3 = rx.feed(flash, timestamp=100)
+    assert result3 is DtmfNoPress.DUPLICATE_END
 
 
 def test_start_only_press_never_emits() -> None:
@@ -464,13 +695,32 @@ def test_start_only_press_never_emits() -> None:
         assert rx.feed(pkt, timestamp=200) is DtmfNoPress.STILL_PRESSING
 
 
-def test_lone_end_packet_emits_once() -> None:
-    """A single end-bit packet for '1' at ts 300 emits DtmfPress('1') exactly once.
+def test_lone_end_packet_never_emits_without_corroboration() -> None:
+    """A single, uncorroborated end-bit packet is never trusted as a press.
 
-    Re-feeding the same timestamp returns DUPLICATE_END.
+    This is the core of the digit-substitution fix (ADR-0096): the very
+    first end packet ever seen for a timestamp is indistinguishable from a
+    forged packet racing the genuine one, so it is recorded but withheld
+    (``AWAITING_CORROBORATION``) rather than emitted outright — this is the
+    honestly-documented behaviour change from the previous (vulnerable)
+    trust-on-first-sight receiver.
     """
     rx = DtmfReceiver(history=4)
     end_pkt = DtmfEvent(event=1, end=True, volume=10, duration=160)
+    result = rx.feed(end_pkt, timestamp=300)
+    assert result is DtmfNoPress.AWAITING_CORROBORATION
+    assert not isinstance(result, DtmfPress)
+
+
+def test_corroborated_end_packet_emits_once() -> None:
+    """A second, agreeing end-bit packet for '1' at ts 300 emits DtmfPress('1').
+
+    A further, third redundant end packet at the same timestamp is
+    suppressed as DUPLICATE_END.
+    """
+    rx = DtmfReceiver(history=4)
+    end_pkt = DtmfEvent(event=1, end=True, volume=10, duration=160)
+    rx.feed(end_pkt, timestamp=300)
     result = rx.feed(end_pkt, timestamp=300)
     assert result == DtmfPress(digit="1")
     # Redundant end at same timestamp must be suppressed.

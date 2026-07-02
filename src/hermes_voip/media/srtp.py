@@ -841,7 +841,20 @@ class SrtpSession:
 
         # Reconstruct the RTP packet from the clear header + decrypted payload.
         plain_wire = header + plaintext
-        return RtpPacket.parse(plain_wire)
+        try:
+            return RtpPacket.parse(plain_wire)
+        except ValueError as exc:
+            # The packet AUTHENTICATED, but its decrypted RTP is malformed (e.g.
+            # bad RFC 3550 §5.1 padding). That is still "a malformed packet" per
+            # this method's contract, so surface it as SrtpError — the type the
+            # caller's ``except SrtpError`` drops per-packet ("dropped, not
+            # fatal"). A bare ValueError from RtpPacket.parse would NOT be caught
+            # (SrtpError subclasses ValueError, so ``except SrtpError`` cannot
+            # catch its parent) and would escape the inbound media coroutine,
+            # tearing the whole call down. The message carries no wire content
+            # (rule 34); ``from exc`` keeps the structural cause for debugging.
+            msg = "decrypted SRTP payload is not a valid RTP packet"
+            raise SrtpError(msg) from exc
 
     # ------------------------------------------------------------------
     # Internal receiver state management

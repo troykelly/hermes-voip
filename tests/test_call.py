@@ -1331,9 +1331,12 @@ async def test_established_call_survives_an_oversized_ascii_cseq_response() -> N
     await asyncio.sleep(0)
     reinvite = _last_request(signaling, "INVITE")
 
-    # More ASCII digits than int() will convert (the limit is >= 640 on any host), yet
-    # every character is isascii()+isdecimal() — so only a length bound closes this.
-    oversized = "9" * (sys.get_int_max_str_digits() + 1)
+    # A CSeq number far longer than the 10-digit cap. When Python's integer-string
+    # conversion limit is enabled (default 4300; 0 disables it) this also exceeds that
+    # limit, so pre-fix int() raised here; the length cap drops it either way. Every
+    # character is isascii()+isdecimal(), so only the length bound closes this.
+    limit = sys.get_int_max_str_digits()
+    oversized = "9" * (limit + 1 if limit else 5000)
     await session.on_response(_response_with_cseq(f"{oversized} BYE"))  # must NOT raise
 
     await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))

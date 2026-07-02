@@ -1,7 +1,9 @@
 # ADR-0081: Skip one unparseable SIP message, but still propagate a framing failure
 
 - **Date:** 2026-06-26
-- **Status:** Accepted
+- **Status:** Accepted — amended by ADR-0098 (the parse-only decision below stands; a
+  scoped reader dispatch-boundary fail-safe backstop now also contains a *post-parse*
+  handler exception to the one message, closing the same class as a class)
 - **Deciders:** operator (backlog item bk646) — agent session (transport robustness lane)
 
 ## Context

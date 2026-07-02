@@ -629,6 +629,14 @@ class SipOverTlsTransport:
         precisely so a non-UTF-8 body is recoverable rather than fatal. A
         ``FramingError`` (an unframable stream) cannot reach this method — it is raised
         by the framer in :meth:`_read_loop` and propagates there (rule 37).
+
+        Routing (:meth:`_dispatch_response` / :meth:`_dispatch_request` and the
+        handlers they await) runs OUTSIDE that parse-only ``try``; a scoped
+        ``except Exception`` fail-safe backstop (ADR-0098, amending ADR-0081)
+        contains any exception a handler raises to this one message, so it cannot
+        end the reader and tear down the OTHER calls + registration on the shared
+        connection. ``asyncio.CancelledError`` is a ``BaseException``, not an
+        ``Exception``, and still propagates (rule 37).
         """
         try:
             text = raw.decode("utf-8")
@@ -648,10 +656,35 @@ class SipOverTlsTransport:
                 len(raw),
             )
             return
-        if isinstance(message, SipResponse):
-            await self._dispatch_response(message)
-        else:
-            await self._dispatch_request(message)
+        # ADR-0098 (amends ADR-0081) reader dispatch-boundary fail-safe backstop.
+        # The per-site ADR-0081 guards — the parse-only ``except ValueError``
+        # above, plus build_response, the _txn_key/_build_ack auto-ACK, the
+        # registration/call CSeq int() guards, the re-INVITE SDP parse, … — each
+        # catch the ONE ValueError their site was known to raise, and REMAIN as
+        # first-line defense-in-depth. This is the last line for the SAME failure
+        # class the per-site campaign keeps finding new siblings of (including the
+        # latent over-long int() residual at every isascii()+isdecimal() site):
+        # ANY exception a handler raises here is contained to this one message, so
+        # it can never end the reader (_on_reader_done -> on_connection_lost) and
+        # DoS the other calls + registration on the shared connection. It is scoped
+        # to the dispatch boundary, NOT a _read_loop catch-all (which would also
+        # swallow a FramingError that MUST end the connection — ADR-0081 rejected
+        # that, correctly), and catches Exception, NOT BaseException, so
+        # asyncio.CancelledError / SystemExit / KeyboardInterrupt STILL propagate
+        # (rule 37 — the precise concern ADR-0081 raised about a broad catch). The
+        # loud WARNING keeps a masked logic bug surfaced, so this is fail-soft, not
+        # silent suppression (rule 20 / rule 37).
+        try:
+            if isinstance(message, SipResponse):
+                await self._dispatch_response(message)
+            else:
+                await self._dispatch_request(message)
+        except Exception as exc:  # noqa: BLE001 — ADR-0098 reader fail-safe backstop
+            _log.warning(
+                "a SIP message handler raised (%s) — dropping the one message,"
+                " connection kept (ADR-0098 reader fail-safe backstop)",
+                type(exc).__name__,
+            )
 
     async def _dispatch_response(self, response: SipResponse) -> None:
         # A 2xx racing a CANCEL we sent (RFC 3261 §9.1 glare) is consumed here: the

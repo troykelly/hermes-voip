@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import ssl
 import sys
 from collections.abc import Callable
 
@@ -1914,3 +1915,147 @@ async def test_tls_cancel_200_totag_matches_487_and_is_stable_across_retransmit(
         await manager.aclose()
         await transport.aclose()
         await server.stop()
+
+
+# --------------------------------------------------------------------------
+# ADR-0098 (amends ADR-0081): a SCOPED reader dispatch-boundary fail-safe
+# backstop. The per-site ADR-0081 guards catch only the specific ``ValueError``
+# each site was known to raise; the reader awaits ``_dispatch_response`` /
+# ``_dispatch_request`` OUTSIDE ``_dispatch``'s parse-only ``try``, so ANY OTHER
+# exception a downstream handler raises escapes the reader → ``_on_reader_done``
+# → ``on_connection_lost``, tearing down every call + registration on the shared
+# connection. These tests inject a SYNTHETIC unanticipated handler fault (a
+# non-``ValueError``) — standing in for the next escape the per-site campaign has
+# not yet found — and assert the scoped backstop keeps the connection alive,
+# while still letting ``asyncio.CancelledError`` propagate (it must NOT swallow
+# cancellation — ``except Exception``, not ``except BaseException``).
+# --------------------------------------------------------------------------
+
+
+class _RaisingSink:
+    """A response sink whose ``on_response`` re-raises a caller-chosen exception.
+
+    Used to synthesise an UNANTICIPATED fault at the reader's dispatch boundary
+    (ADR-0098): a ``RuntimeError`` (a non-``ValueError`` the per-site ADR-0081
+    guards do not catch) or an ``asyncio.CancelledError`` (which the backstop must
+    let propagate). Routing to it is by Call-ID via :meth:`add_call`.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def on_response(self, response: SipResponse) -> None:
+        raise self._exc
+
+
+def _poison_response(call_id: str) -> str:
+    """A well-formed non-2xx response routed to ``call_id`` (CSeq method ``BYE``).
+
+    It parses cleanly and — because its CSeq method is not ``INVITE`` — bypasses
+    the glare / auto-ACK / transaction path (``_handle_glare_2xx`` and
+    ``_auto_ack_non_2xx`` both return early), so it is delivered straight to the
+    registered response sink. A sink that raises then exercises the reader's
+    dispatch boundary directly.
+    """
+    return (
+        "SIP/2.0 480 Temporarily Unavailable\r\n"
+        "Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKpoison;rport\r\n"
+        "From: <sip:2000@pbx.example.test>;tag=remote\r\n"
+        "To: <sip:1000@pbx.example.test>;tag=local\r\n"
+        f"Call-ID: {call_id}\r\n"
+        "CSeq: 1 BYE\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_active_call_survives_a_handler_that_raises_a_non_valueerror(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # ADR-0098: a response routed to a call whose sink raises a NON-ValueError
+    # (a synthetic RuntimeError — the shape of an unanticipated handler bug the
+    # per-site ADR-0081 guards do not catch) is awaited by the reader OUTSIDE
+    # _dispatch's parse-only try. Unguarded it ends the reader and fires
+    # on_connection_lost — a one-message DoS on every OTHER call. The scoped
+    # dispatch-boundary backstop must catch it, log a loud non-PII WARNING, drop
+    # the one message, and keep the connection + every unrelated call alive.
+    active_call_id = new_call_id()
+    active_branch = new_branch()
+    poison_call_id = new_call_id()
+    healthy = _RecordingSink()
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.connection"):
+        await transport.connect()
+        transport.add_call(active_call_id, healthy)
+        transport.add_call(poison_call_id, _RaisingSink(RuntimeError("synthetic")))
+        try:
+            active_invite = _outbound_invite(active_branch, call_id=active_call_id)
+            await transport.send(active_invite)
+            await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+            # The poison response drives the sink's RuntimeError inside the reader.
+            await server.push(_poison_response(poison_call_id))
+            # RED before the backstop: the reader crashes and fires on_connection_lost.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+            assert lost == [], "a handler exception must not fire on_connection_lost"
+            # The reader survived: the UNRELATED active call's own 200 OK is still
+            # routed to its sink.
+            await server.push(_final_2xx_with_contact(SipRequest.parse(active_invite)))
+            await _until(
+                lambda: any(r.status_code == _OK_STATUS for r in healthy.responses)
+            )
+        finally:
+            await transport.aclose()
+            await server.stop()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("RuntimeError" in r.getMessage() for r in warnings), (
+        "the backstop must log a WARNING naming the exception type (RuntimeError)"
+    )
+    # rule 34: the WARNING must carry the type name ONLY — never wire content. The
+    # poison message's Call-ID is routing detail/PII and must not appear in any log.
+    for record in warnings:
+        assert poison_call_id not in record.getMessage(), (
+            f"the backstop WARNING must not leak wire content: {record.getMessage()!r}"
+        )
+
+
+async def test_a_handler_cancellederror_propagates_out_of_dispatch() -> None:
+    # ADR-0098: the backstop catches ``Exception`` — NOT ``BaseException`` —
+    # precisely so ``asyncio.CancelledError`` (cooperative cancellation, a
+    # BaseException in 3.13) still propagates out of ``_dispatch`` and ends the
+    # reader task (``_read_loop`` awaits ``_dispatch`` per message; rule 37). If the
+    # backstop ever widened to ``except BaseException`` it would swallow
+    # cancellation and the reader could not be stopped; this locks the boundary.
+    # Driven directly at ``_dispatch`` — the exact site the backstop wraps — so no
+    # socket/timing is involved. Passes both before AND after the backstop (it is a
+    # guard against over-catching), and would FAIL if the catch were BaseException.
+    call_id = new_call_id()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=0,
+        ssl_context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    transport.add_call(call_id, _RaisingSink(asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await transport._dispatch(_poison_response(call_id).encode())

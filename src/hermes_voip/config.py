@@ -217,16 +217,19 @@ _TTS_REQUIRED_KEY = {
     "aura2": _DEEPGRAM_API_KEY,
 }
 
-# VAD / endpointing / duplex (ADR-0008). Full-duplex barge-in is a deferred
-# Phase-2 design; the enum still accepts the token so config can opt in once the
-# capability lands, but the default is the shipped Phase-1 half-duplex path.
+# VAD / endpointing / duplex (ADR-0008). Full-duplex barge-in ("full") is a
+# deferred Phase-2 design the media engine does not implement -- it never reads
+# duplex_mode at runtime and always behaves half-duplex -- so "full" is REJECTED
+# at config load (rule 37: fail loud rather than silently ship an inert knob);
+# only the shipped Phase-1 "half" mode is accepted. See _parse_duplex_mode.
 _VAD_THRESHOLD_KEY = "HERMES_VOIP_VAD_THRESHOLD"
 _ENDPOINT_SILENCE_MS_KEY = "HERMES_VOIP_ENDPOINT_SILENCE_MS"
 _DUPLEX_MODE_KEY = "HERMES_VOIP_DUPLEX_MODE"
 _DEFAULT_VAD_THRESHOLD = 0.5
 _DEFAULT_ENDPOINT_SILENCE_MS = 500
 _DEFAULT_DUPLEX_MODE = "half"
-_DUPLEX_MODES = frozenset({"half", "full"})
+_DUPLEX_MODES = frozenset({"half"})
+_INERT_DUPLEX_MODE = "full"
 _MIN_VAD_THRESHOLD = 0.0
 _MAX_VAD_THRESHOLD = 1.0
 
@@ -882,7 +885,10 @@ class MediaConfig:
         deepgram_api_key: Deepgram credential (by reference; never logged).
         vad_threshold: Voice-activity probability cut-off in ``[0.0, 1.0]``.
         endpoint_silence_ms: Trailing silence (ms) that ends a caller turn.
-        duplex_mode: ``half`` (shipped) or ``full`` (deferred Phase-2 barge-in).
+        duplex_mode: ``half`` (shipped) -- the only accepted value. ``full``
+            (Phase-2 barge-in) is rejected at config load: the media engine
+            never reads this field at runtime, so accepting it would leave an
+            operator believing full-duplex is active when it is inert.
         greeting: Opening line spoken the instant an inbound call is answered
             (``DEFAULT_GREETING`` when unset; ``""`` disables it). Speaking on
             answer sends RTP first — the caller hears it immediately and a
@@ -1617,9 +1623,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         endpoint_silence_ms=_parse_positive_int(
             env, _ENDPOINT_SILENCE_MS_KEY, _DEFAULT_ENDPOINT_SILENCE_MS
         ),
-        duplex_mode=_parse_enum(
-            env, _DUPLEX_MODE_KEY, _DUPLEX_MODES, _DEFAULT_DUPLEX_MODE
-        ),
+        duplex_mode=_parse_duplex_mode(env),
         greeting=_parse_greeting(env),
         rtp_symmetric=_parse_bool(env, _RTP_SYMMETRIC_KEY, _DEFAULT_RTP_SYMMETRIC),
         rtcp_enabled=_parse_bool(env, _RTCP_ENABLED_KEY, _DEFAULT_RTCP_ENABLED),
@@ -1959,6 +1963,27 @@ def _parse_enum(
         msg = f"{key} must be one of {{{choices}}}, got {token!r}"
         raise ConfigError(msg)
     return token
+
+
+def _parse_duplex_mode(env: Mapping[str, str]) -> str:
+    """Parse ``HERMES_VOIP_DUPLEX_MODE``; only ``half`` (shipped) is accepted.
+
+    ``full`` (Phase-2 barge-in, ADR-0008) is UNIMPLEMENTED: the media engine
+    never reads ``duplex_mode`` at runtime and always behaves half-duplex, so
+    accepting ``full`` here would let an operator believe full-duplex barge-in
+    is active when it is silently inert (rule 37 -- fail loud, never silently
+    no-op). This is checked ahead of the generic enum parse so the operator
+    gets an explicit "not implemented" message instead of a bare "must be one
+    of" list.
+    """
+    token = _value_lower(env, _DUPLEX_MODE_KEY) or _DEFAULT_DUPLEX_MODE
+    if token == _INERT_DUPLEX_MODE:
+        msg = (
+            f"{_DUPLEX_MODE_KEY}=full is not implemented yet (full-duplex "
+            "barge-in is deferred, ADR-0008 Phase 2); use half"
+        )
+        raise ConfigError(msg)
+    return _parse_enum(env, _DUPLEX_MODE_KEY, _DUPLEX_MODES, _DEFAULT_DUPLEX_MODE)
 
 
 def _parse_deny_mode(env: Mapping[str, str]) -> DenyMode:

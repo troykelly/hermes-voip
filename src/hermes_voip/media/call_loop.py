@@ -981,7 +981,12 @@ class CallLoop:
             return
         exc = task.exception()
         if exc is not None:
-            _log.warning("DTMF group delivery failed (call continues): %r", exc)
+            # Log a CONSTANT message with NO exception-derived content: ``deliver_turn``
+            # is an opaque callback, so even ``type(exc).__name__`` is data-derived and
+            # could embed the secret digits (a dynamically-named exception class). The
+            # failure is still surfaced (rule 37); no digit content reaches a log
+            # (rule 34).
+            _log.warning("DTMF group delivery failed (call continues)")
 
     async def _dtmf_flush_after_gap(self) -> None:
         """Wait the inter-digit gap, then dispatch the buffered group as a menu turn.
@@ -1020,7 +1025,10 @@ class CallLoop:
         # window, equivalent to a finalised speech turn (ADR-0057).
         self._caller_active_in_window = True
         text = f"{_DTMF_TURN_PREFIX}{digits}"
-        _log.info("dtmf: delivering menu group %r", text)
+        # Log the digit COUNT, never the content: inbound DTMF is frequently secret
+        # (IVR PINs, card/SSN entry), so it is redacted exactly like the send path
+        # (rule 34). The digits still reach the agent via ``deliver_turn`` below.
+        _log.info("dtmf: delivering menu group (%d digit(s))", len(digits))
         await self._deliver_turn(text)
 
     def _feed_call_progress(

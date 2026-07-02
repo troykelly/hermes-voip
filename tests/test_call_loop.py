@@ -4618,6 +4618,166 @@ async def test_no_input_resets_on_raw_async_dtmf_keypress_before_group_delivery(
     await run_task
 
 
+# ---------------------------------------------------------------------------
+# Inbound DTMF digits are secret (IVR PINs / cards / SSNs): NEVER logged raw
+# (rule 34), mirroring the send path which logs only ``len(digits)``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dtmf_menu_group_delivery_does_not_log_raw_digits(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Delivering a DTMF menu group logs the COUNT, never the raw digits (rule 34).
+
+    Inbound DTMF keypad input is frequently SECRET — an IVR PIN, a card or SSN entry —
+    so it is treated exactly like the SEND path, which logs only ``len(digits)`` and
+    never echoes the content. The INFO delivery log must not emit the raw digits. The
+    digits are STILL delivered to the agent (the functional path is unchanged); only
+    the LOG is redacted.
+    """
+    secret = "1234567890"
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    loop = _build_loop(
+        _FakeTransport([]), _FakeASR([]), _FakeTTS([]), _FakeGuard([]), capture
+    )
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.call_loop"):
+        for digit in secret:
+            await loop.feed_dtmf_async(digit)
+        await loop.feed_dtmf_async("#")  # terminator delivers the group synchronously
+
+    # The digits are STILL delivered to the agent as a tagged turn (rule 19: the
+    # redaction is log-only and must not change the delivery behaviour).
+    assert delivered == [f"{_DTMF_TURN_PREFIX}{secret}"], (
+        f"the DTMF group was not delivered to the agent; got {delivered!r}"
+    )
+
+    # The delivery IS still logged (redacted, not silenced) ...
+    assert [r for r in caplog.records if "menu group" in r.getMessage()], (
+        "the DTMF delivery INFO log disappeared entirely"
+    )
+
+    # ... but NO emitted log record may carry the raw digit string, in either its
+    # rendered message or its raw args (rule 34: secrets never touch logs).
+    for record in caplog.records:
+        rendered = record.getMessage()
+        assert secret not in rendered, (
+            f"raw DTMF digits leaked in a log message: {rendered!r}"
+        )
+        assert secret not in str(record.args), (
+            f"raw DTMF digits leaked in a log record's args: {record.args!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_dtmf_group_delivery_failure_warning_does_not_log_raw_digits(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed DTMF group delivery logs the failure WITHOUT the raw digits (rule 34).
+
+    ``deliver_turn`` is an opaque async callback — in production
+    :meth:`VoipAdapter._deliver_turn` routes the tagged turn text (which embeds the raw
+    digits) into the Hermes agent runtime (``handle_message``), which can raise an
+    exception whose repr echoes the offending turn text. The done-callback that logs a
+    delivery failure must therefore NOT ``%r`` the exception, or the digits leak. The
+    failure is still logged (rule 37: errors are never swallowed) — only the digit-
+    bearing payload is redacted.
+    """
+    secret = "1234567890"
+    tag = f"{_DTMF_TURN_PREFIX}{secret}"
+
+    async def boom(text: str) -> None:
+        # Model the realistic downstream failure: the delivery backend rejects the turn
+        # and echoes the offending text (which embeds the raw digits) in its error.
+        msg = f"delivery backend rejected turn: {text}"
+        raise RuntimeError(msg)
+
+    loop = _build_loop(
+        _FakeTransport([]), _FakeASR([]), _FakeTTS([]), _FakeGuard([]), boom
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.media.call_loop"):
+        for digit in secret:
+            loop.feed_dtmf(digit)  # sync engine entry: terminator dispatches a task
+        loop.feed_dtmf("#")
+        # Let the uncancellable delivery task run and its done-callback (which logs the
+        # failure) fire; the cancelled inter-digit timer settles on the same ticks.
+        for _ in range(50):
+            await asyncio.sleep(0)
+    assert not loop._dtmf_delivery_tasks, "the DTMF delivery task never completed"
+
+    # The failure IS logged (rule 37: errors propagate, never swallowed) ...
+    assert [
+        r for r in caplog.records if "DTMF group delivery failed" in r.getMessage()
+    ], "the DTMF delivery-failure warning was not emitted"
+
+    # ... but neither the raw digits nor the digit-bearing turn text reach a log.
+    for record in caplog.records:
+        rendered = record.getMessage()
+        assert secret not in rendered, (
+            f"raw DTMF digits leaked in a failure log message: {rendered!r}"
+        )
+        assert tag not in rendered, (
+            f"the digit-bearing turn text leaked in a failure log: {rendered!r}"
+        )
+        assert secret not in str(record.args), (
+            f"raw DTMF digits leaked in a failure log record's args: {record.args!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_dtmf_delivery_failure_does_not_log_digit_bearing_exception_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The delivery-failure log carries NO exception-derived content (rule 34).
+
+    ``deliver_turn`` is opaque, so even the exception TYPE is a data-derived field read
+    across that boundary: a downstream callback could raise a dynamically-named
+    exception class whose ``__name__`` embeds the raw digit text, which ``type(exc)``
+    (or its repr) would then leak. The failure log therefore emits a CONSTANT message
+    with no exception-derived field — the failure is still surfaced (rule 37), yet no
+    digit content can reach any log record (message or args).
+    """
+    secret = "1234567890"
+
+    async def boom(text: str) -> None:
+        _ = text  # the leak vector under test is the class NAME, not the turn text
+        # Worst case for an opaque callback: a dynamically-named exception class whose
+        # __name__ embeds the raw digits, so type(exc).__name__ would carry the secret.
+        exc_type = type(f"Rejected{secret}Error", (RuntimeError,), {})
+        raise exc_type("delivery rejected")
+
+    loop = _build_loop(
+        _FakeTransport([]), _FakeASR([]), _FakeTTS([]), _FakeGuard([]), boom
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.media.call_loop"):
+        for digit in secret:
+            loop.feed_dtmf(digit)
+        loop.feed_dtmf("#")
+        for _ in range(50):
+            await asyncio.sleep(0)
+    assert not loop._dtmf_delivery_tasks, "the DTMF delivery task never completed"
+
+    # The failure IS logged (rule 37: errors propagate, never swallowed) ...
+    assert [
+        r for r in caplog.records if "DTMF group delivery failed" in r.getMessage()
+    ], "the DTMF delivery-failure warning was not emitted"
+
+    # ... but the digit-bearing exception CLASS NAME reaches no log record.
+    for record in caplog.records:
+        assert secret not in record.getMessage(), (
+            f"digit-bearing exception name leaked in a log message: "
+            f"{record.getMessage()!r}"
+        )
+        assert secret not in str(record.args), (
+            f"digit-bearing exception name leaked in a log record's args: "
+            f"{record.args!r}"
+        )
+
+
 @pytest.mark.asyncio
 async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     """After N unanswered reprompts the watchdog ends the call gracefully (run returns).

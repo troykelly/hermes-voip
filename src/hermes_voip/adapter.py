@@ -71,6 +71,7 @@ from gateway.session import SessionSource
 from hermes_voip.call import CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
+    _addr_spec,
     extract_call_context,
     render_call_context_block,
 )
@@ -7417,24 +7418,31 @@ _UNKNOWN_CALLER = "unknown"
 def _caller_number(from_header: str) -> str | None:
     """Extract the ``sip:`` user-part of the From AOR, or ``None`` when unresolved.
 
-    The user-part is the (forgeable, presentation-only) caller identity. A real
-    SIP/E.164 user-part carries no whitespace (RFC 3261 §19.1.1), so the class excludes
-    ``@``, ``>`` and whitespace: a well-formed AOR matches, while a space-bearing
-    (hostile/malformed) user-part does not, and falls through. On no match (a ``tel:``
-    URI, or a header with no ``sip:user@``) return ``None`` — an explicit "unresolved"
-    state, NEVER the whole raw ``From`` header (which would leak an entire
-    attacker-controlled string) and NEVER a placeholder STRING (which the caller-group /
-    intercom matchers would treat as an ordinary caller-ID, where an operator pattern
-    could match it and escalate the caller). :func:`_classify_caller` maps ``None`` to
-    the default group directly. A matched user-part stays forgeable and is defanged at
-    the agent-visible seam (:func:`_defang_identity`); caller-ID is never authorization
-    (ADR-0020/0052).
-    """
-    # From: <sip:NUMBER@host>;tag=…  or  sip:NUMBER@host
-    import re  # noqa: PLC0415
+    Parses the ACTUAL From addr-spec (the URI inside ``<...>``, or the bare URI when
+    there is no display-name wrapper) via the shared SIP addr-spec parser
+    (:func:`~hermes_voip.call_context._addr_spec`), so a ``sip:...@`` substring embedded
+    in the DISPLAY NAME or a header parameter is NEVER mistaken for the caller-ID (which
+    a whole-header regex would do — a crafted-``From`` classification/intercom bypass).
+    Only a ``sip:`` / ``sips:`` AOR with a non-empty, whitespace-free user-part resolves
+    (a real SIP/E.164 user-part carries no whitespace — RFC 3261 §19.1.1); a ``tel:``
+    URI, any other scheme, or a malformed value is UNRESOLVED and returns ``None``.
 
-    match = re.search(r"sip:([^@>\s]+)@", from_header)
-    return match.group(1) if match else None
+    ``None`` is an explicit "unresolved" state — NEVER the whole raw header (which would
+    leak an attacker-controlled string) and NEVER a placeholder STRING (which the
+    caller-group / intercom matchers would treat as an ordinary caller-ID, where an
+    operator pattern could match it and escalate the caller). :func:`_classify_caller`
+    maps ``None`` to the default group directly. A matched user-part stays forgeable and
+    is defanged at the agent-visible seam (:func:`_defang_identity`); caller-ID is never
+    authorization (ADR-0020/0052).
+    """
+    addr = _addr_spec(from_header)
+    scheme, sep, rest = addr.partition(":")
+    if not sep or scheme.lower() not in ("sip", "sips"):
+        return None
+    user = rest.partition("@")[0]
+    if not user or any(ch.isspace() for ch in user):
+        return None
+    return user
 
 
 def _classify_caller(

@@ -41,11 +41,18 @@ _CREDIT_CARD_ATTACK = (
 # --- the unit-level clamp on gate_tool_call ---------------------------------
 
 
-def test_privileged_defaults_true_for_back_compat() -> None:
-    # An existing construction site that does not set privileged keeps today's
-    # behaviour (assistant). The clamp is opt-in via privileged=False.
+def test_unprivileged_is_the_construction_default() -> None:
+    # ADR-0097: the bare constructor (no privilege_level/privileged supplied) is
+    # least-privilege (level 0), NOT the operator/assistant tier. A construction
+    # site that wants operator trust must say so explicitly
+    # (privilege_level=3 / privileged=True); an omitted level now fails closed
+    # instead of silently granting the single most-permissive tier. Supersedes
+    # the pre-ADR-0097 back-compat default (level 3 / privileged=True by
+    # default), which the gap-review flagged as a fail-open attractive nuisance
+    # for any future construction site that forgets the argument.
     state = GuardSessionState(call_id="c1")
-    assert state.privileged is True
+    assert state.privileged is False
+    assert state.privilege_level == 0
 
 
 def test_unprivileged_session_blocks_elevated_even_when_clean() -> None:

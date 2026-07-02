@@ -7435,17 +7435,19 @@ def _caller_number(from_header: str) -> str | None:
     is defanged at the agent-visible seam (:func:`_defang_identity`); caller-ID is never
     authorization (ADR-0020/0052).
     """
+    import re  # noqa: PLC0415
+
     addr = _addr_spec(from_header)
     scheme, sep, rest = addr.partition(":")
     if not sep or scheme.lower() not in ("sip", "sips"):
         return None
-    # Require a real ``user@host`` AOR: a host-less ``sip:operator`` (no ``@``) or an
-    # empty-host ``sip:operator@`` is not valid, so its bare token must NOT become a
-    # caller-ID. ``partition`` yields an empty separator when ``@`` is absent.
-    user, at, host = rest.partition("@")
-    if not at or not user or not host.strip() or any(ch.isspace() for ch in user):
-        return None
-    return user
+    # A valid AOR is EXACTLY ``user@host`` where each part is non-empty, whitespace-free
+    # and ``@``-free (a SIP host cannot contain an unescaped ``@``). An anchored match
+    # rejects every malformed shape in one pass — host-less, empty user/host, a
+    # multi-``@`` host, or embedded whitespace — so a crafted From never yields a
+    # caller-ID that could enter caller-group / intercom pattern matching.
+    match = re.fullmatch(r"([^\s@]+)@[^\s@]+", rest)
+    return match.group(1) if match else None
 
 
 def _classify_caller(

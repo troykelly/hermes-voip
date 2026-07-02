@@ -525,3 +525,64 @@ def test_build_in_dialog_request_normal_range_still_increments() -> None:
     )
     result = build_in_dialog_request(d, "BYE")
     assert result.dialog.local_cseq == _MAX_CSEQ - 1
+
+
+# ---- egress control-character guard (task #47 cross-file audit) -----------
+#
+# dialog.py performs no contains_control check of its own on the peer-
+# controlled fields it echoes into headers (Call-ID, From/To URI+tag,
+# Contact-derived remote_target, Record-Route-derived route_set) — message.py's
+# ingress parser is deliberately permissive about non-CRLF control characters
+# (a bare CR, NUL, or DEL can survive parsing as a literal character inside a
+# header value; only a CRLF pair terminates a line), so a malformed or
+# malicious peer value can carry one into a Dialog field. What keeps this safe
+# is architectural, not a local check: build_in_dialog_request routes every
+# header value AND the request-URI through build_request, which rejects a
+# control character unconditionally (message.py's _reject_controls) before any
+# wire text is produced — dialog.py cannot reach the wire any other way. These
+# three tests prove that invariant empirically, one per kind of peer-controlled
+# field dialog.py echoes (direct copy, list-split, substring extraction),
+# rather than resting on a reading of the code.
+
+
+def test_build_in_dialog_request_rejects_control_char_in_peer_call_id() -> None:
+    # UAS path: Call-ID comes verbatim from the peer's inbound INVITE
+    # (Dialog.from_inbound_invite's call_id=_require(invite, "Call-ID")), with
+    # no transformation — an embedded bare CR (not a CRLF pair, so ingress
+    # would not treat it as a line terminator) survives into the field.
+    d = Dialog.from_inbound_invite(
+        _inbound_invite(call_id="call\rxyz"),
+        local_tag="ourtag",
+        local_contact=_LOCAL_CONTACT,
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    with pytest.raises(ValueError, match="control character"):
+        build_in_dialog_request(d, "BYE")
+
+
+def test_build_in_dialog_request_rejects_control_char_in_route_set() -> None:
+    # Record-Route entries become Route headers verbatim (split_header_list
+    # does not strip control characters); a peer-supplied entry carrying a NUL
+    # must not reach the wire.
+    d = Dialog.from_inbound_invite(
+        _inbound_invite(record_route=("<sip:proxy.example.test;lr>\x00",)),
+        local_tag="ourtag",
+        local_contact=_LOCAL_CONTACT,
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    with pytest.raises(ValueError, match="control character"):
+        build_in_dialog_request(d, "BYE")
+
+
+def test_build_in_dialog_request_rejects_control_char_in_remote_target() -> None:
+    # remote_target is extracted from the peer's Contact via _addr_spec (the
+    # substring between '<' and '>'), which does not filter control characters;
+    # it becomes the request-URI of every in-dialog request.
+    d = Dialog.from_invite_2xx(
+        _invite(),
+        _ok(contact="<sip:2000@198.51.100.99:5061\x00;transport=tls>"),
+    )
+    with pytest.raises(ValueError, match="control character"):
+        build_in_dialog_request(d, "BYE")

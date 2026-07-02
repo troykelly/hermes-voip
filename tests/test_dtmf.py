@@ -220,7 +220,57 @@ def test_receiver_dedups_reordered_end_packets() -> None:
 # different digit for the one the real press produced, and the anomaly must
 # be distinguishable from ordinary RFC 4733 redundancy (agreeing duplicate end
 # packets), which must keep collapsing to a single press exactly as before.
+#
+# THE property is about the DANGEROUS ordering (forged arrives FIRST, before
+# the genuine packet) -- not the safe ordering (genuine first, forged second).
+# A same-timestamp conflict can only ever be DETECTED on the packet that
+# disagrees with whatever was seen already, so a design that trusts the very
+# FIRST end packet it ever sees for a timestamp (unconditionally, before any
+# chance of a disagreeing packet arriving) cannot close this gap no matter how
+# the SECOND packet is classified. The test below is the one that actually
+# proves the property; it fails against a receiver that trusts on first sight.
 # ---------------------------------------------------------------------------
+
+
+def test_receiver_never_accepts_forged_digit_that_arrives_first() -> None:
+    """A forged end-event racing ahead of the genuine one must never win.
+
+    This is THE security property, and this is the dangerous ordering the
+    substitution vulnerability actually
+    depends on. Trusting whichever end packet arrives FIRST for a timestamp
+    (unconditionally) leaves this ordering wide open even if a later,
+    disagreeing packet at the same timestamp is correctly labelled a
+    conflict: relabelling the second, already-too-late packet does nothing to
+    stop the first (forged) one from having already been accepted as the
+    digit the system acts on. Proving this property requires the dangerous
+    order specifically -- forged, then genuine -- not the safe order (genuine
+    then forged).
+    """
+    rx = DtmfReceiver()
+    # The attacker's forged end(9) wins the race and arrives FIRST.
+    forged_first = rx.feed(
+        DtmfEvent(event=9, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert not isinstance(forged_first, DtmfPress), (
+        "a single, uncorroborated end packet must never be trusted as a "
+        "press outright -- that is exactly what a forged packet racing the "
+        "genuine one looks like from the receiver's point of view, since "
+        "the receiver cannot yet know whether a disagreeing packet is about "
+        "to arrive at the same timestamp"
+    )
+    # The genuine end(3) arrives second, at the same timestamp, disagreeing.
+    genuine_second = rx.feed(
+        DtmfEvent(event=3, end=True, volume=10, duration=480), timestamp=1000
+    )
+    assert genuine_second != DtmfPress(digit="9"), (
+        "the forged digit must never be substituted for the real one"
+    )
+    assert not isinstance(genuine_second, DtmfPress), (
+        "once a same-timestamp conflict is seen, NEITHER side can be "
+        "trusted -- there is no way to know which packet was genuine, so "
+        "the receiver must fail safe (no digit emitted) rather than fail "
+        "open (the wrong digit accepted)"
+    )
 
 
 def test_receiver_rejects_conflicting_event_at_same_timestamp() -> None:

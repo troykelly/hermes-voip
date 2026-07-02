@@ -76,6 +76,7 @@ from hermes_voip.call_context import (
 )
 from hermes_voip.call_end import CallEndReason, injection_text_for_reason
 from hermes_voip.caller_modes import (
+    CallerClassification,
     CallerGroup,
     CallerGroupConfig,
     CallerMode,
@@ -3044,12 +3045,17 @@ class VoipAdapter(BasePlatformAdapter):
         # proceed; the group's privilege_level sets guard_state and the per-turn
         # persona later.
         from_header = invite.header("From") or ""
-        caller_number = _caller_number(from_header)
         caller_groups = self._caller_groups
         if caller_groups is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: caller-group config not initialised"
             raise RuntimeError(msg)
-        classification = classify_caller_group(caller_number, caller_groups)
+        caller_number, classification = _classify_caller(from_header, caller_groups)
+        # DISPLAY value for the (forgeable) caller identity: the resolved SIP user-part,
+        # or a fixed placeholder when unresolved (a tel:/malformed From). This is a
+        # DISPLAY/log token ONLY — it is never fed back into classification/intercom
+        # matching, so an unresolved caller cannot be matched into an elevated group by
+        # an operator pattern (the classification above forces the default group).
+        caller_display = caller_number if caller_number is not None else _UNKNOWN_CALLER
         group = classification.group
         # ADR-0020 §5/§6: a declined-group caller's disposition is governed by
         # ``deny_mode``. ``reject`` (the default, Phase 1) sends a hard 603 Decline
@@ -3074,7 +3080,7 @@ class VoipAdapter(BasePlatformAdapter):
                     call_id,
                     group.name,
                     classification.source,
-                    _redact_number(caller_number),
+                    _redact_number(caller_display),
                     extra=_rejected_extra(call_id, 603, "caller_declined"),
                 )
                 await transport.send(build_response(invite, 603, "Decline"))
@@ -3087,7 +3093,7 @@ class VoipAdapter(BasePlatformAdapter):
                 call_id,
                 group.name,
                 classification.source,
-                _redact_number(caller_number),
+                _redact_number(caller_display),
             )
         _log.info(
             "INVITE %s: caller group=%s privilege_level=%d (source=%s)",
@@ -3465,9 +3471,15 @@ class VoipAdapter(BasePlatformAdapter):
         # binds this call to that intercom's NAMED opening set, scoping open_entry(name)
         # to ONLY those openings. Caller-ID is forgeable (never auth) — the per-opening
         # secret + the ELEVATED/allowed_tools gate are the protection, not the match.
-        intercom_entry = self._multi_intercom.match(caller_number)
+        # An unresolved caller-ID (None) matches NO intercom — same guardrail as the
+        # classification above: a placeholder string is never routed through pattern
+        # matching, so a crafted/malformed From cannot bind a call to an intercom's
+        # opening set by matching an intercom caller-ID pattern.
+        intercom_entry = (
+            None if caller_number is None else self._multi_intercom.match(caller_number)
+        )
         self._call_info[call_id] = {
-            "name": caller_number,
+            "name": caller_display,
             "remote_uri": from_header,
             "type": "dm",
             "ended": False,
@@ -7424,6 +7436,21 @@ def _caller_number(from_header: str) -> str:
 
     match = re.search(r"sip:([^@>\s]+)@", from_header)
     return match.group(1) if match else _UNKNOWN_CALLER
+
+
+def _classify_caller(
+    from_header: str, caller_groups: CallerGroupConfig
+) -> tuple[str | None, CallerClassification]:
+    """Resolve the caller-ID from a ``From`` header and classify it.
+
+    Returns ``(caller_number, classification)`` — the resolved SIP user-part and the
+    caller-group outcome. Extracted from the inbound-INVITE handler as the single seam
+    that resolves + classifies the caller-ID, so the mapping is unit-testable in
+    isolation. The caller-ID is forgeable and never authorization (ADR-0020/0052);
+    classification only selects a persona / privilege tier.
+    """
+    caller_number = _caller_number(from_header)
+    return caller_number, classify_caller_group(caller_number, caller_groups)
 
 
 def _redact_number(number: str) -> str:

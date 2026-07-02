@@ -1319,11 +1319,12 @@ async def test_established_call_survives_an_oversized_ascii_cseq_response() -> N
     integer string conversion``) — the SAME escape, via the SAME ``on_response`` ->
     reader path that tears down the shared SIP-over-TLS/WSS connection.
 
-    A valid SIP CSeq number is ``< 2**31`` (RFC 3261 §8.1.1.5) — at most 10 decimal
-    digits — so ``_cseq_number`` also drops an over-length token as uncorrelatable
-    (``None``) and never calls ``int()`` on it. Proven, as for the unicode case, with a
-    legitimate re-INVITE kept outstanding: the oversized response must neither raise nor
-    disturb it, and the well-formed answer that follows still completes the hold.
+    ``_cseq_number`` calls ``int()`` on the ASCII-decimal token inside a
+    ``try``/``except ValueError`` and classifies the digit-limit overflow as
+    uncorrelatable (``None``) instead of letting it escape. Proven, as for the unicode
+    case, with a legitimate re-INVITE kept outstanding: the oversized response must
+    neither raise nor disturb it, and the well-formed answer that follows still
+    completes the hold.
     """
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media)
@@ -1331,10 +1332,10 @@ async def test_established_call_survives_an_oversized_ascii_cseq_response() -> N
     await asyncio.sleep(0)
     reinvite = _last_request(signaling, "INVITE")
 
-    # A CSeq number far longer than the 10-digit cap. When Python's integer-string
-    # conversion limit is enabled (default 4300; 0 disables it) this also exceeds that
-    # limit, so pre-fix int() raised here; the length cap drops it either way. Every
-    # character is isascii()+isdecimal(), so only the length bound closes this.
+    # A CSeq number far longer than CPython's integer-string conversion limit (default
+    # 4300; 0 disables it), yet every character is isascii()+isdecimal(). Pre-fix this
+    # made int() raise and escape; now int() runs inside try/except so the overflow (or,
+    # if the limit is disabled, the resulting out-of-range value) maps to None.
     limit = sys.get_int_max_str_digits()
     oversized = "9" * (limit + 1 if limit else 5000)
     await session.on_response(_response_with_cseq(f"{oversized} BYE"))  # must NOT raise
@@ -1349,11 +1350,11 @@ async def test_cseq_number_rejects_a_number_at_or_above_2_31() -> None:
     """_cseq_number drops a CSeq value outside the valid SIP range (RFC 3261 §8.1.1.5).
 
     A SIP CSeq sequence number is ``< 2**31``. The largest valid value (``2**31 - 1``)
-    still parses; ``2**31`` and any larger in-length run (e.g. ``9999999999``, ten ASCII
-    digits that pass the length bound) is out of range and returns ``None`` — dropped as
-    uncorrelatable, never mistaken for a real sequence number. Range enforcement is not
-    observable through ``on_response`` (whose ``_pending`` only ever holds our own small
-    CSeqs), so the boundary is pinned here directly.
+    still parses; ``2**31`` and any larger value (e.g. ``9999999999``) is out of range
+    and returns ``None`` — dropped as uncorrelatable, never mistaken for a real sequence
+    number. Range enforcement is not observable through ``on_response`` (whose
+    ``_pending`` only ever holds our own small CSeqs), so the boundary is pinned here
+    directly.
     """
     assert _cseq_number("2147483647 BYE") == 2**31 - 1  # largest valid CSeq
     assert _cseq_number("2147483648 BYE") is None  # 2**31: out of range

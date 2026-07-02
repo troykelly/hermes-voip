@@ -464,3 +464,19 @@ def test_build_hold_reinvite_carries_auth_header() -> None:
     )
     parsed = SipRequest.parse(result.text)
     assert parsed.header("Authorization") == "Digest username=1000"
+
+
+def test_build_hold_reinvite_rejects_control_char_in_auth_header() -> None:
+    # The auth pair is caller-supplied (typically assembled from a peer's
+    # digest challenge realm/nonce/opaque); incall.py performs no local guard
+    # on it, relying on build_in_dialog_request -> build_request's
+    # unconditional per-header-value check (task #47 egress audit). This
+    # proves that chain covers this call site too, not only the dialog-field
+    # echo paths covered directly in test_dialog.py.
+    with pytest.raises(ValueError, match="control character"):
+        build_hold_reinvite(
+            _dialog(local_cseq=5, sdp_version=2),
+            _MEDIA,
+            "sendonly",
+            auth=("Authorization", "Digest username=1000\r\nEvil-Header: x"),
+        )

@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
@@ -163,6 +163,23 @@ class CallMedia(Protocol):
 
 
 type ReferHandler = Callable[[ReferRequest], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReanswerPlan:
+    """A re-INVITE 200's SDES crypto, split into what to render vs. what to re-key.
+
+    ``render`` is the ``a=crypto`` to advertise in the answer (or ``None`` for a plain
+    answer). ``rekey`` is the ``(inbound, outbound)`` key pair to install in the engine
+    once the answer is committed — set ONLY for a secured peer re-offer, ``None`` when
+    nothing re-keys (offerless re-advertise, or a plain answer). Splitting the pure
+    choice from the irreversible re-key lets :meth:`CallSession._answer_reinvite` build
+    the whole 200 BEFORE touching the SRTP context, so a re-INVITE it cannot answer is
+    dropped WHOLE (ADR-0081).
+    """
+
+    render: CryptoAttribute | None
+    rekey: tuple[CryptoAttribute, CryptoAttribute] | None
 
 
 class CallSession:
@@ -565,14 +582,16 @@ class CallSession:
         audio = offer.audio
         return audio is None or not audio.is_srtp or not audio.crypto_attrs
 
-    async def _reanswer_crypto(
-        self, offer: SessionDescription | None
-    ) -> CryptoAttribute | None:
-        """Pick the SDES ``a=crypto`` for a re-INVITE answer/offer WE emit in a 200.
+    def _plan_reanswer_crypto(self, offer: SessionDescription | None) -> _ReanswerPlan:
+        """Choose the SDES ``a=crypto`` for a re-INVITE answer/offer WE emit in a 200.
+
+        Pure: mutates nothing (no re-key, no key adoption), so the answer can be built
+        BEFORE any irreversible state and a re-INVITE we cannot answer is dropped WHOLE
+        (ADR-0081); :meth:`_commit_reanswer_crypto` applies the planned re-key after.
 
         - Peer re-offer (``offer`` set) on a secured call: mint our fresh answer key
-          echoing the OFFERED tag + suite and re-key the engine — inbound from the
-          peer's key, outbound from ours (RFC 4568 §6.1). A plain-call peer offer is
+          echoing the OFFERED tag + suite; the plan re-keys the engine — inbound from
+          the peer's key, outbound from ours (RFC 4568 §6.1). A plain-call peer offer is
           answered plain. (A secured call's downgrade re-offer never reaches here — it
           is rejected 488 upstream by :meth:`_peer_reoffer_is_downgrade`.)
         - Offerless re-INVITE (``offer`` is ``None``) on a secured call: WE offer, but
@@ -580,23 +599,31 @@ class CallSession:
           answer rides the ACK, which this dialog does not parse for SDP; re-using the
           current key keeps BOTH directions on their agreed keys, so continuity holds
           without consuming the ACK answer. A plain call offers plain.
-
-        Returns the crypto to render, or ``None`` for a plain answer.
         """
         if offer is None:
             # Offerless: re-advertise the current key unchanged (no fresh mint, no
             # engine re-key) so there is no dependency on the peer's ACK-borne answer.
-            return self._local_media.crypto
+            return _ReanswerPlan(render=self._local_media.crypto, rekey=None)
         audio = offer.audio
         if self._local_media.crypto is None or audio is None or not audio.is_srtp:
-            return None
+            return _ReanswerPlan(render=None, rekey=None)
         if not audio.crypto_attrs:
-            return None
+            return _ReanswerPlan(render=None, rekey=None)
         peer_crypto = audio.crypto_attrs[0]
         answer_crypto = generate_answer_crypto(peer_crypto)
+        return _ReanswerPlan(render=answer_crypto, rekey=(peer_crypto, answer_crypto))
+
+    async def _commit_reanswer_crypto(self, plan: _ReanswerPlan) -> None:
+        """Apply the re-key :meth:`_plan_reanswer_crypto` chose (secured peer re-offer).
+
+        Called only once the 200 has been built and is about to be sent, so a re-INVITE
+        we could not answer never touches the live SRTP key (ADR-0081 drop-whole).
+        """
+        if plan.rekey is None:
+            return
+        peer_crypto, answer_crypto = plan.rekey
         await self._media.rekey_srtp(inbound=peer_crypto, outbound=answer_crypto)
         self._adopt_local_crypto(answer_crypto)
-        return answer_crypto
 
     async def _commit_reoffer_keys(
         self, offer_crypto: CryptoAttribute | None, answer: SessionDescription
@@ -691,8 +718,50 @@ class CallSession:
 
     # --- inbound in-dialog requests (DialogConsumer) ------------------------
 
+    def _build_or_drop(self, build: Callable[[], str], *, kind: str) -> str | None:
+        """Build one in-dialog auto-response, or drop the request if it cannot be built.
+
+        Every in-dialog answer echoes the request's Via, From, To, Call-ID and CSeq
+        (RFC 3261 §8.2.6); :func:`build_response` raises :class:`ValueError` when the
+        request lacks one to echo (or carries an un-echoable value). This runs INLINE
+        in the transport reader task — :meth:`handle_request` is the manager's
+        ``DialogConsumer`` and is awaited by the dispatcher OUTSIDE its parse-only
+        guard (ADR-0081) — so an escaping ``ValueError`` would unwind the reader and
+        fire ``on_connection_lost``, dropping every OTHER live call and the
+        registration on the shared signalling connection over one packet (the ADR-0081
+        DoS, response-build side). Fail closed: log a non-PII WARNING (the method
+        ``kind`` and the exception TYPE only — never the wire content, rule 34) and
+        return ``None`` so the caller drops just this request, keeping the reader and
+        every other call alive.
+        """
+        try:
+            return build()
+        except ValueError as exc:
+            _log.warning(
+                "dropping a header-incomplete in-dialog %s we cannot answer (%s) —"
+                " call and connection kept",
+                kind,
+                type(exc).__name__,
+            )
+            return None
+
+    async def _answer_or_drop(self, build: Callable[[], str], *, kind: str) -> None:
+        """Build via :meth:`_build_or_drop` and send the response if it built."""
+        response = self._build_or_drop(build, kind=kind)
+        if response is not None:
+            await self._signaling.send(response)
+
     async def handle_request(self, request: SipRequest) -> None:
-        """Answer an inbound in-dialog request (re-INVITE/REFER/NOTIFY/BYE/INFO/ACK)."""
+        """Answer an inbound in-dialog request (re-INVITE/REFER/NOTIFY/BYE/INFO/ACK).
+
+        A request that PARSES and routes here (routing keys only on the To/From tags +
+        Call-ID) but lacks a mandatory header to echo cannot be answered; each response
+        is built via :meth:`_build_or_drop` / :meth:`_answer_or_drop`, so such a request
+        is dropped fail-closed rather than escaping ``ValueError`` into the reader
+        (ADR-0081). A request whose answer cannot be built has NO other effect: any
+        response that gates call/dialog state is built BEFORE that state is mutated, so
+        a matched-but-unanswerable request is dropped WHOLE.
+        """
         method = request.method
         if method == "INVITE":
             await self._on_reinvite(request)
@@ -707,7 +776,9 @@ class CallSession:
         elif method == "ACK":
             return  # confirms our 2xx answer to an inbound re-INVITE; no response
         else:
-            await self._signaling.send(build_response(request, 501, "Not Implemented"))
+            await self._answer_or_drop(
+                lambda: build_response(request, 501, "Not Implemented"), kind="request"
+            )
 
     async def _on_info(self, request: SipRequest) -> None:
         """Answer an inbound ``INFO`` (SIP INFO DTMF receive, ADR-0036).
@@ -719,9 +790,16 @@ class CallSession:
         confirmation or
         joins a menu group exactly as the other backends do. A non-DTMF INFO (e.g. a
         media-control body) is acknowledged but surfaces nothing, and an INFO with no
-        bound sink is acknowledged and dropped (never crashes the dialog).
+        bound sink is acknowledged and dropped (never crashes the dialog). An INFO we
+        cannot acknowledge (header-incomplete) is dropped WHOLE: the 200 is built first,
+        so its digit is never surfaced when the ACK cannot be sent (ADR-0081).
         """
-        await self._signaling.send(build_response(request, 200, "OK"))
+        response = self._build_or_drop(
+            lambda: build_response(request, 200, "OK"), kind="INFO"
+        )
+        if response is None:
+            return
+        await self._signaling.send(response)
         digit = parse_dtmf_info(request.header("Content-Type") or "", request.body)
         if digit is not None and self.on_dtmf is not None:
             self.on_dtmf(digit)
@@ -731,11 +809,14 @@ class CallSession:
             request, pending_local_offer=self._local_offer_pending
         )
         if isinstance(routing, Glare):
-            await self._signaling.send(build_response(request, 491, "Request Pending"))
+            await self._answer_or_drop(
+                lambda: build_response(request, 491, "Request Pending"), kind="INVITE"
+            )
             return
         if isinstance(routing, UnsupportedReinviteOffer):
-            await self._signaling.send(
-                build_response(request, 488, "Not Acceptable Here")
+            await self._answer_or_drop(
+                lambda: build_response(request, 488, "Not Acceptable Here"),
+                kind="INVITE",
             )
             return
         if isinstance(routing, MediaUpdate):
@@ -743,28 +824,46 @@ class CallSession:
             # (no-a=crypto) re-offer with cleartext media — reject it 488 and leave
             # the established SRTP context untouched.
             if self._peer_reoffer_is_downgrade(routing.offer):
-                await self._signaling.send(
-                    build_response(request, 488, "Not Acceptable Here")
+                await self._answer_or_drop(
+                    lambda: build_response(request, 488, "Not Acceptable Here"),
+                    kind="INVITE",
                 )
                 return
-            await self._answer_reinvite(
+            # Flip hold state only once the re-INVITE is actually answered: an
+            # unanswerable one is dropped WHOLE, so we must not act on a media change
+            # the peer never saw us confirm (ADR-0081 drop-whole).
+            if not await self._answer_reinvite(
                 request, routing.answer_direction, offer=routing.offer
-            )
+            ):
+                return
             self.on_hold = routing.held_by_peer
             await self._media.set_hold(routing.held_by_peer)
             return
-        # OfferlessReinvite: re-offer our current media direction in the 2xx.
+        # OfferlessReinvite: re-offer our current media direction in the 2xx (drops
+        # whole if unanswerable — no further state to gate).
         await self._answer_reinvite(
             request, "sendonly" if self.on_hold else "sendrecv", offer=None
         )
 
     async def _answer_reinvite(
         self, request: SipRequest, direction: str, *, offer: SessionDescription | None
-    ) -> None:
+    ) -> bool:
+        """Answer a re-INVITE ``200 OK``; return whether it was actually answered.
+
+        Answering re-keys the SRTP engine (secured peer re-offer) and bumps the SDP
+        version — both irreversible. A re-INVITE we cannot answer (missing a header to
+        echo) must have NO effect, so the WHOLE 200 (the actual response we send) is
+        built via :meth:`_build_or_drop` BEFORE any of that. On failure the re-INVITE is
+        dropped WHOLE — no re-key, no version bump, no send — and ``False`` is returned
+        so the caller skips the media-state change too. Returns ``True`` once the 200 is
+        sent.
+        """
         # SDES continuity (ADR-0053): on a secured call the re-negotiated media stays
-        # RTP/SAVP + a=crypto, never silently downgrading to cleartext RTP/AVP.
-        answer_crypto = await self._reanswer_crypto(offer)
-        self._dialog = self._dialog.with_next_sdp_version()
+        # RTP/SAVP + a=crypto, never silently downgrading to cleartext RTP/AVP. Plan the
+        # crypto and next dialog version PURELY (no re-key, no assignment) so the answer
+        # is fully built before any irreversible state is touched.
+        plan = self._plan_reanswer_crypto(offer)
+        next_dialog = self._dialog.with_next_sdp_version()
         answer = build_audio_offer(
             local_address=self._local_media.local_address,
             port=self._local_media.port,
@@ -772,11 +871,13 @@ class CallSession:
             direction=direction,
             ptime=self._local_media.ptime,
             session_id=self._local_media.session_id,
-            version=self._dialog.sdp_version,
-            crypto=answer_crypto,
+            version=next_dialog.sdp_version,
+            crypto=plan.render,
         )
-        await self._signaling.send(
-            build_response(
+        # Fail closed (ADR-0081): build the actual 200 first. If it cannot be built the
+        # re-INVITE is unanswerable, dropped WHOLE — no SRTP re-key, no version bump.
+        response = self._build_or_drop(
+            lambda: build_response(
                 request,
                 200,
                 "OK",
@@ -785,11 +886,27 @@ class CallSession:
                     ("Content-Type", "application/sdp"),
                 ),
                 body=answer,
-            )
+            ),
+            kind="INVITE",
         )
+        if response is None:
+            return False
+        # Commit only now that the 200 is built: re-key the engine, advance the dialog
+        # version, then send. Ordering relative to the send is unchanged (re-key first).
+        await self._commit_reanswer_crypto(plan)
+        self._dialog = next_dialog
+        await self._signaling.send(response)
+        return True
 
     async def _on_bye(self, request: SipRequest) -> None:
-        await self._signaling.send(build_response(request, 200, "OK"))
+        # Build the 200 first: a header-incomplete BYE we cannot answer is dropped
+        # WHOLE — the call is NOT ended and media NOT stopped (ADR-0081 drop-whole).
+        response = self._build_or_drop(
+            lambda: build_response(request, 200, "OK"), kind="BYE"
+        )
+        if response is None:
+            return
+        await self._signaling.send(response)
         self.ended = True
         await self._media.stop()
 
@@ -822,17 +939,27 @@ class CallSession:
         event = request.header("Event")
         package = event.split(";", 1)[0].strip().lower() if event is not None else ""
         if package != "refer":
-            await self._signaling.send(build_response(request, 200, "OK"))
+            await self._answer_or_drop(
+                lambda: build_response(request, 200, "OK"), kind="NOTIFY"
+            )
             return
         try:
             progress = parse_notify_sipfrag(request)
         except ReferError:
-            await self._signaling.send(
-                build_response(request, _BAD_REQUEST, "Bad Request")
+            await self._answer_or_drop(
+                lambda: build_response(request, _BAD_REQUEST, "Bad Request"),
+                kind="NOTIFY",
             )
             return
+        # Build the 200 BEFORE recording the progress: a NOTIFY we cannot acknowledge
+        # (header-incomplete) must not update transfer_progress (ADR-0081 drop-whole).
+        response = self._build_or_drop(
+            lambda: build_response(request, 200, "OK"), kind="NOTIFY"
+        )
+        if response is None:
+            return
         self.transfer_progress = progress
-        await self._signaling.send(build_response(request, 200, "OK"))
+        await self._signaling.send(response)
 
     async def _on_refer(self, request: SipRequest) -> None:
         """Answer an inbound REFER; 202 only once it parses, else a 4xx.
@@ -850,11 +977,19 @@ class CallSession:
         try:
             refer = parse_refer(request)
         except ReferError:
-            await self._signaling.send(
-                build_response(request, _BAD_REQUEST, "Bad Request")
+            await self._answer_or_drop(
+                lambda: build_response(request, _BAD_REQUEST, "Bad Request"),
+                kind="REFER",
             )
             return
-        await self._signaling.send(build_response(request, 202, "Accepted"))
+        # Build the 202 BEFORE invoking the transfer handler: a REFER we cannot accept
+        # (header-incomplete) must not trigger the transfer (ADR-0081 drop-whole).
+        response = self._build_or_drop(
+            lambda: build_response(request, 202, "Accepted"), kind="REFER"
+        )
+        if response is None:
+            return
+        await self._signaling.send(response)
         if self._refer_handler is not None:
             await self._refer_handler(refer)
 

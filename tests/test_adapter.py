@@ -898,6 +898,15 @@ def test_caller_number_unresolved_from_returns_none_not_raw_header() -> None:
     # (3) A well-formed AOR still yields its user-part (classification path unaffected).
     assert _caller_number("<sip:1000@pbx.example.test>;tag=y") == "1000"
 
+    # (4) A tel: (unresolved) caller whose DISPLAY NAME embeds a ``sip:...@`` substring
+    #     must NOT be resolved to that embedded user-part — only the ACTUAL From URI (a
+    #     tel:, here) is parsed. Returning "operator" would route a crafted From into
+    #     caller-group / intercom pattern matching; it must be unresolved (None).
+    assert (
+        _caller_number('"sip:operator@pbx.example.test" <tel:+15551234567>;tag=x')
+        is None
+    )
+
 
 @pytest.mark.asyncio
 async def test_deliver_turn_defangs_hostile_caller_identity_fields() -> None:

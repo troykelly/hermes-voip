@@ -998,6 +998,14 @@ def _cseq_number(cseq: str | None) -> int | None:
     if cseq is None:
         return None
     parts = cseq.split()
-    if not parts or not parts[0].isdigit():
+    # Fail closed (ADR-0081): a SIP CSeq number is ASCII `1*DIGIT` (RFC 3261), but
+    # str.isdigit() is True for non-decimal unicode digits (e.g. superscript "²"
+    # U+00B2) that int() rejects with a bare ValueError. on_response/_send_ack run
+    # OUTSIDE the reader's parse-only `except ValueError`, so that escape would tear
+    # down the whole connection. Require isascii()+isdecimal() — exactly the ASCII
+    # 0-9 SIP allows — so a non-conformant CSeq takes the SAME uncorrelatable-CSeq
+    # path (None) a non-numeric one already does; int() then never sees a value it
+    # rejects.
+    if not parts or not (parts[0].isascii() and parts[0].isdecimal()):
         return None
     return int(parts[0])

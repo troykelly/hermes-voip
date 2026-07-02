@@ -757,6 +757,32 @@ class SipOverTlsTransport:
             local_tag=new_tag(),
         )
 
+    async def _answer_or_drop(self, build: Callable[[], str], *, kind: str) -> None:
+        """Build one auto-response and send it; drop the request if it cannot be built.
+
+        ``build_response`` (and the keepalive builders) raise ``ValueError`` when the
+        inbound request lacks a mandatory header to echo — Via / From / To / Call-ID /
+        CSeq (RFC 3261 §8.2.6). It PARSES but cannot be answered (no reliable Via /
+        Call-ID / CSeq to route a response back). Its handling runs INLINE in the reader
+        task (from :meth:`_dispatch_request`, awaited OUTSIDE :meth:`_dispatch`'s
+        parse-only ``try``), so an escaping ``ValueError`` would end the reader and fire
+        ``on_connection_lost`` — dropping every other active call on the connection (the
+        ADR-0081 DoS, response-build side). Fail closed: emit a non-PII WARNING (the
+        exception type only, never the wire content — rule 34) and skip that one
+        auto-response, keeping the connection and every other call alive.
+        """
+        try:
+            response = build()
+        except ValueError as exc:
+            _log.warning(
+                "dropping a header-incomplete inbound %s we cannot answer (%s) —"
+                " connection kept",
+                kind,
+                type(exc).__name__,
+            )
+            return
+        await self.send(response)
+
     async def _handle_cancel(self, cancel: SipRequest) -> None:
         """Answer an inbound CANCEL and terminate the matching INVITE (RFC 3261 §9.2).
 
@@ -769,11 +795,16 @@ class SipOverTlsTransport:
         absorbed — only the ``200 OK`` to the CANCEL is re-sent, with no second
         487 or ``on_cancel`` (idempotent §9.2 handling). A CANCEL matching no
         transaction is answered ``481 Call/Transaction Does Not Exist``.
+
+        Each response is built via :meth:`_answer_or_drop`: a CANCEL (or the matched
+        INVITE) missing a mandatory header to echo cannot be answered and is dropped
+        fail-closed rather than escaping ``ValueError`` into the reader (ADR-0081).
         """
         pending = self._match_cancel(cancel)
         if pending is None:
-            await self.send(
-                build_response(cancel, 481, "Call/Transaction Does Not Exist")
+            await self._answer_or_drop(
+                lambda: build_response(cancel, 481, "Call/Transaction Does Not Exist"),
+                kind="CANCEL",
             )
             return
         already_cancelled = pending.cancelled
@@ -783,16 +814,20 @@ class SipOverTlsTransport:
         # to the CANCEL MUST equal the To-tag on the 487 to the INVITE — both use
         # the pending invite's stable local_tag (never a fresh tag per receipt,
         # which would make retransmitted CANCEL responses non-idempotent).
-        await self.send(build_response(cancel, 200, "OK", to_tag=pending.local_tag))
+        await self._answer_or_drop(
+            lambda: build_response(cancel, 200, "OK", to_tag=pending.local_tag),
+            kind="CANCEL",
+        )
         if already_cancelled:
             return  # the 487 + abort already happened on the first CANCEL
         # 487 the INVITE: a dialog-forming final carrying our stable local tag.
         # This records the final on the server transaction; the cancelled entry is
         # retained (cleared in remove_call) so a late 2xx stays suppressed.
-        await self.send(
-            build_response(
+        await self._answer_or_drop(
+            lambda: build_response(
                 pending.invite, 487, "Request Terminated", to_tag=pending.local_tag
-            )
+            ),
+            kind="INVITE",
         )
         _log.info(
             "INVITE %s CANCELled by peer — 487 Request Terminated, aborting setup",
@@ -831,8 +866,11 @@ class SipOverTlsTransport:
         an out-of-dialog request that *does* carry a ``To``-tag is left to the
         unroutable path, never auto-answered.
 
-        Returns ``True`` when a response was sent (the caller must not also report
-        the request unroutable), ``False`` when this is not a keepalive request.
+        Returns ``True`` when this is a keepalive request we handled — either answered,
+        or (if it is header-incomplete and cannot be answered) dropped fail-closed via
+        :meth:`_answer_or_drop` so its builder ``ValueError`` never reaches the reader.
+        The caller must not also report a handled request unroutable. Returns ``False``
+        when this is not a keepalive request.
 
         Note: this assumes a *qualify* ``OPTIONS`` is out of dialog (no ``To``-tag),
         which holds for RFC 3261 §11 registrars; a tagged ``OPTIONS`` is treated as
@@ -842,10 +880,14 @@ class SipOverTlsTransport:
         if _has_to_tag(request.header("To")):
             return False
         if request.method == "OPTIONS":
-            await self.send(build_options_ok(request, to_tag=new_tag()))
+            await self._answer_or_drop(
+                lambda: build_options_ok(request, to_tag=new_tag()), kind="OPTIONS"
+            )
             return True
         if request.method == "NOTIFY":
-            await self.send(build_keepalive_ok(request, to_tag=new_tag()))
+            await self._answer_or_drop(
+                lambda: build_keepalive_ok(request, to_tag=new_tag()), kind="NOTIFY"
+            )
             return True
         return False
 

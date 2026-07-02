@@ -577,6 +577,32 @@ class WssSipTransport:
             local_tag=new_tag(),
         )
 
+    async def _answer_or_drop(self, build: Callable[[], str], *, kind: str) -> None:
+        """Build one auto-response and send it; drop the request if it cannot be built.
+
+        ``build_response`` (and the keepalive builders) raise ``ValueError`` when the
+        inbound request lacks a mandatory header to echo — Via / From / To / Call-ID /
+        CSeq (RFC 3261 §8.2.6). It PARSES but cannot be answered (no reliable Via /
+        Call-ID / CSeq to route a response back). Its handling runs INLINE in the reader
+        task (from :meth:`_dispatch_request`, awaited OUTSIDE :meth:`_dispatch`'s
+        parse-only ``try``), so an escaping ``ValueError`` would end the reader and fire
+        ``on_connection_lost`` — dropping the registration and every active call (the
+        ADR-0081 DoS, response-build side). Fail closed: emit a non-PII WARNING (the
+        exception type only, never the wire content — rule 34) and skip that one
+        auto-response, keeping the connection and every other call alive.
+        """
+        try:
+            response = build()
+        except ValueError as exc:
+            _log.warning(
+                "dropping a header-incomplete inbound %s we cannot answer (%s) —"
+                " connection kept",
+                kind,
+                type(exc).__name__,
+            )
+            return
+        await self.send(response)
+
     async def _handle_cancel(self, cancel: SipRequest) -> None:
         """Answer an inbound CANCEL and terminate the matching INVITE (RFC 3261 §9.2).
 
@@ -589,11 +615,16 @@ class WssSipTransport:
         only the ``200 OK`` to the CANCEL is re-sent, with no second 487 or
         ``on_cancel`` (idempotent §9.2 handling). A CANCEL matching no transaction
         is answered ``481 Call/Transaction Does Not Exist``.
+
+        Each response is built via :meth:`_answer_or_drop`: a CANCEL (or the matched
+        INVITE) missing a mandatory header to echo cannot be answered and is dropped
+        fail-closed rather than escaping ``ValueError`` into the reader (ADR-0081).
         """
         pending = self._match_cancel(cancel)
         if pending is None:
-            await self.send(
-                build_response(cancel, 481, "Call/Transaction Does Not Exist")
+            await self._answer_or_drop(
+                lambda: build_response(cancel, 481, "Call/Transaction Does Not Exist"),
+                kind="CANCEL",
             )
             return
         already_cancelled = pending.cancelled
@@ -604,14 +635,18 @@ class WssSipTransport:
         # the original request SHOULD be the same." Reusing local_tag (never a
         # fresh new_tag()) also makes the 200 idempotent at the message level: a
         # retransmitted CANCEL is always re-answered with the identical To tag.
-        await self.send(build_response(cancel, 200, "OK", to_tag=pending.local_tag))
+        await self._answer_or_drop(
+            lambda: build_response(cancel, 200, "OK", to_tag=pending.local_tag),
+            kind="CANCEL",
+        )
         if already_cancelled:
             return  # the 487 + abort already happened on the first CANCEL
         # 487 the INVITE: a dialog-forming final carrying our stable local tag.
-        await self.send(
-            build_response(
+        await self._answer_or_drop(
+            lambda: build_response(
                 pending.invite, 487, "Request Terminated", to_tag=pending.local_tag
-            )
+            ),
+            kind="INVITE",
         )
         _log.info(
             "INVITE %s CANCELled by peer — 487 Request Terminated, aborting setup",
@@ -645,16 +680,23 @@ class WssSipTransport:
         respond 200 OK so the registrar does not mark the endpoint unreachable.
         Unsolicited NOTIFY (e.g. MWI) is acknowledged but not processed.
 
-        Returns ``True`` when a response was sent (caller must not also report
-        the request unroutable), ``False`` when this is not a keepalive request.
+        Returns ``True`` when this is a keepalive request we handled — either answered,
+        or (if it is header-incomplete and cannot be answered) dropped fail-closed via
+        :meth:`_answer_or_drop` so its builder ``ValueError`` never reaches the reader.
+        The caller must not also report a handled request unroutable. Returns ``False``
+        when this is not a keepalive request.
         """
         if _has_to_tag(request.header("To")):
             return False
         if request.method == "OPTIONS":
-            await self.send(build_options_ok(request, to_tag=new_tag()))
+            await self._answer_or_drop(
+                lambda: build_options_ok(request, to_tag=new_tag()), kind="OPTIONS"
+            )
             return True
         if request.method == "NOTIFY":
-            await self.send(build_keepalive_ok(request, to_tag=new_tag()))
+            await self._answer_or_drop(
+                lambda: build_keepalive_ok(request, to_tag=new_tag()), kind="NOTIFY"
+            )
             return True
         return False
 

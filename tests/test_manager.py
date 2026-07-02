@@ -99,13 +99,14 @@ def _ok_for(register_text: str, *, expires: int = 300) -> SipResponse:
     )
 
 
-# Standard LogRecord attributes (Python 3.13): framework-populated metadata plus the raw
-# message template/args. A secret reaches the log ONLY via a code-controlled surface --
-# the rendered message, ``%`` args, a code-attached ``extra`` field, or a CUSTOM task
-# name -- so those are the only surfaces the scan below covers. Everything else here is
-# framework metadata (timestamps, thread/process ids, source location, the default
-# "Task-<n>" counter) that never carries a secret and whose nondeterministic numeric
-# values would only false-trip a short-digit scan.
+# Standard LogRecord attributes (Python 3.13). Subtracting this set from
+# ``record.__dict__`` isolates the code-attached ``extra`` fields. A secret reaches the
+# log ONLY via a code-controlled surface -- the rendered message, the ``%`` args, an
+# ``extra`` field, a rendered exception (``exc_text``) or captured traceback
+# (``stack_info``), or a CUSTOM task name -- and the scan below covers exactly those.
+# The rest is framework metadata (timestamps, thread/process ids, source location, the
+# default "Task-<n>" counter) that never carries a secret and whose nondeterministic
+# numeric values would only false-trip a short-digit scan.
 _STANDARD_LOGRECORD_ATTRS = frozenset(
     {
         "name",
@@ -143,7 +144,8 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
     """Assert no fake secret leaks into any CODE-CONTROLLED surface of ``record``.
 
     Deterministic: scans only the surfaces a logging call populates -- code-attached
-    ``extra`` fields, the rendered message, the ``%`` args, and a CUSTOM asyncio task
+    ``extra`` fields, the rendered message, the ``%`` args, a rendered exception
+    (``exc_text``) / captured traceback (``stack_info``), and a CUSTOM asyncio task
     name -- never the framework metadata (timestamps / thread & process ids / source
     location / the default ``Task-<n>`` counter), whose nondeterministic values would
     otherwise coincidentally match a short secret digit like "1000" and flake. A CUSTOM
@@ -168,6 +170,8 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
         "rendered message": record.getMessage(),
         "message args": json.dumps(record.args, default=repr) if record.args else "",
         "custom task name": custom_task_name,
+        "exception text": record.exc_text or "",
+        "stack info": record.stack_info or "",
     }
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
         for surface_name, surface in scanned_surfaces.items():

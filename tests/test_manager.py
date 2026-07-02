@@ -1546,3 +1546,110 @@ async def test_registration_error_subclasses_never_leak_reason_in_default_form()
             assert _REGISTRAR_REASON_SENTINEL not in rendered, (
                 f"{cls.__name__} leaked registrar reason via {form}(): {rendered!r}"
             )
+
+
+# ---- on_response must never propagate: fail-open DoS (ADR-0081) --------------
+#
+# on_response wraps flow.handle() with NO guard and runs OUTSIDE the reader loop's
+# parse-only ``except ValueError`` (transport/connection.py + ws_connection.py). So
+# an exception escaping handle() unwinds _read_loop → on_connection_lost and tears
+# down the WHOLE shared TLS/WSS signalling connection — every active call AND every
+# registration. Two reachable triggers must be contained here so on_response RETURNS
+# normally (the connection survives), per ADR-0081's "one malformed message must not
+# be a DoS against unrelated calls":
+#   (1) an UNANSWERABLE first challenge (digest ValueError) → the flow fails CLOSED to
+#       Failed, which on_response reports via _on_registration_failed; and
+#   (2) a DUPLICATE/late or SUPERSEDED (stale-CSeq) REGISTER final (handle() raises
+#       RuntimeError because the registration Call-ID is stable and routes the stray
+#       final back to a flow with no matching outstanding transaction) → IGNORED, so a
+#       harmless retransmit neither crashes on_response nor flaps the live registration.
+
+
+def _unanswerable_challenge_for(register_text: str) -> SipResponse:
+    """A 401 for ``register_text`` offering ONLY an unsupported algorithm.
+
+    Routes to the owning flow by Call-ID (like ``_challenge_for``) but is
+    UNANSWERABLE: SHA-512-256 is a legitimate RFC 8760 algorithm this flow does not
+    implement, so the digest layer raises ``ValueError`` inside ``handle()``.
+    """
+    reg = SipRequest.parse(register_text)
+    return SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        f"Call-ID: {reg.header('Call-ID')}\r\n"
+        f"CSeq: {reg.header('CSeq')}\r\n"
+        'WWW-Authenticate: Digest realm="pbx.example.test", nonce="abc123", '
+        'algorithm=SHA-512-256, qop="auth"\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_on_response_unanswerable_challenge_does_not_propagate() -> None:
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    # MUST NOT raise: an escaping ValueError here is the DoS — it would unwind the
+    # reader task and drop every call + registration on the shared connection.
+    await manager.on_response(_unanswerable_challenge_for(transport.sent[0]))
+    # The failure is reported (never swallowed, rule 37) and nothing came up.
+    assert errors, "an unanswerable challenge must be reported, not crash on_response"
+    assert manager.is_up is False
+    await manager.aclose()
+
+
+async def test_on_response_duplicate_final_does_not_propagate_or_flap() -> None:
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    first_register = transport.sent[0]
+    # Drive a full, successful registration: 401 → authed REGISTER → 200 OK.
+    await manager.on_response(_challenge_for(first_register))
+    authed = transport.sent[-1]
+    await manager.on_response(_ok_for(authed))
+    up = [s for s in manager.snapshot() if s.registered]
+    assert len(up) == 1  # the extension is registered
+    assert up[0].expires == 300
+
+    # A DUPLICATE 200 OK re-enters handle() after the transaction closed (_txn is
+    # None) → handle() raises RuntimeError. on_response MUST ignore it: no crash, no
+    # flap, no operator alarm.
+    await manager.on_response(_ok_for(authed))
+    still_up = [s for s in manager.snapshot() if s.registered]
+    assert len(still_up) == 1, "a duplicate 200 OK must not flap the live registration"
+    assert not errors, "a harmless duplicate final must not alarm the operator"
+    await manager.aclose()
+
+
+async def test_on_response_stale_cseq_does_not_propagate() -> None:
+    errors: list[tuple[str, BaseException]] = []
+    transport = _FakeTransport()
+    manager = RegistrationManager(
+        _gateway(),
+        transport,
+        on_registration_error=lambda ext, exc: errors.append((ext, exc)),
+    )
+    await manager.start()
+    reg = SipRequest.parse(transport.sent[0])
+    # A 200 OK whose CSeq does NOT match the outstanding REGISTER (1): _check_cseq
+    # raises RuntimeError. A superseded/stale final routing back by the stable
+    # Call-ID must be ignored, never propagate out of on_response.
+    stale = SipResponse.parse(
+        "SIP/2.0 200 OK\r\n"
+        f"Call-ID: {reg.header('Call-ID')}\r\n"
+        "CSeq: 99 REGISTER\r\n"
+        f"Contact: {reg.header('Contact')};expires=300\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    await manager.on_response(stale)  # MUST NOT raise
+    assert manager.is_up is False  # the stale final did not spuriously register us
+    assert not errors
+    await manager.aclose()

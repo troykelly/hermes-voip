@@ -1058,3 +1058,119 @@ def test_min_expires_unicode_digit_does_not_crash() -> None:
     # valid Min-Expires as Failed (no valid retry interval can be computed).
     outcome = flow.handle(response)
     assert not isinstance(outcome, Registered)
+
+
+# --- an UNANSWERABLE first 401/407 must fail CLOSED, never raise (ADR-0081) ------
+#
+# handle() previously let the digest layer's ValueError ESCAPE on an unanswerable
+# first challenge: pick_best_challenge (only an unsupported algorithm),
+# build_authorization (qop without 'auth'), or DigestChallenge.parse (missing
+# nonce/realm, or no challenge header at all) each raise ValueError out of
+# _reauthenticate. RegistrationManager.on_response has no guard and runs OUTSIDE the
+# reader loop's parse-only ``except ValueError``, so an escaping ValueError unwound
+# _read_loop → on_connection_lost and tore down the WHOLE shared signalling
+# connection — every active call AND every registration. That violates ADR-0081's
+# "one malformed message must not be a DoS against unrelated calls", and it is
+# reachable: every registration begins with a REGISTER that draws a 401, and SIP
+# digest challenges have no integrity (an on-path element can rewrite them).
+#
+# The flow must instead fail CLOSED to a ``Failed`` outcome — exactly like its
+# second-challenge path and every other non-answerable branch — so the manager
+# reports it and recovers via a fresh REGISTER (bounded backoff). Each test asserts
+# the SECURITY PROPERTY: an unanswerable challenge yields a ``Failed`` OUTCOME (which,
+# on the unfixed code, cannot hold because ``flow.handle`` raises before returning).
+
+
+def _unsupported_algo_challenge(
+    code: int = 401, header: str = "WWW-Authenticate"
+) -> SipResponse:
+    """A 401/407 offering ONLY an unsupported (yet legitimate RFC 8760) algorithm.
+
+    SHA-512-256 is a real RFC 8760 digest algorithm this flow does not implement, so
+    ``pick_best_challenge`` finds no supported algorithm and raises ``ValueError``.
+    """
+    return SipResponse.parse(
+        f"SIP/2.0 {code} Unauthorized\r\n"
+        f'{header}: Digest realm="pbx.example.test", nonce="abc123", '
+        'algorithm=SHA-512-256, qop="auth"\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def test_unsupported_only_algorithm_fails_closed_not_raises() -> None:
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    outcome = flow.handle(_unsupported_algo_challenge())
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 401
+
+
+def test_qop_auth_int_only_fails_closed_not_raises() -> None:
+    # qop=auth-int (integrity) is a legitimate RFC 7616 qop this flow does not
+    # implement (SIP REGISTER has an empty body); build_authorization raises rather
+    # than silently downgrade. The algorithm (md5) IS supported, so this specifically
+    # exercises the build_authorization qop rejection, not the algorithm rejection.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    resp = SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        'WWW-Authenticate: Digest realm="pbx.example.test", nonce="abc123", '
+        'algorithm=md5, qop="auth-int"\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(resp)
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 401
+
+
+def test_missing_nonce_challenge_fails_closed_not_raises() -> None:
+    # DigestChallenge.parse raises "missing a nonce"; the flow must consume it.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    resp = SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        "WWW-Authenticate: Digest "
+        'realm="pbx.example.test", algorithm=md5, qop="auth"\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(resp)
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 401
+
+
+def test_missing_realm_challenge_fails_closed_not_raises() -> None:
+    # DigestChallenge.parse raises "missing a realm"; the flow must consume it.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    resp = SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        'WWW-Authenticate: Digest nonce="abc123", algorithm=md5, qop="auth"\r\n'
+        "Content-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(resp)
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 401
+
+
+def test_absent_challenge_header_fails_closed_not_raises() -> None:
+    # A 401 with NO WWW-Authenticate header at all: _strongest_challenge calls
+    # DigestChallenge.parse("") which raises "missing a nonce". Fail closed.
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    resp = SipResponse.parse("SIP/2.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+    outcome = flow.handle(resp)
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 401
+
+
+def test_absent_proxy_challenge_header_fails_closed_not_raises() -> None:
+    # The 407 branch of _reauthenticate reads Proxy-Authenticate; an absent header
+    # there must fail closed too (covers the proxy-auth arm of the fix).
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()
+    resp = SipResponse.parse(
+        "SIP/2.0 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n"
+    )
+    outcome = flow.handle(resp)
+    assert isinstance(outcome, Failed)
+    assert outcome.status == 407

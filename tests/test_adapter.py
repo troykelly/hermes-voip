@@ -949,6 +949,42 @@ async def test_deliver_turn_defangs_hostile_caller_identity_fields() -> None:
         assert "\n" not in value, f"{label} carries a newline (multi-line injection)"
 
 
+@pytest.mark.asyncio
+async def test_call_source_defangs_all_identity_params_at_chokepoint() -> None:
+    """Defang at the ``_call_source`` chokepoint EVERY own-session injection uses.
+
+    ``_call_source`` builds the ``SessionSource`` for all five own-session injection
+    sites (the spotlighted turn, the objective seed, the rich call-context seed, the
+    call-progress note, the call-end signal). ``_deliver_turn`` is only one of them, so
+    asserting the defang at ``_call_source`` itself proves the property holds for EVERY
+    site by construction — no current or future site can pass a raw hostile identity
+    through the three caller-derived identity params.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+
+    call_id = new_call_id()
+    adapter._call_info[call_id] = {"name": "1000", "type": "dm", "ended": False}
+
+    source = adapter._call_source(
+        call_id,
+        chat_name=_HOSTILE_CALLER_ID,
+        user_id=_HOSTILE_CALLER_ID,
+        user_name=_HOSTILE_CALLER_ID,
+    )
+    for label, value in (
+        ("chat_name", source.chat_name),
+        ("user_id", source.user_id),
+        ("user_name", source.user_name),
+    ):
+        assert value is not None, f"{label} is unexpectedly None"
+        assert value != _HOSTILE_CALLER_ID, f"{label} passed a raw hostile identity"
+        assert "<<<" not in value, f"{label} carries the fence-open sentinel"
+        assert ">>>" not in value, f"{label} carries the fence-close sentinel"
+        assert "\n" not in value, f"{label} carries a newline (multi-line injection)"
+
+
 def test_spotlight_turn_defangs_callee_name_in_outbound_framing() -> None:
     """The outbound framing names the callee; a hostile callee name must be defanged.
 

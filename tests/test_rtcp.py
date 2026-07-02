@@ -394,6 +394,31 @@ def test_sdes_cname_over_255_utf8_bytes_is_error() -> None:
         SdesChunk(ssrc=1, cname="é" * 128)  # 256 octets: over the limit
 
 
+def test_sdes_rejects_trailing_garbage_after_declared_chunks() -> None:
+    """Trailing bytes after all declared SDES chunks must raise, not parse silently.
+
+    The chunk-count field (SC) says 1 chunk; the packet's declared length is one
+    whole 32-bit word longer than that one chunk needs. ``_from_body`` parses
+    exactly SC chunks and, without a full-consumption check, would return
+    successfully having silently ignored the extra word. The sibling report-block
+    parser (``_parse_report_blocks``, hardened per ADR-0061) already requires the
+    region to be exactly consumed — SDES must match, so a truncated/garbled SC
+    field can't hide data from the parsed result.
+    """
+    ssrc = 0xCAFEBABE
+    cname = b"ab"
+    item = bytes([1, len(cname)]) + cname  # type=CNAME(1), len=2, "ab"
+    chunk = struct.pack("!I", ssrc) + item + b"\x00"  # null terminator
+    chunk += b"\x00" * ((-len(chunk)) % 4)  # pad the chunk to a 32-bit boundary
+    garbage = b"\xff\xff\xff\xff"  # one extra word the SC=1 count doesn't cover
+    body = chunk + garbage
+    header = bytes([0x80 | 1, RTCP_PT_SDES]) + struct.pack("!H", len(body) // 4)
+    wire = header + body
+
+    with pytest.raises(RtcpError, match="trailing"):
+        SourceDescription.parse(wire)
+
+
 # ---------------------------------------------------------------------------
 # BYE (RFC 3550 §6.6)
 # ---------------------------------------------------------------------------
@@ -463,6 +488,29 @@ def test_parse_compound_with_zero_ssrc_bye_raises_rtcp_error() -> None:
     bye = bytes([0x80, RTCP_PT_BYE]) + struct.pack("!H", 0)
     with pytest.raises(RtcpError, match="zero SSRC"):
         parse_compound(bye)
+
+
+def test_bye_rejects_trailing_garbage_after_padded_reason() -> None:
+    """Trailing bytes after the reason's own alignment padding must raise.
+
+    RFC 3550 §6.6: like an SDES item, the length-prefixed reason is padded to a
+    32-bit boundary. This packet declares one whole extra word beyond that
+    properly-padded reason that the length prefix doesn't account for — without a
+    full-consumption check, ``_from_body`` decodes the reason and returns,
+    silently dropping the trailing word instead of treating the packet as
+    malformed.
+    """
+    ssrc = 0xCAFEBABE
+    reason = b"hi"  # 1 (length byte) + 2 = 3 raw bytes -> needs 1 pad byte
+    reason_field = bytes([len(reason)]) + reason
+    reason_field += b"\x00" * ((-len(reason_field)) % 4)  # properly padded: 4 bytes
+    garbage = b"\xff\xff\xff\xff"  # one extra word beyond the padded reason
+    body = struct.pack("!I", ssrc) + reason_field + garbage
+    header = bytes([0x80 | 1, RTCP_PT_BYE]) + struct.pack("!H", len(body) // 4)
+    wire = header + body
+
+    with pytest.raises(RtcpError, match="trailing"):
+        Bye.parse(wire)
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +720,49 @@ def test_rtt_from_report_block_basic() -> None:
 def test_rtt_zero_when_no_sr_acknowledged() -> None:
     """LSR == 0 means the peer has not yet timed any SR of ours: RTT is None."""
     rtt = rtt_from_report_block(now_compact_ntp=12345, lsr=0, dlsr=0)
+    assert rtt is None
+
+
+def test_rtt_from_report_block_rejects_implausible_wrapped_delay() -> None:
+    """A delay that wraps to ~2^32 (a stale/replayed LSR or clock jump) yields None.
+
+    RFC 1982 serial arithmetic: the wrap-safe ``(now - lsr) & _U32`` subtraction is
+    only unambiguous for a genuine forward elapsed time under half the 32-bit
+    space (~9.1 h — compact NTP wraps every ~18.2 h). ``lsr`` slightly AHEAD of
+    ``now`` (a stale/replayed report, or a backward clock jump) makes the raw
+    subtraction go negative and wrap to just under 2^32 (~18.2 h) instead of a
+    small negative number — an implausible RTT that must not reach
+    call-quality/SLO metrics as if it were a real multi-hour round trip.
+    """
+    now_compact = 1000 << 16
+    lsr = now_compact + 5  # lsr is 5 units "ahead" of now: a stale/replayed report
+    rtt = rtt_from_report_block(now_compact_ntp=now_compact, lsr=lsr, dlsr=0)
+    assert rtt is None
+
+
+def test_rtt_from_report_block_accepts_delay_just_under_half_window() -> None:
+    """A delay just under the RFC 1982 half-window (~9.1 h) is still a valid RTT.
+
+    Confirms the fix is the precise RFC 1982 ambiguity boundary, not an arbitrary
+    small cap: an unusual-but-legitimate long delay (our SR sat unacknowledged for
+    hours before this report finally arrived) is still computed, not rejected.
+    """
+    lsr = 1  # any non-zero sentinel value
+    delay_units = (1 << 31) - 1  # one unit under half the 32-bit space
+    rtt = rtt_from_report_block(now_compact_ntp=lsr + delay_units, lsr=lsr, dlsr=0)
+    assert rtt is not None
+    assert rtt > 0
+
+
+def test_rtt_from_report_block_rejects_delay_at_half_window() -> None:
+    """A delay of EXACTLY the RFC 1982 half-window is the ambiguous case: rejected.
+
+    Mirrors ``rtp.py``'s ``_seq_before``, where a distance of exactly half the
+    modulus is "undefined (ambiguous) per the RFC" — treated as not-before, not
+    silently accepted as a small forward delay.
+    """
+    lsr = 1
+    rtt = rtt_from_report_block(now_compact_ntp=lsr + (1 << 31), lsr=lsr, dlsr=0)
     assert rtt is None
 
 

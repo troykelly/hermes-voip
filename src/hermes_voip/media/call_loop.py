@@ -101,6 +101,13 @@ from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.spoken_text import sanitize_for_speech
 from hermes_voip.tts.failover import reset_failover_if_supported
 
+__all__ = [
+    "BargeInGate",
+    "BargeInMode",
+    "CallLoop",
+    "gate_voip_tool",
+]
+
 _log: Final = logging.getLogger(__name__)
 
 #: Maximum audio frames buffered between the pump and the ASR task (back-pressure:

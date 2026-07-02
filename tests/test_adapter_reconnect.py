@@ -543,6 +543,14 @@ async def test_degraded_health_clears_after_successful_reconnect() -> None:
 
         # The retry succeeds; degraded health must clear back to healthy.
         await _until(lambda: adapter.is_flow_healthy, timeout=3.0)
+        # Prove the clear was CAUSED by a genuine successful reconnect, not a
+        # spurious flip: the failed attempt (transport #2) AND the succeeding
+        # retry (transport #3) must both have been constructed by now, so the
+        # health cleared strictly *after* a real reconnect completed.
+        assert call_count >= 3, (
+            f"expected a failed attempt + a successful retry (>=3 transports built), "
+            f"got {call_count} — cannot conclude health cleared after a real reconnect"
+        )
         assert adapter.is_flow_healthy is True, (
             "degraded health did not clear after a successful reconnect"
         )

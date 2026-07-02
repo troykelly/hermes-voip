@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
@@ -163,6 +163,23 @@ class CallMedia(Protocol):
 
 
 type ReferHandler = Callable[[ReferRequest], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReanswerPlan:
+    """A re-INVITE 200's SDES crypto, split into what to render vs. what to re-key.
+
+    ``render`` is the ``a=crypto`` to advertise in the answer (or ``None`` for a plain
+    answer). ``rekey`` is the ``(inbound, outbound)`` key pair to install in the engine
+    once the answer is committed — set ONLY for a secured peer re-offer, ``None`` when
+    nothing re-keys (offerless re-advertise, or a plain answer). Splitting the pure
+    choice from the irreversible re-key lets :meth:`CallSession._answer_reinvite` build
+    the whole 200 BEFORE touching the SRTP context, so a re-INVITE it cannot answer is
+    dropped WHOLE (ADR-0081).
+    """
+
+    render: CryptoAttribute | None
+    rekey: tuple[CryptoAttribute, CryptoAttribute] | None
 
 
 class CallSession:
@@ -565,14 +582,16 @@ class CallSession:
         audio = offer.audio
         return audio is None or not audio.is_srtp or not audio.crypto_attrs
 
-    async def _reanswer_crypto(
-        self, offer: SessionDescription | None
-    ) -> CryptoAttribute | None:
-        """Pick the SDES ``a=crypto`` for a re-INVITE answer/offer WE emit in a 200.
+    def _plan_reanswer_crypto(self, offer: SessionDescription | None) -> _ReanswerPlan:
+        """Choose the SDES ``a=crypto`` for a re-INVITE answer/offer WE emit in a 200.
+
+        Pure: mutates nothing (no re-key, no key adoption), so the answer can be built
+        BEFORE any irreversible state and a re-INVITE we cannot answer is dropped WHOLE
+        (ADR-0081); :meth:`_commit_reanswer_crypto` applies the planned re-key after.
 
         - Peer re-offer (``offer`` set) on a secured call: mint our fresh answer key
-          echoing the OFFERED tag + suite and re-key the engine — inbound from the
-          peer's key, outbound from ours (RFC 4568 §6.1). A plain-call peer offer is
+          echoing the OFFERED tag + suite; the plan re-keys the engine — inbound from
+          the peer's key, outbound from ours (RFC 4568 §6.1). A plain-call peer offer is
           answered plain. (A secured call's downgrade re-offer never reaches here — it
           is rejected 488 upstream by :meth:`_peer_reoffer_is_downgrade`.)
         - Offerless re-INVITE (``offer`` is ``None``) on a secured call: WE offer, but
@@ -580,23 +599,31 @@ class CallSession:
           answer rides the ACK, which this dialog does not parse for SDP; re-using the
           current key keeps BOTH directions on their agreed keys, so continuity holds
           without consuming the ACK answer. A plain call offers plain.
-
-        Returns the crypto to render, or ``None`` for a plain answer.
         """
         if offer is None:
             # Offerless: re-advertise the current key unchanged (no fresh mint, no
             # engine re-key) so there is no dependency on the peer's ACK-borne answer.
-            return self._local_media.crypto
+            return _ReanswerPlan(render=self._local_media.crypto, rekey=None)
         audio = offer.audio
         if self._local_media.crypto is None or audio is None or not audio.is_srtp:
-            return None
+            return _ReanswerPlan(render=None, rekey=None)
         if not audio.crypto_attrs:
-            return None
+            return _ReanswerPlan(render=None, rekey=None)
         peer_crypto = audio.crypto_attrs[0]
         answer_crypto = generate_answer_crypto(peer_crypto)
+        return _ReanswerPlan(render=answer_crypto, rekey=(peer_crypto, answer_crypto))
+
+    async def _commit_reanswer_crypto(self, plan: _ReanswerPlan) -> None:
+        """Apply the re-key :meth:`_plan_reanswer_crypto` chose (secured peer re-offer).
+
+        Called only once the 200 has been built and is about to be sent, so a re-INVITE
+        we could not answer never touches the live SRTP key (ADR-0081 drop-whole).
+        """
+        if plan.rekey is None:
+            return
+        peer_crypto, answer_crypto = plan.rekey
         await self._media.rekey_srtp(inbound=peer_crypto, outbound=answer_crypto)
         self._adopt_local_crypto(answer_crypto)
-        return answer_crypto
 
     async def _commit_reoffer_keys(
         self, offer_crypto: CryptoAttribute | None, answer: SessionDescription
@@ -825,26 +852,18 @@ class CallSession:
 
         Answering re-keys the SRTP engine (secured peer re-offer) and bumps the SDP
         version — both irreversible. A re-INVITE we cannot answer (missing a header to
-        echo) must have NO effect, so its answerability is confirmed via
-        :meth:`_build_or_drop` BEFORE any of that: on failure the re-INVITE is dropped
-        WHOLE (no re-key, no version bump, no send) and ``False`` is returned so the
-        caller skips the media-state change too. Returns ``True`` once the 200 is sent.
+        echo) must have NO effect, so the WHOLE 200 (the actual response we send) is
+        built via :meth:`_build_or_drop` BEFORE any of that. On failure the re-INVITE is
+        dropped WHOLE — no re-key, no version bump, no send — and ``False`` is returned
+        so the caller skips the media-state change too. Returns ``True`` once the 200 is
+        sent.
         """
-        # Fail closed (ADR-0081): confirm the re-INVITE can be answered before the
-        # irreversible re-key / version bump. The real 200 built below echoes the same
-        # (now validated) request headers with our own Contact / Content-Type and the
-        # SDP body, so it cannot raise for a request this probe accepted.
-        if (
-            self._build_or_drop(
-                lambda: build_response(request, 200, "OK"), kind="INVITE"
-            )
-            is None
-        ):
-            return False
         # SDES continuity (ADR-0053): on a secured call the re-negotiated media stays
-        # RTP/SAVP + a=crypto, never silently downgrading to cleartext RTP/AVP.
-        answer_crypto = await self._reanswer_crypto(offer)
-        self._dialog = self._dialog.with_next_sdp_version()
+        # RTP/SAVP + a=crypto, never silently downgrading to cleartext RTP/AVP. Plan the
+        # crypto and next dialog version PURELY (no re-key, no assignment) so the answer
+        # is fully built before any irreversible state is touched.
+        plan = self._plan_reanswer_crypto(offer)
+        next_dialog = self._dialog.with_next_sdp_version()
         answer = build_audio_offer(
             local_address=self._local_media.local_address,
             port=self._local_media.port,
@@ -852,11 +871,13 @@ class CallSession:
             direction=direction,
             ptime=self._local_media.ptime,
             session_id=self._local_media.session_id,
-            version=self._dialog.sdp_version,
-            crypto=answer_crypto,
+            version=next_dialog.sdp_version,
+            crypto=plan.render,
         )
-        await self._signaling.send(
-            build_response(
+        # Fail closed (ADR-0081): build the actual 200 first. If it cannot be built the
+        # re-INVITE is unanswerable, dropped WHOLE — no SRTP re-key, no version bump.
+        response = self._build_or_drop(
+            lambda: build_response(
                 request,
                 200,
                 "OK",
@@ -865,8 +886,16 @@ class CallSession:
                     ("Content-Type", "application/sdp"),
                 ),
                 body=answer,
-            )
+            ),
+            kind="INVITE",
         )
+        if response is None:
+            return False
+        # Commit only now that the 200 is built: re-key the engine, advance the dialog
+        # version, then send. Ordering relative to the send is unchanged (re-key first).
+        await self._commit_reanswer_crypto(plan)
+        self._dialog = next_dialog
+        await self._signaling.send(response)
         return True
 
     async def _on_bye(self, request: SipRequest) -> None:

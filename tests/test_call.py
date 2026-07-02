@@ -1117,11 +1117,13 @@ def _header_incomplete(
     """An in-dialog request routed to this call but missing one mandatory echo header.
 
     ``manager._route_in_dialog`` keys an in-dialog request on its To-tag, From-tag and
-    Call-ID ONLY — never Via or CSeq — so a request that carries those three (here the
-    dialog's ``ours``/``theirs`` tags + ``call-1``) but ``omit``s a mandatory echo
-    header (Via / From / To / Call-ID / CSeq, RFC 3261 §8.2.6) still routes ``InDialog``
-    to the established :class:`CallSession` and reaches an inline ``build_response`` —
-    which raises :class:`ValueError` because it cannot echo the missing header.
+    Call-ID ONLY — never Via or CSeq. So a request carrying those three (here the
+    dialog's ``ours``/``theirs`` tags + ``call-1``) that ``omit``s a header used only to
+    ECHO into the response — Via or CSeq — still routes ``InDialog`` to the established
+    :class:`CallSession` and reaches an inline ``build_response``, which raises
+    :class:`ValueError` because it cannot echo the missing header (RFC 3261 §8.2.6). The
+    tests omit Via / CSeq for exactly that reason; omitting To / From / Call-ID would
+    instead fail routing upstream and never reach ``build_response``.
     """
     headers = [
         ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-in"),

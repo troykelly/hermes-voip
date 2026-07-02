@@ -1358,3 +1358,18 @@ async def test_cseq_number_rejects_a_number_at_or_above_2_31() -> None:
     assert _cseq_number("2147483647 BYE") == 2**31 - 1  # largest valid CSeq
     assert _cseq_number("2147483648 BYE") is None  # 2**31: out of range
     assert _cseq_number("9999999999 BYE") is None  # 10 digits but >= 2**31
+
+
+async def test_cseq_number_accepts_a_leading_zero_padded_cseq() -> None:
+    """Leading zeros are valid in a SIP CSeq number; its VALUE is what counts.
+
+    RFC 3261's CSeq sequence-number grammar is `1*DIGIT`, which permits leading
+    zeros, so ``00000000001`` is a valid encoding of sequence number 1 and MUST
+    correlate as 1 — never dropped for its digit count. ``_cseq_number`` normalizes
+    via ``int()`` (``int("00000000001") == 1``) and range-checks the VALUE, not the
+    length; a bounded-length guard would wrongly drop a legitimately padded CSeq an
+    RFC-compliant peer may send (a real over-drop, not a fail-closed non-numeric case).
+    """
+    assert _cseq_number("00000000001 BYE") == 1  # 11 digits, value 1: not over-dropped
+    # A heavily padded largest-valid CSeq still normalizes and is accepted here.
+    assert _cseq_number("0000000000002147483647 INVITE") == 2**31 - 1

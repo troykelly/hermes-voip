@@ -129,7 +129,25 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
         }
     }
     serialized_fields = json.dumps(structured_fields, sort_keys=True, default=repr)
-    serialized_record = json.dumps(record.__dict__, sort_keys=True, default=repr)
+    # LogRecord runtime metadata (timestamps, thread/process ids, task name) is not
+    # secret-bearing, but its numeric values vary per run and can happen to contain a
+    # short secret digit like "1000" (e.g. relativeCreated mid-suite, a thread/process
+    # id) -- scanning it flakes this check. A real leak still shows up in an extra
+    # field, the message args, or the rendered message, all scanned below.
+    runtime_metadata = {
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "process",
+        "taskName",
+    }
+    scannable_record = {
+        key: value
+        for key, value in record.__dict__.items()
+        if key not in runtime_metadata
+    }
+    serialized_record = json.dumps(scannable_record, sort_keys=True, default=repr)
     rendered_message = record.getMessage()
     for secret in ("pbx.example.test", "1000", "1001", "p1", "p2"):
         assert secret not in serialized_fields, (

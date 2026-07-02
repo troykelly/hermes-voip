@@ -406,7 +406,12 @@ async def test_opus_corrupt_successor_payload_falls_back_to_plc() -> None:
     FEC source, seq 2, carries corrupt bytes instead of real Opus data. FEC
     recovery of frame 1 from packet 2 is therefore impossible — the engine must
     fall back to native PLC rather than let decode_fec's OpusDecodeError escape.
-    The stream must still continue afterward (seq 3, a real packet, decodes).
+    seq 2 itself is also undecodable as a normal frame (the same corrupt
+    bytes), so it is concealed too — two adjacent bad slots in a row. The
+    stream must still continue afterward: seq 3, a real later packet, is
+    collected and asserted to decode to real, non-silent audio, proving the
+    decoder recovered from BOTH corruption events rather than merely that an
+    exception type changed.
     """
     engine = RtpMediaTransport(
         local_address="127.0.0.1",
@@ -432,10 +437,13 @@ async def test_opus_corrupt_successor_payload_falls_back_to_plc() -> None:
     )
     engine._recv_queue.put_nowait((_make_rtp(3, seq3, pt=_OPUS_PT), _FAKE_SRC))
 
-    frames = await _collect_n(engine, 3)
+    frames = await _collect_n(engine, 4)
     await engine.stop()
 
-    assert len(frames) == 3  # Lost(1) concealed via PLC fallback, not fatal
+    assert len(frames) == 4  # Lost(1) concealed via PLC fallback, not fatal
+    assert frames[0].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[0].samples) > 0.0  # seq 0 decodes normally
+
     samples_per_analysis_frame = (
         OPUS_FRAME_SAMPLES * _OPUS_ANALYSIS_RATE // OPUS_SAMPLE_RATE
     )
@@ -445,6 +453,11 @@ async def test_opus_corrupt_successor_payload_falls_back_to_plc() -> None:
     # propagating — the same protection applies to a corrupt "current" packet
     # as to a corrupt FEC-source successor.
     assert len(frames[2].samples) == samples_per_analysis_frame * 2
+
+    # THE call survives BOTH corruption events: seq 3 — the real packet after
+    # them — still decodes to real, non-silent audio.
+    assert frames[3].sample_rate == _OPUS_ANALYSIS_RATE
+    assert _rms(frames[3].samples) > 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -1144,6 +1144,88 @@ async def test_superscript_cseq_number_on_invite_final_survives_connection() -> 
 
 
 # --------------------------------------------------------------------------
+# ADR-0081 class, RESPONSE side (F3): a CORRELATED non-2xx final whose auto-ACK
+# cannot be built (missing To / control char) must not tear the connection down.
+# --------------------------------------------------------------------------
+
+
+def _final_missing_to(invite: SipRequest, status: int, reason: str) -> str:
+    """A non-2xx final correlated to ``invite`` but carrying NO ``To`` header.
+
+    Same Via/branch, Call-ID and CSeq number as ``invite`` (so it matches the
+    outstanding INVITE client transaction), but no ``To``. parse() does not require
+    ``To`` (it frames + parses cleanly), so this reaches _auto_ack_non_2xx and
+    _build_ack's ``_require(response, "To")`` raises ValueError (RFC 3261 §17.1.1.3
+    copies the response's To into the ACK).
+    """
+    return (
+        f"SIP/2.0 {status} {reason}\r\n"
+        f"Via: {invite.header('Via')}\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"Call-ID: {invite.header('Call-ID')}\r\n"
+        f"CSeq: {invite.header('CSeq')}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_correlated_non_2xx_final_missing_to_survives_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # F3 (MEDIUM, ADR-0081): a non-2xx final that CORRELATES to an INVITE we sent
+    # (so a client transaction IS found) but lacks a To header makes _build_ack's
+    # _require(response, "To") raise ValueError. Unguarded it escaped the reader and
+    # tore the connection down. Assert the connection survives, no ACK is sent (the
+    # auto-ACK could not be built), and a non-PII WARNING is logged.
+    branch = new_branch()
+    call_id = new_call_id()
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.connection"):
+        try:
+            await transport.connect()
+            invite = _outbound_invite(branch, call_id=call_id)
+            await transport.send(invite)
+            await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+            await server.push(
+                _final_missing_to(SipRequest.parse(invite), 486, "Busy Here")
+            )
+            # RED before the fix: the reader crashes and fires on_connection_lost.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+            assert lost == [], (
+                "a To-less correlated final must not tear the reader down"
+            )
+            # The auto-ACK could not be built, so none was sent.
+            assert not any(raw.startswith("ACK ") for raw in server.received)
+        finally:
+            await transport.aclose()
+            await server.stop()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("auto-ACK" in r.getMessage() for r in warnings), (
+        "dropping an unbuildable auto-ACK must be logged as a WARNING"
+    )
+
+
+# --------------------------------------------------------------------------
 # ADR-0081 class, BUILD side: a header-incomplete inbound request that PARSES
 # but whose auto-response cannot be built must not tear down the connection.
 # --------------------------------------------------------------------------

@@ -20,6 +20,7 @@ inbound re-INVITE is answered ``491 Request Pending`` (glare).
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Protocol, runtime_checkable
@@ -79,6 +80,8 @@ __all__ = [
     "CallSignaling",
     "ReferHandler",
 ]
+
+_log = logging.getLogger(__name__)
 
 _PROVISIONAL_CEILING = 200  # a status below this is a 1xx provisional response
 _UNAUTHORIZED = 401
@@ -373,6 +376,14 @@ class CallSession:
         moment we send BYE + stop media, and the gateway may never deliver a final
         response on a dropped media path (the same rationale as not blocking
         teardown on a network round-trip).
+
+        The BYE send itself is best-effort for the same reason: a TLS/WS/transport
+        fault there means the peer never receives the BYE, which is functionally
+        the same lost-packet case its own dialog timers already handle. Local
+        teardown (marking ended, stopping media) must complete regardless — an
+        escaped send failure would otherwise leave the session marked ended but
+        the media engine still running, wedging the conversational loop open on a
+        call the session already considers over.
         """
         async with self._lock:
             if self.ended:
@@ -380,7 +391,15 @@ class CallSession:
             request = build_in_dialog_request(self._dialog, "BYE")
             self._dialog = request.dialog
             self.ended = True
-            await self._signaling.send(request.text)
+            try:
+                await self._signaling.send(request.text)
+            except Exception as exc:  # noqa: BLE001 — best-effort BYE; never strand teardown (rule 37: logged, not swallowed)
+                _log.warning(
+                    "hang_up: BYE send failed on call %s (peer may not observe "
+                    "it; local teardown proceeds regardless): %s",
+                    self._dialog.call_id,
+                    exc,
+                )
             await self._media.stop()
 
     async def transfer_blind(

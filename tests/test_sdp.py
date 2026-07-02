@@ -34,6 +34,7 @@ from hermes_voip.sdp import (
     SessionDescription,
     SetupRole,
     _AudioAccumulator,
+    _coerce_crypto,
     _negotiate_answer_crypto,
     build_audio_answer,
     build_audio_offer,
@@ -1160,6 +1161,59 @@ def test_answer_echoes_sha1_32_accepted_suite() -> None:
     assert _FAKE_KEY not in text
 
 
+# --- Unicode-digit crypto tag: bare ValueError must not escape SdpError ---
+# str.isdigit() is True for U+00B2 (superscript two) but int("²") raises a
+# bare ValueError, which escapes the lenient `except SdpError` guards and violates
+# the parse "Raises: SdpError" contract. The house guard is isascii()+isdecimal()
+# (registration.py / transport/framing.py already fixed this exact class).
+
+
+def test_crypto_parse_unicode_digit_tag_raises_sdp_error_not_value_error() -> None:
+    """A Unicode-digit crypto tag raises SdpError, never a bare ValueError.
+
+    ``str.isdigit()`` is True for U+00B2 SUPERSCRIPT TWO, but ``int("²")``
+    raises a bare ``ValueError`` that escapes ``_AudioAccumulator.build``'s
+    ``except SdpError`` leniency and breaks the documented ``Raises: SdpError``
+    contract. The message stays structural (rule 34): a whitespace-split body can
+    carry the inline key in the tag position, so it is never echoed.
+    """
+    with pytest.raises(SdpError) as excinfo:
+        CryptoAttribute.parse(f"² {_SUITE_32} inline:{_FAKE_KEY}")
+    assert _FAKE_KEY not in str(excinfo.value)
+
+
+def test_offer_with_unicode_digit_crypto_tag_parses_leniently() -> None:
+    """An a=crypto line with a Unicode-digit tag is SKIPPED, not fatal to the parse.
+
+    The bare ValueError from ``int("²")`` must not escape the per-line
+    ``except SdpError`` in ``_AudioAccumulator.build`` and tear down the whole
+    ``SessionDescription.parse`` — on the in-dialog re-INVITE path that is an
+    unauthenticated whole-connection DoS (ADR-0081 read-loop-escape class).
+    """
+    offer = (
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\ns=-\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:² {_SUITE_32} inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer)  # must NOT raise
+    assert sdp.audio is not None
+    # The bad line never promotes to a typed attr (leniency preserved).
+    assert sdp.audio.crypto_attrs == ()
+
+
+def test_coerce_crypto_unicode_digit_leading_token_raises_sdp_error() -> None:
+    """_coerce_crypto must not misclassify a Unicode-digit first token as a tag.
+
+    It disambiguates tag-vs-suite by a purely-decimal first token; U+00B2 passes
+    ``str.isdigit()`` but is not int-parseable, so classifying it as the tag reaches
+    ``int()`` and raises a bare ValueError. It must raise SdpError instead — the
+    same isascii()+isdecimal() guard as the parser, keeping our own crypto path
+    from leaking a bare ValueError out of the "Raises: SdpError" contract.
+    """
+    with pytest.raises(SdpError):
+        _coerce_crypto(f"² {_SUITE_32} inline:{_FAKE_ANSWER_KEY}")
+
+
 # --- W3 (security review): SDES key material must never leak via repr/errors ---
 # A `repr()` lands in logs and tracebacks; SDES master key||salt in a repr leaks
 # the SRTP session key. Likewise SdpError messages can surface for our OWN crypto,
@@ -1496,6 +1550,48 @@ def test_ice_candidate_parse_relay() -> None:
     assert cand.port == 50000
     assert cand.raddr == "203.0.113.1"
     assert cand.rport == 49001
+
+
+def test_ice_candidate_non_numeric_rport_raises_sdp_error() -> None:
+    """A non-numeric rport raises SdpError (parse contract), never a bare ValueError.
+
+    IceCandidate.parse wraps its MANDATORY numeric fields in try/except
+    ValueError->SdpError, but the OPTIONAL rport int() was unguarded. The optional
+    conversion must share the same guard so the ``a=candidate`` site's
+    ``suppress(SdpError)`` can skip just this candidate.
+    """
+    body = (
+        "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 rport NOTANUM"
+    )
+    with pytest.raises(SdpError):
+        IceCandidate.parse(body)
+
+
+def test_offer_with_non_numeric_rport_candidate_parses_leniently() -> None:
+    """A candidate with a non-numeric rport is SKIPPED, not fatal to the offer parse.
+
+    The bare ValueError from an unguarded rport ``int()`` bypassed the
+    ``a=candidate`` site's ``contextlib.suppress(SdpError)`` and failed the WHOLE
+    offer parse instead of dropping the one candidate — breaking the documented
+    per-candidate leniency (and, on the in-dialog re-INVITE path, an
+    unauthenticated whole-connection DoS, ADR-0081 read-loop-escape class).
+    """
+    offer = (
+        "v=0\r\no=- 2000 2000 IN IP4 192.0.2.10\r\ns=-\r\nt=0 0\r\n"
+        "m=audio 49000 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\na=setup:actpass\r\n"
+        f"a=ice-ufrag:{_FAKE_UFRAG}\r\na=ice-pwd:{_FAKE_PWD}\r\n"
+        # A well-formed host candidate that MUST survive the parse.
+        "a=candidate:1 1 UDP 2130706431 192.0.2.10 49000 typ host\r\n"
+        # A srflx candidate whose rport is non-numeric — the bad one, dropped.
+        "a=candidate:2 1 UDP 1694498815 203.0.113.1 49000"
+        " typ srflx raddr 192.0.2.10 rport NOTANUM\r\n"
+        "a=rtcp-mux\r\na=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer)  # must NOT raise
+    assert sdp.audio is not None
+    # The bad srflx is dropped; the good host candidate is preserved.
+    assert [c.typ for c in sdp.audio.ice_candidates] == ["host"]
 
 
 def test_ice_candidate_render_host_round_trip() -> None:
@@ -2973,6 +3069,32 @@ def test_negotiate_answer_crypto_picks_strongest_directly() -> None:
     )
     assert accepted.suite == _SUITE_80
     assert accepted.tag == 2
+
+
+def test_wire_answer_suite_equals_installed_keying_suite() -> None:
+    """The wire answer's suite MUST equal the suite the SRTP sessions are keyed with.
+
+    ``build_audio_answer`` selects the STRONGEST offered suite for the wire
+    (anti-downgrade, via :func:`_negotiate_answer_crypto`'s ``max``), but the
+    adapter keys every SRTP/SRTCP session from ``crypto_attrs[0]`` (offer order):
+    ``SrtpSession(audio.crypto_attrs[0])`` inbound and
+    ``generate_answer_crypto(audio.crypto_attrs[0])`` outbound. For a spec-compliant
+    weak-first offer the two suites MUST agree, or the peer keys a different SRTP
+    auth-tag length than we run and the secured call has no audio in either
+    direction — while the anti-downgrade control is silently defeated (we actually
+    run the weaker suite the wire claims to have rejected). This pins the invariant
+    that ``crypto_attrs[0]`` is the SAME accepted suite the wire advertises.
+    """
+    offer = SessionDescription.parse(_savp_offer_two_crypto(_SUITE_32, _SUITE_80))
+    audio = offer.audio
+    assert audio is not None
+    # What the adapter installs: it keys every SrtpSession from crypto_attrs[0].
+    installed = audio.crypto_attrs[0]
+    # What the wire answer advertises: the strongest suite (anti-downgrade).
+    wire = _negotiate_answer_crypto(audio, f"{_SUITE_80} inline:{_FAKE_ANSWER_KEY}")
+    assert installed.suite == wire.suite
+    # Both are the strong suite — selection is by strength, never offer order.
+    assert installed.suite == _SUITE_80
 
 
 # ---------------------------------------------------------------------------

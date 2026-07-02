@@ -172,6 +172,41 @@ def test_construction_validates_field_ranges() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "field", ["payload_type", "sequence_number", "timestamp", "ssrc"]
+)
+def test_construction_rejects_float_numeric_field(field: str) -> None:
+    """A float numeric field is rejected as a TypeError at construction.
+
+    Each field is range-checked, but ``0 <= 1.5 <= max`` is True, so a float would
+    otherwise construct cleanly and only blow up later in ``pack()``'s
+    ``struct.pack`` with a ``struct.error`` — an exception type nothing in this
+    module raises. Mirrors :class:`Lost`'s ``count`` isinstance guard.
+    """
+    kwargs: dict[str, object] = {
+        "payload_type": 0,
+        "sequence_number": 0,
+        "timestamp": 0,
+        "ssrc": 0,
+        "payload": b"",
+    }
+    kwargs[field] = 1.5
+    with pytest.raises(TypeError, match=field):
+        RtpPacket(**kwargs)  # type: ignore[arg-type]  # float rejected at runtime
+
+
+def test_construction_rejects_bool_numeric_field() -> None:
+    """A ``bool`` field is rejected as a TypeError at construction.
+
+    ``bool`` is an ``int`` subtype to the checker (so there is no static error),
+    but it is not a valid RTP field value.
+    """
+    with pytest.raises(TypeError, match="payload_type"):
+        RtpPacket(
+            payload_type=True, sequence_number=0, timestamp=0, ssrc=0, payload=b""
+        )
+
+
 def test_jitter_in_order_emits_in_order() -> None:
     jb = JitterBuffer(target_depth=2)
     for seq in (10, 11, 12):
@@ -273,6 +308,27 @@ def test_jitter_peek_is_non_destructive_and_matches_next_pop() -> None:
     assert len(jb) == 3
     assert jb.pop() == first_peek
     assert _packet(jb.pop()).sequence_number == 11
+
+
+def test_jitter_peek_reports_coalesced_lost_count_like_pop() -> None:
+    """peek() must preview pop()'s COALESCED Lost.count for a far-ahead gap.
+
+    Run-length coalescing was added to pop() (one Lost(count=N) for the whole
+    gap) but peek() still returned the default count=1 — so peek(), documented as
+    "the next pop() result", under-reported loss for any caller that trusted its
+    count. Both must report the same N for the same gap event.
+    """
+    jb = JitterBuffer(target_depth=1, max_ahead=256)
+    jb.push(_pkt(10))
+    jb.push(_pkt(50))
+    assert _packet(jb.pop()).sequence_number == 10  # consume seq 10
+    previewed = jb.peek()
+    consumed = jb.pop()
+    assert isinstance(previewed, Lost)
+    assert isinstance(consumed, Lost)
+    # Same gap event → peek() must report the SAME coalesced count as pop().
+    assert previewed == consumed
+    assert previewed.count == 39  # seqs 11..49 are the coalesced lost run
 
 
 def test_jitter_flush_returns_ordered_remainder_and_empties() -> None:

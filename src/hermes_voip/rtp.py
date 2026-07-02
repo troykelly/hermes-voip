@@ -69,7 +69,27 @@ class RtpPacket:
     marker: bool = False
 
     def __post_init__(self) -> None:
-        """Validate that every fixed-width field fits its RFC 3550 range."""
+        """Validate every fixed-width field is an int within its RFC 3550 range.
+
+        Each field is range-checked, but ``0 <= x <= max`` is also True for a
+        ``float`` (or a ``bool``, which is an ``int`` subclass) from an untyped
+        caller — so it would construct cleanly and then fail LATER and lower, in
+        ``pack()``'s ``struct.pack`` with a ``struct.error`` (not this module's
+        advertised ``ValueError``). Each field is therefore first checked to be a
+        real ``int`` (``bool`` rejected explicitly), matching :class:`Lost`'s
+        validation style, so the failure is immediate and typed at construction.
+        """
+        for name, value in (
+            ("payload_type", self.payload_type),
+            ("sequence_number", self.sequence_number),
+            ("timestamp", self.timestamp),
+            ("ssrc", self.ssrc),
+        ):
+            value_raw: object = value  # widen so isinstance narrows (see Lost)
+            if isinstance(value_raw, bool) or not isinstance(value_raw, int):
+                kind = type(value_raw).__name__
+                msg = f"{name} must be an int, not {kind}"
+                raise TypeError(msg)
         if not 0 <= self.payload_type <= _MAX_PAYLOAD_TYPE:
             msg = f"payload_type out of range 0..127: {self.payload_type}"
             raise ValueError(msg)
@@ -498,28 +518,34 @@ class JitterBuffer:
             self._emitted = True
             if self._adapt:
                 self._clean_run = 0  # a declared loss breaks the clean run
-            # Run-length coalescing: scan forward from ``expected`` to find the
-            # first sequence that IS buffered.  Emit a single Lost(count=N)
-            # instead of N separate Lost events — O(1) allocations + iterations
-            # per gap regardless of gap size (amortized O(1) per packet).
-            # The scan is bounded by _max_ahead so it terminates even for a
-            # permanent gap. The gap is capped at EXACTLY _max_ahead: the strict
-            # ``<`` stops the loop once ``scan`` reaches ``expected + _max_ahead``
-            # (the window edge), so ``gap`` never exceeds _max_ahead and the anchor
-            # cannot over-advance past a packet that later arrives at that edge.
-            # The loop visits at most _max_ahead steps.
-            gap = 1
-            scan = _seq_next(expected)
-            while (
-                scan not in self._packets
-                and (scan - expected) % _SEQ_MOD < self._max_ahead
-            ):
-                gap += 1
-                scan = _seq_next(scan)
-            # Advance the anchor past all gap slots in one step.
+            # Run-length coalescing: emit a single Lost(count=N) for the whole
+            # gap (see ``_coalesced_gap``) instead of N separate Lost events —
+            # amortized O(1) per packet — then advance the anchor past all N slots
+            # in one step.
+            gap = self._coalesced_gap(expected)
             self._next = (expected + gap) % _SEQ_MOD
             return Lost(expected, count=gap)
         return None
+
+    def _coalesced_gap(self, expected: int) -> int:
+        """Count consecutive lost slots from ``expected``, bounded by ``_max_ahead``.
+
+        Scans forward to the first buffered sequence. A pure read that mutates no
+        state, so :meth:`pop` (which then advances the
+        anchor past the run) and :meth:`peek` (which must PREVIEW pop's coalesced
+        ``Lost.count`` without consuming) share one scan. The strict ``<`` stops
+        at the window edge (``expected + _max_ahead``), so the gap never exceeds
+        ``_max_ahead`` and the loop visits at most that many steps — the anchor
+        cannot over-advance past a packet that later arrives at that edge.
+        """
+        gap = 1
+        scan = _seq_next(expected)
+        while (
+            scan not in self._packets and (scan - expected) % _SEQ_MOD < self._max_ahead
+        ):
+            gap += 1
+            scan = _seq_next(scan)
+        return gap
 
     def peek(self) -> JitterOutput | None:
         """Return the next :meth:`pop` result without consuming buffer state."""
@@ -530,7 +556,8 @@ class JitterBuffer:
         if packet is not None:
             return packet
         if len(self._packets) >= self._depth:
-            return Lost(expected)
+            # Preview pop's COALESCED Lost.count for the same gap (non-destructive).
+            return Lost(expected, count=self._coalesced_gap(expected))
         return None
 
     def flush(self) -> list[RtpPacket]:

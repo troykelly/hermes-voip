@@ -112,6 +112,23 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("sip:ext@pbx.example.test", allow) is True
         assert is_outbound_allowed("1001", allow) is False
 
+    def test_non_mask_pattern_keeps_x_literal(self) -> None:
+        """In a non-mask pattern, ``x`` is literal while ``*`` remains glob-like."""
+        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "fax*"})
+        assert is_outbound_allowed("fax123", allow) is True
+        assert is_outbound_allowed("fa9", allow) is False
+
+    def test_literal_x_entry_stays_exact_no_overmatch(self) -> None:
+        """A literal entry with ``x`` and no ``*`` stays EXACT -- no digit over-match.
+
+        Security (fail-closed / no over-match): outside a simple dial mask ``x`` is
+        never a digit wildcard, so a listed ``fax`` permits exactly ``fax`` and MUST
+        NOT authorize ``fa0``..``fa9`` -- targets the operator never enumerated.
+        """
+        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "fax"})
+        assert is_outbound_allowed("fax", allow) is True
+        assert is_outbound_allowed("fa5", allow) is False
+
     # --- fail-closed / empty ---
 
     def test_empty_allow_still_denies_all(self) -> None:

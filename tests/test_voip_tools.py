@@ -704,6 +704,57 @@ def test_send_dtmf_allowed_for_trusted(
     )
 
 
+def test_send_dtmf_schema_caps_digit_length() -> None:
+    """The schema advertises a digits maxLength (defense-in-depth with the handler)."""
+    params = SEND_DTMF_TOOL_SCHEMA["parameters"]
+    assert isinstance(params, dict)
+    props = params.get("properties")
+    assert isinstance(props, dict)
+    digits = props.get("digits")
+    assert isinstance(digits, dict)
+    assert digits.get("maxLength") == 64
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_handler_rejects_over_length_digits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-cap digits string is rejected before dispatch (DoS guard).
+
+    The engine sends DTMF one digit at a time under the call's tx lock (~170ms/digit),
+    so a very long digit string would wedge the live call's outbound audio for the
+    whole send. The handler caps the length at the boundary and never dispatches.
+    """
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+    over_cap = "1" * 65  # one past the 64-digit cap
+
+    result = await send_dtmf_handler({"digits": over_cap})
+
+    assert host.dtmf_sent == []  # never dispatched to the adapter
+    payload = json.loads(result)
+    assert "error" in payload
+    # The error must NOT echo the (possibly secret) digits — only the cap (rule 34).
+    assert over_cap not in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_send_dtmf_handler_at_cap_still_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A digits string exactly at the 64-digit cap is still sent (boundary)."""
+    host = _FakeHost()
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+    at_cap = "1" * 64
+
+    result = await send_dtmf_handler({"digits": at_cap})
+
+    assert host.dtmf_sent == [("call-xyz", at_cap)]
+    assert "result" in json.loads(result)
+
+
 # --- open_entry: the intercom entry action ------------------------------------
 
 

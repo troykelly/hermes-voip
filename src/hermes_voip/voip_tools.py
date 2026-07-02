@@ -477,9 +477,18 @@ SEND_DTMF_TOOL_NAME = "send_dtmf"
 #: level-0 caller cannot open the door.
 OPEN_ENTRY_TOOL_NAME = "open_entry"
 
+#: Maximum ``send_dtmf`` digit-string length. The engine sends one digit at a time
+#: under the call's tx lock (~170ms/digit), so an unbounded string would wedge the
+#: live call's outbound audio for the whole send (a DoS at the ELEVATED tier). 64 is
+#: generous for every legitimate use — a card number + expiry + CVV + ZIP with pause
+#: digits is ~30 — while capping the wedge at a few seconds. Enforced both as the
+#: schema ``maxLength`` (advisory) and as a runtime check in ``send_dtmf_handler``.
+_MAX_DTMF_DIGITS = 64
+
 #: ``send_dtmf`` schema. ``digits`` is the DTMF string to send (``0-9``, ``*``,
-#: ``#``, ``A``-``D``). The call to send on is the current session's own call
-#: (resolved from the session context) — the model cannot target another call.
+#: ``#``, ``A``-``D``), capped at ``_MAX_DTMF_DIGITS`` characters. The call to send on
+#: is the current session's own call (resolved from the session context) — the model
+#: cannot target another call.
 SEND_DTMF_TOOL_SCHEMA: dict[str, object] = {
     "name": SEND_DTMF_TOOL_NAME,
     "description": (
@@ -495,6 +504,7 @@ SEND_DTMF_TOOL_SCHEMA: dict[str, object] = {
         "properties": {
             "digits": {
                 "type": "string",
+                "maxLength": _MAX_DTMF_DIGITS,
                 "description": (
                     "The DTMF digits to send, e.g. '1' or '1234#'. Allowed "
                     "characters: 0-9, *, #, A-D."
@@ -1188,7 +1198,7 @@ async def report_call_result_handler(
         return _tool_failure(REPORT_RESULT_TOOL_NAME, exc)
 
 
-async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch (no adapter / no call / no digits / invalid-DTMF / not-negotiated / inactive / success); collapsing them would hide which failure the model sees
+async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch (no adapter / no call / no digits / too-long / invalid-DTMF / not-negotiated / inactive / success); collapsing them would hide which failure the model sees
     args: Mapping[str, object] | None = None,
     **_kwargs: object,
 ) -> str:
@@ -1197,9 +1207,10 @@ async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail
     Resolves the call from the Hermes session context (its ``chat_id`` is the SIP
     Call-ID) and sends the requested ``digits`` via the live adapter. Returns the
     JSON tool-result contract: ``{"result": …}`` on success, ``{"error": …}`` when
-    no adapter/call is in scope, ``digits`` is missing, the call has ended, the call
-    negotiated no telephone-event payload type, or ``digits`` contains a non-DTMF
-    character. The ``pre_tool_call`` gate has already enforced the ELEVATED privilege
+    no adapter/call is in scope, ``digits`` is missing or exceeds the length cap, the
+    call has ended, the call negotiated no telephone-event payload type, or ``digits``
+    contains a non-DTMF character. The ``pre_tool_call`` gate has already enforced the
+    ELEVATED privilege
     clamp (and any caller-group ``allowed_tools`` sub-ceiling) before this runs. The
     call to send on is fixed to the session's own call — the model cannot target
     another call. The digits are NOT echoed in the result/log (they may be secret).
@@ -1216,6 +1227,15 @@ async def send_dtmf_handler(  # noqa: PLR0911 — each return is a distinct fail
         digits = _str_arg(args, "digits")
         if not digits:
             return json.dumps({"error": "send_dtmf requires a 'digits' string to send"})
+        if len(digits) > _MAX_DTMF_DIGITS:
+            # Defensive length cap: the schema maxLength is advisory (the model can
+            # ignore it), so enforce it at the boundary. An over-long string would wedge
+            # the call's outbound audio (~170ms/digit under the tx lock) for the whole
+            # send — a DoS on the live call. Reject before dispatch; NEVER echo the
+            # digits (they may be secret — rule 34), only the cap.
+            return json.dumps(
+                {"error": f"digits string too long (max {_MAX_DTMF_DIGITS})"}
+            )
         try:
             sent = await adapter.send_dtmf_on_call(call_id, digits)
         except ValueError as exc:
@@ -1345,7 +1365,7 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
         return _tool_failure(TRANSFER_BLIND_TOOL_NAME, exc)
 
 
-async def transfer_attended_handler(
+async def transfer_attended_handler(  # noqa: PLR0911 — one return per fail-clear branch (no adapter / no call / consult / complete / cancel / unknown-action / handler-boundary failure); collapsing them would hide which outcome the model sees
     args: Mapping[str, object] | None = None,
     **_kwargs: object,
 ) -> str:
@@ -1375,22 +1395,27 @@ async def transfer_attended_handler(
     the irreversibility safeguard — the static analogue of ``transfer_blind``'s live
     DTMF confirmation.
     """
-    adapter = _ACTIVE_ADAPTER
-    if adapter is None:
-        return json.dumps({"error": "no active VoIP adapter; cannot transfer the call"})
-    call_id = _current_call_id()
-    if call_id is None:
-        return json.dumps({"error": "no active call in this session to transfer"})
-    action = _str_arg(args, "action")
-    if action == "consult":
-        return await _attended_consult(adapter, call_id, _str_arg(args, "target"))
-    if action == "complete":
-        return await _attended_complete(adapter, call_id)
-    if action == "cancel":
-        return await _attended_cancel(adapter, call_id)
-    return json.dumps(
-        {"error": "transfer_attended 'action' must be consult, complete, or cancel"}
-    )
+    try:
+        adapter = _ACTIVE_ADAPTER
+        if adapter is None:
+            return json.dumps(
+                {"error": "no active VoIP adapter; cannot transfer the call"}
+            )
+        call_id = _current_call_id()
+        if call_id is None:
+            return json.dumps({"error": "no active call in this session to transfer"})
+        action = _str_arg(args, "action")
+        if action == "consult":
+            return await _attended_consult(adapter, call_id, _str_arg(args, "target"))
+        if action == "complete":
+            return await _attended_complete(adapter, call_id)
+        if action == "cancel":
+            return await _attended_cancel(adapter, call_id)
+        return json.dumps(
+            {"error": "transfer_attended 'action' must be consult, complete, or cancel"}
+        )
+    except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
+        return _tool_failure(TRANSFER_ATTENDED_TOOL_NAME, exc)
 
 
 async def _attended_consult(adapter: VoipToolHost, call_id: str, target: str) -> str:

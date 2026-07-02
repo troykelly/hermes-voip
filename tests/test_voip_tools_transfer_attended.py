@@ -363,6 +363,80 @@ async def test_handler_with_no_session_call_returns_error(
     assert "error" in json.loads(result)
 
 
+# --- never-raise on a non-CallError transport fault (VT-1) -------------------
+#
+# ADR-0048 §"Always-JSON, never-raise handler contract" guarantees the handler
+# returns JSON on EVERY error and never raises. Each action helper anticipates only
+# SOME exceptions (consult: OutboundCall*/PermissionError/KeyError/RuntimeError;
+# complete: CallError; cancel: none), so a non-CallError transport fault from the
+# dial/REFER (OSError/ConnectionError/TimeoutError) escaped the tool call before the
+# outer guard. These pin the never-raise contract for all three actions.
+
+
+class _RaisingCompleteHost(_FakeHost):
+    """A fake host whose ``complete_attended_transfer`` raises a chosen exception."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+        raise self._exc
+
+
+class _RaisingCancelHost(_FakeHost):
+    """A fake host whose ``cancel_attended_transfer`` raises a chosen exception."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def cancel_attended_transfer(self, call_id: str) -> bool:
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_consult_transport_fault_is_rendered_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-CallError consult fault renders as error JSON, never raises (VT-1)."""
+    host = _RaisingConsultHost(OSError("tls broke"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "consult", "target": "1000"})
+
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_complete_transport_fault_is_rendered_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-CallError complete fault renders as error JSON, never raises (VT-1)."""
+    host = _RaisingCompleteHost(OSError("tls broke"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert "error" in json.loads(result)
+
+
+@pytest.mark.asyncio
+async def test_cancel_transport_fault_is_rendered_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-CallError cancel fault renders as error JSON, never raises (VT-1)."""
+    host = _RaisingCancelHost(OSError("tls broke"))
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "cancel"})
+
+    assert "error" in json.loads(result)
+
+
 # --- the IRREVERSIBLE privilege gate ----------------------------------------
 
 

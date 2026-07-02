@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -1137,6 +1138,61 @@ async def test_superscript_cseq_number_on_invite_final_survives_connection() -> 
         await server.push(_final_2xx_with_contact(SipRequest.parse(active_invite)))
         await _until(lambda: any(r.status_code == _OK_STATUS for r in sink.responses))
         # No ACK is attempted for the crafted response (it matches no transaction).
+        assert not any(raw.startswith("ACK ") for raw in server.received)
+    finally:
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_overlong_cseq_number_on_invite_final_survives_connection() -> None:
+    # F1 residual (codex adversarial review): a CSeq number that is all-ASCII-decimal
+    # but longer than CPython's int-from-string digit limit
+    # (sys.get_int_max_str_digits(), default 4300) passes ``isascii() and
+    # isdecimal()`` yet still makes ``int()`` raise ValueError ("Exceeds the limit").
+    # So the isascii+isdecimal guard alone does NOT close the escape — a crafted
+    # "CSeq: <thousands of digits> INVITE" response must be dropped like "²" is.
+    overlong = "9" * (sys.get_int_max_str_digits() + 1)
+    active_call_id = new_call_id()
+    active_branch = new_branch()
+    sink = _RecordingSink()
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=on_lost,
+    )
+    await transport.connect()
+    transport.add_call(active_call_id, sink)
+    try:
+        active_invite = _outbound_invite(active_branch, call_id=active_call_id)
+        await transport.send(active_invite)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        unrelated = SipRequest.parse(
+            _outbound_invite(new_branch(), call_id=new_call_id())
+        )
+        await server.push(
+            _final_with_cseq(unrelated, 486, "Busy Here", f"{overlong} INVITE")
+        )
+        # RED before the try/except: the reader crashes and fires on_connection_lost.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(lost_called.wait(), timeout=0.5)
+        assert lost == [], "an over-long CSeq number must not fire on_connection_lost"
+        await server.push(_final_2xx_with_contact(SipRequest.parse(active_invite)))
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in sink.responses))
         assert not any(raw.startswith("ACK ") for raw in server.received)
     finally:
         await transport.aclose()

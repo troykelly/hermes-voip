@@ -34,6 +34,7 @@ from hermes_voip.sdp import (
     SessionDescription,
     SetupRole,
     _AudioAccumulator,
+    _coerce_crypto,
     _negotiate_answer_crypto,
     build_audio_answer,
     build_audio_offer,
@@ -1158,6 +1159,59 @@ def test_answer_echoes_sha1_32_accepted_suite() -> None:
     assert f"a=crypto:5 {_SUITE_32} inline:{_FAKE_ANSWER_KEY}" in text
     # Negative control: the offerer's key material is NOT echoed back.
     assert _FAKE_KEY not in text
+
+
+# --- Unicode-digit crypto tag: bare ValueError must not escape SdpError ---
+# str.isdigit() is True for U+00B2 (superscript two) but int("²") raises a
+# bare ValueError, which escapes the lenient `except SdpError` guards and violates
+# the parse "Raises: SdpError" contract. The house guard is isascii()+isdecimal()
+# (registration.py / transport/framing.py already fixed this exact class).
+
+
+def test_crypto_parse_unicode_digit_tag_raises_sdp_error_not_value_error() -> None:
+    """A Unicode-digit crypto tag raises SdpError, never a bare ValueError.
+
+    ``str.isdigit()`` is True for U+00B2 SUPERSCRIPT TWO, but ``int("²")``
+    raises a bare ``ValueError`` that escapes ``_AudioAccumulator.build``'s
+    ``except SdpError`` leniency and breaks the documented ``Raises: SdpError``
+    contract. The message stays structural (rule 34): a whitespace-split body can
+    carry the inline key in the tag position, so it is never echoed.
+    """
+    with pytest.raises(SdpError) as excinfo:
+        CryptoAttribute.parse(f"² {_SUITE_32} inline:{_FAKE_KEY}")
+    assert _FAKE_KEY not in str(excinfo.value)
+
+
+def test_offer_with_unicode_digit_crypto_tag_parses_leniently() -> None:
+    """An a=crypto line with a Unicode-digit tag is SKIPPED, not fatal to the parse.
+
+    The bare ValueError from ``int("²")`` must not escape the per-line
+    ``except SdpError`` in ``_AudioAccumulator.build`` and tear down the whole
+    ``SessionDescription.parse`` — on the in-dialog re-INVITE path that is an
+    unauthenticated whole-connection DoS (ADR-0081 read-loop-escape class).
+    """
+    offer = (
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.2\r\ns=-\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\n"
+        "m=audio 40002 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=crypto:² {_SUITE_32} inline:{_FAKE_KEY}\r\na=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer)  # must NOT raise
+    assert sdp.audio is not None
+    # The bad line never promotes to a typed attr (leniency preserved).
+    assert sdp.audio.crypto_attrs == ()
+
+
+def test_coerce_crypto_unicode_digit_leading_token_raises_sdp_error() -> None:
+    """_coerce_crypto must not misclassify a Unicode-digit first token as a tag.
+
+    It disambiguates tag-vs-suite by a purely-decimal first token; U+00B2 passes
+    ``str.isdigit()`` but is not int-parseable, so classifying it as the tag reaches
+    ``int()`` and raises a bare ValueError. It must raise SdpError instead — the
+    same isascii()+isdecimal() guard as the parser, keeping our own crypto path
+    from leaking a bare ValueError out of the "Raises: SdpError" contract.
+    """
+    with pytest.raises(SdpError):
+        _coerce_crypto(f"² {_SUITE_32} inline:{_FAKE_ANSWER_KEY}")
 
 
 # --- W3 (security review): SDES key material must never leak via repr/errors ---

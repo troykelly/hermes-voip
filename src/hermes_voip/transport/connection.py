@@ -757,22 +757,22 @@ class SipOverTlsTransport:
             local_tag=new_tag(),
         )
 
-    async def _answer_or_drop(self, build: Callable[[], str], *, kind: str) -> None:
-        """Build one auto-response and send it; drop the request if it cannot be built.
+    def _build_or_drop(self, build: Callable[[], str], *, kind: str) -> str | None:
+        """Build one auto-response, or drop the request if it cannot be built.
 
         ``build_response`` (and the keepalive builders) raise ``ValueError`` when the
         inbound request lacks a mandatory header to echo — Via / From / To / Call-ID /
         CSeq (RFC 3261 §8.2.6). It PARSES but cannot be answered (no reliable Via /
-        Call-ID / CSeq to route a response back). Its handling runs INLINE in the reader
-        task (from :meth:`_dispatch_request`, awaited OUTSIDE :meth:`_dispatch`'s
-        parse-only ``try``), so an escaping ``ValueError`` would end the reader and fire
+        Call-ID / CSeq to route a response back). Building runs INLINE in the reader
+        (from :meth:`_dispatch_request`, awaited OUTSIDE :meth:`_dispatch`'s parse-only
+        ``try``), so an escaping ``ValueError`` would end the reader and fire
         ``on_connection_lost`` — dropping every other active call on the connection (the
-        ADR-0081 DoS, response-build side). Fail closed: emit a non-PII WARNING (the
-        exception type only, never the wire content — rule 34) and skip that one
-        auto-response, keeping the connection and every other call alive.
+        ADR-0081 DoS, response-build side). Fail closed: log a non-PII WARNING (the
+        exception type only, never the wire content — rule 34) and return ``None`` so
+        the caller skips it, keeping the connection and the other calls alive.
         """
         try:
-            response = build()
+            return build()
         except ValueError as exc:
             _log.warning(
                 "dropping a header-incomplete inbound %s we cannot answer (%s) —"
@@ -780,8 +780,13 @@ class SipOverTlsTransport:
                 kind,
                 type(exc).__name__,
             )
-            return
-        await self.send(response)
+            return None
+
+    async def _answer_or_drop(self, build: Callable[[], str], *, kind: str) -> None:
+        """Build via :meth:`_build_or_drop` and send the response if it built."""
+        response = self._build_or_drop(build, kind=kind)
+        if response is not None:
+            await self.send(response)
 
     async def _handle_cancel(self, cancel: SipRequest) -> None:
         """Answer an inbound CANCEL and terminate the matching INVITE (RFC 3261 §9.2).
@@ -796,9 +801,12 @@ class SipOverTlsTransport:
         487 or ``on_cancel`` (idempotent §9.2 handling). A CANCEL matching no
         transaction is answered ``481 Call/Transaction Does Not Exist``.
 
-        Each response is built via :meth:`_answer_or_drop`: a CANCEL (or the matched
-        INVITE) missing a mandatory header to echo cannot be answered and is dropped
-        fail-closed rather than escaping ``ValueError`` into the reader (ADR-0081).
+        Each response is built via :meth:`_build_or_drop` / :meth:`_answer_or_drop`: a
+        request missing a mandatory header to echo cannot be answered and is dropped
+        fail-closed rather than escaping ``ValueError`` into the reader (ADR-0081). A
+        matched CANCEL whose ``200 OK`` cannot be built is un-answerable and is dropped
+        WHOLE — it does not half-drive the transaction (no cancelled flag, no 487, no
+        ``on_cancel``); the pending INVITE setup is left intact.
         """
         pending = self._match_cancel(cancel)
         if pending is None:
@@ -807,17 +815,23 @@ class SipOverTlsTransport:
                 kind="CANCEL",
             )
             return
-        already_cancelled = pending.cancelled
-        pending.cancelled = True
-        # 200 OK to the CANCEL itself (its own transaction). Always re-sent, so a
-        # retransmitted CANCEL is absorbed. RFC 3261 §9.2: the To-tag on the 200
-        # to the CANCEL MUST equal the To-tag on the 487 to the INVITE — both use
-        # the pending invite's stable local_tag (never a fresh tag per receipt,
-        # which would make retransmitted CANCEL responses non-idempotent).
-        await self._answer_or_drop(
+        # 200 OK to the CANCEL, built BEFORE any transaction state is mutated. A
+        # header-incomplete CANCEL whose 200 cannot be built is un-answerable and
+        # dropped WHOLE — no cancelled flag, no 487, no on_cancel — so a malformed
+        # CANCEL cannot cancel a live INVITE. RFC 3261 §9.2: the 200-to-CANCEL and the
+        # 487-to-INVITE share the pending invite's stable local_tag (never a fresh tag),
+        # keeping a retransmitted CANCEL's 200 idempotent.
+        ok = self._build_or_drop(
             lambda: build_response(cancel, 200, "OK", to_tag=pending.local_tag),
             kind="CANCEL",
         )
+        if ok is None:
+            return
+        already_cancelled = pending.cancelled
+        # Mark cancelled BEFORE the send-await, so a 200-to-INVITE racing on the answer
+        # task is suppressed in :meth:`send`; the 200 is re-sent (retransmit-safe).
+        pending.cancelled = True
+        await self.send(ok)
         if already_cancelled:
             return  # the 487 + abort already happened on the first CANCEL
         # 487 the INVITE: a dialog-forming final carrying our stable local tag.

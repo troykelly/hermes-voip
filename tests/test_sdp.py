@@ -1552,6 +1552,48 @@ def test_ice_candidate_parse_relay() -> None:
     assert cand.rport == 49001
 
 
+def test_ice_candidate_non_numeric_rport_raises_sdp_error() -> None:
+    """A non-numeric rport raises SdpError (parse contract), never a bare ValueError.
+
+    IceCandidate.parse wraps its MANDATORY numeric fields in try/except
+    ValueError->SdpError, but the OPTIONAL rport int() was unguarded. The optional
+    conversion must share the same guard so the ``a=candidate`` site's
+    ``suppress(SdpError)`` can skip just this candidate.
+    """
+    body = (
+        "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 rport NOTANUM"
+    )
+    with pytest.raises(SdpError):
+        IceCandidate.parse(body)
+
+
+def test_offer_with_non_numeric_rport_candidate_parses_leniently() -> None:
+    """A candidate with a non-numeric rport is SKIPPED, not fatal to the offer parse.
+
+    The bare ValueError from an unguarded rport ``int()`` bypassed the
+    ``a=candidate`` site's ``contextlib.suppress(SdpError)`` and failed the WHOLE
+    offer parse instead of dropping the one candidate — breaking the documented
+    per-candidate leniency (and, on the in-dialog re-INVITE path, an
+    unauthenticated whole-connection DoS, ADR-0081 read-loop-escape class).
+    """
+    offer = (
+        "v=0\r\no=- 2000 2000 IN IP4 192.0.2.10\r\ns=-\r\nt=0 0\r\n"
+        "m=audio 49000 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\na=setup:actpass\r\n"
+        f"a=ice-ufrag:{_FAKE_UFRAG}\r\na=ice-pwd:{_FAKE_PWD}\r\n"
+        # A well-formed host candidate that MUST survive the parse.
+        "a=candidate:1 1 UDP 2130706431 192.0.2.10 49000 typ host\r\n"
+        # A srflx candidate whose rport is non-numeric — the bad one, dropped.
+        "a=candidate:2 1 UDP 1694498815 203.0.113.1 49000"
+        " typ srflx raddr 192.0.2.10 rport NOTANUM\r\n"
+        "a=rtcp-mux\r\na=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer)  # must NOT raise
+    assert sdp.audio is not None
+    # The bad srflx is dropped; the good host candidate is preserved.
+    assert [c.typ for c in sdp.audio.ice_candidates] == ["host"]
+
+
 def test_ice_candidate_render_host_round_trip() -> None:
     body = "1 1 UDP 2130706431 192.0.2.10 49000 typ host"
     cand = IceCandidate.parse(body)

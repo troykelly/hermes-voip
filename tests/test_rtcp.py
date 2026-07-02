@@ -439,6 +439,32 @@ def test_bye_malformed_utf8_reason_raises_rtcp_error() -> None:
         Bye.parse(wire)
 
 
+def test_bye_parse_rejects_zero_ssrc_count() -> None:
+    """A wire BYE declaring SC=0 must raise RtcpError, not a bare ValueError.
+
+    SC=0 is a minimal, structurally-valid 4-byte packet (``80 cb 00 00``).
+    Without a guard, ``Bye._from_body`` constructs ``Bye(ssrcs=())`` and trips
+    ``__post_init__``'s ``ValueError`` — but that is the CONSTRUCTOR contract, not
+    the wire-parse one. The media engine's ``_ingest_rtcp_datagram`` only catches
+    ``RtcpError`` / ``SrtcpError`` (a malformed datagram is "dropped, not fatal"),
+    so a raw ``ValueError`` here would propagate out of the live inbound generator
+    on the default rtcp-mux path. The parse path must fail closed as ``RtcpError``
+    so one crafted datagram is dropped, not fatal (mirrors
+    ``SourceDescription._from_body``'s zero-chunk guard).
+    """
+    wire = bytes([0x80, RTCP_PT_BYE]) + struct.pack("!H", 0)  # version 2, SC=0
+    assert wire == b"\x80\xcb\x00\x00"  # the exact minimal crafted datagram
+    with pytest.raises(RtcpError, match="zero SSRC"):
+        Bye.parse(wire)
+
+
+def test_parse_compound_with_zero_ssrc_bye_raises_rtcp_error() -> None:
+    """A compound whose BYE sub-packet declares SC=0 also raises RtcpError."""
+    bye = bytes([0x80, RTCP_PT_BYE]) + struct.pack("!H", 0)
+    with pytest.raises(RtcpError, match="zero SSRC"):
+        parse_compound(bye)
+
+
 # ---------------------------------------------------------------------------
 # Compound packets (RFC 3550 §6.1)
 # ---------------------------------------------------------------------------

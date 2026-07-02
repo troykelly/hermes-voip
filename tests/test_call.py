@@ -1235,3 +1235,74 @@ async def test_header_incomplete_in_dialog_drop_is_logged_non_pii(
     assert "theirs" not in blob
     assert "call-1" not in blob
     assert "pbx.example.test" not in blob
+
+
+# ---- fail-closed: an inbound RESPONSE whose CSeq number is a unicode "digit"
+# ---- must not tear down the whole signalling connection (ADR-0081 class,
+# ---- response-correlation side; sibling of the handle_request fix above) -----
+
+
+def _response_with_cseq(cseq: str) -> SipResponse:
+    """A ``200 OK`` routed to this call by Call-ID, carrying an arbitrary ``CSeq``.
+
+    The transport routes a response to a :class:`CallSession` by Call-ID (``call-1``)
+    and calls ``on_response``, whose ONLY use of the message is to parse the CSeq
+    NUMBER (via ``_cseq_number``) to correlate the response to the outstanding verb.
+    A raw ``cseq`` string forges a number ``int()`` cannot parse without tripping the
+    parser — ``SipResponse.parse`` stores the ``CSeq`` header verbatim.
+    """
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/TLS 198.51.100.7:5061;branch=z9hG4bK-resp\r\n"
+        "From: <sip:2000@pbx.example.test>;tag=theirs\r\n"
+        "To: <sip:1000@pbx.example.test>;tag=ours\r\n"
+        "Call-ID: call-1\r\n"
+        f"CSeq: {cseq}\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    return SipResponse.parse(raw)
+
+
+async def test_established_call_survives_a_unicode_digit_cseq_response() -> None:
+    """An inbound response with a unicode-digit CSeq is ignored, not a teardown.
+
+    The transport routes a response to a :class:`CallSession` by Call-ID and calls
+    ``on_response``, which parses the CSeq number via ``_cseq_number`` to correlate
+    it to the outstanding verb. ``_cseq_number`` guarded ``int(parts[0])`` with
+    ``str.isdigit()`` — ``True`` for the superscript ``²`` (U+00B2) — yet
+    ``int("²")`` raises a bare :class:`ValueError`. ``on_response`` runs in the
+    transport reader task OUTSIDE its parse-only ``except ValueError``, so an inbound
+    ``CSeq: ² BYE`` response whose Call-ID matches an active call escaped
+    ``on_response`` -> ``_read_loop`` -> ``on_connection_lost``, tearing down every
+    call and the registration on the shared SIP-over-TLS/WSS connection over one
+    packet (the ADR-0081 DoS class, response-correlation side — the sibling of the
+    ``handle_request`` fix above).
+
+    Fail closed: a non-decimal CSeq number takes the SAME path as any other
+    uncorrelatable CSeq — ``_cseq_number`` returns ``None`` and ``on_response`` drops
+    the response — so ``int()`` is never reached and the reader survives. Proven by
+    keeping a legitimate re-INVITE outstanding (the "unrelated" traffic on the shared
+    connection): the ``²`` response must neither raise nor disturb it, and the
+    well-formed answer that follows must still correlate and complete the hold (no
+    wedge, no over-drop).
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    # A real verb is outstanding on this session: hold() sends a re-INVITE and awaits
+    # its final response (registering the re-INVITE's CSeq in _pending).
+    task = asyncio.create_task(session.hold())
+    await asyncio.sleep(0)
+    reinvite = _last_request(signaling, "INVITE")
+
+    # The forged response arrives on the same connection. Must NOT raise: a
+    # ValueError propagating out of on_response IS the reader unwind (a whole-
+    # connection teardown). ² = U+00B2 — isdigit()-True but int()-unparseable.
+    await session.on_response(_response_with_cseq("² BYE"))
+
+    # Not wedged / no over-drop: the outstanding re-INVITE's correlation is intact,
+    # so its well-formed 200 answer still completes the hold.
+    await session.on_response(SipResponse.parse(_answer_to(reinvite, "recvonly")))
+    await task
+    assert session.on_hold is True
+    assert media.holds == [True]

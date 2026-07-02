@@ -229,6 +229,31 @@ async def test_secret_scan_catches_leak_in_custom_task_name() -> None:
         _assert_failure_log_is_secret_safe(record)
 
 
+async def test_secret_scan_catches_leak_in_exception_text() -> None:
+    """A secret in a logged exception's rendered text is caught (codex must-fix).
+
+    A failure log that adds ``exc_info=True`` renders the exception into
+    ``record.exc_text``; a registrar- or dial-target string captured there is a
+    genuine leak, so it must be scanned like the message, args, and extra fields.
+    """
+    record = _make_clean_record(
+        exc_text="Traceback: ConnectionError contacting pbx.example.test:5061",
+    )
+    with pytest.raises(
+        AssertionError, match=r"leaked secret 'pbx\.example\.test' in exception text"
+    ):
+        _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_stack_info() -> None:
+    """A secret captured in ``stack_info`` (``stack_info=True``) is caught."""
+    record = _make_clean_record(
+        stack_info='Stack (most recent call last):\n  dialing "1001"',
+    )
+    with pytest.raises(AssertionError, match=r"leaked secret '1001' in stack info"):
+        _assert_failure_log_is_secret_safe(record)
+
+
 def _challenge_for(register_text: str) -> SipResponse:
     reg = SipRequest.parse(register_text)
     return SipResponse.parse(

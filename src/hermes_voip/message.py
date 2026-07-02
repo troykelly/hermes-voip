@@ -35,8 +35,11 @@ _CRLF: Final[str] = "\r\n"
 # the (possibly empty) reason phrase: "SIP/2.0 200OK" (no SP) and "SIP/2.0 200"
 # (no reason SP at all) are both rejected as malformed framing, while
 # "SIP/2.0 200 " parses with an empty reason. build_response always emits the
-# SP, so parse and build agree on the wire shape.
-_STATUS_LINE: Final[re.Pattern[str]] = re.compile(r"SIP/2\.0 (\d{3}) (.*)")
+# SP, so parse and build agree on the wire shape. The code is three ASCII DIGITs
+# (RFC 3261 %x30-39): ``[0-9]`` not ``\d``, so non-ASCII decimal digits
+# (Arabic-Indic, fullwidth) that ``int()`` would fold to the same value are
+# rejected as a malformed status-line rather than silently normalised.
+_STATUS_LINE: Final[re.Pattern[str]] = re.compile(r"SIP/2\.0 ([0-9]{3}) (.*)")
 # A request-line is "METHOD request-uri SIP/2.0"; method is an RFC 3261 token
 # (covers extension methods, not just the alphabetic standard ones).
 _REQUEST_LINE: Final[re.Pattern[str]] = re.compile(
@@ -87,7 +90,7 @@ def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
             # not a continuation (those are handled above) and not blank. Silently
             # dropping it would allow garbage to vanish undetected, which is
             # inconsistent with the module's strict-parse stance.
-            msg = f"malformed header line (no colon separator): {line!r}"
+            msg = f"malformed header line (no colon separator, {len(line)} chars)"
             raise ValueError(msg)
     return tuple(headers)
 
@@ -285,9 +288,10 @@ class SipResponse:
             The parsed response.
 
         Raises:
-            ValueError: If the first line is not a valid SIP status-line, a header
-                continuation line has no preceding header, or a non-empty header line
-                has no colon separator (malformed header field).
+            ValueError: If the first line is not a valid SIP status-line, the status
+                code is outside the RFC 3261 range 100..699, a header continuation
+                line has no preceding header, or a non-empty header line has no colon
+                separator (malformed header field).
 
         Note:
             ``raw`` must be exactly one complete message. Octet-accurate stream
@@ -298,10 +302,16 @@ class SipResponse:
         lines = head.split(_CRLF)
         match = _STATUS_LINE.fullmatch(lines[0])
         if match is None:
-            msg = f"not a SIP status-line: {lines[0]!r}"
+            msg = f"not a SIP status-line ({len(lines[0])} chars)"
+            raise ValueError(msg)
+        status_code = int(match.group(1))
+        if not _MIN_STATUS <= status_code <= _MAX_STATUS:
+            # Symmetric with build_response; [0-9]{3} admits 000..999, so 0xx and
+            # 7xx..9xx are rejected as out-of-ABNF-range here.
+            msg = f"status code out of range 100..699: {status_code}"
             raise ValueError(msg)
         return cls(
-            status_code=int(match.group(1)),
+            status_code=status_code,
             # group(2) is always present (possibly "") now the SP is mandatory.
             reason=match.group(2).strip(),
             headers=_parse_headers(lines[1:]),
@@ -352,7 +362,7 @@ class SipRequest:
         lines = head.split(_CRLF)
         match = _REQUEST_LINE.fullmatch(lines[0])
         if match is None:
-            msg = f"not a SIP request-line: {lines[0]!r}"
+            msg = f"not a SIP request-line ({len(lines[0])} chars)"
             raise ValueError(msg)
         return cls(
             method=match.group(1),

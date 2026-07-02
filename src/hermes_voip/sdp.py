@@ -17,6 +17,26 @@ Two exclusive media-keying paths are supported (ADR-0016):
   (RFC 5763 §5).
 
 A media description is EITHER SDES OR DTLS-SRTP, never both.
+
+Scope and leniency
+------------------
+The parser is a bounded, gateway-agnostic reader, not a strict RFC 4566
+validator. It must accept what any RFC-compliant gateway plausibly emits, so it
+is deliberately lenient about COSMETIC wire form and strict about SEMANTICS:
+
+* Tolerated (parsed identically to the clean form): trailing whitespace on a
+  line, bare-LF line endings as well as CRLF, and stray blank lines between
+  descriptions. A second audio section, video/other media, and unknown ``a=``
+  attributes are ignored; ``o=`` and ``s=`` free-text is not interpreted.
+* Rejected fail-closed with :class:`SdpError` (never silently coerced): a
+  negative or ``>65535`` media port (port ``0`` is valid — RFC 4566 §5.7, a
+  disabled stream), a non-positive ``a=ptime``, and a duplicate ``a=rtpmap`` for
+  one payload type.
+
+Leniency stops at line SPLITTING: lines are split only on CRLF or LF, NEVER on a
+bare CR. A lone CR cannot forge a new SDP line, so it cannot inject an attribute
+(direction downgrade, extra codec) the gateway never sent — in free-text it is
+inert, in a structured line it makes the line malformed and is rejected.
 """
 
 from __future__ import annotations

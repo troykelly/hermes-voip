@@ -161,6 +161,21 @@ class LoopbackSipServer:
         self._writer.write(message.encode())
         await self._writer.drain()
 
+    async def push_bytes(self, data: bytes, *, timeout: float = 3.0) -> None:
+        """Send RAW bytes to the connected client (may be non-UTF-8).
+
+        :meth:`push` encodes a ``str``; a well-framed SIP message whose BODY is
+        binary and not valid UTF-8 (an ``application/ISUP`` / ``octet-stream`` /
+        Latin-1 payload) cannot be expressed as ``str``, so this writes the exact
+        bytes onto the wire to exercise the framer's non-UTF-8-body handling.
+        """
+        await asyncio.wait_for(self._connected.wait(), timeout)
+        if self._writer is None:  # pragma: no cover - guarded by the event
+            msg = "no client connected"
+            raise RuntimeError(msg)
+        self._writer.write(data)
+        await self._writer.drain()
+
     async def wait_for_received(
         self, predicate: Callable[[str], bool], *, timeout: float = 3.0
     ) -> str:

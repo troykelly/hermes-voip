@@ -1079,6 +1079,86 @@ async def test_active_call_survives_a_malformed_message_on_the_connection() -> N
         await server.stop()
 
 
+def _nonutf8_body_but_framable() -> bytes:
+    """A message that FRAMES cleanly but whose BODY is not valid UTF-8.
+
+    The head is ASCII and declares ``Content-Length: 1``; the single body byte is
+    ``0xFF`` — a lone continuation byte, invalid UTF-8 — as an inbound binary body
+    (``application/ISUP``, ``octet-stream``, a Latin-1 payload) carries. The framer
+    delimits the message by byte count and consumes it fully, so the stream stays
+    synchronised at the next boundary; a strict ``utf-8`` decode of that framed
+    message is what fails. Returned as RAW bytes because a non-UTF-8 body cannot be
+    expressed as ``str``.
+    """
+    return (
+        b"MESSAGE sip:1000@pbx.example.test SIP/2.0\r\n"
+        b"Via: SIP/2.0/TLS 203.0.113.5:5061;branch=z9hG4bKnonutf8;rport\r\n"
+        b"Call-ID: nonutf8-body-1\r\n"
+        b"CSeq: 1 MESSAGE\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Length: 1\r\n\r\n"
+        b"\xff"
+    )
+
+
+async def test_nonutf8_body_is_skipped_connection_survives_next_dispatches() -> None:
+    # ADR-0081 decode variant: a message that FRAMES cleanly but whose BODY carries a
+    # non-UTF-8 byte must NOT tear the connection down. The strict utf-8 decode used to
+    # run at the FRAMING layer, raising UnicodeDecodeError OUTSIDE _dispatch's
+    # recoverable `except ValueError` guard — ending the reader task and firing
+    # on_connection_lost, dropping EVERY active call + bouncing registration over one
+    # inbound binary body (attacker-reachable via INVITE/MESSAGE bodies through a
+    # trusted gateway). The bad message must be SKIPPED (logged), and a SUBSEQUENT
+    # well-formed INVITE on the SAME connection still dispatched — one malformed
+    # message is not a DoS against unrelated calls.
+    new_calls: list[NewCall] = []
+    lost: list[BaseException | None] = []
+    lost_called = asyncio.Event()
+
+    def on_lost(exc: BaseException | None) -> None:
+        lost.append(exc)
+        lost_called.set()
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_new_call=new_calls.append,
+        on_connection_lost=on_lost,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        # The peer sends ONE non-UTF-8-body message, then a well-formed INVITE.
+        await server.push_bytes(_nonutf8_body_but_framable())
+        await server.push(_inbound_invite(to_user="1000"))
+        # Wait until either the good INVITE dispatches or the connection is torn down.
+        await _until(lambda: len(new_calls) == 1 or bool(lost))
+        assert lost == [], (
+            "a non-UTF-8-body message must NOT fire on_connection_lost — the strict "
+            "utf-8 decode used to tear the shared signalling connection down (DoS "
+            "against every unrelated active call)"
+        )
+        # The well-formed INVITE that FOLLOWED the bad-body message must still dispatch.
+        assert new_calls[0].invite.method == "INVITE"
+        # A short grace so a (buggy) late teardown would have had time to surface.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(lost_called.wait(), timeout=0.25)
+        assert lost == [], "a non-UTF-8-body message must not fire on_connection_lost"
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
 async def test_framing_corruption_still_tears_down_the_reader() -> None:
     # bk646 boundary: only a POST-FRAMING parse failure is skipped. A genuine FRAMING
     # corruption (a complete head with NO Content-Length — the stream can no longer be

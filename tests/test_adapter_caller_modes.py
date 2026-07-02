@@ -2015,6 +2015,52 @@ async def test_deliver_turn_routes_operator_to_operator_channel() -> None:
     assert sources[0] == "voip-operator"
 
 
+def test_classify_caller_unresolved_from_forced_to_default_group() -> None:
+    """SECURITY: an unresolved caller-ID FORCES the default (least-privilege) group.
+
+    A ``tel:`` / malformed ``From`` (no ``sip:user@``) yields NO caller-ID. It must be
+    classified into the default group DIRECTLY — never routed through pattern matching,
+    where a digit-less operator pattern (``"u*"``) matching the old ``"unknown"``
+    placeholder would classify the crafted-``From`` caller into a NON-default group (a
+    tier escalation). The property must hold REGARDLESS of any configured pattern.
+
+    (A privileged group — ``privilege_level >= 2`` — with a digit-less pattern like
+    ``"u*"`` is already rejected by ``CallerGroupConfig.__post_init__``, so level 1 is
+    the highest tier this escalation can reach; it is still a real deviation from the
+    intended receptionist default — a different persona / channel / tool-ceiling.)
+    """
+    from hermes_voip.adapter import _classify_caller  # noqa: PLC0415
+
+    trusted = CallerGroup(
+        name="trusted", privilege_level=1, persona="assistant", declined_at_sip=False
+    )
+    receptionist = CallerGroup(
+        name="receptionist",
+        privilege_level=0,
+        persona="receptionist",
+        declined_at_sip=False,
+    )
+    cfg = CallerGroupConfig(
+        groups=(trusted, receptionist),
+        # A prefix pattern that WOULD match the "unknown" placeholder a malformed From
+        # used to resolve to — the operator config that turns the sentinel into a
+        # classification escalation.
+        group_lists={"trusted": ("u*",)},
+        default_group="receptionist",
+        match_order=("trusted", "receptionist"),
+        normalization=Normalization.NONE,
+    )
+
+    caller_number, classification = _classify_caller("<tel:+15551234567>;tag=x", cfg)
+
+    assert caller_number is None, "an unresolved From must yield no caller-ID"
+    assert classification.group.name == "receptionist", (
+        "unresolved From was classified by a caller-ID pattern into a non-default group"
+    )
+    assert classification.group.privilege_level == 0
+    assert classification.source == "default"
+
+
 @pytest.mark.asyncio
 async def test_call_context_first_turn_routes_to_group_channel() -> None:
     """The ADR-0052 rich call-context seed lands on the call's channel, not 'voip'.

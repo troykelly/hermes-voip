@@ -226,6 +226,16 @@ defect or a load-bearing test gap.
   line-splitting security boundary are pinned this PR (`test_parse_tolerates_trailing_whitespace_without_phantom_payload`
   / `_lf_only_line_endings` / `_embedded_blank_line` / `test_parse_lone_cr_cannot_inject_attribute` /
   `test_parse_rejects_lone_cr_splicing_the_m_line`).
+- [ ] **[low] robustness/security** (surfaced by codex on the leniency PR) — A media-direction
+  attribute corrupted by an embedded bare CR (`a=recvonly\ra=inactive`) is currently dropped as
+  unrecognised, so the direction silently falls back to the default `sendrecv` — broadening media flow
+  versus the `recvonly`/`inactive` the gateway intended (a hold/one-way case becomes two-way). This is
+  NOT a line-injection hole (the forged value never wins; pinned by `test_parse_lone_cr_cannot_inject_attribute`),
+  and transport TLS integrity is the primary control against byte tampering, so it is defence-in-depth,
+  not a live vulnerability. Decide the policy: keep lenient-default, or fail closed (reject a known
+  direction attribute whose value is present-but-corrupt, distinct from a genuinely unknown `a=`). Needs
+  a small design note before changing parser behaviour (the current "unknown `a=` ignored" leniency must
+  not regress).
 
 ## src/hermes_voip/registration.py
 

@@ -19,6 +19,12 @@ env at runtime) and never hard-coded — the repo is public.
 
 MD5 is mandated by the digest scheme; its use here is a wire-format requirement,
 not a security control (hence the ``S324`` suppressions on the hashing calls).
+
+Character encoding: every credential/challenge field is UTF-8 encoded before
+hashing. RFC 7616 §4 defines a ``charset`` auth-param whose only registered value
+is ``UTF-8``; it is not consulted, so a legacy gateway that hashed non-ASCII
+credentials as ISO-8859-1 would derive a different HA1 and the ``response`` would
+not verify. UTF-8 is the modern default and the only value RFC 7616 permits.
 """
 
 from __future__ import annotations
@@ -149,7 +155,11 @@ class DigestChallenge:
     Attributes:
         realm: The protection realm the server hashes the credential against.
         nonce: The server-issued nonce (single-use on many gateways).
-        algorithm: The digest algorithm token, echoed verbatim; defaults to ``MD5``.
+        algorithm: The digest algorithm token. Matching is case-insensitive
+            (RFC 7616 §3.3), but the token is stored — and echoed back in the
+            ``Authorization`` header — VERBATIM in the server's original case:
+            the wire permits either case and echoing the server's own form is
+            always accepted. Defaults to ``MD5`` when the challenge omits it.
         qop: The offered quality-of-protection tokens (e.g. ``("auth",)``).
         opaque: An opaque value to echo back unchanged, if the server sent one.
     """
@@ -175,6 +185,10 @@ class DigestChallenge:
             ValueError: If the challenge carries no ``nonce`` or no ``realm``
                 (both are required; auth is impossible without either).
         """
+        # Cold path: a challenge is parsed once per registration/refresh (never
+        # per RTP packet), so this materialises the full param dict for clarity
+        # even though only ~5 keys are read. Do not "optimise" it into a
+        # single-pass early-exit scan — legibility wins on a per-registration path.
         params: dict[str, str] = {}
         for match in _PARAM.finditer(header_value):
             quoted, bare = match.group(2), match.group(3)
@@ -202,7 +216,15 @@ class DigestChallenge:
 
 @dataclass(frozen=True, slots=True)
 class DigestCredentials:
-    """The shared-secret credential used to answer a digest challenge."""
+    """The shared-secret credential used to answer a digest challenge.
+
+    ``password`` is ``repr``-suppressed (``field(repr=False)``) so it cannot leak
+    into a traceback, log line, or the ``repr()`` of a containing object — but it
+    is STILL the plaintext secret, resident in memory for this object's lifetime.
+    Never log it, interpolate it into an error message, or persist it; it exists
+    only to compute HA1 (AGENTS.md rule 34 — secrets never touch logs/git; the
+    repo is public).
+    """
 
     username: str
     password: str = field(repr=False)
@@ -265,6 +287,12 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
     Implements RFC 7616 ``qop=auth`` for SHA-256 / SHA-256-sess and RFC 2617
     ``qop=auth`` for MD5 / MD5-sess.  ``HA1`` bakes in the realm, so the
     challenge realm must match the realm the server validates against.
+
+    ``qop=auth-int`` (which integrity-protects the message body) is NOT
+    implemented: it is unnecessary for SIP REGISTER, whose body is empty, and
+    out of scope here. A challenge offering ``qop`` with only ``auth-int`` (and
+    not ``auth``) is therefore the rejection path — it raises rather than
+    silently downgrading — while a challenge offering both uses ``auth``.
 
     The ``-sess`` variants (MD5-sess, SHA-256-sess) bind the session key to the
     nonce and cnonce: ``HA1 = H(H(user:realm:pass):nonce:cnonce)``.
@@ -332,6 +360,16 @@ def build_authorization(  # noqa: PLR0913 - digest inputs are irreducible; 4 are
     )
     ha2 = _hash_hex(algo_lower, f"{method}:{uri}")
 
+    # Each param carries a ``quoted`` flag. QUOTED values (username/realm/nonce/
+    # uri/cnonce/response/opaque) render through _quoted(), which rejects control
+    # characters and escapes the quoted-pair specials — that is the header-
+    # injection guard for the attacker-controlled challenge fields. The UNQUOTED
+    # values (algorithm/qop/nc) bypass that guard and are safe only because their
+    # content is already constrained: ``algorithm`` was validated above to be one
+    # of _SUPPORTED_ALGORITHMS (a fixed ``[a-z0-9-]`` token set, so no separator
+    # or control char can appear), ``qop`` is the literal "auth", and ``nc`` is 8
+    # hex digits from ``f"{nc:08x}"``. If that algorithm gate is ever loosened,
+    # route it through _quoted (or a token-grammar check) before this render.
     params: list[tuple[str, str, bool]] = [
         ("username", credentials.username, True),
         ("realm", challenge.realm, True),

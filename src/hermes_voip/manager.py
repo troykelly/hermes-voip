@@ -492,8 +492,6 @@ class RegistrationManager:
             msg = f"no registration flow for Call-ID {call_id!r}"
             raise KeyError(msg)
         state = self._flows[call_id]
-        # The registrar responded: cancel the Timer-F/B deadline for this REGISTER.
-        self._cancel_response_timeout(state)
         try:
             outcome = state.flow.handle(response)
         except RuntimeError as exc:
@@ -510,13 +508,23 @@ class RegistrationManager:
             # unwind _read_loop and tear down the whole shared signalling connection —
             # every call and every registration (ADR-0081's DoS invariant). Surfaced
             # (not swallowed, rule 37) as a non-PII WARNING: exception TYPE only, never
-            # the response or Call-ID (rule 34).
+            # the response or Call-ID (rule 34). CRUCIALLY, we return WITHOUT disarming
+            # the Timer-F/B deadline below: an uncorrelated final did NOT answer the
+            # outstanding REGISTER, so cancelling its deadline would strand the live
+            # transaction with no timeout-driven recovery (a fail-stuck registration).
             _log.warning(
                 "ignoring an uncorrelated REGISTER response (%s) — connection kept",
                 type(exc).__name__,
                 extra={"event": "sip_registration_response_uncorrelated"},
             )
             return
+
+        # The registrar answered THIS REGISTER (a correlated outcome): the Timer-F/B
+        # deadline is now moot, so disarm it. A Challenged/Retry follow-up re-arms it
+        # in _send_register below; Registered/Failed leave it cancelled. Disarming
+        # AFTER correlation (not before handle()) is what keeps an ignored stale/
+        # duplicate final from cancelling the live transaction's deadline.
+        self._cancel_response_timeout(state)
 
         # Challenged (401/407) and Retry (423 Interval Too Brief) both carry a
         # ready-to-send follow-up REGISTER; the rest update registration state.

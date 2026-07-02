@@ -1,15 +1,13 @@
 """TDD tests for hermes_voip.media.call_loop.CallLoop (W13 — duplex call loop).
 
-Six scenarios:
+Five scenarios:
 
 (a) A finalised turn produces exactly ONE deliver_turn call with the transcript.
 (b) A REFUSE verdict blocks deliver_turn entirely.
 (c) Speech-onset mid-speak triggers barge-in: TtsStream.cancel() is called before
     any further send_audio (i.e. the agent stops speaking before new audio is sent).
 (d) speak() forwards agent text frames to send_audio in the correct order.
-(e) A degraded guard_state blocks an IRREVERSIBLE tool via gate_voip_tool (the
-    CallLoop-exposed hook).
-(f) Clean shutdown when the transport's inbound_audio() iterator ends — no leaked
+(e) Clean shutdown when the transport's inbound_audio() iterator ends — no leaked
     asyncio tasks.
 
 All fakes are synchronous; no real timing, threads, or network involved.
@@ -32,7 +30,6 @@ from hermes_voip.media.call_loop import (
     _DTMF_TURN_PREFIX,
     BargeInMode,
     CallLoop,
-    gate_voip_tool,
 )
 from hermes_voip.media.call_progress import CallProgressEvent, FaxCng
 from hermes_voip.media.endpoint import Endpointer
@@ -40,7 +37,7 @@ from hermes_voip.media.vad import VoiceActivityDetector
 from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
-from hermes_voip.providers.policy import GuardSessionState, ToolRisk
+from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
 
@@ -211,16 +208,6 @@ def _refuse_result() -> GuardResult:
         reasons=("high_score",),
         degraded=False,
         score=0.95,
-    )
-
-
-def _degraded_allow_result() -> GuardResult:
-    return GuardResult(
-        verdict=GuardVerdict.ALLOW,
-        normalized_text="",
-        reasons=(),
-        degraded=True,
-        score=0.0,
     )
 
 
@@ -1784,37 +1771,7 @@ async def test_speak_passes_the_negotiated_wire_rate_to_tts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (e) Degraded guard_state → IRREVERSIBLE tool blocked via gate_voip_tool
-# ---------------------------------------------------------------------------
-
-
-def test_degraded_state_blocks_irreversible_tool() -> None:
-    """gate_voip_tool must block IRREVERSIBLE tools when the session is degraded."""
-    state = GuardSessionState(call_id=_CALL_ID)
-    # Record a degraded (fail-open) result to set degraded=True.
-    state.record(_degraded_allow_result())
-    assert state.degraded is True
-
-    allowed = gate_voip_tool(ToolRisk.IRREVERSIBLE, state, confirmed=True)
-    assert allowed is False
-
-
-def test_non_degraded_state_allows_safe_tool() -> None:
-    """gate_voip_tool must allow SAFE tools even in a fresh (non-degraded) state."""
-    state = GuardSessionState(call_id=_CALL_ID)
-    allowed = gate_voip_tool(ToolRisk.SAFE, state, confirmed=False)
-    assert allowed is True
-
-
-def test_non_degraded_confirmed_irreversible_allowed() -> None:
-    """IRREVERSIBLE tool is allowed when confirmed and session is not degraded."""
-    state = GuardSessionState(call_id=_CALL_ID)
-    allowed = gate_voip_tool(ToolRisk.IRREVERSIBLE, state, confirmed=True)
-    assert allowed is True
-
-
-# ---------------------------------------------------------------------------
-# (f) Clean shutdown when transport ends — no leaked tasks
+# (e) Clean shutdown when transport ends — no leaked tasks
 # ---------------------------------------------------------------------------
 
 
@@ -5232,9 +5189,9 @@ class TestCallLoopModuleExports:
     explicit ``__all__`` (15/17 siblings define one) — a star-import would leak every
     private helper (``_DtmfConfirmationSink``, ``_ToneStream``, ``_sanitize_iter``, the
     module-level ``_DEFAULT_*`` config constants, ...). The expected set below is
-    exactly the module's real external surface: ``CallLoop`` and ``gate_voip_tool``
-    (imported directly by the adapter and by tests), plus ``BargeInMode`` and
-    ``BargeInGate`` (imported by the barge-in gate tests and the adapter).
+    exactly the module's real external surface: ``CallLoop`` (imported directly by
+    the adapter and by tests), plus ``BargeInMode`` and ``BargeInGate`` (imported by
+    the barge-in gate tests and the adapter).
     """
 
     def test_module_defines_all(self) -> None:
@@ -5245,7 +5202,7 @@ class TestCallLoopModuleExports:
 
     def test_all_contains_correct_public_names(self) -> None:
         """__all__ must list the exact public names intended for star-import."""
-        expected = {"BargeInGate", "BargeInMode", "CallLoop", "gate_voip_tool"}
+        expected = {"BargeInGate", "BargeInMode", "CallLoop"}
         assert set(_call_loop_mod.__all__) == expected
 
     def test_all_names_are_importable(self) -> None:

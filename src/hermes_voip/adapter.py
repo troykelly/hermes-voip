@@ -7439,8 +7439,10 @@ def _caller_number(from_header: str) -> str | None:
     scheme, sep, rest = addr.partition(":")
     if not sep or scheme.lower() not in ("sip", "sips"):
         return None
-    user = rest.partition("@")[0]
-    if not user or any(ch.isspace() for ch in user):
+    # Require the ``user@host`` separator: a host-less ``sip:operator`` (no ``@``) is
+    # not a valid AOR, so its bare token must NOT become a caller-ID.
+    user, at, _host = rest.partition("@")
+    if not at or not user or any(ch.isspace() for ch in user):
         return None
     return user
 

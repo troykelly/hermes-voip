@@ -1727,6 +1727,19 @@ def test_media_unknown_duplex_mode_rejected() -> None:
         load_media_config({"HERMES_VOIP_DUPLEX_MODE": "quarter"})
 
 
+def test_media_duplex_mode_full_rejected_as_inert() -> None:
+    """``full`` is UNIMPLEMENTED (ADR-0008 Phase 2 is deferred, not shipped).
+
+    The media engine never reads ``duplex_mode`` at runtime — it always behaves
+    half-duplex — so accepting ``full`` at config load would let an operator
+    believe full-duplex barge-in is active when it is silently inert (rule 37:
+    fail loud, never silently no-op). Only ``half`` is a valid value until a
+    follow-up ADR ships Phase 2.
+    """
+    with pytest.raises(ConfigError, match="not implemented"):
+        load_media_config({"HERMES_VOIP_DUPLEX_MODE": "full"})
+
+
 def test_media_unknown_dtmf_mode_rejected() -> None:
     with pytest.raises(ConfigError):
         load_media_config({"HERMES_SIP_DTMF_MODE": "morse"})

@@ -491,9 +491,13 @@ class AudioMedia:
             in offer order — kept for diagnostics even when malformed.  Always
             empty on a WebRTC (``SAVPF``) m-line (RFC 8827 §6.5 / ADR-0016).
         crypto_attrs: The subset of ``crypto`` lines that parse and validate as
-            a supported :class:`CryptoAttribute`, in offer order. Parsing is
-            lenient: a malformed or unsupported crypto line stays in ``crypto``
-            but is excluded here, so this carries only usable offered keys.
+            a supported :class:`CryptoAttribute`, ordered STRONGEST auth-tag suite
+            first (a strength tie keeps offer order). Parsing is lenient: a
+            malformed or unsupported crypto line stays in ``crypto`` but is
+            excluded here, so this carries only usable offered keys.
+            ``crypto_attrs[0]`` is therefore the ACCEPTED suite: the SDES answer
+            advertises it (anti-downgrade) and every SRTP/SRTCP session is keyed
+            from it, so wire suite and installed suite agree by construction.
             Always empty on WebRTC m-lines.
         ptime: Packetisation time in ms, if declared (``a=ptime``).
         direction: ``sendrecv`` / ``sendonly`` / ``recvonly`` / ``inactive``.
@@ -965,6 +969,22 @@ class _AudioAccumulator:
                 crypto_attrs.append(CryptoAttribute.parse(raw))
             except SdpError:
                 continue
+        # Order the accepted crypto STRONGEST-suite-first so ``crypto_attrs[0]`` is
+        # the accepted suite BY CONSTRUCTION. The SDES answer advertises the
+        # strongest offered suite (anti-downgrade, _negotiate_answer_crypto), while
+        # the adapter keys every SRTP/SRTCP session from ``crypto_attrs[0]``; keeping
+        # offer order here would let a weak-first offer install SHA1_32 (4-byte auth
+        # tag) under a SHA1_80 (10-byte tag) wire answer — a broken, silently
+        # downgraded call. list.sort is stable, so a strength tie keeps first-offered
+        # order (RFC 4568 lets the answerer pick any offered suite). Lazy import
+        # avoids the media.srtp <-> sdp import cycle; skipped unless two+ suites were
+        # offered (the common 0/1-suite case needs no ordering).
+        if len(crypto_attrs) > 1:
+            from hermes_voip.media.srtp import crypto_suite_strength  # noqa: PLC0415
+
+            crypto_attrs.sort(
+                key=lambda attr: crypto_suite_strength(attr.suite), reverse=True
+            )
         # WebRTC m-lines use ICE for address/port — no c= connection address.
         effective_conn: str | None
         if self.protocol == _WEBRTC_PROFILE:
@@ -2171,8 +2191,12 @@ def _negotiate_answer_crypto(
     # time, so a module-level import here would be circular.
     from hermes_voip.media.srtp import crypto_suite_strength  # noqa: PLC0415
 
-    # max() returns the FIRST element of maximal key, so a strength tie (or a
-    # single suite) keeps the first-offered — preserving prior behaviour.
+    # crypto_attrs is ordered strongest-suite-first (_AudioAccumulator.build), so
+    # this max() returns crypto_attrs[0] — the SAME attribute the adapter keys every
+    # SRTP/SRTCP session from, so the wire suite equals the installed suite by
+    # construction. max() is kept (rather than indexing [0]) as an explicit,
+    # order-independent restatement of the anti-downgrade choice; it also returns the
+    # FIRST element of maximal key, so a strength tie keeps the first-offered.
     accepted = max(
         audio.crypto_attrs, key=lambda attr: crypto_suite_strength(attr.suite)
     )

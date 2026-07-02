@@ -129,6 +129,34 @@ class TestOutboundAllowWildcard:
         assert is_outbound_allowed("fax", allow) is True
         assert is_outbound_allowed("fa5", allow) is False
 
+    # --- `*` is a LITERAL dial char, never a wildcard (ADR-0029 over-match fix) ---
+
+    def test_star_feature_code_is_exact_no_overmatch(self) -> None:
+        """A star/service feature code (``*67``) is EXACT -- no digit over-match.
+
+        Security (dial gate, no over-match): ``*`` in ``OUTBOUND_ALLOW`` is a LITERAL
+        dial character, never a wildcard. A listed ``*67`` permits exactly ``*67`` and
+        MUST NOT authorise ``067``..``967`` -- ten targets the operator never listed.
+        (Regression: ``*`` previously compiled to a one-digit class, so ``*67`` became
+        ``^[0-9]67$`` -- it DENIED the listed ``*67`` and ALLOWED ``167``.)
+        """
+        allow = load_outbound_allowlist({"HERMES_VOIP_OUTBOUND_ALLOW": "*67"})
+        assert is_outbound_allowed("*67", allow) is True
+        assert is_outbound_allowed("167", allow) is False
+        assert is_outbound_allowed("067", allow) is False
+        assert is_outbound_allowed("967", allow) is False
+
+    def test_star_service_codes_stay_exact(self) -> None:
+        """Star-codes (``*82``, ``*98``, long ``*67...``) match only themselves."""
+        allow = load_outbound_allowlist(
+            {"HERMES_VOIP_OUTBOUND_ALLOW": "*82,*98,*6712345678"}
+        )
+        assert is_outbound_allowed("*82", allow) is True
+        assert is_outbound_allowed("*98", allow) is True
+        assert is_outbound_allowed("*6712345678", allow) is True
+        assert is_outbound_allowed("282", allow) is False
+        assert is_outbound_allowed("098", allow) is False
+
     def test_sip_uri_pattern_keeps_x_literal(self) -> None:
         """SIP URI / non-mask patterns preserve literal ``x`` characters.
 

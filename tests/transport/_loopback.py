@@ -141,11 +141,14 @@ class LoopbackSipServer:
                     return
                 framer.feed(data)
                 for raw in framer:
-                    self.received.append(raw)
+                    # The framer yields raw bytes; this fixture only ever frames the
+                    # well-formed UTF-8 the client sends, so a strict decode is safe.
+                    text = raw.decode("utf-8")
+                    self.received.append(text)
                     self._received_event.set()
-                    if raw.startswith("SIP/2.0 "):
+                    if text.startswith("SIP/2.0 "):
                         continue  # a response from the client; nothing to reply
-                    request = SipRequest.parse(raw)
+                    request = SipRequest.parse(text)
                     for reply in await self._responder(request):
                         writer.write(reply.encode())
                     await writer.drain()

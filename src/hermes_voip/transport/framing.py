@@ -3,15 +3,20 @@
 Over a stream transport (TLS/TCP) a SIP message is **not** self-delimiting at the
 read boundary: one ``recv`` may carry a fragment, a whole message, or several
 messages, and the head/body split can fall anywhere. :class:`SipMessageFramer`
-buffers received bytes and yields each complete message as text: it reads the
-message head up to the first ``CRLFCRLF``, takes the **exact** ``Content-Length``
+buffers received bytes and yields each complete message as **raw bytes**: it reads
+the message head up to the first ``CRLFCRLF``, takes the **exact** ``Content-Length``
 body bytes that follow, and retains any surplus for the next message.
 
 It is **sans-IO** — it owns no socket; the transport feeds it bytes and iterates
 the messages — and it parses no further than the framing boundary:
 :meth:`~hermes_voip.message.SipResponse.parse` /
-:meth:`~hermes_voip.message.SipRequest.parse` own the rest. Bodies are framed by
-byte count, so a body with embedded ``CRLFCRLF`` (multipart) frames correctly.
+:meth:`~hermes_voip.message.SipRequest.parse` own the rest, **including the UTF-8
+decode**. Yielding bytes keeps the framer purely byte-level: a well-framed message
+whose body is not valid UTF-8 (a binary ``application/ISUP`` / ``octet-stream``
+body) is a recoverable *post-framing* decode failure the parse layer handles
+(ADR-0081) — NOT a :class:`FramingError` that tears the connection down, because the
+stream is already synchronised at the next boundary. Bodies are framed by byte
+count, so a body with embedded ``CRLFCRLF`` (multipart) frames correctly.
 """
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ class FramingError(ValueError):
 
 
 class SipMessageFramer:
-    """Accumulate received bytes and yield complete SIP messages as text."""
+    """Accumulate received bytes and yield complete SIP messages as raw bytes."""
 
     def __init__(self) -> None:
         """Start with an empty buffer."""
@@ -56,16 +61,22 @@ class SipMessageFramer:
         """Append received bytes; completed messages become available via iteration."""
         self._buffer += data
 
-    def __iter__(self) -> Iterator[str]:
-        """Yield and consume every message currently complete in the buffer."""
+    def __iter__(self) -> Iterator[bytes]:
+        """Yield and consume every complete message in the buffer, as raw bytes."""
         while True:
             message = self._next_message()
             if message is None:
                 return
             yield message
 
-    def _next_message(self) -> str | None:
-        """Pop one complete message, or return ``None`` if none is complete yet.
+    def _next_message(self) -> bytes | None:
+        """Pop one complete message as raw bytes, or ``None`` if none is complete yet.
+
+        The message is returned **undecoded**: the UTF-8 decode belongs to the parse
+        layer (:meth:`~hermes_voip.message.SipRequest.parse`), so a well-framed body
+        that is not valid UTF-8 is a recoverable post-framing failure (ADR-0081), not
+        a framing failure. The buffer is already advanced past the message before this
+        returns, so the stream stays synchronised regardless of the body's bytes.
 
         Raises:
             FramingError: if a complete head declares no usable Content-Length, an
@@ -90,7 +101,7 @@ class SipMessageFramer:
             return None  # body not fully arrived
         message = bytes(self._buffer[:body_end])
         del self._buffer[:body_end]
-        return message.decode("utf-8")
+        return message
 
     def _skip_keepalive_crlf(self) -> None:
         """Drop leading CRLF keep-alive pings/pongs (RFC 5626 §3.5.1 / RFC 6223).

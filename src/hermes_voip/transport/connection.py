@@ -38,7 +38,8 @@ be delimited (a corrupt ``Content-Length`` / CRLF framing, raised as
 :class:`~hermes_voip.transport.framing.FramingError` by the framer) — is
 unrecoverable: it ends the reader task and is reported via ``on_connection_lost``.
 But once framing **succeeds** and one complete message is extracted, a failure to
-*parse* that single message (a ``ValueError`` from
+*decode or parse* that single message (a ``ValueError`` — including a
+``UnicodeDecodeError`` from a body that is not valid UTF-8 — from the UTF-8 decode or
 :meth:`~hermes_voip.message.SipRequest.parse`) is **not** fatal: the stream is
 still synchronised, so the one bad message is logged loudly (a WARNING with a
 non-PII summary — the repo is PUBLIC, rule 34) and **skipped**, keeping the
@@ -598,9 +599,10 @@ class SipOverTlsTransport:
         or an ``OSError`` (the socket breaking) ends the loop and propagates to the
         task, where :meth:`_on_reader_done` reports the cause via
         ``on_connection_lost`` (rule 37: surfaced, never swallowed). A failure to
-        *parse* a single, successfully-framed message is handled inside
-        :meth:`_dispatch` (logged and skipped — ADR-0081), NOT here, so it does not
-        end the loop. A clean EOF ends the loop with no error.
+        *decode or parse* a single, successfully-framed message (the framer yields
+        raw bytes; the UTF-8 decode and parse both run in :meth:`_dispatch`) is
+        handled there (logged and skipped — ADR-0081), NOT here, so it does not end
+        the loop. A clean EOF ends the loop with no error.
         """
         framer = SipMessageFramer()
         while True:
@@ -611,27 +613,35 @@ class SipOverTlsTransport:
             for raw in framer:
                 await self._dispatch(raw)
 
-    async def _dispatch(self, raw: str) -> None:
-        """Parse one already-framed message and route it; skip if it won't parse.
+    async def _dispatch(self, raw: bytes) -> None:
+        """Decode, parse, and route one already-framed message; skip if it won't parse.
 
-        ``raw`` is a single complete message the framer has already delimited, so a
-        :class:`ValueError` from :meth:`~hermes_voip.message.SipResponse.parse` /
-        :meth:`~hermes_voip.message.SipRequest.parse` here is a *post-framing* parse
-        failure of THIS one message — the stream is still synchronised. It is logged
-        loudly and skipped (ADR-0081), keeping the connection and every other active
-        call alive; one malformed message must not be a DoS against unrelated calls.
-        A ``FramingError`` (an unframable stream) cannot reach this method — it is
-        raised by the framer in :meth:`_read_loop` and propagates there (rule 37).
+        ``raw`` is a single complete message the framer has already delimited, as raw
+        bytes. Turning it into a parsed message here can raise a :class:`ValueError` —
+        a :class:`UnicodeDecodeError` (a subclass of ``ValueError``) from a body that
+        is not valid UTF-8, or a parse ``ValueError`` from
+        :meth:`~hermes_voip.message.SipResponse.parse` /
+        :meth:`~hermes_voip.message.SipRequest.parse`. Either is a *post-framing*
+        failure of THIS one message — the stream is still synchronised — so it is
+        logged loudly and skipped (ADR-0081), keeping the connection and every other
+        active call alive: one malformed message must not be a DoS against unrelated
+        calls. The UTF-8 decode runs HERE, inside the guard (not in the framer),
+        precisely so a non-UTF-8 body is recoverable rather than fatal. A
+        ``FramingError`` (an unframable stream) cannot reach this method — it is raised
+        by the framer in :meth:`_read_loop` and propagates there (rule 37).
         """
-        is_response = raw.startswith(_RESPONSE_PREFIX)
         try:
+            text = raw.decode("utf-8")
             message: SipResponse | SipRequest = (
-                SipResponse.parse(raw) if is_response else SipRequest.parse(raw)
+                SipResponse.parse(text)
+                if text.startswith(_RESPONSE_PREFIX)
+                else SipRequest.parse(text)
             )
         except ValueError as exc:
             # A non-PII summary only — never the raw message (it may carry From/To/
             # Call-ID/SDP; the repo is PUBLIC, rule 34). type(exc).__name__ + length
-            # is loud enough to alert without leaking wire content.
+            # is loud enough to alert without leaking wire content. UnicodeDecodeError
+            # subclasses ValueError, so a non-UTF-8 body is caught here too.
             _log.warning(
                 "dropping an unparseable SIP message (%s, len=%d) — connection kept",
                 type(exc).__name__,

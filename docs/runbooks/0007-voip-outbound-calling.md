@@ -16,7 +16,7 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 | Item | Value |
 | --- | --- |
 | Env var | `HERMES_VOIP_OUTBOUND_ALLOW` |
-| Type | comma-separated list of dial targets (extensions and/or SIP URIs); exact by default; simple dial masks use `*`/`x` as one digit; non-mask patterns use `*` glob and literal `x` |
+| Type | comma-separated list of dial targets (extensions and/or SIP URIs); exact by default. The ONLY wildcard is `x`/`X` (one digit) inside a simple extension mask, e.g. `10xx` = 1000–1099. `*` is a **literal** dial char (so `*67` is exact; `10**` is literal — use `10xx`); SIP URIs match verbatim. No `.*` glob is compiled (no host-swallow, no ReDoS). |
 | Default | **empty** → no outbound call is permitted (the feature is **inert**) |
 | Read by | `hermes_voip.outbound_allow.load_outbound_allowlist` (called at `connect()`) |
 | Enforced at | `VoipAdapter.place_call_with_objective` — the dial chokepoint, BEFORE any INVITE |

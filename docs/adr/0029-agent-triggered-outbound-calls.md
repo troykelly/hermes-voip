@@ -90,18 +90,49 @@ the operator opts numbers in.
   dial targets (extensions and/or SIP URIs). **The default is empty = no outbound
   call is permitted** — the feature is inert until the operator opts numbers in. The
   handler rejects any `number` not on the allowlist with a clear error and never
-  dials an unlisted target. Matching is **exact by default** and **pattern-based only
-  when the operator opts a wildcard entry in explicitly**: entries with no wildcard
-  characters stay exact members; simple dial masks treat `*` and `x` as one decimal
-  digit each (`10**` and `10xx` both mean exactly `1000`..`1099`); SIP URI / non-mask
-  patterns keep `x` literal and allow `*` as the explicit glob. Extensions-only is
-  the assumed shape; a PSTN target is just an allowlist entry if the gateway routes
-  it. The allowlist value lives only in the gitignored `.env` (a real number is
-  potentially PII; extensions are not, but the rule is uniform).
+  dials an unlisted target. Matching is **exact by default**; the ONLY wildcard is
+  `x`/`X` inside a simple extension mask (an entry of digits, `+`, `#`, `*` and at
+  least one `x`/`X`), where each `x`/`X` matches exactly one decimal digit
+  (`10xx` = `1000`..`1099`). **`*` is a LITERAL dial character, never a wildcard** — so
+  a star/service feature code like `*67` is an EXACT entry (matching only `*67`) and the
+  `10**` spelling from issue #355 is a literal string, not a mask alias (use `10xx`).
+  SIP URIs and any other non-mask entry are exact-only; no entry ever compiles to a
+  `.*` glob (see §2a for why). Extensions-only is the assumed shape; a PSTN target is
+  just an allowlist entry if the gateway routes it. The allowlist value lives only in
+  the gitignored `.env` (a real number is potentially PII; extensions are not, but the
+  rule is uniform).
 
 - We deliberately do **not** rely on a `confirmed: bool` tool argument as a guard
   (a model under prompt injection would set it). The allowlist is the hard gate; the
   IRREVERSIBLE level-3 + non-degraded clamp and the empty default are the safeguards.
+
+### 2a. `OUTBOUND_ALLOW` pattern semantics — `*` is literal; `x`/`X` is the sole mask wildcard (amended 2026-07-02)
+
+Issue #355 added opt-in patterns to `OUTBOUND_ALLOW`. A first cut treated `*` as a
+one-digit mask character (and as a `.*` glob in non-mask / URI entries). Cross-tier
+review proved that over-matches the DIAL GATE — a security defect:
+
+- `HERMES_VOIP_OUTBOUND_ALLOW="*67"` compiled to `^[0-9]67$`, so it **denied** the
+  listed `*67` yet **authorised** `067`..`967` — ten targets the operator never listed
+  (all valid dial strings that reach `place_call`). Star/service codes (`*67`, `*82`,
+  `*98`) are exactly the digit-shaped entries this misfired on, silently.
+- a URI entry like `sip:10*@host` compiled to `^sip:10.*@host$`, which a value such as
+  `sip:10@evil.example@host` satisfies (host-swallow); and every `.*` is a ReDoS surface.
+
+**Decision (adjudicated):** in `OUTBOUND_ALLOW`, `*` is a **literal** dial character and
+`x`/`X` is the SOLE digit-wildcard, valid ONLY inside a simple extension mask. A mask
+compiles to an anchored regex where `x`/`X` → one digit and every other character
+(`*` included) is escaped; a non-mask entry (star code, SIP URI, label) is exact-only.
+No compiled pattern contains `.*`, so the gate cannot over-match a target or a host and
+has no ReDoS surface. The issue's primary `10xx` example is unchanged; the `10**` alias
+is dropped (now literal — operators use `10xx`).
+
+**Intentional cross-config divergence:** `PROACTIVE_CALL_FROM` and
+`OUTBOUND_RESULT_CHANNEL` keep `fnmatch` glob semantics (`*` = any sequence), because
+they select trigger origins / result routing over `platform:chat_id`, not dial targets.
+`*` is therefore literal in the dial allowlist but a glob in the trigger/routing configs
+— the gate that grants the right to *dial a target* must never over-match, while the
+origin/routing configs remain bounded by that same dial gate at the chokepoint.
 
 ### 3. Async cross-session result reporting
 
@@ -175,9 +206,9 @@ the operator opts numbers in.
 
 - The agent can place calls *autonomously* once the operator opts a number in — a new
   irreversible capability. It is contained by: (1) the empty-by-default allowlist (no
-  dialling at all until configured), (2) exact-match semantics for entries that contain
-  no wildcard characters, plus explicit per-entry wildcard opt-in where broader matching
-  is genuinely desired, (3) the level-3 + non-degraded privilege clamp (an untrusted
+  dialling at all until configured), (2) exact-match semantics for every entry except a
+  simple `x`/`X` extension mask — `*` is literal, so no entry ever over-matches a target
+  or compiles to a `.*` glob (§2a), (3) the level-3 + non-degraded privilege clamp (an untrusted
   inbound caller can never trigger it), and (4) least privilege on the resulting call
   (the callee is untrusted; the call agent gets the OUTBOUND persona with
   `privilege_level=0`, so it cannot itself place a further call or transfer).

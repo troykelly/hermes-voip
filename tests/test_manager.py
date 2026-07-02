@@ -134,38 +134,50 @@ _STANDARD_LOGRECORD_ATTRS = frozenset(
     }
 )
 
-#: asyncio's framework-DEFAULT task name, ``Task-<n>`` (a monotonic counter that climbs
-#: past "1000"/"1001" across a suite). A ``taskName`` that does NOT match this is
-#: application-set and MAY carry a dial target, so it is scanned; the default is not.
-_DEFAULT_ASYNCIO_TASK_NAME = re.compile(r"Task-\d+")
+#: FRAMEWORK-DEFAULT auto-names for asyncio tasks / threads / processes: fixed labels
+#: (``MainThread``/``MainProcess``) or monotonic counters (``Task-<n>``/``Thread-<n>``)
+#: that carry no user data but can coincidentally contain a short secret digit like
+#: "1000". A ``taskName``/``threadName``/``processName`` that does NOT match is
+#: application-set (e.g. ``create_task(name=f"dial-{ext}")``) and MAY carry a target.
+_FRAMEWORK_AUTO_NAME = re.compile(
+    r"MainThread|MainProcess"
+    r"|(Task|Thread|Process|SpawnProcess|ForkProcess|SpawnPoolWorker"
+    r"|ForkPoolWorker|ThreadPoolExecutor|Dummy|asyncio)[-_].*"
+)
+
+
+def _custom_auto_name(value: object) -> str:
+    """The value of a LogRecord auto-name, scanned only when NOT a framework default.
+
+    A custom task/thread/process name can carry a dial target; the framework default
+    is a fixed label or a counter that would false-trip a short-digit scan.
+    """
+    return (
+        value
+        if isinstance(value, str) and _FRAMEWORK_AUTO_NAME.fullmatch(value) is None
+        else ""
+    )
 
 
 def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
     """Assert no fake secret leaks into any CODE-CONTROLLED surface of ``record``.
 
     Deterministic: scans only the surfaces a logging call populates -- code-attached
-    ``extra`` fields, the rendered message, the ``%`` args, a logged exception
-    (``exc_text`` if formatted, else the raw ``exc_info`` value) / captured traceback
-    (``stack_info``), and a CUSTOM asyncio task
-    name -- never the framework metadata (timestamps / thread & process ids / source
-    location / the default ``Task-<n>`` counter), whose nondeterministic values would
-    otherwise coincidentally match a short secret digit like "1000" and flake. A CUSTOM
-    task name (e.g. ``create_task(name=f"dial-{ext}")``) IS scanned, so a secret leaked
-    only via a named task is still caught; ``taskName`` may be ``None`` (no loop)
-    -- that carries nothing.
+    ``extra`` fields, the rendered message, the ``%`` args, a logged exception rendered
+    via ``formatException`` (``exc_text``/``exc_info``, incl. its ``__cause__`` chain)
+    with its ``stack_info``, and any CUSTOM asyncio-task/thread/process name. It never
+    scans framework metadata: numeric ids/timestamps, the source location, or the
+    framework-DEFAULT auto-names (``MainThread`` / ``Task-<n>`` ...), whose fixed or
+    counter values would coincidentally match a short digit like "1000" and flake. This
+    package logs from the default main thread/process and unnamed tasks, never naming a
+    thread/process with caller data; the one auto-name that CAN be user-set is scanned
+    when custom, so such a leak is still caught. ``None`` auto-names carry nothing.
     """
     extra_fields = {
         key: value
         for key, value in record.__dict__.items()
         if key not in _STANDARD_LOGRECORD_ATTRS
     }
-    task_name = record.__dict__.get("taskName")
-    custom_task_name = (
-        task_name
-        if isinstance(task_name, str)
-        and _DEFAULT_ASYNCIO_TASK_NAME.fullmatch(task_name) is None
-        else ""
-    )
     # ``exc_text`` is populated only once a Formatter runs; on a raw captured record a
     # log with ``exc_info=True`` leaves ``exc_text`` None. Render ``exc_info`` and scan
     # it -- ``formatException`` follows the full ``__cause__`` / ``__context__`` /
@@ -180,7 +192,9 @@ def _assert_failure_log_is_secret_safe(record: logging.LogRecord) -> None:
         "extra fields": json.dumps(extra_fields, sort_keys=True, default=repr),
         "rendered message": record.getMessage(),
         "message args": json.dumps(record.args, default=repr) if record.args else "",
-        "custom task name": custom_task_name,
+        "custom task name": _custom_auto_name(record.__dict__.get("taskName")),
+        "custom thread name": _custom_auto_name(record.__dict__.get("threadName")),
+        "custom process name": _custom_auto_name(record.__dict__.get("processName")),
         "exception text": record.exc_text or "",
         "exception value": formatted_exc,
         "stack info": record.stack_info or "",
@@ -216,11 +230,17 @@ def _make_clean_record(**overrides: object) -> logging.LogRecord:
 async def test_secret_scan_ignores_framework_metadata() -> None:
     """No false-trip on framework metadata that coincidentally contains "1000".
 
-    The asyncio DEFAULT task name ``Task-<n>`` is a monotonic counter that climbs past
-    ``1000``/``1001`` mid-suite, and numeric fields (``relativeCreated`` etc.) vary per
-    run -- both are framework-set, never secrets, so neither may trip the scan.
+    The framework-DEFAULT task/thread/process auto-names (``Task-<n>``/``Thread-<n>``/
+    ``...PoolWorker-<n>``) are monotonic counters that climb past ``1000``/``1001``
+    mid-suite, and numeric fields (``relativeCreated`` etc.) vary per run -- all are
+    framework-set, never secrets, so none may trip the scan.
     """
-    record = _make_clean_record(taskName="Task-1000", relativeCreated=21000.5)
+    record = _make_clean_record(
+        taskName="Task-1000",
+        threadName="Thread-1000 (worker)",
+        processName="SpawnPoolWorker-1001",
+        relativeCreated=21000.5,
+    )
     _assert_failure_log_is_secret_safe(record)  # must NOT raise
 
 
@@ -243,6 +263,23 @@ async def test_secret_scan_catches_leak_in_custom_task_name() -> None:
     record = _make_clean_record(taskName="dial-1000")
     with pytest.raises(AssertionError, match=r"leaked secret '1000'"):
         _assert_failure_log_is_secret_safe(record)
+
+
+async def test_secret_scan_catches_leak_in_custom_thread_or_process_name() -> None:
+    """A secret in a CUSTOM thread or process name is caught (codex must-fix).
+
+    ``threadName``/``processName`` are application-settable (``Thread(name=...)`` /
+    ``multiprocessing`` process names) just like ``taskName``; a custom value carrying a
+    dial target must be caught while the framework defaults stay excluded.
+    """
+    with pytest.raises(
+        AssertionError, match=r"leaked secret '1000' in custom thread name"
+    ):
+        _assert_failure_log_is_secret_safe(_make_clean_record(threadName="dial-1000"))
+    with pytest.raises(
+        AssertionError, match=r"leaked secret '1001' in custom process name"
+    ):
+        _assert_failure_log_is_secret_safe(_make_clean_record(processName="dial-1001"))
 
 
 async def test_secret_scan_catches_leak_in_exception_text() -> None:

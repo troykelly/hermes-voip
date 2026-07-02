@@ -710,7 +710,23 @@ class SipOverTlsTransport:
         txn = self._client_txns.get(key)
         if txn is None:
             return
-        ack = txn.ack_for_response(response)
+        # Building the §17.1.1.3 ACK copies the response's To (and echoes other
+        # headers) into a fresh request, so a correlated non-2xx final that is missing
+        # To — or carries a control char in an echoed header — makes the builder raise
+        # ValueError; unguarded that escapes the reader and tears down the whole
+        # connection (ADR-0081). Catch ONLY the builder's ValueError and drop the
+        # auto-ACK: no ACK was built, so the transaction is untouched and is cleaned up
+        # with the call. The send stays OUTSIDE the try so a genuine OSError from real
+        # IO loss still propagates (rule 37).
+        try:
+            ack = txn.ack_for_response(response)
+        except ValueError as exc:
+            _log.warning(
+                "dropping the auto-ACK for a non-2xx INVITE final that cannot build"
+                " an ACK (%s) — connection kept",
+                type(exc).__name__,
+            )
+            return
         if ack is not None:
             await self.send(ack)
         if txn.state is TransactionState.TERMINATED:

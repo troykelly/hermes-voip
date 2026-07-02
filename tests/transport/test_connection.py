@@ -800,6 +800,92 @@ async def test_non_2xx_invite_response_is_acked_by_the_transport() -> None:
         await server.stop()
 
 
+def _final_with_cseq(
+    invite: SipRequest, status: int, reason: str, cseq_header: str | None
+) -> str:
+    """A final response to ``invite`` with a caller-supplied ``CSeq`` value.
+
+    ``cseq_header`` is the raw header value to send (e.g. ``"INVITE"`` — a method
+    with no sequence number — or ``"abc INVITE"`` — a non-numeric sequence
+    number); ``None`` omits the ``CSeq`` header entirely. Used to regression-guard
+    the loud-failure path when a final's CSeq cannot be parsed (bk1188).
+    """
+    cseq_line = f"CSeq: {cseq_header}\r\n" if cseq_header is not None else ""
+    return (
+        f"SIP/2.0 {status} {reason}\r\n"
+        f"Via: {invite.header('Via')}\r\n"
+        f"From: {invite.header('From')}\r\n"
+        f"To: {invite.header('To')};tag=busy-srv\r\n"
+        f"Call-ID: {invite.header('Call-ID')}\r\n"
+        f"{cseq_line}"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_malformed_cseq_on_invite_final_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A final non-2xx with an unparseable CSeq is logged, not silently dropped.
+
+    Before the fix, ``_auto_ack_non_2xx`` gives up via a bare ``return`` when the
+    CSeq method isn't ``INVITE`` (``_method_of`` returns ``None`` for a missing or
+    number-less CSeq) or when ``_txn_key`` can't parse the sequence number (a
+    non-numeric one) — silently skipping both the mandatory ACK (RFC 3261
+    §17.1.1.3) and the client-transaction cleanup, with NO log at all. This
+    exercises all three malformed shapes (omitted CSeq, CSeq with no number, CSeq
+    with a non-numeric number) and asserts each is logged as a WARNING naming the
+    Call-ID.
+    """
+    call_id = new_call_id()
+
+    async def respond(request: SipRequest) -> list[str]:
+        if request.method != "INVITE":
+            return []
+        return []  # the malformed finals are pushed directly below
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.connection"):
+        try:
+            await transport.connect()
+            invite_text = _outbound_invite(new_branch(), call_id=call_id)
+            await transport.send(invite_text)
+            await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+            invite = SipRequest.parse(invite_text)
+
+            for cseq_header in (None, "INVITE", "abc INVITE"):
+                await server.push(
+                    _final_with_cseq(invite, 486, "Busy Here", cseq_header)
+                )
+
+            await _until(
+                lambda: (
+                    len([r for r in caplog.records if r.levelno == logging.WARNING])
+                    >= 3
+                ),
+                timeout=3.0,
+            )
+        finally:
+            await transport.aclose()
+            await server.stop()
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) >= 3, (
+        f"expected one WARNING per malformed-CSeq shape (3), got {len(warning_records)}"
+    )
+    for record in warning_records:
+        assert call_id in record.getMessage(), (
+            f"WARNING must name the Call-ID, got: {record.getMessage()!r}"
+        )
+
+
 async def test_2xx_to_our_invite_unregisters_txn_and_no_late_ack() -> None:
     # A 2xx terminates the client transaction (the TU owns the 2xx ACK), so the
     # transport unregisters it; a late non-2xx for the same branch then produces

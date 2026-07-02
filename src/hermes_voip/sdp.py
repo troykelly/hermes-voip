@@ -275,9 +275,13 @@ class CryptoAttribute:
         # The remaining tokens are key-params then optional session-params; we
         # keep only the first (the inline key) — session-params are not used.
         key_params = fields[2]
-        if not tag_str.isdigit():
-            # Never echo the tag token: a malformed body can put the inline key
-            # in the tag position (e.g. "inline:<KEY> <suite> inline:<KEY>").
+        if not (tag_str.isascii() and tag_str.isdecimal()):
+            # isascii()+isdecimal(), NOT str.isdigit(): U+00B2 and other Unicode
+            # "digit" characters pass isdigit() but int() then raises a bare
+            # ValueError that would escape the caller's `except SdpError` leniency
+            # (the house guard, matching registration.py / transport/framing.py).
+            # Never echo the tag token: a malformed body can put the inline key in
+            # the tag position (e.g. "inline:<KEY> <suite> inline:<KEY>").
             msg = "crypto tag is not decimal"
             raise SdpError(msg)
         if len(tag_str) > 1 and tag_str[0] == "0":
@@ -1418,7 +1422,15 @@ def _coerce_crypto(crypto: CryptoAttribute | str | None) -> CryptoAttribute | No
     if crypto is None or isinstance(crypto, CryptoAttribute):
         return crypto
     first = crypto.split(maxsplit=1)
-    body = crypto if first and first[0].isdigit() else f"{_DEFAULT_CRYPTO_TAG} {crypto}"
+    # A purely-decimal first token is the tag; anything else gets the default tag.
+    # isascii()+isdecimal(), NOT str.isdigit(): a Unicode "digit" like U+00B2 passes
+    # isdigit() but is not int-parseable, so classifying it as the tag would reach
+    # CryptoAttribute.parse's int() and raise a bare ValueError instead of SdpError.
+    body = (
+        crypto
+        if first and first[0].isascii() and first[0].isdecimal()
+        else f"{_DEFAULT_CRYPTO_TAG} {crypto}"
+    )
     return CryptoAttribute.parse(body)
 
 

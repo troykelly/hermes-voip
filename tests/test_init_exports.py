@@ -4,6 +4,9 @@ import hermes_voip
 import hermes_voip.call_context
 import hermes_voip.dtmf
 import hermes_voip.message
+import hermes_voip.providers.asr
+import hermes_voip.providers.guard
+import hermes_voip.providers.tts
 import hermes_voip.registration
 import hermes_voip.rtcp
 import hermes_voip.rtp
@@ -164,3 +167,72 @@ def test_top_level_exports_pcm_frame() -> None:
     """PcmFrame must appear in hermes_voip.__all__ and be importable."""
     assert "PcmFrame" in hermes_voip.__all__
     assert hasattr(hermes_voip, "PcmFrame")
+
+
+# ── (C) top-level provider-protocol export gaps (bk872) ──────────────────────
+# StreamingASR / StreamingTTS / InjectionGuard are the canonical ADR-0004
+# provider seams — already re-exported at hermes_voip.providers.__all__ — but
+# #324 did not promote them to the hermes_voip top level alongside the other
+# provider-wiring names (Providers, build_providers, PcmFrame).
+
+
+def test_top_level_exports_streaming_asr() -> None:
+    """StreamingASR must appear in hermes_voip.__all__ and be importable."""
+    assert "StreamingASR" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "StreamingASR")
+    assert hermes_voip.StreamingASR is hermes_voip.providers.asr.StreamingASR
+
+
+def test_top_level_exports_streaming_tts() -> None:
+    """StreamingTTS must appear in hermes_voip.__all__ and be importable."""
+    assert "StreamingTTS" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "StreamingTTS")
+    assert hermes_voip.StreamingTTS is hermes_voip.providers.tts.StreamingTTS
+
+
+def test_top_level_exports_injection_guard() -> None:
+    """InjectionGuard must appear in hermes_voip.__all__ and be importable."""
+    assert "InjectionGuard" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "InjectionGuard")
+    assert hermes_voip.InjectionGuard is hermes_voip.providers.guard.InjectionGuard
+
+
+# ── (D) top-level submodule-attribute leak (bk872) ────────────────────────────
+# #324's __all__ correctly excludes these internal submodules (so
+# ``from hermes_voip import *`` already excludes them), but plain
+# ``import hermes_voip`` still left them resolvable as ``hermes_voip.<name>``
+# attributes — Python's import machinery binds every submodule pulled in,
+# directly or transitively, by hermes_voip/__init__.py onto the package. The
+# attribute surface must agree with __all__, not just the star-import surface.
+#
+# Only 4 of the 7 leaked names are covered here (not sip/registration/message):
+# those three are load-bearing for existing tests ABOVE in this same file
+# (test_sip_exports_sip_address_of_record, test_registration_exports_
+# registration_flow, test_message_exports_sip_request all reach the module via
+# hermes_voip.sip/.registration/.message attribute access) — deleting them
+# would raise AttributeError there. caller_modes/config/digest/plugin have no
+# such dependency anywhere in tests/ or src/, so they can be fully closed.
+
+
+def test_top_level_does_not_leak_caller_modes_submodule() -> None:
+    """hermes_voip.caller_modes must not resolve as a top-level attribute."""
+    assert "caller_modes" not in hermes_voip.__all__
+    assert not hasattr(hermes_voip, "caller_modes")
+
+
+def test_top_level_does_not_leak_config_submodule() -> None:
+    """hermes_voip.config must not resolve as a top-level attribute."""
+    assert "config" not in hermes_voip.__all__
+    assert not hasattr(hermes_voip, "config")
+
+
+def test_top_level_does_not_leak_digest_submodule() -> None:
+    """hermes_voip.digest must not resolve as a top-level attribute."""
+    assert "digest" not in hermes_voip.__all__
+    assert not hasattr(hermes_voip, "digest")
+
+
+def test_top_level_does_not_leak_plugin_submodule() -> None:
+    """hermes_voip.plugin must not resolve as a top-level attribute."""
+    assert "plugin" not in hermes_voip.__all__
+    assert not hasattr(hermes_voip, "plugin")

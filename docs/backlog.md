@@ -1355,3 +1355,35 @@ as dedicated fix tasks (#41 VT-1/VT-2/VT-3, #42 VT-4, #43) rather than duplicate
 - [ ] **[low] docs/polish** — `CallControlTools` (`src/hermes_voip/tools.py:242`) is fully implemented and thoroughly tested (`tests/test_tools.py`, 30+ tests including a TOCTOU regression explicitly citing "codex HIGH") but has zero production call sites. `grep -rn "CallControlTools(" src/` has no hits; `plugin.py`'s actual tool-registration entrypoint calls `register_voip_tools` (`voip_tools.py`), never `tools.py`'s `CallControlTools`. Other files (`adapter.py`, `dtmf_confirm.py`) cite it only in docstrings as a design-parity comparison ("identical to `CallControlTools._irreversible`", "mirrors `CallControlTools.list_registrations`"). Verified NOT a live security gap: the actual production path (`adapter.py::transfer_blind_on_call`, L5906-6013) independently re-implements the same TOCTOU protection `CallControlTools` pioneered (re-checks the guard both before and after the confirmation await). This is maintenance dead-weight and a review hazard (a reviewer could mistake `CallControlTools` for the live authorization surface and audit/patch the wrong implementation) rather than a live vulnerability — distinct from task #42's `call_loop.py` duplicate-`gate_voip_tool` finding (different file, different function). Either remove `CallControlTools`/its Protocols/tests as superseded by `voip_tools.py`'s handler-function design, or — if intentionally kept as a reference/alternate implementation — say so explicitly in its module docstring and point the cross-file "identical to"/"mirrors" comments at the live code instead.
 - [ ] **[low] test** — `_voip_tool_names()` vs `_VOIP_TOOLS` completeness has no automated full-set-equality test. `tests/test_voip_tools.py::test_gate_owns_the_control_tools` spot-checks only 3 of the 10 tool names are members of `_voip_tool_names()`, not a full-set equality against `_VOIP_TOOLS`. Currently consistent (manually verified 10/10) but structurally fragile — a future tool addition that's registered but not added to the gate's name-set would not be caught. Assert `vt._voip_tool_names() == {spec.name for spec in vt._VOIP_TOOLS}` (or equivalent) so the two can never silently drift. (`src/hermes_voip/voip_tools.py`, `tests/test_voip_tools.py`)
 - [ ] **[medium] security** — No cooldown / rate-limit on repeated IRREVERSIBLE tool calls (`place_call` / `transfer_blind` / `transfer_attended` / `send_dtmf`). `_outbound_extensions` (`adapter.py:1014`, checked at `:1708`, 503 "already in progress", discarded on completion at `:1725`) only blocks a *concurrent* same-extension dial (a re-entrancy guard), and the attended-consult single-slot guard (`adapter.py:6050`) only blocks a second *concurrent* consult — neither limits sequential redial rate nor repeated transfer/DTMF. Once a session holds level-3 / non-degraded privilege, a confused-deputy loop (a persistent prompt injection driving the model) can redial, transfer, and DTMF-spam bounded only by the static outbound allowlist + the per-transfer DTMF-confirm gate, not by attempt count or elapsed time. Design questions to resolve in an ADR BEFORE implementing (rule 40 — undecided agent-visible-behaviour policy): per-session sliding-window vs fixed cooldown; interaction with `degraded` (does tripping a throttle degrade the session, or just refuse the one call?); and it MUST NOT throttle legitimate rapid redials (e.g. immediately calling back a caller who just dropped) or a normal consult→complete/cancel sequence. Do not add throttle code until the ADR is accepted. (`src/hermes_voip/voip_tools.py`, `src/hermes_voip/adapter.py`, new `docs/adr/`)
+
+## Wave-13 gap-review (discovered 2026-07-02, message.py SIP-parser ingress surface)
+
+Full read of `src/hermes_voip/message.py` (`SipRequest.parse` / `SipResponse.parse` /
+`_parse_headers` / `build_request` / `build_response`) plus its transport catchers, focused on
+the ADR-0081 exception-escape axis (one malformed inbound message must not DoS unrelated calls)
+and the ingress→egress data flow. The exception-escape axis is CLEAN: every op in both parsers
+raises only `ValueError` on hostile `str` (empirically probed, and now locked by a 35-input
+adversarial table asserting `parse` either succeeds or raises `ValueError`, never another
+exception type). Three LOW findings were FIXED in
+this same lane (shipped with the tests): the status-line regex `\d{3}` → `[0-9]{3}` so non-ASCII
+decimal digits are no longer folded (LOW-1); a parse-side status range check 100..699 matching
+`build_response` (LOW-2); and length-only parse-error messages replacing the `{...!r}` raw-wire
+embeds (LOW-4). Two residual, cross-file items follow.
+
+- [ ] **[low] security/robustness** — `message.py` `parse` is permissive about non-CRLF control
+  characters: the request-URI `\S+`, the reason `(.*)`, and header values all retain interior C0
+  controls / bare CR / NUL / DEL. This is NOT injectable within `message.py` itself — both
+  builders call `_reject_controls` (`contains_control`) on every field before it reaches the wire.
+  The residual is defense-in-depth: any OTHER egress path that formats a PARSED header value or
+  request-URI into wire text WITHOUT a control-char gate would be injectable. Needs a cross-file
+  egress audit: `refer.py` is verified clean (it references `contains_control`), but `dialog.py`,
+  `incall.py`, and `session_timer.py` reference neither `contains_control` nor `_reject_controls`,
+  so the audit must confirm whether any of them serialize a parsed value into wire text unguarded.
+  Tracked as task #47. (`src/hermes_voip/message.py`, `src/hermes_voip/refer.py`, `src/hermes_voip/dialog.py`, `src/hermes_voip/incall.py`, `src/hermes_voip/session_timer.py`)
+- [ ] **[low] robustness** — The outbound `send()` / transaction paths re-parse OUR OWN freshly
+  built wire text unguarded (`transport/connection.py:349,390`, `transport/ws_connection.py:333,349`,
+  `transport/transaction.py:64`, `adapter.py:2059,2789`). Low risk — a parse failure there is our
+  builder's bug and propagates out of the builder, not out of the inbound read loop, so it is not
+  an ADR-0081 connection-DoS — but worth confirming no caller logs `str(exc)` of these parses (ties
+  to the LOW-4 redaction discipline now applied at the parser; the messages are length-only, so
+  even a stray `str(exc)` log no longer leaks wire content). (`src/hermes_voip/transport/connection.py`, `src/hermes_voip/transport/ws_connection.py`, `src/hermes_voip/transport/transaction.py`, `src/hermes_voip/adapter.py`)

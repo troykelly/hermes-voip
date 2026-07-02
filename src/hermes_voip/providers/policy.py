@@ -114,18 +114,26 @@ class GuardSessionState:
     ``privilege_level`` (0 = receptionist/SAFE-only, 2 = trusted/+ELEVATED,
     3 = operator/+IRREVERSIBLE) so the gate can express the three tiers the
     operator asked for.  Levels 0 and 3 reproduce ADR-0020's ``privileged=False``
-    / ``True`` **exactly** (no existing behaviour changes).  The backward-compat
-    ``privileged`` property (``level >= 3``) keeps every existing ``state.privileged``
-    reader working without changes.
+    / ``True`` **exactly**.  The backward-compat ``privileged`` property
+    (``level >= 3``) keeps every existing ``state.privileged`` reader working
+    without changes.
 
-    Construction backward-compat:
+    Construction (ADR-0097 — least-privilege by default):
     - ``GuardSessionState(call_id, privilege_level=N)`` — new callers.
     - ``GuardSessionState(call_id, privileged=True/False)`` — old callers: maps to
-      level 3 (True) or level 0 (False).  Cannot combine ``privilege_level`` and
-      ``privileged`` — the constructor raises ``TypeError`` if both are supplied.
-    - ``GuardSessionState(call_id)`` — default, level 3 (assistant), same as
-      ``privileged=True`` was.  Preserves the ADR-0009 default where every session
-      starts as the assistant unless the adapter explicitly lowers the level.
+      level 3 (True) or level 0 (False).  If ``privileged`` is supplied it silently
+      takes precedence over ``privilege_level`` (no error) — no current call site
+      supplies both, so this precedence is a documented fallback, not a load-bearing
+      behaviour.
+    - ``GuardSessionState(call_id)`` — default, level 0 (receptionist/SAFE-only).
+      **ADR-0097** flipped this from the pre-existing level-3 (assistant) default:
+      a caller-classification path that forgets to pass a level now fails closed
+      instead of silently granting operator trust — the same least-privilege
+      principle ADR-0021 §0.3 already applies to an unmatched caller group
+      (``CallerGroupConfig`` rejects a privileged ``default_group``). Every
+      production construction site either already passed an explicit level, or
+      (the one exception, the no-call ``list_registrations`` ambient state) now
+      does so explicitly rather than relying on the constructor default.
 
     Attributes:
         call_id: The call/session this state belongs to.
@@ -156,7 +164,7 @@ class GuardSessionState:
         self,
         call_id: str,
         degraded: bool = False,
-        privilege_level: int = 3,
+        privilege_level: int = 0,
         flagged_turns: tuple[str, ...] = (),
         *,
         privileged: bool | None = None,
@@ -167,13 +175,15 @@ class GuardSessionState:
         Args:
             call_id: The call identifier.
             degraded: Whether the session is already in degraded state.
-            privilege_level: Tool-risk ceiling (0/2/3).  Default 3 = operator/assistant.
-                Ignored if ``privileged`` is supplied.
+            privilege_level: Tool-risk ceiling (0/2/3).  Default 0 = least-privilege
+                (receptionist/SAFE-only) — ADR-0097. Ignored if ``privileged`` is
+                supplied. A caller-classification path that wants operator/trusted
+                trust must state the level explicitly; an omitted level fails
+                closed rather than silently granting operator trust.
             flagged_turns: Initial set of flagged turn IDs (typically empty).
-            privileged: Backward-compat kwarg.  If supplied, overrides
-                ``privilege_level``: ``True`` → 3, ``False`` → 0.  Raise
-                ``TypeError`` if both ``privilege_level`` is explicitly non-default
-                AND ``privileged`` is supplied simultaneously.
+            privileged: Backward-compat kwarg.  If supplied (not ``None``), silently
+                takes precedence over ``privilege_level``: ``True`` → 3,
+                ``False`` → 0. No current call site supplies both.
             allowed_tools: Optional tool-name allow-list (ADR-0031). EMPTY (the
                 default) = no sub-ceiling (level-only gating, the existing
                 behaviour). A NON-EMPTY set scopes the session to ONLY those tools

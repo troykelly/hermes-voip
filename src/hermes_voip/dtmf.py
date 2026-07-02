@@ -53,7 +53,7 @@ _RECEIVER_HISTORY: Final[int] = 32
 
 @dataclass(frozen=True, slots=True)
 class DtmfPress:
-    """A completed DTMF key-press returned by :meth:`DtmfReceiver.feed` (ADR-0077).
+    """A completed DTMF key-press returned by :meth:`DtmfReceiver.feed` (ADR-0096).
 
     Attributes:
         digit: The keypad character that was pressed (``"0"``-``"9"``, ``"*"``,
@@ -64,10 +64,14 @@ class DtmfPress:
 
 
 class DtmfNoPress(enum.Enum):
-    """Non-press outcomes of :meth:`DtmfReceiver.feed` (ADR-0077).
+    """Non-press outcomes of :meth:`DtmfReceiver.feed`.
 
-    Replaces the bare ``None`` that previously conflated all non-press cases,
-    letting callers branch on the exact reason without extra bookkeeping:
+    ``STILL_PRESSING``/``DUPLICATE_END``/``NON_DIGIT_EVENT`` are the original
+    result-type shape (bk366, ADR-0077); ``AWAITING_CORROBORATION`` and
+    ``CONFLICTING_EVENT`` were added by the end-packet corroboration gate
+    (ADR-0096). Replaces the bare ``None`` that previously conflated all
+    non-press cases, letting callers branch on the exact reason without extra
+    bookkeeping:
 
     * ``STILL_PRESSING``       - the end bit is not set; the tone is still in
       progress.
@@ -305,10 +309,9 @@ class DtmfReceiver:
     a timestamp had been seen but not what digit it had decided, and the
     ``dict[int, int]`` form that recorded the event code but trusted it
     immediately on first sight (the digit-substitution gap fixed here: see
-    ADR-0077 and backlog — a receiver that emits on the FIRST packet it ever
-    sees for a timestamp can never detect a disagreement before that packet
-    has already been acted on, no matter how a LATER disagreeing packet is
-    classified).
+    ADR-0096 — a receiver that emits on the FIRST packet it ever sees for a
+    timestamp can never detect a disagreement before that packet has already
+    been acted on, no matter how a LATER disagreeing packet is classified).
 
     Residual scope: corroboration requires two end packets to AGREE, not two
     end packets from the SAME sender — two colluding forged copies are

@@ -102,9 +102,12 @@ def test_dtmf_press_carries_digit() -> None:
 
 
 def test_dtmf_no_press_variants_exist() -> None:
-    """DtmfNoPress has five distinguishable no-press cases (ADR-0077).
+    """DtmfNoPress has five distinguishable no-press cases.
 
-    Callers who previously tested 'result is None' must now pick the right variant:
+    The original three (bk366, ADR-0077) were STILL_PRESSING, DUPLICATE_END,
+    and NON_DIGIT_EVENT; AWAITING_CORROBORATION and CONFLICTING_EVENT were
+    added later by the corroboration gate (ADR-0096). Callers who previously
+    tested 'result is None' must now pick the right variant:
       STILL_PRESSING         — end bit not set; tone still in progress
       AWAITING_CORROBORATION — end bit set, but this is the FIRST end packet
                                ever seen for this timestamp — not yet trusted
@@ -143,8 +146,8 @@ def test_receiver_emits_press_once_and_suppresses_duplicates() -> None:
     Replaces test_receiver_emits_digit_once_per_press with the new API (bk366,
     ADR-0077). The two start/update packets yield STILL_PRESSING; the first of
     the three RFC 4733 redundant end packets yields AWAITING_CORROBORATION (not
-    yet trusted); the second, agreeing, end packet yields DtmfPress('3'); the
-    third yields DUPLICATE_END.
+    yet trusted — the corroboration gate, ADR-0096); the second, agreeing, end
+    packet yields DtmfPress('3'); the third yields DUPLICATE_END.
     """
     rx = DtmfReceiver()
     # two start/update packets — not end, must be STILL_PRESSING
@@ -177,7 +180,7 @@ def test_receiver_distinguishes_repeated_digit_by_timestamp() -> None:
     """Two presses of the same digit with different timestamps each yield DtmfPress.
 
     New timestamp = new press, regardless of the digit character (bk366). Each
-    press needs its own corroborating second end packet (ADR-0077).
+    press needs its own corroborating second end packet (ADR-0096).
     """
     rx = DtmfReceiver()
     assert (
@@ -202,7 +205,7 @@ def test_receiver_non_digit_event_yields_non_digit_variant() -> None:
 
     Previously both a duplicate end AND a non-digit event were indistinguishable None.
     Now NON_DIGIT_EVENT lets callers handle them explicitly. The first end packet at a
-    new timestamp is never trusted outright (ADR-0077), so a second, agreeing packet
+    new timestamp is never trusted outright (ADR-0096), so a second, agreeing packet
     is required before the outcome (digit or non-digit) is decided.
     """
     rx = DtmfReceiver()
@@ -312,7 +315,7 @@ def test_receiver_rejects_conflicting_event_at_same_timestamp() -> None:
     """A same-timestamp mismatching event must never substitute a digit.
 
     It must also never be silently conflated with the digit already reported
-    for that timestamp. The genuine digit is corroborated first (ADR-0077,
+    for that timestamp. The genuine digit is corroborated first (ADR-0096,
     two agreeing end packets) before the conflicting probe arrives.
     """
     rx = DtmfReceiver()
@@ -348,7 +351,7 @@ def test_receiver_still_dedups_agreeing_duplicate_after_conflict_probe() -> None
     The original digit's own genuine redundant end packets arriving
     afterwards must still be recognised as ordinary duplicates — because the
     digit was already safely corroborated by two agreeing packets BEFORE the
-    conflicting probe ever arrived (ADR-0077); a disagreement that shows up
+    conflicting probe ever arrived (ADR-0096); a disagreement that shows up
     only after emission cannot un-emit the digit, so it does not turn every
     later agreeing packet into a fresh alarm either.
     """
@@ -375,7 +378,7 @@ def test_receiver_still_dedups_agreeing_duplicate_after_conflict_probe() -> None
 def test_residual_two_colluding_forged_packets_still_win() -> None:
     """Honest residual: an attacker winning BOTH of the first two races still wins.
 
-    Corroboration (ADR-0077) raises the bar from a single-packet race to a
+    Corroboration (ADR-0096) raises the bar from a single-packet race to a
     same-outcome TWO-packet race — it does not eliminate spoofing on an
     unauthenticated media path. Two colluding forged packets that both arrive
     before the genuine one, and agree with each other, are indistinguishable
@@ -509,7 +512,7 @@ def test_encode_end_false_volume_max() -> None:
 def test_receiver_bounded_window_evicts_oldest_timestamp() -> None:
     """With history=2 the window holds exactly 2 timestamps; the third evicts the first.
 
-    Sequence (each press needs 2 agreeing end packets to corroborate, ADR-0077):
+    Sequence (each press needs 2 agreeing end packets to corroborate, ADR-0096):
       1. Press ts=1000 -> AWAITING_CORROBORATION, then DtmfPress('3').
          _window={1000}.
       2. Press ts=2000 -> AWAITING_CORROBORATION, then DtmfPress('3').
@@ -556,7 +559,7 @@ def test_receiver_bounded_window_retains_recent_timestamps() -> None:
     """Timestamps still within the window yield DUPLICATE_END (dedup still works).
 
     With history=2 and three presses (ts 1000, 2000, 3000, each corroborated
-    with 2 agreeing end packets per ADR-0077), ts=2000 and ts=3000 remain in
+    with 2 agreeing end packets per ADR-0096), ts=2000 and ts=3000 remain in
     the window (ts=1000 is evicted). A THIRD packet for either must return
     DUPLICATE_END — not AWAITING_CORROBORATION (which would mean the window
     forgot it had already been corroborated) and not a fresh DtmfPress (which
@@ -664,7 +667,7 @@ def test_dtmf_event_rejects_duration_above_boundary_65536() -> None:
 def test_feed_non_digit_returns_none() -> None:
     """Event code 16 (flash) is not a keypad digit; feed returns NON_DIGIT_EVENT.
 
-    The first end packet is never trusted outright (ADR-0077): it returns
+    The first end packet is never trusted outright (ADR-0096): it returns
     AWAITING_CORROBORATION. The second, agreeing packet corroborates it and
     surfaces NON_DIGIT_EVENT rather than a DtmfPress. A third, further
     redundant packet is deduped as DUPLICATE_END.
@@ -695,7 +698,7 @@ def test_start_only_press_never_emits() -> None:
 def test_lone_end_packet_never_emits_without_corroboration() -> None:
     """A single, uncorroborated end-bit packet is never trusted as a press.
 
-    This is the core of the digit-substitution fix (ADR-0077): the very
+    This is the core of the digit-substitution fix (ADR-0096): the very
     first end packet ever seen for a timestamp is indistinguishable from a
     forged packet racing the genuine one, so it is recorded but withheld
     (``AWAITING_CORROBORATION``) rather than emitted outright — this is the

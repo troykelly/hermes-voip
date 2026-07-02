@@ -849,7 +849,9 @@ def test_media_full_override() -> None:
             "DEEPGRAM_API_KEY": "dg-secret-token",
             "HERMES_VOIP_VAD_THRESHOLD": "0.75",
             "HERMES_VOIP_ENDPOINT_SILENCE_MS": "650",
-            "HERMES_VOIP_DUPLEX_MODE": "full",
+            # duplex_mode: "half" is the only accepted value ("full" is
+            # rejected at load -- see test_media_duplex_mode_full_rejected_as_inert).
+            "HERMES_VOIP_DUPLEX_MODE": "half",
             "HERMES_VOIP_INJECTION_GUARD": "sidecar",
             "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": "/models/deberta",
             "HERMES_SIP_DTMF_MODE": "rfc4733",
@@ -874,7 +876,7 @@ def test_media_full_override() -> None:
     assert cfg.deepgram_api_key == "dg-secret-token"
     assert cfg.vad_threshold == pytest.approx(0.75)
     assert cfg.endpoint_silence_ms == 650
-    assert cfg.duplex_mode == "full"
+    assert cfg.duplex_mode == "half"
     assert cfg.injection_guard == "sidecar"
     assert cfg.injection_guard_model_dir == "/models/deberta"
     assert cfg.dtmf_mode == "rfc4733"
@@ -1432,13 +1434,13 @@ def test_media_provider_tokens_lowercased() -> None:
     cfg = load_media_config(
         {
             "HERMES_VOIP_STT_PROVIDER": "SHERPA-ONNX",
-            "HERMES_VOIP_DUPLEX_MODE": "Full",
+            "HERMES_VOIP_DUPLEX_MODE": "Half",
             "HERMES_VOIP_INJECTION_GUARD": "ONNX",
             "HERMES_SIP_DTMF_MODE": "RFC4733",
         }
     )
     assert cfg.stt_provider == "sherpa-onnx"
-    assert cfg.duplex_mode == "full"
+    assert cfg.duplex_mode == "half"
     assert cfg.injection_guard == "onnx"
     assert cfg.dtmf_mode == "rfc4733"
 
@@ -1661,7 +1663,9 @@ def test_media_supported_dtmf_modes_accepted() -> None:
 
 
 def test_media_all_duplex_modes_accepted() -> None:
-    for mode in ("half", "full"):
+    # "half" is the only accepted mode -- "full" is rejected as inert (see
+    # test_media_duplex_mode_full_rejected_as_inert).
+    for mode in ("half",):
         assert load_media_config({"HERMES_VOIP_DUPLEX_MODE": mode}).duplex_mode == mode
 
 
@@ -1725,6 +1729,24 @@ def test_gateway_config_password_absent_from_repr() -> None:
 def test_media_unknown_duplex_mode_rejected() -> None:
     with pytest.raises(ConfigError):
         load_media_config({"HERMES_VOIP_DUPLEX_MODE": "quarter"})
+
+
+def test_media_duplex_mode_full_rejected_as_inert() -> None:
+    """``full`` is UNIMPLEMENTED (ADR-0008 Phase 2 is deferred, not shipped).
+
+    The media engine never reads ``duplex_mode`` at runtime — it always behaves
+    half-duplex — so accepting ``full`` at config load would let an operator
+    believe full-duplex barge-in is active when it is silently inert (rule 37:
+    fail loud, never silently no-op). Only ``half`` is a valid value until a
+    follow-up ADR ships Phase 2.
+    """
+    with pytest.raises(ConfigError, match="not implemented") as excinfo:
+        load_media_config({"HERMES_VOIP_DUPLEX_MODE": "full"})
+    # The error must name the specific inert knob + value (actionable), not just a
+    # generic "not implemented" that could drift away from the real guidance.
+    message = str(excinfo.value)
+    assert "HERMES_VOIP_DUPLEX_MODE" in message
+    assert "full" in message
 
 
 def test_media_unknown_dtmf_mode_rejected() -> None:

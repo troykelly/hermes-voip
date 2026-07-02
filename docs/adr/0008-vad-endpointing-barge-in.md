@@ -107,12 +107,14 @@ config pattern):
 | ------- | ------- | ------- |
 | `HERMES_VOIP_VAD_THRESHOLD` | `0.5` | silero-vad speech probability cutoff (Phase 1) |
 | `HERMES_VOIP_ENDPOINT_SILENCE_MS` | `500` | trailing silence to declare end-of-turn (Phase 1) |
-| `HERMES_VOIP_DUPLEX_MODE` | `half` | `half` (Phase 1, the only accepted mode); `full` is reserved for the deferred Phase 2 ADR |
+| `HERMES_VOIP_DUPLEX_MODE` | `half` | `half` (Phase 1, the only accepted mode); `full` is **rejected at config load** (fail-loud) until the deferred Phase 2 ADR implements it |
 | `HERMES_VOIP_AEC` | `off` | (Phase 2, deferred) acoustic echo cancellation: `off` \| `speex` \| `webrtc` |
 
 The `full`/AEC settings are listed for continuity with the Phase 2 research below; they are
-**not** part of the accepted decision and ship no behaviour until the follow-up ADR settles
-cancellation + AEC.
+**not** part of the accepted decision. Because the media engine never reads `duplex_mode` at
+runtime, `HERMES_VOIP_DUPLEX_MODE=full` is **rejected at config load** (fail-loud, rule 37) so
+an operator cannot believe full-duplex barge-in is active while it is silently inert; the AEC
+settings ship no behaviour until the follow-up ADR settles cancellation + AEC.
 
 **Phase 1 — half-duplex (accepted; complete on its own).** While the agent's TTS is
 playing out, the inbound stream is **not** routed to STT; VAD/endpointing only gate caller

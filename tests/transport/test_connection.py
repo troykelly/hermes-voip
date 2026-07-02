@@ -1079,6 +1079,197 @@ async def test_active_call_survives_a_malformed_message_on_the_connection() -> N
         await server.stop()
 
 
+# --------------------------------------------------------------------------
+# ADR-0081 class, BUILD side: a header-incomplete inbound request that PARSES
+# but whose auto-response cannot be built must not tear down the connection.
+# --------------------------------------------------------------------------
+
+
+def _cancel_missing_via() -> str:
+    """A CANCEL that PARSES but carries NO Via — its 481 auto-response has none to echo.
+
+    parse() does not require the echo headers, so this frames + parses cleanly. It
+    routes to a Cancel (no To-tag, method CANCEL), matches no pending INVITE (no Via
+    branch), and reaches _handle_cancel's build_response(cancel, 481, ...) — which
+    RAISES ValueError (RFC 3261 §8.2.6 requires echoing the request's Via). That build
+    runs INLINE in the reader task (OUTSIDE _dispatch's parse-only guard), so before the
+    fix the escape ended the reader and fired on_connection_lost — a one-packet DoS
+    against every active call. The distinctive Call-ID / From-tag are PII tripwires for
+    the log-content assertion below.
+    """
+    return (
+        "CANCEL sip:1000@pbx.example.test SIP/2.0\r\n"
+        "From: <sip:2000@pbx.example.test>;tag=cancel-nohdr-ft\r\n"
+        "To: <sip:1000@pbx.example.test>\r\n"
+        "Call-ID: cancel-no-via-tripwire\r\n"
+        "CSeq: 1 CANCEL\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+def _options_missing_via() -> str:
+    """An out-of-dialog OPTIONS that PARSES but has NO Via — keepalive 200 has none.
+
+    A gateway *qualify* OPTIONS (RFC 3261 §11) is out of dialog, so it routes Unroutable
+    and is auto-answered by _answer_keepalive via build_options_ok → build_response —
+    which RAISES ValueError on the absent Via. Same inline-escape hazard as the CANCEL.
+    """
+    return (
+        "OPTIONS sip:1000@pbx.example.test SIP/2.0\r\n"
+        "From: <sip:qualify@pbx.example.test>;tag=opt-nohdr-ft\r\n"
+        "To: <sip:1000@pbx.example.test>\r\n"
+        "Call-ID: options-no-via-tripwire\r\n"
+        "CSeq: 1 OPTIONS\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+async def test_active_call_survives_a_header_incomplete_cancel() -> None:
+    # ADR-0081 class (build side): a CANCEL that PARSES but is missing a mandatory echo
+    # header (no Via) routes to _handle_cancel, whose build_response(481) raises
+    # ValueError. That build runs INLINE in the reader task (OUTSIDE _dispatch's
+    # parse-only try), so the escape used to end the reader and fire on_connection_lost,
+    # dropping EVERY active call over one packet. The malformed CANCEL must be dropped
+    # (logged) and an unrelated active call's own 200 OK still routed to its sink.
+    sink = _RecordingSink()
+    call_id = new_call_id()
+    branch = new_branch()
+    lost: list[BaseException | None] = []
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)  # so route_request classifies the CANCEL
+    transport.add_call(call_id, sink)
+    try:
+        invite_text = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite_text)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        # The header-incomplete CANCEL arrives on the shared connection, then the active
+        # call's own 200 OK.
+        await server.push(_cancel_missing_via())
+        await server.push(_final_2xx_with_contact(SipRequest.parse(invite_text)))
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in sink.responses))
+        assert lost == [], (
+            "a header-incomplete CANCEL must not tear down the shared connection"
+        )
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_active_call_survives_a_header_incomplete_keepalive_options() -> None:
+    # ADR-0081 class (build side), keepalive path: an out-of-dialog OPTIONS missing Via
+    # is auto-answered by _answer_keepalive → build_options_ok → build_response, which
+    # raises. The inline escape must not tear down the connection: an unrelated active
+    # call's own 200 OK is still routed to its sink.
+    sink = _RecordingSink()
+    call_id = new_call_id()
+    branch = new_branch()
+    lost: list[BaseException | None] = []
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)  # so the OPTIONS reaches _answer_keepalive
+    transport.add_call(call_id, sink)
+    try:
+        invite_text = _outbound_invite(branch, call_id=call_id)
+        await transport.send(invite_text)
+        await server.wait_for_received(lambda raw: raw.startswith("INVITE "))
+        await server.push(_options_missing_via())
+        await server.push(_final_2xx_with_contact(SipRequest.parse(invite_text)))
+        await _until(lambda: any(r.status_code == _OK_STATUS for r in sink.responses))
+        assert lost == [], (
+            "a header-incomplete keepalive OPTIONS must not tear down the connection"
+        )
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_header_incomplete_cancel_drop_is_logged_non_pii(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dropped header-incomplete CANCEL is logged as a non-PII WARNING (rules 37/34).
+
+    Fail-closed is not silent (rule 37): dropping the un-answerable CANCEL emits a
+    WARNING. It must carry ONLY the exception type name — never the wire content
+    (Call-ID / From-tag / URIs are PII on a PUBLIC repo, rule 34). The fixture's
+    distinctive Call-ID and From-tag must NOT appear in the log.
+    """
+    lost: list[BaseException | None] = []
+
+    async def respond(_request: SipRequest) -> list[str]:
+        return []
+
+    server = LoopbackSipServer(respond)
+    await server.start()
+    transport = SipOverTlsTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ssl_context=client_ssl_context(),
+        server_hostname="pbx.example.test",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    await transport.connect()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.transport.connection"):
+        try:
+            await server.push(_cancel_missing_via())
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 3.0
+            while not caplog.records and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+        finally:
+            await manager.aclose()
+            await transport.aclose()
+            await server.stop()
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) >= 1, (
+        "dropping an un-answerable CANCEL must emit a WARNING (surfaced, not swallowed)"
+    )
+    assert "ValueError" in warning_records[0].getMessage(), (
+        f"log must carry type(exc).__name__, got: {warning_records[0].getMessage()!r}"
+    )
+    assert "cancel-no-via-tripwire" not in caplog.text, (
+        "the CANCEL Call-ID must NOT appear in the log (rule 34 / PII guard)"
+    )
+    assert "cancel-nohdr-ft" not in caplog.text, (
+        "the CANCEL From-tag must NOT appear in the log (rule 34 / PII guard)"
+    )
+    assert lost == [], "the header-incomplete CANCEL must not fire on_connection_lost"
+
+
 def _nonutf8_body_but_framable() -> bytes:
     """A message that FRAMES cleanly but whose BODY is not valid UTF-8.
 

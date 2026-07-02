@@ -86,12 +86,18 @@ from hermes_voip.media.g722 import (
     G722Encoder,
 )
 
-# Opus RATE constants only (plain ints — ADR-0032). Importing them at module scope
-# is safe in the default (no-webrtc) gate: media.opus's opuslib/libopus import is
-# lazy (inside the codec constructors), so this import never pulls opuslib in. The
-# OpusEncoder/OpusDecoder CLASSES are imported lazily inside _encode/_decode, mirroring
-# how the G.722 codec objects are created on first use.
-from hermes_voip.media.opus import OPUS_RTP_CLOCK_RATE, OPUS_SAMPLE_RATE
+# Opus RATE constants + OpusDecodeError (plain ints / a dependency-free exception
+# class — ADR-0032). Importing them at module scope is safe in the default
+# (no-webrtc) gate: media.opus's opuslib/libopus import is lazy (inside the codec
+# constructors), so this import never pulls opuslib in — mirroring exactly why
+# SrtpError (below) is also a safe module-scope import. The OpusEncoder/OpusDecoder
+# CLASSES are imported lazily inside _encode/_decode, mirroring how the G.722 codec
+# objects are created on first use.
+from hermes_voip.media.opus import (
+    OPUS_RTP_CLOCK_RATE,
+    OPUS_SAMPLE_RATE,
+    OpusDecodeError,
+)
 
 # SrtpError is defined at srtp.py module level and carries no cryptography
 # dependency (the cryptography backend is imported lazily inside SrtpSession),
@@ -547,11 +553,17 @@ class _OpusDecode(Protocol):
     """The decode method surface of :class:`hermes_voip.media.opus.OpusDecoder`."""
 
     def decode(self, packet: bytes) -> bytes:
-        """Decode one Opus packet to a 20 ms 48 kHz PCM16 frame."""
+        """Decode one Opus packet to a 20 ms 48 kHz PCM16 frame.
+
+        Raises ``OpusDecodeError`` on a corrupt/malformed ``packet``.
+        """
         ...
 
     def decode_fec(self, next_packet: bytes) -> bytes:
-        """Recover a lost frame from the next packet's in-band FEC (ADR-0056)."""
+        """Recover a lost frame from the next packet's in-band FEC (ADR-0056).
+
+        Raises ``OpusDecodeError`` on a corrupt/malformed ``next_packet``.
+        """
         ...
 
     def decode_plc(self) -> bytes:
@@ -1771,10 +1783,26 @@ class RtpMediaTransport:
                         yield frame
                     continue
                 # Decode the wire payload to an analysis-rate PcmFrame and
-                # remember it as the basis for concealing a future loss.
-                frame = self._decode(output.payload, ts_ns)
-                self._last_good_samples = frame.samples
-                self._consecutive_lost = 0
+                # remember it as the basis for concealing a future loss. A
+                # corrupt-but-authenticated Opus payload (OpusDecodeError — e.g.
+                # opuslib's "corrupted stream") is not a parse/auth failure like
+                # the SRTP/RTP guards above; it is one bad frame inside an
+                # otherwise-healthy stream, so it is concealed exactly like a
+                # genuine jitter-buffer Lost (ADR-0056) rather than propagated
+                # to end the call — the same "one malformed packet must not be
+                # a DoS against this call" contract as ADR-0081.
+                try:
+                    frame = self._decode(output.payload, ts_ns)
+                except OpusDecodeError as exc:
+                    _log.debug(
+                        "Opus decode failed on a corrupt inbound payload — "
+                        "concealing as loss: %s",
+                        exc,
+                    )
+                    frame = self._conceal_frame(ts_ns, is_last=True)
+                else:
+                    self._last_good_samples = frame.samples
+                    self._consecutive_lost = 0
                 # Acoustic echo cancellation (ADR-0033): subtract the KNOWN outbound
                 # TTS reference (tapped in the TX path) from this inbound frame
                 # BEFORE the VAD/ASR see it, so the gateway's reflected echo cannot
@@ -3690,6 +3718,14 @@ class RtpMediaTransport:
         resample runs. Each wideband decoder is created lazily on first use so an
         outbound call that connects as a PCMU placeholder then re-negotiates still gets
         a fresh one, and the default no-webrtc path never imports opuslib.
+
+        Raises:
+            OpusDecodeError: For Opus, if ``payload`` is not decodable Opus data
+                (e.g. a corrupt/malformed frame). The caller (:meth:`_inbound_gen`)
+                catches this and conceals the frame as a loss rather than letting
+                it end the call — G.711/G.722 have no equivalent decode-time
+                failure mode (mu-law/A-law accept any byte; see ``_conceal_frame``
+                for the concealment path this feeds).
         """
         if self._codec is Codec.G722:
             if self._g722_decoder is None:
@@ -3729,6 +3765,12 @@ class RtpMediaTransport:
 
     def _conceal_frame(self, ts_ns: int, *, is_last: bool = True) -> PcmFrame:
         """Build one concealment frame for a lost packet (ADR-0056, items 2+3).
+
+        Also used by :meth:`_inbound_gen` for a RECEIVED-but-corrupt Opus payload
+        (``OpusDecodeError`` from :meth:`_decode`) — from this method's point of
+        view a "no usable primary decode for this slot" event is identical
+        whether the packet never arrived or arrived corrupted, so the same
+        concealment (FEC-if-available, else PLC/attenuated-repeat) applies.
 
         Returns an analysis-rate :class:`~hermes_voip.providers.audio.PcmFrame` —
         never an empty/absent slot — so the inbound stream the VAD/endpointer/STT
@@ -3790,12 +3832,26 @@ class RtpMediaTransport:
         decoder predictor coherent. The decoder is created lazily (as in
         :meth:`_decode`) so a connect-as-PCMU-then-Opus call works and the default
         no-webrtc path never imports opuslib.
+
+        If the successor's own payload is ALSO corrupt (``OpusDecodeError`` from
+        :meth:`~hermes_voip.media.opus.OpusDecoder.decode_fec` — a second bad
+        packet arriving right after a genuine loss), FEC recovery is impossible
+        from it; this falls back to native PLC rather than propagate, so two
+        adjacent bad packets still cannot end the call.
         """
         if self._opus_decoder is None:
             self._opus_decoder = _new_opus_decoder()
         successor = self._jitter.peek_next() if use_successor_fec else None
         if successor is not None and successor.payload_type == self._payload_type:
-            decoded = self._opus_decoder.decode_fec(successor.payload)
+            try:
+                decoded = self._opus_decoder.decode_fec(successor.payload)
+            except OpusDecodeError as exc:
+                _log.debug(
+                    "Opus FEC recovery failed on a corrupt successor payload — "
+                    "falling back to PLC: %s",
+                    exc,
+                )
+                decoded = self._opus_decoder.decode_plc()
         else:
             decoded = self._opus_decoder.decode_plc()
         return self._downsample_to_analysis(decoded, OPUS_SAMPLE_RATE)

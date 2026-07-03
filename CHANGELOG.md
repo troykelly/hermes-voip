@@ -11,6 +11,37 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-03
+
+A maintenance / hardening patch release bundling five fixes for operator testing: SIP/SDP
+parser hardening, an ADR-0081 fail-closed completion on the transport, proactive and
+live-call VoIP-tool gate fixes, and a developer-only hermes-contract CI regression fix. No
+breaking changes.
+
+### Fixed
+
+- **ICE candidate `rport` is range-validated** — an out-of-range `rport` value on an ICE
+  candidate line is now rejected with the same bounds check already applied to the
+  candidate port itself, closing an SDP parser-hardening gap. (#426)
+- **Over-long `Content-Length` fails closed as a `FramingError`** — a declared body length
+  beyond the transport's accepted maximum now raises the typed `FramingError` (the single
+  malformed message is dropped and the connection survives) instead of a bare `ValueError`
+  that could unwind the signalling reader, completing the ADR-0081 fail-closed contract for
+  this path. (#427)
+- **Proactive `place_call` gate reachability (ADR-0105)** — the proactive-origin relaxation
+  is now actually reached when the guard session state is absent (the branch was previously
+  unreachable), and a code-enforced deny guarantees a VoIP-owned platform origin can never
+  be treated as a proactive operator origin — a defence-in-depth boundary raised by
+  cross-vendor review. (#428)
+- **hermes-contract CI regression fixed (developer-only)** — the media-engine teardown
+  tests now model faithful RTCP state and a `voip_tools` mypy reachability annotation was
+  widened; both are test / type-check-only changes with no runtime behaviour change. (#429)
+- **Scoped caller groups can still use SAFE tools** — the caller-group `allowed_tools`
+  sub-ceiling now clamps only ELEVATED / IRREVERSIBLE tools, so scoped groups such as
+  intercom and known callers can still `hang_up` and `report_call_result` while sensitive
+  tools remain allow-listed. A guardrail test locks the SAFE tool set to those two tools.
+  (#431)
+
 ## [0.3.0] - 2026-07-03
 
 An observability + operability release. Structured ADR-0075 SLO log events now span the
@@ -432,7 +463,8 @@ gateway.
   `plugin.yaml` manifest version equal, so a release is a single edit in
   `pyproject.toml`.
 
-[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/troykelly/hermes-voip/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/troykelly/hermes-voip/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/troykelly/hermes-voip/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/troykelly/hermes-voip/compare/v0.1.2...v0.1.3

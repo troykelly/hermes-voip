@@ -511,7 +511,7 @@ defect or a load-bearing test gap.
   marker-bit / first-packet semantics (RFC 4733 §2.5.1.2 wants marker on the first packet; `rtp.py`'s
   `RtpPacket.marker` exists). Document that marker handling is the transport's job + which index is "first";
   consider making the end-count a keyword arg.
-- [ ] **[medium] correctness** — `InbandDtmfDetector.feed` (lines 464-490) treats any
+- [x] (done #398 — gap hysteresis: `_INBAND_GAP_RELEASE_FRAMES=3`, clears `_emitted` only after N consecutive gap frames) **[medium] correctness** — `InbandDtmfDetector.feed` (lines 464-490) treats any
   non-validated frame as a full press-end: a gap frame resets `_emitted`/`_candidate`/`_run`
   together (lines 473-479), so a single silent/lost frame in the MIDDLE of one physical
   keypress (packet loss, a brief dip below `_INBAND_MIN_FRAME_ENERGY`) makes the tone's
@@ -824,7 +824,7 @@ These span multiple modules or the repo as a whole.
   `_teardown_call` (`:5173`) has no start-time to subtract. Runbook-0014 §Concurrent calls marks
   `voip.calls.active_count`/`started`/`ended` as NOT YET INSTRUMENTED. Add `time.monotonic()` at admission;
   log `duration_s` and `len(_admitted_calls)` at release.
-- [ ] **[medium] observability** — Log RTCP dormant-path reason per call so operators know which calls lack
+- [x] (done #399 — teardown emits `event='rtcp_dormant'` with a fixed reason code, coalesced to `not_negotiated` when no decision was reached) **[medium] observability** — Log RTCP dormant-path reason per call so operators know which calls lack
   quality data. When RTCP stays dormant (secured call without SRTCP keys, kill-switch off, or PT conflict),
   `adapter.py:5179` silently skips the call-quality log — no record that a given call produced no quality data
   or why. On the live test gateway (SDES-SRTP, runbook-0014 §Secured paths: RTCP is dormant), every
@@ -1258,7 +1258,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 - [ ] **[low] docs** — ADR-0019 still says "to be implemented" and shows the wrong `build_audio_offer` signature. (`docs/adr/0019-outbound-calling-uac-originate.md`)
 - [ ] **[low] docs** — ADR-0010 still claims the expected-length terminator is "not yet wired" with no tracked plan. (`docs/adr/0010-dtmf-handling.md`)
 - [ ] **[low] docs** — Runbook 0014 contains aspirational "NOT YET INSTRUMENTED" / "Metrics sink still TBD" language that violates rule 27. (`docs/runbooks/0014-voip-slo-metrics.md`)
-- [ ] **[medium] docs** — Runbook 0013 "registration down" diagnostics omit the ADR-0088 non-positive-expires failure log pattern. (`docs/runbooks/0013-voip-incident-oncall.md`)
+- [x] (#400 verified-DONE 2026-07-03: premise stale — runbook-0013 §6 "Registrar granted a non-positive or malformed `Expires` (ADR-0088)" already documents the `select(.event=="sip_registration_failed" and .status_code==0)` jq filter + plaintext line, matching `manager.py` emission) **[medium] docs** — Runbook 0013 "registration down" diagnostics omit the ADR-0088 non-positive-expires failure log pattern. (`docs/runbooks/0013-voip-incident-oncall.md`)
 
 ### API / ergonomics
 
@@ -1306,7 +1306,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 Two candidates were already/partially tracked and were not duplicated here: `_granted_expires` multi-Contact fallback (existing registration item) and provider seam `__all__` (partially covered by the existing provider export residual). Newly discovered local-only items follow.
 
 - [x] (#338) **[low] robustness** — RTCP BYE reason should decode UTF-8 strictly and raise `RtcpError` on malformed bytes, matching SDES CNAME handling and rule 37. (`src/hermes_voip/rtcp.py`)
-- [ ] **[medium] robustness** — Drop malformed RTP codec payloads with a log instead of letting codec decode exceptions tear down the whole call. (`src/hermes_voip/media/engine.py`, `src/hermes_voip/media/call_loop.py`)
+- [x] (#400 verified-DONE 2026-07-03: already handled — Opus decode is caught+concealed (`engine.py`, ADR-0056/0081), G.711/G.722 decode is pure per-byte arithmetic that cannot raise, RFC-4733 telephone-event decode is `except ValueError`-guarded; proven by `test_opus_corrupt_payload_is_concealed_and_call_survives`) **[medium] robustness** — Drop malformed RTP codec payloads with a log instead of letting codec decode exceptions tear down the whole call. (`src/hermes_voip/media/engine.py`, `src/hermes_voip/media/call_loop.py`)
 - [x] (#358) **[medium] robustness** — Fail malformed final-INVITE response CSeqs loudly instead of silently skipping ACK/transaction cleanup. (`src/hermes_voip/transport/connection.py`, `src/hermes_voip/transport/ws_connection.py`) — shipped #358 (`_auto_ack_non_2xx` now logs a WARNING on an unparseable CSeq in both transports instead of silently skipping ACK/transaction cleanup).
 - [ ] **[medium] security** — Move outbound dial allowlist values out of inline env into a file-backed setting so real numbers/SIP URIs are not stored in shell-visible env. (`src/hermes_voip/outbound_allow.py`, `docs/runbooks/0007-voip-outbound-calling.md`, `docs/adr/0020-voip-caller-modes.md`)
 - [x] (#339) **[low] packaging** — Licence-check all declared optional runtime extras, not just default deps, so a bad extra licence fails CI. (`.github/workflows/supply-chain.yml`, `docs/runbooks/0003-supply-chain-audit.md`, `pyproject.toml`)
@@ -1432,3 +1432,17 @@ Full read of `src/hermes_voip/sdp.py` (SDES `a=crypto` negotiation + keying, ICE
   currently duplicates are already covered relatively by `tests/test_plugin_manifest.py`;
   the release runbook (0019 step 4) then drops the rename step.
   (`tests/test_version_020.py`, `docs/runbooks/0019-release-process.md`)
+
+## Test / CI robustness (discovered 2026-07-03)
+
+- [ ] **[medium] test/ci** — No global pytest timeout: a flaky async/networking test can
+  hang the local gate AND CI indefinitely with no diagnostic. Observed 2026-07-03 — a
+  lane's `uv run pytest` (extras synced, so the full e2e/adapter socket suite ran) sat in
+  asyncio `do_epoll_wait` at ~1% CPU with no per-test bound; `pyproject.toml`
+  `[tool.pytest.ini_options]` sets no timeout, so the run blocked until an external kill.
+  Add a fail-safe bound: pytest's built-in `faulthandler_timeout` (no new dep — dumps ALL
+  thread stacks and names the hanging test) and/or the `pytest-timeout` dev-dep with a
+  generous per-test cap, wired into `pyproject.toml` and CI. Then use the faulthandler dump
+  to identify and fix the specific flaky socket/await test. Rule 33 (deterministic builds);
+  also prevents the slow pre-push-hook full-suite from reading as a hang.
+  (`pyproject.toml`, `docs/stack.md`)

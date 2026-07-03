@@ -11,6 +11,83 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-02
+
+A security-hardening release. The centrepiece is the **complete closure of the
+ADR-0081 class** — the guarantee that "one malformed inbound SIP message must never
+be a denial of service against unrelated calls". Every reader-reachable path where a
+crafted-but-parseable inbound message could raise an uncaught exception and unwind the
+signalling reader — tearing down the whole TLS/WSS connection along with every active
+call and the registration on it — now **fails closed**: the one bad message is dropped
+and the connection survives. A scoped reader dispatch-boundary backstop (ADR-0098) adds
+defence-in-depth on top of the per-site fixes. Also included: SDES/SRTP suite-keying
+correctness (HIGH), caller-identity injection defence, PII redaction in logs, and a
+least-privilege session default.
+
+### Added
+
+- **Wildcard / pattern matching for outbound allow-lists** — `HERMES_VOIP_OUTBOUND_ALLOW`,
+  `HERMES_VOIP_PROACTIVE_CALL_FROM`, and `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` now accept
+  shell-style glob patterns, not only exact values. (#355)
+- **Provider protocols promoted to top-level exports** — the STT / TTS / media provider
+  protocol types are importable from `hermes_voip` directly. (#367)
+
+### Changed
+
+- **`GuardSessionState` defaults to least privilege** — the per-session privilege level
+  now defaults to `0` (unprivileged); elevation must be granted explicitly rather than
+  assumed. (#389)
+- ⚠ **`HERMES_VOIP_DUPLEX_MODE=full` is rejected at config load** — the value was
+  previously accepted but silently inert. A deployment that set it must remove it (or use
+  a supported mode) before upgrading, or config load fails fast. (#363)
+- **G.722 enforces a combined hot-path CPU budget** — the wideband codec's encode/decode
+  hot path is held to an explicit per-frame CPU budget (rule 22).
+
+### Security
+
+- **ADR-0081 class fully closed — malformed inbound SIP can no longer DoS a whole
+  connection.** Each reader-reachable handler now fails closed instead of unwinding the
+  reader task:
+  - non-decimal / out-of-range CSeq at every parse site — registration `_check_cseq`
+    (#390), transaction key `_txn_key` (#392), and the call `on_response` sink
+    `_cseq_number` (#393); a malformed final-INVITE-response CSeq now warns instead of
+    silently skipping ACK/cleanup (#358);
+  - header-incomplete inbound requests whose inline auto-response build raises — the
+    dispatch-level CANCEL / OPTIONS / answered-guard responses (#388) and the in-dialog
+    request path (#391);
+  - an in-dialog re-INVITE carrying an unparseable SDP offer (#395);
+  - a non-UTF-8 SIP body (#375), a zero-SSRC RTCP BYE (#370), and SDES/BYE trailing
+    garbage, with an implausible-RTT clamp (#383).
+  - A **scoped reader dispatch-boundary fail-safe backstop** (ADR-0098) drops any single
+    message whose handler raises and keeps the connection — defence-in-depth over the
+    per-site fixes, without a broad read-loop catch-all. (#394)
+- **SDES/SRTP suite-keying consistency (HIGH)** — the SRTP crypto suite advertised in the
+  SDP answer can no longer diverge from the key material actually installed; unicode-digit
+  crypto-tag and non-numeric `rport` `int()` escapes are guarded. (#387)
+- **Typed media-layer failures** — SRTP raises `SrtpError` (not a bare `ValueError`) on
+  malformed decrypted RTP (#376), and a corrupt Opus payload is concealed as packet loss
+  rather than crashing the inbound media generator (#377).
+- **Caller identity is defanged before it reaches the agent** — a forgeable `From` /
+  display name can no longer inject content into the agent-visible user / chat / id fields
+  (prompt-injection seam). (#378)
+- **Registration fails closed on an unanswerable challenge**, ignores a stale REGISTER
+  final response (HIGH DoS), and never surfaces the registrar's raw reason string
+  (safe-by-default rendering). (#374)
+- **Tool-surface hardening** — `voip_tools` handlers honour a never-raise contract and cap
+  `send_dtmf` length, closing a tool-abuse surface. (#382)
+- **PII redaction** — raw inbound DTMF digits are redacted from logs (rule 34). (#384)
+- **DTMF digit-substitution resistance** — a same-timestamp telephone-event carrying a
+  conflicting event code is rejected (ADR-0096 corroboration). (#372)
+- **Message ingress hardening** — ASCII-only status text, numeric range checks, and
+  redacted parse-error logging. (#386)
+- **Best-effort hang-up BYE** — a send error while ending a call can no longer escape and
+  disturb teardown. (#380)
+
+### Fixed
+
+- **RTP field type-guards and coalesced loss count** — inbound `RtpPacket` fields are
+  type-guarded, and `peek()` reports a coalesced `Lost(count)` for far-ahead bursts. (#373)
+
 ## [0.1.3] - 2026-06-28
 
 ### Fixed
@@ -317,7 +394,8 @@ gateway.
   `plugin.yaml` manifest version equal, so a release is a single edit in
   `pyproject.toml`.
 
-[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/troykelly/hermes-voip/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/troykelly/hermes-voip/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/troykelly/hermes-voip/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/troykelly/hermes-voip/compare/v0.1.0...v0.1.1

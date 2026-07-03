@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
+from hermes_voip._decimal import _parse_decimal
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
 from hermes_voip.dtmf import DtmfSendMode
@@ -1028,19 +1029,10 @@ def _cseq_number(cseq: str | None) -> int | None:
         return None
     token = parts[0]
     # Fail closed (ADR-0081): a valid SIP CSeq number is ASCII `1*DIGIT` < 2**31
-    # (RFC 3261 §8.1.1.5). str.isdigit() is True for non-decimal unicode digits
-    # (e.g. superscript "²" U+00B2) that int() rejects, so require isascii() and
-    # isdecimal(). int() still raises on an ASCII run longer than CPython's integer
-    # string limit, so that is caught too. on_response/_send_ack run OUTSIDE the
-    # reader's parse-only `except ValueError`, so an escape would tear down the whole
-    # connection — every non-conformant token instead returns None (the uncorrelatable
-    # path a non-numeric CSeq already takes).
-    if not (token.isascii() and token.isdecimal()):
-        return None
-    try:
-        value = int(token)
-    except ValueError:
-        # An ASCII-decimal token longer than CPython's int-from-string limit: not a
-        # valid CSeq; drop it (fail closed) rather than let it unwind the reader.
-        return None
-    return value if value < _MAX_CSEQ else None
+    # (RFC 3261 §8.1.1.5). The shared parser rejects Unicode digits and catches
+    # CPython's over-long-int ValueError while preserving leading-zero value
+    # semantics. on_response/_send_ack run OUTSIDE the reader's parse-only
+    # `except ValueError`, so an escape would tear down the whole connection — every
+    # non-conformant token instead returns None (the uncorrelatable path a
+    # non-numeric CSeq already takes).
+    return _parse_decimal(token, max_exclusive=_MAX_CSEQ)

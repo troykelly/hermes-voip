@@ -69,6 +69,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
+from hermes_voip._decimal import _parse_decimal
+
 # RFC 3551 static payload types we may see without an explicit a=rtpmap.
 _STATIC_PAYLOADS: dict[int, tuple[str, int]] = {
     0: ("PCMU", 8000),
@@ -275,19 +277,20 @@ class CryptoAttribute:
         # The remaining tokens are key-params then optional session-params; we
         # keep only the first (the inline key) — session-params are not used.
         key_params = fields[2]
-        if not (tag_str.isascii() and tag_str.isdecimal()):
-            # isascii()+isdecimal(), NOT str.isdigit(): U+00B2 and other Unicode
-            # "digit" characters pass isdigit() but int() then raises a bare
-            # ValueError that would escape the caller's `except SdpError` leniency
-            # (the house guard, matching registration.py / transport/framing.py).
-            # Never echo the tag token: a malformed body can put the inline key in
-            # the tag position (e.g. "inline:<KEY> <suite> inline:<KEY>").
+        # Validate decimal-ness FIRST, then leading-zero. Order matters for the
+        # anti-echo invariant: the leading-zero branch echoes ``tag_str`` and is only
+        # safe once _parse_decimal has proven the token is pure ASCII digits (so it
+        # cannot carry inline key material). Reject Unicode digits and over-long ASCII
+        # decimal runs without echoing: a malformed body can put the inline key in the
+        # tag position (e.g. "inline:<KEY> <suite> inline:<KEY>").
+        tag = _parse_decimal(tag_str)
+        if tag is None:
             msg = "crypto tag is not decimal"
             raise SdpError(msg)
         if len(tag_str) > 1 and tag_str[0] == "0":
             msg = f"crypto tag has a leading zero: {tag_str!r}"
             raise SdpError(msg)
-        return cls(tag=int(tag_str), suite=suite, key_params=key_params)
+        return cls(tag=tag, suite=suite, key_params=key_params)
 
     def render(self) -> str:
         """Render the attribute body for an ``a=crypto:`` line (no prefix)."""
@@ -439,16 +442,14 @@ class IceCandidate:
                 len(tokens) > _ICE_CAND_RPORT_VAL_IDX
                 and tokens[_ICE_CAND_RPORT_KW_IDX] == "rport"
             ):
-                try:
-                    rport = int(tokens[_ICE_CAND_RPORT_VAL_IDX])
-                except ValueError as exc:
-                    # Same ValueError->SdpError guard as the mandatory numeric
-                    # fields above: rport is attacker-controlled too, and a bare
-                    # ValueError would bypass the a=candidate site's
-                    # suppress(SdpError) and fail the whole offer parse instead of
-                    # skipping this one candidate (ADR-0081 read-loop-escape class).
+                rport = _parse_decimal(tokens[_ICE_CAND_RPORT_VAL_IDX])
+                if rport is None:
+                    # Same fail-closed contract as the mandatory numeric fields:
+                    # rport is attacker-controlled too, and a bare ValueError would
+                    # bypass the a=candidate site's suppress(SdpError) and fail the
+                    # whole offer parse instead of skipping this one candidate.
                     msg = "malformed a=candidate: non-integer rport"
-                    raise SdpError(msg) from exc
+                    raise SdpError(msg)
         return cls(
             foundation=foundation,
             component=component,
@@ -1432,12 +1433,9 @@ def _coerce_crypto(crypto: CryptoAttribute | str | None) -> CryptoAttribute | No
         return crypto
     first = crypto.split(maxsplit=1)
     # A purely-decimal first token is the tag; anything else gets the default tag.
-    # isascii()+isdecimal(), NOT str.isdigit(): a Unicode "digit" like U+00B2 passes
-    # isdigit() but is not int-parseable, so classifying it as the tag would reach
-    # CryptoAttribute.parse's int() and raise a bare ValueError instead of SdpError.
     body = (
         crypto
-        if first and first[0].isascii() and first[0].isdecimal()
+        if first and _parse_decimal(first[0]) is not None
         else f"{_DEFAULT_CRYPTO_TAG} {crypto}"
     )
     return CryptoAttribute.parse(body)

@@ -59,6 +59,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from hermes_voip._decimal import _parse_decimal
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
     Cancel,
@@ -490,8 +491,7 @@ class WssSipTransport:
         # registration/call CSeq int() guards, the re-INVITE SDP parse, … — each
         # catch the ONE ValueError their site was known to raise, and REMAIN as
         # first-line defense-in-depth. This is the last line for the SAME failure
-        # class the per-site campaign keeps finding new siblings of (including the
-        # latent over-long int() residual at every isascii()+isdecimal() site):
+        # class the per-site campaign keeps finding new siblings of:
         # ANY exception a handler raises here is contained to this one frame, so
         # it can never end the reader (_on_reader_done -> on_connection_lost) and
         # DoS the other calls + registration on the shared connection. It is scoped
@@ -808,20 +808,9 @@ def _txn_key(call_id: str | None, cseq: str | None) -> tuple[str, int] | None:
     if call_id is None or cseq is None:
         return None
     parts = cseq.split()
-    # Guard int() with ``isascii() and isdecimal()`` (the house pattern — see
-    # framing.py / sdp.py / registration.py), NOT ``isdigit()``: ``str.isdigit()`` is
-    # True for non-decimal digit characters such as the superscript "²" that ``int()``
-    # cannot parse, so an inbound ``CSeq: ² INVITE`` would raise ValueError here and
-    # escape the reader, tearing down the whole connection (ADR-0081).
-    if not parts or not (parts[0].isascii() and parts[0].isdecimal()):
+    if not parts:
         return None
-    try:
-        number = int(parts[0])
-    except ValueError:
-        # An all-ASCII-decimal token can still overflow CPython's int-from-string
-        # digit limit (sys.get_int_max_str_digits(), default 4300): a crafted
-        # ``CSeq: <thousands of digits> INVITE`` reaches here and int() raises. Fail
-        # closed on that residual too — no transaction match, so the caller drops the
-        # auto-ACK rather than crashing.
+    number = _parse_decimal(parts[0])
+    if number is None:
         return None
     return (call_id, number)

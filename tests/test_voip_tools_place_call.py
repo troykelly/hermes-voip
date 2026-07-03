@@ -412,7 +412,6 @@ def test_voip_tools_gate_proactive_place_call(
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
     set_active_adapter(None)  # no live SIP call / adapter in scope
-    _set_chat(monkeypatch, None)  # the Telegram chat_id is NOT a SIP Call-ID
     _set_origin(monkeypatch, "telegram", "123")
 
     assert voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={}) is None
@@ -424,23 +423,24 @@ def test_voip_tools_gate_proactive_place_call(
     assert verdict["action"] == "block"
 
 
-def test_voip_tools_gate_proactive_blocked_when_live_call_in_scope(
+def test_voip_tools_gate_proactive_inbound_failsafe_holds_by_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A matching origin does NOT unblock when a live Call-ID is in scope.
+    """An inbound SIP call whose guard state is missing stays level 0 — by platform.
 
-    ``state is None`` covers TWO cases: (a) no live call at all (true proactive —
-    the only case the relaxation is for), and (b) a live/claimed Call-ID IS in
-    scope but ``guard_state_for`` MISSED (the unknown/spoofed inbound-call fail-safe
-    path, which MUST stay level 0). The proactive relaxation must require case (a)
-    only: with a Call-ID present and its guard state missing, a configured origin
-    must NOT grant level 3 — otherwise the inbound fail-safe is weakened.
+    ``state is None`` covers TWO cases: (a) a genuine proactive turn (no live call),
+    and (b) an inbound SIP call whose ``guard_state_for`` MISSED. Both have a non-None
+    ``call_id`` (== chat_id), so a call_id-presence check cannot tell them apart — only
+    the PLATFORM can. The inbound fail-safe therefore holds by platform-scoping: an
+    inbound call's ``(platform="voip", chat_id=<Call-ID>)`` origin never matches an
+    operator's non-VoIP ``HERMES_VOIP_PROACTIVE_CALL_FROM`` entry (even the permissive
+    ``telegram:*``), so the relaxation denies and the tool stays level 0. A caller
+    cannot forge the gateway-set session platform.
     """
-    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
     host = _FakeHost(guard=None)  # adapter present, guard_state_for() misses
     set_active_adapter(host)
-    _set_chat(monkeypatch, "some-live-call-id")  # a Call-ID IS in scope
-    _set_origin(monkeypatch, "telegram", "123")  # and the origin matches
+    _set_origin(monkeypatch, "voip", "some-live-call-id")  # platform=voip
 
     verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
 
@@ -463,7 +463,6 @@ def test_voip_tools_gate_proactive_not_place_call(
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     verdict = voip_pre_tool_call(tool_name=tool_name, args={})
@@ -482,7 +481,6 @@ def test_voip_tools_gate_proactive_off_by_default(
     """
     monkeypatch.delenv("HERMES_VOIP_PROACTIVE_CALL_FROM", raising=False)
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -501,7 +499,6 @@ def test_voip_tools_gate_proactive_wrong_origin(
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:999")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -534,7 +531,6 @@ def test_gate_proactive_deny_logs_allow_unset(
     """Opt-in env unset => deny logs ``proactive_allow_unset`` (still blocked)."""
     monkeypatch.delenv("HERMES_VOIP_PROACTIVE_CALL_FROM", raising=False)
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):
@@ -556,7 +552,6 @@ def test_gate_proactive_deny_logs_origin_unavailable(
     """Opt-in set but no readable origin => reason ``origin_unavailable``."""
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, None, None)  # no originating platform/chat_id
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):
@@ -578,7 +573,6 @@ def test_gate_proactive_deny_logs_origin_not_allowlisted(
     """Opt-in set, origin readable but not listed => ``origin_not_allowlisted``."""
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:999")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):
@@ -594,19 +588,21 @@ def test_gate_proactive_deny_logs_origin_not_allowlisted(
     )
 
 
-def test_gate_proactive_deny_logs_live_call_guard_missing(
+def test_gate_proactive_deny_logs_inbound_failsafe_as_not_allowlisted(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Live Call-ID present but guard state missing => ``live_call_guard_missing``.
+    """Inbound guard-missing denies by platform-scoping => ``origin_not_allowlisted``.
 
-    The inbound fail-safe deliberately bypasses proactive-origin relaxation here;
-    the diagnostic distinguishes this from a genuine proactive attempt.
+    After ADR-0105 the inbound guard-missing case is not a distinct reason: its
+    ``(platform="voip", chat_id=<Call-ID>)`` origin simply fails the platform-scoped
+    allowlist match, so the honest diagnostic is ``origin_not_allowlisted``. The
+    removed ``live_call_guard_missing`` mislabelled a legitimate proactive turn (whose
+    chat_id is likewise a non-None Call-ID) as a live-call intrusion.
     """
-    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
     host = _FakeHost(guard=None)  # adapter present, guard_state_for() misses
     set_active_adapter(host)
-    _set_chat(monkeypatch, "some-live-call-id")  # a Call-ID IS in scope
-    _set_origin(monkeypatch, "telegram", "123")
+    _set_origin(monkeypatch, "voip", "some-live-call-id")  # platform=voip
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):
         verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
@@ -617,7 +613,7 @@ def test_gate_proactive_deny_logs_live_call_guard_missing(
     assert len(events) == 1
     assert (
         getattr(events[0], "reason", None)
-        == ProactiveDenyReason.LIVE_CALL_GUARD_MISSING.value
+        == ProactiveDenyReason.ORIGIN_NOT_ALLOWLISTED.value
     )
 
 
@@ -627,7 +623,6 @@ def test_gate_proactive_deny_logs_unsupported_tool(
     """A non-place_call tool in the no-live-call branch => ``unsupported_tool_...``."""
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")  # a matching origin
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):
@@ -649,7 +644,6 @@ def test_gate_proactive_allow_emits_no_deny_log(
     """A matching origin still ALLOWS place_call and emits NO deny event."""
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):
@@ -670,7 +664,6 @@ def test_gate_proactive_deny_log_never_leaks_origin(
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:999")
     set_active_adapter(None)
-    _set_chat(monkeypatch, None)
     _set_origin(monkeypatch, "telegram", "123")
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.voip_tools"):

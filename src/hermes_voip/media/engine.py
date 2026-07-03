@@ -53,6 +53,7 @@ import logging
 import random
 import socket
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
@@ -205,6 +206,16 @@ _AVG_RTCP_SIZE_GAIN: Final[float] = 1.0 / 16.0
 
 _MS_PER_S: Final[float] = 1000.0
 _RTCP_FRACTION_SCALE: Final[float] = 256.0  # fraction-lost 8-bit fixed point
+# The RC/SC field of an SR/RR header is 5 bits (RFC 3550 §6.4.1), so ONE compound
+# report carries at most 31 reception report blocks. A telephony call has exactly
+# one real remote source; more than a handful of distinct SSRCs on the negotiated
+# RTP port is a spoofing/misdirected-traffic flood (there is NO source check on
+# _note_rtp_received). Cap the tracked per-source stats at this ceiling — evicting
+# the LEAST-recently-active source (RFC 3550 §6.1 permits a report to cover a
+# subset of sources) — so _reception cannot grow without bound and _report_blocks()
+# never exceeds the RC/SC ceiling (which would make SenderReport/ReceiverReport
+# __post_init__ raise and kill run_rtcp + strand stop()'s teardown).
+_MAX_RECEPTION_SOURCES: Final[int] = 31
 
 
 @dataclass(frozen=True, slots=True)
@@ -1284,9 +1295,11 @@ class RtpMediaTransport:
         self._rtcp_packets_sent: int = 0
         self._rtcp_octets_sent: int = 0
         # Per-source inbound reception statistics, keyed by the SENDER's SSRC. One
-        # ReceptionStats per remote source feeds the report blocks of our SR/RR. Reset
-        # in connect().
-        self._reception: dict[int, ReceptionStats] = {}
+        # ReceptionStats per remote source feeds the report blocks of our SR/RR. The
+        # ordered map is maintained least-recently-active → most-recently-active so an
+        # SSRC flood evicts stale sources before it can overflow the SR/RR RC field or
+        # grow memory without bound. Reset in connect().
+        self._reception: OrderedDict[int, ReceptionStats] = OrderedDict()
         # For our report blocks' LSR/DLSR (RFC 3550 §6.4.1): per peer-SSRC, the compact
         # (middle-32) NTP of the last SR we received from it, and the wallclock (Unix
         # s) at which we received it (so DLSR = now - that, in 1/65536 s units).
@@ -1457,7 +1470,7 @@ class RtpMediaTransport:
         # channel: no carried sender counts, reception stats, peer reports, or RTT.
         self._rtcp_packets_sent = 0
         self._rtcp_octets_sent = 0
-        self._reception = {}
+        self._reception = OrderedDict()
         self._last_sr_from = {}
         self._last_sr_sent_compact = None
         self._remote_report = None
@@ -2323,8 +2336,20 @@ class RtpMediaTransport:
         """
         stats = self._reception.get(ssrc)
         if stats is None:
+            # A never-before-seen source. Bound the tracked set at the SR/RR RC/SC
+            # 5-bit ceiling (RFC 3550 §6.4.1): evict the LEAST-recently-active source
+            # BEFORE inserting, so an SSRC flood on the negotiated RTP port cannot grow
+            # _reception without bound or push _report_blocks() past 31 (which would
+            # raise in SenderReport/ReceiverReport __post_init__ and kill run_rtcp).
+            # RFC 3550 §6.1 permits a report to cover a subset of sources.
+            if len(self._reception) >= _MAX_RECEPTION_SOURCES:
+                self._reception.popitem(last=False)  # drop the least-recently-active
             stats = ReceptionStats(clock_rate=self._rtp_clock_rate)
-            self._reception[ssrc] = stats
+            self._reception[ssrc] = stats  # a new source is inserted at the MRU end
+        else:
+            # A known source: refresh it to most-recently-active so sustained real
+            # traffic is never the LRU eviction victim of a transient spoof flood.
+            self._reception.move_to_end(ssrc)
         stats.on_packet(seq=seq, rtp_timestamp=rtp_timestamp, arrival_ts=arrival_ts)
 
     def _report_blocks(self) -> tuple[ReportBlock, ...]:
@@ -2543,7 +2568,23 @@ class RtpMediaTransport:
                 await delay(self.rtcp_interval(rng=rng))
                 if self._stop_event.is_set():
                     break
-                report = self.build_rtcp_report()
+                # Fail-safe backstop (ADR-0098 dispatch-boundary fail-safe, amending
+                # ADR-0081) applied to the periodic RTCP loop: a report build that
+                # raises — build_rtcp_report hitting the SR/RR RC/SC 5-bit ceiling if
+                # _reception somehow holds >31 sources (the _note_rtp_received cap
+                # normally prevents this) — must LOG and SKIP this interval, never
+                # escape and kill the periodic task. A dead task would strand stop()'s
+                # teardown (it cancels-and-awaits this task). CancelledError from
+                # stop()'s cancel is not a ValueError, so it still propagates (rule 37)
+                # and runs the finally below.
+                try:
+                    report = self.build_rtcp_report()
+                except ValueError:
+                    _log.warning(
+                        "rtcp: report build failed; skipping this interval",
+                        exc_info=True,
+                    )
+                    continue
                 if report is not None:
                     self._emit_rtcp(report)
         finally:
@@ -3483,8 +3524,22 @@ class RtpMediaTransport:
         rtcp_task, self._rtcp_task = self._rtcp_task, None
         if rtcp_task is not None:
             rtcp_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await rtcp_task
+            except asyncio.CancelledError:
+                # Expected: our cancel above. The loop re-raises it after running its
+                # finally (the BYE flush), rule 37; nothing more to do here.
+                pass
+            except Exception:  # noqa: BLE001 — fail-safe backstop at the task-reaping boundary (ADR-0098)
+                # The task ended with its OWN error (e.g. a report-build ValueError its
+                # in-loop backstop did not cover). LOG it, but do NOT let it abort the
+                # rest of teardown below (the non-muxed RTCP socket/reader cleanup and
+                # the send-sink restore) — a half-torn-down channel leaks a socket and
+                # strands a reused engine.
+                _log.warning(
+                    "rtcp: run_rtcp task ended with an error; continuing teardown",
+                    exc_info=True,
+                )
         # Non-muxed RTCP (RFC 3550 §11, ADR-0061): tear down the sibling-socket reader
         # and the RTCP socket. ORDER (codex review #6):
         #   1. cancel AND AWAIT the reader — mirroring the run_rtcp task above — so it

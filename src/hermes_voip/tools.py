@@ -120,15 +120,18 @@ def gate_voip_tool(
     silently allows an unrecognised action.
 
     **ADR-0031 sub-ceiling.** When ``state.allowed_tools`` is non-empty it is a
-    per-session allow-list checked BEFORE the level/risk gate: any tool not in the
-    set is blocked here, so a caller group (e.g. the intercom group) can scope a
-    session to ONLY a named set of tools. The check can only REMOVE tools — a tool
-    in the allow-list still has to pass :func:`gate_tool_call` (its level/risk
-    clamp), so the allow-list never grants a tool above the session's privilege
-    level. An EMPTY allow-list (the default) means "no sub-ceiling" and reproduces
-    the level-only behaviour exactly. The risk lookup runs first so an UNKNOWN tool
-    is denied even if it appears in the allow-list (the gate cannot register a tool
-    it has no risk class for).
+    per-session allow-list applied to the NON-SAFE tools before the level/risk gate:
+    any ELEVATED/IRREVERSIBLE tool not in the set is blocked here, so a caller group
+    (e.g. the intercom group) can scope a session's SENSITIVE surface to ONLY a named
+    set of tools. SAFE tools (``hang_up`` / ``report_call_result`` — ADR-0026/0029)
+    are EXEMPT and always run: they mutate no external state, so a scoped caller group
+    never loses the ability to END or RECORD its own call. The check can only REMOVE
+    tools — a tool in the allow-list still has to pass :func:`gate_tool_call` (its
+    level/risk clamp), so the allow-list never grants a tool above the session's
+    privilege level. An EMPTY allow-list (the default) means "no sub-ceiling" and
+    reproduces the level-only behaviour exactly. The risk lookup runs first so an
+    UNKNOWN tool is denied even if it appears in the allow-list (the gate cannot
+    register a tool it has no risk class for).
 
     **ADR-0031 grant-only tools.** A tool in :data:`_GRANT_ONLY_TOOLS`
     (``open_entry`` — physical access) is reachable ONLY when the session's
@@ -156,9 +159,19 @@ def gate_voip_tool(
             state.call_id,
         )
         return False
-    if state.allowed_tools and tool_name not in state.allowed_tools:
-        # Scoped session: this tool is outside the group's allow-list. Remove it
-        # regardless of the level (the sub-ceiling never grants, only removes).
+    if (
+        risk is not ToolRisk.SAFE
+        and state.allowed_tools
+        and tool_name not in state.allowed_tools
+    ):
+        # Scoped session: this ELEVATED/IRREVERSIBLE tool is outside the group's
+        # allow-list. Remove it regardless of the level (the sub-ceiling never grants,
+        # only removes). SAFE tools (``hang_up`` / ``report_call_result`` — ADR-0026
+        # /0029) are EXEMPT: they always run ungated, so a scoped caller group (e.g.
+        # the intercom group, ``allowed_tools={open_entry}``) never loses the ability
+        # to END or RECORD its own call. ``gate_tool_call`` already always-allows SAFE,
+        # so exempting them here restores that documented invariant without widening
+        # any privileged surface — the sub-ceiling only ever clamps non-SAFE tools.
         _log.warning(
             "gate_voip_tool BLOCK tool=%s call=%s reason=not_allowlisted",
             tool_name,

@@ -4,12 +4,13 @@
 outbound call to accomplish a task (e.g. "call the restaurant and book a table for two at 7").
 The call runs as its own concurrent Hermes conversation that opens with the objective, and the
 outcome is reported back to the conversation that requested it (ADR-0029). This runbook is the
-operational HOW for the two operator knobs that govern it; the WHY is in **ADR-0029** (and the
-amended **ADR-0019 §4/§8**, **ADR-0026**).
+operational HOW for the operator knobs that govern it; the WHY is in **ADR-0029** (and the
+file-backed allowlist source in **ADR-0099**, plus the amended **ADR-0019 §4/§8**, **ADR-0026**).
 
 > **Public repo.** No secrets here. A dial target (an extension, or a real PSTN number if the
-> gateway routes it) is potentially sensitive and lives ONLY in the gitignored `.env` — never
-> in a tracked file. This runbook references the env-var keys, never a real value.
+> gateway routes it) is potentially sensitive and lives ONLY in the gitignored `.env` (inline)
+> OR in a gitignored file referenced by `HERMES_VOIP_OUTBOUND_ALLOW_FILE` (ADR-0099) — never in
+> a tracked file. This runbook references the env-var keys and the file format, never a real value.
 
 ## The knobs
 
@@ -21,6 +22,17 @@ amended **ADR-0019 §4/§8**, **ADR-0026**).
 | Read by | `hermes_voip.outbound_allow.load_outbound_allowlist` (called at `connect()`) |
 | Enforced at | `VoipAdapter.place_call_with_objective` — the dial chokepoint, BEFORE any INVITE |
 | On an unlisted target | raises `OutboundCallNotAllowed`; the tool returns a clear error; nothing is dialled |
+
+| Item | Value |
+| --- | --- |
+| Env var | `HERMES_VOIP_OUTBOUND_ALLOW_FILE` (optional, ADR-0099) |
+| Type | a **path** to a gitignored file of the SAME entries as `HERMES_VOIP_OUTBOUND_ALLOW`: comma **and/or** newline separated, with the identical `x`-mask / literal-`*` / SIP-URI grammar. It is a **plain list**, not JSON, and has **no comment syntax** (`#` is a legal dial character, so a `#`-comment would be ambiguous with a real target). |
+| Default | **unset/blank** → no file source; the inline var alone governs (behaviour unchanged from pre-ADR-0099) |
+| Merge rule | file entries are **UNIONed** with the inline `HERMES_VOIP_OUTBOUND_ALLOW` entries — both apply; neither source can silently drop or override the other's entries, and a present-but-empty file never wipes the inline list |
+| Default (both empty) | inline empty **and** file empty/unset → the allowlist is empty → the feature is **inert** (deny-all, fail-closed) |
+| Read by | `hermes_voip.outbound_allow.load_outbound_allowlist` (called at `connect()`) |
+| On a missing/unreadable path | raises `ConfigError` (fail-closed + explicit, rule 37); the plugin **fails to connect** rather than silently allowing all or silently allowing none |
+| Why | a real PSTN-number corpus is PII and an env var is shell-visible (`printenv`, `/proc/<pid>/environ`, `ps eww`, container inspect); a gitignored file with restrictive filesystem permissions keeps the values OFF the process environment. Extensions are not PII, but the value is treated uniformly as sensitive config. |
 
 | Item | Value |
 | --- | --- |
@@ -142,8 +154,49 @@ HERMES_VOIP_OUTBOUND_RESULT_CHANNEL=telegram:123456789
 ```
 
 Then redeploy/restart the gateway so the plugin re-reads its config (the allowlist is read at
-`connect()`). With `HERMES_VOIP_OUTBOUND_ALLOW` unset/empty the `place_call` tool is registered
-but refuses every target — the safe default.
+`connect()`). With `HERMES_VOIP_OUTBOUND_ALLOW` unset/empty (and no file, below) the `place_call`
+tool is registered but refuses every target — the safe default.
+
+### File-backed allowlist (`HERMES_VOIP_OUTBOUND_ALLOW_FILE`, ADR-0099)
+
+When the approved targets include real callable numbers (PII) or the list is large, keep them in
+a **gitignored file** instead of the shell-visible env var. Point `HERMES_VOIP_OUTBOUND_ALLOW_FILE`
+at the file's path; its entries are **UNIONed** with any inline `HERMES_VOIP_OUTBOUND_ALLOW` value
+(both apply). The file is a plain list in the SAME grammar as the inline var — entries separated
+by commas and/or newlines, each trimmed, blank fields dropped; `x`-masks (`10xx`), literal-`*`
+codes (`*67`), and SIP URIs all behave identically. There is no JSON and **no comment syntax**
+(`#` is a legal dial character).
+
+Create the file OUTSIDE the repo (or at an already-gitignored path) with restrictive permissions;
+fakes shown — substitute the operator's real approved targets:
+
+```
+# 0600, owner-only; one entry per line (commas also work):
+install -m 600 /dev/null /path/to/outbound_allow.txt
+printf '%s\n' 1000 1001 10xx sip:reception@pbx.example.test >> /path/to/outbound_allow.txt
+```
+
+Then in the gitignored `.env`, reference the path only (the numbers live in the file, not the env):
+
+```
+HERMES_VOIP_OUTBOUND_ALLOW_FILE=/path/to/outbound_allow.txt
+# (optional) a few extra inline entries are still honoured and UNIONed in:
+# HERMES_VOIP_OUTBOUND_ALLOW=1099
+```
+
+Interaction with the env var:
+
+- **Union, not override.** The effective allowlist is `inline ∪ file`; neither source can
+  silently drop or override the other's entries.
+- **Missing/unreadable file fails loud.** If `HERMES_VOIP_OUTBOUND_ALLOW_FILE` names a path that
+  does not exist or cannot be read, the plugin raises `ConfigError` and refuses to connect
+  (fail-closed) — it never falls back to "allow all" or silently to "allow none". Unset the
+  variable to run without a file.
+- **Empty file is safe.** A present-but-empty (or whitespace-only) file contributes nothing and
+  does NOT wipe an inline allowlist.
+- **Migration hygiene.** After moving numbers from `HERMES_VOIP_OUTBOUND_ALLOW` into the file,
+  unset the inline env var so a stale copy does not linger in the shell-visible environment
+  (under the union rule a stale inline entry stays permitted until you remove it).
 
 ### Proactive outbound from an operator chat (issue #202)
 
@@ -191,7 +244,10 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
 2. **Gate + tool behaviour (covered by the test suite):**
    - `uv run pytest tests/test_outbound_allow.py tests/test_wildcard_config.py` — the exact
      allowlist parser, `x`-digit mask entries (`10xx`) and literal `*` entries (`*67`,
-     `10**`), fixed vs wildcard result channel resolution, and fail-closed defaults.
+     `10**`), fixed vs wildcard result channel resolution, fail-closed defaults, AND the
+     `HERMES_VOIP_OUTBOUND_ALLOW_FILE` file source (ADR-0099): file entries permitted with the
+     inline var unset, file ∪ inline union, same mask/URI grammar, an empty file that does not
+     wipe the inline list, and a missing/unreadable path raising `ConfigError` (fail-closed).
    - `uv run pytest tests/test_voip_tools_place_call.py tests/test_wildcard_config.py` — the
      `place_call` / `report_call_result` tools, the IRREVERSIBLE gate (level-0/2/degraded
      blocked, operator level-3 allowed), the unlisted-number refusal, the immediate `{call_id}`
@@ -315,16 +371,19 @@ The allowlist + privilege gate above apply identically on both transports.
 ## Rotation / change
 
 To add or remove an approved target, edit `HERMES_VOIP_OUTBOUND_ALLOW` in the gitignored `.env`
-(or 1Password, if the operator keeps the list there) and redeploy. To change where env-trigger
+(or 1Password, if the operator keeps the list there) **or** edit the gitignored file referenced
+by `HERMES_VOIP_OUTBOUND_ALLOW_FILE` (ADR-0099) — the two are UNIONed, so an entry in either
+grants the target — and redeploy. To change where env-trigger
 outcomes go, edit `HERMES_VOIP_OUTBOUND_RESULT_CHANNEL` and redeploy. To add/remove an operator
 chat allowed to trigger a proactive call, edit `HERMES_VOIP_PROACTIVE_CALL_FROM` (it is read at
 the gate, so a restart that re-reads the environment suffices).
 
 ## Rollback (disable the feature)
 
-Unset `HERMES_VOIP_OUTBOUND_ALLOW` (or set it empty) and redeploy. The `place_call` tool is
-still registered but refuses every target — the feature is inert with no agent-initiated dial
-possible, exactly the default-shipped state.
+Unset `HERMES_VOIP_OUTBOUND_ALLOW` (or set it empty) **and** unset `HERMES_VOIP_OUTBOUND_ALLOW_FILE`
+(the two sources are UNIONed, so BOTH must be empty/unset to fully disable) and redeploy. The
+`place_call` tool is still registered but refuses every target — the feature is inert with no
+agent-initiated dial possible, exactly the default-shipped state.
 
 To disable **only** proactive outbound (keep in-call `place_call`), unset
 `HERMES_VOIP_PROACTIVE_CALL_FROM`: a `place_call` from a non-VoIP session then falls back to

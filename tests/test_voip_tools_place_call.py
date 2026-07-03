@@ -525,7 +525,10 @@ def test_gate_proactive_deny_logs_allow_unset(
     assert verdict["action"] == "block"
     events = _proactive_gate_records(caplog.records)
     assert len(events) == 1
-    assert events[0].reason == ProactiveDenyReason.PROACTIVE_ALLOW_UNSET.value
+    assert (
+        getattr(events[0], "reason", None)
+        == ProactiveDenyReason.PROACTIVE_ALLOW_UNSET.value
+    )
 
 
 def test_gate_proactive_deny_logs_origin_unavailable(
@@ -544,7 +547,10 @@ def test_gate_proactive_deny_logs_origin_unavailable(
     assert verdict["action"] == "block"
     events = _proactive_gate_records(caplog.records)
     assert len(events) == 1
-    assert events[0].reason == ProactiveDenyReason.ORIGIN_UNAVAILABLE.value
+    assert (
+        getattr(events[0], "reason", None)
+        == ProactiveDenyReason.ORIGIN_UNAVAILABLE.value
+    )
 
 
 def test_gate_proactive_deny_logs_origin_not_allowlisted(
@@ -563,7 +569,10 @@ def test_gate_proactive_deny_logs_origin_not_allowlisted(
     assert verdict["action"] == "block"
     events = _proactive_gate_records(caplog.records)
     assert len(events) == 1
-    assert events[0].reason == ProactiveDenyReason.ORIGIN_NOT_ALLOWLISTED.value
+    assert (
+        getattr(events[0], "reason", None)
+        == ProactiveDenyReason.ORIGIN_NOT_ALLOWLISTED.value
+    )
 
 
 def test_gate_proactive_deny_logs_live_call_guard_missing(
@@ -587,7 +596,10 @@ def test_gate_proactive_deny_logs_live_call_guard_missing(
     assert verdict["action"] == "block"
     events = _proactive_gate_records(caplog.records)
     assert len(events) == 1
-    assert events[0].reason == ProactiveDenyReason.LIVE_CALL_GUARD_MISSING.value
+    assert (
+        getattr(events[0], "reason", None)
+        == ProactiveDenyReason.LIVE_CALL_GUARD_MISSING.value
+    )
 
 
 def test_gate_proactive_deny_logs_unsupported_tool(
@@ -607,7 +619,7 @@ def test_gate_proactive_deny_logs_unsupported_tool(
     events = _proactive_gate_records(caplog.records)
     assert len(events) == 1
     assert (
-        events[0].reason
+        getattr(events[0], "reason", None)
         == ProactiveDenyReason.UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN.value
     )
 

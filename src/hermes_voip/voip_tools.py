@@ -58,7 +58,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Protocol, runtime_checkable
 
 from hermes_voip.call import CallError
@@ -96,6 +96,8 @@ __all__ = [
     "_RING_TIMEOUT_ENV",  # ADR-0086: stable public name of the ring-timeout env var
     "AttendedTransferOutcome",
     "PlaceCallOutcome",
+    "ProactiveDecision",
+    "ProactiveDenyReason",
     "TransferOutcome",
     "VoipToolHost",
     "active_voip_adapter",
@@ -884,8 +886,54 @@ def _current_call_id() -> str | None:
     return value or None
 
 
-def _proactive_place_call_allowed(tool_name: str) -> bool:
-    """True iff this proactive (no-live-call) ``place_call`` is from a trusted origin.
+class ProactiveDenyReason(StrEnum):
+    """Why a proactive (no-live-call) ``place_call`` grant was refused (issue #414).
+
+    A NON-SENSITIVE diagnostic category for an operator inspecting why a proactive
+    outbound call was blocked. Derived from the existing fail-closed branches (not
+    invented) so a log line tells the operator the actionable cause WITHOUT leaking
+    any origin value (platform / chat_id / ``HERMES_VOIP_PROACTIVE_CALL_FROM``
+    contents are secrets and never appear here). ``ALLOWED`` is the single member
+    meaning the relaxation granted; every other member is a distinct denial cause:
+
+    * ``ALLOWED`` — the origin matched; the proactive relaxation grants level 3.
+    * ``PROACTIVE_ALLOW_UNSET`` — ``HERMES_VOIP_PROACTIVE_CALL_FROM`` is empty/unset
+      (the fail-safe default; proactive calling is not opted in).
+    * ``ORIGIN_UNAVAILABLE`` — the originating ``(platform, chat_id)`` could not be
+      read from ``gateway.session_context`` (runtime absent, context unavailable, or
+      the reader raised — all fail closed).
+    * ``ORIGIN_NOT_ALLOWLISTED`` — the origin was read but its ``platform:chat_id``
+      matches no configured entry (exact or wildcard).
+    * ``LIVE_CALL_GUARD_MISSING`` — a live Call-ID is in scope but its guard state
+      is missing; the inbound fail-safe deliberately bypasses proactive-origin
+      relaxation here, so this can never weaken it.
+    * ``UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN`` — the tool is not ``place_call`` (the
+      relaxation is place_call-scoped; transfer/dtmf/open_entry stay blocked).
+    """
+
+    ALLOWED = "allowed"
+    PROACTIVE_ALLOW_UNSET = "proactive_allow_unset"
+    ORIGIN_UNAVAILABLE = "origin_unavailable"
+    ORIGIN_NOT_ALLOWLISTED = "origin_not_allowlisted"
+    LIVE_CALL_GUARD_MISSING = "live_call_guard_missing"
+    UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN = "unsupported_tool_for_proactive_origin"
+
+
+@dataclass(frozen=True, slots=True)
+class ProactiveDecision:
+    """The proactive-relaxation decision: whether to grant + the structured reason.
+
+    Immutable audit record (an operator-facing decision must not be mutated after it
+    is produced), mirroring ADR-0085's ``GateDecision``. Invariant: ``allowed`` is
+    ``True`` iff ``reason is ProactiveDenyReason.ALLOWED``.
+    """
+
+    allowed: bool
+    reason: ProactiveDenyReason
+
+
+def _proactive_place_call_allowed(tool_name: str) -> ProactiveDecision:
+    """The proactive (no-live-call) ``place_call`` relaxation decision for #202/#414.
 
     The opt-in relaxation for issue #202: when the privilege gate has NO live SIP
     call in scope (so it would otherwise fall back to a least-privilege level-0
@@ -896,28 +944,40 @@ def _proactive_place_call_allowed(tool_name: str) -> bool:
     ``adapter._capture_origin_session`` captures the same origin and
     ``HERMES_VOIP_OUTBOUND_RESULT_CHANNEL`` reports the outcome back to it.
 
-    Returns ``False`` unless ALL hold:
+    Returns ``ProactiveDecision(allowed=True, reason=ALLOWED)`` ONLY when ALL hold;
+    otherwise ``allowed`` is ``False`` and ``reason`` is the specific fail-closed
+    cause (issue #414 — a non-sensitive diagnostic category, never an origin value):
 
     * the tool is EXACTLY ``place_call`` — ``transfer_blind`` / ``send_dtmf`` /
       ``open_entry`` are meaningless without a live call and stay blocked in the
-      no-call branch (the relaxation is place_call-scoped);
-    * ``HERMES_VOIP_PROACTIVE_CALL_FROM`` is set (EMPTY / unset => ``False``, so the
-      gate is byte-identical to the fail-safe default);
+      no-call branch (``UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN``; place_call-scoped);
+    * ``HERMES_VOIP_PROACTIVE_CALL_FROM`` is set (EMPTY / unset =>
+      ``PROACTIVE_ALLOW_UNSET``, so the gate is byte-identical to the fail-safe
+      default);
     * the originating ``(platform, chat_id)`` is readable from
-      ``gateway.session_context`` and its ``platform:chat_id`` is one of the
-      configured entries (exact match after trimming).
+      ``gateway.session_context`` (else ``ORIGIN_UNAVAILABLE``) and its
+      ``platform:chat_id`` is one of the configured entries (else
+      ``ORIGIN_NOT_ALLOWLISTED``).
 
-    This NEVER weakens the inbound fail-safe: it is consulted ONLY in the no-live-call
-    branch of :func:`voip_pre_tool_call`, and a live call still resolves its real
-    caller-group privilege. The static ``HERMES_VOIP_OUTBOUND_ALLOW`` allowlist
-    (ADR-0029) still enforces the dial target at the chokepoint regardless, so even a
-    misconfigured operator origin can only reach pre-approved numbers.
+    The ``allowed`` field is byte-identical to the prior bare-``bool`` contract for
+    every input — only the structured ``reason`` is ADDED (the security boundary is
+    unchanged). This NEVER weakens the inbound fail-safe: it is consulted ONLY in the
+    no-live-call branch of :func:`voip_pre_tool_call`, and a live call still resolves
+    its real caller-group privilege. The static ``HERMES_VOIP_OUTBOUND_ALLOW``
+    allowlist (ADR-0029) still enforces the dial target at the chokepoint regardless,
+    so even a misconfigured operator origin can only reach pre-approved numbers.
     """
     if tool_name != PLACE_CALL_TOOL_NAME:
-        return False
+        return ProactiveDecision(
+            allowed=False,
+            reason=ProactiveDenyReason.UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN,
+        )
     allowed = os.environ.get(_PROACTIVE_CALL_FROM_ENV, "")
     if not allowed:
-        return False  # opt-in unset => fully fail-safe (the default)
+        # opt-in unset => fully fail-safe (the default)
+        return ProactiveDecision(
+            allowed=False, reason=ProactiveDenyReason.PROACTIVE_ALLOW_UNSET
+        )
     # FAIL CLOSED: this is a privilege-gate decision, so ANY failure to resolve the
     # originating session (runtime absent, context unavailable/misconfigured) denies
     # — it must never raise out of the gate (which could bypass denial handling or
@@ -928,21 +988,33 @@ def _proactive_place_call_allowed(tool_name: str) -> bool:
         platform = get_session_env(_SESSION_PLATFORM_ENV)
         chat_id = get_session_env(_SESSION_CHAT_ID_ENV)
     except Exception:  # noqa: BLE001 — deliberate fail-closed security boundary
-        return False
+        return ProactiveDecision(
+            allowed=False, reason=ProactiveDenyReason.ORIGIN_UNAVAILABLE
+        )
     if not platform or not chat_id:
-        return False
+        return ProactiveDecision(
+            allowed=False, reason=ProactiveDenyReason.ORIGIN_UNAVAILABLE
+        )
     needle = f"{platform}:{chat_id}"
     entries = {entry.strip() for entry in allowed.split(",") if entry.strip()}
-    if needle in entries:
-        return True
     # Wildcard opt-in (issue #355): entries containing ``*`` are matched with
     # fnmatch so operators can write ``telegram:*`` to allow any Telegram origin
     # without enumerating every chat id. Non-wildcard entries continue to use the
     # exact set above. The fail-closed contract is unchanged: any unresolved origin
-    # still returns False; only a positively-matching pattern grants.
+    # still denies; only a positively-matching pattern grants.
     import fnmatch  # noqa: PLC0415 -- lazy; stdlib, negligible cost
 
-    return any(fnmatch.fnmatchcase(needle, entry) for entry in entries if "*" in entry)
+    matched = needle in entries or any(
+        fnmatch.fnmatchcase(needle, entry) for entry in entries if "*" in entry
+    )
+    return ProactiveDecision(
+        allowed=matched,
+        reason=(
+            ProactiveDenyReason.ALLOWED
+            if matched
+            else ProactiveDenyReason.ORIGIN_NOT_ALLOWLISTED
+        ),
+    )
 
 
 async def hang_up_handler(
@@ -1561,6 +1633,12 @@ def voip_pre_tool_call(
     # state when the call/adapter is not in scope, so an unknown context cannot
     # accidentally grant a privileged tool (fail safe).
     state: GuardSessionState | None = None
+    # The non-sensitive proactive-relaxation deny CATEGORY (issue #414), set only when
+    # the fail-safe (no-live-guard-state) path did NOT grant. Logged once BELOW iff the
+    # gate then actually blocks the tool — so an operator can tell the actionable cause
+    # (unset opt-in / unreadable or unlisted origin / live-guard-missing) apart. It is a
+    # category ONLY; the origin values themselves are secrets and are never logged.
+    proactive_deny_reason: ProactiveDenyReason | None = None
     if adapter is not None and call_id is not None:
         state = adapter.guard_state_for(call_id)
     if state is None:
@@ -1575,9 +1653,18 @@ def voip_pre_tool_call(
         # consulted, so this branch can never weaken it. The static
         # HERMES_VOIP_OUTBOUND_ALLOW allowlist (ADR-0029) still gates the dial target
         # at the chokepoint regardless.
-        proactive = call_id is None and _proactive_place_call_allowed(tool_name)
+        if call_id is None:
+            decision = _proactive_place_call_allowed(tool_name)
+        else:
+            # A Call-ID IS in scope but its guard state missed: the inbound fail-safe
+            # bypasses proactive relaxation here (never consulted) — record WHY.
+            decision = ProactiveDecision(
+                allowed=False, reason=ProactiveDenyReason.LIVE_CALL_GUARD_MISSING
+            )
+        if not decision.allowed:
+            proactive_deny_reason = decision.reason
         state = GuardSessionState(
-            call_id=call_id or "", privilege_level=3 if proactive else 0
+            call_id=call_id or "", privilege_level=3 if decision.allowed else 0
         )
     # ``confirmed`` is a fixed per-tool property, never a model input. The two
     # IRREVERSIBLE tools (``place_call``, ``transfer_blind``) are gated WITH
@@ -1588,6 +1675,22 @@ def voip_pre_tool_call(
     # passing False for them is exact, not a stub.
     confirmed = tool_name in _CONFIRMED_AT_CHOKEPOINT
     if not gate_voip_tool(tool_name, state, confirmed=confirmed):
+        if proactive_deny_reason is not None:
+            # ADR-0075-style structured, machine-parseable diagnostic (issue #414):
+            # emit the NON-SENSITIVE deny CATEGORY so an operator can diagnose a
+            # refused proactive place_call. This fires exactly once — only when the
+            # no-live-guard fail-safe path did not grant AND the tool was actually
+            # blocked — alongside the WARNING gate_voip_tool already logs. rule 34:
+            # NEVER log the origin platform/chat_id/allowlist — the category only.
+            _log.warning(
+                "proactive place_call gate denied (reason=%s)",
+                proactive_deny_reason.value,
+                extra={
+                    "event": "proactive_place_call_gate",
+                    "reason": proactive_deny_reason.value,
+                    "tool": tool_name,
+                },
+            )
         return {
             "action": "block",
             "message": f"The {tool_name} tool is not permitted on this call.",

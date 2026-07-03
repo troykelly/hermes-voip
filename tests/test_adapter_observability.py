@@ -360,15 +360,13 @@ async def test_teardown_emits_one_way_audio_event(
     rec = _record_with_event(caplog, "one_way_audio")
     assert rec.call_id == call_id  # type: ignore[attr-defined]
     assert rec.reason == "no_inbound_rtp"  # type: ignore[attr-defined]
-    # The event owns ONLY call_id + reason + numeric metrics — no address/identity field
-    # that could carry PII (rule 34 / ADR-0084). Assert the surface is that fixed set.
-    owned = {
-        k
-        for k in vars(rec)
-        if k in ("event", "call_id", "reason", "local_fraction_lost")
-        or k in ("remote_fraction_lost", "local_jitter_ms", "remote_jitter_ms")
-    }
-    assert owned == {
+    # Redaction (rule 34 / ADR-0084): the event's CUSTOM structured extras — vars(rec)
+    # minus stdlib LogRecord metadata and the rendered `message` — must be EXACTLY the
+    # fixed set (call_id + reason + numeric metrics). Computing the custom set (not
+    # filtering to allowed keys) means a leaked field (remote_host/caller/...) fails.
+    standard = set(vars(logging.makeLogRecord({}))) | {"message"}
+    custom = {k for k in vars(rec) if k not in standard}
+    assert custom == {
         "event",
         "call_id",
         "reason",
@@ -376,7 +374,7 @@ async def test_teardown_emits_one_way_audio_event(
         "remote_fraction_lost",
         "local_jitter_ms",
         "remote_jitter_ms",
-    }
+    }, f"unexpected structured field(s) on the event: {custom}"
 
 
 async def test_teardown_without_rtcp_emits_no_quality_event(

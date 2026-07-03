@@ -73,8 +73,11 @@ these nor `rtcp_call_quality`.
   rejected: they answer different questions (raw numbers vs named condition; direction
   vs quality), so co-emission is simplest and most informative.
 
-## Follow-ups
+## Notes
 
-Threshold tuning from production call data (rule 26) once v0.3.0+ is live-tested; the
-reverse-direction `remote is None` ambiguity could be revisited if the engine later
-exposes an authoritative outbound-sent count.
+The thresholds are diagnostic defaults for operator observability, not control
+decisions: no code depends on a specific value, and mis-labeling seen in production logs
+is a one-line `Final`-constant change (rule 26). The reverse-direction `remote is None`
+ambiguity is deliberately handled by requiring a near-total-loss peer report rather than
+the absence of one; that choice stands unless the engine later exposes an authoritative
+outbound-sent count.

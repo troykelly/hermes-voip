@@ -1327,6 +1327,16 @@ class RtpMediaTransport:
         self._rtcp_transport: asyncio.DatagramTransport | None = None
         self._rtcp_reader: asyncio.Task[None] | None = None
         self._rtcp_local_port: int | None = None
+        # Why RTCP is dormant (ADR-0061 teardown observability, adapter.py
+        # VoipAdapter._teardown_call): set by the adapter when its activation
+        # planner (_RtcpActivation / _plan_rtcp_activation /
+        # _plan_secured_rtcp_activation / _activate_muxed_srtcp_rtcp) declines to
+        # call start_rtcp, or by start_rtcp's own last-line guards below. A fixed
+        # short code, never caller identity (rule 34). ``None`` while RTCP is
+        # active, and ``None`` if a call never reached an RTCP activation decision
+        # at all (e.g. teardown before SDP negotiation completed) — teardown then
+        # logs a dormant record with an unknown reason rather than none at all.
+        self._rtcp_dormant_reason: str | None = None
 
     # ------------------------------------------------------------------
     # MediaTransport Protocol
@@ -1461,6 +1471,10 @@ class RtpMediaTransport:
         self._rtcp_mux_active = False
         self._rtcp_transport = None
         self._rtcp_reader = None
+        # A fresh call starts with no dormant reason either — the adapter's
+        # activation planner (or start_rtcp below) sets one only if THIS call
+        # ends up leaving RTCP dormant.
+        self._rtcp_dormant_reason = None
         # Restore the constructor sink: drop any sibling-socket lambda a previous
         # non-muxed call installed, so this call never sends RTCP via a closed socket.
         self._rtcp_send = self._injected_rtcp_send
@@ -2624,6 +2638,7 @@ class RtpMediaTransport:
                 "the profile and leak SSRC/CNAME). Wire srtcp_inbound + srtcp_outbound "
                 "to activate secured RTCP."
             )
+            self._rtcp_dormant_reason = "secured_no_srtcp_transform"
             return
         # RFC 5761 §4 defense-in-depth: an RTP payload type in 64-95 aliases the RTCP
         # packet-type byte on a muxed stream, so the RTP/RTCP demux is ambiguous. The
@@ -2638,6 +2653,7 @@ class RtpMediaTransport:
                 "type (64-95) — RTCP left DORMANT (muxed RTP/RTCP demux would be "
                 "ambiguous); a separate RTCP port is required for these payload types."
             )
+            self._rtcp_dormant_reason = "mux_payload_type_conflict"
             return
         if not mux:
             if remote_rtcp_addr is None:
@@ -2656,6 +2672,7 @@ class RtpMediaTransport:
                     "media continues: %s",
                     exc,
                 )
+                self._rtcp_dormant_reason = "rtcp_socket_unavailable"
                 return
         # Engage RTCP only AFTER any non-muxed socket is open, so the flags and the I/O
         # path are set up together. ``_rtcp_mux_active`` gates the inbound RTP-socket
@@ -2663,6 +2680,11 @@ class RtpMediaTransport:
         # RTCP rides the sibling socket and the RTP socket stays pure RTP.
         self._rtcp_active = True
         self._rtcp_mux_active = mux
+        # RTCP is now active — clear any reason a PRIOR start_rtcp attempt on this
+        # SAME call left behind (e.g. a mid-call renegotiation that resolves a
+        # previous mux payload-type conflict), so teardown never reports a stale
+        # dormant reason for a call that ended up active.
+        self._rtcp_dormant_reason = None
         # RTCP cadence is WALL-TIME (RFC 3550 §6.2). Pin the loop to asyncio.sleep —
         # it must NOT inherit ``self._sleep``, the outbound-pacing seam callers (e.g.
         # the e2e harness) legitimately stub to a no-op for instant RTP pacing. With a

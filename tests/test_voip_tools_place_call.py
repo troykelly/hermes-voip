@@ -36,6 +36,7 @@ from hermes_voip.voip_tools import (
     AttendedTransferOutcome,
     ProactiveDenyReason,
     TransferOutcome,
+    _voip_owned_platforms,
     place_call_handler,
     report_call_result_handler,
     set_active_adapter,
@@ -381,6 +382,18 @@ def _set_origin(
     monkeypatch.setitem(sys.modules, "gateway.session_context", module)
 
 
+def test_voip_owned_platforms_match_plugin_registration() -> None:
+    """The proactive inbound fail-safe tracks the plugin's registered VoIP platforms."""
+    from hermes_voip.plugin import (  # noqa: PLC0415
+        _PLATFORM_NAME,
+        channel_platform_names,
+    )
+
+    assert _voip_owned_platforms() == frozenset(
+        (_PLATFORM_NAME, *channel_platform_names())
+    )
+
+
 def test_proactive_place_call_reaches_relaxation_on_real_telegram_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -423,6 +436,27 @@ def test_voip_tools_gate_proactive_place_call(
     assert verdict["action"] == "block"
 
 
+@pytest.mark.parametrize("allowed_origin", ["voip:*", "voip:some-live-call-id"])
+def test_gate_proactive_voip_origin_never_grants_even_if_allowlisted(
+    monkeypatch: pytest.MonkeyPatch, allowed_origin: str
+) -> None:
+    """A VoIP-owned origin is never a proactive operator origin, even if listed.
+
+    Regression for the cross-vendor BLOCK on PR #428: a misconfigured
+    ``HERMES_VOIP_PROACTIVE_CALL_FROM=voip:*`` (or exact ``voip:<Call-ID>``) must
+    not let a guard-missing inbound SIP caller reach ``place_call``.
+    """
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", allowed_origin)
+    host = _FakeHost(guard=None)  # adapter present, guard_state_for() misses
+    set_active_adapter(host)
+    _set_origin(monkeypatch, "voip", "some-live-call-id")
+
+    verdict = voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
+
+
 def test_voip_tools_gate_proactive_inbound_failsafe_holds_by_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -431,11 +465,10 @@ def test_voip_tools_gate_proactive_inbound_failsafe_holds_by_platform(
     ``state is None`` covers TWO cases: (a) a genuine proactive turn (no live call),
     and (b) an inbound SIP call whose ``guard_state_for`` MISSED. Both have a non-None
     ``call_id`` (== chat_id), so a call_id-presence check cannot tell them apart — only
-    the PLATFORM can. The inbound fail-safe therefore holds by platform-scoping: an
-    inbound call's ``(platform="voip", chat_id=<Call-ID>)`` origin never matches an
-    operator's non-VoIP ``HERMES_VOIP_PROACTIVE_CALL_FROM`` entry (even the permissive
-    ``telegram:*``), so the relaxation denies and the tool stays level 0. A caller
-    cannot forge the gateway-set session platform.
+    the PLATFORM can. The inbound fail-safe is therefore code-enforced on the owned
+    VoIP platform set: any VoIP-call session is never a proactive operator origin,
+    regardless of ``HERMES_VOIP_PROACTIVE_CALL_FROM`` contents. A caller cannot forge
+    the gateway-set session platform.
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
     host = _FakeHost(guard=None)  # adapter present, guard_state_for() misses
@@ -588,16 +621,15 @@ def test_gate_proactive_deny_logs_origin_not_allowlisted(
     )
 
 
-def test_gate_proactive_deny_logs_inbound_failsafe_as_not_allowlisted(
+def test_gate_proactive_deny_logs_voip_origin(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Inbound guard-missing denies by platform-scoping => ``origin_not_allowlisted``.
+    """VoIP-call origin denies as ``voip_origin_not_proactive`` regardless of allowlist.
 
-    After ADR-0105 the inbound guard-missing case is not a distinct reason: its
-    ``(platform="voip", chat_id=<Call-ID>)`` origin simply fails the platform-scoped
-    allowlist match, so the honest diagnostic is ``origin_not_allowlisted``. The
-    removed ``live_call_guard_missing`` mislabelled a legitimate proactive turn (whose
-    chat_id is likewise a non-None Call-ID) as a live-call intrusion.
+    The inbound guard-missing case is code-denied before the allowlist match because a
+    VoIP-owned platform is never a proactive operator origin. This restores the exact
+    invariant that a broad/misconfigured ``voip:*`` entry cannot authorize an inbound
+    SIP caller whose guard state is missing.
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:*")
     host = _FakeHost(guard=None)  # adapter present, guard_state_for() misses
@@ -613,7 +645,7 @@ def test_gate_proactive_deny_logs_inbound_failsafe_as_not_allowlisted(
     assert len(events) == 1
     assert (
         getattr(events[0], "reason", None)
-        == ProactiveDenyReason.ORIGIN_NOT_ALLOWLISTED.value
+        == ProactiveDenyReason.VOIP_ORIGIN_NOT_PROACTIVE.value
     )
 
 

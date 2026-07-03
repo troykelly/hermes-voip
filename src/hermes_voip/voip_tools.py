@@ -684,6 +684,15 @@ TRANSFER_ATTENDED_TOOL_SCHEMA: dict[str, object] = {
 
 
 @runtime_checkable
+class _VoipOwnedPlatformSource(Protocol):
+    """Optional adapter surface exposing VoIP-owned Hermes platform names."""
+
+    def voip_owned_platform_names(self) -> frozenset[str]:
+        """Return the plugin-owned platform names that identify VoIP call sessions."""
+        ...
+
+
+@runtime_checkable
 class VoipToolHost(Protocol):
     """The adapter surface the VoIP tools drive (``VoipAdapter`` satisfies it).
 
@@ -919,6 +928,31 @@ def _current_call_id() -> str | None:
     return value or None
 
 
+def _static_voip_owned_platforms() -> frozenset[str]:
+    """Return the VoIP platform names registered by ``plugin.register`` (ADR-0035)."""
+    from hermes_voip.plugin import (  # noqa: PLC0415 -- light module; avoids cycles
+        _PLATFORM_NAME,
+        channel_platform_names,
+    )
+
+    return frozenset((_PLATFORM_NAME, *channel_platform_names()))
+
+
+def _voip_owned_platforms() -> frozenset[str]:
+    """Return platform names that identify this plugin's own VoIP call sessions.
+
+    The static set is the primary platform plus every caller-group channel registered
+    by ``plugin.register``. A real adapter may add operator-defined caller-group
+    channels loaded from config; include them when the active adapter exposes them so
+    the proactive gate cannot drift behind runtime routing.
+    """
+    owned: set[str] = set(_static_voip_owned_platforms())
+    adapter = _ACTIVE_ADAPTER
+    if isinstance(adapter, _VoipOwnedPlatformSource):
+        owned.update(adapter.voip_owned_platform_names())
+    return frozenset(owned)
+
+
 class ProactiveDenyReason(StrEnum):
     """Why a proactive (no-live-call) ``place_call`` grant was refused (issue #414).
 
@@ -936,10 +970,10 @@ class ProactiveDenyReason(StrEnum):
       read from ``gateway.session_context`` (runtime absent, context unavailable, or
       the reader raised — all fail closed).
     * ``ORIGIN_NOT_ALLOWLISTED`` — the origin was read but its ``platform:chat_id``
-      matches no configured entry (exact or wildcard). An inbound SIP call whose guard
-      state is missing also lands here: its ``voip:<Call-ID>`` origin never matches an
-      operator's non-VoIP entry, so the inbound fail-safe holds by platform-scoping
-      (ADR-0105), not by a Call-ID-presence check.
+      matches no configured entry (exact or wildcard).
+    * ``VOIP_ORIGIN_NOT_PROACTIVE`` — the origin is a VoIP-call session, which is
+      never a proactive operator origin; deny regardless of allowlist contents (the
+      code-enforced inbound fail-safe).
     * ``UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN`` — the tool is not ``place_call`` (the
       relaxation is place_call-scoped; transfer/dtmf/open_entry stay blocked).
     """
@@ -948,6 +982,7 @@ class ProactiveDenyReason(StrEnum):
     PROACTIVE_ALLOW_UNSET = "proactive_allow_unset"
     ORIGIN_UNAVAILABLE = "origin_unavailable"
     ORIGIN_NOT_ALLOWLISTED = "origin_not_allowlisted"
+    VOIP_ORIGIN_NOT_PROACTIVE = "voip_origin_not_proactive"
     UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN = "unsupported_tool_for_proactive_origin"
 
 
@@ -987,15 +1022,17 @@ def _proactive_place_call_allowed(tool_name: str) -> ProactiveDecision:
       ``PROACTIVE_ALLOW_UNSET``, so the gate is byte-identical to the fail-safe
       default);
     * the originating ``(platform, chat_id)`` is readable from
-      ``gateway.session_context`` (else ``ORIGIN_UNAVAILABLE``) and its
-      ``platform:chat_id`` is one of the configured entries (else
+      ``gateway.session_context`` (else ``ORIGIN_UNAVAILABLE``);
+    * the platform is NOT one this VoIP plugin owns (else
+      ``VOIP_ORIGIN_NOT_PROACTIVE`` — a VoIP call session is never a proactive
+      operator origin, regardless of allowlist contents);
+    * its ``platform:chat_id`` is one of the configured entries (else
       ``ORIGIN_NOT_ALLOWLISTED``).
 
-    The ``allowed`` field is byte-identical to the prior bare-``bool`` contract for
-    every input — only the structured ``reason`` is ADDED (the security boundary is
-    unchanged). This NEVER weakens the inbound fail-safe: it is consulted ONLY in the
-    no-live-call branch of :func:`voip_pre_tool_call`, and a live call still resolves
-    its real caller-group privilege. The static ``HERMES_VOIP_OUTBOUND_ALLOW``
+    This NEVER weakens the inbound fail-safe: it is consulted only when guard
+    ``state is None``, and then code-denies every VoIP-owned platform before matching
+    the operator allowlist. So a misconfigured ``voip:*`` (or a channel alias) cannot
+    authorize a guard-missing inbound caller. The static ``HERMES_VOIP_OUTBOUND_ALLOW``
     allowlist (ADR-0029) still enforces the dial target at the chokepoint regardless,
     so even a misconfigured operator origin can only reach pre-approved numbers.
     """
@@ -1026,6 +1063,17 @@ def _proactive_place_call_allowed(tool_name: str) -> ProactiveDecision:
     if not platform or not chat_id:
         return ProactiveDecision(
             allowed=False, reason=ProactiveDenyReason.ORIGIN_UNAVAILABLE
+        )
+    if platform in _voip_owned_platforms():
+        # Code-enforced inbound fail-safe (ADR-0105): a VoIP-call session is NEVER a
+        # proactive operator origin — the relaxation is for NON-VoIP sessions only
+        # (ADR-0074). Deny regardless of HERMES_VOIP_PROACTIVE_CALL_FROM contents so a
+        # misconfigured ``voip:*`` (or exact ``voip:<Call-ID>``) cannot let a
+        # guard-missing inbound SIP caller reach place_call. This is the exact,
+        # platform-based form of the boundary the removed call_id-is-None check only
+        # approximated; it cannot break the legitimate non-VoIP proactive turn.
+        return ProactiveDecision(
+            allowed=False, reason=ProactiveDenyReason.VOIP_ORIGIN_NOT_PROACTIVE
         )
     needle = f"{platform}:{chat_id}"
     entries = {entry.strip() for entry in allowed.split(",") if entry.strip()}

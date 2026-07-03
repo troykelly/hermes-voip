@@ -291,6 +291,17 @@ ignore_missing_imports = true
 addopts = "-q"
 testpaths = ["tests"]
 asyncio_mode = "strict"  # async tests carry an explicit @pytest.mark.asyncio
+# Hang safety-net (docs/backlog.md "Test / CI robustness", docs/stack.md
+# "Tests"): pytest's built-in faulthandler support dumps every thread's stack
+# to stderr, naming the hung test, once a SINGLE test has run longer than this
+# many seconds -- with no new dependency (rule 33; deliberately not
+# pytest-timeout). 300s (5 minutes) is a GENEROUS ceiling: no legitimate test
+# in this suite approaches it (the base suite is ~34s total; the slowest
+# individual extras-gated socket/crypto tests run in low single-digit
+# seconds), so a real firing is unambiguous evidence of a genuine hang, not a
+# false positive on an ordinary slow test. This bounds any single hung test
+# without failing a slow-but-progressing full extras run (~15-20 min total).
+faulthandler_timeout = 300
 
 # Pins a CVE-safe pyjwt floor (PYSEC-2026-175..179, fix: 2.13.0; ref ADR-0062).
 # hermes-agent==0.17.0 already requires pyjwt[crypto]==2.13.0, so this is a

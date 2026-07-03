@@ -32,6 +32,7 @@ from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.rtcp import (
     Bye,
     ReceiverReport,
+    ReceptionStats,
     ReportBlock,
     RtcpError,
     SenderReport,
@@ -750,6 +751,166 @@ async def test_stop_awaits_and_cancels_registered_rtcp_task() -> None:
     await engine.stop()
     assert task.done()
     assert engine._rtcp_task is None
+
+
+# ---------------------------------------------------------------------------
+# Unbounded-SSRC hardening (RFC 3550 §6.1 RC/SC 5-bit ceiling)
+#
+# A UDP sender reaching the negotiated RTP port + payload type (there is NO
+# source check on _note_rtp_received) can present many distinct SSRCs. Each used
+# to create a permanent _reception entry (unbounded memory) and push
+# build_rtcp_report past 31 report blocks, whose SR/RR __post_init__ raises
+# ValueError at the 5-bit RC/SC ceiling — killing run_rtcp and stranding
+# stop()'s teardown. The engine now (1) caps the tracked source set at the 31
+# most-recently-active sources and (2) has a run_rtcp/stop fail-safe backstop
+# (ADR-0098) so a report-build error can never kill the loop or the teardown.
+# ---------------------------------------------------------------------------
+
+_SSRC_FLOOD_BASE: Final[int] = 0x1000
+_MAX_REPORT_BLOCKS: Final[int] = 31  # RFC 3550 §6.4.1 RC/SC is a 5-bit field
+
+
+def test_report_blocks_capped_at_31_under_ssrc_flood() -> None:
+    """A flood of distinct SSRCs cannot overflow the report or grow _reception.
+
+    Regression (HIGH): feeding 40 never-before-seen SSRCs used to leave
+    _reception with 40 entries and make build_rtcp_report() raise
+    ``ValueError: a single RR carries at most 31 report blocks, got 40``. The
+    tracked source set is now bounded to the 31 most-recently-active sources
+    (RFC 3550 §6.1 permits a report to cover a subset), so the report stays
+    within the RC/SC ceiling and _reception is memory-bounded.
+    """
+    engine = _make_engine()
+    flood = 40
+    for i in range(flood):
+        engine._note_rtp_received(
+            seq=100, rtp_timestamp=0, arrival_ts=0.02 * i, ssrc=_SSRC_FLOOD_BASE + i
+        )
+    # Must NOT raise (pre-fix this raised ValueError at the RC/SC ceiling).
+    report = engine.build_rtcp_report()
+    assert report is not None
+    rr = parse_compound(report)[0]
+    assert isinstance(rr, ReceiverReport)
+    assert len(rr.report_blocks) == _MAX_REPORT_BLOCKS
+    # _report_blocks() itself is capped, and the tracked set is memory-bounded.
+    assert len(engine._report_blocks()) == _MAX_REPORT_BLOCKS
+    assert len(engine._reception) == _MAX_REPORT_BLOCKS
+
+
+def test_continuously_active_source_is_not_evicted_by_ssrc_churn() -> None:
+    """LRU-by-activity keeps a continuously-active peer while churning spoof SSRCs.
+
+    The real peer sends a packet after every single spoof SSRC, so it is
+    refreshed to most-recently-active long before 31 distinct new SSRCs pile up
+    — the cap therefore evicts only stale one-shot spoofs, never the live peer,
+    whose statistics keep accumulating. (A burst of >31 NEW SSRCs *between* two
+    real packets can still evict it; that degraded-under-flood case is documented
+    and RTCP is advisory.)
+    """
+    engine = _make_engine()
+    seq = 100
+    for i in range(200):
+        engine._note_rtp_received(
+            seq=100, rtp_timestamp=0, arrival_ts=float(2 * i), ssrc=0xA000 + i
+        )
+        seq += 1
+        engine._note_rtp_received(
+            seq=seq,
+            rtp_timestamp=160 * (seq - 100),
+            arrival_ts=float(2 * i + 1),
+            ssrc=_PEER_SSRC,
+        )
+    assert _PEER_SSRC in engine._reception  # never evicted
+    assert len(engine._reception) == _MAX_REPORT_BLOCKS  # memory-bounded
+    report = engine.build_rtcp_report()
+    assert report is not None
+    rr = parse_compound(report)[0]
+    assert isinstance(rr, ReceiverReport)
+    peer_block = next(b for b in rr.report_blocks if b.ssrc == _PEER_SSRC)
+    assert peer_block.extended_highest_seq == seq  # its full history, not a reset
+
+
+@pytest.mark.asyncio
+async def test_run_rtcp_survives_a_report_build_overflow() -> None:
+    """run_rtcp's fail-safe backstop keeps the task alive if a report build raises.
+
+    Defence in depth (ADR-0098 dispatch-boundary fail-safe backstop applied to
+    the RTCP send loop): even if _reception somehow holds >31 sources (here forced
+    directly, bypassing the _note_rtp_received cap), build_rtcp_report's SR/RR
+    __post_init__ raises ValueError at the RC/SC ceiling. run_rtcp must LOG and
+    SKIP that interval, never let the ValueError escape and kill the periodic task
+    (a dead task strands stop()'s teardown, which awaits it).
+    """
+    clock = _FakeClock()
+    sink = _RtcpSink()
+    engine = _make_engine(rtcp_send=sink, pace_clock=clock.monotonic)
+    engine._transport = _CaptureTransport()
+    engine._sleep = clock.sleep
+    # Force the overflow directly (the _note_rtp_received cap otherwise prevents it).
+    for i in range(40):
+        engine._reception[0x2000 + i] = ReceptionStats(clock_rate=_G711_RATE)
+
+    ticks = 0
+
+    async def rtcp_sleep(secs: float) -> None:
+        nonlocal ticks
+        clock.t += secs
+        ticks += 1
+        if ticks >= 3:
+            engine._stop_event.set()
+
+    # Must COMPLETE, not raise: pre-fix the first interval's ValueError escaped
+    # run_rtcp and this await raised.
+    await asyncio.wait_for(engine.run_rtcp(sleep=rtcp_sleep), timeout=1.0)
+    assert ticks >= 3  # the loop kept cycling through the raising builds
+    assert sink.sent == []  # every build failed, so nothing was emitted
+
+
+def _arm_dead_nonmuxed_rtcp_channel(
+    engine: RtpMediaTransport, rtcp_task: asyncio.Task[None]
+) -> None:
+    """Register a (dead) run_rtcp task + a non-muxed RTCP channel for stop() to reap.
+
+    The concrete setup assignments live here, NOT in the caller, so they do not
+    narrow the engine's RTCP attributes in the caller's scope — the caller reads
+    their declared Optional types to assert stop() cleared them.
+    """
+    engine._rtcp_task = rtcp_task
+    engine._rtcp_transport = _CaptureTransport()  # type: ignore[assignment]  # test double: a DatagramTransport-shaped stand-in stop() must close+clear
+    engine._rtcp_local_port = 5005
+    engine._rtcp_active = True
+    engine._rtcp_send = _RtcpSink()  # a non-mux sibling-socket send sink
+
+
+@pytest.mark.asyncio
+async def test_stop_completes_teardown_when_rtcp_task_died() -> None:
+    """stop() tears down the RTCP channel fully even if run_rtcp already died.
+
+    Fail-safe backstop at the task-reaping boundary (ADR-0098): a run_rtcp task
+    that ended with a ValueError (the pre-fix RC/SC-ceiling crash, or any error
+    its own backstop did not cover) must NOT abort the rest of stop()'s teardown.
+    Pre-fix, ``await rtcp_task`` re-raised the ValueError past
+    ``suppress(CancelledError)``, skipping the non-muxed RTCP socket/transport
+    cleanup and the send-sink restore that follow it.
+    """
+    engine = _make_engine()
+
+    async def _die() -> None:
+        raise ValueError("simulated report-build ceiling overflow")
+
+    dead: asyncio.Task[None] = asyncio.create_task(_die())
+    with contextlib.suppress(ValueError):
+        await dead  # let it finish (genuinely dead) before stop() reaps it
+    assert dead.done()
+    _arm_dead_nonmuxed_rtcp_channel(engine, dead)
+
+    await engine.stop()  # must NOT raise, and must complete full teardown
+
+    assert engine._rtcp_task is None
+    assert engine._rtcp_transport is None  # non-muxed cleanup ran past the dead task
+    assert engine._rtcp_local_port is None
+    assert engine._rtcp_active is False
+    assert engine._rtcp_send is None  # constructor sink restored (stop reached its end)
 
 
 class _CaptureTransport:

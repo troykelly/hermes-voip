@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import socket
 import threading
 import time
@@ -32,6 +33,7 @@ from hermes_voip.tts.elevenlabs import (
     ElevenLabsVoiceSettings,
     HttpByteStream,
     HttpCancellation,
+    _abort_blocked_read,
     _UrllibHttp,
     elevenlabs_pcm_format,
 )
@@ -187,7 +189,8 @@ class _ScriptedResponse:
     ``read`` replays a script of byte chunks and, where an ``OSError`` is scripted,
     raises it — modelling a TLS ``response.read()`` that RAISES (rather than EOFs)
     once the barge-in socket shutdown interrupts it. ``fp`` is ``None`` so the
-    transport's socket lookup finds nothing and falls back to ``close``.
+    barge-in's socket lookup finds nothing and its abort is a no-op; the response is
+    instead closed by the read loop's own cleanup after the scripted OSError.
     """
 
     def __init__(self, reads: list[bytes | OSError]) -> None:
@@ -846,6 +849,25 @@ def test_open_arms_a_barge_in_that_shuts_the_underlying_socket(
     finally:
         sock_a.close()
         sock_b.close()
+
+
+def test_abort_blocked_read_without_a_socket_is_a_logged_no_op(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the underlying socket is unreachable, the barge-in degrades to a NO-OP.
+
+    Regression (codex review of the fix): the ``sock is None`` path must NOT fall back
+    to a blocking loop-thread ``response.close()`` — that is exactly the whole-event-
+    loop freeze the socket-shutdown mechanism exists to avoid (``close()`` cannot
+    interrupt a parked read and blocks on the buffer lock it holds). The helper now
+    takes ONLY the socket (so the unsafe close is impossible by construction) and
+    logs the degraded path; the worker is reaped by the stream join timeout instead.
+    """
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.tts.elevenlabs"):
+        _abort_blocked_read(None)  # must be a no-op: no raise, no block, no close
+    assert any(
+        "could not reach the response socket" in rec.message for rec in caplog.records
+    ), "the degraded (sock-None) barge-in path must log a warning"
 
 
 def test_urllib_transport_treats_a_cancelled_read_error_as_end_of_stream(

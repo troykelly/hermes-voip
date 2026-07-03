@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import socket
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
@@ -47,6 +48,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from hermes_voip.aio import stream_from_thread
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Annotation-only: keeps the urllib/http import cost out of module import (the
@@ -661,8 +664,9 @@ def _underlying_socket(response: HTTPResponse) -> socket.socket | None:
     makes the parked ``recv`` return at once. The socket lives at
     ``response.fp.raw._sock`` (the buffered ``SocketIO``, for both plain and TLS
     connections); it is reached defensively via ``getattr`` so that if those
-    internals ever change shape this returns None and the caller falls back to
-    ``response.close()`` (no worse than before).
+    internals ever change shape this returns None and the caller degrades to a
+    no-op (NOT a blocking loop-thread ``response.close()`` — see
+    :func:`_abort_blocked_read`), so a barge-in can never re-freeze the loop.
     """
     fp: object = response.fp
     raw: object = getattr(fp, "raw", fp)
@@ -672,8 +676,12 @@ def _underlying_socket(response: HTTPResponse) -> socket.socket | None:
     return None
 
 
-def _abort_blocked_read(sock: socket.socket | None, response: HTTPResponse) -> None:
+def _abort_blocked_read(sock: socket.socket | None) -> None:
     """Interrupt a worker parked in ``response.read()`` (barge-in, loop side).
+
+    Takes ONLY the socket (found by :func:`_underlying_socket`) — deliberately not the
+    response — so the unsafe blocking ``response.close()`` on the loop thread is
+    impossible by construction (codex review).
 
     ``shutdown(SHUT_RDWR)`` is a fast, non-blocking syscall that makes the worker's
     in-progress ``recv`` return immediately — a plain read then yields EOF, a TLS
@@ -682,11 +690,24 @@ def _abort_blocked_read(sock: socket.socket | None, response: HTTPResponse) -> N
     thread never calls the *blocking* ``response.close()`` (which would deadlock on
     the buffer lock the parked read holds — the whole-event-loop freeze this fixes).
     ``shutdown`` on an already-torn-down socket raises ``OSError``, expected and
-    ignored: the read is released regardless. If the socket was not exposed, fall
-    back to ``response.close()`` — no worse than before.
+    ignored: the read is released regardless.
+
+    If the underlying socket is not exposed (``sock is None`` — only if CPython's
+    ``HTTPResponse`` internals ever change shape), this is a deliberate NO-OP: it
+    must NOT fall back to ``response.close()``, because that blocking loop-thread
+    call is exactly the whole-event-loop freeze this mechanism exists to avoid
+    (``close()`` cannot interrupt the parked read and blocks on the buffer lock it
+    holds). The worker instead stays parked until ``stream_from_thread``'s bounded
+    join timeout reaps it on teardown — a bounded per-segment delay, never a loop
+    freeze. This degraded path is logged (it should never happen on a supported
+    CPython).
     """
     if sock is None:
-        response.close()
+        _log.warning(
+            "elevenlabs: barge-in could not reach the response socket to abort a "
+            "blocked read (HTTPResponse internals unexpected); the TTS worker will "
+            "be reaped by the stream join timeout instead of interrupted"
+        )
         return
     with contextlib.suppress(OSError):
         sock.shutdown(socket.SHUT_RDWR)
@@ -733,7 +754,7 @@ class _UrllibHttp:
         # with its shutdown. If a barge-in already fired while connecting, arm()
         # runs the shutdown right now.
         sock = _underlying_socket(response)
-        cancel.arm(lambda: _abort_blocked_read(sock, response))
+        cancel.arm(lambda: _abort_blocked_read(sock))
         try:
             while True:
                 try:

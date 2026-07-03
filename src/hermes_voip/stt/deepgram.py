@@ -78,17 +78,20 @@ _CLOSE_STREAM: Final[str] = json.dumps({"type": "CloseStream"})
 class _FluxSocket(Protocol):
     """The minimal async websocket surface the provider drives.
 
-    Both the real ``websockets`` connection and the test fake satisfy this. Text
-    frames yielded by async iteration are Deepgram Flux JSON events; ``send``
-    accepts bytes (mu-law audio) OR str (control messages); ``close`` ends the
-    session.
+    Both the real ``websockets`` connection and the test fake satisfy this.
+    Frames yielded by async iteration are normally Deepgram Flux JSON events as
+    text (``str``); a websocket BINARY frame surfaces as ``bytes`` (the
+    underlying ``websockets`` library only UTF-8-validates TEXT frames, so a
+    binary or otherwise invalid-UTF-8 frame reaches the caller as raw bytes,
+    not a decode error). ``send`` accepts bytes (mu-law audio) OR str (control
+    messages); ``close`` ends the session.
     """
 
     async def send(self, data: bytes | str) -> None: ...
 
     async def close(self) -> None: ...
 
-    def __aiter__(self) -> AsyncIterator[str]: ...
+    def __aiter__(self) -> AsyncIterator[bytes | str]: ...
 
 
 # Factory that opens a fresh Flux socket; injected so tests supply a fake and the
@@ -278,17 +281,23 @@ async def _receive(socket: _FluxSocket, out: asyncio.Queue[Transcript]) -> None:
             await out.put(transcript)
 
 
-def _parse_flux_frame(raw: str) -> tuple[str, str] | None:
-    """Parse a raw Flux text frame into ``(text, event_type)``, or ``None`` to skip.
+def _parse_flux_frame(raw: bytes | str) -> tuple[str, str] | None:
+    """Parse a raw Flux frame into ``(text, event_type)``, or ``None`` to skip.
 
     Returns ``None`` for any malformed or wrong-shape frame — a single bad
     frame must not kill the live call (robustness).  Each bad frame is logged
     at WARNING level with a safe summary (NO raw frame content — rule 34).
     Genuine task/connection failures propagate normally (rule 37).
+
+    ``raw`` may be ``bytes`` (a websocket BINARY frame, or a TEXT frame that is
+    not valid UTF-8): ``json.loads`` UTF-8-decodes ``bytes`` internally and can
+    raise ``UnicodeDecodeError`` — a ``ValueError`` subclass distinct from
+    ``json.JSONDecodeError`` — which is caught here alongside it so a single
+    binary/malformed frame is skipped rather than killing the receive loop.
     """
     try:
         event = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         _log.warning(
             "deepgram: dropping unparseable Flux frame (len=%d)",
             len(raw),
@@ -317,13 +326,13 @@ def _parse_flux_frame(raw: str) -> tuple[str, str] | None:
     return text, event_type
 
 
-def _map_event(raw: str) -> Transcript | None:
+def _map_event(raw: bytes | str) -> Transcript | None:
     """Map one Flux JSON event to a ``Transcript``, or ``None`` to skip it.
 
     Control/metadata events (and empty hypotheses) yield ``None``; ``Update`` is
     interim; ``EndOfTurn`` / ``EagerEndOfTurn`` finalise the turn natively.
-    Malformed or wrong-shape frames are skipped via :func:`_parse_flux_frame`
-    so a single bad frame cannot kill the live call.
+    Malformed, wrong-shape, or binary/non-UTF-8 frames are skipped via
+    :func:`_parse_flux_frame` so a single bad frame cannot kill the live call.
     """
     parsed = _parse_flux_frame(raw)
     if parsed is None:
@@ -370,21 +379,27 @@ class _FluxConnection:
             await self._opener.__aexit__(None, None, None)
             self._conn = None
 
-    def __aiter__(self) -> AsyncIterator[str]:
+    def __aiter__(self) -> AsyncIterator[bytes | str]:
         return self._messages()
 
-    async def _messages(self) -> AsyncIterator[str]:
+    async def _messages(self) -> AsyncIterator[bytes | str]:
         conn = await self._connection()
         async for message in conn:
             yield message
 
 
 class _WebsocketConnection(Protocol):
-    """Structural view of a ``websockets`` connection's methods we call."""
+    """Structural view of a ``websockets`` connection's methods we call.
+
+    ``websockets`` yields ``str`` for TEXT frames and ``bytes`` for BINARY
+    frames (its own UTF-8 validation applies only to TEXT frames), so iteration
+    is typed ``bytes | str`` to match — not just ``str`` — reflecting what the
+    real library actually hands back.
+    """
 
     async def send(self, data: bytes | str) -> None: ...
 
-    def __aiter__(self) -> AsyncIterator[str]: ...
+    def __aiter__(self) -> AsyncIterator[bytes | str]: ...
 
 
 class _WebsocketOpener(Protocol):

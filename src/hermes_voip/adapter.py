@@ -5874,6 +5874,23 @@ class VoipAdapter(BasePlatformAdapter):
         session = self._call_sessions.get(call_id)
         return session.guard if session is not None else None
 
+    def voip_owned_platform_names(self) -> frozenset[str]:
+        """Return platform names that route sessions owned by this VoIP plugin.
+
+        Used by the proactive ``place_call`` gate to code-deny VoIP-call sessions as
+        proactive origins. Includes the static platforms registered by
+        ``plugin.register`` plus operator-defined caller-group channels loaded from
+        config; a configured channel is still a VoIP-owned routing identity even when
+        it is not one of the canonical defaults.
+        """
+        from hermes_voip.plugin import channel_platform_names  # noqa: PLC0415
+
+        owned: set[str] = {_PLATFORM_NAME, *channel_platform_names()}
+        caller_groups = self._caller_groups
+        if caller_groups is not None:
+            owned.update(channel_for_group(group) for group in caller_groups.groups)
+        return frozenset(owned)
+
     async def hang_up_call(self, call_id: str) -> bool:
         """End ``call_id`` as a SOFT agent hangup (ADR-0026); return whether it ended.
 

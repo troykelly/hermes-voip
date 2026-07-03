@@ -90,6 +90,25 @@ def test_single_long_press_emits_once() -> None:
     assert _feed_all(detector, pcm) == ["9"]
 
 
+@pytest.mark.parametrize("gap_frames", [1, 2])
+def test_short_gap_mid_press_does_not_duplicate_digit(gap_frames: int) -> None:
+    """A gap SHORTER than the release threshold must not re-arm the detector.
+
+    One (or a couple of) lost or momentarily-silent frames in the middle of a held
+    key-press — packet loss, an AEC transient, or a frame dipping below the energy
+    floor — must NOT clear the emitted-digit state. Otherwise, when the SAME tone
+    resumes, it emits a second, spurious digit: a duplicate DTMF digit, which is
+    security-sensitive (a digit can resolve an ADR-0009 confirmation). Only a
+    *sustained* gap (>= ``_INBAND_GAP_RELEASE_FRAMES``, 3 frames / 60 ms) is a real
+    release; a 1-2 frame dropout is not, so the resumed tone stays one held press.
+    """
+    detector = InbandDtmfDetector(sample_rate=_RATE)
+    tone = inband_tone_pcm("5", sample_rate=_RATE, duration_ms=100)  # 5 frames, emits
+    dropout = _silence(_FRAME * gap_frames)  # a brief 1-2 frame gap, NOT a release
+    release = _silence(_FRAME * 4)  # a genuine trailing release closes the stream
+    assert _feed_all(detector, tone + dropout + tone + release) == ["5"]
+
+
 # --- the load-bearing false-positive rejecters ------------------------------
 
 

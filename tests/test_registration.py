@@ -1087,6 +1087,19 @@ def test_cseq_unicode_digit_number_raises_runtimeerror_not_valueerror() -> None:
         flow.handle(response)
 
 
+def test_cseq_overlong_decimal_number_raises_runtimeerror_not_valueerror() -> None:
+    """An over-long ASCII CSeq number fails closed instead of escaping ValueError."""
+    flow = RegistrationFlow(_CONFIG)
+    flow.start()  # CSeq 1 outstanding
+    response = SipResponse.parse(
+        "SIP/2.0 401 Unauthorized\r\n"
+        f"CSeq: {'9' * 5000} REGISTER\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    with pytest.raises(RuntimeError, match="CSeq"):
+        flow.handle(response)
+
+
 # --- an UNANSWERABLE first 401/407 must fail CLOSED, never raise (ADR-0081) ------
 #
 # handle() previously let the digest layer's ValueError ESCAPE on an unanswerable

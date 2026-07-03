@@ -60,6 +60,12 @@ _SAMPLES_PER_FRAME_8K = (_G711_RATE * _PTIME_MS) // 1000
 
 _TO_USER = "1000"  # the extension the plugin registers as
 _TARGET_EXT = "1001"  # the extension the plugin dials outbound
+# A DISTINCTIVE fake dialled number for the redaction assertions (issue #1294): long
+# and unlike any port / hex Call-ID, so "this string is absent from the SLO event
+# records" cannot pass by coincidence. It embeds nothing real (555-01xx is the
+# reserved fictional range); the fake gateway does not validate the dialled target.
+_LEAK_PROBE_TARGET = "15550123456"
+_ADAPTER_LOGGER = "hermes_voip.adapter"
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -518,6 +524,62 @@ async def _until(
 
 
 # ---------------------------------------------------------------------------
+# Structured outbound-lifecycle log-event helpers (issue #1294 / ADR-0075).
+# The adapter emits ``outbound_invite_sent`` / ``outbound_call_connected`` /
+# ``outbound_call_failed`` records carrying only ``call_id`` + fixed non-sensitive
+# context; a log pipeline keys on the ``event`` discriminator to compute the
+# outbound-call SLO. These helpers read the captured records without tripping mypy
+# on the dynamic ``extra`` attributes (no ``# type: ignore`` needed — getattr).
+# ---------------------------------------------------------------------------
+
+
+def _records_with_event(
+    caplog: pytest.LogCaptureFixture, event: str
+) -> list[logging.LogRecord]:
+    """All captured records whose structured ``event`` field equals ``event``."""
+    return [rec for rec in caplog.records if getattr(rec, "event", None) == event]
+
+
+def _one_event_record(
+    caplog: pytest.LogCaptureFixture, event: str
+) -> logging.LogRecord:
+    """The single captured record with ``event``; fails loudly if 0 or >1 seen."""
+    matches = _records_with_event(caplog, event)
+    seen = [getattr(rec, "event", None) for rec in caplog.records]
+    assert len(matches) == 1, (
+        f"expected exactly one record with event={event!r}; got {len(matches)}. "
+        f"events seen: {seen!r}"
+    )
+    return matches[0]
+
+
+def _event_field(record: logging.LogRecord, field: str) -> object:
+    """Read a structured ``extra`` field off a LogRecord (a dynamic attribute)."""
+    return getattr(record, field, None)
+
+
+def _assert_no_pii(record: logging.LogRecord, *needles: str) -> None:
+    """Assert none of the sensitive ``needles`` appear on a SLO event record.
+
+    Scoped to the record's rendered message + the fixed set of ``extra`` fields these
+    events carry — the exact surface a log pipeline persists — so a regression that
+    put the dialled number or gateway host into an outbound SLO event is caught
+    (rule 34 / ADR-0084: gateway connection detail on the SIP path is public-repo
+    sensitive even though it is not a secret).
+    """
+    surface = [record.getMessage()]
+    for field in ("event", "call_id", "transport", "codec", "category"):
+        value = getattr(record, field, None)
+        if value is not None:
+            surface.append(str(value))
+    blob = " | ".join(surface)
+    for needle in needles:
+        assert needle not in blob, (
+            f"event {getattr(record, 'event', None)!r} leaked {needle!r}: {blob!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
@@ -816,6 +878,125 @@ async def test_outbound_call_486_busy() -> None:
             assert not adapter._call_sessions
             assert not adapter._call_loops
 
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_lifecycle_invite_sent_and_connected_events(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """place_call emits outbound_invite_sent + outbound_call_connected (issue #1294).
+
+    ADR-0075-style structured records let a log pipeline compute the outbound-call
+    SLO (attempts vs answers), correlating the pair by the shared Call-ID. Both
+    carry only the Call-ID + fixed non-sensitive context (transport, and — on
+    connect — the negotiated codec); NEVER the dialled number or gateway host
+    (rule 34 / ADR-0084). Driven end-to-end against the real loopback UAC flow.
+    """
+    gateway = OutboundGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+                place_task = asyncio.create_task(adapter.place_call(_LEAK_PROBE_TARGET))
+                await gateway.await_invite_from_plugin(timeout=5.0)  # challenge
+                await gateway.await_invite_from_plugin(timeout=5.0)  # re-auth
+                await gateway.await_ack_from_plugin(timeout=5.0)
+                call_id = await asyncio.wait_for(place_task, timeout=5.0)
+                await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)
+
+            sent = _one_event_record(caplog, "outbound_invite_sent")
+            assert _event_field(sent, "call_id") == call_id
+            assert _event_field(sent, "transport") == "tls"
+
+            connected = _one_event_record(caplog, "outbound_call_connected")
+            assert _event_field(connected, "call_id") == call_id
+            assert _event_field(connected, "transport") == "tls"
+            # A real G.711 answer was negotiated → a concrete codec name (never PII).
+            codec = _event_field(connected, "codec")
+            assert isinstance(codec, str)
+            assert codec, "connected event carries an empty codec"
+
+            # Redaction (rule 34 / ADR-0084): neither event carries the dialled target
+            # or the gateway host in its message or any structured field.
+            for record in (sent, connected):
+                _assert_no_pii(record, _LEAK_PROBE_TARGET, gateway.sip_host)
+    finally:
+        await gateway.stop()
+
+
+async def test_outbound_lifecycle_failed_event_carries_category(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 486 outbound failure emits outbound_call_failed with category 'busy' (#1294).
+
+    The event carries the ADR-0086 failure CATEGORY (the SAME the agent-facing tool
+    result surfaces), NEVER the SIP reason phrase, the dialled number, or the gateway
+    host (rule 34 / ADR-0084). The prior invite_sent event still fired (the INVITE
+    left before the 486), and NO connected event is emitted for a failed attempt.
+    """
+
+    class _BusyGateway(OutboundGateway):
+        """Gateway that always rejects with 486 Busy Here (no auth challenge)."""
+
+        async def _handle_invite(self, request: SipRequest) -> list[str]:
+            await self._received_invites.put(request)
+            via = request.header("Via") or ""
+            from_ = request.header("From") or ""
+            to = request.header("To") or ""
+            call_id = request.header("Call-ID") or ""
+            cseq = request.header("CSeq") or ""
+            return [
+                "SIP/2.0 486 Busy Here\r\n"
+                f"Via: {via}\r\n"
+                f"From: {from_}\r\n"
+                f"To: {to};tag=busy\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                "Content-Length: 0\r\n\r\n"
+            ]
+
+    gateway = _BusyGateway()
+    gateway.set_register_responder()
+    await gateway.start()
+
+    providers = Providers(asr=_FakeASR(), tts=_FakeTTS(), guard=_FakeGuard())
+    try:
+        async with _real_adapter(gateway, providers=providers) as adapter:
+            from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+            assert isinstance(adapter, VoipAdapter)
+
+            with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+                with pytest.raises(OutboundCallFailed) as exc_info:
+                    await adapter.place_call(_LEAK_PROBE_TARGET)
+                assert exc_info.value.status == 486
+
+            failed = _one_event_record(caplog, "outbound_call_failed")
+            assert _event_field(failed, "transport") == "tls"
+            # The failure CATEGORY is the ADR-0086 outcome — 486 → BUSY — never the
+            # SIP reason phrase.
+            assert _event_field(failed, "category") == "busy"
+            failed_call_id = _event_field(failed, "call_id")
+            assert isinstance(failed_call_id, str)
+            assert failed_call_id, "failed event carries an empty call_id"
+
+            # invite_sent fired for the same attempt; no connected event on a failure.
+            sent = _one_event_record(caplog, "outbound_invite_sent")
+            assert _event_field(sent, "call_id") == failed_call_id
+            assert not _records_with_event(caplog, "outbound_call_connected")
+
+            # Redaction (rule 34 / ADR-0084): the failure category and the events carry
+            # no dialled number and no gateway host.
+            for record in (failed, sent):
+                _assert_no_pii(record, _LEAK_PROBE_TARGET, gateway.sip_host)
     finally:
         await gateway.stop()
 

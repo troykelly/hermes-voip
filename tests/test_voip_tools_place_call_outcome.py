@@ -587,3 +587,67 @@ def test_ring_timeout_env_symbol_is_exported() -> None:
 def test_place_call_outcome_is_exported() -> None:
     """PlaceCallOutcome is part of the module's public API (__all__)."""
     assert "PlaceCallOutcome" in vt.__all__
+
+
+# ---------------------------------------------------------------------------
+# outbound_failure_category (issue #1294): the SINGLE classifier that maps an
+# outbound-dial failure exception to its stable ADR-0086 category string. It is
+# shared by BOTH the agent-facing ``place_call`` tool result AND the adapter's
+# ``outbound_call_failed`` SLO log event (ADR-0075) so the two never diverge — and
+# it NEVER carries the SIP reason phrase, the gateway host, or the dialled target
+# (rule 34 / ADR-0084: gateway detail on the SIP path is public-repo-sensitive).
+# ---------------------------------------------------------------------------
+
+
+def test_outbound_failure_category_maps_each_failure_class() -> None:
+    """Each outbound-failure exception maps to its stable ADR-0086 category string."""
+    assert vt.outbound_failure_category(OutboundCallFailed(486, "x")) == "busy"
+    assert vt.outbound_failure_category(OutboundCallFailed(600, "x")) == "busy"
+    assert vt.outbound_failure_category(OutboundCallFailed(408, "x")) == "no_answer"
+    assert vt.outbound_failure_category(OutboundCallFailed(487, "x")) == "no_answer"
+    assert vt.outbound_failure_category(OutboundCallFailed(603, "x")) == "declined"
+    assert vt.outbound_failure_category(OutboundCallFailed(503, "x")) == "failed"
+    assert vt.outbound_failure_category(OutboundCallFailed(500, "x")) == "failed"
+    # A ring-timeout / abort CANCEL is the caller giving up on an unanswered call →
+    # NO_ANSWER, the SAME mapping ``place_call_handler`` applies (ADR-0069/0086).
+    assert (
+        vt.outbound_failure_category(OutboundCallCancelled("cid", "ring timeout"))
+        == "no_answer"
+    )
+    # Any other exception (a transport/media-init RuntimeError, or an unexpected
+    # error on the dial path) → the catch-all FAILED outcome, mirroring the handler's
+    # RuntimeError branch. NotImplementedError (WSS ring-timeout) is a RuntimeError.
+    assert vt.outbound_failure_category(RuntimeError("boom")) == "failed"
+    assert vt.outbound_failure_category(NotImplementedError("wss")) == "failed"
+
+
+def test_outbound_failure_category_values_are_the_place_call_outcome_surface() -> None:
+    """Every returned category is exactly a ``PlaceCallOutcome`` value (no drift)."""
+    values = {outcome.value for outcome in PlaceCallOutcome}
+    for exc in (
+        OutboundCallFailed(486, "x"),
+        OutboundCallFailed(603, "x"),
+        OutboundCallFailed(503, "x"),
+        OutboundCallCancelled("cid", "r"),
+        RuntimeError("x"),
+    ):
+        assert vt.outbound_failure_category(exc) in values
+
+
+def test_outbound_failure_category_never_leaks_reason_or_host() -> None:
+    """Rule 34 / ADR-0084: the category is a fixed code, never the reason / host.
+
+    An ``OutboundCallFailed`` whose message embeds the gateway host AND the dialled
+    number must classify to the bare category, carrying none of that detail through.
+    """
+    exc = OutboundCallFailed(503, "sip:15550123456@pbx.example.test unreachable")
+    category = vt.outbound_failure_category(exc)
+    assert category == "failed"
+    assert "pbx.example.test" not in category
+    assert "15550123456" not in category
+    assert "unreachable" not in category
+
+
+def test_outbound_failure_category_is_exported() -> None:
+    """The shared classifier is a stable public export (``__all__``)."""
+    assert "outbound_failure_category" in vt.__all__

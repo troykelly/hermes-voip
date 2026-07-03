@@ -47,7 +47,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, assert_never
+from typing import TYPE_CHECKING, Final, Never, assert_never
 
 # The real hermes-agent runtime surface. This module is imported ONLY lazily
 # (inside ``hermes_voip.plugin._adapter_factory``), so a bare ``import
@@ -224,6 +224,7 @@ from hermes_voip.voip_tools import (
     AttendedTransferOutcome,
     TransferOutcome,
     active_voip_adapter,
+    outbound_failure_category,
     set_active_adapter,
 )
 
@@ -832,6 +833,22 @@ def _validate_outbound_answer_crypto(
         )
         raise OutboundCallFailed(488, msg)
     return answer_crypto
+
+
+def _fail_outbound_call(status: int, reason: str) -> Never:
+    """Raise ``OutboundCallFailed`` from inside the outbound observability boundary.
+
+    ``_handle_outbound_invite`` wraps the whole UAC state machine so it can emit the
+    additive ``outbound_call_failed`` SLO event before re-raising. Ruff's TRY301 is
+    intentionally strict about direct raises inside such a boundary; this helper keeps
+    the failure construction explicit without obscuring that errors still propagate.
+    """
+    raise OutboundCallFailed(status, reason)
+
+
+def _cancel_outbound_call(call_id: str, reason: str) -> Never:
+    """Raise cancellation from inside the outbound observability boundary."""
+    raise OutboundCallCancelled(call_id, reason)
 
 
 @dataclass
@@ -1899,6 +1916,23 @@ class VoipAdapter(BasePlatformAdapter):
         try:
             await transport.send(invite_text)
             _log.info("INVITE sent: Call-ID %s -> %s", call_id, target_uri)
+            # Outbound lifecycle event (runbook 0014, ADR-0075 style): the INVITE is
+            # on the wire — one outbound attempt begun. A log pipeline correlates the
+            # attempt across outbound_invite_sent → outbound_call_connected /
+            # outbound_call_failed by the shared Call-ID to compute the outbound SLO.
+            # Emitted as its OWN record (not attached to the message above) so it
+            # carries ONLY the Call-ID + fixed transport — never the dialled number,
+            # gateway host, or SIP domain the target_uri message holds (rule 34 /
+            # ADR-0084: gateway detail on the SIP path is public-repo-sensitive).
+            _log.info(
+                "outbound INVITE sent: Call-ID %s",
+                call_id,
+                extra={
+                    "event": "outbound_invite_sent",
+                    "call_id": call_id,
+                    "transport": "tls",
+                },
+            )
 
             # Arm the ring-timeout (ADR-0069): an unanswered call is CANCELled after
             # ring_timeout_secs and raises OutboundCallCancelled. Cancelled on the 2xx
@@ -1970,7 +2004,7 @@ class VoipAdapter(BasePlatformAdapter):
                 )
                 auth_value = response.header(auth_hdr_name)
                 if auth_value is None:
-                    raise OutboundCallFailed(
+                    _fail_outbound_call(
                         response.status_code, "challenge has no auth header"
                     )
                 challenge = DigestChallenge.parse(auth_value)
@@ -2035,10 +2069,10 @@ class VoipAdapter(BasePlatformAdapter):
             if response.status_code == _SIP_REQUEST_TERMINATED:
                 reason = pending.reason or "request terminated"
                 _log.info("INVITE %s: 487 Request Terminated — %s", call_id, reason)
-                raise OutboundCallCancelled(call_id, reason)
+                _cancel_outbound_call(call_id, reason)
             if response.status_code >= _SIP_ERROR_FLOOR:
                 # Non-2xx final: transport auto-ACKs non-2xx (RFC 3261 §17.1.1.3)
-                raise OutboundCallFailed(
+                _fail_outbound_call(
                     response.status_code, response.reason or "Call Failed"
                 )
 
@@ -2058,7 +2092,7 @@ class VoipAdapter(BasePlatformAdapter):
 
             answer_audio = answer_sdp.audio
             if answer_audio is None:
-                raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
+                _fail_outbound_call(500, "2xx SDP answer has no audio media")
 
             # Build the UAC dialog from the 2xx and ACK it BEFORE any acceptance check
             # (ADR-0067 / RFC 3261 §13.2.2.4 + §17.1.2.1). A 2xx ESTABLISHES the dialog
@@ -2133,7 +2167,7 @@ class VoipAdapter(BasePlatformAdapter):
                 ) from exc
 
             if _first_voice_codec(agreed_codecs) is None:
-                raise OutboundCallFailed(488, "2xx answer: no voice codec")
+                _fail_outbound_call(488, "2xx answer: no voice codec")
 
             # Update the engine's remote destination from the 2xx SDP answer.
             remote_address = _effective_address(answer_audio, answer_sdp)
@@ -2262,7 +2296,7 @@ class VoipAdapter(BasePlatformAdapter):
                     call_id,
                     reason,
                 )
-                raise OutboundCallCancelled(call_id, reason)
+                _cancel_outbound_call(call_id, reason)
 
             # --- Wire the CallSession and CallLoop -------------------------
             # ADR-0021 (amended from ADR-0020): an outbound call's remote party
@@ -2404,9 +2438,55 @@ class VoipAdapter(BasePlatformAdapter):
                 first_turn_task.add_done_callback(
                     lambda t: self._on_call_task_done(call_id, t)
                 )
+            # Outbound lifecycle event (runbook 0014, ADR-0075 style): the 2xx answer
+            # established the dialog and the session + CallLoop are wired — the call is
+            # UP. Pairs with outbound_invite_sent (same Call-ID) so a log pipeline can
+            # compute the outbound answer rate. Only the Call-ID + fixed transport +
+            # the negotiated codec NAME — never the callee number or gateway host
+            # (rule 34 / ADR-0084). negotiated_voice is non-None in practice (a
+            # voice-codec guard above 488s the call otherwise); the ternary keeps
+            # mypy happy without asserting.
+            _log.info(
+                "outbound call connected: Call-ID %s",
+                call_id,
+                extra={
+                    "event": "outbound_call_connected",
+                    "call_id": call_id,
+                    "transport": "tls",
+                    "codec": (
+                        negotiated_voice.encoding
+                        if negotiated_voice is not None
+                        else "unknown"
+                    ),
+                },
+            )
             session_established = True
-            return call_id
 
+        except Exception as exc:
+            # Outbound lifecycle event (runbook 0014, ADR-0075 style): the dial attempt
+            # failed — a non-2xx final response, a refused 2xx (codec/SRTP), a CANCEL /
+            # ring-timeout, or an unexpected error. Emitted here (Call-ID in scope) with
+            # the ADR-0086 failure CATEGORY the agent-facing place_call result also
+            # carries (single source of truth: outbound_failure_category) so the SLO
+            # logs and the tool outcome never diverge. NEVER str(exc) / the SIP reason /
+            # the host / the dialled number (rule 34 / ADR-0084). Pure observability:
+            # the exception is RE-RAISED unchanged, so call control, outcome, teardown,
+            # and timing are unaffected (rule 37 — errors propagate; the finally below
+            # still runs the pre-session teardown).
+            _log.info(
+                "outbound call failed: Call-ID %s",
+                call_id,
+                extra={
+                    "event": "outbound_call_failed",
+                    "call_id": call_id,
+                    "transport": "tls",
+                    "category": outbound_failure_category(exc),
+                },
+            )
+            raise
+        else:
+            # Success: the 2xx established the dialog and the loop task owns teardown.
+            return call_id
         finally:
             # The call has left its INVITE transaction (established or failed): drop
             # the ringing-pending registration and disarm the ring-timeout so neither
@@ -2704,7 +2784,7 @@ class VoipAdapter(BasePlatformAdapter):
                 )
                 auth_value = response.header(auth_hdr_name)
                 if auth_value is None:
-                    raise OutboundCallFailed(
+                    _fail_outbound_call(
                         response.status_code, "challenge has no auth header"
                     )
                 challenge = DigestChallenge.parse(auth_value)
@@ -2746,7 +2826,7 @@ class VoipAdapter(BasePlatformAdapter):
                         break
 
             if response.status_code >= _SIP_ERROR_FLOOR:
-                raise OutboundCallFailed(
+                _fail_outbound_call(
                     response.status_code, response.reason or "Call Failed"
                 )
 
@@ -2760,7 +2840,7 @@ class VoipAdapter(BasePlatformAdapter):
                 ) from exc
             answer_audio = answer_sdp.audio
             if answer_audio is None:
-                raise OutboundCallFailed(500, "2xx SDP answer has no audio media")
+                _fail_outbound_call(500, "2xx SDP answer has no audio media")
             if not answer_audio.is_webrtc:
                 raise OutboundCallFailed(
                     488, "2xx answer is not a WebRTC (UDP/TLS/RTP/SAVPF) answer"

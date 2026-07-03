@@ -189,11 +189,17 @@ def _iter_raw_entries(raw: str) -> list[str]:
     Both sources -- the inline ``HERMES_VOIP_OUTBOUND_ALLOW`` value and the
     ``HERMES_VOIP_OUTBOUND_ALLOW_FILE`` file body -- use the SAME grammar: entries are
     separated by commas and/or newlines (a file's natural separator), each entry is
-    stripped, and empty fields are dropped. A comma, a carriage return, and a line
-    feed are the only separators and none is a legal dial character, so no entry is
-    ever split apart (a trailing carriage return from a CRLF file is removed by the
-    strip). This keeps a file entry byte-identical in meaning to the same entry
-    written inline.
+    stripped, and empty fields are dropped (a trailing carriage return from a CRLF file
+    is removed by the strip). This keeps a file entry byte-identical in meaning to the
+    same entry written inline -- the file source is a location change, not a grammar
+    change (it inherits the comma-separated grammar the inline var has always used).
+
+    The comma is ALWAYS a separator, so a literal comma cannot appear WITHIN one entry.
+    Real dial targets never need one -- extensions are digit/``x``-mask strings and a
+    dial-out SIP URI is ``sip:<number>@<host>``. RFC 3261 does permit a comma in a SIP
+    URI user part, so an exotic entry like ``sip:a,b@host`` would be split into two
+    entries that then match nothing -- fail-CLOSED (the target is denied, never
+    over-permitted). Such an address simply cannot be allowlisted via this mechanism.
     """
     return [entry for chunk in re.split(r"[,\r\n]", raw) if (entry := chunk.strip())]
 

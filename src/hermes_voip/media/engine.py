@@ -264,6 +264,85 @@ class CallQuality:
     rtt_seconds: float | None
 
 
+# Media-health inference thresholds (bk1295, ADR-0102). These turn a CallQuality
+# snapshot into operator-observability anomalies at teardown; they are DIAGNOSTIC
+# signals, not control decisions, so reasonable defaults suffice (reversible).
+_MEDIA_DEGRADED_LOSS: Final[float] = 0.05  # >5% loss on a view = degraded
+_MEDIA_DEGRADED_JITTER_MS: Final[float] = 30.0  # >30 ms jitter on a view = degraded
+_ONE_WAY_PEER_LOSS: Final[float] = 0.9  # peer reports >=90% loss of our stream
+
+
+@dataclass(frozen=True)
+class MediaAnomaly:
+    """A media-health anomaly inferred from a :class:`CallQuality` snapshot (bk1295).
+
+    ``event`` is the structured log-event name (``one_way_audio`` / ``media_degraded``);
+    ``reason`` is a fixed non-sensitive category. Neither carries any address / PII — a
+    caller logs only these plus the numeric CallQuality metrics (rule 34 / ADR-0084).
+    """
+
+    event: str
+    reason: str
+
+
+def infer_media_anomalies(quality: CallQuality) -> tuple[MediaAnomaly, ...]:
+    """Classify a call's RTCP :class:`CallQuality` snapshot into media-health anomalies.
+
+    Returns the anomalies to emit at teardown (empty for a clean call). ``local_*`` is
+    what WE received from the peer; ``remote_*`` is what the peer reported receiving
+    from US (``None`` = no such report). See ADR-0102 for the thresholds + rationale.
+
+    * ``one_way_audio`` / ``no_inbound_rtp`` — we received NO inbound RTP
+      (``local_fraction_lost is None``) yet the peer DID report on our stream
+      (``remote_*`` present): audio flowed only outbound. The remote report
+      disambiguates a real one-way failure from a call too short to produce any RTCP.
+    * ``one_way_audio`` / ``peer_no_inbound`` — we received the peer's stream, but it
+      reports near-total loss (``>= _ONE_WAY_PEER_LOSS``) of ours: audio flowed inbound
+      only.
+    * ``media_degraded`` / ``high_loss`` — loss on either view is above the degraded
+      floor but not a one-way failure.
+    * ``media_degraded`` / ``high_jitter`` — jitter on either view exceeds the floor.
+
+    The signals are INDEPENDENT: a call may be both one-way and degraded.
+    """
+    anomalies: list[MediaAnomaly] = []
+    local_lost = quality.local_fraction_lost
+    remote_lost = quality.remote_fraction_lost
+
+    # One-way, inbound dead: no inbound RTP at all, but the peer confirms it received
+    # our outbound stream (so the path is not merely too-short-to-report).
+    if local_lost is None and remote_lost is not None:
+        anomalies.append(MediaAnomaly("one_way_audio", "no_inbound_rtp"))
+
+    # One-way, outbound dead: we received the peer fine, but it reports near-total loss
+    # of our stream.
+    if (
+        local_lost is not None
+        and remote_lost is not None
+        and remote_lost >= _ONE_WAY_PEER_LOSS
+    ):
+        anomalies.append(MediaAnomaly("one_way_audio", "peer_no_inbound"))
+
+    # Degraded (present-but-lossy): loss above the floor on a view that is not already a
+    # one-way-dead direction (None inbound, or >= the one-way ceiling outbound).
+    degraded_loss = (local_lost is not None and local_lost > _MEDIA_DEGRADED_LOSS) or (
+        remote_lost is not None
+        and _MEDIA_DEGRADED_LOSS < remote_lost < _ONE_WAY_PEER_LOSS
+    )
+    if degraded_loss:
+        anomalies.append(MediaAnomaly("media_degraded", "high_loss"))
+
+    local_jitter = quality.local_jitter_ms
+    remote_jitter = quality.remote_jitter_ms
+    degraded_jitter = (
+        local_jitter is not None and local_jitter > _MEDIA_DEGRADED_JITTER_MS
+    ) or (remote_jitter is not None and remote_jitter > _MEDIA_DEGRADED_JITTER_MS)
+    if degraded_jitter:
+        anomalies.append(MediaAnomaly("media_degraded", "high_jitter"))
+
+    return tuple(anomalies)
+
+
 # Size of the inbound datagram queue (datagrams; 512 * ~180 bytes ~ 90 kB).
 _QUEUE_MAXSIZE = 512
 

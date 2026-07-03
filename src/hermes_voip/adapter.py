@@ -129,6 +129,7 @@ from hermes_voip.media.engine import (
     RtpMediaTransport,
     UnsupportedCodecError,
     codec_for_encoding,
+    infer_media_anomalies,
 )
 from hermes_voip.media.sip_dtls_session import SipDtlsMediaSession
 from hermes_voip.media.vad import (
@@ -5704,6 +5705,28 @@ class VoipAdapter(BasePlatformAdapter):
                     "rtt_seconds": q.rtt_seconds,
                 },
             )
+            # Media-health inference (bk1295, ADR-0102): turn the same snapshot into
+            # one_way_audio / media_degraded SLO events so a one-directional NAT-style
+            # media failure or a degraded call is queryable, not just visible as raw
+            # loss/jitter numbers. Each event carries call_id + the fixed reason + the
+            # numeric metrics only — never caller identity/address (rule 34 / ADR-0084).
+            # Additive: pure emits, no teardown control-flow change.
+            for anomaly in infer_media_anomalies(q):
+                _log.warning(
+                    "INVITE %s: media anomaly — %s (%s)",
+                    call_id,
+                    anomaly.event,
+                    anomaly.reason,
+                    extra={
+                        "event": anomaly.event,
+                        "call_id": call_id,
+                        "reason": anomaly.reason,
+                        "local_fraction_lost": q.local_fraction_lost,
+                        "remote_fraction_lost": q.remote_fraction_lost,
+                        "local_jitter_ms": q.local_jitter_ms,
+                        "remote_jitter_ms": q.remote_jitter_ms,
+                    },
+                )
         else:
             # No quality snapshot exists — RTCP was never activated for this call.
             # dormant_reason is threaded from the activation planning result

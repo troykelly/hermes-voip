@@ -37,6 +37,7 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_voip.call_end import CallEndReason
 from hermes_voip.config import ExtensionConfig, load_media_config
 from hermes_voip.manager import NewCall
+from hermes_voip.media.engine import CallQuality
 from hermes_voip.message import SipRequest, new_call_id, new_tag
 
 if TYPE_CHECKING:
@@ -299,6 +300,83 @@ async def test_teardown_emits_structured_rtcp_call_quality_event(
     assert rec.remote_fraction_lost == 0.02  # type: ignore[attr-defined]
     assert rec.remote_jitter_ms == 6.5  # type: ignore[attr-defined]
     assert rec.rtt_seconds == 0.12  # type: ignore[attr-defined]
+    # A healthy call emits the quality record but NO anomaly event (bk1295/ADR-0102).
+    assert not [
+        r
+        for r in caplog.records
+        if getattr(r, "event", None) in ("one_way_audio", "media_degraded")
+    ], "a healthy call must emit no media-anomaly event"
+
+
+def _rtcp_one_way_engine() -> MagicMock:
+    """A fake engine whose CallQuality shows inbound-dead one-way audio (ADR-0102).
+
+    ``local_*`` is None (we received NO inbound RTP) while the peer DID report on our
+    stream (``remote_*`` present) — the disambiguated one-way-inbound-dead signal.
+    """
+    quality = CallQuality(
+        local_fraction_lost=None,
+        local_cumulative_lost=None,
+        local_jitter_ms=None,
+        remote_fraction_lost=0.0,
+        remote_cumulative_lost=0,
+        remote_jitter_ms=5.0,
+        rtt_seconds=0.1,
+    )
+    return MagicMock(
+        stop=AsyncMock(return_value=None),
+        media_timed_out=False,
+        _rtcp_active=True,
+        call_quality=quality,
+    )
+
+
+async def test_teardown_emits_one_way_audio_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A one-way (inbound-dead) call emits a structured one_way_audio SLO event.
+
+    ADR-0102: local=None (no inbound RTP) while the peer reported on our stream =>
+    audio flowed only outbound. The event carries call_id + the fixed reason + numeric
+    metrics only — never caller identity/address (rule 34 / ADR-0084; verified by the
+    field set below).
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    call_id = new_call_id()
+    session = _FakeSession(ended=True, call_id=call_id)
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # _FakeSession double
+
+    with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+        await adapter._teardown_call(
+            call_id=call_id,
+            engine=_rtcp_one_way_engine(),
+            transport=transport,  # type: ignore[arg-type]  # fake transport double
+            dialog_id=session.dialog_id,
+            session=session,  # type: ignore[arg-type]  # _FakeSession double
+            reason=CallEndReason.REMOTE_BYE,
+        )
+
+    rec = _record_with_event(caplog, "one_way_audio")
+    assert rec.call_id == call_id  # type: ignore[attr-defined]
+    assert rec.reason == "no_inbound_rtp"  # type: ignore[attr-defined]
+    # The event owns ONLY call_id + reason + numeric metrics — no address/identity field
+    # that could carry PII (rule 34 / ADR-0084). Assert the surface is that fixed set.
+    owned = {
+        k
+        for k in vars(rec)
+        if k in ("event", "call_id", "reason", "local_fraction_lost")
+        or k in ("remote_fraction_lost", "local_jitter_ms", "remote_jitter_ms")
+    }
+    assert owned == {
+        "event",
+        "call_id",
+        "reason",
+        "local_fraction_lost",
+        "remote_fraction_lost",
+        "local_jitter_ms",
+        "remote_jitter_ms",
+    }
 
 
 async def test_teardown_without_rtcp_emits_no_quality_event(

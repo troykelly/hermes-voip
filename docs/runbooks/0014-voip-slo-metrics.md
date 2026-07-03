@@ -345,9 +345,26 @@ garbled audio).
 
 **Target:** < 0.5% of calls (1 bad call per 200).
 
-**How to observe:**
+**How to observe (structured events, ADR-0075 / ADR-0102).** At teardown the adapter
+infers media anomalies from the RTCP `CallQuality` and emits named events so a log
+pipeline can count bad calls without eyeballing raw loss/jitter. Each carries only
+`call_id` + a fixed `reason` + numeric metrics — no caller identity (rule 34 / ADR-0084):
 
-**NOT YET INSTRUMENTED.** Currently requires manual inspection or caller feedback.
+| `event` | `reason` | Meaning |
+|---------|----------|---------|
+| `one_way_audio` | `no_inbound_rtp` | we received no inbound RTP but the peer got our stream (inbound dead) |
+| `one_way_audio` | `peer_no_inbound` | we received the peer, but it reports ≥90% loss of ours (outbound dead) |
+| `media_degraded` | `high_loss` | loss > 5% on a present view |
+| `media_degraded` | `high_jitter` | jitter > 30 ms on a present view |
+
+```bash
+# Bad-media rate = anomaly calls over a window (JSON logs):
+jq -c 'select(.event=="one_way_audio" or .event=="media_degraded")' /path/to/hermes/log.jsonl | wc -l
+# One-way breakdown by direction:
+jq -r 'select(.event=="one_way_audio") | .reason' /path/to/hermes/log.jsonl | sort | uniq -c
+```
+
+The thresholds are diagnostic defaults (ADR-0102), tunable from real-call data.
 
 **Manual test:**
 ```bash
@@ -363,7 +380,7 @@ garbled audio).
 ```bash
 # Look for these ERROR/WARNING lines:
 grep -E "media engine.*failed|RTP.*error|rtp rx:.*error|rtp tx:.*error" /path/to/hermes/log
-grep "one-way" /path/to/hermes/log
+grep "media anomaly" /path/to/hermes/log   # one_way_audio / media_degraded (see above)
 grep -i "garbled\|decode\|sync" /path/to/hermes/log
 ```
 

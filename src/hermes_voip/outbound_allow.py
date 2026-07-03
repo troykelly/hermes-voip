@@ -1,4 +1,4 @@
-"""Outbound dial allowlist -- the hard gate for agent-triggered calls (ADR-0029).
+"""Outbound dial allowlist -- the hard gate for agent-triggered calls (ADR-0029/0099).
 
 ``HERMES_VOIP_OUTBOUND_ALLOW`` is a comma-separated list of permitted dial targets
 (extensions and/or SIP URIs). It is the **hard gate** on the agent-facing
@@ -8,11 +8,23 @@
 feature ships INERT until the operator opts numbers in (the safe ship). An empty or
 absent value parses to an empty :class:`OutboundAllowlist`, which permits nothing.
 
-PII posture: a dial target (an extension, or potentially a real PSTN number) lives
-ONLY in the gitignored ``.env`` -- never a tracked file. This module reads the value
-from a provided env mapping; tests pass fakes (ext ``1000``/``1001``). Extensions
-are not PII, but the value is treated uniformly as sensitive config (kept out of
-git and out of logs).
+An OPTIONAL file-backed source (ADR-0099), ``HERMES_VOIP_OUTBOUND_ALLOW_FILE``, names
+a path to a gitignored file of the SAME entries (comma/newline separated). Its entries
+are **UNIONed** with the inline list -- so a real-number corpus can live off the
+shell-visible environment. A configured-but-missing or unreadable file fails loud
+(:class:`ConfigError`, rule 37) -- never a silent empty list. With BOTH sources
+absent/blank the allowlist is empty and the feature stays inert (fail-closed).
+
+PII posture (ADR-0099): a dial target (an extension, or potentially a real PSTN
+number) lives ONLY in the gitignored ``.env`` (inline ``HERMES_VOIP_OUTBOUND_ALLOW``)
+OR in a gitignored file referenced by ``HERMES_VOIP_OUTBOUND_ALLOW_FILE`` -- never a
+tracked file. The file form is the stronger posture: the values stay OFF the process
+environment and out of shell/process introspection (``printenv``,
+``/proc/<pid>/environ``, ``ps``, container inspect), which is where a real
+callable-number corpus belongs; the inline form remains convenient for a few
+extensions. This module reads both from a provided env mapping; tests pass fakes (ext
+``1000``/``1001``). Extensions are not PII, but every value is treated uniformly as
+sensitive config (kept out of git and out of logs).
 
 Matching is **exact** for every entry except a simple extension mask. The ONLY
 wildcard is ``x``/``X`` inside a dial mask (an entry of digits, ``+``, ``#``, ``*``
@@ -49,9 +61,13 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+
+from hermes_voip.config import ConfigError
 
 __all__ = [
     "OUTBOUND_ALLOW_ENV",
+    "OUTBOUND_ALLOW_FILE_ENV",
     "OUTBOUND_RESULT_CHANNEL_ENV",
     "OutboundAllowlist",
     "is_outbound_allowed",
@@ -61,6 +77,13 @@ __all__ = [
 
 #: The environment variable naming the comma-separated outbound dial allowlist.
 OUTBOUND_ALLOW_ENV = "HERMES_VOIP_OUTBOUND_ALLOW"
+
+#: The environment variable naming a PATH to a gitignored file of dial-target entries
+#: (comma/newline separated, same grammar as ``OUTBOUND_ALLOW``). Its entries are
+#: UNIONed with the inline ``OUTBOUND_ALLOW`` list (ADR-0099), so a real-number corpus
+#: can live off the shell-visible process environment. A configured-but-missing or
+#: unreadable file fails loud (:class:`~hermes_voip.config.ConfigError`, rule 37).
+OUTBOUND_ALLOW_FILE_ENV = "HERMES_VOIP_OUTBOUND_ALLOW_FILE"
 
 
 def _is_extension_mask(entry: str) -> bool:
@@ -160,13 +183,76 @@ class OutboundAllowlist:
         return hash((self._exact, self._patterns))
 
 
-def load_outbound_allowlist(extra: Mapping[str, str]) -> OutboundAllowlist:
-    """Parse ``HERMES_VOIP_OUTBOUND_ALLOW`` into an :class:`OutboundAllowlist`.
+def _iter_raw_entries(raw: str) -> list[str]:
+    """Split a raw allowlist value into trimmed, non-empty entries.
 
-    A comma-separated list; each entry is trimmed and empty entries are dropped,
-    so ``" 1000 , 1001 ,, "`` yields entries ``{"1000", "1001"}``. An absent or
-    blank value yields the **empty** allowlist -- the feature is inert (no target
-    may be dialled) until the operator opts numbers in.
+    Both sources -- the inline ``HERMES_VOIP_OUTBOUND_ALLOW`` value and the
+    ``HERMES_VOIP_OUTBOUND_ALLOW_FILE`` file body -- use the SAME grammar: entries are
+    separated by commas and/or newlines (a file's natural separator), each entry is
+    stripped, and empty fields are dropped. A comma, a carriage return, and a line
+    feed are the only separators and none is a legal dial character, so no entry is
+    ever split apart (a trailing carriage return from a CRLF file is removed by the
+    strip). This keeps a file entry byte-identical in meaning to the same entry
+    written inline.
+    """
+    return [entry for chunk in re.split(r"[,\r\n]", raw) if (entry := chunk.strip())]
+
+
+def _read_allow_file(extra: Mapping[str, str]) -> str | None:
+    """Return the raw body of the ``HERMES_VOIP_OUTBOUND_ALLOW_FILE`` file, or ``None``.
+
+    An **unset or blank** path yields ``None`` -- the inline var alone governs (the
+    pre-ADR-0099 behaviour; running with only the inline var, or with neither, stays
+    valid). A **configured-but-missing** or **unreadable** path raises
+    :class:`~hermes_voip.config.ConfigError` (rule 37: a typo'd security-list path must
+    fail loudly, never silently behave as an empty list) -- the exact error contract the
+    caller-modes list-file loaders use. The raised ``ConfigError`` propagates through
+    ``VoipAdapter.connect()`` (which does not swallow it), so a misconfigured allow file
+    fails the plugin closed rather than silently allowing all or allowing none.
+
+    Args:
+        extra: The plugin's env-config mapping (``config.extra``).
+
+    Returns:
+        The file's raw text when the path is set and readable, else ``None``.
+
+    Raises:
+        ConfigError: the path is set but does not exist or cannot be read.
+    """
+    path_str = (extra.get(OUTBOUND_ALLOW_FILE_ENV) or "").strip()
+    if not path_str:
+        return None
+    path = Path(path_str)
+    if not path.exists():
+        msg = (
+            f"{OUTBOUND_ALLOW_FILE_ENV}: outbound-allow file {path_str!r} is configured"
+            " but does not exist (unset the variable to run without a file)"
+        )
+        raise ConfigError(msg)
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        msg = f"{OUTBOUND_ALLOW_FILE_ENV}: cannot read outbound-allow file: {exc}"
+        raise ConfigError(msg) from exc
+
+
+def load_outbound_allowlist(extra: Mapping[str, str]) -> OutboundAllowlist:
+    """Parse the inline + file outbound allowlist into an :class:`OutboundAllowlist`.
+
+    Two sources are **UNIONed** (ADR-0099):
+
+    * inline ``HERMES_VOIP_OUTBOUND_ALLOW`` -- a comma-separated list; and
+    * ``HERMES_VOIP_OUTBOUND_ALLOW_FILE`` -- an OPTIONAL path to a gitignored file of
+      the same entries (comma/newline separated), so a real-number corpus can live off
+      the shell-visible environment.
+
+    Each entry (from either source) is trimmed and empty entries are dropped, so
+    ``" 1000 , 1001 ,, "`` yields entries ``{"1000", "1001"}``. With BOTH sources
+    absent or blank the allowlist is **empty** -- the feature is inert (no target may
+    be dialled) until the operator opts numbers in. Union is purely additive: an entry
+    appears iff the operator wrote it in one of the two sources; neither source can
+    silently drop the other's entries (so a present-but-empty file never wipes the
+    inline list).
 
     Entries that are simple extension masks (``x``/``X`` digit-wildcards, e.g.
     ``10xx``) are compiled to anchored regex patterns; every other entry -- exact
@@ -177,20 +263,25 @@ def load_outbound_allowlist(extra: Mapping[str, str]) -> OutboundAllowlist:
         extra: The plugin's env-config mapping (``config.extra``).
 
     Returns:
-        An :class:`OutboundAllowlist` (empty when unset/blank).
+        An :class:`OutboundAllowlist` (empty when both sources are unset/blank).
+
+    Raises:
+        ConfigError: ``HERMES_VOIP_OUTBOUND_ALLOW_FILE`` names a path that does not
+            exist or cannot be read (fail-closed and explicit, rule 37).
     """
-    raw = extra.get(OUTBOUND_ALLOW_ENV, "")
     exact: list[str] = []
     patterns: list[re.Pattern[str]] = []
-    for raw_entry in raw.split(","):
-        entry = raw_entry.strip()
-        if not entry:
-            continue
-        pat = _entry_to_regex(entry)
-        if pat is not None:
-            patterns.append(pat)
-        else:
-            exact.append(entry)
+    raws = [extra.get(OUTBOUND_ALLOW_ENV, "")]
+    file_raw = _read_allow_file(extra)
+    if file_raw is not None:
+        raws.append(file_raw)
+    for raw in raws:
+        for entry in _iter_raw_entries(raw):
+            pat = _entry_to_regex(entry)
+            if pat is not None:
+                patterns.append(pat)
+            else:
+                exact.append(entry)
     return OutboundAllowlist(
         _exact=frozenset(exact),
         _patterns=tuple(patterns),

@@ -143,11 +143,23 @@ def _content_length(head: str) -> int:
             # RFC 3261 Content-Length is ASCII 1*DIGIT. ``isascii() and
             # isdecimal()`` rejects superscripts/exotic Unicode digits (which
             # ``isdigit()`` admits but ``int()`` cannot parse), signs, and empty —
-            # all as FramingError, never a bare ValueError from int().
+            # all as FramingError.
             if not (stripped.isascii() and stripped.isdecimal()):
                 msg = f"non-numeric Content-Length: {stripped!r}"
                 raise FramingError(msg)
-            found = int(stripped)
+            try:
+                found = int(stripped)
+            except ValueError as exc:
+                # An all-decimal value longer than CPython's int-string digit limit
+                # (~4300) still fails int() despite isdecimal(); fold it into the
+                # FramingError contract so no bare ValueError escapes the framer.
+                # ``feed``/iteration runs in the reader's ``_read_loop`` OUTSIDE the
+                # ADR-0098 dispatch backstop, so a bare ValueError there would unwind
+                # the whole connection with an internal error. Such a value is also far
+                # above ``_MAX_MESSAGE`` — an unframable stream, exactly what
+                # FramingError signals.
+                msg = f"Content-Length too long to parse: {len(stripped)} digits"
+                raise FramingError(msg) from exc
     if found is None:
         msg = "message head has no Content-Length"
         raise FramingError(msg)

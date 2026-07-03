@@ -31,6 +31,12 @@ from hermes_voip.manifest import (
 from hermes_voip.providers.asr import StreamingASR, Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import (
+    _ONNX_GUARD,
+    _SHERPA_KOKORO_TTS,
+    _SHERPA_ONNX_ASR,
+    DEFAULT_ASR_FACTORIES,
+    DEFAULT_GUARD_FACTORIES,
+    DEFAULT_TTS_FACTORIES,
     AsrFactory,
     GuardFactory,
     Providers,
@@ -693,3 +699,21 @@ def test_build_fallback_factory_sees_fallback_model_as_tts_model() -> None:
     # Trigger the lazy fallback build and assert it saw the Kokoro dir (not the EL id).
     tts._ensure_fallback()
     assert seen_fallback_model == ["/models/kokoro"]
+
+
+def test_self_host_preflight_token_constants_are_wired_factory_keys() -> None:
+    """Pin the token→factory-map coupling ``check_providers_buildable`` depends on.
+
+    Each self-host token constant it gates its model-directory preflight on MUST be a
+    real key in the production dispatch map it is gated against.
+
+    If a constant drifts from its factory-map key (a provider renamed, the constant
+    not), the model-dir check silently stops firing for a still-selectable provider —
+    the enable-time gap the preflight closes would quietly reopen, the missing dir
+    resurfacing at ``connect()`` as before. This makes such a rename fail HERE, loudly,
+    rather than in production (closes the codex-review residual on #82: only the STT
+    token was implicitly pinned by the plugin-level tests; kokoro/onnx were not).
+    """
+    assert _SHERPA_ONNX_ASR in DEFAULT_ASR_FACTORIES
+    assert _SHERPA_KOKORO_TTS in DEFAULT_TTS_FACTORIES
+    assert _ONNX_GUARD in DEFAULT_GUARD_FACTORIES

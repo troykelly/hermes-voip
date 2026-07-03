@@ -16,6 +16,7 @@ or drifted surface into a hard CI failure instead of a silent skip.
 import importlib
 import inspect
 import os
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -110,7 +111,7 @@ def test_voip_adapter_is_real_base_platform_adapter_subclass() -> None:
     assert issubclass(VoipAdapter, base.BasePlatformAdapter)
 
 
-def test_validate_voip_config_is_truthy_on_valid_config() -> None:
+def test_validate_voip_config_is_truthy_on_valid_config(tmp_path: Path) -> None:
     """``validate_voip_config`` must return truthy for a valid config.
 
     ``PlatformRegistry.create_adapter`` treats a falsey return as a validation
@@ -125,12 +126,18 @@ def test_validate_voip_config_is_truthy_on_valid_config() -> None:
             "HERMES_SIP_HOST": "pbx.example.test",
             "HERMES_SIP_EXTENSION": "1000",
             "HERMES_SIP_PASSWORD": "fake",
+            # The self-host default providers each need a present model dir now that
+            # validate_voip_config preflights the provider wiring; an existing dir
+            # keeps this a complete, buildable config so the truthy contract holds.
+            "HERMES_VOIP_STT_MODEL_DIR": str(tmp_path),
+            "HERMES_VOIP_TTS_MODEL": str(tmp_path),
+            "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": str(tmp_path),
         },
     )
     assert validate_voip_config(cfg) is True
 
 
-def test_platform_registry_create_adapter_builds_voip_adapter() -> None:
+def test_platform_registry_create_adapter_builds_voip_adapter(tmp_path: Path) -> None:
     """The real ``PlatformRegistry.create_adapter`` path must produce an adapter.
 
     This exercises the exact gateway flow: ``register(ctx)`` registers the
@@ -158,6 +165,12 @@ def test_platform_registry_create_adapter_builds_voip_adapter() -> None:
             "HERMES_SIP_HOST": "pbx.example.test",
             "HERMES_SIP_EXTENSION": "1000",
             "HERMES_SIP_PASSWORD": "fake",
+            # create_adapter runs validate_config, which now preflights the provider
+            # wiring; the self-host defaults each need a present model dir, so point
+            # them at an existing directory to keep this a buildable config.
+            "HERMES_VOIP_STT_MODEL_DIR": str(tmp_path),
+            "HERMES_VOIP_TTS_MODEL": str(tmp_path),
+            "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": str(tmp_path),
         },
     )
     adapter = registry_mod.platform_registry.create_adapter("voip", cfg)

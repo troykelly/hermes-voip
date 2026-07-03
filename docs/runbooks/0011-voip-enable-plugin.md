@@ -173,6 +173,35 @@ PY
 For the end-to-end "register on the gateway and place a test call" procedure, see
 [`0002-voip-live-validation.md`](0002-voip-live-validation.md).
 
+## Config preflight: provider misconfiguration is rejected at enable time
+
+When the gateway builds the `voip` adapter it runs the plugin's `validate_config`
+(`validate_voip_config`) **before** `connect()`. As well as checking the SIP/media env
+**shape** (`load_gateway_config` / `load_media_config`), that gate now **preflights the
+provider wiring** (`check_providers_buildable` in
+[`src/hermes_voip/providers/build.py`](../../src/hermes_voip/providers/build.py)), so the
+most common provider misconfiguration is rejected up front — with a clear `ConfigError`
+naming the offending setting (never the SIP password) — instead of surfacing one step later
+as a `connect()`-time crash. It rejects:
+
+- **An unimplemented provider token.** `HERMES_VOIP_STT_PROVIDER` / `HERMES_VOIP_TTS_PROVIDER`
+  / `HERMES_VOIP_INJECTION_GUARD` accept a wider config *vocabulary* than the set of *wired*
+  providers; selecting a valid-but-not-yet-implemented token (e.g. a deferred TTS engine) is
+  rejected here rather than at connect().
+- **A missing or mis-pathed self-host model directory.** When a self-host provider is
+  selected (the defaults are `sherpa-onnx` STT, `sherpa-kokoro` TTS, `onnx` guard), its model
+  directory env var — `HERMES_VOIP_STT_MODEL_DIR` / `HERMES_VOIP_TTS_MODEL` /
+  `HERMES_VOIP_INJECTION_GUARD_MODEL_DIR` (and `HERMES_VOIP_TTS_FALLBACK_MODEL` for a
+  model-backed fallback) — must be set **and** point at an existing directory.
+
+The preflight is deliberately **shallow** (no model load): the model-integrity (SHA-256) and
+SPDX licence gates, and per-call Opus availability, still run at `connect()` — so Opus is
+never required to enable the plugin (a host without the `webrtc` extra keeps the
+G.711/G.722 SIP path). A config that passes the preflight can therefore still fail at
+`connect()` (a swapped or truncated weight, a disallowed licence). To fix a preflight
+rejection, set the named env var to a valid, provisioned value; for downloading + verifying
+the self-host models, see [`0002-voip-live-validation.md`](0002-voip-live-validation.md).
+
 ## Disable / remove / roll back
 
 ```bash

@@ -170,14 +170,22 @@ def validate_voip_config(config: object) -> bool:
 
     Calls :func:`~hermes_voip.config.load_gateway_config` and
     :func:`~hermes_voip.config.load_media_config` against the config's ``extra``
-    mapping. Returns ``True`` when the full VoIP configuration is complete and
-    well-formed.
+    mapping, then :func:`~hermes_voip.providers.build.check_providers_buildable`
+    against the parsed media config. The env loaders check env-var *shape*; the
+    provider preflight closes the gap between the (wider) config *vocabulary* and the
+    (narrower) set of *wired* providers — so an unimplemented provider token or a
+    missing/mis-pathed self-host model directory is rejected HERE, at the enable gate,
+    rather than one step later inside ``adapter.connect()`` where ``build_providers``
+    runs. The preflight is shallow (no model load): a swapped/corrupt weight or a bad
+    licence still surfaces at connect(). Returns ``True`` when the configuration is
+    complete and well-formed.
 
     The Hermes gateway's ``PlatformRegistry.create_adapter`` treats a **falsey**
     return as a validation failure and refuses to build the adapter, so this
     deliberately returns ``True`` on success (never ``None``). A missing or
-    malformed SIP/media env raises :class:`~hermes_voip.config.ConfigError`; the
-    registry catches that and treats it as a rejection as well.
+    malformed SIP/media env — or an unbuildable provider selection — raises
+    :class:`~hermes_voip.config.ConfigError`; the registry catches that and treats it
+    as a rejection as well.
 
     Args:
         config: A Hermes ``PlatformConfig``-like object with an ``extra``
@@ -187,11 +195,19 @@ def validate_voip_config(config: object) -> bool:
         ``True`` if the SIP and media configuration is valid.
 
     Raises:
-        ConfigError: If a required VoIP env var is absent or invalid.
+        ConfigError: If a required VoIP env var is absent or invalid, a selected
+            provider token has no implementation, or a selected self-host provider's
+            model directory is unset or absent on disk.
     """
     extra = getattr(config, "extra", {})
     load_gateway_config(extra)
-    load_media_config(extra)
+    media = load_media_config(extra)
+    # Preflight the provider wiring so a misconfigured provider is rejected at this
+    # dedicated gate, not inside connect(). Imported lazily (like the adapter factory)
+    # so a bare ``import hermes_voip`` stays light; the import chain is ML-free.
+    from hermes_voip.providers.build import check_providers_buildable  # noqa: PLC0415
+
+    check_providers_buildable(media)
     return True
 
 

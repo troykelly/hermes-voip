@@ -284,8 +284,7 @@ appears:
 | -------- | ------------- | --------------- |
 | `proactive_allow_unset` | `HERMES_VOIP_PROACTIVE_CALL_FROM` is empty/unset (proactive calling not opted in) | Set it to the triggering `platform:chat_id` (see "Proactive outbound from an operator chat" above) |
 | `origin_unavailable` | The originating `(platform, chat_id)` could not be read from `gateway.session_context` | Trigger from a supported platform session; check the session context is populated |
-| `origin_not_allowlisted` | The origin was read but its `platform:chat_id` matches no configured entry | Add the origin (exact or `telegram:*` wildcard) to `HERMES_VOIP_PROACTIVE_CALL_FROM` |
-| `live_call_guard_missing` | A live Call-ID is in scope but its guard state is missing; the inbound fail-safe deliberately bypasses proactive relaxation here | Not a proactive path — investigate the missing live-call guard state; do NOT expect the proactive origin to grant here |
+| `origin_not_allowlisted` | The origin was read but its `platform:chat_id` matches no configured entry; after ADR-0105 this also covers an inbound VoIP origin whose guard state is missing (`voip:<Call-ID>` is not an operator non-VoIP origin) | Add the intended operator origin (exact or `telegram:*` wildcard) to `HERMES_VOIP_PROACTIVE_CALL_FROM`; if the origin is `voip:<Call-ID>`, investigate the missing live-call guard state instead |
 | `unsupported_tool_for_proactive_origin` | The tool is not `place_call` (the relaxation is place_call-scoped) | Expected — `transfer_blind` / `send_dtmf` / `open_entry` are meaningless without a live call |
 
 The category is operator-log-only; the agent still receives the conservative

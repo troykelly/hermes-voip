@@ -1340,10 +1340,25 @@ async def _teardown(adapter: VoipAdapter, call_id: str, reason: CallEndReason) -
 
     Keeps each test's call explicit (no ``**dict`` splat that would erase the
     keyword types under ``mypy --strict``).
+
+    The mock engine reports RTCP INACTIVE — ``_rtcp_active=False`` with
+    ``_rtcp_dormant_reason=None`` — exactly as a freshly-constructed real engine
+    that processed no RTP does (``engine.py`` sets both to that at construction).
+    A bare ``MagicMock`` would instead yield a *truthy* ``_rtcp_active`` and a
+    ``call_quality`` whose fields are child mocks; since ADR-0102 (#423) the
+    teardown path feeds that snapshot to ``infer_media_anomalies``, which compares
+    ``remote_fraction_lost >= _ONE_WAY_PEER_LOSS`` and raises ``TypeError`` on a
+    ``MagicMock``. These tests exercise the call-end → session-signal chokepoint,
+    not RTCP quality emission, so the faithful no-op state (dormant path, log only)
+    is the correct engine contract here — no fabricated metrics.
     """
     transport = adapter._transport
     assert transport is not None
-    engine = MagicMock(stop=AsyncMock(return_value=None))
+    engine = MagicMock(
+        stop=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        _rtcp_dormant_reason=None,
+    )
     await adapter._teardown_call(
         call_id=call_id,
         engine=engine,

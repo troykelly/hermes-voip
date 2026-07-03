@@ -1281,7 +1281,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 ### Product features
 
-- [ ] **[medium] feature** — Outbound agents cannot send DTMF through callee IVRs because `send_dtmf` is ELEVATED while the outbound persona is level 0. (`src/hermes_voip/caller_modes.py`)
+- [ ] **[medium] feature** — Outbound agents cannot send DTMF through callee IVRs because `send_dtmf` is ELEVATED while the outbound persona is level 0. (`src/hermes_voip/caller_modes.py`) **Design record added 2026-07-03:** ADR-0104 (`docs/adr/0104-outbound-persona-dtmf-privilege.md`, Status: **Proposed**) recommends a direction-keyed **per-tool** `send_dtmf` grant to the outbound persona only (not a level bump; `open_entry`/transfers stay denied; inbound fails closed), **sequenced after ADR-0103's rate limit** (1380 → 1284) so the IVR-brute-force surface is bounded. Item stays open until the ADR is accepted and implemented.
 
 ## Wave-8 gap-review (discovered 2026-06-27, batch 2)
 

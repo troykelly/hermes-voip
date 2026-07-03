@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -556,3 +557,139 @@ async def test_degraded_health_clears_after_successful_reconnect() -> None:
         )
 
     await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# bk1321: structured SIP transport loss / retry / recovery SLO events.
+# Deterministic — the lost event is driven by a direct _on_connection_lost call
+# and the retry/recovery events by driving _reconnect_with_backoff() with a
+# patched _establish (fail once, then succeed). No sleep-based supervisor race.
+# ---------------------------------------------------------------------------
+
+# A gateway-host-shaped sentinel. ADR-0084 / rule 34: the raw transport exception
+# text (which can embed the gateway host) rides the EXISTING human WARNING prose,
+# but MUST NEVER reach the structured sip_transport_* event records — the no-leak
+# assertions prove that.
+_HOST_SENTINEL = "sip-gw-sentinel.invalid:5061 connection reset"
+
+_TRANSPORT_EVENTS: frozenset[str] = frozenset(
+    {"sip_transport_lost", "sip_transport_retry", "sip_transport_recovered"}
+)
+
+
+def _events_named(
+    caplog: pytest.LogCaptureFixture, name: str
+) -> list[logging.LogRecord]:
+    """Captured records carrying structured ``event == name``."""
+    return [r for r in caplog.records if getattr(r, "event", None) == name]
+
+
+def _assert_no_transport_leak(records: list[logging.LogRecord]) -> None:
+    """No sip_transport_* event record carries the host/exception sentinel."""
+    for record in records:
+        blob = f"{record.getMessage()} {record.__dict__!r}"
+        assert _HOST_SENTINEL not in blob, (
+            f"event {getattr(record, 'event', None)!r} leaked host/exc: {blob!r}"
+        )
+        assert "sip-gw-sentinel" not in blob, (
+            f"event {getattr(record, 'event', None)!r} leaked a host fragment"
+        )
+
+
+async def test_on_connection_lost_emits_transport_lost_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An exception-bearing drop emits sip_transport_lost reason='error' (bk1321).
+
+    The raw exception (host-shaped sentinel) rides the existing WARNING prose but
+    NOT the structured event, which carries only the reason category (ADR-0084).
+    """
+    adapter = VoipAdapter(_platform_config())
+    adapter._connected = True  # else _on_connection_lost returns at its guard
+    adapter._lost_event = asyncio.Event()
+
+    with caplog.at_level(logging.INFO, logger="hermes_voip.adapter"):
+        adapter._on_connection_lost(OSError(_HOST_SENTINEL))
+
+    lost = _events_named(caplog, "sip_transport_lost")
+    assert len(lost) == 1, f"expected one sip_transport_lost, got {len(lost)}"
+    # getattr: `reason` is a dynamic LogRecord extra attr (mypy-strict-safe read).
+    assert getattr(lost[0], "reason", None) == "error", (
+        f"exception drop must be reason='error', got "
+        f"{getattr(lost[0], 'reason', None)!r}"
+    )
+    _assert_no_transport_leak(lost)
+
+
+async def test_on_connection_lost_emits_transport_lost_clean(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A graceful (exception-free) close emits sip_transport_lost reason='clean'."""
+    adapter = VoipAdapter(_platform_config())
+    adapter._connected = True
+    adapter._lost_event = asyncio.Event()
+
+    with caplog.at_level(logging.INFO, logger="hermes_voip.adapter"):
+        adapter._on_connection_lost(None)
+
+    lost = _events_named(caplog, "sip_transport_lost")
+    assert len(lost) == 1
+    assert getattr(lost[0], "reason", None) == "clean"
+
+
+async def test_reconnect_backoff_emits_retry_then_recovered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed-then-successful reconnect emits sip_transport_retry + _recovered.
+
+    Drives ``_reconnect_with_backoff()`` directly with ``_establish`` patched to
+    fail once (raising the host sentinel) then succeed, backoff constants patched
+    to ~0. Asserts the retry event (attempt=1, consecutive_failures=1, backoff_s
+    float) and the recovery event (attempts=2, downtime_s float), and that neither
+    leaks the host/exception text (ADR-0084).
+    """
+    adapter = VoipAdapter(_platform_config())
+    adapter._connected = True
+    adapter._consecutive_failures = 0
+    adapter._transport = None
+    adapter._manager = None
+    adapter._lost_at = time.monotonic()  # a prior loss, for the downtime figure
+
+    establish_calls = 0
+
+    def _establish_fail_once() -> None:
+        nonlocal establish_calls
+        establish_calls += 1
+        if establish_calls == 1:
+            raise OSError(_HOST_SENTINEL)  # first attempt fails
+
+    with (
+        patch.object(
+            adapter, "_establish", new=AsyncMock(side_effect=_establish_fail_once)
+        ),
+        patch("hermes_voip.adapter._RECONNECT_BACKOFF_INITIAL", 0.001),
+        patch("hermes_voip.adapter._RECONNECT_BACKOFF_CAP", 0.001),
+        caplog.at_level(logging.INFO, logger="hermes_voip.adapter"),
+    ):
+        await adapter._reconnect_with_backoff()
+
+    assert establish_calls == 2, f"expected fail+success, got {establish_calls}"
+
+    # getattr: attempt/consecutive_failures/backoff_s/attempts/downtime_s are
+    # dynamic LogRecord extra attrs (mypy-strict-safe read; no # type: ignore).
+    retries = _events_named(caplog, "sip_transport_retry")
+    assert len(retries) == 1, f"expected one retry event, got {len(retries)}"
+    assert getattr(retries[0], "attempt", None) == 1
+    assert getattr(retries[0], "consecutive_failures", None) == 1
+    backoff = getattr(retries[0], "backoff_s", None)
+    assert isinstance(backoff, float)
+    assert backoff >= 0.0
+
+    recovered = _events_named(caplog, "sip_transport_recovered")
+    assert len(recovered) == 1, f"expected one recovered event, got {len(recovered)}"
+    assert getattr(recovered[0], "attempts", None) == 2
+    downtime = getattr(recovered[0], "downtime_s", None)
+    assert isinstance(downtime, float)
+    assert downtime >= 0.0
+
+    _assert_no_transport_leak(retries + recovered)

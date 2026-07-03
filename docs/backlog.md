@@ -1450,10 +1450,10 @@ Full read of `src/hermes_voip/sdp.py` (SDES `a=crypto` negotiation + keying, ICE
 ## Gap-review 2026-07-03 (media / stt / tts / auth — outside the ADR-0081 signaling campaign)
 
 A verified REPLENISH gap-review (7 read-only sub-reviewers; findings independently
-spot-checked, incl. a from-scratch repro of the TTS deadlock). The 3 HIGH robustness bugs
-shipped this wave; the 4 medium + 1 low are open. Confirmed-clean dimensions (no action):
-call_loop/rtp/rtcp, the injection guard (no fail-open under adversarial Unicode),
-srtp/srtcp, digest/keepalive/provider_error/caller_modes.
+spot-checked, incl. a from-scratch repro of the TTS deadlock). All 8 findings — the 3 HIGH
+robustness bugs plus the 4 medium + 1 low — shipped and merged (see the PR refs on each
+item). Confirmed-clean dimensions (no action): call_loop/rtp/rtcp, the injection guard (no
+fail-open under adversarial Unicode), srtp/srtcp, digest/keepalive/provider_error/caller_modes.
 
 - [x] (#404) **[high] robustness** — TTS barge-in deadlocked the WHOLE asyncio event loop
   (froze every concurrent call): `PcmFrameStream.cancel()` on the loop thread called
@@ -1504,3 +1504,28 @@ srtp/srtcp, digest/keepalive/provider_error/caller_modes.
   claims "round toward zero (int() truncation)" but `//` is floor division (rule 27); off by
   exactly 1 LSB on negative samples (no audible impact). Fix the comment or switch to true
   truncation. Bundle with an adjacent lane. (`src/hermes_voip/media/audio.py`)
+
+## Gap-review 2026-07-03 (wave 2 — observability / operability, both shipped)
+
+A second REPLENISH pass after the wave-1 robustness fixes above; two findings, both shipped
+and merged this wave. The pass otherwise re-confirmed the dimensions above as clean.
+
+- [x] (#415) **[medium] operability** — `plugin.validate_voip_config` (the Hermes enable
+  gate) checked SIP/media env *shape* but never that the selected providers can be *built*:
+  the config vocabulary accepted by `load_media_config` is a strict superset of the wired
+  `build_providers` dispatch map (e.g. TTS `piper`/`cartesia`, guard `sidecar` are valid
+  tokens with no factory), and a self-host provider with an unset/absent model dir also
+  passed — so a misconfig surfaced only one step later inside `adapter.connect()`. Fix: a
+  shallow, model-free `check_providers_buildable(config)` (reusing the SAME
+  `DEFAULT_*_FACTORIES` maps, so membership cannot drift) called from `validate_voip_config`
+  — rejects an unwired token or a missing/mis-pathed self-host model dir at the enable gate,
+  never the SIP password (runbook `docs/runbooks/0011-voip-enable-plugin.md`).
+  (`src/hermes_voip/providers/build.py`, `src/hermes_voip/plugin.py`)
+- [x] (#412) **[low] observability** — `IceConnection`'s only log — the RFC 8445
+  nominated-pair line — carried no structured `event` name and no call correlator, unlike
+  the ADR-0075 convention (`sip_registration_established`/`rtcp_call_quality`), so it could
+  not be tied to a call or grepped as a named event. Fix (purely additive): an optional
+  `call_id` correlator (default `None` = zero change for existing callers) plus
+  `extra={event: ice_pair_nominated, call_id, candidate_type}`, wired from both
+  `WebRtcMediaSession` construction sites. (`src/hermes_voip/media/ice.py`,
+  `src/hermes_voip/media/webrtc_session.py`, `src/hermes_voip/adapter.py`)

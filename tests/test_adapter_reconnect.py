@@ -613,8 +613,10 @@ async def test_on_connection_lost_emits_transport_lost_error(
 
     lost = _events_named(caplog, "sip_transport_lost")
     assert len(lost) == 1, f"expected one sip_transport_lost, got {len(lost)}"
-    assert lost[0].reason == "error", (
-        f"exception-bearing drop must be reason='error', got {lost[0].reason!r}"
+    # getattr: `reason` is a dynamic LogRecord extra attr (mypy-strict-safe read).
+    assert getattr(lost[0], "reason", None) == "error", (
+        f"exception drop must be reason='error', got "
+        f"{getattr(lost[0], 'reason', None)!r}"
     )
     _assert_no_transport_leak(lost)
 
@@ -632,7 +634,7 @@ async def test_on_connection_lost_emits_transport_lost_clean(
 
     lost = _events_named(caplog, "sip_transport_lost")
     assert len(lost) == 1
-    assert lost[0].reason == "clean"
+    assert getattr(lost[0], "reason", None) == "clean"
 
 
 async def test_reconnect_backoff_emits_retry_then_recovered(
@@ -673,17 +675,21 @@ async def test_reconnect_backoff_emits_retry_then_recovered(
 
     assert establish_calls == 2, f"expected fail+success, got {establish_calls}"
 
+    # getattr: attempt/consecutive_failures/backoff_s/attempts/downtime_s are
+    # dynamic LogRecord extra attrs (mypy-strict-safe read; no # type: ignore).
     retries = _events_named(caplog, "sip_transport_retry")
     assert len(retries) == 1, f"expected one retry event, got {len(retries)}"
-    assert retries[0].attempt == 1
-    assert retries[0].consecutive_failures == 1
-    assert isinstance(retries[0].backoff_s, float)
-    assert retries[0].backoff_s >= 0.0
+    assert getattr(retries[0], "attempt", None) == 1
+    assert getattr(retries[0], "consecutive_failures", None) == 1
+    backoff = getattr(retries[0], "backoff_s", None)
+    assert isinstance(backoff, float)
+    assert backoff >= 0.0
 
     recovered = _events_named(caplog, "sip_transport_recovered")
     assert len(recovered) == 1, f"expected one recovered event, got {len(recovered)}"
-    assert recovered[0].attempts == 2
-    assert isinstance(recovered[0].downtime_s, float)
-    assert recovered[0].downtime_s >= 0.0
+    assert getattr(recovered[0], "attempts", None) == 2
+    downtime = getattr(recovered[0], "downtime_s", None)
+    assert isinstance(downtime, float)
+    assert downtime >= 0.0
 
     _assert_no_transport_leak(retries + recovered)

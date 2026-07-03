@@ -58,6 +58,25 @@ the gateway.
    # If it goes to voicemail or gets a fast busy → not registered.
    ```
 
+**Structured transport events (ADR-0075, bk1321).** The SIP-over-TLS reconnect supervisor
+emits machine-parseable records so uptime and flap windows are queryable without grepping
+prose. Each carries ONLY non-sensitive fields — never the gateway host or the raw exception
+text (rule 34 / ADR-0084; the human WARNING prose still carries the exception for a person):
+
+| `event` | Emitted when | Key fields |
+|---------|--------------|------------|
+| `sip_transport_lost` | the TLS connection drops | `reason` (`error` = unexpected drop / `clean` = graceful close) |
+| `sip_transport_retry` | a reconnect attempt fails | `attempt`, `consecutive_failures`, `backoff_s` |
+| `sip_transport_recovered` | a reconnect succeeds | `attempts` (tries incl. the success), `downtime_s` |
+
+```bash
+# Flap count (unexpected drops) + total downtime over a window (JSON logs):
+jq -c 'select(.event=="sip_transport_lost" and .reason=="error")' /path/to/hermes/log.jsonl | wc -l
+jq -r 'select(.event=="sip_transport_recovered") | .downtime_s' /path/to/hermes/log.jsonl | paste -sd+ | bc
+# A flapping link shows sip_transport_retry with a rising consecutive_failures:
+jq -r 'select(.event=="sip_transport_retry") | .consecutive_failures' /path/to/hermes/log.jsonl | sort -n | tail -1
+```
+
 **Metrics to emit (future):**
 - `voip.registration.uptime` — gauge, 0–1 (0 = not registered, 1 = registered).
 - `voip.registration.expires` — gauge, seconds until next re-register.

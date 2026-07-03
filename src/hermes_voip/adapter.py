@@ -984,6 +984,10 @@ class VoipAdapter(BasePlatformAdapter):
         self._lost_event: asyncio.Event = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
         self._consecutive_failures: int = 0
+        # Monotonic time of the last connection loss (set by _on_connection_lost),
+        # used only to compute the sip_transport_recovered downtime_s. 0.0 = no
+        # loss recorded yet (a first connect has nothing to recover from).
+        self._lost_at: float = 0.0
 
         # Per-call state: {call_id → CallLoop}
         self._call_loops: dict[str, CallLoop] = {}
@@ -6875,6 +6879,19 @@ class VoipAdapter(BasePlatformAdapter):
             _log.warning("SIP-over-TLS connection lost: %s", exc)
         else:
             _log.warning("SIP-over-TLS connection closed cleanly — will reconnect")
+        self._lost_at = time.monotonic()
+        # Structured SLO event (bk1321, ADR-0075): a SEPARATE record from the WARNING
+        # prose above so it carries ONLY the reason CATEGORY — never str(exc)/the
+        # gateway host (rule 34 / ADR-0084). ``reason`` distinguishes an unexpected
+        # drop ("error") from a graceful close ("clean") so a flap query can exclude
+        # clean closes.
+        _log.info(
+            "sip transport lost",
+            extra={
+                "event": "sip_transport_lost",
+                "reason": "error" if exc is not None else "clean",
+            },
+        )
         self._lost_event.set()
 
     def _on_cancel(self, call_id: str) -> None:
@@ -6993,6 +7010,19 @@ class VoipAdapter(BasePlatformAdapter):
                         "failures; inbound calls go to voicemail until restored",
                         self._consecutive_failures,
                     )
+                # Structured SLO event (bk1321, ADR-0075): a SEPARATE record — never
+                # str(exc)/the gateway host (rule 34 / ADR-0084). attempt +
+                # consecutive_failures make a flap window queryable; backoff_s is the
+                # actual (jittered) delay before the next try.
+                _log.info(
+                    "sip transport reconnect retry",
+                    extra={
+                        "event": "sip_transport_retry",
+                        "attempt": attempt,
+                        "consecutive_failures": self._consecutive_failures,
+                        "backoff_s": actual_delay,
+                    },
+                )
                 # ``disconnect()`` may have set ``_connected = False`` while we
                 # were suspended in the awaits above; mypy narrows the type to
                 # ``True`` at the top-of-loop guard and sees the body of this
@@ -7008,6 +7038,19 @@ class VoipAdapter(BasePlatformAdapter):
                     )
                 else:
                     _log.info("SIP connection re-established")
+                # Structured SLO event (bk1321, ADR-0075): the transport is back up.
+                # attempts = the failed tries + this success; downtime_s is measured
+                # from the last recorded loss (_lost_at), 0.0 if none. No host/exc
+                # rides this record (rule 34 / ADR-0084).
+                downtime = time.monotonic() - self._lost_at if self._lost_at else 0.0
+                _log.info(
+                    "sip transport recovered",
+                    extra={
+                        "event": "sip_transport_recovered",
+                        "attempts": attempt + 1,
+                        "downtime_s": downtime,
+                    },
+                )
                 self._consecutive_failures = 0
                 return
 

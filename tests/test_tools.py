@@ -20,6 +20,7 @@ from hermes_voip.tools import (
     CallControlTools,
     gate_voip_tool,
 )
+from hermes_voip.voip_tools import HANG_UP_TOOL_NAME, REPORT_RESULT_TOOL_NAME
 
 
 class _FakeCall:
@@ -130,6 +131,17 @@ def test_tool_risk_map_is_correct() -> None:
     # intercom group's allowed_tools sub-ceiling restricting it to that group.
     assert TOOL_RISKS["send_dtmf"] is ToolRisk.ELEVATED
     assert TOOL_RISKS["open_entry"] is ToolRisk.ELEVATED
+
+
+def test_safe_tool_set_is_locked_to_hang_up_and_report_call_result() -> None:
+    # LOCK (codex hardening for the SAFE-bypass fix). gate_voip_tool EXEMPTS SAFE tools
+    # from the ADR-0031 allowed_tools sub-ceiling, so a tool ever (mis)classified SAFE
+    # would silently bypass a scoped caller group's allow-list (e.g. open the door for a
+    # spoofed intercom caller). Pin the COMPLETE set of SAFE-risk tools to EXACTLY
+    # {hang_up, report_call_result}: adding or moving any tool into SAFE must be a loud,
+    # reviewable CI failure that forces a deliberate re-check of the exemption above.
+    safe_tools = {name for name, risk in TOOL_RISKS.items() if risk is ToolRisk.SAFE}
+    assert safe_tools == {HANG_UP_TOOL_NAME, REPORT_RESULT_TOOL_NAME}
 
 
 def test_gate_voip_tool_unknown_tool_denied() -> None:

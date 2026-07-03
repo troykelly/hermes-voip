@@ -80,11 +80,11 @@ class _FluxSocket(Protocol):
 
     Both the real ``websockets`` connection and the test fake satisfy this.
     Frames yielded by async iteration are normally Deepgram Flux JSON events as
-    text (``str``); a websocket BINARY frame surfaces as ``bytes`` (the
-    underlying ``websockets`` library only UTF-8-validates TEXT frames, so a
-    binary or otherwise invalid-UTF-8 frame reaches the caller as raw bytes,
-    not a decode error). ``send`` accepts bytes (mu-law audio) OR str (control
-    messages); ``close`` ends the session.
+    text (``str``); a websocket BINARY frame surfaces as ``bytes`` — the
+    underlying ``websockets`` library delivers BINARY frames as raw bytes and
+    UTF-8-validates only TEXT frames, so those bytes need not be valid UTF-8 (or
+    JSON). ``send`` accepts bytes (mu-law audio) OR str (control messages);
+    ``close`` ends the session.
     """
 
     async def send(self, data: bytes | str) -> None: ...
@@ -289,11 +289,12 @@ def _parse_flux_frame(raw: bytes | str) -> tuple[str, str] | None:
     at WARNING level with a safe summary (NO raw frame content — rule 34).
     Genuine task/connection failures propagate normally (rule 37).
 
-    ``raw`` may be ``bytes`` (a websocket BINARY frame, or a TEXT frame that is
-    not valid UTF-8): ``json.loads`` UTF-8-decodes ``bytes`` internally and can
-    raise ``UnicodeDecodeError`` — a ``ValueError`` subclass distinct from
-    ``json.JSONDecodeError`` — which is caught here alongside it so a single
-    binary/malformed frame is skipped rather than killing the receive loop.
+    ``raw`` may be ``bytes`` — a websocket BINARY frame, which the ``websockets``
+    library delivers as raw, non-UTF-8-validated bytes. ``json.loads``
+    UTF-8-decodes ``bytes`` internally and can raise ``UnicodeDecodeError`` — a
+    ``ValueError`` subclass distinct from ``json.JSONDecodeError`` — which is
+    caught here alongside it so a single binary/malformed frame is skipped
+    rather than killing the receive loop.
     """
     try:
         event = json.loads(raw)

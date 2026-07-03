@@ -264,6 +264,33 @@ and **only** when there is no live SIP call in scope; it never affects an inboun
    receives `[Outbound call to '<number>' ended (…): <summary>]`. Dialling an **un-approved**
    number returns an error to the agent and sends no INVITE.
 
+## Diagnosing a blocked proactive `place_call` (ADR-0101, issue #414)
+
+When a proactive (no-live-call) `place_call` is refused, the gate logs a generic
+block (`gate_voip_tool BLOCK … reason=insufficient_privilege`) AND, at WARNING, a
+structured diagnostic carrying the **non-sensitive** cause CATEGORY:
+
+```
+proactive place_call gate denied (reason=<category>)
+  extra={"event": "proactive_place_call_gate", "reason": "<category>", "tool": "place_call"}
+```
+
+Grep `event=proactive_place_call_gate` (or the `reason=` token) and act on the
+category — the origin platform / chat_id / `HERMES_VOIP_PROACTIVE_CALL_FROM`
+contents are secrets and are **never** logged (rule 34), so only the category
+appears:
+
+| `reason` | What it means | Operator action |
+| -------- | ------------- | --------------- |
+| `proactive_allow_unset` | `HERMES_VOIP_PROACTIVE_CALL_FROM` is empty/unset (proactive calling not opted in) | Set it to the triggering `platform:chat_id` (see "Proactive outbound from an operator chat" above) |
+| `origin_unavailable` | The originating `(platform, chat_id)` could not be read from `gateway.session_context` | Trigger from a supported platform session; check the session context is populated |
+| `origin_not_allowlisted` | The origin was read but its `platform:chat_id` matches no configured entry | Add the origin (exact or `telegram:*` wildcard) to `HERMES_VOIP_PROACTIVE_CALL_FROM` |
+| `live_call_guard_missing` | A live Call-ID is in scope but its guard state is missing; the inbound fail-safe deliberately bypasses proactive relaxation here | Not a proactive path — investigate the missing live-call guard state; do NOT expect the proactive origin to grant here |
+| `unsupported_tool_for_proactive_origin` | The tool is not `place_call` (the relaxation is place_call-scoped) | Expected — `transfer_blind` / `send_dtmf` / `open_entry` are meaningless without a live call |
+
+The category is operator-log-only; the agent still receives the conservative
+`The place_call tool is not permitted on this call.` message (no policy leak).
+
 ## Aborting a ringing outbound call (CANCEL — ADR-0069, RFC 3261 §9.1)
 
 This outbound CANCEL path is currently implemented for the **TLS SIP UAC**. On the

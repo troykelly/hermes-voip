@@ -200,6 +200,27 @@ def test_non_numeric_content_length_is_a_framing_error() -> None:
         list(framer)
 
 
+def test_overlong_content_length_is_a_framing_error_not_value_error() -> None:
+    """A Content-Length above CPython's int-string digit limit is a FramingError.
+
+    ``isascii()`` + ``isdecimal()`` admit an all-digit value, but ``int()`` then raises
+    a bare ``ValueError`` ("Exceeds the limit (4300 digits) for integer string
+    conversion") for a value with > ~4300 digits. The framer must fold that into its
+    ``FramingError`` contract: ``feed``/iteration runs in ``_read_loop`` OUTSIDE the
+    ADR-0098 dispatch backstop, so a bare ``ValueError`` there would unwind the whole
+    connection (every call + the registration) with a confusing internal error instead
+    of the framer's clean, intended stream-fault path.
+    """
+    framer = SipMessageFramer()
+    framer.feed(
+        b"SIP/2.0 200 OK\r\n"
+        b"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bK1\r\n"
+        b"Content-Length: " + b"9" * 5000 + b"\r\n\r\n"
+    )
+    with pytest.raises(FramingError):
+        list(framer)
+
+
 def test_head_without_terminator_is_capped_to_bound_memory() -> None:
     framer = SipMessageFramer()
     framer.feed(b"A" * (64 * 1024 + 1))  # never a CRLFCRLF

@@ -143,11 +143,14 @@ class GuardSessionState:
         allowed_tools: An optional per-session tool allow-list — a SUB-ceiling
             below ``privilege_level`` (ADR-0031). EMPTY (the default) means "no
             sub-ceiling": the level alone gates, reproducing every existing
-            decision. A NON-EMPTY set scopes the session to ONLY those tool names:
-            :func:`~hermes_voip.tools.gate_voip_tool` blocks any tool not listed
-            BEFORE the level/risk check, so the set can only REMOVE tools, never
-            grant one above the level. Set from the caller group at INVITE time
-            (the intercom group is scoped to just its entry action).
+            decision. A NON-EMPTY set scopes the session's SENSITIVE surface to ONLY
+            those tool names: :func:`~hermes_voip.tools.gate_voip_tool` blocks any
+            NON-SAFE (ELEVATED/IRREVERSIBLE) tool not listed before the level/risk
+            check, so the set can only REMOVE tools, never grant one above the level.
+            SAFE tools (``hang_up`` / ``report_call_result``) are EXEMPT and always
+            run, so a scoped group never loses the ability to end/record its own call.
+            Set from the caller group at INVITE time (the intercom group is scoped to
+            just its entry action).
         flagged_turns: Identifiers of turns flagged for audit during the call.
     """
 
@@ -186,8 +189,9 @@ class GuardSessionState:
                 ``False`` → 0. No current call site supplies both.
             allowed_tools: Optional tool-name allow-list (ADR-0031). EMPTY (the
                 default) = no sub-ceiling (level-only gating, the existing
-                behaviour). A NON-EMPTY set scopes the session to ONLY those tools
-                (a sub-ceiling that can only remove, never grant above the level).
+                behaviour). A NON-EMPTY set scopes the session's SENSITIVE surface to
+                ONLY those tools (a sub-ceiling that can only remove non-SAFE tools,
+                never grant above the level); SAFE tools are always allowed.
         """
         self.call_id = call_id
         self.degraded = degraded

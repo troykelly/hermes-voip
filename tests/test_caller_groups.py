@@ -1356,6 +1356,40 @@ def test_known_channel_is_limited_no_place_call_or_transfer_or_open_entry() -> N
         )
 
 
+def test_scoped_channels_still_reach_the_safe_conversational_tools() -> None:
+    """Regression: a scoped caller group NEVER loses the SAFE conversational tools.
+
+    Both shipped scoped groups carry a non-empty ``allowed_tools`` sub-ceiling that
+    OMITS the SAFE tools — voip-intercom={open_entry}, voip-known={hold_call,
+    resume_call}. The sub-ceiling clamps only ELEVATED/IRREVERSIBLE tools: ``hang_up``
+    and ``report_call_result`` are SAFE (ADR-0026/0029, "SAFE always runs, never
+    gated"), so the call agent can always END and RECORD its own call inside a scoped
+    group. Before the fix the sub-ceiling ran BEFORE the risk classification and
+    removed these SAFE tools too, so an intercom agent could open the door but could
+    not hang up the call — the exact usability gap the gate exists to avoid.
+    """
+    for channel in ("voip-intercom", "voip-known"):
+        state = _guard_for(_channel_group(channel))
+        assert state.allowed_tools, f"{channel} must carry a scoping allowed_tools set"
+        # SAFE conversational tools are reachable despite the scoped allow-list.
+        assert gate_voip_tool("hang_up", state, confirmed=False) is True, (
+            f"{channel} must still reach hang_up (SAFE)"
+        )
+        assert gate_voip_tool("report_call_result", state, confirmed=False) is True, (
+            f"{channel} must still reach report_call_result (SAFE)"
+        )
+        # ...and the sub-ceiling STILL clamps the non-SAFE tools outside the grant:
+        # send_dtmf (ELEVATED) and transfer_blind (IRREVERSIBLE) are in NEITHER scoped
+        # set, so both groups deny them — even though voip-known's level (2) alone would
+        # otherwise permit the ELEVATED send_dtmf. The clamp is unchanged for non-SAFE.
+        assert gate_voip_tool("send_dtmf", state, confirmed=True) is False, (
+            f"{channel} must NOT expose send_dtmf (ELEVATED, not granted)"
+        )
+        assert gate_voip_tool("transfer_blind", state, confirmed=True) is False, (
+            f"{channel} must NOT expose transfer_blind (IRREVERSIBLE)"
+        )
+
+
 def test_operator_channel_exposes_the_full_tool_set() -> None:
     """voip-operator reaches every tool (IRREVERSIBLE still needs confirmation).
 

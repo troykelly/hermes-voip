@@ -7,6 +7,7 @@ register_platform calls without any real Hermes runtime.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -430,6 +431,80 @@ def test_validate_config_raises_on_missing_selected_provider_key() -> None:
         validate_voip_config(cfg)
 
     assert "deepgram" in str(exc_info.value)
+    assert "fake-password" not in str(exc_info.value)
+
+
+def test_validate_config_rejects_unwired_provider_token() -> None:
+    """A config-valid-but-unwired provider token is rejected at the preflight gate.
+
+    ``HERMES_VOIP_TTS_PROVIDER=piper`` passes ``load_media_config`` (``piper`` is in
+    the config *vocabulary*) but has no factory in ``build_providers``' dispatch map,
+    so the call would only fail one step later inside ``adapter.connect()``. The
+    plugin preflight must reject it here, at the dedicated config gate — naming the
+    offending token, never the SIP password.
+    """
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    cfg = MagicMock()
+    cfg.extra = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "fake-password",
+        "HERMES_VOIP_TTS_PROVIDER": "piper",
+    }
+
+    with pytest.raises(ConfigError, match="piper") as exc_info:
+        validate_voip_config(cfg)
+
+    assert "fake-password" not in str(exc_info.value)
+
+
+def test_validate_config_rejects_missing_self_host_model_dir() -> None:
+    """A self-host provider selected without its model dir is rejected at preflight.
+
+    A bare SIP env selects the ``sherpa-onnx`` STT default, whose model directory is
+    unset — ``build_providers`` raises ``ConfigError`` for exactly this at connect().
+    The plugin preflight must reject it at the enable gate instead, naming the env
+    var (never the password).
+    """
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    cfg = MagicMock()
+    cfg.extra = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "fake-password",
+    }
+
+    with pytest.raises(ConfigError, match="HERMES_VOIP_STT_MODEL_DIR") as exc_info:
+        validate_voip_config(cfg)
+
+    assert "fake-password" not in str(exc_info.value)
+
+
+def test_validate_config_rejects_nonexistent_model_dir(tmp_path: Path) -> None:
+    """A self-host model directory that is set but does not exist is rejected.
+
+    A fat-fingered ``HERMES_VOIP_STT_MODEL_DIR`` pointing at a missing path passes
+    ``load_media_config`` (which never stats the path), but ``build_providers`` could
+    not load a model from it. The preflight rejects it, naming the env key and that
+    the directory does not exist — never the password.
+    """
+    from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
+
+    missing = tmp_path / "no-such-stt-model-dir"
+    cfg = MagicMock()
+    cfg.extra = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_SIP_EXTENSION": "1000",
+        "HERMES_SIP_PASSWORD": "fake-password",
+        "HERMES_VOIP_STT_MODEL_DIR": str(missing),
+    }
+
+    with pytest.raises(ConfigError, match="HERMES_VOIP_STT_MODEL_DIR") as exc_info:
+        validate_voip_config(cfg)
+
+    assert "does not exist" in str(exc_info.value)
     assert "fake-password" not in str(exc_info.value)
 
 

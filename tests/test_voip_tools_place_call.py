@@ -646,7 +646,8 @@ def test_gate_proactive_deny_log_never_leaks_origin(
     """The deny event carries the category ONLY — never a sensitive origin value.
 
     The originating platform, chat_id, and ``HERMES_VOIP_PROACTIVE_CALL_FROM``
-    allowlist entries are secrets: none may appear in ANY field of ANY log record.
+    allowlist entries are secrets: none may appear in the proactive-gate event
+    surface (message + structured fields the event owns).
     """
     monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:999")
     set_active_adapter(None)
@@ -657,7 +658,19 @@ def test_gate_proactive_deny_log_never_leaks_origin(
         voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={})
 
     sensitive = ("telegram", "123", "999", "telegram:999")
-    for record in caplog.records:
-        blob = str(vars(record)) + record.getMessage()
+    events = _proactive_gate_records(caplog.records)
+    assert len(events) == 1
+    # Scan only the log surface controlled by the proactive-gate event: rendered
+    # message + structured extras. Do NOT stringify the whole LogRecord dict — stdlib
+    # metadata such as relativeCreated/process/thread can coincidentally contain a
+    # short numeric sentinel (CI hit `999` in a timestamp), causing a false redaction
+    # failure even when the production event is clean.
+    for record in events:
+        surface = [record.getMessage()]
+        for field in ("event", "reason", "tool"):
+            value = getattr(record, field, None)
+            if value is not None:
+                surface.append(str(value))
+        blob = " | ".join(surface)
         for secret in sensitive:
             assert secret not in blob

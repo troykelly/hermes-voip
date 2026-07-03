@@ -374,6 +374,37 @@ async def test_teardown_emits_structured_rtcp_dormant_event(
     assert rec.dormant_reason == "secured_rtcp_not_enabled"  # type: ignore[attr-defined]
 
 
+async def test_teardown_dormant_without_reason_logs_not_negotiated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dormant call with no reason set still logs a fixed code, never ``None``.
+
+    A call torn down BEFORE any RTCP activation decision was reached
+    (``_rtcp_dormant_reason`` still ``None`` — e.g. an early setup failure before SDP
+    negotiation) must STILL emit a machine-parseable ``rtcp_dormant`` record with a
+    fixed reason code, never ``dormant_reason=None``. The teardown log coalesces
+    ``None`` to ``"not_negotiated"`` so a log pipeline can always key on the reason.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    call_id = new_call_id()
+    session = _FakeSession(ended=True, call_id=call_id)
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # _FakeSession is a CallSession test double
+
+    with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+        await adapter._teardown_call(
+            call_id=call_id,
+            engine=_rtcp_dormant_engine(dormant_reason=None),
+            transport=transport,  # type: ignore[arg-type]  # fake transport double
+            dialog_id=session.dialog_id,
+            session=session,  # type: ignore[arg-type]  # _FakeSession double
+            reason=CallEndReason.REMOTE_BYE,
+        )
+
+    rec = _record_with_event(caplog, "rtcp_dormant")
+    assert rec.dormant_reason == "not_negotiated"  # type: ignore[attr-defined]
+
+
 async def test_teardown_active_rtcp_emits_no_dormant_event(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

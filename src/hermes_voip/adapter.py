@@ -5623,14 +5623,18 @@ class VoipAdapter(BasePlatformAdapter):
             # dormant_reason is threaded from the activation planning result
             # (_RtcpActivation / _plan_rtcp_activation / _plan_secured_rtcp_activation
             # / _activate_muxed_srtcp_rtcp, via _rtcp_dormant_reason) or set directly
-            # by start_rtcp's own last-line guards; ``None`` only when teardown ran
-            # before RTCP activation was ever attempted (e.g. a very early setup
-            # failure). Same PUBLIC-repo safety as above (rule 34): the reason is a
-            # fixed short code, never caller identity.
+            # by start_rtcp's own dormant guards. It is ``None`` only when teardown
+            # ran before RTCP activation was ever attempted (e.g. a very early setup
+            # failure before SDP negotiation) — coalesce that to the fixed code
+            # "not_negotiated" so the event ALWAYS carries a machine-parseable reason
+            # and never emits `None` (the whole point is to distinguish "no RTCP
+            # data" from "RTCP failed to report"). Same PUBLIC-repo safety as above
+            # (rule 34): the reason is a fixed short code, never caller identity.
+            dormant_reason = engine._rtcp_dormant_reason or "not_negotiated"
             _log.info(
                 "INVITE %s: RTCP dormant — no call quality data (reason=%s)",
                 call_id,
-                engine._rtcp_dormant_reason,
+                dormant_reason,
                 # Machine-parseable mirror (runbook 0014 style): a log pipeline
                 # filters on event='rtcp_dormant' to distinguish "no RTCP data"
                 # from "RTCP activated then failed to report" (which instead shows
@@ -5638,7 +5642,7 @@ class VoipAdapter(BasePlatformAdapter):
                 extra={
                     "event": "rtcp_dormant",
                     "call_id": call_id,
-                    "dormant_reason": engine._rtcp_dormant_reason,
+                    "dormant_reason": dormant_reason,
                 },
             )
         try:

@@ -88,8 +88,19 @@ its lifecycle. The events:
 | `call_answered` | the inbound `200 OK` is sent | `call_id`, `outcome="answered"`, `sip_code=200` |
 | `call_loop_started` | the conversational loop goes live | `call_id`, `direction` (`inbound`/`outbound`) |
 | `call_released` | the admission slot is freed at teardown | `call_id`, `duration_s`, `active_calls` |
+| `outbound_invite_sent` | an outbound (`place_call`) INVITE leaves the UAC | `call_id`, `transport="tls"` |
+| `outbound_call_connected` | the outbound `2xx` answer establishes the session | `call_id`, `transport`, `codec` (negotiated name) |
+| `outbound_call_failed` | the outbound dial fails (non-2xx / refused 2xx / CANCEL / error) | `call_id`, `transport`, `category` (`busy`/`no_answer`/`declined`/`failed`) |
 
 Setup success ≈ `count(call_answered) / (count(call_answered) + count(call_rejected))`.
+
+**Outbound setup success** (agent-placed calls, ADR-0075) ≈
+`count(outbound_call_connected) / count(outbound_invite_sent)`; the `outbound_call_failed`
+`category` (the SAME ADR-0086 value the `place_call` tool result carries, so logs and tool
+outcome never diverge) breaks failures into busy / no-answer / declined / other. These carry
+ONLY `call_id` + fixed context — never the dialled number, gateway host, or SIP reason
+phrase (rule 34 / ADR-0084). They cover the SIP-over-TLS outbound path; instrumenting the
+WSS/WebRTC outbound UAC with the same events is a follow-up (backlog).
 
 **Media-transport loss (ADR-0100).** When the RTP socket reports a fatal `error_received`
 the media engine ends the call and emits a `rtp_transport_lost` event (WARNING) carrying
@@ -117,6 +128,10 @@ jq -c 'select(.event=="call_answered")'  /path/to/hermes/log.jsonl | wc -l
 jq -c 'select(.event=="call_rejected")'  /path/to/hermes/log.jsonl | wc -l
 # Reject breakdown by SIP code + reason token:
 jq -r 'select(.event=="call_rejected") | "\(.sip_code) \(.reason)"' /path/to/hermes/log.jsonl | sort | uniq -c
+# Outbound setup success = connected / invite_sent; failures broken down by category:
+jq -c 'select(.event=="outbound_invite_sent")'    /path/to/hermes/log.jsonl | wc -l
+jq -c 'select(.event=="outbound_call_connected")' /path/to/hermes/log.jsonl | wc -l
+jq -r 'select(.event=="outbound_call_failed") | .category' /path/to/hermes/log.jsonl | sort | uniq -c
 ```
 
 The human-readable text is still greppable for plain-text logs:

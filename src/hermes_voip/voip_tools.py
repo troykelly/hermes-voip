@@ -105,6 +105,7 @@ __all__ = [
     "hold_call_handler",
     "list_registrations_handler",
     "open_entry_handler",
+    "outbound_failure_category",
     "place_call_handler",
     "register_voip_tools",
     "report_call_result_handler",
@@ -302,6 +303,38 @@ def _classify_outbound_failure(exc: OutboundCallFailed) -> PlaceCallOutcome:
     if exc.status in _DECLINED_STATUSES:
         return PlaceCallOutcome.DECLINED
     return PlaceCallOutcome.FAILED
+
+
+def outbound_failure_category(exc: Exception) -> str:
+    """Classify an outbound-dial failure into its stable ADR-0086 category string.
+
+    The single source of truth for the failure CATEGORY surfaced BOTH in the
+    agent-facing ``place_call`` tool result (via :func:`_classify_outbound_failure`
+    and the ``place_call_handler`` branches) AND in the adapter's
+    ``outbound_call_failed`` SLO log event (ADR-0075) — so the two never diverge.
+
+    Returns ONLY the fixed category value string
+    (``"busy"`` / ``"no_answer"`` / ``"declined"`` / ``"failed"``) — NEVER the SIP
+    reason phrase, the gateway host, the dialled target, or the exception message.
+    Gateway connection detail on the SIP/media path is public-repo-sensitive even
+    though it is not a secret (rule 34 / ADR-0084 lesson), so a caller may log the
+    returned value freely.
+
+    * :class:`~hermes_voip.originate.OutboundCallFailed` — mapped by SIP status via
+      :func:`_classify_outbound_failure` (486/600 busy, 408/487 no-answer, 603
+      declined, else failed).
+    * :class:`~hermes_voip.originate.OutboundCallCancelled` — our own ring-timeout /
+      abort CANCEL (ADR-0069): the caller stopped waiting on an unanswered call, so
+      the outcome is ``NO_ANSWER`` (the SAME mapping ``place_call_handler`` applies).
+    * Any other exception (a transport/media-init ``RuntimeError``, including the WSS
+      ``NotImplementedError``, or an unexpected error on the dial path) — the
+      catch-all ``FAILED`` outcome, mirroring the handler's ``RuntimeError`` branch.
+    """
+    if isinstance(exc, OutboundCallFailed):
+        return _classify_outbound_failure(exc).value
+    if isinstance(exc, OutboundCallCancelled):
+        return PlaceCallOutcome.NO_ANSWER.value
+    return PlaceCallOutcome.FAILED.value
 
 
 #: The Hermes ``chat_id`` (== SIP Call-ID) session-context variable name.

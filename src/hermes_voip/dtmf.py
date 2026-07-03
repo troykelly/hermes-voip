@@ -473,6 +473,17 @@ _INBAND_MAX_HARMONIC_CORROBORATION: Final[float] = 0.25
 # Debounce: a digit must persist this many consecutive validated frames before it
 # emits (one 20 ms frame is enough to flag a glitch; ~2 frames = a real press).
 _INBAND_MIN_PRESS_FRAMES: Final[int] = 2
+# Release hysteresis: how many CONSECUTIVE gap (no-validated-tone) frames count as a
+# real inter-digit release, after which a held digit is allowed to emit again. A
+# single dropped or momentarily-silent frame mid-press (packet loss, an AEC transient,
+# a frame that dips below the energy floor) must NOT re-arm the detector — that would
+# let the same continuing tone emit a spurious duplicate digit, which is
+# security-sensitive (a digit can resolve an ADR-0009 confirmation). At the 20 ms frame
+# cadence 3 frames = 60 ms: it tolerates up to two consecutive dropped frames yet stays
+# well under any genuine inter-digit pause a caller produces (>= ~100 ms in practice, vs
+# the 40 ms ITU-T Q.24 theoretical floor), so distinct back-to-back presses of the same
+# digit still register as two.
+_INBAND_GAP_RELEASE_FRAMES: Final[int] = 3
 
 
 def inband_tone_pcm(
@@ -569,7 +580,9 @@ class InbandDtmfDetector:
     bounded and the low tone's second harmonic not rivalling the high group (the
     classic voiced-speech rejecter). A candidate must persist for a minimum number
     of consecutive validated frames (debounce) before it emits, exactly once per
-    press; the digit re-arms only after a frame with no validated tone (a gap).
+    press; the digit re-arms only after a SUSTAINED gap (``_INBAND_GAP_RELEASE_FRAMES``
+    consecutive frames with no validated tone), so a single dropped or momentarily-
+    silent frame mid-press does not re-arm it and cannot produce a duplicate digit.
 
     In-band is trusted ONLY on clean G.711 (ADR-0005), so the detector analyses at
     8 kHz. Feed it the AEC-cleaned decoded frame (ADR-0033) so the agent's own
@@ -583,11 +596,17 @@ class InbandDtmfDetector:
             raise ValueError(msg)
         self._sample_rate = sample_rate
         # The digit currently being held (debounced + already emitted), or None
-        # between presses. A new press must differ from this OR follow a gap.
+        # between presses. A new press must differ from this OR follow a sustained
+        # gap (release); a single dropped/silent frame does not clear it.
         self._emitted: str | None = None
         # The candidate digit accumulating consecutive validated frames, and its run.
         self._candidate: str | None = None
         self._run = 0
+        # Consecutive gap (no-validated-tone) frames seen while a press is held, for
+        # release hysteresis: the held press clears only after
+        # _INBAND_GAP_RELEASE_FRAMES of them, so a single dropped/silent frame
+        # mid-press does not re-arm.
+        self._gap_run = 0
 
     def feed(self, pcm16: bytes) -> str | None:
         """Process one PCM16-LE mono frame; return a digit on a new press, else None.
@@ -599,12 +618,23 @@ class InbandDtmfDetector:
         """
         digit = self._detect_frame(pcm16)
         if digit is None:
-            # A gap frame: the held press ends, so the next press (even the same
-            # digit) is a fresh key-press.
-            self._emitted = None
+            # A gap frame. A partial (not-yet-emitted) candidate never survives a gap.
             self._candidate = None
             self._run = 0
+            # Release hysteresis: a SINGLE dropped or momentarily-silent frame
+            # mid-press must NOT re-arm the detector, or the same continuing tone
+            # would emit a spurious duplicate digit. Only a sustained gap counts as a
+            # release: keep the emitted press until _INBAND_GAP_RELEASE_FRAMES
+            # consecutive gap frames, then allow that digit to be pressed again.
+            if self._emitted is not None:
+                self._gap_run += 1
+                if self._gap_run >= _INBAND_GAP_RELEASE_FRAMES:
+                    self._emitted = None
+                    self._gap_run = 0
             return None
+        # A validated tone frame: the tone is present, so any release in progress is
+        # cancelled (an intermittent single-frame dropout does not accumulate).
+        self._gap_run = 0
         if digit == self._candidate:
             self._run += 1
         else:

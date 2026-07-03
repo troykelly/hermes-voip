@@ -706,6 +706,81 @@ class TestFingerprintBeforeKeying:
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed: no agreed DTLS-SRTP profile must ABORT keying (not silently
+# default to the strong suite) — mirroring selected_profile()'s conversion.
+# ---------------------------------------------------------------------------
+
+
+class TestSrtpProfileFailClosed:
+    """derive_* must fail closed when RFC 5764 use_srtp agreed no profile.
+
+    ``get_selected_srtp_profile()`` returns ``b""`` when the DTLS-SRTP profile
+    negotiation produced no agreed suite (any other unmapped value is an
+    unrecognised profile). The historical code did
+    ``_PROFILE_TO_SUITE.get(raw, _SUITE_80)`` — silently ASSUMING the 80-bit-tag
+    suite, masking a real negotiation failure. :meth:`DtlsEndpoint.selected_profile`
+    already converts the SAME raw value fail-closed (RuntimeError); the derive_*
+    methods must do the same so a keying call on an un-negotiated profile aborts
+    rather than proceeding on an assumed suite (it was never a downgrade — the
+    default was the stronger suite — but it hid the failure).
+    """
+
+    @staticmethod
+    def _verified_pair() -> tuple[DtlsEndpoint, DtlsEndpoint]:
+        """A fresh handshaked + fingerprint-verified ``(client, server)`` pair.
+
+        Deliberately NOT the module-scoped ``dtls_pair`` fixture: these tests
+        monkeypatch the endpoint's selected-profile accessor, which must not leak
+        into the shared fixture other tests reuse.
+        """
+        client = DtlsEndpoint(role=DtlsRole.CLIENT)
+        server = DtlsEndpoint(role=DtlsRole.SERVER)
+        _pump_handshake(client, server)
+        client.verify_peer_fingerprint(server.fingerprint())
+        server.verify_peer_fingerprint(client.fingerprint())
+        return client, server
+
+    def test_derive_srtp_sessions_fails_closed_on_no_agreed_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """derive_srtp_sessions raises (not silently keys) when no profile agreed."""
+        client, _server = self._verified_pair()
+        # b"" is exactly what pyOpenSSL returns when use_srtp agreed no profile.
+        monkeypatch.setattr(client._conn, "get_selected_srtp_profile", lambda: b"")
+        with pytest.raises(RuntimeError, match="profile"):
+            client.derive_srtp_sessions()
+
+    def test_derive_srtcp_sessions_fails_closed_on_no_agreed_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """derive_srtcp_sessions raises when no DTLS-SRTP profile was agreed."""
+        client, _server = self._verified_pair()
+        monkeypatch.setattr(client._conn, "get_selected_srtp_profile", lambda: b"")
+        with pytest.raises(RuntimeError, match="profile"):
+            client.derive_srtcp_sessions()
+
+    def test_derive_outbound_srtp_session_fails_closed_on_no_agreed_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """derive_outbound_srtp_session raises when no DTLS-SRTP profile was agreed."""
+        client, _server = self._verified_pair()
+        monkeypatch.setattr(client._conn, "get_selected_srtp_profile", lambda: b"")
+        with pytest.raises(RuntimeError, match="profile"):
+            client.derive_outbound_srtp_session(ssrc=0xCAFE)
+
+    def test_derive_fails_closed_on_unrecognised_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-empty but unrecognised negotiated profile also fails closed."""
+        client, _server = self._verified_pair()
+        monkeypatch.setattr(
+            client._conn, "get_selected_srtp_profile", lambda: b"SRTP_BOGUS_SUITE"
+        )
+        with pytest.raises(RuntimeError, match="profile"):
+            client.derive_srtp_sessions()
+
+
+# ---------------------------------------------------------------------------
 # Security hardening: fatal TLS alert propagation (DEFECT 4 fix)
 # ---------------------------------------------------------------------------
 

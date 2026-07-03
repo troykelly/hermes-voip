@@ -523,3 +523,54 @@ async def test_udp_pipe_recv_raises_type_error_on_internal_non_datagram() -> Non
             await pipe.recv()
     finally:
         await pipe.close()
+
+
+# ---------------------------------------------------------------------------
+# A fatal DTLS alert during the handshake surfaces as RuntimeError (the
+# documented run_handshake contract), never a raw OpenSSL SSL.Error — so the
+# outbound place_call redaction branch (voip_tools) is hit and no raw SSL text
+# (which can embed gateway connection details) reaches the agent (rule 34).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_handshake_wraps_fatal_tls_alert_as_runtimeerror() -> None:
+    """A fatal DTLS alert makes run_handshake raise RuntimeError, not SSL.Error.
+
+    Forces a deterministic fatal alert via a cipher-suite mismatch (the same
+    technique as media/dtls.py's ``TestFatalTlsAlert``): the answerer (a passive
+    DTLS server) offers only AES256-GCM, the offerer (an active client) only
+    AES128-GCM, so the server rejects the (cookie-echoed) ClientHello with a fatal
+    "no shared cipher" alert. ``media/dtls.py`` deliberately re-raises that as a
+    bare OpenSSL ``SSL.Error`` (rule 37). ``run_handshake``'s documented contract
+    is ``RuntimeError`` / ``ValueError`` only, so the session MUST convert it —
+    otherwise the raw ``SSL.Error`` escapes the outbound ``place_call`` redaction
+    branch and its ``str()`` is echoed to the agent-facing result (rule 34).
+    """
+    a_pipe, o_pipe = _linked_pipes()
+    # An active offer makes the answerer PASSIVE = the DTLS SERVER (the side that
+    # rejects the cipher list), so the fatal alert surfaces inside run_handshake.
+    answerer = SipDtlsMediaSession(
+        offer_setup=SetupRole("active"),
+        cipher_list=b"ECDHE-RSA-AES256-GCM-SHA384",
+        pipe_factory=_pipe_factory(a_pipe),
+    )
+    await answerer.prepare(local_address="127.0.0.1", local_port=0)
+    assert answerer.setup.value == "passive"  # answerer is the DTLS server
+    offerer = DtlsEndpoint(
+        role=DtlsRole.CLIENT, cipher_list=b"ECDHE-RSA-AES128-GCM-SHA256"
+    )
+
+    offerer_task = asyncio.create_task(_pump_dtls(offerer, o_pipe))
+    try:
+        with pytest.raises(RuntimeError, match="fatal TLS alert"):
+            await answerer.run_handshake(
+                peer_fingerprint=_endpoint_fingerprint(offerer),
+                peer_address="192.0.2.30",
+                peer_port=41000,
+            )
+    finally:
+        offerer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await offerer_task
+        await answerer.close()

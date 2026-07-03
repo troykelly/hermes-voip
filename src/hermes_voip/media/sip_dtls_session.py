@@ -500,38 +500,59 @@ class SipDtlsMediaSession:
         then — if not yet done — receive the next datagram, demux DTLS (RFC 7983
         first byte 20-63; non-DTLS bytes are dropped), and feed it back. The CLIENT
         (``a=setup:active``) produces the ClientHello on the first drain; the SERVER
-        waits for it. A fatal alert re-raises from feed/get_outbound_datagrams
-        (rule 37).
+        waits for it.
+
+        A fatal TLS alert (no-shared-cipher, certificate_unknown, handshake_failure,
+        protocol_version) surfaces as a bare OpenSSL ``SSL.Error`` out of
+        ``feed()`` / ``get_outbound_datagrams()`` (``media/dtls.py`` re-raises it,
+        rule 37). This method converts ONLY that case to :class:`RuntimeError` so
+        :meth:`run_handshake`'s documented contract (``RuntimeError`` / ``ValueError``
+        only) holds end-to-end: the outbound ``place_call`` path then classifies the
+        failure and REDACTS it, instead of echoing raw ``SSL`` text (which can embed
+        gateway connection details) to the agent-facing result (rule 34).
 
         Raises:
             RuntimeError: If the handshake does not complete within the round/recv
-                bound.
+                bound, or fails on a fatal TLS alert.
         """
-        for _ in range(_MAX_HANDSHAKE_ROUNDS):
-            for dg in self._dtls.get_outbound_datagrams():
-                await pipe.send(dg)
-            if self._dtls.handshake_done():
-                return
-            try:
-                data = await asyncio.wait_for(
-                    pipe.recv(), timeout=_HANDSHAKE_RECV_TIMEOUT_S
-                )
-            except TimeoutError as exc:
-                msg = "DTLS handshake stalled waiting for a peer datagram"
-                raise RuntimeError(msg) from exc
-            if not data:
-                continue
-            first = data[0]
-            if _RFC7983_DTLS_MIN <= first <= _RFC7983_DTLS_MAX:
-                self._dtls.feed(data)
-            else:
-                # A non-DTLS datagram during the handshake (early SRTP/RTP). Ignore
-                # it — only DTLS records advance the state machine.
-                _log.debug(
-                    "sip-dtls: ignoring non-DTLS datagram during handshake "
-                    "(first byte %d)",
-                    first,
-                )
+        try:
+            for _ in range(_MAX_HANDSHAKE_ROUNDS):
+                for dg in self._dtls.get_outbound_datagrams():
+                    await pipe.send(dg)
+                if self._dtls.handshake_done():
+                    return
+                try:
+                    data = await asyncio.wait_for(
+                        pipe.recv(), timeout=_HANDSHAKE_RECV_TIMEOUT_S
+                    )
+                except TimeoutError as exc:
+                    msg = "DTLS handshake stalled waiting for a peer datagram"
+                    raise RuntimeError(msg) from exc
+                if not data:
+                    continue
+                first = data[0]
+                if _RFC7983_DTLS_MIN <= first <= _RFC7983_DTLS_MAX:
+                    self._dtls.feed(data)
+                else:
+                    # A non-DTLS datagram during the handshake (early SRTP/RTP).
+                    # Ignore it — only DTLS records advance the state machine.
+                    _log.debug(
+                        "sip-dtls: ignoring non-DTLS datagram during handshake "
+                        "(first byte %d)",
+                        first,
+                    )
+        except Exception:  # broadest catch, narrowed to a fatal DTLS alert below
+            # Convert ONLY a recorded fatal DTLS alert into the documented
+            # RuntimeError contract. Anything else (our own timeout RuntimeError, a
+            # pipe/connection error, a bug) is NOT a handshake failure — re-raise it
+            # UNCHANGED so real errors still propagate (rule 37). The wrapper message
+            # is static and the cause is dropped (``from None``) so a host/port the
+            # alert might embed cannot leak via a logged traceback — matching the
+            # inbound path's ``raise _MediaNegotiationRejected from None`` redaction.
+            if not self._dtls.handshake_failed():
+                raise
+            msg = "DTLS handshake failed on a fatal TLS alert"
+            raise RuntimeError(msg) from None
         msg = "DTLS handshake did not complete within the round limit"
         raise RuntimeError(msg)
 

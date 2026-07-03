@@ -1610,6 +1610,20 @@ def test_ice_candidate_overlong_rport_raises_sdp_error_not_value_error() -> None
         IceCandidate.parse(body)
 
 
+def test_ice_candidate_out_of_range_rport_raises_sdp_error() -> None:
+    """A numeric-but-out-of-range rport raises SdpError, like the candidate port.
+
+    ``port`` (the candidate's own port) is range-checked (1..65535); ``rport`` — the
+    reflexive/relay base port, equally attacker-controlled from the same SDP — must
+    share that guard. A value like 99999 is a valid short decimal (so neither the
+    non-numeric guard nor Python's over-long-digit limit catches it), yet is not a
+    legal port.
+    """
+    body = "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 rport 99999"
+    with pytest.raises(SdpError, match="rport"):
+        IceCandidate.parse(body)
+
+
 def test_offer_with_non_numeric_rport_candidate_parses_leniently() -> None:
     """A candidate with a non-numeric rport is SKIPPED, not fatal to the offer parse.
 

@@ -1234,6 +1234,19 @@ def test_coerce_crypto_unicode_digit_leading_token_raises_sdp_error() -> None:
         _coerce_crypto(f"² {_SUITE_32} inline:{_FAKE_ANSWER_KEY}")
 
 
+def test_coerce_crypto_overlong_decimal_leading_token_rejected_as_tag() -> None:
+    """An over-long all-decimal first token stays TAG-shaped, not shifted to suite.
+
+    Classification is lexical (isascii()+isdecimal()): an over-long ASCII-decimal
+    token is still tag-shaped, so it must route to the tag position where
+    CryptoAttribute.parse rejects it as non-decimal — NOT be reclassified as "not a
+    tag" and prepended with the default tag (which would push the over-long token into
+    the suite position and change the failure mode). The ``match`` pins the routing.
+    """
+    with pytest.raises(SdpError, match="tag is not decimal"):
+        _coerce_crypto(f"{'9' * 5000} {_SUITE_32} inline:{_FAKE_ANSWER_KEY}")
+
+
 # --- W3 (security review): SDES key material must never leak via repr/errors ---
 # A `repr()` lands in logs and tracebacks; SDES master key||salt in a repr leaks
 # the SRTP session key. Likewise SdpError messages can surface for our OWN crypto,

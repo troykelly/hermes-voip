@@ -1432,10 +1432,16 @@ def _coerce_crypto(crypto: CryptoAttribute | str | None) -> CryptoAttribute | No
     if crypto is None or isinstance(crypto, CryptoAttribute):
         return crypto
     first = crypto.split(maxsplit=1)
-    # A purely-decimal first token is the tag; anything else gets the default tag.
+    # Classification is LEXICAL: a first token that is a run of ASCII decimals is the
+    # tag; anything else gets the default tag prepended. Deliberately NOT
+    # _parse_decimal() here — an over-long all-decimal token is still tag-SHAPED, so it
+    # must route to the tag position where CryptoAttribute.parse rejects it precisely
+    # ("crypto tag is not decimal"), rather than being reclassified as "not a tag" and
+    # shifted into the suite position. isascii()+isdecimal() (not str.isdigit()) so a
+    # Unicode "digit" is not mistaken for a tag.
     body = (
         crypto
-        if first and _parse_decimal(first[0]) is not None
+        if first and first[0].isascii() and first[0].isdecimal()
         else f"{_DEFAULT_CRYPTO_TAG} {crypto}"
     )
     return CryptoAttribute.parse(body)

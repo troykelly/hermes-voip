@@ -429,8 +429,8 @@ class IceConnection:
             gateways are IPv4-only; enable only if the gateway requires it).
         call_id: Optional call/session correlator attached to this agent's
             structured log records (``extra={"call_id": ...}``, ADR-0075
-            style).  ``None`` (default) omits the field -- existing callers
-            are unaffected.  Not a secret (rule 34).
+            style).  ``None`` (default) logs ``call_id=None`` -- existing
+            callers are behaviourally unaffected.  Not a secret (rule 34).
 
     Raises:
         ImportError: At construction time if ``aioice`` is not installed.

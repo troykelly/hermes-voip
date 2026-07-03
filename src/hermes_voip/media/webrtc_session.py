@@ -168,7 +168,7 @@ def _default_ice_factory(  # noqa: PLR0913 -- independent ICE config kwargs (rol
         use_ipv4: Gather IPv4 ICE candidates (the fallback family; ADR-0043).
         use_ipv6: Gather IPv6 ICE candidates (the preferred family; ADR-0043).
         call_id: Optional call/session correlator forwarded to the ICE agent's
-            structured logs (ADR-0075 style); ``None`` omits the field.
+            structured logs (ADR-0075 style); ``None`` logs ``call_id=None``.
 
     Returns:
         A new :class:`IceConnection`.
@@ -249,7 +249,7 @@ class WebRtcMediaSession:
             :class:`IceConnection`; injected in tests).
         cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
         call_id: Optional call/session correlator forwarded to the ICE agent's
-            structured logs (ADR-0075 style); ``None`` omits the field.
+            structured logs (ADR-0075 style); ``None`` logs ``call_id=None``.
     """
 
     def __init__(  # noqa: PLR0913 -- independent keyword config (setup/STUN/TURN/IP-family/factory/cipher)

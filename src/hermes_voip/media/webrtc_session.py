@@ -137,6 +137,7 @@ class _IceFactory(Protocol):
         turn_password: str | None = None,
         use_ipv4: bool = True,
         use_ipv6: bool = True,
+        call_id: str | None = None,
     ) -> _IcePipe:
         """Construct an ICE pipe for the given role, STUN, TURN, and IP families."""
         ...
@@ -151,6 +152,7 @@ def _default_ice_factory(  # noqa: PLR0913 -- independent ICE config kwargs (rol
     turn_password: str | None = None,
     use_ipv4: bool = True,
     use_ipv6: bool = True,
+    call_id: str | None = None,
 ) -> _IcePipe:
     """Build the real :class:`~hermes_voip.media.ice.IceConnection`.
 
@@ -165,6 +167,8 @@ def _default_ice_factory(  # noqa: PLR0913 -- independent ICE config kwargs (rol
         turn_password: TURN long-term password (required when ``turn_urls`` is set).
         use_ipv4: Gather IPv4 ICE candidates (the fallback family; ADR-0043).
         use_ipv6: Gather IPv6 ICE candidates (the preferred family; ADR-0043).
+        call_id: Optional call/session correlator forwarded to the ICE agent's
+            structured logs (ADR-0075 style); ``None`` omits the field.
 
     Returns:
         A new :class:`IceConnection`.
@@ -177,6 +181,7 @@ def _default_ice_factory(  # noqa: PLR0913 -- independent ICE config kwargs (rol
         turn_password=turn_password,
         use_ipv4=use_ipv4,
         use_ipv6=use_ipv6,
+        call_id=call_id,
     )
 
 
@@ -243,6 +248,8 @@ class WebRtcMediaSession:
         ice_factory: Factory building the ICE pipe (defaults to the real
             :class:`IceConnection`; injected in tests).
         cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
+        call_id: Optional call/session correlator forwarded to the ICE agent's
+            structured logs (ADR-0075 style); ``None`` omits the field.
     """
 
     def __init__(  # noqa: PLR0913 -- independent keyword config (setup/STUN/TURN/IP-family/factory/cipher)
@@ -259,6 +266,7 @@ class WebRtcMediaSession:
         ice_factory: _IceFactory = _default_ice_factory,
         cipher_list: bytes | None = None,
         offerer: bool = False,
+        call_id: str | None = None,
     ) -> None:
         """Pick the DTLS role + ICE role and build the DTLS + ICE objects.
 
@@ -294,6 +302,7 @@ class WebRtcMediaSession:
             turn_password=turn_password,
             use_ipv4=use_ipv4,
             use_ipv6=use_ipv6,
+            call_id=call_id,
         )
         self._prepared = False
 
@@ -309,6 +318,7 @@ class WebRtcMediaSession:
         use_ipv6: bool = True,
         ice_factory: _IceFactory = _default_ice_factory,
         cipher_list: bytes | None = None,
+        call_id: str | None = None,
     ) -> WebRtcMediaSession:
         """Construct the outbound-origination session (ADR-0049).
 
@@ -327,6 +337,9 @@ class WebRtcMediaSession:
             use_ipv6: Gather IPv6 ICE candidates (the preferred family; ADR-0043).
             ice_factory: Factory building the ICE pipe (injected in tests).
             cipher_list: Optional DTLS cipher pin passed to :class:`DtlsEndpoint`.
+            call_id: Optional call/session correlator forwarded to the ICE
+                agent's structured logs (ADR-0075 style); ``None`` omits the
+                field.
 
         Returns:
             A new offerer :class:`WebRtcMediaSession`.
@@ -342,6 +355,7 @@ class WebRtcMediaSession:
             ice_factory=ice_factory,
             cipher_list=cipher_list,
             offerer=True,
+            call_id=call_id,
         )
 
     # ------------------------------------------------------------------

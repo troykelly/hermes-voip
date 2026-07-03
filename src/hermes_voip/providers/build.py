@@ -61,6 +61,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 
 from hermes_voip.config import ConfigError, MediaConfig
@@ -88,6 +89,7 @@ __all__ = [
     "Providers",
     "TtsFactory",
     "build_providers",
+    "check_providers_buildable",
 ]
 
 # A provider factory takes the full validated MediaConfig and returns one live
@@ -328,6 +330,151 @@ def build_providers(
     tts = _resolve_tts(tts_factories, config)
     guard = _dispatch("guard", guard_factories, config.injection_guard, config)
     return Providers(asr=asr, tts=tts, guard=guard)
+
+
+# The self-host dispatch-map providers whose factory reads a model directory (the
+# ``_make_*`` guards above). Named here so the shallow preflight and those factories
+# agree on which tokens are self-host + which model-dir config field each one needs;
+# they mirror the keys in the DEFAULT_*_FACTORIES maps.
+_SHERPA_ONNX_ASR = "sherpa-onnx"
+_SHERPA_KOKORO_TTS = "sherpa-kokoro"
+_ONNX_GUARD = "onnx"
+
+
+def check_providers_buildable(
+    config: MediaConfig,
+    *,
+    asr_factories: Mapping[str, AsrFactory] = DEFAULT_ASR_FACTORIES,
+    tts_factories: Mapping[str, TtsFactory] = DEFAULT_TTS_FACTORIES,
+    guard_factories: Mapping[str, GuardFactory] = DEFAULT_GUARD_FACTORIES,
+) -> None:
+    """Cheap, model-free preflight: reject a config ``build_providers`` cannot build.
+
+    The plugin's enable-time gate (:func:`hermes_voip.plugin.validate_voip_config`)
+    calls this so a provider misconfiguration is rejected at the dedicated config gate
+    instead of surfacing as an exception inside ``adapter.connect()`` — the one place
+    :func:`build_providers` actually runs. It checks the two things ``build_providers``
+    checks that need **no model load**:
+
+    * **Dispatch-map membership** for every selected token (``stt_provider``,
+      ``tts_provider``, the optional ``tts_fallback``, ``injection_guard``).
+      :func:`~hermes_voip.config.load_media_config` accepts the wider *config*
+      vocabulary (e.g. a not-yet-wired ``piper`` TTS or ``sidecar`` guard); only the
+      tokens with a factory here can actually build. An unwired token raises
+      :class:`~hermes_voip.config.ConfigError` (``build_providers`` would otherwise
+      raise the generic dispatch ``ValueError`` at connect() time).
+    * **Self-host model-directory presence + existence** — a selected self-host
+      dispatch-map provider must have its model directory configured and present on
+      disk (the directory the factory's own ``None`` guard names).
+
+    It also runs :func:`~hermes_voip.providers.onnx_compat.ensure_sherpa_loadable`
+    (idempotent; a no-op when the ``ml`` extra is absent, and never a rejection) when a
+    sherpa provider is selected, so the onnxruntime symlink is in place ahead of
+    connect().
+
+    **Deliberately NOT checked here** — kept at ``connect()`` so this stays shallow
+    (full eager loading would be an enable-path latency/memory trade-off needing an
+    ADR): eager model construction; the model-integrity SHA-256 gate
+    (:func:`~hermes_voip.manifest.verify_model_files`) and the SPDX licence gate
+    (:func:`~hermes_voip.manifest.validate_manifest`); and Opus availability
+    (:func:`~hermes_voip.media.opus.ensure_opus_available`) — Opus is a
+    *gracefully-degraded optional* codec (a host without the ``webrtc`` extra simply
+    drops it from the SDP menu, ADR-0049), never a hard requirement, so gating on it
+    would falsely reject the primary G.711/G.722 SIP-over-TLS path. A config this
+    passes can therefore still be rejected at connect() (a swapped/truncated weight, a
+    disallowed licence); that residual is the accepted cost of a shallow enable gate.
+
+    Args:
+        config: The validated media/provider config (from ``load_media_config``).
+        asr_factories: ASR token→factory map (defaults to the production wiring).
+        tts_factories: TTS token→factory map.
+        guard_factories: Guard token→factory map.
+
+    Raises:
+        ConfigError: If a selected provider token has no factory in its map, or a
+            selected self-host provider's model directory is unset or absent on disk.
+    """
+    _require_wired("stt_provider", asr_factories, config.stt_provider)
+    _require_wired("tts_provider", tts_factories, config.tts_provider)
+    if config.tts_fallback is not None:
+        _require_wired("tts_fallback", tts_factories, config.tts_fallback)
+    _require_wired("injection_guard", guard_factories, config.injection_guard)
+
+    # Self-host providers whose factory reads a model directory: verify it is set +
+    # present. The factory's own None-guard and the connect-time integrity gate both
+    # read this dir; catching a missing/mis-pathed one here surfaces it at the gate.
+    if config.stt_provider == _SHERPA_ONNX_ASR:
+        _require_present_model_dir(
+            "stt_provider 'sherpa-onnx'",
+            config.stt_model_dir,
+            "HERMES_VOIP_STT_MODEL_DIR",
+        )
+    if config.tts_provider == _SHERPA_KOKORO_TTS:
+        _require_present_model_dir(
+            "tts_provider 'sherpa-kokoro'",
+            config.tts_model,
+            "HERMES_VOIP_TTS_MODEL",
+        )
+    if config.tts_fallback == _SHERPA_KOKORO_TTS:
+        _require_present_model_dir(
+            "tts_fallback 'sherpa-kokoro'",
+            config.tts_fallback_model,
+            "HERMES_VOIP_TTS_FALLBACK_MODEL",
+        )
+    if config.injection_guard == _ONNX_GUARD:
+        _require_present_model_dir(
+            "injection_guard 'onnx'",
+            config.injection_guard_model_dir,
+            "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR",
+        )
+
+    if _uses_sherpa(config):
+        # Sherpa needs onnxruntime discoverable via its RPATH before `import
+        # sherpa_onnx`; this is cheap, idempotent, and a no-op without the ml extra.
+        from hermes_voip.providers.onnx_compat import (  # noqa: PLC0415
+            ensure_sherpa_loadable,
+        )
+
+        ensure_sherpa_loadable()
+
+
+def _require_wired(field: str, factories: Mapping[str, object], token: str) -> None:
+    """Raise :class:`ConfigError` unless ``token`` has a factory in ``factories``.
+
+    ``factories`` is read for membership + key listing only (never invoked), so the
+    covariant ``Mapping[str, object]`` accepts any family's factory map without a cast.
+    """
+    if token not in factories:
+        known = ", ".join(sorted(factories)) or "(none)"
+        msg = (
+            f"{field} {token!r} has no provider implementation "
+            f"(built providers: {{{known}}}); it is a valid config token but is not "
+            "wired, so the adapter would fail to build it when it connects"
+        )
+        raise ConfigError(msg)
+
+
+def _require_present_model_dir(label: str, model_dir: str | None, env_key: str) -> None:
+    """Raise :class:`ConfigError` unless ``model_dir`` is set and an existing directory.
+
+    Mirrors the factory's ``None`` guard (same ``env_key`` message) and adds the cheap
+    on-disk existence check (one ``stat``), stopping short of the SHA-256 integrity
+    gate that reads the files at connect().
+    """
+    if not model_dir:
+        msg = f"{label} requires {env_key} to be set"
+        raise ConfigError(msg)
+    if not Path(model_dir).is_dir():
+        msg = f"{label} model directory {env_key}={model_dir!r} does not exist"
+        raise ConfigError(msg)
+
+
+def _uses_sherpa(config: MediaConfig) -> bool:
+    """Whether any selected provider is a sherpa engine (needs the onnxruntime shim)."""
+    return config.stt_provider == _SHERPA_ONNX_ASR or _SHERPA_KOKORO_TTS in (
+        config.tts_provider,
+        config.tts_fallback,
+    )
 
 
 def _resolve_tts(

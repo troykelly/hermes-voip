@@ -205,7 +205,7 @@ def test_register_validate_config_is_callable_or_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_validate_config_callback_truthy_on_valid_config() -> None:
+def test_validate_config_callback_truthy_on_valid_config(tmp_path: Path) -> None:
     """The registered validate_config callback MUST return truthy on success.
 
     Hermes 0.16.0 ``PlatformRegistry.create_adapter`` aborts adapter creation
@@ -226,6 +226,14 @@ def test_validate_config_callback_truthy_on_valid_config() -> None:
         "HERMES_SIP_HOST": "pbx.example.test",
         "HERMES_SIP_EXTENSION": "1000",
         "HERMES_SIP_PASSWORD": "fake",
+        # Point the self-host default providers (sherpa-onnx STT / sherpa-kokoro TTS /
+        # onnx guard) at an existing model dir: the provider preflight now requires a
+        # wired token + a present model dir, so a bare SIP env is (correctly) no longer
+        # a complete config. This test pins the truthy-return contract, not model-dir
+        # handling, so a real existing directory keeps that contract intact.
+        "HERMES_VOIP_STT_MODEL_DIR": str(tmp_path),
+        "HERMES_VOIP_TTS_MODEL": str(tmp_path),
+        "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": str(tmp_path),
     }
     result = validate(fake_config)
     assert result is True, "validate_config(valid) must return True, not None/falsey"

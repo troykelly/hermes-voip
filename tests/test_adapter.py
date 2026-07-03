@@ -19,6 +19,7 @@ import base64
 import contextlib
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -648,10 +649,18 @@ def test_validate_config_raises_on_missing_host() -> None:
         validate_voip_config(_platform_config({}))
 
 
-def test_validate_config_truthy_with_valid_env() -> None:
+def test_validate_config_truthy_with_valid_env(tmp_path: Path) -> None:
     from hermes_voip.plugin import validate_voip_config  # noqa: PLC0415
 
-    assert validate_voip_config(_platform_config(_FAKE_ENV)) is True
+    # The self-host default providers (sherpa-onnx / sherpa-kokoro / onnx) each need a
+    # present model dir now that validate_voip_config preflights the provider wiring;
+    # point them at an existing directory so this still pins the truthy-return path.
+    env = _FAKE_ENV | {
+        "HERMES_VOIP_STT_MODEL_DIR": str(tmp_path),
+        "HERMES_VOIP_TTS_MODEL": str(tmp_path),
+        "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR": str(tmp_path),
+    }
+    assert validate_voip_config(_platform_config(env)) is True
 
 
 # ---------------------------------------------------------------------------

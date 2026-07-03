@@ -303,10 +303,14 @@ def _addr_spec(value: str) -> str:
 def _uri_and_tag(value: str) -> tuple[str, str | None]:
     """Return ``(addr-spec, tag)`` from a ``From``/``To`` header value."""
     uri = _addr_spec(value)
-    # Header parameters live after the closing ``>`` for a name-addr, or after
-    # the first ``;`` for a bare addr-spec (which has no URI parameters).
-    if ">" in value:
-        params = value.split(">", 1)[1]
+    # Header parameters live after the closing ``>`` of a name-addr, or after the
+    # first ``;`` for a bare addr-spec (which has no URI parameters). Locate the
+    # ``<addr-spec>`` with the same regex ``_addr_spec`` uses, so a literal ``>``
+    # inside a quoted display-name (RFC 3261 §25.1) cannot desync the split and
+    # hide the tag by matching on the wrong ``>``.
+    match = _ANGLE_ADDR.search(value)
+    if match is not None:
+        params = value[match.end() :]
     else:
         _, _, params = value.partition(";")
     return uri, _header_param(params, "tag")

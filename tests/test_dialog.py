@@ -440,6 +440,56 @@ def test_to_tag_in_quoted_param_not_confused() -> None:
     assert d.remote_tag == "right"
 
 
+def test_from_invite_2xx_tag_after_quoted_gt_in_display_name() -> None:
+    # RFC 3261 §25.1 permits a literal ">" inside a quoted display-name. The tag
+    # must be read from the parameters after the real <addr-spec>, not by
+    # splitting on the first ">" — otherwise a valid, tagged To desyncs the split
+    # and is rejected as untagged.
+    tricky = SipResponse(
+        status_code=200,
+        reason="OK",
+        headers=(
+            ("Via", _LOCAL_VIA),
+            ("From", "<sip:1000@pbx.example.test>;tag=ftag"),
+            ("To", '"weird > gateway" <sip:2000@pbx.example.test>;tag=realtag99'),
+            ("Call-ID", "call-abc"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", _PEER_CONTACT),
+        ),
+        body="",
+    )
+    d = Dialog.from_invite_2xx(_invite(), tricky)
+    assert d.remote_tag == "realtag99"
+
+
+def test_from_inbound_invite_tag_after_quoted_gt_in_display_name() -> None:
+    # Same quoted-">" display-name hazard on the inbound (UAS) path: the peer's
+    # tag comes from the INVITE From header and must survive a literal ">" in the
+    # display-name.
+    tricky = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@pbx.example.test",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.50:5061;branch=z9hG4bK-peer;rport"),
+            ("Max-Forwards", "70"),
+            ("From", '"weird > gateway" <sip:3000@pbx.example.test>;tag=realtag99'),
+            ("To", "<sip:1000@pbx.example.test>"),
+            ("Call-ID", "call-xyz"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", "<sip:3000@198.51.100.50:5061;transport=tls>"),
+        ),
+        body="",
+    )
+    d = Dialog.from_inbound_invite(
+        tricky,
+        local_tag="ourtag",
+        local_contact=_LOCAL_CONTACT,
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    assert d.remote_tag == "realtag99"
+
+
 def test_empty_addr_spec_rejected() -> None:
     empty_contact = SipResponse(
         status_code=200,

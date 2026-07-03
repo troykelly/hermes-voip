@@ -1182,6 +1182,26 @@ def test_crypto_parse_unicode_digit_tag_raises_sdp_error_not_value_error() -> No
     assert _FAKE_KEY not in str(excinfo.value)
 
 
+def test_crypto_parse_overlong_decimal_tag_raises_sdp_error_not_value_error() -> None:
+    """An over-long ASCII-decimal crypto tag raises SdpError, not ValueError."""
+    with pytest.raises(SdpError) as excinfo:
+        CryptoAttribute.parse(f"{'9' * 5000} {_SUITE_32} inline:{_FAKE_KEY}")
+    assert _FAKE_KEY not in str(excinfo.value)
+
+
+def test_crypto_parse_leading_zero_keylike_tag_does_not_echo_token() -> None:
+    """A leading-zero tag carrying key-like bytes fails closed without echoing it.
+
+    The decimal gate must run BEFORE the leading-zero check: only a token already
+    proven to be pure ASCII digits is safe to echo in an error. A tag such as
+    ``0<KEY>`` (a malformed body shifting the inline key into the tag position) must
+    be rejected as non-decimal and must never appear in the error text.
+    """
+    with pytest.raises(SdpError) as excinfo:
+        CryptoAttribute.parse(f"0{_FAKE_KEY} {_SUITE_32} inline:{_FAKE_KEY}")
+    assert _FAKE_KEY not in str(excinfo.value)
+
+
 def test_offer_with_unicode_digit_crypto_tag_parses_leniently() -> None:
     """An a=crypto line with a Unicode-digit tag is SKIPPED, not fatal to the parse.
 
@@ -1212,6 +1232,19 @@ def test_coerce_crypto_unicode_digit_leading_token_raises_sdp_error() -> None:
     """
     with pytest.raises(SdpError):
         _coerce_crypto(f"² {_SUITE_32} inline:{_FAKE_ANSWER_KEY}")
+
+
+def test_coerce_crypto_overlong_decimal_leading_token_rejected_as_tag() -> None:
+    """An over-long all-decimal first token stays TAG-shaped, not shifted to suite.
+
+    Classification is lexical (isascii()+isdecimal()): an over-long ASCII-decimal
+    token is still tag-shaped, so it must route to the tag position where
+    CryptoAttribute.parse rejects it as non-decimal — NOT be reclassified as "not a
+    tag" and prepended with the default tag (which would push the over-long token into
+    the suite position and change the failure mode). The ``match`` pins the routing.
+    """
+    with pytest.raises(SdpError, match="tag is not decimal"):
+        _coerce_crypto(f"{'9' * 5000} {_SUITE_32} inline:{_FAKE_ANSWER_KEY}")
 
 
 # --- W3 (security review): SDES key material must never leak via repr/errors ---
@@ -1562,6 +1595,16 @@ def test_ice_candidate_non_numeric_rport_raises_sdp_error() -> None:
     """
     body = (
         "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 rport NOTANUM"
+    )
+    with pytest.raises(SdpError):
+        IceCandidate.parse(body)
+
+
+def test_ice_candidate_overlong_rport_raises_sdp_error_not_value_error() -> None:
+    """An over-long ASCII-decimal rport raises SdpError, not ValueError."""
+    body = (
+        "2 1 UDP 1694498815 203.0.113.1 49000 typ srflx raddr 192.0.2.10 "
+        f"rport {'9' * 5000}"
     )
     with pytest.raises(SdpError):
         IceCandidate.parse(body)

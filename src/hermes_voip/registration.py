@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
+from hermes_voip._decimal import _parse_decimal
 from hermes_voip._header_list import split_header_list
 from hermes_voip.digest import (
     DigestChallenge,
@@ -184,10 +185,10 @@ def _split_contact_binding_uri(uri: str) -> tuple[str, str, str, int | None] | N
         return None
     if port_str == "":
         port: int | None = None
-    elif port_str.isascii() and port_str.isdecimal():
-        port = int(port_str)
     else:
-        return None
+        port = _parse_decimal(port_str)
+        if port is None:
+            return None
     return scheme, userinfo, host, port
 
 
@@ -285,12 +286,7 @@ def _min_expires(response: SipResponse) -> int | None:
     raw = response.header("Min-Expires")
     if raw is None:
         return None
-    stripped = raw.strip()
-    # isascii()+isdecimal() rejects Unicode superscript digits (e.g. U+00B2)
-    # that isdigit() admits but int() cannot parse (framing.py precedent).
-    if not (stripped.isascii() and stripped.isdecimal()):
-        return None
-    return int(stripped)
+    return _parse_decimal(raw.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -655,16 +651,11 @@ class RegistrationFlow:
         # RFC 3261 §8.1.3.5: the CSeq sequence number must match and the method
         # must be REGISTER (a mismatched method is a protocol error — a response
         # to a different transaction routed to this flow by mistake).
-        # isascii()+isdecimal() rejects Unicode superscript digits (e.g. U+00B2 ²)
-        # that isdigit() admits but int() cannot parse (framing.py precedent): a
-        # non-decimal CSeq number falls into this RuntimeError mismatch path (which
-        # on_response catches and ignores) instead of raising a bare ValueError that
-        # would escape to the reader loop and tear the connection down (ADR-0081).
-        if (
-            not (number.isascii() and number.isdecimal())
-            or int(number) != txn.cseq
-            or method != "REGISTER"
-        ):
+        # A non-decimal or over-long CSeq number falls into this RuntimeError mismatch
+        # path (which on_response catches and ignores) instead of raising a bare
+        # ValueError that would escape to the reader loop and tear the connection down
+        # (ADR-0081).
+        if _parse_decimal(number) != txn.cseq or method != "REGISTER":
             msg = (
                 f"response CSeq {cseq!r} does not match outstanding {txn.cseq} REGISTER"
             )
@@ -720,19 +711,18 @@ class RegistrationFlow:
             token = _EXPIRES_TOKEN.search(chosen)
             if token is not None:
                 value = token.group(1)
-                # Present but not a run of ASCII digits (e.g. ``-1`` / ``abc``
-                # / U+00B2 ²) is a malformed expires: fail closed, never the
-                # positive fallback.  isascii()+isdecimal() rejects Unicode
-                # superscript digits that isdigit() admits but int() rejects
-                # (framing.py precedent; prevents ValueError on the read loop).
-                return int(value) if (value.isascii() and value.isdecimal()) else None
+                # Present but not a valid ASCII decimal (e.g. ``-1`` / ``abc`` /
+                # U+00B2 ² / thousands of digits) is malformed: fail closed,
+                # never the positive fallback.
+                return _parse_decimal(value)
         expires = response.header("Expires")
         if expires is not None:
             stripped = expires.strip()
-            # Same guard: isascii()+isdecimal() so a Unicode digit in the
-            # Expires header does not propagate a bare ValueError.
-            if stripped.isascii() and stripped.isdecimal():
-                return int(stripped)
+            # Same fail-closed parser so malformed Expires never propagates a
+            # bare ValueError.
+            parsed = _parse_decimal(stripped)
+            if parsed is not None:
+                return parsed
         return self._cfg.expires
 
     def _build(self, *, expires: int, auth: tuple[str, str] | None) -> str:

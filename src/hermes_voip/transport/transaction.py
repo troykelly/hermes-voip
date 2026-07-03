@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from enum import Enum, auto
 
+from hermes_voip._decimal import _parse_decimal
 from hermes_voip.message import SipRequest, SipResponse, build_request
 
 __all__ = [
@@ -195,7 +196,8 @@ def _require(message: SipRequest | SipResponse, name: str) -> str:
 
 def _cseq_number(cseq: str) -> int:
     parts = cseq.split()
-    if not parts or not parts[0].isdigit():
+    number = _parse_decimal(parts[0]) if parts else None
+    if number is None:
         msg = f"malformed CSeq: {cseq!r}"
         raise ValueError(msg)
-    return int(parts[0])
+    return number

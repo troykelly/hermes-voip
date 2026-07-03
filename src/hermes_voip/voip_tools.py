@@ -947,7 +947,14 @@ def _voip_owned_platforms() -> frozenset[str]:
     the proactive gate cannot drift behind runtime routing.
     """
     owned: set[str] = set(_static_voip_owned_platforms())
-    adapter = _ACTIVE_ADAPTER
+    # Widen to ``object`` before the structural check: with the real hermes types
+    # (the hermes-contract mypy step, ``--extra hermes``) mypy proves ``VoipToolHost``
+    # can never also satisfy the disjoint ``_VoipOwnedPlatformSource`` protocol and
+    # marks the body unreachable under ``warn_unreachable``. The isinstance is a
+    # genuine RUNTIME check (an adapter MAY expose the optional surface), so widen the
+    # static type to ``object`` — a plain widening, not a cast/Any/type-ignore — and
+    # let isinstance narrow ``object`` → ``_VoipOwnedPlatformSource`` cleanly.
+    adapter: object = _ACTIVE_ADAPTER
     if isinstance(adapter, _VoipOwnedPlatformSource):
         owned.update(adapter.voip_owned_platform_names())
     return frozenset(owned)

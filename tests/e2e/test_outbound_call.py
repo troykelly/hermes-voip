@@ -994,9 +994,12 @@ async def test_outbound_lifecycle_failed_event_carries_category(
             assert not _records_with_event(caplog, "outbound_call_connected")
 
             # Redaction (rule 34 / ADR-0084): the failure category and the events carry
-            # no dialled number and no gateway host.
+            # no dialled number and no gateway host — AND the failed event must carry
+            # only the ADR-0086 CATEGORY, never the SIP reason phrase the 486 returned
+            # ("Busy Here"), so a regression that logged str(exc)/the reason is caught.
             for record in (failed, sent):
                 _assert_no_pii(record, _LEAK_PROBE_TARGET, gateway.sip_host)
+            _assert_no_pii(failed, "Busy Here")
     finally:
         await gateway.stop()
 

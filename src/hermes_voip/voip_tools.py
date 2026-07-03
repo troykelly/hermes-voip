@@ -936,10 +936,10 @@ class ProactiveDenyReason(StrEnum):
       read from ``gateway.session_context`` (runtime absent, context unavailable, or
       the reader raised — all fail closed).
     * ``ORIGIN_NOT_ALLOWLISTED`` — the origin was read but its ``platform:chat_id``
-      matches no configured entry (exact or wildcard).
-    * ``LIVE_CALL_GUARD_MISSING`` — a live Call-ID is in scope but its guard state
-      is missing; the inbound fail-safe deliberately bypasses proactive-origin
-      relaxation here, so this can never weaken it.
+      matches no configured entry (exact or wildcard). An inbound SIP call whose guard
+      state is missing also lands here: its ``voip:<Call-ID>`` origin never matches an
+      operator's non-VoIP entry, so the inbound fail-safe holds by platform-scoping
+      (ADR-0105), not by a Call-ID-presence check.
     * ``UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN`` — the tool is not ``place_call`` (the
       relaxation is place_call-scoped; transfer/dtmf/open_entry stay blocked).
     """
@@ -948,7 +948,6 @@ class ProactiveDenyReason(StrEnum):
     PROACTIVE_ALLOW_UNSET = "proactive_allow_unset"
     ORIGIN_UNAVAILABLE = "origin_unavailable"
     ORIGIN_NOT_ALLOWLISTED = "origin_not_allowlisted"
-    LIVE_CALL_GUARD_MISSING = "live_call_guard_missing"
     UNSUPPORTED_TOOL_FOR_PROACTIVE_ORIGIN = "unsupported_tool_for_proactive_origin"
 
 
@@ -1676,24 +1675,22 @@ def voip_pre_tool_call(
         state = adapter.guard_state_for(call_id)
     if state is None:
         # Fail-safe default: least-privilege (level 0) when there is no live SIP call
-        # in scope, so an unknown/spoofed context can never reach a privileged tool.
-        # The ONLY relaxation (issue #202): a PROACTIVE place_call from a configured
-        # operator origin (HERMES_VOIP_PROACTIVE_CALL_FROM) resolves operator level 3
-        # — opt-in and place_call-only. It applies ONLY when there is genuinely NO
-        # live call in scope (``call_id is None``). When a Call-ID IS present but its
-        # guard state is missing (an unknown/spoofed live-call context), the inbound
-        # fail-safe is preserved unconditionally — the proactive origin is NOT
-        # consulted, so this branch can never weaken it. The static
-        # HERMES_VOIP_OUTBOUND_ALLOW allowlist (ADR-0029) still gates the dial target
-        # at the chokepoint regardless.
-        if call_id is None:
-            decision = _proactive_place_call_allowed(tool_name)
-        else:
-            # A Call-ID IS in scope but its guard state missed: the inbound fail-safe
-            # bypasses proactive relaxation here (never consulted) — record WHY.
-            decision = ProactiveDecision(
-                allowed=False, reason=ProactiveDenyReason.LIVE_CALL_GUARD_MISSING
-            )
+        # guard state in scope, so an unknown/spoofed context can never reach a
+        # privileged tool. The ONLY relaxation (issue #202): a PROACTIVE place_call
+        # from a configured operator origin (HERMES_VOIP_PROACTIVE_CALL_FROM) resolves
+        # operator level 3 — opt-in and place_call-only. Per ADR-0074 the relaxation is
+        # reached whenever the guard ``state is None``: on a non-VoIP operator turn
+        # (e.g. a Telegram chat) the session chat_id is NOT a SIP Call-ID, so
+        # ``guard_state_for`` misses even though ``call_id`` is non-None — the
+        # legitimate proactive turn. The INBOUND fail-safe is preserved by
+        # PLATFORM-SCOPED matching inside the helper, NOT by the presence of a Call-ID
+        # (non-None on the proactive turn too): an inbound SIP call's
+        # ``(platform="voip", chat_id=<Call-ID>)`` origin never matches an operator's
+        # non-VoIP HERMES_VOIP_PROACTIVE_CALL_FROM entry, and an unreadable origin
+        # denies via ORIGIN_UNAVAILABLE. The static HERMES_VOIP_OUTBOUND_ALLOW
+        # allowlist (ADR-0029) still gates the dial target at the chokepoint
+        # regardless.
+        decision = _proactive_place_call_allowed(tool_name)
         if not decision.allowed:
             proactive_deny_reason = decision.reason
         state = GuardSessionState(

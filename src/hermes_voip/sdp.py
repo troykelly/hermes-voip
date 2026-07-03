@@ -450,6 +450,13 @@ class IceCandidate:
                     # whole offer parse instead of skipping this one candidate.
                     msg = "malformed a=candidate: non-integer rport"
                     raise SdpError(msg)
+                if not 1 <= rport <= _MAX_PORT:
+                    # Range-validate rport exactly like the candidate's own `port`
+                    # above: a numeric-but-out-of-range value (e.g. 99999) is not a
+                    # legal port and must not survive the parse of an attacker-supplied
+                    # a=candidate line.
+                    msg = f"a=candidate rport out of range 1..{_MAX_PORT}: {rport}"
+                    raise SdpError(msg)
         return cls(
             foundation=foundation,
             component=component,

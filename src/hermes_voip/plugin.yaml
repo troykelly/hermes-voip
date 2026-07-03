@@ -152,6 +152,14 @@ optional_env:
     default: 5.0
     description: "Seconds to wait for in-flight calls to BYE-drain on shutdown before forcing teardown (default: 5.0)."
     prompt: "Shutdown drain timeout in seconds (default: 5.0)"
+  - name: HERMES_VOIP_HANGUP_DRAIN_SECS
+    default: 5.0
+    description: "Seconds the agent hang_up tool waits for an in-flight spoken farewell to finish before sending BYE, so a same-turn goodbye is not truncated (default: 5.0)."
+    prompt: "Agent-hangup farewell drain timeout in seconds (default: 5.0)"
+  - name: HERMES_VOIP_HANGUP_GRACE_SECS
+    default: 0.5
+    description: "Short window (seconds) the agent hang_up drain waits for a same-turn farewell to begin speaking before proceeding; must be <= HERMES_VOIP_HANGUP_DRAIN_SECS (default: 0.5)."
+    prompt: "Agent-hangup farewell arrival grace in seconds (default: 0.5)"
   - name: HERMES_VOIP_KEEPALIVE_INTERVAL
     default: 30.0
     description: >-

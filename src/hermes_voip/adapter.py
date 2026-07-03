@@ -537,6 +537,13 @@ _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
 # ``GatewayConfig.shutdown_drain_secs`` (env ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``); this
 # mirrors its default so a None-config drain is still bounded, never unbounded.
 _DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+# Defensive fallbacks for the agent-hangup farewell drain (#1297, ADR-0106) used only
+# if ``_media_cfg`` is somehow unset when ``hang_up_call`` drains. The AUTHORITATIVE
+# values are ``MediaConfig.agent_hangup_drain_secs`` / ``agent_hangup_grace_secs``
+# (env ``HERMES_VOIP_HANGUP_DRAIN_SECS`` / ``HERMES_VOIP_HANGUP_GRACE_SECS``); keep in
+# sync with config.py.
+_DEFAULT_AGENT_HANGUP_DRAIN_SECS = 5.0  # keep in sync with config.py
+_DEFAULT_AGENT_HANGUP_GRACE_SECS = 0.5  # keep in sync with config.py
 # After the drain timeout, cancelled BYE tasks get this brief, bounded grace to
 # finish cancelling — so cooperative BYEs are awaited and their errors observed
 # (not orphaned when the runtime keeps the loop alive after ``disconnect()``); a
@@ -5912,7 +5919,34 @@ class VoipAdapter(BasePlatformAdapter):
         # stopping media) is already classified as an agent hangup when teardown
         # runs — no race where teardown reads the flag before it is set.
         self._mark_agent_hangup(call_id)
-        _log.info("agent hang_up tool: ending call %s (BYE + media stop)", call_id)
+        # #1297 / ADR-0106: drain an in-flight agent farewell to the wire BEFORE BYE +
+        # media stop. A goodbye the agent speaks in the SAME turn as this tool call
+        # would otherwise be truncated (media.stop mid-playout) or dropped (post-
+        # teardown send-suppression). Bounded, cancellable, released by barge-in, and
+        # a no-op-fast when nothing is (or arrives) speaking — symmetric with the loop
+        # goodbye's inline drain (_end_call_gracefully, ADR-0057). _mark_agent_hangup
+        # stays FIRST so the end still classifies AGENT_HANGUP even if the drain times
+        # out, and the drain runs BEFORE session.hang_up() so info["ended"] (set only
+        # in _teardown_call) is False throughout — the farewell send() is neither
+        # suppressed nor its frames cut.
+        loop = self._call_loops.get(call_id)
+        if loop is not None:
+            if self._media_cfg is not None:
+                drain_secs = self._media_cfg.agent_hangup_drain_secs
+                grace_secs = self._media_cfg.agent_hangup_grace_secs
+            else:
+                drain_secs = _DEFAULT_AGENT_HANGUP_DRAIN_SECS
+                grace_secs = _DEFAULT_AGENT_HANGUP_GRACE_SECS
+            if not await loop.drain_agent_speech(timeout=drain_secs, grace=grace_secs):
+                _log.warning(
+                    "agent hang_up: farewell playout did not drain within %.1fs for "
+                    "call %s; proceeding with BYE + media stop",
+                    drain_secs,
+                    call_id,
+                )
+        _log.info(
+            "agent hang_up tool: ending call %s (drain + BYE + media stop)", call_id
+        )
         await session.hang_up()
         return True
 

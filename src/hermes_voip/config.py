@@ -395,6 +395,19 @@ _DEFAULT_GOODBYE = True
 _GOODBYE_PHRASE_KEY = "HERMES_VOIP_GOODBYE_PHRASE"
 _DEFAULT_GOODBYE_PHRASE = "Goodbye."
 
+# Agent-hangup farewell drain (#1297, ADR-0106). When the agent speaks a goodbye and
+# calls the hang_up tool in the SAME turn, the adapter awaits a BOUNDED, cancellable
+# drain of that in-flight farewell to the wire BEFORE it sends BYE + stops media, so
+# the closing line is heard in full (symmetric with the loop goodbye's inline drain,
+# ADR-0057). ``drain_secs`` is the total bound; ``grace_secs`` is the SHORT arrival
+# window that catches a same-turn farewell dispatched a scheduling beat after the tool
+# call (the (A) dispatch race). Distinct from GatewayConfig.shutdown_drain_secs (the
+# all-calls SIP graceful-shutdown drain) so per-call latency tunes independently.
+_AGENT_HANGUP_DRAIN_SECS_KEY = "HERMES_VOIP_HANGUP_DRAIN_SECS"
+_DEFAULT_AGENT_HANGUP_DRAIN_SECS = 5.0
+_AGENT_HANGUP_GRACE_SECS_KEY = "HERMES_VOIP_HANGUP_GRACE_SECS"
+_DEFAULT_AGENT_HANGUP_GRACE_SECS = 0.5
+
 # Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020 §5).
 # When the gateway's deny_mode is ``decline``, a declined-group caller is ANSWERED and
 # hears this one short line before the call is BYE'd (instead of a hard 603). Operator-
@@ -1201,6 +1214,15 @@ class MediaConfig:
     # ``HERMES_VOIP_GOODBYE`` / ``HERMES_VOIP_GOODBYE_PHRASE``.
     goodbye: bool = _DEFAULT_GOODBYE
     goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE
+    # Agent-hangup farewell drain (#1297, ADR-0106): the bounded, cancellable wait the
+    # adapter awaits on an AGENT-initiated hang_up BEFORE BYE + media stop, so a goodbye
+    # the agent speaks in the same turn is heard in full. ``agent_hangup_drain_secs`` is
+    # the total bound; ``agent_hangup_grace_secs`` is the short arrival window that
+    # catches a same-turn farewell dispatched a beat after the tool call. Both
+    # positive-finite, with grace <= drain (enforced in __post_init__).
+    # ``HERMES_VOIP_HANGUP_DRAIN_SECS`` / ``HERMES_VOIP_HANGUP_GRACE_SECS``.
+    agent_hangup_drain_secs: float = _DEFAULT_AGENT_HANGUP_DRAIN_SECS
+    agent_hangup_grace_secs: float = _DEFAULT_AGENT_HANGUP_GRACE_SECS
     # Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020
     # §5/§6 Phase 2). When the gateway's deny_mode is ``decline``, a declined-group
     # caller is ANSWERED (200 OK) and hears this ONE short line over the real media path
@@ -1284,6 +1306,7 @@ class MediaConfig:
         self._validate_aec()
         self._validate_comfort_filler()
         self._validate_no_input()
+        self._validate_agent_hangup_drain()
         self._validate_media_timers()
         if self.dtmf_mode not in _DTMF_MODES:
             allowed = ", ".join(sorted(_DTMF_MODES))
@@ -1416,6 +1439,31 @@ class MediaConfig:
             raise ConfigError(msg)
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
+            raise ConfigError(msg)
+
+    def _validate_agent_hangup_drain(self) -> None:
+        """Validate the agent-hangup farewell-drain bounds (#1297, ADR-0106).
+
+        Both the total drain and the arrival grace must be positive finite numbers
+        (defence in depth mirroring ``shutdown_drain_secs``); NaN/inf slip past a
+        naive ``> 0`` so finiteness is checked explicitly. The cross-field invariant
+        ``grace <= drain`` holds regardless of how the config is constructed, so a
+        direct :class:`MediaConfig` cannot produce a grace that alone exceeds the
+        whole drain budget.
+        """
+        for name, value in (
+            ("agent_hangup_drain_secs", self.agent_hangup_drain_secs),
+            ("agent_hangup_grace_secs", self.agent_hangup_grace_secs),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                msg = f"{name} must be a positive finite number, got {value!r}"
+                raise ConfigError(msg)
+        if self.agent_hangup_grace_secs > self.agent_hangup_drain_secs:
+            msg = (
+                "agent_hangup_grace_secs must be <= agent_hangup_drain_secs "
+                f"(got grace={self.agent_hangup_grace_secs!r}, "
+                f"drain={self.agent_hangup_drain_secs!r})"
+            )
             raise ConfigError(msg)
         # ADR-0020 §5/§6: the polite-decline line is ONE short spoken line. A blank
         # value would answer-then-immediately-BYE with dead air; a value with a line
@@ -1739,6 +1787,13 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         no_input_reprompt_phrases=_parse_no_input_reprompt_phrases(env),
         goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),
         goodbye_phrase=_parse_goodbye_phrase(env),
+        # #1297 / ADR-0106: bounded agent-hangup farewell drain + arrival grace.
+        agent_hangup_drain_secs=_parse_positive_float(
+            env, _AGENT_HANGUP_DRAIN_SECS_KEY, _DEFAULT_AGENT_HANGUP_DRAIN_SECS
+        ),
+        agent_hangup_grace_secs=_parse_positive_float(
+            env, _AGENT_HANGUP_GRACE_SECS_KEY, _DEFAULT_AGENT_HANGUP_GRACE_SECS
+        ),
         # ADR-0020 §5/§6: the polite-decline line for deny_mode=decline.
         decline_phrase=_parse_decline_phrase(env),
         refuse_decline_phrases=_parse_refuse_decline_phrases(env, language),

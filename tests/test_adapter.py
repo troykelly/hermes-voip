@@ -18,7 +18,7 @@ import asyncio
 import base64
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1701,7 +1701,7 @@ async def test_hang_up_call_unknown_call_returns_false() -> None:
 # ``speak`` + real ``drain_agent_speech``) wired to media Protocol fakes that cleanly
 # satisfy the seam — so the (A) send-then-hangup ordering is proven end-to-end at
 # the adapter, not mocked. The fakes below are self-contained and Protocol-clean (no
-# type: ignore), mirroring the ``tests/test_call_loop.py`` shapes.
+# type-ignore escape hatches), mirroring the ``tests/test_call_loop.py`` shapes.
 
 
 class _DrainMediaTransport:
@@ -1752,7 +1752,7 @@ class _GatedFarewellTtsStream:
     async def __anext__(self) -> PcmFrame:
         return await self._gen.__anext__()
 
-    async def _iter(self) -> AsyncIterator[PcmFrame]:
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
         if self._frames:
             yield self._frames[0]
         await self._release.wait()

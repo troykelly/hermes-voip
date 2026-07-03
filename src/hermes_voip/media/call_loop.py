@@ -211,6 +211,13 @@ _DTMF_TERMINATOR: Final[str] = "#"
 #: as a fake transcript; they arrive clearly marked.
 _DTMF_TURN_PREFIX: Final[str] = "[DTMF] "
 
+#: Poll granularity (seconds) for the bounded agent-hangup farewell drain
+#: (:meth:`CallLoop.drain_agent_speech`, #1297 / ADR-0106). 20 ms is imperceptible
+#: for a once-per-hangup wait (and a <=20 ms barge-in-release delay); the drain's ONLY
+#: await is ``asyncio.sleep`` at this granularity — no Event/Lock/Future/stream await —
+#: so it is leak-free by construction (nothing survives loop teardown to poison a test).
+_AGENT_HANGUP_DRAIN_POLL_SECS: Final[float] = 0.02
+
 
 class _DtmfConfirmationSink(Protocol):
     """The narrow surface the call loop drives on the armed-confirmation resolver.
@@ -715,6 +722,13 @@ class CallLoop:
         # in-flight stream (cancels it, then takes the lock), so the greeting and
         # a following agent reply never interleave frames on the wire.
         self._playout_lock = asyncio.Lock()
+        # Agent-hangup farewell drain (#1297, ADR-0106). Counts agent REPLY speaks in
+        # flight (``speak()`` only — the comfort filler and the loop goodbye call
+        # ``_speak_text`` directly and are deliberately NOT counted: a filler must never
+        # delay a hangup, and the loop goodbye already drains before ``run()`` returns).
+        # A plain int mutated ONLY on the event loop (the class invariant) — no asyncio
+        # primitive, so nothing survives loop teardown; no cross-loop waiter exists.
+        self._active_replies: int = 0
         # Dead-air comfort filler (ADR-0030, extended ADR-0085).
         self._comfort_filler = comfort_filler
         # Delay (seconds) the filler gap awaits before the FIRST filler. The config
@@ -1505,7 +1519,64 @@ class CallLoop:
         #  * a filler already PLAYING is superseded by the stream-supersede inside
         #    _speak_text (its stream is cancelled like any in-flight stream).
         self._cancel_comfort_filler()
-        await self._speak_text(text, on_first_frame=on_first_frame)
+        # Count this agent reply as in flight for the agent-hangup farewell drain
+        # (#1297, ADR-0106). The increment is synchronous (``_cancel_comfort_filler``
+        # has no await), so the count goes positive the instant ``send()``'s
+        # ``await loop.speak(...)`` is first stepped — BEFORE this coroutine yields —
+        # closing the (A) dispatch race; the ``finally`` balances it on EVERY exit
+        # (normal end, supersede, barge-in unwinding ``_play``, synth error, cancel).
+        self._active_replies += 1
+        try:
+            await self._speak_text(text, on_first_frame=on_first_frame)
+        finally:
+            self._active_replies -= 1
+
+    async def drain_agent_speech(self, *, timeout: float, grace: float) -> bool:
+        """Bounded, cancellable wait for an agent farewell to finish before teardown.
+
+        Awaited by the adapter on an AGENT-initiated hang_up BEFORE it sends BYE +
+        stops media, so a goodbye the agent speaks in the same turn is heard in full
+        (#1297, ADR-0106). The live order is tool-then-reply, so this may run BEFORE
+        the goodbye ``speak`` has arrived; two poll phases under one deadline:
+
+          1. Arrival grace — if nothing is speaking, wait up to ``grace`` for an
+             imminent reply ``speak`` to BEGIN (guards outcome A, the dispatch race);
+             if none arrives, return ``True`` at once (a bare hangup must not stall
+             teardown).
+          2. Completion — wait for every in-flight reply ``speak`` to finish, bounded
+             by the remaining ``timeout``.
+
+        Returns ``True`` when speech drained (or none came), ``False`` if the bound
+        elapsed with a reply still in flight (the closing line may clip). The caller
+        proceeds with BYE either way (rule 37 — the wait is BOUNDED). Deadlock-free and
+        leak-free BY CONSTRUCTION: the ONLY await is ``asyncio.sleep`` — no Event/Lock/
+        Future/stream await, no task, no async generator — so a wedged TTS can never
+        block teardown and nothing survives loop teardown to poison a later test. It
+        never acquires ``_playout_lock`` (held by the in-flight ``_play``) and never
+        awaits the ``TtsStream``; it only reads the ``_active_replies`` counter.
+
+        Barge-in RELEASES the drain (cancelling the reply unwinds ``_play`` →
+        ``speak``'s finally decrements the counter → the next poll observes 0) but does
+        NOT abort the hangup — the tool call is an already-committed decision.
+        """
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        deadline = now + timeout
+        grace_deadline = min(now + grace, deadline)
+        step = _AGENT_HANGUP_DRAIN_POLL_SECS
+        # Phase 1: arrival grace (skipped instantly when a reply is already in flight).
+        while self._active_replies == 0:
+            now = loop.time()
+            if now >= grace_deadline:
+                return True
+            await asyncio.sleep(min(step, grace_deadline - now))
+        # Phase 2: completion, bounded by the remaining deadline.
+        while self._active_replies > 0:
+            now = loop.time()
+            if now >= deadline:
+                return False
+            await asyncio.sleep(min(step, deadline - now))
+        return True
 
     async def _speak_text(
         self,

@@ -18,6 +18,7 @@ Scenarios:
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -201,6 +202,65 @@ async def test_selected_pair_typed_fields() -> None:
         # Both candidates must be host-type on loopback.
         assert pair.local_candidate.type == "host"
         assert pair.remote_candidate.type == "host"
+    finally:
+        await controlling.close()
+        await controlled.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_logs_structured_nominated_pair_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """connect() emits an ``ice_pair_nominated`` structured log (ADR-0075 style).
+
+    The nominated pair's candidate type (host/srflx/relay) is the single most
+    diagnostic WebRTC connectivity fact -- it tells you whether a call went
+    direct, traversed a NAT via STUN, or fell back to a TURN relay. Without a
+    stable ``event`` discriminator and a call correlator, this fact cannot be
+    grepped or aggregated per call the way other lifecycle events already are
+    (manager.py's ``sip_registration_established`` etc.). Neither the
+    ``call_id`` correlator nor the candidate type is caller PII (rule 34).
+    """
+    correlator = "deadbeefcafefeed0001"
+    controlling = IceConnection(ice_controlling=True, stun_urls=(), call_id=correlator)
+    controlled = IceConnection(ice_controlling=False, stun_urls=())
+    try:
+        await asyncio.gather(
+            controlling.gather_candidates(),
+            controlled.gather_candidates(),
+        )
+        controlling.set_remote_credentials(controlled.local_ufrag, controlled.local_pwd)
+        controlled.set_remote_credentials(
+            controlling.local_ufrag, controlling.local_pwd
+        )
+
+        for cand in controlling.local_candidates:
+            await controlled.add_remote_candidate(cand)
+        await controlled.add_remote_candidate(None)  # end-of-candidates
+
+        for cand in controlled.local_candidates:
+            await controlling.add_remote_candidate(cand)
+        await controlling.add_remote_candidate(None)  # end-of-candidates
+
+        with caplog.at_level(logging.INFO, logger="hermes_voip.media.ice"):
+            await asyncio.gather(controlling.connect(), controlled.connect())
+
+        nominated = [
+            rec
+            for rec in caplog.records
+            if getattr(rec, "event", None) == "ice_pair_nominated"
+            and getattr(rec, "call_id", None) == correlator
+        ]
+        seen = [
+            (getattr(r, "event", None), getattr(r, "call_id", None))
+            for r in caplog.records
+        ]
+        assert len(nominated) == 1, (
+            f"expected exactly one ice_pair_nominated record carrying "
+            f"call_id={correlator!r}; events seen: {seen!r}"
+        )
+        # Loopback gathers host-only candidates (no STUN/TURN configured).
+        assert getattr(nominated[0], "candidate_type", None) == "host"
     finally:
         await controlling.close()
         await controlled.close()

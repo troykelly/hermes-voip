@@ -2004,6 +2004,101 @@ async def test_latch_logs_peer_media_address(
 
 
 # ---------------------------------------------------------------------------
+# (k) _UdpReceiver.error_received — categorised transport-loss diagnostics (#413)
+# ---------------------------------------------------------------------------
+
+
+def _capture_receiver(
+    remote_host: str, remote_port: int
+) -> tuple[engine_module._UdpReceiver, list[Exception | None]]:
+    """Build a _UdpReceiver whose on_lost callback records each invocation.
+
+    The receiver is exercised directly (white-box, like the ``_OUTBOUND_SSRC``
+    read above): ``error_received`` is an asyncio protocol callback, so no live
+    socket is needed to drive it.
+    """
+    losses: list[Exception | None] = []
+    queue: asyncio.Queue[tuple[bytes, tuple[str, int]]] = asyncio.Queue()
+    receiver = engine_module._UdpReceiver(
+        queue, losses.append, remote_host, remote_port
+    )
+    return receiver, losses
+
+
+def test_error_received_dns_failure_logs_structured_category(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A socket.gaierror is categorised dns_resolution_failed with safe context (#413).
+
+    The configured RTP destination is a HOSTNAME (the form that can fail to
+    resolve). The structured ADR-0075 event carries the category, the host KIND,
+    and the port — but NEVER the raw hostname (ADR-0084: media connection detail is
+    operator-sensitive). The call is still ended (on_lost invoked): behaviour
+    preserved.
+    """
+    remote_host = "media.pbx.example.test"
+    remote_port = 40000
+    receiver, losses = _capture_receiver(remote_host, remote_port)
+    exc: Exception = socket.gaierror(
+        socket.EAI_NONAME, "nodename nor servname provided, or not known"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.media.engine"):
+        receiver.error_received(exc)
+
+    assert losses == [exc]  # call still ended as transport loss
+
+    records = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", None) == "rtp_transport_lost"
+    ]
+    assert len(records) == 1, f"expected one structured event, got {caplog.records}"
+    rec = records[0]
+    assert vars(rec)["category"] == "dns_resolution_failed"
+    assert vars(rec)["remote_host_kind"] == "hostname"
+    assert vars(rec)["remote_port"] == remote_port
+    # No raw host leak anywhere in the emitted record (message or attributes).
+    leaked = [
+        name
+        for name, value in vars(rec).items()
+        if isinstance(value, str) and remote_host in value
+    ]
+    assert not leaked, f"raw hostname leaked into record fields: {leaked}"
+    assert remote_host not in rec.getMessage()
+
+
+def test_error_received_generic_oserror_logs_transport_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A generic OSError is categorised udp_transport_error, IP-literal host (#413).
+
+    ``socket.gaierror`` is a SUBCLASS of ``OSError``, so a plain ``OSError`` must
+    NOT fall into the DNS bucket. The call is still ended (on_lost invoked).
+    """
+    remote_host = "203.0.113.7"  # TEST-NET-3 documentation literal (RFC 5737)
+    remote_port = 41000
+    receiver, losses = _capture_receiver(remote_host, remote_port)
+    exc: Exception = OSError(111, "Connection refused")
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.media.engine"):
+        receiver.error_received(exc)
+
+    assert losses == [exc]  # call still ended as transport loss
+
+    records = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", None) == "rtp_transport_lost"
+    ]
+    assert len(records) == 1, f"expected one structured event, got {caplog.records}"
+    rec = records[0]
+    assert vars(rec)["category"] == "udp_transport_error"
+    assert vars(rec)["remote_host_kind"] == "ip_literal"
+    assert vars(rec)["remote_port"] == remote_port
+
+
+# ---------------------------------------------------------------------------
 # (j) send_dtmf — RFC 4733 telephone-event TX on the active call (ADR-0010/0031)
 # ---------------------------------------------------------------------------
 #

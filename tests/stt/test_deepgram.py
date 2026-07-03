@@ -72,15 +72,18 @@ class _FakeFluxSocket:
     """A fake Deepgram websocket: records sent audio, replays recorded events.
 
     Mirrors the minimal ``async`` websocket surface the provider uses: ``send``
-    (bytes for audio, str for control messages), async iteration for inbound text
-    frames, and ``close``. The replayed text frames are the recorded Flux JSON
-    events, followed by an unbounded wait until ``close()`` is called OR a
-    ``CloseStream`` control message is received via ``send`` — matching real
-    Deepgram behaviour where the server keeps the socket open until it receives
-    ``CloseStream`` (or the client closes the connection).
+    (bytes for audio, str for control messages), async iteration for inbound
+    frames, and ``close``. The replayed frames are normally the recorded Flux
+    JSON events (str), followed by an unbounded wait until ``close()`` is called
+    OR a ``CloseStream`` control message is received via ``send`` — matching
+    real Deepgram behaviour where the server keeps the socket open until it
+    receives ``CloseStream`` (or the client closes the connection). ``events``
+    also accepts raw ``bytes`` entries so tests can simulate a BINARY websocket
+    frame (the real ``websockets`` library yields ``bytes`` for binary frames;
+    only TEXT frames get its own UTF-8 check).
     """
 
-    def __init__(self, events: tuple[str, ...]) -> None:
+    def __init__(self, events: tuple[str | bytes, ...]) -> None:
         self._events = events
         self.sent: list[bytes] = []
         self.sent_text_frames: list[str] = []
@@ -110,8 +113,8 @@ class _FakeFluxSocket:
         self.closed = True
         self._close_event.set()
 
-    def __aiter__(self) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
+    def __aiter__(self) -> AsyncIterator[str | bytes]:
+        async def _gen() -> AsyncIterator[str | bytes]:
             for event in self._events:
                 yield event
             # Simulate real Deepgram: socket stays open (waiting for more audio or
@@ -378,6 +381,49 @@ async def test_stream_survives_malformed_frame_between_valid_ones() -> None:
     )
 
     # Both valid transcripts must arrive; the malformed frame must be skipped.
+    assert [(t.text, t.is_final) for t in out] == [
+        ("hello", False),
+        ("hello world", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_survives_invalid_utf8_binary_frame_between_valid_ones() -> None:
+    """A binary (invalid-UTF-8) frame between valid Flux events must not kill it.
+
+    The real ``websockets`` library yields ``bytes`` for BINARY frames (only TEXT
+    frames get the library's own UTF-8 validation) — the ``_FluxSocket`` Protocol
+    types inbound messages as ``str``, but nothing enforces that at runtime.
+    ``json.loads(<bytes>)`` internally UTF-8-decodes the payload and can raise
+    ``UnicodeDecodeError``, which is a ``ValueError`` SUBCLASS but NOT a
+    ``json.JSONDecodeError`` — a guard that only catches ``JSONDecodeError`` lets
+    it escape, ending the live call's transcription on a single malformed or
+    binary frame. This is distinct from (and a follow-on to) the malformed-TEXT-
+    frame guard proven by ``test_stream_survives_malformed_frame_between_valid_ones``
+    above.
+    """
+    # 0x80 is a continuation byte with no preceding lead byte: invalid at the
+    # start of a UTF-8 sequence, and not a BOM json.detect_encoding() would read
+    # as UTF-16/32 — so json.loads() reliably raises UnicodeDecodeError, not
+    # json.JSONDecodeError (verified: type(exc) is UnicodeDecodeError, and
+    # isinstance(exc, json.JSONDecodeError) is False).
+    invalid_utf8_binary_frame = b"\x80\x80\x80\x80"
+    events: tuple[str | bytes, ...] = (
+        json.dumps({"type": "Update", "transcript": "hello", "end_of_turn": False}),
+        invalid_utf8_binary_frame,  # binary frame — must be skipped, not fatal
+        json.dumps(
+            {"type": "EndOfTurn", "transcript": "hello world", "end_of_turn": True}
+        ),
+    )
+    socket = _FakeFluxSocket(events)
+    asr = _asr_with(socket)
+
+    out = await asyncio.wait_for(
+        _collect(asr.stream(_frames(_frame(0)))),
+        timeout=2.0,
+    )
+
+    # Both valid transcripts must arrive; the binary frame must be skipped.
     assert [(t.text, t.is_final) for t in out] == [
         ("hello", False),
         ("hello world", True),

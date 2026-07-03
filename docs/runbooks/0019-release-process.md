@@ -85,22 +85,38 @@ Replace `X.Y.Z` with the target version (e.g. `0.1.0`).
 
    `hermes_voip.__version__` needs NO edit — it derives from install metadata.
 
-3. **Run the version-sync gate** (and the full suite):
+3. **Sync the lockfile, then run the version-sync gate**:
 
    ```bash
+   uv lock            # bumps hermes-voip's OWN version in uv.lock to X.Y.Z
    uv sync --frozen   # re-installs editable so importlib.metadata sees X.Y.Z
    uv run pytest tests/test_plugin_manifest.py -q
-   uv run pytest -q   # full suite
    ```
 
-   The four version-sync guards listed above must pass. `uv sync` is required after
-   the bump so the editable install's metadata reflects `X.Y.Z` (otherwise
-   `__version__` reports the previously-installed number and the derivation guard
-   fails — a useful tripwire, but run the sync).
+   `uv lock` is required after the pyproject bump: `uv.lock` pins the project's own
+   version, so `uv sync --frozen` otherwise fails with "lockfile out of date". The
+   diff must be version-only — `git diff uv.lock` shows just the `hermes-voip`
+   package version changing, no dependency churn. `uv sync` then makes the editable
+   install's metadata reflect `X.Y.Z` (otherwise `__version__` reports the
+   previously-installed number and the derivation guard fails — a useful tripwire).
+   The four version-sync guards must pass. Run the FULL suite (`uv run pytest -q`)
+   only AFTER step 4 — the CHANGELOG and the version-pin ratchet test (below) must be
+   updated first, or the full suite fails.
 
 4. **Update `CHANGELOG.md`**: move the `[Unreleased]` entries into a new
    `## [X.Y.Z] - YYYY-MM-DD` section, leave a fresh empty `[Unreleased]`, and fix
-   the compare/tag links at the bottom.
+   the compare/tag links at the bottom (`[Unreleased]: …/compare/vX.Y.Z...HEAD` plus
+   a new `[X.Y.Z]: …/compare/vPREV...vX.Y.Z`).
+
+   **Version-pin ratchet test.** `tests/test_version_<prev>.py` is a per-release
+   ratchet that hard-asserts the NEW version across `pyproject.toml`, both
+   `plugin.yaml` copies, and the CHANGELOG `## [X.Y.Z]` section + compare links.
+   Update it in lockstep: rename it to the new version (e.g.
+   `test_version_013.py` → `test_version_020.py`), bump `_EXPECTED_VERSION` and the
+   `_0XY` test-function names, and update the changelog assertions. It fails red on
+   the pre-bump tree and turns green once steps 1–2 and this step are complete. (A
+   backlog item tracks generalising it to derive the version from `pyproject.toml`,
+   which would drop this rename.)
 
 5. **Commit** (Conventional Commit + the AI co-author trailer) on a worktree-lane
    branch, open a PR, run the full local gate (AGENTS.md rule 15), and merge.

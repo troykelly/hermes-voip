@@ -1417,3 +1417,18 @@ Full read of `src/hermes_voip/sdp.py` (SDES `a=crypto` negotiation + keying, ICE
 
 - [ ] **[low] egress/robustness** — The SDES/plain answer echoes the offer-derived `codec.fmtp` verbatim into its own `a=fmtp` line (`_build_audio_body`, `src/hermes_voip/sdp.py:1512`; the same echo is in `_rtpmap_lines:1530`). `codec.encoding` is intersection-safe (only codecs in OUR `supported` menu are emitted), but `fmtp` is free-form offer text passed through unfiltered. Inbound line-splitting already strips CR/LF as delimiters, so only a *lone* CR embedded mid-field could survive into the field value, and a compliant peer re-absorbs a lone CR on its own inbound split (`sdp.py:36-37`) — so this is not an injection today. But the module docstring reasons explicitly about lone-CR absorption on the INBOUND path and is silent about echoing a lone-CR field back OUTBOUND (rule-27-adjacent: the safety argument is asymmetric). Either sanitise `fmtp` (reject/strip control chars) before echo, or extend the docstring's lone-CR reasoning to cover the outbound echo so the invariant is stated where the risk is. (`src/hermes_voip/sdp.py`)
 - [ ] **[low] robustness** — Two unvalidated numeric SDP fields (neither crashes; both benign today): (a) `m=audio` payload-type numbers are parsed with no 0–127 bound (`_AudioAccumulator.set_media_line`, `src/hermes_voip/sdp.py:859`: `[int(pt) for pt in fields[3:]]`) — an out-of-range PT is simply never matched to a codec and dropped, but it is not rejected the way an out-of-range `m=audio` port is (`:846`); (b) `a=maxptime` is stored as a bare `int(rest.strip())` with no positive-value check (`src/hermes_voip/sdp.py:912`), unlike `a=ptime` which is validated `> 0` (`:905-907`). A zero/negative `maxptime` would be a nonsensical upper bound for `negotiate_ptime`; validate it `> 0` (mirror `a=ptime`) or record why it is left lenient. (`src/hermes_voip/sdp.py`)
+
+## Release hygiene (discovered 2026-07-03)
+
+- [ ] **[low] release-hygiene / test-toil** — The per-release version ratchet
+  `tests/test_version_0XY.py` hard-codes the expected version and must be renamed +
+  rewritten every release (0.2.0 shipped it as `test_version_020.py`, renamed from the
+  stale `test_version_012.py` that was still pinning 0.1.3). Generalise it so the
+  expected version is DERIVED from `pyproject.toml [project].version`: keep the
+  CHANGELOG-ratchet assertions (a `## [<version>]` section that is non-empty, a
+  `[Unreleased]` compare link to `v<version>...HEAD`, and a `[<version>]:` compare
+  link) but source `<version>` from pyproject, so the file auto-follows the bump under
+  one stable name (e.g. `test_release_changelog.py`). The absolute manifest pins it
+  currently duplicates are already covered relatively by `tests/test_plugin_manifest.py`;
+  the release runbook (0019 step 4) then drops the rename step.
+  (`tests/test_version_020.py`, `docs/runbooks/0019-release-process.md`)

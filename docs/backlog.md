@@ -1435,7 +1435,7 @@ Full read of `src/hermes_voip/sdp.py` (SDES `a=crypto` negotiation + keying, ICE
 
 ## Test / CI robustness (discovered 2026-07-03)
 
-- [ ] **[medium] test/ci** — No global pytest timeout: a flaky async/networking test can
+- [x] (#401) **[medium] test/ci** — No global pytest timeout: a flaky async/networking test can
   hang the local gate AND CI indefinitely with no diagnostic. Observed 2026-07-03 — a
   lane's `uv run pytest` (extras synced, so the full e2e/adapter socket suite ran) sat in
   asyncio `do_epoll_wait` at ~1% CPU with no per-test bound; `pyproject.toml`
@@ -1446,3 +1446,61 @@ Full read of `src/hermes_voip/sdp.py` (SDES `a=crypto` negotiation + keying, ICE
   to identify and fix the specific flaky socket/await test. Rule 33 (deterministic builds);
   also prevents the slow pre-push-hook full-suite from reading as a hang.
   (`pyproject.toml`, `docs/stack.md`)
+
+## Gap-review 2026-07-03 (media / stt / tts / auth — outside the ADR-0081 signaling campaign)
+
+A verified REPLENISH gap-review (7 read-only sub-reviewers; findings independently
+spot-checked, incl. a from-scratch repro of the TTS deadlock). The 3 HIGH robustness bugs
+shipped this wave; the 4 medium + 1 low are open. Confirmed-clean dimensions (no action):
+call_loop/rtp/rtcp, the injection guard (no fail-open under adversarial Unicode),
+srtp/srtcp, digest/keepalive/provider_error/caller_modes.
+
+- [x] (#404) **[high] robustness** — TTS barge-in deadlocked the WHOLE asyncio event loop
+  (froze every concurrent call): `PcmFrameStream.cancel()` on the loop thread called
+  `response.close()` on an `HTTPResponse` whose `read()` was parked on a worker thread —
+  CPython's `close()` cannot interrupt the read and blocks on the buffer lock it holds.
+  Fixed by arming the barge-in with `sock.shutdown(SHUT_RDWR)` on the underlying socket.
+  (`src/hermes_voip/tts/elevenlabs.py`, `src/hermes_voip/tts/_stream.py`)
+- [x] (#405) **[high] robustness** — Unbounded per-SSRC RTCP `_reception` growth: a UDP
+  flood on the negotiated RTP port (no source check) could push it past 31 SSRCs, making
+  `build_rtcp_report` raise `ValueError` at the RFC 3550 RC/SC ceiling — killing `run_rtcp`
+  and, via `stop()`'s `suppress(CancelledError)`, stranding teardown. Fixed with an
+  `OrderedDict` LRU cap at 31 + a `run_rtcp` `ValueError` backstop + `stop()`
+  non-`CancelledError` robustness (ADR-0098). (`src/hermes_voip/media/engine.py`)
+- [x] (#403) **[high] robustness** — Deepgram Flux BINARY websocket frame raised
+  `UnicodeDecodeError` (a `ValueError` sibling of, but not caught by,
+  `except json.JSONDecodeError`), killing the call's STT stream on one frame. Fixed by
+  broadening the guard + widening the socket types to `bytes | str`. Follow-on to #174.
+  (`src/hermes_voip/stt/deepgram.py`)
+- [ ] **[medium] correctness** — `dialog.py:303-312` `_uri_and_tag` extracts the tag with
+  `value.split(">", 1)[1]` (first literal `>`) instead of reusing the `_ANGLE_ADDR` regex;
+  a quoted display-name containing a literal `>` (RFC 3261 §25.1 permits it) desyncs the
+  tag search and raises `DialogError` on a fully-valid tagged header — rejecting valid calls
+  in BOTH directions (live-verified). Fix: reuse `_ANGLE_ADDR.search(value)`.
+  (`src/hermes_voip/dialog.py`)
+- [ ] **[medium] robustness** — `voip_tools.py:865-877` `_current_call_id` catches only
+  `ImportError` on the `gateway.session_context` import; the `get_session_env(...)` call
+  itself is unguarded, one function from its fail-closed sibling
+  `_proactive_place_call_allowed` (which wraps the identical pattern in
+  `except Exception: return False`). `_current_call_id` promises `None`, not a raise, and
+  feeds `voip_pre_tool_call` (the privilege gate). Fix: wrap the body in
+  `except Exception: return None`. (`src/hermes_voip/voip_tools.py`)
+- [ ] **[medium] robustness/security** — `media/sip_dtls_session.py:452/506` outbound DTLS
+  handshake: a fatal alert re-raises a bare `OpenSSL.SSL.Error` (not `RuntimeError`), so on
+  the outbound/UAC path it propagates through `place_call()` and BYPASSES
+  `place_call_handler`'s dedicated `except RuntimeError` redaction branch (whose comment
+  notes messages there can embed gateway connection details), hitting the generic handler
+  that echoes `str(exc)`. Fix: catch the fatal-alert error in `_pump_dtls_handshake` and
+  re-raise as `RuntimeError`. Serialize with the next item (both touch `media/dtls.py`).
+  (`src/hermes_voip/media/sip_dtls_session.py`, `src/hermes_voip/media/dtls.py`)
+- [ ] **[medium] robustness** — `media/dtls.py:729/783/829` `derive_srtp_sessions` /
+  `derive_srtcp_sessions` / `derive_outbound_srtp_session` all do
+  `_PROFILE_TO_SUITE.get(profile, _SUITE_80)` — silently DEFAULTING the SRTP suite when no
+  DTLS-SRTP profile was negotiated, instead of failing closed like the same file's
+  `selected_profile()` (which converts through an enum and raises `RuntimeError` for an
+  unrecognized value). Fix: route all three through the fail-closed conversion.
+  (`src/hermes_voip/media/dtls.py`)
+- [ ] **[low] correctness/docs** — `media/audio.py:236-240` `linear_fade_out` comment
+  claims "round toward zero (int() truncation)" but `//` is floor division (rule 27); off by
+  exactly 1 LSB on negative samples (no audible impact). Fix the comment or switch to true
+  truncation. Bundle with an adjacent lane. (`src/hermes_voip/media/audio.py`)

@@ -333,6 +333,72 @@ async def test_teardown_without_rtcp_emits_no_quality_event(
     ], "a non-RTCP call must emit no rtcp_call_quality record"
 
 
+def _rtcp_dormant_engine(*, dormant_reason: str | None) -> MagicMock:
+    """A fake media engine that left RTCP dormant, carrying a dormant reason."""
+    return MagicMock(
+        stop=AsyncMock(return_value=None),
+        media_timed_out=False,
+        _rtcp_active=False,
+        _rtcp_dormant_reason=dormant_reason,
+    )
+
+
+async def test_teardown_emits_structured_rtcp_dormant_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When RTCP stayed dormant, teardown emits a machine-parseable dormant record.
+
+    Without this event, a dormant call (secured-without-SRTCP-opt-in, the RTCP
+    kill-switch off, an unsupported answer profile, a muxed payload-type conflict,
+    ...) left teardown SILENT — operators could not distinguish "no RTCP data
+    because RTCP never activated" from "RTCP activated then failed to report".
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    call_id = new_call_id()
+    session = _FakeSession(ended=True, call_id=call_id)
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # _FakeSession is a CallSession test double
+
+    with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+        await adapter._teardown_call(
+            call_id=call_id,
+            engine=_rtcp_dormant_engine(dormant_reason="secured_rtcp_not_enabled"),
+            transport=transport,  # type: ignore[arg-type]  # fake transport double
+            dialog_id=session.dialog_id,
+            session=session,  # type: ignore[arg-type]  # _FakeSession double
+            reason=CallEndReason.REMOTE_BYE,
+        )
+
+    rec = _record_with_event(caplog, "rtcp_dormant")
+    assert rec.call_id == call_id  # type: ignore[attr-defined]
+    assert rec.dormant_reason == "secured_rtcp_not_enabled"  # type: ignore[attr-defined]
+
+
+async def test_teardown_active_rtcp_emits_no_dormant_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An RTCP-active call must not ALSO emit the rtcp_dormant record."""
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    call_id = new_call_id()
+    session = _FakeSession(ended=True, call_id=call_id)
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # _FakeSession is a CallSession test double
+
+    with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+        await adapter._teardown_call(
+            call_id=call_id,
+            engine=_rtcp_active_engine(),
+            transport=transport,  # type: ignore[arg-type]  # fake transport double
+            dialog_id=session.dialog_id,
+            session=session,  # type: ignore[arg-type]  # _FakeSession double
+            reason=CallEndReason.REMOTE_BYE,
+        )
+
+    assert not [
+        rec for rec in caplog.records if getattr(rec, "event", None) == "rtcp_dormant"
+    ], "an RTCP-active call must emit no rtcp_dormant record"
+
+
 # ===========================================================================
 # (3) Admission concurrency gauge + per-call duration on release
 # ===========================================================================

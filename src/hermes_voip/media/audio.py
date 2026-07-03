@@ -234,8 +234,11 @@ def linear_fade_out(pcm16: bytes, *, fade_samples: int) -> bytes:
     start = total - window
     for k in range(window):
         # Gain (L-1-k)/L as integer math: scale the sample by the numerator and
-        # divide by L, so the last sample (k == window-1) is exactly zero. Round
-        # toward zero (int() truncation) — the residual is <1 LSB, inaudible.
+        # divide by L, so the last sample (k == window-1) is exactly zero. `//`
+        # is floor division (rounds toward -infinity), not round-toward-zero: for
+        # a positive sample this truncates as expected, but for a negative sample
+        # it rounds away from zero by up to 1 LSB — either way the residual is
+        # inaudible.
         numerator = window - 1 - k
         samples[start + k] = samples[start + k] * numerator // window
     return struct.pack(f"<{total}h", *samples)

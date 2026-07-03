@@ -3764,6 +3764,16 @@ class VoipAdapter(BasePlatformAdapter):
                 "rtcp-mux" if rtcp_plan.mux else f"port {engine.local_port + 1}",
                 ", SRTCP" if answer_crypto is not None else "",
             )
+        else:
+            # RTCP-dormant teardown observability (ADR-0061): record WHY so
+            # _teardown_call's rtcp_dormant log can distinguish "no RTCP data
+            # because disabled/not-opted-in/unsupported-profile" from "RTCP
+            # activated then failed to report". Mirrors the None-returning
+            # conditions of whichever planner was actually called above.
+            engine._rtcp_dormant_reason = _rtcp_dormant_reason(
+                secured=answer_crypto is not None,
+                rtcp_enabled=media_cfg.rtcp_enabled,
+            )
 
         local_media = LocalMediaSession(
             local_address=local_rtp_host,
@@ -5577,8 +5587,12 @@ class VoipAdapter(BasePlatformAdapter):
         # RTCP was active for this call, emit the final loss/jitter/RTT view (ours +
         # the peer's report about us) before stopping the engine. The CallQuality
         # carries only numeric quality metrics — no caller identity — so it is safe to
-        # log on a PUBLIC repo (rule 34). The read never raises (a pure snapshot);
-        # gated on _rtcp_active so a non-RTCP (secured / disabled) call logs nothing.
+        # log on a PUBLIC repo (rule 34). The read never raises (a pure snapshot).
+        # When RTCP never activated (secured/disabled/unsupported-profile/muxed
+        # payload-type conflict — see _RtcpActivation and start_rtcp), the else
+        # branch below logs WHY instead of nothing, so a call that produced no
+        # quality data is never silently indistinguishable from one where RTCP
+        # genuinely failed.
         if engine._rtcp_active:
             q = engine.call_quality
             _log.info(
@@ -5602,6 +5616,29 @@ class VoipAdapter(BasePlatformAdapter):
                     "remote_fraction_lost": q.remote_fraction_lost,
                     "remote_jitter_ms": q.remote_jitter_ms,
                     "rtt_seconds": q.rtt_seconds,
+                },
+            )
+        else:
+            # No quality snapshot exists — RTCP was never activated for this call.
+            # dormant_reason is threaded from the activation planning result
+            # (_RtcpActivation / _plan_rtcp_activation / _plan_secured_rtcp_activation
+            # / _activate_muxed_srtcp_rtcp, via _rtcp_dormant_reason) or set directly
+            # by start_rtcp's own last-line guards; ``None`` only when teardown ran
+            # before RTCP activation was ever attempted (e.g. a very early setup
+            # failure). Same PUBLIC-repo safety as above (rule 34): the reason is a
+            # fixed short code, never caller identity.
+            _log.info(
+                "INVITE %s: RTCP dormant — no call quality data (reason=%s)",
+                call_id,
+                engine._rtcp_dormant_reason,
+                # Machine-parseable mirror (runbook 0014 style): a log pipeline
+                # filters on event='rtcp_dormant' to distinguish "no RTCP data"
+                # from "RTCP activated then failed to report" (which instead shows
+                # as a missing rtcp_call_quality record with no dormant one either).
+                extra={
+                    "event": "rtcp_dormant",
+                    "call_id": call_id,
+                    "dormant_reason": engine._rtcp_dormant_reason,
                 },
             )
         try:
@@ -7398,6 +7435,27 @@ def _plan_secured_rtcp_activation(
     return _RtcpActivation(mux=mux, remote_rtcp_addr=(remote_address, rtcp_port))
 
 
+def _rtcp_dormant_reason(*, secured: bool, rtcp_enabled: bool) -> str:
+    """Why the chosen RTCP activation planner left RTCP dormant (ADR-0061).
+
+    Mirrors the None-returning conditions of :func:`_plan_rtcp_activation` /
+    :func:`_plan_secured_rtcp_activation`, in the SAME precedence (the operator
+    kill-switch is checked first in both): call with the ``rtcp_enabled`` and the
+    ``secured`` flag (``answer_crypto is not None``) that selected which planner
+    ran, only when that planner actually returned ``None``.
+
+    Read at teardown (:meth:`VoipAdapter._teardown_call`) via
+    ``engine._rtcp_dormant_reason`` so a call that produced no RTCP quality data
+    is distinguishable from one where RTCP genuinely failed. A fixed short code,
+    never caller identity (rule 34).
+    """
+    if not rtcp_enabled:
+        return "disabled"
+    if secured:
+        return "secured_rtcp_not_enabled"
+    return "unsupported_answer_profile"
+
+
 async def _activate_muxed_srtcp_rtcp(
     engine: RtpMediaTransport,
     *,
@@ -7412,9 +7470,12 @@ async def _activate_muxed_srtcp_rtcp(
     separate RTCP port is impossible. The engine already carries the SRTCP transform
     (wired from the DTLS export), so RTCP is encrypted+authenticated (RFC 3711 §3.4) on
     the secured pipe. The operator kill-switch still applies; ``remote_rtcp_addr`` is
-    unused when muxed (RTCP follows the pipe). A no-op when the kill-switch is off.
+    unused when muxed (RTCP follows the pipe). When the kill-switch is off, RTCP stays
+    dormant and ``engine._rtcp_dormant_reason`` is set to ``"disabled"`` (read by
+    :meth:`VoipAdapter._teardown_call` at call end, ADR-0061 teardown observability).
     """
     if not rtcp_enabled:
+        engine._rtcp_dormant_reason = "disabled"
         return
     await engine.start_rtcp(mux=True, rtp_payload_types=payload_types)
     _log.info("INVITE %s: RTCP active (rtcp-mux, SRTCP)", call_id)

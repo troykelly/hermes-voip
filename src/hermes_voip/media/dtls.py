@@ -674,6 +674,27 @@ class DtlsEndpoint:
             msg = f"unsupported DTLS-SRTP profile negotiated: {raw!r}"
             raise RuntimeError(msg)  # noqa: B904 — no cause needed (own error)
 
+    def _selected_suite(self) -> str:
+        """Return the srtp.py suite name for the negotiated DTLS-SRTP profile.
+
+        Routes through :meth:`selected_profile` so an ABSENT or unrecognised
+        ``use_srtp`` result (RFC 5764 §4.1.2 negotiation agreed no profile —
+        ``get_selected_srtp_profile()`` returns ``b""``) FAILS CLOSED with a
+        ``RuntimeError`` instead of silently assuming a suite. A missing agreed
+        profile is a real negotiation failure the call must abort on, not paper
+        over: the historical ``dict.get(raw, _SUITE_80)`` default was the stronger
+        80-bit-tag suite (so never a downgrade), but it masked the failure.
+
+        Both suites in :data:`_PROFILE_TO_SUITE` are keyed on the two
+        :class:`SrtpProfile` members :meth:`selected_profile` can return, so this
+        lookup is total for any value it yields.
+
+        Raises:
+            RuntimeError: If the handshake has not completed, or no supported
+                DTLS-SRTP profile was negotiated (mirrors :meth:`selected_profile`).
+        """
+        return _PROFILE_TO_SUITE[self.selected_profile().value.encode()]
+
     def export_srtp_keying_material(self) -> bytes:
         """Export the RFC 5705 keying material (label ``EXTRACTOR-dtls_srtp``).
 
@@ -715,9 +736,11 @@ class DtlsEndpoint:
             ready for :meth:`~SrtpSession.unprotect` / :meth:`~SrtpSession.protect`.
 
         Raises:
-            RuntimeError: If called before the handshake completes, or if
+            RuntimeError: If called before the handshake completes, if
                 :meth:`verify_peer_fingerprint` has not been called first
-                (RFC 5763 §5 requires fingerprint verification before keying).
+                (RFC 5763 §5 requires fingerprint verification before keying), or
+                if no supported DTLS-SRTP profile was negotiated (fail closed via
+                :meth:`_selected_suite`, never silently defaulting a suite).
         """
         if not self._fingerprint_verified:
             msg = (
@@ -726,9 +749,7 @@ class DtlsEndpoint:
             )
             raise RuntimeError(msg)
         material: bytes = self.export_srtp_keying_material()
-        suite: str = _PROFILE_TO_SUITE.get(
-            self._conn.get_selected_srtp_profile(), _SUITE_80
-        )
+        suite: str = self._selected_suite()
 
         # RFC 5764 §4.2 layout:
         # offset 0   client_write_key  (16 bytes)
@@ -768,9 +789,10 @@ class DtlsEndpoint:
             for :meth:`~SrtcpSession.unprotect` / :meth:`~SrtcpSession.protect`.
 
         Raises:
-            RuntimeError: If called before the handshake completes, or before
+            RuntimeError: If called before the handshake completes, before
                 :meth:`verify_peer_fingerprint` (RFC 5763 §5 — fingerprint verification
-                precedes keying), mirroring :meth:`derive_srtp_sessions`.
+                precedes keying), or if no supported DTLS-SRTP profile was
+                negotiated (fail closed) — mirroring :meth:`derive_srtp_sessions`.
         """
         if not self._fingerprint_verified:
             msg = (
@@ -780,9 +802,7 @@ class DtlsEndpoint:
             )
             raise RuntimeError(msg)
         material: bytes = self.export_srtp_keying_material()
-        suite: str = _PROFILE_TO_SUITE.get(
-            self._conn.get_selected_srtp_profile(), _SUITE_80
-        )
+        suite: str = self._selected_suite()
         # RFC 5764 §4.2 layout (identical to derive_srtp_sessions).
         cwk: bytes = material[0:_SRTP_KEY_LEN]
         swk: bytes = material[_SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN]
@@ -815,9 +835,10 @@ class DtlsEndpoint:
             A new outbound :class:`SrtpSession` pre-bound to ``ssrc``.
 
         Raises:
-            RuntimeError: If called before the handshake completes / before
-                :meth:`verify_peer_fingerprint` (same precondition as
-                :meth:`derive_srtp_sessions`).
+            RuntimeError: If called before the handshake completes, before
+                :meth:`verify_peer_fingerprint`, or if no supported DTLS-SRTP
+                profile was negotiated (fail closed) — same preconditions as
+                :meth:`derive_srtp_sessions`.
         """
         if not self._fingerprint_verified:
             msg = (
@@ -826,9 +847,7 @@ class DtlsEndpoint:
             )
             raise RuntimeError(msg)
         material: bytes = self.export_srtp_keying_material()
-        suite: str = _PROFILE_TO_SUITE.get(
-            self._conn.get_selected_srtp_profile(), _SUITE_80
-        )
+        suite: str = self._selected_suite()
         cwk: bytes = material[0:_SRTP_KEY_LEN]
         swk: bytes = material[_SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN]
         cws: bytes = material[2 * _SRTP_KEY_LEN : 2 * _SRTP_KEY_LEN + _SRTP_SALT_LEN]

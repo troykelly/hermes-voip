@@ -248,6 +248,7 @@ class _IceFactory(Protocol):
         turn_password: str | None = None,
         use_ipv4: bool = True,
         use_ipv6: bool = True,
+        call_id: str | None = None,
     ) -> _LinkedIce:
         """Build an ICE pipe for the given role, STUN, and (optional) TURN."""
         ...
@@ -414,6 +415,7 @@ class FakeWebRtcGateway:
             turn_password: str | None = None,
             use_ipv4: bool = True,
             use_ipv6: bool = True,
+            call_id: str | None = None,
         ) -> _LinkedIce:
             if self._adapter_ice_handed_out:
                 msg = "adapter ICE pipe already handed out (one call per gateway)"
@@ -596,6 +598,7 @@ class FakeWebRtcGateway:
             turn_password: str | None = None,
             use_ipv4: bool = True,
             use_ipv6: bool = True,
+            call_id: str | None = None,
         ) -> _LinkedIce:
             return self._peer_ice
 

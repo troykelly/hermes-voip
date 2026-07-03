@@ -2643,6 +2643,7 @@ class VoipAdapter(BasePlatformAdapter):
         local_sent_by = transport.local_sent_by
         local_rtp_host = _host_of(local_sent_by)
         session_id = int(time.monotonic() * 1000) & 0xFFFF_FFFF
+        call_id = new_call_id()
 
         # --- Build OUR WebRTC offer (ICE-controlling, DTLS active) ----------
         session = WebRtcMediaSession.for_outbound_offer(
@@ -2652,11 +2653,11 @@ class VoipAdapter(BasePlatformAdapter):
             turn_password=media_cfg.ice_turn_password,
             use_ipv4=media_cfg.ice_use_ipv4,
             use_ipv6=media_cfg.ice_use_ipv6,
+            call_id=call_id,
         )
         sink: CallResponseSink = _QueueSink()
         call_session: CallSession | None = None
         session_established = False
-        call_id = new_call_id()
         # OUR offered codec menu (Opus + G.711 fallback + telephone-event); also
         # used to BOUND the 2xx answer negotiation below (RFC 3264: the answer must
         # be a subset of what we offered).
@@ -3914,6 +3915,7 @@ class VoipAdapter(BasePlatformAdapter):
             turn_password=media_cfg.ice_turn_password,
             use_ipv4=media_cfg.ice_use_ipv4,
             use_ipv6=media_cfg.ice_use_ipv6,
+            call_id=call_id,
         )
         try:
             await session.prepare()  # gather ICE; expose fingerprint/setup/creds

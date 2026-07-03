@@ -427,6 +427,10 @@ class IceConnection:
         use_ipv4: Gather IPv4 candidates (default ``True``).
         use_ipv6: Gather IPv6 candidates (default ``False`` -- most SIP
             gateways are IPv4-only; enable only if the gateway requires it).
+        call_id: Optional call/session correlator attached to this agent's
+            structured log records (``extra={"call_id": ...}``, ADR-0075
+            style).  ``None`` (default) logs ``call_id=None`` -- existing
+            callers are behaviourally unaffected.  Not a secret (rule 34).
 
     Raises:
         ImportError: At construction time if ``aioice`` is not installed.
@@ -444,6 +448,7 @@ class IceConnection:
         turn_password: str | None = None,
         use_ipv4: bool = True,
         use_ipv6: bool = False,
+        call_id: str | None = None,
     ) -> None:
         """Construct the ICE agent; no socket is opened until gather_candidates."""
         aioice = _get_aioice()
@@ -485,6 +490,7 @@ class IceConnection:
         self._aioice = aioice
         self._selected_pair: IceSelectedPair | None = None
         self._closed: bool = False
+        self._call_id: str | None = call_id
 
     # ------------------------------------------------------------------
     # Local ICE credentials (available before gathering)
@@ -595,6 +601,11 @@ class IceConnection:
             pair.local_candidate.port,
             pair.remote_candidate.host,
             pair.remote_candidate.port,
+            extra={
+                "event": "ice_pair_nominated",
+                "call_id": self._call_id,
+                "candidate_type": self._selected_pair.local_candidate.type,
+            },
         )
 
     @property

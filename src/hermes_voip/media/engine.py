@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import ipaddress
 import logging
 import random
 import socket
@@ -712,6 +713,26 @@ class _IceDatagramTransport:
 # ---------------------------------------------------------------------------
 
 
+def _remote_host_kind(host: str) -> str:
+    """Classify an RTP remote destination host as an IP literal or a hostname (#413).
+
+    A HOSTNAME is the destination form that can fail name resolution (a
+    ``socket.gaierror`` on send); an IP LITERAL cannot. ``ipaddress.ip_address``
+    parses a literal IPv4/IPv6 address and raises ``ValueError`` for anything else,
+    so a ``ValueError`` means the configured destination is a name.
+
+    Only this CATEGORY token is ever logged — never the raw host. Media/gateway
+    connection detail on the SIP/media path is operator-sensitive even though it is
+    not a secret (ADR-0084), so the diagnostic carries the host KIND plus the port,
+    not the SDP-derived address itself.
+    """
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return "hostname"
+    return "ip_literal"
+
+
 class _UdpReceiver(asyncio.DatagramProtocol):
     """DatagramProtocol that enqueues each received datagram.
 
@@ -723,15 +744,24 @@ class _UdpReceiver(asyncio.DatagramProtocol):
     error (``error_received``) or an ERROR socket close (``connection_lost`` with
     an exception) reports the loss so the engine can end the call as a failure
     instead of leaving the inbound generator blocked forever on a dead socket.
+
+    ``remote_host`` / ``remote_port`` are the configured (SDP-derived) RTP
+    destination, held ONLY to categorise a fatal ``error_received`` — a hostname
+    that will not resolve (``dns_resolution_failed``) versus a generic dead
+    transport (``udp_transport_error``) — with operator-safe context (#413).
     """
 
     def __init__(
         self,
         queue: asyncio.Queue[_Datagram],
         on_lost: Callable[[Exception | None], None],
+        remote_host: str,
+        remote_port: int,
     ) -> None:
         self._queue = queue
         self._on_lost = on_lost
+        self._remote_host = remote_host
+        self._remote_port = remote_port
         self._transport: asyncio.BaseTransport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -750,14 +780,41 @@ class _UdpReceiver(asyncio.DatagramProtocol):
             _log.debug("inbound queue full — datagram dropped from %s", addr)
 
     def error_received(self, exc: Exception) -> None:
-        """Report a fatal ICMP / socket error as a transport loss (ADR-0026).
+        """Report a fatal ICMP / socket error as a categorised transport loss.
 
         Previously DEBUG-only, which left a call hanging on a dead socket (e.g. an
         unreachable destination surfaced here as ICMP port-unreachable). Reporting
         it via ``on_lost`` ends the call as a failure (→ ``/stop``): the loss is
-        now acted upon, never swallowed (rule 37).
+        acted upon, never swallowed (rule 37).
+
+        The failure is now CATEGORISED before ending the call (#413): a name
+        resolution failure — the configured RTP destination host does not resolve
+        from the agent host — is ``dns_resolution_failed``; any other socket/ICMP
+        error is a generic ``udp_transport_error``. ``socket.gaierror`` is a
+        SUBCLASS of ``OSError``, so it is tested FIRST, or a DNS failure would fall
+        into the generic bucket. An ADR-0075 structured ``rtp_transport_lost``
+        event carries operator-safe destination context (the remote host KIND and
+        port, never the raw host — ADR-0084). Behaviour is preserved: the call is
+        still ended in both cases. ``str(exc)`` is the resolver/errno message only
+        (e.g. "nodename nor servname provided, or not known") and does not carry
+        the destination host.
         """
-        _log.warning("UDP error received — ending call as transport loss: %s", exc)
+        category = (
+            "dns_resolution_failed"
+            if isinstance(exc, socket.gaierror)
+            else "udp_transport_error"
+        )
+        _log.warning(
+            "UDP error received — ending call as transport loss (%s): %s",
+            category,
+            exc,
+            extra={
+                "event": "rtp_transport_lost",
+                "category": category,
+                "remote_host_kind": _remote_host_kind(self._remote_host),
+                "remote_port": self._remote_port,
+            },
+        )
         self._on_lost(exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
@@ -1509,7 +1566,12 @@ class RtpMediaTransport:
 
         # SIP-over-TLS path: bind our own UDP socket.
         assert sock is not None  # noqa: S101 — invariant: sock is bound when _ice is None
-        protocol = _UdpReceiver(self._recv_queue, self._on_transport_lost)
+        protocol = _UdpReceiver(
+            self._recv_queue,
+            self._on_transport_lost,
+            self._remote_address,
+            self._remote_port,
+        )
         self._protocol = protocol
 
         transport, _ = await loop.create_datagram_endpoint(

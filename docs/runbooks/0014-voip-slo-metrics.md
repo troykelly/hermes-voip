@@ -91,6 +91,23 @@ its lifecycle. The events:
 
 Setup success ≈ `count(call_answered) / (count(call_answered) + count(call_rejected))`.
 
+**Media-transport loss (ADR-0100).** When the RTP socket reports a fatal `error_received`
+the media engine ends the call and emits a `rtp_transport_lost` event (WARNING) carrying
+`category`, `remote_host_kind`, and `remote_port`. `category` is `dns_resolution_failed`
+(the configured RTP destination host does not resolve from the agent host — a
+`socket.gaierror`) or `udp_transport_error` (a generic dead/unreachable transport, e.g. an
+ICMP port-unreachable). `remote_host_kind` is `hostname` or `ip_literal` — only a
+`hostname` can fail resolution. This event rides the media callback, not the SIP call path,
+so it carries NO `call_id`, and the raw destination host is never logged (ADR-0084: media
+connection detail is operator-sensitive). A run of `dns_resolution_failed` with
+`remote_host_kind="hostname"` points at an unresolvable SDP media address, NOT a dead
+gateway — fix the media address (or its DNS), not the transport.
+
+```bash
+# Media-transport losses split by category (JSON logs):
+jq -r 'select(.event=="rtp_transport_lost") | .category' /path/to/hermes/log.jsonl | sort | uniq -c
+```
+
 With JSON-formatted logs (`jq`):
 
 ```bash

@@ -869,11 +869,18 @@ def _current_call_id() -> str | None:
     (imported lazily so this module stays hermes-free at import time). ``None``
     when the runtime is absent or no session is in scope.
     """
+    # FAIL CLOSED: this feeds voip_pre_tool_call, the privilege gate the Hermes
+    # runtime calls before EVERY VoIP tool invocation — the same deliberate
+    # fail-closed security boundary as _proactive_place_call_allowed below. ANY
+    # failure to resolve the session (runtime absent, or get_session_env raising
+    # for a reason other than the module being missing) must return None here,
+    # never raise out of the gate.
     try:
         from gateway.session_context import get_session_env  # noqa: PLC0415
-    except ImportError:
+
+        value = get_session_env(_SESSION_CHAT_ID_ENV)
+    except Exception:  # noqa: BLE001 — deliberate fail-closed security boundary
         return None
-    value = get_session_env(_SESSION_CHAT_ID_ENV)
     return value or None
 
 

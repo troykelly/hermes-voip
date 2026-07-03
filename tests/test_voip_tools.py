@@ -187,6 +187,34 @@ def _set_chat(monkeypatch: pytest.MonkeyPatch, call_id: str | None) -> None:
     monkeypatch.setattr(vt, "_current_call_id", lambda: call_id)
 
 
+def _set_session_context_raising(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install a fake ``gateway.session_context`` whose ``get_session_env`` raises.
+
+    Exercises the REAL ``_current_call_id`` (unlike :func:`_set_chat`, which
+    monkeypatches the whole function away for unrelated tests) against a
+    session-context reader that fails for a reason other than the module being
+    absent (``ImportError``) — e.g. a corrupted contextvar. Proves
+    ``_current_call_id`` fails CLOSED rather than letting the exception escape
+    into ``voip_pre_tool_call``, the privilege gate the Hermes runtime calls
+    before every VoIP tool invocation.
+    """
+    import sys  # noqa: PLC0415
+    from types import ModuleType  # noqa: PLC0415
+
+    module = ModuleType("gateway.session_context")
+
+    def _get_session_env_raises(key: str) -> str:
+        raise RuntimeError("session context unavailable: " + key)
+
+    # Attribute assignment on a fresh ModuleType — the reader does ``from
+    # gateway.session_context import get_session_env``, so the name must resolve.
+    # ``setattr`` (not ``module.x = ...``) keeps this mypy-strict clean without an
+    # escape hatch: a ModuleType exposes no static stub for an injected attribute.
+    setattr(module, "get_session_env", _get_session_env_raises)  # noqa: B010
+    monkeypatch.setitem(sys.modules, "gateway", ModuleType("gateway"))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", module)
+
+
 def test_set_and_get_active_adapter_roundtrip() -> None:
     host = _FakeHost()
     set_active_adapter(host)
@@ -287,6 +315,46 @@ def test_pre_tool_call_fails_safe_when_call_unknown(
     # SAFE → allowed (None) even with no resolvable state; the key property is no
     # crash and no accidental privilege grant.
     assert voip_pre_tool_call(tool_name=HANG_UP_TOOL_NAME, args={}) is None
+
+
+def test_current_call_id_fails_closed_when_session_context_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_current_call_id`` returns ``None`` when the session reader itself fails.
+
+    Not just when the module is absent (``ImportError``) — the session-context
+    reader can fail for other reasons too. ``_current_call_id``'s docstring
+    promises ``None``, matching the identical fail-closed pattern its sibling
+    ``_proactive_place_call_allowed`` already uses (``except Exception: return
+    False``, "deliberate fail-closed security boundary — must never raise out
+    of the gate").
+    """
+    import hermes_voip.voip_tools as vt  # noqa: PLC0415
+
+    _set_session_context_raising(monkeypatch)
+
+    assert vt._current_call_id() is None
+
+
+def test_pre_tool_call_fails_safe_when_session_context_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate never propagates a session-context failure.
+
+    ``_current_call_id`` feeds ``voip_pre_tool_call`` (called before EVERY VoIP
+    tool invocation). Even with a live, privileged (level-3) adapter guard state
+    registered, a session-context raise must resolve the call as unknown and
+    fail safe — BLOCKING an ELEVATED tool — rather than crashing the hook or
+    accidentally granting the privileged state.
+    """
+    host = _FakeHost(guard=GuardSessionState(call_id="c", privilege_level=3))
+    set_active_adapter(host)
+    _set_session_context_raising(monkeypatch)
+
+    verdict = voip_pre_tool_call(tool_name=HOLD_TOOL_NAME, args={})
+
+    assert verdict is not None
+    assert verdict["action"] == "block"
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,44 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
+An observability + operability release. Structured ADR-0075 SLO log events now span the
+**outbound-call lifecycle**, the **SIP-over-TLS transport** (loss / retry / recovery),
+and **ICE** nomination, so call-setup, uptime, and flap metrics are queryable from logs
+without regex. The plugin-enable gate validates the provider wiring up front, and media
+destination-resolution failures and proactive-call gate denials are now diagnosable. All
+changes are additive — no breaking changes.
+
+### Added
+
+- **Outbound call lifecycle SLO events** — the outbound `place_call` path emits structured
+  `outbound_invite_sent` / `outbound_call_connected` / `outbound_call_failed` log events
+  (ADR-0075), correlated by Call-ID and carrying only non-sensitive context (transport,
+  codec, and the ADR-0086 failure category), so outbound attempt / answer / failure rates
+  are queryable. (#419)
+- **SIP transport loss / retry / recovery SLO events** — the reconnect supervisor emits
+  structured `sip_transport_lost` / `sip_transport_retry` / `sip_transport_recovered`
+  events so uptime and flap windows are queryable without regex. (#420)
+- **Structured `ice_pair_nominated` log event** — the ICE nominated-pair line now carries
+  a structured `event` name, `call_id`, and `candidate_type`. (#412)
+- **Diagnosable proactive `place_call` gate denials** — a blocked proactive call now logs a
+  non-sensitive deny-reason category (`proactive_allow_unset` / `origin_unavailable` /
+  `origin_not_allowlisted` / `live_call_guard_missing` /
+  `unsupported_tool_for_proactive_origin`), preserving the fail-closed boundary and never
+  logging the origin platform / chat-id / allow-list. (#418)
+- **Provider-wiring preflight at the enable gate** — `validate_voip_config` now rejects an
+  unwired provider token or a missing / mis-pathed self-host model directory at
+  plugin-enable time (naming the offending token / env var, never the SIP password),
+  instead of surfacing the failure later inside `connect()`. (#415)
+
+### Fixed
+
+- **RTP media-destination resolution failures are now diagnosable** — a DNS / `gaierror`
+  failure of the SDP media destination is categorised `dns_resolution_failed` (vs
+  `udp_transport_error`) with operator-safe context (host-kind + port, never the raw
+  host), instead of appearing as a generic dead RTP transport. (#417, closes #413)
+
 ## [0.2.0] - 2026-07-02
 
 A security-hardening release. The centrepiece is the **complete closure of the
@@ -394,7 +432,8 @@ gateway.
   `plugin.yaml` manifest version equal, so a release is a single edit in
   `pyproject.toml`.
 
-[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/troykelly/hermes-voip/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/troykelly/hermes-voip/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/troykelly/hermes-voip/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/troykelly/hermes-voip/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/troykelly/hermes-voip/compare/v0.1.1...v0.1.2

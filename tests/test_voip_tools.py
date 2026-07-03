@@ -31,6 +31,7 @@ from hermes_voip.voip_tools import (
     OPEN_ENTRY_TOOL_SCHEMA,
     PLACE_CALL_TOOL_NAME,
     PLACE_CALL_TOOL_SCHEMA,
+    REPORT_RESULT_TOOL_NAME,
     RESUME_TOOL_NAME,
     RESUME_TOOL_SCHEMA,
     SEND_DTMF_TOOL_NAME,
@@ -930,6 +931,33 @@ def test_open_entry_scoped_by_allowed_tools_blocks_other_tools(
         verdict = voip_pre_tool_call(tool_name=blocked, args={})
         assert verdict is not None, f"{blocked} should be blocked by the sub-ceiling"
         assert verdict["action"] == "block"
+
+
+def test_intercom_session_still_permits_the_safe_conversational_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre_tool_call gate lets a SCOPED intercom session hang_up / report_result.
+
+    Companion to ``test_open_entry_scoped_by_allowed_tools_blocks_other_tools``: the
+    sub-ceiling scopes the session's SENSITIVE surface to ``open_entry``, but the SAFE
+    conversational tools (``hang_up`` / ``report_call_result`` — ADR-0026/0029) are
+    ALWAYS allowed — the call agent must be able to END and RECORD its own call inside a
+    scoped caller group. The gate returns ``None`` (allow) for both. Regression for the
+    sub-ceiling blocking SAFE tools at the ``pre_tool_call`` hook (it ran the allow-list
+    removal before the risk classification).
+    """
+    intercom_state = GuardSessionState(
+        call_id="c",
+        privilege_level=2,
+        allowed_tools=frozenset({OPEN_ENTRY_TOOL_NAME}),
+    )
+    host = _FakeHost(guard=intercom_state)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "c")
+
+    # Both SAFE conversational tools pass the gate (None == allowed), never blocked.
+    assert voip_pre_tool_call(tool_name=HANG_UP_TOOL_NAME, args={}) is None
+    assert voip_pre_tool_call(tool_name=REPORT_RESULT_TOOL_NAME, args={}) is None
 
 
 # ---------------------------------------------------------------------------

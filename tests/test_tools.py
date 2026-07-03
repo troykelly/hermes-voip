@@ -214,6 +214,40 @@ def test_allowed_tools_does_not_resurrect_unknown_tools() -> None:
     assert gate_voip_tool("delete_everything", scoped, confirmed=True) is False
 
 
+def test_safe_tools_bypass_the_allowed_tools_sub_ceiling() -> None:
+    # A SAFE tool is EXEMPT from the allowed_tools sub-ceiling: the sub-ceiling is a
+    # SUB-ceiling on ELEVATED/IRREVERSIBLE tools ONLY. hang_up / report_call_result are
+    # SAFE (ADR-0026/0029, "SAFE always runs, never gated"), so a caller group scoped to
+    # e.g. {open_entry} must STILL be able to END and RECORD its own call — otherwise an
+    # intercom/known call agent could open the door but never hang up. The sub-ceiling
+    # must keep clamping every NON-SAFE tool outside the grant.
+    scoped = GuardSessionState(
+        call_id="call-1",
+        privilege_level=2,
+        allowed_tools=frozenset({"open_entry"}),
+    )
+    # SAFE tools run even though they are NOT in the allow-list.
+    assert gate_voip_tool("hang_up", scoped, confirmed=False) is True
+    assert gate_voip_tool("report_call_result", scoped, confirmed=False) is True
+    # The one granted (ELEVATED) tool still passes; every OTHER non-SAFE tool stays
+    # clamped by the sub-ceiling even though the level (2) alone would permit the
+    # ELEVATED ones — the sub-ceiling only ever removes, never grants above the level.
+    assert gate_voip_tool("open_entry", scoped, confirmed=False) is True
+    assert gate_voip_tool("hold_call", scoped, confirmed=False) is False
+    assert gate_voip_tool("send_dtmf", scoped, confirmed=False) is False
+    assert gate_voip_tool("transfer_blind", scoped, confirmed=True) is False
+    assert gate_voip_tool("place_call", scoped, confirmed=True) is False
+    # The SAFE exemption does not alter the EMPTY-allowed_tools path (no sub-ceiling):
+    # a level-2 session still reaches its ELEVATED tools by level, SAFE stays allowed,
+    # and IRREVERSIBLE stays blocked by the level — byte-identical to the prior gate.
+    unscoped = GuardSessionState(call_id="call-1", privilege_level=2)
+    assert unscoped.allowed_tools == frozenset()
+    assert gate_voip_tool("hang_up", unscoped, confirmed=False) is True
+    assert gate_voip_tool("send_dtmf", unscoped, confirmed=False) is True
+    assert gate_voip_tool("hold_call", unscoped, confirmed=False) is True
+    assert gate_voip_tool("transfer_blind", unscoped, confirmed=True) is False
+
+
 # --- ADR-0031: grant-only tools (open_entry) require an EXPLICIT allow-list grant
 
 

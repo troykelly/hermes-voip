@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import socket
 import threading
+import time
+import urllib.request
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
@@ -29,6 +33,8 @@ from hermes_voip.tts.elevenlabs import (
     ElevenLabsVoiceSettings,
     HttpByteStream,
     HttpCancellation,
+    _abort_blocked_read,
+    _UrllibHttp,
     elevenlabs_pcm_format,
 )
 
@@ -143,6 +149,109 @@ class _BlockingHttp:
         # abort releases us, the body is empty (the read was interrupted).
         self._unblock.wait()
         yield from ()
+
+
+class _OddThenBlockHttp:
+    """Yields one odd-length chunk, then parks in its read until barge-in aborts.
+
+    Models a real stream interrupted mid-partial-sample: the frame loop has already
+    emitted an odd number of PCM16 bytes (one byte short of a whole sample) when the
+    barge-in fires, so the segment source ends leaving a 1-byte remainder. cancel()
+    must end the stream cleanly — NOT raise the "ended with a partial sample" error,
+    which would escape a deliberate barge-in as an unhandled fault. The park here is
+    an interruptible event, so this isolates the frame loop's cancel handling from
+    the transport's socket-shutdown fix.
+    """
+
+    _ODD_CHUNK = bytes(101)  # 50 whole PCM16 samples + 1 trailing byte
+
+    def __init__(self) -> None:
+        self.framed = threading.Event()
+        self._unblock = threading.Event()
+
+    def open(
+        self, request: ElevenLabsRequest, cancel: HttpCancellation
+    ) -> Iterator[bytes]:
+        cancel.arm(self._unblock.set)
+        return self._iter()
+
+    def _iter(self) -> Iterator[bytes]:
+        yield self._ODD_CHUNK
+        self.framed.set()
+        # Park as if inside a blocking response.read(); the barge-in abort releases
+        # us and the generator returns, ending the segment with a 1-byte carry.
+        self._unblock.wait()
+
+
+class _ScriptedResponse:
+    """A minimal ``HTTPResponse`` stand-in for the real ``_UrllibHttp`` read loop.
+
+    ``read`` replays a script of byte chunks and, where an ``OSError`` is scripted,
+    raises it — modelling a TLS ``response.read()`` that RAISES (rather than EOFs)
+    once the barge-in socket shutdown interrupts it. ``fp`` is ``None`` so the
+    barge-in's socket lookup finds nothing and its abort is a no-op; the response is
+    instead closed by the read loop's own cleanup after the scripted OSError.
+    """
+
+    def __init__(self, reads: list[bytes | OSError]) -> None:
+        self._reads = list(reads)
+        self.closed = False
+        self.fp: object = None
+
+    def read(self, _amt: int) -> bytes:
+        item = self._reads.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _RawWithSock:
+    """The ``SocketIO`` layer of ``response.fp.raw`` — holds the real ``_sock``."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+
+
+class _FpWithRaw:
+    """The buffered ``response.fp`` layer, exposing ``.raw`` like ``BufferedReader``."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.raw = _RawWithSock(sock)
+
+
+class _SocketBackedResponse:
+    """HTTPResponse stand-in whose ``fp.raw._sock`` is a REAL socket.
+
+    Lets a test prove the transport arms the barge-in with a socket shutdown: after
+    ``open`` primes (EOF), calling the cancellation must ``shutdown`` this socket so
+    a recv parked on it returns — the exact mechanism that frees a blocked read.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.fp = _FpWithRaw(sock)
+        self.closed = False
+
+    def read(self, _amt: int) -> bytes:
+        return b""  # EOF: prime the generator so it arms then returns
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _fake_stream_request() -> ElevenLabsRequest:
+    """A request aimed at an obvious fake host (never the real API — repo is public)."""
+    return ElevenLabsRequest(
+        voice_id="x",
+        model_id=_FLASH_V2_5,
+        voice_settings=DEFAULT_VOICE_SETTINGS,
+        output_format="pcm_8000",
+        url="http://pbx.example.test/v1/text-to-speech/x/stream?output_format=pcm_8000",
+        headers={"xi-api-key": _FAKE_KEY, "Content-Type": "application/json"},
+        text="hello",
+    )
 
 
 async def _drain(stream: TtsStream) -> list[PcmFrame]:
@@ -436,6 +545,164 @@ async def test_cancel_releases_a_worker_blocked_in_the_http_read() -> None:
             await consumer
 
 
+@contextlib.contextmanager
+def _stalling_http_server() -> Iterator[tuple[str, threading.Event]]:
+    """A localhost server that sends 200 headers then stalls mid-body, held open.
+
+    Yields ``(base_url, headers_sent)``. On exit it stops serving and closes the
+    accepted socket, so a worker still parked in the body read is released even when
+    the test under it failed (no leaked thread).
+    """
+    server = socket.create_server(("127.0.0.1", 0))
+    server.settimeout(10.0)
+    host, port = server.getsockname()
+    accepted: list[socket.socket] = []
+    headers_sent = threading.Event()
+    stop_serving = threading.Event()
+
+    def _serve() -> None:
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        accepted.append(conn)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            data = conn.recv(4096)
+            if not data:
+                return
+            buf += data
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\n"
+            b"Content-Length: 1048576\r\n\r\n"
+        )
+        headers_sent.set()
+        while not stop_serving.wait(0.05):  # stall: no body; hold open until torn down
+            pass
+
+    thread = threading.Thread(target=_serve, name="stalling-http-server", daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}", headers_sent
+    finally:
+        stop_serving.set()
+        for conn in accepted:
+            with contextlib.suppress(OSError):
+                conn.close()
+        server.close()
+        thread.join(5.0)
+
+
+def test_barge_in_interrupts_a_worker_blocked_in_a_real_socket_read() -> None:
+    """Barge-in tears down a REAL urllib socket parked mid-body (whole-loop freeze).
+
+    Reproduces the availability bug end to end: a worker thread blocks in the real
+    ``_UrllibHttp`` ``response.read()`` against a server that sent headers then
+    stalled mid-body; a barge-in ``cancel()`` on the event-loop thread must release
+    BOTH the worker AND the loop. With the pre-fix code the loop thread blocks
+    inside ``response.close()`` (waiting on the read lock the parked worker holds)
+    and the worker never returns — a deadlock that freezes every concurrent call.
+
+    The scenario runs on a daemon thread bounded by a join, because that pre-fix
+    freeze happens synchronously on the loop thread (an ``asyncio`` timeout could
+    not fire) — so the bug FAILS this test via the bounded join, never hanging the
+    suite. ``_stalling_http_server`` tears down in ``finally``, releasing the parked
+    worker even on the failing run.
+    """
+    released = threading.Event()
+
+    with _stalling_http_server() as (base_url, headers_sent):
+
+        async def _scenario() -> None:
+            tts = ElevenLabsTTS(
+                api_key=_FAKE_KEY, voice="x", http=_UrllibHttp(), base_url=base_url
+            )
+            stream = tts.synthesize(_text("Interrupt a real socket read. "), voice="x")
+            ended = asyncio.Event()
+
+            async def _consume() -> None:
+                try:
+                    async for _ in stream:
+                        pass
+                finally:
+                    ended.set()
+
+            consumer = asyncio.create_task(_consume())
+            try:
+                await asyncio.to_thread(headers_sent.wait, 5.0)
+                await asyncio.sleep(0.2)  # let the worker enter the blocked read
+                await stream.cancel()  # pre-fix: freezes here inside response.close()
+                await asyncio.wait_for(ended.wait(), timeout=4.0)
+            finally:
+                consumer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consumer
+            released.set()
+
+        def _run() -> None:
+            # A deadlock leaves ``released`` unset; suppress so the daemon thread does
+            # not print a traceback — the bounded join + assertion is the signal.
+            with contextlib.suppress(BaseException):
+                asyncio.run(_scenario())
+
+        scenario = threading.Thread(target=_run, name="scenario", daemon=True)
+        scenario.start()
+        scenario.join(6.0)
+        assert released.is_set(), (
+            "barge-in did not release the loop within 6s: a blocked response.read()"
+            " deadlocked the event loop (cancel() never returned)"
+        )
+        assert all(t.name != "hermes-voip-stream" for t in threading.enumerate())
+
+
+@pytest.mark.asyncio
+async def test_barge_in_after_an_odd_partial_sample_ends_cleanly() -> None:
+    """A barge-in that leaves a 1-byte remainder ends the stream, not raises.
+
+    Once the socket-shutdown fix makes an interrupted read return promptly, the
+    bytes delivered before the barge-in can be an odd count, leaving the frame loop
+    holding a 1-byte carry. cancel() must surface that as a clean end of stream: the
+    "ended with a partial sample" ValueError is a real-stream integrity check, not
+    something a deliberate barge-in should raise into the call loop.
+    """
+    http = _OddThenBlockHttp()
+    tts = _make(http)
+    stream = tts.synthesize(_text("Cut me mid-sample. "), voice="x")
+
+    frames: list[PcmFrame] = []
+    ended = asyncio.Event()
+    errors: list[BaseException] = []
+
+    async def _consume() -> None:
+        try:
+            async for frame in stream:
+                frames.append(frame)
+        except BaseException as exc:  # noqa: BLE001 - the test asserts nothing escaped
+            errors.append(exc)
+        finally:
+            ended.set()
+
+    consumer = asyncio.create_task(_consume())
+    try:
+        # Wait until the odd chunk has been framed and the worker is parked in read.
+        await asyncio.to_thread(http.framed.wait, 2.0)
+
+        async def _has_frame() -> None:
+            while not frames:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_has_frame(), timeout=2.0)
+
+        await stream.cancel()
+        await asyncio.wait_for(ended.wait(), timeout=2.0)
+        assert errors == []  # a barge-in remainder must not surface as an error
+        assert frames  # the whole-sample bytes before the cut were still delivered
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
 # --- flush forces buffered text to synthesis (input iterator still open) -----
 
 
@@ -538,6 +805,103 @@ async def test_http_error_propagates_to_the_consumer() -> None:
     stream = tts.synthesize(_text("Trigger. "), voice="x")
     with pytest.raises(ConnectionError, match="upstream unavailable"):
         await _drain(stream)
+
+
+# --- barge-in interrupts the blocking urllib transport (the deadlock fix) ----
+
+
+def test_open_arms_a_barge_in_that_shuts_the_underlying_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cancel.close() shuts the response's socket, so a parked recv is interrupted.
+
+    Proves the fix mechanism deterministically: the transport arms the barge-in
+    with a shutdown of the underlying socket (not just ``response.close``, which
+    cannot interrupt a concurrent read), so invoking it makes a recv blocked on
+    that socket return at once.
+    """
+    sock_a, sock_b = socket.socketpair()
+    try:
+        response = _SocketBackedResponse(sock_a)
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: response)
+        cancel = HttpCancellation()
+        stream = _UrllibHttp().open(_fake_stream_request(), cancel)
+        with contextlib.suppress(StopIteration):
+            next(stream)  # prime: runs urlopen + arms the barge-in, then EOFs
+
+        result: list[object] = []
+
+        def _reader() -> None:
+            try:
+                result.append(sock_a.recv(4096))
+            except OSError as exc:
+                result.append(exc)
+
+        reader = threading.Thread(target=_reader, name="probe-recv", daemon=True)
+        reader.start()
+        time.sleep(0.1)
+        assert reader.is_alive()  # parked in the blocking recv
+
+        cancel.close()  # barge-in: must shut sock_a so the parked recv returns
+        reader.join(2.0)
+        assert not reader.is_alive(), "shutdown did not interrupt the blocked recv"
+        assert result == [b""]  # SHUT_RD => the recv returns EOF
+    finally:
+        sock_a.close()
+        sock_b.close()
+
+
+def test_abort_blocked_read_without_a_socket_is_a_logged_no_op(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the underlying socket is unreachable, the barge-in degrades to a NO-OP.
+
+    Regression (codex review of the fix): the ``sock is None`` path must NOT fall back
+    to a blocking loop-thread ``response.close()`` — that is exactly the whole-event-
+    loop freeze the socket-shutdown mechanism exists to avoid (``close()`` cannot
+    interrupt a parked read and blocks on the buffer lock it holds). The helper now
+    takes ONLY the socket (so the unsafe close is impossible by construction) and
+    logs the degraded path; the worker is reaped by the stream join timeout instead.
+    """
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.tts.elevenlabs"):
+        _abort_blocked_read(None)  # must be a no-op: no raise, no block, no close
+    assert any(
+        "could not reach the response socket" in rec.message for rec in caplog.records
+    ), "the degraded (sock-None) barge-in path must log a warning"
+
+
+def test_urllib_transport_treats_a_cancelled_read_error_as_end_of_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read that RAISES after a barge-in is the abort — surfaced as a clean end.
+
+    The socket shutdown that frees a parked TLS read makes ``response.read()`` raise
+    ``OSError`` (empirically ``BrokenPipeError``) rather than return ``b''``. Once
+    cancelled, ``_UrllibHttp`` ends the aborted stream instead of letting that error
+    escape and crash the barge-in.
+    """
+    response = _ScriptedResponse([b"AB", OSError("connection shut down")])
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: response)
+    cancel = HttpCancellation()
+    cancel.close()  # a barge-in that fired before the read raised
+
+    chunks = list(_UrllibHttp().open(_fake_stream_request(), cancel))
+
+    assert chunks == [b"AB"]
+    assert response.closed
+
+
+def test_urllib_transport_propagates_a_read_error_without_a_barge_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no barge-in, a read error is a real fault and still propagates (rule 37)."""
+    response = _ScriptedResponse([b"AB", OSError("upstream reset")])
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: response)
+    cancel = HttpCancellation()
+
+    with pytest.raises(OSError, match="upstream reset"):
+        list(_UrllibHttp().open(_fake_stream_request(), cancel))
+    assert response.closed
 
 
 def test_http_byte_stream_protocol_is_satisfied_by_the_fake() -> None:

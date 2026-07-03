@@ -36,15 +36,25 @@ down, which closes the connection.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import socket
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from hermes_voip.aio import stream_from_thread
 from hermes_voip.providers.tts import StreamingTTS, TtsStream
 from hermes_voip.tts._stream import PcmFrameStream, SegmentSource
+
+_log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    # Annotation-only: keeps the urllib/http import cost out of module import (the
+    # real transport lazy-imports http.client inside ``_UrllibHttp.open``).
+    from http.client import HTTPResponse
 
 __all__ = [
     "DEFAULT_VOICE_SETTINGS",
@@ -350,12 +360,17 @@ class HttpCancellation:
     The transport opens the connection *on a worker thread* (so the loop never
     blocks on connect/TLS), but a barge-in ``cancel()`` runs on the **loop**
     thread — and a worker parked in ``response.read()`` cannot see a Python flag.
-    This handle bridges them: the worker :meth:`arm`s it with the live response's
-    ``close`` right after opening, and the loop calls :meth:`close` on barge-in to
-    shut the socket so the blocked read returns and the worker is freed. It is
-    created on the loop side and passed into ``open`` so ``close`` is wireable as
-    ``stream_from_thread``'s ``on_cancel`` before the worker has even connected;
-    if ``close`` lands first, the next :meth:`arm` tears the response down at once.
+    This handle bridges them: the worker :meth:`arm`s it right after opening with a
+    closer that shuts the response's underlying socket, and the loop calls
+    :meth:`close` on barge-in to run that shutdown so the blocked ``recv`` returns
+    and the worker is freed. ``response.close()`` alone cannot do this — CPython
+    neither interrupts a concurrent read nor, worse, returns from ``close()`` while
+    the parked read still holds the buffer lock (so the loop thread would block too,
+    freezing every concurrent call). It is created on the loop side and passed into
+    ``open`` so ``close`` is wireable as ``stream_from_thread``'s ``on_cancel``
+    before the worker has even connected; if ``close`` lands first, the next
+    :meth:`arm` tears the response down at once. :attr:`cancelled` lets the read
+    loop tell an aborted read (which a TLS socket surfaces as an error) from a fault.
     """
 
     def __init__(self) -> None:
@@ -365,7 +380,7 @@ class HttpCancellation:
         self._cancelled = False
 
     def arm(self, closer: Callable[[], None]) -> None:
-        """Register the live response's close (worker side, after it opens).
+        """Register the barge-in closer (worker side, after the response opens).
 
         If :meth:`close` already fired (a barge-in that raced ahead of connect),
         ``closer`` is invoked immediately so the just-opened response is torn down
@@ -380,15 +395,27 @@ class HttpCancellation:
     def close(self) -> None:
         """Abort the in-flight read (loop side, on barge-in). Idempotent.
 
-        Closes the armed response/socket so a worker blocked in ``read()`` returns
-        promptly; if nothing is armed yet, records the cancellation so the next
-        :meth:`arm` closes immediately.
+        Runs the armed closer (shutting the socket) so a worker blocked in ``read()``
+        returns promptly; if nothing is armed yet, records the cancellation so the
+        next :meth:`arm` closes immediately.
         """
         with self._lock:
             self._cancelled = True
             closer, self._closer = self._closer, None
         if closer is not None:
             closer()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether a barge-in has fired.
+
+        The read loop reads this to tell a read that failed *because of* the abort
+        (a TLS ``recv`` on a shut socket raises rather than EOFs) from a genuine
+        transport fault: the former ends the aborted stream cleanly, the latter
+        propagates (rule 37).
+        """
+        with self._lock:
+            return self._cancelled
 
 
 @runtime_checkable
@@ -573,9 +600,9 @@ class ElevenLabsTTS:
 
         def _open(sentence: str) -> SegmentSource:
             # One cancellation handle per segment: the read happens on a worker
-            # thread, so a barge-in must close the response from the loop side.
-            # ``cancel.close`` is both the segment's barge-in ``abort`` (called by
-            # PcmFrameStream.cancel() to unblock a parked read) and on_cancel for
+            # thread, so a barge-in must shut the response's socket from the loop
+            # side. ``cancel.close`` is both the segment's barge-in ``abort`` (called
+            # by PcmFrameStream.cancel() to unblock a parked read) and on_cancel for
             # stream_from_thread (so teardown joins the worker). Without it the
             # worker stays parked in read() until the join timeout (the bug fixed).
             cancel = HttpCancellation()
@@ -628,13 +655,74 @@ class ElevenLabsTTS:
         )
 
 
+def _underlying_socket(response: HTTPResponse) -> socket.socket | None:
+    """Return the raw socket beneath an ``HTTPResponse``, or None if not exposed.
+
+    A worker blocked in ``response.read()`` cannot be freed by ``response.close()``
+    — CPython does not interrupt a concurrent read, and ``close()`` then blocks on
+    the buffer lock the parked read holds. A ``shutdown(SHUT_RDWR)`` on the socket
+    makes the parked ``recv`` return at once. The socket lives at
+    ``response.fp.raw._sock`` (the buffered ``SocketIO``, for both plain and TLS
+    connections); it is reached defensively via ``getattr`` so that if those
+    internals ever change shape this returns None and the caller degrades to a
+    no-op (NOT a blocking loop-thread ``response.close()`` — see
+    :func:`_abort_blocked_read`), so a barge-in can never re-freeze the loop.
+    """
+    fp: object = response.fp
+    raw: object = getattr(fp, "raw", fp)
+    sock: object = getattr(raw, "_sock", None)
+    if isinstance(sock, socket.socket):
+        return sock
+    return None
+
+
+def _abort_blocked_read(sock: socket.socket | None) -> None:
+    """Interrupt a worker parked in ``response.read()`` (barge-in, loop side).
+
+    Takes ONLY the socket (found by :func:`_underlying_socket`) — deliberately not the
+    response — so the unsafe blocking ``response.close()`` on the loop thread is
+    impossible by construction (codex review).
+
+    ``shutdown(SHUT_RDWR)`` is a fast, non-blocking syscall that makes the worker's
+    in-progress ``recv`` return immediately — a plain read then yields EOF, a TLS
+    read raises ``OSError`` (both handled by :meth:`_UrllibHttp.open`). The worker's
+    own ``finally`` closes the response once its read has returned, so the loop
+    thread never calls the *blocking* ``response.close()`` (which would deadlock on
+    the buffer lock the parked read holds — the whole-event-loop freeze this fixes).
+    ``shutdown`` on an already-torn-down socket raises ``OSError``, expected and
+    ignored: the read is released regardless.
+
+    If the underlying socket is not exposed (``sock is None`` — only if CPython's
+    ``HTTPResponse`` internals ever change shape), this is a deliberate NO-OP: it
+    must NOT fall back to ``response.close()``, because that blocking loop-thread
+    call is exactly the whole-event-loop freeze this mechanism exists to avoid
+    (``close()`` cannot interrupt the parked read and blocks on the buffer lock it
+    holds). The worker instead stays parked until ``stream_from_thread``'s bounded
+    join timeout reaps it on teardown — a bounded per-segment delay, never a loop
+    freeze. This degraded path is logged (it should never happen on a supported
+    CPython).
+    """
+    if sock is None:
+        _log.warning(
+            "elevenlabs: barge-in could not reach the response socket to abort a "
+            "blocked read (HTTPResponse internals unexpected); the TTS worker will "
+            "be reaped by the stream join timeout instead of interrupted"
+        )
+        return
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+
+
 class _UrllibHttp:
     """The real streaming-HTTP transport (stdlib ``urllib`` — no extra deps).
 
     Opens the POST and yields the response body in chunks, closing the response
-    when the iterator is closed (on ``cancel()``) or exhausted. Using stdlib
-    keeps the default install lean (no httpx/websockets), matching the project's
-    minimal-dependency posture.
+    when the iterator is closed (on ``cancel()``) or exhausted. A barge-in aborts
+    the in-flight read by shutting the underlying socket (see
+    :func:`_abort_blocked_read`), not by ``response.close()`` from the loop — the
+    latter cannot interrupt the parked read and would itself block on it. Using
+    stdlib keeps the default install lean (no httpx/websockets), matching the
+    project's minimal-dependency posture.
     """
 
     _CHUNK_BYTES = 4096
@@ -644,10 +732,15 @@ class _UrllibHttp:
     ) -> Iterator[bytes]:
         """POST ``request`` and stream the response body in chunks.
 
-        Arms ``cancel`` with the live response's ``close`` immediately after
-        opening (before the first, blocking ``read``), so a barge-in closes the
-        socket from the loop side and the parked read returns promptly.
+        Arms ``cancel`` immediately after opening (before the first, blocking
+        ``read``) with a closer that shuts the response's underlying socket, so a
+        barge-in interrupts the parked read from the loop side and it returns
+        promptly. A read that fails *after* a barge-in (a TLS ``recv`` on a shut
+        socket raises rather than EOFs) is the abort, surfaced as a clean end of
+        the stream; a read error with no barge-in is a real fault and propagates
+        (rule 37).
         """
+        import http.client  # noqa: PLC0415 - lazy: real transport path only
         import urllib.request  # noqa: PLC0415 - lazy: real transport path only
 
         req = urllib.request.Request(  # noqa: S310 - fixed https ElevenLabs API URL
@@ -657,11 +750,21 @@ class _UrllibHttp:
             method="POST",
         )
         response = urllib.request.urlopen(req)  # noqa: S310 - fixed https API URL
-        # If a barge-in already fired while connecting, arm() closes it right now.
-        cancel.arm(response.close)
+        # Capture the live socket now (definitely open here) and arm the barge-in
+        # with its shutdown. If a barge-in already fired while connecting, arm()
+        # runs the shutdown right now.
+        sock = _underlying_socket(response)
+        cancel.arm(lambda: _abort_blocked_read(sock))
         try:
             while True:
-                chunk = response.read(self._CHUNK_BYTES)
+                try:
+                    chunk = response.read(self._CHUNK_BYTES)
+                except (OSError, http.client.IncompleteRead):
+                    # Our socket shutdown interrupted the parked read (a TLS recv
+                    # raises rather than EOFs): end the aborted stream cleanly.
+                    if cancel.cancelled:
+                        return
+                    raise
                 if not chunk:
                     return
                 yield chunk

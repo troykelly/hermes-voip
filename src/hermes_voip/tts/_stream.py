@@ -216,6 +216,12 @@ class PcmFrameStream:
                         carry = pcm16[frame_length:]
                         if frame_bytes:
                             yield self._frame(frame_bytes)
+                    if self._stop.is_set():
+                        # Barge-in aborted this segment's read (its socket was shut),
+                        # so the source ended early: any trailing partial-sample
+                        # remainder is an artefact of the interruption, not a stream
+                        # error. Stop cleanly rather than raising below.
+                        return
                     if carry:
                         msg = "PCM16 byte stream ended with a partial sample"
                         raise ValueError(msg)

@@ -2066,6 +2066,22 @@ def test_error_received_dns_failure_logs_structured_category(
     ]
     assert not leaked, f"raw hostname leaked into record fields: {leaked}"
     assert remote_host not in rec.getMessage()
+    # Robustness (codex #413): the raw hostname must appear in NO captured record
+    # — not only the filtered rtp_transport_lost one — so a future stray log emitted
+    # from the same callback cannot silently leak it. Scan every record's rendered
+    # message and every string-valued attribute.
+    for other in caplog.records:
+        assert remote_host not in other.getMessage(), (
+            f"raw hostname leaked into a log message: {other.getMessage()!r}"
+        )
+        other_leaked = [
+            name
+            for name, value in vars(other).items()
+            if isinstance(value, str) and remote_host in value
+        ]
+        assert not other_leaked, (
+            f"raw hostname leaked into record attributes: {other_leaked}"
+        )
 
 
 def test_error_received_generic_oserror_logs_transport_error(

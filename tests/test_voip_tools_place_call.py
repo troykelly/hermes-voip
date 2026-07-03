@@ -381,6 +381,25 @@ def _set_origin(
     monkeypatch.setitem(sys.modules, "gateway.session_context", module)
 
 
+def test_proactive_place_call_reaches_relaxation_on_real_telegram_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (#202 was unreachable): the REAL proactive flow must be ALLOWED.
+
+    On a genuine Telegram turn the session ``chat_id`` (== ``_current_call_id()``) is a
+    NON-None value, because the gate's Call-ID read and the proactive origin read both
+    resolve the SAME ``HERMES_SESSION_CHAT_ID``. The relaxation must be reached whenever
+    the guard ``state is None`` (no live SIP call), NOT only when ``call_id is None``
+    (which never holds on this path). No ``_set_chat`` here — ``_set_origin`` drives
+    both reads via the shared fake ``gateway.session_context``, exactly as at runtime.
+    """
+    monkeypatch.setenv("HERMES_VOIP_PROACTIVE_CALL_FROM", "telegram:123")
+    set_active_adapter(None)  # no live SIP call in scope
+    _set_origin(monkeypatch, "telegram", "123")
+
+    assert voip_pre_tool_call(tool_name=PLACE_CALL_TOOL_NAME, args={}) is None
+
+
 def test_voip_tools_gate_proactive_place_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

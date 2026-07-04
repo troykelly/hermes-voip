@@ -1218,6 +1218,12 @@ class RtpMediaTransport:
         # never move it again — see :meth:`_maybe_latch`.
         self._outbound_addr: tuple[str, int] = (remote_address, remote_port)
         self._latched: bool = False
+        # The endpoint a set_remote (re-INVITE relocation) moved us AWAY from, or
+        # None. _maybe_latch refuses to re-latch onto it, so a stale in-flight RTP
+        # packet still arriving from the old peer cannot revert the relocation
+        # (intermittent one-way audio). Set once under _tx_lock in set_remote,
+        # cleared when a genuine new-source packet latches.
+        self._relocated_from: tuple[str, int] | None = None
 
         # One-shot diagnostic flags: log the first outbound and first inbound
         # RTP packet at INFO so the media path is visible in the operator log.
@@ -1600,6 +1606,8 @@ class RtpMediaTransport:
         # (On the WebRTC/ICE path symmetric is force-disabled, so this never latches.)
         self._outbound_addr = (self._remote_address, self._remote_port)
         self._latched = False
+        # A fresh call has no prior relocation to protect against.
+        self._relocated_from = None
         # Reset one-shot diagnostic flags so a reconnected engine logs the first
         # outbound and inbound packets of the new call.
         self._first_tx_logged = False
@@ -2021,7 +2029,19 @@ class RtpMediaTransport:
             return
         if packet.payload_type != self._payload_type:
             return  # not the negotiated audio stream — not a latch trigger
+        if self._relocated_from is not None and source == self._relocated_from:
+            # A stale in-flight packet from the endpoint set_remote relocated us
+            # away from. Never re-latch onto it: keep the outbound target on the
+            # new SDP endpoint until a genuine NEW-source packet arrives, else the
+            # relocation self-reverts (intermittent one-way audio). Single event
+            # loop: _relocated_from is written once under _tx_lock in set_remote
+            # and read here on the inbound path (a plain read is race-free for the
+            # single-writer / single-reader-per-call model).
+            return
         self._latched = True
+        # A genuine new-source packet resolved the relocation; forget the old
+        # endpoint so a much later benign reuse of that tuple is not filtered.
+        self._relocated_from = None
         if source == self._outbound_addr:
             return  # already aimed here (SDP address matched reality); nothing to do
         self._outbound_addr = source
@@ -3517,6 +3537,13 @@ class RtpMediaTransport:
         if (address, port) == (self._remote_address, self._remote_port):
             return  # unchanged endpoint — do not disturb an established latch
         async with self._tx_lock:
+            # Record the endpoint we relocate AWAY from (the current live target,
+            # which may be a comedia-learned source, not the SDP address) so
+            # _maybe_latch refuses to re-latch onto a stale in-flight packet still
+            # arriving from it — the old source shares our codec/payload_type around
+            # the 200 OK. Written once here under the TX lock; read on the inbound
+            # path in _maybe_latch.
+            self._relocated_from = self._outbound_addr
             self._remote_address = address
             self._remote_port = port
             # Aim the live send target at the new endpoint and re-arm the latch so

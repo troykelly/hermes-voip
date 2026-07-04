@@ -2140,6 +2140,68 @@ def test_shutdown_drain_secs_rejects_non_positive_or_malformed(bad: str) -> None
         )
 
 
+# ---- agent-hangup farewell drain (#1297, ADR-0106) -------------------------
+
+
+def test_agent_hangup_drain_secs_default() -> None:
+    """The agent-hangup farewell drain + arrival grace default to sane values."""
+    cfg = load_media_config({})
+    assert cfg.agent_hangup_drain_secs == 5.0
+    assert cfg.agent_hangup_grace_secs == 0.5
+
+
+def test_agent_hangup_drain_secs_env_override() -> None:
+    """HERMES_VOIP_HANGUP_DRAIN_SECS / _GRACE_SECS set the bounded drain + grace."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_HANGUP_DRAIN_SECS": "8.5",
+            "HERMES_VOIP_HANGUP_GRACE_SECS": "0.25",
+        }
+    )
+    assert cfg.agent_hangup_drain_secs == 8.5
+    assert cfg.agent_hangup_grace_secs == 0.25
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "nan", "inf"])
+def test_agent_hangup_drain_secs_rejects_non_positive_or_malformed(bad: str) -> None:
+    """A non-positive / non-finite / malformed drain timeout is rejected."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_HANGUP_DRAIN_SECS": bad})
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", "nan", "inf"])
+def test_agent_hangup_grace_secs_rejects_non_positive_or_malformed(bad: str) -> None:
+    """A non-positive / non-finite / malformed arrival grace is rejected."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_HANGUP_GRACE_SECS": bad})
+
+
+def test_agent_hangup_grace_may_not_exceed_drain_via_env() -> None:
+    """The arrival grace must not exceed the total drain — rejected at load.
+
+    A grace greater than the drain would let Phase 1 alone blow the whole budget.
+    """
+    with pytest.raises(ConfigError, match="agent_hangup_grace_secs"):
+        load_media_config(
+            {
+                "HERMES_VOIP_HANGUP_DRAIN_SECS": "1.0",
+                "HERMES_VOIP_HANGUP_GRACE_SECS": "2.0",
+            }
+        )
+
+
+def test_agent_hangup_grace_may_not_exceed_drain_direct_construction() -> None:
+    """A direct MediaConfig(...) with grace > drain is rejected in __post_init__.
+
+    The cross-field invariant defends callers that bypass load_media_config.
+    """
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="agent_hangup_grace_secs"):
+        dataclasses.replace(
+            base, agent_hangup_drain_secs=1.0, agent_hangup_grace_secs=2.0
+        )
+
+
 # ---- adaptive jitter buffer ceiling (ADR-0063) -----------------------------
 
 

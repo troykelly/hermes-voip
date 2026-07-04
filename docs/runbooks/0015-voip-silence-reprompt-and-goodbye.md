@@ -1,4 +1,4 @@
-# Runbook: VoIP caller-silence reprompt + spoken goodbye (ADR-0057)
+# Runbook: VoIP caller-silence reprompt + spoken goodbye (ADR-0057, ADR-0106)
 
 **What it is.** Two voice-UX behaviours in the call loop (`CallLoop`), both **ON by default**:
 
@@ -101,7 +101,60 @@ reply; the **comfort filler** (runbook 0006) covers the LLM think-time wait befo
 arrives. **No operator action and no call-loop change are required for §3.** If a future
 hermes-agent release exposes a per-sentence text callback to platform plugins, revisit ADR-0057.
 
+## Agent-hangup farewell drain (#1297, ADR-0106)
+
+The **loop-initiated** goodbye above drains inline (it is spoken and flushed before `run()`
+returns). Its symmetric counterpart is the **agent-initiated** hangup: when the agent speaks
+a goodbye **and** calls the `hang_up` tool in the **same turn**, the adapter must not send BYE
++ stop media until that in-flight farewell has reached the wire, or the closing line is
+truncated (media stop mid-playout) or dropped (post-teardown send-suppression).
+
+**Wiring (what IS):** `CallLoop` counts agent replies in flight in `self._active_replies`
+(incremented in `speak()` only — the comfort filler and the loop goodbye go through
+`_speak_text` directly and are deliberately **not** counted). `CallLoop.drain_agent_speech(*,
+timeout, grace)` polls that counter using **only** `asyncio.sleep` (no Event/Lock/Future/task/
+async-generator — leak-free by construction): a short arrival grace catches a same-turn
+farewell that is dispatched a scheduling beat after the tool call, then it waits for every
+in-flight reply to finish, bounded by `timeout`. `adapter.hang_up_call` awaits it **between**
+`_mark_agent_hangup` and `session.hang_up()`, so `info["ended"]` is still `False` throughout —
+the farewell `send()` is neither suppressed nor its frames cut. A caller barge-in **releases**
+the drain early (cancelling the reply decrements the counter) but does **not** abort the hangup
+— the tool call is an already-committed decision.
+
+| Env var | Maps to `MediaConfig` field | Default | Notes |
+| --- | --- | --- | --- |
+| `HERMES_VOIP_HANGUP_DRAIN_SECS` | `agent_hangup_drain_secs` | `5.0` | Total bound (s); positive finite. The drain returns after this even if a farewell is still playing (then the closing line may clip — the caller is not left waiting). |
+| `HERMES_VOIP_HANGUP_GRACE_SECS` | `agent_hangup_grace_secs` | `0.5` | Arrival window (s) for a same-turn farewell to **begin**; positive finite and **must be `<= drain`** (enforced in `MediaConfig.__post_init__`). A bare hangup pays only this before BYE. |
+
+Both are read at `connect()` time and validated by `MediaConfig._validate_agent_hangup_drain()`.
+
+**Tuning:** raise `HANGUP_DRAIN_SECS` if the agent's farewells are long/multi-sentence and get
+clipped; lower `HANGUP_GRACE_SECS` toward 0 to effectively disable the same-turn arrival guard
+(fixing only the mid-playout case) if you see a perceptible pre-BYE beat on bare hangups.
+**Residual (documented, not a bug):** a goodbye the model emits in a *genuinely separate later
+message* (after it has already seen the `hang_up` tool result, past the grace) arrives after
+media stop and is correctly dropped — closing that would require dead air on every hangup.
+
 ## How to verify
+
+0. **Agent-hangup drain (deterministic, no real waiting beyond the sub-second bounds):**
+
+   ```
+   uv run pytest tests/test_call_loop.py -k drain_agent_speech
+   uv run pytest tests/test_config.py -k agent_hangup
+   ```
+
+   and, in the `hermes-contract` env (real `VoipAdapter`):
+
+   ```
+   uv run pytest tests/test_adapter.py -k "drains_farewell_before_bye or proceeds_when_no_farewell or proceeds_after_drain_timeout"
+   ```
+
+   proves: the drain waits for an in-flight farewell then returns True; a same-turn farewell
+   arriving during the grace is caught and fully drained; a bare hangup returns on the grace; a
+   wedged playout is bounded (returns False, never hangs); the comfort filler is ignored;
+   barge-in releases it; and at the adapter seam every farewell frame reaches the wire **before**
+   the session BYE.
 
 1. **Behaviour (covered by the test suite, deterministic — injected sleep seam, no real
    waiting):**

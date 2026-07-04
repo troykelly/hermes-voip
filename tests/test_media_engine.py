@@ -861,6 +861,98 @@ async def test_stop_mid_playout_flushes_all_buffered_audio_in_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_flush_pending_audio_emits_padded_tail_before_teardown() -> None:
+    """flush_pending_audio() emits the buffered sub-ptime tail WITHOUT tearing down.
+
+    #432 / ADR-0106: send_audio carry-buffers a trailing sub-ptime partial in
+    _tx_buffer that is otherwise emitted only by stop()'s _flush_tx_tail — which the
+    agent-hangup path runs AFTER BYE, so a gateway that drops media on BYE clips it.
+    flush_pending_audio() emits that tail (the partial zero-padded to one whole frame)
+    on the still-open socket, leaves the engine running, and is idempotent so stop()'s
+    own later flush finds an empty buffer (no double-send).
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+        initial_seq=0,
+        initial_ts=0,
+    )
+    await engine.connect()
+
+    with _capture_sends(engine) as recorder:
+        # 240 samples = 1.5 frames -> one whole frame paced out, an 80-sample partial
+        # left buffered (NOT a whole 20 ms wire frame).
+        await engine.send_audio(_counter_chunk(0, 240, G711_SAMPLE_RATE))
+        assert len(recorder.sent) == 1, "one whole frame is paced out by send_audio"
+        assert engine._tx_buffer, "precondition: a sub-ptime tail remains buffered"
+
+        engine.flush_pending_audio()
+
+        # The buffered tail reached the wire as one padded frame; socket still open.
+        assert len(recorder.sent) == 2, "flush emits the buffered partial as a packet"
+        assert engine._tx_buffer == b"", "flush drains the re-framing buffer"
+        assert engine._transport is not None, "flush must NOT tear down the transport"
+        # The flushed packet is the 80-sample tail zero-padded to a whole 160-sample
+        # frame (one full ptime of PCM after decode), proving the partial was padded.
+        tail_payload = RtpPacket.parse(recorder.sent[1][0]).payload
+        assert len(decode_ulaw(tail_payload)) == _SAMPLES_PER_FRAME * 2
+
+        # Idempotent: a second flush finds an empty buffer and emits nothing.
+        engine.flush_pending_audio()
+        assert len(recorder.sent) == 2, "a second flush is a no-op (buffer drained)"
+
+        # stop()'s own later flush also finds an empty buffer -> no double-send.
+        await engine.stop()
+        assert len(recorder.sent) == 2, "stop() after flush must not re-emit the tail"
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_audio_is_noop_when_held() -> None:
+    """flush_pending_audio() emits nothing while held (hold stops outbound media)."""
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+
+    with _capture_sends(engine) as recorder:
+        await engine.send_audio(_counter_chunk(0, 240, G711_SAMPLE_RATE))
+        await engine.set_hold(True)  # hold drops the buffered tail
+        held_baseline = len(recorder.sent)
+        engine.flush_pending_audio()
+        assert len(recorder.sent) == held_baseline, (
+            "flush while held emitted audio — hold must stop outbound media"
+        )
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_audio_is_noop_after_stop() -> None:
+    """flush_pending_audio() is a safe no-op once stopped (_transport is None)."""
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_sleep,
+    )
+    await engine.connect()
+    await engine.send_audio(_counter_chunk(0, 240, G711_SAMPLE_RATE))
+    await engine.stop()
+    assert engine._transport is None
+    # Must not raise (no socket) and emit nothing — the stopped call is over.
+    engine.flush_pending_audio()
+
+
+@pytest.mark.asyncio
 async def test_hold_drops_buffered_remainder_no_stale_audio_on_resume() -> None:
     """set_hold(True) drops the buffered sub-frame tail (hold stops outbound).
 

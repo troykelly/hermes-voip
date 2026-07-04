@@ -537,6 +537,13 @@ _RECONNECT_ALERT_THRESHOLD = 5  # consecutive failures before ERROR alert
 # ``GatewayConfig.shutdown_drain_secs`` (env ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``); this
 # mirrors its default so a None-config drain is still bounded, never unbounded.
 _DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+# Defensive fallbacks for the agent-hangup farewell drain (#1297, ADR-0106) used only
+# if ``_media_cfg`` is somehow unset when ``hang_up_call`` drains. The AUTHORITATIVE
+# values are ``MediaConfig.agent_hangup_drain_secs`` / ``agent_hangup_grace_secs``
+# (env ``HERMES_VOIP_HANGUP_DRAIN_SECS`` / ``HERMES_VOIP_HANGUP_GRACE_SECS``); keep in
+# sync with config.py.
+_DEFAULT_AGENT_HANGUP_DRAIN_SECS = 5.0  # keep in sync with config.py
+_DEFAULT_AGENT_HANGUP_GRACE_SECS = 0.5  # keep in sync with config.py
 # After the drain timeout, cancelled BYE tasks get this brief, bounded grace to
 # finish cancelling — so cooperative BYEs are awaited and their errors observed
 # (not orphaned when the runtime keeps the loop alive after ``disconnect()``); a
@@ -992,6 +999,13 @@ class VoipAdapter(BasePlatformAdapter):
 
         # Per-call state: {call_id → CallLoop}
         self._call_loops: dict[str, CallLoop] = {}
+        # Per-call CONCRETE media engine: {call_id → RtpMediaTransport} (#432,
+        # ADR-0106). Registered alongside _call_loops in _run_call_loop and dropped in
+        # _teardown_call. hang_up_call reaches the concrete engine here to flush its
+        # buffered outbound tail (flush_pending_audio) BEFORE the BYE — a concrete
+        # handle NOT on the CallMedia/MediaTransport seam (which would cascade to every
+        # media double), since RtpMediaTransport is the single production media engine.
+        self._call_engines: dict[str, RtpMediaTransport] = {}
         # Per-call armed-confirmation resolver (ADR-0010), present only while a call
         # has inbound RFC 4733 DTMF receive active: {call_id → ArmedConfirmation}. The
         # engine's on_dtmf routes digits to the loop, which feeds this resolver while a
@@ -1339,6 +1353,7 @@ class VoipAdapter(BasePlatformAdapter):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._call_tasks.clear()
         self._call_loops.clear()
+        self._call_engines.clear()
         self._dtmf_confirmations.clear()
         self._call_sessions.clear()
         self._admitted_calls.clear()
@@ -5281,6 +5296,9 @@ class VoipAdapter(BasePlatformAdapter):
             call_progress_callback=call_progress_callback,
         )
         self._call_loops[call_id] = call_loop
+        # Register the concrete engine so hang_up_call can flush its buffered outbound
+        # tail before BYE (#432, ADR-0106); dropped with the loop in _teardown_call.
+        self._call_engines[call_id] = engine
         # Wire inbound DTMF receive (ADR-0010): resolve the per-call receive mode from
         # config + the negotiated telephone-event PT, and when RFC 4733 is active wire
         # the engine's on_dtmf demux to the loop's router and bind the armed-
@@ -5652,6 +5670,10 @@ class VoipAdapter(BasePlatformAdapter):
             self._release_admission(call_id)
         if call_loop is None or self._call_loops.get(call_id) is call_loop:
             self._call_loops.pop(call_id, None)
+            # The concrete engine handle dies with the loop (#432, ADR-0106): gated on
+            # the same loop-identity check so a superseding same-Call-ID task's engine
+            # is not evicted.
+            self._call_engines.pop(call_id, None)
             # The per-call DTMF confirmation resolver dies with the loop (ADR-0010).
             # Gated on the same loop-identity check so a superseding same-Call-ID
             # task's resolver is not evicted.
@@ -5912,7 +5934,56 @@ class VoipAdapter(BasePlatformAdapter):
         # stopping media) is already classified as an agent hangup when teardown
         # runs — no race where teardown reads the flag before it is set.
         self._mark_agent_hangup(call_id)
-        _log.info("agent hang_up tool: ending call %s (BYE + media stop)", call_id)
+        # #1297 / ADR-0106: drain an in-flight agent farewell to the wire BEFORE BYE +
+        # media stop. A goodbye the agent speaks in the SAME turn as this tool call
+        # would otherwise be truncated (media.stop mid-playout) or dropped (post-
+        # teardown send-suppression). Bounded, cancellable, released by barge-in, and
+        # a no-op-fast when nothing is (or arrives) speaking — symmetric with the loop
+        # goodbye's inline drain (_end_call_gracefully, ADR-0057). _mark_agent_hangup
+        # stays FIRST so the end still classifies AGENT_HANGUP even if the drain times
+        # out, and the drain runs BEFORE session.hang_up() so info["ended"] (set only
+        # in _teardown_call) is False throughout — the farewell send() is neither
+        # suppressed nor its frames cut.
+        loop = self._call_loops.get(call_id)
+        if loop is not None:
+            if self._media_cfg is not None:
+                drain_secs = self._media_cfg.agent_hangup_drain_secs
+                grace_secs = self._media_cfg.agent_hangup_grace_secs
+            else:
+                drain_secs = _DEFAULT_AGENT_HANGUP_DRAIN_SECS
+                grace_secs = _DEFAULT_AGENT_HANGUP_GRACE_SECS
+            if not await loop.drain_agent_speech(timeout=drain_secs, grace=grace_secs):
+                _log.warning(
+                    "agent hang_up: farewell playout did not drain within %.1fs for "
+                    "call %s; proceeding with BYE + media stop",
+                    drain_secs,
+                    call_id,
+                )
+        # #432 / ADR-0106: flush the engine's buffered outbound TAIL to the wire BEFORE
+        # BYE. drain_agent_speech only waits until the farewell's frames reach
+        # send_audio, but send_audio carry-buffers a trailing sub-ptime partial that is
+        # otherwise emitted only by stop()'s _flush_tx_tail — which CallSession.hang_up
+        # runs AFTER the BYE. A gateway that drops media on BYE clips that final padded
+        # partial, so emit it here (dialog still up), AFTER the drain and BEFORE
+        # session.hang_up(). The concrete RtpMediaTransport is reached via _call_engines
+        # (NOT the CallMedia/MediaTransport seam, which would cascade to every media
+        # double). Best-effort (rule 37): a flush error is logged and never strands the
+        # BYE + media stop below; stop()'s own later flush then finds an empty buffer
+        # (no double-send).
+        engine = self._call_engines.get(call_id)
+        if engine is not None:
+            try:
+                engine.flush_pending_audio()
+            except Exception as exc:  # noqa: BLE001 — best-effort tail flush; never strand teardown (rule 37: logged, not swallowed)
+                _log.warning(
+                    "agent hang_up: farewell tail flush failed for call %s "
+                    "(BYE + media stop proceed regardless): %s",
+                    call_id,
+                    exc,
+                )
+        _log.info(
+            "agent hang_up tool: ending call %s (drain + BYE + media stop)", call_id
+        )
         await session.hang_up()
         return True
 

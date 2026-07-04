@@ -16,6 +16,7 @@ All fakes are synchronous; no real timing, threads, or network involved.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import random
@@ -5381,3 +5382,333 @@ class TestCallLoopModuleExports:
         all_names = _call_loop_mod.__all__
         private_names = [name for name in all_names if name.startswith("_")]
         assert not private_names, f"Private names in __all__: {private_names}"
+
+
+# ===========================================================================
+# Agent-hangup farewell drain (#1297, ADR-0106): CallLoop.drain_agent_speech
+# ===========================================================================
+#
+# The adapter awaits ``drain_agent_speech`` on an AGENT-initiated hang_up BEFORE it
+# sends BYE + stops media, so a goodbye the agent speaks in the same turn is heard
+# in full. These unit tests drive the REAL method: it must wait for an in-flight
+# agent reply, CATCH a reply that arrives during the arrival grace, return promptly
+# when idle, stay BOUNDED on a wedged playout, IGNORE the comfort filler (not an
+# agent reply), and RELEASE early on barge-in. Every fake stream is finite/self-
+# completing or explicitly cancelled, and every test ends by asserting no asyncio
+# task leaked — the structural guard against the cross-test hang that shelved the
+# prior attempt.
+
+
+class _GatedReplyTtsStream:
+    """A reply ``TtsStream`` that emits one frame, parks, then finishes on release.
+
+    Models an agent farewell mid-playout: the first frame reaches the wire (so the
+    drain observes a reply in flight) while the rest are withheld until the test
+    sets ``release`` — or ``cancel()`` (barge-in) ends it early. Same two-task shape
+    as a live call: the drain/pump runs while this coroutine is parked in
+    ``__anext__``.
+    """
+
+    def __init__(self, frames: list[PcmFrame], release: asyncio.Event) -> None:
+        self._frames = frames
+        self._release = release
+        self.cancel_called = False
+        self._cancelled = False
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
+        if self._frames:
+            yield self._frames[0]
+        await self._release.wait()
+        if not self._cancelled:
+            for frame in self._frames[1:]:
+                yield frame
+
+    async def flush(self) -> None:
+        """No-op flush (TtsStream protocol conformance)."""
+
+    async def cancel(self) -> None:
+        self.cancel_called = True
+        self._cancelled = True
+        self._release.set()
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        self._release.set()
+        await self._gen.aclose()
+
+
+class _GatedReplyTTS:
+    """StreamingTTS fake returning a single gated reply stream from synthesize()."""
+
+    def __init__(self, frames: list[PcmFrame], release: asyncio.Event) -> None:
+        self._frames = frames
+        self._release = release
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        _ = text, voice, sample_rate
+        return _GatedReplyTtsStream(self._frames, self._release)
+
+
+async def _pump_until_first_frame(transport: _FakeTransport) -> None:
+    """Yield to the loop until the transport has at least one outbound frame."""
+    for _ in range(1000):
+        if transport.sent_audio:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("no outbound frame was ever sent")
+
+
+@pytest.mark.asyncio
+async def test_drain_agent_speech_waits_for_in_flight_reply() -> None:
+    """The drain blocks until an in-flight agent reply finishes, then returns True.
+
+    A no-op drain fails the "not done while parked" assertion; a truncating one
+    fails the "all frames on the wire" assertion — so this is a real proof the
+    WHOLE farewell drains before teardown (#1297, ADR-0106).
+    """
+    tasks_before = set(asyncio.all_tasks())
+    release = asyncio.Event()
+    frames = [_greeting_frame(1), _greeting_frame(2), _greeting_frame(3)]
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _GatedReplyTTS(frames, release),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    speak_task = asyncio.create_task(loop.speak(_one_chunk("Goodbye and take care!")))
+    await _pump_until_first_frame(transport)  # reply in flight, first frame on wire
+
+    drain_task = asyncio.create_task(loop.drain_agent_speech(timeout=5.0, grace=1.0))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not drain_task.done()  # the drain is waiting on the in-flight reply
+
+    release.set()  # let the rest of the farewell play
+    drained = await asyncio.wait_for(drain_task, timeout=5.0)
+    await asyncio.wait_for(speak_task, timeout=5.0)
+
+    assert drained is True
+    assert transport.sent_audio == frames  # the FULL farewell reached the wire
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_drain_agent_speech_arrival_grace_catches_late_reply() -> None:
+    """A reply that ARRIVES during the arrival grace is caught and fully drained.
+
+    Models the live tool-then-reply order (outcome A): the drain starts while the
+    loop is idle, the agent's farewell arrives a beat later, and the drain must span
+    arrival→completion and return True — it must NOT bail out during the grace.
+    """
+    tasks_before = set(asyncio.all_tasks())
+    release = asyncio.Event()
+    frames = [_greeting_frame(1), _greeting_frame(2)]
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _GatedReplyTTS(frames, release),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    # Drain first, while idle (counter 0) — the arrival grace is now open.
+    drain_task = asyncio.create_task(loop.drain_agent_speech(timeout=5.0, grace=1.0))
+    await asyncio.sleep(0)
+    assert not drain_task.done()
+
+    # The farewell arrives DURING the grace and begins playing.
+    speak_task = asyncio.create_task(loop.speak(_one_chunk("Goodbye!")))
+    await _pump_until_first_frame(transport)
+    # Give the drain a poll cycle (> its 20 ms step) to OBSERVE the arrival and
+    # enter its completion phase, then confirm it is still draining, not done.
+    await asyncio.sleep(0.03)
+    assert not drain_task.done()
+
+    release.set()
+    drained = await asyncio.wait_for(drain_task, timeout=5.0)
+    await asyncio.wait_for(speak_task, timeout=5.0)
+
+    assert drained is True
+    assert transport.sent_audio == frames
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_drain_agent_speech_returns_promptly_when_idle() -> None:
+    """The idle drain pays only the short grace, then returns True (#1297).
+
+    A bare hangup must not stall teardown, so with no agent reply in flight the
+    drain returns after the grace — nowhere near the full timeout.
+    """
+    tasks_before = set(asyncio.all_tasks())
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _FakeTTS([]),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    started = asyncio.get_running_loop().time()
+    drained = await asyncio.wait_for(
+        loop.drain_agent_speech(timeout=5.0, grace=0.05), timeout=5.0
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert drained is True
+    assert elapsed < 1.0  # only the 0.05 s grace, nowhere near the 5 s timeout
+
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_drain_agent_speech_is_bounded_on_wedged_playout() -> None:
+    """A wedged reply cannot hang the drain: it returns False at the deadline.
+
+    A playout that never completes is a fast failure, never a deadlock (#1297).
+    """
+    tasks_before = set(asyncio.all_tasks())
+    release = asyncio.Event()  # deliberately never set — the playout is wedged
+    frames = [_greeting_frame(1), _greeting_frame(2)]
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _GatedReplyTTS(frames, release),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    speak_task = asyncio.create_task(loop.speak(_one_chunk("Goodbye!")))
+    await _pump_until_first_frame(transport)  # reply wedged mid-playout (counter 1)
+
+    started = asyncio.get_running_loop().time()
+    drained = await asyncio.wait_for(
+        loop.drain_agent_speech(timeout=0.05, grace=0.02), timeout=5.0
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert drained is False  # gave up at the bound
+    assert elapsed < 1.0  # ~0.05 s wall, never the wait_for's 5 s safety net
+
+    # Cleanup: cancel the wedged reply so no task/async-generator leaks.
+    speak_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await speak_task
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_drain_agent_speech_ignores_comfort_filler() -> None:
+    """The drain ignores the comfort filler, not an agent reply (#1297, ADR-0106).
+
+    A filler plays via ``_speak_text`` directly (bypassing ``speak``), so it is
+    never counted — the drain returns on the grace even while a filler plays.
+    """
+    tasks_before = set(asyncio.all_tasks())
+    release = asyncio.Event()
+    frames = [_greeting_frame(1), _greeting_frame(2)]
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _GatedReplyTTS(frames, release),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    # Drive a filler exactly as the loop does: _speak_text directly, NOT speak().
+    filler_task = asyncio.create_task(
+        loop._speak_text(_one_chunk("one moment please"), on_first_frame=None)
+    )
+    await _pump_until_first_frame(transport)  # filler mid-playout
+
+    started = asyncio.get_running_loop().time()
+    drained = await asyncio.wait_for(
+        loop.drain_agent_speech(timeout=5.0, grace=0.05), timeout=5.0
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert drained is True
+    assert elapsed < 1.0  # returned on the grace — the filler did NOT block it
+
+    release.set()
+    await asyncio.wait_for(filler_task, timeout=5.0)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_drain_agent_speech_released_by_barge_in() -> None:
+    """Barge-in releases the drain early, returning True before the timeout (#1297).
+
+    Barge-in only shortens the drain — it does not abort the hangup, which is the
+    adapter's committed decision: cancelling the reply decrements the counter.
+    """
+    tasks_before = set(asyncio.all_tasks())
+    release = asyncio.Event()  # never set manually; barge_in cancels the stream
+    frames = [_greeting_frame(1), _greeting_frame(2)]
+    transport = _FakeTransport([])
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        _GatedReplyTTS(frames, release),
+        _FakeGuard([_allow_result()]),
+        _noop,
+    )
+
+    speak_task = asyncio.create_task(loop.speak(_one_chunk("Goodbye!")))
+    await _pump_until_first_frame(transport)  # reply in flight (counter 1)
+
+    drain_task = asyncio.create_task(loop.drain_agent_speech(timeout=5.0, grace=0.5))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not drain_task.done()  # blocked on the in-flight reply
+
+    await loop.barge_in()  # caller interrupts → cancels the active reply stream
+    drained = await asyncio.wait_for(drain_task, timeout=5.0)
+    await asyncio.wait_for(speak_task, timeout=5.0)
+
+    assert drained is True
+    assert loop._active_replies == 0  # the reply unwound and decremented the counter
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"

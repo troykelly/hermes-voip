@@ -18,7 +18,7 @@ import asyncio
 import base64
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -51,7 +51,13 @@ from hermes_voip.manager import (
     RegistrationManager,
     RegistrationStatus,
 )
+from hermes_voip.media.audio import G711_SAMPLE_RATE
+from hermes_voip.media.call_loop import CallLoop
+from hermes_voip.media.endpoint import Endpointer
+from hermes_voip.media.engine import Codec, RtpMediaTransport
+from hermes_voip.media.vad import VoiceActivityDetector
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
+from hermes_voip.providers.asr import Transcript
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
@@ -1685,6 +1691,467 @@ async def test_hang_up_call_unknown_call_returns_false() -> None:
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager)
     assert await adapter.hang_up_call("no-such-call") is False
+
+
+# ---------------------------------------------------------------------------
+# Agent-hangup farewell drain at the adapter seam (#1297, ADR-0106)
+# ---------------------------------------------------------------------------
+#
+# ``hang_up_call`` awaits ``CallLoop.drain_agent_speech`` BEFORE it drives the
+# session BYE + media stop, so a goodbye the agent speaks in the SAME turn as the
+# tool call is heard in full. These tests drive a REAL ``CallLoop`` (its real
+# ``speak`` + real ``drain_agent_speech``) wired to media Protocol fakes that cleanly
+# satisfy the seam — so the (A) send-then-hangup ordering is proven end-to-end at
+# the adapter, not mocked. The fakes below are self-contained and Protocol-clean (no
+# type-ignore escape hatches), mirroring the ``tests/test_call_loop.py`` shapes.
+
+
+class _DrainMediaTransport:
+    """A MediaTransport that records outbound frames; inbound is never driven."""
+
+    def __init__(self) -> None:
+        self.sent_audio: list[PcmFrame] = []
+        self._inbound: list[PcmFrame] = []
+
+    async def connect(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        """No-op teardown (nothing to release in the fake)."""
+
+    def inbound_audio(self) -> AsyncIterator[PcmFrame]:
+        inbound = self._inbound
+
+        async def _gen() -> AsyncIterator[PcmFrame]:
+            for frame in inbound:
+                yield frame
+
+        return _gen()
+
+    async def send_audio(self, frame: PcmFrame) -> None:
+        self.sent_audio.append(frame)
+
+    async def flush_outbound(self, *, fade_ms: int) -> None:
+        _ = fade_ms
+
+    @property
+    def inbound_sample_rate(self) -> int:
+        return 16_000
+
+
+class _GatedFarewellTtsStream:
+    """A farewell TtsStream: emit one frame, park until released, then finish."""
+
+    def __init__(self, frames: list[PcmFrame], release: asyncio.Event) -> None:
+        self._frames = frames
+        self._release = release
+        self._cancelled = False
+        self._gen = self._iter()
+
+    def __aiter__(self) -> AsyncIterator[PcmFrame]:
+        return self
+
+    async def __anext__(self) -> PcmFrame:
+        return await self._gen.__anext__()
+
+    async def _iter(self) -> AsyncGenerator[PcmFrame]:
+        if self._frames:
+            yield self._frames[0]
+        await self._release.wait()
+        if not self._cancelled:
+            for frame in self._frames[1:]:
+                yield frame
+
+    async def flush(self) -> None:
+        """No-op flush (TtsStream protocol conformance)."""
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+        self._release.set()
+
+    async def aclose(self) -> None:
+        self._cancelled = True
+        self._release.set()
+        await self._gen.aclose()
+
+
+class _GatedFarewellTTS:
+    """StreamingTTS returning a single gated farewell stream from synthesize()."""
+
+    def __init__(self, frames: list[PcmFrame], release: asyncio.Event) -> None:
+        self._frames = frames
+        self._release = release
+
+    @property
+    def output_sample_rate(self) -> int:
+        return 16_000
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        _ = text, voice, sample_rate
+        return _GatedFarewellTtsStream(self._frames, self._release)
+
+
+class _LoopASR:
+    """A minimal StreamingASR (never driven — these tests start no run())."""
+
+    def __init__(self) -> None:
+        self._transcripts: list[Transcript] = []
+
+    @property
+    def input_sample_rate(self) -> int:
+        return 16_000
+
+    def stream(self, audio: AsyncIterator[PcmFrame]) -> AsyncIterator[Transcript]:
+        transcripts = self._transcripts
+
+        async def _gen() -> AsyncIterator[Transcript]:
+            async for _ in audio:
+                pass
+            for transcript in transcripts:
+                yield transcript
+
+        return _gen()
+
+
+class _LoopGuard:
+    """A minimal InjectionGuard that ALLOWs (never screened — no turns delivered)."""
+
+    async def screen(self, text: str, *, call_id: str) -> GuardResult:
+        _ = call_id
+        return GuardResult(
+            verdict=GuardVerdict.ALLOW,
+            normalized_text=text,
+            reasons=(),
+            degraded=False,
+            score=0.0,
+        )
+
+
+def _farewell_frame(byte: int) -> PcmFrame:
+    """A distinct outbound TTS frame so farewell RTP is identifiable in send_audio."""
+    return PcmFrame(
+        samples=bytes([byte, 0]) * 128, sample_rate=16_000, monotonic_ts_ns=0
+    )
+
+
+def _build_real_call_loop(
+    transport: _DrainMediaTransport, tts: _GatedFarewellTTS, *, call_id: str
+) -> CallLoop:
+    """A REAL CallLoop wired to media fakes; only speak()/drain_agent_speech() run."""
+
+    async def _noop(text: str) -> None:
+        _ = text
+
+    def _silent_model(window_pcm16: bytes, sample_rate: int) -> float:
+        _ = window_pcm16, sample_rate
+        return 0.0
+
+    return CallLoop(
+        transport=transport,
+        asr=_LoopASR(),
+        tts=tts,
+        guard=_LoopGuard(),
+        vad=VoiceActivityDetector(model=_silent_model, sample_rate_hz=16_000),
+        endpointer=Endpointer(silence_ms=500, sample_rate_hz=16_000),
+        guard_state=GuardSessionState(call_id=call_id),
+        deliver_turn=_noop,
+        voice="fake-voice",
+        call_id=call_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_drains_farewell_before_bye() -> None:
+    """Agent hang_up drains an in-flight farewell to the wire BEFORE BYE (#1297).
+
+    Models the live (A) order: the tool call runs first, then the agent's goodbye
+    reply arrives in the SAME turn (via ``send()``). Pre-fix, ``hang_up_call`` drives
+    the session BYE immediately (``bye_at == 0``) and the farewell is dropped or
+    truncated. With the drain, every farewell frame reaches the transport before the
+    session's BYE (``bye_at == 3``).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    # Ample bounds; the 1.0 s grace covers the same-turn dispatch race.
+    adapter._media_cfg = load_media_config(
+        {
+            "HERMES_VOIP_HANGUP_GRACE_SECS": "1.0",
+            "HERMES_VOIP_HANGUP_DRAIN_SECS": "5.0",
+        }
+    )
+    call_id = new_call_id()
+
+    release = asyncio.Event()
+    frames = [_farewell_frame(1), _farewell_frame(2), _farewell_frame(3)]
+    media = _DrainMediaTransport()
+    loop = _build_real_call_loop(
+        media, _GatedFarewellTTS(frames, release), call_id=call_id
+    )
+    adapter._call_loops[call_id] = loop
+    adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": False}
+
+    events: list[str] = []
+
+    class _Session:
+        ended = False
+
+        async def hang_up(self) -> None:
+            # Snapshot how many farewell frames had reached the wire when BYE fired.
+            events.append(f"BYE@{len(media.sent_audio)}")
+            transport.sent.append("BYE")
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    async def _deliver_farewell() -> None:
+        await asyncio.sleep(0)  # let hang_up enter the drain first (the A order)
+        await adapter.send(call_id, "Goodbye, take care now!")
+
+    async def _release_after_first_frame() -> None:
+        for _ in range(1000):
+            if media.sent_audio:
+                break
+            await asyncio.sleep(0)
+        release.set()
+
+    tasks_before = set(asyncio.all_tasks())
+    await asyncio.gather(
+        adapter.hang_up_call(call_id),
+        _deliver_farewell(),
+        _release_after_first_frame(),
+    )
+
+    # Every farewell frame reached the wire BEFORE the session BYE.
+    assert media.sent_audio == frames
+    assert events == [f"BYE@{len(frames)}"]  # bye_at == 3, not 0
+
+    # No task leaked by the drain/hangup path (the supervisor task is pre-existing).
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
+    assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_proceeds_when_no_farewell() -> None:
+    """With no farewell in flight, hang_up still drives BYE after only the grace."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config(
+        {
+            "HERMES_VOIP_HANGUP_GRACE_SECS": "0.05",
+            "HERMES_VOIP_HANGUP_DRAIN_SECS": "5.0",
+        }
+    )
+    call_id = new_call_id()
+    media = _DrainMediaTransport()
+    loop = _build_real_call_loop(
+        media, _GatedFarewellTTS([], asyncio.Event()), call_id=call_id
+    )
+    adapter._call_loops[call_id] = loop
+
+    hung_up = False
+
+    class _Session:
+        ended = False
+
+        async def hang_up(self) -> None:
+            nonlocal hung_up
+            hung_up = True
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    started = asyncio.get_running_loop().time()
+    ended = await asyncio.wait_for(adapter.hang_up_call(call_id), timeout=5.0)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert ended is True
+    assert hung_up is True  # BYE still sent
+    assert elapsed < 1.0  # only the short grace, not the full 5 s drain
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_proceeds_after_drain_timeout() -> None:
+    """A wedged farewell cannot deadlock hang_up (#1297).
+
+    The drain hits its bound and BYE is still driven — a bounded, cancellable
+    wait, never a hang.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config(
+        {
+            "HERMES_VOIP_HANGUP_GRACE_SECS": "0.02",
+            "HERMES_VOIP_HANGUP_DRAIN_SECS": "0.05",
+        }
+    )
+    call_id = new_call_id()
+    media = _DrainMediaTransport()
+    release = asyncio.Event()  # never set — the farewell wedges mid-playout
+    frames = [_farewell_frame(1), _farewell_frame(2)]
+    loop = _build_real_call_loop(
+        media, _GatedFarewellTTS(frames, release), call_id=call_id
+    )
+    adapter._call_loops[call_id] = loop
+    adapter._call_info[call_id] = {"name": "9999", "type": "dm", "ended": False}
+
+    hung_up = False
+
+    class _Session:
+        ended = False
+
+        async def hang_up(self) -> None:
+            nonlocal hung_up
+            hung_up = True
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    # A farewell that wedges mid-playout (first frame out, the rest gated forever).
+    speak_task = asyncio.create_task(adapter.send(call_id, "Goodbye!"))
+    for _ in range(1000):
+        if media.sent_audio:
+            break
+        await asyncio.sleep(0)
+    assert media.sent_audio  # farewell is in flight and wedged
+
+    started = asyncio.get_running_loop().time()
+    ended = await asyncio.wait_for(adapter.hang_up_call(call_id), timeout=5.0)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert ended is True
+    assert hung_up is True  # BYE still driven despite the wedged farewell
+    assert elapsed < 1.0  # bounded at ~0.05 s, never the wait_for's 5 s safety net
+
+    # Cleanup: cancel the wedged farewell send so nothing leaks.
+    speak_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await speak_task
+
+
+class _TailSendRecorder:
+    """Records the engine's outbound datagrams in place of the real UDP socket.
+
+    Satisfies the engine's ``_DatagramSink`` seam (``sendto`` + ``close``) so a live
+    ``RtpMediaTransport`` can be driven while every emitted packet is observed — and
+    the exact moment each reaches the wire is comparable against the session BYE.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def sendto(self, data: bytes, addr: tuple[str, int] | None = None) -> None:
+        _ = addr
+        self.sent.append(bytes(data))
+
+    def close(self) -> None:
+        """No-op: this recorder owns no socket (the test closes the real one)."""
+
+
+@pytest.mark.asyncio
+async def test_hang_up_call_flushes_engine_tail_before_bye() -> None:
+    """Agent hang_up flushes the engine's buffered sub-ptime tail BEFORE BYE (#432).
+
+    ``drain_agent_speech`` only waits until the farewell's frames reach
+    ``send_audio``, but ``send_audio`` carry-buffers a trailing sub-ptime partial in
+    ``_tx_buffer`` that ``stop()``'s ``_flush_tx_tail`` would otherwise emit AFTER
+    ``CallSession.hang_up`` has already sent BYE (call.py sends BYE, then stops
+    media). A gateway that drops media on BYE clips that final padded farewell packet.
+    ``hang_up_call`` must flush the concrete engine's tail (reached via
+    ``_call_engines``) AFTER the drain and BEFORE ``session.hang_up()``.
+
+    Models the real tail with a LIVE ``RtpMediaTransport`` + a recording datagram
+    sink (the #432 ``_DrainMediaTransport`` does not model ``_tx_buffer``); the fake
+    ``_Session`` mirrors ``CallSession.hang_up`` (BYE, then media stop) so the pre-fix
+    order — the partial flushed by ``stop()`` AFTER BYE — is observable and fails here.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config(
+        {
+            "HERMES_VOIP_HANGUP_GRACE_SECS": "0.02",
+            "HERMES_VOIP_HANGUP_DRAIN_SECS": "0.05",
+        }
+    )
+    call_id = new_call_id()
+
+    async def _no_pace(_secs: float) -> None:
+        """No-op pacing sleep for a deterministic outbound tail."""
+
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="127.0.0.1",
+        remote_port=5004,
+        codec=Codec.PCMU,
+        sleep=_no_pace,
+        initial_seq=0,
+        initial_ts=0,
+    )
+    await engine.connect()
+
+    recorder = _TailSendRecorder()
+    real_transport = engine._transport
+    engine._transport = recorder
+
+    # A farewell whose final chunk is NOT a whole 20 ms frame: 240 samples = 1.5
+    # frames -> one whole frame paced out now, an 80-sample partial left in _tx_buffer.
+    farewell_tail = PcmFrame(
+        samples=bytes([0x11, 0x22]) * 240,
+        sample_rate=G711_SAMPLE_RATE,
+        monotonic_ts_ns=0,
+    )
+    await engine.send_audio(farewell_tail)
+    whole_frames = len(recorder.sent)
+    assert whole_frames == 1, "one whole farewell frame is paced out immediately"
+    assert engine._tx_buffer, "precondition: a sub-ptime farewell tail is buffered"
+
+    # An idle REAL loop so drain_agent_speech returns after only the grace (its own
+    # transport is unused — the flush targets the engine held in _call_engines).
+    idle_loop = _build_real_call_loop(
+        _DrainMediaTransport(), _GatedFarewellTTS([], asyncio.Event()), call_id=call_id
+    )
+    adapter._call_loops[call_id] = idle_loop
+    # The concrete engine handle hang_up_call flushes: _run_call_loop registers it
+    # alongside _call_loops in production; injected directly here to isolate the
+    # flush-before-BYE ordering. Whole-attribute assign so this exercises the ORDERING
+    # defect (not a missing attribute) on the pre-fix branch too.
+    adapter._call_engines = {call_id: engine}
+
+    bye_at: list[int] = []
+
+    class _Session:
+        ended = False
+
+        async def hang_up(self) -> None:
+            # Mirror CallSession.hang_up: snapshot how many datagrams reached the wire
+            # at BYE time, THEN stop media (whose _flush_tx_tail emits any residual).
+            bye_at.append(len(recorder.sent))
+            await engine.stop()
+
+    adapter._call_sessions[call_id] = _Session()  # type: ignore[assignment]  # test double
+
+    await adapter.hang_up_call(call_id)
+
+    # The padded farewell partial reached the wire BEFORE the session BYE.
+    assert bye_at == [whole_frames + 1], (
+        f"the buffered farewell tail must flush BEFORE BYE (bye_at={bye_at}, "
+        f"expected [{whole_frames + 1}])"
+    )
+    # stop()'s own later flush found an empty buffer — the tail is not double-sent.
+    assert len(recorder.sent) == whole_frames + 1
+
+    # Close the real UDP socket stop() left untouched (it closed only the recorder).
+    if real_transport is not None:
+        real_transport.close()
 
 
 @pytest.mark.asyncio

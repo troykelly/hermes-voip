@@ -1685,3 +1685,75 @@ async def test_on_response_stale_cseq_preserves_outstanding_response_timeout() -
         "a stale/uncorrelated final must not cancel the outstanding REGISTER's timeout"
     )
     await manager.aclose()
+
+
+async def test_aclose_deregisters_registered_flow() -> None:
+    """Graceful shutdown de-registers a live binding, Expires:0 (#97, ADR-0059).
+
+    Without it the gateway keeps routing inbound calls to the just-closed contact
+    until the binding expires (an inbound black-hole after every restart). aclose()
+    must send the Expires:0 REGISTER (``RegistrationFlow.deregister``) while the
+    transport is still open, before it tears the flow down.
+    """
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()
+    # Register ONLY the flow whose REGISTER is sent[0]; the other stays unregistered.
+    await manager.on_response(_ok_for(transport.sent[0], expires=300))
+    sent_before = len(transport.sent)
+
+    await manager.aclose()
+
+    deregs = [
+        m
+        for m in transport.sent[sent_before:]
+        if m.startswith("REGISTER ") and SipRequest.parse(m).header("Expires") == "0"
+    ]
+    assert len(deregs) == 1, (
+        "aclose must send exactly one Expires:0 de-register for the one registered "
+        f"flow; new messages after registration: {transport.sent[sent_before:]!r}"
+    )
+
+
+async def test_aclose_does_not_deregister_unregistered_flow() -> None:
+    """De-register ONLY live bindings on aclose, never an unregistered flow (#97)."""
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()  # 2 REGISTERs sent; no 200 fed, so NEITHER flow is registered
+    sent_before = len(transport.sent)
+
+    await manager.aclose()
+
+    assert transport.sent[sent_before:] == [], (
+        "aclose must send no de-register for a flow that never registered"
+    )
+
+
+async def test_aclose_deregister_send_failure_does_not_strand_shutdown() -> None:
+    """A failed de-register send must not strand aclose on shutdown (#97, rule 37)."""
+
+    class _FailingSendTransport(_FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = False
+
+        async def send(self, message: str) -> None:
+            if self.fail:
+                raise ConnectionResetError("transport gone during shutdown de-register")
+            await super().send(message)
+
+    transport = _FailingSendTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()
+    await manager.on_response(_ok_for(transport.sent[0], expires=300))
+    await manager.on_response(_ok_for(transport.sent[1], expires=300))
+    transport.fail = True  # every subsequent send (the de-registers) now raises
+
+    await manager.aclose()  # MUST NOT raise despite the failed de-registers
+
+    # Shutdown still completed for BOTH flows: their tasks are cancelled + cleared.
+    for extension in ("1000", "1001"):
+        state = manager._by_extension[extension]
+        assert state.refresh_task is None
+        assert state.recovery_task is None
+        assert state.response_timeout_task is None

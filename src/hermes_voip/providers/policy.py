@@ -251,6 +251,21 @@ class GuardSessionState:
             turn_id = f"{self.call_id}#{self._turns_seen}"
             self.flagged_turns = (*self.flagged_turns, turn_id)
 
+    def note_trusted_turn(self) -> None:
+        """Clear the per-turn read-only clamp for a NON-classifier-screened turn.
+
+        A delivery path that carries no natural-language injection surface — DTMF
+        keypad input (constrained to ``0-9*#ABCD``, gated by privilege + explicit
+        confirmation, never the classifier) — must still set ``turn_restricted`` for
+        ITS turn, or the flag stays stale from the previous screened turn (a
+        stale-``True`` over-blocks the legitimate keypad turn, e.g. an ADR-0010
+        DTMF-confirmed transfer; a stale-``False`` would silently carry a prior
+        clamp's assumptions). A trusted turn is not clamped, so this clears it. The
+        sticky, whole-call ``degraded`` state is deliberately left untouched — a
+        fail-open still hard-blocks non-SAFE tools on every turn, keypad included.
+        """
+        self.turn_restricted = False
+
     def __repr__(self) -> str:
         """Return a developer-friendly representation."""
         return (

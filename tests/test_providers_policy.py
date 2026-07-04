@@ -8,6 +8,7 @@ or the action is unconfirmed. The truth table is asserted exhaustively.
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import (
     GateDecision,
+    GateReason,
     GuardSessionState,
     ToolRisk,
     gate_tool_call,
@@ -174,6 +175,38 @@ def test_safe_tools_run_even_on_a_restricted_turn() -> None:
     state = GuardSessionState(call_id="c1", privilege_level=2)
     state.record(_flagged(GuardVerdict.RESTRICT))
     assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True
+
+
+def test_restrict_block_reports_restricted_reason() -> None:
+    # The block carries GateReason.RESTRICTED (distinct from DEGRADED / privilege),
+    # for the audit trail — and it fires even though level-2 alone permits ELEVATED.
+    state = GuardSessionState(call_id="c1", privilege_level=2)
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    decision = gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False)
+    assert decision.allowed is False
+    assert decision.reason is GateReason.RESTRICTED
+
+
+def test_note_trusted_turn_clears_a_prior_restrict_clamp() -> None:
+    # An UNSCREENED delivered turn (the DTMF keypad path) sets its own trust via
+    # note_trusted_turn, so it is NOT stale-clamped by the PRIOR screened RESTRICT —
+    # the ADR-0010 keypad-confirmed transfer must not inherit the speech turn's verdict.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
+    state.note_trusted_turn()  # the DTMF turn is trusted keypad input
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
+
+
+def test_note_trusted_turn_leaves_degraded_sticky() -> None:
+    # A fail-open still hard-blocks non-SAFE on EVERY turn, DTMF included: a trusted
+    # turn clears only the per-turn clamp, never the sticky degraded state.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
+    state.record(_result(degraded=True))
+    assert state.degraded is True
+    state.note_trusted_turn()
+    assert state.degraded is True
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
 
 
 # --- ADR-0031: allowed_tools sub-ceiling on GuardSessionState -----------------

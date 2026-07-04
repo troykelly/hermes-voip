@@ -22,6 +22,8 @@ from hermes_voip.call import CallError, CallSession, _cseq_number
 from hermes_voip.dialog import Dialog
 from hermes_voip.digest import DigestCredentials
 from hermes_voip.incall import LocalMediaSession
+from hermes_voip.media.engine import Codec as EngineCodec
+from hermes_voip.media.engine import RtpMediaTransport
 from hermes_voip.message import SipRequest, SipResponse, build_response
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.refer import ReferRequest
@@ -1438,3 +1440,130 @@ async def test_malformed_sdp_reinvite_reject_is_logged_non_pii(
     assert "theirs" not in blob
     assert "call-1" not in blob
     assert "pbx.example.test" not in blob
+
+
+# ---- inbound re-INVITE that RELOCATES the peer RTP endpoint (ADR-0107) ------
+
+
+def _real_engine(
+    *, remote_address: str = "198.51.100.99", remote_port: int = 41000
+) -> RtpMediaTransport:
+    """A real, plain (no-SRTP) media engine, to assert a re-INVITE re-points it.
+
+    The one-way-audio fix is a CallSession -> engine wiring, so these tests drive
+    the ACTUAL engine (not a media double) and assert on its live send target.
+    """
+    return RtpMediaTransport(
+        local_address="198.51.100.7",
+        local_port=0,
+        remote_address=remote_address,
+        remote_port=remote_port,
+        codec=EngineCodec.PCMU,
+    )
+
+
+def _engine_session(
+    signaling: _FakeSignaling, engine: RtpMediaTransport
+) -> CallSession:
+    return CallSession(
+        dialog=_dialog(),
+        signaling=signaling,
+        media=engine,
+        guard=GuardSessionState(call_id="call-1"),
+        local_media=_MEDIA,
+        credentials=_CREDENTIALS,
+        response_timeout=2.0,
+    )
+
+
+async def test_inbound_reinvite_relocating_endpoint_repoints_media() -> None:
+    """A re-INVITE that moves the peer's RTP endpoint re-points OUR media engine.
+
+    One-way-audio regression: an in-dialog re-INVITE whose SDP offer relocates the
+    peer's audio to a NEW ``c=``/``m=audio`` endpoint (attended-transfer media
+    re-anchor, MoH resume-elsewhere, SBC relocation) must re-point our outbound
+    RTP to the new endpoint and re-arm the comedia latch. Otherwise agent->caller
+    audio keeps flowing to the stale address while the call stays up.
+    """
+    signaling = _FakeSignaling()
+    engine = _real_engine()  # negotiated remote 198.51.100.99:41000
+    # An established call, latched onto the peer's original media source.
+    engine._latched = True
+    engine._outbound_addr = ("198.51.100.99", 41000)
+    session = _engine_session(signaling, engine)
+    # The peer re-INVITEs with its audio relocated to a new (still active) endpoint.
+    offer = build_audio_offer(
+        local_address="203.0.113.55",
+        port=43000,
+        codecs=(_PCMU,),
+        direction="sendrecv",
+        session_id=7,
+    )
+
+    await session.handle_request(_inbound("INVITE", body=offer))
+
+    response = SipResponse.parse(signaling.sent[-1])
+    assert response.status_code == 200  # the re-INVITE is answered
+    # The engine now targets the relocated endpoint; the latch is re-armed.
+    assert engine._remote_address == "203.0.113.55"
+    assert engine._remote_port == 43000
+    assert engine._outbound_addr == ("203.0.113.55", 43000)
+    assert engine._latched is False
+
+
+async def test_inbound_reinvite_same_endpoint_hold_keeps_media_latch() -> None:
+    """An in-place hold (SAME endpoint) never re-points or resets the latch.
+
+    The peer is not receiving our media (``sendonly``), and the learned NAT
+    source is kept so a later resume still reaches the working media path.
+    """
+    signaling = _FakeSignaling()
+    engine = _real_engine()  # negotiated remote 198.51.100.99:41000
+    # Latched onto a NAT-rewritten source that differs from the SDP address.
+    engine._latched = True
+    engine._outbound_addr = ("192.0.2.200", 50000)
+    session = _engine_session(signaling, engine)
+    # SAME ``c=``/``m=`` as the negotiated remote — just a hold direction flip.
+    offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=41000,
+        codecs=(_PCMU,),
+        direction="sendonly",
+        session_id=7,
+    )
+
+    await session.handle_request(_inbound("INVITE", body=offer))
+
+    assert session.on_hold is True  # the hold took effect
+    # The comedia latch is untouched: same learned source, still armed.
+    assert engine._outbound_addr == ("192.0.2.200", 50000)
+    assert engine._latched is True
+    assert engine._remote_address == "198.51.100.99"
+    assert engine._remote_port == 41000
+
+
+async def test_inbound_reinvite_same_endpoint_resume_keeps_media_latch() -> None:
+    """A same-endpoint RESUME (``sendrecv``) leaves the comedia latch intact.
+
+    The not-held path reaches set_remote, but the engine no-ops the unchanged
+    endpoint, so a plain resume never disturbs a working media path (in-place).
+    """
+    signaling = _FakeSignaling()
+    engine = _real_engine()  # negotiated remote 198.51.100.99:41000
+    engine._latched = True
+    engine._outbound_addr = ("192.0.2.200", 50000)  # comedia-learned, != SDP addr
+    session = _engine_session(signaling, engine)
+    # SAME endpoint as negotiated, active (``sendrecv``) — a resume, not a move.
+    offer = build_audio_offer(
+        local_address="198.51.100.99",
+        port=41000,
+        codecs=(_PCMU,),
+        direction="sendrecv",
+        session_id=7,
+    )
+
+    await session.handle_request(_inbound("INVITE", body=offer))
+
+    assert session.on_hold is False
+    assert engine._outbound_addr == ("192.0.2.200", 50000)  # no-op, latch kept
+    assert engine._latched is True

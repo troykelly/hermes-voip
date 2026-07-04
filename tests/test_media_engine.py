@@ -2630,3 +2630,84 @@ async def test_send_audio_logs_tx_amplitude_near_zero_for_silence(
 
     capture_sock.close()
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# set_remote: re-point the outbound RTP target on a re-INVITE that RELOCATES the
+# peer's media endpoint (ADR-0107) — the one-way-audio fix. The engine's remote
+# addr is otherwise fixed at construction and _maybe_latch latches ONCE, so a
+# relocated peer would keep receiving nothing while we send to the stale target.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_remote_repoints_target_and_rearms_latch() -> None:
+    """set_remote re-points the outbound target and re-arms the comedia latch.
+
+    A re-INVITE that moves the peer's RTP endpoint (attended-transfer media
+    re-anchor, MoH resume-elsewhere, SBC relocation) must re-point OUR outbound
+    RTP to the new endpoint AND reset the comedia latch so _maybe_latch re-learns
+    the relocated peer's real source — else agent->caller audio keeps flowing to
+    the stale (latched) address (one-way audio).
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="198.51.100.99",
+        remote_port=41000,
+        codec=Codec.PCMU,
+    )
+    # An established call, already latched onto the peer's original media source.
+    engine._latched = True
+    engine._outbound_addr = ("192.0.2.200", 50000)
+
+    await engine.set_remote("203.0.113.55", 43000)
+
+    assert engine._remote_address == "203.0.113.55"
+    assert engine._remote_port == 43000
+    assert engine._outbound_addr == ("203.0.113.55", 43000)
+    assert engine._latched is False  # re-armed so _maybe_latch re-learns the source
+
+
+@pytest.mark.asyncio
+async def test_set_remote_unchanged_endpoint_is_noop_and_keeps_latch() -> None:
+    """set_remote to the SAME negotiated endpoint is a no-op.
+
+    An established comedia latch (a NAT-learned source that differs from the SDP
+    address) is NOT disturbed, so an in-place hold/resume re-INVITE keeps sending
+    to the working, learned source rather than snapping back to the SDP address.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="198.51.100.99",
+        remote_port=41000,
+        codec=Codec.PCMU,
+    )
+    engine._latched = True
+    engine._outbound_addr = ("192.0.2.200", 50000)  # comedia-learned, != SDP addr
+
+    await engine.set_remote("198.51.100.99", 41000)  # unchanged endpoint
+
+    assert engine._outbound_addr == ("192.0.2.200", 50000)  # latch preserved
+    assert engine._latched is True
+
+
+@pytest.mark.asyncio
+async def test_set_remote_rejects_out_of_range_port() -> None:
+    """set_remote validates the RTP port range 1..65535 like the SDP builders.
+
+    A re-point to a rejected/held stream (port 0) or an out-of-range port fails
+    loudly rather than aiming outbound RTP at an impossible destination.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="198.51.100.99",
+        remote_port=41000,
+        codec=Codec.PCMU,
+    )
+    with pytest.raises(ValueError, match="port out of range"):
+        await engine.set_remote("203.0.113.55", 0)
+    with pytest.raises(ValueError, match="port out of range"):
+        await engine.set_remote("203.0.113.55", 70000)

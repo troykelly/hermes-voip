@@ -1,6 +1,6 @@
 # ADR-0106: Bounded, cancellable agent-hangup farewell drain
 
-- **Date:** 2026-07-03
+- **Date:** 2026-07-03 (amended 2026-07-04, #432 — flush the engine's buffered outbound tail before BYE)
 - **Status:** Accepted
 - **Deciders:** agent session (MEDIUM UX fix #1297; delicate async, one prior attempt shelved)
 - **Relates to:** ADR-0026 (call termination / AGENT_HANGUP classification — amends),
@@ -83,6 +83,26 @@ still live — then BYE and `media.stop()` fire.
    counter → the drain's next poll observes 0 and returns promptly. But the `hang_up` tool is
    an explicit, already-committed decision, so barge-in only **shortens** the drain.
 
+6. **Flush the engine's buffered outbound tail before BYE (#432 amendment).** The drain above
+   waits until the farewell's frames reach `RtpMediaTransport.send_audio` — but `send_audio`
+   re-frames into whole 20 ms wire packets and **carry-buffers the trailing sub-`ptime`
+   remainder** in `_tx_buffer` (ADR-0022's anti-choppiness fix), emitting that final padded
+   partial **only** from `stop()`'s `_flush_tx_tail`. Since `CallSession.hang_up` sends BYE
+   **then** `await self._media.stop()`, that last `<20 ms` of the goodbye leaves *after* the BYE
+   — clipped on a gateway that drops media on BYE. So `RtpMediaTransport` gains a public
+   **`flush_pending_audio()`** (emit the parked in-flight frame + whole frames + zero-padded
+   partial via the existing `_flush_tx_tail`, **without** tearing down; no-op when held / not
+   connected; idempotent), and `adapter.hang_up_call` calls it **after** the drain and **before**
+   `session.hang_up()`. It reaches the **concrete** engine through a new per-call
+   `VoipAdapter._call_engines: dict[str, RtpMediaTransport]` (registered beside `_call_loops` in
+   `_run_call_loop`, dropped under the same loop-identity guard in `_teardown_call`) — **not** a
+   method on the `CallMedia`/`MediaTransport` seam, which would cascade to every media double;
+   `RtpMediaTransport` is the single production media engine, so a concrete handle is exact. The
+   flush is **best-effort** (rule 37: a failure is logged, never strands BYE + media stop), and
+   `stop()`'s own later `_flush_tx_tail` then finds an **empty** buffer, so the tail is never
+   double-sent. This is deliberately **not** `flush_outbound(fade_ms=)` (barge-in), which *fades*
+   the audio to silence — a goodbye must be emitted **unfaded, in full**.
+
 ## Rejected alternatives
 
 - **The `asyncio.Event` mechanism** (a loop-local `_playout_idle`/`_playout_busy` pair drained
@@ -121,8 +141,16 @@ still live — then BYE and `media.stop()` fire.
   use finite/gated/cancelled fake streams, and end with a pending-task assertion; the formerly-
   hanging inbound-INVITE victim test is run **after** the new drain/hangup tests under an
   OS-level `SIGABRT` timeout so any residual stall is a fast, stack-dumping failure.
-- `call.py`, `engine.py`, `_active_tts_stream`, `_play`, and `barge_in` are **not** touched;
-  the ordering is fixed entirely at the adapter seam plus a one-int counter in `speak()`.
+- The same-turn farewell now reaches the wire **in full — including its final sub-`ptime`
+  partial — before BYE** (#432). The counter-drain alone guaranteed the frames reached
+  `send_audio`, **not** that the buffered tail reached the wire pre-BYE; the tail flush closes
+  that "last `<20 ms` clipped on a media-dropping gateway" residual.
+- The original drain touched neither `call.py` nor `engine.py` (ordering fixed at the adapter
+  seam plus a one-int counter in `speak()`); `_active_tts_stream`, `_play`, and `barge_in` remain
+  untouched. The #432 amendment adds **one** public `RtpMediaTransport.flush_pending_audio()` (a
+  thin wrapper over the existing `_flush_tx_tail`), the per-call `_call_engines` registry, and the
+  best-effort flush call in `hang_up_call`; `call.py` (the BYE-then-stop ordering) is still
+  untouched.
 - **Live validation** (rule 26) is required before "done": place a call, have the agent say
   goodbye + `hang_up` in one turn, and confirm on the recording that the full farewell is heard
   before the BYE. Pending the operator's redeploy.

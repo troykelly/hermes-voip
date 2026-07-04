@@ -999,6 +999,13 @@ class VoipAdapter(BasePlatformAdapter):
 
         # Per-call state: {call_id → CallLoop}
         self._call_loops: dict[str, CallLoop] = {}
+        # Per-call CONCRETE media engine: {call_id → RtpMediaTransport} (#432,
+        # ADR-0106). Registered alongside _call_loops in _run_call_loop and dropped in
+        # _teardown_call. hang_up_call reaches the concrete engine here to flush its
+        # buffered outbound tail (flush_pending_audio) BEFORE the BYE — a concrete
+        # handle NOT on the CallMedia/MediaTransport seam (which would cascade to every
+        # media double), since RtpMediaTransport is the single production media engine.
+        self._call_engines: dict[str, RtpMediaTransport] = {}
         # Per-call armed-confirmation resolver (ADR-0010), present only while a call
         # has inbound RFC 4733 DTMF receive active: {call_id → ArmedConfirmation}. The
         # engine's on_dtmf routes digits to the loop, which feeds this resolver while a
@@ -1346,6 +1353,7 @@ class VoipAdapter(BasePlatformAdapter):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._call_tasks.clear()
         self._call_loops.clear()
+        self._call_engines.clear()
         self._dtmf_confirmations.clear()
         self._call_sessions.clear()
         self._admitted_calls.clear()
@@ -5288,6 +5296,9 @@ class VoipAdapter(BasePlatformAdapter):
             call_progress_callback=call_progress_callback,
         )
         self._call_loops[call_id] = call_loop
+        # Register the concrete engine so hang_up_call can flush its buffered outbound
+        # tail before BYE (#432, ADR-0106); dropped with the loop in _teardown_call.
+        self._call_engines[call_id] = engine
         # Wire inbound DTMF receive (ADR-0010): resolve the per-call receive mode from
         # config + the negotiated telephone-event PT, and when RFC 4733 is active wire
         # the engine's on_dtmf demux to the loop's router and bind the armed-
@@ -5659,6 +5670,10 @@ class VoipAdapter(BasePlatformAdapter):
             self._release_admission(call_id)
         if call_loop is None or self._call_loops.get(call_id) is call_loop:
             self._call_loops.pop(call_id, None)
+            # The concrete engine handle dies with the loop (#432, ADR-0106): gated on
+            # the same loop-identity check so a superseding same-Call-ID task's engine
+            # is not evicted.
+            self._call_engines.pop(call_id, None)
             # The per-call DTMF confirmation resolver dies with the loop (ADR-0010).
             # Gated on the same loop-identity check so a superseding same-Call-ID
             # task's resolver is not evicted.
@@ -5943,6 +5958,28 @@ class VoipAdapter(BasePlatformAdapter):
                     "call %s; proceeding with BYE + media stop",
                     drain_secs,
                     call_id,
+                )
+        # #432 / ADR-0106: flush the engine's buffered outbound TAIL to the wire BEFORE
+        # BYE. drain_agent_speech only waits until the farewell's frames reach
+        # send_audio, but send_audio carry-buffers a trailing sub-ptime partial that is
+        # otherwise emitted only by stop()'s _flush_tx_tail — which CallSession.hang_up
+        # runs AFTER the BYE. A gateway that drops media on BYE clips that final padded
+        # partial, so emit it here (dialog still up), AFTER the drain and BEFORE
+        # session.hang_up(). The concrete RtpMediaTransport is reached via _call_engines
+        # (NOT the CallMedia/MediaTransport seam, which would cascade to every media
+        # double). Best-effort (rule 37): a flush error is logged and never strands the
+        # BYE + media stop below; stop()'s own later flush then finds an empty buffer
+        # (no double-send).
+        engine = self._call_engines.get(call_id)
+        if engine is not None:
+            try:
+                engine.flush_pending_audio()
+            except Exception as exc:  # noqa: BLE001 — best-effort tail flush; never strand teardown (rule 37: logged, not swallowed)
+                _log.warning(
+                    "agent hang_up: farewell tail flush failed for call %s "
+                    "(BYE + media stop proceed regardless): %s",
+                    call_id,
+                    exc,
                 )
         _log.info(
             "agent hang_up tool: ending call %s (drain + BYE + media stop)", call_id

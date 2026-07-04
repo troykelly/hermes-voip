@@ -3610,6 +3610,34 @@ class RtpMediaTransport:
             faded = faded + bytes(chunk_bytes - remainder)
         self._emit_inline_frames(faded, transport)
 
+    def flush_pending_audio(self) -> None:
+        """Emit the buffered outbound tail to the wire WITHOUT tearing down (ADR-0106).
+
+        The agent-hangup drain (``CallLoop.drain_agent_speech``, awaited by
+        ``VoipAdapter.hang_up_call`` before
+        :meth:`~hermes_voip.call.CallSession.hang_up`) waits only until a farewell's
+        frames reach :meth:`send_audio` — but ``send_audio`` carry-buffers a trailing
+        sub-``ptime`` partial in :attr:`_tx_buffer` that is otherwise emitted only by
+        :meth:`stop`'s :meth:`_flush_tx_tail`, which runs AFTER ``CallSession.hang_up``
+        has already sent BYE (it sends BYE, then stops media). A gateway that discards
+        media on BYE would clip that final padded partial. Flushing HERE — after the
+        drain, before BYE — puts the whole farewell on the wire while the dialog is up.
+
+        Emits exactly the tail :meth:`stop` would (the parked in-flight frame, then
+        every whole buffered frame, then the trailing partial zero-padded to one frame
+        — all inline, no pacing) through the still-open socket via
+        :meth:`_flush_tx_tail`, then leaves the engine RUNNING (socket open, seq/ts
+        advanced). Idempotent and a no-op when nothing is buffered: a second call — and
+        :meth:`stop`'s own later flush — find an empty :attr:`_tx_buffer`, so the tail
+        is never double-sent. Skipped while :attr:`on_hold` (hold stops outbound media)
+        or before connect / after stop (``_transport`` is ``None``), mirroring
+        :meth:`stop`'s own flush guard.
+        """
+        transport = self._transport
+        if transport is None or self.on_hold:
+            return
+        self._flush_tx_tail(transport)
+
     async def stop(self) -> None:
         """Tear down the media plane; close the socket; idempotent.
 

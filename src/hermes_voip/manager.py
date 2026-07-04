@@ -221,6 +221,9 @@ _DEFAULT_REFRESH_TIMEOUT = 32.0
 _DEFAULT_RETRY_BACKOFF = 1.0
 _RETRY_BACKOFF_CAP = 30.0
 _RETRY_JITTER = 0.2
+# Bound on the best-effort Expires:0 de-register send during aclose() (#97): a dead
+# or slow transport must never strand a graceful shutdown (rule 37).
+_DEREGISTER_SEND_TIMEOUT_SECS = 2.0
 _TAG_PARAM = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
 
@@ -443,13 +446,28 @@ class RegistrationManager:
         return self.is_up
 
     async def aclose(self) -> None:
-        """Cancel every background task; the transport is closed by its owner.
+        """Cancel every background task, then de-register live bindings.
 
-        Each task's done callback has already observed any real failure; the
-        ``gather`` here only drains the resulting cancellations. The refresh, the
-        Timer-F/B response-timeout, and the recovery re-REGISTER tasks are all
-        cancelled so none fires after shutdown.
+        On a graceful shutdown the refresh, the Timer-F/B response-timeout, and
+        the recovery re-REGISTER tasks are all cancelled and drained FIRST, so no
+        in-flight or scheduled refresh/recovery REGISTER can race with — or land
+        after — the de-register and recreate the binding at the gateway. Only then
+        is each still-registered flow de-registered (an Expires:0 REGISTER,
+        :meth:`RegistrationFlow.deregister`) while the transport is still open
+        (its owner closes it after us), so the gateway drops our binding at once
+        instead of black-holing inbound calls until it expires (ADR-0059). Because
+        the de-register is the last REGISTER on the wire for the flow, the gateway
+        settles de-registered. The send is best-effort and bounded: a dead or slow
+        transport must never strand shutdown (rule 37).
         """
+        # Mark every registered flow deregistering (suppresses recovery) and cancel +
+        # drain ALL per-flow tasks BEFORE any de-register goes out: a still-live refresh
+        # could otherwise send a normal REGISTER after the Expires:0 and re-create the
+        # binding, so the inbound black-hole would persist. Each task's done callback
+        # has already observed any real failure; this ``gather`` drains the cancels.
+        for state in self._flows.values():
+            if state.registered:
+                state.deregistering = True
         tasks = [
             task
             for state in self._flows.values()
@@ -467,6 +485,24 @@ class RegistrationManager:
             state.refresh_task = None
             state.response_timeout_task = None
             state.recovery_task = None
+        # Now that no sender task is live, de-register each binding (Expires:0) while
+        # the transport is still open (ADR-0059). Best-effort + bounded (rule 37): a
+        # dead/slow transport must never strand shutdown; ``deregistering`` already
+        # marks the intent so any failure here is an expected end, not an outage.
+        for state in self._flows.values():
+            if not state.registered:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._transport.send(state.flow.deregister()),
+                    _DEREGISTER_SEND_TIMEOUT_SECS,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort de-register; never strand shutdown (rule 37: logged, not swallowed)
+                _log.warning(
+                    "registration: de-register on graceful shutdown failed "
+                    "(the gateway binding lapses on its own): %s",
+                    exc,
+                )
 
     # --- inbound responses --------------------------------------------------
 

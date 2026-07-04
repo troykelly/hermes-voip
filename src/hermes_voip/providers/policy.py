@@ -55,12 +55,16 @@ class GateReason(Enum):
             on an otherwise operator-level, non-degraded session.
         DEGRADED: The session is in the sticky fail-open ``degraded`` state — the
             ADR-0009 hard-block that fires regardless of privilege/confirmation.
+        RESTRICTED: The CURRENT caller turn was screened ``RESTRICT`` or ``CLARIFY``
+            (ADR-0009), so this turn is clamped read-only (no non-SAFE tool) — a
+            PER-TURN block that a later ``ALLOW`` turn clears (unlike sticky degraded).
     """
 
     ALLOWED = "allowed"
     INSUFFICIENT_PRIVILEGE = "insufficient_privilege"
     UNCONFIRMED = "unconfirmed"
     DEGRADED = "degraded"
+    RESTRICTED = "restricted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +142,10 @@ class GuardSessionState:
     Attributes:
         call_id: The call/session this state belongs to.
         degraded: True once any fail-open screen occurred; never un-sets in-call.
+        turn_restricted: True when the CURRENT turn was screened RESTRICT/CLARIFY
+            (ADR-0009), clamping it read-only (no non-SAFE tool). PER-TURN — set by
+            :meth:`record` each screen, cleared by a clean ALLOW turn (unlike the
+            sticky ``degraded``).
         privilege_level: The tool-risk ceiling for this session (0/2/3).
             Set from the caller group at INVITE time (ADR-0021).
         allowed_tools: An optional per-session tool allow-list — a SUB-ceiling
@@ -161,6 +169,7 @@ class GuardSessionState:
         "degraded",
         "flagged_turns",
         "privilege_level",
+        "turn_restricted",
     )
 
     def __init__(  # noqa: PLR0913 — each arg is an independent session-state field; the back-compat ``privileged`` kwarg + the ADR-0031 ``allowed_tools`` sub-ceiling both have to live alongside the four existing fields
@@ -198,6 +207,10 @@ class GuardSessionState:
         self.flagged_turns = flagged_turns
         self.allowed_tools = allowed_tools
         self._turns_seen = 0
+        # Per-turn read-only clamp (ADR-0009): set by ``record`` when the CURRENT
+        # turn's verdict is not ALLOW (RESTRICT/CLARIFY/REFUSE). Distinct from the
+        # sticky, whole-call ``degraded`` flag — a later ALLOW turn clears it.
+        self.turn_restricted = False
         if privileged is not None:
             # Backward-compat: map old bool kwarg → level.
             # True = operator (3); False = receptionist (0).
@@ -229,6 +242,11 @@ class GuardSessionState:
         """
         self._turns_seen += 1
         self.degraded = self.degraded or result.degraded
+        # Per-turn read-only clamp (ADR-0009): a non-ALLOW verdict (RESTRICT/CLARIFY,
+        # or the RESTRICT a fail-open returns) clamps THIS turn to SAFE-only; a clean
+        # ALLOW turn clears it. Overwritten every screen, so it tracks the current
+        # turn — unlike the sticky ``degraded`` bit above.
+        self.turn_restricted = result.verdict is not GuardVerdict.ALLOW
         if result.verdict is not GuardVerdict.ALLOW or result.degraded:
             turn_id = f"{self.call_id}#{self._turns_seen}"
             self.flagged_turns = (*self.flagged_turns, turn_id)
@@ -329,6 +347,12 @@ def _gate_non_safe(
     """
     if state.degraded:
         return GateDecision(allowed=False, reason=GateReason.DEGRADED)
+    if state.turn_restricted:
+        # The current turn was screened RESTRICT/CLARIFY (ADR-0009): clamp read-only,
+        # no non-SAFE tool this turn, regardless of the session's privilege_level.
+        # Per-turn (a later ALLOW screen clears it), so this reports before the
+        # structural privilege/confirmation causes.
+        return GateDecision(allowed=False, reason=GateReason.RESTRICTED)
     if state.privilege_level < min_level:
         return GateDecision(allowed=False, reason=GateReason.INSUFFICIENT_PRIVILEGE)
     if not confirmation_ok:

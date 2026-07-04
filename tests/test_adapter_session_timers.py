@@ -510,6 +510,45 @@ async def test_inbound_require_timer_is_supported_not_420() -> None:
 
 
 # ===========================================================================
+# (b4) 420 Bad Extension takes precedence over the at-capacity 486 Busy Here.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_inbound_unsupported_require_420_precedes_486_at_capacity() -> None:
+    """A required unsupported extension is 420'd even at capacity — before the 486.
+
+    RFC 3261 §8.2.2.3 header inspection (Require) precedes §8.2.5 request processing,
+    where the at-capacity 486 Busy Here arises. A peer requiring an extension we cannot
+    honour must be told 420 Bad Extension (retry WITHOUT it), never 486 Busy Here (retry
+    the SAME unsatisfiable request later).
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    # Saturate admission so the at-capacity 486 branch would fire for a new call.
+    assert adapter._gateway_cfg is not None
+    max_calls = adapter._gateway_cfg.max_calls
+    adapter._admitted_calls.update(f"admitted-{i}" for i in range(max_calls))
+
+    call_id = new_call_id()
+    invite_text = _make_invite(
+        _SDP_PLAIN, call_id, session_expires="600", supported_timer=True
+    ).replace("CSeq: 1 INVITE\r\n", "CSeq: 1 INVITE\r\nRequire: 100rel\r\n")
+    invite = SipRequest.parse(invite_text)
+
+    with _patched_invite_env():
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: bool(transport.sent))
+        await asyncio.sleep(0)
+
+    statuses = [r.status_code for r in _sent_responses(transport)]
+    assert 420 in statuses, (
+        f"an unsupported Require must 420 even at capacity (before 486); got {statuses}"
+    )
+    assert 486 not in statuses, (
+        f"420 Bad Extension must take precedence over 486 Busy Here; got {statuses}"
+    )
+
+
+# ===========================================================================
 # (c) we are refresher -> a refresh re-INVITE is emitted around SE/2.
 # ===========================================================================
 @pytest.mark.asyncio

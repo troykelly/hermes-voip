@@ -3226,31 +3226,14 @@ class VoipAdapter(BasePlatformAdapter):
         if gateway_cfg is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: gateway config not initialised"
             raise RuntimeError(msg)
-        # Admission control fast-path (ADR-0059): if we are already at the concurrent
-        # -call cap, reject this NEW INVITE with 486 Busy Here immediately — before the
-        # classification + SDP work — so a burst/flood does the least work. This read
-        # is advisory (the authoritative atomic reserve is at the media boundary
-        # below); a retransmit of an ALREADY-admitted call (its Call-ID already holds a
-        # slot) is never rejected here. 486 is the RFC 3261 §21.4.24 "the callee is
-        # busy" code a gateway maps to a busy/queue treatment.
-        if (
-            call_id not in self._admitted_calls
-            and len(self._admitted_calls) >= gateway_cfg.max_calls
-        ):
-            _log.warning(
-                "INVITE %s: REJECTED 486 Busy Here — at concurrent-call cap (%d)",
-                call_id,
-                gateway_cfg.max_calls,
-                extra=_rejected_extra(call_id, 486, "at_capacity"),
-            )
-            await transport.send(build_response(invite, 486, "Busy Here"))
-            return
-        # RFC 3261 §8.2.2.3: an INVITE whose Require header lists an option-tag we do
-        # not support is REJECTED 420 Bad Extension here — before any dialog, media
-        # engine, or agent surface — carrying an Unsupported header so the UAC can retry
-        # without those tags. Silently ignoring an unknown Require would answer a call
-        # whose mandatory extension (e.g. 100rel, precondition) we cannot honour; the
-        # one extension we engage as a UAS is RFC 4028 session timers ("timer").
+        # RFC 3261 §8.2.2.3: Require header inspection precedes §8.2.5 request
+        # processing (where the 486-at-capacity decision below lives), so an INVITE
+        # requiring an option-tag we do not support is REJECTED 420 Bad Extension —
+        # before the capacity check, any dialog, media engine, or agent surface —
+        # carrying an Unsupported header so the UAC can retry without those tags.
+        # Silently ignoring an unknown Require would answer a call whose mandatory
+        # extension (e.g. 100rel, precondition) we cannot honour; the one extension we
+        # engage as a UAS is RFC 4028 session timers ("timer").
         unsupported_tags = _unsupported_require_tags(invite)
         if unsupported_tags:
             unsupported_value = ", ".join(unsupported_tags)
@@ -3269,6 +3252,25 @@ class VoipAdapter(BasePlatformAdapter):
                     extra_headers=(("Unsupported", unsupported_value),),
                 )
             )
+            return
+        # Admission control fast-path (ADR-0059): if we are already at the concurrent
+        # -call cap, reject this NEW INVITE with 486 Busy Here immediately — before the
+        # classification + SDP work — so a burst/flood does the least work. This read
+        # is advisory (the authoritative atomic reserve is at the media boundary
+        # below); a retransmit of an ALREADY-admitted call (its Call-ID already holds a
+        # slot) is never rejected here. 486 is the RFC 3261 §21.4.24 "the callee is
+        # busy" code a gateway maps to a busy/queue treatment.
+        if (
+            call_id not in self._admitted_calls
+            and len(self._admitted_calls) >= gateway_cfg.max_calls
+        ):
+            _log.warning(
+                "INVITE %s: REJECTED 486 Busy Here — at concurrent-call cap (%d)",
+                call_id,
+                gateway_cfg.max_calls,
+                extra=_rejected_extra(call_id, 486, "at_capacity"),
+            )
+            await transport.send(build_response(invite, 486, "Busy Here"))
             return
         # ADR-0038: the Via transport token for the inbound dialog + the
         # agent-facing call context follows the configured transport (TLS | WSS),

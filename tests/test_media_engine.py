@@ -2630,3 +2630,151 @@ async def test_send_audio_logs_tx_amplitude_near_zero_for_silence(
 
     capture_sock.close()
     await engine.stop()
+
+
+# ---------------------------------------------------------------------------
+# set_remote: re-point the outbound RTP target on a re-INVITE that RELOCATES the
+# peer's media endpoint (ADR-0107) — the one-way-audio fix. The engine's remote
+# addr is otherwise fixed at construction and _maybe_latch latches ONCE, so a
+# relocated peer would keep receiving nothing while we send to the stale target.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_remote_repoints_target_and_rearms_latch() -> None:
+    """set_remote re-points the outbound target and re-arms the comedia latch.
+
+    A re-INVITE that moves the peer's RTP endpoint (attended-transfer media
+    re-anchor, MoH resume-elsewhere, SBC relocation) must re-point OUR outbound
+    RTP to the new endpoint AND reset the comedia latch so _maybe_latch re-learns
+    the relocated peer's real source — else agent->caller audio keeps flowing to
+    the stale (latched) address (one-way audio).
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="198.51.100.99",
+        remote_port=41000,
+        codec=Codec.PCMU,
+    )
+    # An established call, already latched onto the peer's original media source.
+    engine._latched = True
+    engine._outbound_addr = ("192.0.2.200", 50000)
+
+    await engine.set_remote("203.0.113.55", 43000)
+
+    assert engine._remote_address == "203.0.113.55"
+    assert engine._remote_port == 43000
+    assert engine._outbound_addr == ("203.0.113.55", 43000)
+    assert engine._latched is False  # re-armed so _maybe_latch re-learns the source
+
+
+@pytest.mark.asyncio
+async def test_set_remote_unchanged_endpoint_is_noop_and_keeps_latch() -> None:
+    """set_remote to the SAME negotiated endpoint is a no-op.
+
+    An established comedia latch (a NAT-learned source that differs from the SDP
+    address) is NOT disturbed, so an in-place hold/resume re-INVITE keeps sending
+    to the working, learned source rather than snapping back to the SDP address.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="198.51.100.99",
+        remote_port=41000,
+        codec=Codec.PCMU,
+    )
+    engine._latched = True
+    engine._outbound_addr = ("192.0.2.200", 50000)  # comedia-learned, != SDP addr
+
+    await engine.set_remote("198.51.100.99", 41000)  # unchanged endpoint
+
+    assert engine._outbound_addr == ("192.0.2.200", 50000)  # latch preserved
+    assert engine._latched is True
+
+
+@pytest.mark.asyncio
+async def test_set_remote_rejects_out_of_range_port() -> None:
+    """set_remote validates the RTP port range 1..65535 like the SDP builders.
+
+    A re-point to a rejected/held stream (port 0) or an out-of-range port fails
+    loudly rather than aiming outbound RTP at an impossible destination.
+    """
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address="198.51.100.99",
+        remote_port=41000,
+        codec=Codec.PCMU,
+    )
+    with pytest.raises(ValueError, match="port out of range"):
+        await engine.set_remote("203.0.113.55", 0)
+    with pytest.raises(ValueError, match="port out of range"):
+        await engine.set_remote("203.0.113.55", 70000)
+
+
+@pytest.mark.asyncio
+async def test_set_remote_ignores_stale_packet_from_old_endpoint() -> None:
+    """A stale packet from the endpoint we relocated AWAY from must not re-latch.
+
+    set_remote re-arms the comedia latch (`_latched=False`) so `_maybe_latch`
+    re-learns the new peer. But `_maybe_latch` runs on the inbound path and latches
+    to the FIRST valid audio-PT source. A stray in-flight packet from the OLD source
+    (same codec, common around the 200 OK during an attended-transfer/SBC re-anchor)
+    would otherwise re-latch `_outbound_addr` back to the stale address, so one-way
+    audio persists intermittently. The relocated-from record makes `_maybe_latch`
+    skip it — the target stays on the new SDP endpoint until a GENUINE new-source
+    packet latches (which also handles a NAT'd relocation).
+    """
+    old_src = ("198.51.100.99", 41000)
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address=old_src[0],
+        remote_port=old_src[1],
+        codec=Codec.PCMU,
+        symmetric=True,
+    )
+    # An established call latched onto the OLD peer source.
+    engine._latched = True
+    engine._outbound_addr = old_src
+
+    # The peer relocates its RTP endpoint.
+    new_addr, new_port = "203.0.113.55", 43000
+    await engine.set_remote(new_addr, new_port)
+    # Capture the bool into a fresh local at each check: asserting ``is``/``is
+    # False`` directly on ``engine._latched`` would narrow the attribute to a
+    # Literal that mypy keeps across the sync ``_maybe_latch`` call (unlike an
+    # ``await``), making the later ``is True`` look unreachable.
+    latched_after_relocate = engine._latched
+    assert engine._outbound_addr == (new_addr, new_port)  # re-pointed
+    assert latched_after_relocate is False  # re-armed
+
+    # A STALE in-flight packet from the OLD endpoint (negotiated audio PT) arrives.
+    stale = RtpPacket(
+        payload_type=0,
+        sequence_number=1,
+        timestamp=0,
+        ssrc=_FAKE_SSRC,
+        payload=_ulaw_silence(),
+    )
+    engine._maybe_latch(stale, old_src)
+    latched_after_stale = engine._latched
+    # It must NOT re-latch back to the stale address; still un-latched, waiting.
+    assert engine._outbound_addr == (new_addr, new_port)
+    assert latched_after_stale is False
+
+    # A GENUINE packet from the new peer's real (NAT'd) source then latches.
+    fresh_src = ("203.0.113.55", 55000)
+    fresh = RtpPacket(
+        payload_type=0,
+        sequence_number=2,
+        timestamp=_SAMPLES_PER_FRAME,
+        ssrc=_FAKE_SSRC,
+        payload=_ulaw_silence(),
+    )
+    engine._maybe_latch(fresh, fresh_src)
+    latched_after_fresh = engine._latched
+    assert latched_after_fresh is True
+    assert engine._outbound_addr == fresh_src
+    assert engine._relocated_from is None  # relocation resolved by the new source

@@ -135,6 +135,20 @@ class CallMedia(Protocol):
         """Gate (hold) or restore (resume) the RTP send and jitter buffer."""
         ...
 
+    async def set_remote(self, address: str, port: int) -> None:
+        """Re-point the outbound RTP target to a relocated peer media endpoint.
+
+        Called on an in-dialog re-INVITE whose SDP offer moves the peer's audio to
+        a new ``c=``/``m=audio`` endpoint (attended-transfer media re-anchor, MoH
+        resume-elsewhere, SBC media relocation): re-point OUR outbound RTP to
+        ``address``/``port`` and reset comedia latching so the transport re-learns
+        the relocated peer's source — else agent→caller audio keeps flowing to the
+        stale (latched) address (one-way audio). A no-op when the endpoint is
+        unchanged, so an in-place hold/resume keeps its established latch. (Async
+        to match the other seam methods; the implementation body may be sync work.)
+        """
+        ...
+
     async def send_dtmf(self, digits: str) -> None:
         """Send ``digits`` as RFC 4733 telephone-event RTP on the active call.
 
@@ -858,6 +872,20 @@ class CallSession:
                 request, routing.answer_direction, offer=routing.offer
             ):
                 return
+            # Re-point outbound RTP when the peer RELOCATED its media endpoint while
+            # still receiving our audio (not held): a re-INVITE that moves c=/m=audio
+            # (attended-transfer re-anchor, MoH resume-elsewhere, SBC relocation)
+            # otherwise leaves agent→caller RTP going to the stale address (one-way
+            # audio). Done BEFORE the hold flip so a resume-and-relocate resumes onto
+            # the new target. Skipped when held_by_peer — a hold/black-hole re-offer
+            # names no live target and the peer is not receiving our media anyway;
+            # the engine no-ops an unchanged endpoint, so an in-place resume keeps
+            # its comedia latch.
+            if not routing.held_by_peer:
+                audio = routing.offer.audio
+                new_addr = audio.connection_address if audio is not None else None
+                if audio is not None and new_addr is not None and audio.port > 0:
+                    await self._media.set_remote(new_addr, audio.port)
             self.on_hold = routing.held_by_peer
             await self._media.set_hold(routing.held_by_peer)
             return

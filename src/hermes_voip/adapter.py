@@ -589,6 +589,14 @@ _SESSION_REFRESH_MAX_GLARE_RETRIES = 5
 # = 2; with re-auth it is at most ~4. 32 is generous without being unbounded.
 _SINK_QUEUE_MAX = 32
 
+# Absolute bound on wrong-CSeq INVITE finals skipped while awaiting the final for a
+# specific transaction (_await_invite_final_for_cseq). A legitimate flow sees 0-2 stale
+# retransmitted 401/407 finals for a prior CSeq; because every stale final resets the
+# sink's idle get() timeout, a peer flooding more would otherwise keep the await-final
+# loop — and the whole outbound call — alive indefinitely when no ring-timeout is armed.
+# Exceeding this cap fails the call cleanly instead of hanging (W1 / codex #433).
+_MAX_STALE_INVITE_FINALS = 8
+
 #: Reservation sentinel for ``_attended_consults`` (ADR-0048): placed in the pairing
 #: slot BEFORE the consult dial awaits, so a concurrent second ``consult`` for the same
 #: original call is refused. It is never a real SIP Call-ID (no session matches it), so
@@ -2690,11 +2698,27 @@ class VoipAdapter(BasePlatformAdapter):
         the real final for CSeq N is still in flight, so skip any final whose CSeq does
         not match ``expected_cseq``. (:meth:`_await_invite_response` already drops
         provisionals and the 200-to-CANCEL, ADR-0069.)
+
+        Skipping is bounded: every stale final resets the sink's idle ``get()`` timeout,
+        so a peer flooding stale finals for a prior CSeq (< that timeout apart) could
+        otherwise keep this loop — and the whole call — alive indefinitely when no
+        ring-timeout is armed. Past :data:`_MAX_STALE_INVITE_FINALS` skips the call
+        FAILS CLEANLY (``OutboundCallFailed`` 504) rather than hanging (codex #433).
         """
+        stale_finals = 0
         while True:
             response = await self._await_invite_response(sink, call_id)
             if _cseq_num(response) == expected_cseq:
                 return response  # final response for OUR transaction
+            stale_finals += 1
+            if stale_finals > _MAX_STALE_INVITE_FINALS:
+                # A stale-final flood — never our transaction's final. Fail cleanly so
+                # place_call returns instead of extending the call unboundedly (W1).
+                _fail_outbound_call(
+                    504,
+                    f"too many stale INVITE finals (> {_MAX_STALE_INVITE_FINALS}) "
+                    "while awaiting the final response",
+                )
             _log.debug(
                 "INVITE %s: ignoring stale response %d CSeq=%s (expected CSeq=%d)",
                 call_id,

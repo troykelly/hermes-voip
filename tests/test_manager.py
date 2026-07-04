@@ -1757,3 +1757,48 @@ async def test_aclose_deregister_send_failure_does_not_strand_shutdown() -> None
         assert state.refresh_task is None
         assert state.recovery_task is None
         assert state.response_timeout_task is None
+
+
+async def test_aclose_cancels_refresh_before_sending_deregister() -> None:
+    """The Expires:0 de-register is sent only AFTER refresh tasks are cancelled (#97).
+
+    Otherwise a still-live refresh task could send a normal REGISTER after the
+    de-register and recreate the binding at the gateway — the inbound black-hole
+    would persist (codex #435). So aclose must cancel + drain the per-flow tasks
+    before it de-registers.
+    """
+    snapshots: list[tuple[str, bool]] = []  # (message, any refresh task still live)
+
+    class _OrderTransport(_FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.manager: RegistrationManager | None = None
+
+        async def send(self, message: str) -> None:
+            mgr = self.manager
+            live = mgr is not None and any(
+                s.refresh_task is not None for s in mgr._flows.values()
+            )
+            snapshots.append((message, live))
+            await super().send(message)
+
+    transport = _OrderTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    transport.manager = manager
+    await manager.start()
+    # A successful REGISTER arms this flow's refresh task; it must be cancelled
+    # before the de-register is sent.
+    await manager.on_response(_ok_for(transport.sent[0], expires=300))
+
+    await manager.aclose()
+
+    deregs = [
+        (m, live)
+        for (m, live) in snapshots
+        if m.startswith("REGISTER ") and SipRequest.parse(m).header("Expires") == "0"
+    ]
+    assert deregs, "aclose must send a de-register"
+    assert all(not live for (_, live) in deregs), (
+        "the de-register must be sent AFTER refresh tasks are cancelled — no live "
+        "refresh may follow it and recreate the binding"
+    )

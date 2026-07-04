@@ -589,6 +589,14 @@ _SESSION_REFRESH_MAX_GLARE_RETRIES = 5
 # = 2; with re-auth it is at most ~4. 32 is generous without being unbounded.
 _SINK_QUEUE_MAX = 32
 
+# Absolute bound on wrong-CSeq INVITE finals skipped while awaiting the final for a
+# specific transaction (_await_invite_final_for_cseq). A legitimate flow sees 0-2 stale
+# retransmitted 401/407 finals for a prior CSeq; because every stale final resets the
+# sink's idle get() timeout, a peer flooding more would otherwise keep the await-final
+# loop — and the whole outbound call — alive indefinitely when no ring-timeout is armed.
+# Exceeding this cap fails the call cleanly instead of hanging (W1 / codex #433).
+_MAX_STALE_INVITE_FINALS = 8
+
 #: Reservation sentinel for ``_attended_consults`` (ADR-0048): placed in the pairing
 #: slot BEFORE the consult dial awaits, so a concurrent second ``consult`` for the same
 #: original call is refused. It is never a real SIP Call-ID (no session matches it), so
@@ -1974,15 +1982,30 @@ class VoipAdapter(BasePlatformAdapter):
             assert isinstance(sink, _QueueSink)  # noqa: S101 — mypy narrowing aid; _QueueSink is the only impl here
             response = await self._await_invite_response(sink, call_id)
 
-            # --- RFC 4028 422 retry (ADR-0071) ----------------------------
-            # A 422 (Session Interval Too Small) means the peer's Min-SE is above the
-            # interval we offered: RAISE our Session-Expires to the peer's Min-SE and
-            # re-send the INVITE once (RFC 4028 §6). Done BEFORE the auth/final handling
-            # so a 422 is never mis-classified as a call failure. Capped at one retry:
-            # a peer that 422s its own advertised Min-SE is a normal failure.
-            if response.status_code == _SIP_INTERVAL_TOO_SMALL:
-                min_se_header = response.header("Min-SE")
-                if min_se_header is not None:
+            # --- Resolve digest challenges (401/407) + RFC 4028 422 (ADR-0071) ---
+            # A proxy-auth gateway can interleave a digest challenge and a 422 "Session
+            # Interval Too Small" in EITHER order on the same outbound INVITE:
+            #   INVITE -> 407 -> (auth) INVITE -> 422 -> (raise SE) INVITE -> 200, or
+            #   INVITE -> 422 -> (raise SE) INVITE -> 407 -> (auth) INVITE -> 200.
+            # Handle whichever the CURRENT final response is, re-checking the NEW final
+            # after each re-send — so a 422 arriving AFTER the auth re-send still gets
+            # the RFC 4028 §6 raise-SE-and-retry and is never mis-classified as a call
+            # failure (the earlier one-shot ordering only inspected the FIRST response).
+            # Each remedy is capped at one retry (``se_retried`` / ``auth_retried``) so
+            # the loop is BOUNDED: a peer that repeats the same rejection after we have
+            # already remedied it is a genuine failure. Once authenticated, EVERY later
+            # re-send (including a post-auth raise-SE retry) carries the same
+            # Proxy-/Authorization header via ``auth_header`` so it stays authenticated.
+            auth_header: tuple[str, str] | None = None
+            se_retried = False
+            auth_retried = False
+            while True:
+                status = response.status_code
+                if status == _SIP_INTERVAL_TOO_SMALL and not se_retried:
+                    min_se_header = response.header("Min-SE")
+                    if min_se_header is None:
+                        break  # no Min-SE to raise to — a genuine 422 failure
+                    se_retried = True
                     offered_se = max(offered_se, parse_min_se(min_se_header))
                     session_timer_headers = (
                         (
@@ -2002,6 +2025,7 @@ class VoipAdapter(BasePlatformAdapter):
                         call_id=call_id,
                         from_tag=from_tag,
                         cseq=last_cseq,
+                        auth=auth_header,
                         extra_headers=session_timer_headers,
                     )
                     await transport.send(invite_retry)
@@ -2011,76 +2035,56 @@ class VoipAdapter(BasePlatformAdapter):
                         call_id,
                         offered_se,
                     )
-                    while True:
-                        response = await self._await_invite_response(sink, call_id)
-                        if _cseq_num(response) == last_cseq:
-                            break  # final response for the raised-SE transaction
-
-            if response.status_code in (_SIP_UNAUTHORIZED, _SIP_PROXY_AUTH):
-                # Challenge: build Proxy-Authorization and re-send.
-                is_proxy_auth = response.status_code == _SIP_PROXY_AUTH
-                auth_hdr_name = (
-                    "Proxy-Authenticate" if is_proxy_auth else "WWW-Authenticate"
-                )
-                auth_value = response.header(auth_hdr_name)
-                if auth_value is None:
-                    _fail_outbound_call(
-                        response.status_code, "challenge has no auth header"
+                    response = await self._await_invite_final_for_cseq(
+                        sink, call_id, last_cseq
                     )
-                challenge = DigestChallenge.parse(auth_value)
-                credentials = DigestCredentials(
-                    username=source_ext.username,
-                    password=source_ext.password,
-                )
-                auth_resp_value = build_authorization(
-                    challenge,
-                    credentials,
-                    method="INVITE",
-                    uri=target_uri,
-                )
-                auth_hdr_out = (
-                    "Proxy-Authorization" if is_proxy_auth else "Authorization"
-                )
-                last_cseq += 1
-                invite_text2, _, _ = build_outbound_invite(
-                    target_uri=target_uri,
-                    local_aor=local_aor,
-                    local_contact=local_contact,
-                    local_sent_by=local_sent_by,
-                    transport="TLS",
-                    body=offer_body,
-                    call_id=call_id,
-                    from_tag=from_tag,
-                    cseq=last_cseq,
-                    auth=(auth_hdr_out, auth_resp_value),
-                    extra_headers=session_timer_headers,
-                )
-                await transport.send(invite_text2)
-                _log.info("INVITE re-sent with auth: Call-ID %s", call_id)
-
-                # Skip responses that do not belong to the re-auth transaction.
-                # A retransmitted 407 from the FIRST INVITE (CSeq 1) may arrive
-                # in the sink after we sent the second INVITE (CSeq 2). Accepting
-                # it as the final response causes the call to fail even though the
-                # 2xx for CSeq 2 is in-flight (W1). Filter by CSeq sequence number.
-                # _await_invite_response also drops the 200-to-CANCEL (ADR-0069).
-                while True:
-                    response = await self._await_invite_response(sink, call_id)
-                    if _cseq_num(response) == last_cseq:
-                        break  # final response for OUR transaction
-                    _log.debug(
-                        "INVITE %s: ignoring stale response %d CSeq=%s "
-                        "(expected CSeq=%d)",
-                        call_id,
-                        response.status_code,
-                        response.header("CSeq"),
-                        last_cseq,
+                    continue
+                if status in (_SIP_UNAUTHORIZED, _SIP_PROXY_AUTH) and not auth_retried:
+                    # Challenge: build Proxy-/Authorization and re-send.
+                    auth_retried = True
+                    is_proxy_auth = status == _SIP_PROXY_AUTH
+                    auth_hdr_name = (
+                        "Proxy-Authenticate" if is_proxy_auth else "WWW-Authenticate"
                     )
-
-            elif response.status_code < _SIP_FINAL_FLOOR:
-                # Skip unexpected provisional(s) (and any 200-to-CANCEL) until the
-                # INVITE's own final response.
-                response = await self._await_invite_response(sink, call_id)
+                    auth_value = response.header(auth_hdr_name)
+                    if auth_value is None:
+                        _fail_outbound_call(status, "challenge has no auth header")
+                    challenge = DigestChallenge.parse(auth_value)
+                    credentials = DigestCredentials(
+                        username=source_ext.username,
+                        password=source_ext.password,
+                    )
+                    auth_resp_value = build_authorization(
+                        challenge,
+                        credentials,
+                        method="INVITE",
+                        uri=target_uri,
+                    )
+                    auth_hdr_out = (
+                        "Proxy-Authorization" if is_proxy_auth else "Authorization"
+                    )
+                    auth_header = (auth_hdr_out, auth_resp_value)
+                    last_cseq += 1
+                    invite_text2, _, _ = build_outbound_invite(
+                        target_uri=target_uri,
+                        local_aor=local_aor,
+                        local_contact=local_contact,
+                        local_sent_by=local_sent_by,
+                        transport="TLS",
+                        body=offer_body,
+                        call_id=call_id,
+                        from_tag=from_tag,
+                        cseq=last_cseq,
+                        auth=auth_header,
+                        extra_headers=session_timer_headers,
+                    )
+                    await transport.send(invite_text2)
+                    _log.info("INVITE re-sent with auth: Call-ID %s", call_id)
+                    response = await self._await_invite_final_for_cseq(
+                        sink, call_id, last_cseq
+                    )
+                    continue
+                break
 
             # --- Handle final response to INVITE ---------------------------
             # A 487 Request Terminated means our CANCEL took effect (ADR-0069, RFC
@@ -2682,6 +2686,46 @@ class VoipAdapter(BasePlatformAdapter):
                 _log.debug("INVITE %s: absorbing the 200 OK to our CANCEL", call_id)
                 continue
             return response
+
+    async def _await_invite_final_for_cseq(
+        self, sink: _QueueSink, call_id: str, expected_cseq: int
+    ) -> SipResponse:
+        """Await the INVITE final response whose CSeq number is ``expected_cseq``.
+
+        After a re-send (a raised-SE 422 retry OR an auth re-send) the sink may still
+        hold a stale final for the PREVIOUS CSeq — e.g. a retransmitted 407 for CSeq
+        N-1 arriving after we sent CSeq N (W1). Accepting it would fail the call while
+        the real final for CSeq N is still in flight, so skip any final whose CSeq does
+        not match ``expected_cseq``. (:meth:`_await_invite_response` already drops
+        provisionals and the 200-to-CANCEL, ADR-0069.)
+
+        Skipping is bounded: every stale final resets the sink's idle ``get()`` timeout,
+        so a peer flooding stale finals for a prior CSeq (< that timeout apart) could
+        otherwise keep this loop — and the whole call — alive indefinitely when no
+        ring-timeout is armed. Past :data:`_MAX_STALE_INVITE_FINALS` skips the call
+        FAILS CLEANLY (``OutboundCallFailed`` 504) rather than hanging (codex #433).
+        """
+        stale_finals = 0
+        while True:
+            response = await self._await_invite_response(sink, call_id)
+            if _cseq_num(response) == expected_cseq:
+                return response  # final response for OUR transaction
+            stale_finals += 1
+            if stale_finals > _MAX_STALE_INVITE_FINALS:
+                # A stale-final flood — never our transaction's final. Fail cleanly so
+                # place_call returns instead of extending the call unboundedly (W1).
+                _fail_outbound_call(
+                    504,
+                    f"too many stale INVITE finals (> {_MAX_STALE_INVITE_FINALS}) "
+                    "while awaiting the final response",
+                )
+            _log.debug(
+                "INVITE %s: ignoring stale response %d CSeq=%s (expected CSeq=%d)",
+                call_id,
+                response.status_code,
+                response.header("CSeq"),
+                expected_cseq,
+            )
 
     async def _handle_outbound_webrtc_invite(  # noqa: PLR0912,PLR0915 — UAC WebRTC flow: offer/challenge/2xx/handshake/ACK/loop, one sequence
         self,

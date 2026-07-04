@@ -45,6 +45,7 @@ from hermes_voip.config import (
 )
 from hermes_voip.manager import NewCall, RegistrationManager
 from hermes_voip.message import SipRequest, SipResponse, new_call_id, new_tag
+from hermes_voip.originate import OutboundCallFailed
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.session_timer import Refresher, SessionExpires
@@ -1110,6 +1111,234 @@ async def test_outbound_invite_carries_session_expires_and_retries_on_422() -> N
         f"the 422 retry must raise SE to the peer Min-SE 1200; got {retry_se.delta}"
     )
     assert returned_call_id
+
+    await adapter.disconnect()
+
+
+# A digest challenge the outbound auth path can answer (ext 1000 / password "fake").
+_OUTBOUND_PROXY_CHALLENGE = (
+    'Digest realm="pbx.example.test", nonce="abc123", algorithm=MD5, qop="auth"'
+)
+
+
+# ===========================================================================
+# (e2) outbound: a 422 that arrives AFTER a 407 auth challenge is retried (SE
+#      raised) and the call still connects — NOT mis-reported as a failure.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_outbound_422_after_auth_challenge_retries_and_connects() -> None:
+    """A 407-then-422 gateway: the post-auth 422 raises SE, re-sends, and connects.
+
+    Regression for the ordering gap where the 422 (Session Interval Too Small)
+    handler only inspected the FIRST awaited response: on a proxy-auth gateway the
+    first response is the 407, the authed INVITE draws the 422, and the SE-raise
+    retry never ran → the agent was told the call FAILED. The raise-SE retry must
+    apply to whichever transaction yields the final response, carrying the auth
+    header through so it stays authenticated.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    for state in manager._by_extension.values():
+        state.registered = True
+
+    # Scripted gateway: challenge the UNAUTHENTICATED INVITE (407); once authed,
+    # 422 while our offered SE is below the peer Min-SE (1200); 200 once SE >= 1200.
+    answered: dict[int, bool] = {}
+
+    async def _drive_outbound() -> None:
+        await _until(lambda: bool(_sent_requests(transport, "INVITE")))
+        while True:
+            for req in _sent_requests(transport, "INVITE"):
+                cseq = req.header("CSeq") or ""
+                num = int(cseq.split()[0]) if cseq.split() else 0
+                if answered.get(num):
+                    continue
+                answered[num] = True
+                sink = transport._sinks.get(_call_id_of(req))
+                if sink is None:
+                    continue
+                if req.header("Proxy-Authorization") is None:
+                    resp = _build_response_for_outbound(
+                        req,
+                        407,
+                        "Proxy Authentication Required",
+                        extra=[("Proxy-Authenticate", _OUTBOUND_PROXY_CHALLENGE)],
+                    )
+                else:
+                    offered = SessionExpires.parse(req.header("Session-Expires") or "")
+                    if offered.delta < 1200:
+                        resp = _build_response_for_outbound(
+                            req,
+                            422,
+                            "Session Interval Too Small",
+                            extra=[("Min-SE", "1200")],
+                        )
+                    else:
+                        resp = _build_2xx_for_outbound(req)
+                await sink.on_response(SipResponse.parse(resp))  # type: ignore[attr-defined]
+            await asyncio.sleep(0.001)
+
+    driver = asyncio.create_task(_drive_outbound())
+    with _patched_invite_env():
+        try:
+            returned_call_id = await adapter.place_call("1001")
+        finally:
+            driver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver
+
+    # The call SUCCEEDED — the agent is NOT told it failed.
+    assert returned_call_id
+
+    invites = _sent_requests(transport, "INVITE")
+    assert len(invites) >= 3, (
+        "expected INVITE#1 (unauth) + INVITE#2 (auth) + INVITE#3 (auth + raised SE); "
+        f"got {len(invites)} INVITEs"
+    )
+    # The final INVITE is authenticated AND carries the raised Session-Expires — the
+    # post-auth 422 retry both stayed authed and raised SE to the peer Min-SE.
+    final = invites[-1]
+    assert final.header("Proxy-Authorization") is not None, (
+        "the post-auth 422 retry must remain authenticated"
+    )
+    final_se = SessionExpires.parse(final.header("Session-Expires") or "")
+    assert final_se.delta >= 1200, (
+        f"the post-auth 422 retry must raise SE to >= peer Min-SE 1200; "
+        f"got {final_se.delta}"
+    )
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
+# (e3) outbound: a SECOND 422 after the SE-raise (still after auth) is a genuine
+#      failure — the retry is capped at one, so the loop is BOUNDED (no spin).
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_outbound_second_422_after_auth_se_raise_fails_cleanly() -> None:
+    """A gateway that 422s even the raised-SE authed INVITE fails cleanly, bounded.
+
+    Guards the retry cap: after ONE SE-raise (post auth) a repeat 422 is a real
+    failure, so exactly three INVITEs go out (unauth, auth, auth+raised-SE) and
+    ``place_call`` raises ``OutboundCallFailed`` — the bounded loop never spins.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    for state in manager._by_extension.values():
+        state.registered = True
+
+    answered: dict[int, bool] = {}
+
+    async def _drive_outbound() -> None:
+        await _until(lambda: bool(_sent_requests(transport, "INVITE")))
+        while True:
+            for req in _sent_requests(transport, "INVITE"):
+                cseq = req.header("CSeq") or ""
+                num = int(cseq.split()[0]) if cseq.split() else 0
+                if answered.get(num):
+                    continue
+                answered[num] = True
+                sink = transport._sinks.get(_call_id_of(req))
+                if sink is None:
+                    continue
+                if req.header("Proxy-Authorization") is None:
+                    resp = _build_response_for_outbound(
+                        req,
+                        407,
+                        "Proxy Authentication Required",
+                        extra=[("Proxy-Authenticate", _OUTBOUND_PROXY_CHALLENGE)],
+                    )
+                else:
+                    # ALWAYS 422 once authed — even the raised-SE retry. An uncapped
+                    # loop would spin forever escalating SE; the cap must stop it.
+                    resp = _build_response_for_outbound(
+                        req,
+                        422,
+                        "Session Interval Too Small",
+                        extra=[("Min-SE", "1200")],
+                    )
+                await sink.on_response(SipResponse.parse(resp))  # type: ignore[attr-defined]
+            await asyncio.sleep(0.001)
+
+    driver = asyncio.create_task(_drive_outbound())
+    with _patched_invite_env():
+        try:
+            with pytest.raises(OutboundCallFailed) as excinfo:
+                # wait_for is a safety net: a regression into an infinite retry loop
+                # fails as a timeout instead of hanging the suite.
+                await asyncio.wait_for(adapter.place_call("1001"), timeout=5.0)
+        finally:
+            driver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver
+
+    assert excinfo.value.status == 422, (
+        f"a repeat 422 must fail as 422; got {excinfo.value.status}"
+    )
+    invites = _sent_requests(transport, "INVITE")
+    assert len(invites) == 3, (
+        "the SE-raise retry is capped at one: expected exactly 3 INVITEs "
+        f"(unauth, auth, auth+raised-SE); got {len(invites)} — the loop is not bounded"
+    )
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
+# (e4) outbound: a flood of stale wrong-CSeq INVITE finals is BOUNDED — the
+#      await-final loop fails cleanly instead of extending the call unboundedly.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_outbound_stale_final_flood_is_bounded() -> None:
+    """A peer flooding stale finals for an OLD CSeq fails cleanly, never hangs.
+
+    ``_await_invite_final_for_cseq`` skips finals that do not match the CSeq of the
+    transaction it just sent (the W1 retransmit filter). Each stale final resets the
+    sink's ~35s idle ``get()`` timeout, so WITHOUT an absolute bound a peer
+    retransmitting finals for a PRIOR CSeq (< 35s apart) would keep the await-final
+    loop — and the whole outbound call — alive indefinitely when no ring-timeout is
+    armed. The loop must cap the skipped-final count and fail the call cleanly
+    (``OutboundCallFailed``) so ``place_call`` returns a clean failure instead of
+    hanging (codex review of #433).
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    for state in manager._by_extension.values():
+        state.registered = True
+
+    async def _flood_stale_finals() -> None:
+        # Challenge INVITE#1 (CSeq 1) so the adapter sends the authed INVITE#2
+        # (CSeq 2) and enters the await-final loop expecting CSeq 2.
+        await _until(lambda: bool(_sent_requests(transport, "INVITE")))
+        first = _sent_requests(transport, "INVITE")[0]
+        sink = transport._sinks.get(_call_id_of(first))
+        assert sink is not None
+        challenge = _build_response_for_outbound(
+            first,
+            407,
+            "Proxy Authentication Required",
+            extra=[("Proxy-Authenticate", _OUTBOUND_PROXY_CHALLENGE)],
+        )
+        await sink.on_response(SipResponse.parse(challenge))  # type: ignore[attr-defined]
+        await _until(lambda: len(_sent_requests(transport, "INVITE")) >= 2)
+        # Flood stale finals for the OLD CSeq (CSeq 1) — NEVER the expected CSeq 2 —
+        # so the await-final loop skips every one. An unbounded loop would spin here
+        # forever; the cap must fail the call cleanly.
+        while True:
+            await sink.on_response(SipResponse.parse(challenge))  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+
+    driver = asyncio.create_task(_flood_stale_finals())
+    with _patched_invite_env():
+        try:
+            with pytest.raises(OutboundCallFailed):
+                # wait_for is the hang detector: an unbounded await-final loop fails
+                # as a timeout (not OutboundCallFailed) and the test fails visibly.
+                await asyncio.wait_for(adapter.place_call("1001"), timeout=5.0)
+        finally:
+            driver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver
 
     await adapter.disconnect()
 

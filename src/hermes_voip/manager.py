@@ -221,6 +221,9 @@ _DEFAULT_REFRESH_TIMEOUT = 32.0
 _DEFAULT_RETRY_BACKOFF = 1.0
 _RETRY_BACKOFF_CAP = 30.0
 _RETRY_JITTER = 0.2
+# Bound on the best-effort Expires:0 de-register send during aclose() (#97): a dead
+# or slow transport must never strand a graceful shutdown (rule 37).
+_DEREGISTER_SEND_TIMEOUT_SECS = 2.0
 _TAG_PARAM = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
 _ANGLE_ADDR = re.compile(r"<([^>]*)>")
 
@@ -443,13 +446,40 @@ class RegistrationManager:
         return self.is_up
 
     async def aclose(self) -> None:
-        """Cancel every background task; the transport is closed by its owner.
+        """De-register live bindings, then cancel every background task.
 
-        Each task's done callback has already observed any real failure; the
-        ``gather`` here only drains the resulting cancellations. The refresh, the
-        Timer-F/B response-timeout, and the recovery re-REGISTER tasks are all
-        cancelled so none fires after shutdown.
+        On a graceful shutdown each still-registered flow is de-registered (an
+        Expires:0 REGISTER, :meth:`RegistrationFlow.deregister`) BEFORE its tasks
+        are cancelled and before the transport is closed by its owner, so the
+        gateway drops our binding at once instead of black-holing inbound calls
+        until it expires (ADR-0059). The de-register is best-effort and bounded:
+        a dead or slow transport must never strand shutdown (rule 37).
+
+        Then the refresh, the Timer-F/B response-timeout, and the recovery
+        re-REGISTER tasks are all cancelled so none fires after shutdown; each
+        task's done callback has already observed any real failure, so the
+        ``gather`` here only drains the resulting cancellations.
         """
+        # De-register each live binding (Expires:0) while the transport is still open,
+        # before tearing the flows down (ADR-0059). ``deregistering`` marks the intent
+        # so a resulting failure is an expected end, not an outage that arms recovery.
+        # Best-effort + bounded (rule 37): a dead/slow transport must never strand
+        # shutdown.
+        for state in self._flows.values():
+            if not state.registered:
+                continue
+            state.deregistering = True
+            try:
+                await asyncio.wait_for(
+                    self._transport.send(state.flow.deregister()),
+                    _DEREGISTER_SEND_TIMEOUT_SECS,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort de-register; never strand shutdown (rule 37: logged, not swallowed)
+                _log.warning(
+                    "registration: de-register on graceful shutdown failed "
+                    "(the gateway binding lapses on its own): %s",
+                    exc,
+                )
         tasks = [
             task
             for state in self._flows.values()

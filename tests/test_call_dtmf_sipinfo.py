@@ -50,6 +50,9 @@ class _FakeMedia:
     async def set_hold(self, on_hold: bool) -> None:
         """No-op."""
 
+    async def set_remote(self, address: str, port: int) -> None:
+        """No-op (these tests never relocate the media endpoint)."""
+
     async def send_dtmf(self, digits: str) -> None:
         self.dtmf.append(digits)
 

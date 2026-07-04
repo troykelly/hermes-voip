@@ -146,6 +146,11 @@ _log = logging.getLogger(__name__)
 # Default ptime in milliseconds (one packet per 20 ms = 50 pps).
 _DEFAULT_PTIME_MS = 20
 
+# The maximum RTP port (RFC 4566 §5.7). A re-point target (set_remote) must name a
+# real, active endpoint in 1..65535 — port 0 is "no media" (a hold/reject signal),
+# never an outbound destination. Mirrors sdp.py's port-range validation.
+_MAX_PORT: Final[int] = 65535
+
 # Packet-loss concealment (ADR-0056). For G.711/G.722 (no in-codec PLC) a lost
 # frame is concealed by repeating the last good decoded frame. The FIRST held
 # frame plays at full energy (the standard G.711 Appendix-I-style repeat — the
@@ -3480,6 +3485,49 @@ class RtpMediaTransport:
         if on_hold:
             self._tx_buffer.clear()
         self.on_hold = on_hold
+
+    async def set_remote(self, address: str, port: int) -> None:
+        """Re-point the outbound RTP target to a relocated peer media endpoint.
+
+        Called on an in-dialog re-INVITE that moves the peer's RTP endpoint (new
+        SDP ``c=``/``m=audio`` — attended-transfer media re-anchor, MoH
+        resume-elsewhere, SBC media relocation). Updates the negotiated remote AND
+        the live send target ``_outbound_addr``, and RE-ARMS the comedia latch
+        (``_latched = False``) so :meth:`_maybe_latch` re-learns the relocated
+        peer's real source. The old latched source is gone, so without this our
+        outbound RTP keeps going to the stale address (one-way audio) while the
+        call stays up.
+
+        A no-op when ``address``/``port`` already match the negotiated remote, so
+        an in-place hold/resume re-INVITE (same ``c=``/``m=``) never disturbs a
+        working comedia latch. The mutation is done under the TX lock because
+        ``_outbound_addr`` is the tuple :meth:`_transmit_frame` / send paths aim
+        at — so the re-point cannot race a packet mid-send.
+
+        Args:
+            address: The peer's new RTP destination address (SDP ``c=``).
+            port: The peer's new RTP destination port (SDP ``m=audio``), 1..65535.
+
+        Raises:
+            ValueError: If ``port`` is outside 1..65535 (port 0 = no media).
+        """
+        if not 1 <= port <= _MAX_PORT:
+            msg = f"RTP port out of range 1..{_MAX_PORT}: {port}"
+            raise ValueError(msg)
+        if (address, port) == (self._remote_address, self._remote_port):
+            return  # unchanged endpoint — do not disturb an established latch
+        async with self._tx_lock:
+            self._remote_address = address
+            self._remote_port = port
+            # Aim the live send target at the new endpoint and re-arm the latch so
+            # _maybe_latch re-learns the relocated peer's real (NAT'd) source.
+            self._outbound_addr = (address, port)
+            self._latched = False
+        # The peer's media ip:port is operational, not PII — logging it traces a
+        # live media relocation, mirroring the _maybe_latch latch log.
+        _log.info(
+            "rtp: remote re-pointed to %s:%d (re-INVITE relocation)", address, port
+        )
 
     async def rekey_srtp(
         self,

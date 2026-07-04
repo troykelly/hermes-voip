@@ -70,9 +70,15 @@ class _FakeMedia:
         # Records each SRTP re-key (ADR-0053 in-dialog re-offer keying): one
         # (inbound, outbound) tuple of the CryptoAttribute (or None) per call.
         self.rekeys: list[tuple[CryptoAttribute | None, CryptoAttribute | None]] = []
+        # Records each outbound RTP re-point (ADR-0107 re-INVITE relocation):
+        # one (address, port) per set_remote call.
+        self.remotes: list[tuple[str, int]] = []
 
     async def set_hold(self, on_hold: bool) -> None:
         self.holds.append(on_hold)
+
+    async def set_remote(self, address: str, port: int) -> None:
+        self.remotes.append((address, port))
 
     async def send_dtmf(self, digits: str) -> None:
         self.dtmf.append(digits)

@@ -4675,6 +4675,41 @@ async def test_dtmf_menu_group_delivery_does_not_log_raw_digits(
 
 
 @pytest.mark.asyncio
+async def test_dtmf_turn_clears_a_prior_restrict_clamp() -> None:
+    """A DTMF turn is not stale-clamped by a PRIOR screened RESTRICT (ADR-0009).
+
+    The keypad path is unscreened, so it sets its OWN per-turn trust: a prior speech
+    turn's RESTRICT/CLARIFY verdict must not block a legitimate keypad turn (e.g. an
+    ADR-0010 DTMF-confirmed transfer). Guards the codex #99 staleness finding: the
+    per-turn clamp must reflect the CURRENT delivered turn, not the last screened one.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    state = GuardSessionState(call_id=_CALL_ID, privilege_level=2)
+    # Simulate a prior screened RESTRICT speech turn having clamped this session.
+    state.turn_restricted = True
+    loop = _build_loop(
+        _FakeTransport([]),
+        _FakeASR([]),
+        _FakeTTS([]),
+        _FakeGuard([]),
+        capture,
+        guard_state=state,
+    )
+    await loop.feed_dtmf_async("1")
+    await loop.feed_dtmf_async("#")  # terminator delivers the group synchronously
+
+    assert delivered == [f"{_DTMF_TURN_PREFIX}1"], (
+        f"the DTMF group was not delivered to the agent; got {delivered!r}"
+    )
+    # The unscreened (trusted) DTMF turn cleared the stale per-turn clamp.
+    assert state.turn_restricted is False
+
+
+@pytest.mark.asyncio
 async def test_dtmf_group_delivery_failure_warning_does_not_log_raw_digits(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

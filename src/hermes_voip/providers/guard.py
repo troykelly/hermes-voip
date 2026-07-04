@@ -31,8 +31,8 @@ class GuardVerdict(IntEnum):
     """
 
     ALLOW = 0  # benign turn; proceed normally
-    CLARIFY = 1  # ambiguous; ask a clarifying question, no tools this turn
-    RESTRICT = 2  # weak/medium signal; proceed least-privilege (read-only)
+    CLARIFY = 1  # ambiguous; ask a clarifying question — no non-SAFE tools this turn
+    RESTRICT = 2  # weak/medium signal; least-privilege — no non-SAFE tools this turn
     REFUSE = 3  # strong signal; refuse the instruction, flag, escalate
 
 

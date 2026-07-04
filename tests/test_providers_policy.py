@@ -8,6 +8,7 @@ or the action is unconfirmed. The truth table is asserted exhaustively.
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import (
     GateDecision,
+    GateReason,
     GuardSessionState,
     ToolRisk,
     gate_tool_call,
@@ -129,6 +130,83 @@ def test_flagged_turns_accumulate_across_a_call() -> None:
     state.record(_flagged(GuardVerdict.ALLOW))  # not flagged
     state.record(_flagged(GuardVerdict.RESTRICT))  # flagged
     assert len(state.flagged_turns) == 2
+
+
+# --- ADR-0009: RESTRICT/CLARIFY verdicts clamp the toolset for that turn -------
+#
+# A graded verdict is not only an audit signal: RESTRICT proceeds least-privilege
+# (read-only) and CLARIFY exposes no tools THAT TURN (ADR-0009 §Verdicts, lines
+# 133-134). The clamp is PER-TURN (a later ALLOW turn restores tools) and distinct
+# from the sticky, whole-call ``degraded`` fail-open state. SAFE tools (hang_up /
+# report_call_result) always run — the clamp only removes non-SAFE tools.
+
+
+def test_restrict_verdict_clamps_elevated_this_turn() -> None:
+    # A trusted (level-2) caller normally may invoke ELEVATED; a RESTRICT screen
+    # clamps THAT turn to read-only, so ELEVATED is blocked (ADR-0009 read-only).
+    state = GuardSessionState(call_id="c1", privilege_level=2)
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
+
+
+def test_clarify_verdict_clamps_nonsafe_this_turn() -> None:
+    # CLARIFY exposes no non-SAFE tools that turn: even an operator (level-3) with a
+    # confirmed IRREVERSIBLE action is blocked while the turn is flagged CLARIFY.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
+    state.record(_flagged(GuardVerdict.CLARIFY))
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
+    assert gate_tool_call(ToolRisk.IRREVERSIBLE, state, confirmed=True).allowed is False
+
+
+def test_verdict_clamp_is_per_turn_not_sticky() -> None:
+    # Unlike the sticky degraded state, the RESTRICT/CLARIFY clamp is per-turn: a
+    # subsequent clean ALLOW screen restores the session's normal toolset.
+    state = GuardSessionState(call_id="c1", privilege_level=2)
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
+    state.record(_flagged(GuardVerdict.ALLOW))
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
+
+
+def test_safe_tools_run_even_on_a_restricted_turn() -> None:
+    # The clamp removes only non-SAFE tools; SAFE call-control (hang_up /
+    # report_call_result) must always run so a call can be ended/recorded.
+    state = GuardSessionState(call_id="c1", privilege_level=2)
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    assert gate_tool_call(ToolRisk.SAFE, state, confirmed=False).allowed is True
+
+
+def test_restrict_block_reports_restricted_reason() -> None:
+    # The block carries GateReason.RESTRICTED (distinct from DEGRADED / privilege),
+    # for the audit trail — and it fires even though level-2 alone permits ELEVATED.
+    state = GuardSessionState(call_id="c1", privilege_level=2)
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    decision = gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False)
+    assert decision.allowed is False
+    assert decision.reason is GateReason.RESTRICTED
+
+
+def test_note_trusted_turn_clears_a_prior_restrict_clamp() -> None:
+    # An UNSCREENED delivered turn (the DTMF keypad path) sets its own trust via
+    # note_trusted_turn, so it is NOT stale-clamped by the PRIOR screened RESTRICT —
+    # the ADR-0010 keypad-confirmed transfer must not inherit the speech turn's verdict.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
+    state.record(_flagged(GuardVerdict.RESTRICT))
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
+    state.note_trusted_turn()  # the DTMF turn is trusted keypad input
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is True
+
+
+def test_note_trusted_turn_leaves_degraded_sticky() -> None:
+    # A fail-open still hard-blocks non-SAFE on EVERY turn, DTMF included: a trusted
+    # turn clears only the per-turn clamp, never the sticky degraded state.
+    state = GuardSessionState(call_id="c1", privilege_level=3)
+    state.record(_result(degraded=True))
+    assert state.degraded is True
+    state.note_trusted_turn()
+    assert state.degraded is True
+    assert gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False).allowed is False
 
 
 # --- ADR-0031: allowed_tools sub-ceiling on GuardSessionState -----------------

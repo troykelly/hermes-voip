@@ -1039,6 +1039,12 @@ class CallLoop:
         # window, equivalent to a finalised speech turn (ADR-0057).
         self._caller_active_in_window = True
         text = f"{_DTMF_TURN_PREFIX}{digits}"
+        # This DTMF turn is NOT classifier-screened (keypad input carries no natural-
+        # language injection surface), so set the per-turn guard clamp for ITS turn
+        # rather than inheriting the previous SCREENED turn's verdict (ADR-0009): a
+        # stale RESTRICT/CLARIFY would wrongly block a legitimate keypad turn — e.g. an
+        # ADR-0010 DTMF-confirmed transfer. The sticky ``degraded`` state is untouched.
+        self._guard_state.note_trusted_turn()
         # Log the digit COUNT, never the content: inbound DTMF is frequently secret
         # (IVR PINs, card/SSN entry), so it is redacted exactly like the send path
         # (rule 34). The digits still reach the agent via ``deliver_turn`` below.

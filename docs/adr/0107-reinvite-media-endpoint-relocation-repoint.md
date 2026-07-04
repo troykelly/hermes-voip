@@ -51,12 +51,30 @@ behaviour is preserved: SRTP re-key (ADR-0053), SDP version bump, hold flip, and
 ADR-0081 drop-whole-on-unanswerable ordering (the re-point happens only on the
 committed-answer path, never on a dropped re-INVITE).
 
+Re-arming the latch (`_latched = False`) opens a receive-side race: `_maybe_latch`
+runs on the inbound path (not under `_tx_lock`) and latches to the source of the
+first valid audio-payload-type packet, and a **stale in-flight packet from the old
+endpoint** — common around the `200 OK` during an attended-transfer/SBC re-anchor,
+same codec — could re-latch `_outbound_addr` straight back to the address we just
+left, so one-way audio would persist intermittently. To close it, `set_remote`
+records `_relocated_from` = the endpoint it moved away from (the current live target,
+which may be a comedia-learned source), and `_maybe_latch` refuses to latch onto a
+packet whose source equals `_relocated_from`, clearing it only when a genuine
+new-source packet latches. The outbound target therefore stays on the new SDP
+endpoint until real media arrives from the new path (which also covers a NAT'd
+relocation). `_relocated_from` is a single-writer (`set_remote`, under `_tx_lock`) /
+single-reader-per-call (`_maybe_latch`, inbound path) attribute on one event loop, so
+a plain read is race-free; it resets to `None` in `connect()` for a reused engine.
+
 ## Consequences
 
 - A relocating re-INVITE now restores two-way audio: attended-transfer media
   re-anchor, MoH resume-elsewhere and SBC media relocation all follow the peer.
 - The comedia latch is re-armed exactly once per relocation, so the engine re-learns
   the new peer's real (possibly NAT'd) source on its first packet from the new path.
+- A stale in-flight packet from the old endpoint cannot revert the relocation: the
+  `_relocated_from` skip in `_maybe_latch` proves the fix terminates the one-way-audio
+  bug rather than merely narrowing its window.
 - In-place hold/resume is provably unaffected: the engine no-ops an unchanged
   endpoint, so a plain direction flip never resets a working latch.
 - `CallMedia` implementers must provide `set_remote`; the real engine and the test
@@ -74,3 +92,5 @@ committed-answer path, never on a dropped re-INVITE).
 | Track the current remote in `CallSession` and compare there | Duplicates state the engine already owns; the engine is the single source of truth for the live target, so the unchanged-endpoint no-op belongs there. |
 | Reset the latch inside `set_hold` on resume | `set_hold` has no endpoint; it cannot distinguish a relocation from an in-place resume, so it would either miss relocations or destroy a working latch on every resume. |
 | Re-point after the hold flip | On a resume-and-relocate that resumes sending before the target moves, one or more packets go to the stale address; re-pointing first resumes onto the correct endpoint. |
+| Rely on the re-armed latch alone (no `_relocated_from`) to re-learn the new source | `_maybe_latch` latches to the FIRST valid audio-PT packet; a stale in-flight packet from the old endpoint (common at re-anchor) re-latches back to the stale address, so the relocation self-reverts intermittently. The skip is required to prove termination. |
+| Hold `_tx_lock` inside `_maybe_latch` to serialise the latch against `set_remote` | `_maybe_latch` runs synchronously on the inbound generator; taking `_tx_lock` there risks deadlock/backpressure against the send path. On a single event loop the single-writer/single-reader-per-call attribute needs no lock on the read side. |

@@ -1285,6 +1285,80 @@ async def test_outbound_second_422_after_auth_se_raise_fails_cleanly() -> None:
 
 
 # ===========================================================================
+# (e3b) outbound: a 422 whose Min-SE we cannot parse fails CLOSED (typed 422),
+#       never a raw ValueError crash out of the UAC coroutine (ADR-0081).
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_outbound_422_with_malformed_min_se_fails_closed() -> None:
+    """A 422 whose Min-SE is unparseable fails as a typed 422, not a raw ValueError.
+
+    RFC 4028 §6: a 422 Session Interval Too Small carries a Min-SE naming the interval
+    to raise the Session-Expires to. If that Min-SE is malformed (not delta-seconds) we
+    have no interval to raise to — exactly like a 422 with NO Min-SE — so origination
+    must fail CLOSED as ``OutboundCallFailed(422)``, the typed failure ``place_call``
+    contracts to emit, never a raw ``ValueError`` escaping the UAC coroutine (ADR-0081
+    fail-closed; RFC 3261 §8.1.3.2 robustness). Before the fix the unguarded
+    ``parse_min_se`` raised ``ValueError`` straight out of ``place_call``.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    for state in manager._by_extension.values():
+        state.registered = True
+
+    answered: dict[int, bool] = {}
+
+    async def _drive_outbound() -> None:
+        await _until(lambda: bool(_sent_requests(transport, "INVITE")))
+        while True:
+            for req in _sent_requests(transport, "INVITE"):
+                cseq = req.header("CSeq") or ""
+                num = int(cseq.split()[0]) if cseq.split() else 0
+                if answered.get(num):
+                    continue
+                answered[num] = True
+                if req.header("Session-Expires") is None:
+                    continue  # only react to the session-timer INVITEs
+                sink = transport._sinks.get(_call_id_of(req))
+                if sink is None:
+                    continue
+                # A 422 whose Min-SE is not a delta-seconds value at all.
+                resp = _build_response_for_outbound(
+                    req,
+                    422,
+                    "Session Interval Too Small",
+                    extra=[("Min-SE", "not-a-number")],
+                )
+                await sink.on_response(SipResponse.parse(resp))  # type: ignore[attr-defined]
+            await asyncio.sleep(0.001)
+
+    driver = asyncio.create_task(_drive_outbound())
+    with _patched_invite_env():
+        try:
+            with pytest.raises(OutboundCallFailed) as excinfo:
+                # wait_for safety net: a regression that hangs fails as a timeout
+                # instead of hanging the whole suite.
+                await asyncio.wait_for(adapter.place_call("1001"), timeout=5.0)
+        finally:
+            driver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver
+
+    assert excinfo.value.status == 422, (
+        f"a malformed-Min-SE 422 must fail closed as a typed 422; "
+        f"got status {excinfo.value.status}"
+    )
+    # A malformed Min-SE gives no interval to raise to, so there is no SE-raise retry:
+    # exactly the initial INVITE goes out (fail closed like a 422 with no Min-SE).
+    invites = _sent_requests(transport, "INVITE")
+    assert len(invites) == 1, (
+        f"a malformed-Min-SE 422 must NOT trigger an SE-raise retry; "
+        f"got {len(invites)} INVITEs"
+    )
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
 # (e4) outbound: a flood of stale wrong-CSeq INVITE finals is BOUNDED — the
 #      await-final loop fails cleanly instead of extending the call unboundedly.
 # ===========================================================================

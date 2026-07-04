@@ -2005,8 +2005,17 @@ class VoipAdapter(BasePlatformAdapter):
                     min_se_header = response.header("Min-SE")
                     if min_se_header is None:
                         break  # no Min-SE to raise to — a genuine 422 failure
+                    try:
+                        peer_min_se = parse_min_se(min_se_header)
+                    except ValueError:
+                        # A 422 whose Min-SE is not a delta-seconds value gives us no
+                        # interval to raise the Session-Expires to — fail CLOSED exactly
+                        # like a 422 with no Min-SE (break → the non-2xx final becomes a
+                        # typed OutboundCallFailed below). Never crash origination on a
+                        # malformed peer header (ADR-0081; RFC 3261 robustness).
+                        break
                     se_retried = True
-                    offered_se = max(offered_se, parse_min_se(min_se_header))
+                    offered_se = max(offered_se, peer_min_se)
                     session_timer_headers = (
                         (
                             "Session-Expires",

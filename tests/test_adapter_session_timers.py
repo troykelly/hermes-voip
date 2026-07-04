@@ -436,6 +436,119 @@ async def test_inbound_valid_se_answer_carries_session_expires() -> None:
 
 
 # ===========================================================================
+# (b2) inbound INVITE requiring an UNSUPPORTED option-tag -> 420 Bad Extension.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_inbound_unsupported_require_rejected_420() -> None:
+    """An inbound INVITE requiring an option-tag we do not support is 420'd.
+
+    RFC 3261 §8.2.2.3: a UAS that does not understand an option-tag in a Require
+    header MUST reject the request 420 Bad Extension and list the unsupported tags in
+    an Unsupported header — never silently answer a call whose mandatory extension it
+    cannot honour. The only extension we engage as a UAS is RFC 4028 session timers
+    ("timer"); "100rel" (reliable provisionals) is refused before any dialog, media,
+    or agent surface.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+    invite_text = _make_invite(
+        _SDP_PLAIN, call_id, session_expires="600", supported_timer=True
+    ).replace("CSeq: 1 INVITE\r\n", "CSeq: 1 INVITE\r\nRequire: 100rel\r\n")
+    invite = SipRequest.parse(invite_text)
+
+    with _patched_invite_env():
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: bool(transport.sent))
+        await asyncio.sleep(0)
+
+    responses = _sent_responses(transport)
+    statuses = [r.status_code for r in responses]
+    assert 420 in statuses, f"expected a 420 Bad Extension reject; got {statuses}"
+    assert 200 not in statuses, (
+        f"an unsupported-Require call must NOT be answered; got {statuses}"
+    )
+    rejected = next(r for r in responses if r.status_code == 420)
+    assert rejected.reason == "Bad Extension"
+    unsupported = rejected.header("Unsupported")
+    assert unsupported is not None, "420 must carry an Unsupported header"
+    tags = {t.strip().lower() for t in unsupported.split(",")}
+    assert "100rel" in tags, (
+        f"Unsupported must list the rejected tag 100rel; got {unsupported!r}"
+    )
+    assert "timer" not in tags, (
+        f"a supported tag must not be listed as Unsupported; got {unsupported!r}"
+    )
+    # No dialog is established behind a rejected call.
+    assert call_id not in adapter._call_sessions
+
+
+# ===========================================================================
+# (b3) inbound INVITE requiring "timer" (SUPPORTED) is NOT 420'd, it is answered.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_inbound_require_timer_is_supported_not_420() -> None:
+    """Require: timer is the one tag we support — it must be honoured, not 420'd."""
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+    invite_text = _make_invite(
+        _SDP_PLAIN, call_id, session_expires="600", supported_timer=True
+    ).replace("CSeq: 1 INVITE\r\n", "CSeq: 1 INVITE\r\nRequire: timer\r\n")
+    invite = SipRequest.parse(invite_text)
+
+    with _patched_invite_env():
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: any(m.startswith("SIP/2.0 200") for m in transport.sent))
+        await asyncio.sleep(0)
+
+    statuses = [r.status_code for r in _sent_responses(transport)]
+    assert 420 not in statuses, (
+        f"Require: timer is supported and must not be 420'd; got {statuses}"
+    )
+    assert 200 in statuses, f"a Require: timer call must be answered; got {statuses}"
+
+
+# ===========================================================================
+# (b4) 420 Bad Extension takes precedence over the at-capacity 486 Busy Here.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_inbound_unsupported_require_420_precedes_486_at_capacity() -> None:
+    """A required unsupported extension is 420'd even at capacity — before the 486.
+
+    RFC 3261 §8.2.2.3 header inspection (Require) precedes §8.2.5 request processing,
+    where the at-capacity 486 Busy Here arises. A peer requiring an extension we cannot
+    honour must be told 420 Bad Extension (retry WITHOUT it), never 486 Busy Here (retry
+    the SAME unsatisfiable request later).
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    # Saturate admission so the at-capacity 486 branch would fire for a new call.
+    assert adapter._gateway_cfg is not None
+    max_calls = adapter._gateway_cfg.max_calls
+    adapter._admitted_calls.update(f"admitted-{i}" for i in range(max_calls))
+
+    call_id = new_call_id()
+    invite_text = _make_invite(
+        _SDP_PLAIN, call_id, session_expires="600", supported_timer=True
+    ).replace("CSeq: 1 INVITE\r\n", "CSeq: 1 INVITE\r\nRequire: 100rel\r\n")
+    invite = SipRequest.parse(invite_text)
+
+    with _patched_invite_env():
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
+        await _until(lambda: bool(transport.sent))
+        await asyncio.sleep(0)
+
+    statuses = [r.status_code for r in _sent_responses(transport)]
+    assert 420 in statuses, (
+        f"an unsupported Require must 420 even at capacity (before 486); got {statuses}"
+    )
+    assert 486 not in statuses, (
+        f"420 Bad Extension must take precedence over 486 Busy Here; got {statuses}"
+    )
+
+
+# ===========================================================================
 # (c) we are refresher -> a refresh re-INVITE is emitted around SE/2.
 # ===========================================================================
 @pytest.mark.asyncio

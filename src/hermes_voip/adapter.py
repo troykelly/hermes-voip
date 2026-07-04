@@ -265,6 +265,35 @@ def _rejected_extra(call_id: str, sip_code: int, reason: str) -> dict[str, str |
     }
 
 
+# RFC 3261 §8.2.2.3: the SIP extension option-tags this UAS understands. A Require
+# header naming anything outside this set is rejected 420 Bad Extension — we cannot
+# honour a mandatory extension we do not implement. The sole extension we engage as a
+# UAS is RFC 4028 session timers ("timer"); the 2xx advertises exactly that.
+_SUPPORTED_OPTION_TAGS: frozenset[str] = frozenset({"timer"})
+
+
+def _unsupported_require_tags(invite: SipRequest) -> tuple[str, ...]:
+    """The inbound ``Require`` option-tags this UAS does not support (RFC 3261).
+
+    The ``Require`` header may repeat and each value may be a comma-separated
+    option-tag list. Tags are matched case-insensitively against
+    :data:`_SUPPORTED_OPTION_TAGS`; the returned tags keep their as-received spelling
+    for the ``Unsupported`` echo and are de-duplicated (case-insensitively) in
+    first-seen order. Empty when every required tag is supported or there is no
+    ``Require``.
+    """
+    unsupported: dict[str, str] = {}  # lowercased tag -> first-seen spelling
+    for value in invite.headers_all("Require"):
+        for raw in value.split(","):
+            tag = raw.strip()
+            if not tag:
+                continue
+            low = tag.lower()
+            if low not in _SUPPORTED_OPTION_TAGS and low not in unsupported:
+                unsupported[low] = tag
+    return tuple(unsupported.values())
+
+
 class _MediaNegotiationRejected(Exception):  # noqa: N818 — control-flow signal, not an error condition
     """Internal signal: the call was rejected (488) inside a media-setup helper.
 
@@ -3197,6 +3226,33 @@ class VoipAdapter(BasePlatformAdapter):
         if gateway_cfg is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: gateway config not initialised"
             raise RuntimeError(msg)
+        # RFC 3261 §8.2.2.3: Require header inspection precedes §8.2.5 request
+        # processing (where the 486-at-capacity decision below lives), so an INVITE
+        # requiring an option-tag we do not support is REJECTED 420 Bad Extension —
+        # before the capacity check, any dialog, media engine, or agent surface —
+        # carrying an Unsupported header so the UAC can retry without those tags.
+        # Silently ignoring an unknown Require would answer a call whose mandatory
+        # extension (e.g. 100rel, precondition) we cannot honour; the one extension we
+        # engage as a UAS is RFC 4028 session timers ("timer").
+        unsupported_tags = _unsupported_require_tags(invite)
+        if unsupported_tags:
+            unsupported_value = ", ".join(unsupported_tags)
+            _log.info(
+                "INVITE %s: REJECTED 420 Bad Extension — unsupported Require "
+                "option-tag(s): %s (RFC 3261 §8.2.2.3)",
+                call_id,
+                unsupported_value,
+                extra=_rejected_extra(call_id, 420, "unsupported_require"),
+            )
+            await transport.send(
+                build_response(
+                    invite,
+                    420,
+                    "Bad Extension",
+                    extra_headers=(("Unsupported", unsupported_value),),
+                )
+            )
+            return
         # Admission control fast-path (ADR-0059): if we are already at the concurrent
         # -call cap, reject this NEW INVITE with 486 Busy Here immediately — before the
         # classification + SDP work — so a burst/flood does the least work. This read

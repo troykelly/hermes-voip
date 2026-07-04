@@ -2711,3 +2711,70 @@ async def test_set_remote_rejects_out_of_range_port() -> None:
         await engine.set_remote("203.0.113.55", 0)
     with pytest.raises(ValueError, match="port out of range"):
         await engine.set_remote("203.0.113.55", 70000)
+
+
+@pytest.mark.asyncio
+async def test_set_remote_ignores_stale_packet_from_old_endpoint() -> None:
+    """A stale packet from the endpoint we relocated AWAY from must not re-latch.
+
+    set_remote re-arms the comedia latch (`_latched=False`) so `_maybe_latch`
+    re-learns the new peer. But `_maybe_latch` runs on the inbound path and latches
+    to the FIRST valid audio-PT source. A stray in-flight packet from the OLD source
+    (same codec, common around the 200 OK during an attended-transfer/SBC re-anchor)
+    would otherwise re-latch `_outbound_addr` back to the stale address, so one-way
+    audio persists intermittently. The relocated-from record makes `_maybe_latch`
+    skip it — the target stays on the new SDP endpoint until a GENUINE new-source
+    packet latches (which also handles a NAT'd relocation).
+    """
+    old_src = ("198.51.100.99", 41000)
+    engine = RtpMediaTransport(
+        local_address="127.0.0.1",
+        local_port=0,
+        remote_address=old_src[0],
+        remote_port=old_src[1],
+        codec=Codec.PCMU,
+        symmetric=True,
+    )
+    # An established call latched onto the OLD peer source.
+    engine._latched = True
+    engine._outbound_addr = old_src
+
+    # The peer relocates its RTP endpoint.
+    new_addr, new_port = "203.0.113.55", 43000
+    await engine.set_remote(new_addr, new_port)
+    # Capture the bool into a fresh local at each check: asserting ``is``/``is
+    # False`` directly on ``engine._latched`` would narrow the attribute to a
+    # Literal that mypy keeps across the sync ``_maybe_latch`` call (unlike an
+    # ``await``), making the later ``is True`` look unreachable.
+    latched_after_relocate = engine._latched
+    assert engine._outbound_addr == (new_addr, new_port)  # re-pointed
+    assert latched_after_relocate is False  # re-armed
+
+    # A STALE in-flight packet from the OLD endpoint (negotiated audio PT) arrives.
+    stale = RtpPacket(
+        payload_type=0,
+        sequence_number=1,
+        timestamp=0,
+        ssrc=_FAKE_SSRC,
+        payload=_ulaw_silence(),
+    )
+    engine._maybe_latch(stale, old_src)
+    latched_after_stale = engine._latched
+    # It must NOT re-latch back to the stale address; still un-latched, waiting.
+    assert engine._outbound_addr == (new_addr, new_port)
+    assert latched_after_stale is False
+
+    # A GENUINE packet from the new peer's real (NAT'd) source then latches.
+    fresh_src = ("203.0.113.55", 55000)
+    fresh = RtpPacket(
+        payload_type=0,
+        sequence_number=2,
+        timestamp=_SAMPLES_PER_FRAME,
+        ssrc=_FAKE_SSRC,
+        payload=_ulaw_silence(),
+    )
+    engine._maybe_latch(fresh, fresh_src)
+    latched_after_fresh = engine._latched
+    assert latched_after_fresh is True
+    assert engine._outbound_addr == fresh_src
+    assert engine._relocated_from is None  # relocation resolved by the new source

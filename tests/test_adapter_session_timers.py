@@ -1284,6 +1284,65 @@ async def test_outbound_second_422_after_auth_se_raise_fails_cleanly() -> None:
     await adapter.disconnect()
 
 
+# ===========================================================================
+# (e4) outbound: a flood of stale wrong-CSeq INVITE finals is BOUNDED — the
+#      await-final loop fails cleanly instead of extending the call unboundedly.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_outbound_stale_final_flood_is_bounded() -> None:
+    """A peer flooding stale finals for an OLD CSeq fails cleanly, never hangs.
+
+    ``_await_invite_final_for_cseq`` skips finals that do not match the CSeq of the
+    transaction it just sent (the W1 retransmit filter). Each stale final resets the
+    sink's ~35s idle ``get()`` timeout, so WITHOUT an absolute bound a peer
+    retransmitting finals for a PRIOR CSeq (< 35s apart) would keep the await-final
+    loop — and the whole outbound call — alive indefinitely when no ring-timeout is
+    armed. The loop must cap the skipped-final count and fail the call cleanly
+    (``OutboundCallFailed``) so ``place_call`` returns a clean failure instead of
+    hanging (codex review of #433).
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    for state in manager._by_extension.values():
+        state.registered = True
+
+    async def _flood_stale_finals() -> None:
+        # Challenge INVITE#1 (CSeq 1) so the adapter sends the authed INVITE#2
+        # (CSeq 2) and enters the await-final loop expecting CSeq 2.
+        await _until(lambda: bool(_sent_requests(transport, "INVITE")))
+        first = _sent_requests(transport, "INVITE")[0]
+        sink = transport._sinks.get(_call_id_of(first))
+        assert sink is not None
+        challenge = _build_response_for_outbound(
+            first,
+            407,
+            "Proxy Authentication Required",
+            extra=[("Proxy-Authenticate", _OUTBOUND_PROXY_CHALLENGE)],
+        )
+        await sink.on_response(SipResponse.parse(challenge))  # type: ignore[attr-defined]
+        await _until(lambda: len(_sent_requests(transport, "INVITE")) >= 2)
+        # Flood stale finals for the OLD CSeq (CSeq 1) — NEVER the expected CSeq 2 —
+        # so the await-final loop skips every one. An unbounded loop would spin here
+        # forever; the cap must fail the call cleanly.
+        while True:
+            await sink.on_response(SipResponse.parse(challenge))  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+
+    driver = asyncio.create_task(_flood_stale_finals())
+    with _patched_invite_env():
+        try:
+            with pytest.raises(OutboundCallFailed):
+                # wait_for is the hang detector: an unbounded await-final loop fails
+                # as a timeout (not OutboundCallFailed) and the test fails visibly.
+                await asyncio.wait_for(adapter.place_call("1001"), timeout=5.0)
+        finally:
+            driver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver
+
+    await adapter.disconnect()
+
+
 # ---------------------------------------------------------------------------
 # Response builders for the inbound (UAS) refresh re-INVITE the SESSION sent.
 # We are the UAC of the refresh; the gateway (test) answers it.

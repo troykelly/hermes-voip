@@ -3215,6 +3215,70 @@ async def test_run_call_loop_builds_detectors_at_engine_inbound_rate() -> None:
     assert endpointer_rates == [8_000]
 
 
+async def _run_call_loop_capturing_greeting(*, outbound: bool) -> str:
+    """Drive ``_run_call_loop`` with the given direction and return the greeting.
+
+    Patches out the detectors and ``CallLoop`` (its ``run`` is a no-op) so we can
+    read back exactly the ``greeting`` keyword the adapter constructs the loop
+    with, for the given call direction.
+    """
+    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager)
+    adapter._media_cfg = load_media_config(
+        {"HERMES_VOIP_GREETING": "Hello, how can I help you?"}
+    )
+    adapter._providers = MagicMock(asr=MagicMock(), tts=MagicMock(), guard=MagicMock())
+
+    engine = MagicMock()
+    engine.inbound_sample_rate = 8_000
+
+    call_loop_cls = MagicMock(return_value=MagicMock(run=AsyncMock(return_value=None)))
+
+    with (
+        patch.object(adapter_mod, "_make_vad", return_value=MagicMock()),
+        patch.object(adapter_mod, "_make_endpointer", return_value=MagicMock()),
+        patch.object(adapter_mod, "CallLoop", call_loop_cls),
+    ):
+        await adapter._run_call_loop(
+            call_id="call-greeting-1",
+            engine=engine,
+            guard_state=MagicMock(),
+            outbound=outbound,
+        )
+
+    call_loop_cls.assert_called_once()
+    greeting = call_loop_cls.call_args.kwargs["greeting"]
+    assert isinstance(greeting, str)
+    return greeting
+
+
+@pytest.mark.asyncio
+async def test_run_call_loop_suppresses_greeting_on_outbound() -> None:
+    """An OUTBOUND call must NOT play the canned inbound greeting (ADR-0019).
+
+    On an agent-placed outbound call the agent's first turn opens the call
+    (``_inject_objective_first_turn``); the callee must NOT hear the inbound
+    "Hello, how can I help you?" line the instant they answer. So the adapter
+    must build the ``CallLoop`` with an empty greeting when ``outbound=True``.
+    """
+    greeting = await _run_call_loop_capturing_greeting(outbound=True)
+    assert greeting == ""
+
+
+@pytest.mark.asyncio
+async def test_run_call_loop_keeps_greeting_on_inbound() -> None:
+    """An INBOUND call keeps the configured on-answer greeting (ADR-0002).
+
+    The inbound path is unchanged: the configured opening line still reaches the
+    per-call loop so RTP flows out first and a NAT'd gateway latches.
+    """
+    greeting = await _run_call_loop_capturing_greeting(outbound=False)
+    assert greeting == "Hello, how can I help you?"
+
+
 # ---------------------------------------------------------------------------
 # Operator invariant: before answering, verify we support a codec+rate pair; if
 # not, DON'T answer — reject with 488 and log a CLEAR error, never fail silently.

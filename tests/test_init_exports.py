@@ -197,6 +197,13 @@ def test_top_level_exports_injection_guard() -> None:
     assert hermes_voip.InjectionGuard is hermes_voip.providers.guard.InjectionGuard
 
 
+def test_top_level_exports_media_transport() -> None:
+    """MediaTransport must appear in hermes_voip.__all__ and be importable."""
+    assert "MediaTransport" in hermes_voip.__all__
+    assert hasattr(hermes_voip, "MediaTransport")
+    assert hermes_voip.MediaTransport is hermes_voip.providers.transport.MediaTransport
+
+
 # ── (D) top-level submodule-attribute access (bk872) ──────────────────────────
 # The submodules pulled in (directly/transitively) by hermes_voip/__init__.py
 # stay reachable as ``hermes_voip.<name>`` — this is intentional, standard

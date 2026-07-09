@@ -37,6 +37,7 @@ from hermes_voip.providers.asr import StreamingASR
 from hermes_voip.providers.audio import PcmFrame
 from hermes_voip.providers.build import Providers, build_providers
 from hermes_voip.providers.guard import InjectionGuard
+from hermes_voip.providers.transport import MediaTransport
 from hermes_voip.providers.tts import StreamingTTS
 from hermes_voip.registration import (
     Challenged,
@@ -59,6 +60,7 @@ __all__ = [
     "InboundCallContext",
     "InjectionGuard",
     "MediaConfig",
+    "MediaTransport",
     "PcmFrame",
     "Providers",
     "Registered",

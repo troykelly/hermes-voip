@@ -490,6 +490,85 @@ def test_from_inbound_invite_tag_after_quoted_gt_in_display_name() -> None:
     assert d.remote_tag == "realtag99"
 
 
+def test_from_invite_2xx_addr_spec_and_tag_survive_bracketed_display_name() -> None:
+    # RFC 3261 §25.1 permits BOTH ``<`` and ``>`` inside a quoted display-name.
+    # A name-addr whose quoted display-name contains a full ``<...>`` span must
+    # not have that span mistaken for the real <addr-spec>: the URI must be the
+    # real addr-spec and the trailing ;tag must survive. Locating the angle-addr
+    # on the FIRST ``<...>`` extracts ``<Team>`` and loses the tag entirely.
+    tricky = SipResponse(
+        status_code=200,
+        reason="OK",
+        headers=(
+            ("Via", _LOCAL_VIA),
+            ("From", "<sip:1000@pbx.example.test>;tag=ftag"),
+            ("To", '"Support <Team>" <sip:2000@pbx.example.test>;tag=realtag99'),
+            ("Call-ID", "call-abc"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", _PEER_CONTACT),
+        ),
+        body="",
+    )
+    d = Dialog.from_invite_2xx(_invite(), tricky)
+    assert d.remote_uri == "sip:2000@pbx.example.test"
+    assert d.remote_tag == "realtag99"
+
+
+def test_from_inbound_invite_survives_bracketed_display_name() -> None:
+    # Same quoted-``<...>`` display-name hazard on the inbound (UAS) path: the
+    # peer's From carries a bracketed display-name plus a real tag. The valid
+    # INVITE must be accepted (not rejected as untagged) with the correct URI.
+    tricky = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@pbx.example.test",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.50:5061;branch=z9hG4bK-peer;rport"),
+            ("Max-Forwards", "70"),
+            ("From", '"Desk <A>" <sip:3000@pbx.example.test>;tag=realtag99'),
+            ("To", "<sip:1000@pbx.example.test>"),
+            ("Call-ID", "call-xyz"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", "<sip:3000@198.51.100.50:5061;transport=tls>"),
+        ),
+        body="",
+    )
+    d = Dialog.from_inbound_invite(
+        tricky,
+        local_tag="ourtag",
+        local_contact=_LOCAL_CONTACT,
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+    )
+    assert d.remote_uri == "sip:3000@pbx.example.test"
+    assert d.remote_tag == "realtag99"
+
+
+def test_plain_name_addr_and_bare_addr_spec_still_extract() -> None:
+    # A plain name-addr (no brackets in the display-name) and a bare addr-spec
+    # (no ``<...>`` at all) keep extracting the addr-spec and tag correctly.
+    plain = _ok(to_tag="ttag")
+    d_plain = Dialog.from_invite_2xx(_invite(), plain)
+    assert d_plain.remote_uri == "sip:2000@pbx.example.test"
+    assert d_plain.remote_tag == "ttag"
+
+    bare = SipResponse(
+        status_code=200,
+        reason="OK",
+        headers=(
+            ("Via", _LOCAL_VIA),
+            ("From", "<sip:1000@pbx.example.test>;tag=ftag"),
+            ("To", "sip:2000@pbx.example.test;tag=baretag"),
+            ("Call-ID", "call-abc"),
+            ("CSeq", "1 INVITE"),
+            ("Contact", _PEER_CONTACT),
+        ),
+        body="",
+    )
+    d_bare = Dialog.from_invite_2xx(_invite(), bare)
+    assert d_bare.remote_uri == "sip:2000@pbx.example.test"
+    assert d_bare.remote_tag == "baretag"
+
+
 def test_empty_addr_spec_rejected() -> None:
     empty_contact = SipResponse(
         status_code=200,

@@ -145,6 +145,38 @@ def test_parse_refer_with_referred_by() -> None:
     assert parsed.referred_by == "sip:1000@pbx.example.test"
 
 
+def test_parse_refer_refer_to_survives_bracketed_display_name() -> None:
+    # RFC 3261 §25.1 permits ``<`` and ``>`` inside a quoted display-name. A
+    # Refer-To name-addr whose quoted display-name contains a full ``<...>`` span
+    # must extract the real addr-spec, not the bracketed display text. Locating
+    # the angle-addr on the FIRST ``<...>`` extracts ``<Team>`` — which the
+    # injection guard then rejects as a non-dialable target.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(("Refer-To", '"Support <Team>" <sip:3000@pbx.example.test>'),),
+        body="",
+    )
+    parsed = parse_refer(refer)
+    assert parsed.refer_to == "sip:3000@pbx.example.test"
+
+
+def test_parse_refer_referred_by_survives_bracketed_display_name() -> None:
+    # Referred-By flows through the same angle-addr locator. A bracketed
+    # display-name must not desync the addr-spec extraction.
+    refer = SipRequest(
+        method="REFER",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Refer-To", "<sip:3000@pbx.example.test>"),
+            ("Referred-By", '"Agent <A>" <sip:1000@pbx.example.test>'),
+        ),
+        body="",
+    )
+    parsed = parse_refer(refer)
+    assert parsed.referred_by == "sip:1000@pbx.example.test"
+
+
 def test_parse_refer_without_refer_to_raises() -> None:
     refer = SipRequest(
         method="REFER",

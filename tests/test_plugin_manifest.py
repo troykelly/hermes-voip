@@ -727,3 +727,161 @@ def test_optional_env_advertises_keepalive_interval_with_matching_default(
         f"({manifest_default!r}) must match config.py "
         f"_DEFAULT_KEEPALIVE_INTERVAL ({_DEFAULT_KEEPALIVE_INTERVAL!r})"
     )
+
+
+# ---------------------------------------------------------------------------
+# (h) THE MANIFEST-VS-CONFIG DRIFT GUARD: every operator knob config.py parses
+#     is listed in the manifest (requires_env or optional_env), or is named in an
+#     explicit, justified, in-file exclusion set. Without this, a new
+#     HERMES_(SIP|VOIP)_* knob can land in config.py and stay invisible to the
+#     manifest forever (the #109-era gap this backlog item closes: ~65 of ~88
+#     parsed keys were undocumented, including the security-posture default
+#     HERMES_VOIP_REQUIRE_SECURE_MEDIA).
+# ---------------------------------------------------------------------------
+
+_CONFIG_PY = _REPO_ROOT / "src" / "hermes_voip" / "config.py"
+
+#: Every module-level ``_SOME_KEY = "HERMES_(SIP|VOIP)_..."`` / ``_SOME_PREFIX =
+#: "HERMES_(SIP|VOIP)_..."`` / ``_BARE_SOME = "HERMES_(SIP|VOIP)_..."`` constant
+#: assignment in config.py is a real env var the parser reads. This regex is
+#: naming-convention-based (matches the actual style every key in the file uses,
+#: verified by ``test_env_key_regex_finds_every_known_constant`` below) rather
+#: than an enumerated list, so a NEW key added the same way is picked up
+#: automatically — the drift guard cannot go stale by omission.
+_ENV_KEY_ASSIGNMENT_RE = re.compile(
+    r'^_[A-Z0-9_]+\s*=\s*"(HERMES_(?:SIP|VOIP)_[A-Z0-9_]*)"', re.MULTILINE
+)
+
+#: Genuinely-internal knobs, deliberately excluded from the manifest coverage
+#: guard below. Each entry is justified — this set must stay small and specific,
+#: never a catch-all, or the coverage guard it lives in becomes vacuous.
+_INTERNAL_ONLY_ENV_KEYS = frozenset(
+    {
+        # Indexed multi-registration prefixes (HERMES_SIP_EXTENSION_<n> etc,
+        # config.py:132-134). A flat manifest entry cannot express an indexed
+        # "<name>_<n>" family; the manifest's own optional_env comment (~line
+        # 73-76) documents this scheme in the README + runbook 0001 instead.
+        "HERMES_SIP_EXTENSION_",
+        "HERMES_SIP_PASSWORD_",
+        "HERMES_SIP_USERNAME_",
+        # Provisioner-only aliases of the canonical HERMES_SIP_HOST /
+        # HERMES_SIP_PORT (config.py:86-94) — same setting, alternate spelling
+        # emitted by the 1Password provisioner; not a distinct operator knob to
+        # advertise separately from the canonical name already in the manifest.
+        "HERMES_SIP_SERVER_HOST",
+        "HERMES_SIP_TLS_PORT",
+    }
+)
+
+
+def _config_py_env_keys() -> set[str]:
+    """Every ``HERMES_(SIP|VOIP)_*`` key config.py's constant-assignment style names."""
+    source = _CONFIG_PY.read_text(encoding="utf-8")
+    return set(_ENV_KEY_ASSIGNMENT_RE.findall(source))
+
+
+def test_env_key_regex_finds_every_known_constant() -> None:
+    """Sanity: the extraction regex is not silently under-matching config.py.
+
+    Locks the regex to a known-good count so a future refactor that changes the
+    constant-naming convention (breaking silent under-extraction) is caught here
+    rather than by the coverage guard quietly checking fewer keys than it thinks.
+    """
+    found = _config_py_env_keys()
+    assert len(found) >= 85, (
+        f"only found {len(found)} HERMES_(SIP|VOIP)_* constants in config.py — "
+        "the extraction regex may have stopped matching the file's constant style"
+    )
+    # A handful of keys known to exist at every point in this file's history.
+    for expected in (
+        "HERMES_SIP_HOST",
+        "HERMES_VOIP_REQUIRE_SECURE_MEDIA",
+        "HERMES_VOIP_DENY_MODE",
+    ):
+        assert expected in found, f"regex failed to find {expected!r} in config.py"
+
+
+def test_internal_only_env_keys_are_all_real_and_few() -> None:
+    """The exclusion set names only keys that actually exist in config.py.
+
+    Guards the exclusion set itself: every name in it must be a real config.py
+    constant (so it cannot silently exclude a typo'd/renamed/removed key,
+    quietly leaving nothing checked for it) and the set stays small (a growing
+    exclusion list would defeat the coverage guard's purpose).
+    """
+    found = _config_py_env_keys()
+    for key in _INTERNAL_ONLY_ENV_KEYS:
+        assert key in found, (
+            f"{key!r} is listed in _INTERNAL_ONLY_ENV_KEYS but is not a "
+            "config.py constant — remove the stale exclusion"
+        )
+    assert len(_INTERNAL_ONLY_ENV_KEYS) <= 8, (
+        "the internal-only exclusion set has grown large enough to look like a "
+        "catch-all — re-justify each entry or add it to the manifest instead"
+    )
+
+
+def test_config_py_env_vars_are_covered_by_the_manifest() -> None:
+    """Every config.py-parsed HERMES_(SIP|VOIP)_* key is in the manifest.
+
+    Checked against ``requires_env`` or ``optional_env`` — or explicitly,
+    justifiably excluded. THE DRIFT GUARD: a new knob added to config.py
+    without a matching manifest
+    entry fails here, so the manifest can no longer silently drift behind the
+    real parsed surface (the gap this test closes: HERMES_VOIP_REQUIRE_SECURE_MEDIA
+    — a security-posture default — plus ~65 other keys were undocumented).
+    """
+    parsed = _config_py_env_keys()
+    manifest = _load_manifest(_PACKAGING_MANIFEST)
+    declared = set(_env_entry_names(manifest.get("requires_env")))
+    declared |= set(_env_entry_names(manifest.get("optional_env")))
+    relevant = parsed - _INTERNAL_ONLY_ENV_KEYS
+    missing = sorted(relevant - declared)
+    assert not missing, (
+        "plugin.yaml optional_env/requires_env has drifted behind config.py — "
+        f"{len(missing)} key(s) parsed in config.py are not in the manifest and "
+        f"are not in _INTERNAL_ONLY_ENV_KEYS: {missing}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (i) Minimum Python version: the manifest states the runtime floor
+#     (pyproject.toml [project].requires-python, pinned in .python-version) so an
+#     operator reading the manifest sees the platform requirement, not only the
+#     tool count / provider knobs.
+# ---------------------------------------------------------------------------
+
+_REQUIRES_PYTHON_RE = re.compile(r"(\d+\.\d+)")
+
+
+def _pyproject_min_python() -> str:
+    """The minimum Python version from pyproject.toml's ``requires-python``."""
+    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    project = data["project"]
+    assert isinstance(project, dict)
+    requires_python = project["requires-python"]
+    assert isinstance(requires_python, str)
+    match = _REQUIRES_PYTHON_RE.search(requires_python)
+    assert match, f"pyproject.toml requires-python {requires_python!r} has no version"
+    return match.group(1)
+
+
+def test_manifest_description_states_minimum_python_version() -> None:
+    """The manifest description names the minimum Python version.
+
+    Sourced from pyproject.toml [project].requires-python (pinned in
+    .python-version) so an operator reading only plugin.yaml — the
+    self-describing manifest — sees the runtime floor without cross-referencing
+    pyproject.toml. Locked to the live value so a future requires-python bump
+    that forgets the manifest fails here instead of shipping a stale claim
+    (rule 27: no aspirational docs).
+    """
+    min_python = _pyproject_min_python()
+    manifest = _load_manifest(_PACKAGING_MANIFEST)
+    description = manifest.get("description")
+    assert isinstance(description, str)
+    assert f"Python {min_python}" in description, (
+        f"plugin.yaml description must state the minimum Python version "
+        f"(Python {min_python}, from pyproject.toml requires-python) — got: "
+        f"{description!r}"
+    )

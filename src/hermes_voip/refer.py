@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote
 
 from hermes_voip._chars import contains_control
+from hermes_voip._name_addr import find_name_addr
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.message import (
     SipRequest,
@@ -62,7 +63,6 @@ _SDP_CONTENT_TYPE = ("Content-Type", "application/sdp")
 _SIPFRAG_CONTENT_TYPE = ("Content-Type", "message/sipfrag;version=2.0")
 _DEFAULT_SUBSCRIPTION_STATE = "active;expires=60"
 
-_ANGLE_ADDR = re.compile(r"<([^>]*)>")
 _SIPFRAG_STATUS = re.compile(r"SIP/2\.0\s+(\d{3})\s*(.*)")
 
 # Refer-To injection guard (security; the transfer analogue of the outbound
@@ -509,9 +509,14 @@ def _wrap_uri(value: str) -> str:
 
 
 def _bracketed_uri(value: str) -> str:
-    """Return the URI inside ``<...>``, or the bare value when unbracketed."""
-    match = _ANGLE_ADDR.search(value)
-    return match.group(1).strip() if match is not None else value.strip()
+    """Return the URI inside ``<...>``, or the bare value when unbracketed.
+
+    The angle-addr is located outside any quoted display-name (RFC 3261 §25.1),
+    so a bracketed display-name (e.g. ``"Support <Team>" <sip:…>``) cannot be
+    mistaken for the addr-spec and corrupt a Refer-To/Referred-By target.
+    """
+    name_addr = find_name_addr(value)
+    return name_addr[0].strip() if name_addr is not None else value.strip()
 
 
 def _validate_refer_to_query(query: str) -> None:

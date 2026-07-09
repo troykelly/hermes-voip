@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from hermes_voip._header_list import split_header_list
+from hermes_voip._name_addr import find_name_addr
 from hermes_voip.message import (
     SipRequest,
     SipResponse,
@@ -47,7 +48,6 @@ _MAX_FORWARDS = "70"
 # RFC 3261 §8.1.1.5: the CSeq sequence number must be below 2**31.
 _MAX_CSEQ = 2**31
 
-_ANGLE_ADDR = re.compile(r"<([^>]*)>")
 # Anchored at the start of the topmost Via value: transport then sent-by
 # (host:port, no whitespace or parameters).
 _VIA_TOP = re.compile(r"SIP/2\.0/(\S+)\s+([^\s;]+)")
@@ -288,11 +288,16 @@ def _addr_spec(value: str) -> str:
     """Return the (non-empty) addr-spec from a name-addr / addr-spec value.
 
     Inside ``<...>`` if present (params there are URI params), otherwise up to
-    the first ``;`` (where params are header params, per RFC 3261 §20).
+    the first ``;`` (where params are header params, per RFC 3261 §20). The
+    angle-addr is located outside any quoted display-name (RFC 3261 §25.1), so a
+    bracketed display-name (e.g. ``"Support <Team>" <sip:…>``) cannot be mistaken
+    for the addr-spec.
     """
-    match = _ANGLE_ADDR.search(value)
+    name_addr = find_name_addr(value)
     spec = (
-        match.group(1).strip() if match is not None else value.split(";", 1)[0].strip()
+        name_addr[0].strip()
+        if name_addr is not None
+        else value.split(";", 1)[0].strip()
     )
     if not spec:
         msg = f"empty addr-spec in header: {value!r}"
@@ -305,12 +310,13 @@ def _uri_and_tag(value: str) -> tuple[str, str | None]:
     uri = _addr_spec(value)
     # Header parameters live after the closing ``>`` of a name-addr, or after the
     # first ``;`` for a bare addr-spec (which has no URI parameters). Locate the
-    # ``<addr-spec>`` with the same regex ``_addr_spec`` uses, so a literal ``>``
-    # inside a quoted display-name (RFC 3261 §25.1) cannot desync the split and
-    # hide the tag by matching on the wrong ``>``.
-    match = _ANGLE_ADDR.search(value)
-    if match is not None:
-        params = value[match.end() :]
+    # ``<addr-spec>`` the same way ``_addr_spec`` does — quote-aware, outside any
+    # display-name — so a literal ``<`` or ``>`` inside a quoted display-name
+    # (RFC 3261 §25.1) cannot desync the split and hide the tag by matching on the
+    # wrong bracket.
+    name_addr = find_name_addr(value)
+    if name_addr is not None:
+        params = name_addr[1]
     else:
         _, _, params = value.partition(";")
     return uri, _header_param(params, "tag")

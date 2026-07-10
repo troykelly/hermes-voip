@@ -265,6 +265,12 @@ class CallSession:
         # so the decision is immune to a post-wake mutation.
         self._transfer_outcome_latched: bool = False
         self._transfer_outcome_progress: NotifyProgress | None = None
+        # ADR-0109 (codex round-3): guards against a SECOND transfer arming while the
+        # first still awaits its outcome (the wait runs OUTSIDE self._lock, so the lock
+        # alone does not serialize it). One leg transfers to one place at a time; a
+        # concurrent second transfer fails fast in :meth:`_arm_transfer_outcome` rather
+        # than clobbering the first transfer's event / REFER CSeq / latch.
+        self._transfer_in_progress: bool = False
 
     @property
     def dialog(self) -> Dialog:
@@ -549,7 +555,17 @@ class CallSession:
         races the 2xx is never missed: :meth:`_on_notify` sets the freshly-armed event
         and the wait armed here observes it (ADR-0109). Returns the exact Event owned by
         this transfer so its ``finally`` cleanup cannot clear a newer transfer's state.
+
+        Raises:
+            CallError: if a transfer is already awaiting its outcome on this call — the
+                outcome state is session-wide, so a concurrent second transfer would
+                clobber the first's event / CSeq / latch (codex round-3). One leg
+                transfers to one place at a time; the second fails fast.
         """
+        if self._transfer_in_progress:
+            msg = "a transfer is already awaiting its outcome on this call"
+            raise CallError(msg)
+        self._transfer_in_progress = True
         self.transfer_progress = None
         self._active_refer_cseq = None
         self._transfer_outcome_latched = False
@@ -571,6 +587,7 @@ class CallSession:
             self._active_refer_cseq = None
             self._transfer_outcome_latched = False
             self._transfer_outcome_progress = None
+            self._transfer_in_progress = False
 
     async def _await_transfer_outcome(
         self, event: asyncio.Event, timeout: float

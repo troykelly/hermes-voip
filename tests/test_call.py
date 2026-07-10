@@ -26,7 +26,12 @@ from hermes_voip.media.engine import Codec as EngineCodec
 from hermes_voip.media.engine import RtpMediaTransport
 from hermes_voip.message import SipRequest, SipResponse, build_response
 from hermes_voip.providers.policy import GuardSessionState
-from hermes_voip.refer import ReferRequest
+from hermes_voip.refer import (
+    NotifyProgress,
+    ReferRequest,
+    TransferOutcomeReport,
+    TransferUnknownReason,
+)
 from hermes_voip.sdp import (
     Codec,
     CryptoAttribute,
@@ -958,6 +963,126 @@ async def test_transfer_blind_idless_notify_honored_best_effort() -> None:
     progress = await asyncio.wait_for(task, timeout=2.0)
     assert progress is not None
     assert progress.status_code == 200
+
+
+# ---- outbound: transfer OUTCOME_UNKNOWN reason discrimination (ADR-0109 P2) -
+
+
+async def test_await_transfer_outcome_wait_disabled_reports_reason() -> None:
+    """``timeout <= 0`` opts out of the wait: WAIT_DISABLED, no progress (ADR-0109 P2).
+
+    The REFER was sent but no wait was attempted, so the report must name
+    WAIT_DISABLED — not claim a bounded wait that never elapsed.
+    """
+    session = _session(_FakeSignaling(), _FakeMedia())
+    report = await session._await_transfer_outcome(asyncio.Event(), 0.0)
+    assert isinstance(report, TransferOutcomeReport)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.WAIT_DISABLED
+
+
+async def test_await_transfer_outcome_timeout_reports_reason() -> None:
+    """A wait that elapses with no terminal NOTIFY reports TIMEOUT (ADR-0109 P2)."""
+    session = _session(_FakeSignaling(), _FakeMedia())
+    report = await session._await_transfer_outcome(asyncio.Event(), 0.05)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.TIMEOUT
+
+
+async def test_await_transfer_outcome_terminal_progress_has_no_reason() -> None:
+    """A terminal NOTIFY yields the progress and NO unknown reason (ADR-0109 P2)."""
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    session.transfer_progress = NotifyProgress(
+        status_code=200, reason="OK", terminated=True
+    )
+    event.set()
+    report = await session._await_transfer_outcome(event, 2.0)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+    assert report.progress.terminated is True
+
+
+async def test_await_transfer_outcome_call_ended_reports_reason() -> None:
+    """The event firing with no terminal progress (a BYE woke it) -> CALL_ENDED (P2).
+
+    We never infer success from a torn-down leg, so a wake with nothing terminal
+    recorded is reported as CALL_ENDED, not a timeout.
+    """
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    event.set()  # woken by call-end; transfer_progress is still None
+    report = await session._await_transfer_outcome(event, 2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
+
+
+async def test_await_transfer_outcome_nonterminal_progress_is_call_ended() -> None:
+    """A non-terminal ``100 Trying`` at wake is not a terminal outcome -> CALL_ENDED."""
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    session.transfer_progress = NotifyProgress(
+        status_code=100, reason="Trying", terminated=False
+    )
+    event.set()
+    report = await session._await_transfer_outcome(event, 2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
+
+
+async def test_transfer_blind_refer_sub_false_reports_subscription_declined() -> None:
+    """RFC 4488 ``Refer-Sub: false`` -> SUBSCRIPTION_DECLINED report (ADR-0109 P2)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=100.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    accepted = build_response(
+        refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+    )
+    await session.on_response(SipResponse.parse(accepted))
+    report = await asyncio.wait_for(task, timeout=1.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.SUBSCRIPTION_DECLINED
+
+
+async def test_transfer_attended_refer_sub_false_reports_subscription_declined() -> (
+    None
+):
+    """Attended transfer mirrors the blind SUBSCRIPTION_DECLINED report (P2)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_attended(_consult_dialog(), outcome_timeout=100.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    accepted = build_response(
+        refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+    )
+    await session.on_response(SipResponse.parse(accepted))
+    report = await asyncio.wait_for(task, timeout=1.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.SUBSCRIPTION_DECLINED
+
+
+async def test_transfer_blind_terminal_2xx_report_has_no_reason() -> None:
+    """A terminal 2xx NOTIFY yields a progress-bearing report, no reason (P2)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
 
 
 # ---- inbound: handle_request -----------------------------------------------

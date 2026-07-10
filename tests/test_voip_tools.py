@@ -20,6 +20,7 @@ import pytest
 
 from hermes_voip.config import ConfigError
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import TransferUnknownReason
 from hermes_voip.voip_tools import (
     HANG_UP_TOOL_NAME,
     HANG_UP_TOOL_SCHEMA,
@@ -97,6 +98,9 @@ class _FakeHost:
         self.transfer_notify_status: int | None = None
         self.transfer_notify_reason: str | None = None
         self.transfer_timeout_secs: float | None = None
+        # ADR-0109 P2: the discriminated OUTCOME_UNKNOWN reason (declined / call-ended
+        # / wait-disabled / timeout) the handler renders a distinct message for.
+        self.transfer_unknown_reason: TransferUnknownReason | None = None
         # When set, transfer_blind_on_call raises this (e.g. a REFER-rejected CallError
         # or the no-DTMF RuntimeError) so the handler can render a clear tool error.
         self.transfer_raises: Exception | None = None
@@ -173,6 +177,7 @@ class _FakeHost:
             notify_status=self.transfer_notify_status,
             notify_reason=self.transfer_notify_reason,
             timeout_secs=self.transfer_timeout_secs,
+            unknown_reason=self.transfer_unknown_reason,
         )
 
     # ADR-0048 VoipToolHost members (attended transfer): unused by this module's
@@ -1197,6 +1202,88 @@ async def test_transfer_blind_handler_outcome_unknown_reports_initiated(
         "outcome not confirmed within 20s."
     )
     assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_timeout_reports_within(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OUTCOME_UNKNOWN with a TIMEOUT reason names the bounded wait (ADR-0109 P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.TIMEOUT
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; "
+        "outcome not confirmed within 20s."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_declined_reports_declined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declined RFC 4488 subscription reports the peer declined it (ADR-0109 P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.SUBSCRIPTION_DECLINED
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; the peer declined the "
+        "transfer-progress subscription, so the final outcome was not reported."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_call_ended_reports_call_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leg torn down before the outcome reports the call ended (ADR-0109 P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.CALL_ENDED
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; the call ended before "
+        "the transfer outcome was reported."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_wait_disabled_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled outcome confirmation (timeout 0) reports only 'initiated' (P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.WAIT_DISABLED
+    host.transfer_timeout_secs = 0.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert json.loads(result) == {
+        "result": "Transfer to sip:1001@pbx.example.test initiated."
+    }
 
 
 # --- the gate OWNS transfer_blind and clamps it to operator level 3 ----------

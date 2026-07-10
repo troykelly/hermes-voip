@@ -2945,6 +2945,25 @@ class VoipAdapter(BasePlatformAdapter):
             _log.info(
                 "WebRTC INVITE sent over WSS: Call-ID %s -> %s", call_id, target_uri
             )
+            # Outbound lifecycle event (runbook 0014, ADR-0075 style): the WebRTC
+            # INVITE is on the wire — one outbound attempt begun. Mirrors the SIP/TLS
+            # leg's outbound_invite_sent (issue #1294) on the WebRTC/WSS leg (#1296)
+            # so a log pipeline correlates the attempt across outbound_invite_sent →
+            # outbound_call_connected / outbound_call_failed by the shared Call-ID.
+            # Its OWN record carries ONLY the Call-ID + fixed transport — never the
+            # dialled number, gateway host, or SIP domain the message above holds
+            # (rule 34 / ADR-0084). transport="webrtc" is the same WebRTC-surface
+            # token the inbound secured-handshake events use, so SLO queries group
+            # both call directions by one label.
+            _log.info(
+                "outbound INVITE sent: Call-ID %s",
+                call_id,
+                extra={
+                    "event": "outbound_invite_sent",
+                    "call_id": call_id,
+                    "transport": "webrtc",
+                },
+            )
 
             assert isinstance(sink, _QueueSink)  # noqa: S101 — mypy narrowing aid
             response = await sink.get()

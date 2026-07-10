@@ -110,7 +110,13 @@ its lifecycle. The events:
 | `call_released` | the admission slot is freed at teardown | `call_id`, `duration_s`, `active_calls` |
 | `outbound_invite_sent` | an outbound (`place_call`) INVITE leaves the UAC | `call_id`, `transport` (`tls`/`webrtc`) |
 | `outbound_call_connected` | the outbound `2xx` answer establishes the session | `call_id`, `transport` (`tls`/`webrtc`), `codec` (negotiated name) |
-| `outbound_call_failed` | the outbound dial fails (non-2xx / refused 2xx / CANCEL / error) | `call_id`, `transport` (`tls`/`webrtc`), `category` (`busy`/`no_answer`/`declined`/`failed`) |
+| `outbound_call_failed` | the outbound dial fails — a non-2xx / refused-2xx final response, or a raised setup error (any exception before the session is established) | `call_id`, `transport` (`tls`/`webrtc`), `category` (`busy`/`no_answer`/`declined`/`failed`) |
+
+A dial aborted by local task cancellation (`asyncio.CancelledError`, e.g. on shutdown) is
+deliberately NOT emitted as `outbound_call_failed` on either leg — cancellation is not a
+dial outcome, and it re-raises unchanged (rule 37). Such an attempt logs `outbound_invite_sent`
+with no terminal event; treat an `invite_sent` with neither `outbound_call_connected` nor
+`outbound_call_failed` as an aborted attempt, not a failure.
 
 Setup success ≈ `count(call_answered) / (count(call_answered) + count(call_rejected))`.
 

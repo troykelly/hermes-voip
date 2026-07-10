@@ -841,3 +841,117 @@ async def test_place_call_over_wss_emits_outbound_invite_sent(
     assert _event_field(sent, "transport") == "webrtc"
     # A cancelled-mid-flight attempt yields no connected/failed event.
     assert not _records_with_event(caplog, "outbound_call_connected")
+
+
+async def _feed_response(
+    transport: _FakeTransport, call_id: str, raw_response: str
+) -> None:
+    """Deliver a raw SIP response to the outbound INVITE sink for ``call_id``.
+
+    The WebRTC UAC coroutine parks on its ``_QueueSink.get()`` awaiting the 2xx/4xx;
+    the fake transport captured that sink under the Call-ID via ``add_call``. Pushing
+    through ``on_response`` is the exact seam the real read-loop uses to wake it.
+    """
+    from hermes_voip.adapter import _QueueSink  # noqa: PLC0415
+
+    sink = transport._calls[call_id]
+    assert isinstance(sink, _QueueSink)  # narrow object -> the concrete sink
+    await sink.on_response(SipResponse.parse(raw_response))
+
+
+def _webrtc_2xx_answer(invite: SipRequest, *, to_tag: str = "ans-wss") -> str:
+    """A 200 OK WebRTC answer for ``invite`` (SAVPF/Opus, DTLS fp + ICE creds).
+
+    Echoes the INVITE's Via/From/Call-ID/CSeq (RFC 3261 §8.2.6.2), adds a To-tag and
+    a Contact so ``Dialog.from_invite_2xx`` can build the UAC dialog, and carries a
+    WebRTC media answer the outbound leg negotiates (Opus + G.711, bounded by our
+    offer). Reuses the SAVPF attributes of ``_WEBRTC_OFFER`` — structurally a valid
+    answer (fingerprint, ice-ufrag/pwd, candidate); the outbound leg reads only those
+    attributes + the codecs, never the a=setup direction.
+    """
+    via = invite.header("Via") or ""
+    from_ = invite.header("From") or ""
+    to = invite.header("To") or ""
+    call_id = invite.header("Call-ID") or ""
+    cseq = invite.header("CSeq") or ""
+    body_bytes = _WEBRTC_OFFER.encode("utf-8")
+    return (
+        "SIP/2.0 200 OK\r\n"
+        f"Via: {via}\r\n"
+        f"From: {from_}\r\n"
+        f"To: {to};tag={to_tag}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq}\r\n"
+        "Contact: <sip:1001@peer9x.invalid;transport=ws>\r\n"
+        "Content-Type: application/sdp\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        "\r\n"
+        f"{_WEBRTC_OFFER}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_place_call_over_wss_emits_outbound_call_connected_on_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 2xx WebRTC answer on the WebRTC leg emits ``outbound_call_connected``.
+
+    Mirrors the SIP/TLS leg's #1294 connect event on the WebRTC/WSS leg (#1296): once
+    the 2xx established the dialog and the CallSession + CallLoop are wired, a record
+    carrying the Call-ID + ``transport="webrtc"`` + the negotiated codec NAME — never
+    the callee number or gateway host (rule 34 / ADR-0084).
+    """
+    in_call = asyncio.Event()
+
+    async def _blocking_run() -> None:
+        await in_call.wait()
+
+    fake_engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    call_id: str | None = None
+    async with _wss_adapter_ready() as (adapter, transport):
+        with (
+            caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER),
+            patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine),
+            patch(
+                "hermes_voip.adapter.CallLoop",
+                return_value=MagicMock(run=_blocking_run),
+            ),
+            patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+            patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+        ):
+            call_task = asyncio.ensure_future(adapter.place_call("1001"))
+            try:
+                await _until(
+                    lambda: any(m.startswith("INVITE") for m in transport.sent)
+                )
+                call_id = _sent_invite(transport).header("Call-ID")
+                assert call_id is not None
+                await _feed_response(
+                    transport, call_id, _webrtc_2xx_answer(_sent_invite(transport))
+                )
+                returned = await asyncio.wait_for(call_task, timeout=5.0)
+                assert returned == call_id
+            finally:
+                in_call.set()
+                for task in list(adapter._call_tasks.get(call_id or "", set())):
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(task, timeout=5.0)
+
+    connected = _one_event_record(caplog, "outbound_call_connected")
+    assert _event_field(connected, "call_id") == call_id
+    assert _event_field(connected, "transport") == "webrtc"
+    codec = _event_field(connected, "codec")
+    assert isinstance(codec, str)
+    assert codec.lower() == "opus", "connected event must carry the negotiated codec"
+    # The invite_sent event fired for the same attempt; no failure on a connect.
+    sent = _one_event_record(caplog, "outbound_invite_sent")
+    assert _event_field(sent, "call_id") == call_id
+    assert not _records_with_event(caplog, "outbound_call_failed")

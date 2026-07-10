@@ -255,8 +255,10 @@ def _rtcp_active_engine() -> MagicMock:
     """A fake media engine that DID activate RTCP, with a populated CallQuality."""
     quality = MagicMock(
         local_fraction_lost=0.01,
+        local_cumulative_lost=3,
         local_jitter_ms=4.5,
         remote_fraction_lost=0.02,
+        remote_cumulative_lost=7,
         remote_jitter_ms=6.5,
         rtt_seconds=0.12,
     )
@@ -296,10 +298,30 @@ async def test_teardown_emits_structured_rtcp_call_quality_event(
     rec = _record_with_event(caplog, "rtcp_call_quality")
     assert rec.call_id == call_id  # type: ignore[attr-defined]
     assert rec.local_fraction_lost == 0.01  # type: ignore[attr-defined]
+    assert rec.local_cumulative_lost == 3  # type: ignore[attr-defined]
     assert rec.local_jitter_ms == 4.5  # type: ignore[attr-defined]
     assert rec.remote_fraction_lost == 0.02  # type: ignore[attr-defined]
+    assert rec.remote_cumulative_lost == 7  # type: ignore[attr-defined]
     assert rec.remote_jitter_ms == 6.5  # type: ignore[attr-defined]
     assert rec.rtt_seconds == 0.12  # type: ignore[attr-defined]
+    # Redaction (rule 34 / ADR-0084): the event's CUSTOM structured extras — vars(rec)
+    # minus stdlib LogRecord metadata and the rendered `message` — must be EXACTLY the
+    # fixed set (call_id + the numeric quality metrics, including the cumulative-loss
+    # counters). Computing the custom set (not filtering to allowed keys) means a
+    # leaked field (remote_host/caller/...) fails.
+    standard = set(vars(logging.makeLogRecord({}))) | {"message"}
+    custom = {k for k in vars(rec) if k not in standard}
+    assert custom == {
+        "event",
+        "call_id",
+        "local_fraction_lost",
+        "local_cumulative_lost",
+        "local_jitter_ms",
+        "remote_fraction_lost",
+        "remote_cumulative_lost",
+        "remote_jitter_ms",
+        "rtt_seconds",
+    }, f"unexpected structured field(s) on the event: {custom}"
     # A healthy call emits the quality record but NO anomaly event (bk1295/ADR-0102).
     assert not [
         r
@@ -360,10 +382,13 @@ async def test_teardown_emits_one_way_audio_event(
     rec = _record_with_event(caplog, "one_way_audio")
     assert rec.call_id == call_id  # type: ignore[attr-defined]
     assert rec.reason == "no_inbound_rtp"  # type: ignore[attr-defined]
+    assert rec.local_cumulative_lost is None  # type: ignore[attr-defined]
+    assert rec.remote_cumulative_lost == 0  # type: ignore[attr-defined]
     # Redaction (rule 34 / ADR-0084): the event's CUSTOM structured extras — vars(rec)
     # minus stdlib LogRecord metadata and the rendered `message` — must be EXACTLY the
-    # fixed set (call_id + reason + numeric metrics). Computing the custom set (not
-    # filtering to allowed keys) means a leaked field (remote_host/caller/...) fails.
+    # fixed set (call_id + reason + numeric metrics, including the cumulative-loss
+    # counters). Computing the custom set (not filtering to allowed keys) means a
+    # leaked field (remote_host/caller/...) fails.
     standard = set(vars(logging.makeLogRecord({}))) | {"message"}
     custom = {k for k in vars(rec) if k not in standard}
     assert custom == {
@@ -371,7 +396,9 @@ async def test_teardown_emits_one_way_audio_event(
         "call_id",
         "reason",
         "local_fraction_lost",
+        "local_cumulative_lost",
         "remote_fraction_lost",
+        "remote_cumulative_lost",
         "local_jitter_ms",
         "remote_jitter_ms",
     }, f"unexpected structured field(s) on the event: {custom}"

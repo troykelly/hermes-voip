@@ -1279,7 +1279,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 ### UX / conversational
 
-- [ ] **[medium] ux** — A spoke-but-untranscribed caller should get a "didn't catch that" reprompt instead of silence followed by "Are you still there?". (`src/hermes_voip/media/call_loop.py`)
+- [ ] **[medium] ux** — A spoke-but-untranscribed caller should get a "didn't catch that" reprompt instead of silence followed by "Are you still there?". (`src/hermes_voip/media/call_loop.py`) **Wave-3 attempt DROPPED (block+block):** the reprompt MUST be spoken NON-BLOCKING — the attempt `await`ed it inline on the ASR pump (`call_loop.py:1385`), the sole `audio_q` consumer, blocking it for seconds; mirror the no-input-watchdog reprompt's non-blocking scheduling. Config `_parse_didnt_catch_phrases` must support an explicit empty-set opt-out AND reject (not silently drop) blank members. Set `_caller_active_in_window=True` so the generic watchdog does not double-fire. Do NOT write an ADR (the attempt's ADR-0108 over-engineered a medium UX knob).
 
 ### Product features
 
@@ -1559,13 +1559,19 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
   (`_binding_uri` Contact matching), and `transport/connection.py` (Contact/Record-Route target): the
   quoted-`<...>` display-name desync (the #439 defect family) is now closed in the identity/registration/
   in-dialog paths, and tag extraction is restricted to the post-`>` trailing.
-- [ ] **[high] correctness/security** — Fully quote-safe `;`-param / `;tag=` split in the SIP identity sites.
-  #448 restricted the tag search to the `find_name_addr` trailing, but `manager._tag` (`_TAG_PARAM`) and
-  `connection._has_to_tag` (`_TO_TAG_PARAM`) still regex-search that trailing un-quote-aware, so a `;tag=`
-  inside a quoted generic-param value (`<sip:a>;g=";tag=fake";tag=real`) desyncs (codex review on #448). The
-  same class is in `message.py:224` (`_after_angle`, which can also suppress our real To-tag when BUILDING a
-  response) and `call_context._display_name/_addr_spec`. Consolidate all onto a shared quote-aware `;`-split
-  (promote `dialog._split_semicolons` to `_name_addr.py`), with per-site red tests.
+- [x] **[high] correctness/security** (#450) — Fully quote-safe `;`-param / `;tag=` split in the SIP identity
+  sites. Consolidated `manager._tag`, `connection._has_to_tag`, `ws_connection._has_to_tag`, `message`
+  (To-tag minting), `call_context._display_name/_addr_spec`, and `dialog._uri_and_tag` onto shared quote-aware
+  primitives in `_name_addr.py` (`name_addr_parts`/`find_name_addr`/`split_params`/`tag_param`/
+  `params_after_addr`). A forged `;tag=` inside a quoted generic-param or a quoted display-name (incl. before
+  an unterminated `<`, and with backslash-escaped quotes) no longer desyncs the addr-spec or forges a dialog
+  tag; empty `;tag=` is rejected. codex (orchestrator-run, in-workflow codex was sandbox-blocked) found + this
+  PR closed the None-fallback / escape / 5th-site gaps over 3 review rounds.
+- [ ] **[high] correctness/security** — `tag_param` (`_name_addr.py`) still accepts a QUOTED tag value
+  (`;tag="fake"`, `;tag=""`) — a pre-existing leniency (the old `_TAG_PARAM` regex accepted it too) that fails
+  CLOSED (a quoted tag misclassifies→rejects; it does not forge a matching dialog tag). Tighten `tag_param` to
+  validate the value against the strict SIP `token` grammar (RFC 3261) and reject quoted/non-token tags —
+  WITHOUT over-rejecting valid-but-unusual tags real gateways send. (codex round-3 follow-up on #450)
 - [ ] **[medium] test** — Prove an outbound call *carrying an objective* still emits its objective first
   turn via `_inject_objective_first_turn` while the greeting is suppressed (`adapter.py`; #443's e2e covers
   only the no-objective outbound case). [follow-up from #443]

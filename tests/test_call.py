@@ -677,6 +677,23 @@ async def test_transfer_rejected_raises() -> None:
         await task
 
 
+async def test_transfer_redirect_3xx_rejected_raises() -> None:
+    # A REFER 3xx redirect is NOT an acceptance: SIP success is 2xx only (RFC 3261
+    # §21), so a 302 must raise CallError like any non-2xx final — never proceed into
+    # the outcome wait and falsely report OUTCOME_UNKNOWN/"initiated". _refer rejects
+    # ``>= _FIRST_ERROR_STATUS`` (300), so this holds; pin it against regression.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(session.transfer_blind("sip:3000@pbx.example.test"))
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    await session.on_response(
+        SipResponse.parse(build_response(refer, 302, "Moved Temporarily"))
+    )
+    with pytest.raises(CallError, match="REFER rejected"):
+        await task
+
+
 # ---- outbound: transfer outcome wait (ADR-0109) ----------------------------
 
 

@@ -391,6 +391,20 @@ _DEFAULT_NO_INPUT_REPROMPT_PHRASES: tuple[str, ...] = (
     "Sorry, I can't hear anything. Are you still there?",
 )
 
+# Pipe-separated "didn't catch that" reprompt set (item 1282), spoken when a caller
+# speaks but ASR returns an empty final. UNLIKE the no-input set: a present-but-empty
+# value OPTS OUT (empty set), and a blank member is REJECTED (not silently dropped) —
+# see _parse_didnt_catch_phrases.
+_DIDNT_CATCH_PHRASES_KEY = "HERMES_VOIP_DIDNT_CATCH_PHRASES"
+# The built-in English "didn't catch that" set — MUST exactly match
+# _DEFAULT_DIDNT_CATCH_PHRASES in media/call_loop.py so behaviour is unchanged when the
+# env var is unset.
+_DEFAULT_DIDNT_CATCH_PHRASES: tuple[str, ...] = (
+    "Sorry, I didn't catch that.",
+    "Sorry, I didn't quite catch that — could you say it again?",
+    "I didn't get that. Could you repeat it?",
+)
+
 # Spoken goodbye on a loop-initiated graceful end (ADR-0057). When ON (the default),
 # the call loop speaks ``goodbye_phrase`` and flushes it BEFORE run() returns, so the
 # caller hears a clean closing line rather than a silent BYE. NOT spoken on a
@@ -1241,6 +1255,10 @@ class MediaConfig:
     no_input_timeout_ms: int = _DEFAULT_NO_INPUT_TIMEOUT_MS
     no_input_max_reprompts: int = _DEFAULT_NO_INPUT_MAX_REPROMPTS
     no_input_reprompt_phrases: tuple[str, ...] = _DEFAULT_NO_INPUT_REPROMPT_PHRASES
+    # "Didn't catch that" reprompt set (item 1282), spoken when a caller speaks but ASR
+    # returns an empty final. An EMPTY tuple opts out. MUST match call_loop's
+    # _DEFAULT_DIDNT_CATCH_PHRASES. ``HERMES_VOIP_DIDNT_CATCH_PHRASES``.
+    didnt_catch_phrases: tuple[str, ...] = _DEFAULT_DIDNT_CATCH_PHRASES
     # Spoken goodbye on a loop-initiated graceful end (ADR-0057). When True (the
     # default), the loop speaks ``goodbye_phrase`` before run() returns so the caller
     # hears a clean closing line. The phrase MUST exactly match call_loop.py's
@@ -1487,6 +1505,11 @@ class MediaConfig:
             raise ConfigError(msg)
         if any(not phrase.strip() for phrase in self.no_input_reprompt_phrases):
             msg = "no_input_reprompt_phrases must not contain a blank phrase"
+            raise ConfigError(msg)
+        # didnt_catch_phrases MAY be empty (opt-out), but must carry no blank member — a
+        # blank reprompt is a silent no-op (item 1282).
+        if any(not phrase.strip() for phrase in self.didnt_catch_phrases):
+            msg = "didnt_catch_phrases must not contain a blank phrase"
             raise ConfigError(msg)
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
@@ -1856,6 +1879,7 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
             env, _MAX_CONSECUTIVE_REFUSE_KEY, _DEFAULT_MAX_CONSECUTIVE_REFUSALS
         ),
         no_input_reprompt_phrases=_parse_no_input_reprompt_phrases(env),
+        didnt_catch_phrases=_parse_didnt_catch_phrases(env),
         goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),
         goodbye_phrase=_parse_goodbye_phrase(env),
         # #1297 / ADR-0106: bounded agent-hangup farewell drain + arrival grace.
@@ -2399,6 +2423,38 @@ def _parse_no_input_reprompt_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
         part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP) if part.strip()
     )
     return phrases or _DEFAULT_NO_INPUT_REPROMPT_PHRASES
+
+
+def _parse_didnt_catch_phrases(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Parse the ``|``-separated "didn't catch that" reprompt set (item 1282).
+
+    UNLIKE :func:`_parse_no_input_reprompt_phrases`, this distinguishes three cases so
+    an operator can positively opt out AND cannot ship a malformed set:
+
+    * UNSET (key absent) → the built-in default set (feature ON, behaviour unchanged);
+    * present-but-EMPTY / all-whitespace → the EMPTY set, which OPTS the feature OUT
+      (the empty final is then just dropped, as before item 1282);
+    * a non-empty value with a BLANK member (a doubled / leading / trailing ``|``) is
+      REJECTED with a :class:`ConfigError` — a blank reprompt is a silent no-op that
+      almost certainly means a typo, so it is a hard error, not a silent drop.
+
+    Members are trimmed. ``key`` absent is distinguished from present-but-blank via
+    ``env.get`` returning ``None`` vs ``""`` (the same discipline as
+    :func:`_parse_greeting`).
+    """
+    raw = env.get(_DIDNT_CATCH_PHRASES_KEY)
+    if raw is None:  # key absent → built-in default (feature ON)
+        return _DEFAULT_DIDNT_CATCH_PHRASES
+    if not raw.strip():  # present-but-empty → explicit opt-out
+        return ()
+    phrases = tuple(part.strip() for part in raw.split(_COMFORT_FILLER_PHRASE_SEP))
+    if any(not phrase for phrase in phrases):
+        msg = (
+            f"{_DIDNT_CATCH_PHRASES_KEY} must not contain a blank phrase "
+            "(a doubled / leading / trailing '|'); set it empty to disable the reprompt"
+        )
+        raise ConfigError(msg)
+    return phrases
 
 
 def _parse_refuse_decline_phrases(

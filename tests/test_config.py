@@ -21,6 +21,7 @@ from hermes_voip.config import (
     load_media_config,
 )
 from hermes_voip.media.call_loop import (
+    _DEFAULT_DIDNT_CATCH_PHRASES,
     _DEFAULT_GOODBYE_PHRASE,
     _DEFAULT_NO_INPUT_MAX_REPROMPTS,
     _DEFAULT_NO_INPUT_REPROMPT,
@@ -2415,6 +2416,40 @@ def test_no_input_reprompt_phrases_blank_falls_back_to_default() -> None:
     # Falls back to the built-in default (same as unset).
     assert "Are you still there?" in cfg.no_input_reprompt_phrases
     assert len(cfg.no_input_reprompt_phrases) > 1
+
+
+# --- item 1282: "didn't catch that" reprompt phrase set -------------------------
+#
+# Unlike the no-input set (which drops blank members and falls back to a default), the
+# didn't-catch parser distinguishes UNSET (→ built-in default, feature ON) from an
+# explicit-empty value (→ opt-out), and REJECTS a blank member rather than dropping it.
+
+
+def test_didnt_catch_phrases_unset_defaults_on() -> None:
+    """Unset HERMES_VOIP_DIDNT_CATCH_PHRASES → the built-in default set (feature ON)."""
+    cfg = load_media_config({})
+    assert cfg.didnt_catch_phrases == _DEFAULT_DIDNT_CATCH_PHRASES
+    assert cfg.didnt_catch_phrases, "the default set must be non-empty (feature ON)"
+
+
+def test_didnt_catch_phrases_pipe_separated() -> None:
+    """HERMES_VOIP_DIDNT_CATCH_PHRASES is parsed as a trimmed pipe-separated set."""
+    cfg = load_media_config(
+        {"HERMES_VOIP_DIDNT_CATCH_PHRASES": "Sorry? | Come again? "}
+    )
+    assert cfg.didnt_catch_phrases == ("Sorry?", "Come again?")
+
+
+def test_didnt_catch_phrases_explicit_empty_opts_out() -> None:
+    """A present-but-empty value opts the feature OUT (empty set), not the default."""
+    cfg = load_media_config({"HERMES_VOIP_DIDNT_CATCH_PHRASES": ""})
+    assert cfg.didnt_catch_phrases == ()
+
+
+def test_didnt_catch_phrases_rejects_blank_member() -> None:
+    """A blank pipe member is REJECTED (not silently dropped like the no-input set)."""
+    with pytest.raises(ConfigError, match="HERMES_VOIP_DIDNT_CATCH_PHRASES"):
+        load_media_config({"HERMES_VOIP_DIDNT_CATCH_PHRASES": "Sorry?||Come again?"})
 
 
 def test_refuse_decline_phrases_default_matches_call_loop() -> None:

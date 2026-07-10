@@ -5570,6 +5570,7 @@ class VoipAdapter(BasePlatformAdapter):
             no_input_max_reprompts=media_cfg.no_input_max_reprompts,
             max_consecutive_refusals=media_cfg.max_consecutive_refusals,
             no_input_reprompt_phrases=media_cfg.no_input_reprompt_phrases,
+            didnt_catch_phrases=media_cfg.didnt_catch_phrases,
             goodbye=media_cfg.goodbye,
             goodbye_phrase=media_cfg.goodbye_phrase,
             # Safe-decline line on a guard REFUSE (ADR-0076): a caller the injection

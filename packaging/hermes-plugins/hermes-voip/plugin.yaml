@@ -385,6 +385,9 @@ optional_env:
   - name: HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES
     description: "Pipe-separated (|) no-input reprompt phrase override; blank/unset uses the built-in English set."
     prompt: "No-input reprompt phrase override, pipe-separated (optional)"
+  - name: HERMES_VOIP_DIDNT_CATCH_PHRASES
+    description: "Pipe-separated (|) 'didn't catch that' reprompt override, spoken when a caller speaks but ASR cannot transcribe it; unset uses the built-in English set, an explicit empty value disables the reprompt, and a blank member is rejected."
+    prompt: "'Didn't catch that' reprompt override, pipe-separated (empty disables; optional)"
   - name: HERMES_VOIP_GOODBYE
     default: true
     description: "Speak a goodbye line and let it finish before a loop-initiated graceful call end (default: true). Not spoken on caller-hangup/error ends."

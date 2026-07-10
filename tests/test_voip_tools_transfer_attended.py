@@ -32,7 +32,9 @@ from hermes_voip.voip_tools import (
     TRANSFER_ATTENDED_TOOL_NAME,
     TRANSFER_ATTENDED_TOOL_SCHEMA,
     AttendedTransferOutcome,
+    AttendedTransferResult,
     TransferOutcome,
+    TransferResult,
     set_active_adapter,
     transfer_attended_handler,
     voip_pre_tool_call,
@@ -42,21 +44,26 @@ from hermes_voip.voip_tools import (
 class _FakeHost:
     """A fake ``VoipToolHost`` for the attended-transfer tool: records each step."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — a test fake wiring up several independent, keyword-only outcome knobs (guard/allowed/consult-id/complete-outcome + ADR-0109 notify status/reason/timeout/cancelled)
         self,
         *,
         guard: GuardSessionState | None = None,
         allowed: bool = True,
         consult_id: str = "consult-1",
-        complete_outcome: AttendedTransferOutcome = (
-            AttendedTransferOutcome.TRANSFERRED
-        ),
+        complete_outcome: AttendedTransferOutcome = (AttendedTransferOutcome.COMPLETED),
+        complete_notify_status: int | None = None,
+        complete_notify_reason: str | None = None,
+        complete_timeout_secs: float | None = None,
         cancelled: bool = True,
     ) -> None:
         self._guard = guard
         self._allowed = allowed
         self._consult_id = consult_id
         self._complete_outcome = complete_outcome
+        # ADR-0109: the terminal NOTIFY detail + bounded wait the result carries.
+        self._complete_notify_status = complete_notify_status
+        self._complete_notify_reason = complete_notify_reason
+        self._complete_timeout_secs = complete_timeout_secs
         self._cancelled = cancelled
         self.consulted: list[tuple[str, str]] = []
         self.completed: list[str] = []
@@ -71,9 +78,14 @@ class _FakeHost:
         self.consulted.append((call_id, target))
         return self._consult_id
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
         self.completed.append(call_id)
-        return self._complete_outcome
+        return AttendedTransferResult(
+            outcome=self._complete_outcome,
+            notify_status=self._complete_notify_status,
+            notify_reason=self._complete_notify_reason,
+            timeout_secs=self._complete_timeout_secs,
+        )
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:
         self.cancelledcalls.append(call_id)
@@ -111,10 +123,8 @@ class _FakeHost:
     async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         return True
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
-        return TransferOutcome.TRANSFERRED
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
+        return TransferResult(outcome=TransferOutcome.COMPLETED)
 
 
 @pytest.fixture(autouse=True)
@@ -271,7 +281,7 @@ async def test_complete_sends_the_refer_replaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """action=complete bridges the caller to the target (REFER+Replaces)."""
-    host = _FakeHost(complete_outcome=AttendedTransferOutcome.TRANSFERRED)
+    host = _FakeHost(complete_outcome=AttendedTransferOutcome.COMPLETED)
     set_active_adapter(host)
     _set_chat(monkeypatch, "orig-call")
 
@@ -436,7 +446,7 @@ class _RaisingCompleteHost(_FakeHost):
         super().__init__()
         self._exc = exc
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
         raise self._exc
 
 

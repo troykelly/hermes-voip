@@ -34,8 +34,10 @@ from hermes_voip.voip_tools import (
     SEND_DTMF_TOOL_NAME,
     TRANSFER_BLIND_TOOL_NAME,
     AttendedTransferOutcome,
+    AttendedTransferResult,
     ProactiveDenyReason,
     TransferOutcome,
+    TransferResult,
     _voip_owned_platforms,
     place_call_handler,
     report_call_result_handler,
@@ -99,16 +101,14 @@ class _FakeHost:
     async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         return True
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
-        return TransferOutcome.TRANSFERRED
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
+        return TransferResult(outcome=TransferOutcome.COMPLETED)
 
     async def start_attended_consult(self, call_id: str, target: str) -> str:
         return ""
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
-        return AttendedTransferOutcome.TRANSFERRED
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
+        return AttendedTransferResult(outcome=AttendedTransferOutcome.COMPLETED)
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:
         return True

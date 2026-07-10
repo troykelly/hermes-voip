@@ -698,7 +698,7 @@ These span multiple modules or the repo as a whole.
 - [x] **[medium] api/consistency** — **`typing.Final` on module constants is inconsistent.**
   `media/audio.py` annotates public constants with `Final`; `dtmf.py`/`rtp.py` do not. Adopt `Final`
   uniformly for mutation-resistance and consistency. — shipped #297
-- [ ] **[medium] correctness/consistency** (partial — residual: audioop.error not wrapped/documented as propagating.) — **Exception-type contract is inconsistent across the
+- [x] **[medium] correctness/consistency** (done — the named residual, `audioop.error` from media/audio decode/resample, is now wrapped as `ValueError` with `__cause__` and documented: shipped #262; the reason-less `AttributeError` half was fixed earlier) — **Exception-type contract is inconsistent across the
   foundation.** Some guards raise `ValueError`/`SdpError`, others leak `AttributeError` (message.py
   reason-less status) or `audioop.error` (media/audio decode/resample). Define and document one coherent
   exception contract per layer (parse layers raise `ValueError`/domain errors on hostile input; never leak
@@ -708,7 +708,7 @@ These span multiple modules or the repo as a whole.
   and `DtmfEvent` validate in `__init__`/`__post_init__`; `Resampler` (rates), `DtmfReceiver` (history),
   `RegistrationConfig` (aor/transport/expires), and `PcmFrame` (length/rate) do not — deferring failures
   to deep, mid-call sites. Standardise fail-fast construction across the foundation.
-- [ ] **[medium] api/consistency** (partial — residual: provider Protocols/types (PcmFrame, MediaTransport, AsrProvider, TtsProvider, GuardProvider) and media codecs are still deep-import only; no) — **Public-import discoverability.** Only `sip_address_of_record` is
+- [x] **[medium] api/consistency** (done — all named provider Protocols/types are now exported at the package top level: PcmFrame/StreamingASR/StreamingTTS/InjectionGuard/Providers via #324, and the last one, MediaTransport, via #441) — **Public-import discoverability.** Only `sip_address_of_record` is
   exported from `hermes_voip/__init__.py`; `RegistrationFlow`, the provider Protocols/types, and the media
   codecs are reachable only via deep paths and are untested at the package boundary. Decide a deliberate
   public surface and pin it with import tests.
@@ -838,7 +838,7 @@ These span multiple modules or the repo as a whole.
 
 ## src/hermes_voip/media/call_loop.py
 
-- [ ] **[medium] test** — Add REFUSE-verdict caller-activity tests to `CallLoop` (two mutation-surviving
+- [ ] **[medium] test** (partial — the `_caller_active_in_window` half shipped #359 as `test_no_input_watchdog_resets_on_refuse_verdict`; residual = the comfort-filler-must-NOT-be-scheduled-on-REFUSE assertion, test-only in tests/test_call_loop.py) — Add REFUSE-verdict caller-activity tests to `CallLoop` (two mutation-surviving
   paths). In `_screen_and_deliver` (`call_loop.py:2015-2027`): (1) line 2017 sets `_caller_active_in_window
   = True` even on REFUSE — a mutant omitting this assignment would silently trigger spurious reprompts; (2)
   the `if result.verdict is not GuardVerdict.REFUSE:` guard (line 2020) prevents `_schedule_comfort_filler`
@@ -984,7 +984,7 @@ These span multiple modules or the repo as a whole.
   The existing backlog entry (line 512) is now stale — `Providers`/`build_providers` ARE re-exported; the
   remaining gap is the Protocol+type surface. Fix: re-export all ADR-0004 public names from
   `providers/__init__.py` and add a package-boundary import test.
-- [ ] **[medium] api** — `hermes_voip` top-level missing config and provider types; accidental submodule names
+- [x] **[medium] api** (done: #324 — MediaConfig/GatewayConfig/ConfigError/Providers/build_providers/PcmFrame/StreamingASR/StreamingTTS/InjectionGuard now exported at top level, pinned in tests/test_init_exports.py) — `hermes_voip` top-level missing config and provider types; accidental submodule names
   leak into the namespace. `import hermes_voip; dir(hermes_voip)` shows sub-module objects (`caller_modes`,
   `config`, `digest`, `message`, `plugin`, `registration`, `sip`) leaking because those modules have no `__all__`
   and are imported transitively. Meanwhile `MediaConfig`, `GatewayConfig`, `ConfigError`, `Providers`,
@@ -1072,7 +1072,9 @@ These span multiple modules or the repo as a whole.
 
 - **2026-06-23**: 44 new items above were discovered by the Wave-1 `/orchestrate` autonomous gap-review
   (ADR-0072). The review fanned out across 11 of 12 dimensions; the `performance` dimension's agent failed
-  with an API error (HTTP 200, empty/malformed response) and its dimension still needs a re-run. Items already
+  with an API error (HTTP 200, empty/malformed response). That performance/efficiency dimension has since
+  been re-reviewed in later waves (the 2026-06-27 perf items and subsequent gap-reviews through 2026-07-10),
+  so it no longer needs a re-run. Items already
   tracked in this backlog before this date (12 items, primarily DTMF encode/boundary vectors, jitter-buffer
   payload fidelity, resampler 24 kHz paths, and digest quoting assertions) were deduplicated and not
   re-appended. The `backlog.md preamble is stale` docs-drift finding was resolved in-place (preamble rewrite
@@ -1221,7 +1223,7 @@ These span multiple modules or the repo as a whole.
 Tracked as GitHub issues #239–#244; resolved in PRs #253–#254.  The items
 below were not in the backlog before the issues were filed.
 
-- [x] (#254) **[medium] packaging** — `[webrtc]` extra pins `websockets==16.0`, conflicting with Hermes's own pin of 15.0.1 (issue #240). Relax to `websockets>=15.0,<17` so Hermes and hermes-voip can co-install; note the stable API surface used (connect/subprotocols/max_size/ping_interval). ADR-0083 records the constraint policy (`pyproject.toml`, `uv.lock`, `docs/adr/0083-extra-dependency-constraint-policy.md`).
+- [x] (#254) **[medium] packaging** — `[webrtc]` extra pins `websockets==16.0`, conflicting with Hermes's own pin of 15.0.1 (issue #240). Relax to `websockets>=15.0,<17` so Hermes and hermes-voip can co-install; note the stable API surface used (connect/subprotocols/max_size/ping_interval). ADR-0083 records the constraint policy (`pyproject.toml`, `uv.lock`, `docs/adr/0083-relax-extra-deps-to-compatible-ranges.md`).
 - [x] (#254) **[medium] packaging** — `[media]` extra pins `cryptography==48.0.1`, conflicting with co-installed packages that require `<47` (issue #241). Relax to `cryptography>=46.0.7,<49` (floor = CVE-2026-39892/-34073 patch; ceiling keeps pyopenssl 26.2.0 satisfiable); only AES-CTR hazmat is used (`pyproject.toml`, ADR-0083).
 - [x] (#254) **[medium] packaging** — `[ml]` extra pins `onnxruntime==1.24.4` which has no macOS py3.13 wheel (issue #239). Add `; sys_platform != 'darwin'` marker so macOS users relying on sherpa-onnx's self-bundled onnxruntime are not broken (`pyproject.toml`, ADR-0083).
 - [x] (#253) **[low] docs** — `docs/runbooks/0011-voip-enable-plugin.md` did not explain that `hermes plugins enable/list` uses filesystem discovery only and never consults `importlib.metadata` entry-points (issue #244, upstream NousResearch/hermes-agent#23802). Cross-reference added.
@@ -1529,3 +1531,77 @@ and merged this wave. The pass otherwise re-confirmed the dimensions above as cl
   `extra={event: ice_pair_nominated, call_id, candidate_type}`, wired from both
   `WebRtcMediaSession` construction sites. (`src/hermes_voip/media/ice.py`,
   `src/hermes_voip/media/webrtc_session.py`, `src/hermes_voip/adapter.py`)
+
+## Gap-review wave 2026-07-09/10 (ADR-0072 autonomous loop)
+
+A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 candidate items.
+
+**Shipped this wave** (all TDD, cross-vendor codex + cross-tier Claude review, full gate + CI green):
+
+- [x] **[medium] correctness** (#439) — Quote-aware SIP angle-addr locator: a name-addr whose quoted
+  display-name contains `<`/`>` no longer desyncs addr-spec/tag extraction (it was rejecting valid inbound
+  INVITE/2xx and corrupting REFER transfer targets). New shared `src/hermes_voip/_name_addr.py`;
+  `dialog.py`/`refer.py` migrated off the naive `<([^>]*)>` regex. #439
+- [x] **[medium] test** (#440) — Cover the hanging-transport branch of `RegistrationManager.aclose`'s bounded
+  `asyncio.wait_for` de-register (a stuck/slow transport must never strand shutdown). #440
+- [x] **[low] api** (#441) — Export `MediaTransport` from the `hermes_voip` top-level `__all__` (closes the
+  bk711 provider-Protocol residual). #441
+- [x] **[medium] operability** (#442) — `plugin.yaml` now advertises `HERMES_VOIP_REQUIRE_SECURE_MEDIA` + the
+  other operator knobs and the minimum-Python floor, guarded by a manifest-vs-config drift test that also
+  guards its own vacuousness. #442
+- [x] **[medium] correctness** (#443) — Outbound calls no longer play the inbound greeting on answer
+  (ADR-0019: the agent's objective opens an outbound call, not a canned greeting). #443
+
+**Discovered but not shipped this wave** (new tracked work):
+
+- [ ] **[high] correctness/security** — Migrate the naive `<([^>]*)>` angle-addr regex to the new shared
+  `find_name_addr` helper in `manager.py:851` (`_addr_spec` / To-user extraction), `registration.py:103`
+  (`_binding_uri` Contact matching), `transport/connection.py:1100` (Contact/Record-Route target), AND fix
+  `manager.py:227 _TAG_PARAM` (un-quote-aware `;tag` search) — the same quoted-bracket desync/injection
+  family #439 closed only in `dialog.py`/`refer.py`. (identity/registration-adjacent) [follow-up from #439]
+- [ ] **[medium] test** — Prove an outbound call *carrying an objective* still emits its objective first
+  turn via `_inject_objective_first_turn` while the greeting is suppressed (`adapter.py`; #443's e2e covers
+  only the no-objective outbound case). [follow-up from #443]
+- [ ] **[medium] efficiency** (needs ADR — dropped this wave) — SRTP/SRTCP `protect`/`unprotect` big-int
+  XOR (`srtp.py:764/:837`, `srtcp.py:489/:556`): ~11x on the XOR step, but the XOR is NOT the media
+  bottleneck (the AES-CTR C backend dominates). A cross-vendor (codex) review **blocked** the naive big-int
+  swap as a timing side-channel (CPython bigint XOR limb-count varies with operand leading-zero structure;
+  the per-byte generator is more uniform). Needs a Proposed ADR deciding whether a constant-time requirement
+  applies to the media XOR step (payload = confidential audio) before optimizing — do NOT re-attempt as a
+  drive-by.
+- [ ] **[low] robustness/ux** (redo carefully — dropped this wave) — Empty-sanitized agent reply
+  (emoji/URL/markdown-only) → dead air; speak a fallback (`call_loop.py:492-503`). The wave attempt was
+  dropped: cross-vendor review found 3 HIGH concurrency defects (supersession must compare stream IDENTITY
+  not `is not None`; the up-front sanitized-chunk drain must run AFTER registering the new stream +
+  cancelling the old, not before; skip `synthesize()` entirely on an empty iterator) AND it shipped rule-27
+  aspirational docs. Redo as a dedicated opus lane: fix the concurrency issues, wire a REAL
+  `_EMPTY_REPLY_FALLBACK_PHRASES_BY_LANGUAGE` + parser + adapter (mirror comfort/refuse), guard the empty
+  phrase-set (no `IndexError`), and write NO aspirational docs.
+- [ ] **[medium] robustness** — Bound the inbound-call context block before injecting it into the agent
+  session (`call_context.py` renders Diversion/History-Info/User-Agent unbounded; `adapter.py` injects it;
+  the outbound path already caps at 600 chars).
+- [ ] **[low] security** — `render_call_context_block` does not collapse interior newlines in
+  caller-supplied SIP fields (`call_context._defang` neutralises only the `<<</>>>` fences, unlike
+  `adapter._defang_identity`'s `' '.join(value.split())`); a bare LF in a header value can inject a forged
+  `- Label: value` line into the untrusted ADR-0052 context block. Can be combined with the bound-context
+  item as one `call_context.py` lane.
+- [ ] **[low] observability** — `rtcp_call_quality` structured log drops
+  `CallQuality.local/remote_cumulative_lost` (`adapter.py:5829-5837` + `media_anomaly` at `:5851`;
+  `tests/test_adapter_observability.py:369-377` pins the field set). Add the two fields + update the
+  assertions.
+- [ ] **[medium] docs** — `docs/runbooks/0014-voip-slo-metrics.md` §Registration uptime documents only the
+  plain-text grep method and lists `voip.registration.*` as "future", but `manager.py` already emits the
+  `sip_registration_established` / `_refreshed` / `_failed` / `_response_uncorrelated` structured events
+  (#274). Document them with a `jq` example (verify the exact `extra=` field names against `manager.py`
+  first — rule 27).
+- [ ] **[medium] docs** — README lacks PyPI install docs / two-install-models / pre-release-flag guidance.
+  Before writing any `pip install <dist-name>` instruction, verify the package is actually published to
+  PyPI (else word it "once the first PyPI release lands" — rule 27).
+- [ ] **[low] docs** — README minimum-Python-version line ("Python 3.13+ required"); the `plugin.yaml` half
+  shipped #442.
+- [ ] **[low] operability/docs** — Release-process docs: automate runbook-0019's manual per-release
+  test-version file rename; add "always tag from `main`" guidance to `publish.yml` / runbook-0019.
+- [ ] **[low] feature** — Music/comfort-on-hold: ADR-0011 promises MOH ("Hold gates the RTP send
+  (MOH/silence)") but the held caller gets silence (`call.py` `hold()` → `set_hold(True)`); real UX gap
+  during attended-transfer consult. Shippable local-only behind a new `HERMES_VOIP_HOLD_AUDIO` env
+  (default off = current silence behaviour preserved).

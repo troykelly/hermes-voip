@@ -28,8 +28,8 @@ import pytest
 
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.voip_tools import (
-    AttendedTransferOutcome,
-    TransferOutcome,
+    AttendedTransferResult,
+    TransferResult,
     hang_up_handler,
     hold_call_handler,
     list_registrations_handler,
@@ -99,9 +99,7 @@ class _ExplodingHost:
     async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         raise _SyntheticHostError(_BOOM)
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
         raise _SyntheticHostError(_BOOM)
 
     # ADR-0048 VoipToolHost members (attended transfer): present so the host
@@ -110,7 +108,7 @@ class _ExplodingHost:
     async def start_attended_consult(self, call_id: str, target: str) -> str:
         raise _SyntheticHostError(_BOOM)
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
         raise _SyntheticHostError(_BOOM)
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:

@@ -28,11 +28,14 @@ import pytest
 
 from hermes_voip.originate import OutboundCallFailed, OutboundCallNotAllowed
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import TransferUnknownReason
 from hermes_voip.voip_tools import (
     TRANSFER_ATTENDED_TOOL_NAME,
     TRANSFER_ATTENDED_TOOL_SCHEMA,
     AttendedTransferOutcome,
+    AttendedTransferResult,
     TransferOutcome,
+    TransferResult,
     set_active_adapter,
     transfer_attended_handler,
     voip_pre_tool_call,
@@ -42,21 +45,29 @@ from hermes_voip.voip_tools import (
 class _FakeHost:
     """A fake ``VoipToolHost`` for the attended-transfer tool: records each step."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — a test fake wiring up several independent, keyword-only outcome knobs (guard/allowed/consult-id/complete-outcome + ADR-0109 notify status/reason/timeout/cancelled)
         self,
         *,
         guard: GuardSessionState | None = None,
         allowed: bool = True,
         consult_id: str = "consult-1",
-        complete_outcome: AttendedTransferOutcome = (
-            AttendedTransferOutcome.TRANSFERRED
-        ),
+        complete_outcome: AttendedTransferOutcome = (AttendedTransferOutcome.COMPLETED),
+        complete_notify_status: int | None = None,
+        complete_notify_reason: str | None = None,
+        complete_timeout_secs: float | None = None,
+        complete_unknown_reason: TransferUnknownReason | None = None,
         cancelled: bool = True,
     ) -> None:
         self._guard = guard
         self._allowed = allowed
         self._consult_id = consult_id
         self._complete_outcome = complete_outcome
+        # ADR-0109: the terminal NOTIFY detail + bounded wait the result carries.
+        self._complete_notify_status = complete_notify_status
+        self._complete_notify_reason = complete_notify_reason
+        self._complete_timeout_secs = complete_timeout_secs
+        # ADR-0109 P2: the discriminated OUTCOME_UNKNOWN reason the message reflects.
+        self._complete_unknown_reason = complete_unknown_reason
         self._cancelled = cancelled
         self.consulted: list[tuple[str, str]] = []
         self.completed: list[str] = []
@@ -71,9 +82,15 @@ class _FakeHost:
         self.consulted.append((call_id, target))
         return self._consult_id
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
         self.completed.append(call_id)
-        return self._complete_outcome
+        return AttendedTransferResult(
+            outcome=self._complete_outcome,
+            notify_status=self._complete_notify_status,
+            notify_reason=self._complete_notify_reason,
+            timeout_secs=self._complete_timeout_secs,
+            unknown_reason=self._complete_unknown_reason,
+        )
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:
         self.cancelledcalls.append(call_id)
@@ -111,10 +128,8 @@ class _FakeHost:
     async def open_entry(self, call_id: str, name: str | None = None) -> bool:
         return True
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
-        return TransferOutcome.TRANSFERRED
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
+        return TransferResult(outcome=TransferOutcome.COMPLETED)
 
 
 @pytest.fixture(autouse=True)
@@ -271,7 +286,7 @@ async def test_complete_sends_the_refer_replaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """action=complete bridges the caller to the target (REFER+Replaces)."""
-    host = _FakeHost(complete_outcome=AttendedTransferOutcome.TRANSFERRED)
+    host = _FakeHost(complete_outcome=AttendedTransferOutcome.COMPLETED)
     set_active_adapter(host)
     _set_chat(monkeypatch, "orig-call")
 
@@ -293,6 +308,143 @@ async def test_complete_without_a_consult_is_a_clear_error(
     result = await transfer_attended_handler({"action": "complete"})
 
     assert "error" in json.loads(result)
+
+
+# --- ADR-0109: the terminal attended-transfer outcome surfaced to the agent --
+
+
+@pytest.mark.asyncio
+async def test_complete_completed_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A COMPLETED attended transfer (terminal 2xx NOTIFY) reports a success result."""
+    host = _FakeHost(complete_outcome=AttendedTransferOutcome.COMPLETED)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {
+        "result": "Caller connected to the consultation target."
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_failed_reports_status_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FAILED attended transfer surfaces the SIP status + reason as a tool error."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.FAILED,
+        complete_notify_status=486,
+        complete_notify_reason="Busy Here",
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {"error": "Transfer failed: 486 Busy Here."}
+
+
+@pytest.mark.asyncio
+async def test_complete_outcome_unknown_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OUTCOME_UNKNOWN attended transfer keeps the honest 'initiated' wording."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
+        complete_timeout_secs=20.0,
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {
+        "result": "Transfer initiated; outcome not confirmed within 20s."
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_unknown_timeout_reports_within(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OUTCOME_UNKNOWN TIMEOUT names the bounded wait (ADR-0109 P2)."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
+        complete_unknown_reason=TransferUnknownReason.TIMEOUT,
+        complete_timeout_secs=20.0,
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {
+        "result": "Transfer initiated; outcome not confirmed within 20s."
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_unknown_declined_reports_declined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declined RFC 4488 subscription reports no progress subscription (P2)."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
+        complete_unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
+        complete_timeout_secs=20.0,
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    expected = (
+        "Transfer initiated; the transfer response signalled no progress "
+        "subscription, so its final outcome was not reported."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_complete_unknown_call_ended_reports_call_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leg torn down before the outcome reports the call ended (ADR-0109 P2)."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
+        complete_unknown_reason=TransferUnknownReason.CALL_ENDED,
+        complete_timeout_secs=20.0,
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    expected = (
+        "Transfer initiated; the call ended before the transfer outcome was reported."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_complete_unknown_wait_disabled_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled outcome confirmation (timeout 0) reports only 'initiated' (P2)."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
+        complete_unknown_reason=TransferUnknownReason.WAIT_DISABLED,
+        complete_timeout_secs=0.0,
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {"result": "Transfer initiated."}
 
 
 # --- cancel -----------------------------------------------------------------
@@ -380,7 +532,7 @@ class _RaisingCompleteHost(_FakeHost):
         super().__init__()
         self._exc = exc
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
         raise self._exc
 
 

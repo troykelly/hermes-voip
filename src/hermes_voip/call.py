@@ -20,6 +20,7 @@ inbound re-INVITE is answered ``491 Request Pending`` (glare).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
@@ -57,6 +58,8 @@ from hermes_voip.refer import (
     NotifyProgress,
     ReferError,
     ReferRequest,
+    TransferOutcomeReport,
+    TransferUnknownReason,
     build_attended_refer,
     build_blind_refer,
     parse_notify_sipfrag,
@@ -239,6 +242,36 @@ class CallSession:
         self.on_hold = False
         self.ended = False
         self.transfer_progress: NotifyProgress | None = None
+        # ADR-0109: the per-transfer terminal-outcome signal. Armed (a fresh Event)
+        # by :meth:`_arm_transfer_outcome` BEFORE a REFER is sent, set by
+        # :meth:`_on_notify` on a terminated transfer NOTIFY — and also on call-end
+        # (BYE / hang_up) so an outcome wait wakes when the referrer leg is torn down.
+        # ``None`` until the first transfer arms it.
+        self._transfer_terminal: asyncio.Event | None = None
+        # ADR-0109 P1: the CSeq NUMBER of the REFER whose transfer is currently
+        # awaiting its outcome — the RFC 3515 implicit-subscription id a progress
+        # NOTIFY carries as ``Event: refer;id=<CSeq>``. Set in :meth:`_refer` before the
+        # REFER response is awaited (so a NOTIFY racing the 2xx still correlates),
+        # cleared in :meth:`_disarm_transfer_outcome` when the wait ends. Lets
+        # :meth:`_on_notify` reject a stale/late NOTIFY from a PRIOR transfer's still-
+        # live subscription so it cannot wake or mis-classify a newer transfer. ``None``
+        # when no transfer is awaiting an outcome.
+        self._active_refer_cseq: int | None = None
+        # ADR-0109 P1-b: the terminal transfer outcome LATCHED the instant the wait is
+        # first woken — by :meth:`_on_notify` (a terminated NOTIFY → its progress) or
+        # :meth:`_wake_transfer_on_end` (a BYE/hang_up → ``None``). Whichever fires
+        # FIRST wins (``_transfer_outcome_latched`` guards the write), so a terminal
+        # NOTIFY racing in AFTER a BYE cannot flip a torn-down leg's CALL_ENDED to
+        # COMPLETED. The wait reads THIS, never the mutable :attr:`transfer_progress`,
+        # so the decision is immune to a post-wake mutation.
+        self._transfer_outcome_latched: bool = False
+        self._transfer_outcome_progress: NotifyProgress | None = None
+        # ADR-0109 (codex round-3): guards against a SECOND transfer arming while the
+        # first still awaits its outcome (the wait runs OUTSIDE self._lock, so the lock
+        # alone does not serialize it). One leg transfers to one place at a time; a
+        # concurrent second transfer fails fast in :meth:`_arm_transfer_outcome` rather
+        # than clobbering the first transfer's event / REFER CSeq / latch.
+        self._transfer_in_progress: bool = False
 
     @property
     def dialog(self) -> Dialog:
@@ -423,6 +456,7 @@ class CallSession:
             request = build_in_dialog_request(self._dialog, "BYE")
             self._dialog = request.dialog
             self.ended = True
+            self._wake_transfer_on_end()
             try:
                 await self._signaling.send(request.text)
             except Exception as exc:  # noqa: BLE001 — best-effort BYE; never strand teardown (rule 37: logged, not swallowed)
@@ -435,26 +469,225 @@ class CallSession:
             await self._media.stop()
 
     async def transfer_blind(
-        self, target_uri: str, *, referred_by: str | None = None
-    ) -> None:
-        """Blind-transfer the caller to ``target_uri`` (REFER); progress via NOTIFY."""
-        async with self._lock:
-            await self._refer(
-                lambda auth: build_blind_refer(
-                    self._dialog, target_uri, referred_by=referred_by, auth=auth
+        self,
+        target_uri: str,
+        *,
+        referred_by: str | None = None,
+        outcome_timeout: float = 0.0,
+    ) -> TransferOutcomeReport:
+        """Blind-transfer the caller to ``target_uri`` (REFER); return the outcome.
+
+        Sends the RFC 3515 REFER, then waits up to ``outcome_timeout`` seconds for the
+        terminal transfer-progress NOTIFY and returns a
+        :class:`~hermes_voip.refer.TransferOutcomeReport` (ADR-0109 P2): a terminal
+        NOTIFY yields the ``progress`` with no ``unknown_reason``; otherwise the report
+        names why the outcome is unknown — ``SUBSCRIPTION_DECLINED`` when the peer
+        declines the subscription (RFC 4488 ``Refer-Sub: false``), else ``TIMEOUT`` /
+        ``CALL_ENDED`` / ``WAIT_DISABLED`` per :meth:`_await_transfer_outcome`.
+
+        Raises:
+            CallError: if the gateway rejects the REFER (a ``>= 300`` final response).
+        """
+        armed_event: asyncio.Event | None = None
+        try:
+            async with self._lock:
+                armed_event = self._arm_transfer_outcome()
+                response = await self._refer(
+                    lambda auth: build_blind_refer(
+                        self._dialog, target_uri, referred_by=referred_by, auth=auth
+                    )
                 )
-            )
+                subscription_declined = _refer_subscription_declined(response)
+            # The REFER is accepted and the lock released; await the terminal NOTIFY
+            # OUTSIDE the lock so the bounded wait never blocks a concurrent
+            # hold / refresh / DTMF on the same dialog.
+            if subscription_declined:
+                # A terminal NOTIFY may have raced the 2xx and already latched (the
+                # event is armed before the REFER, and NOTIFY handling takes no call
+                # lock); honour it. Else the peer declined the progress subscription
+                # (RFC 4488), so no outcome will follow (codex round-6).
+                latched = self._latched_transfer_outcome()
+                if latched is not None:
+                    return latched
+                return TransferOutcomeReport(
+                    progress=None,
+                    unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
+                )
+            return await self._await_transfer_outcome(armed_event, outcome_timeout)
+        finally:
+            if armed_event is not None:
+                self._disarm_transfer_outcome(armed_event)
 
     async def transfer_attended(
-        self, consult: Dialog, *, referred_by: str | None = None
-    ) -> None:
-        """Attended-transfer the caller to the ``consult`` peer (REFER + Replaces)."""
-        async with self._lock:
-            await self._refer(
-                lambda auth: build_attended_refer(
-                    self._dialog, consult, referred_by=referred_by, auth=auth
+        self,
+        consult: Dialog,
+        *,
+        referred_by: str | None = None,
+        outcome_timeout: float = 0.0,
+    ) -> TransferOutcomeReport:
+        """Attended-transfer the caller to the ``consult`` peer (REFER + Replaces).
+
+        Same outcome contract as :meth:`transfer_blind`: after the REFER 2xx it waits
+        up to ``outcome_timeout`` seconds for the terminal NOTIFY and returns a
+        :class:`~hermes_voip.refer.TransferOutcomeReport` — the terminal ``progress``,
+        or the discriminated reason it is unknown (``SUBSCRIPTION_DECLINED`` /
+        ``TIMEOUT`` / ``CALL_ENDED`` / ``WAIT_DISABLED``) (ADR-0109 P2).
+
+        Raises:
+            CallError: if the gateway rejects the REFER (a ``>= 300`` final response).
+        """
+        armed_event: asyncio.Event | None = None
+        try:
+            async with self._lock:
+                armed_event = self._arm_transfer_outcome()
+                response = await self._refer(
+                    lambda auth: build_attended_refer(
+                        self._dialog, consult, referred_by=referred_by, auth=auth
+                    )
                 )
-            )
+                subscription_declined = _refer_subscription_declined(response)
+            if subscription_declined:
+                # A terminal NOTIFY may have raced the 2xx and already latched (the
+                # event is armed before the REFER, and NOTIFY handling takes no call
+                # lock); honour it. Else the peer declined the progress subscription
+                # (RFC 4488), so no outcome will follow (codex round-6).
+                latched = self._latched_transfer_outcome()
+                if latched is not None:
+                    return latched
+                return TransferOutcomeReport(
+                    progress=None,
+                    unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
+                )
+            return await self._await_transfer_outcome(armed_event, outcome_timeout)
+        finally:
+            if armed_event is not None:
+                self._disarm_transfer_outcome(armed_event)
+
+    def _arm_transfer_outcome(self) -> asyncio.Event:
+        """Reset transfer progress + arm the terminal-NOTIFY event BEFORE the REFER.
+
+        Done under the call lock before the REFER is sent so a terminal NOTIFY that
+        races the 2xx is never missed: :meth:`_on_notify` sets the freshly-armed event
+        and the wait armed here observes it (ADR-0109). Returns the exact Event owned by
+        this transfer so its ``finally`` cleanup cannot clear a newer transfer's state.
+
+        Raises:
+            CallError: if the call has already ended — a BYE that raced the adapter's
+                ended-check (codex round-4): never REFER a dead dialog nor arm an event
+                nothing will signal. Or if a transfer is already awaiting its outcome on
+                this call — the outcome state is session-wide, so a concurrent second
+                transfer would clobber the first's event / CSeq / latch (codex round-3).
+                One leg transfers to one place at a time; the second fails fast.
+        """
+        if self.ended:
+            msg = "the call has ended; cannot transfer"
+            raise CallError(msg)
+        if self._transfer_in_progress:
+            msg = "a transfer is already awaiting its outcome on this call"
+            raise CallError(msg)
+        self._transfer_in_progress = True
+        self.transfer_progress = None
+        self._active_refer_cseq = None
+        self._transfer_outcome_latched = False
+        self._transfer_outcome_progress = None
+        event = asyncio.Event()
+        self._transfer_terminal = event
+        return event
+
+    def _disarm_transfer_outcome(self, event: asyncio.Event) -> None:
+        """Clear correlation/wait state iff ``event`` is still the active transfer.
+
+        A timed-out RFC 3515 subscription may keep sending NOTIFYs. Clearing its REFER
+        CSeq and Event once the transfer method returns makes those stale reports unable
+        to linger as the call's active outcome state. The identity check is defense in
+        depth against a prior transfer's cleanup clobbering a newly-armed event.
+        """
+        if self._transfer_terminal is event:
+            self._transfer_terminal = None
+            self._active_refer_cseq = None
+            self._transfer_outcome_latched = False
+            self._transfer_outcome_progress = None
+            self._transfer_in_progress = False
+
+    def _latched_transfer_outcome(self) -> TransferOutcomeReport | None:
+        """The already-latched transfer outcome, or ``None`` if nothing is latched.
+
+        The cause is latched atomically when the wait is first woken (ADR-0109 P1-b): a
+        terminal :attr:`transfer_progress` is the final outcome (COMPLETED / FAILED); a
+        latched ``None`` means the leg ended first (CALL_ENDED). Callers consult this
+        BEFORE reporting an opt-out / timeout / subscription-declined reason so a
+        terminal NOTIFY that raced the REFER 2xx is never discarded (codex round-5/6).
+        """
+        if not self._transfer_outcome_latched:
+            return None
+        progress = self._transfer_outcome_progress
+        if progress is not None:
+            return TransferOutcomeReport(progress=progress, unknown_reason=None)
+        return TransferOutcomeReport(
+            progress=None, unknown_reason=TransferUnknownReason.CALL_ENDED
+        )
+
+    async def _await_transfer_outcome(
+        self, event: asyncio.Event, timeout: float
+    ) -> TransferOutcomeReport:
+        """Wait up to ``timeout`` s for the terminal transfer NOTIFY (ADR-0109).
+
+        Returns a :class:`~hermes_voip.refer.TransferOutcomeReport` naming the real
+        outcome (ADR-0109 P2): a terminal :attr:`transfer_progress` (set by
+        :meth:`_on_notify` on a terminated NOTIFY) yields ``(progress, unknown_reason
+        =None)``; otherwise the report carries no progress and the discriminated reason
+        the wait ended for:
+
+        * ``timeout <= 0`` with nothing already latched — the wait is opted out:
+          ``WAIT_DISABLED`` (no wait ran). A terminal outcome latched before the REFER
+          2xx (it can race the arm) is still reported, never discarded.
+        * the wait elapses with no terminal NOTIFY: ``TIMEOUT``.
+        * the event fires with no terminal outcome latched — a BYE / hang_up woke it
+          first (or only a non-terminal ``100 Trying`` arrived): ``CALL_ENDED``. The
+          cause is latched when the wait is first woken, so a terminal NOTIFY racing in
+          after the BYE cannot flip it (P1-b); we never infer success from a torn-down
+          leg.
+        """
+        # The event is armed BEFORE the REFER, so a terminal NOTIFY (or a call-end) can
+        # latch an outcome before we decide to wait (racing the 2xx) or right as the
+        # deadline fires. Wait only when nothing is latched and the wait is enabled; a
+        # TimeoutError falls THROUGH to the single latch re-read below (never returning
+        # early), so an outcome latched at the deadline is honoured, never lost as a
+        # TIMEOUT (codex round-5/6). ``_latched_transfer_outcome`` reads the LATCHED
+        # cause (fixed atomically when the wait was first woken, ADR-0109 P1-b), never
+        # the mutable transfer_progress.
+        if not self._transfer_outcome_latched and timeout > 0:
+            # A timeout falls through to the latch re-read below — a NOTIFY may have
+            # latched an outcome right at the deadline (codex round-6).
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(event.wait(), timeout)
+        latched = self._latched_transfer_outcome()
+        if latched is not None:
+            return latched
+        return TransferOutcomeReport(
+            progress=None,
+            unknown_reason=(
+                TransferUnknownReason.TIMEOUT
+                if timeout > 0
+                else TransferUnknownReason.WAIT_DISABLED
+            ),
+        )
+
+    def _wake_transfer_on_end(self) -> None:
+        """Wake a pending transfer-outcome wait when the call ends (ADR-0109).
+
+        A BYE (either side) tears the referrer leg down; a bounded outcome wait must
+        return rather than block for the full timeout. If no terminal outcome has been
+        latched yet, latch CALL_ENDED (``None``) — the FIRST waker wins (P1-b), so a
+        terminal NOTIFY racing in after this cannot flip a torn-down leg to COMPLETED
+        (we never infer success from a BYE) — then set the armed event. A no-op when no
+        transfer is in flight.
+        """
+        if self._transfer_terminal is not None:
+            if not self._transfer_outcome_latched:
+                self._transfer_outcome_latched = True
+                self._transfer_outcome_progress = None
+            self._transfer_terminal.set()
 
     async def refresh_session(
         self, extra_headers: Sequence[tuple[str, str]]
@@ -679,9 +912,21 @@ class CallSession:
 
     async def _refer(
         self, build: Callable[[tuple[str, str] | None], InDialogRequest]
-    ) -> None:
+    ) -> SipResponse:
+        """Send a REFER (re-auth once on 401/407); return its 2xx, raise on >= 300.
+
+        Returns the REFER's final 2xx response so the caller can inspect its
+        ``Refer-Sub`` (RFC 4488) to decide whether a progress NOTIFY will follow
+        (ADR-0109).
+        """
         result = build(None)
         self._dialog = result.dialog
+        # build_in_dialog_request stamps CSeq ``old local_cseq + 1`` into the REFER
+        # and returns the dialog carrying THAT new value. Capture it before awaiting
+        # the response so a NOTIFY racing the 2xx can correlate to the exact request.
+        # If authentication retries, the rebuilt REFER advances CSeq again below and
+        # replaces this with the accepted REFER's actual id.
+        self._active_refer_cseq = self._dialog.local_cseq
         response = await self._send_and_await_final(
             result.text, self._dialog.local_cseq
         )
@@ -689,12 +934,14 @@ class CallSession:
             auth = self._authorization(response, "REFER")
             result = build(auth)
             self._dialog = result.dialog
+            self._active_refer_cseq = self._dialog.local_cseq
             response = await self._send_and_await_final(
                 result.text, self._dialog.local_cseq
             )
         if response.status_code >= _FIRST_ERROR_STATUS:
             msg = f"REFER rejected: {response.status_code} {response.reason}"
             raise CallError(msg)
+        return response
 
     def _authorization(self, response: SipResponse, method: str) -> tuple[str, str]:
         proxy = response.status_code == _PROXY_AUTH_REQUIRED
@@ -958,6 +1205,7 @@ class CallSession:
             return
         await self._signaling.send(response)
         self.ended = True
+        self._wake_transfer_on_end()
         await self._media.stop()
 
     async def _on_notify(self, request: SipRequest) -> None:
@@ -975,7 +1223,12 @@ class CallSession:
         like one.
 
         The Event-type token is the part before any ``;`` parameters, compared
-        case-insensitively (RFC 6665 §8.2.1: event-type is case-insensitive).
+        case-insensitively (RFC 6665 §8.2.1: event-type is case-insensitive). For the
+        ``refer`` package, RFC 3515 correlates an implicit subscription with
+        ``Event: refer;id=<REFER-CSeq>``. While a transfer is armed, a present ``id``
+        must match that transfer's REFER CSeq before progress/event state is updated; a
+        stale subscription's non-matching NOTIFY is still a valid request and receives
+        ``200 OK``. An omitted ``id`` is honoured best-effort for compatibility.
 
         Only the ``refer`` package reaches ``parse_notify_sipfrag``, which raises
         :class:`ReferError` on a NOTIFY missing ``Subscription-State`` or whose body
@@ -988,7 +1241,7 @@ class CallSession:
         """
         event = request.header("Event")
         package = event.split(";", 1)[0].strip().lower() if event is not None else ""
-        if package != "refer":
+        if event is None or package != "refer":
             await self._answer_or_drop(
                 lambda: build_response(request, 200, "OK"), kind="NOTIFY"
             )
@@ -1008,7 +1261,35 @@ class CallSession:
         )
         if response is None:
             return
-        self.transfer_progress = progress
+        active_cseq = self._active_refer_cseq
+        event_id_present, event_id = _refer_event_id(event)
+        # RFC 3515 §2.4.6: a refer subscription's Event ``id`` is the CSeq NUMBER
+        # of the REFER that created it. If an outcome wait is armed, a present id must
+        # match the active REFER before it can mutate/wake that transfer; a late NOTIFY
+        # from a timed-out prior subscription is still valid and receives 200 below.
+        # Some peers omit ``id`` entirely. With only one transfer armed, honour an
+        # id-less NOTIFY best-effort; residual: an id-less stale report cannot be
+        # distinguished from the active subscription and may still contaminate it.
+        matches_active = (
+            active_cseq is None or not event_id_present or event_id == active_cseq
+        )
+        if matches_active:
+            self.transfer_progress = progress
+            # ADR-0109: a terminated NOTIFY wakes the bounded wait ONLY when it carries
+            # a DEFINITIVE final status (>= 200). A terminated subscription reporting a
+            # non-final ``1xx`` (e.g. ``100 Trying``) is not a real transfer outcome
+            # (codex round-4) and is never latched here; interim updates never wake.
+            if (
+                progress.terminated
+                and progress.status_code >= _PROVISIONAL_CEILING
+                and self._transfer_terminal is not None
+            ):
+                # P1-b: latch this outcome the instant we wake the wait (first waker
+                # wins), so a BYE arriving right after cannot overwrite it.
+                if not self._transfer_outcome_latched:
+                    self._transfer_outcome_latched = True
+                    self._transfer_outcome_progress = progress
+                self._transfer_terminal.set()
         await self._signaling.send(response)
 
     async def _on_refer(self, request: SipRequest) -> None:
@@ -1042,6 +1323,45 @@ class CallSession:
         await self._signaling.send(response)
         if self._refer_handler is not None:
             await self._refer_handler(refer)
+
+
+def _refer_event_id(event: str) -> tuple[bool, int | None]:
+    """Parse RFC 3515 ``Event: refer;id=<REFER-CSeq>`` correlation.
+
+    Returns ``(False, None)`` when ``id`` is omitted (the best-effort compatibility
+    path), ``(True, n)`` for exactly one valid CSeq number, and ``(True, None)`` for a
+    present but malformed/duplicate ``id``. The latter must not be laundered into the
+    id-less fallback: it cannot match an active transfer, although the NOTIFY remains a
+    valid request to acknowledge with 200.
+    """
+    raw_ids: list[str] = []
+    for parameter in event.split(";")[1:]:
+        name, separator, value = parameter.partition("=")
+        if separator and name.strip().lower() == "id":
+            raw_ids.append(value.strip())
+    if not raw_ids:
+        return (False, None)
+    if len(raw_ids) != 1:
+        return (True, None)
+    return (True, _parse_decimal(raw_ids[0], max_exclusive=_MAX_CSEQ))
+
+
+def _refer_subscription_declined(response: SipResponse) -> bool:
+    """RFC 4488: ``True`` when a REFER 2xx carries ``Refer-Sub: false`` (ADR-0109).
+
+    Per RFC 4488 a referee sends ``Refer-Sub: false`` in the 2xx to CONFIRM the
+    referrer's own ``Refer-Sub: false`` request; we do not currently send that
+    request, so a compliant peer keeps the implicit subscription and NOTIFYs follow.
+    This is thus a DEFENSIVE / forward-looking check: if a response nonetheless
+    signals no subscription, no progress NOTIFY will follow, so the caller skips the
+    outcome wait and reports OUTCOME_UNKNOWN at once. The header token is the part
+    before any ``;``-parameters, compared case-insensitively; an absent header (the
+    common case — the subscription is active) is ``False``.
+    """
+    value = response.header("Refer-Sub")
+    if value is None:
+        return False
+    return value.split(";", 1)[0].strip().lower() == "false"
 
 
 # RFC 3261 §8.1.1.5: a CSeq sequence number is < 2**31. Leading zeros are valid

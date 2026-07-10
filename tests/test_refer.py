@@ -20,10 +20,12 @@ from hermes_voip.refer import (
     ReferError,
     ReferRequest,
     ReplacesSpec,
+    TransferOutcomeClass,
     build_attended_refer,
     build_blind_refer,
     build_notify_sipfrag,
     build_triggered_invite,
+    classify_transfer_progress,
     match_replaces,
     parse_notify_sipfrag,
     parse_refer,
@@ -361,6 +363,42 @@ def test_parse_notify_sipfrag_without_status_line_raises() -> None:
 def test_replaces_spec_header_value_round_trips() -> None:
     spec = ReplacesSpec(call_id="x@h", to_tag="t1", from_tag="f1", early_only=True)
     assert spec.header_value() == "x@h;to-tag=t1;from-tag=f1;early-only"
+
+
+# --- ADR-0109: pure terminal-outcome classification of a transfer NOTIFY ------
+
+
+def test_classify_transfer_progress_terminal_2xx_is_completed() -> None:
+    """A terminated NOTIFY with a 2xx sipfrag status classifies as COMPLETED."""
+    progress = NotifyProgress(status_code=200, reason="OK", terminated=True)
+    assert classify_transfer_progress(progress) is TransferOutcomeClass.COMPLETED
+
+
+def test_classify_transfer_progress_terminal_486_is_failed() -> None:
+    """A terminated NOTIFY carrying a 4xx (busy) classifies as FAILED."""
+    progress = NotifyProgress(status_code=486, reason="Busy Here", terminated=True)
+    assert classify_transfer_progress(progress) is TransferOutcomeClass.FAILED
+
+
+def test_classify_transfer_progress_terminal_603_is_failed() -> None:
+    """A terminated NOTIFY carrying a 6xx (decline) classifies as FAILED."""
+    progress = NotifyProgress(status_code=603, reason="Decline", terminated=True)
+    assert classify_transfer_progress(progress) is TransferOutcomeClass.FAILED
+
+
+def test_classify_transfer_progress_none_is_outcome_unknown() -> None:
+    """No terminal NOTIFY (``None``) classifies as OUTCOME_UNKNOWN."""
+    assert classify_transfer_progress(None) is TransferOutcomeClass.OUTCOME_UNKNOWN
+
+
+def test_classify_transfer_progress_non_terminal_100_is_outcome_unknown() -> None:
+    """A non-terminal 100 Trying that leaked through is OUTCOME_UNKNOWN, not COMPLETED.
+
+    Only a ``terminated`` NOTIFY reaches a final verdict; a progress update with
+    ``terminated is False`` (e.g. the interim 100) must never be read as a success.
+    """
+    progress = NotifyProgress(status_code=100, reason="Trying", terminated=False)
+    assert classify_transfer_progress(progress) is TransferOutcomeClass.OUTCOME_UNKNOWN
 
 
 # ---- review hardening: strict RFC 3515/3891/6665 parsing -------------------

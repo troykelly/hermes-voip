@@ -69,6 +69,12 @@ from hermes_voip.originate import (
     OutboundCallNotAllowed,
 )
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import (
+    NotifyProgress,
+    TransferOutcomeClass,
+    TransferUnknownReason,
+    classify_transfer_progress,
+)
 from hermes_voip.tools import gate_voip_tool
 
 __all__ = [
@@ -95,12 +101,16 @@ __all__ = [
     "VOIP_TOOLSET",
     "_RING_TIMEOUT_ENV",  # ADR-0086: stable public name of the ring-timeout env var
     "AttendedTransferOutcome",
+    "AttendedTransferResult",
     "PlaceCallOutcome",
     "ProactiveDecision",
     "ProactiveDenyReason",
     "TransferOutcome",
+    "TransferResult",
     "VoipToolHost",
     "active_voip_adapter",
+    "build_attended_transfer_result",
+    "build_transfer_result",
     "hang_up_handler",
     "hold_call_handler",
     "list_registrations_handler",
@@ -166,13 +176,14 @@ def _tool_failure_redacted(tool_name: str, exc: BaseException) -> str:
 
 
 class TransferOutcome(Enum):
-    """The tri-state result of a DTMF-confirmed blind transfer (ADR-0010/0031).
+    """The result of a DTMF-confirmed blind transfer (ADR-0010/0031/0109).
 
-    The host method :meth:`VoipToolHost.transfer_blind_on_call` returns this so the
-    handler distinguishes a fired REFER from a *refused-by-the-caller* one from a
-    stale call — each maps to a distinct tool-result message:
+    :meth:`VoipToolHost.transfer_blind_on_call` returns this (wrapped in a
+    :class:`TransferResult`) so the handler maps each outcome to a distinct tool
+    message.
 
-    * ``TRANSFERRED`` — the caller pressed the armed confirm digit; the REFER fired.
+    Pre-REFER outcomes (the REFER never fired):
+
     * ``UNCONFIRMED`` — a wrong digit or the confirmation timed out; **no REFER**.
     * ``NO_CALL`` — the call was unknown or had already ended; **no REFER**.
     * ``BLOCKED`` — the call's OWN privilege gate refused the transfer (it is not an
@@ -181,6 +192,20 @@ class TransferOutcome(Enum):
       depth), so a session that lost privilege or went ``degraded`` *during* the
       confirmation window — or any direct/bypass invocation — cannot fire the REFER.
       **No REFER**.
+
+    Post-REFER terminal outcomes (ADR-0109 — the REFER was accepted and its
+    transfer-progress NOTIFY, if any, observed):
+
+    * ``COMPLETED`` — the terminal NOTIFY reported a 2xx; the caller reached the target.
+    * ``FAILED`` — the terminal NOTIFY reported a 3xx-6xx (busy / declined /
+      unreachable); the transfer definitively did not complete.
+    * ``OUTCOME_UNKNOWN`` — no terminal NOTIFY arrived within the bounded wait (timeout
+      / call-end / a declined RFC 4488 subscription), so the real outcome is unknown.
+
+    ``TRANSFERRED`` is the internal REFER-accepted intermediate (the confirm digit was
+    pressed and the REFER fired); the adapter resolves it into COMPLETED / FAILED /
+    OUTCOME_UNKNOWN via the terminal NOTIFY before returning, so it is no longer a
+    terminal tool result.
 
     A *failure* to even obtain a confirmation (no telephone-event negotiated) or a
     REFER the gateway rejects is signalled by an exception, not a member — those are
@@ -191,22 +216,38 @@ class TransferOutcome(Enum):
     UNCONFIRMED = "unconfirmed"
     NO_CALL = "no_call"
     BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 class AttendedTransferOutcome(Enum):
-    """The result of COMPLETING an attended (consultative) transfer (ADR-0048).
+    """The result of COMPLETING an attended (consultative) transfer (ADR-0048/0109).
 
-    Returned by :meth:`VoipToolHost.complete_attended_transfer` so the handler maps
-    each outcome to a distinct tool-result message:
+    Returned by :meth:`VoipToolHost.complete_attended_transfer` (wrapped in an
+    :class:`AttendedTransferResult`) so the handler maps each outcome to a distinct
+    tool-result message.
 
-    * ``TRANSFERRED`` — the REFER+Replaces (RFC 3891) fired; the caller is bridged to
-      the consultation target and our legs are released.
+    Pre-REFER outcomes (the REFER+Replaces never fired):
+
     * ``NO_CONSULT`` — no consultation leg is in flight for this call (the agent must
       ``consult`` first); **no REFER**.
     * ``NO_CALL`` — the original call (or the consult leg) is unknown / already ended;
       **no REFER**.
     * ``BLOCKED`` — the original call's privilege clamp refused it (not operator-level,
       or degraded — possibly a state change during the consultation); **no REFER**.
+
+    Post-REFER terminal outcomes (ADR-0109 — the REFER+Replaces fired and its
+    transfer-progress NOTIFY, if any, observed):
+
+    * ``COMPLETED`` — the terminal NOTIFY reported a 2xx; the caller reached the target.
+    * ``FAILED`` — the terminal NOTIFY reported a 3xx-6xx; the transfer failed.
+    * ``OUTCOME_UNKNOWN`` — no terminal NOTIFY within the bounded wait (timeout /
+      call-end / declined RFC 4488 subscription), so the real outcome is unknown.
+
+    ``TRANSFERRED`` is the internal REFER-fired intermediate; the adapter resolves it
+    into COMPLETED / FAILED / OUTCOME_UNKNOWN via the terminal NOTIFY before returning,
+    so it is no longer a terminal tool result.
 
     A gateway REFER rejection is signalled by an exception (``CallError``), not a
     member — a loud error, never a silent no-op (rule 37).
@@ -216,6 +257,107 @@ class AttendedTransferOutcome(Enum):
     NO_CONSULT = "no_consult"
     NO_CALL = "no_call"
     BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class TransferResult:
+    """The terminal result of a blind transfer (ADR-0109): outcome + NOTIFY detail.
+
+    :meth:`VoipToolHost.transfer_blind_on_call` returns this so the handler renders the
+    real transfer outcome. ``outcome`` is the tool-facing :class:`TransferOutcome`; for
+    a NOTIFY-reported ``FAILED``, ``notify_status`` + ``notify_reason`` carry the
+    sipfrag SIP status line the message shows. ``timeout_secs`` is the bounded wait the
+    adapter applied, so the ``OUTCOME_UNKNOWN`` message can name it. ``unknown_reason``
+    (ADR-0109 P2) discriminates WHY an ``OUTCOME_UNKNOWN`` outcome is unknown (timeout
+    / declined subscription / call-ended / wait-disabled) so the message states the real
+    reason. The notify/timeout/reason fields are ``None`` for the pre-REFER outcomes
+    (``NO_CALL`` / ``UNCONFIRMED`` / ``BLOCKED``).
+    """
+
+    outcome: TransferOutcome
+    notify_status: int | None = None
+    notify_reason: str | None = None
+    timeout_secs: float | None = None
+    unknown_reason: TransferUnknownReason | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttendedTransferResult:
+    """The terminal result of an attended transfer (ADR-0109): outcome + NOTIFY detail.
+
+    The attended analogue of :class:`TransferResult`, returned by
+    :meth:`VoipToolHost.complete_attended_transfer`; the field semantics are identical
+    (including the ADR-0109 P2 ``unknown_reason``).
+    """
+
+    outcome: AttendedTransferOutcome
+    notify_status: int | None = None
+    notify_reason: str | None = None
+    timeout_secs: float | None = None
+    unknown_reason: TransferUnknownReason | None = None
+
+
+# ADR-0109: map the pure terminal classification to the tool-facing outcome enums.
+_BLIND_OUTCOME_BY_CLASS: dict[TransferOutcomeClass, TransferOutcome] = {
+    TransferOutcomeClass.COMPLETED: TransferOutcome.COMPLETED,
+    TransferOutcomeClass.FAILED: TransferOutcome.FAILED,
+    TransferOutcomeClass.OUTCOME_UNKNOWN: TransferOutcome.OUTCOME_UNKNOWN,
+}
+_ATTENDED_OUTCOME_BY_CLASS: dict[TransferOutcomeClass, AttendedTransferOutcome] = {
+    TransferOutcomeClass.COMPLETED: AttendedTransferOutcome.COMPLETED,
+    TransferOutcomeClass.FAILED: AttendedTransferOutcome.FAILED,
+    TransferOutcomeClass.OUTCOME_UNKNOWN: AttendedTransferOutcome.OUTCOME_UNKNOWN,
+}
+
+
+def _terminal_notify(progress: NotifyProgress | None) -> NotifyProgress | None:
+    """Return ``progress`` only when it is a TERMINAL NOTIFY, else ``None`` (ADR-0109).
+
+    A non-terminal update (a ``100 Trying`` that leaked through) carries no final
+    status, so its status/reason must not be shown as an outcome.
+    """
+    return progress if progress is not None and progress.terminated else None
+
+
+def build_transfer_result(
+    progress: NotifyProgress | None,
+    timeout_secs: float,
+    unknown_reason: TransferUnknownReason | None = None,
+) -> TransferResult:
+    """Classify a blind transfer's terminal NOTIFY into a :class:`TransferResult`.
+
+    The adapter's glue (ADR-0109): maps the pure classification to the tool-facing
+    :class:`TransferOutcome` and attaches the terminal SIP status/reason (for
+    ``FAILED``) plus the bounded wait applied and the discriminated ``unknown_reason``
+    (ADR-0109 P2) the ``OUTCOME_UNKNOWN`` message names.
+    """
+    terminal = _terminal_notify(progress)
+    return TransferResult(
+        outcome=_BLIND_OUTCOME_BY_CLASS[classify_transfer_progress(progress)],
+        notify_status=terminal.status_code if terminal is not None else None,
+        notify_reason=terminal.reason if terminal is not None else None,
+        timeout_secs=timeout_secs,
+        unknown_reason=unknown_reason,
+    )
+
+
+def build_attended_transfer_result(
+    progress: NotifyProgress | None,
+    timeout_secs: float,
+    unknown_reason: TransferUnknownReason | None = None,
+) -> AttendedTransferResult:
+    """Attended analogue of :func:`build_transfer_result` (ADR-0109)."""
+    terminal = _terminal_notify(progress)
+    return AttendedTransferResult(
+        outcome=_ATTENDED_OUTCOME_BY_CLASS[classify_transfer_progress(progress)],
+        notify_status=terminal.status_code if terminal is not None else None,
+        notify_reason=terminal.reason if terminal is not None else None,
+        timeout_secs=timeout_secs,
+        unknown_reason=unknown_reason,
+    )
 
 
 class PlaceCallOutcome(Enum):
@@ -780,20 +922,24 @@ class VoipToolHost(Protocol):
         """
         ...
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
-        """DTMF-confirmed blind transfer of ``call_id`` to ``target`` (ADR-0010/0031).
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
+        """Blind-transfer ``call_id`` to ``target`` (DTMF-confirmed; ADR-0031/0109).
 
         The spoof-resistant chokepoint: awaits the call's per-call
         :class:`~hermes_voip.dtmf_confirm.ArmedConfirmation` (prompts the person on
         the call to press the confirm digit) and sends the RFC 3515 REFER via
         :meth:`hermes_voip.call.CallSession.transfer_blind` **only** when the caller
-        confirms. Returns a :class:`TransferOutcome`:
+        confirms; then (ADR-0109) waits bounded for the terminal transfer-progress
+        NOTIFY and classifies the real outcome. Returns a :class:`TransferResult`
+        whose ``outcome`` is:
 
-        * ``TRANSFERRED`` — confirmed; the REFER fired.
+        * ``COMPLETED`` — confirmed + a terminal 2xx NOTIFY; the caller reached target.
+        * ``FAILED`` — confirmed + a terminal 3xx-6xx NOTIFY (``notify_status`` +
+          ``notify_reason`` carry the SIP status); the transfer did not complete.
+        * ``OUTCOME_UNKNOWN`` — confirmed but no terminal NOTIFY within the wait.
         * ``UNCONFIRMED`` — a wrong digit / timeout; no REFER.
         * ``NO_CALL`` — the call was unknown or had already ended; no REFER.
+        * ``BLOCKED`` — the chokepoint's own privilege re-check refused it; no REFER.
 
         Raises (never a silent no-op — rule 37):
 
@@ -824,13 +970,16 @@ class VoipToolHost(Protocol):
         """
         ...
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
-        """COMPLETE the attended transfer for ``call_id`` (REFER+Replaces, ADR-0048).
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
+        """COMPLETE the attended transfer for ``call_id`` (ADR-0048/0109).
 
         Sends the REFER on the ORIGINAL call naming the paired consultation dialog
         (RFC 3891 ``Replaces``), so the gateway bridges the caller to the target and
-        releases our legs; clears the pairing. Re-enforces the privilege clamp itself.
-        Returns an :class:`AttendedTransferOutcome`. Raises
+        releases our legs; clears the pairing. Re-enforces the privilege clamp itself,
+        then (ADR-0109) waits bounded for the terminal NOTIFY and classifies the real
+        outcome. Returns an :class:`AttendedTransferResult` (``COMPLETED`` / ``FAILED``
+        with the SIP status / ``OUTCOME_UNKNOWN`` after the REFER, or the pre-REFER
+        ``NO_CONSULT`` / ``NO_CALL`` / ``BLOCKED``). Raises
         :class:`~hermes_voip.call.CallError` if the gateway rejects the REFER.
         """
         ...
@@ -1462,6 +1611,56 @@ async def open_entry_handler(
         return _tool_failure_redacted(OPEN_ENTRY_TOOL_NAME, exc)
 
 
+def _sip_status_detail(status: int | None, reason: str | None) -> str:
+    """Render a sipfrag ``<status> <reason>`` detail for a FAILED transfer (ADR-0109).
+
+    Tolerates a missing part (a terminal NOTIFY always carries a status, but the reason
+    phrase is optional); an empty detail collapses to a generic phrase so a message
+    never reads ``failed: .``.
+    """
+    parts = [str(status) if status is not None else "", reason or ""]
+    return " ".join(part for part in parts if part) or "no status reported"
+
+
+def _within_timeout(timeout_secs: float | None) -> str:
+    """Render the ``within Ns`` clause of the OUTCOME_UNKNOWN message (ADR-0109).
+
+    ``timeout_secs`` is the bounded wait the adapter applied (``None`` only when it is
+    unavailable); ``:g`` trims a whole-number float (``20.0`` -> ``20``).
+    """
+    if timeout_secs is None:
+        return "within the timeout"
+    return f"within {timeout_secs:g}s"
+
+
+def _outcome_unknown_message(
+    reason: TransferUnknownReason | None, timeout_secs: float | None, *, prefix: str
+) -> str:
+    """Render the OUTCOME_UNKNOWN tool message for the discriminated reason (P2).
+
+    ``prefix`` opens the message with the transfer-identifying clause — ``"Transfer to
+    {target}"`` (blind) or ``"Transfer"`` (attended) — so the per-reason wording is
+    shared. Each reason states what actually happened instead of always claiming a
+    bounded wait (ADR-0109 §4): a declined RFC 4488 subscription, the call ending first,
+    or outcome confirmation being disabled. A ``TIMEOUT`` — or a defensive ``None``
+    reason — keeps the honest "outcome not confirmed within Ns" wording naming the wait
+    that actually elapsed.
+    """
+    if reason is TransferUnknownReason.WAIT_DISABLED:
+        return f"{prefix} initiated."
+    if reason is TransferUnknownReason.SUBSCRIPTION_DECLINED:
+        return (
+            f"{prefix} initiated; the transfer response signalled no progress "
+            "subscription, so its final outcome was not reported."
+        )
+    if reason is TransferUnknownReason.CALL_ENDED:
+        return (
+            f"{prefix} initiated; the call ended before the transfer outcome "
+            "was reported."
+        )
+    return f"{prefix} initiated; outcome not confirmed {_within_timeout(timeout_secs)}."
+
+
 async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch the model must be able to tell apart (no adapter / no call / no target / transfer-failed / transferred / not-confirmed / call-ended); collapsing them would hide which outcome occurred
     args: Mapping[str, object] | None = None,
     **_kwargs: object,
@@ -1475,12 +1674,15 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
     person on the call presses the armed confirm digit; a wrong digit or a timeout
     transfers nobody.
 
-    Returns the JSON tool-result contract: ``{"result": …}`` once the transfer is
-    initiated (TRANSFERRED), or ``{"error": …}`` when no adapter/call is in scope,
-    ``target`` is missing, the caller did not confirm (UNCONFIRMED), the call ended
-    (NO_CALL), the call cannot obtain a spoof-resistant confirmation (no
-    telephone-event negotiated), or the gateway rejected the REFER. The call to
-    transfer is fixed to the session's own call — the model only chooses the target.
+    Returns the JSON tool-result contract reporting the REAL transfer outcome
+    (ADR-0109): ``{"result": …}`` when the transfer COMPLETED (terminal 2xx NOTIFY) or
+    the outcome is genuinely unknown (no terminal NOTIFY within the wait — the honest
+    "initiated" wording); ``{"error": …}`` when it FAILED (terminal 3xx-6xx, carrying
+    the SIP status), no adapter/call is in scope, ``target`` is missing, the caller did
+    not confirm (UNCONFIRMED), the call ended (NO_CALL), the call cannot obtain a
+    spoof-resistant confirmation (no telephone-event), or the gateway rejected the
+    REFER. The call to transfer is fixed to the session's own call — the model only
+    chooses the target.
 
     The ``pre_tool_call`` gate has already enforced the operator-level (3) +
     non-degraded privilege clamp before this runs (a fail-fast: an unprivileged or
@@ -1503,14 +1705,35 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
                 {"error": "transfer_blind requires a 'target' to transfer to"}
             )
         try:
-            outcome = await adapter.transfer_blind_on_call(call_id, target)
+            result = await adapter.transfer_blind_on_call(call_id, target)
         except RuntimeError as exc:
             # No confirmation channel (no telephone-event) OR the gateway rejected the
             # REFER (CallError is a RuntimeError). Surface it clearly — nobody was
             # transferred, and the failure is reported, never hidden (rule 37).
             return json.dumps({"error": f"transfer failed: {exc}"})
-        if outcome is TransferOutcome.TRANSFERRED:
-            return json.dumps({"result": f"Transfer to {target} initiated."})
+        outcome = result.outcome
+        if outcome is TransferOutcome.COMPLETED:
+            # ADR-0109: the terminal NOTIFY reported a 2xx — the caller reached target.
+            return json.dumps({"result": f"Transfer to {target} completed."})
+        if outcome is TransferOutcome.FAILED:
+            # The terminal NOTIFY reported a 3xx-6xx (busy / declined / unreachable):
+            # the transfer definitively did not complete — the agent can recover.
+            detail = _sip_status_detail(result.notify_status, result.notify_reason)
+            return json.dumps({"error": f"Transfer to {target} failed: {detail}."})
+        if outcome is TransferOutcome.OUTCOME_UNKNOWN:
+            # The REFER was accepted but no terminal NOTIFY resolved the transfer. The
+            # honest "initiated" wording stays, but ADR-0109 P2 names WHY it is unknown
+            # (timeout / declined subscription / call-ended / wait-disabled) instead of
+            # always claiming a bounded wait that may never have elapsed (rule 27).
+            return json.dumps(
+                {
+                    "result": _outcome_unknown_message(
+                        result.unknown_reason,
+                        result.timeout_secs,
+                        prefix=f"Transfer to {target}",
+                    )
+                }
+            )
         if outcome is TransferOutcome.UNCONFIRMED:
             return json.dumps(
                 {
@@ -1525,7 +1748,9 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
             # degraded — possibly a state change during the confirmation window). The
             # privilege clamp is enforced at the chokepoint, not only at the gate.
             return json.dumps({"error": "the transfer is not permitted on this call"})
-        # NO_CALL — the call is unknown or already ended.
+        # NO_CALL — the call is unknown or already ended. (TRANSFERRED is the internal
+        # REFER-accepted intermediate the adapter resolves before returning, so it
+        # never reaches the handler.)
         return json.dumps({"error": "the call is not active (unknown or ended)"})
     except Exception as exc:  # noqa: BLE001 — handler-boundary log-and-return (see _tool_failure)
         return _tool_failure(TRANSFER_BLIND_TOOL_NAME, exc)
@@ -1609,17 +1834,32 @@ async def _attended_consult(adapter: VoipToolHost, call_id: str, target: str) ->
     return json.dumps({"consult_call_id": consult_call_id})
 
 
-async def _attended_complete(adapter: VoipToolHost, call_id: str) -> str:
-    """``transfer_attended action=complete``: send the REFER+Replaces (ADR-0048)."""
+async def _attended_complete(adapter: VoipToolHost, call_id: str) -> str:  # noqa: PLR0911 — one return per fail-clear outcome the model must tell apart (completed/failed/unknown/no-consult/blocked/no-call); collapsing them hides which occurred
+    """action=complete: send the REFER+Replaces + await the outcome (ADR-0109)."""
     try:
-        outcome = await adapter.complete_attended_transfer(call_id)
+        result = await adapter.complete_attended_transfer(call_id)
     except CallError as exc:
         # The gateway rejected the REFER (CallError, a RuntimeError subclass). Catch
         # it SPECIFICALLY — an unrelated RuntimeError is a real bug and must propagate
         # (rule 37), not be masked as a transfer failure. Nobody was transferred.
         return json.dumps({"error": f"transfer failed: {exc}"})
-    if outcome is AttendedTransferOutcome.TRANSFERRED:
+    outcome = result.outcome
+    if outcome is AttendedTransferOutcome.COMPLETED:
+        # ADR-0109: the terminal NOTIFY reported a 2xx — the caller reached the target.
         return json.dumps({"result": "Caller connected to the consultation target."})
+    if outcome is AttendedTransferOutcome.FAILED:
+        detail = _sip_status_detail(result.notify_status, result.notify_reason)
+        return json.dumps({"error": f"Transfer failed: {detail}."})
+    if outcome is AttendedTransferOutcome.OUTCOME_UNKNOWN:
+        # ADR-0109 P2: name WHY the outcome is unknown (mirrors the blind path, with no
+        # {target} in the attended phrasing) rather than always claiming a bounded wait.
+        return json.dumps(
+            {
+                "result": _outcome_unknown_message(
+                    result.unknown_reason, result.timeout_secs, prefix="Transfer"
+                )
+            }
+        )
     if outcome is AttendedTransferOutcome.NO_CONSULT:
         return json.dumps(
             {"error": "no consultation is in progress; call the target first (consult)"}
@@ -1627,6 +1867,7 @@ async def _attended_complete(adapter: VoipToolHost, call_id: str) -> str:
     if outcome is AttendedTransferOutcome.BLOCKED:
         return json.dumps({"error": "the transfer is not permitted on this call"})
     # NO_CALL — the original call or the consult leg is unknown / already ended.
+    # (TRANSFERRED is the internal intermediate the adapter resolves before returning.)
     return json.dumps({"error": "the call is not active (unknown or ended)"})
 
 

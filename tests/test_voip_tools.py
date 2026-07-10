@@ -20,6 +20,7 @@ import pytest
 
 from hermes_voip.config import ConfigError
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import TransferUnknownReason
 from hermes_voip.voip_tools import (
     HANG_UP_TOOL_NAME,
     HANG_UP_TOOL_SCHEMA,
@@ -39,7 +40,9 @@ from hermes_voip.voip_tools import (
     TRANSFER_BLIND_TOOL_NAME,
     TRANSFER_BLIND_TOOL_SCHEMA,
     AttendedTransferOutcome,
+    AttendedTransferResult,
     TransferOutcome,
+    TransferResult,
     _parse_ring_timeout,
     active_voip_adapter,
     hang_up_handler,
@@ -87,10 +90,17 @@ class _FakeHost:
         # When set, send_dtmf_on_call raises this instead of recording (e.g. the
         # telephone-event-not-negotiated RuntimeError).
         self.dtmf_raises: Exception | None = None
-        # transfer_blind_on_call outcome (ADR-0010/0031): the host method returns a
-        # tri-state so the handler can distinguish a fired transfer from an
-        # unconfirmed one from an unknown/ended call. Override per-test.
-        self.transfer_outcome: TransferOutcome = TransferOutcome.TRANSFERRED
+        # transfer_blind_on_call outcome (ADR-0010/0031/0109): the host method returns a
+        # TransferResult whose ``outcome`` the handler maps to a message. Override
+        # per-test; the ADR-0109 terminal NOTIFY detail (status/reason) + the bounded
+        # wait are carried alongside for the FAILED / OUTCOME_UNKNOWN messages.
+        self.transfer_outcome: TransferOutcome = TransferOutcome.COMPLETED
+        self.transfer_notify_status: int | None = None
+        self.transfer_notify_reason: str | None = None
+        self.transfer_timeout_secs: float | None = None
+        # ADR-0109 P2: the discriminated OUTCOME_UNKNOWN reason (declined / call-ended
+        # / wait-disabled / timeout) the handler renders a distinct message for.
+        self.transfer_unknown_reason: TransferUnknownReason | None = None
         # When set, transfer_blind_on_call raises this (e.g. a REFER-rejected CallError
         # or the no-DTMF RuntimeError) so the handler can render a clear tool error.
         self.transfer_raises: Exception | None = None
@@ -147,27 +157,36 @@ class _FakeHost:
         self.entry_names.append(name)
         return self.known and not self.already_ended
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
-        # ADR-0010/0031 VoipToolHost member: DTMF-confirmed blind transfer (REFER).
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
+        # ADR-0010/0031/0109 VoipToolHost member: DTMF-confirmed blind transfer (REFER)
+        # then the terminal-outcome classification.
         if self.transfer_raises is not None:
             raise self.transfer_raises
         if not self.known or self.already_ended:
-            return TransferOutcome.NO_CALL
-        # Only record the (call, target) when the configured outcome is a fired
-        # transfer — an unconfirmed outcome must leave no REFER trace.
-        if self.transfer_outcome is TransferOutcome.TRANSFERRED:
+            return TransferResult(outcome=TransferOutcome.NO_CALL)
+        # Record the (call, target) only when the REFER fired — the pre-REFER outcomes
+        # (UNCONFIRMED / BLOCKED / NO_CALL) leave no REFER trace.
+        if self.transfer_outcome not in (
+            TransferOutcome.UNCONFIRMED,
+            TransferOutcome.BLOCKED,
+            TransferOutcome.NO_CALL,
+        ):
             self.transfers.append((call_id, target))
-        return self.transfer_outcome
+        return TransferResult(
+            outcome=self.transfer_outcome,
+            notify_status=self.transfer_notify_status,
+            notify_reason=self.transfer_notify_reason,
+            timeout_secs=self.transfer_timeout_secs,
+            unknown_reason=self.transfer_unknown_reason,
+        )
 
     # ADR-0048 VoipToolHost members (attended transfer): unused by this module's
     # tests but present so set_active_adapter(host) type-checks against the protocol.
     async def start_attended_consult(self, call_id: str, target: str) -> str:
         return ""
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
-        return AttendedTransferOutcome.TRANSFERRED
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
+        return AttendedTransferResult(outcome=AttendedTransferOutcome.COMPLETED)
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:
         return True
@@ -988,14 +1007,14 @@ def test_transfer_blind_schema_takes_a_target_string() -> None:
 async def test_transfer_blind_handler_fires_on_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A confirmed transfer resolves the session call and fires the REFER to target.
+    """A confirmed + COMPLETED transfer resolves the call and fires the REFER to target.
 
-    The host method returns TRANSFERRED only after the ArmedConfirmation resolves
-    True; the handler reports success and the REFER reached exactly the session's
-    own call with the requested target.
+    The host method returns COMPLETED (ADR-0109: the REFER fired and the terminal
+    NOTIFY reported success); the handler reports success and the REFER reached exactly
+    the session's own call with the requested target.
     """
     host = _FakeHost()
-    host.transfer_outcome = TransferOutcome.TRANSFERRED
+    host.transfer_outcome = TransferOutcome.COMPLETED
     set_active_adapter(host)
     _set_chat(monkeypatch, "call-xyz")
 
@@ -1125,6 +1144,146 @@ async def test_transfer_blind_handler_refer_rejected_reports_error(
 
     assert host.transfers == []
     assert "error" in json.loads(result)
+
+
+# --- ADR-0109: the terminal transfer outcome surfaced to the agent -----------
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_completed_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A COMPLETED transfer (terminal 2xx NOTIFY) reports a clear success result."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.COMPLETED
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert json.loads(result) == {
+        "result": "Transfer to sip:1001@pbx.example.test completed."
+    }
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_failed_reports_status_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FAILED transfer (terminal 4xx/6xx) reports the SIP status + reason as error."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.FAILED
+    host.transfer_notify_status = 486
+    host.transfer_notify_reason = "Busy Here"
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = "Transfer to sip:1001@pbx.example.test failed: 486 Busy Here."
+    assert json.loads(result) == {"error": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_outcome_unknown_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OUTCOME_UNKNOWN (no terminal NOTIFY within N s) keeps the honest wording."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; "
+        "outcome not confirmed within 20s."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_timeout_reports_within(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OUTCOME_UNKNOWN with a TIMEOUT reason names the bounded wait (ADR-0109 P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.TIMEOUT
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; "
+        "outcome not confirmed within 20s."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_declined_reports_declined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declined RFC 4488 subscription reports no progress subscription (P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.SUBSCRIPTION_DECLINED
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; the transfer response "
+        "signalled no progress subscription, so its final outcome was not reported."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_call_ended_reports_call_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leg torn down before the outcome reports the call ended (ADR-0109 P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.CALL_ENDED
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; the call ended before "
+        "the transfer outcome was reported."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_unknown_wait_disabled_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled outcome confirmation (timeout 0) reports only 'initiated' (P2)."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_unknown_reason = TransferUnknownReason.WAIT_DISABLED
+    host.transfer_timeout_secs = 0.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert json.loads(result) == {
+        "result": "Transfer to sip:1001@pbx.example.test initiated."
+    }
 
 
 # --- the gate OWNS transfer_blind and clamps it to operator level 3 ----------

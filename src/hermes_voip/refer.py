@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from urllib.parse import quote, unquote
 
 from hermes_voip._chars import contains_control
@@ -48,10 +49,14 @@ __all__ = [
     "ReferError",
     "ReferRequest",
     "ReplacesSpec",
+    "TransferOutcomeClass",
+    "TransferOutcomeReport",
+    "TransferUnknownReason",
     "build_attended_refer",
     "build_blind_refer",
     "build_notify_sipfrag",
     "build_triggered_invite",
+    "classify_transfer_progress",
     "match_replaces",
     "parse_notify_sipfrag",
     "parse_refer",
@@ -271,6 +276,110 @@ class NotifyProgress:
     status_code: int
     reason: str
     terminated: bool
+
+
+class TransferOutcomeClass(Enum):
+    """The terminal classification of a transfer's progress NOTIFY (ADR-0109).
+
+    A blind/attended transfer's referee answers ``202`` (received), then reports the
+    real outcome over the RFC 3515 implicit subscription as a ``message/sipfrag``
+    NOTIFY. This is the pure verdict :func:`classify_transfer_progress` derives from
+    the terminal :class:`NotifyProgress` (or its absence):
+
+    * ``COMPLETED`` — a terminated NOTIFY with a ``2xx`` sipfrag status.
+    * ``FAILED`` — a terminated NOTIFY with a ``3xx``/``4xx``/``5xx``/``6xx`` status
+      (busy / declined / unreachable): the transfer definitively did not complete.
+    * ``OUTCOME_UNKNOWN`` — no terminal NOTIFY was observed (``None``: the wait timed
+      out, the leg was BYE'd first, or the peer declined the subscription), or only a
+      non-terminal progress update (a ``100 Trying`` that leaked through). We never
+      infer success or failure from an unterminated/absent NOTIFY.
+    """
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class TransferUnknownReason(Enum):
+    """Why a transfer's outcome is OUTCOME_UNKNOWN (ADR-0109 §4, P2).
+
+    :func:`classify_transfer_progress` collapses every non-terminal transfer to a
+    single ``OUTCOME_UNKNOWN`` verdict, but the FOUR ways a transfer reaches it are
+    materially different to the agent — and only one of them is a wait that actually
+    elapsed. This enum discriminates them so the tool message states the real reason
+    instead of always claiming ``outcome not confirmed within Ns``:
+
+    * ``TIMEOUT`` — the bounded outcome wait elapsed with no terminal NOTIFY.
+    * ``SUBSCRIPTION_DECLINED`` — the referee declined the RFC 3515 implicit
+      subscription (RFC 4488 ``Refer-Sub: false``); no NOTIFY will ever arrive.
+    * ``CALL_ENDED`` — the referrer leg was BYE'd before any terminal NOTIFY (we
+      never infer success from a torn-down leg).
+    * ``WAIT_DISABLED`` — outcome confirmation is opted out (``timeout <= 0``): the
+      REFER was sent but no wait was attempted.
+    """
+
+    TIMEOUT = "timeout"
+    SUBSCRIPTION_DECLINED = "subscription_declined"
+    CALL_ENDED = "call_ended"
+    WAIT_DISABLED = "wait_disabled"
+
+
+@dataclass(frozen=True, slots=True)
+class TransferOutcomeReport:
+    """A transfer's terminal outcome: the progress NOTIFY, or why it is unknown.
+
+    Returned by :meth:`~hermes_voip.call.CallSession.transfer_blind` /
+    :meth:`~hermes_voip.call.CallSession.transfer_attended` (ADR-0109 P2). Exactly
+    one arm is populated: a terminal ``progress`` (with ``unknown_reason is None``)
+    OR an ``unknown_reason`` naming why no terminal outcome arrived (with ``progress
+    is None``). The invariant — ``unknown_reason`` is ``None`` iff a terminal
+    ``progress`` arrived — lets the tool layer render a reason-specific message
+    instead of the single always-"outcome not confirmed" string the bare ``None``
+    return previously forced.
+
+    Attributes:
+        progress: The terminal transfer-progress NOTIFY, or ``None`` when none did.
+        unknown_reason: Why no terminal outcome was reported, or ``None`` when a
+            terminal ``progress`` did arrive.
+    """
+
+    progress: NotifyProgress | None
+    unknown_reason: TransferUnknownReason | None
+
+
+# The SIP status bands (RFC 3515 sipfrag): 2xx = the transfer succeeded, 3xx-6xx =
+# it failed. A terminated status outside both bands (a malformed terminated 1xx) is
+# treated as unknown rather than claimed either way.
+_SUCCESS_STATUS_FLOOR = 200
+_FAILURE_STATUS_FLOOR = 300
+_FAILURE_STATUS_CEILING = 699
+
+
+def classify_transfer_progress(
+    progress: NotifyProgress | None,
+) -> TransferOutcomeClass:
+    """Classify a transfer's terminal progress NOTIFY into an outcome (ADR-0109).
+
+    Pure: maps the terminal :class:`NotifyProgress` (or ``None`` when none was
+    observed) to a :class:`TransferOutcomeClass`. Only a ``terminated`` NOTIFY yields
+    a definitive verdict — a ``2xx`` is :attr:`~TransferOutcomeClass.COMPLETED`, a
+    ``3xx``-``6xx`` is :attr:`~TransferOutcomeClass.FAILED`; ``None`` or a
+    non-terminal update is :attr:`~TransferOutcomeClass.OUTCOME_UNKNOWN`.
+
+    Args:
+        progress: The terminal transfer-progress NOTIFY, or ``None`` when the bounded
+            wait produced none (timeout, BYE, or a declined subscription).
+
+    Returns:
+        The terminal outcome classification.
+    """
+    if progress is None or not progress.terminated:
+        return TransferOutcomeClass.OUTCOME_UNKNOWN
+    if _SUCCESS_STATUS_FLOOR <= progress.status_code < _FAILURE_STATUS_FLOOR:
+        return TransferOutcomeClass.COMPLETED
+    if _FAILURE_STATUS_FLOOR <= progress.status_code <= _FAILURE_STATUS_CEILING:
+        return TransferOutcomeClass.FAILED
+    return TransferOutcomeClass.OUTCOME_UNKNOWN
 
 
 # --- Transferor: build REFER ------------------------------------------------

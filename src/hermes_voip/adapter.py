@@ -223,8 +223,12 @@ from hermes_voip.voip_tools import (
     TRANSFER_ATTENDED_TOOL_NAME,
     TRANSFER_BLIND_TOOL_NAME,
     AttendedTransferOutcome,
+    AttendedTransferResult,
     TransferOutcome,
+    TransferResult,
     active_voip_adapter,
+    build_attended_transfer_result,
+    build_transfer_result,
     outbound_failure_category,
     set_active_adapter,
 )
@@ -635,6 +639,10 @@ _DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
 # sync with config.py.
 _DEFAULT_AGENT_HANGUP_DRAIN_SECS = 5.0  # keep in sync with config.py
 _DEFAULT_AGENT_HANGUP_GRACE_SECS = 0.5  # keep in sync with config.py
+# ADR-0109: the bounded wait for the terminal transfer-progress NOTIFY, applied only
+# when no MediaConfig is bound (a live call always has one). Env
+# ``HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S``; keep in sync with config.py.
+_DEFAULT_TRANSFER_OUTCOME_TIMEOUT_S = 20.0  # keep in sync with config.py
 # After the drain timeout, cancelled BYE tasks get this brief, bounded grace to
 # finish cancelling — so cooperative BYEs are awaited and their errors observed
 # (not orphaned when the runtime keeps the loop alive after ``disconnect()``); a
@@ -6388,9 +6396,19 @@ class VoipAdapter(BasePlatformAdapter):
         _log.info("intercom open_entry (dtmf) for call %s", call_id)
         return await self.send_dtmf_on_call(call_id, cfg.dtmf_digits)
 
-    async def transfer_blind_on_call(
-        self, call_id: str, target: str
-    ) -> TransferOutcome:
+    def _transfer_outcome_timeout(self) -> float:
+        """The bounded wait for a transfer's terminal NOTIFY (ADR-0109 knob).
+
+        Reads ``MediaConfig.transfer_outcome_timeout_secs`` (env
+        ``HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S``); falls back to the module default
+        only before a MediaConfig is bound (a live call always has one). ``0`` opts out
+        of the wait entirely — the session returns immediately (OUTCOME_UNKNOWN).
+        """
+        if self._media_cfg is not None:
+            return self._media_cfg.transfer_outcome_timeout_secs
+        return _DEFAULT_TRANSFER_OUTCOME_TIMEOUT_S
+
+    async def transfer_blind_on_call(self, call_id: str, target: str) -> TransferResult:
         """DTMF-confirmed blind transfer of ``call_id`` to ``target`` (ADR-0010/0031).
 
         The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the agent
@@ -6429,7 +6447,7 @@ class VoipAdapter(BasePlatformAdapter):
         """
         session = self._call_sessions.get(call_id)
         if session is None or session.ended:
-            return TransferOutcome.NO_CALL
+            return TransferResult(outcome=TransferOutcome.NO_CALL)
         # Defense in depth (cross-vendor review): the REFER chokepoint enforces the
         # privilege clamp ITSELF, not only via the pre_tool_call gate. The transfer is
         # IRREVERSIBLE, so ``gate_voip_tool(..., confirmed=True)`` returns True iff
@@ -6444,7 +6462,7 @@ class VoipAdapter(BasePlatformAdapter):
                 "(privilege/degraded clamp); refusing before confirmation",
                 call_id,
             )
-            return TransferOutcome.BLOCKED
+            return TransferResult(outcome=TransferOutcome.BLOCKED)
         confirmation = self._dtmf_confirmations.get(call_id)
         if confirmation is None:
             # No spoof-resistant confirmation channel for this call (no telephone-event
@@ -6468,13 +6486,13 @@ class VoipAdapter(BasePlatformAdapter):
                 "transferred",
                 call_id,
             )
-            return TransferOutcome.UNCONFIRMED
+            return TransferResult(outcome=TransferOutcome.UNCONFIRMED)
         # Re-validate after the await (TOCTOU): the confirmation was sought for THIS
         # call; if it ended while the prompt/window was in flight, do not REFER a stale
         # session. Re-read the map rather than trusting the earlier reference.
         session = self._call_sessions.get(call_id)
         if session is None or session.ended:
-            return TransferOutcome.NO_CALL
+            return TransferResult(outcome=TransferOutcome.NO_CALL)
         # Re-run the privilege clamp AFTER the await too (the load-bearing TOCTOU fix
         # from the review): a fail-open screen during the confirmation window can flip
         # the session ``degraded`` (sticky), and a concurrent re-classification could
@@ -6487,14 +6505,22 @@ class VoipAdapter(BasePlatformAdapter):
                 "confirmation (privilege/degraded clamp); REFER NOT sent",
                 call_id,
             )
-            return TransferOutcome.BLOCKED
+            return TransferResult(outcome=TransferOutcome.BLOCKED)
         referred_by = session.dialog.local_uri
         _log.info(
             "agent transfer_blind tool: confirmed — transferring call %s (REFER)",
             call_id,
         )
-        await session.transfer_blind(target, referred_by=referred_by)
-        return TransferOutcome.TRANSFERRED
+        # ADR-0109: after the REFER 2xx, await the terminal transfer-progress NOTIFY
+        # (bounded by the configured knob) and classify the real outcome, so the agent
+        # learns whether the transfer actually completed — not just that it was sent.
+        timeout = self._transfer_outcome_timeout()
+        report = await session.transfer_blind(
+            target, referred_by=referred_by, outcome_timeout=timeout
+        )
+        # ADR-0109 P2: thread the discriminated OUTCOME_UNKNOWN reason through so the
+        # tool message names WHY (timeout / declined / call-ended / wait-disabled).
+        return build_transfer_result(report.progress, timeout, report.unknown_reason)
 
     async def start_attended_consult(self, call_id: str, target: str) -> str:
         """Originate the CONSULTATION leg of an attended transfer (ADR-0048).
@@ -6581,7 +6607,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._attended_consults[call_id] = consult_call_id
         return consult_call_id
 
-    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferOutcome:
+    async def complete_attended_transfer(self, call_id: str) -> AttendedTransferResult:
         """COMPLETE an attended transfer: REFER+Replaces on the original (ADR-0048).
 
         The :class:`~hermes_voip.voip_tools.VoipToolHost` entry point the
@@ -6605,16 +6631,16 @@ class VoipAdapter(BasePlatformAdapter):
         """
         consult_call_id = self._attended_consults.get(call_id)
         if consult_call_id is None:
-            return AttendedTransferOutcome.NO_CONSULT
+            return AttendedTransferResult(outcome=AttendedTransferOutcome.NO_CONSULT)
         session = self._call_sessions.get(call_id)
         if session is None or session.ended:
-            return AttendedTransferOutcome.NO_CALL
+            return AttendedTransferResult(outcome=AttendedTransferOutcome.NO_CALL)
         consult = self._call_sessions.get(consult_call_id)
         if consult is None or consult.ended:
             # The consultation ended before we completed — there is nothing to bridge
             # to. Clear the stale pairing and report it as no-call (no REFER).
             self._attended_consults.pop(call_id, None)
-            return AttendedTransferOutcome.NO_CALL
+            return AttendedTransferResult(outcome=AttendedTransferOutcome.NO_CALL)
         # Defense in depth: re-run the privilege clamp before sending the REFER, so a
         # session that lost privilege or went degraded during the consultation cannot
         # complete the transfer (mirrors transfer_blind_on_call's post-await re-check).
@@ -6626,16 +6652,24 @@ class VoipAdapter(BasePlatformAdapter):
                 "REFER NOT sent",
                 call_id,
             )
-            return AttendedTransferOutcome.BLOCKED
+            return AttendedTransferResult(outcome=AttendedTransferOutcome.BLOCKED)
         referred_by = session.dialog.local_uri
         _log.info(
             "agent transfer_attended tool: completing call %s -> consult %s (REFER)",
             call_id,
             consult_call_id,
         )
-        await session.transfer_attended(consult.dialog, referred_by=referred_by)
+        # ADR-0109: await the terminal transfer-progress NOTIFY (bounded) after the
+        # REFER+Replaces 2xx and classify the real outcome, like the blind path.
+        timeout = self._transfer_outcome_timeout()
+        report = await session.transfer_attended(
+            consult.dialog, referred_by=referred_by, outcome_timeout=timeout
+        )
         self._attended_consults.pop(call_id, None)
-        return AttendedTransferOutcome.TRANSFERRED
+        # ADR-0109 P2: pass the discriminated OUTCOME_UNKNOWN reason to the message.
+        return build_attended_transfer_result(
+            report.progress, timeout, report.unknown_reason
+        )
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:
         """Abandon the consultation for ``call_id`` (ADR-0048); whether it acted.

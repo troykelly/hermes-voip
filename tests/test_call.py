@@ -26,7 +26,12 @@ from hermes_voip.media.engine import Codec as EngineCodec
 from hermes_voip.media.engine import RtpMediaTransport
 from hermes_voip.message import SipRequest, SipResponse, build_response
 from hermes_voip.providers.policy import GuardSessionState
-from hermes_voip.refer import ReferRequest
+from hermes_voip.refer import (
+    NotifyProgress,
+    ReferRequest,
+    TransferOutcomeReport,
+    TransferUnknownReason,
+)
 from hermes_voip.sdp import (
     Codec,
     CryptoAttribute,
@@ -670,6 +675,596 @@ async def test_transfer_rejected_raises() -> None:
     await session.on_response(SipResponse.parse(build_response(refer, 603, "Decline")))
     with pytest.raises(CallError, match="REFER rejected"):
         await task
+
+
+async def test_transfer_redirect_3xx_rejected_raises() -> None:
+    # A REFER 3xx redirect is NOT an acceptance: SIP success is 2xx only (RFC 3261
+    # §21), so a 302 must raise CallError like any non-2xx final — never proceed into
+    # the outcome wait and falsely report OUTCOME_UNKNOWN/"initiated". _refer rejects
+    # ``>= _FIRST_ERROR_STATUS`` (300), so this holds; pin it against regression.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(session.transfer_blind("sip:3000@pbx.example.test"))
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    await session.on_response(
+        SipResponse.parse(build_response(refer, 302, "Moved Temporarily"))
+    )
+    with pytest.raises(CallError, match="REFER rejected"):
+        await task
+
+
+# ---- outbound: transfer outcome wait (ADR-0109) ----------------------------
+
+
+def _refer_notify(
+    status_line: str, *, terminated: bool, event_id: int | None = None
+) -> SipRequest:
+    """Build an inbound ``Event:refer`` transfer-progress NOTIFY (``message/sipfrag``).
+
+    ``terminated`` sets ``Subscription-State: terminated`` (the final outcome) vs
+    ``active`` (an interim ``100 Trying``-class update). ``event_id`` sets the RFC 3515
+    ``Event: refer;id=<n>`` correlation parameter (the CSeq of the REFER the NOTIFY
+    reports on); ``None`` omits it entirely (an id-less peer).
+    """
+    sub_state = "terminated;reason=noresource" if terminated else "active;expires=60"
+    event = "refer" if event_id is None else f"refer;id={event_id}"
+    return SipRequest(
+        method="NOTIFY",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.99:5061;branch=z9hG4bK-nt"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirs"),
+            ("To", "<sip:1000@pbx.example.test>;tag=ours"),
+            ("Call-ID", "call-1"),
+            ("CSeq", "13 NOTIFY"),
+            ("Event", event),
+            ("Subscription-State", sub_state),
+            ("Content-Type", "message/sipfrag;version=2.0"),
+        ),
+        body=status_line,
+    )
+
+
+def _refer_cseq(signaling: _FakeSignaling) -> int:
+    """The CSeq NUMBER stamped in the REFER the transfer just sent (its Event id)."""
+    cseq = _last_request(signaling, "REFER").header("CSeq")
+    assert cseq is not None
+    return int(cseq.split()[0])
+
+
+def _consult_dialog() -> Dialog:
+    return Dialog(
+        call_id="ac-call",
+        local_uri="sip:1000@pbx.example.test",
+        local_tag="a-ctag",
+        remote_uri="sip:3000@pbx.example.test",
+        remote_tag="c-tag",
+        remote_target="sip:3000@198.51.100.50:5061;transport=tls",
+        route_set=(),
+        local_contact="<sip:1000@198.51.100.7:5061;transport=tls>",
+        local_sent_by="198.51.100.7:5061",
+        transport="TLS",
+        local_cseq=5,
+        sdp_version=0,
+    )
+
+
+async def _accept_refer(session: CallSession, signaling: _FakeSignaling) -> None:
+    """Feed a plain ``202 Accepted`` to the REFER the transfer just sent."""
+    refer = _last_request(signaling, "REFER")
+    await session.on_response(SipResponse.parse(build_response(refer, 202, "Accepted")))
+    await asyncio.sleep(0)  # let the verb release the lock and reach the outcome wait
+
+
+async def test_transfer_blind_returns_terminal_notify_progress_on_2xx() -> None:
+    """After the REFER 202, a terminal 2xx NOTIFY is returned to the caller (ADR-0109).
+
+    The bounded outcome wait resolves the instant the terminated sipfrag NOTIFY
+    arrives — the referee reported the transfer completed.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is not None
+    assert progress.status_code == 200
+    assert progress.terminated is True
+
+
+async def test_bye_before_late_terminal_notify_latches_call_ended() -> None:
+    # P1-b (codex round 2): the outcome wait must latch its cause the instant it is
+    # woken. If a BYE wakes it FIRST, a terminal NOTIFY that records transfer_progress
+    # before the waiting task resumes must NOT flip the outcome to COMPLETED — the
+    # documented contract is "never infer success from a torn-down leg". Deterministic
+    # reproduction: wake (BYE) then record the late terminal progress synchronously (no
+    # await between), so the waiter cannot resume until we await the task.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)  # the waiter is now in the outcome wait
+    session._wake_transfer_on_end()  # BYE wakes it FIRST — must latch CALL_ENDED
+    # A terminal NOTIFY records progress after the BYE, before the waiter resumes:
+    session.transfer_progress = NotifyProgress(
+        status_code=200, reason="OK", terminated=True
+    )
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
+
+
+async def test_second_transfer_while_one_awaits_is_rejected() -> None:
+    # codex round-3 P1: transfer_blind/attended release self._lock before awaiting the
+    # outcome, but the correlation/latch state is session-wide. A second transfer while
+    # the first is still awaiting must FAIL FAST (not clobber the first's event/CSeq and
+    # leave it to time out). Transfers on one leg are inherently serial.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task1 = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)  # transfer1 is now awaiting its outcome
+    with pytest.raises(CallError, match="already"):
+        await asyncio.wait_for(
+            session.transfer_blind("sip:4000@pbx.example.test", outcome_timeout=2.0),
+            timeout=1.0,
+        )
+    # transfer1 is uncorrupted: its terminal NOTIFY still resolves it to COMPLETED.
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    report = await asyncio.wait_for(task1, timeout=2.0)
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+
+
+async def test_transfer_on_ended_call_is_rejected() -> None:
+    # codex round-4: a BYE can end the call between the adapter's ended-check and the
+    # arm. Arming a transfer on an ended call must fail fast — never send a REFER on a
+    # dead dialog nor arm an event that is never signalled (→ a false TIMEOUT).
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    session.ended = True
+    with pytest.raises(CallError, match="ended"):
+        await asyncio.wait_for(
+            session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0),
+            timeout=1.0,
+        )
+
+
+async def test_terminated_nonfinal_sipfrag_is_not_a_terminal_outcome() -> None:
+    # codex round-4: a terminated subscription carrying a NON-final status ("100
+    # Trying") is not a definitive transfer outcome. It must not be latched/reported
+    # as a terminal progress (which classifies OUTCOME_UNKNOWN with no reason → a
+    # false "not confirmed within Ns"). It does not wake the wait; the bounded wait
+    # times out → TIMEOUT.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=0.1)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 100 Trying", terminated=True))
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.TIMEOUT
+
+
+async def test_transfer_blind_returns_failed_notify_progress_on_4xx() -> None:
+    """A terminal 4xx NOTIFY (busy) is returned so the adapter can classify FAILED."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(
+        _refer_notify("SIP/2.0 486 Busy Here", terminated=True)
+    )
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is not None
+    assert progress.status_code == 486
+    assert progress.terminated is True
+
+
+async def test_transfer_blind_times_out_returns_none() -> None:
+    """No terminal NOTIFY within the bounded wait yields ``None`` (OUTCOME_UNKNOWN)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=0.05)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is None
+
+
+async def test_transfer_blind_bye_before_terminal_returns_none() -> None:
+    """A BYE tearing the leg down before any terminal NOTIFY wakes the wait -> ``None``.
+
+    We do NOT infer success from a BYE (a proxy may BYE the referrer leg on either
+    success or failure), so the outcome stays unknown.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=5.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_inbound("BYE"))
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is None
+    assert session.ended is True
+
+
+async def test_transfer_blind_refer_sub_false_skips_wait_returns_none() -> None:
+    """RFC 4488: a ``Refer-Sub: false`` 2xx declines the subscription -> immediate None.
+
+    A large ``outcome_timeout`` is used deliberately: if the fast-path were missing
+    the verb would block on the wait and ``wait_for(task, 1.0)`` would time out — so
+    completing under a second proves the wait was skipped, not merely that it returned
+    ``None`` eventually.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=100.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    accepted = build_response(
+        refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+    )
+    await session.on_response(SipResponse.parse(accepted))
+    progress = (await asyncio.wait_for(task, timeout=1.0)).progress
+    assert progress is None
+
+
+async def test_transfer_blind_terminal_notify_racing_the_202() -> None:
+    """A terminal NOTIFY arriving BEFORE the 202 is not missed (event armed pre-REFER).
+
+    The per-transfer event is created before the REFER is sent, so a NOTIFY that
+    races ahead of the 202 sets it; the wait then observes an already-set event and
+    returns the terminal progress.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    # The terminal NOTIFY arrives while the REFER's 202 is still in flight.
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    await session.on_response(SipResponse.parse(build_response(refer, 202, "Accepted")))
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is not None
+    assert progress.status_code == 200
+
+
+async def test_transfer_blind_no_wait_when_timeout_zero() -> None:
+    """``outcome_timeout=0`` opts out of the wait: returns ``None`` without blocking."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=0.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    await session.on_response(SipResponse.parse(build_response(refer, 202, "Accepted")))
+    progress = (await asyncio.wait_for(task, timeout=1.0)).progress
+    assert progress is None
+
+
+async def test_transfer_attended_returns_terminal_notify_progress() -> None:
+    """Attended transfer also awaits + returns the terminal NOTIFY (ADR-0109)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_attended(_consult_dialog(), outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is not None
+    assert progress.status_code == 200
+    assert progress.terminated is True
+
+
+# ---- outbound: transfer NOTIFY subscription correlation (ADR-0109 P1) -------
+
+
+async def test_transfer_blind_stale_notify_id_does_not_wake_new_transfer() -> None:
+    """A prior transfer's late NOTIFY must not wake a NEWLY-armed transfer (RFC 3515).
+
+    Transfer #1 times out but its implicit subscription stays alive; transfer #2 is
+    then armed on the SAME call. A terminal NOTIFY carrying #1's Event ``id`` (the CSeq
+    of #1's REFER) arrives while #2 waits. Correlated by ``Event: refer;id=<CSeq>``, it
+    belongs to #1's subscription — it must NOT wake or classify #2. #2 therefore keeps
+    waiting and times out on its OWN (short) deadline, returning ``None`` rather than
+    #1's stale ``200 OK`` outcome.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+
+    # Transfer #1: send + accept the REFER, capture its CSeq, then let it time out.
+    task1 = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=0.05)
+    )
+    await asyncio.sleep(0)
+    cseq1 = _refer_cseq(signaling)
+    await _accept_refer(session, signaling)
+    assert (await asyncio.wait_for(task1, timeout=2.0)).progress is None
+
+    # Transfer #2: arm on the same call; its REFER carries a DIFFERENT CSeq.
+    task2 = asyncio.create_task(
+        session.transfer_blind("sip:4000@pbx.example.test", outcome_timeout=0.1)
+    )
+    await asyncio.sleep(0)
+    cseq2 = _refer_cseq(signaling)
+    assert cseq2 != cseq1
+    await _accept_refer(session, signaling)
+
+    # #1's late terminal NOTIFY (its own id) must be ignored by #2's wait.
+    await session.handle_request(
+        _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq1)
+    )
+    progress = (await asyncio.wait_for(task2, timeout=2.0)).progress
+    assert progress is None  # #2 was NOT contaminated by #1's stale 200 OK
+
+
+async def test_transfer_blind_matching_event_id_wakes_wait() -> None:
+    """A terminal NOTIFY carrying the REFER's own CSeq ``id`` wakes the active wait."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    cseq = _refer_cseq(signaling)
+    await _accept_refer(session, signaling)
+    await session.handle_request(
+        _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq)
+    )
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is not None
+    assert progress.status_code == 200
+
+
+async def test_await_prelatched_outcome_reported_when_wait_disabled() -> None:
+    # The outcome event is armed BEFORE the REFER, so a terminal NOTIFY can latch an
+    # outcome before we decide whether to wait. Even with the wait opted out (timeout
+    # <= 0), an already-latched terminal outcome must be reported, not discarded as
+    # WAIT_DISABLED (codex round-5).
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    session._transfer_outcome_latched = True
+    session._transfer_outcome_progress = NotifyProgress(
+        status_code=200, reason="OK", terminated=True
+    )
+    event.set()
+    report = await session._await_transfer_outcome(event, 0.0)  # wait opted out
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+
+
+async def test_await_reads_latch_set_during_a_timed_out_wait() -> None:
+    # codex round-6: a terminal outcome latched DURING the wait (e.g. right at the
+    # deadline) must be reported even when wait_for resolves as a TimeoutError — _await
+    # falls through to re-read the latch, never returning TIMEOUT while one is latched.
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+
+    async def latch_midway() -> None:
+        await asyncio.sleep(0.02)
+        # Latch a terminal outcome but deliberately do NOT set the event, so the wait
+        # times out — this exercises the post-timeout latch re-read.
+        session._transfer_outcome_latched = True
+        session._transfer_outcome_progress = NotifyProgress(
+            status_code=200, reason="OK", terminated=True
+        )
+
+    latcher = asyncio.create_task(latch_midway())
+    report = await session._await_transfer_outcome(event, 0.1)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+    await latcher
+
+
+async def test_prelatched_terminal_takes_precedence_over_refer_sub_false() -> None:
+    # codex round-6: a correlated terminal NOTIFY can latch BEFORE the REFER's 2xx —
+    # the event is armed before the REFER, and inbound NOTIFY handling does not take
+    # the call lock. Even when that 2xx declines the subscription (Refer-Sub: false),
+    # the already-latched terminal outcome must be reported, not discarded as
+    # SUBSCRIPTION_DECLINED.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    cseq = _refer_cseq(signaling)
+    await session.handle_request(
+        _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq)
+    )
+    refer = _last_request(signaling, "REFER")
+    await session.on_response(
+        SipResponse.parse(
+            build_response(
+                refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+            )
+        )
+    )
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+
+
+async def test_transfer_blind_idless_notify_honored_best_effort() -> None:
+    """An id-less terminal NOTIFY is honoured for the single active transfer.
+
+    Some peers omit the RFC 3515 Event ``id``; with one transfer in flight we honour it
+    best-effort. Documented residual: an id-less late NOTIFY from a prior subscription
+    cannot be told apart from the active one.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
+    assert progress is not None
+    assert progress.status_code == 200
+
+
+# ---- outbound: transfer OUTCOME_UNKNOWN reason discrimination (ADR-0109 P2) -
+
+
+async def test_await_transfer_outcome_wait_disabled_reports_reason() -> None:
+    """``timeout <= 0`` opts out of the wait: WAIT_DISABLED, no progress (ADR-0109 P2).
+
+    The REFER was sent but no wait was attempted, so the report must name
+    WAIT_DISABLED — not claim a bounded wait that never elapsed.
+    """
+    session = _session(_FakeSignaling(), _FakeMedia())
+    report = await session._await_transfer_outcome(asyncio.Event(), 0.0)
+    assert isinstance(report, TransferOutcomeReport)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.WAIT_DISABLED
+
+
+async def test_await_transfer_outcome_timeout_reports_reason() -> None:
+    """A wait that elapses with no terminal NOTIFY reports TIMEOUT (ADR-0109 P2)."""
+    session = _session(_FakeSignaling(), _FakeMedia())
+    report = await session._await_transfer_outcome(asyncio.Event(), 0.05)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.TIMEOUT
+
+
+async def test_await_transfer_outcome_terminal_progress_has_no_reason() -> None:
+    """A latched terminal outcome yields the progress with NO reason (P2/P1-b)."""
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    # A terminated NOTIFY latches the outcome (what _on_notify does), then wakes the
+    # wait; _await reads the LATCH, not the mutable transfer_progress (P1-b).
+    session._transfer_outcome_latched = True
+    session._transfer_outcome_progress = NotifyProgress(
+        status_code=200, reason="OK", terminated=True
+    )
+    event.set()
+    report = await session._await_transfer_outcome(event, 2.0)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+    assert report.progress.terminated is True
+
+
+async def test_await_transfer_outcome_call_ended_reports_reason() -> None:
+    """The event firing with no terminal progress (a BYE woke it) -> CALL_ENDED (P2).
+
+    We never infer success from a torn-down leg, so a wake latched by call-end with
+    no terminal outcome is reported as CALL_ENDED, not a timeout.
+    """
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    # A BYE latches CALL_ENDED (progress stays None), then wakes the wait — this is
+    # what _wake_transfer_on_end does:
+    session._transfer_outcome_latched = True
+    event.set()
+    report = await session._await_transfer_outcome(event, 2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
+
+
+async def test_await_transfer_outcome_nonterminal_progress_is_call_ended() -> None:
+    """A non-terminal ``100 Trying`` recording is never mistaken for a terminal outcome.
+
+    Only a terminal NOTIFY latches an outcome; a bare ``100 Trying`` does not. When a
+    BYE then latches CALL_ENDED and wakes the wait, the non-terminal recording (below)
+    is never read — the latch decides (P1-b).
+    """
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    session.transfer_progress = NotifyProgress(
+        status_code=100, reason="Trying", terminated=False
+    )
+    session._transfer_outcome_latched = True  # a BYE latched CALL_ENDED (progress None)
+    event.set()
+    report = await session._await_transfer_outcome(event, 2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
+
+
+async def test_transfer_blind_refer_sub_false_reports_subscription_declined() -> None:
+    """RFC 4488 ``Refer-Sub: false`` -> SUBSCRIPTION_DECLINED report (ADR-0109 P2)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=100.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    accepted = build_response(
+        refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+    )
+    await session.on_response(SipResponse.parse(accepted))
+    report = await asyncio.wait_for(task, timeout=1.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.SUBSCRIPTION_DECLINED
+
+
+async def test_transfer_attended_refer_sub_false_reports_subscription_declined() -> (
+    None
+):
+    """Attended transfer mirrors the blind SUBSCRIPTION_DECLINED report (P2)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_attended(_consult_dialog(), outcome_timeout=100.0)
+    )
+    await asyncio.sleep(0)
+    refer = _last_request(signaling, "REFER")
+    accepted = build_response(
+        refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+    )
+    await session.on_response(SipResponse.parse(accepted))
+    report = await asyncio.wait_for(task, timeout=1.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.SUBSCRIPTION_DECLINED
+
+
+async def test_transfer_blind_terminal_2xx_report_has_no_reason() -> None:
+    """A terminal 2xx NOTIFY yields a progress-bearing report, no reason (P2)."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
 
 
 # ---- inbound: handle_request -----------------------------------------------

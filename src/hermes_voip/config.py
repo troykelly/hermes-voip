@@ -411,10 +411,27 @@ _DEFAULT_AGENT_HANGUP_GRACE_SECS = 0.5
 # Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020 §5).
 # When the gateway's deny_mode is ``decline``, a declined-group caller is ANSWERED and
 # hears this one short line before the call is BYE'd (instead of a hard 603). Operator-
-# overridable; blank/whitespace → the built-in default. NOT spoken on the default
-# ``reject`` mode (no media path there). ``HERMES_VOIP_DECLINE_PHRASE``.
+# overridable; blank/whitespace → the selected language's built-in line (ADR-0084), or
+# English when the language has no built-in line. NOT spoken on the default ``reject``
+# mode (no media path there). ``HERMES_VOIP_DECLINE_PHRASE``.
 _DECLINE_PHRASE_KEY = "HERMES_VOIP_DECLINE_PHRASE"
-_DEFAULT_DECLINE_PHRASE = "Sorry, I cannot take this call."
+# Built-in polite-decline lines keyed by language code, mirroring
+# _SAFE_ERROR_REPLY_BY_LANGUAGE in provider_error.py: one short, natural line per
+# language (no bracket tag), unlike the guard-REFUSE set (a rotation of several lines
+# spoken repeatedly across a call) this line is spoken exactly ONCE before the BYE, so
+# a single phrase per language is sufficient (ADR-0020 §5/§6). To add a language, add
+# an entry here — nothing else changes.
+_DECLINE_PHRASE_BY_LANGUAGE: dict[str, str] = {
+    "en": "Sorry, I cannot take this call.",
+    "fr": "Désolé, je ne peux pas prendre cet appel.",
+    "de": "Entschuldigung, ich kann diesen Anruf nicht entgegennehmen.",
+    "es": "Lo siento, no puedo atender esta llamada.",
+    "pt": "Desculpe, não posso atender esta chamada.",
+}
+# The English line is the back-compatible default for a directly-constructed
+# MediaConfig (no env, no language argument) and the fallback for an unrecognised
+# language (ADR-0084).
+_DEFAULT_DECLINE_PHRASE = _DECLINE_PHRASE_BY_LANGUAGE[_DEFAULT_LANGUAGE]
 # ADR-0020 §5/§6 require ONE SHORT line: the decline phrase is spoken once over the
 # answered media path before the BYE, not a multi-line block. So a value containing a
 # line break is rejected, and the length is capped to this sane maximum (≈ a long
@@ -1794,8 +1811,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         agent_hangup_grace_secs=_parse_positive_float(
             env, _AGENT_HANGUP_GRACE_SECS_KEY, _DEFAULT_AGENT_HANGUP_GRACE_SECS
         ),
-        # ADR-0020 §5/§6: the polite-decline line for deny_mode=decline.
-        decline_phrase=_parse_decline_phrase(env),
+        # ADR-0020 §5/§6 + ADR-0084: the language-keyed polite-decline line for
+        # deny_mode=decline.
+        decline_phrase=_parse_decline_phrase(env, language),
         refuse_decline_phrases=_parse_refuse_decline_phrases(env, language),
         error_apology=_value(env, _ERROR_APOLOGY_KEY) or "",
     )
@@ -2336,17 +2354,22 @@ def _parse_goodbye_phrase(env: Mapping[str, str]) -> str:
     return raw or _DEFAULT_GOODBYE_PHRASE
 
 
-def _parse_decline_phrase(env: Mapping[str, str]) -> str:
+def _parse_decline_phrase(env: Mapping[str, str], language: str) -> str:
     """Parse ``HERMES_VOIP_DECLINE_PHRASE``, defaulting when unset or blank.
 
     The polite-decline line spoken on a ``deny_mode=decline`` declined caller
-    (ADR-0020 §5/§6). A blank/whitespace value falls back to the built-in default —
-    answering a declined caller only to play dead air is a misconfiguration, so the
-    spoken line is always non-trivially short. The operator keeps the hard-603 posture
-    via ``HERMES_VOIP_DENY_MODE=reject`` (the default), not by blanking this phrase.
+    (ADR-0020 §5/§6). A blank/whitespace value falls back to the selected
+    *language*'s built-in line (:data:`_DECLINE_PHRASE_BY_LANGUAGE`), or to the
+    English default when the language has no built-in line (ADR-0084) — answering a
+    declined caller only to play dead air is a misconfiguration, so the spoken line is
+    always non-trivially short and never English-only by construction. An explicit
+    value always wins. The operator keeps the hard-603 posture via
+    ``HERMES_VOIP_DENY_MODE=reject`` (the default), not by blanking this phrase.
+    ``language`` is pre-validated by :func:`_parse_language`.
     """
+    default = _DECLINE_PHRASE_BY_LANGUAGE.get(language, _DEFAULT_DECLINE_PHRASE)
     raw = _value(env, _DECLINE_PHRASE_KEY)
-    return raw or _DEFAULT_DECLINE_PHRASE
+    return raw or default
 
 
 def _parse_ice_stun_urls(env: Mapping[str, str]) -> tuple[str, ...]:

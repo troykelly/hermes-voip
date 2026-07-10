@@ -164,7 +164,7 @@ the inbound INVITE. Independent of which list scheme you use.
 | Env var | Meaning | Default |
 |---|---|---|
 | `HERMES_VOIP_DENY_MODE` | `reject` → hard `603 Decline` (pre-200-OK; no media, no agent). `decline` → ANSWER (`200 OK`), speak one short line, then `BYE`. | `reject` |
-| `HERMES_VOIP_DECLINE_PHRASE` | the one line spoken in `decline` mode (blank/unset → the built-in default) | `Sorry, I cannot take this call.` |
+| `HERMES_VOIP_DECLINE_PHRASE` | the one line spoken in `decline` mode (blank/unset → the built-in line for `HERMES_VOIP_LANGUAGE`, English fallback) | `Sorry, I cannot take this call.` (English) |
 
 - **`reject` (default):** cheapest and gives the caller zero agent surface. A persistent
   spammer may learn the number is blocked and retry from a fresh number.
@@ -173,10 +173,12 @@ the inbound INVITE. Independent of which list scheme you use.
   **never reaches the agent**. Use where a polite "we can't take this call" trains a
   spammer less than a hard 603. An invalid `HERMES_VOIP_DENY_MODE` value fails loud
   (`ConfigError` naming the var) at startup. A **blank/unset** `HERMES_VOIP_DECLINE_PHRASE`
-  uses the built-in default `Sorry, I cannot take this call.` (it is never answered as
-  dead air — a blank value defaults). The phrase must be **ONE short line**: a value with
-  an embedded line break, or longer than 200 characters, is rejected at startup
-  (`ConfigError` naming the var) — it is spoken once, not as a multi-line block.
+  uses the built-in line for the configured `HERMES_VOIP_LANGUAGE` (`en`/`fr`/`de`/`es`/`pt`
+  built in; any other language falls back to English) — it is never answered as dead air,
+  and never English-only for a non-English deployment when a built-in line exists
+  (ADR-0084). The phrase must be **ONE short line**: a value with an embedded line break,
+  or longer than 200 characters, is rejected at startup (`ConfigError` naming the var) — it
+  is spoken once, not as a multi-line block.
 
 **Verify** `decline`: place a call from a deny-listed caller-ID with
 `HERMES_VOIP_DENY_MODE=decline` set; the call connects (200 OK), you hear the decline

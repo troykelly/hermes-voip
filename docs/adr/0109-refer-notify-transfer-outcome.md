@@ -94,11 +94,43 @@ messages:
 
 - `COMPLETED` → `"Transfer to {target} completed."`
 - `FAILED` → `"Transfer to {target} failed: {status} {reason}."`
-- `OUTCOME_UNKNOWN` → `"Transfer to {target} initiated; outcome not confirmed
-  within {N}s."` (keeps the honest "initiated" wording for the genuinely-unknown
-  case).
+- `OUTCOME_UNKNOWN` → a per-reason message refined in §4a (P2). The original single
+  wording `"Transfer to {target} initiated; outcome not confirmed within {N}s."` is
+  now the `TIMEOUT`-reason case only.
 
 `NO_CALL` / `REFUSED` (DTMF) / `BLOCKED` are unchanged.
+
+### 4a. Discriminated `OUTCOME_UNKNOWN` reason (P2, 2026-07-10)
+
+The single `OUTCOME_UNKNOWN` message above conflated the FOUR ways a transfer reaches
+it, and always claimed a bounded wait ("outcome not confirmed within {N}s") — a lie for
+the three causes where no wait actually elapsed (rule 27). P2 threads a discriminated
+reason through the whole path:
+
+- `CallSession.transfer_blind` / `transfer_attended` / `_await_transfer_outcome` now
+  return a frozen `refer.TransferOutcomeReport(progress, unknown_reason)` — exactly one
+  arm populated (`unknown_reason is None` iff a terminal `progress` arrived) — instead
+  of a bare `NotifyProgress | None`.
+- `refer.TransferUnknownReason` enumerates `TIMEOUT`, `SUBSCRIPTION_DECLINED`,
+  `CALL_ENDED`, `WAIT_DISABLED`.
+- `TransferResult` / `AttendedTransferResult` gain an `unknown_reason` field; the
+  adapter passes `report.unknown_reason` to `build_transfer_result` /
+  `build_attended_transfer_result`, and the handler renders a distinct message.
+
+Per-reason agent-facing message (blind carries `{target}`; the attended phrasing omits
+it — e.g. `"Transfer initiated; …"`):
+
+- `TIMEOUT` → `"Transfer to {target} initiated; outcome not confirmed within {N}s."`
+  (unchanged wording — the bounded wait genuinely elapsed).
+- `SUBSCRIPTION_DECLINED` → `"Transfer to {target} initiated; the peer declined the
+  transfer-progress subscription, so the final outcome was not reported."`
+- `CALL_ENDED` → `"Transfer to {target} initiated; the call ended before the transfer
+  outcome was reported."`
+- `WAIT_DISABLED` → `"Transfer to {target} initiated."` (outcome confirmation is opted
+  out, `timeout <= 0`; the REFER was sent but no wait ran).
+
+A defensive `None` reason keeps the `TIMEOUT` wording. The P1 NOTIFY-correlation fix
+(Event-`id`/CSeq matching) is independent and unchanged by P2.
 
 ### 5. Timeout knob
 
@@ -121,6 +153,12 @@ backstop if the header is absent but the peer still never NOTIFIes.)
 
 - **Correctness/UX:** the agent learns whether a transfer actually completed and can
   recover on failure — the point of the feature.
+- **Accuracy (rule 27, P2):** the `OUTCOME_UNKNOWN` message now names the real reason
+  (declined subscription / call-ended / wait-disabled / timeout) via the discriminated
+  `TransferUnknownReason`, instead of always claiming a bounded wait that — for three of
+  the four causes — never elapsed. The agent recovers appropriately (e.g. take a message
+  when the call ended, retry when the subscription was declined) rather than being told a
+  uniform "not confirmed within {N}s".
 - **Latency:** a transfer tool call now blocks up to `TRANSFER_OUTCOME_TIMEOUT_S`
   (default 20 s) in the unknown/slow case; the common success case returns as soon
   as the terminal NOTIFY arrives (typically 1–8 s). Operators who prefer the old
@@ -140,7 +178,11 @@ backstop if the header is absent but the peer still never NOTIFIes.)
   `OUTCOME_UNKNOWN`; `Refer-Sub: false` → immediate `OUTCOME_UNKNOWN`; terminal
   NOTIFY racing the 202 (event created pre-REFER) → `COMPLETED`; both blind and
   attended paths; config parse/validation of the new knob; the agent-facing message
-  strings.
+  strings. (P2) `_await_transfer_outcome` / `transfer_blind` / `transfer_attended`
+  return the correct `TransferUnknownReason` per path (`WAIT_DISABLED` / `TIMEOUT` /
+  `CALL_ENDED` / `SUBSCRIPTION_DECLINED`, and a terminal NOTIFY → progress with no
+  reason), and each reason renders its distinct agent-facing message for blind and
+  attended.
 
 ## Alternatives considered
 

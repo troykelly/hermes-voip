@@ -847,7 +847,7 @@ async def _drain_call_tasks(adapter: VoipAdapter, call_id: str) -> None:
     Only ``CancelledError`` is suppressed (the expected outcome of cancelling the
     bounded ACK-wait); a real exception from the task still propagates (rule 37).
     """
-    tasks = list(adapter._call_tasks.get(call_id, set()))  # type: ignore[attr-defined]
+    tasks = list(adapter._call_tasks.get(call_id, set()))
     for task in tasks:
         task.cancel()
     for task in tasks:

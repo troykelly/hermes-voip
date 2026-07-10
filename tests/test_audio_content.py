@@ -183,6 +183,7 @@ class _CountingTransport:
     def __init__(self) -> None:
         self.inbound_sample_rate: int = G711_SAMPLE_RATE
         self.send_count: int = 0
+        self.on_hold: bool = False
 
     async def connect(self) -> bool:
         return True

@@ -17,8 +17,9 @@ class MediaTransport(Protocol):
     Hides G.711 codec, RTP packetisation, jitter buffering, and DTMF (RFC 4733,
     ADR-0010). Above this line everything is PCM16 frames. This is the single
     canonical media seam: exactly one media interface name (``MediaTransport``)
-    with ``inbound_audio()`` / ``send_audio()`` and an ``inbound_sample_rate``
-    property. ADR-0005 implements this exact Protocol for its in-process engine.
+    with ``inbound_audio()`` / ``send_audio()``, an ``inbound_sample_rate`` property,
+    and an ``on_hold`` hold-state flag. ADR-0005 implements this exact Protocol for its
+    in-process engine.
     """
 
     async def connect(self) -> bool:
@@ -50,4 +51,15 @@ class MediaTransport(Protocol):
     @property
     def inbound_sample_rate(self) -> int:
         """Declared rate of frames yielded by ``inbound_audio()`` (e.g. 8000)."""
+        ...
+
+    @property
+    def on_hold(self) -> bool:
+        """Whether the call is on hold (media suspended in BOTH directions).
+
+        While held, inbound datagrams are discarded and outbound send/flush is muted, so
+        a silence window is not caller silence. The no-input watchdog reads this to skip
+        a held window instead of reprompting into or hanging up a held call (agent- or
+        peer-initiated hold).
+        """
         ...

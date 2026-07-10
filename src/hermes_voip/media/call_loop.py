@@ -1885,6 +1885,16 @@ class CallLoop:
         reprompts_sent = 0
         while True:
             await self._sleep(self._no_input_timeout_s)
+            if self._transport.on_hold:
+                # On hold (agent ``hold_call`` or a peer/PBX hold re-INVITE): the media
+                # plane is suspended BOTH ways — inbound discarded, outbound muted — so
+                # this window is NOT caller silence and a reprompt would play into dead
+                # media. Skip it, and reset the budget so a RESUMED call gets the full
+                # reprompt allowance instead of being hung up on the first post-resume
+                # window. The activity flag is left untouched (pre-hold caller life
+                # persists to the next non-held window's check).
+                reprompts_sent = 0
+                continue
             # Consume the activity flag at exactly ONE point (here, after the window),
             # never at the loop top (codex review): caller life that arrives AFTER this
             # check — e.g. a barge-in WHILE a reprompt is playing, or during a skipped

@@ -114,6 +114,8 @@ class _SpeechThenSilenceModel:
 class _FiniteTransport:
     """MediaTransport fake: yields a fixed sequence of 8 kHz PCM frames."""
 
+    on_hold: bool = False
+
     def __init__(self, frames: list[PcmFrame]) -> None:
         self._frames = frames
         self.sent_audio: list[PcmFrame] = []

@@ -104,6 +104,8 @@ class _AllowGuard:
 class _LoopbackTransport:
     """A MediaTransport that echoes sent frames back on inbound_audio."""
 
+    on_hold: bool = False
+
     def __init__(self) -> None:
         self.sent: list[PcmFrame] = []
         self.connected = False

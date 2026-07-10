@@ -74,6 +74,8 @@ class FakeGuard:
 
 
 class FakeTransport:
+    on_hold: bool = False
+
     @property
     def inbound_sample_rate(self) -> int:
         return 8000

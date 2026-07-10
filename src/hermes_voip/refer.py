@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from urllib.parse import quote, unquote
 
 from hermes_voip._chars import contains_control
@@ -48,10 +49,12 @@ __all__ = [
     "ReferError",
     "ReferRequest",
     "ReplacesSpec",
+    "TransferOutcomeClass",
     "build_attended_refer",
     "build_blind_refer",
     "build_notify_sipfrag",
     "build_triggered_invite",
+    "classify_transfer_progress",
     "match_replaces",
     "parse_notify_sipfrag",
     "parse_refer",
@@ -271,6 +274,63 @@ class NotifyProgress:
     status_code: int
     reason: str
     terminated: bool
+
+
+class TransferOutcomeClass(Enum):
+    """The terminal classification of a transfer's progress NOTIFY (ADR-0109).
+
+    A blind/attended transfer's referee answers ``202`` (received), then reports the
+    real outcome over the RFC 3515 implicit subscription as a ``message/sipfrag``
+    NOTIFY. This is the pure verdict :func:`classify_transfer_progress` derives from
+    the terminal :class:`NotifyProgress` (or its absence):
+
+    * ``COMPLETED`` — a terminated NOTIFY with a ``2xx`` sipfrag status.
+    * ``FAILED`` — a terminated NOTIFY with a ``3xx``/``4xx``/``5xx``/``6xx`` status
+      (busy / declined / unreachable): the transfer definitively did not complete.
+    * ``OUTCOME_UNKNOWN`` — no terminal NOTIFY was observed (``None``: the wait timed
+      out, the leg was BYE'd first, or the peer declined the subscription), or only a
+      non-terminal progress update (a ``100 Trying`` that leaked through). We never
+      infer success or failure from an unterminated/absent NOTIFY.
+    """
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+# The SIP status bands (RFC 3515 sipfrag): 2xx = the transfer succeeded, 3xx-6xx =
+# it failed. A terminated status outside both bands (a malformed terminated 1xx) is
+# treated as unknown rather than claimed either way.
+_SUCCESS_STATUS_FLOOR = 200
+_FAILURE_STATUS_FLOOR = 300
+_FAILURE_STATUS_CEILING = 699
+
+
+def classify_transfer_progress(
+    progress: NotifyProgress | None,
+) -> TransferOutcomeClass:
+    """Classify a transfer's terminal progress NOTIFY into an outcome (ADR-0109).
+
+    Pure: maps the terminal :class:`NotifyProgress` (or ``None`` when none was
+    observed) to a :class:`TransferOutcomeClass`. Only a ``terminated`` NOTIFY yields
+    a definitive verdict — a ``2xx`` is :attr:`~TransferOutcomeClass.COMPLETED`, a
+    ``3xx``-``6xx`` is :attr:`~TransferOutcomeClass.FAILED`; ``None`` or a
+    non-terminal update is :attr:`~TransferOutcomeClass.OUTCOME_UNKNOWN`.
+
+    Args:
+        progress: The terminal transfer-progress NOTIFY, or ``None`` when the bounded
+            wait produced none (timeout, BYE, or a declined subscription).
+
+    Returns:
+        The terminal outcome classification.
+    """
+    if progress is None or not progress.terminated:
+        return TransferOutcomeClass.OUTCOME_UNKNOWN
+    if _SUCCESS_STATUS_FLOOR <= progress.status_code < _FAILURE_STATUS_FLOOR:
+        return TransferOutcomeClass.COMPLETED
+    if _FAILURE_STATUS_FLOOR <= progress.status_code <= _FAILURE_STATUS_CEILING:
+        return TransferOutcomeClass.FAILED
+    return TransferOutcomeClass.OUTCOME_UNKNOWN
 
 
 # --- Transferor: build REFER ------------------------------------------------

@@ -24,7 +24,7 @@ text. So a call that failed secured-media setup AFTER the `200 OK` was counted a
 `call_answered` (success) with ZERO failure signal. runbook-0014's call-setup-success
 SLO — `count(call_answered) / (count(call_answered) + count(call_rejected))` —
 silently **overcounted**, and an operator could not distinguish a fingerprint mismatch
-(misconfig) from an ICE-connectivity failure (network) from a handshake timeout (peer)
+(misconfig) from an ICE-connectivity failure (network) from a DTLS handshake failure (peer)
 via a log query.
 
 The OUTBOUND WebRTC/TLS leg's identical `run_handshake()` failure IS already captured
@@ -43,8 +43,10 @@ contract:
   `a=fingerprint` (RFC 5763 §5): a misconfiguration.
 - `ConnectionError` → `"ice"` — ICE connectivity checks failed (WebRTC only): a
   network failure.
-- `RuntimeError` → `"dtls_timeout"` — the DTLS handshake did not complete within the
-  round/recv bound: a peer timeout.
+- `RuntimeError` → `"dtls"` — a generic DTLS/SRTP handshake failure. The SIP-DTLS leg
+  wraps a pyOpenSSL `SSL.Error` as a `RuntimeError` as well as a round/recv timeout, so
+  this is the catch-all DTLS-failure bucket, NOT a timeout-only signal (mislabelling it
+  `dtls_timeout` would lie for a plain SSL error).
 - any other exception → `"failed"` — an unexpected error on the handshake path.
 
 The classification lives in a pure module-level helper
@@ -56,8 +58,10 @@ The branch order is unambiguous: `ConnectionError` is disjoint from `ValueError`
 **Control flow is unchanged.** The call is still torn down exactly as before — media
 released, the answered dialog ACK-aware BYE'd (ADR-0065), and `_MediaNegotiationRejected`
 re-raised so the inbound handler builds no `CallLoop` on dead media. This is a pure
-observability addition: only the structured signal is new. The existing `_log.exception`
-call (ERROR level, with traceback) is retained; the `extra={}` fields ride alongside it.
+observability addition: only the structured signal is new. The failure is still logged at
+ERROR level, but via `_log.error` (fixed message + structured `extra={}`, and NO traceback)
+rather than the previous `_log.exception` — a DTLS/SSL traceback can embed the gateway host,
+and this repo is PUBLIC (rule 34 / ADR-0084).
 
 runbook 0014's call-setup-success section documents the event and the corrected SLO:
 `(count(call_answered) − count(inbound_secured_handshake_failed)) /
@@ -77,14 +81,15 @@ pipeline may filter and group on it freely.
 - **Reuse `outbound_failure_category` verbatim.** Rejected: its categories
   (`busy`/`no_answer`/`declined`/`failed`) are SIP-status-derived and meaningless for a
   post-200 secured-media handshake, which fails on cryptography/connectivity, not a SIP
-  response. A dedicated inbound taxonomy (`fingerprint`/`ice`/`dtls_timeout`/`failed`)
+  response. A dedicated inbound taxonomy (`fingerprint`/`ice`/`dtls`/`failed`)
   is what an operator needs to triage misconfig vs network vs peer.
 - **Change control flow to a distinct SIP response.** Rejected and out of scope: the
   call was already answered `200 OK`; there is no valid pre-answer reject to send, and
   the ADR-0065 abort is correct. This ADR adds signal only.
-- **Emit at INFO like the outbound event.** Rejected: the inbound path already logs the
-  failure at ERROR with a traceback (a keying failure on an answered call is an error,
-  not a routine outcome); we preserve that level and only attach `extra={}`.
+- **Emit at INFO like the outbound event.** Rejected on level: a keying failure on an
+  answered call is an error, not a routine outcome, so we log at ERROR (as the inbound
+  path already did). We do NOT preserve the previous traceback, though — `_log.error`
+  with `extra={}` only — so no DTLS/SSL traceback can leak the gateway host (rule 34).
 
 ## Consequences
 

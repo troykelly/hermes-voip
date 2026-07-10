@@ -80,6 +80,13 @@ class SentenceAggregator:
         self._buffer += text
         segments: list[str] = []
         while (cut := self._next_boundary()) is not None:
+            # Front-slice the emitted head off the buffer. This copies the buffer
+            # remainder per emitted segment (same shape as the #310 RTP _tx_buffer
+            # slice), but it is a COLD path: text arrives at LLM-chunk rate and the
+            # buffer holds at most a sentence or two, so the copy costs a few
+            # microseconds per SENTENCE. An offset cursor would add complexity for no
+            # measurable gain, so the plain slice is kept (item 1687; rule 22 — do
+            # not "optimise" this cold path).
             head, self._buffer = self._buffer[:cut], self._buffer[cut:]
             stripped = head.strip()
             if stripped:

@@ -1043,6 +1043,24 @@ async def test_transfer_blind_matching_event_id_wakes_wait() -> None:
     assert progress.status_code == 200
 
 
+async def test_await_prelatched_outcome_reported_when_wait_disabled() -> None:
+    # The outcome event is armed BEFORE the REFER, so a terminal NOTIFY can latch an
+    # outcome before we decide whether to wait. Even with the wait opted out (timeout
+    # <= 0), an already-latched terminal outcome must be reported, not discarded as
+    # WAIT_DISABLED (codex round-5).
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+    session._transfer_outcome_latched = True
+    session._transfer_outcome_progress = NotifyProgress(
+        status_code=200, reason="OK", terminated=True
+    )
+    event.set()
+    report = await session._await_transfer_outcome(event, 0.0)  # wait opted out
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+
+
 async def test_transfer_blind_idless_notify_honored_best_effort() -> None:
     """An id-less terminal NOTIFY is honoured for the single active transfer.
 

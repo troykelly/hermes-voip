@@ -44,6 +44,7 @@ from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.sdp import Codec
+from hermes_voip.spoken_text import sanitize_for_speech
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -486,3 +487,59 @@ async def test_deny_mode_decline_answers_200_speaks_then_byes() -> None:
     assert tts.voices == [voice], tts.voices
     # No CallLoop / CallSession-driven agent path was started for the declined caller.
     assert call_id not in adapter._call_loops
+
+
+@pytest.mark.asyncio
+async def test_deny_mode_decline_sanitizes_custom_phrase_before_tts() -> None:
+    """A custom decline phrase (markdown / URL) is sanitised before TTS (item 1325).
+
+    Deny-mode 'decline' speaks the operator-authored HERMES_VOIP_DECLINE_PHRASE. Like
+    every other spoken line (agent text goes through _sanitize_iter), it must first pass
+    through sanitize_for_speech, or raw markdown / URLs / emoji are voiced verbatim.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    tts = _RecordingTTS()
+    phrase = "Sorry, please visit https://example.test for **help**."
+    adapter = await _build_adapter(
+        transport,
+        manager,
+        caller_modes=_deny_caller("9999"),
+        tts=tts,
+        deny_mode="decline",
+        decline_phrase=phrase,
+        tts_voice="operator-voice-7",
+    )
+
+    call_id = new_call_id()
+    invite = SipRequest.parse(_make_invite(caller="9999", call_id=call_id))
+    engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        send_audio=AsyncMock(return_value=None),
+        set_hold=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=20002,
+        inbound_sample_rate=8000,
+    )
+    session = _real_call_session(
+        signaling=transport, media=engine, call_id=call_id, caller="9999"
+    )
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=engine),
+        patch("hermes_voip.adapter.CallSession", return_value=session),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        new_call = NewCall(registration=_ext_config(), invite=invite)
+        adapter._on_inbound_invite(new_call)
+        for _ in range(60):
+            await asyncio.sleep(0)
+
+    assert tts.phrases, "the decline phrase was never synthesised"
+    # The SANITISED phrase reached TTS, not the raw markdown/URL (item 1325): the bare
+    # URL is dropped and the ** markers stripped by sanitize_for_speech.
+    assert tts.phrases[0] == sanitize_for_speech(phrase)
+    assert "https://example.test" not in tts.phrases[0]
+    assert "**" not in tts.phrases[0]

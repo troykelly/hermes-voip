@@ -11,6 +11,97 @@ pinned equal by the test suite.
 
 ## [Unreleased]
 
+### Added
+
+- **Cumulative packet-loss counters on the call-quality logs** — the `rtcp_call_quality`
+  teardown event and the `media_anomaly` (`one_way_audio` / `media_degraded`) events now
+  carry `local_cumulative_lost` / `remote_cumulative_lost`, so absolute per-call
+  lost-packet totals are queryable as structured fields instead of only the loss
+  fractions. (#446)
+- **`inbound_secured_handshake_failed` observability event** — an inbound WebRTC
+  (ICE/DTLS) or SIP secured-media call whose handshake fails *after* the `200 OK` now
+  emits a structured event (`call_id`, transport, and a `fingerprint` / `ice` / `dtls` /
+  `failed` category) instead of being silently counted as answered, correcting the
+  call-setup-success SLO overcount; the exception is never stringified into the log. (#455)
+
+### Changed
+
+- **`HERMES_VOIP_DENY_MODE=decline` now speaks a language-keyed phrase** — the spoken
+  decline line is selected from a built-in per-language set (en/fr/de/es/pt) keyed on
+  `HERMES_VOIP_LANGUAGE` with English fallback, instead of always English; an explicit
+  `HERMES_VOIP_DECLINE_PHRASE` override still wins. (#447)
+
+### Fixed
+
+- **Agent-initiated hang-up no longer truncates the spoken farewell** — before sending
+  `BYE` and stopping media, the adapter now waits (bounded) for an in-flight reply to
+  reach the wire and flushes the engine's buffered outbound tail, so a same-turn goodbye
+  is delivered in full instead of being clipped or dropped on a gateway that stops media
+  on `BYE`. Bounded by the new `HERMES_VOIP_HANGUP_DRAIN_SECS` /
+  `HERMES_VOIP_HANGUP_GRACE_SECS` knobs. (#432)
+- **Outbound `422 Session Interval Too Small` after an auth challenge now retries** — on a
+  proxy-auth gateway the `INVITE → 407 → authenticated INVITE → 422` flow was mis-reported
+  to the agent as a failed call; the raise-`Session-Expires`-and-retry remedy now runs
+  whichever order the challenge and the `422` arrive in (each capped at one retry), and a
+  stale-final flood is bounded so the outbound call can no longer hang. (#433)
+- **A re-INVITE that relocates the peer's RTP endpoint no longer causes one-way audio** —
+  a re-INVITE moving the peer to a new `c=` / `m=audio` endpoint (attended-transfer
+  re-anchor, hold-then-resume-elsewhere, or SBC media relocation) now re-points the
+  outbound media to the new address and ignores a stale in-flight packet from the old one,
+  so agent-to-caller audio follows the relocation instead of continuing to the now-dead
+  address. (#434)
+- **Graceful shutdown de-registers each live binding** — `aclose()` now cancels the
+  per-flow refresh tasks and *then* sends an `Expires: 0` REGISTER for every binding before
+  teardown (bounded, best-effort), so a restart no longer leaves the gateway routing
+  inbound calls to the just-closed contact — a silent inbound black-hole — until the
+  binding expires. (#435)
+- **A malformed `Min-SE` in an outbound `422` fails closed** — a `422 Session Interval Too
+  Small` whose `Min-SE` is not a valid delta-seconds value now surfaces as a typed
+  `place_call` failure (exactly like a `422` carrying no `Min-SE`) instead of raising an
+  unhandled error out of the outbound-call coroutine. (#436)
+- **Inbound INVITE with an unsupported `Require` is rejected `420 Bad Extension`** — an
+  INVITE demanding an option-tag the plugin cannot honour (e.g. `100rel`, `precondition`)
+  is now rejected per RFC 3261 §8.2.2.3 with an `Unsupported` header listing the tags,
+  before any dialog / media / agent surface, rather than being silently answered `200`;
+  the `420` takes precedence over the at-capacity `486`, and `Require: timer` is still
+  honoured. (#437)
+- **Guard `RESTRICT` / `CLARIFY` verdicts now clamp the toolset for that turn** — the
+  tool-policy gate previously ignored a guard verdict below the `REFUSE` threshold, so an
+  injected caller turn screened as `RESTRICT` or `CLARIFY` still reached the agent with its
+  tools unchanged; a per-turn read-only clamp now blocks every non-SAFE tool on such a turn
+  (SAFE call-control such as `hang_up` still runs), and is reset each turn including on the
+  unscreened DTMF path. (#438)
+- **Bracketed text in a quoted display-name no longer desyncs SIP identity parsing** — a
+  name-addr whose quoted display-name legitimately contains `<…>` or `;tag=` (RFC 3261
+  §25.1) is now parsed with a quote-aware angle-addr locator in the dialog and REFER
+  layers, so the real addr-spec and dialog tag are extracted instead of the bracketed
+  display text — a valid inbound INVITE/2xx is no longer rejected and blind/attended
+  transfer targets are no longer corrupted. (#439)
+- **Outbound calls no longer play the inbound greeting** — an agent-placed call previously
+  spoke the canned on-answer greeting to the party it called the instant they answered; per
+  ADR-0019 the agent's first turn now opens an outbound conversation, while the inbound
+  on-answer greeting path is unchanged. (#443)
+- **A caller display-name can no longer forge a line in the agent's context block** — a
+  bare `LF` / `CR` embedded in a `From` display-name (which SIP header parsing does not
+  treat as a line boundary) previously survived verbatim into the untrusted caller-context
+  block; identity defanging now collapses every interior whitespace run to a single space,
+  keeping each rendered field on one line. (#445)
+- **Quote-aware angle-addr parsing extended to the registration and routing sites** — the
+  quote-safe locator from #439 now also backs To-user routing, Contact-binding matching,
+  and Record-Route / in-dialog classification, so a quoted display-name containing `<…>` or
+  `;tag=` can no longer corrupt the extracted URI or hide the real tag on those paths.
+  (#448)
+- **All SIP identity-header parsing consolidated onto one quote-safe primitive** — the
+  remaining naive `;`-parameter / `;tag=` / angle-addr scans (including the WSS in-dialog
+  classifier and the caller-context display/URI extraction) now share the quote-aware
+  parser, closing residual gaps where a forged `;tag=` inside a quoted parameter value, or a
+  quoted display-name, could inject or suppress a dialog tag; an empty `;tag=` is treated as
+  absent and backslash escapes are honoured. (#450)
+- **`;tag=` values are validated against the strict RFC 3261 token grammar** — the shared
+  tag parser now treats a quoted, empty, or otherwise non-`token` tag value as absent
+  (fail-closed) and strips only RFC 3261 LWS (SP/HTAB) around the value, so a malformed tag
+  can no longer be accepted as a dialog identifier. (#456)
+
 ## [0.3.1] - 2026-07-03
 
 A maintenance / hardening patch release bundling five fixes for operator testing: SIP/SDP

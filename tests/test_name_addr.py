@@ -12,6 +12,7 @@ from __future__ import annotations
 from hermes_voip._name_addr import (
     find_name_addr,
     name_addr_parts,
+    params_after_addr,
     split_params,
     tag_param,
 )
@@ -57,3 +58,32 @@ def test_name_addr_parts_none_for_bare_addr_spec() -> None:
     # A bare addr-spec has no angle-addr, so there is no display-name to split.
     assert name_addr_parts("sip:2000@pbx.example.test;tag=abc") is None
     assert find_name_addr("sip:2000@pbx.example.test;tag=abc") is None
+
+
+def test_tag_param_rejects_empty_or_whitespace_tag() -> None:
+    # A present-but-empty ';tag=' (or whitespace-only) is malformed (RFC 3261
+    # tag = token, 1+ chars) and must count as ABSENT — so it neither classifies a
+    # request as in-dialog nor suppresses our own To-tag minting.
+    assert tag_param(";tag=") is None
+    assert tag_param(";tag=   ") is None
+    assert tag_param('g=";tag=fake";tag=') is None
+    # A non-empty tag is still returned unchanged.
+    assert tag_param(";tag=realtag") == "realtag"
+
+
+def test_params_after_addr_is_quote_aware_for_the_none_fallback() -> None:
+    # When find_name_addr() returns None (a bare addr-spec, or a MALFORMED
+    # unterminated '<'), the four identity sites fall back to params_after_addr().
+    # A forged ';tag=fake' hidden inside a quoted display-name before an
+    # unterminated '<' must NOT be exposed as a real parameter (the old naive
+    # str.partition(';') split it inside the quoted span and forged a dialog tag).
+    forged = '"X;tag=fake" <sip:1000@pbx.example.test'  # no closing '>'
+    assert find_name_addr(forged) is None
+    assert params_after_addr(forged) == ""  # the quoted ';' is not a top-level boundary
+    assert tag_param(params_after_addr(forged)) is None  # so no forged tag survives
+    # A bare addr-spec's real trailing params ARE returned (after the first
+    # top-level ';').
+    assert params_after_addr("sip:1000@pbx.example.test;tag=abc") == "tag=abc"
+    assert tag_param(params_after_addr("sip:1000@pbx.example.test;tag=abc")) == "abc"
+    # No parameters at all.
+    assert params_after_addr("sip:1000@pbx.example.test") == ""

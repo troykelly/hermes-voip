@@ -17,7 +17,13 @@ its trailing parameters from the correct bracket.
 
 from __future__ import annotations
 
-__all__ = ["find_name_addr", "name_addr_parts", "split_params", "tag_param"]
+__all__ = [
+    "find_name_addr",
+    "name_addr_parts",
+    "params_after_addr",
+    "split_params",
+    "tag_param",
+]
 
 
 def name_addr_parts(value: str) -> tuple[str, str, str] | None:
@@ -109,5 +115,33 @@ def tag_param(trailing: str) -> str | None:
     for part in split_params(trailing):
         key, sep, raw = part.partition("=")
         if sep and key.strip().lower() == "tag":
-            return raw.strip()
+            # A present-but-empty tag (``;tag=`` or ``;tag="  "``) is malformed
+            # (RFC 3261 tag = token, 1+ chars); treat it as absent so it neither
+            # counts as an in-dialog tag nor suppresses our own tag minting.
+            return raw.strip() or None
     return None
+
+
+def params_after_addr(value: str) -> str:
+    """Header parameters after a bare/unterminated addr-spec's first top-level ``;``.
+
+    The fallback for callers that have already tried :func:`find_name_addr` and got
+    ``None`` (a bare ``addr-spec`` or a MALFORMED, unterminated ``<``). Returns
+    everything after the first ``;`` located OUTSIDE any ``"..."`` quoted-string span
+    or ``<...>`` angle span, so a ``;`` inside a quoted display-name (e.g. a forged
+    ``"x;tag=fake"`` before an unterminated ``<``) is never mistaken for the parameter
+    boundary. Returns ``""`` when there is no top-level ``;``. Lenient: an unterminated
+    quote/angle just runs to the end (never raises).
+    """
+    in_quote = False
+    angle_depth = 0
+    for index, char in enumerate(value):
+        if char == '"':
+            in_quote = not in_quote
+        elif char == "<" and not in_quote:
+            angle_depth += 1
+        elif char == ">" and not in_quote and angle_depth > 0:
+            angle_depth -= 1
+        elif char == ";" and not in_quote and angle_depth == 0:
+            return value[index + 1 :]
+    return ""

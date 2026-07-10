@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, assert_never, runtime_checkable
 
-from hermes_voip._name_addr import find_name_addr, tag_param
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 from hermes_voip.config import ExtensionConfig, GatewayConfig
 from hermes_voip.message import SipRequest, SipResponse
 from hermes_voip.registration import (
@@ -843,7 +843,9 @@ def _tag(header_value: str | None) -> str | None:
     # that trailing quote-aware, so a forged ';tag=' hidden inside a quoted
     # generic-param value is never mistaken for the real dialog tag.
     name_addr = find_name_addr(header_value)
-    trailing = name_addr[1] if name_addr is not None else header_value.partition(";")[2]
+    trailing = (
+        name_addr[1] if name_addr is not None else params_after_addr(header_value)
+    )
     return tag_param(trailing)
 
 

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from hermes_voip._chars import contains_control
-from hermes_voip._name_addr import find_name_addr, tag_param
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 
 __all__ = [
     "SipRequest",
@@ -258,7 +258,9 @@ def _has_tag(header_value: str) -> bool:
     generic-param value is not read as a present tag.
     """
     name_addr = find_name_addr(header_value)
-    trailing = name_addr[1] if name_addr is not None else header_value.partition(";")[2]
+    trailing = (
+        name_addr[1] if name_addr is not None else params_after_addr(header_value)
+    )
     return tag_param(trailing) is not None
 
 

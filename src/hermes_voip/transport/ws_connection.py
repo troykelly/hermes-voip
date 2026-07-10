@@ -60,7 +60,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from hermes_voip._decimal import _parse_decimal
-from hermes_voip._name_addr import find_name_addr, tag_param
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
     Cancel,
@@ -792,7 +792,7 @@ def _has_to_tag(to_value: str | None) -> bool:
     if to_value is None:
         return False
     name_addr = find_name_addr(to_value)
-    trailing = name_addr[1] if name_addr is not None else to_value.partition(";")[2]
+    trailing = name_addr[1] if name_addr is not None else params_after_addr(to_value)
     return tag_param(trailing) is not None
 
 

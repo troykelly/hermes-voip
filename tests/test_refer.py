@@ -360,6 +360,28 @@ def test_parse_notify_sipfrag_without_status_line_raises() -> None:
         parse_notify_sipfrag(notify)
 
 
+def test_parse_notify_sipfrag_rejects_non_ascii_status_digits() -> None:
+    r"""A sipfrag status-line with non-ASCII digits is rejected, not folded (item 1670).
+
+    The status code is matched ASCII-only (``[0-9]{3}``, not ``\d``), so an
+    Arabic-Indic or fullwidth 3-digit code does not silently parse to an int().
+    """
+    # Arabic-Indic 200 (U+0662 U+0660 U+0660), built from code points so this source
+    # stays ASCII; the [0-9]{3}-only status guard must reject it.
+    arabic_200 = "".join(chr(0x0660 + int(d)) for d in "200")
+    notify = SipRequest(
+        method="NOTIFY",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Subscription-State", "active;expires=60"),
+            ("Content-Type", "message/sipfrag;version=2.0"),
+        ),
+        body=f"SIP/2.0 {arabic_200} OK\r\n",
+    )
+    with pytest.raises(ReferError):
+        parse_notify_sipfrag(notify)
+
+
 def test_replaces_spec_header_value_round_trips() -> None:
     spec = ReplacesSpec(call_id="x@h", to_tag="t1", from_tag="f1", early_only=True)
     assert spec.header_value() == "x@h;to-tag=t1;from-tag=f1;early-only"

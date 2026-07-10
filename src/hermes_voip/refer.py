@@ -68,7 +68,9 @@ _SDP_CONTENT_TYPE = ("Content-Type", "application/sdp")
 _SIPFRAG_CONTENT_TYPE = ("Content-Type", "message/sipfrag;version=2.0")
 _DEFAULT_SUBSCRIPTION_STATE = "active;expires=60"
 
-_SIPFRAG_STATUS = re.compile(r"SIP/2\.0\s+(\d{3})\s*(.*)")
+# ASCII [0-9]{3} (NOT \d{3}) so a non-ASCII 3-digit status code is rejected, not folded
+# to an int() equivalent — matching message.py's strict posture (item 1670).
+_SIPFRAG_STATUS = re.compile(r"SIP/2\.0\s+([0-9]{3})\s*(.*)")
 
 # Refer-To injection guard (security; the transfer analogue of the outbound
 # Request-URI guard ``adapter._validate_dialable_target``).

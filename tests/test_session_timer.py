@@ -36,6 +36,19 @@ from hermes_voip.session_timer import (
     teardown_deadline_secs,
 )
 
+
+# Non-ASCII digit renderings of an ASCII numeral, built from code points so THIS test's
+# source stays pure ASCII (no ambiguous-character lint) while still feeding the parsers
+# real Arabic-Indic (U+0660-9) / fullwidth (U+FF10-9) digits — the strict [0-9]-only
+# guard must REJECT these, not fold them (item 1670).
+def _arabic_indic(ascii_digits: str) -> str:
+    return "".join(chr(0x0660 + int(d)) for d in ascii_digits)
+
+
+def _fullwidth(ascii_digits: str) -> str:
+    return "".join(chr(0xFF10 + int(d)) for d in ascii_digits)
+
+
 # ---------------------------------------------------------------------------
 # The RFC 4028 floor.
 # ---------------------------------------------------------------------------
@@ -86,6 +99,14 @@ def test_parse_session_expires_ignores_unknown_params() -> None:
     assert se.refresher is Refresher.UAC
 
 
+def test_parse_session_expires_param_tail_not_delta_validated() -> None:
+    """The ';'-tail is never delta-validated: odd / folded param content parses fine."""
+    assert SessionExpires.parse("1800;foo=a=b").delta == 1800
+    folded = SessionExpires.parse("1800;note=a\r\n b;refresher=uac")
+    assert folded.delta == 1800
+    assert folded.refresher is Refresher.UAC
+
+
 def test_parse_session_expires_compact_uses_the_same_parser() -> None:
     """The compact-form ``x`` header carries the same value grammar as the long form."""
     se = SessionExpires.parse("450;refresher=uas")
@@ -93,9 +114,27 @@ def test_parse_session_expires_compact_uses_the_same_parser() -> None:
     assert se.refresher is Refresher.UAS
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "abc", "-5", "1800;refresher=bogus", ";"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        "abc",
+        "-5",
+        "1800;refresher=bogus",
+        ";",
+        # Non-ASCII digits must NOT be silently folded — ASCII [0-9] only, matching
+        # message.py's strict posture (item 1670).
+        _arabic_indic("1800"),
+        _fullwidth("1800"),
+        # Trailing garbage after the delta must be REJECTED, not silently dropped
+        # (fullmatch-anchored, contrast the prior prefix .match; item 1674).
+        "1800x",
+        "1800 foo",
+    ],
+)
 def test_parse_session_expires_rejects_malformed(bad: str) -> None:
-    """A non-numeric delta, a negative delta, or a bad refresher token raises."""
+    """Reject non-ASCII-digit / trailing-garbage / non-numeric deltas (1670/1674)."""
     with pytest.raises(ValueError):  # noqa: PT011 — module raises bare ValueError
         SessionExpires.parse(bad)
 
@@ -115,9 +154,23 @@ def test_parse_min_se_strips_params_and_whitespace() -> None:
     assert parse_min_se("  300 ;foo=bar ") == 300
 
 
-@pytest.mark.parametrize("bad", ["", "abc", "-1", ";"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "abc",
+        "-1",
+        ";",
+        # ASCII [0-9] only — non-ASCII digits are not silently folded (item 1670).
+        _arabic_indic("90"),
+        _fullwidth("90"),
+        # Trailing garbage is rejected, not dropped (fullmatch-anchored; item 1674).
+        "90x",
+        "90 foo",
+    ],
+)
 def test_parse_min_se_rejects_malformed(bad: str) -> None:
-    """A non-numeric or negative Min-SE raises."""
+    """Reject non-ASCII-digit / trailing-garbage / non-numeric Min-SE (1670/1674)."""
     with pytest.raises(ValueError):  # noqa: PT011 — module raises bare ValueError
         parse_min_se(bad)
 

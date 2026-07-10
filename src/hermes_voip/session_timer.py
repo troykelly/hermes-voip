@@ -84,8 +84,13 @@ MIN_SE_FLOOR = 90
 # RFC 4028 §10: the non-refresher's teardown guard band is capped at 32 seconds.
 TEARDOWN_GUARD_CAP_SECS = 32
 
-# A leading non-negative integer delta (the rest is parameters or whitespace).
-_LEADING_DELTA = re.compile(r"\s*(\d+)")
+# A leading non-negative integer delta-seconds, anchored at end-of-value or the first
+# ";" (which introduces RFC 4028 generic-params). ASCII [0-9] only, not \d, so non-ASCII
+# digits (Arabic-Indic / fullwidth) are rejected, not folded (item 1670). The (?:;|$)
+# anchor rejects trailing garbage with no ";" ("1800x", "90 foo") instead of silently
+# dropping it (item 1674); params after ";" are parsed by _refresher_param (an unknown
+# param is ignored, not fatal — the delta regex deliberately does not inspect them).
+_LEADING_DELTA = re.compile(r"\s*([0-9]+)\s*(?:;|$)")
 
 
 class Refresher(enum.Enum):

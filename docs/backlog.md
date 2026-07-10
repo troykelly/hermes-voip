@@ -1618,3 +1618,76 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
   (MOH/silence)") but the held caller gets silence (`call.py` `hold()` → `set_hold(True)`); real UX gap
   during attended-transfer consult. Shippable local-only behind a new `HERMES_VOIP_HOLD_AUDIO` env
   (default off = current silence behaviour preserved).
+
+## Gap-review wave 2026-07-10 (wave 5 re-scan, ADR-0072)
+
+A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session) surfaced 16 items;
+`py.typed`-explicit (line 1205) was already tracked. The genuinely-new items:
+
+- [ ] **[high] observability** — Inbound post-200-OK DTLS/ICE handshake failure emits NO structured SLO
+  event, so a call that fails secured-media setup AFTER the 200 OK is counted as `call_answered` (success)
+  with no failure signal — the call-setup-success SLO silently overcounts. `_setup_webrtc_call`
+  (`adapter.py:4229-4230`) and `_setup_sip_dtls_call` (`adapter.py:4516-4527`) both `_log.exception(...)` with
+  NO `extra={}`/`event`, unlike the OUTBOUND leg which emits `event=outbound_call_failed` +
+  `outbound_failure_category` (`adapter.py:2527-2545`). Add a structured inbound failure `event`
+  (fingerprint-mismatch vs ICE-fail vs timeout category) + a runbook-0014 entry.
+- [ ] **[high] test/packaging** — The wheel-smoke CI (`.github/workflows/gate.yml`) validates `plugin.yaml`
+  is packaged but NOT that the 5 bundled skills' `SKILL.md` files (hatchling glob `src/hermes_voip/skills/**/SKILL.md`,
+  pyproject.toml:131) ship in the wheel — a broken glob / removed dir would ship an incomplete wheel silently.
+  Add a wheel-smoke assertion (+ an `importlib.resources` resolve test for the skills).
+- [ ] **[high] feature/correctness** — Hold state is invisible to the CallLoop no-input watchdog, so held
+  calls get TORN DOWN. `call.py` flips `set_hold(True)` (agent `hold_call`, `call.py:301`) / `set_hold(held_by_peer)`
+  (`call.py:890`) at the media layer and the engine then discards inbound datagrams (`engine.py:2209`), but
+  CallLoop has no hold awareness — the watchdog keeps counting empty windows, reprompts into dead media, and
+  after `no_input_max_reprompts` (~30s) ENDS the call. Failure: agent holds to consult → the live caller is
+  hung up ~30s later; symmetric for peer/PBX hold. Bridge the CallSession hold flip into CallLoop to suspend
+  the no-input watchdog while held (both agent- and peer-initiated). (`call_loop.py`, `call.py`, `engine.py`)
+- [ ] **[medium] test** — `gate_tool_call` block-reason precedence (DEGRADED > RESTRICTED >
+  INSUFFICIENT_PRIVILEGE > UNCONFIRMED — `policy.py` `_gate_non_safe` :363-373, docstringed as
+  security-load-bearing for the audit trail) is never pinned at the RESTRICTED boundaries: no test sets
+  `turn_restricted=True` WITH `privilege_level < min_level`, nor `degraded=True` WITH `turn_restricted=True`.
+  Swapping those check orders keeps the suite green (surviving mutant). Add the two pairwise tests.
+- [ ] **[medium] docs** — Backfill `CHANGELOG.md [Unreleased]`: empty, but 5 user-facing fix PRs merged since
+  0.3.1 (#434 re-INVITE media re-point, #435 Expires:0 de-register, #436 Min-SE fail-closed, #437 420 Bad
+  Extension, #438 RESTRICT/CLARIFY gate). Breaks the Keep-a-Changelog convention (runbook-0019 step 4 moves
+  pre-existing entries); nothing in CI catches a PR landing without one.
+- [ ] **[medium] ux** — Unbounded guard-REFUSE decline loop: on REFUSE, `CallLoop._screen_and_deliver` sets
+  `_caller_active_in_window=True` (`call_loop.py:2182`), resetting the no-input watchdog every window, so a
+  persistently-refused caller (accent/phrasing tripping the injection guard) hears the decline set cycle
+  forever, never reaching the agent nor a graceful close. Add a consecutive-REFUSE counter + graceful end
+  after N (new `HERMES_VOIP_*` knob mirroring `no_input_max_reprompts`). (`call_loop.py`, `policy.py`)
+- [ ] **[medium] operability** — `_env_enablement()` (`plugin.py:198-224`) copies EVERY `HERMES_SIP_*`/
+  `HERMES_VOIP_*` env var into `extra`, and `validate_voip_config()` reads only known keys by exact name — so
+  an operator typo (`HERMES_VOIP_STT_PROIVDER`) is silently dropped, the default is used, and the enable gate
+  returns True with no warning. Cross-check the present key set against the plugin.yaml `optional_env`/
+  `requires_env` registry (already pinned by test_plugin_manifest) and warn/reject unknown keys.
+- [ ] **[medium] test** — No importable-resource test that the 5 bundled skills' `SKILL.md` resolve via
+  `importlib.resources` from the installed wheel (mirrors the existing `plugin.yaml` resolve test at
+  test_plugin_manifest.py:553-567). Companion to the wheel-smoke [high] above.
+- [ ] **[medium] operability** — No pre-commit hook catching version drift across the 4 sources
+  (`pyproject.toml`, both `plugin.yaml` copies, `CHANGELOG.md`); ratchet tests catch it only at CI time. Add a
+  fast pre-commit consistency check.
+- [ ] **[low] correctness** — `session_timer._LEADING_DELTA` (`session_timer.py:88`) and `refer._SIPFRAG_STATUS`
+  (`refer.py:66`, int() at :498) parse inbound numerics with Unicode-aware `\d`, so non-ASCII digits
+  (Arabic-Indic/fullwidth) are silently folded — diverges from the strict-ASCII `[0-9]`/`_parse_decimal`
+  posture elsewhere (message.py:43). Route through `_parse_decimal`/`[0-9]` with a rejecting test per field.
+- [ ] **[low] correctness** — `SessionExpires.parse`/`parse_min_se` (`session_timer.py:133/157`) apply
+  `_LEADING_DELTA` via `.match` (prefix-only), so `Session-Expires: 1800x` / `Min-SE: 90 foo` parse and drop
+  the trailing garbage instead of rejecting it (contrast the strict `fullmatch` in dialog._cseq /
+  message._STATUS_LINE). Anchor the delta token (end-of-string or `;`) + a boundary test.
+- [ ] **[low] security/robustness** — WSS transport (`ws_connection.py:215-232`) opens with
+  `subprotocols=["sip"]` but never asserts the negotiated subprotocol; the pinned websockets client returns
+  `subprotocol=None` (no raise) when the server omits it, so the SIP channel can be established against a
+  non-SIP handler (ADR-0038/0016 require 'sip'). Assert `subprotocol == "sip"` fail-closed. Defense-in-depth
+  (TLS already authenticates the peer), hence low.
+- [ ] **[low] api** — Promote the remaining 7 ADR-0004 provider result/factory types (`GuardResult`,
+  `GuardVerdict`, `Transcript`, `TtsStream`, `AsrFactory`, `TtsFactory`, `GuardFactory`) to the `hermes_voip`
+  top-level `__all__` — `providers/__init__` re-exports all 14 but the root package only 7; a custom-provider
+  author needs the result/factory types without a deep import. (`__init__.py`, test_init_exports.py)
+- [ ] **[low] efficiency** — `SentenceAggregator.push()` (`tts/segment.py:83`) re-slices the whole text buffer
+  per emitted segment (same class as the #310 RTP `_tx_buffer` front-slice, but on the TTS text path;
+  LLM-chunk-rate + one-sentence buffer = microseconds, NOT a ptime concern). Add an offset cursor OR a
+  cold-path comment pinning the intentional smallness.
+- [ ] **[low] test** — Directory-install layout (`packaging/hermes-plugins/hermes-voip/`) has no e2e test that
+  copying it into `~/.hermes/plugins/` and `hermes plugins enable` discovers + loads it (only file identity is
+  tested, test_plugin_manifest.py:535). (runbook-0011)

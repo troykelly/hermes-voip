@@ -374,8 +374,9 @@ _NO_INPUT_MAX_REPROMPTS_KEY = "HERMES_VOIP_NO_INPUT_MAX_REPROMPTS"
 _DEFAULT_NO_INPUT_MAX_REPROMPTS = 2
 
 # Consecutive guard-REFUSE turns before the loop ends the call gracefully (ADR-0076).
-# MUST match call_loop.py's _DEFAULT_MAX_CONSECUTIVE_REFUSALS so behaviour is UNCHANGED
-# when the env var is unset; 0 disables. Env HERMES_VOIP_MAX_CONSECUTIVE_REFUSE.
+# MUST match call_loop.py's _DEFAULT_MAX_CONSECUTIVE_REFUSALS (both construction paths
+# agree). The default 3 DELIBERATELY bounds the previously-unbounded decline loop; 0
+# restores the old unbounded behaviour. Env HERMES_VOIP_MAX_CONSECUTIVE_REFUSE.
 _MAX_CONSECUTIVE_REFUSE_KEY = "HERMES_VOIP_MAX_CONSECUTIVE_REFUSE"
 _DEFAULT_MAX_CONSECUTIVE_REFUSALS = 3
 # Pipe-separated reprompt phrase set; blank/empty → the built-in English default.

@@ -295,6 +295,62 @@ async def test_complete_without_a_consult_is_a_clear_error(
     assert "error" in json.loads(result)
 
 
+# --- ADR-0109: the terminal attended-transfer outcome surfaced to the agent --
+
+
+@pytest.mark.asyncio
+async def test_complete_completed_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A COMPLETED attended transfer (terminal 2xx NOTIFY) reports a success result."""
+    host = _FakeHost(complete_outcome=AttendedTransferOutcome.COMPLETED)
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {
+        "result": "Caller connected to the consultation target."
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_failed_reports_status_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FAILED attended transfer surfaces the SIP status + reason as a tool error."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.FAILED,
+        complete_notify_status=486,
+        complete_notify_reason="Busy Here",
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {"error": "Transfer failed: 486 Busy Here."}
+
+
+@pytest.mark.asyncio
+async def test_complete_outcome_unknown_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OUTCOME_UNKNOWN attended transfer keeps the honest 'initiated' wording."""
+    host = _FakeHost(
+        complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
+        complete_timeout_secs=20.0,
+    )
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "orig-call")
+
+    result = await transfer_attended_handler({"action": "complete"})
+
+    assert json.loads(result) == {
+        "result": "Transfer initiated; outcome not confirmed within 20s."
+    }
+
+
 # --- cancel -----------------------------------------------------------------
 
 

@@ -1127,6 +1127,64 @@ async def test_transfer_blind_handler_refer_rejected_reports_error(
     assert "error" in json.loads(result)
 
 
+# --- ADR-0109: the terminal transfer outcome surfaced to the agent -----------
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_completed_reports_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A COMPLETED transfer (terminal 2xx NOTIFY) reports a clear success result."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.COMPLETED
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    assert json.loads(result) == {
+        "result": "Transfer to sip:1001@pbx.example.test completed."
+    }
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_failed_reports_status_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FAILED transfer (terminal 4xx/6xx) reports the SIP status + reason as error."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.FAILED
+    host.transfer_notify_status = 486
+    host.transfer_notify_reason = "Busy Here"
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = "Transfer to sip:1001@pbx.example.test failed: 486 Busy Here."
+    assert json.loads(result) == {"error": expected}
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_handler_outcome_unknown_reports_initiated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OUTCOME_UNKNOWN (no terminal NOTIFY within N s) keeps the honest wording."""
+    host = _FakeHost()
+    host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
+    host.transfer_timeout_secs = 20.0
+    set_active_adapter(host)
+    _set_chat(monkeypatch, "call-xyz")
+
+    result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
+
+    expected = (
+        "Transfer to sip:1001@pbx.example.test initiated; "
+        "outcome not confirmed within 20s."
+    )
+    assert json.loads(result) == {"result": expected}
+
+
 # --- the gate OWNS transfer_blind and clamps it to operator level 3 ----------
 
 

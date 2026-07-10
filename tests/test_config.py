@@ -2537,6 +2537,33 @@ def test_decline_phrase_blank_direct_construction_rejected() -> None:
         dataclasses.replace(base, decline_phrase="   ")
 
 
+def test_decline_phrase_language_es_yields_localized_phrase() -> None:
+    """HERMES_VOIP_LANGUAGE=es with no override selects the Spanish decline line.
+
+    Mirrors the sibling guard-REFUSE language-keyed mechanism (ADR-0084): the
+    polite-decline line for ``deny_mode=decline`` must not be English-only.
+    """
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "es"})
+    assert cfg.decline_phrase == "Lo siento, no puedo atender esta llamada."
+
+
+def test_decline_phrase_language_without_builtin_set_falls_back_to_english() -> None:
+    """A language with no built-in decline phrase falls back to English (ADR-0084)."""
+    cfg = load_media_config({"HERMES_VOIP_LANGUAGE": "zz"})
+    assert cfg.decline_phrase == "Sorry, I cannot take this call."
+
+
+def test_decline_phrase_language_explicit_override_still_wins() -> None:
+    """An explicit HERMES_VOIP_DECLINE_PHRASE wins over the language default."""
+    cfg = load_media_config(
+        {
+            "HERMES_VOIP_LANGUAGE": "es",
+            "HERMES_VOIP_DECLINE_PHRASE": "We can't take this call.",
+        }
+    )
+    assert cfg.decline_phrase == "We can't take this call."
+
+
 # ---------------------------------------------------------------------------
 # Multi-language accept policy (ADR-0084)
 # ---------------------------------------------------------------------------

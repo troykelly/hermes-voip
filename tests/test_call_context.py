@@ -572,8 +572,8 @@ def test_render_block_is_bounded_when_caller_floods_headers() -> None:
         ]
     )
     block = render_call_context_block(ctx)
-    # Bounded to the 600-char cap plus the one-char ellipsis truncation marker.
-    assert len(block) <= 601, len(block)
+    # A true hard cap: total length never exceeds 600, the ellipsis marker included.
+    assert len(block) <= 600, len(block)
     # Actively truncated — the ellipsis marker proves the cap fired.
     assert block.endswith("…")
     # Truncation removes the caller's tail, never the fixed trusted framing header:

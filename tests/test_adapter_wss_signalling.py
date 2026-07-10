@@ -955,3 +955,59 @@ async def test_place_call_over_wss_emits_outbound_call_connected_on_answer(
     sent = _one_event_record(caplog, "outbound_invite_sent")
     assert _event_field(sent, "call_id") == call_id
     assert not _records_with_event(caplog, "outbound_call_failed")
+
+
+def _busy_response(invite: SipRequest, *, to_tag: str = "busy-wss") -> str:
+    """A 486 Busy Here final for ``invite`` (no auth challenge, no body)."""
+    via = invite.header("Via") or ""
+    from_ = invite.header("From") or ""
+    to = invite.header("To") or ""
+    call_id = invite.header("Call-ID") or ""
+    cseq = invite.header("CSeq") or ""
+    return (
+        "SIP/2.0 486 Busy Here\r\n"
+        f"Via: {via}\r\n"
+        f"From: {from_}\r\n"
+        f"To: {to};tag={to_tag}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq}\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_place_call_over_wss_emits_outbound_call_failed_on_486(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 486 final on the WebRTC leg emits ``outbound_call_failed`` category='busy'.
+
+    Mirrors the SIP/TLS leg's #1294 failure event on the WebRTC/WSS leg (#1296): the
+    record carries the ADR-0086 failure CATEGORY (the SAME the agent-facing place_call
+    result surfaces), NEVER the SIP reason, dialled number, or gateway host (rule 34 /
+    ADR-0084). The invite_sent event still fired; no connect event on a failed attempt.
+    """
+    from hermes_voip.originate import OutboundCallFailed  # noqa: PLC0415
+
+    call_id: str | None = None
+    async with _wss_adapter_ready() as (adapter, transport):
+        with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+            call_task = asyncio.ensure_future(adapter.place_call("1001"))
+            await _until(lambda: any(m.startswith("INVITE") for m in transport.sent))
+            call_id = _sent_invite(transport).header("Call-ID")
+            assert call_id is not None
+            await _feed_response(
+                transport, call_id, _busy_response(_sent_invite(transport))
+            )
+            with pytest.raises(OutboundCallFailed) as exc_info:
+                await asyncio.wait_for(call_task, timeout=5.0)
+            assert exc_info.value.status == 486
+
+    failed = _one_event_record(caplog, "outbound_call_failed")
+    assert _event_field(failed, "call_id") == call_id
+    assert _event_field(failed, "transport") == "webrtc"
+    # The failure CATEGORY is the ADR-0086 outcome — 486 → busy — never the reason.
+    assert _event_field(failed, "category") == "busy"
+    # invite_sent fired for the same attempt; no connect event on a failure.
+    sent = _one_event_record(caplog, "outbound_invite_sent")
+    assert _event_field(sent, "call_id") == call_id
+    assert not _records_with_event(caplog, "outbound_call_connected")

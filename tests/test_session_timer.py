@@ -99,6 +99,14 @@ def test_parse_session_expires_ignores_unknown_params() -> None:
     assert se.refresher is Refresher.UAC
 
 
+def test_parse_session_expires_param_tail_not_delta_validated() -> None:
+    """The ';'-tail is never delta-validated: odd / folded param content parses fine."""
+    assert SessionExpires.parse("1800;foo=a=b").delta == 1800
+    folded = SessionExpires.parse("1800;note=a\r\n b;refresher=uac")
+    assert folded.delta == 1800
+    assert folded.refresher is Refresher.UAC
+
+
 def test_parse_session_expires_compact_uses_the_same_parser() -> None:
     """The compact-form ``x`` header carries the same value grammar as the long form."""
     se = SessionExpires.parse("450;refresher=uas")

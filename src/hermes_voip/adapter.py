@@ -3331,10 +3331,14 @@ class VoipAdapter(BasePlatformAdapter):
         """Async body of _on_inbound_invite; wires the full call stack."""
         invite = new_call.invite
         call_id = invite.header("Call-ID") or ""
-        # Time-to-first-audio SLO (runbook 0014, item 854): stamp the INVITE-receipt
-        # instant now, at admission, so the CallLoop can log the INVITE -> first-RTP
-        # latency when the opening greeting's first packet goes out. monotonic() is
-        # process-wide, so the loop's own monotonic() reads compare directly.
+        # Time-to-first-audio SLO (runbook 0014, item 854): stamp the instant this
+        # inbound-INVITE handler begins — the earliest plugin-controlled point. The
+        # whole caller-perceived wait (admission + SDP negotiation + TTS synthesis +
+        # RTP startup) unfolds AFTER this stamp; only sub-millisecond pre-dispatch
+        # (transport socket read -> coroutine schedule) sits outside the measured
+        # span. The CallLoop logs INVITE -> first outbound RTP off this stamp when the
+        # opening greeting's first packet goes out. monotonic() is process-wide, so
+        # the loop's own monotonic() reads compare directly.
         invite_monotonic = time.monotonic()
         _log.info(
             "INVITE received: Call-ID %s, registration ext %s",

@@ -6031,3 +6031,229 @@ async def test_no_first_audio_latency_when_invite_instant_absent(
     assert not [
         r for r in caplog.records if r.__dict__.get("event") == "first_audio_latency"
     ]
+
+
+# ===========================================================================
+# Item 1282 — "didn't catch that" reprompt on a spoke-but-untranscribed turn
+# ===========================================================================
+#
+# A caller who speaks but whose speech ASR cannot transcribe produces an empty /
+# whitespace-only FINAL turn. #269 drops it from delivery (no phantom agent turn) —
+# correct — but left the caller in silence until the generic no-input watchdog
+# eventually asks "Are you still there?", which is wrong: they DID speak. Item 1282
+# speaks a distinct "didn't catch that" reprompt instead, and marks caller activity so
+# the silence watchdog does not ALSO fire. The reprompt MUST be spoken NON-BLOCKING:
+# the ASR pump is the SOLE audio_q consumer, so awaiting the synth inline (the dropped
+# Wave-3 attempt) starves the pump for seconds.
+_DIDNT_CATCH_PHRASE: Final[str] = "Sorry, I didn't catch that."
+
+
+def _didnt_catch_loop(  # noqa: PLR0913 — factory mirrors CallLoop's keyword __init__
+    transport: _FakeTransport,
+    asr: StreamingASR,
+    tts: StreamingTTS,
+    *,
+    deliver_turn: Callable[[str], Awaitable[None]] | None = None,
+    guard: _FakeGuard | None = None,
+    didnt_catch_phrases: tuple[str, ...] = (_DIDNT_CATCH_PHRASE,),
+    no_input_reprompt: bool = False,
+) -> CallLoop:
+    """Build a CallLoop wired for the untranscribed-turn reprompt (item 1282).
+
+    The no-input watchdog is OFF by default so a test isolates the didn't-catch path;
+    the comfort filler is off for the same reason. An empty ``didnt_catch_phrases``
+    opts the feature out.
+    """
+    return CallLoop(
+        transport=transport,
+        asr=asr,
+        tts=tts,
+        guard=guard or _FakeGuard([_allow_result()]),
+        vad=_make_vad(),
+        endpointer=_make_endpointer(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=deliver_turn or _noop,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        comfort_filler=False,
+        no_input_reprompt=no_input_reprompt,
+        didnt_catch_phrases=didnt_catch_phrases,
+    )
+
+
+class _GatedTtsStream(_CapturingTtsStream):
+    """A capturing TtsStream that withholds its FRAMES until an event is set.
+
+    Records the synthesised text immediately (like the base), then blocks before
+    emitting any audio frame — modelling a slow synth so a test can prove the
+    didn't-catch reprompt plays on its OWN task and never stalls the ASR pump.
+    """
+
+    def __init__(
+        self,
+        frames: list[PcmFrame],
+        text: AsyncIterator[str],
+        sink: list[str],
+        gate: asyncio.Event,
+    ) -> None:
+        super().__init__(frames, text, sink)
+        self._gate = gate
+
+    async def _iter(self) -> AsyncIterator[PcmFrame]:
+        async for chunk in self._text:
+            self._sink.append(chunk)
+        await self._gate.wait()
+        for frame in self._frames:
+            if self._cancelled:
+                return
+            yield frame
+
+
+class _GatedCapturingTTS(_FakeTTS):
+    """A capturing TTS whose synth frames are gated on a caller-supplied event."""
+
+    def __init__(self, frames: list[PcmFrame], gate: asyncio.Event) -> None:
+        super().__init__(frames)
+        self.synthesised: list[str] = []
+        self._gate = gate
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        self.last_sample_rate = sample_rate
+        stream = _GatedTtsStream(self._frames, text, self.synthesised, self._gate)
+        self.last_stream = stream
+        return stream
+
+
+@pytest.mark.asyncio
+async def test_untranscribed_turn_speaks_didnt_catch_reprompt() -> None:
+    """An empty final (caller spoke, ASR blank) speaks one 'didn't catch that' line."""
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    tts = _CapturingTTS([_greeting_frame(1)])
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    loop = _didnt_catch_loop(
+        transport,
+        _FakeASR([("", True, True)]),
+        tts,
+        deliver_turn=capture,
+    )
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if tts.synthesised:
+            break
+
+    assert tts.synthesised == [_DIDNT_CATCH_PHRASE], (
+        f"the didn't-catch reprompt was not synthesised; got {tts.synthesised!r}"
+    )
+    assert delivered == [], (
+        "an untranscribed turn must NOT become a delivered agent turn"
+    )
+
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_untranscribed_turn_reprompt_runs_off_the_asr_pump() -> None:
+    """The reprompt plays on its own task — a blocked synth does not stall delivery.
+
+    Injects an empty final FOLLOWED by a real "hello" turn, with a TTS whose frames are
+    gated shut. If the reprompt were awaited inline on the ASR pump (the dropped Wave-3
+    attempt), the pump would block on the gated synth and never deliver "hello". The
+    real turn must arrive while the reprompt synth is still blocked.
+    """
+    gate = asyncio.Event()
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    tts = _GatedCapturingTTS([_greeting_frame(1)], gate)
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    loop = _didnt_catch_loop(
+        transport,
+        _FakeASR([("", True, True), ("hello", True, True)]),
+        tts,
+        deliver_turn=capture,
+    )
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if delivered:
+            break
+
+    assert delivered == ["hello"], (
+        "the untranscribed-turn reprompt blocked the ASR pump: the following real turn "
+        f"was starved (delivered={delivered!r})"
+    )
+
+    # The reprompt DOES fire — on its own task. Let its synth record the phrase (it then
+    # parks on the shut gate before emitting any frame). This runs concurrently with the
+    # delivery above, hence the separate poll.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if tts.synthesised:
+            break
+    assert tts.synthesised == [_DIDNT_CATCH_PHRASE], (
+        f"the didn't-catch reprompt was not synthesised; got {tts.synthesised!r}"
+    )
+    assert transport.sent_audio == [], (
+        "the gated reprompt frames must not have been sent while the gate is shut"
+    )
+
+    gate.set()
+    transport.close_inbound()
+    await run_task
+
+
+@pytest.mark.asyncio
+async def test_untranscribed_turn_marks_caller_active_in_window() -> None:
+    """An untranscribed turn is caller ACTIVITY — it sets _caller_active_in_window.
+
+    So the no-input watchdog, which reads that flag, does not ALSO fire "Are you still
+    there?" on top of the didn't-catch reprompt (no double-reprompt).
+    """
+    tts = _CapturingTTS([_greeting_frame(1)])
+    loop = _didnt_catch_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([("", True, True)]),
+        tts,
+    )
+    await loop.run()
+
+    assert loop._caller_active_in_window is True, (
+        "an untranscribed caller turn must mark caller activity so the silence "
+        "watchdog does not double-fire"
+    )
+
+
+@pytest.mark.asyncio
+async def test_untranscribed_turn_opt_out_speaks_nothing() -> None:
+    """With the feature off, an empty final is silent and not marked active.
+
+    Preserves the #269 drop-and-ignore behaviour: nothing spoken, and caller activity
+    NOT marked (the generic watchdog keeps its prior semantics).
+    """
+    tts = _CapturingTTS([_greeting_frame(1)])
+    loop = _didnt_catch_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([("", True, True)]),
+        tts,
+        didnt_catch_phrases=(),
+    )
+    await loop.run()
+
+    assert tts.synthesised == [], "opt-out must speak no reprompt"
+    assert loop._caller_active_in_window is False, (
+        "opt-out must preserve the prior behaviour: an empty final is not marked active"
+    )

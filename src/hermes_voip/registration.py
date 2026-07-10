@@ -29,6 +29,7 @@ from typing import Literal
 
 from hermes_voip._decimal import _parse_decimal
 from hermes_voip._header_list import split_header_list
+from hermes_voip._name_addr import find_name_addr
 from hermes_voip.digest import (
     DigestChallenge,
     DigestCredentials,
@@ -76,8 +77,6 @@ _BINDING_REMOVED = 0
 # (codex MUST-FIX 1). The narrower ``\d+`` form alone silently dropped a malformed
 # token, hiding a registrar that did not actually grant our binding.
 _EXPIRES_TOKEN = re.compile(r";\s*expires\s*=\s*([^;,\s]+)", re.IGNORECASE)
-# The addr-spec inside a Contact name-addr's angle brackets (``<sip:...>``).
-_ANGLE_ADDR = re.compile(r"<([^>]*)>")
 # The SIP schemes an AOR may carry; sips is ADR-0005's SIP-over-TLS scheme.
 _AOR_SCHEMES = frozenset({"sip", "sips"})
 # The Via transports that carry signalling over an encrypted channel (lower-cased
@@ -99,10 +98,15 @@ def _split_contacts(header_value: str) -> list[str]:
 
 
 def _binding_uri(binding: str) -> str:
-    """The bare addr-spec of one Contact binding (inside ``<...>`` if present)."""
-    match = _ANGLE_ADDR.search(binding)
-    if match is not None:
-        return match.group(1).strip()
+    """The bare addr-spec of one Contact binding (inside ``<...>`` if present).
+
+    The angle-addr is located outside any quoted display-name (RFC 3261 §25.1), so
+    a bracketed display-name (e.g. ``"Desk <A>" <sip:…>``) cannot be mistaken for
+    the addr-spec and desync Contact-binding matching.
+    """
+    name_addr = find_name_addr(binding)
+    if name_addr is not None:
+        return name_addr[0].strip()
     # A bare URI form (no angle brackets): everything before the first ';' param.
     return binding.split(";", 1)[0].strip()
 

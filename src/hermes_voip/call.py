@@ -605,7 +605,9 @@ class CallSession:
         =None)``; otherwise the report carries no progress and the discriminated reason
         the wait ended for:
 
-        * ``timeout <= 0`` — the wait is opted out: ``WAIT_DISABLED`` (no wait ran).
+        * ``timeout <= 0`` with nothing already latched — the wait is opted out:
+          ``WAIT_DISABLED`` (no wait ran). A terminal outcome latched before the REFER
+          2xx (it can race the arm) is still reported, never discarded.
         * the wait elapses with no terminal NOTIFY: ``TIMEOUT``.
         * the event fires with no terminal outcome latched — a BYE / hang_up woke it
           first (or only a non-terminal ``100 Trying`` arrived): ``CALL_ENDED``. The
@@ -613,21 +615,26 @@ class CallSession:
           after the BYE cannot flip it (P1-b); we never infer success from a torn-down
           leg.
         """
-        if timeout <= 0:
-            return TransferOutcomeReport(
-                progress=None, unknown_reason=TransferUnknownReason.WAIT_DISABLED
-            )
-        try:
-            await asyncio.wait_for(event.wait(), timeout)
-        except TimeoutError:
-            return TransferOutcomeReport(
-                progress=None, unknown_reason=TransferUnknownReason.TIMEOUT
-            )
+        # The event is armed BEFORE the REFER, so a terminal NOTIFY (or a call-end) can
+        # latch an outcome before we even decide to wait — it races the 2xx. Honour an
+        # already-latched outcome first, even when the wait is opted out (round-5).
+        if not self._transfer_outcome_latched:
+            if timeout <= 0:
+                return TransferOutcomeReport(
+                    progress=None, unknown_reason=TransferUnknownReason.WAIT_DISABLED
+                )
+            try:
+                await asyncio.wait_for(event.wait(), timeout)
+            except TimeoutError:
+                return TransferOutcomeReport(
+                    progress=None, unknown_reason=TransferUnknownReason.TIMEOUT
+                )
         # ADR-0109 P1-b: read the LATCHED cause (fixed atomically when the wait was
         # first woken), never the mutable transfer_progress — a terminal NOTIFY that
         # records progress AFTER a BYE woke the wait must not flip CALL_ENDED to
-        # COMPLETED. Once the event has fired the cause is always latched: a terminal
-        # progress is the transfer's final outcome; ``None`` means the leg ended first.
+        # COMPLETED. Once latched — whether it already was, or the event fired — a
+        # terminal progress is the transfer's final outcome; ``None`` means the leg
+        # ended first.
         progress = self._transfer_outcome_progress
         if progress is not None:
             return TransferOutcomeReport(progress=progress, unknown_reason=None)

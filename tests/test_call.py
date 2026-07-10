@@ -825,6 +825,39 @@ async def test_second_transfer_while_one_awaits_is_rejected() -> None:
     assert report.progress.status_code == 200
 
 
+async def test_transfer_on_ended_call_is_rejected() -> None:
+    # codex round-4: a BYE can end the call between the adapter's ended-check and the
+    # arm. Arming a transfer on an ended call must fail fast — never send a REFER on a
+    # dead dialog nor arm an event that is never signalled (→ a false TIMEOUT).
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    session.ended = True
+    with pytest.raises(CallError, match="ended"):
+        await asyncio.wait_for(
+            session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0),
+            timeout=1.0,
+        )
+
+
+async def test_terminated_nonfinal_sipfrag_is_not_a_terminal_outcome() -> None:
+    # codex round-4: a terminated subscription carrying a NON-final status ("100
+    # Trying") is not a definitive transfer outcome. It must not be latched/reported
+    # as a terminal progress (which classifies OUTCOME_UNKNOWN with no reason → a
+    # false "not confirmed within Ns"). It does not wake the wait; the bounded wait
+    # times out → TIMEOUT.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=0.1)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 100 Trying", terminated=True))
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.TIMEOUT
+
+
 async def test_transfer_blind_returns_failed_notify_progress_on_4xx() -> None:
     """A terminal 4xx NOTIFY (busy) is returned so the adapter can classify FAILED."""
     signaling, media = _FakeSignaling(), _FakeMedia()

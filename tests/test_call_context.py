@@ -84,6 +84,18 @@ def test_from_bare_uri_no_angle_brackets() -> None:
     assert ctx.from_display_name is None
 
 
+def test_from_quoted_display_name_with_brackets_does_not_desync_uri() -> None:
+    # RFC 3261 §25.1 permits ``<`` and ``>`` inside a quoted display-name. A
+    # naive ``value.find('<')`` latches the ``<`` INSIDE the quoted display-name,
+    # corrupting both the extracted display-name and the addr-spec/URI (the #378
+    # caller-identity spoofing surface).
+    from_value = '"Alice <hacker@evil.test>" <sip:2000@pbx.example.test>;tag=abc'
+    ctx = _ctx([("From", from_value)])
+    assert ctx.from_display_name == "Alice <hacker@evil.test>"
+    assert ctx.from_uri == "sip:2000@pbx.example.test"
+    assert ctx.from_number == "2000"
+
+
 def test_p_asserted_identity_sip_and_tel_forms() -> None:
     ctx = _ctx(
         [

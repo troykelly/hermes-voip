@@ -75,6 +75,28 @@ def test_build_response_does_not_duplicate_existing_to_tag() -> None:
     assert resp.header("To") == "<sip:1000@pbx.example.test>;tag=already"
 
 
+def test_build_response_appends_to_tag_despite_bracketed_quoted_display_name() -> None:
+    # RFC 3261 §25.1: a quoted display-name may contain ``>`` and a literal
+    # ``;tag=``. A naive split-on-'>' scan of the To latches that quoted
+    # ``;tag=fake`` and wrongly concludes a real dialog tag is already present,
+    # SUPPRESSING our minted 2xx To-tag — the response then has no dialog tag.
+    request = SipRequest(
+        method="INVITE",
+        request_uri="sip:1000@198.51.100.7:5061",
+        headers=(
+            ("Via", "SIP/2.0/TLS 198.51.100.50:5061;branch=z9hG4bK-a"),
+            ("From", "<sip:2000@pbx.example.test>;tag=theirtag"),
+            ("To", '"X>;tag=fake" <sip:1000@pbx.example.test>'),
+            ("Call-ID", "call-xyz"),
+            ("CSeq", "5 INVITE"),
+        ),
+        body="",
+    )
+    text = build_response(request, 200, "OK", to_tag="newtag")
+    resp = SipResponse.parse(text)
+    assert resp.header("To") == '"X>;tag=fake" <sip:1000@pbx.example.test>;tag=newtag'
+
+
 def test_build_response_carries_extra_headers_and_body() -> None:
     sdp = "v=0\r\n"
     text = build_response(

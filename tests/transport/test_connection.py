@@ -2095,3 +2095,16 @@ async def test_addr_spec_and_has_to_tag_plain_and_bare_unchanged() -> None:
     assert _has_to_tag("<sip:1000@pbx.example.test>;tag=real") is True
     assert _has_to_tag("<sip:1000@pbx.example.test>") is False
     assert _has_to_tag("sip:1000@pbx.example.test;tag=baretag") is True
+
+
+async def test_has_to_tag_ignores_tag_inside_quoted_generic_param() -> None:
+    # RFC 3261 §25.1 permits a literal ``;tag=`` inside a QUOTED generic-param
+    # value that sits AFTER the real ``<addr-spec>``. A naive regex on the
+    # trailing latches that quoted ``;tag=fake`` and mis-classifies an
+    # out-of-dialog request (no real To-tag) as in-dialog.
+    to_forged_only = '<sip:1000@pbx.example.test>;g=";tag=fake"'
+    assert _has_to_tag(to_forged_only) is False
+
+    # The same shape WITH a real top-level trailing tag is genuinely in-dialog.
+    to_forged_and_real = '<sip:1000@pbx.example.test>;g=";tag=fake";tag=real'
+    assert _has_to_tag(to_forged_and_real) is True

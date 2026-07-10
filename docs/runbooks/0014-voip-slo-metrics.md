@@ -287,9 +287,11 @@ demuxes inbound RTCP (RFC 5761 §4 on the muxed port, or a sibling socket on RTP
 not muxed — RFC 3550 §11), and flushes a closing BYE on stop. At call teardown the adapter
 logs the final `call_quality` snapshot (an INFO line: local/remote loss, jitter, RTT). That
 line now ALSO carries a structured `extra={}` (ADR-0075): `event="rtcp_call_quality"`,
-`call_id`, and the five numeric quality fields (`local_fraction_lost`, `local_jitter_ms`,
-`remote_fraction_lost`, `remote_jitter_ms`, `rtt_seconds`) — so a log pipeline filters and
-aggregates per-call quality without parsing the message. The record is gated on the call
+`call_id`, and all seven numeric quality fields (`local_fraction_lost`,
+`local_cumulative_lost`, `local_jitter_ms`, `remote_fraction_lost`,
+`remote_cumulative_lost`, `remote_jitter_ms`, `rtt_seconds`) — so a log pipeline filters and
+aggregates per-call quality (including absolute lost-packet counts, not just the loss
+fraction) without parsing the message. The record is gated on the call
 having actually run RTCP (`_rtcp_active`), so a secured/disabled call emits nothing. RTCP
 is on by default; the operator kill-switch is `HERMES_VOIP_RTCP_ENABLED=false`.
 

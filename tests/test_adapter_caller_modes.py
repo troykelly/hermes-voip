@@ -51,6 +51,7 @@ from hermes_voip.outbound_allow import load_outbound_allowlist
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import NotifyProgress
 from hermes_voip.voip_tools import AttendedTransferOutcome, TransferOutcome
 
 
@@ -288,7 +289,12 @@ async def _build_adapter(
             # session_expires/min_se are real ints so the RFC 4028 session-timer
             # negotiation (ADR-0071) compares them, not TypeError on a MagicMock.
             return_value=MagicMock(
-                require_secure_media=False, session_expires=600, min_se=90
+                require_secure_media=False,
+                session_expires=600,
+                min_se=90,
+                # ADR-0109: a real float so the adapter threads a usable bounded wait
+                # to CallSession.transfer_blind/_attended (not a MagicMock child).
+                transfer_outcome_timeout_secs=20.0,
             ),
         ),
         patch(
@@ -420,7 +426,12 @@ async def test_connect_fails_loud_on_empty_privileged_allow_file(
             # session_expires/min_se are real ints so the RFC 4028 session-timer
             # negotiation (ADR-0071) compares them, not TypeError on a MagicMock.
             return_value=MagicMock(
-                require_secure_media=False, session_expires=600, min_se=90
+                require_secure_media=False,
+                session_expires=600,
+                min_se=90,
+                # ADR-0109: a real float so the adapter threads a usable bounded wait
+                # to CallSession.transfer_blind/_attended (not a MagicMock child).
+                transfer_outcome_timeout_secs=20.0,
             ),
         ),
         patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
@@ -1473,6 +1484,7 @@ class _FakeTransferSession:
         ended: bool = False,
         local_uri: str = "sip:1000@pbx",
         guard: GuardSessionState | None = None,
+        transfer_progress: NotifyProgress | None = None,
     ) -> None:
         self.ended = ended
         # CallSession.transfer_blind reads the local AOR for Referred-By from
@@ -1480,11 +1492,21 @@ class _FakeTransferSession:
         self.dialog = SimpleNamespace(local_uri=local_uri)
         self.guard = guard or GuardSessionState(call_id="c", privilege_level=3)
         self.blind: list[tuple[str, str | None]] = []
+        # ADR-0109: the terminal transfer-progress NOTIFY the REFER's outcome wait
+        # returns, and the bounded timeouts the adapter threaded down (one per REFER).
+        self._transfer_progress = transfer_progress
+        self.outcome_timeouts: list[float] = []
 
     async def transfer_blind(
-        self, target_uri: str, *, referred_by: str | None = None
-    ) -> None:
+        self,
+        target_uri: str,
+        *,
+        referred_by: str | None = None,
+        outcome_timeout: float = 0.0,
+    ) -> NotifyProgress | None:
         self.blind.append((target_uri, referred_by))
+        self.outcome_timeouts.append(outcome_timeout)
+        return self._transfer_progress
 
 
 def _confirmation_pressing(digit: str) -> ArmedConfirmation:
@@ -1517,6 +1539,70 @@ async def test_transfer_blind_on_call_fires_refer_after_confirm() -> None:
 
     assert outcome is TransferOutcome.TRANSFERRED
     assert session.blind == [("sip:1001@pbx.example.test", "sip:1000@pbx.example.test")]
+
+
+# --- ADR-0109: terminal transfer outcome classified from the NOTIFY ----------
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_completed_on_terminal_2xx() -> None:
+    """A confirmed transfer + a terminal 2xx NOTIFY classifies COMPLETED (ADR-0109)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(
+        transfer_progress=NotifyProgress(status_code=200, reason="OK", terminated=True)
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
+
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert result.outcome is TransferOutcome.COMPLETED
+    assert result.notify_status == 200
+    # The configured bounded wait (ADR-0109 knob) is threaded down to the session.
+    assert session.outcome_timeouts == [20.0]
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_failed_on_terminal_4xx() -> None:
+    """A confirmed transfer + a terminal 4xx NOTIFY classifies FAILED with status."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(
+        transfer_progress=NotifyProgress(
+            status_code=486, reason="Busy Here", terminated=True
+        )
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
+
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert result.outcome is TransferOutcome.FAILED
+    assert result.notify_status == 486
+    assert result.notify_reason == "Busy Here"
+
+
+@pytest.mark.asyncio
+async def test_transfer_blind_on_call_outcome_unknown_without_notify() -> None:
+    """A confirmed transfer with no terminal NOTIFY classifies OUTCOME_UNKNOWN."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    session = _FakeTransferSession(transfer_progress=None)
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
+    adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
+
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+
+    assert result.outcome is TransferOutcome.OUTCOME_UNKNOWN
+    assert result.notify_status is None
+    assert result.timeout_secs == 20.0
 
 
 @pytest.mark.asyncio
@@ -2184,16 +2270,26 @@ class _FakeAttendedOriginalSession:
         ended: bool = False,
         local_uri: str = "sip:1000@pbx.example.test",
         guard: GuardSessionState | None = None,
+        transfer_progress: NotifyProgress | None = None,
     ) -> None:
         self.ended = ended
         self.dialog = SimpleNamespace(local_uri=local_uri)
         self.guard = guard or GuardSessionState(call_id="c", privilege_level=3)
         self.attended: list[tuple[object, str | None]] = []
+        # ADR-0109: the terminal NOTIFY the outcome wait returns + timeouts threaded.
+        self._transfer_progress = transfer_progress
+        self.outcome_timeouts: list[float] = []
 
     async def transfer_attended(
-        self, consult: object, *, referred_by: str | None = None
-    ) -> None:
+        self,
+        consult: object,
+        *,
+        referred_by: str | None = None,
+        outcome_timeout: float = 0.0,
+    ) -> NotifyProgress | None:
         self.attended.append((consult, referred_by))
+        self.outcome_timeouts.append(outcome_timeout)
+        return self._transfer_progress
 
 
 class _FakeConsultSession:
@@ -2336,6 +2432,70 @@ async def test_complete_attended_transfer_sends_refer_replaces() -> None:
     assert referred_by == "sip:1000@pbx.example.test"
     # The pairing is cleared once the REFER is sent.
     assert call_id not in adapter._attended_consults
+
+
+@pytest.mark.asyncio
+async def test_complete_attended_transfer_completed_on_terminal_2xx() -> None:
+    """Completing + a terminal 2xx NOTIFY classifies COMPLETED (ADR-0109)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession(
+        local_uri="sip:1000@pbx.example.test",
+        transfer_progress=NotifyProgress(status_code=200, reason="OK", terminated=True),
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    adapter._call_sessions["consult-call-id"] = _FakeConsultSession()  # type: ignore[assignment]  # fake session
+    adapter._attended_consults[call_id] = "consult-call-id"
+
+    result = await adapter.complete_attended_transfer(call_id)
+
+    assert result.outcome is AttendedTransferOutcome.COMPLETED
+    assert result.notify_status == 200
+    assert original.outcome_timeouts == [20.0]
+
+
+@pytest.mark.asyncio
+async def test_complete_attended_transfer_failed_on_terminal_4xx() -> None:
+    """Completing + a terminal 4xx NOTIFY classifies FAILED with the SIP status."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession(
+        transfer_progress=NotifyProgress(
+            status_code=486, reason="Busy Here", terminated=True
+        ),
+    )
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    adapter._call_sessions["consult-call-id"] = _FakeConsultSession()  # type: ignore[assignment]  # fake session
+    adapter._attended_consults[call_id] = "consult-call-id"
+
+    result = await adapter.complete_attended_transfer(call_id)
+
+    assert result.outcome is AttendedTransferOutcome.FAILED
+    assert result.notify_status == 486
+    assert result.notify_reason == "Busy Here"
+
+
+@pytest.mark.asyncio
+async def test_complete_attended_transfer_outcome_unknown_without_notify() -> None:
+    """Completing with no terminal NOTIFY classifies OUTCOME_UNKNOWN (ADR-0109)."""
+    transport = _FakeTransport()
+    manager = _FakeManager(is_up=True)
+    adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
+    original = _FakeAttendedOriginalSession(transfer_progress=None)
+    call_id = new_call_id()
+    adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
+    adapter._call_sessions["consult-call-id"] = _FakeConsultSession()  # type: ignore[assignment]  # fake session
+    adapter._attended_consults[call_id] = "consult-call-id"
+
+    result = await adapter.complete_attended_transfer(call_id)
+
+    assert result.outcome is AttendedTransferOutcome.OUTCOME_UNKNOWN
+    assert result.notify_status is None
+    assert result.timeout_secs == 20.0
 
 
 @pytest.mark.asyncio

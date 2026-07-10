@@ -256,6 +256,15 @@ class CallSession:
         # live subscription so it cannot wake or mis-classify a newer transfer. ``None``
         # when no transfer is awaiting an outcome.
         self._active_refer_cseq: int | None = None
+        # ADR-0109 P1-b: the terminal transfer outcome LATCHED the instant the wait is
+        # first woken — by :meth:`_on_notify` (a terminated NOTIFY → its progress) or
+        # :meth:`_wake_transfer_on_end` (a BYE/hang_up → ``None``). Whichever fires
+        # FIRST wins (``_transfer_outcome_latched`` guards the write), so a terminal
+        # NOTIFY racing in AFTER a BYE cannot flip a torn-down leg's CALL_ENDED to
+        # COMPLETED. The wait reads THIS, never the mutable :attr:`transfer_progress`,
+        # so the decision is immune to a post-wake mutation.
+        self._transfer_outcome_latched: bool = False
+        self._transfer_outcome_progress: NotifyProgress | None = None
 
     @property
     def dialog(self) -> Dialog:
@@ -543,6 +552,8 @@ class CallSession:
         """
         self.transfer_progress = None
         self._active_refer_cseq = None
+        self._transfer_outcome_latched = False
+        self._transfer_outcome_progress = None
         event = asyncio.Event()
         self._transfer_terminal = event
         return event
@@ -558,6 +569,8 @@ class CallSession:
         if self._transfer_terminal is event:
             self._transfer_terminal = None
             self._active_refer_cseq = None
+            self._transfer_outcome_latched = False
+            self._transfer_outcome_progress = None
 
     async def _await_transfer_outcome(
         self, event: asyncio.Event, timeout: float
@@ -572,9 +585,11 @@ class CallSession:
 
         * ``timeout <= 0`` — the wait is opted out: ``WAIT_DISABLED`` (no wait ran).
         * the wait elapses with no terminal NOTIFY: ``TIMEOUT``.
-        * the event fires but nothing terminal was recorded — a BYE / hang_up woke it
-          (or only a non-terminal ``100 Trying`` arrived): ``CALL_ENDED``. We never
-          infer success from a torn-down leg.
+        * the event fires with no terminal outcome latched — a BYE / hang_up woke it
+          first (or only a non-terminal ``100 Trying`` arrived): ``CALL_ENDED``. The
+          cause is latched when the wait is first woken, so a terminal NOTIFY racing in
+          after the BYE cannot flip it (P1-b); we never infer success from a torn-down
+          leg.
         """
         if timeout <= 0:
             return TransferOutcomeReport(
@@ -586,8 +601,13 @@ class CallSession:
             return TransferOutcomeReport(
                 progress=None, unknown_reason=TransferUnknownReason.TIMEOUT
             )
-        progress = self.transfer_progress
-        if progress is not None and progress.terminated:
+        # ADR-0109 P1-b: read the LATCHED cause (fixed atomically when the wait was
+        # first woken), never the mutable transfer_progress — a terminal NOTIFY that
+        # records progress AFTER a BYE woke the wait must not flip CALL_ENDED to
+        # COMPLETED. Once the event has fired the cause is always latched: a terminal
+        # progress is the transfer's final outcome; ``None`` means the leg ended first.
+        progress = self._transfer_outcome_progress
+        if progress is not None:
             return TransferOutcomeReport(progress=progress, unknown_reason=None)
         return TransferOutcomeReport(
             progress=None, unknown_reason=TransferUnknownReason.CALL_ENDED
@@ -597,12 +617,16 @@ class CallSession:
         """Wake a pending transfer-outcome wait when the call ends (ADR-0109).
 
         A BYE (either side) tears the referrer leg down; a bounded outcome wait must
-        return rather than block for the full timeout. Setting the armed terminal event
-        wakes it — ``transfer_progress`` keeps whatever (if anything) had arrived, so
-        the classifier maps a no-terminal-NOTIFY end to OUTCOME_UNKNOWN (never inferring
-        success from a BYE). A no-op when no transfer is in flight.
+        return rather than block for the full timeout. If no terminal outcome has been
+        latched yet, latch CALL_ENDED (``None``) — the FIRST waker wins (P1-b), so a
+        terminal NOTIFY racing in after this cannot flip a torn-down leg to COMPLETED
+        (we never infer success from a BYE) — then set the armed event. A no-op when no
+        transfer is in flight.
         """
         if self._transfer_terminal is not None:
+            if not self._transfer_outcome_latched:
+                self._transfer_outcome_latched = True
+                self._transfer_outcome_progress = None
             self._transfer_terminal.set()
 
     async def refresh_session(
@@ -1194,6 +1218,11 @@ class CallSession:
             # ADR-0109: a terminated NOTIFY is the transfer's final outcome; wake
             # the bounded wait. Interim progress updates do not wake it.
             if progress.terminated and self._transfer_terminal is not None:
+                # P1-b: latch this outcome the instant we wake the wait (first waker
+                # wins), so a BYE arriving right after cannot overwrite it.
+                if not self._transfer_outcome_latched:
+                    self._transfer_outcome_latched = True
+                    self._transfer_outcome_progress = progress
                 self._transfer_terminal.set()
         await self._signaling.send(response)
 

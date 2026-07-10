@@ -1031,10 +1031,13 @@ async def test_await_transfer_outcome_timeout_reports_reason() -> None:
 
 
 async def test_await_transfer_outcome_terminal_progress_has_no_reason() -> None:
-    """A terminal NOTIFY yields the progress and NO unknown reason (ADR-0109 P2)."""
+    """A latched terminal outcome yields the progress with NO reason (P2/P1-b)."""
     session = _session(_FakeSignaling(), _FakeMedia())
     event = asyncio.Event()
-    session.transfer_progress = NotifyProgress(
+    # A terminated NOTIFY latches the outcome (what _on_notify does), then wakes the
+    # wait; _await reads the LATCH, not the mutable transfer_progress (P1-b).
+    session._transfer_outcome_latched = True
+    session._transfer_outcome_progress = NotifyProgress(
         status_code=200, reason="OK", terminated=True
     )
     event.set()
@@ -1048,24 +1051,33 @@ async def test_await_transfer_outcome_terminal_progress_has_no_reason() -> None:
 async def test_await_transfer_outcome_call_ended_reports_reason() -> None:
     """The event firing with no terminal progress (a BYE woke it) -> CALL_ENDED (P2).
 
-    We never infer success from a torn-down leg, so a wake with nothing terminal
-    recorded is reported as CALL_ENDED, not a timeout.
+    We never infer success from a torn-down leg, so a wake latched by call-end with
+    no terminal outcome is reported as CALL_ENDED, not a timeout.
     """
     session = _session(_FakeSignaling(), _FakeMedia())
     event = asyncio.Event()
-    event.set()  # woken by call-end; transfer_progress is still None
+    # A BYE latches CALL_ENDED (progress stays None), then wakes the wait — this is
+    # what _wake_transfer_on_end does:
+    session._transfer_outcome_latched = True
+    event.set()
     report = await session._await_transfer_outcome(event, 2.0)
     assert report.progress is None
     assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
 
 
 async def test_await_transfer_outcome_nonterminal_progress_is_call_ended() -> None:
-    """A non-terminal ``100 Trying`` at wake is not a terminal outcome -> CALL_ENDED."""
+    """A non-terminal ``100 Trying`` recording is never mistaken for a terminal outcome.
+
+    Only a terminal NOTIFY latches an outcome; a bare ``100 Trying`` does not. When a
+    BYE then latches CALL_ENDED and wakes the wait, the non-terminal recording (below)
+    is never read — the latch decides (P1-b).
+    """
     session = _session(_FakeSignaling(), _FakeMedia())
     event = asyncio.Event()
     session.transfer_progress = NotifyProgress(
         status_code=100, reason="Trying", terminated=False
     )
+    session._transfer_outcome_latched = True  # a BYE latched CALL_ENDED (progress None)
     event.set()
     report = await session._await_transfer_outcome(event, 2.0)
     assert report.progress is None

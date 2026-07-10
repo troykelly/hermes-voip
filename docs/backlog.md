@@ -1571,8 +1571,8 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
   (`;tag="fake"`, `;tag=""`) — a pre-existing leniency (the old `_TAG_PARAM` regex accepted it too) that fails
   CLOSED (a quoted tag misclassifies→rejects; it does not forge a matching dialog tag). Tighten `tag_param` to
   validate the value against the strict SIP `token` grammar (RFC 3261) and reject quoted/non-token tags —
-  WITHOUT over-rejecting valid-but-unusual tags real gateways send. (codex round-3 follow-up on #450)
-- [ ] **[medium] test** — Prove an outbound call *carrying an objective* still emits its objective first
+  WITHOUT over-rejecting valid-but-unusual tags real gateways send. (codex round-3 follow-up on #450) **Wave-4 attempt DROPPED (codex block):** a naive strict-token regex OVER-REJECTS grammar-legal LWS — RFC 3261 `SEMI = SWS ";" SWS`, `EQUAL = SWS "=" SWS`, and `message.py` unfolds continuation lines by joining with a space, so a folded `;tag = value` reaches the parser with surrounding whitespace. The redo MUST strip LWS around the tag value (and the `;`/`=`) BEFORE the token `fullmatch`, and keep every existing dialog/manager/connection tag round-trip test green (they exercise realistic tags).
+- [x] **[medium] test** (#452 — residual: also assert the objective is the FIRST delivered turn, `received.index == 0`, not merely delivered, since an end-of-call/teardown message could race; codex on #452) — Prove an outbound call *carrying an objective* still emits its objective first
   turn via `_inject_objective_first_turn` while the greeting is suppressed (`adapter.py`; #443's e2e covers
   only the no-objective outbound case). [follow-up from #443]
 - [ ] **[medium] efficiency** (needs ADR — dropped this wave) — SRTP/SRTCP `protect`/`unprotect` big-int

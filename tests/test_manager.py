@@ -19,6 +19,7 @@ from collections.abc import Callable
 
 import pytest
 
+import hermes_voip.manager as manager_module
 from hermes_voip.config import GatewayConfig, load_gateway_config
 from hermes_voip.manager import (
     _MIN_REFRESH_DELAY,
@@ -1802,3 +1803,61 @@ async def test_aclose_cancels_refresh_before_sending_deregister() -> None:
         "the de-register must be sent AFTER refresh tasks are cancelled — no live "
         "refresh may follow it and recreate the binding"
     )
+
+
+async def test_aclose_bounds_a_hanging_deregister_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A HANGING (not just failing) de-register send must not strand aclose.
+
+    (#435, rule 37) aclose() wraps the shutdown Expires:0 de-register send in
+    ``asyncio.wait_for(self._transport.send(...), _DEREGISTER_SEND_TIMEOUT_SECS)``
+    because a dead/slow transport must never strand shutdown. The only existing
+    negative-path test
+    (``test_aclose_deregister_send_failure_does_not_strand_shutdown``) uses a
+    transport whose ``send()`` RAISES immediately — an ``await`` of that
+    raising coroutine returns (with an exception) exactly as fast as an
+    ``await`` of the whole ``wait_for`` wrapper, so it cannot tell the two
+    apart. A mutant that deletes the ``wait_for`` wrapper and awaits
+    ``send()`` directly would still pass that test yet block ``aclose()``
+    indefinitely in production against a transport whose ``send()`` never
+    returns. This test uses a transport whose ``send()`` awaits an
+    ``asyncio.Event`` that is never set — the only way it can complete is via
+    the ``wait_for`` bound's cancellation of the pending send.
+    """
+    # Deterministic and fast: shrink the production bound rather than sleeping
+    # for it, so the test proves the SAME wait_for behaviour without being slow.
+    monkeypatch.setattr(manager_module, "_DEREGISTER_SEND_TIMEOUT_SECS", 0.05)
+
+    class _HangingSendTransport(_FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hang = False
+            self._never = asyncio.Event()  # deliberately never set
+
+        async def send(self, message: str) -> None:
+            if self.hang:
+                await self._never.wait()
+                return
+            await super().send(message)
+
+    transport = _HangingSendTransport()
+    manager = RegistrationManager(_gateway(), transport)
+    await manager.start()
+    await manager.on_response(_ok_for(transport.sent[0], expires=300))
+    await manager.on_response(_ok_for(transport.sent[1], expires=300))
+    transport.hang = True  # every subsequent send (the de-registers) now hangs forever
+
+    # An outer bound generous relative to the (shrunk) production timeout: if the
+    # wait_for wrapper were removed, aclose() would hang forever and THIS assertion
+    # is what turns that hang into a deterministic test failure instead of a wedged
+    # test run.
+    await asyncio.wait_for(manager.aclose(), timeout=2.0)
+
+    # Shutdown still completed for BOTH flows despite the hung sends: their tasks
+    # are cancelled + cleared, exactly as the failing-send negative path asserts.
+    for extension in ("1000", "1001"):
+        state = manager._by_extension[extension]
+        assert state.refresh_task is None
+        assert state.recovery_task is None
+        assert state.response_timeout_task is None

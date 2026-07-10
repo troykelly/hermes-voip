@@ -1684,10 +1684,10 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   `GuardVerdict`, `Transcript`, `TtsStream`, `AsrFactory`, `TtsFactory`, `GuardFactory`) to the `hermes_voip`
   top-level `__all__` — `providers/__init__` re-exports all 14 but the root package only 7; a custom-provider
   author needs the result/factory types without a deep import. (`__init__.py`, test_init_exports.py)
-- [ ] **[low] efficiency** — `SentenceAggregator.push()` (`tts/segment.py:83`) re-slices the whole text buffer
+- [x] **[low] efficiency** (#478) — `SentenceAggregator.push()` (`tts/segment.py:83`) re-slices the whole text buffer
   per emitted segment (same class as the #310 RTP `_tx_buffer` front-slice, but on the TTS text path;
   LLM-chunk-rate + one-sentence buffer = microseconds, NOT a ptime concern). Add an offset cursor OR a
-  cold-path comment pinning the intentional smallness.
+  cold-path comment pinning the intentional smallness. — #478 pinned it with a cold-path comment (rule 22: cold path, no offset cursor).
 - [ ] **[low] test** — Directory-install layout (`packaging/hermes-plugins/hermes-voip/`) has no e2e test that
   copying it into `~/.hermes/plugins/` and `hermes plugins enable` discovers + loads it (only file identity is
   tested, test_plugin_manifest.py:535). (runbook-0011)

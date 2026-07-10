@@ -312,7 +312,8 @@ def gate_tool_call(
     bool byte-for-byte (the truth table is unchanged); the ``reason`` is the ADDED
     audit WHY. When MULTIPLE block causes hold at once the reason follows a fixed,
     security-ordered precedence — ``DEGRADED`` (the sticky fail-open, the most
-    security-significant signal) first, then ``INSUFFICIENT_PRIVILEGE`` (a level a
+    security-significant signal) first, then ``RESTRICTED`` (the per-turn
+    RESTRICT/CLARIFY clamp, ADR-0009), then ``INSUFFICIENT_PRIVILEGE`` (a level a
     confirmation can never lift), then ``UNCONFIRMED`` (the residual cause on an
     otherwise-eligible operator session). The precedence governs only WHICH reason
     is reported on a block; it never changes whether the tool is blocked.
@@ -355,8 +356,9 @@ def _gate_non_safe(
     confirmation satisfied or not required (ELEVATED never needs it); ``False`` ⇒
     an IRREVERSIBLE tool still awaits its explicit caller confirmation. The
     block-reason precedence is fixed: a ``degraded`` session (the load-bearing
-    fail-open hard-block) is reported first, then an insufficient ``privilege_level``
-    (a level no confirmation can lift), then the residual ``UNCONFIRMED`` cause.
+    fail-open hard-block) is reported first, then a ``turn_restricted`` per-turn
+    RESTRICT/CLARIFY clamp (ADR-0009), then an insufficient ``privilege_level`` (a
+    level no confirmation can lift), then the residual ``UNCONFIRMED`` cause.
     Precedence governs only WHICH reason is reported; the allow/block decision is the
     prior bool byte-for-byte.
     """

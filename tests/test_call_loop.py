@@ -5945,3 +5945,89 @@ async def test_drain_agent_speech_released_by_barge_in() -> None:
     await asyncio.sleep(0)
     leaked = set(asyncio.all_tasks()) - tasks_before - {asyncio.current_task()}
     assert leaked == set(), f"leaked tasks: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# Latency SLO events (runbook 0014): first_audio_latency (854) + turn_latency (848)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_audio_latency_logged_once_from_invite_to_first_rtp(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The greeting's first RTP frame logs one first_audio_latency (INVITE→first RTP).
+
+    Item 854 / runbook 0014. The adapter stamps the INVITE-receipt monotonic instant
+    and threads it into the CallLoop; when the opening greeting's first packet is sent
+    the loop logs a structured INFO with the INVITE→first-RTP delta in integer ms.
+    Fires exactly once per call. The record carries only ``call_id`` + the integer ms
+    — no caller PII (rule 34 / ADR-0084).
+    """
+    # Freeze the loop's monotonic clock so the measured latency is deterministic.
+    fixed_now = 5_000.0
+    monkeypatch.setattr(_call_loop_mod, "monotonic", lambda: fixed_now, raising=False)
+
+    greeting = "Hello, you're through to the assistant."
+    tts = _RecordingTTS([_greeting_frame(1)])
+    transport = _FakeTransport([])  # no inbound audio: the greeting IS the first RTP
+
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+        greeting=greeting,
+    )
+    # The adapter sets this at INVITE receipt; wire it directly for the unit test
+    # (mirrors the _call_progress_callback test-only wiring). 400 ms before "now".
+    loop._invite_monotonic = fixed_now - 0.4
+
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.call_loop"):
+        await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    records = [
+        r for r in caplog.records if r.__dict__.get("event") == "first_audio_latency"
+    ]
+    assert len(records) == 1, "expected exactly one first_audio_latency record"
+    rec = records[0]
+    assert rec.__dict__["call_id"] == _CALL_ID
+    assert rec.__dict__["first_audio_latency_ms"] == 400
+    assert isinstance(rec.__dict__["first_audio_latency_ms"], int)
+    # PII-free field set: only event/call_id/first_audio_latency_ms (ADR-0084/rule 34).
+    for banned in ("caller", "from_uri", "remote_addr", "sdp", "text", "transcript"):
+        assert banned not in rec.__dict__
+
+
+@pytest.mark.asyncio
+async def test_no_first_audio_latency_when_invite_instant_absent(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No INVITE instant (e.g. an outbound call) → no first_audio_latency record.
+
+    Outbound calls have no INVITE receipt, so the adapter threads ``None`` and the
+    loop emits nothing — the greeting still plays, but the SLO event is inbound-only.
+    """
+    monkeypatch.setattr(_call_loop_mod, "monotonic", lambda: 5_000.0, raising=False)
+    tts = _RecordingTTS([_greeting_frame(1)])
+    transport = _FakeTransport([])
+
+    loop = _build_loop(
+        transport,
+        _FakeASR([]),
+        tts,
+        _FakeGuard([_allow_result()]),
+        _noop,
+        greeting="Hello there.",
+    )
+    # invite_monotonic defaults to None (the outbound / not-wired case).
+
+    with caplog.at_level(logging.INFO, logger="hermes_voip.media.call_loop"):
+        await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    assert not [
+        r for r in caplog.records if r.__dict__.get("event") == "first_audio_latency"
+    ]

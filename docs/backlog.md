@@ -1667,14 +1667,14 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
 - [ ] **[medium] operability** — No pre-commit hook catching version drift across the 4 sources
   (`pyproject.toml`, both `plugin.yaml` copies, `CHANGELOG.md`); ratchet tests catch it only at CI time. Add a
   fast pre-commit consistency check.
-- [ ] **[low] correctness** — `session_timer._LEADING_DELTA` (`session_timer.py:88`) and `refer._SIPFRAG_STATUS`
+- [x] **[low] correctness** (#479) — `session_timer._LEADING_DELTA` (`session_timer.py:88`) and `refer._SIPFRAG_STATUS`
   (`refer.py:66`, int() at :498) parse inbound numerics with Unicode-aware `\d`, so non-ASCII digits
   (Arabic-Indic/fullwidth) are silently folded — diverges from the strict-ASCII `[0-9]`/`_parse_decimal`
-  posture elsewhere (message.py:43). Route through `_parse_decimal`/`[0-9]` with a rejecting test per field.
-- [ ] **[low] correctness** — `SessionExpires.parse`/`parse_min_se` (`session_timer.py:133/157`) apply
+  posture elsewhere (message.py:43). Route through `_parse_decimal`/`[0-9]` with a rejecting test per field. — #479 switched both regexes to `[0-9]` with rejecting tests (non-ASCII digits now raise).
+- [x] **[low] correctness** (#479) — `SessionExpires.parse`/`parse_min_se` (`session_timer.py:133/157`) apply
   `_LEADING_DELTA` via `.match` (prefix-only), so `Session-Expires: 1800x` / `Min-SE: 90 foo` parse and drop
   the trailing garbage instead of rejecting it (contrast the strict `fullmatch` in dialog._cseq /
-  message._STATUS_LINE). Anchor the delta token (end-of-string or `;`) + a boundary test.
+  message._STATUS_LINE). Anchor the delta token (end-of-string or `;`) + a boundary test. — #479 anchored the delta with `(?:;|$)`; `1800x`/`90 foo` now raise.
 - [ ] **[low] security/robustness** — WSS transport (`ws_connection.py:215-232`) opens with
   `subprotocols=["sip"]` but never asserts the negotiated subprotocol; the pinned websockets client returns
   `subprotocol=None` (no raise) when the server omits it, so the SIP channel can be established against a

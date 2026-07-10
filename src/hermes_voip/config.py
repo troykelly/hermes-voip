@@ -372,6 +372,12 @@ _DEFAULT_NO_INPUT_TIMEOUT_MS = 10_000
 # first silent window with no reprompt; must be non-negative.
 _NO_INPUT_MAX_REPROMPTS_KEY = "HERMES_VOIP_NO_INPUT_MAX_REPROMPTS"
 _DEFAULT_NO_INPUT_MAX_REPROMPTS = 2
+
+# Consecutive guard-REFUSE turns before the loop ends the call gracefully (ADR-0076).
+# MUST match call_loop.py's _DEFAULT_MAX_CONSECUTIVE_REFUSALS so behaviour is UNCHANGED
+# when the env var is unset; 0 disables. Env HERMES_VOIP_MAX_CONSECUTIVE_REFUSE.
+_MAX_CONSECUTIVE_REFUSE_KEY = "HERMES_VOIP_MAX_CONSECUTIVE_REFUSE"
+_DEFAULT_MAX_CONSECUTIVE_REFUSALS = 3
 # Pipe-separated reprompt phrase set; blank/empty → the built-in English default.
 # Same parse convention as HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES.
 _NO_INPUT_REPROMPT_PHRASES_KEY = "HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES"
@@ -1255,6 +1261,10 @@ class MediaConfig:
     # agent. The default MUST match call_loop.py's _DEFAULT_REFUSE_DECLINE_PHRASES so
     # behaviour matches when env is unset. ``HERMES_VOIP_REFUSE_DECLINE_PHRASES``.
     refuse_decline_phrases: tuple[str, ...] = _DEFAULT_REFUSE_DECLINE_PHRASES
+    # After this many CONSECUTIVE guard REFUSEs the loop ends the call gracefully
+    # instead of declining again (0 disables). Default MUST match call_loop.py's
+    # _DEFAULT_MAX_CONSECUTIVE_REFUSALS. ``HERMES_VOIP_MAX_CONSECUTIVE_REFUSE``.
+    max_consecutive_refusals: int = _DEFAULT_MAX_CONSECUTIVE_REFUSALS
     # Operator-overridable spoken apology for provider/runtime errors (ADR-0063).
     # When set to a non-empty string (``HERMES_VOIP_ERROR_APOLOGY`` env var), this
     # line is spoken instead of the built-in per-language apology, allowing operators
@@ -1446,6 +1456,12 @@ class MediaConfig:
             msg = (
                 "no_input_max_reprompts must be non-negative, "
                 f"got {self.no_input_max_reprompts}"
+            )
+            raise ConfigError(msg)
+        if self.max_consecutive_refusals < 0:
+            msg = (
+                "max_consecutive_refusals must be non-negative, "
+                f"got {self.max_consecutive_refusals}"
             )
             raise ConfigError(msg)
         if not self.no_input_reprompt_phrases:
@@ -1800,6 +1816,9 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         ),
         no_input_max_reprompts=_parse_non_negative_int(
             env, _NO_INPUT_MAX_REPROMPTS_KEY, _DEFAULT_NO_INPUT_MAX_REPROMPTS
+        ),
+        max_consecutive_refusals=_parse_non_negative_int(
+            env, _MAX_CONSECUTIVE_REFUSE_KEY, _DEFAULT_MAX_CONSECUTIVE_REFUSALS
         ),
         no_input_reprompt_phrases=_parse_no_input_reprompt_phrases(env),
         goodbye=_parse_bool(env, _GOODBYE_KEY, _DEFAULT_GOODBYE),

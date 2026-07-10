@@ -395,6 +395,9 @@ optional_env:
   - name: HERMES_VOIP_REFUSE_DECLINE_PHRASES
     description: "Pipe-separated (|) safe-decline phrase override, spoken once when the injection guard refuses a turn; blank/unset uses the built-in language set."
     prompt: "Guard-refusal decline phrase override, pipe-separated (optional)"
+  - name: HERMES_VOIP_MAX_CONSECUTIVE_REFUSE
+    description: "Consecutive guard-refused turns before the call ends gracefully instead of repeating the safe-decline line (a persistently mis-screened caller is otherwise stuck forever). 0 disables the bound. Default 3."
+    prompt: "Max consecutive guard refusals before ending the call (0=off)"
   - name: HERMES_VOIP_ERROR_APOLOGY
     description: "Operator override for the spoken apology on a provider/runtime error; blank/unset uses the built-in per-language default."
     prompt: "Provider/runtime error apology line override (optional)"

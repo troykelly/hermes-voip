@@ -5478,6 +5478,7 @@ class VoipAdapter(BasePlatformAdapter):
             no_input_reprompt=media_cfg.no_input_reprompt,
             no_input_timeout_ms=media_cfg.no_input_timeout_ms,
             no_input_max_reprompts=media_cfg.no_input_max_reprompts,
+            max_consecutive_refusals=media_cfg.max_consecutive_refusals,
             no_input_reprompt_phrases=media_cfg.no_input_reprompt_phrases,
             goodbye=media_cfg.goodbye,
             goodbye_phrase=media_cfg.goodbye_phrase,

@@ -1349,9 +1349,12 @@ def _refer_event_id(event: str) -> tuple[bool, int | None]:
 def _refer_subscription_declined(response: SipResponse) -> bool:
     """RFC 4488: ``True`` when a REFER 2xx carries ``Refer-Sub: false`` (ADR-0109).
 
-    A referee that answers the REFER with ``Refer-Sub: false`` has declined the
-    implicit subscription, so no progress NOTIFY will follow — the caller skips the
-    outcome wait and reports OUTCOME_UNKNOWN immediately. The header token is the part
+    Per RFC 4488 a referee sends ``Refer-Sub: false`` in the 2xx to CONFIRM the
+    referrer's own ``Refer-Sub: false`` request; we do not currently send that
+    request, so a compliant peer keeps the implicit subscription and NOTIFYs follow.
+    This is thus a DEFENSIVE / forward-looking check: if a response nonetheless
+    signals no subscription, no progress NOTIFY will follow, so the caller skips the
+    outcome wait and reports OUTCOME_UNKNOWN at once. The header token is the part
     before any ``;``-parameters, compared case-insensitively; an absent header (the
     common case — the subscription is active) is ``False``.
     """

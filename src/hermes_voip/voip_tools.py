@@ -1650,8 +1650,8 @@ def _outcome_unknown_message(
         return f"{prefix} initiated."
     if reason is TransferUnknownReason.SUBSCRIPTION_DECLINED:
         return (
-            f"{prefix} initiated; the peer declined the transfer-progress "
-            "subscription, so the final outcome was not reported."
+            f"{prefix} initiated; the transfer response signalled no progress "
+            "subscription, so its final outcome was not reported."
         )
     if reason is TransferUnknownReason.CALL_ENDED:
         return (

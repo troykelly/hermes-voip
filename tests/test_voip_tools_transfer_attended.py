@@ -390,7 +390,7 @@ async def test_complete_unknown_timeout_reports_within(
 async def test_complete_unknown_declined_reports_declined(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A declined RFC 4488 subscription reports the peer declined it (ADR-0109 P2)."""
+    """A declined RFC 4488 subscription reports no progress subscription (P2)."""
     host = _FakeHost(
         complete_outcome=AttendedTransferOutcome.OUTCOME_UNKNOWN,
         complete_unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
@@ -402,8 +402,8 @@ async def test_complete_unknown_declined_reports_declined(
     result = await transfer_attended_handler({"action": "complete"})
 
     expected = (
-        "Transfer initiated; the peer declined the transfer-progress "
-        "subscription, so the final outcome was not reported."
+        "Transfer initiated; the transfer response signalled no progress "
+        "subscription, so its final outcome was not reported."
     )
     assert json.loads(result) == {"result": expected}
 

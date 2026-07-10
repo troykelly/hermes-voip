@@ -1229,7 +1229,7 @@ async def test_transfer_blind_handler_unknown_timeout_reports_within(
 async def test_transfer_blind_handler_unknown_declined_reports_declined(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A declined RFC 4488 subscription reports the peer declined it (ADR-0109 P2)."""
+    """A declined RFC 4488 subscription reports no progress subscription (P2)."""
     host = _FakeHost()
     host.transfer_outcome = TransferOutcome.OUTCOME_UNKNOWN
     host.transfer_unknown_reason = TransferUnknownReason.SUBSCRIPTION_DECLINED
@@ -1240,8 +1240,8 @@ async def test_transfer_blind_handler_unknown_declined_reports_declined(
     result = await transfer_blind_handler({"target": "sip:1001@pbx.example.test"})
 
     expected = (
-        "Transfer to sip:1001@pbx.example.test initiated; the peer declined the "
-        "transfer-progress subscription, so the final outcome was not reported."
+        "Transfer to sip:1001@pbx.example.test initiated; the transfer response "
+        "signalled no progress subscription, so its final outcome was not reported."
     )
     assert json.loads(result) == {"result": expected}
 

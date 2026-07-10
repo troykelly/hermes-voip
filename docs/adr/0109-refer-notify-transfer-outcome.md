@@ -122,8 +122,8 @@ it — e.g. `"Transfer initiated; …"`):
 
 - `TIMEOUT` → `"Transfer to {target} initiated; outcome not confirmed within {N}s."`
   (unchanged wording — the bounded wait genuinely elapsed).
-- `SUBSCRIPTION_DECLINED` → `"Transfer to {target} initiated; the peer declined the
-  transfer-progress subscription, so the final outcome was not reported."`
+- `SUBSCRIPTION_DECLINED` → `"Transfer to {target} initiated; the transfer response
+  signalled no progress subscription, so its final outcome was not reported."`
 - `CALL_ENDED` → `"Transfer to {target} initiated; the call ended before the transfer
   outcome was reported."`
 - `WAIT_DISABLED` → `"Transfer to {target} initiated."` (outcome confirmation is opted
@@ -142,12 +142,18 @@ config load (mirrors the existing non-negative knobs). Parsed in `load_media_con
 via `_parse_non_negative_int`'s float analogue; registered in both `plugin.yaml`
 copies and `_KNOWN_ENV_KEYS`.
 
-### 6. RFC 4488 (`Refer-Sub: false`) fast path
+### 6. RFC 4488 (`Refer-Sub: false`) — defensive fast path
 
-If the referee's `2xx` to the REFER carries `Refer-Sub: false` it has declined the
-subscription; no NOTIFY will arrive. Detect it and return `OUTCOME_UNKNOWN`
-immediately rather than waiting the full timeout. (The timeout is the functional
-backstop if the header is absent but the peer still never NOTIFIes.)
+Per RFC 4488 the referrer requests subscription suppression by sending `Refer-Sub:
+false` on the REFER, and a referee CONFIRMS it by echoing `Refer-Sub: false` in the
+`2xx`. We do NOT send `Refer-Sub: false`, so a compliant peer keeps the implicit
+subscription and NOTIFYs follow — `SUBSCRIPTION_DECLINED` is therefore a **defensive /
+forward-looking** path, not a peer unilaterally refusing notifications (which RFC 4488
+does not define; codex round-7). If a `2xx` nonetheless signals no subscription no
+NOTIFY will arrive, so we return `OUTCOME_UNKNOWN` (reason `SUBSCRIPTION_DECLINED`)
+at once rather than waiting the full timeout; the timeout is the backstop when the
+header is absent but the peer never NOTIFIes. A future opt-out policy that sends
+`Refer-Sub: false` on the REFER would turn this into the RFC-defined confirmation.
 
 ## Consequences
 

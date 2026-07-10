@@ -754,7 +754,7 @@ async def test_transfer_blind_returns_terminal_notify_progress_on_2xx() -> None:
     await asyncio.sleep(0)
     await _accept_refer(session, signaling)
     await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is not None
     assert progress.status_code == 200
     assert progress.terminated is True
@@ -772,7 +772,7 @@ async def test_transfer_blind_returns_failed_notify_progress_on_4xx() -> None:
     await session.handle_request(
         _refer_notify("SIP/2.0 486 Busy Here", terminated=True)
     )
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is not None
     assert progress.status_code == 486
     assert progress.terminated is True
@@ -787,7 +787,7 @@ async def test_transfer_blind_times_out_returns_none() -> None:
     )
     await asyncio.sleep(0)
     await _accept_refer(session, signaling)
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is None
 
 
@@ -805,7 +805,7 @@ async def test_transfer_blind_bye_before_terminal_returns_none() -> None:
     await asyncio.sleep(0)
     await _accept_refer(session, signaling)
     await session.handle_request(_inbound("BYE"))
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is None
     assert session.ended is True
 
@@ -829,7 +829,7 @@ async def test_transfer_blind_refer_sub_false_skips_wait_returns_none() -> None:
         refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
     )
     await session.on_response(SipResponse.parse(accepted))
-    progress = await asyncio.wait_for(task, timeout=1.0)
+    progress = (await asyncio.wait_for(task, timeout=1.0)).progress
     assert progress is None
 
 
@@ -850,7 +850,7 @@ async def test_transfer_blind_terminal_notify_racing_the_202() -> None:
     # The terminal NOTIFY arrives while the REFER's 202 is still in flight.
     await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
     await session.on_response(SipResponse.parse(build_response(refer, 202, "Accepted")))
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is not None
     assert progress.status_code == 200
 
@@ -865,7 +865,7 @@ async def test_transfer_blind_no_wait_when_timeout_zero() -> None:
     await asyncio.sleep(0)
     refer = _last_request(signaling, "REFER")
     await session.on_response(SipResponse.parse(build_response(refer, 202, "Accepted")))
-    progress = await asyncio.wait_for(task, timeout=1.0)
+    progress = (await asyncio.wait_for(task, timeout=1.0)).progress
     assert progress is None
 
 
@@ -879,7 +879,7 @@ async def test_transfer_attended_returns_terminal_notify_progress() -> None:
     await asyncio.sleep(0)
     await _accept_refer(session, signaling)
     await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is not None
     assert progress.status_code == 200
     assert progress.terminated is True
@@ -908,7 +908,7 @@ async def test_transfer_blind_stale_notify_id_does_not_wake_new_transfer() -> No
     await asyncio.sleep(0)
     cseq1 = _refer_cseq(signaling)
     await _accept_refer(session, signaling)
-    assert await asyncio.wait_for(task1, timeout=2.0) is None
+    assert (await asyncio.wait_for(task1, timeout=2.0)).progress is None
 
     # Transfer #2: arm on the same call; its REFER carries a DIFFERENT CSeq.
     task2 = asyncio.create_task(
@@ -923,7 +923,7 @@ async def test_transfer_blind_stale_notify_id_does_not_wake_new_transfer() -> No
     await session.handle_request(
         _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq1)
     )
-    progress = await asyncio.wait_for(task2, timeout=2.0)
+    progress = (await asyncio.wait_for(task2, timeout=2.0)).progress
     assert progress is None  # #2 was NOT contaminated by #1's stale 200 OK
 
 
@@ -940,7 +940,7 @@ async def test_transfer_blind_matching_event_id_wakes_wait() -> None:
     await session.handle_request(
         _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq)
     )
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is not None
     assert progress.status_code == 200
 
@@ -960,7 +960,7 @@ async def test_transfer_blind_idless_notify_honored_best_effort() -> None:
     await asyncio.sleep(0)
     await _accept_refer(session, signaling)
     await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
-    progress = await asyncio.wait_for(task, timeout=2.0)
+    progress = (await asyncio.wait_for(task, timeout=2.0)).progress
     assert progress is not None
     assert progress.status_code == 200
 

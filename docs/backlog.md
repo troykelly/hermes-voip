@@ -1321,7 +1321,7 @@ Two candidates were already/partially tracked and were not duplicated here: `_gr
 - [x] (#356) **[high] efficiency** — Gate G.722 hot-path CPU cost with a benchmark/budget or stop preferring it by default while the pure-Python codec remains expensive. (`src/hermes_voip/adapter.py`, `src/hermes_voip/media/engine.py`, `src/hermes_voip/media/g722.py`) — shipped #356 (ADR-0094 + combined encode/decode CPU budget gate).
 - [ ] **[high] efficiency** — AEC hot-path CPU budget: MEASURED, premise falsified — this needs a design decision (a new ADR), not a budget-constant add. The NLMS AEC at the shipped default (`aec_filter_ms=64` → 512 taps, `_AEC_MAX_TAPS`) measures ~39.8 ms/frame (37–43 ms) at 16 kHz while the filter is ADAPTING — the common case whenever the agent is speaking and its own echo is returning — roughly 2x the 20 ms ptime; even 8 kHz adaptation-active measures ~21.2 ms/frame, also over budget. The RX path is SYNCHRONOUS: `_inbound_gen` (`engine.py:1582`) calls `_decode` (`engine.py:1774`) then `_cancel_echo` (`engine.py:1785`) inline in the same async media coroutine with no thread/executor offload, so combined 16 kHz RX cost is ~42 ms/frame. A `< 20 ms` budget gate as originally scoped therefore CANNOT pass without a design change — gating on it as-is would force a choice between failing CI and disabling AEC outright. The `engine.py:267` "~13.8 ms at 16 kHz" comment (and ADR-0033's matching "Consequences" figure) measured a FROZEN/non-adapting filter and did not account for the NLMS update loop, which materially raises the per-frame cost while adapting. Needs a Proposed ADR weighing: (a) shorten the default filter so cancel+decode fits under ptime — but ADR-0033's design history (commit `ff73953`) found a 16 ms window leaves a ~40 ms-delayed broadband echo essentially uncancelled, so this trades echo-cancellation reach for CPU; (b) disable AEC by default at 16 kHz; (c) offload `_cancel_echo` to a worker thread; (d) a block/partitioned frequency-domain AEC (ADR-0033 rejected FDAF for adding algorithmic latency — would need re-litigating against the no-added-latency requirement); (e) accept a numpy dependency in the `media`-extra path (`aec.py` currently forbids this by design — a rule 22/35 trade-off). (`src/hermes_voip/media/engine.py`, `src/hermes_voip/media/aec.py`, `src/hermes_voip/config.py`) **Design record added 2026-07-02:** ADR-0095 (`docs/adr/0095-aec-realtime-cpu-budget.md`, Status: Proposed — Deferred) now records this measurement, the synchronous-RX-path arithmetic, and a scored (a)-(e) option set with a recommendation (interim: disable AEC by default at 16 kHz; durable: thread-offload or block-FDAF, operator's call). This item stays open — no option is adopted yet, only the design record.
 - [ ] **[medium] observability** — Emit structured SIP transport loss/retry/recovery events so uptime and flap windows are queryable without regex. (`src/hermes_voip/adapter.py`, `docs/runbooks/0014-voip-slo-metrics.md`)
-- [ ] **[medium] ux** — Add language-keyed default polite-decline phrases so `HERMES_VOIP_DENY_MODE=decline` is not English-only by default. (`src/hermes_voip/config.py`, `src/hermes_voip/adapter.py`)
+- [x] **[medium] ux** (#447) — Add language-keyed default polite-decline phrases so `HERMES_VOIP_DENY_MODE=decline` is not English-only by default. (`src/hermes_voip/config.py`, `src/hermes_voip/adapter.py`)
 - [ ] **[low] ux** — Sanitize custom polite-decline text before TTS so markdown/URLs/emoji are not spoken raw in deny-mode decline. (`src/hermes_voip/adapter.py`, `src/hermes_voip/media/call_loop.py`)
 - [x] (#342) **[medium] operability** — Expose `HERMES_VOIP_CARTESIA_API_KEY` in the plugin manifest so supported Cartesia configuration is discoverable and verifiable. (`src/hermes_voip/plugin.yaml`, `src/hermes_voip/config.py`)
 - [ ] **[low] operability** — Document the `HERMES_VOIP_TEST_TONE` diagnostic knob in manifest/runbooks for no-audio incident triage. (`src/hermes_voip/plugin.yaml`, `docs/runbooks/0002-voip-live-validation.md`, `docs/runbooks/0013-voip-incident-oncall.md`)
@@ -1554,11 +1554,18 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
 
 **Discovered but not shipped this wave** (new tracked work):
 
-- [ ] **[high] correctness/security** — Migrate the naive `<([^>]*)>` angle-addr regex to the new shared
-  `find_name_addr` helper in `manager.py:851` (`_addr_spec` / To-user extraction), `registration.py:103`
-  (`_binding_uri` Contact matching), `transport/connection.py:1100` (Contact/Record-Route target), AND fix
-  `manager.py:227 _TAG_PARAM` (un-quote-aware `;tag` search) — the same quoted-bracket desync/injection
-  family #439 closed only in `dialog.py`/`refer.py`. (identity/registration-adjacent) [follow-up from #439]
+- [x] **[high] correctness/security** (#448) — Migrated the naive `<([^>]*)>` angle-addr regex to the shared
+  `find_name_addr` helper in `manager.py` (`_addr_spec` / To-user extraction), `registration.py`
+  (`_binding_uri` Contact matching), and `transport/connection.py` (Contact/Record-Route target): the
+  quoted-`<...>` display-name desync (the #439 defect family) is now closed in the identity/registration/
+  in-dialog paths, and tag extraction is restricted to the post-`>` trailing.
+- [ ] **[high] correctness/security** — Fully quote-safe `;`-param / `;tag=` split in the SIP identity sites.
+  #448 restricted the tag search to the `find_name_addr` trailing, but `manager._tag` (`_TAG_PARAM`) and
+  `connection._has_to_tag` (`_TO_TAG_PARAM`) still regex-search that trailing un-quote-aware, so a `;tag=`
+  inside a quoted generic-param value (`<sip:a>;g=";tag=fake";tag=real`) desyncs (codex review on #448). The
+  same class is in `message.py:224` (`_after_angle`, which can also suppress our real To-tag when BUILDING a
+  response) and `call_context._display_name/_addr_spec`. Consolidate all onto a shared quote-aware `;`-split
+  (promote `dialog._split_semicolons` to `_name_addr.py`), with per-site red tests.
 - [ ] **[medium] test** — Prove an outbound call *carrying an objective* still emits its objective first
   turn via `_inject_objective_first_turn` while the greeting is suppressed (`adapter.py`; #443's e2e covers
   only the no-objective outbound case). [follow-up from #443]
@@ -1580,12 +1587,12 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
 - [ ] **[medium] robustness** — Bound the inbound-call context block before injecting it into the agent
   session (`call_context.py` renders Diversion/History-Info/User-Agent unbounded; `adapter.py` injects it;
   the outbound path already caps at 600 chars).
-- [ ] **[low] security** — `render_call_context_block` does not collapse interior newlines in
+- [x] **[low] security** (#445) — `render_call_context_block` does not collapse interior newlines in
   caller-supplied SIP fields (`call_context._defang` neutralises only the `<<</>>>` fences, unlike
   `adapter._defang_identity`'s `' '.join(value.split())`); a bare LF in a header value can inject a forged
   `- Label: value` line into the untrusted ADR-0052 context block. Can be combined with the bound-context
   item as one `call_context.py` lane.
-- [ ] **[low] observability** — `rtcp_call_quality` structured log drops
+- [x] **[low] observability** (#446) — `rtcp_call_quality` structured log drops
   `CallQuality.local/remote_cumulative_lost` (`adapter.py:5829-5837` + `media_anomaly` at `:5851`;
   `tests/test_adapter_observability.py:369-377` pins the field set). Add the two fields + update the
   assertions.

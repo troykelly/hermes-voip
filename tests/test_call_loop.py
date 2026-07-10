@@ -74,6 +74,9 @@ class _FakeTransport:
         # barge-in clean-stop assertions (ADR-0028) read these.
         self.flush_calls: int = 0
         self.last_flush_fade_ms: int | None = None
+        # Hold state (MediaTransport.on_hold): the no-input watchdog reads this to skip
+        # a held window. The real engine flips it via set_hold; fakes default not-held.
+        self.on_hold: bool = False
 
     @property
     def inbound_sample_rate(self) -> int:
@@ -4867,6 +4870,67 @@ async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     assert run_task.exception() is None, (
         "a no-input graceful end must return cleanly (not raise)"
     )
+
+
+@pytest.mark.asyncio
+async def test_no_input_watchdog_suspended_while_call_is_held() -> None:
+    """A call ON HOLD is never reprompted or torn down by the no-input watchdog.
+
+    When the agent (``hold_call``) or the peer/PBX (a hold re-INVITE) holds the
+    call, the media engine suspends the media plane BOTH ways — inbound datagrams
+    are discarded and outbound send/flush is muted — so every silence window looks
+    empty to the watchdog. Without hold awareness the watchdog reprompts into dead
+    media and, after ``no_input_max_reprompts``, ends the call (~30s) — hanging up a
+    LIVE caller during an agent's consult hold. Driving three silent windows — past
+    the 2-reprompt budget AND the graceful-end window — while ``on_hold`` must leave
+    NOTHING spoken and the call still running (a graceful end would return run()).
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=3)  # two reprompt windows + the graceful-end window
+    # A silent-but-LIVE caller (continuous inbound RTP) so the pump WOULD observe a
+    # graceful self-end — making "call still running" a real assertion, not a no-op.
+    transport = _LiveSilenceTransport()
+    transport.on_hold = True  # the call is on hold for the whole test
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=2,
+        no_input_reprompt_phrases=("Are you still there?",),
+        goodbye=False,  # isolate the reprompt/end behaviour from the goodbye
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the no-input watchdog did not arm a silence-window wait"
+
+    # Three silent windows elapse — past the reprompt budget and the end window — every
+    # one while the call is held.
+    for _ in range(3):
+        sleep.step()
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    assert transport.sent_audio == [], (
+        f"a held call was reprompted by the no-input watchdog: {transport.sent_audio!r}"
+    )
+    assert tts.synthesised == [], (
+        f"a held call synthesised watchdog audio: {tts.synthesised!r}"
+    )
+    assert not run_task.done(), (
+        "the no-input watchdog tore down a held call (agent hold hung up a live caller)"
+    )
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
 
 
 @pytest.mark.asyncio

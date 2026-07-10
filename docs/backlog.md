@@ -1279,7 +1279,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 ### UX / conversational
 
-- [ ] **[medium] ux** — A spoke-but-untranscribed caller should get a "didn't catch that" reprompt instead of silence followed by "Are you still there?". (`src/hermes_voip/media/call_loop.py`) **Wave-3 attempt DROPPED (block+block):** the reprompt MUST be spoken NON-BLOCKING — the attempt `await`ed it inline on the ASR pump (`call_loop.py:1385`), the sole `audio_q` consumer, blocking it for seconds; mirror the no-input-watchdog reprompt's non-blocking scheduling. Config `_parse_didnt_catch_phrases` must support an explicit empty-set opt-out AND reject (not silently drop) blank members. Set `_caller_active_in_window=True` so the generic watchdog does not double-fire. Do NOT write an ADR (the attempt's ADR-0108 over-engineered a medium UX knob).
+- [x] **[medium] ux** (#476) — A spoke-but-untranscribed caller should get a "didn't catch that" reprompt instead of silence followed by "Are you still there?". (`src/hermes_voip/media/call_loop.py`) **Wave-3 attempt DROPPED (block+block):** the reprompt MUST be spoken NON-BLOCKING — the attempt `await`ed it inline on the ASR pump (`call_loop.py:1385`), the sole `audio_q` consumer, blocking it for seconds; mirror the no-input-watchdog reprompt's non-blocking scheduling. Config `_parse_didnt_catch_phrases` must support an explicit empty-set opt-out AND reject (not silently drop) blank members. Set `_caller_active_in_window=True` so the generic watchdog does not double-fire. Do NOT write an ADR (the attempt's ADR-0108 over-engineered a medium UX knob).
 
 ### Product features
 

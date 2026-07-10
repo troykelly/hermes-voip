@@ -38,6 +38,7 @@ __all__ = [
     "render_call_context_block",
 ]
 
+from hermes_voip._name_addr import name_addr_parts
 from hermes_voip.message import SipRequest
 
 # The ADR-0009 spotlight delimiters a caller could try to forge in any header value.
@@ -79,13 +80,16 @@ def _display_name(value: str) -> str | None:
     """Extract the display-name of a SIP name-addr value, or ``None``.
 
     A name-addr is ``display-name <uri>;params``. The display-name is the span before
-    the ``<`` (quotes stripped, surrounding whitespace removed). A bare ``addr-spec``
+    the real ``<`` (quotes stripped, surrounding whitespace removed). The angle-addr
+    is located OUTSIDE any quoted display-name (RFC 3261 §25.1), so a quoted
+    display-name that legitimately contains ``<``/``>`` (the #378 caller-identity
+    spoofing surface) is not truncated at the wrong bracket. A bare ``addr-spec``
     (``sip:user@host;params``, no angle brackets) has no display-name.
     """
-    angle = value.find("<")
-    if angle <= 0:  # no '<', or '<' is the first char (empty display-name)
+    parts = name_addr_parts(value)
+    if parts is None:  # bare addr-spec (or unterminated '<'): no display-name
         return None
-    name = value[:angle].strip()
+    name = parts[0].strip()
     if not name:
         return None
     return _strip_quotes(name)
@@ -95,16 +99,14 @@ def _addr_spec(value: str) -> str:
     """Extract the bare URI (addr-spec) from a SIP name-addr or addr-spec value.
 
     ``display-name <URI>;params`` → ``URI``. A bare ``URI;params`` (no angle brackets)
-    → the URI with its trailing ``;params`` removed. A value with neither ``<`` nor a
-    recognisable scheme is returned stripped, verbatim (lenient — never raises).
+    → the URI with its trailing ``;params`` removed. The angle-addr is located OUTSIDE
+    any quoted display-name (RFC 3261 §25.1), so a quoted display-name containing
+    ``<``/``>`` cannot be mistaken for the addr-spec. A value with neither a real
+    ``<...>`` nor a recognisable scheme is returned stripped, verbatim (lenient).
     """
-    open_angle = value.find("<")
-    if open_angle != -1:
-        close_angle = value.find(">", open_angle)
-        if close_angle != -1:
-            return value[open_angle + 1 : close_angle]
-        # Unterminated angle bracket — take the rest after '<'.
-        return value[open_angle + 1 :].strip()
+    parts = name_addr_parts(value)
+    if parts is not None:
+        return parts[1]
     # No angle brackets: a bare addr-spec; drop any header parameters after the URI.
     return value.split(";", 1)[0].strip()
 
@@ -175,16 +177,18 @@ def _header_params(value: str) -> dict[str, str]:
     of quotes stripped. A valueless flag parameter maps to the empty string. Lenient.
     """
     # Params follow the name-addr ``<uri>``: take everything after the URI's CLOSING
-    # angle (the first ``>`` after the first ``<``), so neither a ';' inside the URI
-    # nor a later ``>`` inside a param value (e.g. +sip.instance="<urn:uuid:…>") is
+    # angle, located OUTSIDE any quoted display-name (RFC 3261 §25.1), so neither a
+    # ';'/`>` inside the URI nor a ``<``/``>`` inside a quoted display-name (or a
+    # later ``>`` inside a param value, e.g. +sip.instance="<urn:uuid:…>") is
     # mistaken for the URI boundary.
-    open_angle = value.find("<")
-    close_angle = value.find(">", open_angle) if open_angle != -1 else -1
-    tail = value[close_angle + 1 :] if close_angle != -1 else value
-    # For a bare addr-spec the URI itself precedes the first ';'; drop it (top-level
-    # ';' only — a ';' inside a quoted display-name or URI is not a param boundary).
-    if close_angle == -1:
-        _head, found, rest = _split_first_top_level(tail, ";")
+    parts = name_addr_parts(value)
+    if parts is not None:
+        tail = parts[2]
+    else:
+        # A bare addr-spec (or unterminated '<'): the URI itself precedes the first
+        # top-level ';'; drop it (top-level ';' only — a ';' inside a quoted
+        # display-name or URI is not a param boundary).
+        _head, found, rest = _split_first_top_level(value, ";")
         tail = f";{rest}" if found else ""
     params: dict[str, str] = {}
     for raw_part in _split_top_level(tail, ";"):

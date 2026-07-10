@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from hermes_voip._header_list import split_header_list
-from hermes_voip._name_addr import find_name_addr
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 from hermes_voip.message import (
     SipRequest,
     SipResponse,
@@ -315,42 +315,8 @@ def _uri_and_tag(value: str) -> tuple[str, str | None]:
     # (RFC 3261 §25.1) cannot desync the split and hide the tag by matching on the
     # wrong bracket.
     name_addr = find_name_addr(value)
-    if name_addr is not None:
-        params = name_addr[1]
-    else:
-        _, _, params = value.partition(";")
-    return uri, _header_param(params, "tag")
-
-
-def _header_param(params: str, name: str) -> str | None:
-    """Return the value of header parameter ``name`` (quote-aware), or ``None``.
-
-    Splits on ``;`` outside double-quoted strings, so a quoted value that itself
-    contains ``;tag=`` is not mistaken for the parameter.
-    """
-    for part in _split_semicolons(params):
-        key, sep, raw = part.partition("=")
-        if sep and key.strip().lower() == name:
-            return raw.strip()
-    return None
-
-
-def _split_semicolons(text: str) -> list[str]:
-    """Split ``text`` on ``;`` that fall outside double-quoted spans."""
-    parts: list[str] = []
-    buffer: list[str] = []
-    in_quote = False
-    for char in text:
-        if char == '"':
-            in_quote = not in_quote
-            buffer.append(char)
-        elif char == ";" and not in_quote:
-            parts.append("".join(buffer))
-            buffer = []
-        else:
-            buffer.append(char)
-    parts.append("".join(buffer))
-    return parts
+    params = name_addr[1] if name_addr is not None else params_after_addr(value)
+    return uri, tag_param(params)
 
 
 def _via_transport_sent_by(value: str) -> tuple[str, str]:

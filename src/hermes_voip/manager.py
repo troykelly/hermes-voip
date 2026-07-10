@@ -26,12 +26,11 @@ import contextlib
 import enum
 import logging
 import random
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, assert_never, runtime_checkable
 
-from hermes_voip._name_addr import find_name_addr
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 from hermes_voip.config import ExtensionConfig, GatewayConfig
 from hermes_voip.message import SipRequest, SipResponse
 from hermes_voip.registration import (
@@ -225,7 +224,6 @@ _RETRY_JITTER = 0.2
 # Bound on the best-effort Expires:0 de-register send during aclose() (#97): a dead
 # or slow transport must never strand a graceful shutdown (rule 37).
 _DEREGISTER_SEND_TIMEOUT_SECS = 2.0
-_TAG_PARAM = re.compile(r";\s*tag=([^;,\s]+)", re.IGNORECASE)
 
 
 @runtime_checkable
@@ -838,15 +836,17 @@ class RegistrationManager:
 def _tag(header_value: str | None) -> str | None:
     if header_value is None:
         return None
-    # The tag is a header parameter, so it lives after the closing '>' of a
-    # name-addr. Locate the angle-addr quote-aware (RFC 3261 §25.1), so a '>' or a
-    # literal ';tag=' inside a quoted display-name cannot desync the search onto
-    # the wrong bracket; a bare addr-spec (no name-addr) has no URI params, so its
-    # header params run from the value start.
+    # The tag is a header parameter: it lives after the closing '>' of a name-addr
+    # (located quote-aware, RFC 3261 §25.1, so a '>' or a literal ';tag=' inside a
+    # quoted display-name cannot desync onto the wrong bracket), or after the first
+    # ';' of a bare addr-spec (which has no URI params). ``tag_param`` then splits
+    # that trailing quote-aware, so a forged ';tag=' hidden inside a quoted
+    # generic-param value is never mistaken for the real dialog tag.
     name_addr = find_name_addr(header_value)
-    search_space = name_addr[1] if name_addr is not None else header_value
-    match = _TAG_PARAM.search(search_space)
-    return match.group(1) if match is not None else None
+    trailing = (
+        name_addr[1] if name_addr is not None else params_after_addr(header_value)
+    )
+    return tag_param(trailing)
 
 
 def _addr_spec(value: str) -> str:

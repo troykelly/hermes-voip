@@ -1884,3 +1884,16 @@ async def test_addr_spec_and_tag_plain_and_bare_unchanged() -> None:
     bare = "sip:2000@pbx.example.test;tag=baretag"
     assert manager_module._addr_spec(bare) == "sip:2000@pbx.example.test"
     assert manager_module._tag(bare) == "baretag"
+
+
+async def test_tag_prefers_real_tag_over_quoted_generic_param_forgery() -> None:
+    # RFC 3261 §25.1 also permits a literal ``;tag=`` inside a QUOTED generic
+    # parameter value that sits AFTER the real ``<addr-spec>``. A naive regex on
+    # the trailing latches the quoted ``;tag=fake`` inside ``g`` instead of the
+    # real top-level ``;tag=realtag99`` — a caller-controlled dialog-tag forgery.
+    value = '<sip:2000@pbx.example.test>;g=";tag=fake";tag=realtag99'
+    assert manager_module._tag(value) == "realtag99"
+
+    # A quoted ``;tag=`` with NO real trailing tag is not a dialog tag at all.
+    only_forged = '<sip:2000@pbx.example.test>;g=";tag=fake"'
+    assert manager_module._tag(only_forged) is None

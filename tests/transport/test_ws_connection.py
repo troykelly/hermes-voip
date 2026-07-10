@@ -39,7 +39,7 @@ from hermes_voip.message import (
     new_call_id,
     new_tag,
 )
-from hermes_voip.transport.ws_connection import WssSipTransport
+from hermes_voip.transport.ws_connection import WssSipTransport, _has_to_tag
 
 try:
     from websockets.asyncio.server import ServerConnection, serve
@@ -1848,3 +1848,23 @@ async def test_a_handler_cancellederror_propagates_out_of_dispatch() -> None:
     transport.add_call(call_id, _RaisingSink(asyncio.CancelledError()))
     with pytest.raises(asyncio.CancelledError):
         await transport._dispatch(_poison_response(call_id))
+
+
+async def test_has_to_tag_quote_safe_across_bracketed_and_quoted_generic_param() -> (
+    None
+):
+    # RFC 3261 §25.1 permits a quoted display-name to contain ``>`` and a literal
+    # ``;tag=``, and a quoted generic-param value (after the real <addr-spec>) to
+    # contain ``;tag=`` too. The naive split-on-'>' scan latches that quoted
+    # ``;tag=`` and mis-classifies an out-of-dialog request as in-dialog. The WSS
+    # transport shares the same quote-aware primitive as connection.py.
+    # A ';tag=' only inside a quoted display-name is NOT a real dialog tag.
+    assert _has_to_tag('"X>;tag=fake" <sip:1000@pbx.example.test>') is False
+    # A ';tag=' only inside a quoted generic-param is NOT a real dialog tag.
+    assert _has_to_tag('<sip:1000@pbx.example.test>;g=";tag=fake"') is False
+    # A real top-level trailing tag IS in-dialog, brackets/quotes notwithstanding.
+    assert _has_to_tag('"X>;tag=fake" <sip:1000@pbx.example.test>;tag=real') is True
+    # Plain and bare shapes stay exactly as before.
+    assert _has_to_tag("<sip:1000@pbx.example.test>;tag=real") is True
+    assert _has_to_tag("<sip:1000@pbx.example.test>") is False
+    assert _has_to_tag("sip:1000@pbx.example.test;tag=baretag") is True

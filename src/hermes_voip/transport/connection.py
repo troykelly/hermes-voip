@@ -60,7 +60,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from hermes_voip._decimal import _parse_decimal
-from hermes_voip._name_addr import find_name_addr
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
     Cancel,
@@ -89,8 +89,6 @@ __all__ = ["CallResponseSink", "SipOverTlsTransport"]
 _log = logging.getLogger(__name__)
 
 _RESPONSE_PREFIX = "SIP/2.0 "
-# A To/From header parameter carrying a dialog tag (after the name-addr's '>').
-_TO_TAG_PARAM = re.compile(r";\s*tag=", re.IGNORECASE)
 # The Via ``branch`` parameter (RFC 3261 §8.1.1.7) that identifies a transaction.
 _VIA_BRANCH = re.compile(r";\s*branch=([^;,\s]+)", re.IGNORECASE)
 _FINAL_STATUS = 200  # status >= 200 is a final response (terminates the txn)
@@ -981,10 +979,12 @@ def _has_to_tag(to_value: str | None) -> bool:
     # Locate the name-addr angle-addr quote-aware (RFC 3261 §25.1): a '>' or a
     # literal ';tag=' inside a quoted display-name must not desync the search onto
     # the wrong bracket and mis-classify an out-of-dialog request as in-dialog. A
-    # bare addr-spec has no URI params, so its header params run from the start.
+    # bare addr-spec has no URI params, so its header params run from the first
+    # ';'. ``tag_param`` splits that trailing quote-aware, so a forged ';tag='
+    # hidden inside a quoted generic-param value is not read as a dialog tag.
     name_addr = find_name_addr(to_value)
-    search_space = name_addr[1] if name_addr is not None else to_value
-    return _TO_TAG_PARAM.search(search_space) is not None
+    trailing = name_addr[1] if name_addr is not None else params_after_addr(to_value)
+    return tag_param(trailing) is not None
 
 
 def _format_sent_by(host: str, port: int) -> str:

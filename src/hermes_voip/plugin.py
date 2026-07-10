@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import ssl
 from typing import TYPE_CHECKING
 
@@ -91,6 +92,113 @@ _EXTRA_ENV_PREFIXES: tuple[str, ...] = ("HERMES_SIP_", "HERMES_VOIP_")
 # ``HERMES_VOIP_TTS_PROVIDER=elevenlabs``.  Neither carries one of the two
 # prefixes above, so they must be copied by exact name alongside the prefix match.
 _EXTRA_ENV_KEYS: frozenset[str] = frozenset({"DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY"})
+
+# The complete set of RECOGNISED env-var names — the plugin.yaml ``requires_env`` +
+# ``optional_env`` registry, kept byte-for-byte in sync by the drift test
+# ``test_known_env_keys_matches_manifest``. A key matching an ``_EXTRA_ENV_PREFIXES``
+# prefix but absent from this set (and not an indexed ``HERMES_SIP_*_<n>`` form, below)
+# is a likely operator TYPO: ``_env_enablement`` copies it into ``extra`` but nothing
+# reads it, so the default is silently used and the enable gate still passes — hence the
+# warning. Generated from the manifest; the drift test forbids divergence.
+_KNOWN_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "DEEPGRAM_API_KEY",
+        "ELEVENLABS_API_KEY",
+        "HERMES_SIP_DEFAULT_EXTENSION",
+        "HERMES_SIP_DTMF_INBAND_ENABLED",
+        "HERMES_SIP_DTMF_INTERDIGIT_MS",
+        "HERMES_SIP_DTMF_MODE",
+        "HERMES_SIP_EXPIRES",
+        "HERMES_SIP_EXTENSION",
+        "HERMES_SIP_HOST",
+        "HERMES_SIP_MAX_CALLS",
+        "HERMES_SIP_PASSWORD",
+        "HERMES_SIP_PORT",
+        "HERMES_SIP_SHUTDOWN_DRAIN_SECS",
+        "HERMES_SIP_TRANSPORT",
+        "HERMES_SIP_USERNAME",
+        "HERMES_SIP_USER_AGENT",
+        "HERMES_SIP_WS_PASSWORD",
+        "HERMES_SIP_WS_PATH",
+        "HERMES_VOIP_AEC_BULK_DELAY_MS",
+        "HERMES_VOIP_AEC_ENABLED",
+        "HERMES_VOIP_AEC_FILTER_MS",
+        "HERMES_VOIP_AEC_MU",
+        "HERMES_VOIP_AMD",
+        "HERMES_VOIP_AMD_HANGUP_ON_FAX",
+        "HERMES_VOIP_BARGE_IN_FADE_MS",
+        "HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS",
+        "HERMES_VOIP_BARGE_IN_MODE",
+        "HERMES_VOIP_BARGE_IN_TAIL_MS",
+        "HERMES_VOIP_CALL_ON_CONNECT",
+        "HERMES_VOIP_CALL_PROGRESS",
+        "HERMES_VOIP_CARTESIA_API_KEY",
+        "HERMES_VOIP_DECLINE_PHRASE",
+        "HERMES_VOIP_DENY_MODE",
+        "HERMES_VOIP_DUPLEX_MODE",
+        "HERMES_VOIP_ENDPOINT_SILENCE_MS",
+        "HERMES_VOIP_ERROR_APOLOGY",
+        "HERMES_VOIP_GOODBYE",
+        "HERMES_VOIP_GOODBYE_PHRASE",
+        "HERMES_VOIP_GREETING",
+        "HERMES_VOIP_HANGUP_DRAIN_SECS",
+        "HERMES_VOIP_HANGUP_GRACE_SECS",
+        "HERMES_VOIP_ICE_STUN_URLS",
+        "HERMES_VOIP_ICE_TURN_PASSWORD",
+        "HERMES_VOIP_ICE_TURN_URLS",
+        "HERMES_VOIP_ICE_TURN_USERNAME",
+        "HERMES_VOIP_ICE_USE_IPV4",
+        "HERMES_VOIP_ICE_USE_IPV6",
+        "HERMES_VOIP_INJECTION_GUARD",
+        "HERMES_VOIP_INJECTION_GUARD_MODEL_DIR",
+        "HERMES_VOIP_JITTER_MAX_DEPTH",
+        "HERMES_VOIP_KEEPALIVE_INTERVAL",
+        "HERMES_VOIP_LANGUAGE",
+        "HERMES_VOIP_MIN_SE",
+        "HERMES_VOIP_NO_INPUT_MAX_REPROMPTS",
+        "HERMES_VOIP_NO_INPUT_REPROMPT",
+        "HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES",
+        "HERMES_VOIP_NO_INPUT_TIMEOUT_MS",
+        "HERMES_VOIP_REFUSE_DECLINE_PHRASES",
+        "HERMES_VOIP_REQUIRE_SECURE_MEDIA",
+        "HERMES_VOIP_RING_TIMEOUT_SECS",
+        "HERMES_VOIP_RTCP_ENABLED",
+        "HERMES_VOIP_RTP_SYMMETRIC",
+        "HERMES_VOIP_RTP_TIMEOUT_SECS",
+        "HERMES_VOIP_SECURED_RTCP_ENABLED",
+        "HERMES_VOIP_SESSION_EXPIRES",
+        "HERMES_VOIP_SIP_DTLS_SETUP",
+        "HERMES_VOIP_SIP_DTLS_SRTP",
+        "HERMES_VOIP_SIP_SDES_OFFER",
+        "HERMES_VOIP_STT_MODEL_DIR",
+        "HERMES_VOIP_STT_PROVIDER",
+        "HERMES_VOIP_TEST_TONE",
+        "HERMES_VOIP_TTS_COMFORT_FILLER",
+        "HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS",
+        "HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES",
+        "HERMES_VOIP_TTS_COMFORT_FILLER_REPEAT_MS",
+        "HERMES_VOIP_TTS_FALLBACK",
+        "HERMES_VOIP_TTS_FALLBACK_MODEL",
+        "HERMES_VOIP_TTS_MODEL",
+        "HERMES_VOIP_TTS_PROVIDER",
+        "HERMES_VOIP_TTS_SIMILARITY",
+        "HERMES_VOIP_TTS_SPEAKER_BOOST",
+        "HERMES_VOIP_TTS_STABILITY",
+        "HERMES_VOIP_TTS_STREAMING_LATENCY",
+        "HERMES_VOIP_TTS_STYLE",
+        "HERMES_VOIP_TTS_VOICE",
+        "HERMES_VOIP_VAD_MODEL_DIR",
+        "HERMES_VOIP_VAD_THRESHOLD",
+        "HERMES_VOIP_VIDEO_FPS",
+        "HERMES_VOIP_VIDEO_SOURCE_PATH",
+        "HERMES_VOIP_WEBRTC_DTLS_SETUP",
+    }
+)
+
+# Indexed multi-registration keys (``config.py``): ``HERMES_SIP_EXTENSION_<n>`` /
+# ``HERMES_SIP_PASSWORD_<n>`` / ``HERMES_SIP_USERNAME_<n>`` for each registration. These
+# are valid but dynamic, so they are matched by pattern rather than enumerated above.
+_INDEXED_SIP_ENV_RE = re.compile(r"HERMES_SIP_(?:EXTENSION|PASSWORD|USERNAME)_[0-9]+")
 
 # The primary platform name (the one connecting adapter). ADR-0035 adds the caller-
 # group CHANNEL platforms as routing aliases of this one.
@@ -238,11 +346,36 @@ def _env_enablement() -> dict[str, str]:
         A mapping of every relevant variable currently set in the process
         environment to its value (empty dict if none are set).
     """
-    return {
+    seed = {
         key: value
         for key, value in os.environ.items()
         if key.startswith(_EXTRA_ENV_PREFIXES) or key in _EXTRA_ENV_KEYS
     }
+    _warn_unknown_env_keys(seed)
+    return seed
+
+
+def _warn_unknown_env_keys(env: dict[str, str]) -> None:
+    """Warn (key-only) for each prefixed env var that is not a recognised setting.
+
+    A ``HERMES_SIP_*`` / ``HERMES_VOIP_*`` key not in :data:`_KNOWN_ENV_KEYS` and not
+    an indexed ``HERMES_SIP_*_<n>`` form is a likely operator typo — it is copied into
+    ``extra`` but no consumer reads it, so the default is silently used and the enable
+    gate still passes. The message names the KEY only, never its value (rule 34). The
+    non-prefixed cloud keys (``_EXTRA_ENV_KEYS``) are matched by exact name, so a typo
+    of one never reaches ``extra`` at all — nothing to warn about there.
+    """
+    for key in env:
+        if not key.startswith(_EXTRA_ENV_PREFIXES):
+            continue
+        if key in _KNOWN_ENV_KEYS or _INDEXED_SIP_ENV_RE.fullmatch(key):
+            continue
+        _log.warning(
+            "ignoring unrecognised VoIP env var %r: it matches the "
+            "HERMES_SIP_/HERMES_VOIP_ prefix but is not a known setting — check for a "
+            "typo (its default is used and the platform still enables)",
+            key,
+        )
 
 
 def _is_connected(config: object) -> bool:

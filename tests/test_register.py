@@ -401,6 +401,60 @@ def test_env_enablement_warns_on_unknown_prefixed_key(
     )
 
 
+def test_env_enablement_does_not_warn_on_known_or_indexed_keys(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Recognised manifest keys and indexed HERMES_SIP_*_<n> forms never warn."""
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    known_and_indexed = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_VOIP_GREETING": "Hello there",
+        "HERMES_SIP_EXTENSION_2": "1001",
+        "HERMES_SIP_PASSWORD_2": "fake-password",
+        "HERMES_SIP_USERNAME_2": "user2",
+    }
+    for key, value in known_and_indexed.items():
+        monkeypatch.setenv(key, value)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.plugin"):
+        _env_enablement()
+
+    # None of the keys we set may appear in a warning (robust to any stray env var).
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    for key in known_and_indexed:
+        assert not any(key in msg for msg in warned), (
+            f"a recognised/indexed key wrongly warned: {key!r} in {warned!r}"
+        )
+
+
+def test_known_env_keys_matches_manifest() -> None:
+    """_KNOWN_ENV_KEYS must equal the plugin.yaml requires_env + optional_env names.
+
+    The unknown-env-key warning cross-checks against this constant, so if it drifts from
+    the manifest — a knob added to plugin.yaml but not here (or vice versa) — a VALID
+    key would wrongly warn (or a typo would slip through). Pinned byte-for-byte here.
+    """
+    from importlib.resources import files  # noqa: PLC0415
+
+    import yaml  # noqa: PLC0415
+
+    from hermes_voip.plugin import _KNOWN_ENV_KEYS  # noqa: PLC0415
+
+    manifest = yaml.safe_load(
+        files("hermes_voip").joinpath("plugin.yaml").read_text(encoding="utf-8")
+    )
+    names = {
+        entry["name"]
+        for section in ("requires_env", "optional_env")
+        for entry in manifest.get(section, ())
+    }
+    assert names == _KNOWN_ENV_KEYS, (
+        "_KNOWN_ENV_KEYS drifted from plugin.yaml requires_env/optional_env; "
+        f"missing={names - _KNOWN_ENV_KEYS}, extra={_KNOWN_ENV_KEYS - names}"
+    )
+
+
 def test_register_supplies_is_connected() -> None:
     """register_platform must pass an is_connected gate callable."""
     from hermes_voip.plugin import register  # noqa: PLC0415

@@ -159,6 +159,33 @@ def test_privilege_precedence_over_confirmation_on_clean_session() -> None:
     assert decision.reason is GateReason.INSUFFICIENT_PRIVILEGE
 
 
+def test_degraded_precedence_over_restricted() -> None:
+    # A degraded + turn-restricted session reports DEGRADED, not RESTRICTED: the sticky
+    # fail-open hard-block is the most security-significant cause, so ADR-0085 reports
+    # it before the per-turn RESTRICT/CLARIFY clamp. privilege_level=3 + ELEVATED
+    # isolates the degraded-vs-restricted boundary. Pins the degraded-before-restricted
+    # order in _gate_non_safe (swapping those two checks is a surviving mutant: same
+    # block bool, only the audit reason flips).
+    state = GuardSessionState(call_id="c1", privilege_level=3, degraded=True)
+    state.turn_restricted = True  # current turn screened RESTRICT/CLARIFY (ADR-0009)
+    decision = gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False)
+    assert decision.allowed is False
+    assert decision.reason is GateReason.DEGRADED
+
+
+def test_restricted_precedence_over_insufficient_privilege() -> None:
+    # A turn-restricted + under-privileged (non-degraded) session reports RESTRICTED,
+    # not INSUFFICIENT_PRIVILEGE: the per-turn RESTRICT/CLARIFY clamp (which a later
+    # ALLOW turn clears) is reported before the structural privilege cause (ADR-0085).
+    # Pins the restricted-before-privilege order in _gate_non_safe (swapping those two
+    # checks is a surviving mutant: same block bool, only the audit reason flips).
+    state = GuardSessionState(call_id="c1", privilege_level=0)
+    state.turn_restricted = True  # current turn screened RESTRICT/CLARIFY (ADR-0009)
+    decision = gate_tool_call(ToolRisk.ELEVATED, state, confirmed=False)
+    assert decision.allowed is False
+    assert decision.reason is GateReason.RESTRICTED
+
+
 # --- the decision matches the prior bool truth table exactly -------------------
 
 

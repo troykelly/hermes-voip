@@ -415,6 +415,16 @@ _DEFAULT_AGENT_HANGUP_DRAIN_SECS = 5.0
 _AGENT_HANGUP_GRACE_SECS_KEY = "HERMES_VOIP_HANGUP_GRACE_SECS"
 _DEFAULT_AGENT_HANGUP_GRACE_SECS = 0.5
 
+# Transfer-outcome NOTIFY wait (#1330, ADR-0109). After a blind/attended transfer's
+# REFER is accepted (202), the transfer tools wait up to this many seconds for the
+# terminal transfer-progress NOTIFY (RFC 3515 message/sipfrag) before returning
+# outcome-unknown, so the agent learns whether the transfer actually completed rather
+# than only that the REFER was received. ``0`` opts out of the wait (the prior fast
+# "initiated" return); negative is rejected at load.
+# ``HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S``.
+_TRANSFER_OUTCOME_TIMEOUT_KEY = "HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S"
+_DEFAULT_TRANSFER_OUTCOME_TIMEOUT_S = 20.0
+
 # Polite-decline line spoken on a ``deny_mode=decline`` declined caller (ADR-0020 §5).
 # When the gateway's deny_mode is ``decline``, a declined-group caller is ANSWERED and
 # hears this one short line before the call is BYE'd (instead of a hard 603). Operator-
@@ -1273,6 +1283,12 @@ class MediaConfig:
     # use the per-language built-in line (or English fallback for an unknown language).
     # NOT repr-suppressed: the apology text is safe to log (no secret content).
     error_apology: str = ""
+    # Transfer-outcome NOTIFY wait (#1330, ADR-0109): seconds a blind/attended transfer
+    # tool waits after the REFER 202 for the terminal transfer-progress NOTIFY before
+    # returning outcome-unknown, so the agent learns whether the transfer completed.
+    # ``0`` opts out of the wait (returns immediately); negative is rejected (validated
+    # in __post_init__). Defaulted so existing direct constructions stay valid.
+    transfer_outcome_timeout_secs: float = _DEFAULT_TRANSFER_OUTCOME_TIMEOUT_S
 
     def __post_init__(self) -> None:
         """Enforce the value invariants the type promises.
@@ -1354,6 +1370,7 @@ class MediaConfig:
                 f"got {self.tone_secs!r}"
             )
             raise ConfigError(msg)
+        self._validate_transfer_outcome_timeout()
         self._validate_tts_tuning()
         # Cloud keys first: a missing PRIMARY credential is the more fundamental error
         # (reported before the fallback's own requirements).
@@ -1473,6 +1490,23 @@ class MediaConfig:
             raise ConfigError(msg)
         if not self.goodbye_phrase.strip():
             msg = "goodbye_phrase must not be blank"
+            raise ConfigError(msg)
+
+    def _validate_transfer_outcome_timeout(self) -> None:
+        """Validate the transfer-outcome NOTIFY wait (#1330, ADR-0109).
+
+        ``0`` opts out of the wait; a negative / NaN / infinite value is rejected so a
+        misconfigured knob fails loud at load rather than mid-transfer (NaN slips past a
+        naive ``>= 0`` so finiteness is checked explicitly).
+        """
+        if (
+            not math.isfinite(self.transfer_outcome_timeout_secs)
+            or self.transfer_outcome_timeout_secs < 0
+        ):
+            msg = (
+                "transfer_outcome_timeout_secs must be a non-negative finite number, "
+                f"got {self.transfer_outcome_timeout_secs!r}"
+            )
             raise ConfigError(msg)
 
     def _validate_agent_hangup_drain(self) -> None:
@@ -1836,6 +1870,10 @@ def load_media_config(env: Mapping[str, str]) -> MediaConfig:
         decline_phrase=_parse_decline_phrase(env, language),
         refuse_decline_phrases=_parse_refuse_decline_phrases(env, language),
         error_apology=_value(env, _ERROR_APOLOGY_KEY) or "",
+        # #1330 / ADR-0109: bounded wait for the terminal transfer-progress NOTIFY.
+        transfer_outcome_timeout_secs=_parse_non_negative_float(
+            env, _TRANSFER_OUTCOME_TIMEOUT_KEY, _DEFAULT_TRANSFER_OUTCOME_TIMEOUT_S
+        ),
     )
 
 
@@ -1999,6 +2037,33 @@ def _parse_positive_float(env: Mapping[str, str], key: str, default: float) -> f
         raise ConfigError(msg) from exc
     if not math.isfinite(value) or value <= 0:
         msg = f"{key} must be a positive finite number, got {raw!r}"
+        raise ConfigError(msg)
+    return value
+
+
+def _parse_non_negative_float(
+    env: Mapping[str, str], key: str, default: float
+) -> float:
+    """Parse ``key`` as a ``>= 0`` finite float, defaulting when unset (ADR-0109).
+
+    Unlike :func:`_parse_positive_float`, ``0`` is accepted (a transfer-outcome timeout
+    of ``0`` opts out of the bounded NOTIFY wait). A negative, NaN, or infinite value
+    is rejected fail-fast (rule 37) — NaN slips past a naive ``>= 0`` test, so
+    finiteness is checked explicitly.
+
+    Raises:
+        ConfigError: If the value is non-numeric, NaN/inf, or ``< 0``.
+    """
+    raw = _value(env, key)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        msg = f"{key} must be a non-negative number, got {raw!r}"
+        raise ConfigError(msg) from exc
+    if not math.isfinite(value) or value < 0:
+        msg = f"{key} must be a non-negative finite number, got {raw!r}"
         raise ConfigError(msg)
     return value
 

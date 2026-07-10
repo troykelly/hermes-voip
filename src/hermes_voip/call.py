@@ -557,11 +557,16 @@ class CallSession:
         this transfer so its ``finally`` cleanup cannot clear a newer transfer's state.
 
         Raises:
-            CallError: if a transfer is already awaiting its outcome on this call — the
-                outcome state is session-wide, so a concurrent second transfer would
-                clobber the first's event / CSeq / latch (codex round-3). One leg
-                transfers to one place at a time; the second fails fast.
+            CallError: if the call has already ended — a BYE that raced the adapter's
+                ended-check (codex round-4): never REFER a dead dialog nor arm an event
+                nothing will signal. Or if a transfer is already awaiting its outcome on
+                this call — the outcome state is session-wide, so a concurrent second
+                transfer would clobber the first's event / CSeq / latch (codex round-3).
+                One leg transfers to one place at a time; the second fails fast.
         """
+        if self.ended:
+            msg = "the call has ended; cannot transfer"
+            raise CallError(msg)
         if self._transfer_in_progress:
             msg = "a transfer is already awaiting its outcome on this call"
             raise CallError(msg)
@@ -1232,9 +1237,15 @@ class CallSession:
         )
         if matches_active:
             self.transfer_progress = progress
-            # ADR-0109: a terminated NOTIFY is the transfer's final outcome; wake
-            # the bounded wait. Interim progress updates do not wake it.
-            if progress.terminated and self._transfer_terminal is not None:
+            # ADR-0109: a terminated NOTIFY wakes the bounded wait ONLY when it carries
+            # a DEFINITIVE final status (>= 200). A terminated subscription reporting a
+            # non-final ``1xx`` (e.g. ``100 Trying``) is not a real transfer outcome
+            # (codex round-4) and is never latched here; interim updates never wake.
+            if (
+                progress.terminated
+                and progress.status_code >= _PROVISIONAL_CEILING
+                and self._transfer_terminal is not None
+            ):
                 # P1-b: latch this outcome the instant we wake the wait (first waker
                 # wins), so a BYE arriving right after cannot overwrite it.
                 if not self._transfer_outcome_latched:

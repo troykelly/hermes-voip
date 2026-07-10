@@ -207,6 +207,8 @@ class _EndingTransport:
     then exits cleanly. send_audio records every sent frame for assertions.
     """
 
+    on_hold: bool = False
+
     def __init__(self, call_id: str, n_frames: int) -> None:
         self._call_id = call_id
         self._n_frames = n_frames
@@ -725,6 +727,8 @@ class _AwaitingInboundTransport:
     inject an equivalent fatal error so the greeting task fails and the TaskGroup
     tears the whole loop down mid-iteration).
     """
+
+    on_hold: bool = False
 
     def __init__(
         self,

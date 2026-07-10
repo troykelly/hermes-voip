@@ -74,6 +74,9 @@ class _FakeTransport:
         # barge-in clean-stop assertions (ADR-0028) read these.
         self.flush_calls: int = 0
         self.last_flush_fade_ms: int | None = None
+        # Hold state (MediaTransport.on_hold): the no-input watchdog reads this to skip
+        # a held window. The real engine flips it via set_hold; fakes default not-held.
+        self.on_hold: bool = False
 
     @property
     def inbound_sample_rate(self) -> int:
@@ -4867,6 +4870,141 @@ async def test_no_input_ends_call_after_max_unanswered_reprompts() -> None:
     assert run_task.exception() is None, (
         "a no-input graceful end must return cleanly (not raise)"
     )
+
+
+@pytest.mark.asyncio
+async def test_no_input_watchdog_suspended_while_call_is_held() -> None:
+    """A call ON HOLD is never reprompted or torn down by the no-input watchdog.
+
+    When the agent (``hold_call``) or the peer/PBX (a hold re-INVITE) holds the
+    call, the media engine suspends the media plane BOTH ways — inbound datagrams
+    are discarded and outbound send/flush is muted — so every silence window looks
+    empty to the watchdog. Without hold awareness the watchdog reprompts into dead
+    media and, after ``no_input_max_reprompts``, ends the call (~30s) — hanging up a
+    LIVE caller during an agent's consult hold. Driving three silent windows — past
+    the 2-reprompt budget AND the graceful-end window — while ``on_hold`` must leave
+    NOTHING spoken and the call still running (a graceful end would return run()).
+    """
+    reprompt_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=3)  # two reprompt windows + the graceful-end window
+    # A silent-but-LIVE caller (continuous inbound RTP) so the pump WOULD observe a
+    # graceful self-end — making "call still running" a real assertion, not a no-op.
+    transport = _LiveSilenceTransport()
+    transport.on_hold = True  # the call is on hold for the whole test
+    tts = _CapturingTTS([reprompt_frame])
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),  # drain the continuous silence so the pump never wedges
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=2,
+        no_input_reprompt_phrases=("Are you still there?",),
+        goodbye=False,  # isolate the reprompt/end behaviour from the goodbye
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the no-input watchdog did not arm a silence-window wait"
+
+    # Three silent windows elapse — past the reprompt budget and the end window — every
+    # one while the call is held.
+    for _ in range(3):
+        sleep.step()
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    assert transport.sent_audio == [], (
+        f"a held call was reprompted by the no-input watchdog: {transport.sent_audio!r}"
+    )
+    assert tts.synthesised == [], (
+        f"a held call synthesised watchdog audio: {tts.synthesised!r}"
+    )
+    assert not run_task.done(), (
+        "the no-input watchdog tore down a held call (agent hold hung up a live caller)"
+    )
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+
+class _HoldDuringGoodbyeTTS(_CapturingTTS):
+    """Flip the transport to ``on_hold`` the instant the goodbye is synthesised.
+
+    Models a hold (agent ``hold_call`` / peer re-INVITE) that lands WHILE the no-input
+    goodbye is playing — the TOCTOU gap between the watchdog's per-window hold check and
+    the irreversible ``_end_call.set()`` inside ``_end_call_gracefully``.
+    """
+
+    def __init__(self, frames: list[PcmFrame], transport: _FakeTransport) -> None:
+        super().__init__(frames)
+        self._held_transport = transport
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        self._held_transport.on_hold = True  # the hold lands as the goodbye begins
+        return super().synthesize(text, voice, sample_rate=sample_rate)
+
+
+@pytest.mark.asyncio
+async def test_no_input_end_aborts_if_hold_lands_during_goodbye() -> None:
+    """A hold arriving DURING the no-input goodbye aborts the end (no teardown).
+
+    The watchdog samples ``on_hold`` once per window, but ``_end_call_gracefully`` then
+    awaits the goodbye synthesis before the irreversible ``_end_call.set()``. A hold
+    landing in that gap must NOT tear down the call: the end is aborted (exactly like a
+    caller barge-in during the goodbye) and the watchdog resumes, skipping held windows.
+    """
+    goodbye_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=2)
+    transport = _LiveSilenceTransport()  # NOT held at the per-window check
+    tts = _HoldDuringGoodbyeTTS([goodbye_frame], transport)
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=0,  # the first silent window goes straight to the end
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the no-input watchdog did not arm a silence-window wait"
+
+    # First silent window: budget is 0, so the watchdog goes straight to the graceful
+    # end — and synthesising the goodbye flips the call to held mid-teardown.
+    sleep.step()
+    for _ in range(30):
+        await asyncio.sleep(0)
+
+    assert transport.on_hold, "precondition: synthesising the goodbye sets on_hold"
+    assert tts.synthesised == ["Goodbye."], (
+        f"the goodbye path must have been reached; got {tts.synthesised!r}"
+    )
+    assert not run_task.done(), (
+        "a hold during the goodbye must abort the end, not tear down the held call"
+    )
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
 
 
 @pytest.mark.asyncio

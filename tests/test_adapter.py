@@ -1709,6 +1709,8 @@ async def test_hang_up_call_unknown_call_returns_false() -> None:
 class _DrainMediaTransport:
     """A MediaTransport that records outbound frames; inbound is never driven."""
 
+    on_hold: bool = False
+
     def __init__(self) -> None:
         self.sent_audio: list[PcmFrame] = []
         self._inbound: list[PcmFrame] = []

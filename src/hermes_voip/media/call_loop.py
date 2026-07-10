@@ -1873,6 +1873,15 @@ class CallLoop:
            reprompt (best-effort) and continue; once the budget is spent, end the call
            gracefully — speak the goodbye (if enabled) and signal the pump to wind up.
 
+        On HOLD (agent ``hold_call`` / peer or PBX hold re-INVITE, per the engine's
+        ``on_hold``) a window is SKIPPED — no reprompt, no end — as the media plane is
+        muted both ways; and :meth:`_end_call_gracefully` re-checks hold before the
+        irreversible end, so a held call is never torn down (the exact safety property).
+        The reprompt COUNT across a brief hold TRANSITION is best-effort: a reprompt
+        whose audio a hold mutes mid-window is dropped by the engine (harmless), and
+        precise per-utterance accounting is out of scope — at worst the caller gets
+        one extra/fewer reprompt on an already-silent call, never a held teardown.
+
         The reprompt and goodbye route through :meth:`_speak_text`, so they are
         sanitised, model-tag-aware (ADR-0027), echo-gate-arming and flushable
         (ADR-0023/0028) like any agent audio — a barge-in cancels a playing reprompt
@@ -1885,6 +1894,16 @@ class CallLoop:
         reprompts_sent = 0
         while True:
             await self._sleep(self._no_input_timeout_s)
+            if self._transport.on_hold:
+                # On hold (agent ``hold_call`` or a peer/PBX hold re-INVITE): the media
+                # plane is suspended BOTH ways — inbound discarded, outbound muted — so
+                # this window is NOT caller silence and a reprompt would play into dead
+                # media. Skip it, and reset the budget so a RESUMED call gets the full
+                # reprompt allowance instead of being hung up on the first post-resume
+                # window. The activity flag is left untouched (pre-hold caller life
+                # persists to the next non-held window's check).
+                reprompts_sent = 0
+                continue
             # Consume the activity flag at exactly ONE point (here, after the window),
             # never at the loop top (codex review): caller life that arrives AFTER this
             # check — e.g. a barge-in WHILE a reprompt is playing, or during a skipped
@@ -1971,7 +1990,9 @@ class CallLoop:
         :meth:`barge_in` — the caller is engaging, so the end is ABORTED: we do NOT set
         :attr:`_end_call`, we consume the flag, and return ``False`` so the watchdog
         resumes the reprompt cycle. Read-then-clear with no await between, so the check
-        cannot miss a concurrent set. Returns ``True`` when the end is committed.
+        cannot miss a concurrent set. The end is ABORTED the same way if the call was
+        placed on hold while the goodbye played (a held call is never torn down) —
+        checked with no await before the set. Returns ``True`` when the end commits.
         """
         if self._goodbye and self._goodbye_phrase:
             _log.info("no-input: speaking goodbye before end: %r", self._goodbye_phrase)
@@ -1981,6 +2002,14 @@ class CallLoop:
         if self._caller_active_in_window:
             self._caller_active_in_window = False
             _log.info("no-input: caller answered during the goodbye; aborting the end")
+            return False
+        # A hold that arrived while the goodbye played (agent ``hold_call`` / peer or
+        # PBX hold re-INVITE) means the call must NOT be torn down — abort the end and
+        # let the watchdog resume (it keeps skipping held windows). Checked with NO
+        # await before the set, so a concurrent ``set_hold`` on the one event loop
+        # cannot be missed between this check and the commit.
+        if self._transport.on_hold:
+            _log.info("no-input: call held during the goodbye; aborting the end")
             return False
         self._end_call.set()
         return True

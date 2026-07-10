@@ -131,6 +131,8 @@ def _voiced_frames(f0: float, *, duration_ms: int, start_idx: int) -> list[PcmFr
 class _FakeTransport:
     """MediaTransport fake driving a preset 8 kHz inbound frame sequence."""
 
+    on_hold: bool = False
+
     def __init__(self, frames: list[PcmFrame]) -> None:
         self._frames = frames
         self.sent_audio: list[PcmFrame] = []

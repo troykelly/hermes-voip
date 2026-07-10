@@ -3033,7 +3033,7 @@ class VoipAdapter(BasePlatformAdapter):
             if answer_audio is None:
                 _fail_outbound_call(500, "2xx SDP answer has no audio media")
             if not answer_audio.is_webrtc:
-                raise OutboundCallFailed(
+                _fail_outbound_call(
                     488, "2xx answer is not a WebRTC (UDP/TLS/RTP/SAVPF) answer"
                 )
             peer_fp = answer_audio.fingerprint
@@ -3042,7 +3042,7 @@ class VoipAdapter(BasePlatformAdapter):
                 or answer_audio.ice_ufrag is None
                 or answer_audio.ice_pwd is None
             ):
-                raise OutboundCallFailed(
+                _fail_outbound_call(
                     488,
                     "2xx WebRTC answer missing fingerprint / ICE credentials",
                 )
@@ -3060,7 +3060,7 @@ class VoipAdapter(BasePlatformAdapter):
                 ) from exc
             voice = _first_voice_codec(agreed_codecs)
             if voice is None:
-                raise OutboundCallFailed(488, "2xx WebRTC answer has no voice codec")
+                _fail_outbound_call(488, "2xx WebRTC answer has no voice codec")
             try:
                 engine_codec = _to_engine_codec(voice)
             except UnsupportedCodecError as exc:
@@ -3263,6 +3263,31 @@ class VoipAdapter(BasePlatformAdapter):
                 },
             )
             session_established = True
+        except Exception as exc:
+            # Outbound lifecycle event (runbook 0014, ADR-0075 style): the WebRTC dial
+            # attempt failed — a non-2xx final, an unparseable / non-WebRTC 2xx answer,
+            # a codec/fingerprint/ICE rejection, or a DTLS/ICE handshake error. Mirrors
+            # the SIP/TLS leg's outbound_call_failed (issue #1294) on the WebRTC/WSS leg
+            # (#1296), carrying the ADR-0086 failure CATEGORY the place_call result also
+            # carries (single source of truth: outbound_failure_category) so the SLO
+            # logs and the tool outcome never diverge. NEVER str(exc) / the SIP
+            # reason / the host / the dialled number (rule 34 / ADR-0084). Pure
+            # observability: the exception is RE-RAISED unchanged, so control flow, the
+            # outcome, and the finally teardown below are unaffected (rule 37 — errors
+            # propagate). CancelledError is a BaseException, so an aborted dial is not
+            # mis-logged as a failure here.
+            _log.info(
+                "outbound call failed: Call-ID %s",
+                call_id,
+                extra={
+                    "event": "outbound_call_failed",
+                    "call_id": call_id,
+                    "transport": "webrtc",
+                    "category": outbound_failure_category(exc),
+                },
+            )
+            raise
+        else:
             return call_id
         finally:
             if not session_established:

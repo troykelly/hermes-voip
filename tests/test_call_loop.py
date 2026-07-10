@@ -6165,12 +6165,13 @@ async def test_untranscribed_turn_speaks_didnt_catch_reprompt() -> None:
 
 @pytest.mark.asyncio
 async def test_untranscribed_turn_reprompt_runs_off_the_asr_pump() -> None:
-    """The reprompt plays on its own task — a blocked synth does not stall delivery.
+    """Reprompt runs off the pump; a following real turn is delivered and cancels it.
 
     Injects an empty final FOLLOWED by a real "hello" turn, with a TTS whose frames are
     gated shut. If the reprompt were awaited inline on the ASR pump (the dropped Wave-3
-    attempt), the pump would block on the gated synth and never deliver "hello". The
-    real turn must arrive while the reprompt synth is still blocked.
+    attempt), the pump would block on the gated synth and never deliver "hello" — so
+    delivering it proves the reprompt runs on its OWN task. Delivering a real turn also
+    cancels the now-moot reprompt: no stale "didn't catch that" plays over the reply.
     """
     gate = asyncio.Event()
     delivered: list[str] = []
@@ -6192,24 +6193,23 @@ async def test_untranscribed_turn_reprompt_runs_off_the_asr_pump() -> None:
         if delivered:
             break
 
+    # Non-blocking: the real turn arrived despite the gated reprompt synth. Inline-await
+    # would have starved the pump (verified in review by flipping the hook to inline).
     assert delivered == ["hello"], (
         "the untranscribed-turn reprompt blocked the ASR pump: the following real turn "
         f"was starved (delivered={delivered!r})"
     )
 
-    # The reprompt DOES fire — on its own task. Let its synth record the phrase (it then
-    # parks on the shut gate before emitting any frame). This runs concurrently with the
-    # delivery above, hence the separate poll.
+    # The delivered turn cancels the now-moot reprompt: its task handle clears and no
+    # stale reprompt audio reaches the wire.
     for _ in range(50):
         await asyncio.sleep(0)
-        if tts.synthesised:
+        if loop._didnt_catch_task is None:
             break
-    assert tts.synthesised == [_DIDNT_CATCH_PHRASE], (
-        f"the didn't-catch reprompt was not synthesised; got {tts.synthesised!r}"
+    assert loop._didnt_catch_task is None, (
+        "a delivered turn must cancel the pending didn't-catch reprompt"
     )
-    assert transport.sent_audio == [], (
-        "the gated reprompt frames must not have been sent while the gate is shut"
-    )
+    assert transport.sent_audio == [], "no stale reprompt audio should reach the wire"
 
     gate.set()
     transport.close_inbound()
@@ -6257,3 +6257,19 @@ async def test_untranscribed_turn_opt_out_speaks_nothing() -> None:
     assert loop._caller_active_in_window is False, (
         "opt-out must preserve the prior behaviour: an empty final is not marked active"
     )
+
+
+@pytest.mark.asyncio
+async def test_untranscribed_turn_opt_out_after_a_reprompt_still_drops() -> None:
+    """Opt-out via an empty phrase set never speaks, even across multiple empties."""
+    tts = _CapturingTTS([_greeting_frame(1)])
+    loop = _didnt_catch_loop(
+        _FakeTransport([_silence_frame(0)]),
+        _FakeASR([("", True, True), ("  ", True, True)]),
+        tts,
+        didnt_catch_phrases=(),
+    )
+    await loop.run()
+
+    assert tts.synthesised == [], "opt-out must speak nothing across repeated empties"
+    assert loop._didnt_catch_task is None

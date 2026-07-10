@@ -1956,8 +1956,9 @@ class CallLoop:
         pump keeps draining while this synthesises and plays. Routes through
         :meth:`_speak_phrase_best_effort` so it is sanitised, echo-gate-arming and
         flushable like any agent audio, and a synth/send hiccup is logged and swallowed
-        (rule 37); a ``CancelledError`` (teardown, or a barge-in cancelling a playing
-        reprompt) is the normal stop and propagates.
+        (rule 37). It ends cleanly on teardown (task cancel → ``CancelledError``), on a
+        barge-in, or when a later speak (a reply or the safe-decline) supersedes its
+        stream — ``_speak_text`` playout is single-owner.
         """
         phrase = self._next_didnt_catch_phrase()
         _log.info(
@@ -2367,6 +2368,12 @@ class CallLoop:
         # The caller finished a turn (heard, even if the guard refuses to forward it):
         # reset the no-input silence window (ADR-0057).
         self._caller_active_in_window = True
+        # This turn WAS transcribed, so any "didn't catch that" reprompt still pending
+        # from a PRIOR untranscribed turn is now moot: cancel it so it never plays stale
+        # over this turn's response nor races it (item 1282). ``_speak_text`` is already
+        # single-owner (a later speak supersedes an in-flight one), but cancelling here
+        # makes the outcome deterministic regardless of scheduling.
+        self._cancel_didnt_catch()
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
         if result.verdict is GuardVerdict.REFUSE:

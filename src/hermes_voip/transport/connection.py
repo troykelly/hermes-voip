@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from hermes_voip._decimal import _parse_decimal
+from hermes_voip._name_addr import find_name_addr
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
     Cancel,
@@ -95,8 +96,6 @@ _VIA_BRANCH = re.compile(r";\s*branch=([^;,\s]+)", re.IGNORECASE)
 _FINAL_STATUS = 200  # status >= 200 is a final response (terminates the txn)
 _FIRST_FAILURE = 300  # status >= 300 is a non-2xx final
 _MAX_FORWARDS = "70"
-# The addr-spec inside a name-addr ``<...>`` (a Contact/Record-Route URI).
-_ANGLE_ADDR = re.compile(r"<([^>]*)>")
 
 
 @dataclass(slots=True)
@@ -979,7 +978,12 @@ def _has_to_tag(to_value: str | None) -> bool:
     """
     if to_value is None:
         return False
-    search_space = to_value.split(">", 1)[1] if ">" in to_value else to_value
+    # Locate the name-addr angle-addr quote-aware (RFC 3261 §25.1): a '>' or a
+    # literal ';tag=' inside a quoted display-name must not desync the search onto
+    # the wrong bracket and mis-classify an out-of-dialog request as in-dialog. A
+    # bare addr-spec has no URI params, so its header params run from the start.
+    name_addr = find_name_addr(to_value)
+    search_space = name_addr[1] if name_addr is not None else to_value
     return _TO_TAG_PARAM.search(search_space) is not None
 
 
@@ -1097,10 +1101,13 @@ def _addr_spec(header_value: str | None) -> str | None:
     """
     if header_value is None:
         return None
-    match = _ANGLE_ADDR.search(header_value)
+    # The addr-spec is inside the name-addr '<...>' (located outside any quoted
+    # display-name, RFC 3261 §25.1) if present, else up to the first ';' (header
+    # params) of a bare addr-spec.
+    name_addr = find_name_addr(header_value)
     spec = (
-        match.group(1).strip()
-        if match is not None
+        name_addr[0].strip()
+        if name_addr is not None
         else header_value.split(";", 1)[0].strip()
     )
     return spec or None

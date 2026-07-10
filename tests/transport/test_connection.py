@@ -36,7 +36,11 @@ from hermes_voip.message import (
     new_call_id,
     new_tag,
 )
-from hermes_voip.transport.connection import SipOverTlsTransport
+from hermes_voip.transport.connection import (
+    SipOverTlsTransport,
+    _addr_spec,
+    _has_to_tag,
+)
 
 from ._loopback import LoopbackSipServer, Responder, client_ssl_context
 
@@ -2059,3 +2063,35 @@ async def test_a_handler_cancellederror_propagates_out_of_dispatch() -> None:
     transport.add_call(call_id, _RaisingSink(asyncio.CancelledError()))
     with pytest.raises(asyncio.CancelledError):
         await transport._dispatch(_poison_response(call_id).encode())
+
+
+async def test_addr_spec_and_has_to_tag_survive_bracketed_quoted_display_name() -> None:
+    # RFC 3261 §25.1 permits ``<`` and ``>`` inside a quoted display-name. A
+    # Contact/To value whose quoted display-name contains a ``<...>`` span AND a
+    # ``;tag=`` must not have that span mistaken for the real <addr-spec>: the
+    # naive ``<([^>]*)>`` search extracts ``<Y>`` (a garbage in-dialog target) and
+    # the split-on-'>' To-tag scan latches the quoted ``;tag=`` inside the display
+    # name, mis-classifying an out-of-dialog request as in-dialog.
+    contact = '"Desk <A>" <sip:3000@203.0.113.9:5061;transport=tls>;expires=60'
+    assert _addr_spec(contact) == "sip:3000@203.0.113.9:5061;transport=tls"
+
+    # A To value with a bracketed quoted display-name but NO real header tag: the
+    # ``;tag=`` lives only inside the quoted display-name, so it is NOT a dialog tag.
+    to_no_tag = '"X <Y>;tag=fake" <sip:1000@pbx.example.test>'
+    assert _has_to_tag(to_no_tag) is False
+
+    # The same shape WITH a real trailing header tag is in-dialog.
+    to_tagged = '"X <Y>;tag=fake" <sip:1000@pbx.example.test>;tag=real'
+    assert _has_to_tag(to_tagged) is True
+
+
+async def test_addr_spec_and_has_to_tag_plain_and_bare_unchanged() -> None:
+    plain = '"Agent" <sip:3000@203.0.113.9:5061;transport=tls>;expires=60'
+    assert _addr_spec(plain) == "sip:3000@203.0.113.9:5061;transport=tls"
+
+    bare = "sip:3000@203.0.113.9:5061;transport=tls"
+    assert _addr_spec(bare) == "sip:3000@203.0.113.9:5061"
+
+    assert _has_to_tag("<sip:1000@pbx.example.test>;tag=real") is True
+    assert _has_to_tag("<sip:1000@pbx.example.test>") is False
+    assert _has_to_tag("sip:1000@pbx.example.test;tag=baretag") is True

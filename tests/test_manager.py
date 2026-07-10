@@ -1861,3 +1861,26 @@ async def test_aclose_bounds_a_hanging_deregister_send(
         assert state.refresh_task is None
         assert state.recovery_task is None
         assert state.response_timeout_task is None
+
+
+async def test_addr_spec_and_tag_survive_bracketed_quoted_display_name() -> None:
+    # RFC 3261 §25.1 permits BOTH ``<`` and ``>`` inside a quoted display-name.
+    # A To value whose quoted display-name contains a ``<...>`` span AND a
+    # ``;tag=`` must not have that span mistaken for the real <addr-spec>: the
+    # naive ``<([^>]*)>`` search extracts ``<Y>`` (garbage) and the split-on-'>'
+    # tag scan latches the quoted ``;tag=fake`` instead of the real header tag.
+    value = '"X <Y>;tag=fake" <sip:2000@pbx.example.test>;tag=realtag99'
+    assert manager_module._addr_spec(value) == "sip:2000@pbx.example.test"
+    assert manager_module._tag(value) == "realtag99"
+
+
+async def test_addr_spec_and_tag_plain_and_bare_unchanged() -> None:
+    # A plain name-addr (no brackets in the display-name) and a bare addr-spec
+    # (no ``<...>`` at all) keep extracting the addr-spec and tag exactly as before.
+    plain = '"Agent" <sip:2000@pbx.example.test>;tag=ttag'
+    assert manager_module._addr_spec(plain) == "sip:2000@pbx.example.test"
+    assert manager_module._tag(plain) == "ttag"
+
+    bare = "sip:2000@pbx.example.test;tag=baretag"
+    assert manager_module._addr_spec(bare) == "sip:2000@pbx.example.test"
+    assert manager_module._tag(bare) == "baretag"

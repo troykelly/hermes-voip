@@ -25,6 +25,7 @@ from hermes_voip.registration import (
     RegistrationFlow,
     Retry,
     ViaTransport,
+    _binding_uri,
 )
 
 # The canonical fixture registers over TLS, so its AOR uses the mandated ``sips:``
@@ -1214,3 +1215,20 @@ def test_absent_proxy_challenge_header_fails_closed_not_raises() -> None:
     outcome = flow.handle(resp)
     assert isinstance(outcome, Failed)
     assert outcome.status == 407
+
+
+def test_binding_uri_survives_bracketed_quoted_display_name() -> None:
+    # RFC 3261 §25.1 permits ``<`` and ``>`` inside a Contact quoted display-name.
+    # The naive ``<([^>]*)>`` search latches the bracketed display text and returns
+    # a garbage URI, desyncing Contact-binding matching. The real addr-spec lies in
+    # the angle-addr OUTSIDE the quoted display-name.
+    binding = '"Desk <A>" <sip:1000@203.0.113.7:5061;transport=tls>;expires=300'
+    assert _binding_uri(binding) == "sip:1000@203.0.113.7:5061;transport=tls"
+
+
+def test_binding_uri_plain_and_bare_unchanged() -> None:
+    plain = "<sip:1000@203.0.113.7:5061;transport=tls>;expires=300"
+    assert _binding_uri(plain) == "sip:1000@203.0.113.7:5061;transport=tls"
+
+    bare = "sip:1000@203.0.113.7:5061;transport=tls;expires=300"
+    assert _binding_uri(bare) == "sip:1000@203.0.113.7:5061"

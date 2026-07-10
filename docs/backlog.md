@@ -1590,7 +1590,7 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
   aspirational docs. Redo as a dedicated opus lane: fix the concurrency issues, wire a REAL
   `_EMPTY_REPLY_FALLBACK_PHRASES_BY_LANGUAGE` + parser + adapter (mirror comfort/refuse), guard the empty
   phrase-set (no `IndexError`), and write NO aspirational docs.
-- [ ] **[medium] robustness** — Bound the inbound-call context block before injecting it into the agent
+- [x] **[medium] robustness** (#466) — Bound the inbound-call context block before injecting it into the agent
   session (`call_context.py` renders Diversion/History-Info/User-Agent unbounded; `adapter.py` injects it;
   the outbound path already caps at 600 chars).
 - [x] **[low] security** (#445) — `render_call_context_block` does not collapse interior newlines in
@@ -1651,7 +1651,7 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   0.3.1 (#434 re-INVITE media re-point, #435 Expires:0 de-register, #436 Min-SE fail-closed, #437 420 Bad
   Extension, #438 RESTRICT/CLARIFY gate). Breaks the Keep-a-Changelog convention (runbook-0019 step 4 moves
   pre-existing entries); nothing in CI catches a PR landing without one.
-- [ ] **[medium] ux** — Unbounded guard-REFUSE decline loop: on REFUSE, `CallLoop._screen_and_deliver` sets
+- [x] **[medium] ux** (#465) — Unbounded guard-REFUSE decline loop: on REFUSE, `CallLoop._screen_and_deliver` sets
   `_caller_active_in_window=True` (`call_loop.py:2182`), resetting the no-input watchdog every window, so a
   persistently-refused caller (accent/phrasing tripping the injection guard) hears the decline set cycle
   forever, never reaching the agent nor a graceful close. Add a consecutive-REFUSE counter + graceful end

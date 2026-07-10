@@ -777,6 +777,30 @@ async def test_transfer_blind_returns_terminal_notify_progress_on_2xx() -> None:
     assert progress.terminated is True
 
 
+async def test_bye_before_late_terminal_notify_latches_call_ended() -> None:
+    # P1-b (codex round 2): the outcome wait must latch its cause the instant it is
+    # woken. If a BYE wakes it FIRST, a terminal NOTIFY that records transfer_progress
+    # before the waiting task resumes must NOT flip the outcome to COMPLETED — the
+    # documented contract is "never infer success from a torn-down leg". Deterministic
+    # reproduction: wake (BYE) then record the late terminal progress synchronously (no
+    # await between), so the waiter cannot resume until we await the task.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)  # the waiter is now in the outcome wait
+    session._wake_transfer_on_end()  # BYE wakes it FIRST — must latch CALL_ENDED
+    # A terminal NOTIFY records progress after the BYE, before the waiter resumes:
+    session.transfer_progress = NotifyProgress(
+        status_code=200, reason="OK", terminated=True
+    )
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.progress is None
+    assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
+
+
 async def test_transfer_blind_returns_failed_notify_progress_on_4xx() -> None:
     """A terminal 4xx NOTIFY (busy) is returned so the adapter can classify FAILED."""
     signaling, media = _FakeSignaling(), _FakeMedia()

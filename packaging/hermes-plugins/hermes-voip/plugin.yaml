@@ -31,7 +31,8 @@ version: "0.3.1"
 description: >-
   Two-way voice over telephony for a Hermes agent — answer and place phone calls on
   any RFC-compliant SIP-over-TLS or WebRTC voice gateway, with streaming STT/TTS, a
-  prompt-injection guard, and per-call privilege gating.
+  prompt-injection guard, and per-call privilege gating. Requires Python 3.13 or
+  later (pinned in .python-version; see pyproject.toml requires-python).
 author: Aperim Pty Ltd
 
 # Gateway adapter -> kind: platform. register() calls ctx.register_platform("voip", …),
@@ -185,3 +186,295 @@ optional_env:
       allowlist gate is intentionally skipped. Do NOT set this unless you understand
       and accept the allowlist bypass. Unset (the default) — no dial-on-connect.
     prompt: "Extension/URI to dial on first registration (allowlist bypass — see runbook 0007)"
+
+  # --- Registration / gateway (HERMES_SIP_*) -------------------------------
+  - name: HERMES_SIP_USERNAME
+    description: "Digest auth username, if different from the extension (defaults to the extension)."
+    prompt: "SIP digest auth username (default: same as extension)"
+  - name: HERMES_SIP_EXPIRES
+    default: 300
+    description: "Requested REGISTER lifetime in seconds (default: 300)."
+    prompt: "Registration expiry in seconds (default: 300)"
+  - name: HERMES_SIP_USER_AGENT
+    default: "hermes-voip/0"
+    description: "The User-Agent header value sent on every SIP request (default: hermes-voip/0)."
+    prompt: "SIP User-Agent header value (default: hermes-voip/0)"
+  - name: HERMES_SIP_DEFAULT_EXTENSION
+    description: >-
+      For a multi-registration deployment (HERMES_SIP_EXTENSION_<n>), the extension
+      number that receives an inbound call with no matching Request-URI extension
+      (default: the lowest-index configured extension).
+    prompt: "Inbound-fallback extension for a multi-registration deployment"
+  - name: HERMES_SIP_WS_PATH
+    default: "/ws"
+    description: "WebSocket upgrade path for the SIP-over-WSS transport (RFC 7118, default: /ws). Only meaningful when HERMES_SIP_TRANSPORT=wss."
+    prompt: "SIP-over-WSS upgrade path (default: /ws)"
+  - name: HERMES_SIP_WS_PASSWORD
+    description: >-
+      A digest-password override for the wss endpoint, when it differs from the
+      per-extension SIP password. Unset (the default) falls back to the
+      per-extension password.
+    prompt: "SIP-over-WSS digest password override (optional)"
+    secret: true
+
+  # --- Security / media protection posture (ADR-0053/0066/0067/0070) -------
+  - name: HERMES_VOIP_REQUIRE_SECURE_MEDIA
+    default: true
+    description: >-
+      SECURITY POSTURE DEFAULT. When true (the default), an inbound INVITE
+      offering plain RTP/AVP (no SRTP) is rejected 488 Not Acceptable Here
+      instead of being answered as cleartext media. Setting this to false
+      is a deliberate downgrade to opportunistic plaintext media for a gateway
+      that can only offer cleartext — do not disable it without understanding
+      that trade-off.
+    prompt: "Require SRTP/DTLS-SRTP on inbound media (default: true — false = plaintext-media rollback)"
+  - name: HERMES_VOIP_DENY_MODE
+    default: "reject"
+    description: "How a declined-group caller is handled: reject (hard 603, default) or decline (answer + spoken decline line + BYE)."
+    prompt: "Inbound deny enforcement: reject or decline (default: reject)"
+  - name: HERMES_VOIP_SIP_DTLS_SRTP
+    default: true
+    description: "Answer a SIP-over-TLS UDP/TLS/RTP/SAVP offer with cert-keyed DTLS-SRTP media (default: true). Set false as a rollback to fall through to the SDES/plain handler."
+    prompt: "Enable SIP DTLS-SRTP media (default: true)"
+  - name: HERMES_VOIP_SIP_SDES_OFFER
+    default: false
+    description: "Offer RTP/SAVP with a fresh per-call SDES a=crypto on an agent-originated outbound SIP INVITE (default: false, opt-in). A plain-RTP/AVP answer then fails the call (fail-closed)."
+    prompt: "Offer SDES-SRTP on outbound SIP INVITEs (default: false)"
+  - name: HERMES_VOIP_SIP_DTLS_SETUP
+    default: "auto"
+    description: "SIP DTLS-SRTP answerer role for an a=setup:actpass offer: auto (default, we become active), active, or passive."
+    prompt: "SIP DTLS-SRTP setup role: auto/active/passive (default: auto)"
+  - name: HERMES_VOIP_WEBRTC_DTLS_SETUP
+    default: "auto"
+    description: "WebRTC DTLS answerer role for an a=setup:actpass offer: auto (default, we become active), active, or passive."
+    prompt: "WebRTC DTLS setup role: auto/active/passive (default: auto)"
+  - name: HERMES_VOIP_RTCP_ENABLED
+    default: true
+    description: "Send/receive RTCP on the cleartext plain-RTP media path (default: true). Set false as an operator kill-switch to suppress all RTCP."
+    prompt: "Enable RTCP on plain-RTP calls (default: true)"
+  - name: HERMES_VOIP_SECURED_RTCP_ENABLED
+    default: false
+    description: "Activate SRTCP on a secured (SDES RTP/SAVP) call with no a=rtcp-mux (default: false — secured calls stay RTCP-dormant until gateway-validated)."
+    prompt: "Enable SRTCP on secured calls without rtcp-mux (default: false)"
+  - name: HERMES_VOIP_RTP_SYMMETRIC
+    default: true
+    description: "Latch the outbound RTP destination onto the peer's actual source tuple for NAT traversal (default: true). Set false to always honour the SDP c=/m= address."
+    prompt: "Symmetric-RTP (comedia) NAT latching (default: true)"
+  - name: HERMES_VOIP_INJECTION_GUARD
+    default: "onnx"
+    description: "Prompt-injection guard backend: onnx (in-process classifier, default) or sidecar (loopback sidecar, opt-in)."
+    prompt: "Injection-guard backend: onnx or sidecar (default: onnx)"
+
+  # --- Session timers / watchdogs (RFC 4028, ADR-0026/0056/0071) -----------
+  - name: HERMES_VOIP_SESSION_EXPIRES
+    default: 600
+    description: "RFC 4028 Session-Expires interval in seconds we offer/insert so a dead dialog is detected and torn down (default: 600). Must be >= HERMES_VOIP_MIN_SE."
+    prompt: "Session-Expires interval in seconds (default: 600)"
+  - name: HERMES_VOIP_MIN_SE
+    default: 90
+    description: "RFC 4028 Min-SE: the smallest Session-Expires we accept inbound; a smaller offer is rejected 422 (default: 90, the RFC 4028 floor)."
+    prompt: "Min-SE floor in seconds (default: 90)"
+  - name: HERMES_VOIP_RTP_TIMEOUT_SECS
+    default: 20
+    description: "Seconds of RTP inactivity before the call is ended as a media timeout (default: 20; range 1-300)."
+    prompt: "RTP-inactivity watchdog timeout in seconds (default: 20)"
+  - name: HERMES_VOIP_JITTER_MAX_DEPTH
+    default: 10
+    description: "Ceiling (packets) the adaptive RX jitter buffer may grow to under loss/reorder (default: 10 ≈ 200 ms at 20 ms ptime)."
+    prompt: "Adaptive jitter-buffer ceiling in packets (default: 10)"
+
+  # --- DTMF (ADR-0010/0034/0036) --------------------------------------------
+  - name: HERMES_SIP_DTMF_MODE
+    default: "auto"
+    description: "DTMF mechanism: auto (default, negotiate RFC 4733 or fall back to in-band), rfc4733, sip_info, or inband."
+    prompt: "DTMF mode: auto/rfc4733/sip_info/inband (default: auto)"
+  - name: HERMES_SIP_DTMF_INTERDIGIT_MS
+    description: "Minimum gap in milliseconds enforced between sent DTMF digits."
+    prompt: "DTMF inter-digit gap in milliseconds"
+  - name: HERMES_SIP_DTMF_INBAND_ENABLED
+    default: true
+    description: "Allow in-band (Goertzel) DTMF detection as a last-resort receive path on a G.711 call (default: true)."
+    prompt: "Enable in-band DTMF detection fallback (default: true)"
+
+  # --- Acoustic echo cancellation (ADR-0033) --------------------------------
+  - name: HERMES_VOIP_AEC_ENABLED
+    default: true
+    description: "In-process NLMS acoustic echo cancellation on the inbound leg, so a reflected TTS echo cannot false-trigger barge-in (default: true)."
+    prompt: "Enable acoustic echo cancellation (default: true)"
+  - name: HERMES_VOIP_AEC_FILTER_MS
+    default: 64
+    description: "AEC adaptive-filter tap span in milliseconds, covering the expected echo-return delay (default: 64)."
+    prompt: "AEC filter length in milliseconds (default: 64)"
+  - name: HERMES_VOIP_AEC_BULK_DELAY_MS
+    default: 0
+    description: "A fixed bulk delay in milliseconds to shift the AEC filter's covered window for a longer echo-return path (default: 0, none)."
+    prompt: "AEC bulk delay in milliseconds (default: 0)"
+  - name: HERMES_VOIP_AEC_MU
+    default: 0.3
+    description: "NLMS adaptive-filter step size in (0, 2) — higher converges faster but is less stable (default: 0.30)."
+    prompt: "AEC NLMS step size (default: 0.30)"
+
+  # --- Barge-in (ADR-0023/0028) ---------------------------------------------
+  - name: HERMES_VOIP_BARGE_IN_MODE
+    default: "gated"
+    description: "Barge-in mode: gated (default, requires sustained voiced speech before interrupting), full (immediate, for echo-cancelled gateways), or off."
+    prompt: "Barge-in mode: gated/full/off (default: gated)"
+  - name: HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS
+    default: 600
+    description: "Sustained voiced-speech window in milliseconds required to count as a genuine barge-in (default: 600; 200 when AEC is on)."
+    prompt: "Barge-in sustained-speech threshold in milliseconds (default: 600)"
+  - name: HERMES_VOIP_BARGE_IN_TAIL_MS
+    default: 250
+    description: "Trailing window in milliseconds after TTS playback during which a sustained voiced run still counts as a barge-in (default: 250)."
+    prompt: "Barge-in trailing window in milliseconds (default: 250)"
+  - name: HERMES_VOIP_BARGE_IN_FADE_MS
+    default: 30
+    description: "Linear fade-out in milliseconds applied to the agent's final outbound frames on a barge-in flush, for a click-free cut (default: 30; 0 = instant hard cut)."
+    prompt: "Barge-in flush fade-out in milliseconds (default: 30)"
+
+  # --- VAD / endpointing / duplex (ADR-0008) --------------------------------
+  - name: HERMES_VOIP_VAD_THRESHOLD
+    default: 0.5
+    description: "Silero VAD voice-probability threshold in [0.0, 1.0] (default: 0.5)."
+    prompt: "VAD voice-probability threshold (default: 0.5)"
+  - name: HERMES_VOIP_ENDPOINT_SILENCE_MS
+    default: 500
+    description: "Trailing silence in milliseconds that ends the caller's speaking turn (default: 500)."
+    prompt: "End-of-turn silence threshold in milliseconds (default: 500)"
+  - name: HERMES_VOIP_DUPLEX_MODE
+    default: "half"
+    description: "Media duplex mode. Only half (the shipped default) is accepted; full is a deferred, unimplemented design and is rejected at config load."
+    prompt: "Media duplex mode: half only (default: half)"
+
+  # --- Spoken UX: language, comfort filler, no-input, goodbye, decline -----
+  - name: HERMES_VOIP_LANGUAGE
+    default: "en"
+    description: "The active conversation language (BCP-47 primary subtag), selecting the built-in comfort-filler/reprompt/decline phrase sets (default: en)."
+    prompt: "Conversation language, BCP-47 (default: en)"
+  - name: HERMES_VOIP_TTS_COMFORT_FILLER
+    default: true
+    description: "Speak a short filler ('One moment please.') on a slow-turn dead-air gap so the caller never hears silence (default: true)."
+    prompt: "Enable dead-air comfort filler (default: true)"
+  - name: HERMES_VOIP_TTS_COMFORT_FILLER_DELAY_MS
+    default: 900
+    description: "Dead-air gap in milliseconds before the first comfort filler fires (default: 900)."
+    prompt: "Comfort-filler initial delay in milliseconds (default: 900)"
+  - name: HERMES_VOIP_TTS_COMFORT_FILLER_REPEAT_MS
+    default: 900
+    description: "Interval in milliseconds between repeated comfort fillers on a sustained gap (default: 900, same as the initial delay)."
+    prompt: "Comfort-filler repeat interval in milliseconds (default: 900)"
+  - name: HERMES_VOIP_TTS_COMFORT_FILLER_PHRASES
+    description: "Pipe-separated (|) comfort-filler phrase override; blank/unset uses the built-in language phrase set."
+    prompt: "Comfort-filler phrase override, pipe-separated (optional)"
+  - name: HERMES_VOIP_NO_INPUT_REPROMPT
+    default: true
+    description: "Speak a reprompt when the caller is connected but silent past the timeout, ending the call after too many unanswered reprompts (default: true)."
+    prompt: "Enable caller-silence reprompt (default: true)"
+  - name: HERMES_VOIP_NO_INPUT_TIMEOUT_MS
+    default: 10000
+    description: "Silence window in milliseconds before a no-input reprompt fires (default: 10000)."
+    prompt: "No-input reprompt timeout in milliseconds (default: 10000)"
+  - name: HERMES_VOIP_NO_INPUT_MAX_REPROMPTS
+    default: 2
+    description: "Number of unanswered reprompts before the call ends gracefully (default: 2; 0 = end on the first silent window)."
+    prompt: "Max no-input reprompts before graceful end (default: 2)"
+  - name: HERMES_VOIP_NO_INPUT_REPROMPT_PHRASES
+    description: "Pipe-separated (|) no-input reprompt phrase override; blank/unset uses the built-in English set."
+    prompt: "No-input reprompt phrase override, pipe-separated (optional)"
+  - name: HERMES_VOIP_GOODBYE
+    default: true
+    description: "Speak a goodbye line and let it finish before a loop-initiated graceful call end (default: true). Not spoken on caller-hangup/error ends."
+    prompt: "Speak a goodbye line on graceful call end (default: true)"
+  - name: HERMES_VOIP_GOODBYE_PHRASE
+    default: "Goodbye."
+    description: 'The spoken goodbye line on a loop-initiated graceful end (default: "Goodbye.").'
+    prompt: 'Goodbye line (default: "Goodbye.")'
+  - name: HERMES_VOIP_DECLINE_PHRASE
+    default: "Sorry, I cannot take this call."
+    description: 'The line spoken to a HERMES_VOIP_DENY_MODE=decline caller before BYE (default: "Sorry, I cannot take this call."). One short line, no line breaks, max 200 chars.'
+    prompt: 'Decline-mode spoken line (default: "Sorry, I cannot take this call.")'
+  - name: HERMES_VOIP_REFUSE_DECLINE_PHRASES
+    description: "Pipe-separated (|) safe-decline phrase override, spoken once when the injection guard refuses a turn; blank/unset uses the built-in language set."
+    prompt: "Guard-refusal decline phrase override, pipe-separated (optional)"
+  - name: HERMES_VOIP_ERROR_APOLOGY
+    description: "Operator override for the spoken apology on a provider/runtime error; blank/unset uses the built-in per-language default."
+    prompt: "Provider/runtime error apology line override (optional)"
+
+  # --- TTS tuning (ADR-0006/0007/0025) --------------------------------------
+  - name: HERMES_VOIP_TTS_VOICE
+    description: "The TTS provider's voice id/name (self-host: a Kokoro speaker name; cloud: the provider's voice id)."
+    prompt: "TTS voice id/name"
+  - name: HERMES_VOIP_TTS_FALLBACK
+    description: "Fallback TTS provider token used if the primary raises during synthesis; none/unset disables failover (cloud primaries default to sherpa-kokoro)."
+    prompt: "TTS failover provider (default: none, or sherpa-kokoro for a cloud primary)"
+  - name: HERMES_VOIP_TTS_FALLBACK_MODEL
+    description: "Model directory for the fallback TTS provider, when the fallback needs one (e.g. sherpa-kokoro)."
+    prompt: "TTS fallback provider's model dir"
+  - name: HERMES_VOIP_TTS_STABILITY
+    description: "ElevenLabs voice_settings.stability override in [0.0, 1.0]; unset uses the provider's dynamic default."
+    prompt: "ElevenLabs TTS stability (optional, 0.0-1.0)"
+  - name: HERMES_VOIP_TTS_STYLE
+    description: "ElevenLabs voice_settings.style override in [0.0, 1.0]; unset uses the provider's dynamic default."
+    prompt: "ElevenLabs TTS style (optional, 0.0-1.0)"
+  - name: HERMES_VOIP_TTS_SIMILARITY
+    description: "ElevenLabs voice_settings.similarity_boost override in [0.0, 1.0]; unset uses the provider's dynamic default."
+    prompt: "ElevenLabs TTS similarity boost (optional, 0.0-1.0)"
+  - name: HERMES_VOIP_TTS_SPEAKER_BOOST
+    description: "ElevenLabs voice_settings.use_speaker_boost override; unset uses the provider's dynamic default."
+    prompt: "ElevenLabs TTS speaker boost (optional, true/false)"
+  - name: HERMES_VOIP_TTS_STREAMING_LATENCY
+    description: "ElevenLabs optimize_streaming_latency override, an integer in [0, 4] (0 = none, 4 = max); unset uses the provider default."
+    prompt: "ElevenLabs streaming-latency optimisation (optional, 0-4)"
+
+  # --- Call-progress detection (ADR-0064) -----------------------------------
+  - name: HERMES_VOIP_CALL_PROGRESS
+    default: false
+    description: "Enable fax CNG/CED + answering-machine detection (default: false — off by default, adds per-frame Goertzel work and extra system turns)."
+    prompt: "Enable call-progress (fax/AMD) detection (default: false)"
+  - name: HERMES_VOIP_AMD
+    default: false
+    description: "Enable answering-machine detection on outbound calls; only meaningful when HERMES_VOIP_CALL_PROGRESS is on (default: false)."
+    prompt: "Enable answering-machine detection (default: false)"
+  - name: HERMES_VOIP_AMD_HANGUP_ON_FAX
+    default: true
+    description: "Automatically hang up when a fax tone is detected, rather than leaving the line open (default: true)."
+    prompt: "Auto hang-up on detected fax tone (default: true)"
+
+  # --- WebRTC ICE / TURN / video (ADR-0032/0034/0043/0044) -----------------
+  - name: HERMES_VOIP_ICE_STUN_URLS
+    description: >-
+      Comma-separated stun: URLs for WebRTC server-reflexive ICE candidates
+      (default: two public dual-stack STUN servers; an explicit empty value
+      disables STUN — host-candidates only). No effect on the SIP-over-TLS path.
+    prompt: "WebRTC STUN server URLs, comma-separated (default: public STUN pair)"
+  - name: HERMES_VOIP_ICE_USE_IPV4
+    default: true
+    description: "Gather IPv4 WebRTC ICE candidates (default: true)."
+    prompt: "Enable IPv4 ICE candidates (default: true)"
+  - name: HERMES_VOIP_ICE_USE_IPV6
+    default: true
+    description: "Gather (and prefer) IPv6 WebRTC ICE candidates, with IPv4 as fallback (default: true)."
+    prompt: "Enable IPv6 ICE candidates (default: true)"
+  - name: HERMES_VOIP_ICE_TURN_URLS
+    description: "Comma-separated turn:/turns: relay URLs (RFC 8656) for WebRTC behind symmetric NAT/restrictive firewalls; unset (default) = no relay candidate. Requires username + password when set."
+    prompt: "WebRTC TURN relay URLs, comma-separated (optional)"
+  - name: HERMES_VOIP_ICE_TURN_USERNAME
+    description: "TURN relay long-term-credential username; required when HERMES_VOIP_ICE_TURN_URLS is set."
+    prompt: "WebRTC TURN relay username"
+  - name: HERMES_VOIP_ICE_TURN_PASSWORD
+    description: "TURN relay long-term-credential password; required when HERMES_VOIP_ICE_TURN_URLS is set."
+    prompt: "WebRTC TURN relay password"
+    secret: true
+  - name: HERMES_VOIP_VIDEO_SOURCE_PATH
+    description: "Local path to a pre-encoded H.264 Annex-B file looped as outbound WebRTC video; unset (default) = no outbound video (a=inactive)."
+    prompt: "WebRTC outbound video source file path (optional)"
+  - name: HERMES_VOIP_VIDEO_FPS
+    default: 10
+    description: "Frame rate of the WebRTC video source file, used to pace the 90 kHz RTP timestamp (default: 10; range 1-60)."
+    prompt: "WebRTC video source frame rate (default: 10)"
+
+  # --- Diagnostics -----------------------------------------------------------
+  - name: HERMES_VOIP_TEST_TONE
+    default: 0.0
+    description: "Operator diagnostic: seconds of a generated 440 Hz tone played on answer instead of the TTS greeting, to confirm the RTP/G.711 path (default: 0.0, disabled)."
+    prompt: "Diagnostic test-tone duration in seconds (default: 0.0, disabled)"

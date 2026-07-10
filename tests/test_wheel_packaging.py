@@ -213,15 +213,15 @@ def test_pyproject_wheel_artifacts_include_skills() -> None:
         declared.extend(str(k) for k in force_include)
         declared.extend(str(v) for v in force_include.values())
 
-    combined = " ".join(declared)
-    assert "SKILL.md" in combined, (
-        "pyproject.toml wheel target must declare the skills' SKILL.md (e.g. "
-        "src/hermes_voip/skills/**/SKILL.md) in artifacts or force-include so every "
-        "bundled skill lands in the built wheel"
-    )
-    assert "skills" in combined, (
-        "the skills' SKILL.md artifact glob must be anchored under the skills/ "
-        "package-data directory (src/hermes_voip/skills/**/SKILL.md)"
+    # The single artifact glob that ships every bundled skill's SKILL.md, checked as
+    # one whole path token — NOT two loose "skills"/"SKILL.md" substrings, which an
+    # unrelated entry could satisfy separately (codex review). The wheel-smoke job
+    # (assertion 2b) is the live guard against a broken glob; this asserts the build
+    # config. Normalise separators so a Windows-style path still matches.
+    combined = " ".join(declared).replace("\\", "/")
+    assert "skills/**/SKILL.md" in combined, (
+        "pyproject.toml wheel target must declare src/hermes_voip/skills/**/SKILL.md "
+        "in artifacts or force-include so every bundled skill lands in the built wheel"
     )
 
 

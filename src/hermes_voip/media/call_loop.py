@@ -2227,6 +2227,27 @@ class CallLoop:
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
         if result.verdict is GuardVerdict.REFUSE:
+            self._consecutive_refusals += 1
+            if (
+                self._max_consecutive_refusals > 0
+                and self._consecutive_refusals >= self._max_consecutive_refusals
+            ):
+                # A caller whose turns keep tripping the guard is looping the
+                # decline forever (each REFUSE resets the no-input watchdog above,
+                # so nothing else ends the call). Wind up gracefully instead of
+                # declining again. The just-refused turn set _caller_active_in_window
+                # above; clear it so _end_call_gracefully does not read it as a
+                # barge-in and abort (a real barge-in DURING the goodbye still aborts,
+                # giving the caller another turn — refused again, re-triggering this).
+                self._caller_active_in_window = False
+                _log.info(
+                    "guard REFUSE: %d consecutive refusals reached the limit (%d); "
+                    "ending the call gracefully",
+                    self._consecutive_refusals,
+                    self._max_consecutive_refusals,
+                )
+                await self._end_call_gracefully()
+                return
             # The guard refused this turn: it is NEVER handed to the agent (and no
             # filler is armed — there is no agent gap to fill). But silence here strands
             # a false-positived caller, so speak ONE short safe-decline line (ADR-0076)
@@ -2238,6 +2259,9 @@ class CallLoop:
                 _log.info("guard REFUSE: speaking safe-decline line: %r", phrase)
                 await self._speak_phrase_best_effort(phrase, what="decline")
             return
+        # A delivered (non-REFUSE) turn: the caller got through, so reset the
+        # consecutive-REFUSE cycle.
+        self._consecutive_refusals = 0
         # Arm the filler BEFORE handing off the turn, so its delay measures the
         # dead-air gap from the caller-finish moment (this point) — robust even if
         # ``_deliver_turn`` were to block on agent work, rather than relying on it

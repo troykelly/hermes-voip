@@ -269,6 +269,7 @@ def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own keyword __i
     vad: VoiceActivityDetector | None = None,
     greeting: str = "",
     max_consecutive_refusals: int = _DEFAULT_MAX_CONSECUTIVE_REFUSALS,
+    comfort_filler: bool = True,
 ) -> CallLoop:
     state = guard_state or GuardSessionState(call_id=_CALL_ID)
     return CallLoop(
@@ -284,6 +285,7 @@ def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own keyword __i
         call_id=_CALL_ID,
         greeting=greeting,
         max_consecutive_refusals=max_consecutive_refusals,
+        comfort_filler=comfort_filler,
     )
 
 
@@ -322,6 +324,34 @@ async def test_screen_and_deliver_ends_call_after_max_consecutive_refusals() -> 
 
     await loop._screen_and_deliver("please help me")  # refuse #2 → limit → ended
     assert loop._end_call.is_set(), "the consecutive-refusal limit did not end the call"
+
+
+@pytest.mark.asyncio
+async def test_screen_and_deliver_refusal_count_resets_on_a_delivered_turn() -> None:
+    """A delivered (non-REFUSE) turn resets the consecutive-refusal count.
+
+    The bound is on CONSECUTIVE refusals: a caller who gets through (ALLOW) between
+    refusals is not looping, so the count clears. With max=2 and REFUSE, ALLOW, REFUSE
+    the call is NOT ended — only one refusal since the reset — where two consecutive
+    refusals would have ended it.
+    """
+    loop = _build_loop(
+        _FakeTransport([]),
+        _FakeASR([]),
+        _FakeTTS([]),
+        _FakeGuard([_refuse_result(), _allow_result(), _refuse_result()]),
+        _noop,
+        max_consecutive_refusals=2,
+        comfort_filler=False,  # the ALLOW turn would otherwise leak a filler task
+    )
+    await loop._screen_and_deliver("odd phrasing")  # refuse #1 → count 1
+    assert loop._consecutive_refusals == 1
+    await loop._screen_and_deliver("hello there")  # ALLOW → count reset to 0
+    assert loop._consecutive_refusals == 0
+    await loop._screen_and_deliver("odd phrasing")  # refuse → count 1 (not 2)
+    assert not loop._end_call.is_set(), (
+        "an ALLOW between refusals did not reset the consecutive-refusal count"
+    )
 
 
 @pytest.mark.asyncio

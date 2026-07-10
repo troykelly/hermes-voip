@@ -675,13 +675,18 @@ async def test_transfer_rejected_raises() -> None:
 # ---- outbound: transfer outcome wait (ADR-0109) ----------------------------
 
 
-def _refer_notify(status_line: str, *, terminated: bool) -> SipRequest:
+def _refer_notify(
+    status_line: str, *, terminated: bool, event_id: int | None = None
+) -> SipRequest:
     """Build an inbound ``Event:refer`` transfer-progress NOTIFY (``message/sipfrag``).
 
     ``terminated`` sets ``Subscription-State: terminated`` (the final outcome) vs
-    ``active`` (an interim ``100 Trying``-class update).
+    ``active`` (an interim ``100 Trying``-class update). ``event_id`` sets the RFC 3515
+    ``Event: refer;id=<n>`` correlation parameter (the CSeq of the REFER the NOTIFY
+    reports on); ``None`` omits it entirely (an id-less peer).
     """
     sub_state = "terminated;reason=noresource" if terminated else "active;expires=60"
+    event = "refer" if event_id is None else f"refer;id={event_id}"
     return SipRequest(
         method="NOTIFY",
         request_uri="sip:1000@198.51.100.7:5061",
@@ -691,12 +696,19 @@ def _refer_notify(status_line: str, *, terminated: bool) -> SipRequest:
             ("To", "<sip:1000@pbx.example.test>;tag=ours"),
             ("Call-ID", "call-1"),
             ("CSeq", "13 NOTIFY"),
-            ("Event", "refer"),
+            ("Event", event),
             ("Subscription-State", sub_state),
             ("Content-Type", "message/sipfrag;version=2.0"),
         ),
         body=status_line,
     )
+
+
+def _refer_cseq(signaling: _FakeSignaling) -> int:
+    """The CSeq NUMBER stamped in the REFER the transfer just sent (its Event id)."""
+    cseq = _last_request(signaling, "REFER").header("CSeq")
+    assert cseq is not None
+    return int(cseq.split()[0])
 
 
 def _consult_dialog() -> Dialog:
@@ -866,6 +878,86 @@ async def test_transfer_attended_returns_terminal_notify_progress() -> None:
     assert progress is not None
     assert progress.status_code == 200
     assert progress.terminated is True
+
+
+# ---- outbound: transfer NOTIFY subscription correlation (ADR-0109 P1) -------
+
+
+async def test_transfer_blind_stale_notify_id_does_not_wake_new_transfer() -> None:
+    """A prior transfer's late NOTIFY must not wake a NEWLY-armed transfer (RFC 3515).
+
+    Transfer #1 times out but its implicit subscription stays alive; transfer #2 is
+    then armed on the SAME call. A terminal NOTIFY carrying #1's Event ``id`` (the CSeq
+    of #1's REFER) arrives while #2 waits. Correlated by ``Event: refer;id=<CSeq>``, it
+    belongs to #1's subscription — it must NOT wake or classify #2. #2 therefore keeps
+    waiting and times out on its OWN (short) deadline, returning ``None`` rather than
+    #1's stale ``200 OK`` outcome.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+
+    # Transfer #1: send + accept the REFER, capture its CSeq, then let it time out.
+    task1 = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=0.05)
+    )
+    await asyncio.sleep(0)
+    cseq1 = _refer_cseq(signaling)
+    await _accept_refer(session, signaling)
+    assert await asyncio.wait_for(task1, timeout=2.0) is None
+
+    # Transfer #2: arm on the same call; its REFER carries a DIFFERENT CSeq.
+    task2 = asyncio.create_task(
+        session.transfer_blind("sip:4000@pbx.example.test", outcome_timeout=0.1)
+    )
+    await asyncio.sleep(0)
+    cseq2 = _refer_cseq(signaling)
+    assert cseq2 != cseq1
+    await _accept_refer(session, signaling)
+
+    # #1's late terminal NOTIFY (its own id) must be ignored by #2's wait.
+    await session.handle_request(
+        _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq1)
+    )
+    progress = await asyncio.wait_for(task2, timeout=2.0)
+    assert progress is None  # #2 was NOT contaminated by #1's stale 200 OK
+
+
+async def test_transfer_blind_matching_event_id_wakes_wait() -> None:
+    """A terminal NOTIFY carrying the REFER's own CSeq ``id`` wakes the active wait."""
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    cseq = _refer_cseq(signaling)
+    await _accept_refer(session, signaling)
+    await session.handle_request(
+        _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq)
+    )
+    progress = await asyncio.wait_for(task, timeout=2.0)
+    assert progress is not None
+    assert progress.status_code == 200
+
+
+async def test_transfer_blind_idless_notify_honored_best_effort() -> None:
+    """An id-less terminal NOTIFY is honoured for the single active transfer.
+
+    Some peers omit the RFC 3515 Event ``id``; with one transfer in flight we honour it
+    best-effort. Documented residual: an id-less late NOTIFY from a prior subscription
+    cannot be told apart from the active one.
+    """
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    progress = await asyncio.wait_for(task, timeout=2.0)
+    assert progress is not None
+    assert progress.status_code == 200
 
 
 # ---- inbound: handle_request -----------------------------------------------

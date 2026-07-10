@@ -20,6 +20,8 @@ fakes: no live gateway, no real ICE/DTLS. Fakes only (``pbx.example.test`` / ext
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -726,3 +728,116 @@ async def test_place_call_with_ring_timeout_over_wss_raises_not_supported() -> N
     assert not any(m.startswith("INVITE") for m in transport.sent), (
         "place_call must not dial when it cannot honour the requested ring timeout"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6: outbound WebRTC lifecycle SLO log events (issue #1296 / ADR-0075).
+#
+# The SIP/TLS UAC leg (issue #1294, PR #419) emits ``outbound_invite_sent`` /
+# ``outbound_call_connected`` / ``outbound_call_failed`` so a log pipeline can compute
+# the outbound-call SLO (attempts vs answers vs failures) by the shared Call-ID. #1294
+# landed ONLY on the TLS leg; the WebRTC/WSS UAC leg (_handle_outbound_webrtc_invite)
+# emitted none of them, so an outbound WebRTC call was invisible to those SLO queries.
+# These tests hold the WebRTC leg to the SAME three events — each carrying only the
+# Call-ID + ``transport="webrtc"`` (+ the negotiated codec on connect, the ADR-0086
+# category on failure); NEVER the dialled number or gateway host (rule 34 / ADR-0084).
+# ---------------------------------------------------------------------------
+
+
+_ADAPTER_LOGGER = "hermes_voip.adapter"
+
+
+def _records_with_event(
+    caplog: pytest.LogCaptureFixture, event: str
+) -> list[logging.LogRecord]:
+    """All captured records whose structured ``event`` field equals ``event``."""
+    return [rec for rec in caplog.records if getattr(rec, "event", None) == event]
+
+
+def _one_event_record(
+    caplog: pytest.LogCaptureFixture, event: str
+) -> logging.LogRecord:
+    """The single captured record with ``event``; fails loudly if 0 or >1 seen."""
+    matches = _records_with_event(caplog, event)
+    seen = [getattr(rec, "event", None) for rec in caplog.records]
+    assert len(matches) == 1, (
+        f"expected exactly one record with event={event!r}; got {len(matches)}. "
+        f"events seen: {seen!r}"
+    )
+    return matches[0]
+
+
+def _event_field(record: logging.LogRecord, field: str) -> object:
+    """Read a structured ``extra`` field off a LogRecord (a dynamic attribute)."""
+    return getattr(record, field, None)
+
+
+@contextlib.asynccontextmanager
+async def _wss_adapter_ready() -> AsyncIterator[tuple[VoipAdapter, _FakeTransport]]:
+    """A connected WSS adapter with a registered extension, ready to ``place_call``.
+
+    Yields the adapter + its fake transport with the REGISTER already drained from
+    ``transport.sent`` and ``WebRtcMediaSession`` patched to the fake for the block —
+    so a test can drive ``place_call`` (→ the WebRTC UAC leg) and feed sink responses.
+    """
+    from hermes_voip.adapter import VoipAdapter  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    manager = RegistrationManager(_gateway_config("wss"), transport)
+    config = PlatformConfig(enabled=True, extra=dict(_FAKE_ENV_WSS))
+    with (
+        patch(
+            "hermes_voip.adapter.load_gateway_config",
+            return_value=_gateway_config("wss"),
+        ),
+        patch(
+            "hermes_voip.adapter.load_media_config", return_value=load_media_config({})
+        ),
+        patch("hermes_voip.adapter.build_providers", return_value=_fake_providers()),
+        patch("hermes_voip.adapter._make_tls_context", return_value=MagicMock()),
+        patch("hermes_voip.adapter.WssSipTransport", return_value=transport),
+        patch("hermes_voip.adapter.RegistrationManager", return_value=manager),
+    ):
+        adapter = VoipAdapter(config)
+        await adapter.connect()
+        _mark_registered(manager)
+        transport.sent.clear()
+        with patch("hermes_voip.adapter.WebRtcMediaSession", _FakeWebRtcSession):
+            yield adapter, transport
+
+
+def _sent_invite(transport: _FakeTransport) -> SipRequest:
+    """The first INVITE the adapter put on the wire (parsed)."""
+    invites = [m for m in transport.sent if m.startswith("INVITE")]
+    assert invites, "no INVITE was sent over the WSS transport"
+    return SipRequest.parse(invites[0])
+
+
+@pytest.mark.asyncio
+async def test_place_call_over_wss_emits_outbound_invite_sent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The WebRTC UAC leg emits ``outbound_invite_sent`` once the INVITE is on the wire.
+
+    Mirrors the SIP/TLS leg's #1294 event on the WebRTC/WSS leg (#1296): a record
+    carrying ONLY the Call-ID + ``transport="webrtc"`` — never the dialled number or
+    the gateway host (rule 34 / ADR-0084).
+    """
+    async with _wss_adapter_ready() as (adapter, transport):
+        with caplog.at_level(logging.INFO, logger=_ADAPTER_LOGGER):
+            call_task = asyncio.ensure_future(adapter.place_call("1001"))
+            try:
+                await _until(
+                    lambda: any(m.startswith("INVITE") for m in transport.sent)
+                )
+            finally:
+                call_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await call_task
+
+    invite = _sent_invite(transport)
+    sent = _one_event_record(caplog, "outbound_invite_sent")
+    assert _event_field(sent, "call_id") == invite.header("Call-ID")
+    assert _event_field(sent, "transport") == "webrtc"
+    # A cancelled-mid-flight attempt yields no connected/failed event.
+    assert not _records_with_event(caplog, "outbound_call_connected")

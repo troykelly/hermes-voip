@@ -71,6 +71,34 @@ def test_tag_param_rejects_empty_or_whitespace_tag() -> None:
     assert tag_param(";tag=realtag") == "realtag"
 
 
+def test_tag_param_rejects_quoted_and_non_token_values() -> None:
+    # RFC 3261 ``tag-param = "tag" EQUAL token``: the value is a strict ``token``.
+    # A double-quoted value, an empty quoted value, or any value carrying a
+    # non-token character is malformed and treated as ABSENT (``None``) — never
+    # returned verbatim where it could be compared as if it were a real dialog tag
+    # (fail-closed; a quoted tag misclassifies -> rejects, it does not forge a match).
+    assert tag_param(';tag="fake"') is None
+    assert tag_param(';tag=""') is None
+    assert tag_param(';tag="realtag99"') is None
+    assert tag_param(';tag="a b"') is None
+    # Non-token characters (@ / , and an internal space) are rejected, not returned.
+    assert tag_param(";tag=ab@cd") is None
+    assert tag_param(";tag=a/b") is None
+    assert tag_param(";tag=a,b") is None
+    assert tag_param(";tag=ab cd") is None
+
+
+def test_tag_param_accepts_token_with_grammar_legal_lws_and_specials() -> None:
+    # ``SEMI = SWS ";" SWS`` / ``EQUAL = SWS "=" SWS`` and header line-unfolding
+    # (message.py joins folded continuation lines with a space) can leave LWS around
+    # the value; it is stripped BEFORE the token check, never causing a rejection.
+    assert tag_param(";tag = abc123") == "abc123"
+    assert tag_param(";tag=\t abc123 ") == "abc123"
+    assert tag_param("; tag =realtag99") == "realtag99"
+    # Every RFC 3261 ``token`` special char is a legal tag character.
+    assert tag_param(";tag=a-b.c!d%e*f_g+h`i'j~k") == "a-b.c!d%e*f_g+h`i'j~k"
+
+
 def test_params_after_addr_is_quote_aware_for_the_none_fallback() -> None:
     # When find_name_addr() returns None (a bare addr-spec, or a MALFORMED
     # unterminated '<'), the four identity sites fall back to params_after_addr().

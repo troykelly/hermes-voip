@@ -17,6 +17,8 @@ its trailing parameters from the correct bracket.
 
 from __future__ import annotations
 
+import re
+
 __all__ = [
     "find_name_addr",
     "name_addr_parts",
@@ -105,20 +107,38 @@ def split_params(trailing: str) -> list[str]:
     return parts
 
 
+# RFC 3261 §25.1 ``token`` — the grammar a ``tag`` value must match
+# (``tag-param = "tag" EQUAL token``): ``1*(alphanum / "-.!%*_+`'~")``. It excludes
+# the double-quote, so a quoted ``;tag="..."`` value fails the match and is treated
+# as an absent (malformed) tag rather than returned with its quotes intact.
+_TAG_TOKEN = re.compile(r"[A-Za-z0-9\-.!%*_+`'~]+")
+
+
 def tag_param(trailing: str) -> str | None:
     """Return the value of the ``tag`` header parameter (quote-aware), or ``None``.
 
     Splits ``trailing`` with :func:`split_params` so a forged ``;tag=`` hidden
     inside a quoted generic-param value is never mistaken for the real dialog
     tag; the first top-level ``tag=`` wins.
+
+    The value must be a strict RFC 3261 ``token``. A quoted (``;tag="fake"`` /
+    ``;tag=""``), empty, or otherwise non-token value is malformed and treated as
+    ABSENT (``None``) — it neither classifies the request as in-dialog nor is ever
+    returned verbatim to be compared as though it were a real dialog tag (fail-closed).
+    Grammar-legal linear whitespace that ``SEMI``/``EQUAL`` (``SWS ";"/"=" SWS``) and
+    header line-unfolding (``message.py`` joins folded continuation lines with a space)
+    can leave around the value is stripped BEFORE the token check, so a realistic token
+    tag carrying surrounding LWS still parses.
     """
     for part in split_params(trailing):
         key, sep, raw = part.partition("=")
-        if sep and key.strip().lower() == "tag":
-            # A present-but-empty tag (``;tag=`` or ``;tag="  "``) is malformed
-            # (RFC 3261 tag = token, 1+ chars); treat it as absent so it neither
-            # counts as an in-dialog tag nor suppresses our own tag minting.
-            return raw.strip() or None
+        # RFC 3261 LWS is SP / HTAB only (CRLF folding is already unfolded to a single
+        # space by message.py), so strip exactly those around the name and value — NOT
+        # str.strip()'s broader Unicode-whitespace set, which would silently accept a
+        # value wrapped in non-LWS whitespace (form-feed, NBSP, …) as if well-formed.
+        if sep and key.strip(" \t").lower() == "tag":
+            value = raw.strip(" \t")
+            return value if _TAG_TOKEN.fullmatch(value) else None
     return None
 
 

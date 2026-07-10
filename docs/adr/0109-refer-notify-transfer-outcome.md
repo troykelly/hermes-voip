@@ -176,6 +176,17 @@ header is absent but the peer never NOTIFIes. A future opt-out policy that sends
   `_on_notify` and never sets the terminal event, so it collapses to the timeout
   path; the wait never raises past `OUTCOME_UNKNOWN`. The BYE-race is handled
   explicitly (§3). DTMF-confirm gating is unchanged (it precedes the REFER).
+- **Concurrency hardening (adversarial review):** the outcome state is session-wide and
+  awaited outside `self._lock`, so it was hardened across successive review rounds — a
+  NOTIFY is correlated to the active transfer by its REFER CSeq (`Event: refer;id`) so a
+  stale subscription's late NOTIFY cannot contaminate a newer transfer; the outcome is
+  latched atomically at the first wake so a NOTIFY racing a BYE cannot flip `CALL_ENDED`
+  to `COMPLETED`; a second concurrent transfer and a transfer on an already-ended call
+  both fail fast in `_arm_transfer_outcome`; only a definitive final status (`>= 200`)
+  counts as a terminal outcome (a terminated `100 Trying` does not); and every
+  unknown-outcome path (opt-out / timeout / declined) first honours a terminal outcome
+  that latched before the `2xx` (`_latched_transfer_outcome`), so a raced NOTIFY is
+  never discarded.
 - **Tool-contract change:** transfer tool results change from always-"initiated" to
   reporting the real outcome. This is a behavioural change agents/operators must
   expect; it is documented here and covered by tests.

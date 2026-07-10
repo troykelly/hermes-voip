@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from hermes_voip._decimal import _parse_decimal
+from hermes_voip._name_addr import find_name_addr, tag_param
 from hermes_voip.keepalive import build_keepalive_ok, build_options_ok
 from hermes_voip.manager import (
     Cancel,
@@ -88,8 +89,6 @@ _RESPONSE_PREFIX = "SIP/2.0 "
 # single-CRLF pong. Over WebSocket each arrives as one (whitespace-only) text frame.
 _CRLF_KEEPALIVE_PING = "\r\n\r\n"
 _CRLF_KEEPALIVE_PONG = "\r\n"
-# A To/From header parameter carrying a dialog tag (after the name-addr's '>').
-_TO_TAG_PARAM = re.compile(r";\s*tag=", re.IGNORECASE)
 # The Via ``branch`` parameter (RFC 3261 §8.1.1.7) — the transaction identifier.
 _VIA_BRANCH = re.compile(r";\s*branch=([^;,\s]+)", re.IGNORECASE)
 _FINAL_STATUS = 200  # status >= 200 is a final response
@@ -782,11 +781,19 @@ class WssSipTransport:
 
 
 def _has_to_tag(to_value: str | None) -> bool:
-    """``True`` when a ``To`` header carries a dialog ``tag`` parameter."""
+    """``True`` when a ``To`` header carries a dialog ``tag`` parameter.
+
+    Shares the quote-aware primitive with :func:`connection._has_to_tag`: the
+    angle-addr is located OUTSIDE any quoted display-name (RFC 3261 §25.1), and
+    ``tag_param`` splits the trailing header params quote-aware, so neither a
+    ``>``/``;tag=`` inside a quoted display-name nor a ``;tag=`` inside a quoted
+    generic-param value mis-classifies an out-of-dialog request as in-dialog.
+    """
     if to_value is None:
         return False
-    search_space = to_value.split(">", 1)[1] if ">" in to_value else to_value
-    return _TO_TAG_PARAM.search(search_space) is not None
+    name_addr = find_name_addr(to_value)
+    trailing = name_addr[1] if name_addr is not None else to_value.partition(";")[2]
+    return tag_param(trailing) is not None
 
 
 def _method_of(cseq: str | None) -> str | None:

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from hermes_voip._chars import contains_control
+from hermes_voip._name_addr import find_name_addr, tag_param
 
 __all__ = [
     "SipRequest",
@@ -47,8 +48,6 @@ _REQUEST_LINE: Final[re.Pattern[str]] = re.compile(
 )
 # A header field name is an RFC 3261 token: no whitespace, colon, or controls.
 _HEADER_NAME: Final[re.Pattern[str]] = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-# A To/From header already carrying a dialog tag parameter.
-_TAG_PRESENT: Final[re.Pattern[str]] = re.compile(r";\s*tag=", re.IGNORECASE)
 # The header this module computes itself; callers must not also supply it.
 _CONTENT_LENGTH: Final[str] = "Content-Length"
 
@@ -221,7 +220,7 @@ def build_response(  # noqa: PLR0913 — status, reason, to-tag, extra headers a
     to_value = _require_echo(request, "To")
     call_id = _require_echo(request, "Call-ID")
     cseq = _require_echo(request, "CSeq")
-    if to_tag is not None and _TAG_PRESENT.search(_after_angle(to_value)) is None:
+    if to_tag is not None and not _has_tag(to_value):
         to_value = f"{to_value};tag={to_tag}"
     headers: list[tuple[str, str]] = [("Via", via) for via in vias]
     headers.append(("From", from_value))
@@ -248,9 +247,19 @@ def _require_echo(request: SipRequest, name: str) -> str:
     return value
 
 
-def _after_angle(header_value: str) -> str:
-    """The header-parameter span of a name-addr value (after ``>``)."""
-    return header_value.split(">", 1)[1] if ">" in header_value else header_value
+def _has_tag(header_value: str) -> bool:
+    """``True`` when a ``To``/``From`` value already carries a dialog ``tag``.
+
+    The tag is a header parameter: it lives after the closing ``>`` of a
+    name-addr (located quote-aware, RFC 3261 §25.1, so a ``>`` or a literal
+    ``;tag=`` inside a quoted display-name cannot desync the scan and suppress our
+    minted To-tag), or after the first ``;`` of a bare addr-spec. ``tag_param``
+    splits that trailing quote-aware, so a forged ``;tag=`` hidden inside a quoted
+    generic-param value is not read as a present tag.
+    """
+    name_addr = find_name_addr(header_value)
+    trailing = name_addr[1] if name_addr is not None else header_value.partition(";")[2]
+    return tag_param(trailing) is not None
 
 
 @dataclass(frozen=True, slots=True)

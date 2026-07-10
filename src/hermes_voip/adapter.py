@@ -5350,8 +5350,13 @@ class VoipAdapter(BasePlatformAdapter):
             voice=media_cfg.tts_voice or "",
             call_id=call_id,
             # Speak the configured opening line on answer so RTP flows out first
-            # — the caller hears it and a NAT'd gateway latches (ADR-0002).
-            greeting=media_cfg.greeting,
+            # — the caller hears it and a NAT'd gateway latches (ADR-0002). This
+            # is INBOUND-only: on an agent-placed OUTBOUND call the agent's first
+            # turn opens the call (_inject_objective_first_turn), so an inbound
+            # "Hello, how can I help you?" spoken to the party we CALLED is
+            # nonsensical — suppress it (ADR-0019). The NAT-latch still holds:
+            # the objective first turn is the first RTP out.
+            greeting="" if outbound else media_cfg.greeting,
             # Tone diagnostic: when set, plays a 440 Hz sine at 8 kHz bypassing
             # TTS + resample entirely so the operator can isolate transport issues.
             tone_secs=media_cfg.tone_secs,

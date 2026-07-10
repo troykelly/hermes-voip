@@ -6,6 +6,7 @@ register_platform calls without any real Hermes runtime.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -368,6 +369,96 @@ def test_env_enablement_fn_seeds_sip_and_voip_env(
     assert seed.get("HERMES_SIP_PASSWORD") == "fake-password"
     assert seed.get("HERMES_VOIP_STT_MODEL_DIR") == "/models/stt"
     assert "UNRELATED_VAR" not in seed
+
+
+def test_env_enablement_warns_on_unknown_prefixed_key(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A typo'd HERMES_SIP_*/HERMES_VOIP_* env var is warned about, key-only.
+
+    Such a key matches the prefix so ``_env_enablement`` copies it into ``extra``, but
+    it is not a recognised setting — downstream the default is used and the enable gate
+    still passes, silently. The warning names the KEY only, never its value (rule 34).
+    """
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_VOIP_STT_PROIVDER", "deepgram")  # typo of ..._PROVIDER
+    monkeypatch.setenv("HERMES_SIP_EXTENSION_2X", "1002")  # malformed index
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.plugin"):
+        seed = _env_enablement()
+
+    # The typo'd key is still copied (extra is permissive)...
+    assert "HERMES_VOIP_STT_PROIVDER" in seed
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # ...but a warning names it, so the operator is not left guessing.
+    assert any("HERMES_VOIP_STT_PROIVDER" in r.getMessage() for r in warnings), (
+        "no warning was emitted for the unknown/typo'd VoIP env key"
+    )
+    # A malformed indexed suffix (non-digit) is NOT the valid HERMES_SIP_*_<n> form —
+    # the anchored fullmatch rejects it, so it still warns (codex coverage note).
+    assert any("HERMES_SIP_EXTENSION_2X" in r.getMessage() for r in warnings), (
+        "a malformed indexed key (non-digit suffix) must still warn"
+    )
+    # The value must never be logged (rule 34).
+    assert not any("deepgram" in r.getMessage() for r in warnings), (
+        "the unknown-env-key warning leaked the value"
+    )
+
+
+def test_env_enablement_does_not_warn_on_known_or_indexed_keys(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Recognised manifest keys and indexed HERMES_SIP_*_<n> forms never warn."""
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    known_and_indexed = {
+        "HERMES_SIP_HOST": "pbx.example.test",
+        "HERMES_VOIP_GREETING": "Hello there",
+        "HERMES_SIP_EXTENSION_2": "1001",
+        "HERMES_SIP_PASSWORD_2": "fake-password",
+        "HERMES_SIP_USERNAME_2": "user2",
+    }
+    for key, value in known_and_indexed.items():
+        monkeypatch.setenv(key, value)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.plugin"):
+        _env_enablement()
+
+    # None of the keys we set may appear in a warning (robust to any stray env var).
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    for key in known_and_indexed:
+        assert not any(key in msg for msg in warned), (
+            f"a recognised/indexed key wrongly warned: {key!r} in {warned!r}"
+        )
+
+
+def test_known_env_keys_matches_manifest() -> None:
+    """_KNOWN_ENV_KEYS must equal the plugin.yaml requires_env + optional_env names.
+
+    The unknown-env-key warning cross-checks against this constant, so if it drifts from
+    the manifest — a knob added to plugin.yaml but not here (or vice versa) — a VALID
+    key would wrongly warn (or a typo would slip through). Pinned byte-for-byte here.
+    """
+    from importlib.resources import files  # noqa: PLC0415
+
+    import yaml  # noqa: PLC0415
+
+    from hermes_voip.plugin import _KNOWN_ENV_KEYS  # noqa: PLC0415
+
+    manifest = yaml.safe_load(
+        files("hermes_voip").joinpath("plugin.yaml").read_text(encoding="utf-8")
+    )
+    names = {
+        entry["name"]
+        for section in ("requires_env", "optional_env")
+        for entry in manifest.get(section, ())
+    }
+    assert names == _KNOWN_ENV_KEYS, (
+        "_KNOWN_ENV_KEYS drifted from plugin.yaml requires_env/optional_env; "
+        f"missing={names - _KNOWN_ENV_KEYS}, extra={_KNOWN_ENV_KEYS - names}"
+    )
 
 
 def test_register_supplies_is_connected() -> None:

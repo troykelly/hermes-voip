@@ -25,7 +25,7 @@ dependencies = [
 # optional extra so its large transitive tree stays out of the default install,
 # the production licence gate, and the default pip-audit env. The typed boundary
 # is hermes_voip.hermes_surface; the contract test verifies the real surface.
-hermes = ["hermes-agent==0.17.0"]
+hermes = ["hermes-agent==0.18.0"]
 # Local-inference ML stack for the conversational providers (ADR-0006/0007/0008/
 # 0009): onnxruntime for VAD (silero) + the injection guard (DeBERTa), sherpa-onnx
 # for streaming STT/TTS, tokenizers for the DeBERTa guard's SentencePiece tokenizer

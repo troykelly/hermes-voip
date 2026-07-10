@@ -6,6 +6,7 @@ register_platform calls without any real Hermes runtime.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -368,6 +369,36 @@ def test_env_enablement_fn_seeds_sip_and_voip_env(
     assert seed.get("HERMES_SIP_PASSWORD") == "fake-password"
     assert seed.get("HERMES_VOIP_STT_MODEL_DIR") == "/models/stt"
     assert "UNRELATED_VAR" not in seed
+
+
+def test_env_enablement_warns_on_unknown_prefixed_key(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A typo'd HERMES_SIP_*/HERMES_VOIP_* env var is warned about, key-only.
+
+    Such a key matches the prefix so ``_env_enablement`` copies it into ``extra``, but
+    it is not a recognised setting — downstream the default is used and the enable gate
+    still passes, silently. The warning names the KEY only, never its value (rule 34).
+    """
+    from hermes_voip.plugin import _env_enablement  # noqa: PLC0415
+
+    monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
+    monkeypatch.setenv("HERMES_VOIP_STT_PROIVDER", "deepgram")  # typo of ..._PROVIDER
+
+    with caplog.at_level(logging.WARNING, logger="hermes_voip.plugin"):
+        seed = _env_enablement()
+
+    # The typo'd key is still copied (extra is permissive)...
+    assert "HERMES_VOIP_STT_PROIVDER" in seed
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # ...but a warning names it, so the operator is not left guessing.
+    assert any("HERMES_VOIP_STT_PROIVDER" in r.getMessage() for r in warnings), (
+        "no warning was emitted for the unknown/typo'd VoIP env key"
+    )
+    # The value must never be logged (rule 34).
+    assert not any("deepgram" in r.getMessage() for r in warnings), (
+        "the unknown-env-key warning leaked the value"
+    )
 
 
 def test_register_supplies_is_connected() -> None:

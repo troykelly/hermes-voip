@@ -622,7 +622,8 @@ def render_call_context_block(context: InboundCallContext) -> str:
     ]
     block = "\n".join(lines)
     if len(block) > _MAX_CONTEXT_CHARS:
-        # Tail-truncate with an ellipsis, mirroring _sanitize_untrusted_summary.
-        # rstrip() first so the marker never trails a half-word's whitespace.
-        block = block[:_MAX_CONTEXT_CHARS].rstrip() + "…"
+        # Tail-truncate to a true hard cap: reserve one char for the ellipsis so the
+        # marked block still fits WITHIN _MAX_CONTEXT_CHARS. rstrip() first so the
+        # marker never trails a half-word's whitespace.
+        block = block[: _MAX_CONTEXT_CHARS - 1].rstrip() + "…"
     return block

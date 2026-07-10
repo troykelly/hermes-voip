@@ -20,6 +20,8 @@ credentials and hostnames are obvious fakes (``pbx.example.test`` / ext ``1000``
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -39,6 +41,7 @@ from hermes_voip.config import ExtensionConfig, load_media_config
 from hermes_voip.manager import NewCall
 from hermes_voip.media.engine import CallQuality
 from hermes_voip.message import SipRequest, new_call_id, new_tag
+from hermes_voip.sdp import Fingerprint, IceCandidate, SetupRole
 
 if TYPE_CHECKING:
     from hermes_voip.adapter import VoipAdapter
@@ -674,3 +677,279 @@ async def test_inbound_invite_admitted_emits_answered_and_loop_started_events(
 
     loop_started = _record_with_event(caplog, "call_loop_started")
     assert loop_started.call_id == call_id  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Inbound post-200-OK secured-media (DTLS/ICE) handshake failure (SLO overcount)
+# ---------------------------------------------------------------------------
+#
+# A secured-media (WebRTC ICE/DTLS or SIP UDP/TLS/RTP/SAVP) call is ANSWERED (the
+# 200 OK carrying our fingerprint/ICE creds is sent) BEFORE the handshake runs — so a
+# post-200 handshake failure was counted as ``call_answered`` (success) with ZERO
+# failure signal, silently OVERCOUNTING the runbook-0014 call-setup-success SLO. These
+# tests assert BOTH inbound secured paths now emit a structured
+# ``inbound_secured_handshake_failed`` event carrying the ``call_id`` and a stable
+# ``failure_category`` (fingerprint / ice / dtls_timeout / failed) an operator can
+# subtract from the SLO AND use to distinguish misconfig vs network vs peer-timeout.
+
+# A WebRTC SAVPF/Opus/DTLS+ICE offer (mirrors tests/test_adapter_webrtc.py).
+_WEBRTC_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "t=0 0\r\n"
+    "m=audio 50000 UDP/TLS/RTP/SAVPF 111 0\r\n"
+    "a=rtpmap:111 opus/48000/2\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=fingerprint:sha-256 "
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
+    "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n"
+    "a=setup:actpass\r\n"
+    "a=ice-ufrag:peerUFRG\r\n"
+    "a=ice-pwd:peerPWDpeerPWDpeerPWDpeer\r\n"
+    "a=candidate:1 1 UDP 2130706431 127.0.0.1 50000 typ host\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+# A SIP DTLS-SRTP offer: UDP/TLS/RTP/SAVP (no ICE), a=fingerprint + a=setup, a real
+# c=/port (mirrors tests/test_adapter_sip_dtls.py).
+_SIP_DTLS_OFFER = (
+    "v=0\r\n"
+    "o=- 0 0 IN IP4 127.0.0.1\r\n"
+    "s=-\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 40000 UDP/TLS/RTP/SAVP 0 8 101\r\n"
+    "a=rtpmap:0 PCMU/8000\r\n"
+    "a=rtpmap:8 PCMA/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    "a=fmtp:101 0-16\r\n"
+    "a=fingerprint:sha-256 "
+    "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:"
+    "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n"
+    "a=setup:actpass\r\n"
+    "a=rtcp-mux\r\n"
+    "a=sendrecv\r\n"
+)
+
+
+def _make_invite_with_offer(offer: str, call_id: str) -> str:
+    """An inbound INVITE carrying ``offer`` (WebRTC / SIP-DTLS SDP) for ``call_id``."""
+    content_length = len(offer.encode("utf-8"))
+    ftag = new_tag()
+    return (
+        f"INVITE sip:1000@pbx.example.test SIP/2.0\r\n"
+        f"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bKfake\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <sip:9999@pbx.example.test>;tag={ftag}\r\n"
+        f"To: <sip:1000@pbx.example.test>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:9999@127.0.0.1:60000;transport=tls>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"\r\n"
+        f"{offer}"
+    )
+
+
+class _FailingWebRtcSession:
+    """A fake WebRtcMediaSession whose ``run_handshake`` raises ``_EXC`` post-200.
+
+    Builds a valid SAVPF answer (fixed fingerprint / setup / ICE creds + candidate) so
+    the 200 OK is sent, then fails the handshake with the class-configured exception —
+    exercising the post-200 secured-handshake failure branch.
+    """
+
+    _EXC: BaseException = ValueError("fingerprint mismatch")
+
+    def __init__(self, **_kw: object) -> None:
+        self.closed = False
+
+    async def prepare(self) -> None:
+        return None
+
+    @property
+    def setup(self) -> SetupRole:
+        return SetupRole("passive")
+
+    @property
+    def fingerprint(self) -> Fingerprint:
+        return Fingerprint(algorithm="sha-256", value=":".join(["AB"] * 32))
+
+    @property
+    def ice_ufrag(self) -> str:
+        return "ourUFRAGxx"
+
+    @property
+    def ice_pwd(self) -> str:
+        return "ourPWDourPWDourPWDourPWD"
+
+    @property
+    def ice_candidates(self) -> list[IceCandidate]:
+        return [
+            IceCandidate(
+                foundation="candidate:1",
+                component=1,
+                transport="UDP",
+                priority=2130706431,
+                address="127.0.0.1",
+                port=51000,
+                typ="host",
+                raddr=None,
+                rport=None,
+            )
+        ]
+
+    async def run_handshake(self, **_kw: object) -> tuple[object, object]:
+        raise self._EXC
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FailingSipDtlsSession:
+    """A fake SipDtlsMediaSession whose ``run_handshake`` raises ``_EXC`` post-200."""
+
+    _EXC: BaseException = ValueError("fingerprint mismatch")
+    _SESSION_PORT = 40100
+
+    def __init__(self, **_kw: object) -> None:
+        self.closed = False
+        self.pipe = MagicMock(name="udp_pipe")
+
+    async def prepare(self, *, local_address: str, local_port: int = 0) -> None:
+        return None
+
+    @property
+    def setup(self) -> SetupRole:
+        return SetupRole("active")
+
+    @property
+    def fingerprint(self) -> Fingerprint:
+        return Fingerprint(algorithm="sha-256", value=":".join(["AB"] * 32))
+
+    @property
+    def local_port(self) -> int:
+        return self._SESSION_PORT
+
+    async def run_handshake(self, **_kw: object) -> tuple[object, object]:
+        raise self._EXC
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def _drain_call_tasks(adapter: VoipAdapter, call_id: str) -> None:
+    """Cancel + await the abort's background ACK-wait/BYE task so none leak.
+
+    Only ``CancelledError`` is suppressed (the expected outcome of cancelling the
+    bounded ACK-wait); a real exception from the task still propagates (rule 37).
+    """
+    tasks = list(adapter._call_tasks.get(call_id, set()))  # type: ignore[attr-defined]
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [
+        (ValueError("cert fingerprint mismatch"), "fingerprint"),
+        (ConnectionError("ICE connectivity failed"), "ice"),
+        (RuntimeError("DTLS handshake did not complete"), "dtls_timeout"),
+        (OSError("unexpected media error"), "failed"),
+    ],
+)
+async def test_inbound_webrtc_post200_handshake_failure_emits_structured_event(
+    caplog: pytest.LogCaptureFixture,
+    exc: BaseException,
+    category: str,
+) -> None:
+    """A post-200 WebRTC ICE/DTLS handshake failure emits the structured SLO event.
+
+    ``call_answered`` still fires (the 200 OK was sent), so the SLO would OVERCOUNT
+    without a subtractable failure signal — the new
+    ``inbound_secured_handshake_failed`` record carries the ``call_id`` and the
+    ``failure_category`` (fingerprint / ice / dtls_timeout / failed) an operator uses
+    to distinguish misconfig vs network vs peer-timeout.
+    """
+    _FailingWebRtcSession._EXC = exc
+    transport = _FakeTransport()
+    adapter = await _build_adapter(
+        transport, _FakeManager(), env={"HERMES_SIP_MAX_CALLS": "4"}
+    )
+
+    call_id = new_call_id()
+    invite_req = SipRequest.parse(_make_invite_with_offer(_WEBRTC_OFFER, call_id))
+    new_call = NewCall(registration=_ext_config(), invite=invite_req)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER),
+        patch("hermes_voip.adapter.WebRtcMediaSession", _FailingWebRtcSession),
+        patch("hermes_voip.adapter._preflight_codec_dependency", return_value=None),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=MagicMock()),
+    ):
+        await adapter._handle_inbound_invite(new_call)
+        await _drain_call_tasks(adapter, call_id)
+
+    # The 200 OK was sent (the call WAS answered) — this is the overcount surface.
+    answered = _record_with_event(caplog, "call_answered")
+    assert answered.call_id == call_id  # type: ignore[attr-defined]
+
+    failed = _record_with_event(caplog, "inbound_secured_handshake_failed")
+    assert failed.call_id == call_id  # type: ignore[attr-defined]
+    assert failed.failure_category == category  # type: ignore[attr-defined]
+    # Public-repo safety (rule 34): the fixed message text carries only the call_id,
+    # never the exception detail (which can embed gateway connection detail).
+    assert call_id in failed.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [
+        (ValueError("cert fingerprint mismatch"), "fingerprint"),
+        (RuntimeError("DTLS handshake did not complete"), "dtls_timeout"),
+        (OSError("unexpected media error"), "failed"),
+    ],
+)
+async def test_inbound_sip_dtls_post200_handshake_failure_emits_structured_event(
+    caplog: pytest.LogCaptureFixture,
+    exc: BaseException,
+    category: str,
+) -> None:
+    """A post-200 SIP UDP/TLS/RTP/SAVP DTLS handshake failure emits the SLO event.
+
+    The SIP-DTLS leg has NO ICE, so a ``ConnectionError`` is not a category here; a
+    fingerprint mismatch (``ValueError``) and a handshake timeout (``RuntimeError``)
+    are the derivable modes, with any other exception the ``failed`` catch-all.
+    """
+    _FailingSipDtlsSession._EXC = exc
+    transport = _FakeTransport()
+    adapter = await _build_adapter(
+        transport, _FakeManager(), env={"HERMES_SIP_MAX_CALLS": "4"}
+    )
+
+    call_id = new_call_id()
+    invite_req = SipRequest.parse(_make_invite_with_offer(_SIP_DTLS_OFFER, call_id))
+    new_call = NewCall(registration=_ext_config(), invite=invite_req)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER),
+        patch("hermes_voip.adapter.SipDtlsMediaSession", _FailingSipDtlsSession),
+        patch("hermes_voip.adapter._preflight_codec_dependency", return_value=None),
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=MagicMock()),
+    ):
+        await adapter._handle_inbound_invite(new_call)
+        await _drain_call_tasks(adapter, call_id)
+
+    answered = _record_with_event(caplog, "call_answered")
+    assert answered.call_id == call_id  # type: ignore[attr-defined]
+
+    failed = _record_with_event(caplog, "inbound_secured_handshake_failed")
+    assert failed.call_id == call_id  # type: ignore[attr-defined]
+    assert failed.failure_category == category  # type: ignore[attr-defined]
+    assert call_id in failed.getMessage()

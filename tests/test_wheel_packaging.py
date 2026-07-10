@@ -71,6 +71,37 @@ def test_gate_yml_has_wheel_smoke_job() -> None:
     )
 
 
+def test_gate_yml_wheel_smoke_asserts_skills_packaged() -> None:
+    """The wheel-smoke job must assert the bundled skills' SKILL.md land in the wheel.
+
+    Like ``plugin.yaml`` (assertion 2), each skill's ``SKILL.md`` is non-``.py``
+    package data that hatchling ships ONLY because the wheel target declares the
+    ``skills/**/SKILL.md`` artifacts glob. A dropped glob would build a skill-less
+    wheel that passes every other check but makes ``register_skills`` raise inside
+    the Hermes runtime (a missing SKILL.md is a packaging defect, ADR-0047 / rule 37).
+    RED (rule 18) until the wheel-smoke job gains a step that inspects the built
+    wheel's zip entries for the skills' ``SKILL.md``.
+    """
+    raw = _GATE_YML.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    assert isinstance(data, dict)
+    jobs = data.get("jobs", {})
+    assert isinstance(jobs, dict)
+    wheel_smoke = jobs.get("wheel-smoke", {})
+    assert isinstance(wheel_smoke, dict)
+    steps = wheel_smoke.get("steps", [])
+    assert isinstance(steps, list)
+    runs = "\n".join(
+        str(step.get("run", "")) for step in steps if isinstance(step, dict)
+    )
+    assert "SKILL.md" in runs, (
+        "the wheel-smoke job must assert the bundled skills' SKILL.md are packaged "
+        "in the built wheel (mirroring the plugin.yaml zipfile check) — otherwise a "
+        "dropped skills/**/SKILL.md artifacts glob ships a skill-less wheel that "
+        "passes CI green but makes register_skills() raise in the Hermes runtime"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (B) In-process structural checks (version / pyproject / entry-point)
 #     These are fast and require no wheel build.

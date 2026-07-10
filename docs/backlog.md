@@ -1635,7 +1635,7 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   is packaged but NOT that the 5 bundled skills' `SKILL.md` files (hatchling glob `src/hermes_voip/skills/**/SKILL.md`,
   pyproject.toml:131) ship in the wheel — a broken glob / removed dir would ship an incomplete wheel silently.
   Add a wheel-smoke assertion (+ an `importlib.resources` resolve test for the skills).
-- [ ] **[high] feature/correctness** — Hold state is invisible to the CallLoop no-input watchdog, so held
+- [x] (#460) **[high] feature/correctness** — Hold state is invisible to the CallLoop no-input watchdog, so held
   calls get TORN DOWN. `call.py` flips `set_hold(True)` (agent `hold_call`, `call.py:301`) / `set_hold(held_by_peer)`
   (`call.py:890`) at the media layer and the engine then discards inbound datagrams (`engine.py:2209`), but
   CallLoop has no hold awareness — the watchdog keeps counting empty windows, reprompts into dead media, and

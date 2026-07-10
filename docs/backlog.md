@@ -1642,7 +1642,7 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   after `no_input_max_reprompts` (~30s) ENDS the call. Failure: agent holds to consult → the live caller is
   hung up ~30s later; symmetric for peer/PBX hold. Bridge the CallSession hold flip into CallLoop to suspend
   the no-input watchdog while held (both agent- and peer-initiated). (`call_loop.py`, `call.py`, `engine.py`)
-- [ ] **[medium] test** — `gate_tool_call` block-reason precedence (DEGRADED > RESTRICTED >
+- [x] (#462) **[medium] test** — `gate_tool_call` block-reason precedence (DEGRADED > RESTRICTED >
   INSUFFICIENT_PRIVILEGE > UNCONFIRMED — `policy.py` `_gate_non_safe` :363-373, docstringed as
   security-load-bearing for the audit trail) is never pinned at the RESTRICTED boundaries: no test sets
   `turn_restricted=True` WITH `privilege_level < min_level`, nor `degraded=True` WITH `turn_restricted=True`.
@@ -1656,7 +1656,7 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   persistently-refused caller (accent/phrasing tripping the injection guard) hears the decline set cycle
   forever, never reaching the agent nor a graceful close. Add a consecutive-REFUSE counter + graceful end
   after N (new `HERMES_VOIP_*` knob mirroring `no_input_max_reprompts`). (`call_loop.py`, `policy.py`)
-- [ ] **[medium] operability** — `_env_enablement()` (`plugin.py:198-224`) copies EVERY `HERMES_SIP_*`/
+- [x] (#463) **[medium] operability** — `_env_enablement()` (`plugin.py:198-224`) copies EVERY `HERMES_SIP_*`/
   `HERMES_VOIP_*` env var into `extra`, and `validate_voip_config()` reads only known keys by exact name — so
   an operator typo (`HERMES_VOIP_STT_PROIVDER`) is silently dropped, the default is used, and the enable gate
   returns True with no warning. Cross-check the present key set against the plugin.yaml `optional_env`/

@@ -1271,7 +1271,7 @@ Two self-referential backlog-hygiene items from the 37-candidate review were app
 
 - [ ] **[low] efficiency** — Replace `struct.unpack_from` + generator peak scan with `audioop.max` in `call_loop._play()`. (`src/hermes_voip/media/call_loop.py`)
 - [ ] **[low] efficiency** — Widen call-progress / Goertzel helpers to accept `Sequence[float]` so `on_audio_frame` can avoid a per-frame `list[float]` allocation. (`src/hermes_voip/media/call_progress.py`)
-- [ ] **[low] efficiency** — Remove the redundant `float()` coercion in `EchoCanceller.push_reference()`'s per-sample loop. (`src/hermes_voip/media/aec.py`)
+- [x] **[low] efficiency** (#468) — Remove the redundant `float()` coercion in `EchoCanceller.push_reference()`'s per-sample loop. (`src/hermes_voip/media/aec.py`)
 
 ### Observability
 
@@ -1327,7 +1327,7 @@ Two candidates were already/partially tracked and were not duplicated here: `_gr
 - [ ] **[low] operability** — Document the `HERMES_VOIP_TEST_TONE` diagnostic knob in manifest/runbooks for no-audio incident triage. (`src/hermes_voip/plugin.yaml`, `docs/runbooks/0002-voip-live-validation.md`, `docs/runbooks/0013-voip-incident-oncall.md`)
 - [x] (#363) **[medium] operability** — Reject inert `HERMES_VOIP_DUPLEX_MODE=full` at config load so operators cannot believe full-duplex is active when runtime ignores it. (`src/hermes_voip/config.py`) — shipped #363.
 - [ ] **[medium] feature** — Deliver inbound `take-message` results to an operator-visible channel; today inbound capture reports success to the agent but not to the operator. (`src/hermes_voip/adapter.py`, `docs/adr/0047-bundled-call-skills.md`, `src/hermes_voip/skills/take-message/SKILL.md`)
-- [ ] **[medium] feature** — Surface terminal REFER/NOTIFY transfer outcome to the agent/operator instead of treating REFER acceptance as final success. (`src/hermes_voip/call.py`, `src/hermes_voip/adapter.py`, `src/hermes_voip/voip_tools.py`)
+- [x] **[medium] feature** (#469) — Surface terminal REFER/NOTIFY transfer outcome to the agent/operator instead of treating REFER acceptance as final success. (`src/hermes_voip/call.py`, `src/hermes_voip/adapter.py`, `src/hermes_voip/voip_tools.py`)
 
 ## Wave-10 gap-review items (discovered 2026-06-28)
 

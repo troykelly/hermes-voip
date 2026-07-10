@@ -1981,7 +1981,9 @@ class CallLoop:
         :meth:`barge_in` — the caller is engaging, so the end is ABORTED: we do NOT set
         :attr:`_end_call`, we consume the flag, and return ``False`` so the watchdog
         resumes the reprompt cycle. Read-then-clear with no await between, so the check
-        cannot miss a concurrent set. Returns ``True`` when the end is committed.
+        cannot miss a concurrent set. The end is ABORTED the same way if the call was
+        placed on hold while the goodbye played (a held call is never torn down) —
+        checked with no await before the set. Returns ``True`` when the end commits.
         """
         if self._goodbye and self._goodbye_phrase:
             _log.info("no-input: speaking goodbye before end: %r", self._goodbye_phrase)
@@ -1991,6 +1993,14 @@ class CallLoop:
         if self._caller_active_in_window:
             self._caller_active_in_window = False
             _log.info("no-input: caller answered during the goodbye; aborting the end")
+            return False
+        # A hold that arrived while the goodbye played (agent ``hold_call`` / peer or
+        # PBX hold re-INVITE) means the call must NOT be torn down — abort the end and
+        # let the watchdog resume (it keeps skipping held windows). Checked with NO
+        # await before the set, so a concurrent ``set_hold`` on the one event loop
+        # cannot be missed between this check and the commit.
+        if self._transport.on_hold:
+            _log.info("no-input: call held during the goodbye; aborting the end")
             return False
         self._end_call.set()
         return True

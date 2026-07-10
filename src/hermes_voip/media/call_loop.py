@@ -177,6 +177,20 @@ _DEFAULT_NO_INPUT_REPROMPT_PHRASES: Final[tuple[str, ...]] = (
     "Sorry, I can't hear anything. Are you still there?",
 )
 
+#: Default "didn't catch that" reprompt set (item 1282), spoken when a caller SPEAKS but
+#: ASR returns an empty/whitespace final (they endpointed on real speech we could not
+#: transcribe). Distinct from the no-input reprompt: the caller is NOT silent, so "Are
+#: you still there?" would be wrong — this asks them to repeat. Each phrase reads
+#: naturally on every TTS model (no bracket tag) and is chosen at RANDOM per fire (no
+#: immediate repeat). An EMPTY set opts the feature out (the empty final is then just
+#: dropped, as before item 1282). Multi-language selection follows the comfort-filler /
+#: reprompt mechanism (ADR-0085/0057).
+_DEFAULT_DIDNT_CATCH_PHRASES: Final[tuple[str, ...]] = (
+    "Sorry, I didn't catch that.",
+    "Sorry, I didn't quite catch that — could you say it again?",
+    "I didn't get that. Could you repeat it?",
+)
+
 #: Default spoken-goodbye master switch (ADR-0057): ON. On a loop-initiated graceful end
 #: (the no-input reprompt limit is exhausted) a short closing line is spoken and flushed
 #: BEFORE the loop returns (so it still has a live media path), instead of dropping
@@ -610,6 +624,11 @@ class CallLoop:
             fire, never repeating the immediately-previous phrase. Each phrase reads
             naturally on every TTS model. Must be non-empty (defaults to the built-in
             set). Multi-language-ready like the comfort-filler phrases (ADR-0085).
+        didnt_catch_phrases: The "didn't catch that" reprompt set (item 1282), spoken
+            NON-BLOCKING when the caller speaks but ASR returns an empty final. One is
+            chosen at RANDOM per fire (no immediate repeat). An EMPTY set OPTS THE
+            FEATURE OUT — the empty final is then just dropped (the pre-1282 behaviour).
+            Defaults to the built-in set.
         goodbye: Spoken-goodbye master switch (ADR-0057), ``True`` by default. When
             ``True``, the loop-initiated graceful end (no-input limit exhausted) speaks
             ``goodbye_phrase`` and flushes it BEFORE :meth:`run` returns, so it has a
@@ -681,6 +700,7 @@ class CallLoop:
         no_input_timeout_ms: int = _DEFAULT_NO_INPUT_TIMEOUT_MS,
         no_input_max_reprompts: int = _DEFAULT_NO_INPUT_MAX_REPROMPTS,
         no_input_reprompt_phrases: tuple[str, ...] = _DEFAULT_NO_INPUT_REPROMPT_PHRASES,
+        didnt_catch_phrases: tuple[str, ...] = _DEFAULT_DIDNT_CATCH_PHRASES,
         goodbye: bool = _DEFAULT_GOODBYE,
         goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE,
         refuse_decline_phrases: tuple[str, ...] = _DEFAULT_REFUSE_DECLINE_PHRASES,
@@ -784,6 +804,14 @@ class CallLoop:
         # The reprompt phrase chosen on the previous fire, so the random selector can
         # avoid an immediate repeat. ``None`` until the first fire. Loop-only.
         self._last_reprompt_phrase: str | None = None
+        # "Didn't catch that" reprompt on a spoke-but-untranscribed turn (item 1282). An
+        # EMPTY set opts the feature out. The reprompt is spoken on its OWN task
+        # (_didnt_catch_task) scheduled from the ASR pump — NEVER awaited inline, which
+        # would stall the pump (the sole audio_q consumer) for the synth's duration.
+        # Single in-flight at a time; the done-callback nulls it, teardown cancels it.
+        self._didnt_catch_phrases = didnt_catch_phrases
+        self._last_didnt_catch_phrase: str | None = None
+        self._didnt_catch_task: asyncio.Task[None] | None = None
         # Spoken goodbye on the loop-initiated graceful end (ADR-0057).
         self._goodbye = goodbye
         self._goodbye_phrase = goodbye_phrase
@@ -1413,6 +1441,13 @@ class CallLoop:
                         )
                         if transcript.text.strip():
                             await transcript_q.put(transcript.text)
+                        else:
+                            # The caller endpointed on real speech we could not
+                            # transcribe: they are NOT silent. Drop the empty turn from
+                            # delivery (no phantom turn, #269) but reprompt them to
+                            # repeat, and mark caller activity so the silence watchdog
+                            # does not ALSO fire "Are you still there?" (item 1282).
+                            self._on_untranscribed_turn()
             await transcript_q.put(_END_OF_STREAM)
 
         async def _delivery() -> None:
@@ -1464,15 +1499,19 @@ class CallLoop:
                 if greeting_stream is not None:
                     tg.create_task(self._play_greeting(greeting_stream))
         finally:
-            # The no-input watchdog (ADR-0057) is a tracked task outside the TaskGroup
-            # (armed at loop start). Cancel + JOIN it on every exit path so it never
-            # outlives the call — incl. one parked mid-reprompt/goodbye playout. Same
-            # best-effort join as the filler: its result is handled by its own
+            # The no-input watchdog (ADR-0057, armed at loop start) and the "didn't
+            # catch that" reprompt (item 1282, per untranscribed turn) are tracked tasks
+            # OUTSIDE the TaskGroup. Cancel BOTH and JOIN them on every exit path so
+            # neither outlives the call — incl. one parked mid-reprompt/goodbye playout.
+            # Best-effort join (like the filler): each result is handled by its own
             # done-callback (rule 37) and must not mask the loop's teardown/exception.
             watchdog = self._no_input_task
             self._cancel_no_input_watchdog()
-            if watchdog is not None:
-                await asyncio.wait({watchdog})
+            didnt_catch = self._didnt_catch_task
+            self._cancel_didnt_catch()
+            tracked_singles = {t for t in (watchdog, didnt_catch) if t is not None}
+            if tracked_singles:
+                await asyncio.wait(tracked_singles)
             # The comfort filler runs as a tracked task OUTSIDE the TaskGroup (it is
             # armed per delivered turn, not at loop start). On every exit path —
             # normal end, error, or cancellation — cancel it AND JOIN it so it fully
@@ -1866,6 +1905,77 @@ class CallLoop:
         phrase = self._comfort_rng.choice(alternatives) if alternatives else phrases[0]
         self._last_reprompt_phrase = phrase
         return phrase
+
+    def _next_didnt_catch_phrase(self) -> str:
+        """Return a RANDOM 'didn't-catch' phrase, never the immediately-previous one.
+
+        Same discipline as :meth:`_next_reprompt_phrase` (ADR-0057): random, no
+        back-to-back repeat, a direct choice among the distinct alternatives so it
+        terminates even for a single-phrase set. Only called when the set is
+        non-empty (the caller checks). Uses the shared injected ``_comfort_rng``.
+        """
+        phrases = self._didnt_catch_phrases
+        alternatives = tuple(
+            dict.fromkeys(p for p in phrases if p != self._last_didnt_catch_phrase)
+        )
+        phrase = self._comfort_rng.choice(alternatives) if alternatives else phrases[0]
+        self._last_didnt_catch_phrase = phrase
+        return phrase
+
+    def _on_untranscribed_turn(self) -> None:
+        """Handle a spoke-but-untranscribed caller turn (empty final; item 1282).
+
+        Called from the ASR pump when an end-of-turn fires with no transcribable text.
+        When enabled (a non-empty phrase set): mark caller activity so the no-input
+        watchdog does not double-fire, and SCHEDULE a "didn't catch that" reprompt on
+        its OWN task — never awaited here: the pump is the sole ``audio_q`` consumer
+        and awaiting the synth would stall it. At most one reprompt is in flight at a
+        time; a further untranscribed turn while one is still speaking is ignored (no
+        stacked reprompts). When opted out (empty set) this is a no-op and the empty
+        final is simply dropped (the pre-1282 behaviour).
+        """
+        if not self._didnt_catch_phrases:
+            return
+        self._caller_active_in_window = True
+        existing = self._didnt_catch_task
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._speak_didnt_catch())
+        self._didnt_catch_task = task
+        task.add_done_callback(self._clear_didnt_catch_task)
+
+    def _clear_didnt_catch_task(self, task: asyncio.Task[None]) -> None:
+        """Null the didn't-catch task handle when THIS task finishes (done-callback)."""
+        if self._didnt_catch_task is task:
+            self._didnt_catch_task = None
+
+    async def _speak_didnt_catch(self) -> None:
+        """Speak ONE 'didn't catch that' reprompt after an untranscribed caller turn.
+
+        Runs as its own task (scheduled by :meth:`_on_untranscribed_turn`) so the ASR
+        pump keeps draining while this synthesises and plays. Routes through
+        :meth:`_speak_phrase_best_effort` so it is sanitised, echo-gate-arming and
+        flushable like any agent audio, and a synth/send hiccup is logged and swallowed
+        (rule 37); a ``CancelledError`` (teardown, or a barge-in cancelling a playing
+        reprompt) is the normal stop and propagates.
+        """
+        phrase = self._next_didnt_catch_phrase()
+        _log.info(
+            "asr: untranscribed caller turn — 'didn't catch that' reprompt: %r", phrase
+        )
+        await self._speak_phrase_best_effort(phrase, what="didn't-catch reprompt")
+
+    def _cancel_didnt_catch(self) -> None:
+        """Cancel and forget the in-flight didn't-catch reprompt task (idempotent).
+
+        Called from :meth:`run`'s teardown so a reprompt parked mid-playout never
+        outlives the call. Cancelling raises ``CancelledError`` inside
+        :meth:`_speak_didnt_catch`, ending it cleanly; the done-callback ignores it.
+        """
+        task = self._didnt_catch_task
+        if task is not None:
+            self._didnt_catch_task = None
+            task.cancel()
 
     def _next_refuse_decline_phrase(self) -> str:
         """Return a RANDOM safe-decline phrase, never the immediately-previous one.

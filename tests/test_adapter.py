@@ -3280,6 +3280,174 @@ async def test_run_call_loop_keeps_greeting_on_inbound() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #443 redo: an OUTBOUND call carrying an objective emits it as the first turn
+# via the REAL injection-scheduling path -- not by patching/counting
+# ``_inject_objective_first_turn``. Drives ``place_call`` over a real
+# ``RegistrationManager`` + real ``Dialog``/UAC transaction to an actual 2xx
+# answer (rule 26: only the media engine, ``CallLoop``, and the ASR/TTS/guard
+# providers are fakes), so the outbound-handler branch that runs when
+# ``outbound=True`` AND an objective is set (``_handle_outbound_invite``) really
+# executes end to end.
+# ---------------------------------------------------------------------------
+
+
+def _outbound_sent_invites(transport: _FakeTransport) -> list[SipRequest]:
+    """The INVITE requests the adapter placed on ``transport`` (outbound UAC)."""
+    out: list[SipRequest] = []
+    for message in transport.sent:
+        if message.startswith("SIP/2.0 "):
+            continue
+        req = SipRequest.parse(message)
+        if req.method == "INVITE":
+            out.append(req)
+    return out
+
+
+def _build_outbound_2xx(req: SipRequest) -> str:
+    """A 2xx answer to an outbound INVITE offering plain PCMU/PCMA (matches offer)."""
+    body = (
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 127.0.0.1\r\n"
+        "s=-\r\n"
+        "c=IN IP4 127.0.0.1\r\n"
+        "t=0 0\r\n"
+        "m=audio 30000 RTP/AVP 0 8\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=sendrecv\r\n"
+    )
+    via = req.header("Via") or ""
+    from_hdr = req.header("From") or ""
+    to_hdr = req.header("To") or ""
+    call_id = req.header("Call-ID") or ""
+    cseq = req.header("CSeq") or ""
+    return (
+        "SIP/2.0 200 OK\r\n"
+        f"Via: {via}\r\n"
+        f"From: {from_hdr}\r\n"
+        f"To: {to_hdr};tag={new_tag()}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq}\r\n"
+        "Contact: <sip:1001@127.0.0.1:5061;transport=tls>\r\n"
+        "Content-Type: application/sdp\r\n"
+        f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+        "\r\n"
+        f"{body}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbound_call_with_objective_injects_via_real_path() -> None:
+    """An outbound call carrying an objective injects it via the REAL path.
+
+    Drives ``place_call`` to a real 2xx answer over a real ``RegistrationManager``
+    + real ``Dialog``/UAC transaction (rule 26: only the media engine, ``CallLoop``,
+    and the ASR/TTS/guard providers are fakes), so the outbound-handler branch that
+    runs when ``outbound=True`` AND an objective is set (adapter.py's
+    ``_handle_outbound_invite``) really executes, proving BOTH:
+
+    (a) the ``CallLoop`` is built with an empty greeting (outbound greeting
+        suppression, ADR-0019/#443) -- read back from the REAL constructor call.
+    (b) the objective first turn is ACTUALLY injected: the real (never patched,
+        never call-counted) ``_inject_objective_first_turn`` runs as its own
+        background task (``place_call``'s own ``asyncio.create_task``), builds a
+        real ``MessageEvent``, and calls the real inherited ``handle_message`` --
+        observed by capturing what reaches the agent's message handler (the real
+        delivery seam), never a mock call-count on ``_inject_objective_first_turn``
+        itself.
+    """
+    transport = _FakeTransport()
+    adapter, manager = await _build_adapter_with_real_manager(transport)
+    for state in manager._by_extension.values():
+        state.registered = True
+
+    received: list[object] = []
+
+    async def _handler(event: object) -> None:
+        received.append(event)
+
+    adapter.set_message_handler(_handler)
+
+    from hermes_voip import adapter as adapter_mod  # noqa: PLC0415
+    from hermes_voip.dtmf import DtmfSendMode  # noqa: PLC0415
+
+    engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        set_hold=AsyncMock(return_value=None),
+        rekey_srtp=AsyncMock(return_value=None),
+        send_dtmf=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=20002,
+        inbound_sample_rate=8_000,
+        dtmf_send_mode=DtmfSendMode.RFC4733,
+    )
+    call_loop_cls = MagicMock(return_value=MagicMock(run=AsyncMock(return_value=None)))
+
+    objective = "confirm tomorrow's delivery window"
+
+    async def _drive_outbound() -> None:
+        await _until(lambda: bool(_outbound_sent_invites(transport)))
+        for req in _outbound_sent_invites(transport):
+            sink = transport._calls.get(req.header("Call-ID") or "")
+            if sink is None:
+                continue
+            await sink.on_response(  # type: ignore[attr-defined]  # test double
+                SipResponse.parse(_build_outbound_2xx(req))
+            )
+
+    driver = asyncio.create_task(_drive_outbound())
+    with (
+        patch.object(adapter_mod, "RtpMediaTransport", return_value=engine),
+        patch.object(adapter_mod, "CallLoop", call_loop_cls),
+        patch.object(adapter_mod, "GuardSessionState", return_value=MagicMock()),
+        patch.object(adapter_mod, "_make_vad", return_value=MagicMock()),
+        patch.object(adapter_mod, "_make_endpointer", return_value=MagicMock()),
+    ):
+        try:
+            call_id = await adapter.place_call("1001", objective=objective)
+        finally:
+            driver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await driver
+
+        assert call_id
+
+        def _objective_delivered() -> bool:
+            return any(objective in getattr(e, "text", "") for e in received)
+
+        # place_call returns as soon as the background ``_run_and_teardown`` /
+        # ``_inject_objective_first_turn`` tasks are CREATED (fire-and-forget); it
+        # does not await either. Poll for both real effects before asserting. (The
+        # mocked ``CallLoop.run`` returns immediately, so the call's OWN teardown
+        # may also deliver an end-of-call system message on this same handler --
+        # wait specifically for the objective text, not just "any message".)
+        await _until(lambda: call_loop_cls.called and _objective_delivered())
+
+        # (a) the REAL CallLoop constructor call carried the outbound greeting
+        # suppression (#443) -- read back from the actual call, not a stub.
+        call_loop_cls.assert_called_once()
+        assert call_loop_cls.call_args.kwargs["greeting"] == ""
+
+        # (b) the objective-injection scheduling ran for REAL (place_call's own
+        # ``asyncio.create_task(self._inject_objective_first_turn(call_id))`` is
+        # never patched here); its real effect already reached the agent above.
+
+    matching = [e for e in received if objective in getattr(e, "text", "")]
+    assert len(matching) == 1, (
+        "the objective first turn must reach the agent exactly once "
+        f"(matched {len(matching)} of {len(received)} delivered events)"
+    )
+    event = matching[0]
+    assert getattr(event, "internal", False) is True, (
+        "the objective seed must be an internal system directive, not caller speech"
+    )
+
+    await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
 # Operator invariant: before answering, verify we support a codec+rate pair; if
 # not, DON'T answer — reject with 488 and log a CLEAR error, never fail silently.
 # An offer with NO supported voice codec (G.729 / PT 18 only) must be rejected

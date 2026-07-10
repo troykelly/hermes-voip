@@ -801,6 +801,30 @@ async def test_bye_before_late_terminal_notify_latches_call_ended() -> None:
     assert report.unknown_reason is TransferUnknownReason.CALL_ENDED
 
 
+async def test_second_transfer_while_one_awaits_is_rejected() -> None:
+    # codex round-3 P1: transfer_blind/attended release self._lock before awaiting the
+    # outcome, but the correlation/latch state is session-wide. A second transfer while
+    # the first is still awaiting must FAIL FAST (not clobber the first's event/CSeq and
+    # leave it to time out). Transfers on one leg are inherently serial.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task1 = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    await _accept_refer(session, signaling)  # transfer1 is now awaiting its outcome
+    with pytest.raises(CallError, match="already"):
+        await asyncio.wait_for(
+            session.transfer_blind("sip:4000@pbx.example.test", outcome_timeout=2.0),
+            timeout=1.0,
+        )
+    # transfer1 is uncorrupted: its terminal NOTIFY still resolves it to COMPLETED.
+    await session.handle_request(_refer_notify("SIP/2.0 200 OK", terminated=True))
+    report = await asyncio.wait_for(task1, timeout=2.0)
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+
+
 async def test_transfer_blind_returns_failed_notify_progress_on_4xx() -> None:
     """A terminal 4xx NOTIFY (busy) is returned so the adapter can classify FAILED."""
     signaling, media = _FakeSignaling(), _FakeMedia()

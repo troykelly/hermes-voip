@@ -108,9 +108,15 @@ its lifecycle. The events:
 | `inbound_secured_handshake_failed` | a post-200-OK inbound WebRTC ICE/DTLS or SIP `UDP/TLS/RTP/SAVP` handshake fails (the answered call cannot be keyed) | `call_id`, `transport` (`webrtc`/`sip-dtls`), `failure_category` (`fingerprint`/`ice`/`dtls`/`failed`) |
 | `call_loop_started` | the conversational loop goes live | `call_id`, `direction` (`inbound`/`outbound`) |
 | `call_released` | the admission slot is freed at teardown | `call_id`, `duration_s`, `active_calls` |
-| `outbound_invite_sent` | an outbound (`place_call`) INVITE leaves the UAC | `call_id`, `transport="tls"` |
-| `outbound_call_connected` | the outbound `2xx` answer establishes the session | `call_id`, `transport`, `codec` (negotiated name) |
-| `outbound_call_failed` | the outbound dial fails (non-2xx / refused 2xx / CANCEL / error) | `call_id`, `transport`, `category` (`busy`/`no_answer`/`declined`/`failed`) |
+| `outbound_invite_sent` | an outbound (`place_call`) INVITE leaves the UAC | `call_id`, `transport` (`tls`/`webrtc`) |
+| `outbound_call_connected` | the outbound `2xx` answer establishes the session | `call_id`, `transport` (`tls`/`webrtc`), `codec` (negotiated name) |
+| `outbound_call_failed` | the outbound dial fails — a non-2xx / refused-2xx final response, or a raised setup error (any exception before the session is established) | `call_id`, `transport` (`tls`/`webrtc`), `category` (`busy`/`no_answer`/`declined`/`failed`) |
+
+A dial aborted by local task cancellation (`asyncio.CancelledError`, e.g. on shutdown) is
+deliberately NOT emitted as `outbound_call_failed` on either leg — cancellation is not a
+dial outcome, and it re-raises unchanged (rule 37). Such an attempt logs `outbound_invite_sent`
+with no terminal event; treat an `invite_sent` with neither `outbound_call_connected` nor
+`outbound_call_failed` as an aborted attempt, not a failure.
 
 Setup success ≈ `count(call_answered) / (count(call_answered) + count(call_rejected))`.
 
@@ -132,8 +138,11 @@ never the peer fingerprint, gateway host, or exception text (rule 34 / ADR-0084)
 `category` (the SAME ADR-0086 value the `place_call` tool result carries, so logs and tool
 outcome never diverge) breaks failures into busy / no-answer / declined / other. These carry
 ONLY `call_id` + fixed context — never the dialled number, gateway host, or SIP reason
-phrase (rule 34 / ADR-0084). They cover the SIP-over-TLS outbound path; instrumenting the
-WSS/WebRTC outbound UAC with the same events is a follow-up (backlog).
+phrase (rule 34 / ADR-0084). BOTH outbound legs emit all three — the SIP-over-TLS UAC
+(`transport="tls"`, #1294) and the WSS/WebRTC UAC (`transport="webrtc"`, #1296) — so the
+success/failure queries above cover every outbound call regardless of transport; filter on
+the `transport` field to split TLS vs WebRTC. (`webrtc` is the same surface token the
+inbound `inbound_secured_handshake_failed` event uses, so one filter spans both directions.)
 
 **Media-transport loss (ADR-0100).** When the RTP socket reports a fatal `error_received`
 the media engine ends the call and emits a `rtp_transport_lost` event (WARNING) carrying

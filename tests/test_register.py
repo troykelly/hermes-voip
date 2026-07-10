@@ -384,6 +384,7 @@ def test_env_enablement_warns_on_unknown_prefixed_key(
 
     monkeypatch.setenv("HERMES_SIP_HOST", "pbx.example.test")
     monkeypatch.setenv("HERMES_VOIP_STT_PROIVDER", "deepgram")  # typo of ..._PROVIDER
+    monkeypatch.setenv("HERMES_SIP_EXTENSION_2X", "1002")  # malformed index
 
     with caplog.at_level(logging.WARNING, logger="hermes_voip.plugin"):
         seed = _env_enablement()
@@ -394,6 +395,11 @@ def test_env_enablement_warns_on_unknown_prefixed_key(
     # ...but a warning names it, so the operator is not left guessing.
     assert any("HERMES_VOIP_STT_PROIVDER" in r.getMessage() for r in warnings), (
         "no warning was emitted for the unknown/typo'd VoIP env key"
+    )
+    # A malformed indexed suffix (non-digit) is NOT the valid HERMES_SIP_*_<n> form —
+    # the anchored fullmatch rejects it, so it still warns (codex coverage note).
+    assert any("HERMES_SIP_EXTENSION_2X" in r.getMessage() for r in warnings), (
+        "a malformed indexed key (non-digit suffix) must still warn"
     )
     # The value must never be logged (rule 34).
     assert not any("deepgram" in r.getMessage() for r in warnings), (

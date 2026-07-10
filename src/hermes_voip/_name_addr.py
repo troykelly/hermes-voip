@@ -135,8 +135,15 @@ def params_after_addr(value: str) -> str:
     """
     in_quote = False
     angle_depth = 0
+    escaped = False
     for index, char in enumerate(value):
-        if char == '"':
+        if escaped:
+            # The previous char was a backslash inside a quoted span; this char is
+            # its escaped literal (RFC 3261 §25.1 quoted-pair) — never structural.
+            escaped = False
+        elif in_quote and char == "\\":
+            escaped = True
+        elif char == '"':
             in_quote = not in_quote
         elif char == "<" and not in_quote:
             angle_depth += 1

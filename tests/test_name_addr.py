@@ -87,3 +87,13 @@ def test_params_after_addr_is_quote_aware_for_the_none_fallback() -> None:
     assert tag_param(params_after_addr("sip:1000@pbx.example.test;tag=abc")) == "abc"
     # No parameters at all.
     assert params_after_addr("sip:1000@pbx.example.test") == ""
+
+
+def test_params_after_addr_honours_backslash_escaped_quote() -> None:
+    # A backslash-escaped quote (RFC 3261 §25.1 quoted-pair) inside the quoted
+    # display-name does NOT end the quoted span, so a ';tag=' after it is still
+    # inside the quotes — not a top-level parameter. Mirrors split_params.
+    forged = r'"X\";tag=fake" <sip:1000@pbx.example.test'  # unterminated '<'
+    assert find_name_addr(forged) is None
+    assert params_after_addr(forged) == ""
+    assert tag_param(params_after_addr(forged)) is None

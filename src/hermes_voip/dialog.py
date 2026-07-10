@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from hermes_voip._header_list import split_header_list
-from hermes_voip._name_addr import find_name_addr, tag_param
+from hermes_voip._name_addr import find_name_addr, params_after_addr, tag_param
 from hermes_voip.message import (
     SipRequest,
     SipResponse,
@@ -315,10 +315,7 @@ def _uri_and_tag(value: str) -> tuple[str, str | None]:
     # (RFC 3261 §25.1) cannot desync the split and hide the tag by matching on the
     # wrong bracket.
     name_addr = find_name_addr(value)
-    if name_addr is not None:
-        params = name_addr[1]
-    else:
-        _, _, params = value.partition(";")
+    params = name_addr[1] if name_addr is not None else params_after_addr(value)
     return uri, tag_param(params)
 
 

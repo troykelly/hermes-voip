@@ -2538,6 +2538,8 @@ class VoipAdapter(BasePlatformAdapter):
                         engine=_bg_engine,
                         guard_state=_bg_guard_state,
                         outbound=True,
+                        # Outbound: no INVITE receipt, so no time-to-first-audio (854).
+                        invite_monotonic=None,
                     )
                     _raised = False
                 finally:
@@ -3217,6 +3219,8 @@ class VoipAdapter(BasePlatformAdapter):
                         engine=_bg_engine,
                         guard_state=_bg_guard_state,
                         outbound=True,
+                        # Outbound: no INVITE receipt, so no time-to-first-audio (854).
+                        invite_monotonic=None,
                     )
                     _raised = False
                 finally:
@@ -3327,6 +3331,15 @@ class VoipAdapter(BasePlatformAdapter):
         """Async body of _on_inbound_invite; wires the full call stack."""
         invite = new_call.invite
         call_id = invite.header("Call-ID") or ""
+        # Time-to-first-audio SLO (runbook 0014, item 854): stamp the instant this
+        # inbound-INVITE handler begins — the earliest plugin-controlled point. The
+        # whole caller-perceived wait (admission + SDP negotiation + TTS synthesis +
+        # RTP startup) unfolds AFTER this stamp; only sub-millisecond pre-dispatch
+        # (transport socket read -> coroutine schedule) sits outside the measured
+        # span. The CallLoop logs INVITE -> first outbound RTP off this stamp when the
+        # opening greeting's first packet goes out. monotonic() is process-wide, so
+        # the loop's own monotonic() reads compare directly.
+        invite_monotonic = time.monotonic()
         _log.info(
             "INVITE received: Call-ID %s, registration ext %s",
             call_id,
@@ -3930,6 +3943,8 @@ class VoipAdapter(BasePlatformAdapter):
                 engine=engine,
                 guard_state=guard_state,
                 outbound=False,
+                # Inbound: the INVITE-receipt instant drives time-to-first-audio (854).
+                invite_monotonic=invite_monotonic,
             )
             loop_raised = False
         finally:
@@ -5417,6 +5432,7 @@ class VoipAdapter(BasePlatformAdapter):
         engine: RtpMediaTransport,
         guard_state: GuardSessionState,
         outbound: bool,
+        invite_monotonic: float | None = None,
     ) -> CallLoop:
         """Build the per-call ``CallLoop``, drive it to completion, return it.
 
@@ -5506,6 +5522,10 @@ class VoipAdapter(BasePlatformAdapter):
             # hears the operator's chosen voice exactly as a normal caller does.
             voice=media_cfg.tts_voice or "",
             call_id=call_id,
+            # Time-to-first-audio SLO (runbook 0014, item 854): the INVITE-receipt
+            # instant for inbound calls (``None`` on outbound — no INVITE receipt, and
+            # no greeting, so the loop emits no first_audio_latency there).
+            invite_monotonic=invite_monotonic,
             # Speak the configured opening line on answer so RTP flows out first
             # — the caller hears it and a NAT'd gateway latches (ADR-0002). This
             # is INBOUND-only: on an agent-placed OUTBOUND call the agent's first

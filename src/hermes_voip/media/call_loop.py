@@ -79,6 +79,7 @@ import random
 import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
+from time import monotonic
 from typing import Final, Protocol
 
 from hermes_voip.media.audio import generate_tone_frames
@@ -546,6 +547,11 @@ class CallLoop:
             Hermes agent.
         voice: Opaque voice identifier passed to ``tts.synthesize()``.
         call_id: The call/session identifier passed to ``guard.screen()``.
+        invite_monotonic: The :func:`time.monotonic` instant the adapter received the
+            inbound INVITE, or ``None``. When set (inbound calls), the loop logs a
+            ``first_audio_latency`` event (INVITE → first outbound RTP) when the
+            opening greeting/tone puts its first packet on the wire (runbook 0014,
+            item 854). ``None`` on outbound calls (no INVITE receipt) suppresses it.
         greeting: The opening line spoken the instant the loop starts (before any
             inbound audio). Empty string disables the greeting. Defaults to empty
             so a caller that does not want one need not pass it.
@@ -647,7 +653,7 @@ class CallLoop:
             callback failure is logged and never kills the call (rule 37).
     """
 
-    def __init__(  # noqa: PLR0913 — keyword-only constructor; all params are real dependencies/config
+    def __init__(  # noqa: PLR0913, PLR0915 — keyword-only constructor; every param + init statement is a real dependency/config field
         self,
         *,
         transport: MediaTransport,
@@ -660,6 +666,7 @@ class CallLoop:
         deliver_turn: Callable[[str], Awaitable[None]],
         voice: str,
         call_id: str,
+        invite_monotonic: float | None = None,
         greeting: str = "",
         tone_secs: float = 0.0,
         barge_in_mode: BargeInMode = BargeInMode.GATED,
@@ -697,6 +704,14 @@ class CallLoop:
         self._deliver_turn = deliver_turn
         self._voice = voice
         self._call_id = call_id
+        # The INVITE-receipt monotonic instant (inbound only) for time-to-first-audio
+        # (runbook 0014, item 854); ``None`` on outbound calls suppresses the event.
+        self._invite_monotonic = invite_monotonic
+        # STT-finalize instant of the turn awaiting a reply, for the per-turn latency
+        # SLO event (runbook 0014, item 848). Set at each ASR finalize; consumed and
+        # cleared when the reply's first frame goes out (fires once per turn). ``None``
+        # means no turn is awaiting a reply.
+        self._turn_t0: float | None = None
         self._greeting = greeting
         self._tone_secs = tone_secs
         self.barge_in_mode = barge_in_mode
@@ -2156,6 +2171,24 @@ class CallLoop:
 
         def _log_first_rtp() -> None:
             _log.info("greeting: first RTP sent")
+            # Time-to-first-audio SLO (runbook 0014, item 854): when the adapter passed
+            # the INVITE-receipt instant (inbound calls), log the INVITE -> first-RTP
+            # latency ONCE — this callback fires only on the opening's first frame.
+            # Local-only structured INFO (ADR-0075): call_id + the integer ms only, no
+            # caller PII (rule 34 / ADR-0084). Total + non-blocking (a subtraction, a
+            # round, and a log) so it never delays or breaks the greeting playout.
+            invite_t0 = self._invite_monotonic
+            if invite_t0 is not None:
+                first_audio_latency_ms = round((monotonic() - invite_t0) * 1000)
+                _log.info(
+                    "first audio latency: %d ms (INVITE -> first RTP)",
+                    first_audio_latency_ms,
+                    extra={
+                        "event": "first_audio_latency",
+                        "call_id": self._call_id,
+                        "first_audio_latency_ms": first_audio_latency_ms,
+                    },
+                )
 
         await self._play(stream, on_first_frame=_log_first_rtp)
 

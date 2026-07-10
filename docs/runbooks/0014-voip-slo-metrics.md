@@ -231,8 +231,18 @@ grep "rtp tx: first packet" /path/to/hermes/log | head -1
 - 200 OK sent → first RTP sent: < 1.5 s (TTS synthesis of the greeting + RTP startup).
   - If > 2 s: check for TTS provider latency (ElevenLabs API calls or Kokoro synthesis).
 
-**NOT YET INSTRUMENTED:**
-- `voip.media.first_audio_latency_ms` — histogram, wall-clock time INVITE → first RTP tx.
+**LIVE (structured event, ADR-0075):** `first_audio_latency` on the
+`hermes_voip.media.call_loop` logger — emitted once per **inbound** call on the greeting's
+first outbound RTP frame. Fields: `call_id`, `first_audio_latency_ms` (wall-clock
+INVITE → first RTP tx, ms; PII-free per ADR-0084). Outbound calls carry no INVITE instant,
+so the event is inbound-only.
+
+```jsonl
+# Time-to-first-audio (ms) across inbound calls, sorted (eyeball p50/p99):
+jq -r 'select(.event=="first_audio_latency") | .first_audio_latency_ms' /path/to/hermes/log.jsonl | sort -n
+# Count breaches of the < 2 s budget:
+jq -r 'select(.event=="first_audio_latency" and .first_audio_latency_ms > 2000) | .call_id' /path/to/hermes/log.jsonl | wc -l
+```
 
 ---
 
@@ -535,13 +545,14 @@ grep "asr: delivering turn" /path/to/hermes/log | wc -l
 
 ## Instrumentation roadmap
 
-**Current state (as of 2026-06-26):**
+**Current state (as of 2026-07-10):**
 - ✅ **STRUCTURED LOG EVENTS (ADR-0075):** per-call lifecycle (`invite_received`,
   `call_rejected`, `call_answered`, `inbound_secured_handshake_failed`,
-  `call_loop_started`, `call_released`) and RTCP
+  `call_loop_started`, `call_released`), time-to-first-audio (`first_audio_latency`),
+  and RTCP
   call-quality (`rtcp_call_quality`) emit machine-parseable `extra={}` fields — call setup
-  success, RTP loss/jitter/RTT, and concurrency gauge are now countable from logs without
-  prose-grepping. LOCAL-ONLY stdlib logging; no external sink.
+  success, time to first audio, RTP loss/jitter/RTT, and concurrency gauge are now countable
+  from logs without prose-grepping. LOCAL-ONLY stdlib logging; no external sink.
 - ✅ **MEASURABLE from logs:** registration events, call setup (INVITE → 200 OK), time to first audio,
   per-turn latency (rough), concurrent calls.
 - 🟡 **SOURCE EXISTS, EMISSION TBD:** the structured events above are not yet PUSHED to a

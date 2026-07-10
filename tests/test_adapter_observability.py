@@ -679,6 +679,69 @@ async def test_inbound_invite_admitted_emits_answered_and_loop_started_events(
     assert loop_started.call_id == call_id  # type: ignore[attr-defined]
 
 
+async def test_inbound_invite_threads_invite_monotonic_into_call_loop() -> None:
+    """The inbound path threads the captured INVITE monotonic instant into CallLoop.
+
+    ``first_audio_latency`` (runbook-0014, 854) is emitted INSIDE CallLoop off
+    ``self._invite_monotonic``. The CallLoop unit test proves that, given a real
+    instant, the event fires on the greeting's first RTP frame. This test covers
+    the complementary WIRING seam: that ``_handle_inbound_invite`` actually
+    constructs CallLoop with ``invite_monotonic`` set to a real ``float`` — NOT
+    the ``None`` outbound-sentinel that suppresses the event. Without it, a
+    refactor could silently pass ``None`` and the SLO metric would never fire in
+    production while every CallLoop unit test stayed green (AGENTS.md rule 26).
+
+    CallLoop is patched (this asserts the adapter wiring, not the RTP emit).
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(
+        transport, _FakeManager(), env={"HERMES_SIP_MAX_CALLS": "4"}
+    )
+    adapter._media_cfg = load_media_config(
+        {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+    )
+
+    call_id = new_call_id()
+    invite_req = SipRequest.parse(_make_invite(call_id=call_id))
+    new_call = NewCall(registration=_ext_config(), invite=invite_req)
+
+    with (
+        patch(
+            "hermes_voip.adapter.RtpMediaTransport",
+            return_value=MagicMock(
+                connect=AsyncMock(return_value=True),
+                stop=AsyncMock(return_value=None),
+                start_rtcp=AsyncMock(return_value=None),
+                _rtcp_active=False,
+                local_port=20002,
+                inbound_sample_rate=8_000,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallSession",
+            return_value=MagicMock(
+                dialog_id=(call_id, "local-tag", "remote-tag"),
+                ended=False,
+            ),
+        ),
+        patch(
+            "hermes_voip.adapter.CallLoop",
+            return_value=MagicMock(run=AsyncMock(return_value=None)),
+        ) as call_loop_cls,
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
+        patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
+    ):
+        await adapter._handle_inbound_invite(new_call)
+
+    call_loop_cls.assert_called_once()
+    passed = call_loop_cls.call_args.kwargs.get("invite_monotonic")
+    assert isinstance(passed, float), (
+        "inbound _handle_inbound_invite must construct CallLoop with a real float "
+        f"invite_monotonic (the captured INVITE instant), got {passed!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Inbound post-200-OK secured-media (DTLS/ICE) handshake failure (SLO overcount)
 # ---------------------------------------------------------------------------

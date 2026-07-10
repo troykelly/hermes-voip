@@ -390,7 +390,6 @@ optional_env:
     description: 'The spoken goodbye line on a loop-initiated graceful end (default: "Goodbye.").'
     prompt: 'Goodbye line (default: "Goodbye.")'
   - name: HERMES_VOIP_DECLINE_PHRASE
-    default: "Sorry, I cannot take this call."
     description: 'The line spoken to a HERMES_VOIP_DENY_MODE=decline caller before BYE (default for English: "Sorry, I cannot take this call."). Blank/unset selects the built-in line for HERMES_VOIP_LANGUAGE (English fallback for a language with no built-in line). One short line, no line breaks, max 200 chars.'
     prompt: 'Decline-mode spoken line (default: "Sorry, I cannot take this call.")'
   - name: HERMES_VOIP_REFUSE_DECLINE_PHRASES

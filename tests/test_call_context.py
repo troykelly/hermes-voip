@@ -553,3 +553,31 @@ def test_render_block_omits_absent_fields() -> None:
     # No "Forwarded"/diversion section when there is no diversion.
     assert "Diversion" not in block
     assert "User-Agent" not in block
+
+
+def test_render_block_is_bounded_when_caller_floods_headers() -> None:
+    # A caller floods the untrusted, network-reported header fields (User-Agent,
+    # Subject, Organization) with huge values to balloon the injected agent-context
+    # block. The rendered block must be bounded — mirroring the outbound summary cap
+    # (adapter._MAX_SUMMARY_CHARS = 600) — so a caller cannot inflate the agent's
+    # context window via forgeable INVITE headers, nor push the trusted framing
+    # header out of the model's attention behind a wall of attacker-controlled text.
+    flood = "A" * 5000
+    ctx = _ctx(
+        [
+            ("From", '"Mallory" <sip:2000@pbx.example.test>;tag=abc'),
+            ("User-Agent", flood),
+            ("Subject", flood),
+            ("Organization", flood),
+        ]
+    )
+    block = render_call_context_block(ctx)
+    # Bounded to the 600-char cap plus the one-char ellipsis truncation marker.
+    assert len(block) <= 601, len(block)
+    # Actively truncated — the ellipsis marker proves the cap fired.
+    assert block.endswith("…")
+    # Truncation removes the caller's tail, never the fixed trusted framing header:
+    # the untrusted/spoofable label still opens the block (mirrors the label test).
+    low = block.lower()
+    assert "spoof" in low
+    assert "untrusted" in low

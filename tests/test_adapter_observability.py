@@ -689,7 +689,7 @@ async def test_inbound_invite_admitted_emits_answered_and_loop_started_events(
 # failure signal, silently OVERCOUNTING the runbook-0014 call-setup-success SLO. These
 # tests assert BOTH inbound secured paths now emit a structured
 # ``inbound_secured_handshake_failed`` event carrying the ``call_id`` and a stable
-# ``failure_category`` (fingerprint / ice / dtls_timeout / failed) an operator can
+# ``failure_category`` (fingerprint / ice / dtls / failed) an operator can
 # subtract from the SLO AND use to distinguish misconfig vs network vs peer-timeout.
 
 # A WebRTC SAVPF/Opus/DTLS+ICE offer (mirrors tests/test_adapter_webrtc.py).
@@ -860,7 +860,7 @@ async def _drain_call_tasks(adapter: VoipAdapter, call_id: str) -> None:
     [
         (ValueError("cert fingerprint mismatch"), "fingerprint"),
         (ConnectionError("ICE connectivity failed"), "ice"),
-        (RuntimeError("DTLS handshake did not complete"), "dtls_timeout"),
+        (RuntimeError("DTLS handshake did not complete"), "dtls"),
         (OSError("unexpected media error"), "failed"),
     ],
 )
@@ -874,7 +874,7 @@ async def test_inbound_webrtc_post200_handshake_failure_emits_structured_event(
     ``call_answered`` still fires (the 200 OK was sent), so the SLO would OVERCOUNT
     without a subtractable failure signal — the new
     ``inbound_secured_handshake_failed`` record carries the ``call_id`` and the
-    ``failure_category`` (fingerprint / ice / dtls_timeout / failed) an operator uses
+    ``failure_category`` (fingerprint / ice / dtls / failed) an operator uses
     to distinguish misconfig vs network vs peer-timeout.
     """
     _FailingWebRtcSession._EXC = exc
@@ -904,15 +904,18 @@ async def test_inbound_webrtc_post200_handshake_failure_emits_structured_event(
     assert failed.call_id == call_id  # type: ignore[attr-defined]
     assert failed.failure_category == category  # type: ignore[attr-defined]
     # Public-repo safety (rule 34): the fixed message text carries only the call_id,
-    # never the exception detail (which can embed gateway connection detail).
+    # never the exception detail (which can embed gateway connection detail), and the
+    # record carries NO exception traceback (``_log.error``, not ``_log.exception``),
+    # since a DTLS/SSL traceback can embed the gateway host.
     assert call_id in failed.getMessage()
+    assert failed.exc_info is None
 
 
 @pytest.mark.parametrize(
     ("exc", "category"),
     [
         (ValueError("cert fingerprint mismatch"), "fingerprint"),
-        (RuntimeError("DTLS handshake did not complete"), "dtls_timeout"),
+        (RuntimeError("DTLS handshake did not complete"), "dtls"),
         (OSError("unexpected media error"), "failed"),
     ],
 )
@@ -953,3 +956,6 @@ async def test_inbound_sip_dtls_post200_handshake_failure_emits_structured_event
     assert failed.call_id == call_id  # type: ignore[attr-defined]
     assert failed.failure_category == category  # type: ignore[attr-defined]
     assert call_id in failed.getMessage()
+    # No exception traceback attached (``_log.error``, not ``_log.exception``) — a
+    # DTLS/SSL traceback can embed the gateway host (rule 34).
+    assert failed.exc_info is None

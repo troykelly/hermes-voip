@@ -105,7 +105,7 @@ its lifecycle. The events:
 | `invite_received` | inbound INVITE arrives | `call_id`, `extension` |
 | `call_rejected` | any pre-200-OK reject (486/603/488/422) | `call_id`, `outcome="rejected"`, `sip_code`, `reason` |
 | `call_answered` | the inbound `200 OK` is sent | `call_id`, `outcome="answered"`, `sip_code=200` |
-| `inbound_secured_handshake_failed` | a post-200-OK inbound WebRTC ICE/DTLS or SIP `UDP/TLS/RTP/SAVP` handshake fails (the answered call cannot be keyed) | `call_id`, `transport` (`webrtc`/`sip-dtls`), `failure_category` (`fingerprint`/`ice`/`dtls_timeout`/`failed`) |
+| `inbound_secured_handshake_failed` | a post-200-OK inbound WebRTC ICE/DTLS or SIP `UDP/TLS/RTP/SAVP` handshake fails (the answered call cannot be keyed) | `call_id`, `transport` (`webrtc`/`sip-dtls`), `failure_category` (`fingerprint`/`ice`/`dtls`/`failed`) |
 | `call_loop_started` | the conversational loop goes live | `call_id`, `direction` (`inbound`/`outbound`) |
 | `call_released` | the admission slot is freed at teardown | `call_id`, `duration_s`, `active_calls` |
 | `outbound_invite_sent` | an outbound (`place_call`) INVITE leaves the UAC | `call_id`, `transport="tls"` |
@@ -123,7 +123,7 @@ setup success ≈ `(count(call_answered) − count(inbound_secured_handshake_fai
 (count(call_answered) + count(call_rejected))`. The `failure_category` on
 `inbound_secured_handshake_failed` distinguishes the failure MODE — `fingerprint` (a
 misconfigured `a=fingerprint`, RFC 5763 §5), `ice` (ICE connectivity failure, WebRTC
-only), `dtls_timeout` (the peer never completed the DTLS handshake), or `failed` (any
+only), `dtls` (a DTLS/SRTP handshake failure — SSL error, abort, or timeout), or `failed` (any
 other error). These carry ONLY `call_id` + `transport` + the fixed category token —
 never the peer fingerprint, gateway host, or exception text (rule 34 / ADR-0084).
 

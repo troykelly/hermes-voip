@@ -297,7 +297,10 @@ def _inbound_secured_failure_category(exc: BaseException) -> str:
     if isinstance(exc, ConnectionError):
         return "ice"
     if isinstance(exc, RuntimeError):
-        return "dtls_timeout"
+        # A RuntimeError from either secured path is a generic DTLS handshake
+        # failure — the SIP-DTLS leg also wraps a pyOpenSSL ``SSL.Error`` as a
+        # RuntimeError, not only a timeout — so do NOT mislabel it as a timeout.
+        return "dtls"
     return "failed"
 
 
@@ -306,7 +309,7 @@ def _inbound_secured_failure_extra(
 ) -> dict[str, str]:
     """Structured ``extra={}`` for a post-200 inbound secured-handshake failure.
 
-    Attached to the existing ``_log.exception`` in the WebRTC / SIP-DTLS handshake
+    Attached to the ``_log.error`` in the WebRTC / SIP-DTLS handshake
     ``except`` blocks so a log pipeline can filter
     ``event='inbound_secured_handshake_failed'`` and break failures down by
     :func:`_inbound_secured_failure_category`. ``transport`` is the fixed secured
@@ -4288,9 +4291,12 @@ class VoipAdapter(BasePlatformAdapter):
             # ``call_answered``, so without this the setup-success SLO OVERCOUNTS. Emit
             # ``inbound_secured_handshake_failed`` + a ``failure_category`` so the SLO
             # query can subtract it and the operator can tell fingerprint (misconfig) /
-            # ice (network) / dtls_timeout (peer) apart. Control flow is unchanged — the
-            # call is still torn down and the reject signal re-raised below.
-            _log.exception(
+            # ice (network) / dtls (peer) apart. Control flow is unchanged — the call
+            # is still torn down and the reject signal re-raised below. Use ``error``
+            # (not ``exception``) so the traceback — which can carry the SIP gateway
+            # host — is NOT attached to this public-repo-logged record; the fixed
+            # category token is the safe, sufficient signal (rule 34).
+            _log.error(
                 "INVITE %s: WebRTC ICE/DTLS handshake failed",
                 call_id,
                 extra=_inbound_secured_failure_extra(call_id, exc, transport="webrtc"),
@@ -4597,7 +4603,7 @@ class VoipAdapter(BasePlatformAdapter):
             # has no ICE, so only fingerprint / dtls_timeout / failed are derivable) so
             # the SLO query can subtract it. Control flow is unchanged — the call is
             # still torn down and the reject signal re-raised below.
-            _log.exception(
+            _log.error(
                 "INVITE %s: SIP DTLS-SRTP handshake failed",
                 call_id,
                 extra=_inbound_secured_failure_extra(

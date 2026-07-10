@@ -158,6 +158,13 @@ _DEFAULT_NO_INPUT_TIMEOUT_MS: Final[int] = 10_000
 #: the caller is treated as gone and the call is wound up (goodbye, then a clean end).
 _DEFAULT_NO_INPUT_MAX_REPROMPTS: Final[int] = 2
 
+#: Default number of CONSECUTIVE guard-REFUSE turns before the loop ends the call
+#: gracefully. A caller whose turns keep tripping the injection guard otherwise loops
+#: the safe-decline line forever: a REFUSE is caller activity, so it resets the no-input
+#: watchdog every turn and nothing else ends the call. 0 DISABLES the bound (the prior
+#: unbounded behaviour); a delivered (non-REFUSE) turn resets the count.
+_DEFAULT_MAX_CONSECUTIVE_REFUSALS: Final[int] = 3
+
 #: Default reprompt phrase set (ADR-0057), used when a CallLoop is built without an
 #: explicit set. Each phrase reads naturally on every TTS model (no bracket tag), and is
 #: chosen at RANDOM per fire (no immediate repeat) so repeated reprompts on one call do
@@ -670,6 +677,7 @@ class CallLoop:
         goodbye: bool = _DEFAULT_GOODBYE,
         goodbye_phrase: str = _DEFAULT_GOODBYE_PHRASE,
         refuse_decline_phrases: tuple[str, ...] = _DEFAULT_REFUSE_DECLINE_PHRASES,
+        max_consecutive_refusals: int = _DEFAULT_MAX_CONSECUTIVE_REFUSALS,
         rng: random.Random | None = None,
         dtmf_interdigit_ms: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -771,6 +779,12 @@ class CallLoop:
         # The decline phrase chosen on the previous REFUSE, so the random selector can
         # avoid an immediate repeat. ``None`` until the first refusal. Loop-only.
         self._last_refuse_decline_phrase: str | None = None
+        # After this many CONSECUTIVE guard REFUSEs the loop ends the call gracefully
+        # instead of speaking yet another decline — a persistently-refused caller would
+        # otherwise never reach the agent nor a close (ADR-0076). 0 disables the bound;
+        # a delivered (non-REFUSE) turn resets the count. Loop-only state.
+        self._max_consecutive_refusals = max_consecutive_refusals
+        self._consecutive_refusals = 0
         # The single in-flight no-input watchdog task, or None when off / not yet armed.
         # ``run`` arms it at loop start (when enabled) and cancels+joins it at teardown
         # so it never leaks. The done-callback nulls it on completion.
@@ -2213,6 +2227,27 @@ class CallLoop:
         result = await self._guard.screen(text, call_id=self._call_id)
         self._guard_state.record(result)
         if result.verdict is GuardVerdict.REFUSE:
+            self._consecutive_refusals += 1
+            if (
+                self._max_consecutive_refusals > 0
+                and self._consecutive_refusals >= self._max_consecutive_refusals
+            ):
+                # A caller whose turns keep tripping the guard is looping the
+                # decline forever (each REFUSE resets the no-input watchdog above,
+                # so nothing else ends the call). Wind up gracefully instead of
+                # declining again. The just-refused turn set _caller_active_in_window
+                # above; clear it so _end_call_gracefully does not read it as a
+                # barge-in and abort (a real barge-in DURING the goodbye still aborts,
+                # giving the caller another turn — refused again, re-triggering this).
+                self._caller_active_in_window = False
+                _log.info(
+                    "guard REFUSE: %d consecutive refusals reached the limit (%d); "
+                    "ending the call gracefully",
+                    self._consecutive_refusals,
+                    self._max_consecutive_refusals,
+                )
+                await self._end_call_gracefully()
+                return
             # The guard refused this turn: it is NEVER handed to the agent (and no
             # filler is armed — there is no agent gap to fill). But silence here strands
             # a false-positived caller, so speak ONE short safe-decline line (ADR-0076)
@@ -2224,6 +2259,9 @@ class CallLoop:
                 _log.info("guard REFUSE: speaking safe-decline line: %r", phrase)
                 await self._speak_phrase_best_effort(phrase, what="decline")
             return
+        # A delivered (non-REFUSE) turn: the caller got through, so reset the
+        # consecutive-REFUSE cycle.
+        self._consecutive_refusals = 0
         # Arm the filler BEFORE handing off the turn, so its delay measures the
         # dead-air gap from the caller-finish moment (this point) — robust even if
         # ``_deliver_turn`` were to block on agent work, rather than relying on it

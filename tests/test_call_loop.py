@@ -28,6 +28,7 @@ import pytest
 
 import hermes_voip.media.call_loop as _call_loop_mod
 from hermes_voip.media.call_loop import (
+    _DEFAULT_MAX_CONSECUTIVE_REFUSALS,
     _DTMF_TURN_PREFIX,
     BargeInMode,
     CallLoop,
@@ -267,6 +268,8 @@ def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own keyword __i
     *,
     vad: VoiceActivityDetector | None = None,
     greeting: str = "",
+    max_consecutive_refusals: int = _DEFAULT_MAX_CONSECUTIVE_REFUSALS,
+    comfort_filler: bool = True,
 ) -> CallLoop:
     state = guard_state or GuardSessionState(call_id=_CALL_ID)
     return CallLoop(
@@ -281,6 +284,8 @@ def _build_loop(  # noqa: PLR0913 — factory mirrors CallLoop's own keyword __i
         voice=_VOICE,
         call_id=_CALL_ID,
         greeting=greeting,
+        max_consecutive_refusals=max_consecutive_refusals,
+        comfort_filler=comfort_filler,
     )
 
 
@@ -292,6 +297,61 @@ async def _noop(text: str) -> None:
 async def _one_chunk(text: str) -> AsyncIterator[str]:
     """A single-chunk agent-text iterator for speak()."""
     yield text
+
+
+@pytest.mark.asyncio
+async def test_screen_and_deliver_ends_call_after_max_consecutive_refusals() -> None:
+    """A persistently guard-REFUSE'd caller is ended gracefully after N refusals.
+
+    Every REFUSE marks caller activity (resetting the no-input watchdog), so without a
+    bound a caller whose turns keep tripping the injection guard loops the safe-decline
+    line forever — never reaching the agent nor a graceful close. After
+    ``max_consecutive_refusals`` CONSECUTIVE refusals the loop ends the call (sets the
+    pump's end signal) instead of declining again.
+    """
+    loop = _build_loop(
+        _FakeTransport([]),
+        _FakeASR([]),
+        _FakeTTS([]),
+        _FakeGuard([_refuse_result()]),  # cycles → every turn is REFUSE
+        _noop,
+        max_consecutive_refusals=2,
+    )
+    assert not loop._end_call.is_set()
+
+    await loop._screen_and_deliver("please help me")  # refuse #1 → decline, not ended
+    assert not loop._end_call.is_set(), "ended before the refusal limit was reached"
+
+    await loop._screen_and_deliver("please help me")  # refuse #2 → limit → ended
+    assert loop._end_call.is_set(), "the consecutive-refusal limit did not end the call"
+
+
+@pytest.mark.asyncio
+async def test_screen_and_deliver_refusal_count_resets_on_a_delivered_turn() -> None:
+    """A delivered (non-REFUSE) turn resets the consecutive-refusal count.
+
+    The bound is on CONSECUTIVE refusals: a caller who gets through (ALLOW) between
+    refusals is not looping, so the count clears. With max=2 and REFUSE, ALLOW, REFUSE
+    the call is NOT ended — only one refusal since the reset — where two consecutive
+    refusals would have ended it.
+    """
+    loop = _build_loop(
+        _FakeTransport([]),
+        _FakeASR([]),
+        _FakeTTS([]),
+        _FakeGuard([_refuse_result(), _allow_result(), _refuse_result()]),
+        _noop,
+        max_consecutive_refusals=2,
+        comfort_filler=False,  # the ALLOW turn would otherwise leak a filler task
+    )
+    await loop._screen_and_deliver("odd phrasing")  # refuse #1 → count 1
+    assert loop._consecutive_refusals == 1
+    await loop._screen_and_deliver("hello there")  # ALLOW → count reset to 0
+    assert loop._consecutive_refusals == 0
+    await loop._screen_and_deliver("odd phrasing")  # refuse → count 1 (not 2)
+    assert not loop._end_call.is_set(), (
+        "an ALLOW between refusals did not reset the consecutive-refusal count"
+    )
 
 
 @pytest.mark.asyncio

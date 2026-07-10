@@ -84,8 +84,12 @@ MIN_SE_FLOOR = 90
 # RFC 4028 §10: the non-refresher's teardown guard band is capped at 32 seconds.
 TEARDOWN_GUARD_CAP_SECS = 32
 
-# A leading non-negative integer delta (the rest is parameters or whitespace).
-_LEADING_DELTA = re.compile(r"\s*(\d+)")
+# A non-negative integer delta-seconds, optionally followed by ``;`` generic-params
+# (RFC 4028). ASCII ``[0-9]`` only, NOT ``\d``: non-ASCII digits (Arabic-Indic /
+# fullwidth) are rejected, not folded (item 1670), matching message.py. Used with
+# ``.fullmatch`` so trailing garbage after the delta (e.g. "1800x") is REJECTED, not
+# silently dropped (item 1674).
+_LEADING_DELTA = re.compile(r"\s*([0-9]+)\s*(?:;.*)?")
 
 
 class Refresher(enum.Enum):
@@ -130,7 +134,7 @@ class SessionExpires:
             ValueError: if the value has no leading integer delta, or a present
                 ``refresher`` parameter carries an unknown value.
         """
-        match = _LEADING_DELTA.match(value)
+        match = _LEADING_DELTA.fullmatch(value)
         if match is None or not value.strip():
             msg = f"malformed Session-Expires (no integer delta): {value!r}"
             raise ValueError(msg)
@@ -154,7 +158,7 @@ def parse_min_se(value: str) -> int:
     Raises:
         ValueError: if the value has no leading integer delta.
     """
-    match = _LEADING_DELTA.match(value)
+    match = _LEADING_DELTA.fullmatch(value)
     if match is None or not value.strip():
         msg = f"malformed Min-SE (no integer delta): {value!r}"
         raise ValueError(msg)

@@ -1061,6 +1061,60 @@ async def test_await_prelatched_outcome_reported_when_wait_disabled() -> None:
     assert report.progress.status_code == 200
 
 
+async def test_await_reads_latch_set_during_a_timed_out_wait() -> None:
+    # codex round-6: a terminal outcome latched DURING the wait (e.g. right at the
+    # deadline) must be reported even when wait_for resolves as a TimeoutError — _await
+    # falls through to re-read the latch, never returning TIMEOUT while one is latched.
+    session = _session(_FakeSignaling(), _FakeMedia())
+    event = asyncio.Event()
+
+    async def latch_midway() -> None:
+        await asyncio.sleep(0.02)
+        # Latch a terminal outcome but deliberately do NOT set the event, so the wait
+        # times out — this exercises the post-timeout latch re-read.
+        session._transfer_outcome_latched = True
+        session._transfer_outcome_progress = NotifyProgress(
+            status_code=200, reason="OK", terminated=True
+        )
+
+    latcher = asyncio.create_task(latch_midway())
+    report = await session._await_transfer_outcome(event, 0.1)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+    await latcher
+
+
+async def test_prelatched_terminal_takes_precedence_over_refer_sub_false() -> None:
+    # codex round-6: a correlated terminal NOTIFY can latch BEFORE the REFER's 2xx —
+    # the event is armed before the REFER, and inbound NOTIFY handling does not take
+    # the call lock. Even when that 2xx declines the subscription (Refer-Sub: false),
+    # the already-latched terminal outcome must be reported, not discarded as
+    # SUBSCRIPTION_DECLINED.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    task = asyncio.create_task(
+        session.transfer_blind("sip:3000@pbx.example.test", outcome_timeout=2.0)
+    )
+    await asyncio.sleep(0)
+    cseq = _refer_cseq(signaling)
+    await session.handle_request(
+        _refer_notify("SIP/2.0 200 OK", terminated=True, event_id=cseq)
+    )
+    refer = _last_request(signaling, "REFER")
+    await session.on_response(
+        SipResponse.parse(
+            build_response(
+                refer, 202, "Accepted", extra_headers=(("Refer-Sub", "false"),)
+            )
+        )
+    )
+    report = await asyncio.wait_for(task, timeout=2.0)
+    assert report.unknown_reason is None
+    assert report.progress is not None
+    assert report.progress.status_code == 200
+
+
 async def test_transfer_blind_idless_notify_honored_best_effort() -> None:
     """An id-less terminal NOTIFY is honoured for the single active transfer.
 

@@ -49,8 +49,22 @@ _FENCE_CLOSE = ">>>"
 
 
 def _defang(text: str) -> str:
-    """Neutralise spotlight-fence bracket runs in a caller string (ADR-0009)."""
-    return text.replace(_FENCE_OPEN, "< < <").replace(_FENCE_CLOSE, "> > >")
+    """Neutralise a caller string for the untrusted context block (ADR-0009).
+
+    Two defences, mirroring :func:`hermes_voip.adapter._defang_identity`: neutralise
+    the ``<<<``/``>>>`` spotlight-fence bracket runs, AND collapse every whitespace
+    run (including embedded CR/LF) to a single space. ``SipRequest.parse`` unfolds
+    only RFC 3261 §7.3.1 continuation lines and splits headers on a literal CRLF —
+    a bare LF (or lone CR) embedded in a header value is preserved verbatim inside
+    the parsed field, not rejected. Without the whitespace collapse, such a value
+    would render as its own line inside :func:`render_call_context_block`'s
+    newline-joined block, letting a hostile caller/gateway inject a forged
+    ``- Label: value`` line. Collapsing keeps every field a single line, so it can
+    never introduce one.
+    """
+    return " ".join(
+        text.replace(_FENCE_OPEN, "< < <").replace(_FENCE_CLOSE, "> > >").split()
+    )
 
 
 def _strip_quotes(token: str) -> str:

@@ -51,7 +51,11 @@ from hermes_voip.outbound_allow import load_outbound_allowlist
 from hermes_voip.providers.build import Providers
 from hermes_voip.providers.guard import GuardResult, GuardVerdict
 from hermes_voip.providers.policy import GuardSessionState
-from hermes_voip.refer import NotifyProgress
+from hermes_voip.refer import (
+    NotifyProgress,
+    TransferOutcomeReport,
+    TransferUnknownReason,
+)
 from hermes_voip.voip_tools import AttendedTransferOutcome, TransferOutcome
 
 
@@ -1471,6 +1475,20 @@ async def test_legacy_open_entry_no_name_still_works() -> None:
 # confirmation (DTMF not negotiated) fails LOUD — never a silent no-op (rule 37).
 
 
+def _report_from_progress(progress: NotifyProgress | None) -> TransferOutcomeReport:
+    """Wrap a fake session's terminal NOTIFY into the ADR-0109 P2 outcome report.
+
+    Mirrors ``CallSession._await_transfer_outcome``: a terminal NOTIFY yields
+    ``(progress, None)``; its absence (no NOTIFY within the wait — the OUTCOME_UNKNOWN
+    case these fakes model) yields a ``TIMEOUT``-reason report.
+    """
+    if progress is not None and progress.terminated:
+        return TransferOutcomeReport(progress=progress, unknown_reason=None)
+    return TransferOutcomeReport(
+        progress=None, unknown_reason=TransferUnknownReason.TIMEOUT
+    )
+
+
 class _FakeTransferSession:
     """A CallSession stand-in for transfer tests: records REFER targets.
 
@@ -1503,10 +1521,10 @@ class _FakeTransferSession:
         *,
         referred_by: str | None = None,
         outcome_timeout: float = 0.0,
-    ) -> NotifyProgress | None:
+    ) -> TransferOutcomeReport:
         self.blind.append((target_uri, referred_by))
         self.outcome_timeouts.append(outcome_timeout)
-        return self._transfer_progress
+        return _report_from_progress(self._transfer_progress)
 
 
 def _confirmation_pressing(digit: str) -> ArmedConfirmation:
@@ -2287,10 +2305,10 @@ class _FakeAttendedOriginalSession:
         *,
         referred_by: str | None = None,
         outcome_timeout: float = 0.0,
-    ) -> NotifyProgress | None:
+    ) -> TransferOutcomeReport:
         self.attended.append((consult, referred_by))
         self.outcome_timeouts.append(outcome_timeout)
-        return self._transfer_progress
+        return _report_from_progress(self._transfer_progress)
 
 
 class _FakeConsultSession:

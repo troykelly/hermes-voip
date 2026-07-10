@@ -20,6 +20,7 @@ inbound re-INVITE is answered ``491 Request Pending`` (glare).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
@@ -501,6 +502,13 @@ class CallSession:
             # OUTSIDE the lock so the bounded wait never blocks a concurrent
             # hold / refresh / DTMF on the same dialog.
             if subscription_declined:
+                # A terminal NOTIFY may have raced the 2xx and already latched (the
+                # event is armed before the REFER, and NOTIFY handling takes no call
+                # lock); honour it. Else the peer declined the progress subscription
+                # (RFC 4488), so no outcome will follow (codex round-6).
+                latched = self._latched_transfer_outcome()
+                if latched is not None:
+                    return latched
                 return TransferOutcomeReport(
                     progress=None,
                     unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
@@ -539,6 +547,13 @@ class CallSession:
                 )
                 subscription_declined = _refer_subscription_declined(response)
             if subscription_declined:
+                # A terminal NOTIFY may have raced the 2xx and already latched (the
+                # event is armed before the REFER, and NOTIFY handling takes no call
+                # lock); honour it. Else the peer declined the progress subscription
+                # (RFC 4488), so no outcome will follow (codex round-6).
+                latched = self._latched_transfer_outcome()
+                if latched is not None:
+                    return latched
                 return TransferOutcomeReport(
                     progress=None,
                     unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
@@ -594,6 +609,24 @@ class CallSession:
             self._transfer_outcome_progress = None
             self._transfer_in_progress = False
 
+    def _latched_transfer_outcome(self) -> TransferOutcomeReport | None:
+        """The already-latched transfer outcome, or ``None`` if nothing is latched.
+
+        The cause is latched atomically when the wait is first woken (ADR-0109 P1-b): a
+        terminal :attr:`transfer_progress` is the final outcome (COMPLETED / FAILED); a
+        latched ``None`` means the leg ended first (CALL_ENDED). Callers consult this
+        BEFORE reporting an opt-out / timeout / subscription-declined reason so a
+        terminal NOTIFY that raced the REFER 2xx is never discarded (codex round-5/6).
+        """
+        if not self._transfer_outcome_latched:
+            return None
+        progress = self._transfer_outcome_progress
+        if progress is not None:
+            return TransferOutcomeReport(progress=progress, unknown_reason=None)
+        return TransferOutcomeReport(
+            progress=None, unknown_reason=TransferUnknownReason.CALL_ENDED
+        )
+
     async def _await_transfer_outcome(
         self, event: asyncio.Event, timeout: float
     ) -> TransferOutcomeReport:
@@ -616,30 +649,28 @@ class CallSession:
           leg.
         """
         # The event is armed BEFORE the REFER, so a terminal NOTIFY (or a call-end) can
-        # latch an outcome before we even decide to wait — it races the 2xx. Honour an
-        # already-latched outcome first, even when the wait is opted out (round-5).
-        if not self._transfer_outcome_latched:
-            if timeout <= 0:
-                return TransferOutcomeReport(
-                    progress=None, unknown_reason=TransferUnknownReason.WAIT_DISABLED
-                )
-            try:
+        # latch an outcome before we decide to wait (racing the 2xx) or right as the
+        # deadline fires. Wait only when nothing is latched and the wait is enabled; a
+        # TimeoutError falls THROUGH to the single latch re-read below (never returning
+        # early), so an outcome latched at the deadline is honoured, never lost as a
+        # TIMEOUT (codex round-5/6). ``_latched_transfer_outcome`` reads the LATCHED
+        # cause (fixed atomically when the wait was first woken, ADR-0109 P1-b), never
+        # the mutable transfer_progress.
+        if not self._transfer_outcome_latched and timeout > 0:
+            # A timeout falls through to the latch re-read below — a NOTIFY may have
+            # latched an outcome right at the deadline (codex round-6).
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(event.wait(), timeout)
-            except TimeoutError:
-                return TransferOutcomeReport(
-                    progress=None, unknown_reason=TransferUnknownReason.TIMEOUT
-                )
-        # ADR-0109 P1-b: read the LATCHED cause (fixed atomically when the wait was
-        # first woken), never the mutable transfer_progress — a terminal NOTIFY that
-        # records progress AFTER a BYE woke the wait must not flip CALL_ENDED to
-        # COMPLETED. Once latched — whether it already was, or the event fired — a
-        # terminal progress is the transfer's final outcome; ``None`` means the leg
-        # ended first.
-        progress = self._transfer_outcome_progress
-        if progress is not None:
-            return TransferOutcomeReport(progress=progress, unknown_reason=None)
+        latched = self._latched_transfer_outcome()
+        if latched is not None:
+            return latched
         return TransferOutcomeReport(
-            progress=None, unknown_reason=TransferUnknownReason.CALL_ENDED
+            progress=None,
+            unknown_reason=(
+                TransferUnknownReason.TIMEOUT
+                if timeout > 0
+                else TransferUnknownReason.WAIT_DISABLED
+            ),
         )
 
     def _wake_transfer_on_end(self) -> None:

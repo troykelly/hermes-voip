@@ -157,6 +157,28 @@ jobs:
               sys.exit(1)
           print('PASS: plugin.yaml found in wheel', wheels[0])
           "
+      # Assertion 2b: every bundled skill's SKILL.md is packaged inside the wheel
+      # zipfile (ADR-0047). The INSTALLED package's own skill_names() is the source
+      # of truth, so this fails if a declared skill's SKILL.md is dropped from the
+      # skills/**/SKILL.md artifacts glob — which register_skills() would otherwise
+      # only surface as a runtime raise inside the Hermes runtime (rule 37).
+      - name: assert bundled skills' SKILL.md in wheel
+        run: |
+          dist/.smoke-venv/bin/python -c "
+          import zipfile, glob, sys
+          from hermes_voip.skills import skill_names
+          wheels = glob.glob('dist/*.whl')
+          assert wheels, 'no wheel found in dist/'
+          names = set(zipfile.ZipFile(wheels[0]).namelist())
+          expected = [f'hermes_voip/skills/{n}/SKILL.md' for n in skill_names()]
+          assert expected, 'skill_names() returned no bundled skills'
+          missing = [e for e in expected if e not in names]
+          if missing:
+              print('FAIL: bundled skill SKILL.md missing from wheel:', missing)
+              print('Contents:', sorted(n for n in names if 'skills/' in n))
+              sys.exit(1)
+          print('PASS: all', len(expected), 'bundled skills SKILL.md in wheel', wheels[0])
+          "
       # Assertion 3: hermes_agent.plugins entry point resolves to hermes_voip
       # with a `register` callable.
       - name: assert entry point resolves

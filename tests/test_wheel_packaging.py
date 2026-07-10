@@ -179,6 +179,52 @@ def test_pyproject_wheel_artifacts_include_plugin_yaml() -> None:
     )
 
 
+def test_pyproject_wheel_artifacts_include_skills() -> None:
+    """The hatch wheel target declares the bundled skills' SKILL.md as package data.
+
+    Each ``skills/<name>/SKILL.md`` is non-.py package data hatchling ships ONLY
+    because the wheel target declares the ``skills/**/SKILL.md`` artifacts glob
+    (ADR-0047). A dropped declaration builds a skill-less wheel — which the
+    importlib.resources resolve test would NOT catch in an editable install (the
+    source files resolve regardless), and which makes ``register_skills`` raise in
+    the Hermes runtime (rule 37). The wheel-smoke CI job verifies the actual zipfile;
+    this verifies the BUILD CONFIG that produces that outcome.
+    """
+    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    tool = data.get("tool", {})
+    assert isinstance(tool, dict)
+    hatch = tool.get("hatch", {})
+    assert isinstance(hatch, dict)
+    build = hatch.get("build", {})
+    assert isinstance(build, dict)
+    targets = build.get("targets", {})
+    assert isinstance(targets, dict)
+    wheel = targets.get("wheel", {})
+    assert isinstance(wheel, dict)
+
+    declared: list[str] = []
+    artifacts = wheel.get("artifacts")
+    if isinstance(artifacts, list):
+        declared.extend(str(v) for v in artifacts)
+    force_include = wheel.get("force-include")
+    if isinstance(force_include, list):
+        declared.extend(str(v) for v in force_include)
+    elif isinstance(force_include, dict):
+        declared.extend(str(k) for k in force_include)
+        declared.extend(str(v) for v in force_include.values())
+
+    combined = " ".join(declared)
+    assert "SKILL.md" in combined, (
+        "pyproject.toml wheel target must declare the skills' SKILL.md (e.g. "
+        "src/hermes_voip/skills/**/SKILL.md) in artifacts or force-include so every "
+        "bundled skill lands in the built wheel"
+    )
+    assert "skills" in combined, (
+        "the skills' SKILL.md artifact glob must be anchored under the skills/ "
+        "package-data directory (src/hermes_voip/skills/**/SKILL.md)"
+    )
+
+
 def test_entry_point_declared_and_resolves() -> None:
     """The hermes_agent.plugins entry point is declared and loads hermes_voip.register.
 

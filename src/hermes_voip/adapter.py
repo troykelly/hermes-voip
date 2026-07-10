@@ -3244,6 +3244,24 @@ class VoipAdapter(BasePlatformAdapter):
                 first_turn_task.add_done_callback(
                     lambda t: self._on_call_task_done(call_id, t)
                 )
+            # Outbound lifecycle event (runbook 0014, ADR-0075 style): the 2xx answer
+            # established the dialog and the session + CallLoop are wired — the call is
+            # UP. Mirrors the SIP/TLS leg's outbound_call_connected (issue #1294) on the
+            # WebRTC/WSS leg (#1296); pairs with outbound_invite_sent (same Call-ID) so
+            # a log pipeline computes the outbound answer rate. Only the Call-ID + fixed
+            # transport + the negotiated codec NAME — never the callee number or gateway
+            # host (rule 34 / ADR-0084). ``voice`` is non-None here (the no-voice-codec
+            # guard above 488s the call otherwise).
+            _log.info(
+                "outbound call connected: Call-ID %s",
+                call_id,
+                extra={
+                    "event": "outbound_call_connected",
+                    "call_id": call_id,
+                    "transport": "webrtc",
+                    "codec": voice.encoding,
+                },
+            )
             session_established = True
             return call_id
         finally:

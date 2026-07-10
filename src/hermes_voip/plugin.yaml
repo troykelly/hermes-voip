@@ -161,6 +161,10 @@ optional_env:
     default: 0.5
     description: "Short window (seconds) the agent hang_up drain waits for a same-turn farewell to begin speaking before proceeding; must be <= HERMES_VOIP_HANGUP_DRAIN_SECS (default: 0.5)."
     prompt: "Agent-hangup farewell arrival grace in seconds (default: 0.5)"
+  - name: HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S
+    default: 20.0
+    description: "Seconds a blind/attended transfer tool waits after the REFER is accepted for the terminal transfer-progress NOTIFY before returning outcome-unknown, so the agent learns whether the transfer completed; 0 opts out of the wait (returns immediately). Negative is rejected (default: 20.0)."
+    prompt: "Transfer-outcome NOTIFY wait timeout in seconds; 0 to opt out (default: 20.0)"
   - name: HERMES_VOIP_KEEPALIVE_INTERVAL
     default: 30.0
     description: >-

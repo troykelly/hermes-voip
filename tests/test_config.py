@@ -2202,6 +2202,41 @@ def test_agent_hangup_grace_may_not_exceed_drain_direct_construction() -> None:
         )
 
 
+# ---- transfer-outcome NOTIFY wait timeout (ADR-0109) -----------------------
+
+
+def test_transfer_outcome_timeout_default() -> None:
+    """The transfer-outcome NOTIFY wait defaults to 20.0 s."""
+    cfg = load_media_config({})
+    assert cfg.transfer_outcome_timeout_secs == 20.0
+
+
+def test_transfer_outcome_timeout_env_override() -> None:
+    """HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S sets the bounded wait."""
+    cfg = load_media_config({"HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S": "8.5"})
+    assert cfg.transfer_outcome_timeout_secs == 8.5
+
+
+def test_transfer_outcome_timeout_zero_opts_out() -> None:
+    """``0`` is accepted — it opts out of the wait (the prior fast behaviour)."""
+    cfg = load_media_config({"HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S": "0"})
+    assert cfg.transfer_outcome_timeout_secs == 0.0
+
+
+@pytest.mark.parametrize("bad", ["-1", "-0.5", "abc", "nan", "inf"])
+def test_transfer_outcome_timeout_rejects_negative_or_malformed(bad: str) -> None:
+    """A negative / non-finite / malformed timeout is rejected (0 is allowed)."""
+    with pytest.raises(ConfigError):
+        load_media_config({"HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S": bad})
+
+
+def test_transfer_outcome_timeout_negative_rejected_direct_construction() -> None:
+    """A direct MediaConfig(...) with a negative timeout is rejected (__post_init__)."""
+    base = load_media_config({})
+    with pytest.raises(ConfigError, match="transfer_outcome_timeout_secs"):
+        dataclasses.replace(base, transfer_outcome_timeout_secs=-1.0)
+
+
 # ---- adaptive jitter buffer ceiling (ADR-0063) -----------------------------
 
 

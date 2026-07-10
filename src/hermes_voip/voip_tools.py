@@ -69,6 +69,11 @@ from hermes_voip.originate import (
     OutboundCallNotAllowed,
 )
 from hermes_voip.providers.policy import GuardSessionState
+from hermes_voip.refer import (
+    NotifyProgress,
+    TransferOutcomeClass,
+    classify_transfer_progress,
+)
 from hermes_voip.tools import gate_voip_tool
 
 __all__ = [
@@ -103,6 +108,8 @@ __all__ = [
     "TransferResult",
     "VoipToolHost",
     "active_voip_adapter",
+    "build_attended_transfer_result",
+    "build_transfer_result",
     "hang_up_handler",
     "hold_call_handler",
     "list_registrations_handler",
@@ -285,6 +292,59 @@ class AttendedTransferResult:
     notify_status: int | None = None
     notify_reason: str | None = None
     timeout_secs: float | None = None
+
+
+# ADR-0109: map the pure terminal classification to the tool-facing outcome enums.
+_BLIND_OUTCOME_BY_CLASS: dict[TransferOutcomeClass, TransferOutcome] = {
+    TransferOutcomeClass.COMPLETED: TransferOutcome.COMPLETED,
+    TransferOutcomeClass.FAILED: TransferOutcome.FAILED,
+    TransferOutcomeClass.OUTCOME_UNKNOWN: TransferOutcome.OUTCOME_UNKNOWN,
+}
+_ATTENDED_OUTCOME_BY_CLASS: dict[TransferOutcomeClass, AttendedTransferOutcome] = {
+    TransferOutcomeClass.COMPLETED: AttendedTransferOutcome.COMPLETED,
+    TransferOutcomeClass.FAILED: AttendedTransferOutcome.FAILED,
+    TransferOutcomeClass.OUTCOME_UNKNOWN: AttendedTransferOutcome.OUTCOME_UNKNOWN,
+}
+
+
+def _terminal_notify(progress: NotifyProgress | None) -> NotifyProgress | None:
+    """Return ``progress`` only when it is a TERMINAL NOTIFY, else ``None`` (ADR-0109).
+
+    A non-terminal update (a ``100 Trying`` that leaked through) carries no final
+    status, so its status/reason must not be shown as an outcome.
+    """
+    return progress if progress is not None and progress.terminated else None
+
+
+def build_transfer_result(
+    progress: NotifyProgress | None, timeout_secs: float
+) -> TransferResult:
+    """Classify a blind transfer's terminal NOTIFY into a :class:`TransferResult`.
+
+    The adapter's glue (ADR-0109): maps the pure classification to the tool-facing
+    :class:`TransferOutcome` and attaches the terminal SIP status/reason (for
+    ``FAILED``) plus the bounded wait applied (for the ``OUTCOME_UNKNOWN`` message).
+    """
+    terminal = _terminal_notify(progress)
+    return TransferResult(
+        outcome=_BLIND_OUTCOME_BY_CLASS[classify_transfer_progress(progress)],
+        notify_status=terminal.status_code if terminal is not None else None,
+        notify_reason=terminal.reason if terminal is not None else None,
+        timeout_secs=timeout_secs,
+    )
+
+
+def build_attended_transfer_result(
+    progress: NotifyProgress | None, timeout_secs: float
+) -> AttendedTransferResult:
+    """Attended analogue of :func:`build_transfer_result` (ADR-0109)."""
+    terminal = _terminal_notify(progress)
+    return AttendedTransferResult(
+        outcome=_ATTENDED_OUTCOME_BY_CLASS[classify_transfer_progress(progress)],
+        notify_status=terminal.status_code if terminal is not None else None,
+        notify_reason=terminal.reason if terminal is not None else None,
+        timeout_secs=timeout_secs,
+    )
 
 
 class PlaceCallOutcome(Enum):

@@ -1530,14 +1530,17 @@ async def test_transfer_blind_on_call_fires_refer_after_confirm() -> None:
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
-    session = _FakeTransferSession(local_uri="sip:1000@pbx.example.test")
+    session = _FakeTransferSession(
+        local_uri="sip:1000@pbx.example.test",
+        transfer_progress=NotifyProgress(status_code=200, reason="OK", terminated=True),
+    )
     call_id = new_call_id()
     adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
     adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
 
-    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
 
-    assert outcome is TransferOutcome.TRANSFERRED
+    assert result.outcome is TransferOutcome.COMPLETED
     assert session.blind == [("sip:1001@pbx.example.test", "sip:1000@pbx.example.test")]
 
 
@@ -1616,9 +1619,9 @@ async def test_transfer_blind_on_call_wrong_digit_does_not_refer() -> None:
     adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
     adapter._dtmf_confirmations[call_id] = _confirmation_pressing("2")  # not "1"
 
-    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
 
-    assert outcome is TransferOutcome.UNCONFIRMED
+    assert result.outcome is TransferOutcome.UNCONFIRMED
     assert session.blind == []  # nothing transferred
 
 
@@ -1641,9 +1644,9 @@ async def test_transfer_blind_on_call_timeout_does_not_refer() -> None:
         prompt=_noop_prompt, sleep=_fast_sleep
     )
 
-    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
 
-    assert outcome is TransferOutcome.UNCONFIRMED
+    assert result.outcome is TransferOutcome.UNCONFIRMED
     assert session.blind == []
 
 
@@ -1670,10 +1673,8 @@ async def test_transfer_blind_on_call_unknown_call_returns_no_call() -> None:
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
-    assert (
-        await adapter.transfer_blind_on_call("nope", "sip:1001@pbx.example.test")
-        is TransferOutcome.NO_CALL
-    )
+    result = await adapter.transfer_blind_on_call("nope", "sip:1001@pbx.example.test")
+    assert result.outcome is TransferOutcome.NO_CALL
 
 
 # --- defense in depth: the REFER chokepoint re-checks the privilege clamp ------
@@ -1699,9 +1700,9 @@ async def test_transfer_blind_on_call_blocks_non_operator_before_prompt() -> Non
     confirmation = _confirmation_pressing("1")
     adapter._dtmf_confirmations[call_id] = confirmation
 
-    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
 
-    assert outcome is TransferOutcome.BLOCKED
+    assert result.outcome is TransferOutcome.BLOCKED
     assert session.blind == []  # no REFER
     assert confirmation.armed is False  # never armed → never prompted
 
@@ -1719,9 +1720,9 @@ async def test_transfer_blind_on_call_blocks_degraded_operator_before_prompt() -
     adapter._call_sessions[call_id] = session  # type: ignore[assignment]  # fake session
     adapter._dtmf_confirmations[call_id] = _confirmation_pressing("1")
 
-    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
 
-    assert outcome is TransferOutcome.BLOCKED
+    assert result.outcome is TransferOutcome.BLOCKED
     assert session.blind == []  # no REFER
 
 
@@ -1755,9 +1756,9 @@ async def test_transfer_blind_on_call_toctou_degrade_during_confirm_blocks() -> 
     confirmation._prompt = _degrade_then_press
     adapter._dtmf_confirmations[call_id] = confirmation
 
-    outcome = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
+    result = await adapter.transfer_blind_on_call(call_id, "sip:1001@pbx.example.test")
 
-    assert outcome is TransferOutcome.BLOCKED
+    assert result.outcome is TransferOutcome.BLOCKED
     assert session.blind == []  # confirmed, but degraded-during-window → no REFER
 
 
@@ -2416,16 +2417,19 @@ async def test_complete_attended_transfer_sends_refer_replaces() -> None:
     transport = _FakeTransport()
     manager = _FakeManager(is_up=True)
     adapter = await _build_adapter(transport, manager, caller_modes=_grey_only())
-    original = _FakeAttendedOriginalSession(local_uri="sip:1000@pbx.example.test")
+    original = _FakeAttendedOriginalSession(
+        local_uri="sip:1000@pbx.example.test",
+        transfer_progress=NotifyProgress(status_code=200, reason="OK", terminated=True),
+    )
     call_id = new_call_id()
     adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
     consult = _FakeConsultSession()
     adapter._call_sessions["consult-call-id"] = consult  # type: ignore[assignment]  # fake session
     adapter._attended_consults[call_id] = "consult-call-id"
 
-    outcome = await adapter.complete_attended_transfer(call_id)
+    result = await adapter.complete_attended_transfer(call_id)
 
-    assert outcome is AttendedTransferOutcome.TRANSFERRED
+    assert result.outcome is AttendedTransferOutcome.COMPLETED
     assert len(original.attended) == 1
     sent_consult, referred_by = original.attended[0]
     assert sent_consult is consult.dialog  # the consult leg's Dialog drives Replaces
@@ -2508,9 +2512,9 @@ async def test_complete_attended_transfer_without_consult_returns_no_consult() -
     call_id = new_call_id()
     adapter._call_sessions[call_id] = original  # type: ignore[assignment]  # fake session
 
-    outcome = await adapter.complete_attended_transfer(call_id)
+    result = await adapter.complete_attended_transfer(call_id)
 
-    assert outcome is AttendedTransferOutcome.NO_CONSULT
+    assert result.outcome is AttendedTransferOutcome.NO_CONSULT
     assert original.attended == []
 
 
@@ -2529,9 +2533,9 @@ async def test_complete_attended_transfer_blocks_degraded_operator() -> None:
     adapter._call_sessions["consult-call-id"] = consult  # type: ignore[assignment]  # fake session
     adapter._attended_consults[call_id] = "consult-call-id"
 
-    outcome = await adapter.complete_attended_transfer(call_id)
+    result = await adapter.complete_attended_transfer(call_id)
 
-    assert outcome is AttendedTransferOutcome.BLOCKED
+    assert result.outcome is AttendedTransferOutcome.BLOCKED
     assert original.attended == []
 
 

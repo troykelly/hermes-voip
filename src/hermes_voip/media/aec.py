@@ -188,7 +188,11 @@ class EchoCanceller:
         n = len(aligned) // PCM16_BYTES_PER_SAMPLE
         if n == 0:
             return
-        self._x.extend(float(s) for s in struct.unpack(f"<{n}h", aligned))
+        # ``_x`` is an ``array('d')``: its ``extend`` coerces the unpacked int16
+        # samples to C doubles itself, so an explicit per-sample ``float()`` (a
+        # Python generator + one call per sample) is redundant on this per-TX-frame
+        # hot path. Hand the unpacked tuple straight to the C-level ``extend``.
+        self._x.extend(struct.unpack(f"<{n}h", aligned))
         # The FIFO is trimmed in cancel() relative to the read cursor (not here by
         # the newest sample), because push runs ahead of cancel and a far-end sample
         # must survive until its matching near-end has consumed it.

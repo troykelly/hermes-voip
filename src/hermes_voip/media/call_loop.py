@@ -1873,6 +1873,15 @@ class CallLoop:
            reprompt (best-effort) and continue; once the budget is spent, end the call
            gracefully — speak the goodbye (if enabled) and signal the pump to wind up.
 
+        On HOLD (agent ``hold_call`` / peer or PBX hold re-INVITE, per the engine's
+        ``on_hold``) a window is SKIPPED — no reprompt, no end — as the media plane is
+        muted both ways; and :meth:`_end_call_gracefully` re-checks hold before the
+        irreversible end, so a held call is never torn down (the exact safety property).
+        The reprompt COUNT across a brief hold TRANSITION is best-effort: a reprompt
+        whose audio a hold mutes mid-window is dropped by the engine (harmless), and
+        precise per-utterance accounting is out of scope — at worst the caller gets
+        one extra/fewer reprompt on an already-silent call, never a held teardown.
+
         The reprompt and goodbye route through :meth:`_speak_text`, so they are
         sanitised, model-tag-aware (ADR-0027), echo-gate-arming and flushable
         (ADR-0023/0028) like any agent audio — a barge-in cancels a playing reprompt

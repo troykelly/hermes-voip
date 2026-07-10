@@ -5647,8 +5647,11 @@ class VoipAdapter(BasePlatformAdapter):
         # Sanitise the operator-authored decline line the SAME way the conversational
         # path sanitises agent text (spoken_text.sanitize_for_speech, applied by the
         # CallLoop's _sanitize_iter), so markdown, raw URLs, and emoji are not voiced
-        # verbatim to the caller (item 1325).
-        phrase = sanitize_for_speech(media_cfg.decline_phrase)
+        # verbatim to the caller (item 1325). If a pathological all-markup / all-emoji
+        # value sanitises to empty, fall back to the RAW phrase rather than dead air —
+        # the pre-1325 behaviour for that misconfiguration (ADR-0020 needs ONE line).
+        sanitised = sanitize_for_speech(media_cfg.decline_phrase)
+        phrase = sanitised or media_cfg.decline_phrase
         # Use the SAME configured TTS voice the normal conversational path uses
         # (``MediaConfig.tts_voice``); ``None`` resolves to ``""`` (the provider's
         # default voice), exactly as the CallLoop voice seam does — so the decline line

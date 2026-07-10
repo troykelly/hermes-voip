@@ -489,28 +489,23 @@ async def test_deny_mode_decline_answers_200_speaks_then_byes() -> None:
     assert call_id not in adapter._call_loops
 
 
-@pytest.mark.asyncio
-async def test_deny_mode_decline_sanitizes_custom_phrase_before_tts() -> None:
-    """A custom decline phrase (markdown / URL) is sanitised before TTS (item 1325).
+async def _drive_deny_decline(*, decline_phrase: str) -> _RecordingTTS:
+    """Drive one denied INVITE through answer -> speak-decline -> BYE (item 1325 tests).
 
-    Deny-mode 'decline' speaks the operator-authored HERMES_VOIP_DECLINE_PHRASE. Like
-    every other spoken line (agent text goes through _sanitize_iter), it must first pass
-    through sanitize_for_speech, or raw markdown / URLs / emoji are voiced verbatim.
+    Builds a decline-mode adapter for caller "9999" and returns the recording TTS whose
+    ``.phrases`` hold the synthesised decline line.
     """
     transport = _FakeTransport()
-    manager = _FakeManager(is_up=True)
     tts = _RecordingTTS()
-    phrase = "Sorry, please visit https://example.test for **help**."
     adapter = await _build_adapter(
         transport,
-        manager,
+        _FakeManager(is_up=True),
         caller_modes=_deny_caller("9999"),
         tts=tts,
         deny_mode="decline",
-        decline_phrase=phrase,
+        decline_phrase=decline_phrase,
         tts_voice="operator-voice-7",
     )
-
     call_id = new_call_id()
     invite = SipRequest.parse(_make_invite(caller="9999", call_id=call_id))
     engine = MagicMock(
@@ -532,10 +527,22 @@ async def test_deny_mode_decline_sanitizes_custom_phrase_before_tts() -> None:
         patch("hermes_voip.adapter._make_vad", return_value=MagicMock()),
         patch("hermes_voip.adapter._make_endpointer", return_value=MagicMock()),
     ):
-        new_call = NewCall(registration=_ext_config(), invite=invite)
-        adapter._on_inbound_invite(new_call)
+        adapter._on_inbound_invite(NewCall(registration=_ext_config(), invite=invite))
         for _ in range(60):
             await asyncio.sleep(0)
+    return tts
+
+
+@pytest.mark.asyncio
+async def test_deny_mode_decline_sanitizes_custom_phrase_before_tts() -> None:
+    """A custom decline phrase (markdown / URL) is sanitised before TTS (item 1325).
+
+    Deny-mode 'decline' speaks the operator-authored HERMES_VOIP_DECLINE_PHRASE. Like
+    every other spoken line (agent text goes through _sanitize_iter), it must first pass
+    through sanitize_for_speech, or raw markdown / URLs / emoji are voiced verbatim.
+    """
+    phrase = "Sorry, please visit https://example.test for **help**."
+    tts = await _drive_deny_decline(decline_phrase=phrase)
 
     assert tts.phrases, "the decline phrase was never synthesised"
     # The SANITISED phrase reached TTS, not the raw markdown/URL (item 1325): the bare
@@ -543,3 +550,15 @@ async def test_deny_mode_decline_sanitizes_custom_phrase_before_tts() -> None:
     assert tts.phrases[0] == sanitize_for_speech(phrase)
     assert "https://example.test" not in tts.phrases[0]
     assert "**" not in tts.phrases[0]
+
+
+@pytest.mark.asyncio
+async def test_deny_mode_decline_empty_sanitised_phrase_falls_back_to_raw() -> None:
+    """A phrase that sanitises to empty falls back to the raw phrase, never dead air."""
+    phrase = "https://example.test"  # a bare URL: sanitize_for_speech drops it -> ""
+    assert sanitize_for_speech(phrase) == "", "precondition: phrase sanitises to empty"
+    tts = await _drive_deny_decline(decline_phrase=phrase)
+
+    # Not dead air: the raw phrase was synthesised (the pre-1325 fallback behaviour).
+    assert tts.phrases
+    assert tts.phrases[0] == phrase

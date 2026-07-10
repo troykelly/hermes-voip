@@ -4933,6 +4933,80 @@ async def test_no_input_watchdog_suspended_while_call_is_held() -> None:
         await run_task
 
 
+class _HoldDuringGoodbyeTTS(_CapturingTTS):
+    """Flip the transport to ``on_hold`` the instant the goodbye is synthesised.
+
+    Models a hold (agent ``hold_call`` / peer re-INVITE) that lands WHILE the no-input
+    goodbye is playing — the TOCTOU gap between the watchdog's per-window hold check and
+    the irreversible ``_end_call.set()`` inside ``_end_call_gracefully``.
+    """
+
+    def __init__(self, frames: list[PcmFrame], transport: _FakeTransport) -> None:
+        super().__init__(frames)
+        self._held_transport = transport
+
+    def synthesize(
+        self,
+        text: AsyncIterator[str],
+        voice: str,
+        *,
+        sample_rate: int | None = None,
+    ) -> TtsStream:
+        self._held_transport.on_hold = True  # the hold lands as the goodbye begins
+        return super().synthesize(text, voice, sample_rate=sample_rate)
+
+
+@pytest.mark.asyncio
+async def test_no_input_end_aborts_if_hold_lands_during_goodbye() -> None:
+    """A hold arriving DURING the no-input goodbye aborts the end (no teardown).
+
+    The watchdog samples ``on_hold`` once per window, but ``_end_call_gracefully`` then
+    awaits the goodbye synthesis before the irreversible ``_end_call.set()``. A hold
+    landing in that gap must NOT tear down the call: the end is aborted (exactly like a
+    caller barge-in during the goodbye) and the watchdog resumes, skipping held windows.
+    """
+    goodbye_frame = PcmFrame(
+        samples=b"\x20\x00" * 256, sample_rate=16_000, monotonic_ts_ns=1
+    )
+    sleep = _SteppedSleep(steps=2)
+    transport = _LiveSilenceTransport()  # NOT held at the per-window check
+    tts = _HoldDuringGoodbyeTTS([goodbye_frame], transport)
+    loop = _no_input_loop(
+        transport,
+        _DrainingSilentASR(),
+        tts,
+        sleep=sleep,
+        no_input_max_reprompts=0,  # the first silent window goes straight to the end
+        goodbye=True,
+        goodbye_phrase="Goodbye.",
+    )
+
+    run_task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if sleep.calls:
+            break
+    assert sleep.calls, "the no-input watchdog did not arm a silence-window wait"
+
+    # First silent window: budget is 0, so the watchdog goes straight to the graceful
+    # end — and synthesising the goodbye flips the call to held mid-teardown.
+    sleep.step()
+    for _ in range(30):
+        await asyncio.sleep(0)
+
+    assert transport.on_hold, "precondition: synthesising the goodbye sets on_hold"
+    assert tts.synthesised == ["Goodbye."], (
+        f"the goodbye path must have been reached; got {tts.synthesised!r}"
+    )
+    assert not run_task.done(), (
+        "a hold during the goodbye must abort the end, not tear down the held call"
+    )
+
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+
 @pytest.mark.asyncio
 async def test_no_input_off_emits_nothing_and_does_not_self_end() -> None:
     """With the watchdog OFF nothing is reprompted and the call never ends itself.

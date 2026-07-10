@@ -105,6 +105,7 @@ its lifecycle. The events:
 | `invite_received` | inbound INVITE arrives | `call_id`, `extension` |
 | `call_rejected` | any pre-200-OK reject (486/603/488/422) | `call_id`, `outcome="rejected"`, `sip_code`, `reason` |
 | `call_answered` | the inbound `200 OK` is sent | `call_id`, `outcome="answered"`, `sip_code=200` |
+| `inbound_secured_handshake_failed` | a post-200-OK inbound WebRTC ICE/DTLS or SIP `UDP/TLS/RTP/SAVP` handshake fails (the answered call cannot be keyed) | `call_id`, `transport` (`webrtc`/`sip-dtls`), `failure_category` (`fingerprint`/`ice`/`dtls_timeout`/`failed`) |
 | `call_loop_started` | the conversational loop goes live | `call_id`, `direction` (`inbound`/`outbound`) |
 | `call_released` | the admission slot is freed at teardown | `call_id`, `duration_s`, `active_calls` |
 | `outbound_invite_sent` | an outbound (`place_call`) INVITE leaves the UAC | `call_id`, `transport="tls"` |
@@ -112,6 +113,19 @@ its lifecycle. The events:
 | `outbound_call_failed` | the outbound dial fails (non-2xx / refused 2xx / CANCEL / error) | `call_id`, `transport`, `category` (`busy`/`no_answer`/`declined`/`failed`) |
 
 Setup success ≈ `count(call_answered) / (count(call_answered) + count(call_rejected))`.
+
+**Post-200 secured-media handshake failures overcount `call_answered` (ADR-0108).** A
+WebRTC ICE/DTLS or SIP `UDP/TLS/RTP/SAVP` call is ANSWERED (the 200 OK carrying our
+`a=fingerprint` / ICE creds is sent) BEFORE the DTLS/ICE handshake runs, so a handshake
+failure fires `call_answered` yet the call never carries media. Subtract these from the
+numerator to avoid overcounting:
+setup success ≈ `(count(call_answered) − count(inbound_secured_handshake_failed)) /
+(count(call_answered) + count(call_rejected))`. The `failure_category` on
+`inbound_secured_handshake_failed` distinguishes the failure MODE — `fingerprint` (a
+misconfigured `a=fingerprint`, RFC 5763 §5), `ice` (ICE connectivity failure, WebRTC
+only), `dtls_timeout` (the peer never completed the DTLS handshake), or `failed` (any
+other error). These carry ONLY `call_id` + `transport` + the fixed category token —
+never the peer fingerprint, gateway host, or exception text (rule 34 / ADR-0084).
 
 **Outbound setup success** (agent-placed calls, ADR-0075) ≈
 `count(outbound_call_connected) / count(outbound_invite_sent)`; the `outbound_call_failed`
@@ -147,6 +161,9 @@ jq -c 'select(.event=="call_answered")'  /path/to/hermes/log.jsonl | wc -l
 jq -c 'select(.event=="call_rejected")'  /path/to/hermes/log.jsonl | wc -l
 # Reject breakdown by SIP code + reason token:
 jq -r 'select(.event=="call_rejected") | "\(.sip_code) \(.reason)"' /path/to/hermes/log.jsonl | sort | uniq -c
+# Post-200 secured-handshake failures (subtract from call_answered), by category:
+jq -c 'select(.event=="inbound_secured_handshake_failed")' /path/to/hermes/log.jsonl | wc -l
+jq -r 'select(.event=="inbound_secured_handshake_failed") | "\(.transport) \(.failure_category)"' /path/to/hermes/log.jsonl | sort | uniq -c
 # Outbound setup success = connected / invite_sent; failures broken down by category:
 jq -c 'select(.event=="outbound_invite_sent")'    /path/to/hermes/log.jsonl | wc -l
 jq -c 'select(.event=="outbound_call_connected")' /path/to/hermes/log.jsonl | wc -l
@@ -173,7 +190,8 @@ grep -E "REJECTED [4-6][0-9][0-9]" /path/to/hermes/log | wc -l
 - `voip.calls.inbound_invite_received` — counter (`event=invite_received`).
 - `voip.calls.setup_success` — counter (`event=call_answered`).
 - `voip.calls.setup_rejected` — counter (`event=call_rejected`, label `sip_code`/`reason`).
-- `voip.calls.setup_success_pct` — gauge, `success / (success + rejected)`.
+- `voip.calls.secured_handshake_failed` — counter (`event=inbound_secured_handshake_failed`, label `transport`/`failure_category`); subtracted from `setup_success`.
+- `voip.calls.setup_success_pct` — gauge, `(success − secured_handshake_failed) / (success + rejected)`.
 
 ---
 
@@ -510,7 +528,8 @@ grep "asr: delivering turn" /path/to/hermes/log | wc -l
 
 **Current state (as of 2026-06-26):**
 - ✅ **STRUCTURED LOG EVENTS (ADR-0075):** per-call lifecycle (`invite_received`,
-  `call_rejected`, `call_answered`, `call_loop_started`, `call_released`) and RTCP
+  `call_rejected`, `call_answered`, `inbound_secured_handshake_failed`,
+  `call_loop_started`, `call_released`) and RTCP
   call-quality (`rtcp_call_quality`) emit machine-parseable `extra={}` fields — call setup
   success, RTP loss/jitter/RTT, and concurrency gauge are now countable from logs without
   prose-grepping. LOCAL-ONLY stdlib logging; no external sink.

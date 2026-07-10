@@ -265,6 +265,63 @@ def _rejected_extra(call_id: str, sip_code: int, reason: str) -> dict[str, str |
     }
 
 
+def _inbound_secured_failure_category(exc: BaseException) -> str:
+    """Classify a post-200-OK inbound secured-media (DTLS/ICE) handshake failure.
+
+    The INBOUND mirror of :func:`outbound_failure_category` (runbook 0014): a WebRTC
+    ICE/DTLS or SIP ``UDP/TLS/RTP/SAVP`` call is ANSWERED (the 200 OK carrying our
+    fingerprint / ICE creds is sent) BEFORE the handshake runs, so a handshake failure
+    here is counted as ``call_answered`` (success). This label is attached to the new
+    ``inbound_secured_handshake_failed`` event so an operator can SUBTRACT the failure
+    from the call-setup-success SLO AND distinguish the failure MODE from a log query.
+
+    The category is derived from the media session's documented ``run_handshake``
+    contract (``media/webrtc_session.py`` / ``media/sip_dtls_session.py``):
+
+    * :class:`ValueError` — the peer certificate fingerprint did not match the offered
+      ``a=fingerprint`` (RFC 5763 §5): a MISCONFIG. ⇒ ``"fingerprint"``.
+    * :class:`ConnectionError` — ICE connectivity checks failed (WebRTC only): a
+      NETWORK failure. ⇒ ``"ice"``.
+    * :class:`RuntimeError` — the DTLS handshake did not complete within the
+      round/recv bound: a peer TIMEOUT. ⇒ ``"dtls_timeout"``.
+    * any other exception — an unexpected error on the handshake path. ⇒ ``"failed"``.
+
+    :class:`ConnectionError` is checked before :class:`OSError`'s other subclasses and
+    is disjoint from :class:`ValueError` / :class:`RuntimeError`, so the branch order is
+    unambiguous. Returns ONLY the fixed category token — never the exception message,
+    the peer fingerprint, the gateway host, or any caller detail — so a caller may log
+    the returned value freely (rule 34 / ADR-0084).
+    """
+    if isinstance(exc, ValueError):
+        return "fingerprint"
+    if isinstance(exc, ConnectionError):
+        return "ice"
+    if isinstance(exc, RuntimeError):
+        return "dtls_timeout"
+    return "failed"
+
+
+def _inbound_secured_failure_extra(
+    call_id: str, exc: BaseException, *, transport: str
+) -> dict[str, str]:
+    """Structured ``extra={}`` for a post-200 inbound secured-handshake failure.
+
+    Attached to the existing ``_log.exception`` in the WebRTC / SIP-DTLS handshake
+    ``except`` blocks so a log pipeline can filter
+    ``event='inbound_secured_handshake_failed'`` and break failures down by
+    :func:`_inbound_secured_failure_category`. ``transport`` is the fixed secured
+    surface (``"webrtc"`` / ``"sip-dtls"``). All fields are PUBLIC-repo safe (rule 34):
+    ``call_id`` correlates to the same call's ``call_answered`` record; the category is
+    a fixed token; the exception itself is NEVER stringified into the record.
+    """
+    return {
+        "event": "inbound_secured_handshake_failed",
+        "call_id": call_id,
+        "transport": transport,
+        "failure_category": _inbound_secured_failure_category(exc),
+    }
+
+
 # RFC 3261 §8.2.2.3: the SIP extension option-tags this UAS understands. A Require
 # header naming anything outside this set is rejected 420 Bad Extension — we cannot
 # honour a mandatory extension we do not implement. The sole extension we engage as a
@@ -4222,12 +4279,22 @@ class VoipAdapter(BasePlatformAdapter):
                 peer_ice_pwd=audio.ice_pwd,
                 peer_candidates=audio.ice_candidates,
             )
-        except Exception:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
+        except Exception as exc:  # noqa: BLE001 — any ICE/DTLS failure aborts the call (caught + re-raised as reject)
             # A DTLS/ICE failure (fingerprint mismatch, no connectivity, handshake
             # timeout). The call was answered (200 OK sent) but cannot be keyed — close
             # media + ACK-aware BYE the dialog, then re-raise the reject signal so the
             # inbound handler stops without building a CallLoop on dead media.
-            _log.exception("INVITE %s: WebRTC ICE/DTLS handshake failed", call_id)
+            # STRUCTURED SLO SIGNAL (runbook 0014): the 200 OK already emitted
+            # ``call_answered``, so without this the setup-success SLO OVERCOUNTS. Emit
+            # ``inbound_secured_handshake_failed`` + a ``failure_category`` so the SLO
+            # query can subtract it and the operator can tell fingerprint (misconfig) /
+            # ice (network) / dtls_timeout (peer) apart. Control flow is unchanged — the
+            # call is still torn down and the reject signal re-raised below.
+            _log.exception(
+                "INVITE %s: WebRTC ICE/DTLS handshake failed",
+                call_id,
+                extra=_inbound_secured_failure_extra(call_id, exc, transport="webrtc"),
+            )
             await self._abort_answered_call(
                 dialog=dialog,
                 transport=transport,
@@ -4518,13 +4585,25 @@ class VoipAdapter(BasePlatformAdapter):
                 peer_address=remote_address,
                 peer_port=audio.port,
             )
-        except Exception:  # noqa: BLE001 — any DTLS failure aborts the call (caught + re-raised as reject)
+        except Exception as exc:  # noqa: BLE001 — any DTLS failure aborts the call (caught + re-raised as reject)
             # A fingerprint mismatch / timeout AFTER the 200 OK: the peer holds an
             # ANSWERED UDP/TLS/RTP/SAVP call, so this is NOT a 488 and there is NO
             # plaintext fallback (RFC 5763 §5). Close media now + BYE the dialog once
             # confirmed (the guard tracks the ACK; §15.1.1), then re-raise the reject
             # signal so the inbound handler builds no CallLoop on dead media.
-            _log.exception("INVITE %s: SIP DTLS-SRTP handshake failed", call_id)
+            # STRUCTURED SLO SIGNAL (runbook 0014): the 200 OK already emitted
+            # ``call_answered``, so without this the setup-success SLO OVERCOUNTS. Emit
+            # ``inbound_secured_handshake_failed`` + a ``failure_category`` (this leg
+            # has no ICE, so only fingerprint / dtls_timeout / failed are derivable) so
+            # the SLO query can subtract it. Control flow is unchanged — the call is
+            # still torn down and the reject signal re-raised below.
+            _log.exception(
+                "INVITE %s: SIP DTLS-SRTP handshake failed",
+                call_id,
+                extra=_inbound_secured_failure_extra(
+                    call_id, exc, transport="sip-dtls"
+                ),
+            )
             await self._abort_answered_call(
                 dialog=dialog,
                 transport=transport,

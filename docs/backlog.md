@@ -1567,7 +1567,7 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
   an unterminated `<`, and with backslash-escaped quotes) no longer desyncs the addr-spec or forges a dialog
   tag; empty `;tag=` is rejected. codex (orchestrator-run, in-workflow codex was sandbox-blocked) found + this
   PR closed the None-fallback / escape / 5th-site gaps over 3 review rounds.
-- [ ] **[high] correctness/security** — `tag_param` (`_name_addr.py`) still accepts a QUOTED tag value
+- [x] (#456) **[high] correctness/security** — `tag_param` (`_name_addr.py`) still accepts a QUOTED tag value
   (`;tag="fake"`, `;tag=""`) — a pre-existing leniency (the old `_TAG_PARAM` regex accepted it too) that fails
   CLOSED (a quoted tag misclassifies→rejects; it does not forge a matching dialog tag). Tighten `tag_param` to
   validate the value against the strict SIP `token` grammar (RFC 3261) and reject quoted/non-token tags —
@@ -1624,14 +1624,14 @@ A 12-dimension `/orchestrate` gap-review against `main @ 28cfe47` discovered 20 
 A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session) surfaced 16 items;
 `py.typed`-explicit (line 1205) was already tracked. The genuinely-new items:
 
-- [ ] **[high] observability** — Inbound post-200-OK DTLS/ICE handshake failure emits NO structured SLO
+- [x] (#455) **[high] observability** — Inbound post-200-OK DTLS/ICE handshake failure emits NO structured SLO
   event, so a call that fails secured-media setup AFTER the 200 OK is counted as `call_answered` (success)
   with no failure signal — the call-setup-success SLO silently overcounts. `_setup_webrtc_call`
   (`adapter.py:4229-4230`) and `_setup_sip_dtls_call` (`adapter.py:4516-4527`) both `_log.exception(...)` with
   NO `extra={}`/`event`, unlike the OUTBOUND leg which emits `event=outbound_call_failed` +
   `outbound_failure_category` (`adapter.py:2527-2545`). Add a structured inbound failure `event`
   (fingerprint-mismatch vs ICE-fail vs timeout category) + a runbook-0014 entry.
-- [ ] **[high] test/packaging** — The wheel-smoke CI (`.github/workflows/gate.yml`) validates `plugin.yaml`
+- [x] (#457) **[high] test/packaging** — The wheel-smoke CI (`.github/workflows/gate.yml`) validates `plugin.yaml`
   is packaged but NOT that the 5 bundled skills' `SKILL.md` files (hatchling glob `src/hermes_voip/skills/**/SKILL.md`,
   pyproject.toml:131) ship in the wheel — a broken glob / removed dir would ship an incomplete wheel silently.
   Add a wheel-smoke assertion (+ an `importlib.resources` resolve test for the skills).
@@ -1661,7 +1661,7 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   an operator typo (`HERMES_VOIP_STT_PROIVDER`) is silently dropped, the default is used, and the enable gate
   returns True with no warning. Cross-check the present key set against the plugin.yaml `optional_env`/
   `requires_env` registry (already pinned by test_plugin_manifest) and warn/reject unknown keys.
-- [ ] **[medium] test** — No importable-resource test that the 5 bundled skills' `SKILL.md` resolve via
+- [x] (#457) **[medium] test** — No importable-resource test that the 5 bundled skills' `SKILL.md` resolve via
   `importlib.resources` from the installed wheel (mirrors the existing `plugin.yaml` resolve test at
   test_plugin_manifest.py:553-567). Companion to the wheel-smoke [high] above.
 - [ ] **[medium] operability** — No pre-commit hook catching version drift across the 4 sources

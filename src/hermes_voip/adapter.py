@@ -6515,10 +6515,12 @@ class VoipAdapter(BasePlatformAdapter):
         # (bounded by the configured knob) and classify the real outcome, so the agent
         # learns whether the transfer actually completed — not just that it was sent.
         timeout = self._transfer_outcome_timeout()
-        progress = await session.transfer_blind(
+        report = await session.transfer_blind(
             target, referred_by=referred_by, outcome_timeout=timeout
         )
-        return build_transfer_result(progress, timeout)
+        # ADR-0109 P2: thread the discriminated OUTCOME_UNKNOWN reason through so the
+        # tool message names WHY (timeout / declined / call-ended / wait-disabled).
+        return build_transfer_result(report.progress, timeout, report.unknown_reason)
 
     async def start_attended_consult(self, call_id: str, target: str) -> str:
         """Originate the CONSULTATION leg of an attended transfer (ADR-0048).
@@ -6660,11 +6662,14 @@ class VoipAdapter(BasePlatformAdapter):
         # ADR-0109: await the terminal transfer-progress NOTIFY (bounded) after the
         # REFER+Replaces 2xx and classify the real outcome, like the blind path.
         timeout = self._transfer_outcome_timeout()
-        progress = await session.transfer_attended(
+        report = await session.transfer_attended(
             consult.dialog, referred_by=referred_by, outcome_timeout=timeout
         )
         self._attended_consults.pop(call_id, None)
-        return build_attended_transfer_result(progress, timeout)
+        # ADR-0109 P2: pass the discriminated OUTCOME_UNKNOWN reason to the message.
+        return build_attended_transfer_result(
+            report.progress, timeout, report.unknown_reason
+        )
 
     async def cancel_attended_transfer(self, call_id: str) -> bool:
         """Abandon the consultation for ``call_id`` (ADR-0048); whether it acted.

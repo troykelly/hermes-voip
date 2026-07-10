@@ -72,6 +72,7 @@ from hermes_voip.providers.policy import GuardSessionState
 from hermes_voip.refer import (
     NotifyProgress,
     TransferOutcomeClass,
+    TransferUnknownReason,
     classify_transfer_progress,
 )
 from hermes_voip.tools import gate_voip_tool
@@ -269,15 +270,18 @@ class TransferResult:
     real transfer outcome. ``outcome`` is the tool-facing :class:`TransferOutcome`; for
     a NOTIFY-reported ``FAILED``, ``notify_status`` + ``notify_reason`` carry the
     sipfrag SIP status line the message shows. ``timeout_secs`` is the bounded wait the
-    adapter applied, so the ``OUTCOME_UNKNOWN`` message can name it. The notify/timeout
-    fields are ``None`` for the pre-REFER outcomes (``NO_CALL`` / ``UNCONFIRMED`` /
-    ``BLOCKED``).
+    adapter applied, so the ``OUTCOME_UNKNOWN`` message can name it. ``unknown_reason``
+    (ADR-0109 P2) discriminates WHY an ``OUTCOME_UNKNOWN`` outcome is unknown (timeout
+    / declined subscription / call-ended / wait-disabled) so the message states the real
+    reason. The notify/timeout/reason fields are ``None`` for the pre-REFER outcomes
+    (``NO_CALL`` / ``UNCONFIRMED`` / ``BLOCKED``).
     """
 
     outcome: TransferOutcome
     notify_status: int | None = None
     notify_reason: str | None = None
     timeout_secs: float | None = None
+    unknown_reason: TransferUnknownReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,13 +289,15 @@ class AttendedTransferResult:
     """The terminal result of an attended transfer (ADR-0109): outcome + NOTIFY detail.
 
     The attended analogue of :class:`TransferResult`, returned by
-    :meth:`VoipToolHost.complete_attended_transfer`; the field semantics are identical.
+    :meth:`VoipToolHost.complete_attended_transfer`; the field semantics are identical
+    (including the ADR-0109 P2 ``unknown_reason``).
     """
 
     outcome: AttendedTransferOutcome
     notify_status: int | None = None
     notify_reason: str | None = None
     timeout_secs: float | None = None
+    unknown_reason: TransferUnknownReason | None = None
 
 
 # ADR-0109: map the pure terminal classification to the tool-facing outcome enums.
@@ -317,13 +323,16 @@ def _terminal_notify(progress: NotifyProgress | None) -> NotifyProgress | None:
 
 
 def build_transfer_result(
-    progress: NotifyProgress | None, timeout_secs: float
+    progress: NotifyProgress | None,
+    timeout_secs: float,
+    unknown_reason: TransferUnknownReason | None = None,
 ) -> TransferResult:
     """Classify a blind transfer's terminal NOTIFY into a :class:`TransferResult`.
 
     The adapter's glue (ADR-0109): maps the pure classification to the tool-facing
     :class:`TransferOutcome` and attaches the terminal SIP status/reason (for
-    ``FAILED``) plus the bounded wait applied (for the ``OUTCOME_UNKNOWN`` message).
+    ``FAILED``) plus the bounded wait applied and the discriminated ``unknown_reason``
+    (ADR-0109 P2) the ``OUTCOME_UNKNOWN`` message names.
     """
     terminal = _terminal_notify(progress)
     return TransferResult(
@@ -331,11 +340,14 @@ def build_transfer_result(
         notify_status=terminal.status_code if terminal is not None else None,
         notify_reason=terminal.reason if terminal is not None else None,
         timeout_secs=timeout_secs,
+        unknown_reason=unknown_reason,
     )
 
 
 def build_attended_transfer_result(
-    progress: NotifyProgress | None, timeout_secs: float
+    progress: NotifyProgress | None,
+    timeout_secs: float,
+    unknown_reason: TransferUnknownReason | None = None,
 ) -> AttendedTransferResult:
     """Attended analogue of :func:`build_transfer_result` (ADR-0109)."""
     terminal = _terminal_notify(progress)
@@ -344,6 +356,7 @@ def build_attended_transfer_result(
         notify_status=terminal.status_code if terminal is not None else None,
         notify_reason=terminal.reason if terminal is not None else None,
         timeout_secs=timeout_secs,
+        unknown_reason=unknown_reason,
     )
 
 
@@ -1620,6 +1633,34 @@ def _within_timeout(timeout_secs: float | None) -> str:
     return f"within {timeout_secs:g}s"
 
 
+def _outcome_unknown_message(
+    reason: TransferUnknownReason | None, timeout_secs: float | None, *, prefix: str
+) -> str:
+    """Render the OUTCOME_UNKNOWN tool message for the discriminated reason (P2).
+
+    ``prefix`` opens the message with the transfer-identifying clause — ``"Transfer to
+    {target}"`` (blind) or ``"Transfer"`` (attended) — so the per-reason wording is
+    shared. Each reason states what actually happened instead of always claiming a
+    bounded wait (ADR-0109 §4): a declined RFC 4488 subscription, the call ending first,
+    or outcome confirmation being disabled. A ``TIMEOUT`` — or a defensive ``None``
+    reason — keeps the honest "outcome not confirmed within Ns" wording naming the wait
+    that actually elapsed.
+    """
+    if reason is TransferUnknownReason.WAIT_DISABLED:
+        return f"{prefix} initiated."
+    if reason is TransferUnknownReason.SUBSCRIPTION_DECLINED:
+        return (
+            f"{prefix} initiated; the peer declined the transfer-progress "
+            "subscription, so the final outcome was not reported."
+        )
+    if reason is TransferUnknownReason.CALL_ENDED:
+        return (
+            f"{prefix} initiated; the call ended before the transfer outcome "
+            "was reported."
+        )
+    return f"{prefix} initiated; outcome not confirmed {_within_timeout(timeout_secs)}."
+
+
 async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct fail-clear branch the model must be able to tell apart (no adapter / no call / no target / transfer-failed / transferred / not-confirmed / call-ended); collapsing them would hide which outcome occurred
     args: Mapping[str, object] | None = None,
     **_kwargs: object,
@@ -1680,14 +1721,16 @@ async def transfer_blind_handler(  # noqa: PLR0911 — each return is a distinct
             detail = _sip_status_detail(result.notify_status, result.notify_reason)
             return json.dumps({"error": f"Transfer to {target} failed: {detail}."})
         if outcome is TransferOutcome.OUTCOME_UNKNOWN:
-            # No terminal NOTIFY within the bounded wait — keep the honest "initiated"
-            # wording (the REFER was accepted; the real outcome is genuinely unknown).
-            within = _within_timeout(result.timeout_secs)
+            # The REFER was accepted but no terminal NOTIFY resolved the transfer. The
+            # honest "initiated" wording stays, but ADR-0109 P2 names WHY it is unknown
+            # (timeout / declined subscription / call-ended / wait-disabled) instead of
+            # always claiming a bounded wait that may never have elapsed (rule 27).
             return json.dumps(
                 {
-                    "result": (
-                        f"Transfer to {target} initiated; "
-                        f"outcome not confirmed {within}."
+                    "result": _outcome_unknown_message(
+                        result.unknown_reason,
+                        result.timeout_secs,
+                        prefix=f"Transfer to {target}",
                     )
                 }
             )
@@ -1808,9 +1851,14 @@ async def _attended_complete(adapter: VoipToolHost, call_id: str) -> str:  # noq
         detail = _sip_status_detail(result.notify_status, result.notify_reason)
         return json.dumps({"error": f"Transfer failed: {detail}."})
     if outcome is AttendedTransferOutcome.OUTCOME_UNKNOWN:
-        within = _within_timeout(result.timeout_secs)
+        # ADR-0109 P2: name WHY the outcome is unknown (mirrors the blind path, with no
+        # {target} in the attended phrasing) rather than always claiming a bounded wait.
         return json.dumps(
-            {"result": f"Transfer initiated; outcome not confirmed {within}."}
+            {
+                "result": _outcome_unknown_message(
+                    result.unknown_reason, result.timeout_secs, prefix="Transfer"
+                )
+            }
         )
     if outcome is AttendedTransferOutcome.NO_CONSULT:
         return json.dumps(

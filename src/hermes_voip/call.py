@@ -57,6 +57,8 @@ from hermes_voip.refer import (
     NotifyProgress,
     ReferError,
     ReferRequest,
+    TransferOutcomeReport,
+    TransferUnknownReason,
     build_attended_refer,
     build_blind_refer,
     parse_notify_sipfrag,
@@ -456,13 +458,16 @@ class CallSession:
         *,
         referred_by: str | None = None,
         outcome_timeout: float = 0.0,
-    ) -> NotifyProgress | None:
+    ) -> TransferOutcomeReport:
         """Blind-transfer the caller to ``target_uri`` (REFER); return the outcome.
 
         Sends the RFC 3515 REFER, then waits up to ``outcome_timeout`` seconds for the
-        terminal transfer-progress NOTIFY (ADR-0109) and returns it — ``None`` when the
-        peer declines the subscription (RFC 4488 ``Refer-Sub: false``), the wait times
-        out, the leg ends first, or the wait is opted out (``outcome_timeout <= 0``).
+        terminal transfer-progress NOTIFY and returns a
+        :class:`~hermes_voip.refer.TransferOutcomeReport` (ADR-0109 P2): a terminal
+        NOTIFY yields the ``progress`` with no ``unknown_reason``; otherwise the report
+        names why the outcome is unknown — ``SUBSCRIPTION_DECLINED`` when the peer
+        declines the subscription (RFC 4488 ``Refer-Sub: false``), else ``TIMEOUT`` /
+        ``CALL_ENDED`` / ``WAIT_DISABLED`` per :meth:`_await_transfer_outcome`.
 
         Raises:
             CallError: if the gateway rejects the REFER (a ``>= 300`` final response).
@@ -481,7 +486,10 @@ class CallSession:
             # OUTSIDE the lock so the bounded wait never blocks a concurrent
             # hold / refresh / DTMF on the same dialog.
             if subscription_declined:
-                return None
+                return TransferOutcomeReport(
+                    progress=None,
+                    unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
+                )
             return await self._await_transfer_outcome(armed_event, outcome_timeout)
         finally:
             if armed_event is not None:
@@ -493,12 +501,14 @@ class CallSession:
         *,
         referred_by: str | None = None,
         outcome_timeout: float = 0.0,
-    ) -> NotifyProgress | None:
+    ) -> TransferOutcomeReport:
         """Attended-transfer the caller to the ``consult`` peer (REFER + Replaces).
 
         Same outcome contract as :meth:`transfer_blind`: after the REFER 2xx it waits
-        up to ``outcome_timeout`` seconds for the terminal NOTIFY and returns it (or
-        ``None`` — declined subscription / timeout / call-end / opt-out) (ADR-0109).
+        up to ``outcome_timeout`` seconds for the terminal NOTIFY and returns a
+        :class:`~hermes_voip.refer.TransferOutcomeReport` — the terminal ``progress``,
+        or the discriminated reason it is unknown (``SUBSCRIPTION_DECLINED`` /
+        ``TIMEOUT`` / ``CALL_ENDED`` / ``WAIT_DISABLED``) (ADR-0109 P2).
 
         Raises:
             CallError: if the gateway rejects the REFER (a ``>= 300`` final response).
@@ -514,7 +524,10 @@ class CallSession:
                 )
                 subscription_declined = _refer_subscription_declined(response)
             if subscription_declined:
-                return None
+                return TransferOutcomeReport(
+                    progress=None,
+                    unknown_reason=TransferUnknownReason.SUBSCRIPTION_DECLINED,
+                )
             return await self._await_transfer_outcome(armed_event, outcome_timeout)
         finally:
             if armed_event is not None:
@@ -548,23 +561,37 @@ class CallSession:
 
     async def _await_transfer_outcome(
         self, event: asyncio.Event, timeout: float
-    ) -> NotifyProgress | None:
+    ) -> TransferOutcomeReport:
         """Wait up to ``timeout`` s for the terminal transfer NOTIFY (ADR-0109).
 
-        Returns the recorded :attr:`transfer_progress` once ``event`` fires — set by
-        :meth:`_on_notify` on a terminated NOTIFY, or on call-end (BYE / hang_up) so a
-        torn-down referrer leg wakes the wait. Returns ``None`` on timeout or when the
-        wait is opted out (``timeout <= 0``). The returned progress may be non-terminal
-        / ``None`` when woken by call-end; the pure classifier maps that to
-        OUTCOME_UNKNOWN — we never infer success from a BYE.
+        Returns a :class:`~hermes_voip.refer.TransferOutcomeReport` naming the real
+        outcome (ADR-0109 P2): a terminal :attr:`transfer_progress` (set by
+        :meth:`_on_notify` on a terminated NOTIFY) yields ``(progress, unknown_reason
+        =None)``; otherwise the report carries no progress and the discriminated reason
+        the wait ended for:
+
+        * ``timeout <= 0`` — the wait is opted out: ``WAIT_DISABLED`` (no wait ran).
+        * the wait elapses with no terminal NOTIFY: ``TIMEOUT``.
+        * the event fires but nothing terminal was recorded — a BYE / hang_up woke it
+          (or only a non-terminal ``100 Trying`` arrived): ``CALL_ENDED``. We never
+          infer success from a torn-down leg.
         """
         if timeout <= 0:
-            return None
+            return TransferOutcomeReport(
+                progress=None, unknown_reason=TransferUnknownReason.WAIT_DISABLED
+            )
         try:
             await asyncio.wait_for(event.wait(), timeout)
         except TimeoutError:
-            return None
-        return self.transfer_progress
+            return TransferOutcomeReport(
+                progress=None, unknown_reason=TransferUnknownReason.TIMEOUT
+            )
+        progress = self.transfer_progress
+        if progress is not None and progress.terminated:
+            return TransferOutcomeReport(progress=progress, unknown_reason=None)
+        return TransferOutcomeReport(
+            progress=None, unknown_reason=TransferUnknownReason.CALL_ENDED
+        )
 
     def _wake_transfer_on_end(self) -> None:
         """Wake a pending transfer-outcome wait when the call ends (ADR-0109).

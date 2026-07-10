@@ -215,6 +215,7 @@ from hermes_voip.session_timer import (
     refresh_interval_secs,
     teardown_deadline_secs,
 )
+from hermes_voip.spoken_text import sanitize_for_speech
 from hermes_voip.tools import gate_voip_tool
 from hermes_voip.transport.connection import CallResponseSink, SipOverTlsTransport
 from hermes_voip.transport.ws_connection import WssSipTransport
@@ -5643,7 +5644,11 @@ class VoipAdapter(BasePlatformAdapter):
         if providers is None:  # connect() populates this before any INVITE
             msg = f"INVITE {call_id}: providers not initialised"
             raise RuntimeError(msg)
-        phrase = media_cfg.decline_phrase
+        # Sanitise the operator-authored decline line the SAME way the conversational
+        # path sanitises agent text (spoken_text.sanitize_for_speech, applied by the
+        # CallLoop's _sanitize_iter), so markdown, raw URLs, and emoji are not voiced
+        # verbatim to the caller (item 1325).
+        phrase = sanitize_for_speech(media_cfg.decline_phrase)
         # Use the SAME configured TTS voice the normal conversational path uses
         # (``MediaConfig.tts_voice``); ``None`` resolves to ``""`` (the provider's
         # default voice), exactly as the CallLoop voice seam does — so the decline line

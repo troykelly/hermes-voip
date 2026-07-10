@@ -282,8 +282,10 @@ def _inbound_secured_failure_category(exc: BaseException) -> str:
       ``a=fingerprint`` (RFC 5763 §5): a MISCONFIG. ⇒ ``"fingerprint"``.
     * :class:`ConnectionError` — ICE connectivity checks failed (WebRTC only): a
       NETWORK failure. ⇒ ``"ice"``.
-    * :class:`RuntimeError` — the DTLS handshake did not complete within the
-      round/recv bound: a peer TIMEOUT. ⇒ ``"dtls_timeout"``.
+    * :class:`RuntimeError` — a generic DTLS/SRTP handshake failure: the SIP-DTLS leg
+      wraps a pyOpenSSL ``SSL.Error`` as a RuntimeError as well as a round/recv timeout,
+      so this is the catch-all DTLS-failure bucket, NOT a timeout-only signal. ⇒
+      ``"dtls"``.
     * any other exception — an unexpected error on the handshake path. ⇒ ``"failed"``.
 
     :class:`ConnectionError` is checked before :class:`OSError`'s other subclasses and
@@ -4600,7 +4602,7 @@ class VoipAdapter(BasePlatformAdapter):
             # STRUCTURED SLO SIGNAL (runbook 0014): the 200 OK already emitted
             # ``call_answered``, so without this the setup-success SLO OVERCOUNTS. Emit
             # ``inbound_secured_handshake_failed`` + a ``failure_category`` (this leg
-            # has no ICE, so only fingerprint / dtls_timeout / failed are derivable) so
+            # has no ICE, so only fingerprint / dtls / failed are derivable) so
             # the SLO query can subtract it. Control flow is unchanged — the call is
             # still torn down and the reject signal re-raised below.
             _log.error(

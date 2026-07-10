@@ -239,6 +239,12 @@ class CallSession:
         self.on_hold = False
         self.ended = False
         self.transfer_progress: NotifyProgress | None = None
+        # ADR-0109: the per-transfer terminal-outcome signal. Armed (a fresh Event)
+        # by :meth:`_arm_transfer_outcome` BEFORE a REFER is sent, set by
+        # :meth:`_on_notify` on a terminated transfer NOTIFY — and also on call-end
+        # (BYE / hang_up) so an outcome wait wakes when the referrer leg is torn down.
+        # ``None`` until the first transfer arms it.
+        self._transfer_terminal: asyncio.Event | None = None
 
     @property
     def dialog(self) -> Dialog:
@@ -423,6 +429,7 @@ class CallSession:
             request = build_in_dialog_request(self._dialog, "BYE")
             self._dialog = request.dialog
             self.ended = True
+            self._wake_transfer_on_end()
             try:
                 await self._signaling.send(request.text)
             except Exception as exc:  # noqa: BLE001 — best-effort BYE; never strand teardown (rule 37: logged, not swallowed)
@@ -435,26 +442,105 @@ class CallSession:
             await self._media.stop()
 
     async def transfer_blind(
-        self, target_uri: str, *, referred_by: str | None = None
-    ) -> None:
-        """Blind-transfer the caller to ``target_uri`` (REFER); progress via NOTIFY."""
+        self,
+        target_uri: str,
+        *,
+        referred_by: str | None = None,
+        outcome_timeout: float = 0.0,
+    ) -> NotifyProgress | None:
+        """Blind-transfer the caller to ``target_uri`` (REFER); return the outcome.
+
+        Sends the RFC 3515 REFER, then waits up to ``outcome_timeout`` seconds for the
+        terminal transfer-progress NOTIFY (ADR-0109) and returns it — ``None`` when the
+        peer declines the subscription (RFC 4488 ``Refer-Sub: false``), the wait times
+        out, the leg ends first, or the wait is opted out (``outcome_timeout <= 0``).
+
+        Raises:
+            CallError: if the gateway rejects the REFER (a ``>= 300`` final response).
+        """
         async with self._lock:
-            await self._refer(
+            self._arm_transfer_outcome()
+            response = await self._refer(
                 lambda auth: build_blind_refer(
                     self._dialog, target_uri, referred_by=referred_by, auth=auth
                 )
             )
+            subscription_declined = _refer_subscription_declined(response)
+        # The REFER is accepted and the lock released; await the terminal NOTIFY
+        # OUTSIDE the lock so the bounded wait never blocks a concurrent
+        # hold / refresh / DTMF on the same dialog.
+        if subscription_declined:
+            return None
+        return await self._await_transfer_outcome(outcome_timeout)
 
     async def transfer_attended(
-        self, consult: Dialog, *, referred_by: str | None = None
-    ) -> None:
-        """Attended-transfer the caller to the ``consult`` peer (REFER + Replaces)."""
+        self,
+        consult: Dialog,
+        *,
+        referred_by: str | None = None,
+        outcome_timeout: float = 0.0,
+    ) -> NotifyProgress | None:
+        """Attended-transfer the caller to the ``consult`` peer (REFER + Replaces).
+
+        Same outcome contract as :meth:`transfer_blind`: after the REFER 2xx it waits
+        up to ``outcome_timeout`` seconds for the terminal NOTIFY and returns it (or
+        ``None`` — declined subscription / timeout / call-end / opt-out) (ADR-0109).
+
+        Raises:
+            CallError: if the gateway rejects the REFER (a ``>= 300`` final response).
+        """
         async with self._lock:
-            await self._refer(
+            self._arm_transfer_outcome()
+            response = await self._refer(
                 lambda auth: build_attended_refer(
                     self._dialog, consult, referred_by=referred_by, auth=auth
                 )
             )
+            subscription_declined = _refer_subscription_declined(response)
+        if subscription_declined:
+            return None
+        return await self._await_transfer_outcome(outcome_timeout)
+
+    def _arm_transfer_outcome(self) -> None:
+        """Reset transfer progress + arm the terminal-NOTIFY event BEFORE the REFER.
+
+        Done under the call lock before the REFER is sent so a terminal NOTIFY that
+        races the 2xx is never missed: :meth:`_on_notify` sets the freshly-armed event
+        and the wait armed here observes it (ADR-0109).
+        """
+        self.transfer_progress = None
+        self._transfer_terminal = asyncio.Event()
+
+    async def _await_transfer_outcome(self, timeout: float) -> NotifyProgress | None:
+        """Wait up to ``timeout`` s for the terminal transfer NOTIFY (ADR-0109).
+
+        Returns the recorded :attr:`transfer_progress` once the terminal event fires —
+        set by :meth:`_on_notify` on a terminated NOTIFY, or on call-end (BYE /
+        hang_up) so a torn-down referrer leg wakes the wait. Returns ``None`` on
+        timeout or when the wait is opted out (``timeout <= 0``). The returned progress
+        may be non-terminal / ``None`` when woken by call-end; the pure classifier maps
+        that to OUTCOME_UNKNOWN — we never infer success from a BYE.
+        """
+        event = self._transfer_terminal
+        if event is None or timeout <= 0:
+            return None
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except TimeoutError:
+            return None
+        return self.transfer_progress
+
+    def _wake_transfer_on_end(self) -> None:
+        """Wake a pending transfer-outcome wait when the call ends (ADR-0109).
+
+        A BYE (either side) tears the referrer leg down; a bounded outcome wait must
+        return rather than block for the full timeout. Setting the armed terminal event
+        wakes it — ``transfer_progress`` keeps whatever (if anything) had arrived, so
+        the classifier maps a no-terminal-NOTIFY end to OUTCOME_UNKNOWN (never inferring
+        success from a BYE). A no-op when no transfer is in flight.
+        """
+        if self._transfer_terminal is not None:
+            self._transfer_terminal.set()
 
     async def refresh_session(
         self, extra_headers: Sequence[tuple[str, str]]
@@ -679,7 +765,13 @@ class CallSession:
 
     async def _refer(
         self, build: Callable[[tuple[str, str] | None], InDialogRequest]
-    ) -> None:
+    ) -> SipResponse:
+        """Send a REFER (re-auth once on 401/407); return its 2xx, raise on >= 300.
+
+        Returns the REFER's final 2xx response so the caller can inspect its
+        ``Refer-Sub`` (RFC 4488) to decide whether a progress NOTIFY will follow
+        (ADR-0109).
+        """
         result = build(None)
         self._dialog = result.dialog
         response = await self._send_and_await_final(
@@ -695,6 +787,7 @@ class CallSession:
         if response.status_code >= _FIRST_ERROR_STATUS:
             msg = f"REFER rejected: {response.status_code} {response.reason}"
             raise CallError(msg)
+        return response
 
     def _authorization(self, response: SipResponse, method: str) -> tuple[str, str]:
         proxy = response.status_code == _PROXY_AUTH_REQUIRED
@@ -958,6 +1051,7 @@ class CallSession:
             return
         await self._signaling.send(response)
         self.ended = True
+        self._wake_transfer_on_end()
         await self._media.stop()
 
     async def _on_notify(self, request: SipRequest) -> None:
@@ -1009,6 +1103,11 @@ class CallSession:
         if response is None:
             return
         self.transfer_progress = progress
+        # ADR-0109: a terminated NOTIFY is the transfer's final outcome — wake any
+        # bounded outcome wait (a non-terminal 100 Trying updates progress only, so a
+        # waiter keeps waiting for the terminal report).
+        if progress.terminated and self._transfer_terminal is not None:
+            self._transfer_terminal.set()
         await self._signaling.send(response)
 
     async def _on_refer(self, request: SipRequest) -> None:
@@ -1042,6 +1141,21 @@ class CallSession:
         await self._signaling.send(response)
         if self._refer_handler is not None:
             await self._refer_handler(refer)
+
+
+def _refer_subscription_declined(response: SipResponse) -> bool:
+    """RFC 4488: ``True`` when a REFER 2xx carries ``Refer-Sub: false`` (ADR-0109).
+
+    A referee that answers the REFER with ``Refer-Sub: false`` has declined the
+    implicit subscription, so no progress NOTIFY will follow — the caller skips the
+    outcome wait and reports OUTCOME_UNKNOWN immediately. The header token is the part
+    before any ``;``-parameters, compared case-insensitively; an absent header (the
+    common case — the subscription is active) is ``False``.
+    """
+    value = response.header("Refer-Sub")
+    if value is None:
+        return False
+    return value.split(";", 1)[0].strip().lower() == "false"
 
 
 # RFC 3261 §8.1.1.5: a CSeq sequence number is < 2**31. Leading zeros are valid

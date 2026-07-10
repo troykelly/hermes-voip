@@ -71,6 +71,37 @@ def test_gate_yml_has_wheel_smoke_job() -> None:
     )
 
 
+def test_gate_yml_wheel_smoke_asserts_skills_packaged() -> None:
+    """The wheel-smoke job must assert the bundled skills' SKILL.md land in the wheel.
+
+    Like ``plugin.yaml`` (assertion 2), each skill's ``SKILL.md`` is non-``.py``
+    package data that hatchling ships ONLY because the wheel target declares the
+    ``skills/**/SKILL.md`` artifacts glob. A dropped glob would build a skill-less
+    wheel that passes every other check but makes ``register_skills`` raise inside
+    the Hermes runtime (a missing SKILL.md is a packaging defect, ADR-0047 / rule 37).
+    RED (rule 18) until the wheel-smoke job gains a step that inspects the built
+    wheel's zip entries for the skills' ``SKILL.md``.
+    """
+    raw = _GATE_YML.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    assert isinstance(data, dict)
+    jobs = data.get("jobs", {})
+    assert isinstance(jobs, dict)
+    wheel_smoke = jobs.get("wheel-smoke", {})
+    assert isinstance(wheel_smoke, dict)
+    steps = wheel_smoke.get("steps", [])
+    assert isinstance(steps, list)
+    runs = "\n".join(
+        str(step.get("run", "")) for step in steps if isinstance(step, dict)
+    )
+    assert "SKILL.md" in runs, (
+        "the wheel-smoke job must assert the bundled skills' SKILL.md are packaged "
+        "in the built wheel (mirroring the plugin.yaml zipfile check) — otherwise a "
+        "dropped skills/**/SKILL.md artifacts glob ships a skill-less wheel that "
+        "passes CI green but makes register_skills() raise in the Hermes runtime"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (B) In-process structural checks (version / pyproject / entry-point)
 #     These are fast and require no wheel build.
@@ -145,6 +176,52 @@ def test_pyproject_wheel_artifacts_include_plugin_yaml() -> None:
     assert "plugin.yaml" in combined, (
         "pyproject.toml wheel target must declare src/hermes_voip/plugin.yaml "
         "in artifacts or force-include so it lands in the built wheel"
+    )
+
+
+def test_pyproject_wheel_artifacts_include_skills() -> None:
+    """The hatch wheel target declares the bundled skills' SKILL.md as package data.
+
+    Each ``skills/<name>/SKILL.md`` is non-.py package data hatchling ships ONLY
+    because the wheel target declares the ``skills/**/SKILL.md`` artifacts glob
+    (ADR-0047). A dropped declaration builds a skill-less wheel — which the
+    importlib.resources resolve test would NOT catch in an editable install (the
+    source files resolve regardless), and which makes ``register_skills`` raise in
+    the Hermes runtime (rule 37). The wheel-smoke CI job verifies the actual zipfile;
+    this verifies the BUILD CONFIG that produces that outcome.
+    """
+    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    tool = data.get("tool", {})
+    assert isinstance(tool, dict)
+    hatch = tool.get("hatch", {})
+    assert isinstance(hatch, dict)
+    build = hatch.get("build", {})
+    assert isinstance(build, dict)
+    targets = build.get("targets", {})
+    assert isinstance(targets, dict)
+    wheel = targets.get("wheel", {})
+    assert isinstance(wheel, dict)
+
+    declared: list[str] = []
+    artifacts = wheel.get("artifacts")
+    if isinstance(artifacts, list):
+        declared.extend(str(v) for v in artifacts)
+    force_include = wheel.get("force-include")
+    if isinstance(force_include, list):
+        declared.extend(str(v) for v in force_include)
+    elif isinstance(force_include, dict):
+        declared.extend(str(k) for k in force_include)
+        declared.extend(str(v) for v in force_include.values())
+
+    # The single artifact glob that ships every bundled skill's SKILL.md, checked as
+    # one whole path token — NOT two loose "skills"/"SKILL.md" substrings, which an
+    # unrelated entry could satisfy separately (codex review). The wheel-smoke job
+    # (assertion 2b) is the live guard against a broken glob; this asserts the build
+    # config. Normalise separators so a Windows-style path still matches.
+    combined = " ".join(declared).replace("\\", "/")
+    assert "skills/**/SKILL.md" in combined, (
+        "pyproject.toml wheel target must declare src/hermes_voip/skills/**/SKILL.md "
+        "in artifacts or force-include so every bundled skill lands in the built wheel"
     )
 
 

@@ -568,6 +568,34 @@ def test_manifest_is_importable_package_data() -> None:
     assert data.get("name") == "hermes-voip"
 
 
+def test_bundled_skills_are_importable_package_data() -> None:
+    """Every bundled skill's SKILL.md resolves as hermes_voip package data.
+
+    The skills companion to :func:`test_manifest_is_importable_package_data`: each
+    ``skills/<name>/SKILL.md`` (ADR-0047) must resolve via ``importlib.resources`` —
+    the access pattern a pip-installed consumer uses — so the wheel can surface them
+    and ``register_skills`` can hand hermes a real path. NOTE: in an editable install
+    this resolves to ``src/hermes_voip/skills/...`` regardless of wheel config, so the
+    *wheel* guard is the separate wheel-smoke SKILL.md zipfile assertion and
+    ``test_wheel_packaging.test_pyproject_wheel_artifacts_include_skills``.
+    """
+    from importlib.resources import files  # noqa: PLC0415
+
+    from hermes_voip.skills import BUNDLED_SKILLS  # noqa: PLC0415
+
+    assert BUNDLED_SKILLS, "no bundled skills are declared"
+    for spec in BUNDLED_SKILLS:
+        resource = files("hermes_voip").joinpath("skills", spec.name, "SKILL.md")
+        assert resource.is_file(), (
+            f"skill {spec.name!r}: SKILL.md must resolve as hermes_voip package data"
+        )
+        text = resource.read_text(encoding="utf-8")
+        assert text.startswith("---"), f"{spec.name}: SKILL.md lacks YAML frontmatter"
+        assert f"name: {spec.name}" in text, (
+            f"{spec.name}: SKILL.md frontmatter must declare 'name: {spec.name}'"
+        )
+
+
 def test_pyproject_packages_the_manifest_into_the_wheel() -> None:
     """The hatch wheel target must ship the manifest as package data.
 

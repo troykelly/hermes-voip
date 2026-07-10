@@ -132,8 +132,12 @@ def tag_param(trailing: str) -> str | None:
     """
     for part in split_params(trailing):
         key, sep, raw = part.partition("=")
-        if sep and key.strip().lower() == "tag":
-            value = raw.strip()
+        # RFC 3261 LWS is SP / HTAB only (CRLF folding is already unfolded to a single
+        # space by message.py), so strip exactly those around the name and value — NOT
+        # str.strip()'s broader Unicode-whitespace set, which would silently accept a
+        # value wrapped in non-LWS whitespace (form-feed, NBSP, …) as if well-formed.
+        if sep and key.strip(" \t").lower() == "tag":
+            value = raw.strip(" \t")
             return value if _TAG_TOKEN.fullmatch(value) else None
     return None
 

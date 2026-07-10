@@ -86,6 +86,11 @@ def test_tag_param_rejects_quoted_and_non_token_values() -> None:
     assert tag_param(";tag=a/b") is None
     assert tag_param(";tag=a,b") is None
     assert tag_param(";tag=ab cd") is None
+    # RFC 3261 LWS is SP/HTAB only: a value wrapped in NON-LWS whitespace (form-feed,
+    # NBSP) is malformed, not silently trimmed to a bare token by ``str.strip()``.
+    assert tag_param(";tag=\x0cabc\x0c") is None
+    assert tag_param(";tag=\xa0abc") is None
+    assert tag_param(";tag=abc\xa0") is None
 
 
 def test_tag_param_accepts_token_with_grammar_legal_lws_and_specials() -> None:

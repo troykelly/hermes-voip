@@ -6,7 +6,7 @@ Tests the full outbound UAC flow:
 - Plugin re-sends with Proxy-Authorization
 - Gateway sends 180 Ringing then 200 OK with SDP answer
 - Plugin sends ACK
-- RTP flows (plugin sends greeting audio)
+- No inbound greeting RTP flows (ADR-0019: the agent's first turn opens the call)
 - Gateway sends BYE
 - Plugin tears down cleanly
 
@@ -594,7 +594,9 @@ async def test_outbound_call_auth_challenge_then_200() -> None:
     4. Plugin re-sends INVITE with Proxy-Authorization.
     5. Gateway sends 180 Ringing then 200 OK with SDP answer.
     6. Plugin sends ACK.
-    7. Plugin sends greeting RTP (at least 1 packet from the greeting).
+    7. Plugin sends NO greeting RTP: an outbound call plays no inbound greeting
+       (ADR-0019); the agent's first turn opens the call, and this no-objective
+       dial injects no first turn, so the callee hears nothing.
     8. Gateway sends BYE.
     9. Call tears down cleanly (no engine leak, no uncancelled tasks).
     """
@@ -638,9 +640,15 @@ async def test_outbound_call_auth_challenge_then_200() -> None:
             returned_call_id = await asyncio.wait_for(place_task, timeout=5.0)
             assert returned_call_id == call_id
 
-            # Greeting RTP should flow to the gateway's RTP endpoint
-            await gateway.rtp.wait_for_frames(1, timeout=3.0)
-            assert len(gateway.rtp.received_packets) >= 1
+            # ADR-0019: an OUTBOUND call plays NO inbound greeting — the agent's
+            # first turn opens the call. This dial carries no objective, so
+            # _inject_objective_first_turn (ADR-0029) seeds nothing, and the
+            # greeting was the harness's only RTP source. So NO unsolicited RTP
+            # must reach the gateway. Before the fix the canned inbound greeting
+            # ("Hello, how can I help you?") flowed here; assert its absence over a
+            # bounded window so a regression that re-plays it fails this test.
+            await asyncio.sleep(0.5)
+            assert gateway.rtp.received_packets == []
 
             # Wait for call to be tracked
             await _until(lambda: call_id in adapter._call_sessions, timeout=5.0)

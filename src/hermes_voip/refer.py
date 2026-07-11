@@ -154,11 +154,13 @@ def _validate_transfer_target(target: str) -> None:
 
     Anything else — a bare-extension host hijack (``1001@evil.com``), a
     ``?Replaces=`` header or a ``;Route=`` param smuggle, an angle-bracket ``>``
-    breakout, a CR/LF or other control character, whitespace, or an angle bracket
-    in EITHER the literal value OR its percent-decoded form (so a percent-escaped
-    ``%0D%0A`` / ``%20`` / ``%3C`` that a gateway would unescape is caught), an
-    over-long value, or empty — raises :class:`ValueError`, so the injection
-    never reaches the header and no REFER is built.
+    breakout, a CR/LF or other control character, whitespace, a non-ASCII character
+    (e.g. a fullwidth / Arabic-Indic "digit" that a Unicode-aware regex class would
+    fold), or an angle bracket in EITHER the literal value OR its percent-decoded
+    form (so a percent-escaped ``%0D%0A`` / ``%20`` / ``%3C`` / ``%EF%BC%90`` that a
+    gateway would unescape is caught), an over-long value, or empty — raises
+    :class:`ValueError`, so the injection never reaches the header and no REFER is
+    built.
 
     Args:
         target: The agent-supplied transfer target (extension or sip URI).
@@ -191,6 +193,16 @@ def _validate_transfer_target(target: str) -> None:
             raise ValueError(msg)
         if "<" in candidate or ">" in candidate:
             msg = "transfer target contains an angle bracket"
+            raise ValueError(msg)
+        # RFC 3261 SIP URIs and dialable numbers are US-ASCII. Reject ANY non-ASCII
+        # character (in the literal OR the percent-decoded form) so a fullwidth /
+        # Arabic-Indic "digit" cannot fold past this injection allowlist onto the
+        # UTF-8-encoded Refer-To wire: a Unicode-aware regex class (the negated
+        # ``_URI_USER`` user-part, or a stray ``\d``/``\w``) would otherwise accept
+        # it. The authority regexes (``_IPV4``/``_AUTHORITY``) also use explicit
+        # ``[0-9]`` — this is the end-to-end enforcement, those are defence in depth.
+        if not candidate.isascii():
+            msg = "transfer target contains a non-ASCII character"
             raise ValueError(msg)
     if _DIALABLE_TARGET.fullmatch(target) is not None:
         return

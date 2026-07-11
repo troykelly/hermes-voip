@@ -617,6 +617,41 @@ def test_build_blind_refer_rejects_fullwidth_digit_ipv4_octet() -> None:
         build_blind_refer(_dialog(), target)
 
 
+def _to_arabic_indic_digits(ascii_digits: str) -> str:
+    """Map ASCII digits to their U+0660..U+0669 Arabic-Indic forms.
+
+    See :func:`_to_fullwidth_digits` — built via code points so the source stays
+    plain-ASCII while the runtime string carries the real non-ASCII digits.
+    """
+    table = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
+    return ascii_digits.translate(table)
+
+
+def test_build_blind_refer_rejects_fullwidth_digit_user_part() -> None:
+    # The bypass is NOT limited to the authority: a fullwidth digit anywhere in the
+    # target (here the user-part, gated only by the permissive negated ``_URI_USER``
+    # class) must be rejected end-to-end by the US-ASCII invariant.
+    target = "sip:" + _to_fullwidth_digits("3000") + "@198.51.100.50:5061"
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), target)
+
+
+def test_build_blind_refer_rejects_arabic_indic_digit() -> None:
+    # Arabic-Indic (U+0660..U+0669) are also Unicode decimal digits a Unicode-aware
+    # `\d` would fold; the US-ASCII invariant rejects them too.
+    target = "sip:3000@198.51.100.50:" + _to_arabic_indic_digits("5061")
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), target)
+
+
+def test_build_blind_refer_rejects_percent_encoded_non_ascii() -> None:
+    # A percent-encoded non-ASCII byte sequence (``%EF%BC%90`` == UTF-8 fullwidth
+    # "0") is ASCII on our wire but a gateway unescaping it would inject a non-ASCII
+    # digit — caught via the percent-decoded arm of the US-ASCII check.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@198.51.100.50:%EF%BC%90061")
+
+
 def test_build_blind_refer_rejects_crlf_header_injection() -> None:
     with pytest.raises(ValueError, match="transfer target"):
         build_blind_refer(_dialog(), "sip:3000@pbx.example.test>\r\nEvil-Header: x")

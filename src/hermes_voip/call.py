@@ -29,7 +29,7 @@ from typing import Protocol, runtime_checkable
 from hermes_voip._decimal import _parse_decimal
 from hermes_voip.dialog import Dialog, InDialogRequest, build_in_dialog_request
 from hermes_voip.digest import DigestChallenge, DigestCredentials, build_authorization
-from hermes_voip.dtmf import DtmfSendMode
+from hermes_voip.dtmf import DtmfSendMode, digit_to_event
 from hermes_voip.dtmf_sipinfo import (
     DTMF_RELAY_CONTENT_TYPE,
     build_dtmf_relay_body,
@@ -349,11 +349,20 @@ class CallSession:
         call's stream under its own TX mutex (so DTMF never interleaves with audio). No
         re-INVITE and no hold gating — DTMF rides the established dialog/media path.
         Raises if the resolved backend cannot run (e.g. RFC 4733 with no negotiated
-        telephone-event); DTMF is never silently dropped (rule 6/37).
+        telephone-event), or :class:`ValueError` if ``digits`` contains a non-DTMF
+        character — validated BEFORE any digit is transmitted (both paths pre-validate
+        the whole burst) so a bad digit never emits a partial burst. DTMF is never
+        silently dropped (rule 6/37).
         """
         if self._dtmf_send_mode is DtmfSendMode.SIP_INFO:
             await self.send_dtmf_info(digits)
             return
+        # Validate the WHOLE burst before any transmission (mirrors send_dtmf_info):
+        # the engine emits RFC 4733 events digit-by-digit and would otherwise raise
+        # mid-burst on a bad char after a valid prefix reached the wire — a partial send
+        # the tool misreports as "(nothing sent)".
+        for digit in digits:
+            digit_to_event(digit)
         await self._media.send_dtmf(digits)
 
     async def send_dtmf_info(self, digits: str, *, duration_ms: int = 160) -> None:

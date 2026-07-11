@@ -74,6 +74,11 @@ class GuardConfig:
         cumulative_threshold: Per-call running-sum of scores that forces escalation.
         window: Number of recent turns the sliding window considers.
         window_threshold: Suspicious-turn count in the window that forces escalation.
+        max_screen_chars: Upper bound (chars) on a finalized turn; a longer turn is
+            failed closed (RESTRICT + degraded) BEFORE normalisation, so no single
+            oversized turn can consume unbounded CPU and stall the shared event loop
+            (the endpointer bounds a normal turn on trailing silence, not on length).
+            Default 16384 — far beyond any legitimate transcribed turn.
     """
 
     clarify_threshold: float = 0.3
@@ -83,6 +88,7 @@ class GuardConfig:
     cumulative_threshold: float = 1.5
     window: int = 5
     window_threshold: int = 3
+    max_screen_chars: int = 16384
 
     def __post_init__(self) -> None:
         """Reject a config whose thresholds are not coherent probabilities."""
@@ -108,6 +114,12 @@ class GuardConfig:
             raise ValueError(msg)
         if self.window < 1:
             msg = f"GuardConfig.window must be >= 1, got {self.window!r}"
+            raise ValueError(msg)
+        if self.max_screen_chars < 1:
+            msg = (
+                "GuardConfig.max_screen_chars must be >= 1, got "
+                f"{self.max_screen_chars!r}"
+            )
             raise ValueError(msg)
         if self.window_threshold < 1:
             msg = (
@@ -165,7 +177,7 @@ class OnnxInjectionGuard:
     async def screen(self, text: str, *, call_id: str) -> GuardResult:
         """Screen one finalized caller turn (ADR-0004 ``InjectionGuard``).
 
-        Normalises ``text``, classifies it off the event-loop thread, grades the
+        Normalises and classifies ``text`` off the event-loop thread, grades the
         score against the single-turn ladder and the per-call cumulative +
         sliding-window signals, and returns a graded :class:`GuardResult`. On any
         inference failure it fails open to ``RESTRICT`` + ``degraded`` (never a
@@ -178,7 +190,24 @@ class OnnxInjectionGuard:
         Returns:
             The graded outcome for this turn.
         """
-        normalized = normalize(text)
+        # Bound the work FIRST: an oversized finalized turn is anomalous — the
+        # endpointer bounds a normal turn on trailing silence, not on length, so a
+        # caller who never pauses can produce an unbounded turn — and normalize()'s
+        # per-char CPU work (which the GIL does not fully yield even off-thread) would
+        # then stall the shared event loop for EVERY concurrent call (a DoS, backlog
+        # L1699). Fail CLOSED before normalising: never truncate-then-screen (that
+        # drops an injection tail) and never ALLOW.
+        cap = self._config.max_screen_chars
+        if len(text) > cap:
+            oversized = NormalizedText(canonical="", candidates=("",), reasons=())
+            return self._fail_open(
+                oversized, reason=f"oversized-turn: {len(text)} chars > {cap}"
+            )
+        # Normalise the (now length-bounded) turn off the event loop too — not only the
+        # classifier below — so its multi-pass regex / homoglyph / decode work never
+        # runs inline on the single-threaded loop (defence in depth beside the cap;
+        # rule 22).
+        normalized = await asyncio.to_thread(normalize, text)
         try:
             raw = await asyncio.to_thread(self._classify, normalized.screened_text)
             # ``_is_valid_probability`` runs INSIDE this try (not after it): the

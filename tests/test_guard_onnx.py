@@ -27,9 +27,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import threading
+from unittest.mock import patch
 
 import pytest
 
+from hermes_voip.guard.normalize import NormalizedText, normalize
 from hermes_voip.guard.onnx import GuardConfig, OnnxInjectionGuard
 from hermes_voip.providers.guard import GuardResult, GuardVerdict, InjectionGuard
 
@@ -65,6 +67,67 @@ async def test_low_score_allows() -> None:
     assert result.verdict is GuardVerdict.ALLOW
     assert result.degraded is False
     assert result.score == pytest.approx(0.01)
+
+
+@pytest.mark.asyncio
+async def test_screen_runs_normalize_off_the_event_loop() -> None:
+    """normalize() runs in a worker thread, not on the event loop (backlog L1699 DoS).
+
+    normalize()'s multi-pass regex / homoglyph / decode work is CPU-bound and scales
+    with the (uncapped) turn length; run inline on the single-threaded loop it let one
+    very long caller turn stall RTP / jitter / DTMF / TTS for every concurrent call.
+    Assert it is dispatched off the loop thread — like the classifier already is.
+    """
+    loop_thread = threading.get_ident()
+    seen: dict[str, int] = {}
+
+    def _recording_normalize(text: str) -> NormalizedText:
+        seen["thread"] = threading.get_ident()
+        return normalize(text)
+
+    guard = _guard(_const(0.01))
+    with patch("hermes_voip.guard.onnx.normalize", _recording_normalize):
+        result = await _screen(guard, "hello there", call_id="c1")
+
+    assert result.verdict is GuardVerdict.ALLOW  # the real pipeline still completes
+    assert seen.get("thread") is not None, "normalize was not invoked"
+    assert seen["thread"] != loop_thread, (
+        "normalize() ran on the event-loop thread — a long turn would stall all calls"
+    )
+
+
+@pytest.mark.asyncio
+async def test_screen_fails_closed_on_an_oversized_turn() -> None:
+    """A turn longer than max_screen_chars is failed closed BEFORE normalise (DoS cap).
+
+    The endpointer bounds a normal turn on trailing silence, not length, so a caller
+    who never pauses can produce an unbounded turn; normalising it would stall the
+    shared loop. An over-cap turn is rejected (RESTRICT + degraded) WITHOUT normalising
+    — never ALLOW, and never truncate-then-screen (which would drop an injection tail).
+    """
+    normalized_calls = 0
+
+    def _tracking_normalize(text: str) -> NormalizedText:
+        nonlocal normalized_calls
+        normalized_calls += 1
+        return normalize(text)
+
+    guard = _guard(_const(0.01), config=GuardConfig(max_screen_chars=100))
+    with patch("hermes_voip.guard.onnx.normalize", _tracking_normalize):
+        over = await _screen(guard, "x" * 101, call_id="c1")
+        assert over.verdict is GuardVerdict.RESTRICT
+        assert over.degraded is True
+        assert normalized_calls == 0, "oversized turn must be rejected pre-normalise"
+        # A turn AT the cap still screens normally (normalise runs).
+        ok = await _screen(guard, "x" * 100, call_id="c2")
+        assert ok.verdict is GuardVerdict.ALLOW
+        assert normalized_calls == 1
+
+
+def test_guard_config_rejects_non_positive_max_screen_chars() -> None:
+    """GuardConfig rejects a non-positive max_screen_chars (nonsensical cap)."""
+    with pytest.raises(ValueError, match="max_screen_chars must be >= 1"):
+        GuardConfig(max_screen_chars=0)
 
 
 @pytest.mark.asyncio

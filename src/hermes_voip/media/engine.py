@@ -2509,7 +2509,11 @@ class RtpMediaTransport:
             # raise in SenderReport/ReceiverReport __post_init__ and kill run_rtcp).
             # RFC 3550 §6.1 permits a report to cover a subset of sources.
             if len(self._reception) >= _MAX_RECEPTION_SOURCES:
-                self._reception.popitem(last=False)  # drop the least-recently-active
+                # Evict the LRU source AND prune its SR timing in lockstep (CWE-400):
+                # _last_sr_from is read only for _reception keys, so an evicted entry is
+                # dead weight an interleaved RTP+SR SSRC flood would otherwise grow.
+                evicted_ssrc, _ = self._reception.popitem(last=False)
+                self._last_sr_from.pop(evicted_ssrc, None)
             stats = ReceptionStats(clock_rate=self._rtp_clock_rate)
             self._reception[ssrc] = stats  # a new source is inserted at the MRU end
         else:
@@ -2615,10 +2619,10 @@ class RtpMediaTransport:
             if isinstance(packet, SenderReport):
                 # Acknowledge the peer's SR: remember its compact (middle-32) NTP +
                 # our receive time so our next RR/SR block reports LSR/DLSR for this
-                # source (RFC 3550 §6.4.1). Gate on _reception: _last_sr_from is read
-                # only for _reception keys (via _lsr_dlsr_for), so a flood of spoofed
-                # distinct-SSRC SRs on a plain-RTP call cannot grow it unbounded — it is
-                # capped in lockstep with _reception, mirroring _note_rtp_received.
+                # source (RFC 3550 §6.4.1). Gate on _reception so a BARE-SR flood (no
+                # RTP) is never stored; and _note_rtp_received prunes _last_sr_from on
+                # eviction, so an interleaved RTP+SR flood cannot grow it either. Read
+                # only for _reception keys (via _lsr_dlsr_for) — capped in lockstep.
                 if packet.ssrc in self._reception:
                     self._last_sr_from[packet.ssrc] = (
                         (packet.ntp_timestamp >> 16) & 0xFFFFFFFF,

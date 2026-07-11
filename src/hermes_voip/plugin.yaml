@@ -153,6 +153,10 @@ optional_env:
     default: 5.0
     description: "Seconds to wait for in-flight calls to BYE-drain on shutdown before forcing teardown (default: 5.0)."
     prompt: "Shutdown drain timeout in seconds (default: 5.0)"
+  - name: HERMES_VOIP_MAX_CALL_DURATION_SECS
+    default: 14400.0
+    description: "Per-call active-duration ceiling in seconds; a call still up after this long is force-torn-down so a continuous-RTP caller cannot pin an admission slot forever (default: 14400.0 = 4h; 0 disables the cap)."
+    prompt: "Max active call duration in seconds (default: 14400.0 = 4h; 0 disables)"
   - name: HERMES_VOIP_HANGUP_DRAIN_SECS
     default: 5.0
     description: "Seconds the agent hang_up tool waits for an in-flight spoken farewell to finish before sending BYE, so a same-turn goodbye is not truncated (default: 5.0)."

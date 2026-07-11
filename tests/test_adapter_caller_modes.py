@@ -278,6 +278,8 @@ async def _build_adapter(
                 # comparison + drain timeout work, not TypeError on a MagicMock.
                 max_calls=8,
                 shutdown_drain_secs=5.0,
+                # ADR-0113: 0 disables the max-duration watchdog (no real timer here).
+                max_call_duration_secs=0.0,
                 # ADR-0020 §5/§6: a MagicMock returns a non-string mock for any
                 # unset attr; pin deny_mode to the real default so the deny
                 # chokepoint takes the Phase-1 603 path (not the decline branch).
@@ -415,6 +417,8 @@ async def test_connect_fails_loud_on_empty_privileged_allow_file(
                 # comparison + drain timeout work, not TypeError on a MagicMock.
                 max_calls=8,
                 shutdown_drain_secs=5.0,
+                # ADR-0113: 0 disables the max-duration watchdog (no real timer here).
+                max_call_duration_secs=0.0,
                 # ADR-0020 §5/§6: a MagicMock returns a non-string mock for any
                 # unset attr; pin deny_mode to the real default so the deny
                 # chokepoint takes the Phase-1 603 path (not the decline branch).

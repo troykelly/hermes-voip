@@ -50,6 +50,7 @@ def test_failure_reasons_are_failures_and_forbid_followup() -> None:
         CallEndReason.SIP_ERROR,
         CallEndReason.CONNECTION_LOST,
         CallEndReason.REGISTRATION_LOST,
+        CallEndReason.MAX_CALL_DURATION,
     ):
         assert reason.was_failure is True, reason
         assert reason.can_followup is False, reason
@@ -97,12 +98,12 @@ def test_all_members_are_distinct_no_silent_aliasing() -> None:
     silently aliasing.
     """
     members = list(CallEndReason)
-    # All eight names are live, distinct members (a naive bool-pair enum yields 2).
+    # All names are live, distinct members (a naive bool-pair enum would yield 2).
     # These runtime-set cardinalities are the real re-aliasing lock: a revert to
-    # bool-pair values would collapse them to 2 and fail here.
-    assert len(members) == 8
-    assert len({m.name for m in members}) == 8
-    assert len({m.value for m in members}) == 8
+    # bool-pair values would collapse them and fail here.
+    assert len(members) == 9
+    assert len({m.name for m in members}) == 9
+    assert len({m.value for m in members}) == 9
     # Names resolve to themselves (an alias would report the canonical member's name).
     assert CallEndReason.SIP_ERROR.name == "SIP_ERROR"
     assert CallEndReason.AGENT_HANGUP.name == "AGENT_HANGUP"
@@ -118,6 +119,23 @@ def test_all_members_are_distinct_no_silent_aliasing() -> None:
     ]
     for first, second in aliased_before:
         assert first is not second, (first, second)
+
+
+def test_max_call_duration_is_a_distinct_failure_end() -> None:
+    """MAX_CALL_DURATION (ADR-0113) is a DISTINCT failure member injecting ``/stop``.
+
+    The per-call max-duration watchdog force-ends an over-long active call; the end
+    must hard-stop the session (a policy teardown the agent did not choose), and it
+    must be observably its OWN reason — not an alias of MEDIA_TIMEOUT — so logs and
+    the outbound-outcome map can tell a duration cap apart from an RTP drop.
+    """
+    reason = CallEndReason.MAX_CALL_DURATION
+    assert reason.was_failure is True
+    assert reason.can_followup is False
+    assert injection_text_for_reason(reason) == STOP_COMMAND
+    # A distinct member, not an alias (an alias would report MEDIA_TIMEOUT's name).
+    assert reason.name == "MAX_CALL_DURATION"
+    assert reason.value == "max_call_duration"
 
 
 def test_fail_safe_unknown_end_is_a_failure_stop() -> None:

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,6 +37,7 @@ pytest.importorskip("gateway.config")
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
+from hermes_voip.call_end import CallEndReason
 from hermes_voip.config import (
     ExtensionConfig,
     GatewayConfig,
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
 
     from hermes_voip.adapter import VoipAdapter
+    from hermes_voip.call import CallSession
     from hermes_voip.providers.audio import PcmFrame
     from hermes_voip.providers.tts import TtsStream
 
@@ -901,6 +903,244 @@ async def test_refresh_408_byes_the_dialog() -> None:
 
     assert _sent_requests(transport, "BYE"), "a 408 refresh must BYE the dialog"
     assert session.ended, "the session must be ended after the 408 BYE"
+
+    await adapter.disconnect()
+
+
+# ===========================================================================
+# Per-call max-duration watchdog (ADR-0113).
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_max_duration_watchdog_byes_the_call_at_the_cap() -> None:
+    """An active call that exceeds the max-duration cap is force-ended (ADR-0113).
+
+    The watchdog arms in ``_run_call_loop`` (default 14400s cap) and, when the cap
+    elapses, flags the call (so ``_classify_end_reason`` tags MAX_CALL_DURATION) and
+    gracefully hangs it up — an in-dialog BYE + media stop. The fake ``CallLoop.run``
+    blocks forever, so the loop's own classify/teardown finally is not reached here
+    (disconnect cancels it); the reason mapping is locked separately by
+    ``test_classify_end_reason_max_duration_flag_wins``.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+
+    cap_reached = asyncio.Event()
+    release = asyncio.Event()
+    slept: list[float] = []
+
+    async def _fake_cap_sleep(secs: float) -> None:
+        slept.append(secs)
+        cap_reached.set()
+        await release.wait()  # the cap "elapses" only when the test releases it
+
+    adapter._max_call_duration_sleep = _fake_cap_sleep
+
+    call_id = new_call_id()
+    with _patched_invite_env(block_loop=True):
+        _drive_inbound_call_to_established(
+            adapter, transport, call_id, session_expires="600;refresher=uas"
+        )
+        await _until(lambda: call_id in adapter._call_sessions)
+        session = adapter._call_sessions[call_id]
+        await _until(cap_reached.is_set)
+        # Armed at the configured default (4h), tracked as a per-call task.
+        assert slept, "the watchdog must reach its cap sleep"
+        assert slept[0] == pytest.approx(14400.0)
+        assert call_id in adapter._max_duration_timers
+        # The cap elapses.
+        release.set()
+        await _until(lambda: session.ended)
+
+    byes = _sent_requests(transport, "BYE")
+    assert len(byes) == 1, "the cap must send EXACTLY one graceful BYE (no double)"
+    assert session.ended
+    # The marker is set to THIS session (teardown, which would consume it, is not
+    # reached with the blocked fake loop), so classify would tag MAX_CALL_DURATION.
+    assert adapter._call_duration_exceeded.get(call_id) is session
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_classify_end_reason_max_duration_is_session_identity_keyed() -> None:
+    """MAX_CALL_DURATION is tagged only for the SESSION whose cap fired, ahead of all.
+
+    The watchdog ends its call via a graceful hang-up (``raised=False``,
+    ``media_timed_out=False``) which would otherwise classify REMOTE_BYE, so the
+    marker is consulted FIRST — but keyed on session identity so a superseded
+    same-Call-ID call's marker never tags a newer session's clean end.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+    engine = _fake_engine()
+    engine.media_timed_out = False
+    session = cast("CallSession", MagicMock(ended=False))
+    other = cast("CallSession", MagicMock(ended=False))
+
+    # No marker → a clean return is a normal REMOTE_BYE.
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=False, session=session)
+        is CallEndReason.REMOTE_BYE
+    )
+    # Marker for THIS session → MAX_CALL_DURATION, ahead of raised / media_timed_out.
+    adapter._call_duration_exceeded[call_id] = session
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=False, session=session)
+        is CallEndReason.MAX_CALL_DURATION
+    )
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=True, session=session)
+        is CallEndReason.MAX_CALL_DURATION
+    )
+    # Marker belongs to a DIFFERENT (superseded) session → the newer `other` call
+    # classifies on its OWN merits — no stale-marker contamination.
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=False, session=other)
+        is CallEndReason.REMOTE_BYE
+    )
+    assert (
+        adapter._classify_end_reason(call_id, engine, raised=True, session=other)
+        is CallEndReason.PIPELINE_FAILURE
+    )
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_max_duration_timer_arm_cancel_and_disabled() -> None:
+    """Arm registers + re-arm cancels the stale timer; cancel removes; 0 arms none."""
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+
+    fired = False
+
+    async def _never_elapses(_secs: float) -> None:
+        nonlocal fired
+        await asyncio.Event().wait()  # blocks until cancelled — the cap never elapses
+        fired = True
+
+    adapter._max_call_duration_sleep = _never_elapses
+    session = cast("CallSession", MagicMock(ended=False, hang_up=AsyncMock()))
+
+    # Arm: (task, session) tracked in _max_duration_timers, the task in _call_tasks.
+    adapter._arm_max_duration_timer(call_id, session, 14400.0)
+    assert call_id in adapter._max_duration_timers
+    task, owner = adapter._max_duration_timers[call_id]
+    assert owner is session
+    assert task in adapter._call_tasks.get(call_id, set())
+
+    # Re-arm for the SAME Call-ID (a superseding call) cancels the stale timer so it
+    # cannot outlive its call or fire against the newer one.
+    first = adapter._max_duration_timers[call_id][0]
+    adapter._arm_max_duration_timer(call_id, session, 14400.0)
+    assert adapter._max_duration_timers[call_id][0] is not first
+    with contextlib.suppress(asyncio.CancelledError):
+        await first
+    assert first.cancelled()
+
+    # A DIFFERENT session's cancel is a no-op (ownership-scoped) — the timer survives.
+    other = cast("CallSession", MagicMock(ended=False))
+    await adapter._cancel_max_duration_timer(call_id, other)
+    assert call_id in adapter._max_duration_timers
+
+    # OUR cancel: removed and never fired.
+    await adapter._cancel_max_duration_timer(call_id, session)
+    assert call_id not in adapter._max_duration_timers
+    assert not fired
+
+    # A disabled cap (0) arms nothing (the opt-out).
+    adapter._arm_max_duration_timer(call_id, session, 0.0)
+    assert call_id not in adapter._max_duration_timers
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_max_duration_watchdog_is_identity_bound_to_its_session() -> None:
+    """A superseded / ended session's watchdog no-ops — it never ends another call.
+
+    Same-Call-ID isolation (the teardown chokepoint's invariant): the watchdog is
+    bound to the exact session it was armed for and fires only while that session is
+    still the current ``_call_sessions[call_id]`` and not ended — so a stale timer
+    from a superseded retransmission / fork can neither hang up the newer call nor
+    flag the Call-ID.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+
+    async def _fire_now(_secs: float) -> None:
+        return  # the cap "elapses" immediately
+
+    adapter._max_call_duration_sleep = _fire_now
+
+    superseded = cast("CallSession", MagicMock(ended=False, hang_up=AsyncMock()))
+    current = cast("CallSession", MagicMock(ended=False, hang_up=AsyncMock()))
+    # The CURRENT registered session for this Call-ID is `current`, not `superseded`.
+    adapter._call_sessions[call_id] = current
+
+    # The SUPERSEDED call's watchdog must no-op: never hang up `current` or itself,
+    # never flag the Call-ID.
+    await adapter._run_max_duration_timer(call_id, superseded, 1.0)
+    cast("AsyncMock", superseded.hang_up).assert_not_awaited()
+    cast("AsyncMock", current.hang_up).assert_not_awaited()
+    assert call_id not in adapter._call_duration_exceeded
+
+    # An already-ENDED (current) session likewise no-ops — nothing to force.
+    ended = cast("CallSession", MagicMock(ended=True, hang_up=AsyncMock()))
+    adapter._call_sessions[call_id] = ended
+    await adapter._run_max_duration_timer(call_id, ended, 1.0)
+    cast("AsyncMock", ended.hang_up).assert_not_awaited()
+    assert call_id not in adapter._call_duration_exceeded
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_superseded_teardown_keeps_the_current_calls_marker_and_timer() -> None:
+    """A superseded same-Call-ID teardown must NOT strip the current call's state.
+
+    Same-Call-ID isolation: both the max-duration marker AND the armed watchdog timer
+    are session-owned, so a stale / forked / pre-session teardown consumes neither the
+    newer call's MAX_CALL_DURATION classification nor its DoS cap.
+    """
+    transport = _FakeTransport()
+    adapter, _manager = await _build_adapter_with_real_manager(transport, _media_cfg())
+    call_id = new_call_id()
+
+    async def _never_elapses(_secs: float) -> None:
+        await asyncio.Event().wait()  # the current call's timer never fires here
+
+    adapter._max_call_duration_sleep = _never_elapses
+
+    current = cast("CallSession", MagicMock(ended=False, hang_up=AsyncMock()))
+    superseded = cast("CallSession", MagicMock(ended=True, hang_up=AsyncMock()))
+    # `current` is the registered session; it owns the marker AND an armed watchdog.
+    adapter._call_sessions[call_id] = current
+    adapter._call_duration_exceeded[call_id] = current
+    adapter._arm_max_duration_timer(call_id, current, 14400.0)
+    current_timer = adapter._max_duration_timers[call_id][0]
+
+    engine = _fake_engine()
+    engine.media_timed_out = False
+    # The SUPERSEDED session tears down (is_current is False for it) — it must leave
+    # the current call's marker AND timer untouched.
+    await adapter._teardown_call(
+        call_id=call_id,
+        engine=engine,
+        transport=transport,  # type: ignore[arg-type]  # fake transport double
+        dialog_id=(call_id, "supersede-a", "supersede-b"),
+        session=superseded,
+        reason=CallEndReason.REMOTE_BYE,
+    )
+    assert adapter._call_duration_exceeded.get(call_id) is current
+    entry = adapter._max_duration_timers.get(call_id)
+    assert entry is not None
+    assert entry[0] is current_timer
+    assert entry[1] is current
+    assert not current_timer.cancelled()
 
     await adapter.disconnect()
 

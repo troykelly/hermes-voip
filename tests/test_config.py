@@ -2141,6 +2141,76 @@ def test_shutdown_drain_secs_rejects_non_positive_or_malformed(bad: str) -> None
         )
 
 
+# ---- max-call-duration cap (ADR-0113) --------------------------------------
+
+
+def test_max_call_duration_secs_default() -> None:
+    """The active-call duration cap defaults to 4h (14400s) when unset (ADR-0113)."""
+    cfg = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="x")
+    )
+    assert cfg.max_call_duration_secs == 14400.0
+
+
+def test_max_call_duration_secs_override() -> None:
+    """HERMES_VOIP_MAX_CALL_DURATION_SECS sets the per-call active-duration ceiling."""
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_VOIP_MAX_CALL_DURATION_SECS="7200",
+        )
+    )
+    assert cfg.max_call_duration_secs == 7200.0
+
+
+def test_max_call_duration_secs_zero_disables_the_cap() -> None:
+    """0 is ACCEPTED and disables the cap (opt-out) — unlike the RTP watchdog knob.
+
+    The RTP-inactivity watchdog rejects 0 (a safety watchdog must never be disabled
+    via its knob); the max-duration cap is a policy ceiling, so 0 legitimately opts a
+    deployment out of any active-call time limit.
+    """
+    cfg = load_gateway_config(
+        _base(
+            HERMES_SIP_EXTENSION="1000",
+            HERMES_SIP_PASSWORD="x",
+            HERMES_VOIP_MAX_CALL_DURATION_SECS="0",
+        )
+    )
+    assert cfg.max_call_duration_secs == 0.0
+
+
+@pytest.mark.parametrize("bad", ["-1", "-0.5", "abc", "nan", "inf"])
+def test_max_call_duration_secs_rejects_negative_or_malformed(bad: str) -> None:
+    """A negative / non-finite / malformed cap is rejected fail-fast (0 is NOT here)."""
+    with pytest.raises(ConfigError):
+        load_gateway_config(
+            _base(
+                HERMES_SIP_EXTENSION="1000",
+                HERMES_SIP_PASSWORD="x",
+                HERMES_VOIP_MAX_CALL_DURATION_SECS=bad,
+            )
+        )
+
+
+def test_max_call_duration_secs_post_init_rejects_direct_negative() -> None:
+    """Direct GatewayConfig construction self-validates the cap (``< 0`` rejected).
+
+    The env parser rejects a negative before construction; this locks the dataclass's
+    own ``__post_init__`` guard (the public API), including that ``0`` is accepted.
+    """
+    from dataclasses import replace  # noqa: PLC0415
+
+    base = load_gateway_config(
+        _base(HERMES_SIP_EXTENSION="1000", HERMES_SIP_PASSWORD="x")
+    )
+    with pytest.raises(ConfigError):
+        replace(base, max_call_duration_secs=-1.0)
+    # 0 is valid (disables the cap) — a direct construction with 0 must NOT raise.
+    assert replace(base, max_call_duration_secs=0.0).max_call_duration_secs == 0.0
+
+
 # ---- agent-hangup farewell drain (#1297, ADR-0106) -------------------------
 
 

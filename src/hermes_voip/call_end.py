@@ -73,8 +73,9 @@ class CallEndReason(enum.Enum):
     * **Failure** ends — the call died abnormally: :attr:`MEDIA_TIMEOUT` (RTP
       inactivity / silent media drop), :attr:`PIPELINE_FAILURE` (an ASR/TTS/guard
       task raised), :attr:`SIP_ERROR`, :attr:`CONNECTION_LOST` (the TLS transport
-      dropped), and :attr:`REGISTRATION_LOST`. All inject :data:`STOP_COMMAND`
-      (a hard ``/stop``).
+      dropped), :attr:`REGISTRATION_LOST`, and :attr:`MAX_CALL_DURATION` (a policy
+      teardown: the active call exceeded the configured max-duration cap, ADR-0113).
+      All inject :data:`STOP_COMMAND` (a hard ``/stop``).
 
     A failure forbids follow-up: the session is hard-stopped, so there is nothing
     to follow up on. A normal end allows it (background work only — see the module
@@ -105,6 +106,11 @@ class CallEndReason(enum.Enum):
     SIP_ERROR = ("sip_error", True, False)
     CONNECTION_LOST = ("connection_lost", True, False)
     REGISTRATION_LOST = ("registration_lost", True, False)
+    # A POLICY teardown: the per-call max-duration watchdog force-ended this call
+    # because it exceeded the configured active-call ceiling (ADR-0113). A FAILURE
+    # end (hard ``/stop``, no follow-up) like MEDIA_TIMEOUT — the agent did not
+    # choose to end it, so the session is stopped, not handed an ambiguous turn.
+    MAX_CALL_DURATION = ("max_call_duration", True, False)
 
     @property
     def was_failure(self) -> bool:

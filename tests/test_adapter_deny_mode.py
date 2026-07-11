@@ -314,6 +314,8 @@ async def _build_adapter(  # noqa: PLR0913 — keyword-only test wiring: transpo
                 via_transport="TLS",
                 max_calls=8,
                 shutdown_drain_secs=5.0,
+                # ADR-0113: 0 disables the max-duration watchdog (no real timer here).
+                max_call_duration_secs=0.0,
                 deny_mode=deny_mode,
             ),
         ),

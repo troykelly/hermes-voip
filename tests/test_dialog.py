@@ -17,6 +17,7 @@ from hermes_voip.dialog import (
     _MAX_CSEQ,
     Dialog,
     DialogError,
+    _cseq,
     build_in_dialog_request,
 )
 from hermes_voip.message import SipRequest, SipResponse
@@ -359,6 +360,23 @@ def test_from_invite_2xx_rejects_missing_contact() -> None:
     )
     with pytest.raises(DialogError):
         Dialog.from_invite_2xx(_invite(), no_contact)
+
+
+@pytest.mark.parametrize(
+    "base",
+    [0xFF10, 0x0660, 0x06F0],
+    ids=["fullwidth", "arabic_indic", "ext_arabic_indic"],
+)
+def test_cseq_rejects_non_ascii_digits(base: int) -> None:
+    # RFC 3261 §25: the CSeq sequence is 1*DIGIT — US-ASCII 0x30-0x39 only. A
+    # Unicode-aware ``\d`` in the parser lets a peer smuggle fullwidth/Arabic-Indic
+    # digits that ``int()`` still folds to a value, while an RFC-strict proxy parses
+    # the same header differently — a parser-differential (same class as the #479/#485
+    # strict-ASCII SIP-numeric fixes). The value is built from ``chr()`` so the source
+    # stays plain-ASCII (no RUF001 ambiguous-Unicode literals).
+    seq = "".join(chr(base + int(d)) for d in "42")
+    with pytest.raises(DialogError):
+        _cseq(f"{seq} INVITE")
 
 
 def test_from_inbound_invite_rejects_missing_from_tag() -> None:

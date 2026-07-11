@@ -120,10 +120,14 @@ _SIP_URI = re.compile(
     re.IGNORECASE,
 )
 # Allowlisted sip-URI ``;``-parameter names (RFC 3261 §19.1.1). These carry no
-# routing/dialog-seizing capability; ANY other param name (notably ``replaces``,
-# ``route``, ``refer-to``) is rejected so a transfer cannot be re-aimed via a
-# smuggled parameter.
-_ALLOWED_URI_PARAMS = frozenset({"transport", "user", "method", "ttl", "maddr", "lr"})
+# destination-overriding capability, so a transfer cannot be re-aimed via a smuggled
+# param: ``transport`` only selects the wire protocol, ``user``/``method``/``ttl``
+# are benign, and ``lr`` is a loose-route flag. ``maddr`` is DELIBERATELY excluded
+# (ADR-0112): per RFC 3261 §19.1.1 it OVERRIDES the destination a compliant proxy
+# routes to while the URI host stays innocuous — a covert host-hijack a Refer-To
+# transfer target has no legitimate need for. ANY other/unknown name (notably
+# ``replaces``, ``route``, ``refer-to``, and ``maddr``) is rejected.
+_ALLOWED_URI_PARAMS = frozenset({"transport", "user", "method", "ttl", "lr"})
 # A bound on the target length: ample for an international E.164 number with a
 # few DTMF digits, or a sip URI with a host and a couple of params, but short
 # enough to refuse an absurd value before it reaches the wire.
@@ -148,9 +152,10 @@ def _validate_transfer_target(target: str) -> None:
       header-injection / dialog-seizing vector;
     * any ``;``-**parameters** are restricted to the safe allowlist
       ``_ALLOWED_URI_PARAMS`` (``transport``, ``user``, ``method``, ``ttl``,
-      ``maddr``, ``lr``) with token-only names/values; any other/unknown param
-      name (notably ``replaces``, ``route``, ``refer-to``) is rejected, so a
-      transfer cannot be re-aimed via a smuggled parameter.
+      ``lr`` — NOT ``maddr``, which overrides the routed destination, ADR-0112)
+      with token-only names/values; any other/unknown param name (notably
+      ``replaces``, ``route``, ``refer-to``, ``maddr``) is rejected, so a transfer
+      cannot be re-aimed via a smuggled parameter.
 
     Anything else — a bare-extension host hijack (``1001@evil.com``), a
     ``?Replaces=`` header or a ``;Route=`` param smuggle, an angle-bracket ``>``

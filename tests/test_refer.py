@@ -547,9 +547,11 @@ def test_build_blind_refer_accepts_valid_sip_uri() -> None:
 
 def test_build_blind_refer_accepts_valid_sips_uri_with_params() -> None:
     # The tightened policy still accepts a sips: URI carrying ONLY allowlisted
-    # ``;``-params (here ``transport``/``ttl``/``maddr``, names compared
-    # case-insensitively) — ``transport=tls`` is the common legitimate case.
-    target = "sips:3000@pbx.example.test;transport=tls;ttl=1;Maddr=198.51.100.1"
+    # ``;``-params (here ``transport``/``ttl``, names compared case-insensitively)
+    # — ``transport=tls`` is the common legitimate case. ``maddr`` was REMOVED from
+    # the allowlist (ADR-0112, host-hijack) — see
+    # test_build_blind_refer_rejects_sip_uri_with_maddr.
+    target = "sips:3000@pbx.example.test;transport=tls;ttl=1"
     result = build_blind_refer(_dialog(), target)
     req = SipRequest.parse(result.text)
     assert req.header("Refer-To") == f"<{target}>"

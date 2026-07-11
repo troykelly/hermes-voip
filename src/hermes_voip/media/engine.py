@@ -2615,11 +2615,15 @@ class RtpMediaTransport:
             if isinstance(packet, SenderReport):
                 # Acknowledge the peer's SR: remember its compact (middle-32) NTP +
                 # our receive time so our next RR/SR block reports LSR/DLSR for this
-                # source (RFC 3550 §6.4.1).
-                self._last_sr_from[packet.ssrc] = (
-                    (packet.ntp_timestamp >> 16) & 0xFFFFFFFF,
-                    now_unix,
-                )
+                # source (RFC 3550 §6.4.1). Gate on _reception: _last_sr_from is read
+                # only for _reception keys (via _lsr_dlsr_for), so a flood of spoofed
+                # distinct-SSRC SRs on a plain-RTP call cannot grow it unbounded — it is
+                # capped in lockstep with _reception, mirroring _note_rtp_received.
+                if packet.ssrc in self._reception:
+                    self._last_sr_from[packet.ssrc] = (
+                        (packet.ntp_timestamp >> 16) & 0xFFFFFFFF,
+                        now_unix,
+                    )
                 self._absorb_remote_blocks(packet.report_blocks, now_unix)
             elif isinstance(packet, ReceiverReport):
                 self._absorb_remote_blocks(packet.report_blocks, now_unix)

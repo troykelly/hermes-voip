@@ -24,6 +24,7 @@ from typing import Final
 import pytest
 
 from hermes_voip.media.engine import (
+    _MAX_RECEPTION_SOURCES,
     OUTBOUND_AUDIO_SSRC,
     Codec,
     RtpMediaTransport,
@@ -332,6 +333,34 @@ def test_ingest_peer_sender_report_records_lsr_for_our_next_block() -> None:
     # LSR is the middle 32 bits of the peer's SR NTP (RFC 3550 §6.4.1).
     expected_lsr = (to_ntp(1_699_999_999.0) >> 16) & 0xFFFFFFFF
     assert rr.report_blocks[0].lsr == expected_lsr
+
+
+def test_ingest_rtcp_sr_flood_distinct_ssrc_does_not_grow_last_sr_from() -> None:
+    # DoS guard (CWE-400): on a plain-RTP call an attacker injects minimal RTCP Sender
+    # Reports at the media port (no auth / source check), each a distinct sender SSRC.
+    # _last_sr_from must NOT grow unbounded — it is read only for _reception keys (via
+    # _lsr_dlsr_for), so a source we never received RTP from need not be stored.
+    # It stays capped in lockstep with _reception, like _note_rtp_received.
+    engine = _make_engine(ntp_clock=lambda: 1_700_000_000.0)
+
+    def _sr(ssrc: int) -> SenderReport:
+        return SenderReport(
+            ssrc=ssrc,
+            ntp_timestamp=to_ntp(1_699_999_999.0),
+            rtp_timestamp=0,
+            packet_count=0,
+            octet_count=0,
+            report_blocks=(),
+        )
+
+    for ssrc in range(0x1000, 0x1000 + 500):  # 500 distinct spoofed SR senders, no RTP
+        engine.ingest_rtcp(build_compound((_sr(ssrc),)))
+    # Untracked senders are not stored, so the map stays bounded (was unbounded: 500).
+    assert len(engine._last_sr_from) <= _MAX_RECEPTION_SOURCES
+    # A source we DO receive RTP from is still recorded (behaviour preserved).
+    engine._note_rtp_received(seq=1, rtp_timestamp=0, arrival_ts=0.0, ssrc=_PEER_SSRC)
+    engine.ingest_rtcp(build_compound((_sr(_PEER_SSRC),)))
+    assert _PEER_SSRC in engine._last_sr_from
 
 
 def test_ingest_peer_receiver_report_yields_round_trip_time() -> None:

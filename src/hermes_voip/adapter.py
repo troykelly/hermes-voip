@@ -44,6 +44,7 @@ import re
 import secrets
 import ssl
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -1131,6 +1132,10 @@ class VoipAdapter(BasePlatformAdapter):
         self._dtmf_confirmations: dict[str, ArmedConfirmation] = {}
         # Per-call metadata: {call_id → {name, remote_uri, type, ended}}
         self._call_info: dict[str, dict[str, object]] = {}
+        # FIFO of ENDED Call-IDs (CWE-400, _MAX_ENDED_CALL_INFO): _call_info entries are
+        # retained after end for send() late-reply suppression, so reap the oldest ended
+        # entry once the cap is exceeded — a live call's entry is never in this FIFO.
+        self._ended_call_order: OrderedDict[str, None] = OrderedDict()
         # Background tasks per Call-ID. A gateway can deliver multiple overlapping
         # INVITEs with the SAME Call-ID (retransmission before our 200 OK, or a
         # fork), each spawning its own handler task — so this maps a Call-ID to
@@ -1490,6 +1495,8 @@ class VoipAdapter(BasePlatformAdapter):
         self._admitted_calls.clear()
         self._admission_start.clear()
         self._call_duration_exceeded.clear()
+        self._call_info.clear()
+        self._ended_call_order.clear()
 
         manager = self._manager
         if manager is not None:
@@ -6067,6 +6074,21 @@ class VoipAdapter(BasePlatformAdapter):
         else:
             _log.debug("INVITE %s: inbound DTMF receive disabled", call_id)
 
+    def _retain_ended_call_info(self, call_id: str) -> None:
+        """Register an ended Call-ID; reap the oldest ended entry past the cap.
+
+        ``_call_info`` entries are retained after end for ``send()`` late-reply
+        suppression; bound the retained set (CWE-400, ``_MAX_ENDED_CALL_INFO``) so
+        sequential calls cannot grow it without bound. Reaps only ended entries, and
+        never a live same-Call-ID call's (one still in ``_call_sessions``).
+        """
+        self._ended_call_order[call_id] = None
+        self._ended_call_order.move_to_end(call_id)
+        while len(self._ended_call_order) > _MAX_ENDED_CALL_INFO:
+            oldest, _ = self._ended_call_order.popitem(last=False)
+            if oldest not in self._call_sessions:
+                self._call_info.pop(oldest, None)
+
     async def _teardown_call(  # noqa: PLR0913 — seven keyword-only params all needed: call_id + engine + transport + dialog_id + session + call_loop + reason for isolation + the Hermes signal
         self,
         *,
@@ -6128,6 +6150,9 @@ class VoipAdapter(BasePlatformAdapter):
             info = dict(self._call_info.get(call_id, {}))
             info["ended"] = True
             self._call_info[call_id] = info
+            # Retain this ended entry for send() late-reply suppression, but bound the
+            # retained set (CWE-400) so sequential calls cannot grow _call_info forever.
+            self._retain_ended_call_info(call_id)
             # Signal the Hermes session exactly once: only when WE own the call AND
             # it was not already flagged ended (a duplicate/retried teardown of the
             # same task must not re-inject). Reached on every end path through this

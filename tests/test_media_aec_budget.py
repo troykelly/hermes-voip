@@ -215,11 +215,12 @@ def test_reference_fifo_stays_bounded_when_tx_runs_far_ahead_of_rx() -> None:
     frame = _pack([1000] * ((rate * _PTIME_MS) // 1000))
     for _ in range(2000):  # 40 s of outbound with zero inbound to cancel
         aec.push_reference(frame, sample_rate=rate)
-    # White-box efficiency invariant (rule 20): the reference FIFO is capped, not the
-    # ~640k samples an unbounded append would retain after 2000 pushes.
-    assert aec._x.size < 200_000, (
-        f"reference FIFO grew unbounded under TX-ahead: {aec._x.size} samples "
-        "(quadratic np.concatenate + OOM risk on a stalled inbound leg)"
+    # White-box efficiency invariant (rule 20): the reference FIFO is capped at
+    # _max_fifo (= bulk_delay + filter_len + 3*rate), not the ~640k samples an
+    # unbounded append would retain after 2000 pushes.
+    assert aec._x.size <= aec._max_fifo, (
+        f"reference FIFO exceeded its cap under TX-ahead: {aec._x.size} > "
+        f"{aec._max_fifo} (quadratic np.concatenate + OOM risk on a stalled leg)"
     )
 
 

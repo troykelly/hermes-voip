@@ -547,9 +547,11 @@ def test_build_blind_refer_accepts_valid_sip_uri() -> None:
 
 def test_build_blind_refer_accepts_valid_sips_uri_with_params() -> None:
     # The tightened policy still accepts a sips: URI carrying ONLY allowlisted
-    # ``;``-params (here ``transport``/``ttl``/``maddr``, names compared
-    # case-insensitively) — ``transport=tls`` is the common legitimate case.
-    target = "sips:3000@pbx.example.test;transport=tls;ttl=1;Maddr=198.51.100.1"
+    # ``;``-params (here ``transport``/``ttl``, names compared case-insensitively)
+    # — ``transport=tls`` is the common legitimate case. ``maddr`` was REMOVED from
+    # the allowlist (ADR-0112, host-hijack) — see
+    # test_build_blind_refer_rejects_sip_uri_with_maddr.
+    target = "sips:3000@pbx.example.test;transport=tls;ttl=1"
     result = build_blind_refer(_dialog(), target)
     req = SipRequest.parse(result.text)
     assert req.header("Refer-To") == f"<{target}>"
@@ -585,6 +587,17 @@ def test_build_blind_refer_rejects_bare_extension_with_replaces() -> None:
 def test_build_blind_refer_rejects_bare_extension_with_params() -> None:
     with pytest.raises(ValueError, match="transfer target"):
         build_blind_refer(_dialog(), "1001;maddr=evil.com")
+
+
+def test_build_blind_refer_rejects_sip_uri_with_maddr() -> None:
+    # A well-formed sip: URI whose host IS the trusted transfer target but which
+    # also carries ``;maddr`` — which per RFC 3261 §19.1.1 OVERRIDES the network
+    # destination a compliant proxy routes to, while the visible host stays
+    # innocuous — is a covert host-hijack (a transfer names WHERE to transfer; it
+    # has no legitimate need to re-aim routing away from that host). ``maddr`` is
+    # therefore NOT allowlisted, so the whole target is rejected (ADR-0112).
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test;maddr=198.51.100.66")
 
 
 def _to_fullwidth_digits(ascii_digits: str) -> str:

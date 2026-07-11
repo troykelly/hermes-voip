@@ -123,17 +123,22 @@ def _content_length(head: str) -> int:
     # Skip the start-line; unfold RFC 3261 §7.3.1 continuations before scanning
     # for Content-Length / compact ``l`` so folded headers frame identically to
     # the full header parser in ``message._parse_headers``.
-    unfolded: list[str] = []
+    # Linear (O(total length)) unfold: collect each header's fragments and join once.
+    # The earlier per-fold string rebuild was O(N^2) — and this runs in the reader's
+    # _read_loop OUTSIDE the ADR-0098 dispatch backstop — a line-folded header stalled
+    # the event loop (CWE-407). Mirrors message._parse_headers.
+    unfolded: list[list[str]] = []
     for line in head.split(_CRLF.decode())[1:]:
         if line[:1] in (" ", "\t"):
             if not unfolded:
                 msg = "header continuation line with no preceding header"
                 raise FramingError(msg)
-            unfolded[-1] = f"{unfolded[-1]} {line.strip()}"
+            unfolded[-1].append(line.strip())
         else:
-            unfolded.append(line)
+            unfolded.append([line])
     found: int | None = None
-    for line in unfolded:
+    for parts in unfolded:
+        line = " ".join(parts)
         name, sep, value = line.partition(":")
         if sep and name.strip().lower() in _CONTENT_LENGTH_NAMES:
             if found is not None:

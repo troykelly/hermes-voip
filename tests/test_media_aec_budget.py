@@ -5,7 +5,9 @@ The in-process echo canceller runs on the **synchronous RX media coroutine**
 no offload, on every 20 ms inbound packet whenever the agent's TTS echo is
 returning — i.e. most of a call. ADR-0095 measured the shipped time-domain
 per-sample NLMS canceller at ~39.8 ms/frame while adapting at 16 kHz (2x the
-20 ms ptime) and ~21.2 ms at 8 kHz — a real per-packet stall. ADR-0110 replaces
+20 ms ptime) and ~21.2 ms at 8 kHz (host-dependent — the same filter measured
+~91 ms / ~35 ms on the current devcontainer host; either way over budget) — a
+real per-packet stall. ADR-0110 replaces
 the per-sample O(filter_len) recursion with a numpy-vectorised **block-NLMS**
 whose per-frame cost is a handful of small matmuls, and pins the durable bar:
 
@@ -218,4 +220,37 @@ def test_reference_fifo_stays_bounded_when_tx_runs_far_ahead_of_rx() -> None:
     assert aec._x.size < 200_000, (
         f"reference FIFO grew unbounded under TX-ahead: {aec._x.size} samples "
         "(quadratic np.concatenate + OOM risk on a stalled inbound leg)"
+    )
+
+
+def test_cancellation_recovers_after_inbound_stall() -> None:
+    """After a multi-second one-way-audio stall, AEC re-locks on the current echo.
+
+    If inbound RTP stalls (``cancel`` not called) while outbound keeps flowing, the
+    read cursor is left on stale reference. When inbound resumes the canceller must
+    realign to the CURRENT echo — not stay pinned to seconds-old reference and never
+    cancel again (which the naive FIFO cap would do). Drives a ~10 s TX-only stall,
+    then a real delayed broadband echo, and asserts the converged tail is cancelled.
+    """
+    rate = _G722_RATE
+    blk = (rate * _PTIME_MS) // 1000
+    aec = EchoCanceller(sample_rate=rate, filter_len=_MAX_TAPS, bulk_delay=0, mu=0.5)
+    stall_frame = _pack([800] * blk)
+    for _ in range((10 * rate) // blk):  # ~10 s of outbound with zero inbound
+        aec.push_reference(stall_frame, sample_rate=rate)
+    # Inbound resumes: a delayed broadband echo of fresh reference.
+    n = rate * 2
+    reference = _noise(n, amplitude=0.3, seed=5)
+    delay = (rate * 15) // 1000
+    echo = [int(0.6 * reference[i - delay]) if i >= delay else 0 for i in range(n)]
+    residual = bytearray()
+    for off in range(0, n, blk):
+        aec.push_reference(_pack(reference[off : off + blk]), sample_rate=rate)
+        residual += aec.cancel(_pack(echo[off : off + blk]))
+    echo_rms = _rms(_pack(echo))
+    tail_rms = _rms(residual[len(residual) // 2 :])
+    assert echo_rms > 200.0
+    assert tail_rms < echo_rms * 0.25, (
+        f"AEC did not re-lock after an inbound stall: residual={tail_rms:.1f} "
+        f"echo={echo_rms:.1f} (cursor stuck on stale reference?)"
     )

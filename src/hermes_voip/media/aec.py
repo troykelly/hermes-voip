@@ -109,6 +109,17 @@ _MIN_ESTIMATE_MS_ENERGY = 1.0
 # exactly but multiplies the numpy call count and erodes the CPU-budget margin.
 _ADAPT_BLOCK: Final[int] = 2
 
+# Reference-FIFO cap (seconds of TX-ahead reference beyond the filter window). On a
+# real call push_reference (TX) leads cancel (RX) by the system delay and cancel
+# trims the FIFO as it consumes it; but if the inbound leg stalls entirely (one-way
+# audio) cancel never runs to trim, so push_reference bounds the FIFO too. Only a
+# multi-second inbound stall reaches the cap (a normal greeting keeps cancel running
+# on inbound comfort-noise frames); it then resyncs the read cursor to the retained
+# recent reference. Bounds memory AND the per-push append (an uncapped growing
+# np.concatenate would be quadratic under sustained TX-ahead). 2 s is ~100 frames —
+# far above the one-frame steady-state TX-ahead, so only a genuine stall reaches it.
+_MAX_TX_AHEAD_SECONDS: Final[int] = 2
+
 # Measured push_reference+cancel cost for one *adapting* 512-tap (``_AEC_MAX_TAPS``)
 # 20 ms frame on CPython 3.13 in the devcontainer (rule 22 / ADR-0094 pattern),
 # gated against the 20 ms packet period by ``tests/test_media_aec_budget.py``.
@@ -199,6 +210,13 @@ class EchoCanceller:
         # matching near-end arrives (1 s).
         self._span = bulk_delay + filter_len
         self._keep_behind = self._span + sample_rate
+        # Bounds for a stalled inbound leg (cancel not called to trim — see
+        # _MAX_TX_AHEAD_SECONDS). Normal steady-state TX-ahead is ONE frame; the
+        # cursor may lag the newest far by at most _max_ahead before cancel()
+        # realigns to it, and push_reference retains at most keep_behind behind the
+        # cursor plus _max_ahead ahead of it.
+        self._max_ahead = _MAX_TX_AHEAD_SECONDS * sample_rate
+        self._max_fifo = self._keep_behind + self._max_ahead
         # Per-source-rate resampler for an off-analysis-rate reference (Opus 48 kHz
         # → 16 kHz). Created lazily on the first off-rate push; None while the
         # reference already arrives at the analysis rate.
@@ -234,10 +252,21 @@ class EchoCanceller:
         samples = np.frombuffer(aligned, dtype=_PCM16_LE).astype(np.float64)
         if samples.size == 0:
             return
-        # The FIFO is trimmed in cancel() relative to the read cursor (not here by
-        # the newest sample), because push runs ahead of cancel and a far-end sample
-        # must survive until its matching near-end has consumed it.
+        # cancel() trims the FIFO from BEHIND the read cursor as it consumes the
+        # far-end (not here by the newest sample), because push runs ahead of cancel
+        # and a far-end sample must survive until its matching near-end has consumed
+        # it. But cancel() only runs on inbound frames, so a stalled inbound leg
+        # (one-way audio) would never trim — cap the FIFO here too.
         self._x = np.concatenate((self._x, samples))
+        # Bound the FIFO: on a stalled inbound leg cancel() is not called to trim, so
+        # drop the oldest samples once the FIFO exceeds _max_fifo. This keeps memory
+        # AND the per-push append bounded (an uncapped, forever-growing np.concatenate
+        # is quadratic under sustained TX-ahead — cross-vendor review). The cursor is
+        # shifted with the drop; cancel() realigns it to the newest far on resume.
+        overflow = self._x.size - self._max_fifo
+        if overflow > 0:
+            self._x = self._x[overflow:].copy()
+            self._read = max(0, self._read - overflow)
 
     def cancel(self, pcm16: bytes) -> bytes:
         """Return ``pcm16`` with the estimated echo of the reference removed.
@@ -274,6 +303,15 @@ class EchoCanceller:
         x = self._x
         xlen = x.size
         eps = _NLMS_EPS
+
+        # Stall realign: if TX has run far ahead of the read cursor (a multi-second
+        # inbound stall left it on stale reference — normal steady-state TX-ahead is
+        # a single frame), snap the cursor to the newest far so the resuming near-end
+        # aligns with the CURRENT echo rather than seconds-stale reference. The
+        # converged taps re-lock within the filter span; without this the cursor would
+        # stay pinned to pre-stall reference and never cancel again.
+        if xlen - read > self._max_ahead:
+            read = xlen
 
         # The residual defaults to the near-end (pass-through): any sample whose
         # aligned reference has not been pushed yet (the agent has not spoken far

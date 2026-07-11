@@ -1244,7 +1244,6 @@ class CallLoop:
             ``TtsStream.cancel`` (a stop flag, never ``aclose`` from another task).
             """
             nonlocal _eot_count
-            window_index = 0
             frames_received = 0
             # Track the agent's TTS-audio-active state across frames so the echo
             # gate (ADR-0023) can arm a post-TTS tail at the True→False edge.
@@ -1343,7 +1342,14 @@ class CallLoop:
                     # the edges and tick — so a withheld echo run never arms it.
                     for vad_event in frame_events:
                         self._endpointer.on_event(vad_event)
-                    if self._endpointer.advance(window_index):
+                    # Drive the endpointer on the VAD-WINDOW clock
+                    # (``latest_vad_window`` — the same ordinal ``on_event`` stamps
+                    # into ``_silence_since``), NOT a per-frame counter. Inbound
+                    # frames are one ptime (160 samples @8k) but a silero window is
+                    # 256 samples, so a per-frame counter runs ~1.6x fast; feeding
+                    # that drift to advance() fired end-of-turn far too early and cut
+                    # the caller off mid-sentence (gap-review 2026-07-11).
+                    if self._endpointer.advance(latest_vad_window):
                         # ADR-0008: endpointer owns the turn boundary. Increment the
                         # EOT counter so the ASR task's next is_final transcript is
                         # delivered as end-of-turn. Each increment is consumed by
@@ -1351,17 +1357,16 @@ class CallLoop:
                         # an Event is boolean and loses duplicates).
                         _eot_count += 1
                         _log.info(
-                            "pump: end-of-turn at window %d (frames=%d)",
-                            window_index,
+                            "pump: end-of-turn at vad-window %d (frames=%d)",
+                            latest_vad_window,
                             frames_received,
                         )
-                window_index += 1
                 frames_received += 1
                 if frames_received % 50 == 0:
                     _log.debug(
-                        "pump: %d frames received, window=%d",
+                        "pump: %d frames received, vad-window=%d",
                         frames_received,
-                        window_index,
+                        latest_vad_window,
                     )
                 if suppress_echo:
                     # Drop the echoed frame from the ASR input (see above). The VAD
@@ -1371,9 +1376,9 @@ class CallLoop:
                     if not echo_drop_logged:
                         echo_drop_logged = True
                         _log.debug(
-                            "pump: withholding echo audio from ASR at window %d "
+                            "pump: withholding echo audio from ASR at vad-window %d "
                             "(unauthorised speech during TTS playout/tail)",
-                            window_index,
+                            latest_vad_window,
                         )
                     continue
                 await audio_q.put(frame)

@@ -51,11 +51,18 @@ STOP_COMMAND = "/stop"
 NORMAL_END_NOTE = "[The caller has hung up; the line is now disconnected.]"
 
 
+@enum.unique
 class CallEndReason(enum.Enum):
     """Why a call ended, and what the plugin signals to the Hermes session.
 
-    The value of each member is its ``(was_failure, can_followup)`` pair; the two
-    properties read it back. The taxonomy is split into two families:
+    Each member carries two booleans — ``was_failure`` and ``can_followup`` — read
+    back by the two properties. Several reasons share the same
+    ``(was_failure, can_followup)`` behaviour, so the booleans are stored as
+    attributes (see :meth:`__new__`) while the enum ``value`` is the member's own
+    unique key string. A plain bool-pair value would make equal-valued members
+    silent ALIASES of one another — collapsing ``reason.name`` in logs and the
+    by-member ``_OUTBOUND_REASON_PHRASE`` outcome map (ADR-0029) — which
+    ``@enum.unique`` now forbids. The taxonomy is split into two families:
 
     * **Normal** ends — the call completed without an error condition:
       :attr:`REMOTE_BYE` (the caller hung up), :attr:`AGENT_HANGUP` (the agent
@@ -74,20 +81,35 @@ class CallEndReason(enum.Enum):
     docstring; there is no live media path post-BYE).
     """
 
-    REMOTE_BYE = (False, True)
-    AGENT_HANGUP = (False, True)
-    EOS = (False, True)
-    MEDIA_TIMEOUT = (True, False)
-    PIPELINE_FAILURE = (True, False)
-    SIP_ERROR = (True, False)
-    CONNECTION_LOST = (True, False)
-    REGISTRATION_LOST = (True, False)
+    _was_failure: bool
+    _can_followup: bool
+
+    def __new__(cls, key: str, was_failure: bool, can_followup: bool) -> CallEndReason:
+        """Create a member whose enum ``value`` is its unique ``key`` string.
+
+        The two booleans are stored as attributes rather than BEING the value, so
+        two reasons with identical ``(was_failure, can_followup)`` behaviour stay
+        DISTINCT members — a bool-pair value would alias them (see class docstring).
+        """
+        member = object.__new__(cls)
+        member._value_ = key
+        member._was_failure = was_failure
+        member._can_followup = can_followup
+        return member
+
+    REMOTE_BYE = ("remote_bye", False, True)
+    AGENT_HANGUP = ("agent_hangup", False, True)
+    EOS = ("eos", False, True)
+    MEDIA_TIMEOUT = ("media_timeout", True, False)
+    PIPELINE_FAILURE = ("pipeline_failure", True, False)
+    SIP_ERROR = ("sip_error", True, False)
+    CONNECTION_LOST = ("connection_lost", True, False)
+    REGISTRATION_LOST = ("registration_lost", True, False)
 
     @property
     def was_failure(self) -> bool:
         """Whether this end is a failure (inject ``/stop``) vs a normal end."""
-        failure, _ = self.value
-        return failure
+        return self._was_failure
 
     @property
     def can_followup(self) -> bool:
@@ -97,8 +119,7 @@ class CallEndReason(enum.Enum):
         be reached — the media path is gone after the call ends; follow-up is
         background agent work / a new outbound callback / another channel.
         """
-        _, followup = self.value
-        return followup
+        return self._can_followup
 
     @staticmethod
     def classify_clean_return(*, agent_hangup: bool) -> CallEndReason:

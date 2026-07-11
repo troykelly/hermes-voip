@@ -291,30 +291,34 @@ def test_parse_unfolds_continuation_lines() -> None:
 
 
 def test_parse_folded_header_unfold_is_linear_not_quadratic() -> None:
-    # CWE-407 guard: RFC 3261 obs-fold unfolding must be O(total length), not O(N^2). A
-    # single header folded into many minimal continuation lines parses SYNCHRONOUSLY on
-    # the shared asyncio loop, so a quadratic unfold stalls every concurrent call (an
-    # availability DoS — worst on the un-framed WSS path). The old rebuild-the-growing-
-    # string unfold measured seconds here; the linear list-join is a few ms.
-    folds = 300_000
-    raw = (
-        "SIP/2.0 200 OK\r\n"
-        "Contact: <sip:1000@pbx.example.test>\r\n"
-        + " Z\r\n"
-        * folds
-        + "Content-Length: 0\r\n"
-        "\r\n"
-    )
-    start = time.perf_counter()
-    resp = SipResponse.parse(raw)
-    elapsed = time.perf_counter() - start
-    # Linear parse is a few ms even at 300k folds; the generous 0.5 s bound fails loudly
-    # if the O(N^2) unfold returns (seconds here) but never flakes on a linear one.
-    assert elapsed < 0.5, (
-        f"folded-header parse took {elapsed:.3f}s — O(N^2) regression?"
-    )
-    # The continuation lines joined into the Contact value (behaviour preserved).
-    assert (resp.header("Contact") or "").count("Z") == folds
+    # CWE-407 guard: RFC 3261 obs-fold unfolding must be O(total length), not O(N^2).
+    # Parse runs SYNCHRONOUSLY on the shared asyncio loop, so a quadratic unfold on a
+    # crafted line-folded header stalls every concurrent call (availability DoS).
+    # Compare parse time at N and 4N folds: linear ~4x, quadratic ~16x. The ratio
+    # cancels machine speed, so a generous < 8 threshold never flakes on a slow CI
+    # runner yet fails loudly if the O(N^2) rebuild returns. min-of-3 damps jitter.
+    def _parse_time(folds: int) -> float:
+        raw = (
+            "SIP/2.0 200 OK\r\n"
+            "Contact: <sip:1000@pbx.example.test>\r\n"
+            + " Z\r\n"
+            * folds
+            + "Content-Length: 0\r\n"
+            "\r\n"
+        )
+        resp = SipResponse.parse(raw)
+        # Behaviour preserved: the continuation lines joined into the Contact value.
+        assert (resp.header("Contact") or "").count("Z") == folds
+        best = float("inf")
+        for _ in range(3):
+            start = time.perf_counter()
+            SipResponse.parse(raw)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    base = 100_000
+    ratio = _parse_time(base * 4) / _parse_time(base)
+    assert ratio < 8.0, f"parse scaled {ratio:.1f}x for 4x input — O(N^2) regression?"
 
 
 def test_parse_rejects_malformed_status_line() -> None:

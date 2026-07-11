@@ -6217,6 +6217,51 @@ async def test_untranscribed_turn_reprompt_runs_off_the_asr_pump() -> None:
 
 
 @pytest.mark.asyncio
+async def test_untranscribed_turn_no_stacked_reprompts() -> None:
+    """A 2nd untranscribed turn while the 1st reprompt is still in flight is IGNORED.
+
+    The "at most one reprompt in flight" guard (item 1282, ``_on_untranscribed_turn``:
+    ``if existing is not None and not existing.done(): return``). Two untranscribed
+    turns fired back-to-back — with a GATED (never-completing) reprompt synth so the
+    first task stays in flight — must schedule exactly ONE reprompt task and synthesise
+    exactly ONE "didn't catch that" line, never two overlapping ones. Regression lock:
+    the other 1282 tests never fire a second untranscribed turn while the first reprompt
+    is still speaking, so a dropped/inverted guard would pass CI silently.
+    """
+    gate = asyncio.Event()  # never set until cleanup: the 1st reprompt stays in flight
+    tts = _GatedCapturingTTS([_greeting_frame(1)], gate)
+    transport = _HoldOpenTransport([_silence_frame(0)])
+    loop = _didnt_catch_loop(transport, _FakeASR([]), tts)
+
+    # Fire two untranscribed turns back-to-back. No await between them, so the task the
+    # first schedules has not run yet (``not done``) when the second consults the guard.
+    loop._on_untranscribed_turn()
+    first = loop._didnt_catch_task
+    assert first is not None, "the first untranscribed turn must schedule a reprompt"
+    loop._on_untranscribed_turn()
+    assert loop._didnt_catch_task is first, (
+        "a second untranscribed turn scheduled a STACKED reprompt while the first was "
+        "still in flight — the no-stacked-reprompt guard was bypassed"
+    )
+
+    # The single reprompt task runs to its gate: exactly ONE synthesis occurred.
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if tts.synthesised:
+            break
+    assert tts.synthesised == [_DIDNT_CATCH_PHRASE], (
+        f"exactly one reprompt must synthesise, not a stacked pair; got "
+        f"{tts.synthesised!r}"
+    )
+
+    gate.set()
+    if first is not None and not first.done():
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+
+
+@pytest.mark.asyncio
 async def test_untranscribed_turn_marks_caller_active_in_window() -> None:
     """An untranscribed turn is caller ACTIVITY — it sets _caller_active_in_window.
 

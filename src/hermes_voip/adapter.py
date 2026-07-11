@@ -698,6 +698,14 @@ _SINK_QUEUE_MAX = 32
 # Exceeding this cap fails the call cleanly instead of hanging (W1 / codex #433).
 _MAX_STALE_INVITE_FINALS = 8
 
+# Bound on retained ENDED-call metadata (CWE-400). A finished call's ``_call_info``
+# entry is kept (flagged ``ended``) so ``send()`` can DROP a late agent reply to it
+# without the gateway's retry noise; it was never reaped, so sequential calls grew
+# ``_call_info`` forever. Only ended entries are bounded (via ``_ended_call_order``) —
+# a live call's entry is never evicted — and this many recent ends comfortably covers
+# any late-reply window while keeping per-call memory bounded.
+_MAX_ENDED_CALL_INFO: Final[int] = 256
+
 #: Reservation sentinel for ``_attended_consults`` (ADR-0048): placed in the pairing
 #: slot BEFORE the consult dial awaits, so a concurrent second ``consult`` for the same
 #: original call is refused. It is never a real SIP Call-ID (no session matches it), so

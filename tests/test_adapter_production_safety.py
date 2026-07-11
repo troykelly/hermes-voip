@@ -483,6 +483,78 @@ async def test_admission_slot_released_on_teardown_no_leak() -> None:
     )
 
 
+async def test_ended_call_info_retention_is_bounded_no_leak() -> None:
+    """Ended ``_call_info`` entries are bounded (CWE-400), not retained forever.
+
+    They are kept (flagged ``ended``) for ``send()`` late-reply suppression, but
+    ``_teardown_call`` never removed them, so sequential calls (distinct forgeable
+    Call-IDs) grew ``_call_info`` without bound over the long-lived adapter's lifetime.
+    """
+    from hermes_voip.adapter import _MAX_ENDED_CALL_INFO  # noqa: PLC0415
+
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    for i in range(_MAX_ENDED_CALL_INFO + 100):
+        call_id = f"seq-call-{i}"
+        adapter._call_info[call_id] = {"name": "caller", "ended": True}
+        await adapter._teardown_call(
+            call_id=call_id,
+            engine=_fake_engine(),
+            transport=transport,  # type: ignore[arg-type]  # fake transport double
+            dialog_id=(call_id, "lt", "rt"),
+            reason=CallEndReason.REMOTE_BYE,
+        )
+
+    assert len(adapter._call_info) <= _MAX_ENDED_CALL_INFO
+
+
+async def test_recent_ended_call_info_survives_for_late_reply_suppression() -> None:
+    """A just-ended call's ``_call_info`` entry survives the bound for suppression.
+
+    ``send()`` must still be able to drop a late reply to it — only entries older than
+    the retention cap are reaped, never a recent one (or a still-live call's).
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    recent = "recent-call"
+    adapter._call_info[recent] = {"name": "caller", "ended": True}
+    await adapter._teardown_call(
+        call_id=recent,
+        engine=_fake_engine(),
+        transport=transport,  # type: ignore[arg-type]  # fake transport double
+        dialog_id=(recent, "lt", "rt"),
+        reason=CallEndReason.REMOTE_BYE,
+    )
+    # A handful of later calls end; the recent one is well within the cap and survives.
+    for i in range(10):
+        cid = f"later-{i}"
+        adapter._call_info[cid] = {"name": "x", "ended": True}
+        await adapter._teardown_call(
+            call_id=cid,
+            engine=_fake_engine(),
+            transport=transport,  # type: ignore[arg-type]  # fake transport double
+            dialog_id=(cid, "lt", "rt"),
+            reason=CallEndReason.REMOTE_BYE,
+        )
+
+    assert adapter._call_info.get(recent, {}).get("ended") is True
+
+
+async def test_disconnect_clears_call_info_no_residual() -> None:
+    """``disconnect()`` clears ``_call_info`` (it omitted it from the shutdown clear).
+
+    It cleared 8 sibling per-call maps but not ``_call_info``, leaving the per-call
+    metadata behind at shutdown.
+    """
+    transport = _FakeTransport()
+    adapter = await _build_adapter(transport, _FakeManager())
+    adapter._call_info["c1"] = {"name": "caller", "ended": True}
+
+    await adapter.disconnect()
+
+    assert adapter._call_info == {}
+
+
 async def test_inbound_invite_under_capacity_is_admitted() -> None:
     """Below the cap, a new INVITE is admitted, answered 200 OK, and leaks no slot.
 

@@ -363,6 +363,34 @@ def test_ingest_rtcp_sr_flood_distinct_ssrc_does_not_grow_last_sr_from() -> None
     assert _PEER_SSRC in engine._last_sr_from
 
 
+def test_ingest_rtcp_interleaved_rtp_and_sr_flood_does_not_grow_last_sr_from() -> None:
+    # DoS guard (CWE-400), companion to the bare-SR flood test above. That test floods
+    # SRs with NO prior RTP, so the `ssrc in _reception` gate blocks them. The vector it
+    # misses: an attacker sends, per distinct spoofed SSRC, an RTP packet (which enters
+    # _reception) THEN a Sender Report (which records _last_sr_from while the SSRC is
+    # momentarily in _reception). _reception is LRU-capped, but _last_sr_from must be
+    # pruned in LOCKSTEP on eviction — otherwise every evicted source leaves a dead
+    # entry behind and the map grows without bound (the "capped in lockstep" comment).
+    engine = _make_engine(ntp_clock=lambda: 1_700_000_000.0)
+
+    def _sr(ssrc: int) -> SenderReport:
+        return SenderReport(
+            ssrc=ssrc,
+            ntp_timestamp=to_ntp(1_699_999_999.0),
+            rtp_timestamp=0,
+            packet_count=0,
+            octet_count=0,
+            report_blocks=(),
+        )
+
+    for ssrc in range(0x2000, 0x2000 + 500):  # 500 distinct interleaved RTP+SR senders
+        engine._note_rtp_received(seq=1, rtp_timestamp=0, arrival_ts=0.0, ssrc=ssrc)
+        engine.ingest_rtcp(build_compound((_sr(ssrc),)))
+    # Both maps stay capped in lockstep, not grown to 500.
+    assert len(engine._last_sr_from) <= _MAX_RECEPTION_SOURCES
+    assert len(engine._reception) <= _MAX_RECEPTION_SOURCES
+
+
 def test_ingest_peer_receiver_report_yields_round_trip_time() -> None:
     """A peer RR echoing our SR (via LSR/DLSR) gives us the round-trip time (§6.4.1).
 

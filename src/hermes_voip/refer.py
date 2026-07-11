@@ -101,9 +101,14 @@ _DIALABLE_TARGET = re.compile(r"\+?[0-9*#]+")
 # rejected (literal and percent-decoded) before this runs, so it need not.
 _HOST_LABEL = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
 _HOSTNAME = rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*\.?"
-_IPV4 = r"(?:\d{1,3}\.){3}\d{1,3}"
+# `[0-9]` not `\d`: `\d` is Unicode-aware and would fold fullwidth / Arabic-Indic
+# digits into a "valid" IPv4 octet or port, letting a non-ASCII target smuggle past
+# this security-sensitive guard onto the UTF-8-encoded Refer-To wire (RFC 3261
+# requires US-ASCII DIGIT). Matches the strict-ASCII posture of message.py and the
+# _SIPFRAG_STATUS `\d{3}` -> `[0-9]{3}` fix (#479).
+_IPV4 = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
 _IPV6_REF = r"\[[0-9A-Fa-f:.]+\]"
-_AUTHORITY = rf"(?:{_IPV4}|{_IPV6_REF}|{_HOSTNAME})(?::\d{{1,5}})?"
+_AUTHORITY = rf"(?:{_IPV4}|{_IPV6_REF}|{_HOSTNAME})(?::[0-9]{{1,5}})?"
 # user-part: any URI char except the structural separators / brackets / ws / a
 # password-introducing ``:`` — kept restrictive so ``;``/``?``/``@`` cannot hide.
 _URI_USER = r"[^\s@<>;?:/\"',]+"

@@ -39,6 +39,7 @@ __all__ = [
     "render_call_context_block",
 ]
 
+from hermes_voip._decimal import _parse_decimal
 from hermes_voip._name_addr import name_addr_parts
 from hermes_voip.message import SipRequest
 
@@ -260,9 +261,10 @@ def _parse_diversion(raw: str) -> DiversionHop:
     """Parse one ``Diversion`` header value into a :class:`DiversionHop` (lenient)."""
     params = _header_params(raw)
     counter_raw = params.get("counter")
-    counter = (
-        int(counter_raw) if counter_raw is not None and counter_raw.isdigit() else None
-    )
+    # _parse_decimal (not str.isdigit()+int()) fails closed on non-ASCII/Unicode digits
+    # like U+00B2 that isdigit() accepts but int() rejects — the module's "never raises"
+    # contract; a raise here crashes extraction — an admission-slot-leak DoS.
+    counter = _parse_decimal(counter_raw) if counter_raw is not None else None
     return DiversionHop(
         uri=_addr_spec(raw),
         display_name=_display_name(raw),
@@ -277,7 +279,9 @@ def _parse_history_info(raw: str) -> HistoryInfoEntry:
     """Parse one ``History-Info`` header value into an entry (lenient)."""
     params = _header_params(raw)
     cause_raw = params.get("cause")
-    cause = int(cause_raw) if cause_raw is not None and cause_raw.isdigit() else None
+    # _parse_decimal fails closed on Unicode digits (see _parse_diversion) so a crafted
+    # ``;cause=<U+00B2>`` cannot raise out of the "never raises" extractor.
+    cause = _parse_decimal(cause_raw) if cause_raw is not None else None
     return HistoryInfoEntry(
         uri=_addr_spec(raw),
         index=params.get("index"),
@@ -316,9 +320,17 @@ def _history_info_sort_key(entry: HistoryInfoEntry) -> tuple[int, tuple[int, ...
     if index is None:
         return (1, ())
     parts = index.split(".")
-    if all(part.isdigit() for part in parts) and parts != [""]:
-        return (0, tuple(int(part) for part in parts))
-    return (1, ())
+    if parts == [""]:
+        return (1, ())
+    # Parse each dotted component via the fail-closed helper (not isdigit()+int(),
+    # which raises on a Unicode digit like U+00B2). Malformed part -> sort last.
+    parsed: list[int] = []
+    for part in parts:
+        value = _parse_decimal(part)
+        if value is None:
+            return (1, ())
+        parsed.append(value)
+    return (0, tuple(parsed))
 
 
 @dataclass(frozen=True, slots=True)

@@ -33,10 +33,11 @@ allowlist comment is corrected to state the (now-true) no-destination-override p
 
 **Keep `transport`.** It selects only the wire protocol, not the destination host, and a
 transfer legitimately may be `sip:x@host;transport=tls` (already tested/accepted). Its
-residual risk is a *downgrade* — an attacker-supplied `;transport=udp` could push the
-triggered leg to cleartext — but that is lower severity than a host-hijack, and blocking it
-would reject legitimate TLS transfers; it stays allowlisted. `user`/`method`/`ttl`/`lr` are
-benign and stay.
+residual risk is a *downgrade* — an attacker-supplied `;transport=udp` **or `;transport=tcp`**
+could push the triggered leg to a **cleartext** transport (only `tls` is confidential; plain
+TCP is NOT secure) — but that is lower severity than a host-hijack, and blocking it would
+reject legitimate TLS transfers; it stays allowlisted. `user`/`method`/`ttl`/`lr` are benign
+and stay.
 
 ## Consequences
 
@@ -46,8 +47,10 @@ benign and stay.
 - No legitimate transfer regresses (a real transfer names host + user, optionally
   `transport=tls`).
 - Residual (noted, not fixed here): `transport` can still force a cleartext downgrade on the
-  triggered leg — a follow-up may restrict it to secure transports (`tls`/`tcp`) if a
-  deployment warrants it. Tracked as a lower-priority hardening, not part of this ADR.
+  triggered leg (both `udp` and `tcp` are cleartext — only `tls` is confidential) — a
+  follow-up may clamp `transport` to `tls` (and reject a non-`tls` transport on a `sips:`
+  target, which by definition implies TLS) if a deployment warrants it. Tracked as a
+  lower-priority hardening, not part of this ADR.
 
 ## References
 

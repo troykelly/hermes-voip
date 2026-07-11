@@ -139,6 +139,19 @@ class LoopbackWsSipServer:
             raise RuntimeError(msg)
         await self._ws.send(message)
 
+    async def push_bytes(self, data: bytes, *, timeout: float = 3.0) -> None:
+        """Send an unsolicited BINARY WebSocket frame to the client.
+
+        ``websockets`` frames ``bytes`` as a binary frame (``str`` -> text frame), so
+        this exercises the reader's binary-frame path — including bytes that are not
+        valid UTF-8 (which must be dropped, never UTF-8-decoded).
+        """
+        await asyncio.wait_for(self._connected.wait(), timeout)
+        if self._ws is None:  # pragma: no cover — guarded by the event
+            msg = "no client connected"
+            raise RuntimeError(msg)
+        await self._ws.send(data)
+
     async def wait_for_received(
         self,
         predicate: Callable[[str], bool],
@@ -878,6 +891,48 @@ async def test_header_incomplete_cancel_frame_does_not_tear_down_reader_wss() ->
         assert "200 OK" in response_frame
         assert lost == [], (
             "a header-incomplete CANCEL frame must not fire on_connection_lost"
+        )
+    finally:
+        await manager.aclose()
+        await transport.aclose()
+        await server.stop()
+
+
+async def test_binary_frame_invalid_utf8_does_not_tear_down_reader_wss() -> None:
+    # ADR-0081 class (WSS, RECEIVE side): a BINARY WebSocket frame whose bytes are not
+    # valid UTF-8 (a lone 0xFF, or a non-UTF-8 SIP body a gateway forwards as a binary
+    # frame) must NOT tear down the reader. ws.recv() (decode=None) returns a binary
+    # frame as bytes — dropped by the ``isinstance(frame, str)`` guard, never decoded.
+    # The old recv(decode=True) force-decoded it, raising UnicodeDecodeError ->
+    # ConnectionClosed, which escaped the reader and dropped the registration + EVERY
+    # active call on the shared connection. Mirrors the TLS transport's
+    # test_nonutf8_body_is_skipped_connection_survives_next_dispatches.
+    lost: list[BaseException | None] = []
+
+    def responder(_frame: str) -> list[str]:
+        return []
+
+    server = LoopbackWsSipServer(responder)
+    await server.start()
+    transport = WssSipTransport(
+        host="pbx.example.test",
+        port=server.port,
+        ws_path="/ws",
+        connect_address="127.0.0.1",
+        on_connection_lost=lost.append,
+    )
+    manager = RegistrationManager(_gateway(), transport)
+    transport.bind_manager(manager)
+    try:
+        await transport.connect()
+        await server.push_bytes(b"\xff\xfe\xff")  # binary frame, invalid UTF-8
+        await server.push(_inbound_options(to_user="1000"))
+        response_frame = await server.wait_for_received(
+            lambda f: f.startswith("SIP/2.0 200 "), timeout=3.0
+        )
+        assert "200 OK" in response_frame
+        assert lost == [], (
+            "a binary frame with invalid UTF-8 must not fire on_connection_lost"
         )
     finally:
         await manager.aclose()

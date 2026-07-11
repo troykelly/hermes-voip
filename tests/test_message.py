@@ -7,6 +7,7 @@ case-insensitive, repeatable header access), and the token generators
 """
 
 import re
+import time
 from collections.abc import Callable
 from typing import Final
 
@@ -287,6 +288,33 @@ def test_parse_unfolds_continuation_lines() -> None:
     assert "nonce=" in value
     challenge = DigestChallenge.parse(value)
     assert challenge.qop == ("auth",)
+
+
+def test_parse_folded_header_unfold_is_linear_not_quadratic() -> None:
+    # CWE-407 guard: RFC 3261 obs-fold unfolding must be O(total length), not O(N^2). A
+    # single header folded into many minimal continuation lines parses SYNCHRONOUSLY on
+    # the shared asyncio loop, so a quadratic unfold stalls every concurrent call (an
+    # availability DoS — worst on the un-framed WSS path). The old rebuild-the-growing-
+    # string unfold measured seconds here; the linear list-join is a few ms.
+    folds = 300_000
+    raw = (
+        "SIP/2.0 200 OK\r\n"
+        "Contact: <sip:1000@pbx.example.test>\r\n"
+        + " Z\r\n"
+        * folds
+        + "Content-Length: 0\r\n"
+        "\r\n"
+    )
+    start = time.perf_counter()
+    resp = SipResponse.parse(raw)
+    elapsed = time.perf_counter() - start
+    # Linear parse is a few ms even at 300k folds; the generous 0.5 s bound fails loudly
+    # if the O(N^2) unfold returns (seconds here) but never flakes on a linear one.
+    assert elapsed < 0.5, (
+        f"folded-header parse took {elapsed:.3f}s — O(N^2) regression?"
+    )
+    # The continuation lines joined into the Contact value (behaviour preserved).
+    assert (resp.header("Contact") or "").count("Z") == folds
 
 
 def test_parse_rejects_malformed_status_line() -> None:

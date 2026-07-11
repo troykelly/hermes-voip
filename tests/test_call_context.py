@@ -402,6 +402,12 @@ def test_unicode_digit_numeric_params_do_not_raise() -> None:
     # counter=² previously raised in _parse_diversion -> must parse to None.
     ctx_counter = _ctx([("Diversion", f"<sip:a@pbx.example.test>;counter={sup2}")])
     assert ctx_counter.diversion[0].counter is None
+    # Strict-ASCII hardening (per #479/#485/#488): an int()-VALID but non-ASCII Unicode
+    # decimal digit (Arabic-Indic U+0665) is rejected too — it parsed leniently to 5
+    # before, a parser-differential vs an RFC-strict proxy on these advisory fields.
+    arabic5 = chr(0x0665)  # isdigit() True, int()==5, isascii() False
+    ctx_arabic = _ctx([("Diversion", f"<sip:a@pbx.example.test>;counter={arabic5}")])
+    assert ctx_arabic.diversion[0].counter is None
 
 
 # --------------------------------------------------------------------------- #

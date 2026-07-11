@@ -432,14 +432,3 @@ class EchoCanceller:
         if self._ref_resampler is None:
             self._ref_resampler = Resampler(sample_rate, self._rate)
         return self._ref_resampler.resample(pcm16)
-
-    def reset(self) -> None:
-        """Drop all per-call state: taps, reference history, resampler.
-
-        Called at call start (engine ``connect``) so a reused engine begins with a
-        zeroed filter and empty history — no stale echo path from a prior call.
-        """
-        self._w = np.zeros(self._filter_len, dtype=np.float64)
-        self._x = np.zeros(0, dtype=np.float64)
-        self._read = 0
-        self._ref_resampler = None

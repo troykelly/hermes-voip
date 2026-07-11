@@ -1159,6 +1159,20 @@ class VoipAdapter(BasePlatformAdapter):
         # open for follow-up) rather than REMOTE_BYE. Set by ``_mark_agent_hangup``;
         # read by ``_classify_end_reason``; discarded in ``_teardown_call``.
         self._agent_hangups: set[str] = set()
+        # Per-call MAX-DURATION watchdog state (ADR-0113). ``_max_duration_timers``
+        # holds the per-call force-teardown timer (cancelled in _teardown_call, like
+        # _session_timers); ``_call_duration_exceeded`` maps a call whose cap fired to
+        # the exact CallSession it fired for, so _classify_end_reason identity-matches
+        # it (a superseded same-Call-ID call's marker never tags a newer session); the
+        # sleep seam is injectable so tests fire the cap deterministically instead of
+        # sleeping real hours. Production uses the real event-loop sleep.
+        self._max_duration_timers: dict[
+            str, tuple[asyncio.Task[None], CallSession]
+        ] = {}
+        self._call_duration_exceeded: dict[str, CallSession] = {}
+        self._max_call_duration_sleep: Callable[[float], Awaitable[None]] = (
+            asyncio.sleep
+        )
 
         # Admission control (ADR-0059): the Call-IDs of calls that have RESERVED a
         # concurrency slot. A slot is reserved in ``_handle_inbound_invite`` the
@@ -1466,6 +1480,7 @@ class VoipAdapter(BasePlatformAdapter):
         self._call_sessions.clear()
         self._admitted_calls.clear()
         self._admission_start.clear()
+        self._call_duration_exceeded.clear()
 
         manager = self._manager
         if manager is not None:
@@ -2545,7 +2560,7 @@ class VoipAdapter(BasePlatformAdapter):
                     _raised = False
                 finally:
                     _reason = self._classify_end_reason(
-                        _bg_call_id, _bg_engine, raised=_raised
+                        _bg_call_id, _bg_engine, raised=_raised, session=_bg_session
                     )
                     await self._teardown_call(
                         call_id=_bg_call_id,
@@ -3226,7 +3241,7 @@ class VoipAdapter(BasePlatformAdapter):
                     _raised = False
                 finally:
                     _reason = self._classify_end_reason(
-                        _bg_call_id, _bg_engine, raised=_raised
+                        _bg_call_id, _bg_engine, raised=_raised, session=_bg_session
                     )
                     await self._teardown_call(
                         call_id=_bg_call_id,
@@ -3949,7 +3964,9 @@ class VoipAdapter(BasePlatformAdapter):
             )
             loop_raised = False
         finally:
-            reason = self._classify_end_reason(call_id, engine, raised=loop_raised)
+            reason = self._classify_end_reason(
+                call_id, engine, raised=loop_raised, session=session
+            )
             await self._teardown_call(
                 call_id=call_id,
                 engine=engine,
@@ -5362,6 +5379,132 @@ class VoipAdapter(BasePlatformAdapter):
             if not tasks:
                 self._call_tasks.pop(call_id, None)
 
+    def _arm_max_duration_timer(
+        self, call_id: str, session: CallSession, cap_secs: float
+    ) -> None:
+        """Arm this call's max-duration watchdog (ADR-0113); a no-op when disabled.
+
+        ``cap_secs <= 0`` disables the cap (operator opt-out via
+        ``HERMES_VOIP_MAX_CALL_DURATION_SECS=0``), so nothing is armed. Otherwise a
+        force-teardown timer bound to THIS ``session`` is tracked in
+        ``_max_duration_timers`` (cancelled in :meth:`_teardown_call`) and in
+        ``_call_tasks`` (so ``disconnect`` cancels it); a done-callback surfaces any
+        unexpected error (rule 37). Mirrors :meth:`_start_session_timer`.
+
+        A superseding same-Call-ID call (retransmission / fork) re-arms here: this
+        task's ``session`` just became the registered one, so any timer left by the
+        now-superseded call is cancelled first — it must neither outlive its call nor
+        fire against the newer one (the same-Call-ID isolation the teardown chokepoint
+        enforces).
+        """
+        if cap_secs <= 0:
+            return
+        stale = self._max_duration_timers.pop(call_id, None)
+        if stale is not None and not stale[0].done():
+            stale[0].cancel()  # its done-callback drops it from _call_tasks
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._run_max_duration_timer(call_id, session, cap_secs)
+        )
+        # Store the owning session with the task so cancellation is session-scoped: a
+        # superseded / pre-session same-Call-ID teardown must never cancel this timer.
+        self._max_duration_timers[call_id] = (task, session)
+        self._call_tasks.setdefault(call_id, set()).add(task)
+        task.add_done_callback(lambda t: self._on_max_duration_timer_done(call_id, t))
+
+    async def _run_max_duration_timer(
+        self, call_id: str, session: CallSession, cap_secs: float
+    ) -> None:
+        """Force-teardown a call that exceeds the max-duration cap (ADR-0113).
+
+        Sleeps for ``cap_secs`` (an injectable seam so tests fire the cap without real
+        time), then — if THIS ``session`` is still the live, current call for its
+        Call-ID — flags it so :meth:`_classify_end_reason` tags MAX_CALL_DURATION and
+        gracefully hangs it up via the idempotent :meth:`CallSession.hang_up` (an
+        in-dialog BYE + media stop). Stopping the media unblocks ``call_loop.run()`` so
+        the call's OWN teardown finally runs the single chokepoint — the same graceful
+        path a shutdown drain / agent hang-up uses, with NO cross-task cancellation of
+        the running loop (which would risk the aclose race).
+
+        Identity-guarded: a superseded same-Call-ID call must NOT end the newer one and
+        an already-ended call needs nothing, so the timer no-ops unless ``session`` is
+        still ``_call_sessions[call_id]`` and not ended. Cancelled (a no-op) if the
+        call ends before the cap.
+        """
+        try:
+            await self._max_call_duration_sleep(cap_secs)
+        except asyncio.CancelledError:
+            return  # the call ended (or teardown disarmed us) before the cap
+        if session.ended or self._call_sessions.get(call_id) is not session:
+            return  # superseded / already ending — never touch a different call
+        _log.warning(
+            "call %s: max-duration cap (%.0fs) reached — forcing graceful teardown",
+            call_id,
+            cap_secs,
+            extra={
+                "event": "max_call_duration_exceeded",
+                "call_id": call_id,
+                "cap_secs": cap_secs,
+            },
+        )
+        # Mark BEFORE hang_up: media stop makes call_loop.run() return, whose finally
+        # classifies immediately — it must see MAX_CALL_DURATION, not the REMOTE_BYE a
+        # clean return would otherwise give. Keyed to THIS session so classify (and the
+        # teardown consume) identity-match it, never a superseding same-Call-ID call.
+        self._call_duration_exceeded[call_id] = session
+        await session.hang_up()
+
+    def _on_max_duration_timer_done(
+        self, call_id: str, task: asyncio.Task[None]
+    ) -> None:
+        """Discard a finished max-duration watchdog + surface an unexpected error.
+
+        A clean return (cap fired / nothing to do) or a cancellation (teardown /
+        disconnect) is normal and silent; an unexpected exception is logged (rule 37).
+        Mirrors :meth:`_on_session_timer_done`.
+        """
+        tasks = self._call_tasks.get(call_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._call_tasks.pop(call_id, None)
+        entry = self._max_duration_timers.get(call_id)
+        if entry is not None and entry[0] is task:
+            del self._max_duration_timers[call_id]
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log.error(
+                "call %s: max-duration watchdog failed: %s",
+                call_id,
+                exc,
+                exc_info=exc,
+            )
+
+    async def _cancel_max_duration_timer(
+        self, call_id: str, session: CallSession | None
+    ) -> None:
+        """Cancel + await the max-duration watchdog IF it belongs to ``session``.
+
+        Session-scoped so a superseded — or pre-session (``session is None``) —
+        same-Call-ID teardown can NEVER cancel a newer call's watchdog (which would
+        silently strip its cap). Mirrors :meth:`_cancel_session_timer`, but ownership-
+        checked. A no-op when no timer is armed or it is a different session's.
+        """
+        entry = self._max_duration_timers.get(call_id)
+        if entry is None or entry[1] is not session:
+            return
+        task = entry[0]
+        del self._max_duration_timers[call_id]
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        tasks = self._call_tasks.get(call_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._call_tasks.pop(call_id, None)
+
     async def _send_answer_200(  # noqa: PLR0913 — the dialog-forming 200 OK needs all of these to build the response
         self,
         *,
@@ -5593,6 +5736,20 @@ class VoipAdapter(BasePlatformAdapter):
         # Register the concrete engine so hang_up_call can flush its buffered outbound
         # tail before BYE (#432, ADR-0106); dropped with the loop in _teardown_call.
         self._call_engines[call_id] = engine
+        # Per-call MAX-DURATION watchdog (ADR-0113): force-teardown an active call that
+        # outlives the configured ceiling so a runaway / continuous-RTP call cannot pin
+        # an admission slot + STT/LLM pipeline forever. Armed HERE — the single
+        # chokepoint every call path (inbound + both outbound legs) funnels through —
+        # and disarmed in _teardown_call. A no-op when the cap is 0 (disabled).
+        gateway_cfg = self._gateway_cfg
+        cap_secs = (
+            gateway_cfg.max_call_duration_secs if gateway_cfg is not None else 0.0
+        )
+        # Bind the watchdog to THIS call's registered session so it can identity-check
+        # before firing (a superseded same-Call-ID call must never end the newer one).
+        watchdog_session = self._call_sessions.get(call_id)
+        if watchdog_session is not None:
+            self._arm_max_duration_timer(call_id, watchdog_session, cap_secs)
         # Wire inbound DTMF receive (ADR-0010): resolve the per-call receive mode from
         # config + the negotiated telephone-event PT, and when RFC 4733 is active wire
         # the engine's on_dtmf demux to the loop's router and bind the armed-
@@ -5926,6 +6083,10 @@ class VoipAdapter(BasePlatformAdapter):
             # in-flight refresh re-INVITE cannot race this teardown's BYE on the same
             # dialog. A no-op when no watchdog runs (pre-session teardown / no timer).
             await self._cancel_session_timer(call_id)
+            # Disarm the max-duration watchdog too (ADR-0113): a normal end must not
+            # leave a dangling timer that later fires a spurious teardown. A no-op when
+            # unarmed (cap disabled) or already fired.
+            await self._cancel_max_duration_timer(call_id, session)
             # Only flag the call ended / drop its metadata when WE own it — else a
             # newer same-Call-ID task is live and must keep reporting as active.
             # Set ``ended`` BEFORE signalling so a late agent reply to the replayed
@@ -5984,6 +6145,13 @@ class VoipAdapter(BasePlatformAdapter):
         # This call's agent-hangup marker (if any) is consumed: the reason has
         # already been classified, and a fresh same-Call-ID call must start clean.
         self._agent_hangups.discard(call_id)
+        # Likewise consume this call's max-duration marker (ADR-0113) — but ONLY if it
+        # is still OURS: a superseding same-Call-ID call may have replaced it, and its
+        # marker must survive for its own classification. The reason is already read.
+        # (``session is not None`` guards the pre-session teardown: a None session must
+        # not match a missing marker's ``None`` default and delete a non-existent key.)
+        if session is not None and self._call_duration_exceeded.get(call_id) is session:
+            del self._call_duration_exceeded[call_id]
         if self._manager is not None:
             self._manager.remove_call(dialog_id)
         # Identity-checked: only evict the transport response sink if it is still
@@ -7067,11 +7235,18 @@ class VoipAdapter(BasePlatformAdapter):
         engine: RtpMediaTransport,
         *,
         raised: bool,
+        session: CallSession | None = None,
     ) -> CallEndReason:
         """Classify why a call ended, for the Hermes signal (ADR-0026).
 
         Decision order (fail-safe by construction):
 
+        0. ``_call_duration_exceeded[call_id] is session`` — the per-call max-duration
+           watchdog fired and force-ended THIS session: a **MAX_CALL_DURATION** →
+           ``/stop`` (ADR-0113). Checked FIRST: the watchdog ends the call via a
+           graceful hang-up (``raised=False``, ``media_timed_out=False``), so without
+           this it would misclassify as a normal REMOTE_BYE. Identity-keyed on the
+           session so a superseded same-Call-ID call's marker never tags a newer one.
         1. ``raised`` — the call loop raised (an ``ExceptionGroup`` from a failed
            ASR/TTS/guard/transport task, or any pre-``run()`` error): a
            **PIPELINE_FAILURE** → ``/stop``. This is also the fail-safe for any
@@ -7087,10 +7262,14 @@ class VoipAdapter(BasePlatformAdapter):
             call_id: The call being classified.
             engine: The call's media engine (read for ``media_timed_out``).
             raised: Whether the call loop ended by raising.
+            session: The session being torn down, identity-matched against the
+                max-duration marker; ``None`` for a pre-session teardown.
 
         Returns:
             The classified :class:`CallEndReason`.
         """
+        if session is not None and self._call_duration_exceeded.get(call_id) is session:
+            return CallEndReason.MAX_CALL_DURATION
         if raised:
             return CallEndReason.PIPELINE_FAILURE
         if engine.media_timed_out:
@@ -8366,6 +8545,7 @@ _OUTBOUND_REASON_PHRASE: dict[CallEndReason, str] = {
     CallEndReason.SIP_ERROR: "the call could not be completed",
     CallEndReason.CONNECTION_LOST: "the connection was lost",
     CallEndReason.REGISTRATION_LOST: "the phone line registration was lost",
+    CallEndReason.MAX_CALL_DURATION: "the call reached its time limit",
 }
 
 

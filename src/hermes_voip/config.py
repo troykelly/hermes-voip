@@ -113,6 +113,14 @@ _MAX_CALLS_KEY = "HERMES_SIP_MAX_CALLS"
 _DEFAULT_MAX_CALLS = 8
 _SHUTDOWN_DRAIN_SECS_KEY = "HERMES_SIP_SHUTDOWN_DRAIN_SECS"
 _DEFAULT_SHUTDOWN_DRAIN_SECS = 5.0
+# Per-call MAX-DURATION cap (ADR-0113): force-teardown of an ACTIVE call that runs
+# longer than this many seconds, so a caller streaming continuous RTP cannot pin an
+# admission slot (ADR-0059) + its STT/LLM pipeline FOREVER — a DoS that neither
+# ``media_timeout_secs`` (RTP-inactivity) nor the RFC 4028 session timer catches.
+# Default 4h; ``0`` DISABLES the cap (opt-out for a deployment that genuinely runs
+# unbounded calls). ``HERMES_VOIP_`` prefix (like deny_mode) — a media/call knob.
+_MAX_CALL_DURATION_SECS_KEY = "HERMES_VOIP_MAX_CALL_DURATION_SECS"
+_DEFAULT_MAX_CALL_DURATION_SECS = 14400.0
 # Deny enforcement style for a declined-group caller (ADR-0020 §5/§6). ``reject``
 # (the default, Phase 1) sends a hard ``603 Decline`` in the pre-200-OK window —
 # cheapest, gives the caller no agent surface. ``decline`` (Phase 2) instead ANSWERS
@@ -805,6 +813,13 @@ class GatewayConfig:
             BYE to every live call and waits up to this long for the drain before
             forcing teardown, so a restart no longer hard-drops live callers. Strictly
             positive and finite (default 5.0). ``HERMES_SIP_SHUTDOWN_DRAIN_SECS``.
+        max_call_duration_secs: The per-call ACTIVE-duration ceiling in seconds
+            (ADR-0113). A call still up after this long is force-torn-down (a graceful
+            in-dialog BYE + ``/stop`` signal) so a caller streaming continuous RTP
+            cannot hold an admission slot + STT/LLM pipeline indefinitely — the ceiling
+            that ``media_timeout_secs`` (RTP-inactivity) and the RFC 4028 session timer
+            do NOT provide. Non-negative and finite (default 14400.0 = 4h); ``0``
+            DISABLES the cap. ``HERMES_VOIP_MAX_CALL_DURATION_SECS``.
         deny_mode: How a declined-group caller is handled at the inbound INVITE
             (ADR-0020 §5/§6). ``reject`` (the default, Phase 1) sends a hard
             ``603 Decline`` in the pre-200-OK window — no dialog, no media, no agent
@@ -824,6 +839,7 @@ class GatewayConfig:
     ws_password: str | None = field(default=None, repr=False)
     max_calls: int = _DEFAULT_MAX_CALLS
     shutdown_drain_secs: float = _DEFAULT_SHUTDOWN_DRAIN_SECS
+    max_call_duration_secs: float = _DEFAULT_MAX_CALL_DURATION_SECS
     deny_mode: DenyMode = _DEFAULT_DENY_MODE
 
     def __post_init__(self) -> None:
@@ -857,6 +873,18 @@ class GatewayConfig:
             msg = (
                 "shutdown_drain_secs must be a positive finite number, "
                 f"got {self.shutdown_drain_secs!r}"
+            )
+            raise ConfigError(msg)
+        # ADR-0113: 0 is VALID (disables the cap), so the check is ``< 0``, not
+        # ``<= 0`` — the opposite polarity of the RTP-inactivity watchdog, which
+        # rejects 0 (that safety watchdog must never be disabled via its knob).
+        if (
+            not math.isfinite(self.max_call_duration_secs)
+            or self.max_call_duration_secs < 0
+        ):
+            msg = (
+                "max_call_duration_secs must be a non-negative finite number "
+                f"(0 disables the cap), got {self.max_call_duration_secs!r}"
             )
             raise ConfigError(msg)
         # deny_mode is a Literal, but a direct (non-parser) construction could pass an
@@ -1935,6 +1963,11 @@ def load_gateway_config(env: Mapping[str, str]) -> GatewayConfig:
         max_calls=_parse_positive_int(env, _MAX_CALLS_KEY, _DEFAULT_MAX_CALLS),
         shutdown_drain_secs=_parse_positive_float(
             env, _SHUTDOWN_DRAIN_SECS_KEY, _DEFAULT_SHUTDOWN_DRAIN_SECS
+        ),
+        # ADR-0113: per-call active-duration cap (0 disables) — the runaway-call DoS
+        # ceiling. ``_parse_non_negative_float`` so 0 is accepted (opt-out).
+        max_call_duration_secs=_parse_non_negative_float(
+            env, _MAX_CALL_DURATION_SECS_KEY, _DEFAULT_MAX_CALL_DURATION_SECS
         ),
         # ADR-0020 §5/§6: declined-caller disposition (reject 603 | decline+TTS+BYE).
         deny_mode=_parse_deny_mode(env),

@@ -391,6 +391,9 @@ async def _build_adapter(
                 # TypeError.
                 max_calls=8,
                 shutdown_drain_secs=5.0,
+                # ADR-0113: 0 disables the max-duration watchdog so these
+                # non-max-duration tests spawn no real long-sleep timer task.
+                max_call_duration_secs=0.0,
             ),
         ),
         patch("hermes_voip.adapter.load_media_config", return_value=media),

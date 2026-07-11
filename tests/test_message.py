@@ -7,6 +7,7 @@ case-insensitive, repeatable header access), and the token generators
 """
 
 import re
+import time
 from collections.abc import Callable
 from typing import Final
 
@@ -287,6 +288,37 @@ def test_parse_unfolds_continuation_lines() -> None:
     assert "nonce=" in value
     challenge = DigestChallenge.parse(value)
     assert challenge.qop == ("auth",)
+
+
+def test_parse_folded_header_unfold_is_linear_not_quadratic() -> None:
+    # CWE-407 guard: RFC 3261 obs-fold unfolding must be O(total length), not O(N^2).
+    # Parse runs SYNCHRONOUSLY on the shared asyncio loop, so a quadratic unfold on a
+    # crafted line-folded header stalls every concurrent call (availability DoS).
+    # Compare parse time at N and 4N folds: linear ~4x, quadratic ~16x. The ratio
+    # cancels machine speed, so a generous < 8 threshold never flakes on a slow CI
+    # runner yet fails loudly if the O(N^2) rebuild returns. min-of-3 damps jitter.
+    def _parse_time(folds: int) -> float:
+        raw = (
+            "SIP/2.0 200 OK\r\n"
+            "Contact: <sip:1000@pbx.example.test>\r\n"
+            + " Z\r\n"
+            * folds
+            + "Content-Length: 0\r\n"
+            "\r\n"
+        )
+        resp = SipResponse.parse(raw)
+        # Behaviour preserved: the continuation lines joined into the Contact value.
+        assert (resp.header("Contact") or "").count("Z") == folds
+        best = float("inf")
+        for _ in range(3):
+            start = time.perf_counter()
+            SipResponse.parse(raw)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    base = 100_000
+    ratio = _parse_time(base * 4) / _parse_time(base)
+    assert ratio < 8.0, f"parse scaled {ratio:.1f}x for 4x input — O(N^2) regression?"
 
 
 def test_parse_rejects_malformed_status_line() -> None:

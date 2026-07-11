@@ -70,17 +70,22 @@ def _parse_headers(lines: list[str]) -> tuple[tuple[str, str], ...]:
         ValueError: If a continuation line has no preceding header, or a non-empty
             header line has no colon separator (malformed header field).
     """
-    unfolded: list[str] = []
+    # Collect each header's fragments and join ONCE (O(total length)). Rebuilding the
+    # growing value on every fold was O(N^2) and stalled the shared event loop
+    # synchronously on a line-folded header — an availability DoS (CWE-407). The single
+    # join yields the identical space-joined value.
+    unfolded: list[list[str]] = []
     for line in lines:
         if line[:1] in (" ", "\t"):
             if not unfolded:
                 msg = "header continuation line with no preceding header"
                 raise ValueError(msg)
-            unfolded[-1] = f"{unfolded[-1]} {line.strip()}"
+            unfolded[-1].append(line.strip())
         else:
-            unfolded.append(line)
+            unfolded.append([line])
     headers: list[tuple[str, str]] = []
-    for line in unfolded:
+    for parts in unfolded:
+        line = " ".join(parts)
         name, sep, value = line.partition(":")
         if sep:
             headers.append((name.strip(), value.strip()))

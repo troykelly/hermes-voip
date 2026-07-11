@@ -138,6 +138,18 @@ def test_parse_audio_maxptime_when_present() -> None:
     assert sdp.audio.maxptime == 40
 
 
+@pytest.mark.parametrize("bad", ["0", "-1", "-40"])
+def test_parse_audio_rejects_non_positive_maxptime(bad: str) -> None:
+    """A zero/negative a=maxptime is rejected — symmetric with a=ptime (ADR-0056).
+
+    A non-positive upper bound is a nonsensical framing ceiling for negotiate_ptime;
+    a=ptime already rejects <= 0, and a=maxptime now does too.
+    """
+    offer = _OFFER_AVP + f"a=maxptime:{bad}\r\n"
+    with pytest.raises(SdpError, match="maxptime must be positive"):
+        SessionDescription.parse(offer)
+
+
 def test_negotiate_ptime_honours_supported_offer_ptime() -> None:
     """The offer's ptime is used when the engine supports it (ADR-0056 item 5)."""
     assert negotiate_ptime(30, None, supported=(20, 30, 40), default=20) == 30

@@ -68,6 +68,7 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource
 
+from hermes_voip._decimal import _parse_decimal
 from hermes_voip.call import CallSession, CallSignaling
 from hermes_voip.call_context import (
     InboundCallContext,
@@ -7743,14 +7744,19 @@ def _cseq_num(response: SipResponse) -> int:
     """Return the CSeq sequence number from a SIP response, or 0 on parse failure.
 
     Used to filter a stale 407 (CSeq N-1) from a re-auth INVITE's final response
-    (CSeq N) when both may be in the _QueueSink simultaneously (W1).
+    (CSeq N) when both may be in the _QueueSink simultaneously (W1). The number is
+    parsed strict-ASCII via ``_parse_decimal`` (backlog L1703): ``str.isdigit()`` is
+    too broad — it accepts Unicode digits that ``int()`` FOLDS to an ASCII value (a
+    matching differential vs an RFC 3261 §25-strict peer, so a crafted response could
+    match an outstanding ASCII CSeq) or cannot parse at all (a bare ``ValueError``).
+    Both fail closed to 0, mirroring the other peer-facing CSeq parsers (transaction.py,
+    connection.py, registration.py, call.py).
     """
     cseq_hdr = response.header("CSeq") or ""
     # CSeq value: "<number> <method>" (RFC 3261 §20.16).
     parts = cseq_hdr.split()
-    if parts and parts[0].isdigit():
-        return int(parts[0])
-    return 0
+    number = _parse_decimal(parts[0]) if parts else None
+    return number if number is not None else 0
 
 
 def _cseq_method(response: SipResponse) -> str | None:

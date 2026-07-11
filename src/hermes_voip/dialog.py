@@ -51,13 +51,14 @@ _MAX_CSEQ = 2**31
 # Anchored at the start of the topmost Via value: transport then sent-by
 # (host:port, no whitespace or parameters).
 _VIA_TOP = re.compile(r"SIP/2\.0/(\S+)\s+([^\s;]+)")
-# RFC 3261 §25: the CSeq number is 1*DIGIT (US-ASCII) and the method is a letter
-# token. [0-9]/[A-Za-z] (not Unicode \d/\w) plus re.ASCII (so \s never matches a
-# Unicode space) reject fullwidth/Arabic-Indic digits — and any Unicode-space splice
-# — that an RFC-strict proxy parses differently (same strict-ASCII class as #479/#485).
-# _cseq() is latent (parses only our own outbound CSeq); the reachable sibling parsers
-# that split()+int() a peer CSeq are a tracked sweep (see docs/backlog.md).
-_CSEQ = re.compile(r"([0-9]+)\s+([A-Za-z]+)", re.ASCII)
+# RFC 3261 §25: the CSeq number is 1*DIGIT (US-ASCII) and the method is a token
+# (alphanum + -.!%*_+`'~), not just letters. Explicit ASCII classes (not Unicode
+# \d/\w) + re.ASCII reject fullwidth/Arabic-Indic digits and any Unicode-space
+# splice an RFC-strict proxy parses differently — without over-restricting valid
+# extension methods (e.g. X-FOO). Same strict-ASCII class as #479/#485. _cseq() is
+# latent (our own outbound CSeq only); the reachable siblings that split()+int() a
+# peer CSeq are a tracked sweep (see docs/backlog.md).
+_CSEQ = re.compile(r"([0-9]+)\s+([A-Za-z0-9.!%*_+`'~-]+)", re.ASCII)
 # A loose-routing first hop carries an ``lr`` flag parameter (RFC 3261 §16.12).
 _LR_PARAM = re.compile(r";\s*lr\b", re.IGNORECASE)
 

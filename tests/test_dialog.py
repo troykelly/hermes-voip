@@ -379,12 +379,14 @@ def test_cseq_rejects_non_ascii_digits(base: int) -> None:
         _cseq(f"{seq} INVITE")
 
 
-def test_cseq_accepts_valid_ascii() -> None:
+def test_cseq_accepts_valid_ascii_token_methods() -> None:
     # Guard against over-restriction: the strict-ASCII regex must still parse every
-    # legitimate all-ASCII CSeq. Real SIP methods are letter tokens (INVITE/BYE/ACK/…),
-    # so ``[A-Za-z]+`` accepts them all — only the Unicode surface is dropped.
+    # legitimate all-ASCII CSeq. RFC 3261 §25.1 method is a token (alphanum plus
+    # -.!%*_+`'~), not only letters, so a hyphenated/dotted extension method parses too.
     assert _cseq("1 INVITE") == (1, "INVITE")
     assert _cseq("314159 BYE") == (314159, "BYE")
+    assert _cseq("7 X-FOO") == (7, "X-FOO")
+    assert _cseq("8 REFER.EXT") == (8, "REFER.EXT")
 
 
 def test_cseq_rejects_mixed_ascii_and_unicode_digits() -> None:

@@ -255,3 +255,65 @@ def test_cancellation_recovers_after_inbound_stall() -> None:
         f"AEC did not re-lock after an inbound stall: residual={tail_rms:.1f} "
         f"echo={echo_rms:.1f} (cursor stuck on stale reference?)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Stability guard: a CORRELATED (tonal) reference converges + taps stay bounded
+# (ADR-0110 claims total-energy normalisation is stable on tonal, not just
+# broadband, input — cross-tier review flagged that no committed test locked it)
+# ---------------------------------------------------------------------------
+
+
+def _tone(n: int, *, rate: int) -> list[int]:
+    """A two-partial sinusoid — a highly correlated reference.
+
+    This is the pathological case for a block-NLMS update normalised by AVERAGE
+    window energy (which diverges on tonal input); the shipped TOTAL-energy
+    normalisation stays stable, which this signal is built to exercise.
+    """
+    return [
+        int(
+            0.30 * 32767.0 * math.sin(2.0 * math.pi * 440.0 * i / rate)
+            + 0.18 * 32767.0 * math.sin(2.0 * math.pi * 1234.0 * i / rate)
+        )
+        for i in range(n)
+    ]
+
+
+def test_tonal_reference_converges_and_taps_stay_bounded() -> None:
+    """A tonal (correlated) reference is cancelled and the filter never diverges.
+
+    ADR-0110's block-NLMS normalises the tap update by the TOTAL sub-block reference
+    energy, which is provably non-expansive for mu in (0, 2) on ANY input correlation
+    (every eigenvalue of the block Gram matrix is <= its trace). The other convergence
+    tests only drive broadband noise; this guards the tonal claim. It is also a
+    regression tripwire: switching to an AVERAGE-energy normalisation converges faster
+    on broadband but DIVERGES on this tonal input (verified in the ADR-0110 sweep), so
+    a future normalisation change that silently breaks tonal stability fails here.
+    """
+    rate = _G722_RATE
+    n = rate * 2
+    reference = _tone(n, rate=rate)
+    echo = _echo_of(reference, delay=12, gain=0.6, taps=(1.0, 0.4, -0.2))
+    aec = EchoCanceller(sample_rate=rate, filter_len=256, bulk_delay=0, mu=0.5)
+    block = (rate * _PTIME_MS) // 1000
+    residual = bytearray()
+    for off in range(0, n, block):
+        aec.push_reference(_pack(reference[off : off + block]), sample_rate=rate)
+        residual += aec.cancel(_pack(echo[off : off + block]))
+
+    echo_rms = _rms(_pack(echo))
+    tail_rms = _rms(residual[len(residual) // 2 :])
+    assert echo_rms > 200.0
+    # Convergence on correlated input: an average-energy normalisation would DIVERGE
+    # here (residual > echo); the total-energy one drives the tonal echo well down.
+    assert tail_rms < echo_rms * 0.25, (
+        f"tonal echo not cancelled (correlated-input convergence regressed): "
+        f"residual={tail_rms:.1f} echo={echo_rms:.1f}"
+    )
+    # Stability: the taps stay finite and bounded — no divergence at the tonal input.
+    taps = [float(w) for w in aec._w]
+    assert all(math.isfinite(w) for w in taps), "filter taps diverged to inf/nan"
+    assert max(abs(w) for w in taps) < 100.0, (
+        f"filter taps grew unbounded on tonal input: max|w|={max(abs(w) for w in taps)}"
+    )

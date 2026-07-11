@@ -188,3 +188,34 @@ def test_aec_converges_to_30db_erle_8k() -> None:
     """The canceller drives a known echo to >= 30 dB ERLE at 8 kHz."""
     erle = _erle_db_on_converged_tail(_G711_RATE)
     assert erle >= 30.0, f"ERLE {erle:.1f} dB < 30 dB at 8 kHz (echo not cancelled)"
+
+
+# ---------------------------------------------------------------------------
+# Robustness: the reference FIFO stays bounded when TX runs far ahead of RX
+# (cross-vendor review — a stalled inbound leg must not OOM / go quadratic)
+# ---------------------------------------------------------------------------
+
+
+def test_reference_fifo_stays_bounded_when_tx_runs_far_ahead_of_rx() -> None:
+    """A stalled inbound leg must not grow the reference FIFO without bound.
+
+    On a real call ``push_reference`` (TX) runs ahead of ``cancel`` (RX) by the
+    system delay, and the FIFO is trimmed as ``cancel`` consumes it. But if inbound
+    RTP stalls entirely (one-way audio) while outbound keeps flowing, ``cancel`` is
+    never called to trim — so the FIFO must be capped in ``push_reference`` itself,
+    or the per-push ``np.concatenate`` becomes quadratic and memory is unbounded.
+    The canceller caps the FIFO and resyncs its read cursor once TX runs multiple
+    seconds ahead (the near-end that never arrived is dropped; the filter
+    re-converges against the retained recent reference when inbound resumes).
+    """
+    rate = _G722_RATE
+    aec = EchoCanceller(sample_rate=rate, filter_len=_MAX_TAPS, bulk_delay=0, mu=0.5)
+    frame = _pack([1000] * ((rate * _PTIME_MS) // 1000))
+    for _ in range(2000):  # 40 s of outbound with zero inbound to cancel
+        aec.push_reference(frame, sample_rate=rate)
+    # White-box efficiency invariant (rule 20): the reference FIFO is capped, not the
+    # ~640k samples an unbounded append would retain after 2000 pushes.
+    assert aec._x.size < 200_000, (
+        f"reference FIFO grew unbounded under TX-ahead: {aec._x.size} samples "
+        "(quadratic np.concatenate + OOM risk on a stalled inbound leg)"
+    )

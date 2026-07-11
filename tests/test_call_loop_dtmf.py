@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable
 import pytest
 
 from hermes_voip.dtmf_confirm import ArmedConfirmation
-from hermes_voip.media.call_loop import CallLoop
+from hermes_voip.media.call_loop import _MAX_DTMF_BUFFER, CallLoop
 from hermes_voip.providers.policy import GuardSessionState
 
 # Reuse the fakes + builders from the main call-loop suite (same package).
@@ -60,6 +60,27 @@ def _make_loop(
         dtmf_interdigit_ms=dtmf_interdigit_ms,
         sleep=sleep,
     )
+
+
+@pytest.mark.asyncio
+async def test_dtmf_buffer_is_bounded_under_a_sub_gap_flood() -> None:
+    """A sub-inter-digit-gap DTMF flood must not grow ``_dtmf_buffer`` without bound.
+
+    Each non-``#`` digit re-arms the inter-digit flush timer (cancel + recreate), so a
+    caller pressing digits faster than the gap keeps ``_take_dtmf_group`` from ever
+    running — the buffer would grow for the whole call (CWE-400, bounded only by the 4 h
+    max-call-duration watchdog). The buffer is capped at ``_MAX_DTMF_BUFFER``; digits
+    past it are dropped (no legitimate menu/account entry is that long), so per-call
+    memory stays bounded.
+    """
+    loop = _make_loop(deliver_turn=_noop, dtmf_interdigit_ms=2000)
+    # 500 digits fed with NO inter-digit gap: the flush timer is re-armed on every digit
+    # and never fires (no await elapses its 2 s sleep), so nothing drains the buffer.
+    for _ in range(500):
+        loop.feed_dtmf("1")
+    assert len(loop._dtmf_buffer) <= _MAX_DTMF_BUFFER
+    # Flush + cancel the pending inter-digit timer (clean teardown).
+    await loop.feed_dtmf_async("#")
 
 
 @pytest.mark.asyncio

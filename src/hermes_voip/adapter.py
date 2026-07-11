@@ -3796,162 +3796,179 @@ class VoipAdapter(BasePlatformAdapter):
             raise
         # On return the engine is connected and the 200 OK has been sent; execution
         # continues to the shared dialog-registration + CallLoop tail below.
-
-        # --- Register the call for in-dialog routing -----------------------
-        # One GuardSessionState per call, shared between CallSession and CallLoop.
-        # ADR-0021: the caller group's privilege_level sets the tool-risk ceiling
-        # (0=receptionist/SAFE-only, 2=trusted/+ELEVATED, 3=operator/+IRREVERSIBLE).
-        # Levels 0 and 3 reproduce ADR-0020's privileged=False/True exactly.
-        # ADR-0031: the group's allowed_tools is the per-session SUB-ceiling (empty =
-        # no sub-ceiling = level-only; a non-empty set — e.g. the intercom group's
-        # {open_entry} — scopes the call to ONLY those tools). THREADING THIS IS
-        # LOAD-BEARING: without it the sub-ceiling never reaches the live gate and a
-        # spoofed intercom caller would keep every level-2 tool.
-        guard_state = GuardSessionState(
-            call_id,
-            privilege_level=group.privilege_level,
-            allowed_tools=group.allowed_tools,
-        )
-        credentials = DigestCredentials(
-            username=new_call.registration.username,
-            password=new_call.registration.password,
-        )
-        session = CallSession(
-            dialog=dialog,
-            signaling=transport,
-            media=engine,
-            guard=guard_state,
-            local_media=local_media,
-            credentials=credentials,
-            # The resolved DTMF send backend (ADR-0036): in SIP-INFO mode the session
-            # emits in-dialog INFO itself; otherwise send_dtmf delegates to the engine.
-            # Read back from the engine so the backend is resolved in exactly one place.
-            dtmf_send_mode=engine.dtmf_send_mode,
-        )
-        if self._manager is not None:
-            self._manager.add_call(session.dialog_id, session)
-        transport.add_call(call_id, session)
-        # Mirror in _call_sessions so _establish() can re-attach on reconnect.
-        self._call_sessions[call_id] = session
-        _log.info(
-            "INVITE %s: CallSession registered — dialog_id %s",
-            call_id,
-            session.dialog_id,
-        )
-
-        # --- Arm the RFC 4028 session-timer watchdog (ADR-0071) -------------
-        # Now the dialog is confirmed (200 OK sent, in-dialog routes installed): start
-        # the per-call watchdog. As the refresher we send a refresh re-INVITE at SE/2;
-        # as the non-refresher we BYE near expiry if no refresh arrives. Cancelled in
-        # _teardown_call. A no-op when the call negotiated no session timer (e.g. a peer
-        # that did not support timer and we still inserted ours — we always insert, so
-        # an answered inbound call is timer-driven).
-        self._start_session_timer(call_id, session, session_timer)
-
-        # --- Extract caller info from the inbound INVITE -------------------
-        # `group` (classified at the top of this handler) drives the per-turn
-        # persona preamble in _deliver_turn; persist it on the call info.
         #
-        # ADR-0052: extract the RICH inbound-call context (caller identity,
-        # dialled target, redirection/diversion chain, calling device, media)
-        # from the same parsed INVITE — every value is caller-/network-supplied
-        # and FORGEABLE, so it is surfaced to the agent only as a labelled,
-        # untrusted block (never used for authorization). `codec`, `audio`, and
-        # `is_webrtc` are in scope here from the SDP-negotiation steps above; the
-        # signalling transport is the configured one (TLS | WSS, ADR-0038) — the
-        # same token the dialog above carries.
-        call_context = extract_call_context(
-            invite,
-            negotiated_codec=codec.encoding,
-            is_srtp=audio.is_srtp,
-            is_webrtc=is_webrtc,
-            transport=via_transport,
-        )
-        # ADR-0045: match the caller-ID against the multi-intercom config. A match
-        # binds this call to that intercom's NAMED opening set, scoping open_entry(name)
-        # to ONLY those openings. Caller-ID is forgeable (never auth) — the per-opening
-        # secret + the ELEVATED/allowed_tools gate are the protection, not the match.
-        # An unresolved caller-ID (None) matches NO intercom — same guardrail as the
-        # classification above: a placeholder string is never routed through pattern
-        # matching, so a crafted/malformed From cannot bind a call to an intercom's
-        # opening set by matching an intercom caller-ID pattern.
-        intercom_entry = (
-            None if caller_number is None else self._multi_intercom.match(caller_number)
-        )
-        self._call_info[call_id] = {
-            "name": caller_display,
-            "remote_uri": from_header,
-            "type": "dm",
-            "ended": False,
-            "group": group,
-            # ADR-0020 back-compat: the legacy CallerMode this group maps to
-            # (ALLOW for an operator-tier group, GREY otherwise; DENY never
-            # reaches here — it was rejected with 603 above). Kept so callers
-            # reading the legacy "mode" key keep working.
-            "mode": classification.mode,
-            # ADR-0052: the rich, structured inbound-call context (forgeable).
-            "context": call_context,
-        }
-        if intercom_entry is not None:
-            # ADR-0045: bind the matched intercom's NAMED opening set to this call so
-            # open_entry(name) is scoped to ONLY these openings (and surface the NAMES,
-            # never the secret codes/urls, to the agent below).
-            self._call_info[call_id]["intercom_entry"] = intercom_entry
-
-        # --- Polite decline (ADR-0020 §5/§6, deny_mode=decline) -------------
-        # A declined caller answered under ``decline`` mode never reaches the agent:
-        # speak ONE short line over the now-live media path, then BYE — reusing the
-        # SAME answer-200/TTS/BYE machinery (no new transport/infra), skipping the
-        # context injection + conversational CallLoop entirely. Leak-safe: the engine
-        # + dialog routes are torn down in the ``finally`` exactly as the normal path.
-        if decline_after_answer:
-            try:
-                await self._speak_decline_then_bye(
-                    call_id=call_id,
-                    engine=engine,
-                    session=session,
-                    media_cfg=media_cfg,
-                )
-            finally:
-                await self._teardown_call(
-                    call_id=call_id,
-                    engine=engine,
-                    transport=transport,
-                    dialog_id=session.dialog_id,
-                    session=session,
-                    call_loop=None,
-                    reason=CallEndReason.AGENT_HANGUP,
-                )
-            return
-
-        # --- Seed the agent's first turn with the rich call context (ADR-0052) ---
-        # Inject the labelled, untrusted call-context block as the call's first system
-        # turn so the agent knows who called, what was dialled, and how the call reached
-        # it BEFORE the caller speaks. Awaited HERE, before _run_call_loop starts the
-        # media pump, so the context turn is delivered ahead of any caller transcript
-        # (the loop only begins consuming inbound audio after this returns) — making
-        # "first turn" deterministic, not a race with the first caller utterance. The
-        # injection is best-effort (it catches and logs its own failure internally), so
-        # awaiting it can never strand the call. Outbound calls carry the objective seed
-        # instead (no "context" key), so this is a no-op there.
-        await self._inject_call_context_first_turn(call_id)
-
-        # --- Build + run CallLoop (leak-safe) ------------------------------
-        # Everything from here on has already accepted the call (200 OK sent,
-        # in-dialog routes installed). ANY failure now — provider/config not
-        # ready, VAD/endpointer/CallLoop construction, or the loop itself —
-        # must release the RTP engine and both call routes, never leak them.
-        # Initialise to None so teardown's identity check degrades gracefully
-        # to an unconditional pop if _run_call_loop raises before the CallLoop
-        # is returned (e.g. providers not initialised at the very start).
+        # The call is now ANSWERED. Every step from here — session wiring, in-dialog
+        # routes, the session-timer, context extraction, the CallLoop — runs inside the
+        # single leak-safe try/finally below. Before this fix that setup ran outside
+        # any try, so a post-answer failure (e.g. a forgeable INVITE header making
+        # extract_call_context raise) skipped _teardown_call and permanently leaked
+        # the admission slot (ADR-0059) + RTP socket + both in-dialog routes — repeat
+        # max_calls times for a 486-Busy DoS (backlog L1705). ``session`` starts None
+        # so the finally stays safe in the window before CallSession exists; teardown
+        # and _classify_end_reason are both None-safe.
+        session: CallSession | None = None
+        # Initialise to None so teardown's identity check degrades gracefully to an
+        # unconditional pop if the loop raises before the CallLoop is returned (e.g.
+        # providers not initialised at the very start).
         this_call_loop: CallLoop | None = None
-        # Track whether the loop ended by raising so the chokepoint can classify
-        # the end (ADR-0026): a raised end is a PIPELINE_FAILURE → /stop; a clean
-        # return is MEDIA_TIMEOUT (engine timed out), AGENT_HANGUP, or REMOTE_BYE.
-        # Start True (the fail-safe): only a clean return past _run_call_loop sets
-        # it False, so any propagating exception classifies as a failure.
+        # Track whether the loop ended by raising so the chokepoint can classify the end
+        # (ADR-0026): a raised end is a PIPELINE_FAILURE → /stop; a clean return is
+        # MEDIA_TIMEOUT (engine timed out), AGENT_HANGUP, or REMOTE_BYE. Start True (the
+        # fail-safe): only a clean return past _run_call_loop sets it False, so any
+        # propagating exception — from the wiring OR the loop — classifies as a failure.
         loop_raised = True
+        # The polite-decline branch tears itself down with its own (AGENT_HANGUP) reason
+        # and returns; this guard stops the finally repeating that teardown.
+        torn_down = False
         try:
+            # --- Register the call for in-dialog routing -----------------------
+            # One GuardSessionState per call, shared between CallSession and CallLoop.
+            # ADR-0021: the caller group's privilege_level sets the tool-risk ceiling
+            # (0=receptionist/SAFE-only, 2=trusted/+ELEVATED, 3=operator/+IRREVERSIBLE).
+            # Levels 0 and 3 reproduce ADR-0020's privileged=False/True exactly.
+            # ADR-0031: the group's allowed_tools is the per-session SUB-ceiling
+            # (empty = no sub-ceiling = level-only; a non-empty set — e.g. the intercom
+            # group's {open_entry} — scopes the call to ONLY those tools). THREADING
+            # THIS IS LOAD-BEARING: without it the sub-ceiling never reaches the live
+            # gate and a spoofed intercom caller would keep every level-2 tool.
+            guard_state = GuardSessionState(
+                call_id,
+                privilege_level=group.privilege_level,
+                allowed_tools=group.allowed_tools,
+            )
+            credentials = DigestCredentials(
+                username=new_call.registration.username,
+                password=new_call.registration.password,
+            )
+            session = CallSession(
+                dialog=dialog,
+                signaling=transport,
+                media=engine,
+                guard=guard_state,
+                local_media=local_media,
+                credentials=credentials,
+                # The resolved DTMF send backend (ADR-0036): in SIP-INFO mode the
+                # session emits in-dialog INFO itself; otherwise send_dtmf delegates to
+                # the engine. Read it back from the engine so the backend resolves in
+                # exactly one place.
+                dtmf_send_mode=engine.dtmf_send_mode,
+            )
+            if self._manager is not None:
+                self._manager.add_call(session.dialog_id, session)
+            transport.add_call(call_id, session)
+            # Mirror in _call_sessions so _establish() can re-attach on reconnect.
+            self._call_sessions[call_id] = session
+            _log.info(
+                "INVITE %s: CallSession registered — dialog_id %s",
+                call_id,
+                session.dialog_id,
+            )
+
+            # --- Arm the RFC 4028 session-timer watchdog (ADR-0071) -------------
+            # Now the dialog is confirmed (200 OK sent, in-dialog routes installed):
+            # start the per-call watchdog. As the refresher we send a refresh re-INVITE
+            # at SE/2; as the non-refresher we BYE near expiry if no refresh arrives.
+            # Cancelled in _teardown_call. A no-op when the call negotiated no session
+            # timer (e.g. a peer that did not support timer and we still inserted ours —
+            # we always insert, so an answered inbound call is timer-driven).
+            self._start_session_timer(call_id, session, session_timer)
+
+            # --- Extract caller info from the inbound INVITE -------------------
+            # `group` (classified at the top of this handler) drives the per-turn
+            # persona preamble in _deliver_turn; persist it on the call info.
+            #
+            # ADR-0052: extract the RICH inbound-call context (caller identity,
+            # dialled target, redirection/diversion chain, calling device, media)
+            # from the same parsed INVITE — every value is caller-/network-supplied
+            # and FORGEABLE, so it is surfaced to the agent only as a labelled,
+            # untrusted block (never used for authorization). `codec`, `audio`, and
+            # `is_webrtc` are in scope here from the SDP-negotiation steps above; the
+            # signalling transport is the configured one (TLS | WSS, ADR-0038) — the
+            # same token the dialog above carries. A forgeable header can make this
+            # raise (e.g. a Unicode-digit History-Info index); the enclosing try now
+            # tears the answered call down instead of leaking it (backlog L1705).
+            call_context = extract_call_context(
+                invite,
+                negotiated_codec=codec.encoding,
+                is_srtp=audio.is_srtp,
+                is_webrtc=is_webrtc,
+                transport=via_transport,
+            )
+            # ADR-0045: match the caller-ID against the multi-intercom config. A match
+            # binds this call to that intercom's NAMED opening set, scoping
+            # open_entry(name) to ONLY those openings. Caller-ID is forgeable (never
+            # auth) — the per-opening secret + the ELEVATED/allowed_tools gate are the
+            # protection, not the match. An unresolved caller-ID (None) matches NO
+            # intercom — same guardrail as the classification above: a placeholder
+            # string is never routed through pattern matching, so a crafted/malformed
+            # From cannot bind a call to an intercom's opening set.
+            intercom_entry = (
+                None
+                if caller_number is None
+                else self._multi_intercom.match(caller_number)
+            )
+            self._call_info[call_id] = {
+                "name": caller_display,
+                "remote_uri": from_header,
+                "type": "dm",
+                "ended": False,
+                "group": group,
+                # ADR-0020 back-compat: the legacy CallerMode this group maps to
+                # (ALLOW for an operator-tier group, GREY otherwise; DENY never
+                # reaches here — it was rejected with 603 above). Kept so callers
+                # reading the legacy "mode" key keep working.
+                "mode": classification.mode,
+                # ADR-0052: the rich, structured inbound-call context (forgeable).
+                "context": call_context,
+            }
+            if intercom_entry is not None:
+                # ADR-0045: bind the matched intercom's NAMED opening set to this call
+                # so open_entry(name) is scoped to ONLY these openings (and surface the
+                # NAMES, never the secret codes/urls, to the agent below).
+                self._call_info[call_id]["intercom_entry"] = intercom_entry
+
+            # --- Polite decline (ADR-0020 §5/§6, deny_mode=decline) -------------
+            # A declined caller answered under ``decline`` mode never reaches the agent:
+            # speak ONE short line over the now-live media path, then BYE — reusing the
+            # SAME answer-200/TTS/BYE machinery (no new transport/infra), skipping the
+            # context injection + conversational CallLoop entirely. It tears down with
+            # its own AGENT_HANGUP reason, then ``torn_down`` stops the outer finally
+            # repeating the teardown.
+            if decline_after_answer:
+                try:
+                    await self._speak_decline_then_bye(
+                        call_id=call_id,
+                        engine=engine,
+                        session=session,
+                        media_cfg=media_cfg,
+                    )
+                finally:
+                    await self._teardown_call(
+                        call_id=call_id,
+                        engine=engine,
+                        transport=transport,
+                        dialog_id=session.dialog_id,
+                        session=session,
+                        call_loop=None,
+                        reason=CallEndReason.AGENT_HANGUP,
+                    )
+                    torn_down = True
+                return
+
+            # --- Seed the agent's first turn with the rich call context (ADR-0052) ---
+            # Inject the labelled, untrusted call-context block as the call's first
+            # system turn so the agent knows who called, what was dialled, and how the
+            # call reached it BEFORE the caller speaks. Awaited HERE, before
+            # _run_call_loop starts the media pump, so the context turn is delivered
+            # ahead of any caller transcript (the loop only begins consuming inbound
+            # audio after this returns) — making "first turn" deterministic, not a race
+            # with the first caller utterance. The injection is best-effort (it catches
+            # and logs its own failure internally), so awaiting it can never strand the
+            # call. Outbound calls carry the objective seed instead (no "context" key),
+            # so this is a no-op there.
+            await self._inject_call_context_first_turn(call_id)
+
+            # --- Build + run CallLoop ------------------------------------------
             # Inbound call: the agent IS the answerer, so AMD/record-cue are inert;
             # fax detection still runs both directions (ADR-0064).
             this_call_loop = await self._run_call_loop(
@@ -3964,18 +3981,26 @@ class VoipAdapter(BasePlatformAdapter):
             )
             loop_raised = False
         finally:
-            reason = self._classify_end_reason(
-                call_id, engine, raised=loop_raised, session=session
-            )
-            await self._teardown_call(
-                call_id=call_id,
-                engine=engine,
-                transport=transport,
-                dialog_id=session.dialog_id,
-                session=session,
-                call_loop=this_call_loop,
-                reason=reason,
-            )
+            # One teardown for the whole answered call: session wiring, routes, timer,
+            # context extraction, AND the loop all funnel here (unless the decline
+            # branch already tore down). ``session`` may be None if construction failed
+            # before it was built, so fall back to a dialog_id that pops nothing
+            # (ADR-0059).
+            if not torn_down:
+                reason = self._classify_end_reason(
+                    call_id, engine, raised=loop_raised, session=session
+                )
+                await self._teardown_call(
+                    call_id=call_id,
+                    engine=engine,
+                    transport=transport,
+                    dialog_id=(
+                        session.dialog_id if session is not None else (call_id, "", "")
+                    ),
+                    session=session,
+                    call_loop=this_call_loop,
+                    reason=reason,
+                )
 
     async def _setup_sdes_call(  # noqa: PLR0913 — the inbound handler's locals threaded through; the alternative is one giant method
         self,

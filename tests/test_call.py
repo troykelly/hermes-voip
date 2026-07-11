@@ -526,6 +526,18 @@ async def test_send_dtmf_delegates_to_media_without_reinvite() -> None:
         _last_request(signaling, "INVITE")
 
 
+async def test_send_dtmf_rejects_invalid_burst_before_reaching_media() -> None:
+    # A mixed valid-then-invalid burst must raise BEFORE any digit reaches the media
+    # engine: the RFC 4733 path sends digit-by-digit and would otherwise emit the valid
+    # prefix "12" before raising on "X", after which the tool wrongly reports "(nothing
+    # sent)". Mirrors send_dtmf_info, which pre-validates every body.
+    signaling, media = _FakeSignaling(), _FakeMedia()
+    session = _session(signaling, media)
+    with pytest.raises(ValueError, match="not a DTMF digit"):
+        await session.send_dtmf("12X")
+    assert media.dtmf == []  # nothing reached the media engine — no partial burst
+
+
 async def test_hold_skips_provisional_then_completes() -> None:
     signaling, media = _FakeSignaling(), _FakeMedia()
     session = _session(signaling, media)

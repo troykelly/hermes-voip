@@ -940,8 +940,7 @@ class CallLoop:
             self._cancel_dtmf_flush_timer()
             self._dispatch_dtmf_group(self._take_dtmf_group())
         else:
-            self._dtmf_buffer.append(digit)
-            self._arm_dtmf_flush_timer()
+            self._buffer_dtmf_digit(digit)
 
     async def feed_dtmf_async(self, digit: str) -> None:
         """Awaitable twin of :meth:`feed_dtmf` (delivers synchronously on a terminator).
@@ -964,8 +963,7 @@ class CallLoop:
             self._cancel_dtmf_flush_timer()
             await self._deliver_dtmf_group(self._take_dtmf_group())
         else:
-            self._dtmf_buffer.append(digit)
-            self._arm_dtmf_flush_timer()
+            self._buffer_dtmf_digit(digit)
 
     def _mark_caller_active(self) -> None:
         """Mark caller activity for the no-input watchdog (ADR-0057): proof of life.
@@ -997,6 +995,19 @@ class CallLoop:
         digits = "".join(self._dtmf_buffer)
         self._dtmf_buffer = []
         return digits
+
+    def _buffer_dtmf_digit(self, digit: str) -> None:
+        """Buffer a non-terminator digit and (re)arm the inter-digit flush timer.
+
+        Bounded at ``_MAX_DTMF_BUFFER`` (CWE-400): a digit past the cap is DROPPED, not
+        appended, so a sub-inter-digit-gap flood — which keeps re-arming the timer,
+        never letting ``_take_dtmf_group`` drain — cannot grow the buffer without bound.
+        The timer is still (re)armed, so the bounded group flushes once the flood pauses
+        (a ``#`` or the inter-digit gap). No legit menu/account entry nears the cap.
+        """
+        if len(self._dtmf_buffer) < _MAX_DTMF_BUFFER:
+            self._dtmf_buffer.append(digit)
+        self._arm_dtmf_flush_timer()
 
     def _arm_dtmf_flush_timer(self) -> None:
         """(Re)start the inter-digit timer so a multi-digit entry flushes as one group.

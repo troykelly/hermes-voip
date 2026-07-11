@@ -948,6 +948,43 @@ def test_caller_number_unresolved_from_returns_none_not_raw_header() -> None:
     assert _caller_number("<sip:1000@pbx.example.test:5060;transport=tls>") == "1000"
 
 
+def test_cseq_num_rejects_a_unicode_digit_cseq_number() -> None:
+    """``_cseq_num`` parses the response CSeq number strict-ASCII (backlog L1703).
+
+    It filters a stale 407 from the re-auth INVITE final by CSeq NUMBER.
+    ``str.isdigit()`` is too broad: a fullwidth/Arabic-Indic digit that ``int()`` folds
+    to an ASCII value lets a crafted peer response match an outstanding ASCII CSeq (a
+    matching differential vs an RFC 3261-strict proxy), and a superscript two (isdigit
+    True, int-unparseable) escapes as a bare ``ValueError``. Both must fail closed to 0.
+    Unicode digits are built via ``chr()`` so the source stays plain ASCII (RUF001).
+    """
+    from hermes_voip.adapter import _cseq_num  # noqa: PLC0415
+
+    def _response_with_cseq(cseq_value: str) -> SipResponse:
+        text = (
+            "SIP/2.0 200 OK\r\n"
+            "Via: SIP/2.0/TLS 192.0.2.1:5061;branch=z9hG4bKcseq;rport\r\n"
+            "From: <sip:agent@pbx.example.test>;tag=abc\r\n"
+            "To: <sip:1000@pbx.example.test>;tag=xyz\r\n"
+            "Call-ID: cseq-strict@pbx.example.test\r\n"
+            f"CSeq: {cseq_value}\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+        return SipResponse.parse(text)
+
+    # Fullwidth digit seven (U+FF17): int() FOLDS it to 7 -> must not match an ASCII 7.
+    assert _cseq_num(_response_with_cseq(f"{chr(0xFF17)} INVITE")) == 0
+    # Arabic-Indic digit three (U+0663): int() folds to 3 -> must not fold.
+    assert _cseq_num(_response_with_cseq(f"{chr(0x0663)} INVITE")) == 0
+    # Superscript two (U+00B2): isdigit() True but int() raises on it -> fail closed.
+    assert _cseq_num(_response_with_cseq(f"{chr(0x00B2)} INVITE")) == 0
+    # Sanity: a well-formed ASCII CSeq number still parses (no over-drop).
+    assert _cseq_num(_response_with_cseq("7 INVITE")) == 7
+    # Leading zeros are a valid 1*DIGIT encoding (RFC 3261 §8.1.1.5).
+    assert _cseq_num(_response_with_cseq("007 INVITE")) == 7
+
+
 def test_defang_identity_exact_transform() -> None:
     """``_defang_identity`` performs the EXACT identity-neutralising transform.
 

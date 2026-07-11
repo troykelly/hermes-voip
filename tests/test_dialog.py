@@ -17,6 +17,7 @@ from hermes_voip.dialog import (
     _MAX_CSEQ,
     Dialog,
     DialogError,
+    _cseq,
     build_in_dialog_request,
 )
 from hermes_voip.message import SipRequest, SipResponse
@@ -359,6 +360,43 @@ def test_from_invite_2xx_rejects_missing_contact() -> None:
     )
     with pytest.raises(DialogError):
         Dialog.from_invite_2xx(_invite(), no_contact)
+
+
+@pytest.mark.parametrize(
+    "base",
+    [0xFF10, 0x0660, 0x06F0],
+    ids=["fullwidth", "arabic_indic", "ext_arabic_indic"],
+)
+def test_cseq_rejects_non_ascii_digits(base: int) -> None:
+    # RFC 3261 §25: the CSeq sequence is 1*DIGIT — US-ASCII 0x30-0x39 only. A
+    # Unicode-aware ``\d`` in the parser lets a peer smuggle fullwidth/Arabic-Indic
+    # digits that ``int()`` still folds to a value, while an RFC-strict proxy parses
+    # the same header differently — a parser-differential (same class as the #479/#485
+    # strict-ASCII SIP-numeric fixes). The value is built from ``chr()`` so the source
+    # stays plain-ASCII (no RUF001 ambiguous-Unicode literals).
+    seq = "".join(chr(base + int(d)) for d in "42")
+    with pytest.raises(DialogError):
+        _cseq(f"{seq} INVITE")
+
+
+def test_cseq_accepts_valid_ascii_token_methods() -> None:
+    # Guard against over-restriction: the strict-ASCII regex must still parse every
+    # legitimate all-ASCII CSeq. RFC 3261 §25.1 method is a token (alphanum plus
+    # -.!%*_+`'~), not only letters, so a hyphenated/dotted extension method parses too.
+    assert _cseq("1 INVITE") == (1, "INVITE")
+    assert _cseq("314159 BYE") == (314159, "BYE")
+    assert _cseq("7 X-FOO") == (7, "X-FOO")
+    assert _cseq("8 REFER.EXT") == (8, "REFER.EXT")
+
+
+def test_cseq_rejects_mixed_ascii_and_unicode_digits() -> None:
+    # A number splicing an ASCII '4' onto a fullwidth '2' must NOT fullmatch — no
+    # partial ASCII-prefix acceptance: ``[0-9]+`` stops at the fullwidth char and the
+    # anchored fullmatch then fails (before the fix, Unicode-aware ``\d`` swallowed both
+    # and ``int()`` folded them to 42).
+    mixed = "4" + chr(0xFF10 + 2)
+    with pytest.raises(DialogError):
+        _cseq(f"{mixed} INVITE")
 
 
 def test_from_inbound_invite_rejects_missing_from_tag() -> None:

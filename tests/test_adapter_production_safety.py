@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -558,6 +558,122 @@ async def test_inbound_invite_under_capacity_is_admitted() -> None:
     # The slot was reserved during the call and released by the teardown that runs
     # when the (mocked) CallLoop returns — no leak.
     assert call_id not in adapter._admitted_calls
+
+
+class _InboundLeakCase(NamedTuple):
+    """The mocked collaborators + ids for one inbound post-answer leak test."""
+
+    adapter: VoipAdapter
+    call_id: str
+    engine: MagicMock
+    session: MagicMock
+    dialog_id: tuple[str, str, str]
+
+
+async def _drive_inbound_to_post_answer(
+    transport: _FakeTransport, manager: _FakeManager
+) -> _InboundLeakCase:
+    """Build an adapter + INVITE that clears admission and is answered 200 OK.
+
+    The RTP engine / CallSession / GuardSessionState are mocked (the test patches
+    them in), so the real _setup_sdes_call sends the 200 OK but no real pipeline is
+    built; the test then injects a post-answer failure and asserts nothing leaks.
+    """
+    adapter = await _build_adapter(
+        transport, manager, env={"HERMES_SIP_MAX_CALLS": "4"}
+    )
+    # Cleartext admission path (the plain RTP/AVP offer), like the admission test.
+    adapter._media_cfg = load_media_config(
+        {"HERMES_VOIP_REQUIRE_SECURE_MEDIA": "false"}
+    )
+    call_id = new_call_id()
+    engine = MagicMock(
+        connect=AsyncMock(return_value=True),
+        stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=20002,
+        inbound_sample_rate=8_000,
+    )
+    dialog_id = (call_id, "local-tag", "remote-tag")
+    session = MagicMock(dialog_id=dialog_id, ended=False)
+    return _InboundLeakCase(adapter, call_id, engine, session, dialog_id)
+
+
+def _assert_answered_then_no_leak(
+    transport: _FakeTransport, manager: _FakeManager, case: _InboundLeakCase
+) -> None:
+    """The answered call's setup failed, so it must release everything it allocated.
+
+    Checks the exact set that leaked into a 486-Busy DoS before the leak-safe boundary
+    (L1705): the admission slot, the RTP engine (socket), and both in-dialog routes.
+    """
+    assert any(m.startswith("SIP/2.0 200") for m in transport.sent), (
+        f"the call must have been answered before the failure; sent: {transport.sent!r}"
+    )
+    assert case.call_id not in case.adapter._admitted_calls, (
+        "admission slot leaked — repeat max_calls times for a 486-Busy DoS (L1705)"
+    )
+    case.engine.stop.assert_awaited_once()  # the bound RTP socket is released
+    assert case.call_id not in transport._calls, "transport in-dialog route leaked"
+    assert case.dialog_id not in manager._calls, "manager in-dialog route leaked"
+    assert case.call_id not in case.adapter._call_sessions, "call-session mirror leaked"
+
+
+async def test_inbound_post_answer_context_failure_releases_all_no_leak() -> None:
+    """A forgeable header making extract_call_context raise post-answer is leak-safe.
+
+    extract_call_context is documented "never raises" but a Unicode-digit
+    History-Info index does; before the leak-safe boundary this ran outside any
+    try/finally, so the raise skipped _teardown_call and permanently held the slot.
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager()
+    case = await _drive_inbound_to_post_answer(transport, manager)
+    invite_req = SipRequest.parse(_make_invite(call_id=case.call_id))
+    new_call = NewCall(registration=_ext_config(), invite=invite_req)
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=case.engine),
+        patch("hermes_voip.adapter.CallSession", return_value=case.session),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch(
+            "hermes_voip.adapter.extract_call_context",
+            MagicMock(side_effect=RuntimeError("forged INVITE header")),
+        ),
+        pytest.raises(RuntimeError, match="forged INVITE header"),
+    ):
+        await case.adapter._handle_inbound_invite(new_call)
+
+    _assert_answered_then_no_leak(transport, manager, case)
+
+
+async def test_inbound_post_answer_timer_failure_releases_all_no_leak() -> None:
+    """A different post-answer step (_start_session_timer) raising is equally leak-safe.
+
+    Proves the whole answered-setup region — not just extract_call_context — is inside
+    the single leak-safe try/finally (L1705).
+    """
+    transport = _FakeTransport()
+    manager = _FakeManager()
+    case = await _drive_inbound_to_post_answer(transport, manager)
+    invite_req = SipRequest.parse(_make_invite(call_id=case.call_id))
+    new_call = NewCall(registration=_ext_config(), invite=invite_req)
+
+    with (
+        patch("hermes_voip.adapter.RtpMediaTransport", return_value=case.engine),
+        patch("hermes_voip.adapter.CallSession", return_value=case.session),
+        patch("hermes_voip.adapter.GuardSessionState", return_value=MagicMock()),
+        patch.object(
+            case.adapter,
+            "_start_session_timer",
+            side_effect=RuntimeError("timer boom"),
+        ),
+        pytest.raises(RuntimeError, match="timer boom"),
+    ):
+        await case.adapter._handle_inbound_invite(new_call)
+
+    _assert_answered_then_no_leak(transport, manager, case)
 
 
 # ===========================================================================

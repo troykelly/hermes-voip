@@ -379,6 +379,24 @@ def test_cseq_rejects_non_ascii_digits(base: int) -> None:
         _cseq(f"{seq} INVITE")
 
 
+def test_cseq_accepts_valid_ascii() -> None:
+    # Guard against over-restriction: the strict-ASCII regex must still parse every
+    # legitimate all-ASCII CSeq. Real SIP methods are letter tokens (INVITE/BYE/ACK/…),
+    # so ``[A-Za-z]+`` accepts them all — only the Unicode surface is dropped.
+    assert _cseq("1 INVITE") == (1, "INVITE")
+    assert _cseq("314159 BYE") == (314159, "BYE")
+
+
+def test_cseq_rejects_mixed_ascii_and_unicode_digits() -> None:
+    # A number splicing an ASCII '4' onto a fullwidth '2' must NOT fullmatch — no
+    # partial ASCII-prefix acceptance: ``[0-9]+`` stops at the fullwidth char and the
+    # anchored fullmatch then fails (before the fix, Unicode-aware ``\d`` swallowed both
+    # and ``int()`` folded them to 42).
+    mixed = "4" + chr(0xFF10 + 2)
+    with pytest.raises(DialogError):
+        _cseq(f"{mixed} INVITE")
+
+
 def test_from_inbound_invite_rejects_missing_from_tag() -> None:
     bad = SipRequest(
         method="INVITE",

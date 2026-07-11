@@ -1647,7 +1647,7 @@ A 12-dimension re-scan of `main @ 139dbd1` (after the 14 PRs merged this session
   security-load-bearing for the audit trail) is never pinned at the RESTRICTED boundaries: no test sets
   `turn_restricted=True` WITH `privilege_level < min_level`, nor `degraded=True` WITH `turn_restricted=True`.
   Swapping those check orders keeps the suite green (surviving mutant). Add the two pairwise tests.
-- [ ] **[medium] docs** — Backfill `CHANGELOG.md [Unreleased]`: empty, but 5 user-facing fix PRs merged since
+- [x] (#499) **[medium] docs** — Backfill `CHANGELOG.md [Unreleased]` (done — now current through #497; the "empty" premise was stale, #459 had already backfilled #432-456, so #499 added the 21 user-facing PRs #460-#497). Was: empty, but 5 user-facing fix PRs merged since
   0.3.1 (#434 re-INVITE media re-point, #435 Expires:0 de-register, #436 Min-SE fail-closed, #437 420 Bad
   Extension, #438 RESTRICT/CLARIFY gate). Breaks the Keep-a-Changelog convention (runbook-0019 step 4 moves
   pre-existing entries); nothing in CI catches a PR landing without one.

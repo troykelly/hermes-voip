@@ -23,6 +23,45 @@ pinned equal by the test suite.
   emits a structured event (`call_id`, transport, and a `fingerprint` / `ice` / `dtls` /
   `failed` category) instead of being silently counted as answered, correcting the
   call-setup-success SLO overcount; the exception is never stringified into the log. (#455)
+- **Unrecognised `HERMES_SIP_*` / `HERMES_VOIP_*` env vars now log a warning** — a typo'd
+  knob (e.g. `HERMES_VOIP_STT_PROIVDER`) was previously copied into config but read by no
+  consumer, so the default was used silently with no signal; each prefixed env var is now
+  cross-checked against the manifest's known-key registry (plus the indexed
+  `HERMES_SIP_(EXTENSION|PASSWORD|USERNAME)_<n>` pattern) and anything unrecognised logs a
+  `WARNING` naming the key only, never its value. Warn-only: the key still flows through
+  unchanged. (#463)
+- **Call transfers now report their real terminal outcome to the agent** — a blind or
+  attended transfer previously returned "initiated" on the REFER `202 Accepted` (which
+  only acknowledges receipt) and never consumed the terminal `message/sipfrag` NOTIFY, so
+  the agent could not tell whether the callee answered, was busy, or was unreachable;
+  `transfer_blind` and `transfer_attended` now bounded-wait for the terminal NOTIFY and
+  surface the real outcome (COMPLETED / FAILED-with-SIP-status / OUTCOME_UNKNOWN) with an
+  accurate per-cause message, correlated to the active transfer by REFER CSeq. New
+  `HERMES_VOIP_TRANSFER_OUTCOME_TIMEOUT_S` knob (default 20 s; `0` opts out); see
+  ADR-0109. (#469)
+- **Outbound WebRTC/WSS call-lifecycle SLO events** — the WebRTC (WSS) outbound-call leg
+  now emits the same structured `outbound_invite_sent` / `outbound_call_connected` /
+  `outbound_call_failed` log events (tagged `transport="webrtc"`) that the SIP/TLS leg
+  already did, so outbound call-setup SLO queries span both transports instead of going
+  dark on the WebRTC path. (#471)
+- **`first_audio_latency` SLO event** — each inbound call now emits a structured
+  `first_audio_latency_ms`, the wall-clock time from INVITE receipt to the greeting's
+  first outbound RTP frame, making the "time to first audio < 2 s" SLO countable from logs
+  instead of eyeballed. (#474)
+- **"Didn't catch that" reprompt on an untranscribable turn** — a caller who speaks but
+  whose audio ASR returns as an empty transcript now hears a distinct reprompt asking them
+  to repeat, instead of falling through to the "Are you still there?" silence prompt; the
+  reprompt is scheduled off the ASR pump so it never stalls inbound audio, and its phrase
+  set is configurable via `HERMES_VOIP_DIDNT_CATCH_PHRASES` (pipe-separated;
+  explicit-empty opts out). (#476)
+- **Per-call maximum-duration watchdog caps runaway active calls** — a new
+  `HERMES_VOIP_MAX_CALL_DURATION_SECS` knob (default `14400`, 4h; `0` disables) arms a
+  per-call watchdog that gracefully hangs up (in-dialog `BYE` + media stop) any call still
+  active past the cap, so a caller streaming continuous RTP can no longer hold an
+  admission slot and run the STT/LLM/TTS pipeline indefinitely — closing the
+  slot-exhaustion path that `media_timeout` (silent RTP) and the RFC 4028 session timer
+  (dead dialog) both miss; the end is tagged with a distinct `MAX_CALL_DURATION` reason.
+  (#497)
 
 ### Changed
 
@@ -101,6 +140,104 @@ pinned equal by the test suite.
   tag parser now treats a quoted, empty, or otherwise non-`token` tag value as absent
   (fail-closed) and strips only RFC 3261 LWS (SP/HTAB) around the value, so a malformed tag
   can no longer be accepted as a dialog identifier. (#456)
+- **Held calls are no longer torn down by the no-input watchdog** — when the agent
+  (`hold_call`) or the peer/PBX (a hold re-INVITE) puts a call on hold the media plane is
+  suspended both ways, but the watchdog kept counting silent windows, reprompting into
+  dead media and hanging up the live caller after ~30 s; it is now hold-aware, skipping a
+  held silence window (and resetting the reprompt budget), and the graceful-end path
+  re-checks hold immediately before the irreversible teardown so a call held during the
+  goodbye is not dropped. (#460)
+- **A caller who repeatedly trips the injection guard is no longer declined forever** —
+  because a guard `REFUSE` marked the caller active each turn it kept resetting the
+  no-input watchdog, so a legitimate caller whose accent/phrasing kept tripping the guard
+  heard the safe-decline line indefinitely, never reaching the agent and never closing;
+  consecutive REFUSEs are now counted and the call is ended gracefully once they reach
+  `HERMES_VOIP_MAX_CONSECUTIVE_REFUSE` (default 3 → two declines then a graceful close;
+  `0` disables the bound), with any delivered turn resetting the count. (#465)
+- **Deny-mode decline phrase is sanitised before it is spoken** — a custom
+  `HERMES_VOIP_DECLINE_PHRASE` containing markdown, a bare URL, or emoji is now run
+  through the same speech sanitiser as agent replies before being voiced to a denied
+  caller, instead of verbatim; if sanitisation empties the phrase the raw value is still
+  spoken, so the one-line decline is never dead air. (#480)
+- **Acoustic echo canceller no longer stalls the inbound media path** — the on-by-default
+  AEC previously ran a per-sample time-domain NLMS costing ~35 ms/frame at 8 kHz and ~91
+  ms/frame at 16 kHz (2–4× the 20 ms RTP packet period), stalling the inbound leg whenever
+  the agent's TTS echo was returning; it is re-implemented as a numpy-vectorised
+  block-NLMS running ~1.3–4.2 ms/frame (≥5× under budget) with unchanged cancellation
+  quality and zero added latency. `numpy` is now a base dependency. (#481)
+- **A bad character in a DTMF string no longer emits a partial burst** — the RFC 4733
+  `send_dtmf` path streamed digits to the media engine and raised on the first non-DTMF
+  character only *after* a valid prefix had already reached the wire, so an agent sending
+  e.g. a space-grouped code (`4111 1111 1111 1111`) corrupted the far-end IVR entry while
+  the tool still reported "nothing sent"; the whole burst is now validated before any
+  transmission, so a bad digit raises before anything is sent. (#491)
+- **Call-end reasons are no longer silently collapsed in logs and caller outcome text** —
+  six of the eight `CallEndReason` values shared identical enum data and so became silent
+  aliases, making the outcome phrase relayed to the originating session (ADR-0029) and the
+  `reason.name` in logs correct for only two reasons (every failure reported as
+  `MEDIA_TIMEOUT`, agent hang-up / end-of-stream as `REMOTE_BYE`); each reason now carries
+  a distinct value, so the spoken outcome and the structured logs label the real cause.
+  (#496)
+
+### Security
+
+- **The inbound-call context block injected into the agent is now length-capped** — most
+  of the block's fields are caller-controlled (From display name, Diversion / History-Info
+  chains, User-Agent, Subject, Organization), so an oversized INVITE could balloon it (a
+  flooded INVITE rendered 15488 chars) to inflate the agent's context window and dilute
+  the trusted framing header behind attacker-controlled text; the rendered block is now
+  hard-capped at 600 chars with tail truncation — mirroring the existing outbound-summary
+  cap — trimming only the caller-controlled tail and never the untrusted-data / spoofable
+  warning. (#466)
+- **Strict ASCII / anchored parsing of SIP numeric headers** — `Session-Expires`,
+  `Min-SE`, and NOTIFY sipfrag status codes now reject non-ASCII digits (e.g.
+  Arabic-Indic, fullwidth) instead of silently folding them through `int()`, and reject
+  trailing garbage after the value, so attacker-influenced headers are parsed as strictly
+  as the message parser already was. (#479)
+- **Transfer-target URIs reject fullwidth / non-ASCII digits** — the REFER transfer-target
+  guard parsed IPv4 octets and ports with a Unicode-aware regex, so a prompt-injected
+  `transfer_blind` / `transfer_attended` target could fold fullwidth / Arabic-Indic
+  "digits" into a seemingly-valid host or port and smuggle non-ASCII characters past the
+  injection allowlist onto the UTF-8 `Refer-To` wire; both regexes are now strict ASCII
+  (`[0-9]`), as RFC 3261 requires. (#485)
+- **`;maddr` dropped from the transfer-target parameter allowlist** — a prompt-injected
+  `transfer_blind` / `transfer_attended` target such as
+  `sip:1000@trusted;maddr=<attacker>` passed the URI guard with an innocuous host yet, per
+  RFC 3261 §19.1.1, `maddr` overrides the routed destination and covertly re-aimed the
+  triggered INVITE at an attacker (host-hijack); `maddr` is no longer allowlisted, while
+  `transport` is retained for legitimate TLS transfers. Decision recorded in ADR-0112.
+  (#486)
+- **Strict-ASCII CSeq parsing in the dialog layer** — the `CSeq` parser previously used a
+  Unicode-aware regex whose fullwidth / Arabic-Indic digits `int()` would fold, a
+  parser-differential against an RFC 3261-strict proxy; it now requires ASCII digits.
+  Defense-in-depth hardening in the same strict-ASCII series as the SIP numeric-header
+  fixes (the value parsed here is currently self-built outbound, with the
+  attacker-reachable peer-response CSeq siblings tracked separately). (#488)
+- **One binary WebSocket frame can no longer tear down a WSS signaling connection** — the
+  WSS reader force-UTF-8-decoded inbound frames, so a single BINARY frame carrying
+  non-UTF-8 bytes raised inside `recv()` and escaped the read-loop guards, killing SIP
+  registration and every active call on that connection; the reader now takes frames
+  undecoded (TEXT dispatched, BINARY dropped) so no binary frame can crash it. (#489)
+- **A Unicode-digit SIP header param can no longer DoS inbound call setup** — `Diversion`
+  / `History-Info` parsing used `str.isdigit()` + `int()`, so a crafted `;index=` /
+  `;cause=` / `;counter=` value carrying a Unicode digit such as `²` (accepted by
+  `isdigit()`, rejected by `int()`) raised after the INVITE was answered and skipped
+  teardown, permanently leaking the admission slot, RTP socket and in-dialog routes;
+  repeating it `max_calls` times drove every further inbound INVITE to `486 Busy Here`.
+  The three sites now parse through the fail-closed decimal helper. (#490)
+- **Linear RFC 3261 header unfolding closes a quadratic-parse event-loop DoS** — folded
+  (obs-fold continuation) headers were reassembled by rebuilding the growing value on
+  every fold, making one crafted header O(N²); because parsing runs synchronously on the
+  shared asyncio loop, a single message folded into many tiny continuation lines stalled
+  every concurrent call's media and timers (measured ~3.3 s for 300k folds, worst on the
+  un-capped WSS path). Header fragments are now joined once, yielding the identical value
+  in linear time. (#492)
+- **RTCP Sender-Report SSRC flood can no longer exhaust media-process memory** — on a
+  plain-RTP call (no SRTCP, a common SIP-trunk config) the unauthenticated RTCP ingest
+  path stored a permanent entry for every distinct sender SSRC, so a sustained low-rate
+  stream of forged Sender Reports grew an unbounded map until the shared media process ran
+  out of memory, taking down every concurrent call; the map is now capped in lockstep with
+  the already-bounded reception table (≤ 31 tracked sources). (#494)
 
 ## [0.3.1] - 2026-07-03
 

@@ -46,6 +46,12 @@ _DEFAULT_MAX_DEPTH: Final[int] = 10
 # straight back up; one full window's worth of clean packets is a reasonable
 # "the link has settled" signal.
 _SHRINK_AFTER: Final[int] = 50
+# Consecutive too-far-ahead (> max_ahead), forward-progressing packets that confirm the
+# stream has jumped past the playout window — a loss burst >= max_ahead (or a source
+# resync) that stranded the anchor behind an unrecoverable gap — before the buffer
+# RE-ANCHORS onto the recovery sequence. A run (not a single packet) so a lone stray
+# far-future packet cannot force a resync; mirrors the SSRC-hysteresis run counter.
+_REANCHOR_AFTER: Final[int] = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +374,14 @@ class JitterBuffer:
         # _ssrc_hysteresis.
         self._ssrc_candidate: int | None = None
         self._ssrc_candidate_count: int = 0
+        # Re-anchor hysteresis (backlog L1704). A run of consecutive, forward-
+        # progressing too-far-ahead (> max_ahead) packets means a loss burst
+        # >= max_ahead stranded the anchor behind an unrecoverable gap — every
+        # recovery packet would be dropped and the buffer would stall forever (the
+        # agent goes deaf). ``_ahead_candidate`` is the last such seq; the run resets
+        # on any in-window arrival, and the re-anchor fires at ``_REANCHOR_AFTER``.
+        self._ahead_candidate: int | None = None
+        self._ahead_run: int = 0
 
     def __len__(self) -> int:
         """Return the current buffered packet count."""
@@ -398,6 +412,8 @@ class JitterBuffer:
         self._depth = self._floor
         self._ssrc_candidate = None
         self._ssrc_candidate_count = 0
+        self._ahead_candidate = None
+        self._ahead_run = 0
 
     def _grow(self) -> None:
         """Widen the reorder tolerance by one, bounded by the ceiling (adaptive)."""
@@ -437,6 +453,51 @@ class JitterBuffer:
         self._ssrc = packet.ssrc
         return True
 
+    def _break_ahead_run(self) -> None:
+        """Reset the too-far-ahead run; any qualifying arrival interrupts it."""
+        self._ahead_run = 0
+        self._ahead_candidate = None
+
+    def _reanchor_if_stranded(self, seq: int) -> bool:
+        """Track a too-far-ahead run and re-anchor if the stream jumped the window.
+
+        A single stray far-future packet is normal noise; a SUSTAINED, forward-
+        progressing run of packets more than ``max_ahead`` ahead means a loss burst
+        >= ``max_ahead`` (or a source resync) moved the whole stream past the window
+        and stranded the anchor — every recovery packet would otherwise be dropped and
+        the buffer would stall forever (the agent goes deaf, backlog L1704).
+
+        The re-anchor fires ONLY when the buffer is genuinely stranded: the anchor is
+        not itself buffered AND occupancy is below the loss-gate depth — the exact
+        condition under which :meth:`pop` returns ``None`` and cannot advance. While a
+        packet at the anchor is buffered (or the loss-gate can already fire), pop()
+        still makes progress on its own, so re-anchoring would needlessly DISCARD
+        still-playable audio; we drop the stray far packet and reset the run instead.
+
+        Returns ``True`` while the forward run is unconfirmed (the caller DROPS the
+        packet, keeping storage bounded); returns ``False`` once ``_REANCHOR_AFTER``
+        consecutive forward packets confirm the jump, having re-homed the anchor onto
+        ``seq`` and dropped the now-stale buffered packets — the caller then buffers
+        ``seq`` so the next :meth:`pop` drains it. SSRC / adaptive state are preserved
+        (a resync past the gap, not a new source).
+        """
+        if self._next in self._packets or len(self._packets) >= self._depth:
+            # Not stranded — pop() can still advance; never evict playable audio.
+            self._break_ahead_run()
+            return True
+        if self._ahead_candidate is not None and _seq_before(
+            self._ahead_candidate, seq
+        ):
+            self._ahead_run += 1
+        else:
+            self._ahead_run = 1
+        self._ahead_candidate = seq
+        if self._ahead_run < _REANCHOR_AFTER:
+            return True  # not yet a confirmed forward move — drop, stay bounded
+        self._packets.clear()
+        self._next = seq
+        return False
+
     def push(self, packet: RtpPacket) -> None:
         """Add a packet; duplicate, late, and too-far-ahead packets are dropped.
 
@@ -464,12 +525,21 @@ class JitterBuffer:
                     # loss too eagerly — grow so the next such reorder survives.
                     if self._adapt and (self._next - seq) % _SEQ_MOD <= self._max_ahead:
                         self._grow()
+                    self._break_ahead_run()  # a late arrival interrupts any far-run
                     return
                 if (self._next - seq) % _SEQ_MOD > self._max_ahead:
-                    return  # too far behind to be a start reorder; bound the window
+                    # too far behind to be a start reorder; bound the window
+                    self._break_ahead_run()
+                    return
                 self._next = seq  # pre-playout reorder within window: revise anchor
             elif (seq - self._next) % _SEQ_MOD > self._max_ahead:
-                return  # outside the playout window: keep storage bounded
+                # Outside the playout window (ahead) — normally a stray far-future
+                # packet, but a sustained forward run means a loss burst >= max_ahead
+                # stranded the anchor (backlog L1704). Drop until the run is confirmed;
+                # on confirmation the buffer re-anchors onto seq and we fall through to
+                # buffer this packet so the next pop() drains it.
+                if self._reanchor_if_stranded(seq):
+                    return
             elif (
                 self._adapt
                 and self._highest is not None
@@ -486,6 +556,9 @@ class JitterBuffer:
                 self._grow()
         else:
             self._next = seq  # tentative anchor at the first arrival
+        # Reaching here is an in-window arrival (or a just-completed re-anchor): any
+        # too-far-ahead run is broken.
+        self._break_ahead_run()
         if self._highest is None or _seq_before(self._highest, seq):
             self._highest = seq
         self._packets.setdefault(seq, packet)  # first arrival wins; ignore duplicates

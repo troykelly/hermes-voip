@@ -2997,6 +2997,18 @@ def _one_window_frame_8k() -> PcmFrame:
     )
 
 
+def _sub_window_frame_8k() -> PcmFrame:
+    """A live 20 ms 8 kHz inbound frame (160 samples → 320 bytes).
+
+    SMALLER than one silero window (256 samples), so the pump's per-frame counter and
+    the VAD-window ordinal diverge (~1.6x) — the real inbound topology (ADR-0017 8 kHz
+    at the default 20 ms ptime), unlike ``_one_window_frame_8k`` where they coincide.
+    """
+    return PcmFrame(
+        samples=bytes(320), sample_rate=_G711_INBOUND_RATE, monotonic_ts_ns=0
+    )
+
+
 class _ScriptedInboundTransport(_FakeTransport):
     """8 kHz transport that releases its (one-window) frames on a gate.
 
@@ -3324,6 +3336,53 @@ async def test_gated_normal_turn_during_silence_still_delivered() -> None:
     )
     await asyncio.wait_for(loop.run(), timeout=5.0)
     assert delivered == ["hello there"]
+
+
+@pytest.mark.asyncio
+async def test_endpointer_driven_by_vad_window_clock_not_per_frame_counter() -> None:
+    """A short mid-turn pause must NOT end the turn — the endpointer counts VAD WINDOWS.
+
+    The pump must drive ``endpointer.advance()`` with the VAD-window clock, not the
+    per-frame counter (gap-review 2026-07-11). Live topology: inbound frames are 160
+    samples (20 ms @8k) but a silero window is 256 samples, so a per-frame counter runs
+    ~1.6x faster than the VAD ordinal. Before the fix that inflated drift made advance()
+    fire end-of-turn on the FIRST silent frame once a call had run ~1 s — cutting the
+    caller off the instant they paused. Here the caller speaks (40 windows) then pauses
+    for only 10 windows (~320 ms, under the 16-window / 500 ms endpoint threshold): with
+    the per-frame clock the endpointer fires during that sub-threshold pause and the
+    turn is delivered; with the VAD-window clock it does not, so the
+    ``_DrainThenFinalASR`` final (``end_of_turn=False``) is never delivered.
+    """
+    delivered: list[str] = []
+
+    async def capture(text: str) -> None:
+        delivered.append(text)
+
+    # 40 voiced windows, then only 10 silent windows (~320 ms < the 500 ms / 16-window
+    # endpoint threshold). 80 sub-window frames = 40 * 256 samples = exactly 50 windows.
+    probs = [0.9] * 40 + [0.0] * 10
+    frames = [_sub_window_frame_8k() for _ in range(80)]
+
+    loop = CallLoop(
+        transport=_Transport8k(frames),
+        asr=_DrainThenFinalASR("caller mid sentence"),
+        tts=_FakeTTS([]),
+        guard=_FakeGuard([_allow_result()]),
+        vad=_scripted_vad_8k(probs),
+        endpointer=_make_endpointer_8k(),
+        guard_state=GuardSessionState(call_id=_CALL_ID),
+        deliver_turn=capture,
+        voice=_VOICE,
+        call_id=_CALL_ID,
+        greeting="",  # no TTS -> gate never armed; the endpointer owns the boundary
+    )
+
+    await asyncio.wait_for(loop.run(), timeout=5.0)
+
+    assert delivered == [], (
+        "a sub-threshold (~320 ms) pause must not end the turn; the endpointer must be "
+        "driven by the VAD-window clock, not the faster per-frame counter"
+    )
 
 
 @pytest.mark.asyncio

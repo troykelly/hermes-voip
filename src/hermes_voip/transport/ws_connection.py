@@ -425,7 +425,15 @@ class WssSipTransport:
         raises on an error (reported via ``on_connection_lost``).
         """
         while True:
-            frame = await ws.recv(decode=True)
+            # recv() with the default decode=None returns str for TEXT frames and bytes
+            # for BINARY frames, so a binary frame is dropped by the isinstance(frame,
+            # str) guard below — never UTF-8-decoded. decode=True force-decodes a binary
+            # frame; a non-UTF-8 one then raises UnicodeDecodeError -> ConnectionClosed,
+            # which escapes this loop (the parse/handler guards live in _dispatch(raw:
+            # str), unreachable here) and tears down registration + every active call
+            # (ADR-0081). A TEXT frame with genuinely invalid UTF-8 still fails the
+            # connection — a real RFC 6455 violation the WS layer must reject.
+            frame = await ws.recv()
             if isinstance(frame, str):
                 # RFC 7118 / RFC 5626 §4.4 CRLF keepalive: the gateway may send a
                 # bare double-CRLF ping ("\r\n\r\n"), a single-CRLF pong ("\r\n"),

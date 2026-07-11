@@ -587,6 +587,17 @@ def test_build_blind_refer_rejects_bare_extension_with_params() -> None:
         build_blind_refer(_dialog(), "1001;maddr=evil.com")
 
 
+def test_build_blind_refer_rejects_sip_uri_with_maddr() -> None:
+    # A well-formed sip: URI whose host IS the trusted transfer target but which
+    # also carries ``;maddr`` — which per RFC 3261 §19.1.1 OVERRIDES the network
+    # destination a compliant proxy routes to, while the visible host stays
+    # innocuous — is a covert host-hijack (a transfer names WHERE to transfer; it
+    # has no legitimate need to re-aim routing away from that host). ``maddr`` is
+    # therefore NOT allowlisted, so the whole target is rejected (ADR-0112).
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@pbx.example.test;maddr=198.51.100.66")
+
+
 def _to_fullwidth_digits(ascii_digits: str) -> str:
     """Map ASCII digits to their U+FF10..U+FF19 fullwidth forms.
 

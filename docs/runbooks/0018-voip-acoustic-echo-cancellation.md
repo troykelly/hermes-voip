@@ -9,12 +9,16 @@ VAD/ASR see it, so the reflected echo cannot false-trigger barge-in. That is wha
 barge-in sustained threshold (`HERMES_VOIP_BARGE_IN_MIN_SPEECH_MS`) drop from 600 ms to a
 responsive **200 ms** when AEC is on — **aggressive barge-in** without echo false-positives.
 
-It is a pure-stdlib **NLMS** (Normalised Least-Mean-Squares) adaptive FIR filter — **no new
-dependency** (no clean `cp313` AEC wheel exists on PyPI; see ADR-0033's library survey). It adds
-**no algorithmic delay** (per-sample, buffer-free) so it does not slow the conversational path.
+It is a **numpy block-NLMS** (Normalised Least-Mean-Squares) adaptive FIR filter. `numpy` is a
+**base dependency** (ADR-0110): the estimate + tap update run as small matmuls over a short
+sub-block of samples, so the per-frame cost is a handful of matmuls instead of the per-sample
+`O(filter_len)` recursion the original stdlib filter used (which stalled the RX coroutine at ~2x
+the packet period — ADR-0095). It still adds **no algorithmic delay** — each `cancel` processes and
+returns its whole frame with no look-ahead buffering — so it does not slow the conversational path.
 
-The WHY lives in **ADR-0033** (and the deferral it closes, ADR-0008/0023/0028). This runbook is
-the operational HOW for the operator knobs.
+The WHY lives in **ADR-0033** (the original design + the deferral it closes, ADR-0008/0023/0028)
+and **ADR-0110** (the block-NLMS CPU-budget refactor that supersedes ADR-0033's no-numpy /
+no-latency constraints). This runbook is the operational HOW for the operator knobs.
 
 > **Public repo.** No secrets here — these are a boolean, two integers, and a float.
 
@@ -55,10 +59,13 @@ Validation (fail-fast at startup, `MediaConfig.__post_init__` → `_validate_aec
   VAD. A **double-talk hold** freezes adaptation when the near-end carries far more energy than the
   reference could produce as echo (the caller talking over the echo), so the caller can never pull
   the filter into cancelling them.
-- **No added latency (rule 22).** `cancel` is per-sample and buffer-free — it returns the same
-  frame length it was given, with no look-ahead. The added CPU is `O(filter_len)` multiply-adds per
-  sample — measured ~6.9 ms/frame at 8 kHz (full 64 ms window) and ~13.8 ms/frame at 16 kHz
-  (the 512-tap cap, ~32 ms window), both under the 20 ms ptime budget, in `array('d')`.
+- **No added latency + within CPU budget (rule 22, ADR-0110).** `cancel` returns the same frame
+  length it was given, with no look-ahead buffering. The per-frame CPU is a handful of small numpy
+  matmuls (block-NLMS) — measured ~1.3 ms/frame at 8 kHz and ~4.2 ms/frame at 16 kHz for the
+  worst-case 512-tap (`_AEC_MAX_TAPS`) filter while adapting, well under the 20 ms ptime budget
+  (the superseded per-sample stdlib filter was ~35 ms / ~91 ms — 2x-4x over). The budget is gated
+  in CI by `tests/test_media_aec_budget.py`, which also pins ≥ 30 dB convergence (ERLE) at both
+  rates.
 - **No-op when disabled or on an echo-cancelled gateway.** `HERMES_VOIP_AEC_ENABLED=false` builds
   no canceller (the RX/TX taps are no-ops) and restores the 600 ms threshold default. On a gateway
   with its own echo cancellation there is no echo to model and the inbound is uncorrelated with the
@@ -117,6 +124,8 @@ load; a running call keeps the settings it started with).
    `uv run pytest tests/test_aec_barge_in_integration.py` proves the cancelled echo does not
    self-interrupt at the lowered 200 ms threshold while a real caller still barges in.
    `uv run pytest tests/test_config_aec.py` proves the parse + validation + the coupled default.
+   `uv run pytest tests/test_media_aec_budget.py` proves `cancel` stays under the 20 ms packet
+   budget at both rates while adapting and converges to ≥ 30 dB ERLE (ADR-0110).
 
 3. **Live:** with AEC on, place a call on a gateway known to reflect TTS (the test gateway) and
    talk over the agent. The operator log should show the agent barging in promptly (~200 ms of your
@@ -128,10 +137,11 @@ load; a running call keeps the settings it started with).
 
 - **`HERMES_VOIP_AEC_FILTER_MS`** — the window must span the echo-RETURN delay (round-trip), not
   just the impulse response, or a delayed broadband echo is left uncancelled. The 64 ms default
-  gives a full 64 ms window at 8 kHz (~6.9 ms/frame); the engine caps the tap count at 512
-  (`_AEC_MAX_TAPS`), so 16 kHz is held to ~32 ms (~13.8 ms/frame) for the per-frame budget. Raising
-  this past the cap has no effect (the clamp wins) unless you also accept the cap; lower it only if
-  the echo delay is known-short. For a longer 16 kHz echo, prefer `HERMES_VOIP_AEC_BULK_DELAY_MS`.
+  gives a full 64 ms window at 8 kHz; the engine caps the tap count at 512 (`_AEC_MAX_TAPS`), so
+  16 kHz is held to ~32 ms. With block-NLMS the per-frame cost at the 512-tap cap is a few ms
+  (see above), so the cap is now about echo *reach*, not the CPU budget. Raising this past the cap
+  has no effect (the clamp wins) unless you also accept the cap; lower it only if the echo delay is
+  known-short. For a longer 16 kHz echo, prefer `HERMES_VOIP_AEC_BULK_DELAY_MS`.
 - **`HERMES_VOIP_AEC_BULK_DELAY_MS`** — set this to the gateway's constant echo-return delay if it
   is large and known, so the adaptive taps model only the impulse response after it (a shorter, more
   responsive filter). `0` (the default) lets the taps cover the delay directly.

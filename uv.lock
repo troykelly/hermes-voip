@@ -554,6 +554,7 @@ version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "audioop-lts" },
+    { name = "numpy" },
 ]
 
 [package.optional-dependencies]
@@ -564,7 +565,6 @@ media = [
     { name = "cryptography" },
 ]
 ml = [
-    { name = "numpy" },
     { name = "onnxruntime", marker = "sys_platform != 'darwin'" },
     { name = "sherpa-onnx" },
     { name = "tokenizers" },
@@ -594,7 +594,7 @@ requires-dist = [
     { name = "audioop-lts", specifier = "==0.2.2" },
     { name = "cryptography", marker = "extra == 'media'", specifier = ">=46.0.7,<49" },
     { name = "hermes-agent", marker = "extra == 'hermes'", specifier = "==0.17.0" },
-    { name = "numpy", marker = "extra == 'ml'", specifier = "==2.4.6" },
+    { name = "numpy", specifier = "==2.4.6" },
     { name = "onnxruntime", marker = "sys_platform != 'darwin' and extra == 'ml'", specifier = "==1.24.4" },
     { name = "opuslib", marker = "extra == 'webrtc'", specifier = "==3.0.1" },
     { name = "pyopenssl", marker = "extra == 'webrtc'", specifier = "==26.2.0" },

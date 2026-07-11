@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-02
 - **Status:** Superseded by ADR-0110 (2026-07-11) — the operator chose the durable
-  best-practice fix (frequency-domain MDF), ruling out the interim disable, which resolves
+  best-practice fix (numpy block-NLMS), ruling out the interim disable, which resolves
   this deferral. Originally: Proposed — Deferred (a genuine open architecture decision;
   adoption required operator approval per AGENTS.md rule 40 — see ADR-0060 for the precedent
   of recording a deferred decision on the record before an operator choice is made)

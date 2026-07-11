@@ -849,6 +849,22 @@ class _AudioAccumulator:
     # BUNDLE media identification (a=mid, RFC 5888 / 8843). ADR-0044.
     mid: str | None = None
 
+    @staticmethod
+    def _positive_ms(rest: str, tag: str) -> int:
+        """Parse an ``a=ptime`` / ``a=maxptime`` value as a strictly-positive int (ms).
+
+        Raises:
+            SdpError: If the value is non-positive — a zero/negative packetisation
+                time or ceiling is a nonsensical framing bound for negotiate_ptime.
+                A non-integer raises ``ValueError``, folded to ``SdpError`` by
+                :meth:`add_attribute`.
+        """
+        value = int(rest.strip())
+        if value <= 0:
+            msg = f"a={tag} must be positive, got {value}"
+            raise SdpError(msg)
+        return value
+
     def set_media_line(self, value: str) -> None:
         """Apply an ``m=audio <port> <proto> <fmt...>`` line.
 
@@ -857,6 +873,13 @@ class _AudioAccumulator:
                 payload type, or carries a port that is negative or > 65535.
                 Port 0 is VALID (RFC 4566 §5.7 / RFC 3264: signals a
                 disabled/rejected media stream) and is accepted.
+
+        Payload-type NUMBERS are deliberately range-lenient: unlike the port (an
+        out-of-range value breaks the transport, so it is rejected), a payload type
+        outside RFC 3550's 0..127 is never matched to a codec and is simply dropped,
+        so a peer offering a stray out-of-range PT alongside valid ones still
+        negotiates on the valid ones instead of having the whole m-line rejected.
+        Only a NON-INTEGER payload type is rejected (it cannot be parsed at all).
         """
         fields = value.split()
         if len(fields) < _M_AUDIO_MIN_FIELDS:
@@ -909,15 +932,12 @@ class _AudioAccumulator:
         elif tag == "crypto":
             self.crypto.append(rest.strip())
         elif tag == "ptime":
-            ptime = int(rest.strip())
-            if ptime <= 0:
-                msg = f"a=ptime must be positive, got {ptime}"
-                raise SdpError(msg)
-            self.ptime = ptime
+            self.ptime = self._positive_ms(rest, "ptime")
         elif tag == "maxptime":
-            # RFC 4566 §6: the maximum packetisation time the peer accepts (ms),
-            # an upper bound negotiate_ptime honours (ADR-0056).
-            self.maxptime = int(rest.strip())
+            # RFC 4566 §6: the maximum packetisation time the peer accepts (ms), an
+            # upper bound negotiate_ptime honours (ADR-0056). Validated > 0 (symmetric
+            # with a=ptime) — a zero/negative ceiling is a nonsensical framing bound.
+            self.maxptime = self._positive_ms(rest, "maxptime")
         elif value.lower() in _DIRECTIONS:
             self.direction = value.lower()
         # WebRTC attributes (ADR-0016, RFC 5763/8839).  Malformed lines are

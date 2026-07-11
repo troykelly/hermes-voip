@@ -65,7 +65,31 @@ uv lock                                     # must resolve without error
 uv sync --frozen --all-extras
 uv run pip-audit                            # must exit 0 with no vulnerabilities
 uv run python -c "import jwt; print(jwt.__version__)"   # must print >=2.13.0
+uv run python -c "import cryptography; print(cryptography.__version__)"  # must print >=48.0.1
 ```
+
+## hermes-agent 0.18.2 + cryptography — resolved (ADR-0111)
+
+**Bumped 2026-07-11** from `hermes-agent==0.17.0` (which carried **CVE-2026-10222**; main's
+daily `audit` had been red on it since 2026-07-10) to the **current 0.18.2**, per the
+operator directive to track the current hermes-agent, not an ancient pin. The bump clears
+CVE-2026-10222 but surfaced a second advisory: hermes-agent's 0.18 line hard-pins
+`cryptography==46.0.7`, which is vulnerable to **GHSA-537c-gmf6-5ccf** (the statically-linked
+OpenSSL bundled in cryptography wheels before 48.0.1).
+
+**Resolved** with a second `[tool.uv] override-dependencies` entry `cryptography>=48.0.1,<49`
+(alongside the pyjwt one), forcing the patched 48.0.1 over hermes-agent's exact pin. `<49`
+keeps `pyopenssl==26.2.0` satisfiable and stays inside the `media` extra's `>=46.0.7,<49`
+range. Verified: `uv lock` clean, `pip-audit` reports no vulnerabilities, `import gateway`
+succeeds on cryptography 48.0.1, the typed contract shim is unchanged (mypy clean vs the real
+0.18.2 runtime — no surface drift), and the `hermes-contract` suite is green. See ADR-0111.
+cryptography's licence (`Apache-2.0 OR BSD-3-Clause`) was already in the optional-extras
+allowlist (it ships in the `media`/`webrtc` extras), so no allowlist change was needed.
+
+**Upkeep (keep hermes-agent current — operator standing directive).** On each hermes-agent
+bump, re-run the Verify block below + the hermes-contract validation. If a future
+hermes-agent pins a non-vulnerable cryptography, the `cryptography` override becomes a no-op
+and may be dropped; if it needs cryptography `<48` or `>=49`, revisit the override.
 
 ## Verify (locally, before relying on CI — rule 15)
 

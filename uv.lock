@@ -7,7 +7,10 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "pyjwt", extras = ["crypto"], specifier = ">=2.13.0" }]
+overrides = [
+    { name = "cryptography", specifier = ">=48.0.1,<49" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.13.0" },
+]
 
 [[package]]
 name = "aioice"
@@ -510,12 +513,13 @@ wheels = [
 
 [[package]]
 name = "hermes-agent"
-version = "0.17.0"
+version = "0.18.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
     { name = "croniter" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "fire" },
     { name = "httpx", extra = ["socks"] },
@@ -543,9 +547,9 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/c2/6b65b1c1d093eff415304472709479a392ac1422e36d007e32f3bb848f58/hermes_agent-0.17.0.tar.gz", hash = "sha256:5ceda2a131627fecf5fd52b05d0162b48032023a5d814bb5d1894db4aa146120", size = 12156176, upload-time = "2026-06-19T19:40:16.589Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/44/c2e588a0d49049aa3fa6833d52bd6e803dc62ac7369a7ecb483b9a7b9a3d/hermes_agent-0.18.2.tar.gz", hash = "sha256:1cc7ccb6bca6e6d2aef448bbf9b79d4bc31247288a8bf549231fc148a343c678", size = 13618103, upload-time = "2026-07-08T03:12:49.202Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e3/e2/d18d5ec6735b412fde47ecac3b6a63874c824c83e9821e1c1f4a07bcff85/hermes_agent-0.17.0-py3-none-any.whl", hash = "sha256:f11dcc1b168d2db626ef8b2175301741a86b5247c5ffaff4b0f0e24018d1b190", size = 8642279, upload-time = "2026-06-19T19:40:14.014Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/4c/91652c61450763bfe165c65b83026503de0ac9ddad2c11ee522490bf4c2d/hermes_agent-0.18.2-py3-none-any.whl", hash = "sha256:8f02155cfc84b28bd98551cd18dffec0efa9ec070dd08f90f1a850f1c779492f", size = 9569078, upload-time = "2026-07-08T03:12:46.369Z" },
 ]
 
 [[package]]
@@ -593,7 +597,7 @@ requires-dist = [
     { name = "aioice", marker = "extra == 'webrtc'", specifier = "==0.10.2" },
     { name = "audioop-lts", specifier = "==0.2.2" },
     { name = "cryptography", marker = "extra == 'media'", specifier = ">=46.0.7,<49" },
-    { name = "hermes-agent", marker = "extra == 'hermes'", specifier = "==0.17.0" },
+    { name = "hermes-agent", marker = "extra == 'hermes'", specifier = "==0.18.2" },
     { name = "numpy", specifier = "==2.4.6" },
     { name = "onnxruntime", marker = "sys_platform != 'darwin' and extra == 'ml'", specifier = "==1.24.4" },
     { name = "opuslib", marker = "extra == 'webrtc'", specifier = "==3.0.1" },

@@ -33,7 +33,7 @@ dependencies = [
 # optional extra so its large transitive tree stays out of the default install,
 # the production licence gate, and the default pip-audit env. The typed boundary
 # is hermes_voip.hermes_surface; the contract test verifies the real surface.
-hermes = ["hermes-agent==0.17.0"]
+hermes = ["hermes-agent==0.18.2"]
 # Local-inference ML stack for the conversational providers (ADR-0006/0007/0008/
 # 0009): onnxruntime for VAD (silero) + the injection guard (DeBERTa), sherpa-onnx
 # for streaming STT/TTS, tokenizers for the DeBERTa guard's SentencePiece tokenizer
@@ -313,11 +313,22 @@ asyncio_mode = "strict"  # async tests carry an explicit @pytest.mark.asyncio
 faulthandler_timeout = 300
 
 # Pins a CVE-safe pyjwt floor (PYSEC-2026-175..179, fix: 2.13.0; ref ADR-0062).
-# hermes-agent==0.17.0 already requires pyjwt[crypto]==2.13.0, so this is a
+# hermes-agent==0.18.2 already requires pyjwt[crypto]==2.13.0, so this is a
 # defence-in-depth floor that keeps the resolution safe against any future
 # hermes-agent change that would relax the pin below the patched version.
+#
+# Pins a CVE-safe cryptography floor (GHSA-537c-gmf6-5ccf: the statically-linked
+# OpenSSL in cryptography wheels before 48.0.1 is vulnerable; ref ADR-0111).
+# hermes-agent==0.18.2 hard-pins cryptography==46.0.7 exactly (the 0.18 line added a
+# cryptography dependency where 0.17 declared none), which — left alone — resolves
+# to exactly the vulnerable 46.0.7. This override forces the patched 48.0.x. The <49
+# upper bound keeps pyopenssl==26.2.0 (the webrtc extra's DTLS stack) satisfiable —
+# it requires cryptography<49 — and stays inside the `media` extra's own
+# >=46.0.7,<49 range (see that extra's comment). Same override mechanism and
+# rationale as the pyjwt entry above; validated against the real hermes runtime by
+# the hermes-contract CI job (hermes-agent 0.18.2 runs on cryptography 48.0.x).
 [tool.uv]
-override-dependencies = ["pyjwt[crypto]>=2.13.0"]
+override-dependencies = ["pyjwt[crypto]>=2.13.0", "cryptography>=48.0.1,<49"]
 
 [dependency-groups]
 # Exact pins (AGENTS.md rule 33: no floating ranges); uv.lock is the full

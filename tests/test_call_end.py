@@ -84,6 +84,42 @@ def test_classify_clean_return_normal_vs_agent_hangup() -> None:
     )
 
 
+def test_all_members_are_distinct_no_silent_aliasing() -> None:
+    """Every CallEndReason name is a DISTINCT member — no two collapse to an alias.
+
+    A plain ``enum.Enum`` makes members with EQUAL values aliases of one another. If
+    each member's value were only its ``(was_failure, can_followup)`` bool-pair, the
+    five failure names would collapse onto a single member and the three normal names
+    onto another — silently breaking ``reason.name`` in logs and the by-member
+    outbound-outcome phrase map (ADR-0029, ``_OUTBOUND_REASON_PHRASE``). Each member
+    therefore carries a UNIQUE value and the class is ``@enum.unique``; this locks it
+    so a future edit that reintroduces a duplicate value fails loudly here rather than
+    silently aliasing.
+    """
+    members = list(CallEndReason)
+    # All eight names are live, distinct members (a naive bool-pair enum yields 2).
+    # These runtime-set cardinalities are the real re-aliasing lock: a revert to
+    # bool-pair values would collapse them to 2 and fail here.
+    assert len(members) == 8
+    assert len({m.name for m in members}) == 8
+    assert len({m.value for m in members}) == 8
+    # Names resolve to themselves (an alias would report the canonical member's name).
+    assert CallEndReason.SIP_ERROR.name == "SIP_ERROR"
+    assert CallEndReason.AGENT_HANGUP.name == "AGENT_HANGUP"
+    # The specific pairs that ALIAS under the naive (bool, bool)-value scheme are now
+    # distinct. Typed as the widened enum (not member literals) so the identity check
+    # is a genuine runtime assertion, not a statically-true no-op.
+    aliased_before: list[tuple[CallEndReason, CallEndReason]] = [
+        (CallEndReason.MEDIA_TIMEOUT, CallEndReason.PIPELINE_FAILURE),
+        (CallEndReason.SIP_ERROR, CallEndReason.CONNECTION_LOST),
+        (CallEndReason.REGISTRATION_LOST, CallEndReason.MEDIA_TIMEOUT),
+        (CallEndReason.AGENT_HANGUP, CallEndReason.REMOTE_BYE),
+        (CallEndReason.EOS, CallEndReason.REMOTE_BYE),
+    ]
+    for first, second in aliased_before:
+        assert first is not second, (first, second)
+
+
 def test_fail_safe_unknown_end_is_a_failure_stop() -> None:
     """The fail-safe default for an unknown/ambiguous end is a failure (``/stop``)."""
     # ``fail_safe`` is the reason the chokepoint uses when it cannot otherwise

@@ -1094,8 +1094,10 @@ async def test_call_end_reports_failure_outcome_into_origin_when_no_result() -> 
     ]
     assert origin_events, f"no failure report reached the origin; got {captured!r}"
     text = getattr(origin_events[0], "text", "").lower()
-    # The report mentions the call ended / did not succeed (the reason rides as text).
-    assert "ended" in text or "call" in text
+    # The report carries the SPECIFIC classified reason (ADR-0029): SIP_ERROR's own
+    # phrase, not a generic/collapsed one (while CallEndReason members aliased, every
+    # failure reported "the phone line registration was lost").
+    assert "could not be completed" in text
 
 
 @pytest.mark.asyncio
@@ -1175,6 +1177,34 @@ def test_outbound_result_text_neutralises_a_malicious_summary() -> None:
     # The callee's original (pre-defang) forged close marker is the same literal as
     # the legitimate close; the by-construction guarantee is the exactly-one count
     # above (the defang broke the callee's '>>>' run apart, leaving only our pair).
+
+
+def test_outbound_reason_phrase_is_total_and_distinct() -> None:
+    """Every CallEndReason maps to its OWN distinct outbound-outcome phrase (ADR-0029).
+
+    Regression lock for the CallEndReason enum-aliasing bug: while members aliased,
+    this by-member dict literal collapsed to two live keys (every normal end reported
+    one phrase, every failure another). With distinct members the map is TOTAL over
+    the enum and every phrase is unique, so the originating session gets an accurate
+    per-reason outcome instead of a wrong, collapsed one.
+    """
+    from hermes_voip.adapter import (  # noqa: PLC0415
+        _OUTBOUND_REASON_PHRASE,
+        _outbound_result_text,
+    )
+    from hermes_voip.call_end import CallEndReason  # noqa: PLC0415
+
+    # Total over the enum: no reason falls through to the generic ``.get`` fallback.
+    assert set(_OUTBOUND_REASON_PHRASE) == set(CallEndReason)
+    # Every reason has its OWN phrase (aliasing had collapsed this to 2 strings).
+    assert len(set(_OUTBOUND_REASON_PHRASE.values())) == len(CallEndReason)
+    # Spot-check reasons that aliased onto MEDIA_TIMEOUT / REMOTE_BYE before the fix.
+    sip = _outbound_result_text("1000", CallEndReason.SIP_ERROR, None)
+    agent = _outbound_result_text("1000", CallEndReason.AGENT_HANGUP, None)
+    conn = _outbound_result_text("1000", CallEndReason.CONNECTION_LOST, None)
+    assert "could not be completed" in sip
+    assert "you ended the call" in agent
+    assert "connection was lost" in conn
 
 
 @pytest.mark.asyncio

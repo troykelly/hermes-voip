@@ -587,6 +587,71 @@ def test_build_blind_refer_rejects_bare_extension_with_params() -> None:
         build_blind_refer(_dialog(), "1001;maddr=evil.com")
 
 
+def _to_fullwidth_digits(ascii_digits: str) -> str:
+    """Map ASCII digits to their U+FF10..U+FF19 fullwidth forms.
+
+    Built via code points so this source file stays plain-ASCII (no RUF001
+    ambiguous-character literals) while the RUNTIME string carries the real
+    non-ASCII "digits" the transfer-target bypass depends on.
+    """
+    table = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
+    return ascii_digits.translate(table)
+
+
+def test_build_blind_refer_rejects_fullwidth_digit_port() -> None:
+    # A non-ASCII (fullwidth) digit in the port must NOT be Unicode-folded into a
+    # "valid" port by the authority regex: RFC 3261 requires US-ASCII DIGIT
+    # (%x30-39), and folding lets a multi-byte "digit" ride into the wire-emitted
+    # Refer-To, bypassing the transfer-target injection allowlist. Same strict-ASCII
+    # posture as #479's _SIPFRAG_STATUS `\d{3}` -> `[0-9]{3}` fix.
+    target = "sip:3000@198.51.100.50:" + _to_fullwidth_digits("5061")
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), target)
+
+
+def test_build_blind_refer_rejects_fullwidth_digit_ipv4_octet() -> None:
+    # Fullwidth digits in an IPv4 authority octet must likewise be rejected, not
+    # folded to ASCII by a Unicode-aware `\d` in _IPV4.
+    target = "sip:3000@" + _to_fullwidth_digits("192") + ".168.1.1:5061"
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), target)
+
+
+def _to_arabic_indic_digits(ascii_digits: str) -> str:
+    """Map ASCII digits to their U+0660..U+0669 Arabic-Indic forms.
+
+    See :func:`_to_fullwidth_digits` — built via code points so the source stays
+    plain-ASCII while the runtime string carries the real non-ASCII digits.
+    """
+    table = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
+    return ascii_digits.translate(table)
+
+
+def test_build_blind_refer_rejects_fullwidth_digit_user_part() -> None:
+    # The bypass is NOT limited to the authority: a fullwidth digit anywhere in the
+    # target (here the user-part, gated only by the permissive negated ``_URI_USER``
+    # class) must be rejected end-to-end by the US-ASCII invariant.
+    target = "sip:" + _to_fullwidth_digits("3000") + "@198.51.100.50:5061"
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), target)
+
+
+def test_build_blind_refer_rejects_arabic_indic_digit() -> None:
+    # Arabic-Indic (U+0660..U+0669) are also Unicode decimal digits a Unicode-aware
+    # `\d` would fold; the US-ASCII invariant rejects them too.
+    target = "sip:3000@198.51.100.50:" + _to_arabic_indic_digits("5061")
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), target)
+
+
+def test_build_blind_refer_rejects_percent_encoded_non_ascii() -> None:
+    # A percent-encoded non-ASCII byte sequence (``%EF%BC%90`` == UTF-8 fullwidth
+    # "0") is ASCII on our wire but a gateway unescaping it would inject a non-ASCII
+    # digit — caught via the percent-decoded arm of the US-ASCII check.
+    with pytest.raises(ValueError, match="transfer target"):
+        build_blind_refer(_dialog(), "sip:3000@198.51.100.50:%EF%BC%90061")
+
+
 def test_build_blind_refer_rejects_crlf_header_injection() -> None:
     with pytest.raises(ValueError, match="transfer target"):
         build_blind_refer(_dialog(), "sip:3000@pbx.example.test>\r\nEvil-Header: x")

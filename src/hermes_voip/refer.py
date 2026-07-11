@@ -101,9 +101,14 @@ _DIALABLE_TARGET = re.compile(r"\+?[0-9*#]+")
 # rejected (literal and percent-decoded) before this runs, so it need not.
 _HOST_LABEL = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
 _HOSTNAME = rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*\.?"
-_IPV4 = r"(?:\d{1,3}\.){3}\d{1,3}"
+# `[0-9]` not `\d`: `\d` is Unicode-aware and would fold fullwidth / Arabic-Indic
+# digits into a "valid" IPv4 octet or port, letting a non-ASCII target smuggle past
+# this security-sensitive guard onto the UTF-8-encoded Refer-To wire (RFC 3261
+# requires US-ASCII DIGIT). Matches the strict-ASCII posture of message.py and the
+# _SIPFRAG_STATUS `\d{3}` -> `[0-9]{3}` fix (#479).
+_IPV4 = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
 _IPV6_REF = r"\[[0-9A-Fa-f:.]+\]"
-_AUTHORITY = rf"(?:{_IPV4}|{_IPV6_REF}|{_HOSTNAME})(?::\d{{1,5}})?"
+_AUTHORITY = rf"(?:{_IPV4}|{_IPV6_REF}|{_HOSTNAME})(?::[0-9]{{1,5}})?"
 # user-part: any URI char except the structural separators / brackets / ws / a
 # password-introducing ``:`` — kept restrictive so ``;``/``?``/``@`` cannot hide.
 _URI_USER = r"[^\s@<>;?:/\"',]+"
@@ -149,11 +154,13 @@ def _validate_transfer_target(target: str) -> None:
 
     Anything else — a bare-extension host hijack (``1001@evil.com``), a
     ``?Replaces=`` header or a ``;Route=`` param smuggle, an angle-bracket ``>``
-    breakout, a CR/LF or other control character, whitespace, or an angle bracket
-    in EITHER the literal value OR its percent-decoded form (so a percent-escaped
-    ``%0D%0A`` / ``%20`` / ``%3C`` that a gateway would unescape is caught), an
-    over-long value, or empty — raises :class:`ValueError`, so the injection
-    never reaches the header and no REFER is built.
+    breakout, a CR/LF or other control character, whitespace, a non-ASCII character
+    (e.g. a fullwidth / Arabic-Indic "digit" that a Unicode-aware regex class would
+    fold), or an angle bracket in EITHER the literal value OR its percent-decoded
+    form (so a percent-escaped ``%0D%0A`` / ``%20`` / ``%3C`` / ``%EF%BC%90`` that a
+    gateway would unescape is caught), an over-long value, or empty — raises
+    :class:`ValueError`, so the injection never reaches the header and no REFER is
+    built.
 
     Args:
         target: The agent-supplied transfer target (extension or sip URI).
@@ -186,6 +193,16 @@ def _validate_transfer_target(target: str) -> None:
             raise ValueError(msg)
         if "<" in candidate or ">" in candidate:
             msg = "transfer target contains an angle bracket"
+            raise ValueError(msg)
+        # RFC 3261 SIP URIs and dialable numbers are US-ASCII. Reject ANY non-ASCII
+        # character (in the literal OR the percent-decoded form) so a fullwidth /
+        # Arabic-Indic "digit" cannot fold past this injection allowlist onto the
+        # UTF-8-encoded Refer-To wire: a Unicode-aware regex class (the negated
+        # ``_URI_USER`` user-part, or a stray ``\d``/``\w``) would otherwise accept
+        # it. The authority regexes (``_IPV4``/``_AUTHORITY``) also use explicit
+        # ``[0-9]`` — this is the end-to-end enforcement, those are defence in depth.
+        if not candidate.isascii():
+            msg = "transfer target contains a non-ASCII character"
             raise ValueError(msg)
     if _DIALABLE_TARGET.fullmatch(target) is not None:
         return

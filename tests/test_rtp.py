@@ -12,7 +12,14 @@ import struct
 import pytest
 
 import hermes_voip.rtp as rtp_module
-from hermes_voip.rtp import _SEQ_HALF, JitterBuffer, Lost, RtpPacket, _seq_before
+from hermes_voip.rtp import (
+    _REANCHOR_AFTER,
+    _SEQ_HALF,
+    JitterBuffer,
+    Lost,
+    RtpPacket,
+    _seq_before,
+)
 
 
 def _pkt(
@@ -284,6 +291,155 @@ def test_jitter_permanent_gap_stays_bounded() -> None:
     else:
         pytest.fail("jitter buffer never reached the buffered cluster")
     assert seen_loss
+
+
+def test_jitter_reanchors_after_loss_burst_equal_to_window() -> None:
+    """A loss burst == max_ahead must not strand the buffer forever (backlog L1704).
+
+    After exactly ``max_ahead`` consecutive losses the anchor freezes: the first
+    recovery packet lands on the inclusive window edge and IS buffered, but
+    occupancy (1) never reaches ``target_depth`` (2), so the total-occupancy
+    loss-gate never fires; every later recovery packet is then > max_ahead ahead
+    and — before this fix — was dropped forever, so ``pop()`` returned ``None`` for
+    the rest of the call (the agent went permanently deaf). A confirmed forward run
+    now re-homes the anchor and playout resumes.
+    """
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    jb.push(_pkt(10))
+    assert _packet(jb.pop()).sequence_number == 10  # anchor advances to 11
+
+    # 11..266 are lost (a 256-packet burst). Recovery resumes at 267 (exactly
+    # max_ahead ahead of the stranded anchor) and continues contiguously.
+    for seq in range(267, 275):
+        jb.push(_pkt(seq))
+
+    recovered: list[RtpPacket] = []
+    for _ in range(8):
+        out = jb.pop()
+        if isinstance(out, RtpPacket):
+            recovered.append(out)
+    assert recovered, "buffer stalled after a loss burst == max_ahead (no re-anchor)"
+    # The edge packet (267) plus the two run-up packets (268, 269) are sacrificed
+    # to confirm the jump; playout then resumes contiguously from the re-anchor.
+    assert [p.sequence_number for p in recovered] == list(range(270, 275))
+
+
+@pytest.mark.parametrize("gap", [257, 300, 1000])
+def test_jitter_reanchors_after_loss_burst_wider_than_window(gap: int) -> None:
+    """A loss burst > max_ahead leaves ZERO recovery packets in window (L1704).
+
+    Before this fix ``pop()`` returned ``None`` for the rest of the call. A
+    confirmed forward run re-homes the anchor, sacrificing only the
+    ``_REANCHOR_AFTER - 1`` packets needed to confirm the stream jump.
+    """
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    jb.push(_pkt(10))
+    assert _packet(jb.pop()).sequence_number == 10  # anchor advances to 11
+
+    first = 11 + gap  # every recovery packet starts > max_ahead ahead of the anchor
+    for seq in range(first, first + 8):
+        jb.push(_pkt(seq))
+
+    recovered: list[RtpPacket] = []
+    for _ in range(8):
+        out = jb.pop()
+        if isinstance(out, RtpPacket):
+            recovered.append(out)
+    # Re-anchor confirms on the _REANCHOR_AFTER-th forward packet; the earlier ones
+    # are dropped, then playout is contiguous from the re-anchor point onward.
+    anchor_seq = first + _REANCHOR_AFTER - 1
+    assert [p.sequence_number for p in recovered] == list(range(anchor_seq, first + 8))
+
+
+@pytest.mark.parametrize("gap", [254, 255])
+def test_jitter_loss_burst_below_window_recovers_via_loss_gate(gap: int) -> None:
+    """A burst just UNDER max_ahead recovers via the loss-gate, not the re-anchor.
+
+    The repro control boundary (backlog L1704): recovery packets stay inside the
+    window, so the existing total-occupancy loss-gate drains the gap as one
+    coalesced ``Lost`` — the re-anchor path must NOT engage, and no recovery
+    packet is sacrificed.
+    """
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    jb.push(_pkt(10))
+    assert _packet(jb.pop()).sequence_number == 10  # anchor advances to 11
+
+    first = 11 + gap  # <= max_ahead ahead: in-window, buffered rather than dropped
+    jb.push(_pkt(first))
+    jb.push(_pkt(first + 1))  # occupancy reaches target_depth -> loss-gate arms
+
+    lost = jb.pop()
+    assert isinstance(lost, Lost)
+    assert lost.sequence == 11
+    assert lost.count == gap  # the whole burst coalesced into a single Lost event
+    # BOTH recovery packets drain (nothing sacrificed) — proof the loss-gate, not
+    # the re-anchor, cleared the gap.
+    assert _packet(jb.pop()).sequence_number == first
+    assert _packet(jb.pop()).sequence_number == first + 1
+    assert jb._ahead_run == 0  # the re-anchor run never advanced
+
+
+def test_jitter_far_future_burst_does_not_discard_playable_buffer() -> None:
+    """A far-future burst must not evict still-playable buffered packets.
+
+    The re-anchor fires only when the buffer is genuinely stranded (pop() cannot
+    advance). While packets at the anchor are still buffered, a > max_ahead jump is
+    dropped as before and the buffered audio plays out intact — re-anchoring here
+    would silently eat live audio (a receive loop can enqueue a burst before the
+    playout loop drains it).
+    """
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    jb.push(_pkt(10))
+    jb.push(_pkt(11))  # playable, buffered, not yet drained (anchor still 10)
+
+    # A > max_ahead jump arrives before playout drains 10/11 — MORE than enough far
+    # packets to cross the re-anchor threshold, but the buffer is NOT stranded.
+    for seq in range(267, 267 + _REANCHOR_AFTER + 2):
+        jb.push(_pkt(seq))
+
+    # 10 and 11 still play out in order; the far burst was dropped, not re-anchored.
+    assert _packet(jb.pop()).sequence_number == 10
+    assert _packet(jb.pop()).sequence_number == 11
+
+
+def test_jitter_stranded_far_future_run_below_threshold_does_not_reanchor() -> None:
+    """A stranded far-future run shorter than _REANCHOR_AFTER does not re-anchor.
+
+    Once the buffer IS stranded (nothing playable at the anchor), a forward far-run
+    still must reach ``_REANCHOR_AFTER`` before it re-homes the anchor. One short
+    leaves the anchor untouched — this pins the threshold and stops a brief blip
+    from resyncing the stream.
+    """
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    jb.push(_pkt(10))
+    assert _packet(jb.pop()).sequence_number == 10  # strand: anchor=11, empty
+
+    for i in range(_REANCHOR_AFTER - 1):
+        jb.push(_pkt(300 + i))  # forward far packets, one short of confirmation
+    assert jb._ahead_run == _REANCHOR_AFTER - 1  # armed but NOT fired
+    assert jb._next == 11  # anchor not re-homed
+    assert jb.pop() is None  # still stranded — no spurious forward jump
+
+
+def test_jitter_stranded_non_progressing_far_run_does_not_reanchor() -> None:
+    """A stranded far-future run only counts while it PROGRESSES forward.
+
+    A far packet that does not advance past the run's high-water mark restarts the
+    count, so scattered far blips (not a coherent forward stream jump) never reach
+    the confirmation threshold and never re-anchor.
+    """
+    jb = JitterBuffer(target_depth=2, max_ahead=256)
+    jb.push(_pkt(10))
+    assert _packet(jb.pop()).sequence_number == 10  # strand: anchor=11, empty
+
+    jb.push(_pkt(400))  # far, forward -> run = 1
+    assert jb._ahead_run == 1
+    jb.push(_pkt(300))  # far but BEHIND 400 -> not forward -> run restarts at 1
+    assert jb._ahead_run == 1
+    jb.push(_pkt(500))  # forward from 300 -> run = 2 (still below the threshold)
+    assert jb._ahead_run == 2
+    assert jb._next == 11  # three far packets, but never a confirmed forward run
+    assert jb.pop() is None
 
 
 def test_jitter_len_reports_buffered_packet_count() -> None:

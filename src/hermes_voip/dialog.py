@@ -51,7 +51,11 @@ _MAX_CSEQ = 2**31
 # Anchored at the start of the topmost Via value: transport then sent-by
 # (host:port, no whitespace or parameters).
 _VIA_TOP = re.compile(r"SIP/2\.0/(\S+)\s+([^\s;]+)")
-_CSEQ = re.compile(r"(\d+)\s+(\w+)")
+# RFC 3261 §25: the CSeq number is 1*DIGIT (US-ASCII 0x30-0x39) and the method is a
+# token — both ASCII. ``[0-9]`` (not Unicode-aware ``\d``) plus ``re.ASCII`` (so ``\s``
+# and ``\w`` never match Unicode) reject fullwidth/Arabic-Indic digits an RFC-strict
+# proxy would parse differently — a parser-differential (same class as #479/#485).
+_CSEQ = re.compile(r"([0-9]+)\s+(\w+)", re.ASCII)
 # A loose-routing first hop carries an ``lr`` flag parameter (RFC 3261 §16.12).
 _LR_PARAM = re.compile(r";\s*lr\b", re.IGNORECASE)
 

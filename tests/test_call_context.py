@@ -379,6 +379,37 @@ def test_history_info_malformed_index_sorts_last_stably() -> None:
     assert ctx.history_info[1].uri == "sip:bad@pbx.example.test"
 
 
+def test_unicode_digit_numeric_params_do_not_raise() -> None:
+    # Regression (ADR-0052 "parsing never raises"): History-Info index/cause and
+    # Diversion counter were parsed with str.isdigit()+int(); str.isdigit() accepts
+    # Unicode digits (U+00B2 superscript two) that int() rejects — so a crafted param
+    # raised ValueError and crashed call-context extraction (an inbound-INVITE
+    # admission-slot-leak DoS once it runs on an already-answered call). The value is
+    # built from chr() so the source stays plain-ASCII (no RUF001 ambiguous-Unicode).
+    sup2 = chr(0x00B2)  # superscript two: str.isdigit() True, int() raises
+    # index=² previously raised in the History-Info sort key -> must instead sort last.
+    ctx_index = _ctx(
+        [
+            ("History-Info", f"<sip:bad@pbx.example.test>;index={sup2}"),
+            ("History-Info", "<sip:good@pbx.example.test>;index=1"),
+        ]
+    )
+    assert ctx_index.history_info[0].uri == "sip:good@pbx.example.test"
+    assert ctx_index.history_info[1].uri == "sip:bad@pbx.example.test"
+    # cause=² previously raised in _parse_history_info -> must parse to None.
+    ctx_cause = _ctx([("History-Info", f"<sip:a@pbx.example.test>;cause={sup2}")])
+    assert ctx_cause.history_info[0].cause is None
+    # counter=² previously raised in _parse_diversion -> must parse to None.
+    ctx_counter = _ctx([("Diversion", f"<sip:a@pbx.example.test>;counter={sup2}")])
+    assert ctx_counter.diversion[0].counter is None
+    # Strict-ASCII hardening (per #479/#485/#488): an int()-VALID but non-ASCII Unicode
+    # decimal digit (Arabic-Indic U+0665) is rejected too — it parsed leniently to 5
+    # before, a parser-differential vs an RFC-strict proxy on these advisory fields.
+    arabic5 = chr(0x0665)  # isdigit() True, int()==5, isascii() False
+    ctx_arabic = _ctx([("Diversion", f"<sip:a@pbx.example.test>;counter={arabic5}")])
+    assert ctx_arabic.diversion[0].counter is None
+
+
 # --------------------------------------------------------------------------- #
 # Device / context                                                           #
 # --------------------------------------------------------------------------- #

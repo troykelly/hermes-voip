@@ -224,6 +224,13 @@ _DEFAULT_REFUSE_DECLINE_PHRASES: Final[tuple[str, ...]] = (
 #: than a human's between-key gap so a single multi-digit entry is not split.
 _DEFAULT_DTMF_INTERDIGIT_MS: Final[int] = 2000
 
+#: Hard cap on the buffered inter-digit DTMF group (CWE-400). A non-``#`` digit re-arms
+#: the inter-digit flush timer, so a caller pressing digits faster than the gap keeps
+#: the group from ever flushing; past this many digits it is dropped-not-appended so
+#: per-call memory stays bounded. 64 matches the outbound ``send_dtmf`` alphabet cap and
+#: dwarfs any legitimate menu/account entry.
+_MAX_DTMF_BUFFER: Final[int] = 64
+
 #: The DTMF group terminator: a ``#`` ends the current digit group immediately (the
 #: conventional "enter" key for keypad data entry), ADR-0010.
 _DTMF_TERMINATOR: Final[str] = "#"

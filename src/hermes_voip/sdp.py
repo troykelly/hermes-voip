@@ -403,7 +403,8 @@ class IceCandidate:
 
         Raises:
             SdpError: If the body is truncated, a numeric field is non-integer,
-                or the port is out of range.
+                the port is out of range, or the mandatory ``typ`` keyword is
+                missing from its expected position.
         """
         tokens = body.split()
         if len(tokens) < _ICE_CAND_MIN_FIELDS:
@@ -425,8 +426,22 @@ class IceCandidate:
         foundation = tokens[0]
         transport = tokens[2]
         address = tokens[4]
-        # tokens[6] should be "typ"; tokens[7] is the type value.
+        # RFC 8839 §5.1: cand-type = "typ" SP candidate-types, where
+        # candidate-types = "host" / "srflx" / "prflx" / "relay" / token. The
+        # keyword and the four base types are case-insensitive quoted ABNF
+        # (RFC 5234 §2.3), and the trailing `token` is an extension point. Enforce
+        # the mandatory "typ" keyword case-insensitively: a candidate whose keyword
+        # token is not "typ" is malformed and raises SdpError, which the a=candidate
+        # site's suppress(SdpError) drops. Normalise a recognised base type to
+        # canonical lowercase; pass an extension type through unchanged (never
+        # reject it — over-restricting would silently drop a valid peer candidate
+        # and break ICE).
+        if tokens[_ICE_CAND_TYP_IDX].lower() != "typ":
+            msg = 'malformed a=candidate: "typ" keyword not at expected position'
+            raise SdpError(msg)
         typ = tokens[_ICE_CAND_TYPE_IDX]
+        if typ.lower() in _ICE_CANDIDATE_TYPES:
+            typ = typ.lower()
         # Parse optional raddr/rport extension for non-host candidates.
         # Extension layout (0-based): ..., "raddr", <addr>, "rport", <port>
         # i.e. indices 8, 9, 10, 11 (when all four tokens are present).
@@ -1086,8 +1101,12 @@ class SessionDescription:
         vacc: _VideoAccumulator | None = None
         # Collects the SESSION-level a= attributes (those before the first m=
         # line). Only its DTLS/ICE fields are consumed by build(); reusing the
-        # accumulator keeps a single attribute-parsing code path (DRY) and an
-        # unrelated session-level a= line is parsed harmlessly and ignored.
+        # accumulator keeps a single attribute-parsing code path (DRY). This
+        # dispatch is NOT wrapped in suppress(SdpError): an unrecognised session
+        # a= line is ignored and DTLS/ICE sub-parse errors are suppressed inside
+        # add_attribute, but a malformed numeric attribute (rtpmap/fmtp/ptime/
+        # maxptime, or a duplicate rtpmap) raises SdpError here and fails the whole
+        # parse closed rather than being silently ignored.
         session_acc = _AudioAccumulator()
         # The section the current a=/c= lines belong to: "audio", "video", or "".
         section = ""

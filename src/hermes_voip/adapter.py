@@ -2944,6 +2944,10 @@ class VoipAdapter(BasePlatformAdapter):
         sink: CallResponseSink = _QueueSink()
         call_session: CallSession | None = None
         session_established = False
+        # The ACK confirms the dialog on the callee (RFC 3261 §12); a post-ACK failure
+        # must BYE it (§15) — gated on ack_sent + the built dialog, like the SIP leg.
+        ack_sent = False
+        dialog: Dialog | None = None
         # OUR offered codec menu (Opus + G.711 fallback + telephone-event); also
         # used to BOUND the 2xx answer negotiation below (RFC 3264: the answer must
         # be a subset of what we offered).
@@ -3140,6 +3144,7 @@ class VoipAdapter(BasePlatformAdapter):
                 build_request("ACK", dialog.remote_target, ack_headers)
             )
             _log.info("WebRTC ACK sent: Call-ID %s", call_id)
+            ack_sent = True
 
             # --- Build the media engine over the ICE pipe ------------------
             te_pt = _telephone_event_payload_type(agreed_codecs)
@@ -3327,11 +3332,16 @@ class VoipAdapter(BasePlatformAdapter):
             return call_id
         finally:
             if not session_established:
-                # Release the ICE session (aioice sockets) on any pre-session
-                # failure (errors propagate; this only frees resources, rule 37).
-                # No _teardown_call here: a pre-session failure built no CallLoop and
-                # added no manager dialog, so there is nothing to tear down — only the
-                # temporary response sink to remove.
+                # A PRE-ACK failure built no dialog on the callee — just release the ICE
+                # session (aioice sockets) + the temporary response sink. But a POST-ACK
+                # failure (media/session wiring after we ACKed the 2xx) left a CONFIRMED
+                # dialog on the callee (RFC 3261 §15): BYE it first, via the same
+                # ack_sent-gated helper as the SIP/TLS leg, never left half-open.
+                # Best-effort: a BYE-send failure never masks the propagating error
+                # (rule 37); the callee's session timer reaps an un-BYE'd dialog. No
+                # _teardown_call here: no CallLoop / manager dialog was built.
+                if ack_sent and dialog is not None:
+                    await self._bye_answered_outbound_dialog(transport, dialog)
                 await session.close()
                 transport_cur = self._transport
                 if transport_cur is not None:

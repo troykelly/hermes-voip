@@ -957,6 +957,42 @@ async def test_place_call_over_wss_emits_outbound_call_connected_on_answer(
     assert not _records_with_event(caplog, "outbound_call_failed")
 
 
+@pytest.mark.asyncio
+async def test_place_call_over_wss_byes_confirmed_dialog_on_post_ack_failure() -> None:
+    """A POST-ACK failure in the outbound WebRTC UAC must BYE the confirmed dialog.
+
+    Once the 2xx is ACKed the dialog is established on the callee (RFC 3261 §12); if the
+    media wiring then fails (here ``engine.connect()`` raises, after the ACK and before
+    ``session_established``), the handler must close it with an in-dialog BYE (§15) —
+    exactly as the SIP/TLS leg does — not leave it half-open. Before the fix the WebRTC
+    ``finally`` only released the ICE session, leaking a dangling dialog on the callee.
+    """
+    fake_engine = MagicMock(
+        connect=AsyncMock(side_effect=RuntimeError("post-ACK media wiring failed")),
+        stop=AsyncMock(return_value=None),
+        start_rtcp=AsyncMock(return_value=None),
+        _rtcp_active=False,
+        local_port=0,
+        inbound_sample_rate=16_000,
+    )
+    async with _wss_adapter_ready() as (adapter, transport):
+        with patch("hermes_voip.adapter.RtpMediaTransport", return_value=fake_engine):
+            call_task = asyncio.ensure_future(adapter.place_call("1001"))
+            await _until(lambda: any(m.startswith("INVITE") for m in transport.sent))
+            call_id = _sent_invite(transport).header("Call-ID")
+            await _feed_response(
+                transport, call_id, _webrtc_2xx_answer(_sent_invite(transport))
+            )
+            with pytest.raises(RuntimeError, match="post-ACK media wiring failed"):
+                await asyncio.wait_for(call_task, timeout=5.0)
+
+    assert any(m.startswith("ACK ") for m in transport.sent), (
+        "the handler must have ACKed the 2xx (establishing the dialog on the callee)"
+    )
+    byes = [m for m in transport.sent if m.startswith("BYE ")]
+    assert byes, "a post-ACK failure must BYE the confirmed dialog (RFC 3261 §15)"
+
+
 def _busy_response(invite: SipRequest, *, to_tag: str = "busy-wss") -> str:
     """A 486 Busy Here final for ``invite`` (no auth challenge, no body)."""
     via = invite.header("Via") or ""

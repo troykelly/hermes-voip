@@ -980,6 +980,7 @@ async def test_place_call_over_wss_byes_confirmed_dialog_on_post_ack_failure() -
             call_task = asyncio.ensure_future(adapter.place_call("1001"))
             await _until(lambda: any(m.startswith("INVITE") for m in transport.sent))
             call_id = _sent_invite(transport).header("Call-ID")
+            assert call_id is not None  # every INVITE carries a Call-ID
             await _feed_response(
                 transport, call_id, _webrtc_2xx_answer(_sent_invite(transport))
             )

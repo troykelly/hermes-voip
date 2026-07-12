@@ -1690,6 +1690,58 @@ def test_ice_candidate_rejects_bad_port() -> None:
         IceCandidate.parse("1 1 UDP 2130706431 192.0.2.10 99999 typ host")
 
 
+def test_ice_candidate_typ_keyword_and_type_are_case_insensitive() -> None:
+    """The "typ" keyword and base type token are matched case-insensitively.
+
+    RFC 8839 §5.1 spells ``cand-type = "typ" SP candidate-types`` in quoted ABNF,
+    which RFC 5234 §2.3 defines as case-insensitive. ``TYP HOST`` is therefore a
+    valid candidate; a recognised base type is normalised to canonical lowercase.
+    """
+    cand = IceCandidate.parse("1 1 UDP 2130706431 192.0.2.10 49000 TYP HOST")
+    assert cand.typ == "host"
+
+
+def test_ice_candidate_accepts_extension_type() -> None:
+    """An extension candidate type (RFC 8839 ``token``) is accepted, not rejected.
+
+    ``candidate-types`` ends with ``/ token``; over-restricting to the four base
+    types would silently drop a peer's valid candidate and break ICE. An unknown
+    type is passed through verbatim (no normalisation, no rejection).
+    """
+    cand = IceCandidate.parse("1 1 UDP 2130706431 192.0.2.10 49000 typ my-ext")
+    assert cand.typ == "my-ext"
+
+
+def test_ice_candidate_rejects_misplaced_typ_keyword() -> None:
+    """The mandatory "typ" keyword must occupy its token; anything else is malformed."""
+    with pytest.raises(SdpError, match="candidate"):
+        IceCandidate.parse("1 1 UDP 2130706431 192.0.2.10 49000 nottyp host")
+
+
+def test_offer_with_keywordless_candidate_parses_leniently() -> None:
+    """A candidate missing the "typ" keyword is SKIPPED, not fatal to the offer parse.
+
+    One malformed candidate raises SdpError, which the ``a=candidate`` site
+    suppresses, so the well-formed candidates in the same offer still parse
+    (per-candidate leniency; no whole-offer DoS).
+    """
+    offer = (
+        "v=0\r\no=- 2000 2000 IN IP4 192.0.2.10\r\ns=-\r\nt=0 0\r\n"
+        "m=audio 49000 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        f"a=fingerprint:sha-256 {_FAKE_FINGERPRINT}\r\na=setup:actpass\r\n"
+        f"a=ice-ufrag:{_FAKE_UFRAG}\r\na=ice-pwd:{_FAKE_PWD}\r\n"
+        # A well-formed host candidate that MUST survive the parse.
+        "a=candidate:1 1 UDP 2130706431 192.0.2.10 49000 typ host\r\n"
+        # A candidate missing the mandatory "typ" keyword — the bad one, dropped.
+        "a=candidate:2 1 UDP 1694498815 203.0.113.1 49000 nottyp relay\r\n"
+        "a=rtcp-mux\r\na=sendrecv\r\n"
+    )
+    sdp = SessionDescription.parse(offer)  # must NOT raise
+    assert sdp.audio is not None
+    # The malformed candidate is dropped; the good host candidate is preserved.
+    assert [c.typ for c in sdp.audio.ice_candidates] == ["host"]
+
+
 # --- AudioMedia.is_webrtc property ---
 
 

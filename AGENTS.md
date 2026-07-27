@@ -92,8 +92,11 @@ abort trap — are in `docs/standards/engineering.md` under *Working hazards*.
 Context is re-sent every turn, so anything you put in it you pay for repeatedly.
 
 - **Batch shell calls.** One `cmd-a && cmd-b && cmd-c` beats three turns.
-- **Never read files through Bash.** Read, Grep and Glob are bounded; `cat`, `grep`
-  and `find` are not. A hook enforces this.
+- **Never read files through Bash.** `Read` takes offset/limit, so use it instead of
+  `cat`, `head` or `tail`. The `Grep`/`Glob` tools do **not** exist in this harness, so
+  cap shell searches yourself — `-l`, `-c`, `-m N`, or `| head -n 50`. `graphify query`
+  answers most codebase questions without a search at all. A hook enforces both rules
+  and names the fix; `# raw:` overrides it when you genuinely need the unbounded form.
 - **Keep output small.** `git log --oneline -20`, `pytest -q`, `uv sync --quiet`.
   Redirect long build output to a file and read the tail.
 - **Delegate breadth to subagents.** A subagent's transcript never enters this

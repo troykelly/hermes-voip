@@ -199,7 +199,11 @@ The loop's cost model, and why this design exists:
   orchestrator's context — only their final structured message. Keep every agent schema
   capped, require `file:line` evidence, and forbid file bodies in return values.
 - **Bash is 74.6% of tool-result bytes.** `.claude/hooks/prefer-native-tools.mjs` blocks
-  file reads routed through Bash. Batch shell calls; keep output small.
+  *unbounded* reads and searches routed through Bash: `Read` replaces `cat`/`head`/`tail`,
+  and a shell search must cap its own output (`-l`, `-c`, `-m N`, or `| head -n 50`). The
+  `Grep`/`Glob` tools do not exist in this harness — verified directly, in a subagent, and
+  in a headless `claude -p` run, which is what `tick.sh` spawns — so the hook **bounds**
+  rather than redirecting to a tool that is not there. Batch shell calls; keep output small.
 - **Model tiering:** mechanical lanes on `haiku`, implementation and focused review on
   `sonnet`, architecture and adjudication on `opus`. Reviewer must differ from the author.
 - **Caps:** `maxWave` bounds a wave, `maxOpenPRs` bounds work in flight, `maxFilePerSweep`

@@ -24,26 +24,24 @@ export const meta = {
 }
 
 // ---------------------------------------------------------------------------
-// Shared: a compact digest of the binding AGENTS.md rules every subagent obeys.
-// (Subagents get fresh context — they do not see the orchestrator's chat.)
+// Shared: the few things a subagent must know BEFORE it reads anything. Subagents
+// get fresh context, so this cannot be empty — but it is deliberately not a copy
+// of the contract. Everything else is a file they can open, and re-sending it on
+// every prompt is what made this workflow's fixed floor larger than the diffs it
+// reviewed. Full contract: docs/standards/engineering.md.
 // ---------------------------------------------------------------------------
 const RULES = [
   'PUBLIC REPO: never put the SIP host/extension/password/device-model or any PII in a tracked',
   'file, comment, test, fixture, doc, commit message, or log. Tests use fakes (pbx.example.test,',
   'ext 1000). Secrets live only in the gitignored .env / 1Password.',
-  'WORKTREE LANE ONLY (rule 8): edit only inside your own worktree; never the root checkout.',
-  'TDD (rules 18/19/25): write the failing test FIRST, run it, capture the red output, commit the',
-  'red test as its OWN commit, then implement to green WITHOUT touching the test. Never weaken,',
-  'skip, .only, or delete a test; no tautological/assertion-free tests.',
-  'TYPING (rules 17/39): mypy --strict clean; no Any, no unjustified # type: ignore, no laundering',
-  'cast. ERRORS PROPAGATE (rule 37): no swallowed exceptions.',
-  'NO PARTIAL-SHIP (rule 6): land the change wired end-to-end in one push, or do not ship it.',
-  'ADRs for non-trivial decisions (rule 30, docs/adr/, next free NNNN). Runbooks AS YOU WORK for',
-  'any infra/ops change (rule 42, docs/runbooks/).',
-  'NO new hosting/platform/SaaS/cost without operator ADR approval (rule 40/41). Local-only is OK;',
-  'anything needing infra/cost is PROPOSE-ONLY (a Proposed ADR + a backlog item), never built.',
-  'Conventional Commits + trailer: Co-Authored-By: Claude <noreply@anthropic.com>.',
+  'LANE ONLY: edit inside your own worktree; never the root checkout.',
   'Do NOT use the memory MCP (qdrant) — it is single-process and owned by the orchestrator.',
+  'GATES SCALE WITH BLAST RADIUS: run `uv run python -m tools.classify` and meet that class in',
+  'docs/standards/engineering.md Part A. Read AGENTS.md for the invariants; read the standard',
+  'for the gates. Do not assume every change owes every gate.',
+  'Always: mypy --strict clean (no Any / unjustified ignore / laundering cast); errors propagate;',
+  'never weaken, skip or delete a test; no new hosting/platform/SaaS without an operator-approved',
+  'ADR. Conventional Commits + trailer: Co-Authored-By: Claude <noreply@anthropic.com>.',
 ].join(' ')
 
 const GATE =
@@ -59,15 +57,15 @@ const EXTRA_GATES = [
 
 const DEFAULT_DIMENSIONS = [
   { key: 'correctness', model: 'opus', focus: 'logic bugs, contract violations, RFC compliance, off-by-ones, races' },
-  { key: 'robustness', model: 'sonnet', focus: 'error handling (rule 37), hostile input, edge cases, fail-closed behaviour' },
+  { key: 'robustness', model: 'sonnet', focus: 'error handling and propagation, hostile input, edge cases, fail-closed behaviour' },
   { key: 'security-auth', model: 'opus', focus: 'injection guard, caller groups/modes, SIP digest, SRTP/DTLS, secret hygiene (public repo), supply-chain advisories + licences' },
   { key: 'tests-mutation', model: 'sonnet', focus: 'coverage gaps, weak/assertion-free tests, missing async tests, surviving mutants' },
-  { key: 'docs-drift', model: 'sonnet', focus: 'rule 27 aspirational/contradictory docs vs code; stale IMPLEMENTATION-PLAN.md / backlog.md preamble / README; runbook numbering collisions' },
+  { key: 'docs-drift', model: 'sonnet', focus: 'aspirational or contradictory docs vs code; stale IMPLEMENTATION-PLAN.md / backlog.md preamble / README; runbook numbering collisions' },
   { key: 'api-ergonomics', model: 'sonnet', focus: '__all__, public exports, typed surfaces, import discoverability' },
-  { key: 'performance', model: 'sonnet', focus: 'hot-path budgets, allocations, rule 22 (record concrete numbers)' },
+  { key: 'performance', model: 'sonnet', focus: 'hot-path budgets, allocations (record concrete numbers)' },
   { key: 'observability', model: 'sonnet', focus: 'instrument runbook-0014 SLOs, RTCP metrics, structured logs — LOCAL-ONLY emission only (external sink/dashboard is propose-only)' },
   { key: 'ux-conversational', model: 'opus', focus: 'greeting, barge-in feel, silence/goodbye, error speech, multi-language, voice accessibility' },
-  { key: 'operability', model: 'sonnet', focus: 'runbooks current (rule 42), plugin enablement, graceful shutdown, config validation' },
+  { key: 'operability', model: 'sonnet', focus: 'runbooks current, plugin enablement, graceful shutdown, config validation' },
   { key: 'packaging-release', model: 'haiku', focus: 'plugin manifest, entry points, version hygiene, dependency pinning' },
   { key: 'product-features', model: 'opus', focus: 'implied/designed features (agent-screened answering [designed in backlog], issue #64 video→vision, call transfer); infra-needing surfaces → Proposed ADR only' },
 ]
@@ -142,7 +140,7 @@ const REVIEW_SCHEMA = {
       },
     },
     noted: { type: 'array', items: { type: 'string' }, description: 'non-blocking observations' },
-    riskStatement: { type: 'string', description: 'at least one substantive risk (rule 16); rubber-stamping is a defect' },
+    riskStatement: { type: 'string', description: 'at least one substantive risk; rubber-stamping is a defect' },
   },
   required: ['verdict', 'mustFix', 'riskStatement'],
 }
@@ -190,7 +188,7 @@ function implPrompt(item, index) {
     `   as its OWN commit (Conventional Commit, with the Co-Authored-By trailer).`,
     `4. Implement to GREEN without touching the test. If you make a non-trivial design decision,`,
     `   write an ADR (docs/adr/NNNN — next free number). If you touch infra/ops, write/update the`,
-    `   runbook (docs/runbooks/). No aspirational docs (rule 27).`,
+    `   runbook (docs/runbooks/) when it changes a real resource. No aspirational docs.`,
     `5. Run the FULL local gate and capture exit codes: \`${GATE}\`.`,
     `   Extra surface-specific gates when relevant: ${EXTRA_GATES}.`,
     `6. Commit the green implementation. Push: \`git push -u origin ${branchHint}\`.`,
@@ -215,30 +213,31 @@ function codexReviewPrompt(impl, item) {
     `2. Run codex non-interactively (check \`codex --help\`; typically \`codex exec "<prompt>"\`).`,
     `   Ask it to review the diff for CORRECTNESS, SECURITY, SPEC-CONFORMANCE, and GUARDRAIL`,
     `   defects ONLY (ignore cosmetics). Spec to check against: "${item.title}".`,
+    `   Send codex the DIFF and the spec — not the repo tree, not whole files.`,
     `3. If codex is unavailable/unauthenticated, do NOT fail the wave: set reviewer`,
     `   "codex-unavailable", give your own careful read, and say so in riskStatement.`,
     ``,
     `Materiality: mustFix = correctness/security/spec/guardrail/blast-radius only. Give ≥1`,
-    `substantive risk statement — rubber-stamping is a defect (rule 16). Return ONLY the object.`,
+    `substantive risk statement — rubber-stamping is a defect. Return ONLY the object.`,
   ].join('\n')
 }
 
 function claudeReviewPrompt(impl, item, reviewerModel) {
   return [
     `You are an ADVERSARIAL REVIEWER (model: ${reviewerModel}) in a FRESH context. You see only`,
-    `the diff + spec + this checklist — never the author's reasoning (rule 21). Try to REFUTE the`,
+    `the diff + spec + this checklist — never the author's reasoning. Try to REFUTE the`,
     `change's correctness.`,
     ``,
     `1. \`git fetch origin ${impl.branch}\`; review \`git diff origin/main...origin/${impl.branch}\`.`,
     `2. Spec: "${item.title}" — ${item.rationale || item.spec || ''}.`,
     `3. Check: does the failing-test-first discipline hold (a real red→green)? Are there`,
     `   correctness/security/spec/guardrail defects? Typing escape hatches (Any / ignore / cast)?`,
-    `   Swallowed errors (rule 37)? Public-repo secret leakage? Partial-ship (rule 6)?`,
+    `   Swallowed errors? Public-repo secret leakage? A half-wired change?`,
     ``,
-    `Materiality gate (rule 16): mustFix = correctness/security/spec/guardrail/blast-radius only;`,
-    `note cosmetics without blocking. Give ≥1 substantive risk statement. Return ONLY the object.`,
-    ``,
-    `Binding rules: ${RULES}`,
+    `Materiality gate: mustFix = correctness/security/spec/guardrail/blast-radius only;`,
+    `note cosmetics without blocking. An unreproducible finding is advisory, not blocking.`,
+    `Give ≥1 substantive risk statement — unanimous approval is a yellow flag.`,
+    `Contract if you need it: docs/standards/engineering.md (Part D covers evidence).`,
   ].join('\n')
 }
 
@@ -389,7 +388,7 @@ if (phaseArg === 'implement') {
         const mustFix = vs.flatMap((v) => v.mustFix || [])
         const clean = vs.length > 0 && mustFix.length === 0 && vs.every((v) => v.verdict === 'approve')
         // A rubber-stamp = a clean pass where NO reviewer offered a substantive risk
-        // statement or observation (rule 16: unanimous low-effort approval is a yellow flag
+        // statement or observation (unanimous low-effort approval is a yellow flag
         // the orchestrator must escalate). Trigger on absent signal, not on a missing field.
         const substantive = (v) =>
           (Array.isArray(v.noted) && v.noted.length > 0) ||

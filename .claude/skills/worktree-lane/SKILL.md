@@ -5,11 +5,13 @@ description: Create, work in, integrate, and clean up an isolated git worktree l
 
 # Worktree lane lifecycle
 
-Implements AGENTS.md rules 8–13. A "lane" is one unit of work: one worktree, one file
-territory, one deliverable (a PR for solo work; a returned commit SHA for delegated work).
-The root checkout is a pristine mirror of `main` — never edit or commit there. A PreToolUse
-hook (`.claude/hooks/enforce-worktree.mjs`) blocks Edit/Write against the root checkout as
-defence in depth.
+Worktree isolation is unconditional (`AGENTS.md`): each task gets one lane, one file
+territory and one deliverable (a solo PR or a delegated commit SHA). The root checkout
+stays a pristine `main` mirror. `.claude/hooks/enforce-worktree.mjs` blocks Edit/Write
+there as defence in depth; it cannot see Bash writes, so do not route around it.
+
+Ceremony inside the lane scales by R0–R3; use `docs/standards/engineering.md` Part A and
+classify with `uv run python -m tools.classify`.
 
 ## 1. Create — always from current HEAD
 
@@ -20,33 +22,35 @@ git worktree add --detach ".worktrees/$LANE" HEAD
 git -C ".worktrees/$LANE" switch -c <type>/<topic>
 ```
 
-- `--detach` from `HEAD`, never from a branch name or older SHA — stale bases produce
-  conflicts at integration. Record the base SHA: `git rev-parse HEAD`.
+- Use `--detach` from `HEAD`, never a branch name or older SHA — stale bases produce
+  integration conflicts. Record the base SHA: `git rev-parse HEAD`.
 - `.worktrees/` is gitignored; never place worktrees in `/tmp`.
-- Do not launch a standalone session from inside `.worktrees/` expecting the memory MCP —
-  the embedded store's single-process lock belongs to the root session, and `.mcp.json`
-  points at the root checkout's `.memory/`.
+- A standalone session launched inside `.worktrees/` cannot use the memory MCP: the root
+  session owns the embedded store's single-process lock, and `.mcp.json` points to the
+  root checkout's `.memory/`.
 
-## 2. Work — only inside the lane, absolute paths
+## 2. Work — only inside the lane, with absolute paths
 
-- Every file the lane touches lives under `.worktrees/$LANE/...`. Never edit the root
-  checkout from a lane.
-- Install dependencies in the lane before testing — lanes do not share the `.venv`. (uv's
-  global cache is shared, so `uv sync` in a lane is fast.)
-- Build output stays worktree-local (`dist/` etc. inside the lane). Do not share build
-  caches across lanes — a shared cache can link a sibling's stale artifacts and fake a
-  green run.
-- Commit in the lane with Conventional Commits + the AI co-author trailer. Failing tests
-  are committed on their own before the implementation commit.
-- Git hooks caveat: `.git/hooks` is shared across all worktrees; some hook managers pin the
-  dependency path of whichever checkout installed last. Keep the root checkout's
-  dependencies installed so hooks keep working; CI is the authoritative gate either way.
+- Every touched file lives under `.worktrees/$LANE/...`; never edit the root checkout.
+- Install dependencies in the lane before testing. Lanes do not share `.venv`, but uv's
+  global cache makes `uv sync` fast.
+- Keep build output (`dist/`, etc.) worktree-local. Shared build caches can link stale
+  sibling artefacts and fake a green run.
+- Use Conventional Commits and the AI co-author trailer. Commit the failing test separately
+  before implementation for behavioural R1 changes and all R2/R3 changes; R0 does not use
+  test-first.
+- `.git/hooks` is shared across every worktree, so a commit in any lane runs through
+  whichever checkout's dependency path the hook manager pinned when it last installed —
+  normally the root checkout's `.venv`. Keep the root checkout's dependencies installed so
+  hooks keep working; CI remains the authoritative gate either way.
 
 ## 3. Deliver
 
-- **Solo lane:** push the branch, open the PR, and own it to merge (rule 14).
-- **Delegated lane:** report the final commit SHA (and base SHA) to the integrator. A lane
-  that didn't commit produced nothing integrable.
+- **Solo lane:** push and open the PR. Run the full local gate before the PR only for
+  R2/R3; R0/R1 use CI. Carry the PR to landing under its class gates: agent merge on green
+  for R0/R1, human approval for R2, dual control for R3.
+- **Delegated lane:** report the final commit SHA and base SHA to the integrator. A lane
+  without a commit produced nothing integrable.
 
 ## 4. Integrate delegated lanes — pick by pick, in the integrator's lane
 
@@ -56,9 +60,9 @@ git -C ".worktrees/<integrator-lane>" cherry-pick <sha>     # one at a time
 ```
 
 - List `base..HEAD` first — lanes sometimes make more commits than they report.
-- Individual single-commit picks, not multi-commit ranges.
-- After integrating, re-verify from a clean build in the integrating lane. An agent's
-  in-worktree green is not integration evidence.
+- Cherry-pick individual commits, never multi-commit ranges.
+- Re-verify from a clean build in the integrating lane. An agent's in-worktree green is
+  not integration evidence.
 
 ## 5. Clean up — the lane dies with its work, and root catches up
 
@@ -70,5 +74,5 @@ git worktree prune
 git fetch origin && git pull --ff-only origin main
 ```
 
-Run cleanup as soon as the lane's work is merged/integrated. Sweep any orphaned worktrees
-or scratch dirs idle for more than a few hours: `git worktree list`.
+Clean up as soon as the work is merged/integrated. Find orphaned worktrees or scratch dirs
+idle for more than a few hours with `git worktree list`.

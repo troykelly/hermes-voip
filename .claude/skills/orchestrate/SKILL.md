@@ -24,7 +24,7 @@ never reasons to halt. Every wave ends by guaranteeing the next wave. Stopping i
 
 Banned end-states (treat each as a trigger, not a terminus):
 - "The backlog is empty / there's nothing left" → run a **REPLENISH** gap-review (Phase 1).
-- "Awaiting review / CI / operator approval" → you OWN PRs to merge (AGENTS rule 14). Reap
+- "Awaiting review / CI / operator approval" → you OWN PRs to merge. Reap
   them next wave. Never wait on a human.
 - "This is a natural place to pause / hand off / wrap up" → forbidden. End with the next
   wave's plan + a scheduled wake.
@@ -67,7 +67,7 @@ is itself a long idle-poll, not a halt.
 ```
 
 You **delegate execution**; you **personally own** sensing, selection, PR/merge decisions,
-memory, and the continuation guarantee. Keep your own context lean (AGENTS rule 29): never
+memory, and the continuation guarantee. Keep your own context lean: never
 read whole modules yourself — fan reading/implementation into subagents and keep only their
 summaries. State lives on disk, not in this conversation, so a context summary or restart
 loses nothing.
@@ -128,7 +128,7 @@ almost always finds something; that is the design.
 1. Batch up to `fleetWidth = min(16, cores − 2)` **ready** items.
 2. Order: `[high] > [medium] > [low]`; correctness/security before polish; **unblockers
    first** (e.g. a missing test runner that gates other work); respect stated dependencies.
-3. **Independence (AGENTS rule 32):** one non-overlapping file territory per lane. Serialize
+3. **Independence:** one non-overlapping file territory per lane. Serialize
    hot shared files (`src/hermes_voip/adapter.py`, `media/call_loop.py`, `docs/backlog.md`)
    to **≤1 lane per wave**. Group tiny same-module items into one lane to cut PR overhead.
 4. Assign each item a **model tier** (rubric below) and an effort level.
@@ -146,22 +146,23 @@ moment its implementation goes green — no barrier. Per item:
   `{item, branch, redCommit, greenCommits, gate, adr?, runbook?, files, spec, selfRisk}`
   or `{item, failed, reason}`.
 - **reviewStage** (cross-vendor + cross-tier, fresh context, **diff+spec+checklist only** —
-  rule 21): `codex` (OpenAI) **and** a different-tier Claude reviewer. Returns
+  fresh context): `codex` (OpenAI) **and** a different-tier Claude reviewer. Returns
   `{verdict, mustFix[], noted[]}`. Must-fix → loop a fix agent → re-review (bounded retries).
-  Materiality (rule 16): must-fix = correctness/security/spec/guardrail/blast-radius only.
+  Materiality: must-fix = correctness/security/spec/guardrail/blast-radius only; an
+  unreproducible finding is advisory, not blocking.
   **Unanimous rubber-stamp is a yellow flag** → escalate to an opus deep-review before trust.
 
 The Workflow returns `[{item, branch, verdict, evidence}]`. `.filter(Boolean)` the failures.
 
 ### Phase 5 — GATE → PR → MERGE  (you, the orchestrator)
 For each item with a **clean** verdict:
-1. **Integrator re-verify on current HEAD** (rule 11): the lane was cut from an older HEAD;
+1. **Integrator re-verify on current HEAD:** the lane was cut from an older HEAD;
    confirm it still rebases cleanly and the gate is green from a clean build. If drifted,
    have an agent rebase + re-gate before trusting the green.
 2. `gh pr create` — title = Conventional Commit; body = spec, ADR/runbook links, gate
    evidence (command+exit codes), review summary + the substantive risk statement,
    blast-radius, `Co-Authored-By` trailer.
-3. Watch CI (`gh pr checks <n> --watch` or poll). CI is the authoritative gate (rule 15).
+3. Watch CI (`gh pr checks <n> --watch` or poll). CI is the authoritative gate.
    Fix any CI-only failures in the lane.
 4. **Squash-merge on green CI + clean review** (operator-approved auto-merge). Conventional
    squash title. Slow CI must **not** block the wave — leave the PR open and let Phase 0 of
@@ -178,7 +179,7 @@ For each item with a **clean** verdict:
 ### Phase 6 — INTEGRATE & CLEAN
 1. Check off the shipped backlog item(s) with the PR # (batch into the next docs lane).
 2. `git worktree remove --force <lane>` + `git worktree prune`.
-3. Refresh root: `git fetch origin && git pull --ff-only origin main` (rule 9) so the next
+3. Refresh root: `git fetch origin && git pull --ff-only origin main` so the next
    lane bases on current HEAD.
 4. `qdrant-store` any non-trivial decision/gotcha/operator-feedback learned (orchestrator
    only; never secrets — see Invariants).
@@ -210,22 +211,22 @@ Fan out **one agent per dimension**. Each hunts NEW work only in its lane and re
 structured items. Cover, at minimum:
 
 1. **correctness** — bugs, contract violations, RFC compliance, off-by-ones.
-2. **robustness / fail-closed** — error handling (rule 37), edge cases, hostile input.
+2. **robustness / fail-closed** — error handling and propagation, edge cases, hostile input.
 3. **security & auth** — injection guard, caller groups/modes, SIP digest, SRTP/DTLS,
    secret hygiene (public repo!), supply-chain advisories (`uv` audit + licences).
 4. **tests & mutation** — coverage gaps, weak/assertion-free tests, missing async tests,
-   surviving mutants (rule 19).
-5. **docs & doc-drift** — rule 27: comments/docs describing behaviour the code lacks;
+   surviving mutants.
+5. **docs & doc-drift** — comments/docs describing behaviour the code lacks;
    reconcile stale `IMPLEMENTATION-PLAN.md` / `backlog.md` preamble / `README.md`; runbook
    numbering collisions.
 6. **API & ergonomics** — `__all__`, public exports, typed surfaces, import discoverability.
-7. **performance / efficiency** — hot-path budgets, allocations, rule 22 (record numbers).
+7. **performance / efficiency** — hot-path budgets, allocations (record numbers).
 8. **observability / reporting / monitoring** — instrument the runbook-0014 SLOs, RTCP
    metrics, structured logs. *Local-only emission is in-bounds*; an external sink/dashboard
    is **propose-only** (see Invariants).
 9. **UX & conversational quality** — greeting, barge-in feel, silence/goodbye handling,
    error speech, multi-language, voice accessibility. Investigate and improve relentlessly.
-10. **operability** — runbooks current (rule 42), plugin enablement, graceful shutdown,
+10. **operability** — runbooks current, plugin enablement, graceful shutdown,
     config validation.
 11. **packaging / release** — plugin manifest, entry points, version hygiene, deps.
 12. **product / feature gaps** — implied/designed features (e.g. agent-screened answering
@@ -244,7 +245,7 @@ Pick for intelligence **and** speed/efficiency. Pass `model` (and `effort`) to e
 | **opus** | `opus` (`claude-opus-4-8`) | hard correctness/security, new subsystems, ADR design, crypto/SRTP/digest/injection-guard, the barge-in state machine, ambiguous root-cause, final synthesis, escalated/ tie-break reviews. effort `high`/`xhigh`. |
 | **sonnet** | `sonnet` (`claude-sonnet-4-6`) | standard spec'd feat/fix, most implementation lanes, moderate test work, standard reviews. effort `medium`/`high`. |
 | **haiku** | `haiku` (`claude-haiku-4-5`) | mechanical/bounded — `__all__`/`Final`, docstrings, test vectors, backlog dedup/formatting, lint fixes, search/triage. effort `low`. |
-| **fable** | `fable` (`claude-fable-5`) | fast high-capability peer; **primary Claude cross-tier reviewer** for model diversity (rule 21); medium tasks needing speed. |
+| **fable** | `fable` (`claude-fable-5`) | fast high-capability peer; **primary Claude cross-tier reviewer** for model diversity; medium tasks needing speed. |
 
 Defaults by stage: gap-review judgment → opus/sonnet; doc-drift/coverage discovery →
 sonnet/haiku; implementation → per item; **review → a model different from the author**
@@ -253,29 +254,25 @@ A haiku triage agent may pre-score each item's complexity to pick the tier.
 
 ---
 
-## Invariants (binding — never weaken; see AGENTS.md)
+## Invariants (binding — never weaken)
+
+`AGENTS.md` has the full list and `docs/standards/engineering.md` the gate matrix. These are
+the ones the loop gets wrong if nobody restates them:
 
 - **Public repo.** Never let the SIP host/extension/password/device-model or any PII reach a
   tracked file, commit message, PR body, or CI log. Tests use fakes (`pbx.example.test`,
   ext `1000`). Tell every subagent this.
-- **Worktree lanes only** (rule 8). All edits in `.worktrees/<lane>`; the root checkout is a
-  pristine mirror — the PreToolUse hook blocks root edits. Lanes branch from **current HEAD**.
-- **TDD, real tests** (rules 18/19/25). Red test first, committed separately; green without
-  touching tests; never weaken/skip a test to pass.
-- **Full local gate before every PR** (rule 15): `uv run ruff format --check .` ·
-  `uv run ruff check .` · `uv run mypy` · `uv run pytest` (+ the `--extra hermes/ml/media/
-  webrtc` jobs when deps or those surfaces change). CI is never the first run.
-- **Absolute typing, no escape hatches** (rules 17/39): no `Any`, no unjustified
-  `# type: ignore`, no laundering `cast`; `mypy --strict` clean.
-- **Adversarial cross-vendor review** (rule 21) before merge; ≥1 substantive risk statement
-  (rule 16).
-- **ADRs for non-trivial decisions** (rule 30); **runbooks written as you work** (rule 42).
-- **No new hosting/platform/SaaS/cost without operator approval recorded in an ADR**
-  (rule 40/41). The loop builds **local-only** surfaces freely; anything needing infra or
-  cost (website, HTTP API, S3 call-events/recordings, external metrics sink) gets a
+- **Worktree lanes only.** All edits in `.worktrees/<lane>`; the root checkout is a pristine
+  mirror — the PreToolUse hook blocks root edits. Lanes branch from **current HEAD**.
+- **Gates scale with blast radius.** Each item is classified by
+  `uv run python -m tools.classify` and owes that class's gates — not every gate on every
+  item. R0/R1 rely on CI and a single diff-only review; R2/R3 owe the full local gate, a
+  scoped cross-vendor review and human approval. Never weaken or skip a test to pass,
+  whatever the class.
+- **No new hosting/platform/SaaS/cost without operator approval recorded in an ADR.** The
+  loop builds **local-only** surfaces freely; anything needing infra or cost (website, HTTP
+  API, object storage for call events or recordings, external metrics sink) gets a
   **Proposed** ADR + backlog item and waits — it never silently stands up infra.
-- **Errors propagate** (rule 37). **No partial-ship** (rule 6): every item lands wired
-  end-to-end in one push, or it isn't shipped.
 - **Memory MCP is orchestrator-only** (single-process lock); subagents never call qdrant.
 
 ---

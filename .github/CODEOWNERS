@@ -1,0 +1,27 @@
+# Code owners for the surfaces that classify R2/R3 in docs/standards/engineering.md.
+#
+# HONEST SCOPE: this file is ADVISORY here. The repository has no branch protection and
+# no rulesets, so GitHub requests these reviews but nothing mechanically blocks a merge
+# without them. Treat it as the record of who must look, not as a gate. Enabling branch
+# protection with "require review from Code Owners" is what would make it binding.
+
+# The agent policy surface: changing what the rules are, or what classifies a change.
+/AGENTS.md                      @troykelly
+/CLAUDE.md                      @troykelly
+/docs/standards/                @troykelly
+/tools/classify.py              @troykelly
+/tests/test_classify.py         @troykelly
+/.claude/                       @troykelly
+
+# CI, and the two apply paths that publish to PyPI and cut public Releases.
+/.github/                       @troykelly
+/pyproject.toml                 @troykelly
+/uv.lock                        @troykelly
+/packaging/                     @troykelly
+
+# Credential, secret-scanning and legal surfaces (R3).
+/.gitleaks.toml                 @troykelly
+/LICENSE                        @troykelly
+/NOTICE                         @troykelly
+/THIRD_PARTY_NOTICES.md         @troykelly
+/src/hermes_voip/digest.py      @troykelly

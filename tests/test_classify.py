@@ -127,64 +127,64 @@ class TestDefaults:
         assert classify_paths(paths) is Class.R3
 
 
-class TestR0ContentTest:
-    """R0 is decided by content, and only when the content proves it."""
+class TestR0IsAllowlistOnly:
+    """R0 is decided by an explicit allowlist, never by diff content.
 
-    @pytest.mark.parametrize("path", ["docs/backlog.md", "CHANGELOG.md"])
+    A content-based downgrade (treat a diff of only ``#`` lines as R0) was implemented
+    and removed after adversarial review: a ``#`` line can be inside a docstring or a
+    multi-line string, and ``# ruff: noqa`` / ``# mypy: ignore-errors`` are whole-file
+    policy directives that disable a checker. Deciding that needs the file, not the
+    diff line. These tests pin the replacement invariant — content NEVER lowers a
+    class — and keep the reported triggers as regressions.
+    """
+
+    @pytest.mark.parametrize("path", ["docs/backlog.md", "docs/plan/ROADMAP.md"])
     def test_allowlisted_non_executable_files_are_r0(self, path: str) -> None:
         assert classify_paths([path]) is Class.R0
 
-    def test_comment_only_python_change_is_r0(self) -> None:
-        diff = [
-            "--- a/src/hermes_voip/spoken_text.py",
-            "+++ b/src/hermes_voip/spoken_text.py",
-            "-# old wording",
-            "+# new wording",
-            "+",
-        ]
-        assert classify(["src/hermes_voip/spoken_text.py"], diff) is Class.R0
+    def test_changelog_is_not_r0_because_a_release_publishes_it(self) -> None:
+        # publish.yml lifts the `## [X.Y.Z]` body into `gh release create --notes-file`,
+        # so its text is published externally and cannot be an unreviewed R0 edit.
+        assert classify_paths(["CHANGELOG.md"]) > Class.R0
 
-    def test_real_code_change_is_not_downgraded(self) -> None:
-        diff = [
-            "--- a/src/hermes_voip/spoken_text.py",
-            "+++ b/src/hermes_voip/spoken_text.py",
-            "+    return None",
-        ]
+    def test_a_lint_suppression_directive_is_not_downgraded(self) -> None:
+        diff = ["+# ruff: noqa"]
         assert classify(["src/hermes_voip/spoken_text.py"], diff) is Class.R1
 
-    def test_trailing_comment_on_code_is_not_downgraded(self) -> None:
-        diff = [
-            "--- a/src/hermes_voip/spoken_text.py",
-            "+++ b/src/hermes_voip/spoken_text.py",
-            "+    value = 1  # a comment",
-        ]
+    def test_a_typechecker_suppression_directive_is_not_downgraded(self) -> None:
+        diff = ["+# mypy: ignore-errors"]
         assert classify(["src/hermes_voip/spoken_text.py"], diff) is Class.R1
+
+    def test_a_hash_line_inside_a_string_constant_is_not_downgraded(self) -> None:
+        # Indistinguishable from a comment at the diff-line level; must stay R1.
+        diff = ["-#!/bin/sh", "+#!/bin/bash --posix"]
+        assert classify(["src/hermes_voip/aio.py"], diff) is Class.R1
 
     def test_comment_only_change_to_an_r2_file_stays_r2(self) -> None:
-        diff = [
-            "--- a/src/hermes_voip/adapter.py",
-            "+++ b/src/hermes_voip/adapter.py",
-            "+# just a comment",
-        ]
+        diff = ["+# just a comment"]
         assert classify(["src/hermes_voip/adapter.py"], diff) is Class.R2
 
-    def test_comment_test_does_not_apply_to_non_python_files(self) -> None:
-        diff = [
-            "--- a/docs/runbooks/0013-voip-incident-oncall.md",
-            "+++ b/docs/runbooks/0013-voip-incident-oncall.md",
-            "+# A markdown heading is not a comment",
-        ]
-        assert (
-            classify(["docs/runbooks/0013-voip-incident-oncall.md"], diff) is Class.R1
-        )
+    def test_diff_content_never_lowers_the_path_derived_class(self) -> None:
+        for path, expected in [
+            ("src/hermes_voip/spoken_text.py", Class.R1),
+            ("src/hermes_voip/adapter.py", Class.R2),
+            ("src/hermes_voip/digest.py", Class.R3),
+        ]:
+            for diff in ([], ["+# c"], ["+"], ["+    return None"]):
+                assert classify([path], diff) is expected
 
-    def test_mixed_python_and_other_files_are_not_downgraded(self) -> None:
-        diff = ["+# comment"]
-        paths = ["src/hermes_voip/spoken_text.py", "README.md"]
-        assert classify(paths, diff) is Class.R1
 
-    def test_no_diff_lines_means_no_downgrade(self) -> None:
-        assert classify(["src/hermes_voip/spoken_text.py"], []) is Class.R1
+class TestCredentialAndActuationSurfaces:
+    """Found by adversarial review: these were falling through to R1."""
+
+    @pytest.mark.parametrize(
+        "path", ["src/hermes_voip/intercom.py", "src/hermes_voip/multi_intercom.py"]
+    )
+    def test_bearer_token_relay_modules_are_r3(self, path: str) -> None:
+        assert classify_paths([path]) is Class.R3
+
+    def test_the_open_entry_grant_policy_module_is_at_least_r2(self) -> None:
+        assert classify_paths(["src/hermes_voip/tools.py"]) >= Class.R2
 
 
 class TestGlobSemantics:

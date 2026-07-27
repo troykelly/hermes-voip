@@ -35,7 +35,11 @@ jobs:
                  "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"; then
               base="$(git merge-base HEAD "origin/${BASE_REF}" || true)"
               if [ -n "$base" ]; then
-                git diff --name-only "$base" HEAD > "$list" || true
+                # --no-renames is load-bearing: with rename detection on, git reports
+                # only a rename's DESTINATION, so `git mv src/hermes_voip/media/srtp.py
+                # docs/srtp.py` would look like a docs-only change and skip the very
+                # jobs that cover the deleted module. --no-renames emits both paths.
+                git diff --no-renames --name-only "$base" HEAD > "$list" || true
                 if [ -s "$list" ]; then
                   code=false
                   while IFS= read -r f; do

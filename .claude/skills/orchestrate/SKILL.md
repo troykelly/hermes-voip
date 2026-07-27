@@ -96,8 +96,8 @@ You keep **no long-term state in context**. Every wave reconstructs from disk:
 ### Phase 0 — SENSE & RESUME
 1. Refresh root: `git -C <root> fetch origin && git -C <root> pull --ff-only origin main`.
 2. **Reap in-flight PRs** (`gh pr list --state open`). For each PR the loop owns:
-   - CI green (`gh pr checks <n>`) **and** review clean → **squash-merge** (Phase 5 rules),
-     then Phase 6 cleanup.
+   - CI green (`gh pr checks <n>`) **and** review clean → **squash-merge** (Phase 5 rules,
+     including the R3 stop-line), then Phase 6 cleanup.
    - CI red → spawn a fix lane (TDD fix → push); leave PR open.
    - Not yet reviewed → run Phase 4 review now.
    - Conflicts → rebase the lane on current HEAD, re-verify, force-push *the lane branch
@@ -164,8 +164,16 @@ For each item with a **clean** verdict:
    blast-radius, `Co-Authored-By` trailer.
 3. Watch CI (`gh pr checks <n> --watch` or poll). CI is the authoritative gate.
    Fix any CI-only failures in the lane.
-4. **Squash-merge on green CI + clean review** (operator-approved auto-merge). Conventional
-   squash title. Slow CI must **not** block the wave — leave the PR open and let Phase 0 of
+4. **Squash-merge on green CI + clean review**, subject to the class gate below.
+   Conventional squash title.
+
+   > **Class gate — the loop's stop-line.** Run `uv run python -m tools.classify` on the
+   > PR. Starting the loop is the operator's standing approval to self-merge **R0/R1/R2**
+   > work on green CI plus a clean cross-vendor review; that exception is recorded in
+   > `docs/standards/engineering.md` Part H. It does **not** extend to **R3** —
+   > credentials, secret handling, publishing to PyPI or a public Release, licence or
+   > legal content. An R3 item is prepared, pushed and left OPEN with the class in the PR
+   > body, and the loop moves on. The loop never merges R3 and never pushes a release tag. Slow CI must **not** block the wave — leave the PR open and let Phase 0 of
    the next wave reap it. PR shepherding is idempotent across waves.
 
    > **Branch-protection note.** This repo may have NO required-status-check branch

@@ -4,14 +4,13 @@ Prints the change class (R0-R3) and the gates that class requires, per
 ``docs/standards/engineering.md``. The class is derived mechanically from the diff
 against the merge base: an agent does not argue with it and cannot lower it.
 
-Two inputs decide the class:
+The class comes from a **path map**: the most severe pattern matched by any changed
+path wins. The map errs upward — anything unmatched is R1, never R0, because
+under-classifying a change is the only failure mode of this script that matters.
 
-* a **path map** — the most severe pattern matched by any changed path wins;
-* an **R0 content test** — R0 is a property of diff *content*, not of paths, so it is
-  only emitted when every changed path is provably non-executable.
-
-The map errs upward. Anything unmatched is R1, never R0, because under-classifying a
-change is the only failure mode of this script that matters.
+R0 is reserved for an explicit allowlist of files with no executable or policy effect.
+A content-based R0 test (downgrade a diff that is only comments) was implemented and
+then removed: see :func:`classify`.
 
 Usage::
 
@@ -61,6 +60,10 @@ _R3_PATTERNS: tuple[str, ...] = (
     ".gitleaks.toml",
     # SIP digest authentication — credential construction and comparison.
     "src/hermes_voip/digest.py",
+    # Intercom relay: builds bearer-token Authorization headers and carries the
+    # leak-safe exception boundary that keeps the token out of a traceback.
+    "src/hermes_voip/intercom.py",
+    "src/hermes_voip/multi_intercom.py",
 )
 
 _R2_PATTERNS: tuple[str, ...] = (
@@ -120,6 +123,8 @@ _R2_PATTERNS: tuple[str, ...] = (
     # --- Public API consumed by the Hermes runtime.
     "src/hermes_voip/voip_tools.py",
     "src/hermes_voip/hermes_surface.py",
+    # Owns the explicit-grant, fail-closed policy for the physical open-entry action.
+    "src/hermes_voip/tools.py",
     # --- Tests that assert a safety invariant rather than product behaviour. Changing
     # one is a policy change, so it is gated like one.
     "tests/test_no_vendor_identifiers.py",
@@ -138,9 +143,12 @@ _R2_PATTERNS: tuple[str, ...] = (
 )
 
 # Files with no executable or policy effect. A change touching only these is R0.
+#
+# CHANGELOG.md is deliberately NOT here: publish.yml parses its `## [X.Y.Z]` section
+# into dist/RELEASE_NOTES.md and passes that to `gh release create --notes-file`, so
+# its text is published externally. It carries the blast radius of the release.
 _R0_PATTERNS: tuple[str, ...] = (
     "docs/backlog.md",
-    "CHANGELOG.md",
     "docs/plan/**",
 )
 
@@ -223,46 +231,30 @@ def classify_paths(paths: Sequence[str]) -> Class:
     return worst
 
 
-def _is_non_executable_line(line: str) -> bool:
-    """Return True if a changed diff line provably has no executable effect.
-
-    Only blank lines and whole-line ``#`` comments qualify. A line that merely
-    *contains* a ``#`` does not: it may be trailing-comment-on-code, or a ``#``
-    inside a string.
-    """
-    body = line[1:].strip()
-    return body == "" or body.startswith("#")
-
-
 def classify(paths: Sequence[str], diff_lines: Sequence[str] = ()) -> Class:
-    """Classify a change from its paths and, for the R0 test, its diff content.
+    """Classify a change. ``diff_lines`` is accepted but does not lower the class.
 
-    ``diff_lines`` are the raw ``git diff`` lines. They are consulted only to
-    downgrade an otherwise-R1 change to R0 when every changed line is a blank line
-    or a whole-line comment in a Python file. Anything that cannot be proven
-    non-executable keeps its path-derived class.
+    R0 is decided purely by the path allowlist. A content-based downgrade was tried
+    and removed: deciding whether a changed line is really a comment needs the file,
+    not the diff line. A ``#`` line can sit inside a docstring or a multi-line string
+    constant, and ``# ruff: noqa`` / ``# mypy: ignore-errors`` are whole-file policy
+    directives that disable a checker. Both looked like comments and would have been
+    downgraded to R0, breaking the one guarantee this module makes. An honest
+    two-class floor beats a content test stretched until it lies.
+
+    ``diff_lines`` is kept in the signature so callers need not change if a sound
+    content test is added later.
     """
-    by_path = classify_paths(paths)
-    if by_path is not Class.R1 or not diff_lines:
-        return by_path
-    if not all(path.endswith(".py") for path in paths):
-        return by_path
-    changed = [
-        line
-        for line in diff_lines
-        if line[:1] in {"+", "-"} and not line.startswith(("+++", "---"))
-    ]
-    if not changed:
-        return by_path
-    if all(_is_non_executable_line(line) for line in changed):
-        return Class.R0
-    return by_path
+    del diff_lines  # deliberately unused; see the docstring.
+    return classify_paths(paths)
 
 
 def _git(args: Sequence[str]) -> str:
     """Run a git command and return its stdout, raising on a non-zero exit."""
     result = subprocess.run(  # noqa: S603
-        ["git", *args],  # noqa: S607 - git is resolved from PATH by design
+        # -c core.quotePath=false: otherwise a non-ASCII path comes back quoted with
+        # octal escapes, matches no pattern, and silently falls through to R1.
+        ["git", "-c", "core.quotePath=false", *args],  # noqa: S607 - git from PATH
         capture_output=True,
         check=True,
     )
@@ -306,9 +298,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths: list[str] = list(args.paths)
     else:
         base = _merge_base(args.base)
-        paths = [p for p in _git(["diff", "--name-only", base]).splitlines() if p]
-        diff_lines = _git(["diff", "--unified=0", base]).splitlines()
-        change = classify(paths, diff_lines)
+        # --no-renames: with rename detection on, git reports only the
+        # destination, so moving an R2 source file into an R1 path would hide it.
+        listing = _git(["diff", "--no-renames", "--name-only", base])
+        paths = [p for p in listing.splitlines() if p]
+        change = classify(paths)
 
     out = sys.stdout
     out.write(f"{change}\n\n")

@@ -86,3 +86,19 @@ hook's `pytest` step hangs, push with `--no-verify` and let CI re-gate — do no
 
 The rest — integration, commit conventions, the env-var registry trio, the pre-commit
 abort trap — are in `docs/standards/engineering.md` under *Working hazards*.
+
+## Working efficiently
+
+Context is re-sent every turn, so anything you put in it you pay for repeatedly.
+
+- **Batch shell calls.** One `cmd-a && cmd-b && cmd-c` beats three turns.
+- **Never read files through Bash.** Read, Grep and Glob are bounded; `cat`, `grep`
+  and `find` are not. A hook enforces this.
+- **Keep output small.** `git log --oneline -20`, `pytest -q`, `uv sync --quiet`.
+  Redirect long build output to a file and read the tail.
+- **Delegate breadth to subagents.** A subagent's transcript never enters this
+  context, only its final message. Reading 40 files to answer one question is a
+  subagent's job.
+- **Do not narrate.** No preamble before a tool call, no summary of what a tool
+  returned, no recap. Report the outcome once, at the end.
+- **Finish and stop.** Past ~150 turns, checkpoint to an issue or PR and start fresh.

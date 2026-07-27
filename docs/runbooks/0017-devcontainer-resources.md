@@ -11,7 +11,7 @@ verify, change, and roll back the memory ceiling.
 
 `mem_limit: 64g`
 
-The autonomous orchestration loop (`/orchestrate`, ADR-0072) fans out parallel
+The autonomous delivery cycle (`/orchestrate`, ADR-0114) fans out parallel
 implementation lanes, each of which runs the full `uv run pytest` gate. With the `ml`
 extra pulled in, a single gate load (onnxruntime + sherpa-onnx models) is approximately
 1.5–2.5 GiB resident. Memory is the sole bottleneck on fan-out width because CPU is
@@ -80,5 +80,5 @@ RAM, not the cgroup limit (see Gotchas below).
 
 ## Related
 
-- [ADR-0072: autonomous orchestration loop](../adr/0072-autonomous-orchestration-loop.md) — why the loop needs wide fan-out and why memory is the binding constraint.
-- [Runbook 0016: operating the orchestration loop](0016-orchestration-loop.md) — start/stop/observe/recover the loop; includes the full prerequisite gate.
+- [ADR-0114: one cycle per session](../adr/0114-one-cycle-per-session-orchestration.md) — why the loop needs wide fan-out and why memory is the binding constraint.
+- [Runbook 0016: operating the delivery cycle](0016-orchestration-loop.md) — start/stop/observe/recover the loop; includes the full prerequisite gate.

@@ -80,6 +80,10 @@ _R2_PATTERNS: tuple[str, ...] = (
     "tools/**",
     ".github/**",
     ".claude/**",
+    # Lanes, wave caps and the DONE gate's K for the autonomous delivery cycle. It
+    # sits at the repo root rather than under .claude/, so it needs its own entry:
+    # widening a single-writer lane here is what lets two agents share a hot file.
+    "orchestrate.config.json",
     ".pre-commit-config.yaml",
     "conftest.py",
     # --- Signalling, media and transport: the product surface. A defect here drops

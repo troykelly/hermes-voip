@@ -1,322 +1,140 @@
 ---
 name: orchestrate
-description: Autonomous single-orchestrator build loop. ONE Claude session (the orchestrator) fans out agent teams via ultracode Workflows to drive the whole repo toward done — identifying next work, then shipping correctness/robustness/tests/docs/API/auth/observability/UX, gap-reviewing, backlogging the gaps, and shipping those too. Selects the right model per job. Runs for days. Trigger: `/loop /orchestrate`. The ONLY exit is a genuinely dry repo (no work, no UX to improve) — never a "natural break point".
-disable-model-invocation: true
+description: Run one autonomous delivery cycle — pick up what needs doing, dispatch it in parallel, merge what is ready, and record the result. Use when asked to orchestrate, run the loop, run a delivery cycle, work the backlog, or continue autonomous development. Repo-agnostic; reads orchestrate.config.json for local specifics.
 ---
 
-# /orchestrate — the autonomous build loop
+# Orchestrate
 
-You are the **orchestrator**: a single Claude session that drives this repository toward
-*done* by fanning out agent teams, not by doing the work yourself. One `/orchestrate`
-invocation runs **one wave**. `/loop /orchestrate` runs waves back-to-back, forever, until
-the repo is genuinely dry. You hold the agenda; subagents hold the work.
+One cycle. Then **stop and exit**.
 
-Read the WHY in `docs/adr/0072-autonomous-orchestration-loop.md` and the operational HOW in
-`docs/runbooks/0016-orchestration-loop.md`. This skill is the executable contract.
+## The rule everything else serves
 
----
+**Continuity comes from GitHub, never from this context window.** You do one cycle and end the session. A scheduler starts the next one clean.
 
-## PRIME DIRECTIVE — never stop
+You must never: loop back to the top in-context; call `ScheduleWakeup` to continue yourself; return a "block" decision from a Stop hook; or keep working because it feels unfinished. Those all keep one session alive across thousands of turns, and every turn re-sends the whole transcript. That pattern is 4% of sessions and 66% of spend.
 
-The operator's one hard requirement: **do not stop at natural break points, when a queue
-looks empty, or when you "feel done".** Those feelings are *signals to discover more work*,
-never reasons to halt. Every wave ends by guaranteeing the next wave. Stopping is a defect.
+If the cycle ends with work outstanding, that is the correct outcome. Say so and exit.
 
-Banned end-states (treat each as a trigger, not a terminus):
-- "The backlog is empty / there's nothing left" → run a **REPLENISH** gap-review (Phase 1).
-- "Awaiting review / CI / operator approval" → you OWN PRs to merge. Reap
-  them next wave. Never wait on a human.
-- "This is a natural place to pause / hand off / wrap up" → forbidden. End with the next
-  wave's plan + a scheduled wake.
-- "I think we're done" → that is a hypothesis to *disprove* with a full gap-review, not a
-  conclusion. Decisions gate on **observable evidence** (queue counts, gate exit codes,
-  dry-streak), never a vibe.
+## Config
 
-**Continuation guarantee (do this every wave, last):** The loop runs in one of two modes:
+Read `orchestrate.config.json` from the repo root. If absent, stop and ask for one — do not guess lanes.
 
-- **Dynamic mode** (`/loop` with no interval): your final action is
-  `ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…, reason=…)`. Mandatory even
-  when a wave shipped nothing.
-- **Cron mode** (`/loop /orchestrate` with an interval, e.g. `*/10 * * * *`): the `/loop`
-  skill fires `/orchestrate` on its fixed schedule — that cron IS the continuation. If
-  `ScheduleWakeup` responds with "the /loop dynamic runtime gate is off … the loop has
-  ended; do not re-issue", you are in cron mode. This is NORMAL, not an error. Do NOT
-  delete the cron (doing so breaks the loop), and do NOT re-issue `ScheduleWakeup` after it
-  refuses. A cron-fired `/orchestrate` lands in the same session with preserved context, so
-  a mid-wave tick is recognised as already in-flight and handled — never treated as an
-  overlapping wave.
-
-Either way, the next wave is guaranteed. See **Exit condition** for the only escape, which
-is itself a long idle-poll, not a halt.
-
----
-
-## Mental model
-
-```
-/loop /orchestrate
-   └─ wave N (this invocation, the orchestrator = you)
-        Phase 0 SENSE   ─ refresh, reap open PRs, sweep, recall memory
-        Phase 1 REPLENISH ─ fan out gap-reviewers → append new backlog items
-        Phase 2 SELECT  ─ batch independent ready items, assign a model each
-        Phase 3 IMPLEMENT ┐ Workflow: pipeline(items, impl, review)
-        Phase 4 REVIEW    ┘  cross-vendor (codex) + cross-tier Claude
-        Phase 5 PR+MERGE ─ open PR, watch CI, squash-merge on green+clean
-        Phase 6 CLEAN   ─ check off backlog, prune lane, refresh root, store memory
-        Phase 7 CONTINUE ─ ScheduleWakeup("/loop /orchestrate")  ← never skip
+```json
+{
+  "readyLabel": "status: ready",
+  "blockedLabel": "status: blocked",
+  "knownLanes": ["api", "db", "web", "ui", "docs", "infra"],
+  "singleWriterLanes": ["api", "db", "infra"],
+  "scopedLanes": ["ui"],
+  "maxWave": 6,
+  "maxOpenPRs": 3,
+  "maxFilePerSweep": 10,
+  "requiredDryCycles": 2,
+  "commands": { "bootstrap": "./scripts/bootstrap", "verify": "./scripts/verify", "test": "./scripts/test" },
+  "dimensions": ["spec-parity", "defects", "tests", "docs", "as-built", "security", "observability", "ux"]
+}
 ```
 
-You **delegate execution**; you **personally own** sensing, selection, PR/merge decisions,
-memory, and the continuation guarantee. Keep your own context lean: never
-read whole modules yourself — fan reading/implementation into subagents and keep only their
-summaries. State lives on disk, not in this conversation, so a context summary or restart
-loses nothing.
+## The cycle
 
----
+### 1. Orient — bounded, and from ground truth only
 
-## Durable state (resume across days / restarts)
+Ground truth is `gh`, `git` and CI. Never a status document, never memory, never a previous cycle's say-so.
 
-You keep **no long-term state in context**. Every wave reconstructs from disk:
+```sh
+gh issue list --state open --label "<readyLabel>" --limit 100 --json number,title,labels,assignees
+gh pr list --state open --author "@me" --json number,title,statusCheckRollup,mergeable
+```
 
-| Source | Role |
-|---|---|
-| `docs/backlog.md` | **Canonical prioritized queue.** Checkbox items, `[high]/[medium]/[low]` + kind tags. Shipped → checked off with the PR #. New gaps → appended. |
-| `gh pr list` / `gh issue list` | In-flight state + secondary queue. |
-| `.orchestrator/state.json` (gitignored) | **Best-effort / optional.** Attempt the write; if the worktree hook blocks it (the `enforce-worktree` PreToolUse hook blocks ALL root-checkout writes, including gitignored paths — this is the current behaviour), run stateless and rebuild from `backlog.md` + `gh`; treat a blocked write as expected, not a failure. See schema below. |
-| memory MCP (qdrant) | Decisions, gotchas, operator feedback. **Orchestrator-only** (single-process lock — subagents must NEVER call qdrant). Degrade gracefully if locked/unavailable. |
+Read the loop-state issue (labelled `loop-state`) for `consecutiveDryCycles` and the ledger. **Read it by number**, not by search — list endpoints lag.
 
-`.orchestrator/state.json` schema (all optional; rebuildable):
-`{ "wave": int, "inflight": [{"item": str, "branch": str, "pr": int|null, "retries": int}],
-   "dryStreak": int, "lastGapReviewWave": int, "notes": str }`
+If a live owner holds the lease (recent `heartbeatAt`, different `ownerRunId`), **exit now**. Two orchestrators is worse than none.
 
----
+Keep this step small. Use `--json` with named fields, never bare `gh` output. Never `cat` a file you could `Read`.
 
-## One wave — the eight phases
+### 2. Close — serial, single Closer
 
-### Phase 0 — SENSE & RESUME
-1. Refresh root: `git -C <root> fetch origin && git -C <root> pull --ff-only origin main`.
-2. **Reap in-flight PRs** (`gh pr list --state open`). For each PR the loop owns:
-   - CI green (`gh pr checks <n>`) **and** review clean → **squash-merge** (Phase 5 rules,
-     including the R3 stop-line), then Phase 6 cleanup.
-   - CI red → spawn a fix lane (TDD fix → push); leave PR open.
-   - Not yet reviewed → run Phase 4 review now.
-   - Conflicts → rebase the lane on current HEAD, re-verify, force-push *the lane branch
-     only* (never a shared branch).
-3. Sweep orphaned worktrees/scratch idle > a few hours: `git worktree prune`, then remove
-   stale `.worktrees/*` whose branch is merged and ephemeral `.claude/worktrees/{agent,wf_}*`.
-4. `qdrant-find` the dimensions you'll touch this wave (recall prior decisions/gotchas).
-5. Load `.orchestrator/state.json` if present.
+You are the only thing that merges. Builders never merge; that rule exists because two PRs that were green alone landed red together.
 
-### Phase 1 — REPLENISH (gap-review fan-out — the anti-stop engine)
-Compute `ready = ` unchecked, unblocked backlog items + open issues.
-Run a gap-review **if** `ready < 2 × fleetWidth` **OR** `wave − lastGapReviewWave ≥ 3`
-**OR** the queue is empty (always). Then:
-1. `Workflow({scriptPath: ".claude/skills/orchestrate/wave.workflow.js",
-   args: {phase: "gap-review", dimensions: [...], budget: <tokens>}})` — one agent per
-   **dimension** (see list below), each returning structured candidate items.
-2. **Dedup** the returned items against `backlog.md` + open issues (cheap: a haiku agent or
-   a direct title/file match). Discard anything already tracked.
-3. Genuinely-new items → append to `docs/backlog.md` (and/or `gh issue create` for
-   feature-sized work) **via a docs lane → PR → merge**. New work is now durable.
-4. If the panel returned **zero** genuinely-new items across **all** dimensions, increment
-   `dryStreak`; else reset it to 0.
+For each PR reporting READY, one at a time: rebase onto fresh `main` → wait for a **fresh** CI pass on the rebased head → merge → delete branch → `git worktree prune`.
 
-A near-empty queue is normal and expected — it just means it's time to discover. The panel
-almost always finds something; that is the design.
+`Closes #n` must be plain text, never backticked, or GitHub ignores it. Never `gh pr merge --auto` before green — it merges immediately. `cancelled` is not a passing verdict.
 
-### Phase 2 — SELECT & PLAN
-1. Batch up to `fleetWidth = min(16, cores − 2)` **ready** items.
-2. Order: `[high] > [medium] > [low]`; correctness/security before polish; **unblockers
-   first** (e.g. a missing test runner that gates other work); respect stated dependencies.
-3. **Independence:** one non-overlapping file territory per lane. Serialize
-   hot shared files (`src/hermes_voip/adapter.py`, `media/call_loop.py`, `docs/backlog.md`)
-   to **≤1 lane per wave**. Group tiny same-module items into one lane to cut PR overhead.
-4. Assign each item a **model tier** (rubric below) and an effort level.
+### 3. Dispatch — parallel build, disjoint lanes
 
-### Phase 3 + 4 — IMPLEMENT & REVIEW (one Workflow, pipelined)
-`Workflow({scriptPath: ".claude/skills/orchestrate/wave.workflow.js",
-  args: {phase: "implement", items: [<selected, each with model+spec>], budget: <tokens>}})`
+Classify each candidate into `{ number, lane, scope, blockedBy: [{ number, satisfied }] }`. Verify each blocker with `gh issue view <n> --json state` and `gh pr list --search "<n>"`; do not trust the label.
 
-The script runs `pipeline(items, implStage, reviewStage)` so each item's review starts the
-moment its implementation goes green — no barrier. Per item:
-- **implStage** (assigned model, `isolation: "worktree"`): TDD — write the failing test, run
-  it, capture the red output, **commit the red test separately**, implement to green
-  **without touching the test**, write an ADR/runbook if the change warrants one (rules
-  30/42), run the **full local gate**, push a conventional branch. Returns
-  `{item, branch, redCommit, greenCommits, gate, adr?, runbook?, files, spec, selfRisk}`
-  or `{item, failed, reason}`.
-- **reviewStage** (cross-vendor + cross-tier, fresh context, **diff+spec+checklist only** —
-  fresh context): `codex` (OpenAI) **and** a different-tier Claude reviewer. Returns
-  `{verdict, mustFix[], noted[]}`. Must-fix → loop a fix agent → re-review (bounded retries).
-  Materiality: must-fix = correctness/security/spec/guardrail/blast-radius only; an
-  unreproducible finding is advisory, not blocking.
-  **Unanimous rubber-stamp is a yellow flag** → escalate to an opus deep-review before trust.
+Then partition **in code**, not by judgement:
 
-The Workflow returns `[{item, branch, verdict, evidence}]`. `.filter(Boolean)` the failures.
+```sh
+node .claude/skills/orchestrate/lib/partition.mjs   # via a tiny driver, or import it
+```
 
-### Phase 5 — GATE → PR → MERGE  (you, the orchestrator)
-For each item with a **clean** verdict:
-1. **Integrator re-verify on current HEAD:** the lane was cut from an older HEAD;
-   confirm it still rebases cleanly and the gate is green from a clean build. If drifted,
-   have an agent rebase + re-gate before trusting the green.
-2. `gh pr create` — title = Conventional Commit; body = spec, ADR/runbook links, gate
-   evidence (command+exit codes), review summary + the substantive risk statement,
-   blast-radius, `Co-Authored-By` trailer.
-3. Watch CI (`gh pr checks <n> --watch` or poll). CI is the authoritative gate.
-   Fix any CI-only failures in the lane.
-4. **Squash-merge on green CI + clean review**, subject to the class gate below.
-   Conventional squash title.
+Dispatch the returned wave with the Workflow tool: one agent per issue, `isolation: "worktree"`, a `schema` on every agent, and model per lane — cheap tier for mechanical lanes, top tier for anything on `singleWriterLanes` or `unknown`.
 
-   > **Class gate — the loop's stop-line.** Run `uv run python -m tools.classify` on the
-   > PR. Starting the loop is the operator's standing approval to self-merge **R0/R1/R2**
-   > work on green CI plus a clean cross-vendor review; that exception is recorded in
-   > `docs/standards/engineering.md` Part H. It does **not** extend to **R3** —
-   > credentials, secret handling, publishing to PyPI or a public Release, licence or
-   > legal content. An R3 item is prepared, pushed and left OPEN with the class in the PR
-   > body, and the loop moves on. The loop never merges R3 and never pushes a release tag. Slow CI must **not** block the wave — leave the PR open and let Phase 0 of
-   the next wave reap it. PR shepherding is idempotent across waves.
+Every agent schema must cap its output. Require `file:line` evidence and **forbid file bodies in the return value**. N parallel agents returning file dumps is how the orchestrator's own context explodes.
 
-   > **Branch-protection note.** This repo may have NO required-status-check branch
-   > protection, so `gh pr merge --auto` merges immediately without waiting for CI. For any
-   > CODE change, do NOT use `--auto` blindly: poll `gh pr checks <n>` until the CI jobs
-   > you care about are green, then merge explicitly. Docs/config PRs (no Python surface, no
-   > gate-relevant change) may be merged once the fast `gate` + `scan` jobs pass while
-   > slower extras jobs (`hermes-contract`, etc.) are still running — but verify those slower
-   > jobs do not cover the changed surface before proceeding.
+Builders take an issue to CI-green and report READY. They do not merge.
 
-### Phase 6 — INTEGRATE & CLEAN
-1. Check off the shipped backlog item(s) with the PR # (batch into the next docs lane).
-2. `git worktree remove --force <lane>` + `git worktree prune`.
-3. Refresh root: `git fetch origin && git pull --ff-only origin main` so the next
-   lane bases on current HEAD.
-4. `qdrant-store` any non-trivial decision/gotcha/operator-feedback learned (orchestrator
-   only; never secrets — see Invariants).
-5. Reconcile drifted docs (stale `IMPLEMENTATION-PLAN.md` / `backlog.md` preamble / README)
-   in a batched docs lane.
+Respect `maxOpenPRs`. If the cap is reached, skip dispatch this cycle and go to step 5.
 
-### Phase 7 — CONTINUE  (never skip)
-1. Attempt to update `.orchestrator/state.json` (wave++, in-flight, counters, dryStreak).
-   If the `enforce-worktree` hook blocks the write (it currently does — it blocks all
-   root-checkout writes even to gitignored paths), skip it silently and run stateless; the
-   wave-state is rebuilt next wave from `backlog.md` + `gh` + memory.
-2. Emit a tight wave report: shipped+merged, opened, discovered, cleaned, and the **next
-   wave's plan**. Never end on a "good stopping point".
-3. **Guarantee the next wave:**
-   - If in **dynamic mode**: `ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…,
-     reason="next orchestration wave")`. Pick the delay by what you're waiting on
-     (CI in flight → ~270s; otherwise 1200–1800s).
-   - If `ScheduleWakeup` reports the dynamic runtime gate is off (cron mode): the fixed
-     cron IS the continuation — do not delete it, do not re-issue `ScheduleWakeup`; the
-     next wave fires automatically. This is the normal operating mode when the loop was
-     started with an interval (e.g. `/loop /orchestrate` via a `*/10 * * * *` cron).
-   Either path guarantees the next wave.
+### 4. Discover — only when the frontier is empty
 
----
+An empty backlog is a trigger to look harder, not a reason to stop. Run one sweep across `dimensions`, one agent per dimension, in parallel. Each returns findings as `{ kind, confirmed, title, evidence }`.
 
-## Gap-review dimensions (Phase 1 — "cover everything")
+The generic dimensions, which is what "complete" means here: does it do what was designed (`spec-parity`); is it broken (`defects`); is it tested (`tests`); is it documented (`docs`); do the docs match what was actually built (`as-built`); is it safe (`security`); can you see it running (`observability`); is it decent to use (`ux`).
 
-Fan out **one agent per dimension**. Each hunts NEW work only in its lane and returns
-structured items. Cover, at minimum:
+File at most `maxFilePerSweep`. Anything beyond the cap goes into the cycle report as deferred with its title — **never silently dropped**; the next cycle files it.
 
-1. **correctness** — bugs, contract violations, RFC compliance, off-by-ones.
-2. **robustness / fail-closed** — error handling and propagation, edge cases, hostile input.
-3. **security & auth** — injection guard, caller groups/modes, SIP digest, SRTP/DTLS,
-   secret hygiene (public repo!), supply-chain advisories (`uv` audit + licences).
-4. **tests & mutation** — coverage gaps, weak/assertion-free tests, missing async tests,
-   surviving mutants.
-5. **docs & doc-drift** — comments/docs describing behaviour the code lacks;
-   reconcile stale `IMPLEMENTATION-PLAN.md` / `backlog.md` preamble / `README.md`; runbook
-   numbering collisions.
-6. **API & ergonomics** — `__all__`, public exports, typed surfaces, import discoverability.
-7. **performance / efficiency** — hot-path budgets, allocations (record numbers).
-8. **observability / reporting / monitoring** — instrument the runbook-0014 SLOs, RTCP
-   metrics, structured logs. *Local-only emission is in-bounds*; an external sink/dashboard
-   is **propose-only** (see Invariants).
-9. **UX & conversational quality** — greeting, barge-in feel, silence/goodbye handling,
-   error speech, multi-language, voice accessibility. Investigate and improve relentlessly.
-10. **operability** — runbooks current, plugin enablement, graceful shutdown,
-    config validation.
-11. **packaging / release** — plugin manifest, entry points, version hygiene, deps.
-12. **product / feature gaps** — implied/designed features (e.g. agent-screened answering
-    [designed in backlog], issue #64 video→vision, call transfer). Infra-needing surfaces →
-    **Proposed ADR only**.
+Before creating an issue, append `{ key, title, status: "reserving" }` to the loop-state ledger and save. Then create. Then mark `created` with the number. `gh issue list` lags creates by around a minute, and a naive re-check duplicates epics.
 
----
+**Materiality floor.** A finding only resets the dry-cycle counter if it is a real defect, a security or privacy problem, data loss, a missing designed feature, a wrong document, or something a user would notice. Nits get filed as chores and **do not** reset the counter. Without this floor a thorough reviewer always finds something and the loop can never converge.
 
-## Model-selection rubric ("always the right agent for the job")
+### 5. Record
 
-Pick for intelligence **and** speed/efficiency. Pass `model` (and `effort`) to every
-`agent()`.
+Update the loop-state issue: `ownerRunId`, `heartbeatAt`, `consecutiveDryCycles` (via `nextDryCycles`), the ledger, and a one-paragraph cycle summary. This is what the next session reads instead of your context.
 
-| Tier | Model id (short) | Use for |
-|---|---|---|
-| **opus** | `opus` (`claude-opus-4-8`) | hard correctness/security, new subsystems, ADR design, crypto/SRTP/digest/injection-guard, the barge-in state machine, ambiguous root-cause, final synthesis, escalated/ tie-break reviews. effort `high`/`xhigh`. |
-| **sonnet** | `sonnet` (`claude-sonnet-4-6`) | standard spec'd feat/fix, most implementation lanes, moderate test work, standard reviews. effort `medium`/`high`. |
-| **haiku** | `haiku` (`claude-haiku-4-5`) | mechanical/bounded — `__all__`/`Final`, docstrings, test vectors, backlog dedup/formatting, lint fixes, search/triage. effort `low`. |
-| **fable** | `fable` (`claude-fable-5`) | fast high-capability peer; **primary Claude cross-tier reviewer** for model diversity; medium tasks needing speed. |
+### 6. Decide, report, exit
 
-Defaults by stage: gap-review judgment → opus/sonnet; doc-drift/coverage discovery →
-sonnet/haiku; implementation → per item; **review → a model different from the author**
-(opus-authored → fable or sonnet; sonnet-authored → opus; always also `codex` cross-vendor).
-A haiku triage agent may pre-score each item's complexity to pick the tier.
+```sh
+node .claude/skills/orchestrate/lib/done-gate.mjs   # via a driver: evaluateDone({...})
+```
 
----
+DONE is a computed fact. You may not declare it, override it, or argue `requiredDryCycles` below 2.
 
-## Invariants (binding — never weaken)
+- **DONE** → write the `DONE` sentinel into the loop state dir, comment the final summary on the loop-state issue, exit.
+- **NOT DONE** → print the cycle report and **exit**. The scheduler starts the next cycle in a fresh session.
 
-`AGENTS.md` has the full list and `docs/standards/engineering.md` the gate matrix. These are
-the ones the loop gets wrong if nobody restates them:
-
-- **Public repo.** Never let the SIP host/extension/password/device-model or any PII reach a
-  tracked file, commit message, PR body, or CI log. Tests use fakes (`pbx.example.test`,
-  ext `1000`). Tell every subagent this.
-- **Worktree lanes only.** All edits in `.worktrees/<lane>`; the root checkout is a pristine
-  mirror — the PreToolUse hook blocks root edits. Lanes branch from **current HEAD**.
-- **Gates scale with blast radius.** Each item is classified by
-  `uv run python -m tools.classify` and owes that class's gates — not every gate on every
-  item. R0/R1 rely on CI and a single diff-only review; R2/R3 owe the full local gate, a
-  scoped cross-vendor review and human approval. Never weaken or skip a test to pass,
-  whatever the class.
-- **No new hosting/platform/SaaS/cost without operator approval recorded in an ADR.** The
-  loop builds **local-only** surfaces freely; anything needing infra or cost (website, HTTP
-  API, object storage for call events or recordings, external metrics sink) gets a
-  **Proposed** ADR + backlog item and waits — it never silently stands up infra.
-- **Memory MCP is orchestrator-only** (single-process lock); subagents never call qdrant.
-
----
-
-## Exit condition (deliberately almost-never)
-
-Only *approach* termination when, for **K = 3 consecutive waves**, **all** hold:
-- the full gap-review panel returns **zero** genuinely-new items across **all** dimensions
-  (`dryStreak ≥ 3`), **and**
-- `gh pr list` shows zero open PRs, **and** zero in-flight lanes, **and**
-- the full gate is green on `main`, **and**
-- a dedicated UX / feature-discovery pass this wave yields nothing.
-
-Even then, **do not stop** — **widen**: deeper UX flow-driving, mutation testing, perf
-budget measurement, feature ideation, competitive comparison. Only if the widened pass is
-*also* dry for K more waves do you enter **steady-state**: report it and idle-poll with a
-long `ScheduleWakeup` (≈3600s) so a newly-arrived issue/PR/operator request restarts real
-work. Steady-state is a long sleep, **not** a halt.
-
----
-
-## Quick reference
+Report exactly:
 
 ```
-# trigger (operator)
-/loop /orchestrate
-
-# one wave's two Workflow calls (you, each wave)
-Workflow({scriptPath:".claude/skills/orchestrate/wave.workflow.js", args:{phase:"gap-review", dimensions:[...]}})
-Workflow({scriptPath:".claude/skills/orchestrate/wave.workflow.js", args:{phase:"implement", items:[...]}})
-
-# the gate (subagents, in-lane, before every PR)
-uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest
-
-# continuation (you, last action every wave)
-# dynamic mode: issue ScheduleWakeup
-ScheduleWakeup(prompt="/loop /orchestrate", delaySeconds=…, reason="next orchestration wave")
-# cron mode: if ScheduleWakeup says dynamic gate is off, the fixed cron IS the heartbeat — do nothing, do NOT delete the cron
+CYCLE:     <n>  owner=<runId>
+MERGED:    <PR numbers, or none>
+DISPATCHED:<issue numbers, or none>  deferred=<numbers + one-line reasons>
+FILED:     <issue numbers, or none>  deferred=<titles>
+DRY:       <consecutiveDryCycles>/<K>
+VERDICT:   DONE | PARKED (blocked on human) | CONTINUE
 ```
+
+## Never stop because
+
+The cycle felt complete. You merged something. You hit a milestone or finished an epic. CI is green. The PR list is momentarily empty. A wave finished. These are transitions, not endings — the only endings are the DONE gate, the STOP sentinel, and a stop condition below.
+
+## Never continue because
+
+There is more to do. There is always more to do. **One cycle per session** is the invariant that keeps this affordable.
+
+## Stop and escalate when
+
+Credentials or authority are missing; a destructive action has no tested recovery path; a secret or production dataset appears; CI is red on `main`; the same item has failed twice — label it `blocked`, file a tracking issue, and move on.
+
+## Operator
+
+```sh
+touch .claude/loop/ACTIVE        # arm
+touch .claude/loop/STOP          # stop after the current cycle
+rm    .claude/loop/DONE          # resume after convergence
+./.claude/skills/orchestrate/tick.sh   # run one cycle now, in a fresh session
+```
+
+`tick.sh` is the scheduler's entry point. It takes a lock, runs exactly one cycle in a new `claude` process, and exits. Point cron at it. Do not replace it with anything that keeps a session alive.

@@ -247,12 +247,13 @@ exception may never conceal a failed check, stand in for a review, or be self-gr
 agent that benefits from it. If a gate cannot run, say so; do not write the evidence it
 would have produced.
 
-**Standing exception — the autonomous orchestration loop.** Invoking `/orchestrate` is the
-operator's approval for that loop to self-merge **R0/R1/R2** work on green CI plus a clean
-cross-vendor review, in place of per-PR human approval. It does **not** extend to R3: the
-loop prepares an R3 change, leaves the PR open with the class in its body, and moves on. It
-never merges R3 and never pushes a release tag. This exception is live only while the loop
-is running and is reviewed whenever the class map changes.
+**Standing exception — the autonomous delivery cycle.** Arming the loop
+(`touch .claude/loop/ACTIVE`, ADR-0114) is the operator's approval for it to self-merge
+**R0/R1/R2** work on green CI plus a clean cross-vendor review, in place of per-PR human
+approval. It does **not** extend to R3: the loop prepares an R3 change, leaves the PR open
+with the class in its body, and moves on. It never merges R3 and never pushes a release tag.
+This exception is live only while the `ACTIVE` sentinel is present and is reviewed whenever
+the class map changes.
 
 ---
 

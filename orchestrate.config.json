@@ -1,0 +1,30 @@
+{
+  "readyLabel": "status: ready",
+  "blockedLabel": "status: blocked",
+  "knownLanes": ["sip", "media", "providers", "core", "tests", "docs", "ci"],
+  "singleWriterLanes": ["sip", "media", "core", "ci"],
+  "scopedLanes": ["providers", "tests", "docs"],
+  "maxWave": 6,
+  "maxOpenPRs": 3,
+  "maxFilePerSweep": 10,
+  "requiredDryCycles": 2,
+  "commands": {
+    "bootstrap": "uv sync --frozen",
+    "verify": "uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest",
+    "test": "uv run pytest"
+  },
+  "dimensions": [
+    "correctness",
+    "robustness",
+    "security-auth",
+    "tests-mutation",
+    "docs-drift",
+    "api-ergonomics",
+    "performance",
+    "observability",
+    "ux-conversational",
+    "operability",
+    "packaging-release",
+    "product-features"
+  ]
+}

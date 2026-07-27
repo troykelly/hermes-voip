@@ -1,7 +1,16 @@
 # ADR-0072: Autonomous orchestration loop — single orchestrator, fan-out agent teams
 
 - **Date:** 2026-06-22
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0114
+
+> **Superseded 2026-07-27.** The goal below — do not halt at a natural break point, an
+> empty-looking queue, or a "feels done" judgement — still stands. The *mechanism* did not:
+> continuation inside one live session (`ScheduleWakeup`, or a cron firing back into the
+> same context) made turn count unbounded, and cost is `prefix_size × turn_count`. Sessions
+> over 250 turns measured 4% of sessions and 66% of spend. ADR-0114 keeps the goal and the
+> fan-out, and moves continuity into GitHub with one cycle per session. The `ScheduleWakeup`
+> and never-stop instructions in this record are **historical** — they describe what was
+> decided in June 2026, not what to do now. Do not follow them.
 - **Deciders:** operator (`troy@…`) + agent session (orchestration-loop lane). Composes with
   the worktree-lane discipline (AGENTS rules 8–13), the quality gates (rules 14–22), the
   no-new-platform constraint (rules 40–42), the `adr`/`memory`/`worktree-lane` skills, and the

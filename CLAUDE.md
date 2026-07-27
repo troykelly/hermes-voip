@@ -9,7 +9,9 @@ adds only Claude-Code specifics.
   it cannot see Bash writes, so do not route around it).
 - **Skills:** `adr` when a decision constrains future changes · `worktree-lane` when
   starting or integrating a lane · `memory` for recall/store · `graphify` for codebase
-  questions when `graphify-out/graph.json` exists · `orchestrate` is operator-triggered only.
+  questions when `graphify-out/graph.json` exists · `orchestrate` runs exactly ONE delivery
+  cycle and then exits — never loop back, never `ScheduleWakeup` yourself (ADR-0114); the
+  scheduler re-runs it in a fresh session via `.claude/skills/orchestrate/tick.sh`.
 - **Subagents** may read anything and write only inside their own lane. They return
   conclusions, never transcripts or file dumps. Give each an independent file territory;
   two agents in one lane corrupt the branch. Route by cost: mechanical sweeps → Haiku 4.5,

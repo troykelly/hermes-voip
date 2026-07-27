@@ -36,9 +36,10 @@
 # Worktree lanes — disposable, never committed
 .worktrees/
 
-# Autonomous orchestration-loop wave journal (ADR-0072) — a per-clone optimisation
-# rebuilt from docs/backlog.md + GitHub each wave; never committed.
-.orchestrator/
+# Autonomous delivery-cycle runtime state (ADR-0114): the ACTIVE/STOP/DONE
+# sentinels, the tick lock and tick.log. Per-clone operator state — arming the
+# loop on one machine must never arm it on someone else's. Never committed.
+.claude/loop/
 
 # graphify knowledge-graph output (per-clone, AST-generated; rebuilt with
 # `graphify update .`) — never committed.

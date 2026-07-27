@@ -26,7 +26,10 @@ class TestSelfReference:
             ".github/CODEOWNERS",
             ".claude/settings.json",
             ".claude/hooks/enforce-worktree.mjs",
-            ".claude/skills/orchestrate/wave.workflow.js",
+            ".claude/hooks/prefer-native-tools.mjs",
+            ".claude/workflows/wave.workflow.js",
+            ".claude/skills/orchestrate/tick.sh",
+            "orchestrate.config.json",
             ".pre-commit-config.yaml",
         ],
     )

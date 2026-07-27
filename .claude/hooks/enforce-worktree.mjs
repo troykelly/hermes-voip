@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 /**
  * PreToolUse hook: blocks Edit/Write/NotebookEdit calls that target the root
- * checkout. AGENTS.md rule 8: all work happens in worktree lanes under
- * .worktrees/; the root checkout is a pristine mirror of main.
+ * checkout. All work happens in worktree lanes under .worktrees/; the root
+ * checkout is a pristine mirror of main. See AGENTS.md and the worktree-lane
+ * skill.
+ *
+ * This is defence in depth, not the rule itself, and it is deliberately narrow:
+ * the matcher covers Edit/Write/NotebookEdit only, so a Bash write into the root
+ * checkout is NOT caught. Do not route around it.
  *
  * Allowed: paths under <root>/.worktrees/** and paths outside the repository
  * entirely (e.g. ~/.claude memory, /tmp scratch). Blocked: everything else
@@ -55,8 +60,8 @@ const insideLane =
 
 if (insideRoot && !insideLane) {
   console.error(
-    `Blocked: ${resolved} is in the root checkout. AGENTS.md rule 8: never edit the ` +
-      `root checkout — create a worktree lane (worktree-lane skill) and edit ` +
+    `Blocked: ${resolved} is in the root checkout. Never edit the root checkout — ` +
+      `create a worktree lane (worktree-lane skill) and edit ` +
       `${mainRoot}/.worktrees/<lane>/... instead.`,
   );
   process.exit(2);

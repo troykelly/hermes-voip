@@ -1,6 +1,8 @@
-# Local git gate (AGENTS.md rule 15) — mirrors CI so failures surface before push.
+# Local git gate — mirrors CI so failures surface before push. The full gate is an
+# R2/R3 requirement before a PR; see docs/standards/engineering.md Part A.
 # All hooks are `repo: local` / `language: system` and call the project's own uv
-# toolchain: nothing external is cloned or fetched (rule 36). Install once with:
+# toolchain: nothing external is cloned or fetched (no paid or third-party services).
+# Install once with:
 #   uv run pre-commit install && uv run pre-commit install --hook-type pre-push
 repos:
   - repo: local

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# estate-core v2026.08.1 — full-suite test budget (Claude Code PreToolUse:Bash hook).
+# estate-core v2026.08.2 — full-suite test budget (hook rev 2, atomic counter)
+# (Claude Code PreToolUse:Bash hook).
 # Fail-open: any error in this script must permit the command. Exit 2 = block.
 set -u
 BUDGET=2
@@ -15,11 +16,25 @@ FULL_SUITE_RE='^[[:space:]]*(npm|pnpm|yarn)[[:space:]]+(run[[:space:]]+)?test[[:
 
 printf '%s' "$CMD" | grep -Eq "$FULL_SUITE_RE" || exit 0
 
-D="${CLAUDE_PROJECT_DIR:-.}/.claude"; F="$D/.test-budget-$SID"
-N="$(cat "$F" 2>/dev/null || echo 0)"; case "$N" in ''|*[!0-9]*) N=0;; esac
-if [ "$N" -ge "$BUDGET" ]; then
-  echo "estate-core: full-suite budget spent ($BUDGET/session). Run tests targeted at what you changed; CI runs the full suite at the PR gate." >&2
-  exit 2
-fi
-{ mkdir -p "$D" && echo $((N+1)) > "$F"; } 2>/dev/null || true
-exit 0
+# Atomic claim: each concurrent invocation races to mkdir a numbered slot dir
+# (mkdir is atomic on a local filesystem — exactly one caller wins each slot,
+# unlike a read-modify-write counter). Claiming any slot 1..BUDGET permits the
+# run; failing to claim any of them blocks it. No shared counter file, no race.
+D="${CLAUDE_PROJECT_DIR:-.}/.claude"
+mkdir -p "$D" 2>/dev/null || exit 0
+[ -w "$D" ] || exit 0
+
+CLAIMED=0
+i=1
+while [ "$i" -le "$BUDGET" ]; do
+  if mkdir "$D/.test-budget-$SID.slot$i" 2>/dev/null; then
+    CLAIMED=1
+    break
+  fi
+  i=$((i+1))
+done
+
+[ "$CLAIMED" -eq 1 ] && exit 0
+
+echo "estate-core: full-suite budget spent ($BUDGET/session). Run tests targeted at what you changed; CI runs the full suite at the PR gate." >&2
+exit 2

@@ -72,8 +72,7 @@ In order: solve it → route around it (do adjacent work, open a tracking issue)
   tests + CI; R2 media/transport/signalling/config/deps/CI/agent-policy → full local gate +
   cross-vendor review; R3 credentials/publishing/licence → stop per this file's Obstacles rule.
 - Skills: `adr`, `worktree-lane`, `memory` (qdrant, gitignored `.memory/`, never store the
-  gateway host/extension/password), `graphify` (query before raw grep; update after code
-  changes), `orchestrate` (exactly ONE delivery cycle then exit — never loop or self-
+  gateway host/extension/password), `graphify`, `orchestrate` (exactly ONE delivery cycle then exit — never loop or self-
   `ScheduleWakeup`, ADR-0114; a scheduler re-runs it via `tick.sh`).
 - Hazards: worktree build caches can leak stale artefacts across lanes — rebuild fresh after
   integrating cherry-picks; two agents in one lane corrupt the branch; local green ≠ runtime

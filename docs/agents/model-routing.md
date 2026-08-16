@@ -1,5 +1,5 @@
 # Cross-Vendor Model Routing Reference
-<!-- cspell:words revertable pre-emptively Sakana Fugu Glasswing Zhipu cutoffs cutoff opencode TTFT cursorrules summarises summarisation hostable chatbots tokenises teardowns batchable uncompacted Cowork ccusage authorised authorisations behaviour LLAP xhigh remoteclip -->
+<!-- cspell:words revertable pre-emptively Sakana Fugu Glasswing Zhipu cutoffs cutoff opencode TTFT cursorrules summarises summarisation hostable chatbots tokenises teardowns batchable uncompacted Cowork ccusage authorised authorisations behaviour LLAP xhigh remoteclip gapped prem -->
 
 **As of:** 15 August 2026 · **Scope:** Anthropic (all current), OpenAI (all current), xAI Grok (via LLAP), Z.ai GLM-5.2, Sakana Fugu / Fugu Ultra
 **Read §1 and §5 first. §2 is the lookup table. Everything else is exception handling.**

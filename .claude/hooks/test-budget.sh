@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# estate-core v2026.08 — full-suite test budget (Claude Code PreToolUse:Bash hook).
+# estate-core v2026.08.1 — full-suite test budget (Claude Code PreToolUse:Bash hook).
 # Fail-open: any error in this script must permit the command. Exit 2 = block.
 set -u
 BUDGET=2
@@ -11,7 +11,7 @@ SID="$(printf '%s' "$INPUT" | jq -r '.session_id // "solo"' 2>/dev/null)" || SID
 
 # INSTALLER: replace with this repository's real bare full-suite command patterns.
 # Bare suite invocations only — a targeted run (path/file/-k argument) must NOT match.
-FULL_SUITE_RE='^[[:space:]]*uv[[:space:]]+run[[:space:]]+pytest[[:space:]]*$|^[[:space:]]*pytest[[:space:]]*$'
+FULL_SUITE_RE='^[[:space:]]*(npm|pnpm|yarn)[[:space:]]+(run[[:space:]]+)?test[[:space:]]*$|^[[:space:]]*pytest[[:space:]]*$|^[[:space:]]*go[[:space:]]+test[[:space:]]+\./\.\.\.[[:space:]]*$|^[[:space:]]*cargo[[:space:]]+test[[:space:]]*$|^[[:space:]]*(npx|bunx|pnpm([[:space:]]+(exec|dlx))?|yarn[[:space:]]+exec)[[:space:]]+(vitest|jest)([[:space:]]+(--run|run))?[[:space:]]*$'
 
 printf '%s' "$CMD" | grep -Eq "$FULL_SUITE_RE" || exit 0
 

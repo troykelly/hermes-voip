@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# estate-core v2026.08 — big-dump guard (Claude Code PreToolUse:Bash hook).
+# estate-core v2026.08.1 — big-dump guard (Claude Code PreToolUse:Bash hook).
 # Blocks exactly one pattern: a bare `cat` of one file over LIMIT_BYTES with no
 # pipe or redirect. Everything subtler is handled by output caps and context
 # rules, not hooks. Fail-open: any error here must permit the command. Exit 2 = block.

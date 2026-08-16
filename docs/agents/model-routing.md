@@ -1,4 +1,5 @@
 # Cross-Vendor Model Routing Reference
+<!-- cspell:words revertable pre-emptively Sakana Fugu Glasswing Zhipu cutoffs cutoff opencode TTFT cursorrules summarises summarisation hostable chatbots tokenises teardowns batchable uncompacted Cowork ccusage authorised authorisations behaviour LLAP xhigh remoteclip -->
 
 **As of:** 15 August 2026 · **Scope:** Anthropic (all current), OpenAI (all current), xAI Grok (via LLAP), Z.ai GLM-5.2, Sakana Fugu / Fugu Ultra
 **Read §1 and §5 first. §2 is the lookup table. Everything else is exception handling.**
@@ -9,7 +10,7 @@
 ## 1. Fast routing rules
 
 | If the task is… | Route to | Why |
-|---|---|---|
+| --- | --- | --- |
 | Bulk classification, extraction, reformatting, triage | **GPT-5.6 Luna** or **Claude Haiku 4.5** | 5–25× cheaper than frontier; quality difference is noise on mechanical work |
 | Everyday coding, refactors, PR review, test writing | **Claude Sonnet 5**, **GLM-5.2** or **grok-build-0.1** | Near-frontier coding at commodity prices; Sonnet's $2/$10 is now permanent |
 | Hard code review, deep bug analysis, independent second author | **Grok 4.6** or **GPT-5.6 Terra** | Grok 4.6: 96% SWE-bench Verified at $2/$6 — but slow (~35 s to first token); right for review passes, wrong for interactive loops |
@@ -32,7 +33,7 @@ Prices are USD per million tokens, list rate, standard service tier, short-conte
 ### Anthropic
 
 | Model | API ID | Ctx / Max out | $ in → out | Press into service for | Don't route here |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | **Claude Fable 5** | `claude-fable-5` | 1M / 128k | 10 → 50 | Highest available capability; long-running agents; always-on adaptive thinking | Anything Opus 5 already does well — it's 2× the price and slower |
 | **Claude Mythos 5** | `claude-mythos-5` | 1M / 128k | 10 → 50 | Defensive cybersecurity workflows | Not generally available — invitation-only via Project Glasswing |
 | **Claude Mythos Preview** | `claude-mythos-preview` | 1M / 128k | — | Same, earlier snapshot | Same gating |
@@ -45,7 +46,7 @@ Notes: Opus 5 and Sonnet 5 expose `effort` (levels low/medium/high/**xhigh/max**
 ### OpenAI
 
 | Model | API ID | Ctx / Max out | $ in → out | Press into service for | Don't route here |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | **GPT-5.6 Sol** | `gpt-5.6-sol` (alias `gpt-5.6`) | 1.05M / 128k | 5 → 30 | OpenAI flagship: complex reasoning and coding; currently top of most OpenAI leaderboards | Volume work; anything Terra handles |
 | **GPT-5.6 Terra** | `gpt-5.6-terra` | 1.05M / 128k | 2 → 12 | The intelligence/cost balance point; long-context ingestion | Hardest novel engineering |
 | **GPT-5.6 Luna** | `gpt-5.6-luna` | 1.05M / 128k | 0.20 → 1.20 | Cost-sensitive high volume — cheapest 1M-context model in this table | Multi-step agentic work needing sustained judgement |
@@ -63,7 +64,7 @@ Notes: all 5.6 models have a Feb 16, 2026 knowledge cutoff, six reasoning levels
 Reality check, 15 Aug 2026: **there is no public "Grok 5.x"** — the current line is 4.x, flagship `grok-4.6` released 12 Aug 2026. If LLAP's model list shows a different alias, trust LLAP's list; the specs below are the published ones.
 
 | Model | API ID | Ctx / Max out | $ in → out | Press into service for | Don't route here |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | **Grok 4.6** | `grok-4.6` | 500k / n.p. | 2 → 6 (**4 → 12 above 200k input**) | Flagship; xAI recommends it for coding; 96% SWE-bench Verified (4th of 82). Hard code review, deep bug analysis, independent second author | Interactive/latency-sensitive paths (~68 tok/s, ~35 s TTFT); terminal-heavy agent loops (Terminal-Bench 26%) |
 | **Grok 4.5** | `grok-4.5` | 500k / n.p. | 2 → 6 | Prior flagship; same price as 4.6 — prefer 4.6 | — |
 | **grok-build-0.1** | `grok-build-0.1` | 256k / n.p. | 1 → 2 | Dedicated agentic-coding model (May 2026; succeeds grok-code-fast-1); the natural daily tier inside the grok CLI | Contexts over 256k; hardest novel engineering |
@@ -74,7 +75,7 @@ Notes: OpenAI-compatible API shape only (`api.x.ai/v1`; LLAP fronts it — no An
 ### Z.ai (Zhipu) and Sakana
 
 | Model | API ID | Ctx / Max out | $ in → out | Press into service for | Don't route here |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | **GLM-5.2** | `z-ai/glm-5.2` | 1M / 128k | 1.40 → 4.40 (cached in 0.26) | Best value in the table for long-horizon coding and agentic tool use; **MIT open weights** → self-hostable, no vendor lock; genuinely independent reviewer | Hardest from-scratch coding — it trails the closed frontier there; anywhere PRC-jurisdiction API routing is unacceptable |
 | **Fugu** | `sakana/fugu` | — | billed at the underlying model's own rate (no stacking) | Latency-oriented tier: everyday queries, code review, chatbots | Deep multi-step work — that's Ultra's job |
 | **Fugu Ultra** (v1.1 current; v1.0 = `fugu-ultra-20260615`) | `sakana/fugu-ultra` | 1M / 128k | 5 → 30 (cached 0.50); **10 → 45 above 272k ctx** | Quality-first multi-agent orchestration: AI research, paper reproduction, patent/literature investigation | Anything interactive (observed latency 8–160 s); anything where token spend is the binding constraint (§5) |
@@ -86,7 +87,7 @@ Notes: Fugu is a learned orchestrator routing each task across a swappable pool 
 ## 3. OpenAI specialist models (no cross-vendor equivalent here)
 
 | Need | Model | Rate |
-|---|---|---|
+| --- | --- | --- |
 | Image generation / editing | `gpt-image-2` | $8 in / $30 out per MTok (image); $5 text in |
 | Video | `sora-2` / `sora-2-pro` | $0.10/sec; Pro $0.30–$0.70/sec by resolution |
 | Realtime speech-to-speech | `gpt-realtime-2.1`, `-mini` | $32/$64 audio; mini $10/$20 |
@@ -104,7 +105,7 @@ Hosted tool costs that hit every model: web search $10/1k calls plus content tok
 The point is *independent failure modes*. Same-family review is near-worthless — shared training data means shared blind spots. Grok (xAI/SpaceXAI) is a genuine fourth independent family alongside Anthropic, OpenAI and Z.ai.
 
 | Work produced by | Review with | Second opinion |
-|---|---|---|
+| --- | --- | --- |
 | Any Claude model | **GPT-5.6 Sol** or **Grok 4.6** | **GLM-5.2** |
 | Any GPT model | **Claude Opus 5** or **Grok 4.6** | **GLM-5.2** |
 | Grok | **Claude Opus 5** | **GPT-5.6 Terra** |

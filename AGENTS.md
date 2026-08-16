@@ -1,5 +1,5 @@
-<!-- estate-core v2026.08.1 BEGIN — installed by estate realignment; edit via realignment runs only -->
-<!-- cspell:words revertable pre-emptively cutoffs cutoff authorisations unauthorised opencode LLAP xhigh behaviour -->
+<!-- estate-core v2026.08.2 BEGIN — installed by estate realignment; edit via realignment runs only -->
+<!-- cspell:words revertable pre-emptively cutoffs cutoff authorisations unauthorised opencode LLAP xhigh behaviour graphify AST -->
 # Estate operating rules
 
 ## Environment
@@ -22,6 +22,10 @@ Route to the cheapest tier that handles the task; escalate only on demonstrated 
 
 Effort: this repo pins `effortLevel: medium`. Raise it (`--effort high|xhigh`) only for genuinely hard work, and set it at session start — mid-session model or effort switches invalidate the prompt cache. Full table, prices and traps: `docs/agents/model-routing.md` — read it only when actually routing or costing a job.
 
+## Structure and documents — graphify first
+
+`graphify` (local knowledge graph; installed estate-wide) answers structure and navigation from bash under every agent CLI, grok included: `graphify query '<question>' --budget <n>` · `graphify path <A> <B>` · `graphify explain '<node>'`. Query the graph before any grep-and-read sweep for what-defines/calls/uses-what and change-impact questions; fall back to targeted file reads when the graph answer is thin — never to bulk dumps. PDF and Office content is accessed via graphify extraction; raw-dumping binary documents into context is a defect. Keep the graph honest: `graphify hook install` once per clone keeps the code graph current on commit and checkout (AST-only, no LLM cost); document extraction is not covered by the hook — refresh it after adding or changing binary documents, and treat a stale graph as worse than no graph. CLAUDE.md is always exactly `@AGENTS.md`; installers sometimes re-inject guidance there — anything more is drift: reduce it back.
+
 ## Testing — proportionality, enforced
 
 Tests prove behaviour changes; they are not progress decoration.
@@ -42,7 +46,7 @@ Done means all of: full scope implemented · proportional tests exist and pass �
 ## Obstacles
 
 In order: solve it → route around it (do adjacent work, open a tracking issue) → proceed and record the objection in the PR under `## Concerns`. Stopping is reserved for: destructive operations beyond the disposable environment · the git-irreversible · credentials or customer data · illegal or unauthorised targets. That list does not grow by analogy.
-<!-- estate-core v2026.08.1 END -->
+<!-- estate-core v2026.08.2 END -->
 
 ## Repository specifics
 

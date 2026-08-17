@@ -9,9 +9,10 @@
  * the matcher covers Edit/Write/NotebookEdit only, so a Bash write into the root
  * checkout is NOT caught. Do not route around it.
  *
- * Allowed: paths under <root>/.worktrees/** and paths outside the repository
- * entirely (e.g. ~/.claude memory, /tmp scratch). Blocked: everything else
- * inside the root checkout's working tree.
+ * Allowed: paths under <root>/.worktrees/**, top-level graphify-out/**
+ * (gitignored graph scratch), and paths outside the repository entirely
+ * (e.g. ~/.claude memory, /tmp scratch). Blocked: everything else inside
+ * the root checkout's working tree.
  *
  * Exit codes per the hooks contract: 0 = allow, 2 = block (stderr is fed back
  * to the model). Any unexpected failure allows the call — this hook is defence
@@ -57,8 +58,14 @@ const insideRoot =
 const insideLane =
   rel.startsWith(`.worktrees${path.sep}`) ||
   rel.startsWith(`.claude${path.sep}worktrees${path.sep}`);
+// Gitignored graphify knowledge-graph scratch must be writable in the root
+// checkout — the graph indexes the root clone and outlives worktree lanes;
+// blocking it pushed agents into worktree workarounds (estate remediation
+// 2026-08-17). Top-level and separator-exact only: nested graphify-out/
+// dirs and lookalike names stay blocked.
+const insideGraphifyScratch = rel.startsWith(`graphify-out${path.sep}`);
 
-if (insideRoot && !insideLane) {
+if (insideRoot && !insideLane && !insideGraphifyScratch) {
   console.error(
     `Blocked: ${resolved} is in the root checkout. Never edit the root checkout — ` +
       `create a worktree lane (worktree-lane skill) and edit ` +

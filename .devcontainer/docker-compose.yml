@@ -31,11 +31,6 @@ volumes:
 
 networks:
   devnet:
-    # Deterministic per-repo IPv6 ULA (RFC 4193): fd + 40-bit Global ID derived
-    # from sha256("<org>/<repo>"). Stable across hosts/rebuilds, collision-free
-    # across repos — replaces hand-picked fd00:… prefixes. Docker assigns a
-    # dual-stack IPv4 subnet automatically alongside this.
+    # Docker allocates both subnets from the host's DHCPv6-PD-backed pools.
+    # Never pin an address range in project source.
     enable_ipv6: true
-    ipam:
-      config:
-        - subnet: "fd88:d08f:425a:1::/64"
